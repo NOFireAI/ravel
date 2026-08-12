@@ -113,6 +113,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 4)]
     pub maintain_unit_concurrency: usize,
 
+    /// Consecutive failed ticks an owned `(tenant, signal, shard)` unit must
+    /// accrue, with no intervening success, before it counts toward
+    /// `ravel_maintain_units_stalled` (ADR-0065 decision 2's stuck-owner
+    /// mitigation). A single success resets a unit's counter to zero.
+    #[arg(long, default_value_t = 3)]
+    pub maintain_stalled_after_intervals: u32,
+
     /// Slow safety-net re-verify cadence for the maintenance loop's interior
     /// zone (ADR-0065 decision 3), as a humantime duration (e.g. `6h`). A
     /// terminal interior-zone bucket -- below the frontier, outside the

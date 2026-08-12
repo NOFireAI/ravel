@@ -29,6 +29,8 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--fold-interval-secs <n>` | | `300` | How often each tenant's fold task wakes up to check for newly sealed hours. |
 | `--maintain-interval-secs <n>` | | `300` | Used only in `--mode maintain`. How often each tenant's maintenance task wakes to run retention, compaction, and the sweeper over every shard of both signals. |
 | `--maintain-interior-reverify <duration>` | | `6h` | Used only in `--mode maintain`. The slow safety-net cadence for the ADR-0065 interior zone (the ingest hours that aren't in the head or tail zones this tick): an interior bucket's memoized terminal state is re-verified no less often than this, and the sweeper runs a full-keyspace pass (instead of its per-tick head+tail-only pass) on the same cadence. Head and tail hours are unaffected and are always evaluated every tick. A zero duration disables the safety net (every interior bucket is always due), matching pre-ADR-0065 behavior for that zone; only an unparseable duration fails startup. |
+| `--maintain-unit-concurrency <n>` | | `4` | Used only in `--mode maintain`. The maximum number of owned `(signal, shard)` units this process maintains at once within one tenant's tick (ADR-0065 decision 2's stuck-owner mitigation), replacing the pre-ADR-0065 strictly-sequential per-shard walk so one pathological unit cannot starve the rest of this process's ownership. Clamped to at least 1; a value of `0` degrades to a sequential walk rather than deadlocking. Scale this up on a process that owns many units and has spare I/O concurrency to spend, down on a process sharing a host with other work. |
+| `--maintain-stalled-after-intervals <n>` | | `3` | Used only in `--mode maintain`. Consecutive failed ticks an owned `(tenant, signal, shard)` unit must accrue, with no intervening success, before it counts toward `ravel_maintain_units_stalled` (ADR-0065 decision 2's stuck-owner mitigation). A single success resets that unit's counter to zero. Lower it to page sooner on a flaky unit at the cost of more noise from transient single-tick faults; raise it to tolerate a noisier store at the cost of a slower page. |
 | `--retention-default <duration>` | | none | Used only in `--mode maintain`. The default age-based retention window applied to every tenant with no explicit override, as a humantime duration (`30d`, `720h`). Omitted means no default retention: nothing is age-deleted unless a per-tenant window is set. It is validated at startup against the ADR-0019 floor; a window below the floor fails startup rather than being clamped. |
 | `--retention-tenant TENANT=DURATION` | | none, repeatable | Used only in `--mode maintain`. The per-tenant retention window; it overrides `--retention-default` for that tenant. Parsed with `humantime::parse_duration`. Same below-floor validation. |
 | `--indexed-field FIELD` | | shipped default list, repeatable | POSTINGS indexed field for a tenant with no `--indexed-field-tenant` override (ADR-0049 decision 3). Pass the flag once per field. The shipped default is `service.name`, `k8s.namespace.name`, and `http.status_code`. Any value you pass replaces the shipped default list, not adds to it. |
@@ -1314,6 +1316,44 @@ orphan-breaker-trip counter, but ADR-0044 blocks any
 unless the opt-in `--metrics-tenant-labels` flag is set (see below); by
 default all five samples stay process-wide totals, not broken out per
 tenant.
+
+### Maintenance ownership, concurrency, and merge-memory metrics and alerts (ADR-0065, issue #749)
+
+`--mode maintain` also renders the ADR-0065 leased-distributed-maintenance
+family, one process-wide series per name (`mode` label only, plus `kind` on
+the merge-memory gauge -- no `tenant_hash`, per ADR-0044 section 4):
+
+| Metric | Kind | What |
+|---|---|---|
+| `ravel_maintain_workers_live` | gauge | In-process maintenance workers this supervisor currently sees as live under its own heartbeat/liveness protocol (ADR-0065 decision 1). `1` in a single-replica deployment; a healthy multi-replica deployment holds at the replica count. |
+| `ravel_maintain_units_owned` | gauge | Owned `(tenant, signal, shard)` units this process is currently maintaining, recomputed from scratch every discovery cycle (ADR-0065 decision 2). Summed across every live worker this equals the total unit count, with no unit double-owned or unowned. |
+| `ravel_maintain_units_stalled` | gauge | Owned units whose consecutive failing ticks have crossed `--maintain-stalled-after-intervals` (default `3`), with no intervening success (ADR-0065 decision 2's stuck-owner mitigation). |
+| `ravel_maintain_memo_warm_start_units_total` | counter | Units seeded from a durable memo snapshot on handoff or startup, instead of rescanning cold (ADR-0065 decision 3). Only increments when a membership change hands this process a unit another worker's snapshot already covers; a stable single-replica deployment sees this stay at its startup value. |
+| `ravel_maintain_full_sweep_passes_total` | counter | Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep (ADR-0065 decision 3). A cold-started memo runs one of these per owned unit on the first tick, then only on the `--maintain-interior-reverify` cadence afterward. |
+| `ravel_maintain_rlog_merge_peak_bytes{kind="transient"\|"total"}` | gauge | High-water mark of RLOG k-way merge memory (ADR-0065 decision 4): `transient` is in-flight fetched-minus-released block bytes, `total` adds the buffered writer output. One process-wide tracker shared across every tenant's merges, so this is not a per-merge or per-tenant number. |
+
+Default alert rules:
+
+| Condition | Query | Why |
+|---|---|---|
+| No live maintenance workers | `ravel_maintain_workers_live == 0` while `--mode maintain` is running | A process that cannot see itself as live (a heartbeat write persistently failing, or a liveness-window read persistently erroring, ADR-0065 decision 1's fail-open path only masks a *transient* fault) owns nothing under the rendezvous hash. Every unit it used to own either sits unmaintained or, in a multi-replica deployment, is now double-covered by a sibling racing to pick it up. Fire on the level, not on an `increase()`: there is no counter here to accrue against, only a gauge that should never read zero while this role is up. |
+| Units stalled, sustained | `ravel_maintain_units_stalled > 0` for `30m` | A unit crossing the stall threshold means its last `--maintain-stalled-after-intervals` ticks all failed with no intervening success -- the same unit, not a rotating cast of transient faults (`observe_unit_tick` resets the streak on any single success). A momentary blip during a store hiccup can cross the threshold and clear itself within a cycle or two; a stall that survives multiple maintenance intervals (30 minutes covers several cycles at the default 300s `--maintain-interval-secs`) means that unit's retention, compaction, or sweep pass is genuinely stuck and needs an operator, not just its next scheduled retry. |
+
+`ravel_maintain_memo_warm_start_units_total` and
+`ravel_maintain_full_sweep_passes_total` are not alert targets: both are
+expected-activity counters (a warm start is the *intended* outcome of a
+membership change, and a full sweep is the *intended* outcome of a cold
+start or the interior-reverify cadence), not failure signals. Graph them to
+confirm the warm-start path is exercised during a rolling restart, or to
+see the interior-reverify cadence's periodic full-sweep cost, rather than
+alerting on either.
+
+`ravel_maintain_rlog_merge_peak_bytes` is an inspection gauge for sizing a
+process's memory headroom against real observed merge peaks (ADR-0065
+decision 4), not an alert target on its own: pair it with the process's
+actual memory limit and alert on that ratio if this deployment enforces
+one, rather than on an absolute byte threshold this doc would have to pick
+for every possible workload.
 
 ### Admission usage (ADR-0051 section 6)
 

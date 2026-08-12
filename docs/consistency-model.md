@@ -361,6 +361,39 @@ the split (the scan's interior re-verify interval and the sweeper's
 full-pass cadence): setting it to a non-positive value disables the
 skip in both, reproducing the pre-split full-scan-every-tick behavior.
 
+### Bounded intra-process unit concurrency (ADR-0065 decision 2)
+
+`--maintain-unit-concurrency` (default 4) runs a tick's owned units through
+`run_bounded` (`crates/ravel-fleet`'s order-preserving buffered fan-out)
+instead of the strictly sequential per-shard walk. This changes intra-tick
+resource shape, not any promptness bound in this document: `run_bounded`
+still awaits every owned unit's retention-and-compaction pass and sweep to
+complete before the tick's results (including the deletion rules in the
+table above) are used, exactly as the sequential walk did. A tick still
+either finishes all of its owned units or it hasn't finished, regardless of
+`--maintain-unit-concurrency`'s value; concurrency only changes how many of
+those units are in flight against the store at once, and the sweeper's
+head/tail-vs-interior zone split above remains the only source of a
+documented promptness bound.
+
+This does depend on every owned unit's operation eventually returning
+(`Ok` or `Err`), not merely running slowly: `run_bounded` preserves input
+order in its output, so a unit that never returns blocks every
+later-ordered unit's result from being collected even after their own work
+has actually completed against the store, and therefore blocks this tick,
+this tenant's discovery-cycle entry, and (since `run_discovery_cycle` walks
+tenants sequentially within one `run_loop` iteration) every tenant ordered
+after it this cycle. The stalled-units gauge below cannot observe this case
+either -- `observe_unit_tick` records only once a unit's future resolves.
+The design's actual backstop for a non-terminating unit is decision 1: a
+`run_loop` stuck inside the discovery branch of its `select!` also stops
+polling its heartbeat branch, so the process stops heartbeating and a live
+sibling treats it as stale and takes over its units within `3 * H`, the
+same recovery path a hard process hang would take, not a per-unit lease.
+`ravel_maintain_units_stalled` (docs/guides/operations.md) covers the
+distinct, and more common, case of a unit whose operation keeps returning
+`Err` on schedule rather than never returning at all.
+
 - Orphan GC (data objects with no commit record) considers only objects
   with last_modified age > grace + max_flush_lifetime. Writers abandon any
   flush older than max_flush_lifetime and never publish it afterward; the

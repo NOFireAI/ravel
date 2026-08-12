@@ -232,6 +232,123 @@ impl MaintenanceSafetyMetrics {
     }
 }
 
+/// Default number of consecutive failed ticks a unit must accrue before
+/// `MaintenanceOwnershipMetrics::observe_unit_tick` counts it as stalled
+/// (ADR-0065 stuck-owner mitigation).
+const DEFAULT_STALLED_AFTER_INTERVALS: u32 = 3;
+
+/// Per-unit consecutive-failure counters backing `ravel_maintain_units_stalled`.
+///
+/// A unit (tenant, signal, shard) is "stalled" once it has failed
+/// `stalled_after_intervals` ticks in a row without an intervening success;
+/// a single success resets its counter to zero.
+#[derive(Debug, Default)]
+struct UnitStallTracker {
+    threshold: u32,
+    failures: parking_lot::Mutex<std::collections::HashMap<(TenantHash, Signal, u32), u32>>,
+}
+
+impl UnitStallTracker {
+    fn new(threshold: u32) -> Self {
+        UnitStallTracker {
+            threshold,
+            failures: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Records one tick outcome for `unit` and returns the current count of
+    /// units at or past the stall threshold.
+    fn observe(&self, unit: (TenantHash, Signal, u32), ok: bool) -> u64 {
+        let mut failures = self.failures.lock();
+        if ok {
+            failures.remove(&unit);
+        } else {
+            let count = failures.entry(unit).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        failures
+            .values()
+            .filter(|&&count| count >= self.threshold)
+            .count() as u64
+    }
+}
+
+/// New metrics for ADR-0065's stuck-owner mitigation: how many owned units
+/// this process is carrying, how many workers are live in-process, how many
+/// units warm-started from a durable memo snapshot, and how many units are
+/// stalled (consecutive failing ticks). Exported on `/metrics` with closed
+/// label sets only (ADR-0044 section 4): no `tenant_hash`.
+#[derive(Debug, Default)]
+pub struct MaintenanceOwnershipMetrics {
+    workers_live: AtomicU64,
+    units_owned: AtomicU64,
+    memo_warm_start_units: AtomicU64,
+    full_sweep_passes_total: AtomicU64,
+    units_stalled: AtomicU64,
+    stalls: UnitStallTracker,
+}
+
+impl MaintenanceOwnershipMetrics {
+    pub fn new(stalled_after_intervals: u32) -> Self {
+        MaintenanceOwnershipMetrics {
+            workers_live: AtomicU64::new(0),
+            units_owned: AtomicU64::new(0),
+            memo_warm_start_units: AtomicU64::new(0),
+            full_sweep_passes_total: AtomicU64::new(0),
+            units_stalled: AtomicU64::new(0),
+            stalls: UnitStallTracker::new(stalled_after_intervals),
+        }
+    }
+
+    fn set_workers_live(&self, count: u64) {
+        self.workers_live.store(count, Ordering::Relaxed);
+    }
+
+    fn set_units_owned(&self, count: u64) {
+        self.units_owned.store(count, Ordering::Relaxed);
+    }
+
+    fn add_units_owned(&self, delta: u64) {
+        self.units_owned.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    fn add_memo_warm_start_units(&self, count: u64) {
+        self.memo_warm_start_units
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn inc_full_sweep_passes(&self) {
+        self.full_sweep_passes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one tick outcome for the given owned unit, updating the
+    /// stalled-unit count if this tick crossed (or cleared) the threshold.
+    fn observe_unit_tick(&self, tenant: TenantHash, signal: Signal, shard: u32, ok: bool) {
+        let stalled = self.stalls.observe((tenant, signal, shard), ok);
+        self.units_stalled.store(stalled, Ordering::Relaxed);
+    }
+
+    pub fn workers_live(&self) -> u64 {
+        self.workers_live.load(Ordering::Relaxed)
+    }
+
+    pub fn units_owned(&self) -> u64 {
+        self.units_owned.load(Ordering::Relaxed)
+    }
+
+    pub fn memo_warm_start_units(&self) -> u64 {
+        self.memo_warm_start_units.load(Ordering::Relaxed)
+    }
+
+    pub fn full_sweep_passes_total(&self) -> u64 {
+        self.full_sweep_passes_total.load(Ordering::Relaxed)
+    }
+
+    pub fn units_stalled(&self) -> u64 {
+        self.units_stalled.load(Ordering::Relaxed)
+    }
+}
+
 /// Everything the maintenance task needs beyond the store and the tenant list.
 #[derive(Debug, Clone)]
 pub struct MaintenanceTaskConfig {
@@ -251,6 +368,10 @@ pub struct MaintenanceTaskConfig {
     /// units this process maintains at once within a tenant's tick, replacing
     /// the pre-ADR-0065 strictly-sequential per-shard walk. Default 4.
     pub unit_concurrency: usize,
+    /// Consecutive failed ticks a unit must accrue before
+    /// `ravel_maintain_units_stalled` counts it (ADR-0065 stuck-owner
+    /// mitigation). Default 3.
+    pub stalled_after_intervals: u32,
 }
 
 impl Default for MaintenanceTaskConfig {
@@ -262,6 +383,7 @@ impl Default for MaintenanceTaskConfig {
             compactor: CompactorConfig::default(),
             retention: RetentionConfig::default(),
             unit_concurrency: DEFAULT_UNIT_CONCURRENCY,
+            stalled_after_intervals: DEFAULT_STALLED_AFTER_INTERVALS,
         }
     }
 }
@@ -305,6 +427,7 @@ pub fn spawn(
     config: MaintenanceTaskConfig,
     metrics: Arc<TenantDiscoveryMetrics>,
     safety: Arc<MaintenanceSafetyMetrics>,
+    ownership: Arc<MaintenanceOwnershipMetrics>,
     worker: Arc<WorkerSet>,
 ) -> MaintenanceTasks {
     if !config.enabled {
@@ -341,6 +464,7 @@ pub fn spawn(
             interval,
             metrics,
             safety,
+            ownership,
             worker,
             rng,
             rx,
@@ -363,6 +487,7 @@ async fn run_loop(
     interval: Duration,
     metrics: Arc<TenantDiscoveryMetrics>,
     safety: Arc<MaintenanceSafetyMetrics>,
+    ownership: Arc<MaintenanceOwnershipMetrics>,
     worker: Arc<WorkerSet>,
     rng: Arc<dyn RngSource>,
     mut shutdown: oneshot::Receiver<()>,
@@ -410,6 +535,7 @@ async fn run_loop(
     // ADR-0065 decision 1): ownership stays stable rather than collapsing.
     let clock = WallClock;
     let mut live_set = worker.solo_live_set();
+    ownership.set_workers_live(live_set.len() as u64);
     let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // A `tokio::time::sleep(...)` written directly as a `select!` branch is a
@@ -442,6 +568,7 @@ async fn run_loop(
                             reseed = true;
                         }
                         live_set = computed;
+                        ownership.set_workers_live(live_set.len() as u64);
                     }
                     Err(err) => tracing::warn!(
                         error = %err,
@@ -462,6 +589,7 @@ async fn run_loop(
                             let (units, buckets) = seed_memo_from_snapshots(
                                 &mut memo, &snapshots, now, &worker, &live_set,
                             );
+                            ownership.add_memo_warm_start_units(units as u64);
                             if buckets > 0 {
                                 tracing::info!(
                                     seeded_units = units,
@@ -496,6 +624,7 @@ async fn run_loop(
                     &mut memo,
                     metrics.as_ref(),
                     safety.as_ref(),
+                    ownership.as_ref(),
                     &worker,
                     &live_set,
                 )
@@ -543,6 +672,7 @@ pub async fn run_discovery_cycle(
     memo: &mut MaintainMemo,
     metrics: &TenantDiscoveryMetrics,
     safety: &MaintenanceSafetyMetrics,
+    ownership: &MaintenanceOwnershipMetrics,
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
@@ -566,6 +696,12 @@ pub async fn run_discovery_cycle(
         );
     }
 
+    // Recomputed from scratch every cycle (ADR-0065 stuck-owner mitigation
+    // metrics): each tenant's tick below adds its owned unit count, so this
+    // gauge always reflects the current cycle's ownership, not a running
+    // total across cycles.
+    ownership.set_units_owned(0);
+
     let mut total = MaintainReport::default();
     for tenant in &outcome.maintained {
         let report = run_tick(
@@ -576,6 +712,7 @@ pub async fn run_discovery_cycle(
             shard_count,
             memo,
             safety,
+            ownership,
             worker,
             live_set,
         )
@@ -639,6 +776,7 @@ pub async fn run_tick(
     shard_count: u32,
     memo: &mut MaintainMemo,
     safety: &MaintenanceSafetyMetrics,
+    ownership: &MaintenanceOwnershipMetrics,
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
@@ -733,6 +871,7 @@ pub async fn run_tick(
         let owned_shards: Vec<u32> = (0..scan_shards)
             .filter(|shard| worker.owns_unit(live_set, tenant, signal, *shard))
             .collect();
+        ownership.add_units_owned(owned_shards.len() as u64);
 
         // Carve each owned unit's memo slice out of the shared memo so its
         // concurrent future can mutate it without aliasing another unit's
@@ -754,6 +893,7 @@ pub async fn run_tick(
         // keyspace disjoint from every other unit's.
         let clock_ref = &clock;
         let hold_ref = &hold;
+        let ownership_ref = ownership;
         let unit_results = run_bounded(
             worker.unit_concurrency(),
             units,
@@ -811,6 +951,7 @@ pub async fn run_tick(
                         .await;
                         if outcome.is_ok() {
                             unit_memo.record_full_sweep(*tenant, signal, shard, now);
+                            ownership_ref.inc_full_sweep_passes();
                         }
                         outcome
                     }
@@ -822,6 +963,12 @@ pub async fn run_tick(
 
         for (shard, unit_memo, scan_result, sweep_result) in unit_results {
             memo.merge_unit(unit_memo);
+            ownership.observe_unit_tick(
+                *tenant,
+                signal,
+                shard,
+                scan_result.is_ok() && sweep_result.is_ok(),
+            );
             match scan_result {
                 Ok(report) => {
                     tracing::info!(
@@ -1237,6 +1384,7 @@ mod tests {
         let compactor = CompactorConfig::default();
         let retention = RetentionConfig::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
 
         let mut memo_a = MaintainMemo::with_default_interval();
         let report_a = run_tick(
@@ -1247,6 +1395,7 @@ mod tests {
             SHARDS,
             &mut memo_a,
             &safety,
+            &ownership,
             &a,
             &live_a,
         )
@@ -1261,6 +1410,7 @@ mod tests {
             SHARDS,
             &mut memo_b,
             &safety,
+            &ownership,
             &b,
             &live_b,
         )
@@ -1315,6 +1465,7 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
         let report = run_tick(
             &store,
@@ -1324,6 +1475,7 @@ mod tests {
             4,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -1420,6 +1572,7 @@ mod tests {
         // continues for the deprovisioned-by-token tenant.
         let metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
         let mut memo = MaintainMemo::with_default_interval();
         let report = run_discovery_cycle(
@@ -1431,6 +1584,7 @@ mod tests {
             &mut memo,
             &metrics,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -1501,6 +1655,7 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
         run_tick(
             &store,
@@ -1510,6 +1665,7 @@ mod tests {
             1,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -1728,6 +1884,7 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
 
         // Static shard_count is 2, matching generation 0's count; the scan
@@ -1740,6 +1897,7 @@ mod tests {
             2,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -1772,6 +1930,7 @@ mod tests {
         let retention = RetentionConfig::default();
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
 
         // Per-bucket object reads: the memo elides the per-bucket LIST and GET
@@ -1791,6 +1950,7 @@ mod tests {
             1,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -1812,6 +1972,7 @@ mod tests {
             1,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -1877,6 +2038,7 @@ mod tests {
         .expect("valid retention policy");
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
 
         // Tick 1: the bucket's one sample is from ingest hour 0 (1970), so any
@@ -1891,6 +2053,7 @@ mod tests {
             1,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -1908,6 +2071,7 @@ mod tests {
             1,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -1982,6 +2146,7 @@ mod tests {
         .expect("valid retention policy");
         let mut memo = MaintainMemo::with_default_interval();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
 
         let report = run_tick(
@@ -1992,6 +2157,7 @@ mod tests {
             1,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -2042,6 +2208,7 @@ mod tests {
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
 
         let report = run_discovery_cycle(
@@ -2053,6 +2220,7 @@ mod tests {
             &mut memo,
             &metrics,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -2085,6 +2253,7 @@ mod tests {
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
         let restrict = [acme.hash()];
 
@@ -2097,6 +2266,7 @@ mod tests {
             &mut memo,
             &metrics,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -2145,6 +2315,7 @@ mod tests {
         let mut memo = MaintainMemo::with_default_interval();
         let metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
 
         let report = run_discovery_cycle(
@@ -2156,6 +2327,7 @@ mod tests {
             &mut memo,
             &metrics,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -2206,6 +2378,9 @@ mod tests {
         let retention = Arc::new(RetentionConfig::default());
         let metrics = Arc::new(TenantDiscoveryMetrics::default());
         let safety = Arc::new(MaintenanceSafetyMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
         let worker = Arc::new(WorkerSet::with_defaults(0));
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -2219,6 +2394,7 @@ mod tests {
             discovery_interval,
             metrics.clone(),
             safety,
+            ownership,
             worker,
             Arc::new(SystemRng),
             shutdown_rx,
@@ -2260,6 +2436,7 @@ mod tests {
         let compactor = CompactorConfig::default();
         let retention = RetentionConfig::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let worker = solo_worker();
         let mut memo = MaintainMemo::with_default_interval();
 
@@ -2272,6 +2449,7 @@ mod tests {
             1,
             &mut memo,
             &safety,
+            &ownership,
             &worker,
             &worker.solo_live_set(),
         )
@@ -2337,6 +2515,7 @@ mod tests {
         let compactor = CompactorConfig::default();
         let retention = RetentionConfig::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
 
         // Worker A warms and persists its snapshot.
         let worker_a = solo_worker();
@@ -2349,6 +2528,7 @@ mod tests {
             1,
             &mut memo_a,
             &safety,
+            &ownership,
             &worker_a,
             &worker_a.solo_live_set(),
         )
@@ -2385,6 +2565,7 @@ mod tests {
             1,
             &mut memo_b,
             &safety,
+            &ownership,
             &worker_b,
             &live_b,
         )
@@ -2445,6 +2626,7 @@ mod tests {
         let compactor = CompactorConfig::default();
         let retention = RetentionConfig::default();
         let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
         let mut memo_a = MaintainMemo::with_default_interval();
         run_tick(
             &store,
@@ -2454,6 +2636,7 @@ mod tests {
             SHARDS,
             &mut memo_a,
             &safety,
+            &ownership,
             &a,
             &live_ab,
         )
@@ -2509,6 +2692,7 @@ mod tests {
             SHARDS,
             &mut memo_b,
             &safety,
+            &ownership,
             &b,
             &live_b,
         )
@@ -2591,5 +2775,222 @@ mod tests {
 
         // A different signal is untouched throughout.
         assert_eq!(safety.orphans_present(Signal::Logs), 0);
+    }
+
+    /// A store wrapper that instruments `list_delimited` -- the call
+    /// `scan_and_maintain_with_memo` makes first, via `list_shard_hours`,
+    /// before touching anything else for a unit -- with a run of
+    /// `tokio::task::yield_now` before delegating to `inner`. Widening this
+    /// window gives every unit `run_bounded` has actually admitted a chance to
+    /// reach the probe before any of them release it, so `peak` reports the
+    /// true number of units `run_tick` runs concurrently rather than an
+    /// artifact of one future finishing before the next starts.
+    struct ConcurrencyProbeStore<S> {
+        inner: S,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S> ConcurrencyProbeStore<S> {
+        fn new(inner: S) -> Self {
+            ConcurrencyProbeStore {
+                inner,
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for ConcurrencyProbeStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            use std::sync::atomic::Ordering;
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(cur, Ordering::SeqCst);
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            let result = self.inner.list_delimited(prefix).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// `run_tick` never admits more than `worker.unit_concurrency()` units'
+    /// scans at once, proven end to end through the real driver (not just
+    /// through `run_bounded` in isolation, which ravel-fleet's
+    /// `run_bounded_respects_the_concurrency_cap` already covers). Eight
+    /// shards against a cap of 2, over both maintained signals, gives 16
+    /// probed calls, far more than the cap, so a peak below or above 2 cannot
+    /// be a scheduling coincidence.
+    ///
+    /// Proved to actually bind: with the `worker.unit_concurrency()` argument
+    /// at the `run_bounded` call site in `run_tick` (this file) temporarily
+    /// replaced by `units.len()`, this test's `peak == CAP` assertion failed
+    /// with `peak == 8` (all of one signal's shards admitted at once); reverting
+    /// that one-line substitution restored the pass.
+    #[tokio::test]
+    async fn run_tick_never_exceeds_configured_unit_concurrency() {
+        use std::sync::atomic::Ordering;
+
+        const SHARDS: u32 = 8;
+        const CAP: usize = 2;
+
+        let store = ConcurrencyProbeStore::new(MemoryStore::new());
+        let in_flight = store.in_flight.clone();
+        let peak = store.peak.clone();
+
+        let tenant = TenantId::new("acme").hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = WorkerSet::new(0, Duration::from_secs(60), 3, CAP);
+        let live_set = worker.solo_live_set();
+
+        let _report = run_tick(
+            &store, &tenant, &compactor, &retention, SHARDS, &mut memo, &safety, &ownership,
+            &worker, &live_set,
+        )
+        .await;
+
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "every probed call released by the time the tick returns"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            CAP,
+            "run_tick admits at most, and (with more units than the cap) exactly, \
+             worker.unit_concurrency() unit scans concurrently"
+        );
+    }
+
+    /// A unit that fails every tick, tenant lifecycle otherwise unchanged,
+    /// accrues toward `ownership.units_stalled()` once it reaches
+    /// `stalled_after_intervals` consecutive failures, and a single
+    /// intervening success resets its counter to zero (no partial credit
+    /// carried across a recovered tick). Failure is injected via `FaultStore`
+    /// on `list_delimited`, the first call `scan_and_maintain_with_memo` makes
+    /// for a unit, so the whole per-unit tick (scan and sweep both) reports an
+    /// error for that unit on the faulted ticks.
+    #[tokio::test]
+    async fn units_stalled_fires_after_threshold_consecutive_failures_and_resets_on_success() {
+        const THRESHOLD: u32 = 3;
+
+        let tenant = TenantId::new("acme").hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let worker = solo_worker();
+        let live_set = worker.solo_live_set();
+        let ownership = MaintenanceOwnershipMetrics::new(THRESHOLD);
+
+        // Faults only (tenant, Metrics, shard 0)'s own listing: the legal-hold
+        // refresh (a different shard, Signal::Audit) and the Logs/Spans shard-0
+        // units stay clean, so only the one unit's tick fails.
+        let shard_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid metrics shard prefix");
+
+        // Three consecutive faulted ticks: the unit fails every time, so the
+        // third crosses the threshold and the gauge goes to 1.
+        for tick in 0..THRESHOLD {
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("scan unavailable".into()),
+                )
+                .with_key_contains(shard_prefix.clone()),
+            );
+            let faulted = FaultStore::new(MemoryStore::new(), plan);
+            let mut memo = MaintainMemo::with_default_interval();
+            let _report = run_tick(
+                &faulted,
+                &tenant,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &MaintenanceSafetyMetrics::default(),
+                &ownership,
+                &worker,
+                &live_set,
+            )
+            .await;
+            let expected = u64::from(tick + 1 >= THRESHOLD);
+            assert_eq!(
+                ownership.units_stalled(),
+                expected,
+                "tick {tick}: stalled gauge must reflect exactly whether the \
+                 threshold has been reached, not fire early or stay pinned"
+            );
+        }
+        assert_eq!(ownership.units_stalled(), 1);
+
+        // A clean tick (no fault) succeeds and resets this unit's streak.
+        let clean = MemoryStore::new();
+        let mut memo = MaintainMemo::with_default_interval();
+        let _report = run_tick(
+            &clean,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &MaintenanceSafetyMetrics::default(),
+            &ownership,
+            &worker,
+            &live_set,
+        )
+        .await;
+        assert_eq!(
+            ownership.units_stalled(),
+            0,
+            "a single success resets the unit's consecutive-failure streak"
+        );
     }
 }
