@@ -575,7 +575,7 @@ async fn merge_stream_into_part(
 /// accumulated as records were pushed (streams are merged in sorted id order,
 /// so `first` is the smallest and `last` the largest id in the part).
 #[allow(clippy::too_many_arguments)]
-async fn finalize_part(
+pub(crate) async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
     writer: RlogWriter,
@@ -642,7 +642,7 @@ async fn finalize_part(
 /// are zero and `writer_id` is the compactor's uuid: informational only, never
 /// part of any identity or dedup order (RLOG has none), matching the RSEG L1
 /// writer's identity convention (`build.rs`).
-fn compactor_identity(bucket: &Bucket, config: &CompactorConfig) -> ObjectIdentity {
+pub(crate) fn compactor_identity(bucket: &Bucket, config: &CompactorConfig) -> ObjectIdentity {
     ObjectIdentity {
         tenant_hash: bucket.tenant_hash.0,
         shard: bucket.shard,
