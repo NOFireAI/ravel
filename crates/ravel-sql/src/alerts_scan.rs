@@ -45,6 +45,7 @@ use datafusion::physical_plan::{
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{AttrValue, LogRecord, Predicate};
+use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{LogQuery, LogSegmentFetcher};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -70,6 +71,9 @@ pub struct AlertsScanExec {
     /// Exact per-record attribute equalities (`alert_id`/`rule_id`) handed to
     /// `RlogReader::scan`, applied exactly there.
     content: Arc<Vec<Predicate>>,
+    /// Pending selective-erasure predicates from the resolved snapshot
+    /// (ADR-0064 decision 2, issue #829); fed to [`LogQuery::with_erasure`].
+    erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
@@ -93,6 +97,7 @@ impl AlertsScanExec {
         ts_min: i64,
         ts_max: i64,
         content: Arc<Vec<Predicate>>,
+        erasure: Arc<Vec<ErasurePredicate>>,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -109,6 +114,7 @@ impl AlertsScanExec {
             ts_min,
             ts_max,
             content,
+            erasure,
             schema,
             properties,
             accounting,
@@ -183,6 +189,7 @@ impl ExecutionPlan for AlertsScanExec {
         let fetcher = self.fetcher.clone();
         let tenant_hash = self.tenant_hash;
         let content = Arc::clone(&self.content);
+        let erasure = Arc::clone(&self.erasure);
         let schema = Arc::clone(&self.schema);
 
         let reservation = MemoryConsumer::new(format!("AlertsScanExec[{partition}]"))
@@ -195,6 +202,7 @@ impl ExecutionPlan for AlertsScanExec {
             self.ts_min,
             self.ts_max,
             content,
+            erasure,
             self.accounting.clone(),
         ));
         Ok(Box::pin(AlertScanStream {
@@ -208,6 +216,7 @@ impl ExecutionPlan for AlertsScanExec {
 /// Fetch every segment in this partition and return its records sorted by
 /// `ts_ns` ascending. The ts range and the `alert_id`/`rule_id` equalities prune
 /// the fetch exactly; the residual re-applies everything above.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: LogSegmentFetcher,
     tenant_hash: TenantHash,
@@ -215,9 +224,10 @@ async fn prepare_partition(
     ts_min: i64,
     ts_max: i64,
     content: Arc<Vec<Predicate>>,
+    erasure: Arc<Vec<ErasurePredicate>>,
     accounting: QueryAccounting,
 ) -> DFResult<Vec<LogRecord>> {
-    let mut query = LogQuery::new(ts_min, ts_max);
+    let mut query = LogQuery::new(ts_min, ts_max).with_erasure((*erasure).clone());
     for c in content.iter() {
         query = query.with_content(c.clone());
     }

@@ -33,6 +33,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
@@ -53,6 +54,10 @@ pub struct AlertsTableProvider {
     /// This query's accounting handle (ADR-0044), cloned into every
     /// `AlertsScanExec` the provider builds.
     accounting: QueryAccounting,
+    /// Pending selective-erasure predicates derived once from
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// into every `AlertsScanExec` the provider builds.
+    erasure: Arc<Vec<ErasurePredicate>>,
 }
 
 impl AlertsTableProvider {
@@ -66,6 +71,7 @@ impl AlertsTableProvider {
         config: impl Into<SqlConfig>,
         accounting: QueryAccounting,
     ) -> Self {
+        let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
         AlertsTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
@@ -73,6 +79,7 @@ impl AlertsTableProvider {
             config: config.into(),
             schema: alerts_schema(),
             accounting,
+            erasure,
         }
     }
 
@@ -115,6 +122,7 @@ impl AlertsTableProvider {
             pushdown.ts_min(),
             pushdown.ts_max(),
             Arc::new(pushdown.content.clone()),
+            Arc::clone(&self.erasure),
             self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))

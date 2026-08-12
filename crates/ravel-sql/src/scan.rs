@@ -101,6 +101,7 @@ use datafusion::physical_plan::{
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_promql::LabelMatcher;
+use ravel_query::erasure::{ErasurePredicate, retain_series_soa};
 use ravel_query::{ByteLimit, SegmentFetcher};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, TenantHash};
@@ -164,6 +165,12 @@ pub struct RsegScanExec {
     /// `QueryAccounting` total. `Unlimited` never trips, so a caller that does
     /// not opt in behaves exactly as before this budget existed.
     max_bytes_scanned: ByteLimit,
+    /// Pending selective-erasure predicates from the resolved snapshot
+    /// (ADR-0064 decision 2, issue #829). Applied to each segment's decoded
+    /// `FetchedSeriesSoa` series via [`retain_series_soa`] immediately after
+    /// `fetch_soa_accounted` returns -- after fetch, after the ADR-0046 read
+    /// cache that fetch routes through, before any row reaches DataFusion.
+    erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), cloned into every
@@ -187,6 +194,7 @@ impl RsegScanExec {
         series_ids: Option<Arc<HashSet<[u8; 16]>>>,
         max_series: usize,
         max_bytes_scanned: ByteLimit,
+        erasure: Arc<Vec<ErasurePredicate>>,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -204,6 +212,7 @@ impl RsegScanExec {
             series_ids,
             max_series,
             max_bytes_scanned,
+            erasure,
             schema,
             properties,
             accounting,
@@ -289,6 +298,7 @@ impl ExecutionPlan for RsegScanExec {
         let tenant = self.tenant_hash;
         let matchers = Arc::clone(&self.matchers);
         let series_ids = self.series_ids.clone();
+        let erasure = Arc::clone(&self.erasure);
         let schema = Arc::clone(&self.schema);
 
         // One reservation per partition stream, registered against whatever
@@ -307,6 +317,7 @@ impl ExecutionPlan for RsegScanExec {
             series_ids,
             self.max_series,
             self.max_bytes_scanned,
+            erasure,
             reservation,
             self.accounting.clone(),
         ));
@@ -344,6 +355,7 @@ async fn prepare_partition(
     series_ids: Option<Arc<HashSet<[u8; 16]>>>,
     max_series: usize,
     max_bytes_scanned: ByteLimit,
+    erasure: Arc<Vec<ErasurePredicate>>,
     reservation: MemoryReservation,
     accounting: QueryAccounting,
 ) -> DFResult<(Prepared, MemoryReservation)> {
@@ -351,10 +363,15 @@ async fn prepare_partition(
     let mut labels: HashMap<[u8; 16], LabelSet> = HashMap::new();
 
     for seg in &segs {
-        let (series, stats) = fetcher
+        let (mut series, stats) = fetcher
             .fetch_soa_accounted(tenant, seg, &matchers, &accounting)
             .await
             .map_err(SqlError::from)?;
+        // Selective-erasure exclusion (ADR-0064 decision 2, issue #829):
+        // applied to the decoded series immediately after fetch, after the
+        // ADR-0046 read cache `fetch_soa_accounted` routes through, before any
+        // row below reaches DataFusion. A no-op when `erasure` is empty.
+        retain_series_soa(&mut series, &erasure);
         // Per-tenant bytes-scanned budget (ADR-0061 decision 1): this fetch
         // has just charged its S3 bytes into the shared `accounting` handle,
         // so check the running total against the tenant's cap here, once per

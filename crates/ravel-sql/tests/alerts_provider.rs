@@ -507,6 +507,52 @@ async fn real_ravel_alerting_record_decodes_identically() {
     assert_eq!(map_get(&map, "label.team"), Some("sre".to_string()));
 }
 
+/// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): a pending selective-erasure
+/// request on the resolved snapshot excludes matching rows through the real
+/// `AlertsTableProvider` scan path, the one the SQL `alerts` table uses in
+/// production. Covers `AlertsTableProvider::build_scan` passing the
+/// snapshot-derived predicates into `AlertsScanExec` (alerts_provider.rs) and
+/// `AlertsScanExec` calling `LogQuery::with_erasure` before fetch
+/// (alerts_scan.rs); reverting `.with_erasure((*erasure).clone())` back to a
+/// bare `LogQuery::new(ts_min, ts_max)` in alerts_scan.rs makes the erased row
+/// reappear.
+#[tokio::test]
+async fn pending_erasure_excludes_matching_rows() {
+    let store = MemoryStore::new();
+    let keep = alert_record(1, "id-keep", "cpu-high", "firing", 1, &[("env", "prod")]);
+    let erase = alert_record(2, "id-erase", "cpu-high", "firing", 1, &[("env", "prod")]);
+    let seg = write_object(&store, "alerts/erasure.rlog", &[keep.clone(), erase]).await;
+
+    let request = ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "alert_id".to_string(),
+            value: "id-erase".to_string(),
+        }],
+        ..Default::default()
+    };
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = LogSegmentFetcher::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: vec![request],
+    };
+    let provider = AlertsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
+
+    let got = batches_to_rows(&collect_plan(provider.plan(1).expect("build plan")).await);
+    assert_eq!(
+        got,
+        BTreeSet::from([expected_row(&keep)]),
+        "the erased alert_id is excluded; the other row survives"
+    );
+}
+
 /// The `(key, value)` pairs of one row's `attrs` map cell.
 fn attrs_map(batch: &RecordBatch, row: usize) -> Vec<(String, String)> {
     let map = batch

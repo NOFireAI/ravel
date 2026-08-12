@@ -143,3 +143,11 @@ ravel-commit = { workspace = true }
 # type) is caught here rather than only discovered once both are wired
 # together at runtime.
 ravel-alerting = { workspace = true }
+# Dev-only: the ADR-0064 selective-erasure regression tests (issue #829) build
+# `Snapshot.pending_erasure` fixtures directly with the real commit proto
+# types, and the metric-scan cache-warm test wires a real ADR-0046 read cache
+# into `SegmentFetcher` to prove exclusion still fires on cache-served bytes.
+# Both are already workspace pins used elsewhere (ravel-query depends on both);
+# ravel-sql's non-test code has no need for either.
+ravel-proto = { workspace = true }
+ravel-cache = { workspace = true }

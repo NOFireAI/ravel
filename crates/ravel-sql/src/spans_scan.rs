@@ -64,6 +64,7 @@ use datafusion::physical_plan::{
 };
 use futures::Stream;
 use ravel_catalog::SegmentRef;
+use ravel_query::erasure::{ErasurePredicate, is_erased_span};
 use ravel_rspan::{BloomPredicate, COL_NAME, COL_SERVICE_NAME, SpanQuery};
 
 use crate::error::SqlError;
@@ -89,6 +90,11 @@ pub struct SpansScanExec {
     service_name: Option<String>,
     /// The `name = <literal>` equality pushed, if any: a `COL_NAME` bloom probe.
     name: Option<String>,
+    /// Pending selective-erasure predicates from the resolved snapshot
+    /// (ADR-0064 decision 2, issue #829). Applied per decoded [`SpanRow`] via
+    /// [`is_erased_span`] immediately after `fetcher.fetch` returns, before
+    /// rows are sorted or built into batches. A no-op when empty.
+    erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -104,6 +110,7 @@ impl SpansScanExec {
         query: SpanQuery,
         service_name: Option<String>,
         name: Option<String>,
+        erasure: Arc<Vec<ErasurePredicate>>,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -118,6 +125,7 @@ impl SpansScanExec {
             query,
             service_name,
             name,
+            erasure,
             schema,
             properties,
         })
@@ -211,6 +219,7 @@ impl ExecutionPlan for SpansScanExec {
             self.query,
             self.service_name.clone(),
             self.name.clone(),
+            Arc::clone(&self.erasure),
         ));
         Ok(Box::pin(SpanScanStream {
             schema,
@@ -231,6 +240,7 @@ async fn prepare_partition(
     query: SpanQuery,
     service_name: Option<String>,
     name: Option<String>,
+    erasure: Arc<Vec<ErasurePredicate>>,
 ) -> DFResult<Vec<SpanRow>> {
     // The bloom predicates for this scan: one per pushed literal, field-scoped
     // to the column it names (ADR-0054). The same set applies to every segment.
@@ -258,6 +268,12 @@ async fn prepare_partition(
             continue;
         };
         out.extend(output.records);
+    }
+    // Selective-erasure exclusion (ADR-0064 decision 2, issue #829): applied
+    // to each decoded row immediately after fetch, before sort/build. A
+    // no-op when `erasure` is empty.
+    if !erasure.is_empty() {
+        out.retain(|row| !is_erased_span(&row.record.attrs, row.record.start_ts_ns, &erasure));
     }
     // Stable sort by the native (trace_id, start_ts) key so rows tying on both
     // keep the reader's per-object emission order.

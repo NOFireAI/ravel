@@ -346,3 +346,59 @@ async fn trace_id_query_takes_the_cheap_trace_lookup() {
         "trace query returns exactly the target trace's spans"
     );
 }
+
+/// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): the `spans` SQL table had no
+/// erasure wiring at all before this task -- `SpansTableProvider` never
+/// derived predicates from `snapshot.pending_erasure`, and `SpansScanExec`
+/// never called the `is_erased_span` filter `ravel-query`'s erasure module
+/// documents as built for this surface. This proves the gap is now closed:
+/// a pending selective-erasure request on the resolved snapshot excludes
+/// matching spans through the real `SpansTableProvider` scan path. Covers
+/// `SpansTableProvider::new` computing `erasure` from
+/// `snapshot_pending_erasure_predicates` and passing it into `SpansScanExec`
+/// (spans_provider.rs), and `SpansScanExec::execute`/`prepare_partition`
+/// calling `is_erased_span` on each decoded row before sort/build
+/// (spans_scan.rs); reverting the `if !erasure.is_empty() { out.retain(...) }`
+/// block in spans_scan.rs's `prepare_partition` makes the erased span
+/// reappear.
+#[tokio::test]
+async fn pending_erasure_excludes_matching_spans() {
+    let store = MemoryStore::new();
+
+    let t1 = [0x11u8; 16];
+    let mut hold = span(t1, 0, 100, 110, "erase-me");
+    hold.attrs = vec![("user_id".to_string(), "u1".to_string())];
+    let mut keep = span(t1, 1, 200, 210, "keep-me");
+    keep.attrs = vec![("user_id".to_string(), "u2".to_string())];
+    let records = vec![hold, keep.clone()];
+
+    let seg = write_object(&store, "spans/erasure.rspan", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = SpanSegmentFetcher::new(store);
+
+    let request = ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "user_id".to_string(),
+            value: "u1".to_string(),
+        }],
+        ..Default::default()
+    };
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: vec![request],
+    };
+    let provider = SpansTableProvider::new(snapshot, fetcher, EngineConfig::default());
+    let plan = provider.plan(1).expect("build plan");
+    let batches = collect_plan(plan).await;
+    let got = batches_to_rows(&batches);
+
+    let mut want = BTreeSet::new();
+    want.insert((
+        keep.trace_id,
+        [keep.span_id[0]; 8],
+        keep.start_ts_ns,
+        keep.name.clone(),
+    ));
+    assert_eq!(got, want, "the u1 span is erased; the u2 span survives");
+}
