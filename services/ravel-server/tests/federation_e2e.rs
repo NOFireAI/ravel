@@ -27,6 +27,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +39,8 @@ use ravel_ingest::{Clock, SystemClock};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::{LabelMatcher, MatchOp, Value};
-use ravel_query::distrib::proto::series_fetch_server::SeriesFetchServer;
+use ravel_proto::queryfrag::v1 as pb;
+use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use ravel_query::distrib::{Federation, RemoteCluster};
 use ravel_query::http::{StaticBearerTokenResolver, TenantResolver};
 use ravel_query::{ByteLimit, EngineConfig, QueryEngine, QueryError};
@@ -741,4 +743,184 @@ async fn federated_query_merges_remote_series() {
     );
 
     remote.stop().await;
+}
+
+/// A fake remote `SeriesFetch` server that answers every fetch with a single
+/// well-formed native-histogram frame.
+///
+/// Unlike [`spawn_remote`]'s real [`FragmentService`], which only ever serves
+/// scalar frames, this drives the coordinator's PRODUCTION decode path down its
+/// native-histogram arm: the frame is well-formed on the wire, so the real
+/// `ravel_query::distrib::client::decode_slice_frames` (reached through the real
+/// [`FederationSliceFetcher`], not a fake fetcher that yields the error
+/// directly) is what returns `DistribError::HistogramUnsupported`. Federation
+/// then routes that through `handle_unavailable` (the skip_unavailable
+/// coverage-gap path), distinct from the non-skippable "malformed response"
+/// hard fault.
+struct HistogramFrameService;
+
+#[tonic::async_trait]
+impl SeriesFetch for HistogramFrameService {
+    type FetchStream =
+        Pin<Box<dyn futures::Stream<Item = Result<pb::FetchResponse, tonic::Status>> + Send>>;
+
+    async fn fetch(
+        &self,
+        _request: tonic::Request<pb::FetchRequest>,
+    ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
+        // One well-formed histogram frame. `decode_slice_frames` returns
+        // `HistogramUnsupported` on the first `Hist` frame, before it looks for
+        // a terminal summary, so no summary frame is needed to reach the arm
+        // under test.
+        let frame = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Hist(pb::HistogramFrame {
+                series_id: vec![0u8; 16],
+                labels: Vec::new(),
+                runs: Vec::new(),
+            })),
+        };
+        let stream = futures::stream::iter(vec![Ok(frame)]);
+        Ok(tonic::Response::new(Box::pin(stream)))
+    }
+}
+
+/// Stand up the [`HistogramFrameService`] on a real gRPC listener, returning its
+/// endpoint and a shutdown handle. Same server harness as [`spawn_remote`], but
+/// serving a canned histogram frame instead of a real fragment surface. The
+/// `seen_auth` recorder is unused here (the coverage-gap path is about the
+/// decoded frame, not the presented principal), so it stays empty.
+async fn spawn_histogram_remote() -> Remote {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind histogram remote");
+    let addr = listener.local_addr().expect("histogram remote local addr");
+    let (tx, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        Server::builder()
+            .add_service(SeriesFetchServer::new(HistogramFrameService))
+            .serve_with_incoming_shutdown(TcpIncoming::from(listener), async {
+                let _ = rx.await;
+            })
+            .await
+            .expect("histogram remote serves");
+    });
+    Remote {
+        endpoint: addr.to_string(),
+        seen_auth: Arc::new(Mutex::new(Vec::new())),
+        shutdown: Some(tx),
+        task,
+    }
+}
+
+/// Item 1 (issue #913), skip half: a remote that answers with a real
+/// native-histogram frame over the wire is a coverage gap, not corruption.
+/// Driven through the REAL fetcher (`FederationSliceFetcher` -> the production
+/// `decode_slice_frames` -> `DistribError::HistogramUnsupported`), with
+/// `skip_unavailable = true` the federated query degrades to partial coverage
+/// with a warning naming the cluster; the local series still resolves.
+///
+/// Flip-line proof (the prove-the-test evidence): change the
+/// `Err(DistribError::HistogramUnsupported)` arm in
+/// `crates/ravel-query/src/distrib/federation.rs::Federation::fetch` to return a
+/// hard `QueryError::Federation { .. }` ("remote returned a malformed response")
+/// instead of routing through `handle_unavailable`, and this test fails: the
+/// `expect("skip_unavailable=true degrades ...")` panics because the query
+/// errors typed rather than degrading to partial. Restore the arm and it passes.
+#[tokio::test]
+async fn federated_query_skips_histogram_remote_through_real_decode() {
+    let base = now_ns() - 10 * NS_PER_MIN;
+    let acme = TenantId::new("acme");
+
+    let local_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_series(local_store.as_ref(), &acme, base, "local", 1.0, 1).await;
+
+    // A remote whose gRPC surface returns a well-formed histogram frame, so the
+    // coordinator's real decode path yields HistogramUnsupported.
+    let hist = spawn_histogram_remote().await;
+
+    let clusters = vec![make_remote_cluster(
+        "west",
+        &hist.endpoint,
+        OPERATOR_CRED,
+        true,
+        Duration::from_secs(5),
+    )];
+    let catalog = build_catalog(local_store.clone(), 1, true, 0).expect("catalog");
+    let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
+        .with_federation(Arc::new(Federation::new(clusters)));
+
+    let (value, stats) = engine
+        .instant_with_stats(
+            acme.hash(),
+            METRIC,
+            (base + NS_PER_MIN) / NS_PER_MS,
+            &[],
+            now_ns(),
+            DEADLINE,
+        )
+        .await
+        .expect("skip_unavailable=true degrades past a histogram-only remote");
+
+    assert!(
+        stats.partial,
+        "a histogram coverage gap must mark the query's coverage partial"
+    );
+    assert!(
+        stats.warnings.iter().any(|w| w.contains("west")),
+        "the histogram remote must be named in warnings: {:?}",
+        stats.warnings
+    );
+
+    // The local series still resolves; the histogram remote contributed nothing
+    // but was skipped rather than failing the query.
+    let bits = vector_bits(&value);
+    assert!(
+        bits.iter().any(|(k, _)| k.contains("instance=local")),
+        "the local series must survive the histogram coverage gap: {bits:?}"
+    );
+
+    hist.stop().await;
+}
+
+/// Item 1, default half: with `skip_unavailable = false`, the same
+/// histogram-bearing remote (decoded through the real `decode_slice_frames`)
+/// fails the whole query typed as a `QueryError::Federation` naming the cluster
+/// -- the truthful skippable path taken non-skippably, never a masked drop and
+/// never a panic.
+#[tokio::test]
+async fn federated_query_histogram_remote_fails_typed_without_skip() {
+    let base = now_ns() - 10 * NS_PER_MIN;
+    let acme = TenantId::new("acme");
+    let local_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_series(local_store.as_ref(), &acme, base, "local", 1.0, 1).await;
+
+    let hist = spawn_histogram_remote().await;
+    let cluster = make_remote_cluster(
+        "west",
+        &hist.endpoint,
+        OPERATOR_CRED,
+        false,
+        Duration::from_secs(5),
+    );
+    let catalog = build_catalog(local_store.clone(), 1, true, 0).expect("catalog");
+    let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
+        .with_federation(Arc::new(Federation::new(vec![cluster])));
+
+    let err = engine
+        .instant_with_stats(
+            acme.hash(),
+            METRIC,
+            (base + NS_PER_MIN) / NS_PER_MS,
+            &[],
+            now_ns(),
+            DEADLINE,
+        )
+        .await
+        .expect_err("a histogram remote with skip_unavailable=false must fail the query typed");
+    assert!(
+        matches!(err, QueryError::Federation { .. }),
+        "expected a typed QueryError::Federation, got {err:?}"
+    );
+
+    hist.stop().await;
 }
