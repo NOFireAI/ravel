@@ -27,7 +27,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{ByteLimit, EngineConfig, SegmentFetcher};
+use ravel_query::{ByteLimit, EngineConfig, RequestLimit, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{RavelTableProvider, SqlConfig, TenantMemoryAccountant};
 use ravel_types::accounting::QueryAccounting;
@@ -404,6 +404,75 @@ async fn unlimited_bytes_scanned_matches_prior_behavior() {
     assert!(
         store.gets() > 0,
         "Unlimited must genuinely fetch the snapshot's segments"
+    );
+}
+
+/// The S3 request budget (RH-T2, issue #902, ADR-0073 decision 3) must
+/// reject a partition before every remaining segment is fetched, the same
+/// early-exit contract `max_series` and `max_bytes_scanned` already have.
+/// Proven the same way: compare GET counts between an `Unlimited` baseline
+/// (every segment fetched) and a bounded cap that trips after the first.
+/// `RsegScanExec::prepare_partition` checks
+/// `ravel_query::request_budget_exceeded` once per completed segment fetch
+/// (the same seam PromQL's `fetch_all_series` and the exemplars endpoint
+/// check), so a cap of 1 must let exactly the first segment's GET through
+/// and cancel the rest.
+#[tokio::test]
+async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
+    let specs = five_segments_two_series_each();
+    let raw_store = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(raw_store.as_ref(), &specs).await;
+
+    let baseline_store = CountingStore::wrap(raw_store.clone());
+    let baseline_fetcher =
+        SegmentFetcher::new(Arc::clone(&baseline_store) as Arc<dyn ObjectStoreBackend>);
+    let baseline_config = EngineConfig {
+        max_s3_requests: RequestLimit::Unlimited,
+        ..EngineConfig::default()
+    };
+    let baseline_provider = RavelTableProvider::new(
+        snapshot.clone(),
+        TENANT,
+        baseline_fetcher,
+        baseline_config,
+        QueryAccounting::new(),
+    );
+    let baseline_plan = baseline_provider.plan(1).expect("plan");
+    collect(baseline_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("Unlimited must not trip");
+    let baseline_gets = baseline_store.gets();
+    assert_eq!(
+        baseline_gets, 5,
+        "the baseline must fetch every one of the 5 segments"
+    );
+
+    let capped_store = CountingStore::wrap(raw_store.clone());
+    let capped_fetcher =
+        SegmentFetcher::new(Arc::clone(&capped_store) as Arc<dyn ObjectStoreBackend>);
+    let capped_config = EngineConfig {
+        max_s3_requests: RequestLimit::Bounded(1),
+        ..EngineConfig::default()
+    };
+    let capped_provider = RavelTableProvider::new(
+        snapshot,
+        TENANT,
+        capped_fetcher,
+        capped_config,
+        QueryAccounting::new(),
+    );
+    let capped_plan = capped_provider.plan(1).expect("plan");
+    let err = collect(capped_plan, Arc::new(TaskContext::default()))
+        .await
+        .expect_err("a budget of 1 request must trip after the first segment");
+    let msg = format!("{err}");
+    assert!(msg.contains("S3 requests"), "got: {msg}");
+
+    let capped_gets = capped_store.gets();
+    assert!(
+        capped_gets < baseline_gets,
+        "a tripped request budget must stop fetching before every segment is \
+         pulled (capped={capped_gets}, baseline={baseline_gets})"
     );
 }
 

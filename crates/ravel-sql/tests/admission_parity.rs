@@ -308,3 +308,129 @@ async fn sql_and_promql_agree_sealed_set_still_capped() {
         other => panic!("expected TooManySegments, got {other:?}"),
     }
 }
+
+/// SQL-only recent-hour exemption: five never-folded (thus
+/// `SegmentOrigin::Recent`) segments must be admitted through
+/// `SqlExecutor::execute` even under `max_segments: 0`, mirroring PromQL's
+/// `token_segments_always_admitted`/`recent_hours_exempt_from_segment_cap`
+/// exemption (ADR-0073 decision 2). Pre-RH-T2, the SQL executor's own
+/// whole-snapshot count would have refused this with `TooManySegments { count:
+/// 5, max: 0 }`.
+#[tokio::test]
+async fn sql_recent_hour_segments_are_exempt_from_max_segments() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tid = tenant("acme");
+    let th = tid.hash();
+    let recent_hour = 9_301u32;
+    let now = now_at_seal(recent_hour);
+
+    for seq in 1..6u64 {
+        publish_segment(
+            store.as_ref(),
+            &tid,
+            th,
+            seq,
+            recent_hour,
+            "m",
+            i64::from(recent_hour) * NS_PER_HOUR + (seq as i64) * 60 * NS_PER_SEC,
+            seq as f64,
+        )
+        .await;
+    }
+    // No fold: every segment above stays classified `Recent`.
+    let cat = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+
+    let engine_config = EngineConfig {
+        max_segments: 0,
+        ..EngineConfig::default()
+    };
+    let sql_config = SqlConfig {
+        engine: engine_config,
+        ..SqlConfig::default()
+    };
+    let executor = SqlExecutor::new(
+        cat,
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store.clone()),
+        sql_config,
+        1 << 30,
+    );
+    let window = TimeRange {
+        start_ns: i64::from(recent_hour) * NS_PER_HOUR,
+        end_ns: i64::from(recent_hour + 1) * NS_PER_HOUR,
+    };
+    let outcome = executor
+        .execute(
+            th,
+            &sql_request(
+                "SELECT ts, value FROM samples WHERE label(labels, '__name__') = 'm'",
+                window,
+                now,
+            ),
+        )
+        .await
+        .expect("5 never-folded recent segments must be admitted despite max_segments=0");
+    assert_eq!(outcome.stats.segments, 5);
+    assert_eq!(outcome.output.num_rows(), 5);
+}
+
+/// No-op regression (RH-T2 deliverable 3): with no recent-hour data (every
+/// segment folded/sealed) and the default, effectively-unbounded budgets
+/// (`EngineConfig::default()`: `max_segments` 1024, `max_s3_requests` bounded
+/// at 25,000), admission must behave exactly as it did before this
+/// migration -- every sealed segment fetched, nothing refused.
+#[tokio::test]
+async fn no_recent_hour_data_default_config_is_unaffected() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tid = tenant("acme");
+    let th = tid.hash();
+    let hour = 9_401u32;
+    let now = now_at_seal(hour);
+
+    for seq in 1..4u64 {
+        publish_segment(
+            store.as_ref(),
+            &tid,
+            th,
+            seq,
+            hour,
+            "m",
+            i64::from(hour) * NS_PER_HOUR + (seq as i64) * 60 * NS_PER_SEC,
+            seq as f64,
+        )
+        .await;
+    }
+    let cat = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .await
+        .expect("fold seals hour, leaving no recent-hour data");
+
+    let sql_config = SqlConfig {
+        engine: EngineConfig::default(),
+        ..SqlConfig::default()
+    };
+    let executor = SqlExecutor::new(
+        cat,
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store.clone()),
+        sql_config,
+        1 << 30,
+    );
+    let window = TimeRange {
+        start_ns: i64::from(hour) * NS_PER_HOUR,
+        end_ns: i64::from(hour + 1) * NS_PER_HOUR,
+    };
+    let outcome = executor
+        .execute(
+            th,
+            &sql_request(
+                "SELECT ts, value FROM samples WHERE label(labels, '__name__') = 'm'",
+                window,
+                now,
+            ),
+        )
+        .await
+        .expect("default budgets over 3 sealed segments must admit, unchanged from before RH-T2");
+    assert_eq!(outcome.stats.segments, 3);
+    assert_eq!(outcome.output.num_rows(), 3);
+}
