@@ -2,6 +2,7 @@
 //! inconsistency is a typed variant; nothing panics on adversarial input
 //! (CLAUDE.md invariants, docs/compaction-retention-plan.md §3.6).
 
+use ravel_commit::erasure::ErasureError;
 use ravel_commit::keys::{KeyError, ReconstructionError};
 use ravel_commit::record::RecordError;
 use ravel_logseg::LogSegError;
@@ -30,6 +31,8 @@ pub enum MaintainError {
     LogSeg(#[from] LogSegError),
     #[error(transparent)]
     SpanSeg(#[from] SpanSegError),
+    #[error(transparent)]
+    Erasure(#[from] ErasureError),
     #[error("segment write error: {0}")]
     Write(String),
     #[error(
@@ -69,6 +72,37 @@ pub enum MaintainError {
     },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
+    #[error(
+        "erasure rewrite record-count conservation violated for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: live set carries {input_sample_count} records, {output_sample_count} survived plus {dropped_sample_count} were dropped, which do not sum to the input (fatal invariant breach, ADR-0064 decision 3); publish aborted, nothing written"
+    )]
+    ErasureConservationViolation {
+        /// Hex tenant hash of the bucket (the key-prefix form operators see).
+        tenant_hash: String,
+        /// Signal key prefix (`m`, `l`, `s`).
+        signal: String,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        /// Sum of `sample_count` over the live input record set.
+        input_sample_count: u64,
+        /// Sum of `sample_count` over the built surviving-record output parts.
+        output_sample_count: u64,
+        /// Sum of samples dropped by the applied erasure predicates.
+        dropped_sample_count: u64,
+    },
+    #[error(
+        "erasure rewrite found no live record in a bucket that is not empty (fatal invariant breach at {bucket_prefix:?}): {live_count} compaction/rewrite records present but every one is named by another's superseded_record_key"
+    )]
+    NoLiveRecord {
+        bucket_prefix: String,
+        live_count: usize,
+    },
+    #[error(
+        "erasure rewrite found more than one live record in a bucket (fatal invariant breach at {bucket_prefix:?}): {live_keys:?} are all un-superseded, violating the resolver's at-most-one-live-record-per-generation invariant"
+    )]
+    MultipleLiveRecords {
+        bucket_prefix: String,
+        live_keys: Vec<String>,
+    },
     #[error(
         "provisioning-record access failed during a format migration (shard-generation range or \
          format-floor history): {0}"
