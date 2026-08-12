@@ -279,6 +279,11 @@ defect the deployer controls (the Secret), not a value this module can
 validate against other tenants' plaintexts without ever storing
 plaintext.
 
+**Superseded in part:** the door 3 "takeover" call above turned out wrong
+in practice -- see the amendment below, "cross-tenant token collisions
+are refused, not taken over." Global hash-uniqueness and the same-tenant
+takeover (doors 1 and 2) still stand; only the cross-tenant branch changed.
+
 Belt-and-suspenders: `write_map`, the one function every `sys/auth`
 write funnels through, now runs the same duplicate-`token_hash` check
 `decode_map` runs on read, and refuses (before issuing any store call) a
@@ -315,3 +320,78 @@ understands `format_version = 2` *before* any amended writer's first
 `sys/auth` write, not merely before the first `managed_by`-tagged entry
 appears -- a lagging old server otherwise loses `sys/auth` entirely (its
 bounded-staleness refresh fails closed) until it, too, is upgraded.
+
+## Amendment (2026-08-12): cross-tenant token collisions are refused, not taken over
+
+The door 3 takeover decision above does not converge. Two tenants (say
+`acme` and `globex`) whose Secret-provisioned token values collide are
+both reconciled by the operator's per-tenant loop, in the same order,
+every cycle. Under takeover, whichever of the two runs last in a given
+cycle wins the entry -- and then the OTHER tenant's turn comes on the
+very next cycle, takes it back, and returns `Updated`. The two tenants
+fight over the one hash forever: every reconcile cycle issues a
+`sys/auth` PUT, and every PUT flips which tenant the shared token
+authenticates as. This is worse than the bug the takeover decision was
+written to fix -- doors 1 and 2 converge to a stable single entry after
+one takeover; door 3 under takeover never converges at all.
+
+**Decision, corrected: distinguish the two collision shapes instead of
+handling them alike.**
+
+1. SAME `tenant_id`, different `managed_by` (doors 1 and 2 -- a cli to
+   operator migration, or an unmanaged pre-amendment entry meeting a
+   scoped replace for the first time): takeover, unchanged from the
+   amendment above. Re-tagging `managed_by` in place is safe because the
+   token continues to authenticate the same tenant; there is nothing to
+   arbitrate.
+2. DIFFERENT `tenant_id`, same `token_hash` (door 3): refuse the write
+   outright with a typed `AuthTokenMapError::CrossTenantTokenCollision {
+   token_fingerprint, existing_tenant, attempted_tenant }`, returned
+   before any store call. Never take the token over.
+
+The reason takeover is wrong specifically for door 3, and only for door
+3: `tenant_for_token` is a lookup function, `token_hash -> tenant_id`.
+Doors 1 and 2 change who manages an entry that already resolves to one
+tenant -- the function stays well-defined throughout. Door 3 asks the
+function to return two different answers for the same input depending on
+which tenant last called `replace_tenant_tokens` -- there is no
+deterministic tenant for that token to resolve to, and no amount of
+takeover ordering makes one exist. Refusing is the only choice that
+keeps `tenant_for_token` a function: the ambiguity is in the deployer's
+input (the Secret), not something this module can resolve on the input's
+behalf, so the correct behavior is to surface it as a caller-visible
+error, not to silently arbitrate it every cycle.
+
+This is applied at every writer that can create a token_hash collision,
+not only `replace_tenant_tokens`: `upsert_token` and `upsert_token_owned`
+now refuse a hash already owned by a different tenant the same way (they
+previously re-pointed it, silently changing which tenant the token
+authenticated as -- the single-call analogue of the same bug). A caller
+that genuinely wants to move a token from one tenant to another calls
+`remove_token` (or `remove_tokens_by_tenant`) for the old tenant first,
+then `upsert_token` for the new one -- two calls, an explicit revoke
+in between, never an implicit re-point through one.
+
+Convergence for the operator's reconcile loop specifically: tenant ids
+are reconciled in a fixed order (`BTreeMap<String, Vec<u8>>` iteration,
+alphabetical), so on the cycle that first creates the hash, the
+lexicographically-first colliding tenant's write runs first and
+succeeds; every later tenant sharing that hash, that cycle and every
+cycle after, hits `CrossTenantTokenCollision` and is skipped. The
+winning tenant's own subsequent cycles hit `replace_tenant_tokens`'s
+`current_hashes == desired_hashes` fast path (`SetOutcome::Unchanged`,
+zero store calls) as long as its desired token set does not change. Both
+outcomes are pure functions of persisted map state plus reconcile order,
+so the result is deterministic, and steady state is zero `sys/auth`
+writes from either tenant -- the flap is gone. A `CrossTenantTokenCollision`
+in the operator's per-tenant loop logs the fingerprint and both tenant
+ids (never the token) and skips that tenant for the cycle; it does not
+abort the reconcile pass, so a healthy tenant's tokens and every
+workload's Deployment/Service reconciliation still proceed.
+
+The `write_map` duplicate-hash guard from the amendment above is
+unchanged and stays as belt-and-suspenders: with the refusal now sitting
+in front of every writer, no code path should ever again attempt to
+persist two entries sharing a hash, but the guard remains the backstop
+that turns a future writer's oversight into a typed decode-time refusal
+instead of a silent brick.
