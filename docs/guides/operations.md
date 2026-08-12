@@ -144,6 +144,7 @@ above).
 | `ravel-cli maintain sweep --tenant <n> --signal <metrics\|logs\|spans> --shard <n> [--dry-run]` | | Runs one sweep pass (orphan GC, superseded inputs, unreferenced parts) over a shard and prints the four delete counts. `--dry-run` reports the eligible set but deletes nothing. |
 | `ravel-cli maintain status --tenant <n> --signal <metrics\|logs\|spans> --shard <n> --hour <n>` | | Reports a bucket's state (sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 parts present, unreferenced-part count). Read-only, so no `--dry-run`. |
 | `ravel-cli maintain audit-versions --tenant <n> [--shards <n>]` | `--shards` default `4` | Audits live on-object format versions across all three signals. It flags any RSEG object at a version other than the one supported version (ADR-0027), reports the RLOG population by trailer version (1 vs 2, ADR-0032), and the RSPAN population by trailer version. Exits nonzero on any anomaly. |
+| `ravel-cli maintain migrate --tenant <n> --signal <metrics\|logs\|spans> [--shards <n>] [--target-version <n>] [--family <name>] [--budget-records <n>]` | `--shards` default `4`, `--budget-records` default `0` (unlimited) | Migrates every live record below `--target-version` (defaults to the signal's current supported version) and raises the recorded format floor once a fresh re-audit confirms nothing below it survives (epic EM, EM-T5; see "Format migration" below). Resumable: re-run to continue from the durable cursor after a budget stop. A refused raise ("FOUND STRAGGLERS") means genuine live data still below target, not a self-inflicted false positive (issue #826) -- no interleaved `sweep` is needed for this to converge. |
 | `ravel-cli maintain verify-custody --tenant <n> [--shards <n>]` | `--shards` default `4` | Read-only, no `--dry-run` (nothing is written or deleted). Re-verifies the content-addressed chain at rest: every live data object's key-embedded `hash16` against its actual content hash, and every surviving compaction record's referenced inputs (a mismatch is an anomaly; an input the sweeper already legitimately reclaimed past its protection horizon is reported separately, not as an anomaly). Exits nonzero on any anomaly. |
 | `ravel-cli catalog list --tenant <name> [--hours <n>] [--shards <n>]` | `--hours` default `1`, `--shards` default `4` | Lists commit records that the catalog resolves for that tenant over the last `hours` hours. `--shards` must match the shard count the data was written with. |
 | `ravel-cli catalog fold --tenant <name> [--shards <n>]` | `--shards` default `4` | One-shot catalog fold: seals every eligible hour into a new snapshot part and CAS-advances HEAD. Prints the fold report (watermark before/after, buckets folded, entry count, request counts). This is the same operation that the background fold task runs on a timer. |
@@ -1082,11 +1083,43 @@ maintenance loop uses the defaults.
   `--maintain-interval-secs`. It needs a `multipart`-capable backend and
   serves no ingest or query routes.
 - **One-shot / inspection**: `ravel-cli maintain compact-bucket`,
-  `maintain sweep`, `maintain status`, `maintain audit-versions`, and
-  `maintain verify-custody` (see the CLI table above). `compact-bucket`
-  and `sweep` take `--dry-run` to report exactly what a real run would
-  write or delete, without mutating anything; `verify-custody` is
-  read-only and has no `--dry-run` since there is nothing to simulate.
+  `maintain sweep`, `maintain status`, `maintain audit-versions`,
+  `maintain migrate` (below), and `maintain verify-custody` (see the CLI
+  table above). `compact-bucket` and `sweep` take `--dry-run` to report
+  exactly what a real run would write or delete, without mutating
+  anything; `verify-custody` is read-only and has no `--dry-run` since
+  there is nothing to simulate.
+
+### Format migration (`maintain migrate`)
+
+`ravel-cli maintain migrate --tenant T --signal metrics` raises a `(tenant,
+signal, format family)`'s recorded format floor to a target on-object format
+version (epic EM, EM-T5). One invocation:
+
+1. walks buckets in `(shard, ingest_hour)` order from a durable cursor,
+   rewriting every sealed, un-tombstoned, not-yet-compacted bucket that still
+   has an L0 commit record below the target format version (this reuses the
+   compaction rewrite primitive, so the rewrite is bucket-atomic and produces
+   a compaction record exactly as compaction does);
+2. stops early and persists the cursor once `--budget-records` is spent
+   (0 = unlimited; re-run to resume), or, once the walk drains, re-audits
+   fresh and raises the floor only if that re-audit finds zero records below
+   the target.
+
+A refused raise ("FOUND STRAGGLERS") means the fresh re-audit found genuine
+live data still below the target -- e.g. a bucket too recently landed to be
+sealed and migrated yet, or data that arrived after the walk passed. Re-run
+`migrate`; the target data will migrate once it is sealed.
+
+The re-audit's liveness definition already excludes a bucket's pre-rewrite L0
+commit records once that bucket carries a compaction or rewrite record: those
+records are dead, sweepable leftovers of a rewrite this same invocation may
+have just performed, not stragglers (issue #826). Because of this, a clean
+migration converges and raises the floor in one invocation; running `sweep`
+in between is never required for `migrate` to converge. `sweep`'s
+superseded-input rule (above) still physically deletes those pre-rewrite
+records on its own schedule, independent of `migrate` -- that is a storage-
+reclamation concern, not a correctness precondition for the floor raise.
 
 ### Maintenance safety metrics and alerts
 

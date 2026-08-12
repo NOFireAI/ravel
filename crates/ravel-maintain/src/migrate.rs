@@ -49,7 +49,14 @@
 //! re-audit deliberately counts every live commit and compaction record
 //! regardless of seal state: a fresh, still-unsealed below-target record the
 //! walk could not yet migrate still blocks the raise, which is exactly the
-//! guarantee the floor must carry.
+//! guarantee the floor must carry. "Live" excludes a bucket's pre-rewrite L0
+//! commit records once a compaction or rewrite record for that bucket exists
+//! ([`count_below_target`]): those are sweepable leftovers of a rewrite this
+//! same walk may just have performed, not stragglers, so migrating a bucket
+//! and then re-auditing it in the same invocation converges without needing
+//! an interleaved `sweep` in between (issue #826).
+
+use std::collections::HashSet;
 
 use ravel_catalog::current_floor_from_store;
 use ravel_commit::{keys, record};
@@ -121,8 +128,11 @@ pub enum Verification {
     FloorRaised { floor_version: u32 },
     /// The fresh re-audit found at least one record below the target -- data
     /// that landed after the walk passed, or that the walk could not migrate --
-    /// so the floor was left untouched. `l0` counts below-target commit records,
-    /// `l1` counts below-target compaction parts.
+    /// so the floor was left untouched. `l0` counts below-target commit records
+    /// still live (a bucket's pre-rewrite commit records already superseded by
+    /// a compaction/rewrite record for that bucket are excluded, not counted
+    /// here: [`count_below_target`]), `l1` counts below-target compaction
+    /// parts.
     Stragglers { l0: usize, l1: usize },
 }
 
@@ -305,6 +315,19 @@ async fn list_shard_hours(
 /// enumeration's liveness definition (a surviving commit/compaction record is
 /// the evidence of a live object; data objects are never listed directly). This
 /// is the verification pass; a nonzero total refuses the floor raise.
+///
+/// A bucket's L0 commit records are excluded once that bucket also carries a
+/// compaction or rewrite record: the same "already rewritten, skip the L0
+/// check" gate [`migrate_bucket_format`]'s `AlreadyCompacted` branch applies
+/// before ever touching a bucket. A rewrite in this crate is bucket-atomic
+/// over the complete sealed L0 set (a sealed bucket's input set is frozen, so
+/// nothing can land there afterward), so the compaction/rewrite record's own
+/// parts are the live successor of every one of that bucket's commit records;
+/// the commit records themselves are pre-rewrite leftovers, sweepable but not
+/// live (issue #826). Without this exclusion a migrate invocation that just
+/// rewrote a bucket would count its own superseded L0 records as stragglers
+/// and refuse the floor raise it earned, converging only after an unrelated
+/// sweep physically deletes them.
 pub async fn count_below_target(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -319,21 +342,45 @@ pub async fn count_below_target(
     for shard in 0..scan_shards {
         let prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)?;
         let metas = list_all(store, &prefix).await?;
+
+        // First pass, no store reads: classify every key by shape and record
+        // which buckets (ingest hours) already carry a compaction or rewrite
+        // record. Parsing a key's shape is free (it only inspects the
+        // filename), so this costs nothing beyond the listing already done.
+        let mut entries = Vec::with_capacity(metas.len());
+        let mut superseded_hours = HashSet::new();
         for meta in metas {
-            match keys::partition_bucket_entry(&meta.key) {
-                Ok(keys::BucketEntry::CommitRecord(_)) => {
-                    let got = store.get(&meta.key, GetRange::Full).await?;
+            let entry = keys::partition_bucket_entry(&meta.key).map_err(MaintainError::Key)?;
+            match &entry {
+                keys::BucketEntry::CompactionRecord(k) => {
+                    superseded_hours.insert(k.ingest_hour_bucket);
+                }
+                keys::BucketEntry::RewriteRecord(k) => {
+                    superseded_hours.insert(k.ingest_hour_bucket);
+                }
+                keys::BucketEntry::CommitRecord(_) | keys::BucketEntry::Tombstone(_) => {}
+            }
+            entries.push((meta.key, entry));
+        }
+
+        for (key, entry) in entries {
+            match entry {
+                keys::BucketEntry::CommitRecord(parsed) => {
+                    if superseded_hours.contains(&parsed.ingest_hour_bucket) {
+                        continue;
+                    }
+                    let got = store.get(&key, GetRange::Full).await?;
                     let rec = record::decode(&got.data)?;
                     if rec.segment_format_version < target_version {
                         l0_below += 1;
                     }
                 }
-                Ok(keys::BucketEntry::CompactionRecord(_)) => {
-                    let got = store.get(&meta.key, GetRange::Full).await?;
+                keys::BucketEntry::CompactionRecord(_) => {
+                    let got = store.get(&key, GetRange::Full).await?;
                     let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
                         MaintainError::Invariant(format!(
-                            "compaction record {} is corrupt during migration re-audit: {err}",
-                            meta.key
+                            "compaction record {key} is corrupt during migration re-audit: \
+                             {err}"
                         ))
                     })?;
                     for part in &rec.parts {
@@ -348,12 +395,11 @@ pub async fn count_below_target(
                 // count toward the re-audit exactly like L1 parts, or a
                 // "migration complete" claim could pass over unmigrated
                 // rewritten objects.
-                Ok(keys::BucketEntry::RewriteRecord(_)) => {
-                    let got = store.get(&meta.key, GetRange::Full).await?;
+                keys::BucketEntry::RewriteRecord(_) => {
+                    let got = store.get(&key, GetRange::Full).await?;
                     let rec = RewriteRecord::decode(got.data.as_ref()).map_err(|err| {
                         MaintainError::Invariant(format!(
-                            "rewrite record {} is corrupt during migration re-audit: {err}",
-                            meta.key
+                            "rewrite record {key} is corrupt during migration re-audit: {err}"
                         ))
                     })?;
                     for part in &rec.parts {
@@ -362,8 +408,7 @@ pub async fn count_below_target(
                         }
                     }
                 }
-                Ok(keys::BucketEntry::Tombstone(_)) => {}
-                Err(e) => return Err(MaintainError::Key(e)),
+                keys::BucketEntry::Tombstone(_) => {}
             }
         }
     }
@@ -1298,6 +1343,101 @@ mod tests {
                 floor_version: target
             }),
             "a second run over an already-raised floor still reports the floor, not an error"
+        );
+    }
+
+    /// Regression for issue #826: a bucket the walk itself just rewrote must
+    /// not make its own pre-rewrite L0 commit record look like a straggler.
+    /// The one seeded record is below target, so [`migrate_bucket_format`]
+    /// rewrites it into a superseding compaction record; the pre-rewrite
+    /// commit record is still physically present afterward (only a `sweep`
+    /// deletes it) but must no longer be live.
+    ///
+    /// This asserts against [`count_below_target`] directly rather than
+    /// `migrate_family`'s end-to-end `Verification::FloorRaised`, because
+    /// RSEG cannot produce that end-to-end signal in a test at all: its
+    /// rewrite path copies page bytes verbatim without decoding (see the
+    /// module doc on `rewrite.rs`), so a rewrite always re-publishes at the
+    /// real current writer version, `VERSION_V6`, never at whatever target
+    /// drove the walk. Reaching this bucket's below-target rewrite
+    /// eligibility at all requires `FUTURE_VERSION` (a target above
+    /// `VERSION_V6`, same trick every other test in this module uses); but
+    /// that same fictional target then makes the rewrite's own L1 output
+    /// (recorded at `VERSION_V6`, genuinely `< FUTURE_VERSION`) count as
+    /// below target too, independent of this fix -- a `FloorRaised` result
+    /// is structurally unreachable here, orthogonal to issue #826. Calling
+    /// `count_below_target` directly isolates exactly the mechanism the fix
+    /// changes (the L0 branch) from that unrelated, expected L1 count.
+    ///
+    /// Before the supersession exclusion, `count_below_target`'s L0 branch
+    /// counted every commit record's `segment_format_version` unconditionally,
+    /// with no check of whether the record's bucket also carried a
+    /// compaction/rewrite record. The `if superseded_hours.contains(&parsed
+    /// .ingest_hour_bucket) { continue; }` guard added by the fix is the
+    /// flipped line: delete it and the assertion below sees `(l0_below,
+    /// l1_below) == (1, 1)` instead of `(0, 1)`, i.e. the bucket's own
+    /// pre-rewrite record counts as a straggler alongside the genuinely
+    /// below-target L1 part, refusing a raise it just earned until an
+    /// unrelated sweep clears the leftover record.
+    #[tokio::test]
+    async fn a_bucket_migrated_this_walk_does_not_straggler_on_its_own_pre_rewrite_record() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        // Real v6 bytes recorded at the current version, so RsegCodec's
+        // validate_rewrite_inputs (which refuses an input genuinely below the
+        // *current writer* version, since RSEG copies pages verbatim and
+        // cannot really decode-and-reencode an older layout) accepts it; using
+        // FUTURE_VERSION as the migration target is what makes this same
+        // record count as "below target" and eligible for the walk to
+        // rewrite, exactly as the other tests in this module do.
+        seed_at(&store, 0, 100, 1, "alpha", VERSION_V6 as u32).await;
+
+        let clock = FixedClock::new(sealed_now_ns_for(100));
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
+        let outcome = migrate_bucket_format(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &bucket,
+            FUTURE_VERSION,
+        )
+        .await
+        .expect("migrate bucket");
+        assert!(
+            matches!(outcome, MigrateOutcome::Rewritten { .. }),
+            "the below-target bucket must be rewritten, got {outcome:?}"
+        );
+        assert_eq!(
+            compaction_record_count(&store, 0, 100).await,
+            1,
+            "the rewrite published exactly one compaction record"
+        );
+
+        // No interleaved sweep ran, so the pre-rewrite commit record is still
+        // physically present: the exclusion below is about liveness, not
+        // absence.
+        let l0_unfiltered = list_bucket(&store, &bucket)
+            .await
+            .expect("list bucket")
+            .commit_keys
+            .len();
+        assert_eq!(
+            l0_unfiltered, 1,
+            "the pre-rewrite commit record was never deleted; only the re-audit's liveness \
+             filter, not physical absence, keeps it out of the straggler count"
+        );
+
+        let (l0_below, l1_below) =
+            count_below_target(&store, &tenant_hash(), Signal::Metrics, 1, FUTURE_VERSION)
+                .await
+                .expect("re-audit");
+        assert_eq!(
+            (l0_below, l1_below),
+            (0, 1),
+            "the dead pre-rewrite L0 record must not count as a straggler (l0_below == 0); \
+             the freshly rewritten L1 part, genuinely below the fictional FUTURE_VERSION \
+             target, still correctly counts (l1_below == 1) -- the fix excludes exactly the \
+             superseded L0 record, not the bucket's live output"
         );
     }
 }

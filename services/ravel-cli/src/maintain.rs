@@ -441,7 +441,13 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 /// so a large migration runs across repeated invocations. Once a walk drains
 /// within budget, migrate re-audits fresh and raises the floor only if nothing
 /// below the target survives; if a straggler is found the floor is left
-/// untouched and this exits nonzero, reporting what it found.
+/// untouched and this exits nonzero, reporting what it found. The re-audit
+/// already excludes a bucket's pre-rewrite commit records once that bucket
+/// carries a compaction/rewrite record (dead, sweepable leftovers of a
+/// rewrite this same invocation may have just performed, not stragglers;
+/// issue #826), so a clean migration converges and raises the floor in one
+/// invocation -- no interleaved `sweep` required. A reported straggler is
+/// therefore genuine below-target live data still to migrate.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -520,8 +526,11 @@ pub async fn migrate(
                 "migrate refused to raise the {family} floor for tenant {tenant} signal {sig:?}: \
                  the fresh re-audit found {l0} commit record(s) and {l1} compaction part(s) still \
                  below target version {target} (data landed below the target between the walk \
-                 finishing and the floor raise, or is not yet migratable). The floor was NOT \
-                 raised; re-run migrate once the stragglers are at or above the target."
+                 finishing and the floor raise, or is not yet migratable -- e.g. still \
+                 unsealed). These are genuinely live: a bucket's own pre-rewrite commit records \
+                 are already excluded from this count once that bucket has been migrated, so a \
+                 `sweep` will not make this converge. The floor was NOT raised; re-run migrate \
+                 once the stragglers are at or above the target."
             )
         }
         None => {

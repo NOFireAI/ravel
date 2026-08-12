@@ -532,6 +532,13 @@ enum MaintainCommand {
     /// then raise its recorded format floor once a fresh re-audit confirms
     /// nothing below the target survives (epic EM, EM-T5). Resumable and
     /// bounded: re-run to resume from the durable cursor after a budget stop.
+    /// The re-audit already excludes a bucket's pre-rewrite commit records
+    /// once that bucket has been rewritten (they are dead, sweepable
+    /// leftovers, not stragglers; issue #826), so a clean run converges and
+    /// raises the floor in one invocation with no interleaved `sweep` needed.
+    /// A refused raise ("FOUND STRAGGLERS") therefore means genuine
+    /// below-target live data (e.g. still-unsealed or newly landed); re-run
+    /// migrate once it has settled.
     Migrate {
         #[arg(long)]
         tenant: String,
