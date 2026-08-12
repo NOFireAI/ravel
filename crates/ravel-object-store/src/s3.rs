@@ -60,9 +60,12 @@
 //!   every size rather than silently dropping the precondition the commit
 //!   protocol depends on.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use bytes::Bytes;
 use futures::StreamExt;
-use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredentialProvider};
 use object_store::path::Path;
 use object_store::{
     GetOptions as OsGetOptions, GetRange as OsGetRange, MultipartUpload as OsMultipartUpload,
@@ -75,6 +78,9 @@ use crate::{
     ObjectStoreBackend, PageToken, PartSequence, PutMode, PutOptions, PutOutcome, StoreError,
     UploadChecksum, Version, multipart_finished, multipart_poisoned,
 };
+
+mod credentials;
+use credentials::FileCredentialProvider;
 
 /// Default entries per `ListPage`, chosen to line up with S3's own
 /// `ListObjectsV2` page size. Overridable per instance via
@@ -146,6 +152,36 @@ pub struct S3Config {
     /// `with_dsse_kms_encryption` if a future requirement needs it, but
     /// nothing here builds for that today.
     pub kms_key_id: Option<String>,
+    /// Temporary AWS session token (ADR-0072 decision 1), paired with
+    /// `access_key_id`/`secret_access_key` for STS-issued or IRSA-style
+    /// credentials. Ignored when `credentials_file` is `Some`: the file
+    /// wins. `None` (every current caller: no shipped binary sets this
+    /// field yet, flags land with EE-T4/EE-T6) changes nothing.
+    pub session_token: Option<String>,
+    /// Path to a JSON file of `{access_key_id, secret_access_key,
+    /// session_token}` (`session_token` optional), for credentials an
+    /// external process rotates on disk -- a Kubernetes secret mount, an STS
+    /// sidecar, IRSA-style token projection (ADR-0072 decision 1). Ravel
+    /// itself never calls STS; this only makes an externally-minted rotating
+    /// credential expressible.
+    ///
+    /// **Rotation contract.** [`S3Store::new`] reads and parses this file
+    /// once at construction; an unreadable or malformed file fails
+    /// construction with a typed [`StoreError`] (fail fast at startup, never
+    /// a panic). After that, the file is re-read lazily, only on
+    /// request-path credential access (inside `object_store`'s per-request
+    /// `CredentialProvider::get_credential`), never from a background
+    /// thread with its own lifecycle: unchanged mtime costs one `stat()` and
+    /// returns the cached credential, changed mtime triggers a re-read and,
+    /// on success, an atomic swap so every *subsequent* `get_credential`
+    /// call sees the new credential while a request that already obtained
+    /// the old one finishes on it unaffected. A parse failure while
+    /// rotating (unlike at construction) never fails the request: the
+    /// last-good credential is kept and a rate-limited warning is logged
+    /// instead. When both `credentials_file` and inline
+    /// `access_key_id`/`secret_access_key`/`session_token` are set, the file
+    /// wins.
+    pub credentials_file: Option<PathBuf>,
 }
 
 /// S3 / MinIO backend implementing [`ObjectStoreBackend`] over
@@ -153,17 +189,35 @@ pub struct S3Config {
 pub struct S3Store {
     store: AmazonS3,
     page_size: usize,
+    /// `Some` only when [`S3Config::credentials_file`] was set; kept
+    /// alongside the `AmazonS3` client (which holds its own clone as an
+    /// opaque `object_store::CredentialProvider` trait object) purely so
+    /// [`S3Store::credential_rotation_failures`] has something to read.
+    credential_provider: Option<Arc<FileCredentialProvider>>,
 }
 
 impl S3Store {
     pub fn new(config: S3Config) -> Result<Self, StoreError> {
-        let store = Self::builder(&config)
+        let (builder, credential_provider) = Self::builder(&config)?;
+        let store = builder
             .build()
             .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
         Ok(S3Store {
             store,
             page_size: LIST_PAGE_SIZE,
+            credential_provider,
         })
+    }
+
+    /// Count of [`S3Config::credentials_file`] rotation attempts (a
+    /// request-path mtime change) that failed to read or parse the rotated
+    /// file and fell back to last-good credentials (ADR-0072 decision 1).
+    /// Always `0` when `credentials_file` is unset.
+    pub fn credential_rotation_failures(&self) -> u64 {
+        self.credential_provider
+            .as_deref()
+            .map(FileCredentialProvider::rotation_failures)
+            .unwrap_or(0)
     }
 
     /// Build the `AmazonS3Builder` from a [`S3Config`], with no network
@@ -172,7 +226,16 @@ impl S3Store {
     /// without a live endpoint. The `kms_key_id` branch is the only
     /// behavioral addition over the historical build path: when it is `None`
     /// this produces byte-for-byte the same builder as before ADR-0042.
-    fn builder(config: &S3Config) -> AmazonS3Builder {
+    /// Fails (fail-fast, per [`S3Config::credentials_file`]'s rotation
+    /// contract) only when `credentials_file` is `Some` and that file is
+    /// unreadable or not valid JSON in the expected shape; every other
+    /// config shape only sets local builder fields and cannot fail here.
+    /// Returns the [`FileCredentialProvider`] alongside the builder (rather
+    /// than only handing it to `with_credentials` as an opaque trait object)
+    /// so [`S3Store::new`] can keep its own handle for observability.
+    fn builder(
+        config: &S3Config,
+    ) -> Result<(AmazonS3Builder, Option<Arc<FileCredentialProvider>>), StoreError> {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
             .with_region(&config.region)
@@ -190,7 +253,20 @@ impl S3Store {
         if let Some(kms_key_id) = &config.kms_key_id {
             builder = builder.with_sse_kms_encryption(kms_key_id);
         }
-        builder
+        // Rotating file credentials win over inline ones (ADR-0072 decision
+        // 1, S3Config::credentials_file doc comment): `with_credentials`
+        // overrides the access_key_id/secret_access_key/token set above.
+        // `FileCredentialProvider::load` does the fail-fast read+parse this
+        // function's Result exists for.
+        let mut credential_provider = None;
+        if let Some(credentials_file) = &config.credentials_file {
+            let provider = Arc::new(FileCredentialProvider::load(credentials_file.clone())?);
+            builder = builder.with_credentials(Arc::clone(&provider) as AwsCredentialProvider);
+            credential_provider = Some(provider);
+        } else if let Some(session_token) = &config.session_token {
+            builder = builder.with_token(session_token.clone());
+        }
+        Ok((builder, credential_provider))
     }
 
     /// Same backend, a smaller `list()` page size. Mirrors
@@ -861,6 +937,8 @@ mod tests {
             allow_http: true,
             force_path_style: true,
             kms_key_id: None,
+            session_token: None,
+            credentials_file: None,
         }
     }
 
@@ -911,7 +989,10 @@ mod tests {
         }
 
         assert_eq!(
-            format!("{:?}", S3Store::builder(&config)),
+            format!(
+                "{:?}",
+                S3Store::builder(&config).expect("no credentials file").0
+            ),
             format!("{baseline:?}"),
             "None kms_key_id must not change the builder"
         );
@@ -920,7 +1001,10 @@ mod tests {
         let mut with_key = config.clone();
         with_key.kms_key_id = Some("arn:aws:kms:us-east-1:111122223333:key/abcd".to_string());
         assert_ne!(
-            format!("{:?}", S3Store::builder(&with_key)),
+            format!(
+                "{:?}",
+                S3Store::builder(&with_key).expect("no credentials file").0
+            ),
             format!("{baseline:?}"),
             "Some kms_key_id must change the builder"
         );

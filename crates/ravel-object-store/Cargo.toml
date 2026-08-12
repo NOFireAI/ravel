@@ -19,12 +19,16 @@ tracing = { workspace = true }
 crc32c = { workspace = true }
 # Serde derive for the durable `sys/qualification` record (ADR-0050 section 6),
 # relocated here from ravel-cli so ravel-server and ravel-cli share one
-# definition. JSON-encoded; serde_json stays a dev-dependency (the JSON-shape
-# regression test) since the encode/decode itself lives in the two consumers.
+# definition, and for S3Config::credentials_file's rotating-credentials JSON
+# (ADR-0072 decision 1, crates/ravel-object-store/src/s3/credentials.rs).
 serde = { workspace = true }
+# JSON decode for S3Config::credentials_file (ADR-0072 decision 1): a
+# production dependency now, not just the dev-only JSON-shape regression test
+# serde_json was here for before.
+serde_json = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
