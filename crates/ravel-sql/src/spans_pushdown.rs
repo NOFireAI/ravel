@@ -41,12 +41,30 @@
 //!   sibling of `service_name`. Feeds a `COL_NAME` bloom probe (ADR-0054), the
 //!   other field the v3 per-block bloom is built over.
 //!
-//! All six are conjunctive-only (ADR-0045 decision 5): a disjunction anywhere
-//! in a conjunct's own subtree ([`contains_or`]) drops that whole conjunct
-//! rather than being soundly pushed, since refusing to push is always
-//! widen-safe (the `Inexact` residual re-applies it). This crate does not
-//! attempt a sound OR pushdown; see [`contains_or`]'s doc for what one would
-//! require.
+//! Five of the six are conjunctive-only (ADR-0045 decision 5): a disjunction
+//! anywhere in a conjunct's own subtree ([`contains_or`]) drops that whole
+//! conjunct rather than being soundly pushed, since refusing to push is
+//! always widen-safe (the `Inexact` residual re-applies it).
+//!
+//! The `status_code`/`duration_ns` axes are the exception (issue #519, first
+//! increment): a **same-axis** disjunction -- every disjunct constrains the
+//! *one* axis, nothing else -- is recognized and pushed as the *union* of the
+//! per-disjunct constraints, not the AND-intersection ordinary sibling
+//! conjuncts use. `status_code IN (1, 2)`, `status_code = 1 OR status_code =
+//! 2`, and a duration range union all take this path; see
+//! [`same_axis_status_union`] and [`same_axis_duration_union`]. This is sound
+//! because the union covers every disjunct: a block is dropped only when it
+//! proves no-match against the *combined* constraint, which means it proves
+//! no-match against each individual disjunct too. A **cross-axis**
+//! disjunction (`status_code = 2 OR duration_ns > 5e8`) is still refused: no
+//! disjunct's failure to name a single shared axis is treated as "not this
+//! increment's shape" and falls back to the ordinary widen-safe refusal
+//! ([`contains_or`]'s doc). `trace_id` is not part of this increment: RSPAN's
+//! reader only ever exposes a single-point trace lookup
+//! ([`ravel_rspan::SpanQuery::trace`]) with no range-based skip-index
+//! primitive to union against, so a `trace_id =` disjunction is refused the
+//! same as any other cross-axis case (a follow-up would need a new
+//! `ravel_rspan` primitive first, out of this crate's reach).
 //!
 //! # Why one window covers both `start_ts` and `end_ts`
 //!
@@ -179,6 +197,28 @@ fn walk_conjunct(expr: &Expr, out: &mut SpansPushdown) {
 }
 
 fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
+    // An `Or`-rooted conjunct (the only place an `Or` can sit once
+    // `walk_conjunct` has split every top-level `And`, see `contains_or`'s
+    // doc) may still be soundly pushed when every disjunct constrains the
+    // same single axis (issue #519's same-axis increment): the union of the
+    // disjuncts' constraints is folded in as this conjunct's contribution,
+    // exactly as a single equality would be. A cross-axis or otherwise
+    // unrecognized `Or` shape falls through to the blanket refusal below.
+    if is_or(expr) {
+        if let Some(mask) = same_axis_status_union(expr) {
+            fold_status_mask(out, mask);
+            return;
+        }
+        if let Some((lo, hi)) = same_axis_duration_union(expr) {
+            if let Some(lo) = lo {
+                tighten_duration_lo(out, lo);
+            }
+            if let Some(hi) = hi {
+                tighten_duration_hi(out, hi);
+            }
+            return;
+        }
+    }
     // A disjunction anywhere in this conjunct's subtree means the conjunct
     // as a whole cannot be soundly narrowed on any axis: see `contains_or`'s
     // doc for why refusing is the only safe move. Checked once here, up
@@ -199,7 +239,165 @@ fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
                 tighten_hi(out, hi);
             }
         }
+        // `status_code IN (v1, v2, ...)`: DataFusion's SQL parser lowers `IN`
+        // to `Expr::InList`, not a chain of `Or`s, so this shape never
+        // reaches `same_axis_status_union` above -- it needs its own arm.
+        // Sound for the same reason the `Or` union is: the pushed mask is the
+        // union of the list's bits, so a block is dropped only when it can
+        // hold none of the listed values. `negated` (`NOT IN`) is an AND of
+        // inequalities, a different shape this increment does not attempt.
+        Expr::InList(il) if !il.negated && is_status_code_col(&il.expr) => {
+            if let Some(mask) = status_mask_union(il.list.iter()) {
+                fold_status_mask(out, mask);
+            }
+        }
         _ => {}
+    }
+}
+
+fn is_or(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Or,
+            ..
+        })
+    )
+}
+
+/// AND-fold `mask` into `out.status_mask`, the same combinator
+/// [`handle_binary`]'s plain-equality arm uses: sibling top-level conjuncts
+/// (whether a single equality, an `IN` list, or a same-axis `Or`) always
+/// intersect, since every one of them independently must hold.
+fn fold_status_mask(out: &mut SpansPushdown, mask: u8) {
+    out.status_mask = Some(match out.status_mask {
+        Some(cur) => cur & mask,
+        None => mask,
+    });
+}
+
+/// The union of the `status_code` bits named by a list of literal exprs (an
+/// `IN` list's values, or one same-axis-`Or` disjunct's values), or `None` if
+/// any member is not a literal this extractor can read (an unknown value
+/// might match a real row via that member, so the whole union is unsound to
+/// compute -- refuse rather than guess). A member whose literal *is* known
+/// but names a status code outside `0..=2` contributes no bit: it can never
+/// equal a real row's `status_code` either way, so folding it out of the
+/// union only omits an always-empty disjunct, never a reachable one.
+fn status_mask_union<'a>(values: impl Iterator<Item = &'a Expr>) -> Option<u8> {
+    let mut mask = 0u8;
+    for v in values {
+        let value = lit_i64(v)?;
+        mask |= status_bit(value).unwrap_or(0);
+    }
+    Some(mask)
+}
+
+/// Recognize an `Or`-rooted conjunct as a same-axis `status_code`
+/// disjunction and return the union mask, or `None` if any disjunct touches
+/// something other than a `status_code` equality/`IN` list (cross-axis, or a
+/// shape this increment does not parse) -- the caller then falls back to the
+/// ordinary widen-safe refusal.
+fn same_axis_status_union(expr: &Expr) -> Option<u8> {
+    let mut disjuncts = Vec::new();
+    flatten_or(expr, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return None;
+    }
+    let mut mask = 0u8;
+    for d in disjuncts {
+        mask |= disjunct_status_mask(d)?;
+    }
+    Some(mask)
+}
+
+/// One disjunct's own `status_code` mask: a bare equality, an `IN` list, or
+/// an `And` of such (AND-intersected, matching ordinary conjunct semantics
+/// within the one disjunct). `None` for anything else, including a further
+/// nested `Or` -- this increment's same-axis recognizer is one level deep.
+fn disjunct_status_mask(expr: &Expr) -> Option<u8> {
+    match expr {
+        Expr::BinaryExpr(be) if be.op == Operator::And => {
+            Some(disjunct_status_mask(&be.left)? & disjunct_status_mask(&be.right)?)
+        }
+        Expr::BinaryExpr(be) => status_code_equality(be),
+        Expr::InList(il) if !il.negated && is_status_code_col(&il.expr) => {
+            status_mask_union(il.list.iter())
+        }
+        _ => None,
+    }
+}
+
+/// Recognize an `Or`-rooted conjunct as a same-axis `duration_ns`
+/// disjunction and return the union window as `(lo, hi)`, each `None` when
+/// unbounded on that side (a disjunct with no lower/upper bound makes the
+/// *union*'s corresponding side unbounded too, since that disjunct alone can
+/// already match an arbitrarily low/high duration). `None` overall if any
+/// disjunct touches something other than `duration_ns` comparisons.
+fn same_axis_duration_union(expr: &Expr) -> Option<(Option<i64>, Option<i64>)> {
+    let mut disjuncts = Vec::new();
+    flatten_or(expr, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return None;
+    }
+    let mut los = Vec::with_capacity(disjuncts.len());
+    let mut his = Vec::with_capacity(disjuncts.len());
+    for d in disjuncts {
+        let (lo, hi) = disjunct_duration_bounds(d)?;
+        los.push(lo);
+        his.push(hi);
+    }
+    let lo = if los.iter().any(Option::is_none) {
+        None
+    } else {
+        los.into_iter().flatten().min()
+    };
+    let hi = if his.iter().any(Option::is_none) {
+        None
+    } else {
+        his.into_iter().flatten().max()
+    };
+    Some((lo, hi))
+}
+
+/// One disjunct's own `duration_ns` window, as `(lo, hi)` (each `None` when
+/// unbounded on that side). Walks the disjunct's own `And` structure with the
+/// same bound-tightening [`apply_duration_bound`] uses for top-level
+/// conjuncts -- an intersection *within* the disjunct, which is ordinary AND
+/// semantics, not the union this function's caller folds disjuncts with.
+/// `None` for anything that is not a plain `duration_ns` comparison chained
+/// by `And` (a different column, a further `Or`, an unparseable literal).
+fn disjunct_duration_bounds(expr: &Expr) -> Option<(Option<i64>, Option<i64>)> {
+    let mut local = SpansPushdown::default();
+    walk_duration_only(expr, &mut local)?;
+    Some((local.duration_lo, local.duration_hi))
+}
+
+fn walk_duration_only(expr: &Expr, out: &mut SpansPushdown) -> Option<()> {
+    let Expr::BinaryExpr(be) = expr else {
+        return None;
+    };
+    if be.op == Operator::And {
+        walk_duration_only(&be.left, out)?;
+        walk_duration_only(&be.right, out)?;
+        return Some(());
+    }
+    let (op, ns) = duration_comparison(be)?;
+    apply_duration_bound(out, op, ns);
+    Some(())
+}
+
+/// Flatten an `Or` tree into its leaf disjuncts, at any depth (`(a OR b) OR
+/// c` yields `[a, b, c]`). A non-`Or` expr yields itself as the sole element,
+/// so callers can feed in an already-flat conjunct uniformly.
+fn flatten_or<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr
+        && *op == Operator::Or
+    {
+        flatten_or(left, out);
+        flatten_or(right, out);
+    } else {
+        out.push(expr);
     }
 }
 
@@ -208,22 +406,15 @@ fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
 /// AND hi)` desugars to `col < lo OR col > hi`, a disjunction in substance
 /// even though it has no `Expr::BinaryExpr(Or)` node).
 ///
-/// No shape in this file attempts to push a disjunction soundly; a burned
-/// prior attempt is the reason ("do not attempt to handle OR"). Refusing is
-/// always widen-safe: DataFusion's `Inexact` residual re-applies the
-/// original predicate above the scan, so dropping the whole conjunct only
-/// ever costs pruning, never correctness.
-///
-/// A sound disjunctive pushdown would need a different algorithm, not an
-/// extension of this one: each disjunct would have to be extracted into its
-/// own bound, all disjuncts would have to constrain the *same* single axis
-/// (a mixed `duration_ns > 5 OR status_code = 1` cannot produce one bound on
-/// either axis, since a row can satisfy the predicate via either disjunct
-/// alone), and the per-disjunct bounds would then have to be combined by
-/// *union* (widest span / broadest mask covering every disjunct) rather than
-/// this file's AND-intersection (narrowest span / tightest mask). Detecting
-/// "all disjuncts hit the same column" and building the union bound is the
-/// unimplemented part; this function only ever detects and refuses.
+/// This is the fallback refusal path: [`handle_leaf`] tries
+/// [`same_axis_status_union`]/[`same_axis_duration_union`] on an `Or`-rooted
+/// conjunct first (issue #519's same-axis increment), and only reaches this
+/// blanket check when neither recognizes the shape (cross-axis, a negated
+/// `BETWEEN`, an `Or` mixed with an unrelated column, or an `Or` nested
+/// somewhere other than this conjunct's root). Refusing is always widen-safe:
+/// DataFusion's `Inexact` residual re-applies the original predicate above
+/// the scan, so dropping the whole conjunct only ever costs pruning, never
+/// correctness.
 fn contains_or(expr: &Expr) -> bool {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
@@ -258,11 +449,9 @@ fn handle_binary(be: &BinaryExpr, out: &mut SpansPushdown) {
         // query supplies. A contradictory pair (`= Ok AND = Error`)
         // intersects to a `0` mask, which the reader's skip index treats as
         // "no block can match" -- correct, since no row can satisfy both
-        // equalities either.
-        out.status_mask = Some(match out.status_mask {
-            Some(cur) => cur & bit,
-            None => bit,
-        });
+        // equalities either. [`fold_status_mask`] is the same combinator a
+        // same-axis `Or`/`IN` conjunct folds its own union mask through.
+        fold_status_mask(out, bit);
     } else if let Some(service) = service_name_equality(be) {
         // Last writer wins, mirroring trace_id: two different service names
         // ANDed are unsatisfiable, and pinning either still drops no needed row.
@@ -943,33 +1132,233 @@ mod tests {
         );
     }
 
+    // --- issue #519 first increment: same-axis disjunction ---
+
     #[test]
-    fn disjunctive_status_predicate_disables_pruning_and_keeps_every_block() {
-        // `status_code = 1 OR status_code = 2`: no bound is extracted, per
-        // contains_or. Fed straight into candidate_blocks, that `None` keeps
-        // every block -- including one that (as it happens) cannot satisfy
-        // either disjunct. That is the correct, widen-only behavior: proving
-        // such a block unreachable would require soundly narrowing an OR,
-        // which this file deliberately refuses to attempt (see
-        // `contains_or`'s doc).
+    fn same_axis_status_or_unions_the_masks() {
+        // `status_code = 1 OR status_code = 2` (issue #519's headline
+        // example): the union `OK | ERROR`, not the old widen-to-nothing.
         let disjunctive = or(
             col("status_code").eq(lit(1i64)),
             col("status_code").eq(lit(2i64)),
         );
         let p = extract_spans(&[disjunctive]);
-        assert_eq!(p.status_mask, None, "an OR must not narrow the status axis");
+        assert_eq!(
+            p.status_mask,
+            Some(STATUS_BIT_OK | STATUS_BIT_ERROR),
+            "a same-axis status OR must push the union mask"
+        );
+    }
 
+    #[test]
+    fn status_in_list_unions_the_masks() {
+        // The common target (deliverable item 3): `status_code IN (1, 2)`
+        // lowers to the identical union mask a same-axis `OR` produces.
+        let in_list = col("status_code").in_list(vec![lit(1i64), lit(2i64)], false);
+        let p = extract_spans(&[in_list]);
+        assert_eq!(p.status_mask, Some(STATUS_BIT_OK | STATUS_BIT_ERROR));
+
+        // NOT IN is a different (AND-of-inequalities) shape, not attempted.
+        let not_in = col("status_code").in_list(vec![lit(1i64)], true);
+        let p = extract_spans(&[not_in]);
+        assert_eq!(p.status_mask, None);
+    }
+
+    #[test]
+    fn same_axis_status_union_still_and_intersects_with_sibling_conjuncts() {
+        // `status_code = 1 AND (status_code = 1 OR status_code = 2)`: the
+        // OR's union (OK|ERROR) intersects with the sibling equality's OK
+        // bit, same top-level AND semantics as two plain equalities.
+        let p = extract_spans(&[
+            col("status_code").eq(lit(1i64)),
+            or(
+                col("status_code").eq(lit(1i64)),
+                col("status_code").eq(lit(2i64)),
+            ),
+        ]);
+        assert_eq!(p.status_mask, Some(STATUS_BIT_OK));
+    }
+
+    /// Soundness proof: a block that can hold ONLY the status named by one
+    /// branch of a same-axis OR (not the other) must still survive pruning.
+    /// If the union in `same_axis_status_union` were an intersection instead
+    /// (flip the `mask |= disjunct_status_mask(d)?;` fold in
+    /// `same_axis_status_union` to `mask &= ...`, seeded from `!0` instead of
+    /// `0`), this test fails: `STATUS_BIT_OK & STATUS_BIT_ERROR == 0`, and a
+    /// block whose only rows are `Ok` would be wrongly pruned by a
+    /// `status_code = 1 OR status_code = 2` predicate even though every one
+    /// of its rows satisfies the `= 1` branch.
+    #[test]
+    fn same_axis_status_or_soundness_a_block_matching_one_branch_survives() {
+        let disjunctive = or(
+            col("status_code").eq(lit(1i64)),
+            col("status_code").eq(lit(2i64)),
+        );
+        let p = extract_spans(&[disjunctive]);
+        let mask = p.status_mask.expect("same-axis OR extracts a union mask");
+
+        let only_ok = BlockEntry {
+            status_mask: STATUS_BIT_OK,
+            ..full_range_block()
+        };
         let only_unset = BlockEntry {
             status_mask: STATUS_BIT_UNSET,
             ..full_range_block()
         };
-        let index = SkipIndex::new(vec![only_unset]);
-        let kept = index.candidate_blocks(None, i64::MIN, i64::MAX, None, p.status_mask);
+        let index = SkipIndex::new(vec![only_ok, only_unset]);
+        let kept = index.candidate_blocks(None, i64::MIN, i64::MAX, None, Some(mask));
         assert_eq!(
             kept,
             vec![0],
-            "with pruning disabled for the OR'd axis every block must survive"
+            "the Ok-only block matches the `= 1` branch and must survive; \
+             the Unset-only block matches neither branch and may be pruned"
         );
+    }
+
+    #[test]
+    fn same_axis_duration_or_unions_the_ranges() {
+        // `duration_ns < 100 OR duration_ns > 1000`: the union is
+        // unrepresentable as one contiguous range without widening through
+        // the gap, so both sides come out unbounded -- correct (a
+        // single-range parameter can only over-approximate two disjoint
+        // half-open rays), and still strictly better than dropping the whole
+        // conjunct only when at least one side stays bounded (see the
+        // two-sided-bound case below).
+        let p = extract_spans(&[or(
+            col("duration_ns").lt(lit(100i64)),
+            col("duration_ns").gt(lit(1000i64)),
+        )]);
+        assert_eq!(p.duration_window(), None);
+
+        // Two closed ranges union into their hull: `[100, 200] u [500, 600]`
+        // -> `[100, 600]`. A block whose duration falls in the gap (e.g.
+        // 300) is not soundly prunable from a single range, so the hull
+        // over-approximates there -- still sound, just not maximally tight.
+        let p = extract_spans(&[or(
+            and(
+                col("duration_ns").gt_eq(lit(100i64)),
+                col("duration_ns").lt_eq(lit(200i64)),
+            ),
+            and(
+                col("duration_ns").gt_eq(lit(500i64)),
+                col("duration_ns").lt_eq(lit(600i64)),
+            ),
+        )]);
+        assert_eq!(p.duration_window(), Some((100, 600)));
+    }
+
+    /// Soundness proof, duration axis: a block matching only the low branch
+    /// of a same-axis duration OR must survive. If the hull hi hi/lo fold
+    /// used `los.into_iter().flatten().max()`/`his...min()` (intersection
+    /// shape) instead of the `min`/`max` this file actually uses, the hull
+    /// for `[100,200] OR [500,600]` would collapse to `(500, 200)` (lo > hi,
+    /// the empty range), which `duration_window()` still returns as `Some`
+    /// and the skip index would prune every block -- including the
+    /// `[100,200]`-only block a real row in that range must survive in.
+    #[test]
+    fn same_axis_duration_or_soundness_a_block_matching_one_branch_survives() {
+        let p = extract_spans(&[or(
+            and(
+                col("duration_ns").gt_eq(lit(100i64)),
+                col("duration_ns").lt_eq(lit(200i64)),
+            ),
+            and(
+                col("duration_ns").gt_eq(lit(500i64)),
+                col("duration_ns").lt_eq(lit(600i64)),
+            ),
+        )]);
+        let window = p.duration_window().expect("same-axis OR extracts a window");
+
+        let low_branch_only = BlockEntry {
+            min_duration_ns: 150,
+            max_duration_ns: 150,
+            ..full_range_block()
+        };
+        let index = SkipIndex::new(vec![low_branch_only]);
+        let kept = index.candidate_blocks(None, i64::MIN, i64::MAX, Some(window), None);
+        assert_eq!(
+            kept,
+            vec![0],
+            "a block matching only the [100,200] branch must survive pruning"
+        );
+    }
+
+    #[test]
+    fn cross_axis_disjunction_still_bails_widen_safe() {
+        // `status_code = 2 OR duration_ns > 5e8`: neither axis alone covers
+        // every disjunct (a row can satisfy the predicate via either
+        // disjunct, so no single-axis bound is sound), so this stays
+        // refused exactly like before this increment: no bound on either
+        // axis, and DataFusion's `Inexact` residual re-applies the original
+        // predicate above the scan.
+        let mixed = or(
+            col("status_code").eq(lit(2i64)),
+            col("duration_ns").gt(lit(500_000_000i64)),
+        );
+        let p = extract_spans(&[mixed]);
+        assert_eq!(p, SpansPushdown::default());
+    }
+
+    /// Differential/equivalence test (prove-the-test): a corpus of blocks
+    /// spanning every `status_code` value, pruned by the same-axis union a
+    /// `status_code = 1 OR status_code = 2` predicate extracts. Proves two
+    /// things at once: pruning actually engaged (fewer candidates than the
+    /// full corpus, via a real counter on the returned Vec, not just that
+    /// extraction produced a mask), and every row the unpushed predicate
+    /// would keep is still reachable afterward (the widen-safe equivalence:
+    /// re-evaluating the original OR over each surviving block's exact
+    /// per-row status set -- modeled here by each block's singleton
+    /// `status_mask`, so "block's status" and "row's status" coincide --
+    /// never finds a match among the pruned-away blocks).
+    #[test]
+    fn same_axis_status_union_pruning_engages_and_stays_sound_over_a_corpus() {
+        let disjunctive = or(
+            col("status_code").eq(lit(1i64)),
+            col("status_code").eq(lit(2i64)),
+        );
+        let p = extract_spans(&[disjunctive]);
+        let mask = p.status_mask.expect("same-axis OR extracts a union mask");
+
+        // One block per status value, 40 of each, so the corpus is large
+        // enough that "pruning happened" is not a one-block coincidence.
+        let statuses = [STATUS_BIT_UNSET, STATUS_BIT_OK, STATUS_BIT_ERROR];
+        let blocks: Vec<BlockEntry> = (0..120u32)
+            .map(|i| BlockEntry {
+                status_mask: statuses[(i % 3) as usize],
+                ..full_range_block()
+            })
+            .collect();
+        let want_survive_count = blocks
+            .iter()
+            .filter(|b| b.status_mask != STATUS_BIT_UNSET)
+            .count();
+        let index = SkipIndex::new(blocks.clone());
+
+        let kept = index.candidate_blocks(None, i64::MIN, i64::MAX, None, Some(mask));
+
+        // Pruning engaged: a real counter, not a mask-was-extracted proxy.
+        assert!(
+            kept.len() < blocks.len(),
+            "the Unset-only blocks must be pruned: kept {} of {}",
+            kept.len(),
+            blocks.len()
+        );
+        assert_eq!(
+            kept.len(),
+            want_survive_count,
+            "exactly the Ok/Error blocks survive, none of the Unset ones"
+        );
+        // Widen-safe equivalence: every kept block's own status really can
+        // satisfy the original OR (re-evaluated exactly, per-row status ==
+        // the block's singleton mask here), so pushdown dropped nothing the
+        // unpushed predicate would have kept.
+        for &i in &kept {
+            let s = blocks[i].status_mask;
+            assert!(
+                s == STATUS_BIT_OK || s == STATUS_BIT_ERROR,
+                "block {i} survived pruning but satisfies neither OR branch"
+            );
+        }
     }
 
     #[test]
