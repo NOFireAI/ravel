@@ -83,6 +83,7 @@ fn maintain_config(tenant: &TenantId) -> ServerConfig {
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
         distrib: None,
+        remote_clusters: Vec::new(),
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
@@ -241,19 +242,40 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     // before `units_owned` reflects the final partition; the maintenance
     // interval is 1s, so this comfortably waits for one.
     tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // A single scrape pair can race `run_discovery_cycle`'s
+    // `set_units_owned(0)`-then-accumulate window (maintain.rs): a scrape
+    // landing between one worker's reset and its tenant loop finishing sees
+    // a transient undercount. Poll a short, bounded number of times rather
+    // than lengthening the fixed sleep above -- the reset window is a few
+    // microseconds, so this almost always succeeds on the first scrape and
+    // only retries across a genuine race.
+    let expected_total = u64::from(SHARD_COUNT) * 3;
+    let mut owned_a = 0;
+    let mut owned_b = 0;
+    let mut settled = false;
+    for _ in 0..25 {
+        let body_a = scrape(&client, &base_a).await;
+        let body_b = scrape(&client, &base_b).await;
+        owned_a = sample_value(&body_a, "ravel_maintain_units_owned{mode=\"maintain\"}")
+            .expect("units_owned present on a");
+        owned_b = sample_value(&body_b, "ravel_maintain_units_owned{mode=\"maintain\"}")
+            .expect("units_owned present on b");
+        if owned_a + owned_b == expected_total {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        settled,
+        "the two workers must jointly own every (signal, shard) unit exactly once, no double-pay \
+         (ADR-0065 decision 2), regardless of how the rendezvous hash splits them: got \
+         owned_a={owned_a}, owned_b={owned_b}, expected total {expected_total}"
+    );
+
     let body_a = scrape(&client, &base_a).await;
     let body_b = scrape(&client, &base_b).await;
-
-    let owned_a = sample_value(&body_a, "ravel_maintain_units_owned{mode=\"maintain\"}")
-        .expect("units_owned present on a");
-    let owned_b = sample_value(&body_b, "ravel_maintain_units_owned{mode=\"maintain\"}")
-        .expect("units_owned present on b");
-    assert_eq!(
-        owned_a + owned_b,
-        u64::from(SHARD_COUNT) * 3,
-        "the two workers must jointly own every (signal, shard) unit exactly once, no double-pay \
-         (ADR-0065 decision 2), regardless of how the rendezvous hash splits them"
-    );
 
     for (name, body) in [("a", &body_a), ("b", &body_b)] {
         assert!(
