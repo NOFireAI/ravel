@@ -181,6 +181,17 @@ pub enum SqlError {
     #[error("query scanned too many bytes: {scanned} exceeds max {max}")]
     TooManyBytesScanned { scanned: u64, max: u64 },
 
+    /// The per-tenant S3 request budget was exhausted mid-scan (RH-T2, issue
+    /// #902), checked incrementally against
+    /// `QueryAccounting::total_s3_requests()` at the same checkpoints as
+    /// [`SqlError::TooManyBytesScanned`]. Mirrors
+    /// `ravel_query::QueryError::RequestBudgetExceeded` so both query
+    /// languages surface the same trip the same way; `requests` and `max`
+    /// are counts an operator needs, no server state, so it is echoed
+    /// verbatim like the other budget errors.
+    #[error("query issued {requests} S3 requests, exceeding the budget of {max}")]
+    RequestBudgetExceeded { requests: u64, max: u64 },
+
     /// The per-query or per-tenant byte budget was exhausted. The detail is
     /// the pool's own message (byte counts and limits only).
     #[error("query memory budget exhausted: {0}")]
@@ -239,6 +250,7 @@ impl SqlError {
             | SqlError::TooManySegments { .. }
             | SqlError::TooManySeries { .. }
             | SqlError::TooManyBytesScanned { .. }
+            | SqlError::RequestBudgetExceeded { .. }
             | SqlError::ResourcesExhausted(_)
             | SqlError::Plan(_)
             | SqlError::Execution(_)
@@ -286,6 +298,7 @@ impl SqlError {
             | SqlError::TooManySegments { .. }
             | SqlError::TooManySeries { .. }
             | SqlError::TooManyBytesScanned { .. }
+            | SqlError::RequestBudgetExceeded { .. }
             | SqlError::ResourcesExhausted(_) => self.to_string(),
             SqlError::Plan(_) => MSG_PLAN.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
@@ -475,6 +488,18 @@ mod tests {
         let budget = SqlError::TooManySamples { count: 11, max: 10 };
         assert_eq!(budget.client_message(), budget.to_string());
         assert_eq!(budget.class(), ErrorClass::Unsupported);
+
+        // The S3 request budget (RH-T2, issue #902) is the same shape:
+        // counts and limits only, echoed verbatim, HTTP 422.
+        let request_budget = SqlError::RequestBudgetExceeded {
+            requests: 30_001,
+            max: 30_000,
+        };
+        assert_eq!(request_budget.client_message(), request_budget.to_string());
+        assert_eq!(request_budget.class(), ErrorClass::Unsupported);
+        assert!(request_budget.client_message().contains("30001"));
+        assert!(request_budget.client_message().contains("30000"));
+        assert_redacted(&request_budget.client_message());
 
         // Validation errors quote only the caller's own input.
         let bad = SqlError::Validation(ValidationError::NotReadOnly { kind: "INSERT" });

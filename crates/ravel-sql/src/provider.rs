@@ -191,6 +191,7 @@ impl RavelTableProvider {
             series_ids,
             self.config.engine.max_series,
             self.config.engine.max_bytes_scanned,
+            self.config.engine.max_s3_requests,
             Arc::clone(&self.erasure),
             self.accounting.clone(),
         )?);
