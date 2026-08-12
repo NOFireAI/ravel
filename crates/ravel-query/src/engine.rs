@@ -1273,19 +1273,14 @@ impl QueryEngine {
 ///
 /// Returns an empty vec when the snapshot carries no pending erasure, which is
 /// the common case and makes every call site below a no-op.
+///
+/// Delegates to [`crate::erasure::snapshot_pending_erasure_predicates`], the
+/// shared conversion `ravel-sql`'s SQL scan surfaces also call (issue #829),
+/// so the engine and every SQL table derive predicates from one mapping. Stays
+/// `pub` because the cross-cluster federation resolve path
+/// (`services/ravel-server/src/distrib.rs`) re-exports and calls it.
 pub fn snapshot_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePredicate> {
-    snapshot
-        .pending_erasure
-        .iter()
-        .map(|request| {
-            let matchers = request
-                .predicate
-                .iter()
-                .map(|matcher| (matcher.key.clone(), matcher.value.clone()))
-                .collect();
-            ErasurePredicate::new(matchers, request.window_start_ns, request.window_end_ns)
-        })
-        .collect()
+    crate::erasure::snapshot_pending_erasure_predicates(snapshot)
 }
 
 /// Builds a `series_id -> labels` map incrementally, rejecting the moment a

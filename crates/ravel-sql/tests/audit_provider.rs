@@ -292,6 +292,53 @@ async fn attrs_map_is_generic_across_kinds() {
     assert_eq!(map_get(&query_map, "hold.op"), None);
 }
 
+/// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): a pending selective-erasure
+/// request on the resolved snapshot excludes matching rows through the real
+/// `AuditTableProvider` scan path, the one the SQL `audit` table uses in
+/// production. Covers `AuditTableProvider::build_scan` passing the
+/// snapshot-derived predicates into `AuditScanExec` (audit_provider.rs) and
+/// `AuditScanExec` calling `LogQuery::with_erasure` before fetch
+/// (audit_scan.rs); reverting `.with_erasure((*erasure).clone())` back to a
+/// bare `LogQuery::new(ts_min, ts_max)` in audit_scan.rs makes the erased row
+/// reappear.
+#[tokio::test]
+async fn pending_erasure_excludes_matching_rows() {
+    let store = MemoryStore::new();
+    let hold = audit_record(1, "NOTICE", "erase me", &[("actor", "svc/erase")]);
+    let query = audit_record(2, "INFO", "keep me", &[("actor", "svc/keep")]);
+    let seg = write_object(&store, "audit/erasure.rlog", &[hold, query]).await;
+
+    let request = ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "actor".to_string(),
+            value: "svc/erase".to_string(),
+        }],
+        ..Default::default()
+    };
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = LogSegmentFetcher::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: vec![request],
+    };
+    let provider = AuditTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
+
+    let batches = collect_plan(provider.plan(1).expect("build plan")).await;
+    let got = batches_to_rows(&batches);
+    assert_eq!(
+        got,
+        BTreeSet::from([(2, "INFO".to_string(), "keep me".to_string())]),
+        "the erased row is excluded; the other row survives"
+    );
+}
+
 fn attrs_map(batch: &RecordBatch, row: usize) -> Vec<(String, String)> {
     let map = batch
         .column(3)

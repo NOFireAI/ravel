@@ -33,6 +33,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
@@ -54,6 +55,10 @@ pub struct LogsTableProvider {
     /// `LogsScanExec` the provider builds so every store fetch the scan
     /// issues on this query's behalf is recorded against it.
     accounting: QueryAccounting,
+    /// Pending selective-erasure predicates derived once from
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// into every `LogsScanExec` the provider builds.
+    erasure: Arc<Vec<ErasurePredicate>>,
 }
 
 impl LogsTableProvider {
@@ -67,6 +72,7 @@ impl LogsTableProvider {
         config: impl Into<SqlConfig>,
         accounting: QueryAccounting,
     ) -> Self {
+        let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
         LogsTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
@@ -74,6 +80,7 @@ impl LogsTableProvider {
             config: config.into(),
             schema: logs_schema(),
             accounting,
+            erasure,
         }
     }
 
@@ -116,6 +123,7 @@ impl LogsTableProvider {
             pushdown.ts_max(),
             Arc::new(pushdown.content.clone()),
             Arc::new(pushdown.prune.clone()),
+            Arc::clone(&self.erasure),
             self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))
@@ -976,6 +984,56 @@ mod tests {
                 (4, "another match example".to_string()),
             ]),
             "ts=3 fails the attrs filter, ts=100 fails the ts range"
+        );
+    }
+
+    /// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): a pending selective-erasure
+    /// request on the resolved snapshot excludes matching rows through the real
+    /// `LogsTableProvider` scan path, the one the SQL `logs` table uses in
+    /// production. This covers `LogsTableProvider::build_scan` passing the
+    /// snapshot-derived predicates into `LogsScanExec` (logs_provider.rs) and
+    /// `LogsScanExec` calling `LogQuery::with_erasure` before fetch
+    /// (logs_scan.rs); reverting `.with_erasure((*erasure).clone())` back to a
+    /// bare `LogQuery::new(ts_min, ts_max)` in logs_scan.rs makes the erased row
+    /// reappear.
+    #[tokio::test]
+    async fn pending_erasure_excludes_matching_rows_on_the_sql_path() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records = vec![
+            record(&worker, &[("user_id".to_string(), s("u1"))], 1, "erase me"),
+            record(&worker, &[("user_id".to_string(), s("u2"))], 2, "keep me"),
+        ];
+        let seg = write_object(&store, "logs/erasure.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+
+        let request = ravel_proto::commit::v1::ErasureRequest {
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: "user_id".to_string(),
+                value: "u1".to_string(),
+            }],
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: vec![request],
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
+        let ctx = logs_session(provider).expect("build session");
+        let df = ctx.sql("SELECT ts, body FROM logs").await.expect("plan");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(
+            rows(&batches),
+            BTreeSet::from([(2, "keep me".to_string())]),
+            "u1's row is erased; u2's row survives"
         );
     }
 }

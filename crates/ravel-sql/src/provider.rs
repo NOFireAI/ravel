@@ -39,6 +39,7 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_promql::LabelMatcher;
 use ravel_query::SegmentFetcher;
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
@@ -71,6 +72,14 @@ pub struct RavelTableProvider {
     /// `RsegScanExec` the provider builds so every store fetch the scan
     /// issues on this query's behalf is recorded against it.
     accounting: QueryAccounting,
+    /// Pending selective-erasure predicates derived once from
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// into every `RsegScanExec` the provider builds. The distributed
+    /// coordinator path never reaches `build_merge` (it fans out to workers,
+    /// each of which independently resolves its own snapshot and builds its
+    /// own provider), so this field alone covers the local scan and the
+    /// worker-side fragment.
+    erasure: Arc<Vec<ErasurePredicate>>,
     /// The coordinator-side distributed fan-out, if this provider is acting as
     /// a distributed coordinator (ADR-0071, issue #866). `None` -- the default,
     /// and every non-Flight build -- is the local scan path unchanged.
@@ -91,6 +100,7 @@ impl RavelTableProvider {
         config: impl Into<SqlConfig>,
         accounting: QueryAccounting,
     ) -> Self {
+        let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
         RavelTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
@@ -98,6 +108,7 @@ impl RavelTableProvider {
             config: config.into(),
             schema: public_schema(),
             accounting,
+            erasure,
             #[cfg(feature = "flight-sql")]
             distributed: None,
         }
@@ -178,6 +189,7 @@ impl RavelTableProvider {
             series_ids,
             self.config.engine.max_series,
             self.config.engine.max_bytes_scanned,
+            Arc::clone(&self.erasure),
             self.accounting.clone(),
         )?);
         let scan_schema = scan.schema();

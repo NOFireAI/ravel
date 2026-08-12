@@ -91,6 +91,7 @@ use datafusion::physical_plan::{
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{LogRecord, Predicate, ScanStats};
+use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{LogQuery, LogSegmentFetcher};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -121,6 +122,12 @@ pub struct LogsScanExec {
     /// and are never evaluated per row, so they cannot change which records the
     /// fetch returns for a block it reads, only which blocks it reads.
     prune: Arc<Vec<Predicate>>,
+    /// Pending selective-erasure predicates from the resolved snapshot
+    /// (ADR-0064 decision 2, issue #829). Fed to [`LogQuery::with_erasure`] so
+    /// `LogSegmentFetcher::fetch`'s existing post-fetch, post-cache filter
+    /// (`retain_log_records`) engages; empty when the snapshot has no pending
+    /// erasure, which is a no-op there.
+    erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
@@ -194,6 +201,7 @@ impl LogsScanExec {
         ts_max: i64,
         content: Arc<Vec<Predicate>>,
         prune: Arc<Vec<Predicate>>,
+        erasure: Arc<Vec<ErasurePredicate>>,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -211,6 +219,7 @@ impl LogsScanExec {
             ts_max,
             content,
             prune,
+            erasure,
             schema,
             properties,
             accounting,
@@ -292,6 +301,7 @@ impl ExecutionPlan for LogsScanExec {
         let tenant_hash = self.tenant_hash;
         let content = Arc::clone(&self.content);
         let prune = Arc::clone(&self.prune);
+        let erasure = Arc::clone(&self.erasure);
         let schema = Arc::clone(&self.schema);
         let blocks = BlockMetrics::new(&self.metrics, partition);
 
@@ -306,6 +316,7 @@ impl ExecutionPlan for LogsScanExec {
             self.ts_max,
             content,
             prune,
+            erasure,
             self.accounting.clone(),
             blocks,
         ));
@@ -332,10 +343,11 @@ async fn prepare_partition(
     ts_max: i64,
     content: Arc<Vec<Predicate>>,
     prune: Arc<Vec<Predicate>>,
+    erasure: Arc<Vec<ErasurePredicate>>,
     accounting: QueryAccounting,
     blocks: BlockMetrics,
 ) -> DFResult<Vec<LogRecord>> {
-    let mut query = LogQuery::new(ts_min, ts_max);
+    let mut query = LogQuery::new(ts_min, ts_max).with_erasure((*erasure).clone());
     for c in content.iter() {
         query = query.with_content(c.clone());
     }

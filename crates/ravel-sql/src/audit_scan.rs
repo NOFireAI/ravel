@@ -39,6 +39,7 @@ use datafusion::physical_plan::{
 use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::LogRecord;
+use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{LogQuery, LogSegmentFetcher};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -61,6 +62,9 @@ pub struct AuditScanExec {
     /// Inclusive ts bounds for the fetch's [`LogQuery`].
     ts_min: i64,
     ts_max: i64,
+    /// Pending selective-erasure predicates from the resolved snapshot
+    /// (ADR-0064 decision 2, issue #829); fed to [`LogQuery::with_erasure`].
+    erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
@@ -72,6 +76,9 @@ impl AuditScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, with the given ts
     /// bounds.
+    // `erasure` widened this past clippy's 7-argument threshold; the
+    // codebase allows it at equivalent sites (scan.rs, logs_scan.rs).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
@@ -79,6 +86,7 @@ impl AuditScanExec {
         target_partitions: usize,
         ts_min: i64,
         ts_max: i64,
+        erasure: Arc<Vec<ErasurePredicate>>,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -94,6 +102,7 @@ impl AuditScanExec {
             partitions,
             ts_min,
             ts_max,
+            erasure,
             schema,
             properties,
             accounting,
@@ -162,6 +171,7 @@ impl ExecutionPlan for AuditScanExec {
         let segs = self.partitions.get(partition).cloned().unwrap_or_default();
         let fetcher = self.fetcher.clone();
         let tenant_hash = self.tenant_hash;
+        let erasure = Arc::clone(&self.erasure);
         let schema = Arc::clone(&self.schema);
 
         let reservation = MemoryConsumer::new(format!("AuditScanExec[{partition}]"))
@@ -173,6 +183,7 @@ impl ExecutionPlan for AuditScanExec {
             segs,
             self.ts_min,
             self.ts_max,
+            erasure,
             self.accounting.clone(),
         ));
         Ok(Box::pin(AuditScanStream {
@@ -192,9 +203,10 @@ async fn prepare_partition(
     segs: Vec<SegmentRef>,
     ts_min: i64,
     ts_max: i64,
+    erasure: Arc<Vec<ErasurePredicate>>,
     accounting: QueryAccounting,
 ) -> DFResult<Vec<LogRecord>> {
-    let query = LogQuery::new(ts_min, ts_max);
+    let query = LogQuery::new(ts_min, ts_max).with_erasure((*erasure).clone());
 
     let mut out: Vec<LogRecord> = Vec::new();
     for seg in &segs {

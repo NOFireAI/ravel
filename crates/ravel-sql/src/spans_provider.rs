@@ -29,6 +29,7 @@ use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 
 use crate::config::SqlConfig;
 use crate::error::SqlError;
@@ -44,6 +45,10 @@ pub struct SpansTableProvider {
     fetcher: SpanSegmentFetcher,
     config: SqlConfig,
     schema: SchemaRef,
+    /// Pending selective-erasure predicates derived once from
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// into every `SpansScanExec` the provider builds.
+    erasure: Arc<Vec<ErasurePredicate>>,
 }
 
 impl SpansTableProvider {
@@ -55,11 +60,13 @@ impl SpansTableProvider {
         fetcher: SpanSegmentFetcher,
         config: impl Into<SqlConfig>,
     ) -> Self {
+        let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
         SpansTableProvider {
             snapshot: Arc::new(snapshot),
             fetcher,
             config: config.into(),
             schema: spans_schema(),
+            erasure,
         }
     }
 
@@ -103,6 +110,7 @@ impl SpansTableProvider {
             pushdown.span_query(),
             pushdown.service_name.clone(),
             pushdown.name.clone(),
+            Arc::clone(&self.erasure),
         )?;
         Ok(Arc::new(scan))
     }

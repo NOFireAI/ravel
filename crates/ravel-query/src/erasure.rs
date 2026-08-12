@@ -48,6 +48,7 @@
 //! always carries at least one matcher; as defense in depth every match method
 //! here treats an empty matcher set as matching **nothing**, never everything.
 
+use ravel_catalog::Snapshot;
 use ravel_logseg::{AttrValue, LogRecord};
 use ravel_segment::SeriesEntry;
 use ravel_types::{LabelSet, Sample};
@@ -309,6 +310,41 @@ pub fn retain_log_records(records: &mut Vec<LogRecord>, predicates: &[ErasurePre
             .iter()
             .any(|p| p.matches_log_attrs(&r.attrs) && (!p.has_window() || p.ts_in_window(r.ts_ns)))
     });
+}
+
+/// The pending selective-erasure predicates attached to a resolved snapshot
+/// (ADR-0064 decision 2, EJ-T3, issue #753). Every SQL and PromQL query
+/// surface excludes series/samples/rows/spans matching any of these after
+/// fetch and after cache; this is the single connection point between a
+/// resolved [`Snapshot`] and that filter machinery, so `ravel-query`'s engine
+/// and `ravel-sql`'s scan surfaces derive the same predicates from the same
+/// snapshot field rather than each duplicating the mapping.
+///
+/// EJ-T2 (#752) is the resolver task that lists `t/<th>/<sig>/del/` per resolve
+/// and attaches the decoded pending requests to [`Snapshot::pending_erasure`],
+/// already scoped to this resolve's (tenant, signal). Each `ErasureRequest`
+/// becomes one [`ErasurePredicate`], mapping its repeated `predicate` matchers
+/// into `(key, value)` pairs and carrying the half-open
+/// `[window_start_ns, window_end_ns)` event-time bounds through unchanged
+/// (`0` on a bound is "unset" per `ErasurePredicate`). The request's other
+/// fields (`format_version`, `tenant_hash`, `signal`, `request_id`,
+/// `created_unix_ns`, `reason`) play no part in filtering.
+///
+/// Returns an empty vec when the snapshot carries no pending erasure, which is
+/// the common case and makes every call site below a no-op.
+pub fn snapshot_pending_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePredicate> {
+    snapshot
+        .pending_erasure
+        .iter()
+        .map(|request| {
+            let matchers = request
+                .predicate
+                .iter()
+                .map(|matcher| (matcher.key.clone(), matcher.value.clone()))
+                .collect();
+            ErasurePredicate::new(matchers, request.window_start_ns, request.window_end_ns)
+        })
+        .collect()
 }
 
 /// Compacts two positionally-aligned vecs (timestamps and values) in place,

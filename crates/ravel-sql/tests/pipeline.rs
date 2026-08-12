@@ -25,10 +25,12 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use proptest::prelude::*;
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_query::{EngineConfig, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::RavelTableProvider;
@@ -344,6 +346,147 @@ async fn golden_multi_segment_overlap_each_field_decides() {
         },
     ];
     assert_pipeline_matches_oracle(specs, None).await;
+}
+
+/// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): a pending selective-erasure
+/// request on the resolved snapshot excludes matching series through the real
+/// SQL metric scan path (`RavelTableProvider` -> `RsegScanExec`), which calls
+/// `SegmentFetcher::fetch_soa_accounted` directly rather than through
+/// `ravel-query`'s engine funnel. Covers `RavelTableProvider::build_merge`
+/// passing the snapshot-derived predicates into `RsegScanExec` (provider.rs)
+/// and `RsegScanExec::prepare_partition` calling `retain_series_soa`
+/// immediately after fetch (scan.rs); removing the `retain_series_soa(&mut
+/// series, &erasure);` line in scan.rs makes the erased series reappear.
+#[tokio::test]
+async fn pending_erasure_excludes_matching_series_on_the_metric_scan_path() {
+    let specs = vec![SegSpec {
+        created_unix_ns: 0,
+        writer_epoch: 1,
+        writer_seq: 1,
+        series: vec![
+            SeriesSpec {
+                metric: "erase_me".into(),
+                samples: vec![(100, 1.0)],
+            },
+            SeriesSpec {
+                metric: "keep_me".into(),
+                samples: vec![(100, 2.0)],
+            },
+        ],
+    }];
+    let (store, mut snapshot) = build_snapshot(&specs, None).await;
+    snapshot.pending_erasure = vec![ErasureRequest {
+        predicate: vec![ErasurePredicateMatcher {
+            key: "__name__".to_string(),
+            value: "erase_me".to_string(),
+        }],
+        ..Default::default()
+    }];
+
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let got = run_pipeline(backend, snapshot, 2, EngineConfig::default()).await;
+    let kept_id = series_id_for("keep_me");
+    let erased_id = series_id_for("erase_me");
+    assert!(
+        got.contains_key(&kept_id),
+        "the non-matching series survives"
+    );
+    assert!(
+        !got.contains_key(&erased_id),
+        "the erased series must not appear in the scan output"
+    );
+}
+
+/// Cache-warm case for the same gap (ADR-0064 decision 2's "after fetch, after
+/// cache" wording): once a segment's bytes are resident in the ADR-0046 read
+/// cache, a second query with pending erasure still excludes the matching
+/// series. This is the only test in this suite that wires a real
+/// `ravel_cache::Cache` into `SegmentFetcher`, proving `retain_series_soa`
+/// (scan.rs) fires after cache-served bytes decode, not merely after a live
+/// store GET -- moving the filter call before the fetch instead of after would
+/// look identical on a cold cache but re-leak the erased series once the byte
+/// cache warms, since nothing re-derives predicates on that path.
+#[tokio::test]
+async fn pending_erasure_excludes_matching_series_when_bytes_are_served_from_a_warm_cache() {
+    let specs = vec![SegSpec {
+        created_unix_ns: 0,
+        writer_epoch: 1,
+        writer_seq: 1,
+        series: vec![
+            SeriesSpec {
+                metric: "erase_me".into(),
+                samples: vec![(100, 1.0)],
+            },
+            SeriesSpec {
+                metric: "keep_me".into(),
+                samples: vec![(100, 2.0)],
+            },
+        ],
+    }];
+    let (store, snapshot) = build_snapshot(&specs, None).await;
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+
+    let cache = Arc::new(Cache::new(CacheLimits::new(1 << 20, 1024, 1 << 20)));
+    let fetcher = SegmentFetcher::new(Arc::clone(&backend)).with_cache(Arc::clone(&cache));
+
+    // Warm the cache: a first query with no pending erasure decodes and caches
+    // every segment's bytes.
+    let warm_accounting = QueryAccounting::new();
+    let provider = RavelTableProvider::new(
+        snapshot.clone(),
+        TENANT,
+        fetcher.clone(),
+        EngineConfig::default(),
+        warm_accounting.clone(),
+    );
+    let plan = provider.plan(1).expect("build plan");
+    collect(plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("warm collect");
+    assert!(
+        warm_accounting.snapshot().cache_misses > 0,
+        "the warm-up query is the cold miss that populates the cache"
+    );
+
+    // Second query, same fetcher/cache, now with a pending erasure request:
+    // the erased series must be excluded even though its bytes are
+    // cache-resident.
+    let mut erased_snapshot = snapshot;
+    erased_snapshot.pending_erasure = vec![ErasureRequest {
+        predicate: vec![ErasurePredicateMatcher {
+            key: "__name__".to_string(),
+            value: "erase_me".to_string(),
+        }],
+        ..Default::default()
+    }];
+    let hot_accounting = QueryAccounting::new();
+    let provider = RavelTableProvider::new(
+        erased_snapshot,
+        TENANT,
+        fetcher,
+        EngineConfig::default(),
+        hot_accounting.clone(),
+    );
+    let plan = provider.plan(1).expect("build plan");
+    let batches = collect(plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("collect");
+    let got = reduce_batches(&batches);
+
+    assert!(
+        hot_accounting.snapshot().cache_hits > 0,
+        "the second query must serve this segment's bytes from the warm cache, not a fresh GET"
+    );
+    let kept_id = series_id_for("keep_me");
+    let erased_id = series_id_for("erase_me");
+    assert!(
+        got.contains_key(&kept_id),
+        "the non-matching series survives"
+    );
+    assert!(
+        !got.contains_key(&erased_id),
+        "the erased series must not appear even though its bytes were served from cache"
+    );
 }
 
 /// Regression for the Opus checkpoint finding on B1 (issue #20): every other
