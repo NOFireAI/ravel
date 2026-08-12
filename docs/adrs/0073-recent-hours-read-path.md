@@ -59,9 +59,14 @@ visibility, ordering, or erasure changes.
 `Snapshot` carries a per-segment origin already implied by resolve:
 sealed-below-watermark (extracted from snapshot parts, postings-pruned)
 versus recent (listed above the watermark, or resolved from an explicit
-`min_commit_token`). Resolve records the split (two counters and a flag
-on each `SegmentRef`); no persistent format changes -- `Snapshot` is an
-in-memory type.
+`min_commit_token`). Resolve records the split as a parallel
+`SegmentOrigins` value returned alongside `Snapshot` (sealed/exempt
+counters plus a per-segment origin, in `Snapshot::segments` order), not
+a field on `Snapshot` or `SegmentRef` itself: both types are shared with
+callers that hold segment-ref literals out of resolve's scope, and a
+field on either would force every such literal to fabricate an origin
+it does not have. No persistent format changes either way -- `Snapshot`
+and `SegmentOrigins` are both in-memory types.
 
 ### 2. `max_segments` governs only the sealed set
 
@@ -88,13 +93,19 @@ over many small objects) succeed if they stay under budget.
 
 ### 4. One enforcement seam, all surfaces
 
-A single helper on the snapshot (`Snapshot::admit(&EngineConfig) ->
-Result<SegmentAdmission, _>`) computes the sealed-set count check and
-carries the request budget, and all eight sites consume it: PromQL
-engine, SQL executor, the five SQL providers, and the exemplars state.
-The PromQL/SQL asymmetry (pre- versus post-prune counting) collapses
-into one definition: the sealed count is post-prune everywhere. SQL
-surfaces get the same recent-hour exemption and the same budget.
+A single free function, `segment_admission::admit(&Snapshot,
+&SegmentOrigins, &EngineConfig) -> Result<SegmentAdmission, _>` in
+`ravel-query`, computes the sealed-set count check and carries the
+request budget, and all eight sites consume it: PromQL engine, SQL
+executor, the five SQL providers, and the exemplars state. It lives in
+`ravel-query`, not as a method on `ravel-catalog`'s `Snapshot`, because
+`Snapshot::admit` taking an `EngineConfig` would make the catalog crate
+depend on the query crate's config type, inverting the
+catalog-to-query dependency direction the workspace otherwise holds
+throughout. The PromQL/SQL asymmetry (pre- versus post-prune counting)
+collapses into one definition: the sealed count is post-prune
+everywhere. SQL surfaces get the same recent-hour exemption and the
+same budget.
 
 ### 5. What does not change
 
@@ -149,3 +160,17 @@ through the existing accounting merge.
   stating the exemption and the budget; docs/query-engine.md documents
   the unified admission seam; tests in tests/failure/ pin the
   read-your-write-token case and the sustained-flush-past-cap case.
+
+## Amendment, 2026-08-12 (issue #936)
+
+The request budget from decision 3 is now also re-enforced on the
+cross-cluster/distributed coordinator path (ADR-0071), alongside the
+bytes-scanned budget that path already re-checked after folding
+fan-out accounting: `federate_discovery` re-checks
+`QueryAccounting::total_s3_requests()` against `max_s3_requests` the
+same way `federate_scalar` and the distributed sample fetch already
+did, via `segment_admission::request_budget_exceeded`. Without this, a
+federated discovery query (`/api/v1/series`, `/api/v1/labels`,
+`/api/v1/label/<name>/values`) could exceed the request budget on the
+merged local+remote spend and still succeed, because only the bytes
+budget was re-checked on that call path.

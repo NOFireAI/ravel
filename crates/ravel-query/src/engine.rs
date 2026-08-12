@@ -696,6 +696,14 @@ impl QueryEngine {
         ) {
             return Err(err);
         }
+        // Re-enforce the coordinator's request budget the same way (ADR-0073
+        // decision 3): a budget trip is never masked by skip_unavailable.
+        if let Some(err) = segment_admission::request_budget_exceeded(
+            accounting.snapshot().total_s3_requests(),
+            self.config.max_s3_requests,
+        ) {
+            return Err(err);
+        }
         // The coordinator returns sample-bearing `FetchedSeriesSoa` runs
         // (discovery reuses the query coordinator, which has no labels-only
         // resolve scope); take only each run's series identity for enumeration.
