@@ -111,6 +111,21 @@ exists for disk-hungry jobs.
    require one). One-shot `ravel-cli maintain` subcommands stay outside
    the operator's scope.
 
+   **Superseded note (ADR-0065, issue #749).** The "sustained N>1
+   multiplies object-store traffic for zero throughput" reasoning above
+   no longer holds. ADR-0065 decisions 1 and 2 give every maintain
+   process a self-owned heartbeat identity and partition
+   `(tenant, signal, shard)` units across the live set by rendezvous
+   hash, so a live N>1 divides the unit set instead of every replica
+   re-walking all of it, with automatic takeover of a dead peer's units
+   within `3 * heartbeat_interval`. The single-replica pin and Recreate
+   strategy here were this decision's consequence, not an independent
+   requirement, and are stale for that reason. The CRD's `maintain`
+   block still has no `replicas` field (decision 3 above) and the
+   Deployment strategy in this ADR is unchanged: widening the schema and
+   switching the strategy is a follow-up for whoever next touches the
+   operator, not done by EI-T5.
+
 4. **Health endpoints are in scope**, as the epic's prerequisite server
    task. `/healthz` returns 200 whenever the HTTP listener is serving
    (liveness: the event loop is alive). `/readyz` returns 200 once

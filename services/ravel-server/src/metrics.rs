@@ -211,6 +211,27 @@ pub enum Label {
     RejectReason(RejectReason),
     ScrubReason(ScrubReason),
     Cache(CacheFamily),
+    MergeMemoryKind(MergeMemoryKind),
+}
+
+/// Which high-water mark a `ravel_maintain_rlog_merge_peak_bytes` sample is
+/// (ADR-0065 decision 4): `transient` is the in-flight fetched-minus-released
+/// block bytes at any instant during a k-way merge, `total` additionally
+/// includes the writer's buffered output bytes. One family, split by this
+/// `kind=` label, the same discipline `CacheFamily` above uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMemoryKind {
+    Transient,
+    Total,
+}
+
+impl MergeMemoryKind {
+    fn name(self) -> &'static str {
+        match self {
+            MergeMemoryKind::Transient => "transient",
+            MergeMemoryKind::Total => "total",
+        }
+    }
 }
 
 /// Which ADR-0046 read cache a `ravel_cache_*` sample belongs to (issue #553).
@@ -247,6 +268,7 @@ impl Label {
             Label::RejectReason(_) => "reason",
             Label::ScrubReason(_) => "reason",
             Label::Cache(_) => "cache",
+            Label::MergeMemoryKind(_) => "kind",
         }
     }
 
@@ -262,6 +284,7 @@ impl Label {
             Label::RejectReason(reason) => reason.name().to_string(),
             Label::ScrubReason(reason) => reason.name().to_string(),
             Label::Cache(family) => family.name().to_string(),
+            Label::MergeMemoryKind(kind) => kind.name().to_string(),
         }
     }
 }
@@ -1360,6 +1383,136 @@ fn render_maintain_safety_family(
     }
 }
 
+/// One scrape's ADR-0065 stuck-owner mitigation counters (issue #749): how
+/// many in-process workers are live, how many units this process currently
+/// owns, how many warm-started from a durable memo snapshot, how many full
+/// (unscoped) sweep passes have run, and how many owned units are stalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MaintenanceOwnershipSnapshot {
+    pub workers_live: u64,
+    pub units_owned: u64,
+    pub units_stalled: u64,
+    pub memo_warm_start_units: u64,
+    pub full_sweep_passes_total: u64,
+}
+
+/// No `tenant_hash` label on any series here (ADR-0044 section 4): every
+/// sample is process-wide, not per-tenant, so the closed-label-set rule this
+/// unauthenticated route enforces is satisfied trivially -- there is no
+/// tenant dimension to add in the first place.
+fn render_maintain_ownership_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: &MaintenanceOwnershipSnapshot,
+) {
+    write_header(
+        out,
+        "ravel_maintain_workers_live",
+        "In-process maintenance workers this supervisor currently sees as live \
+         (ADR-0065 decision 1).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_workers_live",
+        &[Label::Mode(mode)],
+        snapshot.workers_live,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_units_owned",
+        "Owned (tenant, signal, shard) units this process is currently maintaining \
+         (ADR-0065 decision 2).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_units_owned",
+        &[Label::Mode(mode)],
+        snapshot.units_owned,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_units_stalled",
+        "Owned units with consecutive failing ticks past the configured threshold \
+         (ADR-0065 decision 2's stuck-owner mitigation). Alert on a sustained nonzero \
+         value, not on any single scrape.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_units_stalled",
+        &[Label::Mode(mode)],
+        snapshot.units_stalled,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_memo_warm_start_units_total",
+        "Units seeded from a durable memo snapshot on handoff or startup, instead of \
+         rescanning cold (ADR-0065 decision 3).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_memo_warm_start_units_total",
+        &[Label::Mode(mode)],
+        snapshot.memo_warm_start_units,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_full_sweep_passes_total",
+        "Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep \
+         (ADR-0065 decision 3).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_full_sweep_passes_total",
+        &[Label::Mode(mode)],
+        snapshot.full_sweep_passes_total,
+    );
+}
+
+/// One scrape's RLOG k-way merge peak-bytes gauge (ADR-0065 decision 4),
+/// sourced from `ravel_maintain::MergeMemoryTracker`. No `tenant_hash`: the
+/// tracker is one process-wide handle shared across every tenant's merges.
+fn render_merge_memory_family(
+    out: &mut String,
+    mode: Mode,
+    tracker: &ravel_maintain::MergeMemoryTracker,
+) {
+    write_header(
+        out,
+        "ravel_maintain_rlog_merge_peak_bytes",
+        "High-water mark of RLOG k-way merge memory, by kind: transient (in-flight \
+         fetched-minus-released block bytes) or total (transient plus buffered writer \
+         output) (ADR-0065 decision 4).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_rlog_merge_peak_bytes",
+        &[
+            Label::Mode(mode),
+            Label::MergeMemoryKind(MergeMemoryKind::Transient),
+        ],
+        tracker.peak_transient_bytes(),
+    );
+    write_sample(
+        out,
+        "ravel_maintain_rlog_merge_peak_bytes",
+        &[
+            Label::Mode(mode),
+            Label::MergeMemoryKind(MergeMemoryKind::Total),
+        ],
+        tracker.peak_total_bytes(),
+    );
+}
+
 /// One signal's at-rest scrubber counters for one scrape (ADR-0059 decisions
 /// 1, 3; issue #694).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2253,6 +2406,8 @@ pub fn render(
     catalog: &CatalogCountersSnapshot,
     maintain: Option<&MaintenanceDiscoverySnapshot>,
     maintain_safety: Option<&MaintenanceSafetySnapshot>,
+    maintain_ownership: Option<&MaintenanceOwnershipSnapshot>,
+    merge_memory: Option<&ravel_maintain::MergeMemoryTracker>,
     scrub: Option<&ScrubSnapshot>,
     cache: Option<&CacheMetricsSnapshot>,
     catalog_cache: Option<&CacheMetricsSnapshot>,
@@ -2287,6 +2442,12 @@ pub fn render(
     }
     if let Some(snapshot) = maintain_safety {
         render_maintain_safety_family(&mut out, mode, snapshot);
+    }
+    if let Some(snapshot) = maintain_ownership {
+        render_maintain_ownership_family(&mut out, mode, snapshot);
+    }
+    if let Some(tracker) = merge_memory {
+        render_merge_memory_family(&mut out, mode, tracker);
     }
     if let Some(snapshot) = scrub {
         render_scrub_family(&mut out, mode, snapshot);
@@ -2338,6 +2499,13 @@ pub struct MetricsState {
     /// `Some` only in [`Mode::Maintain`], alongside `tenant_discovery` above
     /// (ADR-0048 decisions 1, 4, 6; issue #517).
     pub maintenance_safety: Option<Arc<crate::maintain::MaintenanceSafetyMetrics>>,
+    /// `Some` only in [`Mode::Maintain`], alongside `maintenance_safety` above:
+    /// ADR-0065's stuck-owner mitigation counters (issue #749).
+    pub maintenance_ownership: Option<Arc<crate::maintain::MaintenanceOwnershipMetrics>>,
+    /// `Some` only in [`Mode::Maintain`]: the ADR-0065 decision 4 RLOG k-way
+    /// merge peak-bytes tracker, the same handle `ravel_maintain::rlog`'s real
+    /// merge call sites record into.
+    pub merge_memory: Option<ravel_maintain::MergeMemoryTracker>,
     /// `Some` only in [`Mode::Maintain`], alongside `maintenance_safety` above,
     /// the one mode that spawns the at-rest scrubber (ADR-0059, issue #694).
     pub scrub: Option<Arc<crate::scrub::ScrubMetrics>>,
@@ -2439,6 +2607,18 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                     .collect(),
             });
 
+    let maintain_ownership_snapshot =
+        state
+            .maintenance_ownership
+            .as_ref()
+            .map(|metrics| MaintenanceOwnershipSnapshot {
+                workers_live: metrics.workers_live(),
+                units_owned: metrics.units_owned(),
+                units_stalled: metrics.units_stalled(),
+                memo_warm_start_units: metrics.memo_warm_start_units(),
+                full_sweep_passes_total: metrics.full_sweep_passes_total(),
+            });
+
     let scrub_snapshot = state.scrub.as_ref().map(|metrics| ScrubSnapshot {
         signals: crate::maintain::MAINTAINED_SIGNALS
             .iter()
@@ -2501,6 +2681,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &catalog_snapshot,
         maintain_snapshot.as_ref(),
         maintain_safety_snapshot.as_ref(),
+        maintain_ownership_snapshot.as_ref(),
+        state.merge_memory.as_ref(),
         scrub_snapshot.as_ref(),
         cache_snapshot.as_ref(),
         catalog_cache_snapshot.as_ref(),
@@ -2572,6 +2754,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -2609,13 +2793,14 @@ mod tests {
         );
 
         // Half two: the label API makes an unlisted label unrepresentable.
-        // This match has no wildcard arm, so a tenth `Label` variant fails
-        // this compile until a case is added here, and the fixed array below
-        // then fails the length assertion until it is extended too -- two
+        // This match has no wildcard arm, so a new `Label` variant fails this
+        // compile until a case is added here, and the fixed array below then
+        // fails the length assertion until it is extended too -- two
         // independent breaks for one added variant, by design. `reason` is the
         // eighth, added by ADR-0051 section 6 for the admission family; `cache`
         // is the ninth, added by issue #553 to split the read-cache family into
-        // the fetcher and catalog byte caches.
+        // the fetcher and catalog byte caches; `kind` is the tenth, added by
+        // ADR-0065 decision 4 (issue #749) for the RLOG merge-memory gauge.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -2627,6 +2812,7 @@ mod tests {
             Label::RejectReason(RejectReason::ByteRate),
             Label::ScrubReason(ScrubReason::Missing),
             Label::Cache(CacheFamily::Fetch),
+            Label::MergeMemoryKind(MergeMemoryKind::Transient),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -2641,6 +2827,7 @@ mod tests {
                 Label::RejectReason(_) => "reason",
                 Label::ScrubReason(_) => "reason",
                 Label::Cache(_) => "cache",
+                Label::MergeMemoryKind(_) => "kind",
             })
             .collect();
         assert_eq!(
@@ -2659,15 +2846,16 @@ mod tests {
                 // to it.
                 "reason",
                 "cache",
+                "kind",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
-             ADR-0059 section 2's scrub seal-divergence family) and issue #553's `cache`; \
-             `shard` must never appear here"
+             ADR-0059 section 2's scrub seal-divergence family), issue #553's `cache`, and \
+             ADR-0065 decision 4's `kind` (issue #749); `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            10,
-            "exactly 10 label variants, 9 distinct keys"
+            11,
+            "exactly 11 label variants, 10 distinct keys"
         );
     }
 
@@ -2697,6 +2885,8 @@ mod tests {
             &populated_store_snapshot(),
             &ingest,
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -2824,6 +3014,8 @@ mod tests {
             &store,
             &ingest,
             &catalog,
+            None,
+            None,
             None,
             None,
             None,
@@ -2982,6 +3174,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -3002,6 +3196,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -3064,6 +3260,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -3107,6 +3305,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -3137,6 +3337,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -3193,6 +3395,8 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             Some(&snapshot),
+            None,
+            None,
             None,
             None,
             None,
@@ -3274,6 +3478,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -3338,6 +3544,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -3377,6 +3585,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             Some(&snapshot),
@@ -3458,6 +3668,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &AdmissionCountersSnapshot::default(),
             &[],
             0,
@@ -3499,6 +3711,8 @@ mod tests {
             &CatalogCountersSnapshot::default(),
             None,
             Some(&snapshot),
+            None,
+            None,
             None,
             None,
             None,
@@ -3566,6 +3780,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -3667,6 +3883,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&catalog),
             &AdmissionCountersSnapshot::default(),
             &[],
@@ -3693,6 +3911,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -3778,6 +3998,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &snapshot,
             &[],
             0,
@@ -3842,6 +4064,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,
@@ -3918,6 +4142,8 @@ mod tests {
             &StoreMetricsSnapshot::default(),
             &[],
             &CatalogCountersSnapshot::default(),
+            None,
+            None,
             None,
             None,
             None,

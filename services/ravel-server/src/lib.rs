@@ -798,6 +798,28 @@ pub async fn start(
     let scrub_metrics =
         matches!(config.mode, Mode::Maintain).then(|| Arc::new(scrub::ScrubMetrics::default()));
 
+    // Same sharing rationale as `maintenance_safety_metrics` above, for the
+    // ADR-0065 stuck-owner mitigation counters (issue #749): workers live,
+    // units owned, warm-started units, full-sweep passes, and stalled units.
+    let maintenance_ownership_metrics = matches!(config.mode, Mode::Maintain).then(|| {
+        Arc::new(maintain::MaintenanceOwnershipMetrics::new(
+            config.maintain.stalled_after_intervals,
+        ))
+    });
+
+    // The RLOG k-way merge peak-bytes gauge (ADR-0065 decision 4). Built here,
+    // before `config.maintain` is handed to `maintain::spawn` below, and
+    // assigned onto the compactor config in place so the maintenance
+    // supervisor's real merge call sites (`ravel_maintain::rlog`) start
+    // recording into the same handle `/metrics` reads. `None` outside
+    // Mode::Maintain: no maintenance supervisor runs, so there is nothing to
+    // track.
+    let merge_memory_tracker = matches!(config.mode, Mode::Maintain).then(|| {
+        let tracker = ravel_maintain::MergeMemoryTracker::new();
+        config.maintain.compactor.merge_memory_tracker = Some(tracker.clone());
+        tracker
+    });
+
     // --- ADR-0071 distributed read fan-out scaffolding (issue #865) ---
     // The coordinator (a `RoutingSliceFetcher` wrapped in a `Distributed`), the
     // worker-side `FragmentService`, and their shared `FragmentMetrics` are
@@ -867,6 +889,8 @@ pub async fn start(
         catalog: catalog.clone(),
         tenant_discovery: tenant_discovery_metrics.clone(),
         maintenance_safety: maintenance_safety_metrics.clone(),
+        maintenance_ownership: maintenance_ownership_metrics.clone(),
+        merge_memory: merge_memory_tracker.clone(),
         scrub: scrub_metrics.clone(),
         cache_metrics: cache.as_ref().map(|c| c.metrics()),
         catalog_cache_metrics: catalog.byte_cache_metrics(),
@@ -1113,12 +1137,18 @@ pub async fn start(
         let safety_metrics = maintenance_safety_metrics
             .clone()
             .unwrap_or_else(|| Arc::new(maintain::MaintenanceSafetyMetrics::default()));
+        let ownership_metrics = maintenance_ownership_metrics.clone().unwrap_or_else(|| {
+            Arc::new(maintain::MaintenanceOwnershipMetrics::new(
+                config.maintain.stalled_after_intervals,
+            ))
+        });
         let maintenance_tasks = maintain::spawn(
             store.clone(),
             config.fold_tenants.clone(),
             config.maintain.clone(),
             discovery_metrics,
             safety_metrics,
+            ownership_metrics,
             maintain_worker.clone(),
         );
         (fold::FoldTasks::none(), maintenance_tasks)

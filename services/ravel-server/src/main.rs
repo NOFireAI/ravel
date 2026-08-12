@@ -350,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
             compactor,
             retention,
             unit_concurrency: cli.maintain_unit_concurrency,
+            stalled_after_intervals: cli.maintain_stalled_after_intervals,
         },
         alerting: AlertEvalConfig {
             enabled: !alert_rules.is_empty(),
