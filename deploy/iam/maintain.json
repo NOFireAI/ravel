@@ -1,0 +1,69 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "MaintainList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-ravel-bucket",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["t/", "t/*/*/l0/*", "t/*/*/c/*", "t/*/*/l1/*", "t/*/*/idem/*"]
+        }
+      }
+    },
+    {
+      "Sid": "MaintainRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/maint/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc"
+      ]
+    },
+    {
+      "Sid": "MaintainWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/maint/*",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy"
+      ]
+    },
+    {
+      "Sid": "MaintainDelete",
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/l1/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0001/*"
+      ]
+    },
+    {
+      "Sid": "DenyDeleteProtected",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": [
+        "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
+        "arn:aws:s3:::my-ravel-bucket/sys/qualification",
+        "arn:aws:s3:::my-ravel-bucket/sys/gc",
+        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+        "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/*",
+        "arn:aws:s3:::my-ravel-bucket/t/*/u/*/0000/*"
+      ]
+    }
+  ]
+}
