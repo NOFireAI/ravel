@@ -74,3 +74,79 @@ async fn distributed_crossover_matches_local_over_memory_store() {
         );
     }
 }
+
+/// Every metric column the panel reports -- including the ADR-0074 additions
+/// `wall_ms_p99` and `coordinator_cpu_ms` -- is present and finite on the local
+/// panel and on every worker-count panel. This drives the real `run()` path the
+/// bin uses (not a helper in isolation) over a tiny in-process `MemoryStore`, so
+/// it runs in generic CI with no MinIO, and it is the gate that a new column
+/// stays wired through `panel_report` into the serialized report.
+#[tokio::test]
+async fn crossover_reports_all_metric_columns() {
+    let store = Arc::new(MemoryStore::new());
+    let config = CrossoverConfig::smoke(store, "memory".to_string());
+    let report = run(&config).await;
+
+    // One local panel plus one per worker count; each must carry finite metrics.
+    assert_eq!(
+        report.panels.len(),
+        1 + config.worker_counts.len(),
+        "one local panel plus one distributed panel per worker count"
+    );
+    assert!(
+        report.panels.iter().any(|p| p.path == "local"),
+        "a local baseline panel must be present"
+    );
+    for wc in &config.worker_counts {
+        assert!(
+            report
+                .panels
+                .iter()
+                .any(|p| p.path == "distributed" && p.worker_count == *wc),
+            "a distributed panel must be present for worker_count={wc}"
+        );
+    }
+
+    for panel in &report.panels {
+        let label = format!("panel path={} workers={}", panel.path, panel.worker_count);
+        // Wall-time percentiles, including the new p99, are finite and ordered.
+        for (name, v) in [
+            ("wall_ms_p50", panel.wall_ms_p50),
+            ("wall_ms_p95", panel.wall_ms_p95),
+            ("wall_ms_p99", panel.wall_ms_p99),
+            ("wall_ms_max", panel.wall_ms_max),
+            ("coordinator_cpu_ms", panel.coordinator_cpu_ms),
+        ] {
+            assert!(v.is_finite(), "{label}: {name} must be finite, got {v}");
+            assert!(v >= 0.0, "{label}: {name} must be non-negative, got {v}");
+        }
+        assert!(
+            panel.wall_ms_p50 <= panel.wall_ms_p95 + f64::EPSILON
+                && panel.wall_ms_p95 <= panel.wall_ms_p99 + f64::EPSILON
+                && panel.wall_ms_p99 <= panel.wall_ms_max + f64::EPSILON,
+            "{label}: percentiles must be monotonic non-decreasing \
+             (p50={} p95={} p99={} max={})",
+            panel.wall_ms_p50,
+            panel.wall_ms_p95,
+            panel.wall_ms_p99,
+            panel.wall_ms_max,
+        );
+        // The cost counters are populated on every panel.
+        assert!(
+            panel.matched_series > 0,
+            "{label}: matched_series must be present (the query must match series)"
+        );
+        assert!(
+            panel.segments_fetched > 0,
+            "{label}: segments_fetched must be present"
+        );
+        assert!(
+            panel.s3_requests > 0 && panel.s3_get_requests > 0 && panel.s3_bytes > 0,
+            "{label}: store-request and bytes-moved columns must be present, got \
+             reqs={} gets={} bytes={}",
+            panel.s3_requests,
+            panel.s3_get_requests,
+            panel.s3_bytes,
+        );
+    }
+}

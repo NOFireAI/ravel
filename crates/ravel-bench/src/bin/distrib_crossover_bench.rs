@@ -34,6 +34,12 @@ struct Args {
     /// metric name.
     #[arg(long, default_value = "bench_gauge")]
     query: String,
+    /// Corpus time span in seconds: widens the window the samples spread across
+    /// so a sweep can grow the corpus past the gate constants (256 MiB / 64
+    /// segments) without changing series cardinality. Default 1 preserves the
+    /// original one-second corpus.
+    #[arg(long, default_value_t = 1)]
+    corpus_span_secs: u64,
     #[arg(long, default_value_t = 20)]
     query_reps: usize,
     /// Worker counts the distributed path is measured at (repeatable), e.g.
@@ -54,6 +60,7 @@ async fn main() {
         batch_size: args.batch_size,
         ack_timeout_secs: args.ack_timeout_secs,
         query: args.query,
+        corpus_span_secs: args.corpus_span_secs,
         query_reps: args.query_reps,
         worker_counts: args.worker_counts,
     };
@@ -71,6 +78,7 @@ fn print_human_table(report: &Report) {
     println!("  shards           : {}", report.config.shards);
     println!("  target_series    : {}", report.config.target_series);
     println!("  samples/series   : {}", report.config.samples_per_series);
+    println!("  corpus_span_secs : {}", report.config.corpus_span_secs);
     println!("  query            : {}", report.config.query);
     println!("  query_reps       : {}", report.config.query_reps);
     println!("  accepted_points  : {}", report.accepted_points);
@@ -79,12 +87,14 @@ fn print_human_table(report: &Report) {
         report.corpus_segments, report.corpus_shards
     );
     println!(
-        "  {:<12} {:>7}  {:>9} {:>9} {:>9}  {:>7} {:>6}  {:>9} {:>7}  {:>11}",
+        "  {:<12} {:>7}  {:>9} {:>9} {:>9} {:>9}  {:>9}  {:>7} {:>6}  {:>9} {:>7}  {:>11}",
         "path",
         "workers",
         "p50 ms",
         "p95 ms",
+        "p99 ms",
         "max ms",
+        "cpu ms",
         "matched",
         "segs",
         "s3_reqs",
@@ -93,12 +103,14 @@ fn print_human_table(report: &Report) {
     );
     for p in &report.panels {
         println!(
-            "  {:<12} {:>7}  {:>9.3} {:>9.3} {:>9.3}  {:>7} {:>6}  {:>9} {:>7}  {:>11}",
+            "  {:<12} {:>7}  {:>9.3} {:>9.3} {:>9.3} {:>9.3}  {:>9.1}  {:>7} {:>6}  {:>9} {:>7}  {:>11}",
             p.path,
             p.worker_count,
             p.wall_ms_p50,
             p.wall_ms_p95,
+            p.wall_ms_p99,
             p.wall_ms_max,
+            p.coordinator_cpu_ms,
             p.matched_series,
             p.segments_fetched,
             p.s3_requests,
