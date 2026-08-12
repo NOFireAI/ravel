@@ -578,28 +578,131 @@ impl QueryEngine {
                     self.config.max_bytes_scanned,
                 )
                 .await?;
+            // Cross-cluster federation for the discovery path (ADR-0071, issue
+            // #891): fan the same matchers and window out to every configured
+            // remote through the SAME `Federation` coordinator the query path
+            // uses, and union the returned series identities into the local
+            // pool. Without a federation context this is a cheap empty result,
+            // so a single-cluster deployment runs the byte-identical local
+            // discovery path. Run after the local fetch (not concurrently) for
+            // the same reason `prefetch` runs `federate_scalar` sequentially:
+            // an `async_trait` remote fetch nested inside a fan-out combinator
+            // makes the whole query future fail axum's `Handler` `Send` bound.
+            let (fed_series, fed_warnings, fed_partial) = self
+                .federate_discovery(tenant_hash, matchers.to_vec(), window, &accounting)
+                .await?;
+            // Union local + remote identities and enforce `max_series` ONCE
+            // over the combined set, mirroring the query path's single
+            // post-federation merge. A `SeriesId` is a canonical function of
+            // its labels, so cross-cluster duplicate identities collapse
+            // cleanly here (`or_insert` keeps the first, and every copy carries
+            // the same `LabelSet`) -- the sample-level tie-break ambiguity
+            // documented at `is_greater` does not arise for discovery, which
+            // enumerates identities and carries no per-sample provenance.
             let by_id = build_series_by_id(
                 fetched
                     .into_iter()
                     .flatten()
-                    .map(|entry| (entry.series_id, entry.labels)),
+                    .map(|entry| (entry.series_id, entry.labels))
+                    .chain(fed_series),
                 self.config.max_series,
             )?;
-            Ok((by_id.into_iter().collect(), FetchStats::default()))
+            Ok((
+                (
+                    by_id.into_iter().collect::<Vec<_>>(),
+                    fed_warnings,
+                    fed_partial,
+                ),
+                FetchStats::default(),
+            ))
         };
 
         // resolve_series never re-opens the snapshot's segments more than
         // once, unlike `prefetch`'s per-selector fan-out.
-        self.resolve_snapshot_with_retry(
-            tenant_hash,
-            window,
-            min_tokens,
-            now_ns,
-            name_filter.as_deref(),
-            1,
-            attempt,
-        )
-        .await
+        let ((series, warnings, partial), mut stats) = self
+            .resolve_snapshot_with_retry(
+                tenant_hash,
+                window,
+                min_tokens,
+                now_ns,
+                name_filter.as_deref(),
+                1,
+                attempt,
+            )
+            .await?;
+        stats.partial = partial;
+        stats.warnings = warnings;
+        Ok((series, stats))
+    }
+
+    /// Cross-cluster federation fan-out for the discovery path (ADR-0071, issue
+    /// #891): the `/api/v1/series`, `/api/v1/labels`, and
+    /// `/api/v1/label/<name>/values` endpoints. Mirrors [`Self::federate_scalar`]
+    /// but returns `(SeriesId, LabelSet)` identity pairs rather than sample runs,
+    /// because discovery enumerates series, not samples.
+    ///
+    /// Routes through the SAME [`crate::distrib::Federation`] coordinator the
+    /// query path uses -- there is no second federation path. Each remote
+    /// resolves under ITS OWN tenant auth (the operator credential baked into the
+    /// fetcher, never a wire `tenant_hash` and never a client credential),
+    /// enforces its own admission/limits/erasure, and returns decoded series that
+    /// this method unions into the local pool. `skip_unavailable`, the
+    /// deduplicated skipped-cluster warnings, and the partial-coverage marker all
+    /// come straight from the coordinator, identical to the query path.
+    ///
+    /// A named `async fn` for the same higher-ranked-`Send` reason as
+    /// `federate_scalar`: `matchers`/`window` are owned so no borrow crosses the
+    /// inner `SliceFetcher` await into the axum `Handler` future. No federation
+    /// configured is a cheap empty result.
+    async fn federate_discovery(
+        &self,
+        tenant_hash: TenantHash,
+        matchers: Vec<LabelMatcher>,
+        window: TimeRange,
+        accounting: &QueryAccounting,
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool), QueryError> {
+        let mut series: Vec<(SeriesId, LabelSet)> = Vec::new();
+        let Some(federation) = &self.federation else {
+            return Ok((series, Vec::new(), false));
+        };
+        // Empty erasure and empty min-commit-tokens cross the boundary, exactly
+        // as in `federate_scalar`: the remote resolves its own snapshot and
+        // enforces its own erasure, and commit tokens are cluster-local (also
+        // structurally preventing this cluster's tokens from leaking). The
+        // operator credential is baked into the fetcher, so no client credential
+        // is threaded here and the remote's tenant identity comes from its own
+        // auth, never the wire.
+        let outcome = federation
+            .fetch(
+                tenant_hash,
+                Signal::Metrics,
+                matchers,
+                Vec::new(),
+                window.start_ns,
+                window.end_ns,
+                Vec::new(),
+                accounting.clone(),
+                self.config,
+            )
+            .await?;
+        // Re-enforce the coordinator's bytes-scanned budget over the combined
+        // local+remote spend now folded into `accounting`, identical to the
+        // query path. A budget trip is never masked by skip_unavailable.
+        if let Some(err) = bytes_scanned_exceeded(
+            accounting.snapshot().total_s3_bytes(),
+            self.config.max_bytes_scanned,
+        ) {
+            return Err(err);
+        }
+        // The coordinator returns sample-bearing `FetchedSeriesSoa` runs
+        // (discovery reuses the query coordinator, which has no labels-only
+        // resolve scope); take only each run's series identity for enumeration.
+        for run in outcome.series {
+            for fs in run {
+                series.push((fs.series_id, fs.labels));
+            }
+        }
+        Ok((series, outcome.warnings, outcome.partial))
     }
 
     /// Prefetches every selector `plan_selectors` reported: one shared
@@ -1822,6 +1925,20 @@ struct Candidate {
 /// (docs/catalog-and-mvcc.md): `(created_unix_ns, writer_epoch, writer_seq,
 /// in-page index)`, greatest wins; ties broken by raw value bit pattern for
 /// full determinism.
+///
+/// Cross-cluster limitation (ADR-0071, issue #891): when this merge pool is fed
+/// by cross-cluster federation (`federate_scalar`), the provenance tuple is
+/// cluster-LOCAL state with no cross-cluster meaning -- two clusters mint
+/// `writer_epoch`/`writer_seq` independently. This order is therefore defined
+/// only for DISJOINT cross-cluster series identity (the intended deployment:
+/// one series lives in exactly one cluster). For a mirrored-ingest deployment
+/// where the same `(series_id, ts)` arrives from two clusters with different
+/// values, the winner is unspecified (still deterministic for fixed inputs, but
+/// not meaningfully ordered); a globally meaningful cross-cluster ordering is a
+/// separate ADR. See docs/query-engine.md "Cross-cluster duplicate tie-break
+/// limitation". The discovery union (`federate_discovery`) does not reach this
+/// site: it enumerates series identities with no per-sample tie-break, so
+/// duplicate identities collapse cleanly regardless of provenance.
 fn is_greater(a: &Candidate, b: &Candidate) -> bool {
     (a.priority, a.value.to_bits()) > (b.priority, b.value.to_bits())
 }
