@@ -100,6 +100,23 @@ pub fn key_fingerprint(deployment_key: &[u8; 32]) -> [u8; KEY_FINGERPRINT_LEN] {
     out
 }
 
+/// Width of the `token_fingerprint` a [`AuthTokenMapError::CrossTenantTokenCollision`]
+/// names: a prefix of the stored `token_hash`, matching `ravel-cli tenant token
+/// list`'s `TOKEN_FINGERPRINT_LEN` convention. Long enough to correlate a log
+/// line with a `list` entry, short enough that this build never treats the
+/// full keyed hash as a printable value either -- the hash is one-way and
+/// deployment-key-scoped, but this module extends the "never a secret in an
+/// error message" discipline to it anyway rather than drawing that line here.
+const TOKEN_HASH_FINGERPRINT_LEN: usize = 8;
+
+/// The short, printable fingerprint of a stored `token_hash` -- never the
+/// hash itself and never the plaintext token -- for a
+/// [`AuthTokenMapError::CrossTenantTokenCollision`] or a log line to name the
+/// colliding token without exposing it.
+fn hash_fingerprint_hex(hash: &[u8; TOKEN_HASH_LEN]) -> String {
+    hex::encode(&hash[..TOKEN_HASH_FINGERPRINT_LEN])
+}
+
 /// One resolved token->tenant entry, decoded into a plain struct so consumers
 /// never touch the proto type. `token_hash` is the 32-byte keyed hash, never a
 /// plaintext token.
@@ -233,6 +250,27 @@ pub enum AuthTokenMapError {
          failed): re-read and retry rather than overwrite the other write"
     )]
     CasConflict,
+    /// Two different tenants presented a token that hashes to the same
+    /// `token_hash` (ADR-0072 decision 4, second amendment, #897 flap
+    /// follow-up). A token hash must resolve to exactly one tenant --
+    /// [`tenant_for_token`] has no way to pick between two -- so this is
+    /// refused before any write, never arbitrated by takeover. This is
+    /// distinct from the same-tenant, different-`managed_by` case (the cli ->
+    /// operator migration), which still takes the hash over in place: takeover
+    /// only ever changes who owns a hash already resolving to this
+    /// `tenant_id`, never which tenant it resolves to. Named by tenant id and
+    /// a truncated, one-way token fingerprint only -- never the token value,
+    /// and this build never prints the full stored hash either.
+    #[error(
+        "token {token_fingerprint} already authenticates tenant {existing_tenant:?}; refusing to \
+         also grant it to tenant {attempted_tenant:?} (a token can resolve to only one tenant, \
+         ADR-0072 decision 4)"
+    )]
+    CrossTenantTokenCollision {
+        token_fingerprint: String,
+        existing_tenant: String,
+        attempted_tenant: String,
+    },
 }
 
 /// Decode and validate a proto auth map, checking the version, the deployment-key
@@ -408,10 +446,16 @@ async fn write_map(
 
 /// Add or replace the token->tenant mapping for `token`, whole-record
 /// CAS-replace (ADR-0066 decision 6). The token is hashed under `deployment_key`
-/// and only its hash is persisted; the plaintext is never written. When an entry
-/// for the same token hash exists, its `tenant_id` is replaced (re-pointing a
-/// token); otherwise a new entry is appended. On a fresh bucket the object is
-/// created with `CreateIfAbsent`; a concurrent write is a
+/// and only its hash is persisted; the plaintext is never written. When no
+/// entry for the hash exists, one is appended for `tenant_id`; when one
+/// already exists for the SAME `tenant_id`, this is a no-op re-write; when one
+/// exists for a DIFFERENT tenant, the call is refused with
+/// [`AuthTokenMapError::CrossTenantTokenCollision`] before any write --
+/// re-pointing a token to a different tenant is not a single-call operation,
+/// since a token value cannot deterministically authenticate two tenants at
+/// once (ADR-0072 decision 4, second amendment, #897 flap follow-up); revoke
+/// the old tenant's token first, then upsert it for the new one. On a fresh
+/// bucket the object is created with `CreateIfAbsent`; a concurrent write is a
 /// [`AuthTokenMapError::CasConflict`] the caller re-reads and retries on.
 pub async fn upsert_token(
     store: &dyn ObjectStoreBackend,
@@ -428,10 +472,15 @@ pub async fn upsert_token(
 /// pass ([`remove_tokens_by_tenant_owned_by`], [`replace_tenant_tokens`]) can
 /// tell this write's owner from another writer's (ADR-0072 decision 4
 /// amendment, #897). `None` marks the entry unmanaged, matching every entry
-/// [`upsert_token`] writes. Matches purely on `token_hash`: re-upserting a
-/// hash another writer already owns re-tags it to this call's `tenant_id`
-/// and `managed_by` in place -- global last-writer-wins takeover, never a
-/// second entry for the same hash.
+/// [`upsert_token`] writes. Matches on `token_hash`: re-upserting a hash the
+/// SAME `tenant_id` already owns under a different owner re-tags it to this
+/// call's `managed_by` in place -- takeover, never a second entry for the
+/// same hash (the cli -> operator migration, ADR-0072 decision 4 amendment,
+/// #897). A hash already owned by a DIFFERENT tenant is refused outright with
+/// [`AuthTokenMapError::CrossTenantTokenCollision`] before any write -- one
+/// token value cannot deterministically authenticate two tenants, so this is
+/// never arbitrated by takeover (ADR-0072 decision 4, second amendment, #897
+/// flap follow-up).
 pub async fn upsert_token_owned(
     store: &dyn ObjectStoreBackend,
     deployment_key: &[u8; 32],
@@ -455,9 +504,15 @@ pub async fn upsert_token_owned(
         ),
     };
     match map.entries.iter_mut().find(|e| e.token_hash == hash) {
-        Some(entry) => {
-            entry.tenant_id = tenant_id.to_string();
+        Some(entry) if entry.tenant_id == tenant_id => {
             entry.managed_by = managed_by.map(str::to_string);
+        }
+        Some(entry) => {
+            return Err(AuthTokenMapError::CrossTenantTokenCollision {
+                token_fingerprint: hash_fingerprint_hex(&hash),
+                existing_tenant: entry.tenant_id.clone(),
+                attempted_tenant: tenant_id.to_string(),
+            });
         }
         None => map.entries.push(TokenEntry {
             token_hash: hash,
@@ -563,15 +618,27 @@ pub async fn remove_tokens_by_tenant_owned_by(
 /// the tenant's whole desired token set for that owner, so converging to it
 /// is a scoped replace, not an incremental upsert/remove pair.
 ///
-/// `token_hash` is globally unique across the whole map (ADR-0072 decision
-/// 4 amendment, #897 data-loss follow-up): a `token_hash` colliding with one
-/// of `plaintext_tokens`' hashes is dropped no matter which tenant or
-/// `managed_by` owns it today, and the new entry takes over that hash --
-/// last writer wins. Without this, a caller reusing a token value another
-/// entry already holds (a different tenant, or the same tenant under a
-/// different owner tag) would make this call append a second entry sharing
-/// that hash, which [`write_map`]'s duplicate-hash guard now refuses to
-/// persist, rather than [`decode_map`] refusing every later read.
+/// `token_hash` is unique across the whole map (ADR-0072 decision 4
+/// amendment, #897 data-loss follow-up), but the rule for a collision depends
+/// on whether it crosses a tenant boundary (ADR-0072 decision 4, second
+/// amendment, #897 flap follow-up):
+///
+/// - A `token_hash` already owned by THIS `tenant_id` (under a different
+///   `managed_by`, or unmanaged) is dropped and the new entry takes over it
+///   in place -- takeover, matching [`upsert_token_owned`]'s hash-keyed
+///   semantics. Without this, a caller reusing a token value the same
+///   tenant already holds under a different owner tag would make this call
+///   append a second entry sharing that hash, which [`write_map`]'s
+///   duplicate-hash guard now refuses to persist, rather than [`decode_map`]
+///   refusing every later read.
+/// - A `token_hash` already owned by a DIFFERENT tenant is refused outright
+///   with [`AuthTokenMapError::CrossTenantTokenCollision`], before any
+///   retain or write. A single token value cannot deterministically
+///   authenticate two tenants, so this is never arbitrated by takeover: a
+///   takeover here would make each tenant's own reconcile loop keep taking
+///   the hash back for itself every cycle, converging on nothing (the flap
+///   this amendment fixes) rather than a stable, converged, if incomplete,
+///   result.
 ///
 /// Returns [`SetOutcome::Unchanged`] (issuing no write) when the resulting
 /// scoped entry set is byte-for-byte identical to the current one --
@@ -626,23 +693,43 @@ pub async fn replace_tenant_tokens(
         return Ok(SetOutcome::Unchanged);
     }
 
-    // token_hash is globally unique (ADR-0072 decision 4 amendment, #897
-    // data-loss follow-up): the last writer of a hash takes ownership. Drop
-    // this tenant/owner's own prior entries AND any pre-existing entry
-    // anywhere in the map whose hash collides with a desired entry --
-    // regardless of that entry's (tenant_id, managed_by) -- before
-    // extending. Scoping the drop to only this tenant/owner (as a prior
-    // version did) leaves a differently-owned or differently-tenanted
-    // colliding entry in place, so the extend below would append a second
-    // entry with the same hash and `write_map`'s duplicate-hash guard would
-    // then refuse the write outright (previously: `decode_map` would refuse
-    // every subsequent read instead, since the write went through
-    // unguarded).
+    // Refuse a cross-tenant collision before touching anything (ADR-0072
+    // decision 4, second amendment, #897 flap follow-up): a desired hash
+    // already present under a DIFFERENT tenant_id is never taken over here.
+    // Checked against the map exactly as read, before any retain -- the
+    // takeover below must never run on a candidate this loop would have
+    // refused.
     let desired_hash_set: std::collections::HashSet<[u8; TOKEN_HASH_LEN]> =
         desired_entries.iter().map(|e| e.token_hash).collect();
+    if let Some(other) = map
+        .entries
+        .iter()
+        .find(|e| e.tenant_id != tenant_id && desired_hash_set.contains(&e.token_hash))
+    {
+        return Err(AuthTokenMapError::CrossTenantTokenCollision {
+            token_fingerprint: hash_fingerprint_hex(&other.token_hash),
+            existing_tenant: other.tenant_id.clone(),
+            attempted_tenant: tenant_id.to_string(),
+        });
+    }
+
+    // token_hash is unique within one tenant's entries (ADR-0072 decision 4
+    // amendment, #897 data-loss follow-up): the last writer of a hash this
+    // tenant already owns takes ownership of it, regardless of which
+    // `managed_by` wrote it. Drop this tenant/owner's own prior entries AND
+    // any pre-existing entry for this SAME tenant whose hash collides with a
+    // desired entry -- the cross-tenant case was already refused above, so
+    // every remaining collision here is same-tenant, different-owner, safe
+    // to take over. Scoping the drop to only this tenant/owner (as a prior
+    // version did) leaves a differently-owned colliding entry for the same
+    // tenant in place, so the extend below would append a second entry with
+    // the same hash and `write_map`'s duplicate-hash guard would then refuse
+    // the write outright (previously: `decode_map` would refuse every
+    // subsequent read instead, since the write went through unguarded).
     map.entries.retain(|e| {
         let owned_by_this_scope = e.tenant_id == tenant_id && e.managed_by.as_deref() == managed_by;
-        let collides_with_desired = desired_hash_set.contains(&e.token_hash);
+        let collides_with_desired =
+            e.tenant_id == tenant_id && desired_hash_set.contains(&e.token_hash);
         !(owned_by_this_scope || collides_with_desired)
     });
     map.entries.extend(desired_entries);
@@ -756,17 +843,41 @@ mod tests {
         );
     }
 
-    /// Upserting the same token to a new tenant replaces the mapping in place
-    /// rather than adding a second entry (re-pointing a token).
+    /// Upserting a token already mapped to a DIFFERENT tenant is refused with
+    /// a typed [`AuthTokenMapError::CrossTenantTokenCollision`] before any
+    /// write -- one token value cannot deterministically authenticate two
+    /// tenants, so `upsert_token` must never re-point it the way it used to
+    /// (ADR-0072 decision 4, second amendment, #897 flap follow-up).
+    /// Flipped-line proof: this fails against the pre-fix code, where the
+    /// `Some(entry)` match arm in `upsert_token_owned` unconditionally
+    /// rewrote `entry.tenant_id` with no equality check against the caller's
+    /// `tenant_id`; against that code this test observes `Ok(Updated)` and
+    /// `tenant_for_token == Some("tenant-b")` instead of the error asserted
+    /// here.
     #[tokio::test]
-    async fn upsert_same_token_replaces_tenant() {
+    async fn upsert_token_refuses_a_cross_tenant_collision() {
         let store = mem();
-        upsert_token(store.as_ref(), KEY, b"tok", "tenant-a", 1)
+        upsert_token(store.as_ref(), KEY, b"shared-secret-value", "tenant-a", 1)
             .await
             .expect("create");
-        upsert_token(store.as_ref(), KEY, b"tok", "tenant-b", 2)
+        let err = upsert_token(store.as_ref(), KEY, b"shared-secret-value", "tenant-b", 2)
             .await
-            .expect("update");
+            .expect_err("cross-tenant re-point must be refused");
+        assert!(
+            matches!(
+                &err,
+                AuthTokenMapError::CrossTenantTokenCollision {
+                    existing_tenant,
+                    attempted_tenant,
+                    ..
+                } if existing_tenant == "tenant-a" && attempted_tenant == "tenant-b"
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("shared-secret-value"),
+            "the error must never name the token value: {err}"
+        );
         let (map, _v) = read_auth_map(store.as_ref(), KEY)
             .await
             .expect("read")
@@ -774,9 +885,33 @@ mod tests {
         assert_eq!(
             map.entries.len(),
             1,
-            "the token was re-pointed, not doubled"
+            "the refused call must not touch the existing entry"
         );
-        assert_eq!(tenant_for_token(&map, KEY, b"tok"), Some("tenant-b"));
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"shared-secret-value"),
+            Some("tenant-a")
+        );
+    }
+
+    /// Re-upserting the same token for the SAME tenant is a harmless no-op
+    /// rewrite, not a collision -- the same-tenant path the check in
+    /// [`upsert_token_owned`] must still let through (door 1/2 regression
+    /// guard, ADR-0072 decision 4 amendment, #897).
+    #[tokio::test]
+    async fn upsert_same_token_same_tenant_is_idempotent() {
+        let store = mem();
+        upsert_token(store.as_ref(), KEY, b"tok", "tenant-a", 1)
+            .await
+            .expect("create");
+        upsert_token(store.as_ref(), KEY, b"tok", "tenant-a", 2)
+            .await
+            .expect("re-upsert for the same tenant succeeds");
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(map.entries.len(), 1);
+        assert_eq!(tenant_for_token(&map, KEY, b"tok"), Some("tenant-a"));
     }
 
     /// Removing a token (revocation) drops its entry; a subsequent resolve fails.
@@ -1528,15 +1663,25 @@ mod tests {
         );
     }
 
-    /// Door 3 (#897 data-loss follow-up, pre-existing): two tenants sharing
-    /// one token value, each converged via its own `replace_tenant_tokens`
-    /// call (what `reconcile_sys_auth` does, once per tenant key in the
-    /// Secret). The second call must not leave the map holding two entries
-    /// with the same hash: it takes over the hash for its own tenant, and the
-    /// map must stay readable afterward -- never `Corrupt(DuplicateTokenHash)`
-    /// on the very read-back the same reconcile cycle performs next.
+    /// Door 3 / flap regression (#897, ADR-0072 decision 4 second amendment):
+    /// two tenants sharing one token value, each converged via its own
+    /// `replace_tenant_tokens` call (what `reconcile_sys_auth` does, once per
+    /// tenant key in the Secret). The prior round's fix took the hash over
+    /// for the second tenant -- `SetOutcome::Updated`, `tenant_for_token ==
+    /// Some("globex")` -- which is exactly the defect this round fixes: the
+    /// NEXT cycle would present "acme" again, take the hash back, and so on
+    /// forever, never converging. The second call must instead be refused
+    /// with a typed `CrossTenantTokenCollision` naming both tenants, write
+    /// nothing, and leave "acme" holding the token.
+    ///
+    /// Flipped line: in `replace_tenant_tokens`, the pre-fix `retain`
+    /// predicate's `collides_with_desired` term was
+    /// `desired_hash_set.contains(&e.token_hash)` (no tenant check), which
+    /// let this call drop acme's entry and take over the hash instead of
+    /// refusing. This test fails against that line: it asserts an `Err`
+    /// where the pre-fix code returned `Ok(SetOutcome::Updated)`.
     #[tokio::test]
-    async fn replace_tenant_tokens_across_two_tenants_sharing_a_token_stays_readable() {
+    async fn replace_tenant_tokens_refuses_a_cross_tenant_collision() {
         let store = mem();
         replace_tenant_tokens(
             store.as_ref(),
@@ -1549,7 +1694,7 @@ mod tests {
         .await
         .expect("first tenant converges");
 
-        let outcome = replace_tenant_tokens(
+        let err = replace_tenant_tokens(
             store.as_ref(),
             KEY,
             "globex",
@@ -1558,22 +1703,157 @@ mod tests {
             2,
         )
         .await
-        .expect("second tenant's replace must not duplicate the hash");
+        .expect_err("a token another tenant already owns must be refused, not taken over");
+        match &err {
+            AuthTokenMapError::CrossTenantTokenCollision {
+                existing_tenant,
+                attempted_tenant,
+                token_fingerprint,
+            } => {
+                assert_eq!(existing_tenant, "acme");
+                assert_eq!(attempted_tenant, "globex");
+                assert!(
+                    !token_fingerprint.is_empty(),
+                    "the fingerprint must be present so a human can correlate the refusal"
+                );
+            }
+            other => panic!("expected CrossTenantTokenCollision, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            !message.contains("shared-tok"),
+            "the error must never print the token value: {message}"
+        );
+
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read-back")
+            .expect("present");
+        assert_eq!(map.entries.len(), 1, "the refused call must write nothing");
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"shared-tok"),
+            Some("acme"),
+            "acme, the first writer, keeps the token; globex's refused call changed nothing"
+        );
+    }
+
+    /// The convergence property the flap violated, proven at this layer: once
+    /// "acme" holds a token and "globex" has been refused it, repeating BOTH
+    /// calls a second time (an identical reconcile cycle) must leave the map
+    /// byte-for-byte unchanged -- "acme" hits the `Unchanged` fast path
+    /// (already converged, no write), and "globex" is refused again with the
+    /// same typed error, still writing nothing. The operator-level equivalent
+    /// of this test (in `services/ravel-operator/src/controller.rs`) is the
+    /// one that asserts zero `sys/auth` PUTs on cycle two; this one pins the
+    /// same property directly on `replace_tenant_tokens`, one call at a time.
+    #[tokio::test]
+    async fn replace_tenant_tokens_cross_tenant_refusal_converges_on_repeat() {
+        let store = mem();
+        let cycle = |now_ns: i64| {
+            let store = store.clone();
+            async move {
+                let acme = replace_tenant_tokens(
+                    store.as_ref(),
+                    KEY,
+                    "acme",
+                    &[b"shared-tok".to_vec()],
+                    Some(MANAGED_BY_OPERATOR),
+                    now_ns,
+                )
+                .await;
+                let globex = replace_tenant_tokens(
+                    store.as_ref(),
+                    KEY,
+                    "globex",
+                    &[b"shared-tok".to_vec()],
+                    Some(MANAGED_BY_OPERATOR),
+                    now_ns + 1,
+                )
+                .await;
+                (acme, globex)
+            }
+        };
+
+        let (acme1, globex1) = cycle(1).await;
+        assert!(
+            matches!(acme1, Ok(SetOutcome::Created)),
+            "acme creates the object first: {acme1:?}"
+        );
+        assert!(
+            matches!(
+                globex1,
+                Err(AuthTokenMapError::CrossTenantTokenCollision { .. })
+            ),
+            "globex is refused on cycle one: {globex1:?}"
+        );
+
+        let (map_after_1, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read")
+            .expect("present");
+
+        let (acme2, globex2) = cycle(2).await;
+        assert!(
+            matches!(acme2, Ok(SetOutcome::Unchanged)),
+            "acme already owns exactly this hash: zero writes on cycle two: {acme2:?}"
+        );
+        assert!(
+            matches!(
+                globex2,
+                Err(AuthTokenMapError::CrossTenantTokenCollision { .. })
+            ),
+            "globex is refused again on cycle two, identically: {globex2:?}"
+        );
+
+        let (map_after_2, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            map_after_1, map_after_2,
+            "an identical second cycle must leave the map byte-for-byte unchanged, the exact \
+             property the last-writer-wins takeover violated"
+        );
+    }
+
+    /// Same-tenant, different-`managed_by`-owner takeover (doors 1 and 2)
+    /// must still converge to one entry after this round's fix: the
+    /// cross-tenant refusal above must not have disturbed the same-tenant
+    /// case, which stays a legitimate takeover.
+    #[tokio::test]
+    async fn replace_tenant_tokens_same_tenant_cross_owner_still_converges() {
+        let store = mem();
+        // Seed an unmanaged (v1-shaped) entry, matching door 1.
+        upsert_token(store.as_ref(), KEY, b"shared-tok", "acme", 1)
+            .await
+            .expect("seed unmanaged entry");
+
+        let outcome = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "acme",
+            &[b"shared-tok".to_vec()],
+            Some(MANAGED_BY_OPERATOR),
+            2,
+        )
+        .await
+        .expect("same-tenant takeover across managed_by owners must still succeed");
         assert_eq!(outcome, SetOutcome::Updated);
 
         let (map, _v) = read_auth_map(store.as_ref(), KEY)
             .await
-            .expect("read-back must succeed even though two tenants raced for one hash")
+            .expect("read-back must succeed")
             .expect("present");
         assert_eq!(
             map.entries.len(),
             1,
-            "one hash can only ever resolve to one tenant; the second writer takes it over"
+            "same-tenant takeover across owners converges to one entry, not two"
         );
+        assert_eq!(tenant_for_token(&map, KEY, b"shared-tok"), Some("acme"));
         assert_eq!(
-            tenant_for_token(&map, KEY, b"shared-tok"),
-            Some("globex"),
-            "last writer wins the shared hash"
+            map.entries[0].managed_by.as_deref(),
+            Some(MANAGED_BY_OPERATOR),
+            "the operator's replace still takes ownership within the same tenant"
         );
     }
 

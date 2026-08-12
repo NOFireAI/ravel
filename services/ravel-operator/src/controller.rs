@@ -481,6 +481,16 @@ where
 /// [`ravel_catalog::AuthSetOutcome::Unchanged`] without a write (review
 /// blocker 3), so a steady-state reconcile of an unchanged Secret issues zero
 /// `sys/auth` PUTs.
+///
+/// A tenant whose token collides with a DIFFERENT tenant's is a per-tenant
+/// error, not a whole-pass one (ADR-0072 decision 4, second amendment, #897
+/// flap follow-up): [`ravel_catalog::AuthTokenMapError::CrossTenantTokenCollision`]
+/// is logged (tenant ids and a token fingerprint, never the token value) and
+/// that one tenant is skipped this cycle, while every other tenant's upsert
+/// and the remove pass below still run. This is what makes the loop
+/// converge: the refused write is never retried into a takeover, so the same
+/// input yields the same typed skip -- and zero `sys/auth` PUTs -- every
+/// cycle, instead of two tenants trading the hash back and forth forever.
 async fn reconcile_sys_auth(
     deployment_key: &[u8; 32],
     token_values: &BTreeMap<String, Vec<u8>>,
@@ -497,7 +507,7 @@ async fn reconcile_sys_auth(
     }
 
     for (tenant_id, token) in token_values {
-        retry_cas(|| {
+        let result = retry_cas(|| {
             ravel_catalog::replace_tenant_tokens(
                 store,
                 deployment_key,
@@ -507,7 +517,25 @@ async fn reconcile_sys_auth(
                 now_ns,
             )
         })
-        .await?;
+        .await;
+        match result {
+            Ok(_) => {}
+            Err(ravel_catalog::AuthTokenMapError::CrossTenantTokenCollision {
+                token_fingerprint,
+                existing_tenant,
+                attempted_tenant,
+            }) => {
+                warn!(
+                    %token_fingerprint,
+                    %existing_tenant,
+                    %attempted_tenant,
+                    "sys/auth reconcile: this tenant's token collides with a different \
+                     tenant's; skipping it this cycle rather than taking the token over \
+                     (ADR-0072 decision 4, second amendment, #897)"
+                );
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     let operator_managed_tenants: BTreeSet<String> =
@@ -1256,6 +1284,117 @@ mod tests {
         assert_eq!(
             puts_after_second, puts_after_first,
             "an unchanged secret must perform exactly zero additional sys/auth PUTs"
+        );
+    }
+
+    /// The flap acceptance test (#897, ADR-0072 decision 4 second amendment):
+    /// two tenants, "acme" and "globex", both present in the Secret with the
+    /// SAME token value. Against the prior round's last-writer-wins takeover,
+    /// each identical reconcile cycle would take the hash back for whichever
+    /// tenant runs last (alphabetical `BTreeMap` order: "acme" then
+    /// "globex"), so cycle two would look identical to cycle one on the
+    /// surface (one entry, `Ok(())`) while actually performing a full
+    /// `sys/auth` PUT every single cycle forever -- the flap. This test
+    /// proves convergence directly on that PUT count: a SECOND identical
+    /// reconcile must perform ZERO additional `sys/auth` PUTs, using the same
+    /// `Sequence`-of-passthroughs counter as the review-blocker-3 no-op test
+    /// above, because it stands in for a PUT counter `MemoryStore` does not
+    /// expose publicly.
+    ///
+    /// Flipped line: with the prior round's `replace_tenant_tokens`, the
+    /// `collides_with_desired` retain predicate matched on hash alone, so
+    /// "globex" would evict "acme"'s entry and take the hash over on cycle
+    /// one, and "acme" would take it back on cycle two -- `puts_after_second`
+    /// would be strictly greater than `puts_after_first`, not equal.
+    #[tokio::test]
+    async fn reconcile_sys_auth_cross_tenant_collision_converges_with_zero_puts_on_repeat() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence, SequenceStep};
+
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Put)
+                .with_key_contains(ravel_catalog::AUTH_KEY)
+                .with_steps(vec![SequenceStep::Passthrough; 10]),
+        );
+        let store = FaultStore::new(memory_store(), plan);
+        let deployment_key = [21u8; 32];
+
+        let mut tokens = BTreeMap::new();
+        tokens.insert("acme".to_string(), b"shared-tok".to_vec());
+        tokens.insert("globex".to_string(), b"shared-tok".to_vec());
+
+        reconcile_sys_auth(&deployment_key, &tokens, &store, 1_000)
+            .await
+            .expect("a cross-tenant collision is a per-tenant skip, not a whole-pass error");
+        let puts_after_first = store.sequence_progress(0);
+        assert!(
+            puts_after_first > 0,
+            "the winning tenant's first write must still happen"
+        );
+
+        let (map, _version) = ravel_catalog::read_auth_map(&store, &deployment_key)
+            .await
+            .expect("read succeeds")
+            .expect("map exists");
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "exactly one tenant holds the shared token; the other was refused, not taken over"
+        );
+        assert_eq!(
+            ravel_catalog::tenant_for_token(&map, &deployment_key, b"shared-tok"),
+            Some("acme"),
+            "BTreeMap iterates \"acme\" before \"globex\": acme, the first writer this cycle, \
+             keeps the token"
+        );
+
+        reconcile_sys_auth(&deployment_key, &tokens, &store, 2_000)
+            .await
+            .expect("second, identical reconcile still succeeds");
+        let puts_after_second = store.sequence_progress(0);
+        assert_eq!(
+            puts_after_second, puts_after_first,
+            "an identical second cycle must perform zero additional sys/auth PUTs: acme is \
+             already converged (Unchanged, no write) and globex is refused again, identically, \
+             never taking the hash over -- the exact property last-writer-wins takeover violated"
+        );
+    }
+
+    /// A cross-tenant collision must not brick the rest of the reconcile
+    /// pass (ADR-0072 decision 4, second amendment, #897): a third,
+    /// unrelated tenant in the same Secret still gets its token upserted
+    /// even though "acme" and "globex" collide with each other.
+    /// `reconcile_sys_auth_best_effort_swallows_a_persistent_cas_conflict`
+    /// above already pins that a `sys/auth` failure never blocks
+    /// `reconcile_inner`'s Deployment/Service reconciliation downstream of
+    /// this function; this test pins the sibling property one layer in --
+    /// one tenant's refusal does not block ITS OWN sibling tenants within
+    /// the same `sys/auth` reconcile call.
+    #[tokio::test]
+    async fn reconcile_sys_auth_cross_tenant_collision_does_not_block_other_tenants() {
+        let store = memory_store();
+        let deployment_key = [22u8; 32];
+
+        let mut tokens = BTreeMap::new();
+        tokens.insert("acme".to_string(), b"shared-tok".to_vec());
+        tokens.insert("globex".to_string(), b"shared-tok".to_vec());
+        tokens.insert("tenant-healthy".to_string(), b"healthy-tok".to_vec());
+
+        reconcile_sys_auth(&deployment_key, &tokens, &store, 1_000)
+            .await
+            .expect("the colliding pair must not abort the rest of the reconcile");
+
+        let (map, _version) = ravel_catalog::read_auth_map(&store, &deployment_key)
+            .await
+            .expect("read succeeds")
+            .expect("map exists");
+        assert!(
+            map.entries.iter().any(|e| e.tenant_id == "tenant-healthy"),
+            "an unrelated tenant in the same Secret must still be upserted: {map:?}"
+        );
+        assert_eq!(
+            map.entries.len(),
+            2,
+            "the winner of the colliding pair, plus the healthy tenant; the loser was refused"
         );
     }
 
