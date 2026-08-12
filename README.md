@@ -111,10 +111,12 @@ piece, see [docs/adrs/](docs/adrs/).
   the same duplicate-sample resolution as PromQL so the two agree on
   results. **Flight SQL** exposes the same query path over Arrow Flight's
   gRPC surface.
-- **Distributed query** ([ADR-0071](docs/adrs/0071-distributed-read-fanout.md)),
-  off by default, two capabilities that change *where* bytes are fetched,
-  never *what* a query computes (results stay byte-identical to local
-  execution, enforced by a differential test):
+- **Distributed read fan-out and cross-cluster federation**
+  ([ADR-0071](docs/adrs/0071-distributed-read-fanout.md),
+  [guide](docs/guides/distributed-query.md)), both off by default: two
+  capabilities that change *where* bytes are fetched, never *what* a query
+  computes (results stay byte-identical to local execution, enforced by a
+  differential test):
   - **Multi-process fan-out** within one cluster, enabled per query node
     with `--distributed-query` plus a fragment-credential file. The node
     that receives a request coordinates it: it resolves one pinned snapshot,
@@ -133,7 +135,9 @@ piece, see [docs/adrs/](docs/adrs/).
     credential (a client's own credential is never forwarded). A remote
     failure fails the query by default; per-remote `skip_unavailable`
     instead returns partial results, marked with `partial: true` and one
-    `warnings` entry naming each skipped cluster.
+    `warnings` entry naming each skipped cluster. The discovery endpoints
+    (`/api/v1/series`, `/api/v1/labels`, `/api/v1/label/<name>/values`)
+    federate on the same terms.
 - **Analytics**: `POST /api/v1/analytics` runs a range query, then applies
   change point detection (PELT) or exact summary statistics (median, MAD,
   percentiles, standard deviation, variance) to each series.
@@ -456,7 +460,8 @@ Pull the published image, or build natively on an amd64 host, instead.
 - [docs/span-segment-format.md](docs/span-segment-format.md): the RSPAN
   v1 specification (ADR-0041)
 - [docs/guides/](docs/guides/): getting started, ingest, admission limits,
-  query, operations, observability, tracing, inspecting data, Kubernetes
+  query, distributed query, operations, observability, tracing, inspecting
+  data, Kubernetes
 - [docs/adrs/](docs/adrs/): one decision record per architectural choice
 - [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
   conformance table, classifying every construct as supported,
