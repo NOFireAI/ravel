@@ -1677,3 +1677,413 @@ mod memo_snapshot_tests {
         }
     }
 }
+
+/// EJ-T4b (issue #754): proves `erasure_rewrite_bucket` actually invalidates
+/// a memoized terminal state, for all three wired signals (metrics, logs,
+/// spans) -- including metrics, which EJ-T4a left un-invalidated. Lives here
+/// rather than in `erasure_rewrite.rs`'s own test module because
+/// `MaintainMemo::mark_terminal` is private to this module and only visible
+/// to its descendants (the same access pattern `memo_snapshot_tests` above
+/// already relies on).
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod invalidate_tests {
+    use bytes::Bytes;
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
+    use ravel_logseg::{LogRecord, RlogConfig, RlogWriter};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+    use ravel_rspan::writer::ObjectIdentity as SpanObjectIdentity;
+    use ravel_rspan::{RspanConfig, RspanWriter, SpanRecord, StatusCode};
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V6};
+    use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::build::OUTPUT_FORMAT_VERSION;
+    use crate::clock::FixedClock;
+    use crate::erasure_rewrite::{ErasureRewriteOutcome, PendingErasureRequest, erasure_rewrite_bucket};
+    use crate::publish::PublishOutcome;
+    use crate::sweep::NoLeases;
+
+    const TENANT: &str = "acme";
+    const SHARD: u32 = 3;
+    const HOUR: u32 = 500_000;
+    const EPOCH: u64 = 1;
+
+    fn tenant_hash() -> TenantHash {
+        TenantId::new(TENANT).hash()
+    }
+
+    fn sealed_now_ns() -> i64 {
+        (i64::from(HOUR) + 1) * NS_PER_HOUR + 2 * NS_PER_HOUR
+    }
+
+    fn erasure_request(signal: Signal, key: &str, value: &str) -> ErasureRequest {
+        ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            request_id: Uuid::from_u128(1).to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: key.to_string(),
+                value: value.to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        }
+    }
+
+    async fn seed_metrics(store: &dyn ObjectStoreBackend) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(1);
+        let created = i64::from(HOUR) * NS_PER_HOUR;
+        let identity = SegmentIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.to_string(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "checkout_latency".to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(&TenantId::new(TENANT), "checkout_latency", &labels)
+            .expect("series id");
+        let series = SeriesInputV3 {
+            series_id,
+            labels,
+            values: SeriesValues::Scalar(vec![Sample {
+                ts_ns: created + 1,
+                value: 1.0,
+            }]),
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+        };
+        let written = SegmentWriter::write_histograms_with_exemplars(
+            vec![series],
+            identity,
+            bounds,
+            Vec::new(),
+        )
+        .expect("write L0");
+        let content_hash = written.summary.blake3;
+        let data_key = keys::data_key(&th, Signal::Metrics, SHARD, writer_id, EPOCH, 1, &content_hash)
+            .expect("data key");
+        store
+            .put(&data_key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Metrics,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: u32::from(VERSION_V6),
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    async fn seed_logs(store: &dyn ObjectStoreBackend) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(1);
+        let created = i64::from(HOUR) * NS_PER_HOUR;
+        let identity = LogObjectIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let res = vec![(
+            "service.name".to_string(),
+            ravel_logseg::AttrValue::Str("checkout".to_string()),
+        )];
+        let stream_id = ravel_types::logstream::log_stream_id(&res, "scope", "1", &[]);
+        let stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]);
+        let record = LogRecord {
+            stream_id,
+            stream_attrs,
+            ts_ns: created + 1,
+            observed_ts_ns: created + 1,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "checkout failed".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![(
+                "service".to_string(),
+                ravel_logseg::AttrValue::Str("checkout".to_string()),
+            )],
+        };
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        w.push(record).expect("push log record");
+        let bytes = Bytes::from(w.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(&th, Signal::Logs, SHARD, writer_id, EPOCH, 1, &content_hash)
+            .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Logs,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created + 1,
+            max_event_ts_ns: created + 1,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    async fn seed_spans(store: &dyn ObjectStoreBackend) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(1);
+        let created = i64::from(HOUR) * NS_PER_HOUR;
+        let identity = SpanObjectIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let record = SpanRecord {
+            trace_id: [1; 16],
+            span_id: [1; 8],
+            parent_span_id: None,
+            name: "op".into(),
+            start_ts_ns: created + 1,
+            end_ts_ns: created + 2,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![("service".to_string(), "checkout".to_string())],
+        };
+        let mut w = RspanWriter::new(RspanConfig::default(), identity);
+        w.push(record);
+        let bytes = Bytes::from(w.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(&th, Signal::Spans, SHARD, writer_id, EPOCH, 1, &content_hash)
+            .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Spans,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created + 1,
+            max_event_ts_ns: created + 2,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    /// A successful METRICS rewrite forgets the bucket's memoized terminal
+    /// state, so the next scan tick re-evaluates it instead of trusting a
+    /// stale "already compacted" verdict -- the EJ-T4a gap this task closes.
+    /// Flip-line proof: in `invalidate_after_publish`
+    /// (`erasure_rewrite.rs`), changing the call's `bucket.signal` argument
+    /// to a hardcoded `Signal::Logs` (or deleting the call from the
+    /// `Signal::Metrics` dispatch arm) leaves this bucket's memo entry
+    /// intact, failing the `assert_eq!(memo.terminal_state(...), None)`
+    /// below.
+    #[tokio::test]
+    async fn metrics_rewrite_invalidates_memoized_terminal_state() {
+        let store = MemoryStore::new();
+        seed_metrics(&store).await;
+        let t = tenant_hash();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Metrics, SHARD, HOUR), TerminalState::Compacted, 0);
+        assert_eq!(
+            memo.terminal_state(t, Signal::Metrics, SHARD, HOUR),
+            Some(TerminalState::Compacted)
+        );
+
+        let request = erasure_request(Signal::Metrics, "__name__", "checkout_latency");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let bucket = Bucket::new(t, Signal::Metrics, SHARD, HOUR);
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket,
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(matches!(
+            outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            memo.terminal_state(t, Signal::Metrics, SHARD, HOUR),
+            None,
+            "a published metrics rewrite must invalidate the memoized terminal state"
+        );
+    }
+
+    /// The LOGS sibling of the metrics invalidate test above: a published
+    /// LOGS rewrite forgets its bucket's memoized terminal state too, proving
+    /// the wiring is not scoped to the metrics dispatch arm alone. Flip-line
+    /// proof: same as above -- restricting `invalidate_after_publish`'s call
+    /// to fire only for `Signal::Metrics` leaves this bucket's entry intact.
+    #[tokio::test]
+    async fn logs_rewrite_invalidates_memoized_terminal_state() {
+        let store = MemoryStore::new();
+        seed_logs(&store).await;
+        let t = tenant_hash();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Logs, SHARD, HOUR), TerminalState::Compacted, 0);
+
+        let request = erasure_request(Signal::Logs, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let bucket = Bucket::new(t, Signal::Logs, SHARD, HOUR);
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket,
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(matches!(
+            outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            memo.terminal_state(t, Signal::Logs, SHARD, HOUR),
+            None,
+            "a published logs rewrite must invalidate the memoized terminal state"
+        );
+    }
+
+    /// The SPANS sibling of the two invalidate tests above: a published
+    /// SPANS rewrite forgets its bucket's memoized terminal state too.
+    /// Flip-line proof: same as above -- restricting
+    /// `invalidate_after_publish`'s call to fire only for
+    /// `Signal::Metrics`/`Signal::Logs` leaves this bucket's entry intact.
+    #[tokio::test]
+    async fn spans_rewrite_invalidates_memoized_terminal_state() {
+        let store = MemoryStore::new();
+        seed_spans(&store).await;
+        let t = tenant_hash();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Spans, SHARD, HOUR), TerminalState::Compacted, 0);
+
+        let request = erasure_request(Signal::Spans, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let bucket = Bucket::new(t, Signal::Spans, SHARD, HOUR);
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket,
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(matches!(
+            outcome,
+            ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            memo.terminal_state(t, Signal::Spans, SHARD, HOUR),
+            None,
+            "a published spans rewrite must invalidate the memoized terminal state"
+        );
+    }
+}
