@@ -397,11 +397,14 @@ waiting on fragments that need the same pool.
 A coordinator can fan a read out to remote clusters and merge their series
 into the same k-way merge that unions its own selectors (the pool described
 under Flow). Federation is opt-in per deployment: each remote is one
-`--remote-cluster <name>=<endpoint>` flag on `ravel-server`, with an
-optional `--remote-cluster-soft-timeout <name>=<duration>` that bounds how
-long the coordinator waits on that one remote before treating it as
-partially unavailable. A deployment with no `--remote-cluster` flag runs
-exactly the single-cluster path.
+repeatable `--remote-cluster` flag on `ravel-server`, whose value is a
+comma-separated spec (`name`, `endpoint`, and `credential-file` required;
+`tls`, `tls-ca-file`, `skip-unavailable`, and `soft-timeout` optional).
+`--remote-cluster-soft-timeout <duration>` sets the default bound on how
+long the coordinator waits on a remote before treating it as partially
+unavailable, and a remote's own `soft-timeout` key overrides it. A
+deployment with no `--remote-cluster` flag runs exactly the single-cluster
+path. The operator guide is docs/guides/distributed-query.md.
 
 Both the value-bearing endpoints (`/api/v1/query`, `/api/v1/query_range`)
 and the discovery endpoints (`/api/v1/series`, `/api/v1/labels`,

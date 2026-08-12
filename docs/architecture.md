@@ -181,6 +181,11 @@ Sigma/OCSF: later phases. See the spec docs as they land.
   `/healthz`, `/readyz`, `/metrics` routes.
 - `--listen-grpc`: OTLP gRPC and, under the `flight-sql` feature, Flight SQL.
   Bound only in the modes and feature combinations that serve one of those.
+  Under `--distributed-query` it also carries the cluster-internal
+  `SeriesFetch` fragment service (ADR-0071, below). That service is bound
+  here and nowhere else: never on `--listen-http`, never on the mTLS
+  listener. It is also where a worker advertises itself, so a query node with
+  no gRPC listener never joins the worker set and runs every slice itself.
 - `--mtls-listener` (ADR-0050 section 1, issue #477): a third listener,
   required by and only meaningful together with `--mtls-enabled`. It serves
   the same ingest and query surface as `--listen-http`, but its router chain
@@ -219,6 +224,58 @@ Arrow and DataFusion outside `ravel-otap`.
 
 ## Distributed reads and cross-cluster federation (ADR-0071)
 
+<svg viewBox="0 0 900 540" width="900" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cluster topology: symmetric query nodes over one shared bucket, with remote clusters reached only through their API">
+  <style>
+    .b{fill:#ffffff;stroke:#333;stroke-width:1.2;}
+    .g{fill:#f2f2f2;stroke:#333;stroke-width:1.2;}
+    .s{fill:#fff7e0;stroke:#8a6d00;stroke-width:1.2;}
+    .r{fill:#eef4ff;stroke:#1f4e9c;stroke-width:1.2;}
+    .t{font:12px monospace;fill:#111;}
+    .h{font:bold 12px monospace;fill:#111;}
+    .a{stroke:#333;stroke-width:1.2;fill:none;marker-end:url(#arT);}
+    .d{stroke:#1f4e9c;stroke-width:1.2;fill:none;marker-end:url(#arTd);stroke-dasharray:5 3;}
+  </style>
+  <defs>
+    <marker id="arT" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker>
+    <marker id="arTd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1f4e9c"/></marker>
+  </defs>
+  <rect class="b" x="280" y="8" width="280" height="30"/>
+  <text class="h" x="292" y="28">Clients (PromQL / SQL / Flight SQL)</text>
+  <path class="a" d="M380,38 L220,82"/>
+  <path class="a" d="M460,38 L620,82"/>
+  <rect class="b" x="60" y="84" width="320" height="100"/>
+  <text class="h" x="72" y="102">query node A -- coordinator</text>
+  <text class="t" x="72" y="118">mode all|query, --distributed-query</text>
+  <text class="t" x="72" y="134">resolves ONE pinned snapshot</text>
+  <text class="t" x="72" y="150">partitions, dispatches, merges</text>
+  <text class="t" x="72" y="166">serves SeriesFetch + Flight SQL</text>
+  <rect class="b" x="460" y="84" width="380" height="100"/>
+  <text class="h" x="472" y="102">query node B -- peer worker</text>
+  <text class="t" x="472" y="118">same binary, same flags: any node is a</text>
+  <text class="t" x="472" y="134">coordinator for the requests it receives</text>
+  <text class="t" x="472" y="150">and a worker for its peers' slices</text>
+  <text class="t" x="472" y="166">fragment surface on --listen-grpc only</text>
+  <path class="a" d="M380,118 L456,118"/>
+  <path class="a" d="M460,150 L384,150"/>
+  <text class="t" x="20" y="206">A and B exchange slices in either direction over the cluster-internal gRPC listener, bearer-token authed.</text>
+  <path class="a" d="M200,184 L200,226"/>
+  <path class="a" d="M640,184 L640,226"/>
+  <rect class="g" x="60" y="228" width="780" height="76"/>
+  <text class="h" x="76" y="246">S3 bucket = one cluster (the only durable state)</text>
+  <text class="t" x="76" y="262">immutable segments, commit records, manifests, snapshot HEAD/parts</text>
+  <text class="t" x="76" y="278">sys/gc, sys/tenancy, sys/query/workers/&lt;process_id&gt; heartbeats</text>
+  <text class="t" x="20" y="326">Membership: every distributed query node PUTs its own sys/query/workers/&lt;process_id&gt; record every</text>
+  <text class="t" x="20" y="342">60 s; readers take the live set as records within 3 x H and rendezvous-hash (tenant_hash, signal, shard).</text>
+  <path class="d" d="M450,356 L450,390"/>
+  <text class="t" x="470" y="378">reached only through their own API</text>
+  <rect class="r" x="60" y="392" width="780" height="96"/>
+  <text class="h" x="76" y="410">Remote Ravel clusters (--remote-cluster): separate buckets, separate trust domains</text>
+  <text class="t" x="76" y="426">Reached only through the remote's own API endpoint: the coordinator sends matchers and a window,</text>
+  <text class="t" x="76" y="442">the remote resolves its own snapshot under its own operator credential and its own erasure.</text>
+  <text class="t" x="76" y="458">No segment references, no S3 credentials, and no client credential ever cross this boundary.</text>
+  <text class="t" x="20" y="514">Compute stays disposable: a node can be added or removed at any time, and membership reconverges.</text>
+</svg>
+
 A read can span more than one process. This is off by default and cost-gated:
 the query node that receives a request coordinates it, resolves one pinned
 snapshot, and only fans out when a pre-execution estimate clears the gate
@@ -226,7 +283,29 @@ snapshot, and only fans out when a pre-execution estimate clears the gate
 untouched local path. Intra-cluster worker membership needs no new durable
 state — workers self-register with a heartbeat key and are selected by
 rendezvous hashing — and the full slice-partition, budget-re-enforcement, and
-fault matrix live in docs/query-engine.md. Two topologies share the one gRPC
+fault matrix live in docs/query-engine.md. For the operator view (flags, the
+token file, the registry, what a client sees on partial coverage) see
+docs/guides/distributed-query.md.
+
+The distributed role is not a new process type or a new mode. A query-serving
+process (`--mode all` or `--mode query`) started with `--distributed-query`
+takes on two jobs at once, and every such process in a cluster is identical:
+
+- **Coordinator**, for the requests it receives. It resolves the snapshot,
+  applies the cost gate, partitions, dispatches, re-enforces the query's
+  budgets over the folded per-slice accounting, k-way merges, evaluates, and
+  renders `stats.fragments[]`.
+- **Worker**, for its peers. The `FragmentService` on its cluster-internal
+  gRPC listener serves inbound slices, guarding each with a constant-time
+  check of the shared `--fragment-auth-token-file` bearer token and admitting
+  it against `FragmentAdmission`, a workload class distinct from client-query
+  admission (`--max-inflight-fragments`, default 32). That separation is what
+  makes it impossible for a coordinator holding a client-query permit to
+  deadlock waiting on fragments that would need the same pool. A slice a
+  coordinator owns by rendezvous runs through this same service in-process,
+  with no network hop, so local and remote slices cannot diverge in behavior.
+
+Two topologies share the one gRPC
 `SeriesFetch` service and one `SliceFetcher` seam the merge layer holds, so
 the coordinator's k-way merge cannot tell a remote slice from a local one:
 
@@ -234,8 +313,13 @@ the coordinator's k-way merge cannot tell a remote slice from a local one:
   in its own cluster a short-lived fragment token and the already-resolved
   `tenant_hash`, which the worker trusts and uses directly.
 - **Cross-cluster federation** (`Scope::Resolve`): each remote is a separate
-  trust domain configured with `--remote-cluster <name>=<endpoint>` (and an
-  optional `--remote-cluster-soft-timeout`). The coordinator presents an
+  trust domain configured with one repeatable `--remote-cluster` spec
+  (`name`, `endpoint`, and `credential-file` required; `tls`, `tls-ca-file`,
+  `skip-unavailable`, and a per-remote `soft-timeout` optional), with
+  `--remote-cluster-soft-timeout` setting the default bound. Every spec is
+  validated at startup, so a malformed field, a duplicate name, or an
+  unreadable credential file fails the process rather than the first
+  federated query. The coordinator presents an
   ordinary per-remote tenant credential; the remote resolves the tenant from
   its own `TenantResolver` and ignores the wire `tenant_hash`, so a federated
   request can reach exactly the tenants that credential authorizes there and

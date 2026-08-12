@@ -18,6 +18,14 @@ Start here to run Ravel, ingest into it, or query it.
 - [guides/query.md](guides/query.md): the five `/api/v1` endpoints, the
   supported PromQL subset, query budgets, and HTTP status codes. Read this
   to read data back out.
+- [guides/distributed-query.md](guides/distributed-query.md): distributed read
+  fan-out and cross-cluster federation (ADR-0071) for operators -- the cost gate
+  and its two thresholds, `--distributed-query` and the fragment token file, the
+  `sys/query/workers` heartbeat registry, `--remote-cluster` federation setup
+  with `skip_unavailable` and the partial-coverage warnings a client sees,
+  the `stats.fragments[]` block, the `ravel_distrib_*` metrics, and every
+  failure behavior an operator will observe. Read this to scale a read across
+  processes or clusters.
 - [guides/correlation.md](guides/correlation.md): how an exemplar links a
   metric sample to a trace. It covers the storage, the admission cap, the query
   over `/api/v1/query_exemplars`, and the Grafana metric-to-trace link. Read
@@ -64,7 +72,15 @@ code, not only to use it.
   shard actors, flush) and sizing defaults.
 - [query-engine.md](query-engine.md): the query engine's internal structure
   (snapshot resolution, segment fetch, pruning, evaluation) and budgets. It
-  includes the generated PromQL conformance table (ADR-0035).
+  includes the generated PromQL conformance table (ADR-0035). Its
+  distributed-read sections are the internal specification behind
+  [guides/distributed-query.md](guides/distributed-query.md).
+- [reviews/2026-08-adversarial-program/RAVEL-DISTRIBUTED-SEARCH-STATUS.md](reviews/2026-08-adversarial-program/RAVEL-DISTRIBUTED-SEARCH-STATUS.md):
+  the as-built status of the distributed read epic (ADR-0071) against the
+  pre-implementation review next to it -- what shipped file by file, the two
+  places the shipped code deviates from the design and why, the erasure
+  correctness gap the epic found and closed, the fault matrix with its
+  enforcement points, and the deferrals now tracked as their own epics.
 - [sql-conformance.md](sql-conformance.md): the generated SQL conformance
   table (ADR-0035). It classifies every construct in Ravel's claimed SQL
   surface as supported, intentionally rejected, or unclassified.
