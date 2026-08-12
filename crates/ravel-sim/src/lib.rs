@@ -23,7 +23,9 @@ pub mod seed;
 pub mod workload;
 
 pub use digest::{Digest, DigestBuilder};
-pub use driver::{CycleConfig, CycleError, CycleOutcome, run_cycle};
+pub use driver::{
+    CountingGateHandle, CycleConfig, CycleError, CycleOutcome, GateRelease, run_cycle,
+};
 pub use fault_plan::{FaultSchedule, FaultScheduleConfig, GateScript};
 pub use seed::MasterSeed;
 pub use workload::{CardinalityShape, WorkloadConfig};
