@@ -12,25 +12,28 @@ use std::time::Duration;
 use ravel_types::{TenantHash, TenantId};
 use uuid::Uuid;
 
-/// A test-injectable accounting hook for the RLOG compaction merge's peak
-/// resident memory (issue #745, ADR-0065 decision 4).
+/// A test-injectable accounting hook for the RLOG and RSPAN compaction
+/// merges' peak resident memory (RLOG: issue #745, ADR-0065 decision 4; RSPAN:
+/// issue #908).
 ///
-/// The RLOG k-way merge ([`crate::rlog`]) drives this at its real
-/// allocation/decode points so a test can assert the merge's residency is
-/// bounded independently of a stream's size. It is deliberately *load-bearing*,
-/// not decorative: the merge calls [`Self::block_fetched`] when it fetches one
+/// The RLOG k-way merge ([`crate::rlog`]) and the RSPAN k-way merge
+/// ([`crate::rspan_codec`]) drive this at their real allocation/decode points
+/// so a test can assert each merge's residency is bounded independently of a
+/// stream's or trace's size. It is deliberately *load-bearing*, not
+/// decorative: the merge calls [`Self::block_fetched`] when it fetches one
 /// input block's raw bytes, [`Self::block_decoded`]/[`Self::block_released`] as
 /// each decoded block enters and leaves a cursor, and [`Self::set_writer_bytes`]
-/// as records accumulate in the in-progress part's writer. If the merge ever
-/// regressed to decoding a whole stream at once, the `decoded` term would grow
-/// with the stream and the recorded high-water would break the test's bound.
+/// as records accumulate in the in-progress part's writer. If a merge ever
+/// regressed to decoding a whole stream/object at once, the `decoded` term
+/// would grow with its size and the recorded high-water would break the
+/// test's bound.
 ///
 /// Two high-water marks are kept:
 ///
 /// - [`Self::peak_transient_bytes`]: `fetched + decoded`, the merge's *own*
-///   decode-side buffers. This is the quantity issue #745 bounds: at most one
-///   raw block plus one decoded block per input carrying the current stream, so
-///   it is `O(input_count * block_size)` and does NOT scale with stream size.
+///   decode-side buffers. This is the quantity issue #745/#908 bound: at most
+///   one raw block plus one decoded block per input, so it is
+///   `O(input_count * block_size)` and does NOT scale with stream/trace size.
 /// - [`Self::peak_total_bytes`]: `fetched + decoded + writer`, adding the
 ///   in-progress part's writer buffer. The writer term is bounded by
 ///   `max_l1_part_bytes` (a part is flushed once its record-byte estimate
@@ -363,13 +366,14 @@ pub struct CompactorConfig {
     /// config via `..CompactorConfig::default()`, stay byte-for-byte unchanged
     /// with `dry_run == false`. Default `false`.
     pub dry_run: bool,
-    /// Optional test-injectable accounting hook for the RLOG compaction merge's
-    /// peak resident memory (issue #745). `None` in production (the merge's
-    /// accounting hooks are skipped); a test installs one and reads its
-    /// high-water marks after `compact_bucket` to assert the k-way merge stayed
-    /// bounded independently of stream size. Carried in the config, like every
-    /// other merge knob, so `..CompactorConfig::default()` call sites are
-    /// unaffected. Default `None`.
+    /// Optional test-injectable accounting hook for the RLOG (issue #745) and
+    /// RSPAN (issue #908) compaction merges' peak resident memory. `None` in
+    /// production (the merges' accounting hooks are skipped); a test installs
+    /// one and reads its high-water marks after `compact_bucket` to assert the
+    /// k-way merge stayed bounded independently of stream/trace size. Carried
+    /// in the config, like every other merge knob, so
+    /// `..CompactorConfig::default()` call sites are unaffected. Default
+    /// `None`.
     pub merge_memory_tracker: Option<MergeMemoryTracker>,
     /// Slow safety-net re-verify cadence for the interior zone (ADR-0065
     /// decision 3, config `maintain_interior_reverify`). A terminal interior

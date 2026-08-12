@@ -358,6 +358,31 @@ pub fn read_section(
     let stored = bytes
         .get(start..end)
         .ok_or_else(|| SpanSegError::Corrupted("section out of bounds".into()))?;
+    decode_section(stored, desc, max_uncomp)
+}
+
+/// The crc-and-decompress half of [`read_section`], taking a section's
+/// stored bytes directly (offset 0) rather than slicing them out of a
+/// whole object.
+///
+/// This is what a ranged reader ([`crate::ranged::RspanRangeReader`]) uses:
+/// it fetches exactly `[desc.offset, desc.offset + desc.len)` with a ranged
+/// GET, so the fetched buffer *is* the stored section, and passes it here.
+/// `stored` MUST be exactly `desc.len` bytes. The crc is verified against
+/// `desc.crc32c` before any decompression, `uncomp_len` is rejected above
+/// `max_uncomp` before allocating, and the decompressed length must equal
+/// `desc.uncomp_len` exactly (the same discipline [`read_section`] applies
+/// to a whole-object slice).
+pub fn decode_section(
+    stored: &[u8],
+    desc: &SectionDesc,
+    max_uncomp: u64,
+) -> Result<Vec<u8>, SpanSegError> {
+    if stored.len() as u64 != desc.len {
+        return Err(SpanSegError::Corrupted(
+            "section stored length != desc.len".into(),
+        ));
+    }
     if crc32c::crc32c(stored) != desc.crc32c {
         return Err(SpanSegError::Corrupted("section crc mismatch".into()));
     }

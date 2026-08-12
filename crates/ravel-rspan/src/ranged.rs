@@ -24,6 +24,22 @@
 //! [`crate::block::read_block`] and `DecodedBlock::record`, the same path the
 //! whole-object reader uses, so a record decoded through a selective fetch is
 //! byte-for-byte the record a whole-object scan would produce.
+//!
+//! # Sequential block access (issue #908)
+//!
+//! [`TraceBlockSpan`]/[`decode_trace`](RspanRangeReader::decode_trace) serve a
+//! *point lookup*: one named trace's contiguous block run. Compaction's k-way
+//! merge cannot drive off that API, because RSPAN's SKIP_IDX has no
+//! directory of the distinct `trace_id`s an object holds (a block entry
+//! records only its own boundary `min_trace_id`/`max_trace_id`, not every
+//! trace that starts inside it) -- so "the next trace_id in this object"
+//! cannot be discovered without decoding block contents first. Instead the
+//! merge walks every input's block sequence unconditionally, in order, via
+//! [`RspanRangeReader::block_count`], [`RspanRangeReader::block_loc`], and
+//! [`RspanRangeReader::decode_block`] (unfiltered: every row of the block,
+//! not one trace's rows), and lets its own comparator pick out trace
+//! boundaries from the decoded stream. See `ravel-maintain`'s
+//! `rspan_codec.rs` module doc for the merge itself.
 
 use crate::block::{DEFAULT_MAX_UNCOMP, read_block};
 use crate::error::SpanSegError;
@@ -65,6 +81,35 @@ impl TraceBlockSpan {
     /// Number of candidate blocks in the span.
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+}
+
+/// The absolute byte range of one block in the BLOCKS section, addressed by
+/// its skip-index position. Unlike [`TraceBlockSpan`] (one trace's whole
+/// contiguous run), this is exactly one block: compaction's k-way merge
+/// (issue #908) fetches and decodes one at a time, bounding peak resident
+/// bytes to one block per input rather than one trace's whole span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockLoc {
+    index: usize,
+    start: u64,
+    end: u64,
+}
+
+impl BlockLoc {
+    /// Absolute start offset of the range to fetch.
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// Absolute end offset (exclusive) of the range to fetch.
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// Number of bytes to fetch (`end - start`).
+    pub fn byte_len(&self) -> u64 {
+        self.end - self.start
     }
 }
 
@@ -195,6 +240,54 @@ impl RspanRangeReader {
                     out.push(rec);
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// Number of blocks in the BLOCKS section, per the decoded SKIP_IDX.
+    pub fn block_count(&self) -> usize {
+        self.skip.blocks.len()
+    }
+
+    /// The absolute byte range of block `index`, for a caller streaming
+    /// every block of the object in order (issue #908's k-way compaction
+    /// merge) rather than fetching one trace's whole span. `index` must be
+    /// `< self.block_count()`.
+    pub fn block_loc(&self, index: usize) -> Result<BlockLoc, SpanSegError> {
+        let entry = self
+            .skip
+            .blocks
+            .get(index)
+            .ok_or_else(|| SpanSegError::Corrupted("skip block index out of range".into()))?;
+        let (start, end) = self.block_abs_range(entry)?;
+        Ok(BlockLoc { index, start, end })
+    }
+
+    /// Decode every record of block `loc`, in stored order, with no trace
+    /// filter (unlike [`Self::decode_trace`]): the k-way merge needs every
+    /// row of every block, since it discovers trace boundaries by decoding
+    /// records as it goes rather than from a per-object trace directory
+    /// (RSPAN has none -- see the module doc). `block_bytes` MUST be exactly
+    /// `[loc.start(), loc.end())`.
+    pub fn decode_block(
+        &self,
+        loc: &BlockLoc,
+        block_bytes: &[u8],
+    ) -> Result<Vec<SpanRecord>, SpanSegError> {
+        if block_bytes.len() as u64 != loc.byte_len() {
+            return Err(SpanSegError::Corrupted(
+                "block bytes length != block range".into(),
+            ));
+        }
+        let entry = self
+            .skip
+            .blocks
+            .get(loc.index)
+            .ok_or_else(|| SpanSegError::Corrupted("skip block index out of range".into()))?;
+        let decoded = read_block(block_bytes, entry.block_crc32c, DEFAULT_MAX_UNCOMP)?;
+        let mut out = Vec::with_capacity(decoded.record_count());
+        for row in 0..decoded.record_count() {
+            out.push(decoded.record(row)?);
         }
         Ok(out)
     }
