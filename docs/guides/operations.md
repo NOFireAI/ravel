@@ -842,6 +842,47 @@ credential roles" above) — a role that never routes writes through this key
 gains nothing from being able to decrypt it, and every principal added here
 widens the compromise blast radius this key policy exists to narrow.
 
+**Role-side grant (required too, issue #929).** The key policy above only
+grants usage to the *principal*; AWS also requires the calling principal's
+own IAM policy to allow the `kms:*` action, or the request is denied before
+it reaches the key policy at all. Each `deploy/iam/*.json` role template
+carries a matching `<Role>TenantKms` statement, scoped to the tenant key
+ARNs rather than `"*"` (replace the placeholder
+`arn:aws:kms:us-east-1:111122223333:key/*` with your account/region and
+either your tenant keys' exact ARNs or an alias pattern your deployment
+reserves for them):
+
+- **Gateway, Maintain** (write tenant data objects under `t/<hash>/...`
+  through `KmsRoutingStore`, and also read some of what they write — fold,
+  compaction inputs): `kms:Encrypt`, `kms:GenerateDataKey*`, `kms:Decrypt`.
+- **Query** (read-only against tenant data): `kms:Decrypt`.
+- **Admin** (`GetObject`-only per ADR-0055): `kms:Decrypt`, deliberately
+  without `kms:GenerateDataKey*` — granting it would let a leaked Admin
+  credential mint ciphertext under tenant keys it has no write role for.
+
+Without both halves — the key policy's principal grant *and* this role-side
+statement — the first SSE-KMS `PutObject` a role makes against a
+`--tenant-kms-config` tenant fails closed with `AccessDenied`, because
+`KmsRoutingStore` routes that write through the per-tenant key
+unconditionally once the tenant is configured (`crates/ravel-object-store/
+src/kms_routing.rs`); there is no fallback to unencrypted or default-key
+writes once `--tenant-kms-config` names a tenant.
+`crates/ravel-commit/tests/iam_templates.rs` checks the KMS action sets
+shipped in `deploy/iam/*.json` (which roles carry `kms:GenerateDataKey*`,
+which are Decrypt-only) so a future template edit that drops one of these
+grants fails CI instead of a production `--tenant-kms-config` rollout.
+
+Query and Admin also hold narrow `PutObject` grants under `t/<hash>/...`
+(Query: catalog snapshots/HEAD/idx, the query-audit shard; Admin: `c/*` via
+`ravel-cli commit reconstruct`, and the audit prefix). Those writes route
+through the same per-tenant key once one is configured, the same as any
+other `t/<hash>/...` PUT, but this change does not add `kms:GenerateDataKey*`
+to either role's grant — Query and Admin are scoped to `kms:Decrypt` per the
+mapping above. A `--tenant-kms-config` deployment relying on those specific
+write paths for a KMS-routed tenant should treat this as an open gap, not a
+covered one, and grant `kms:GenerateDataKey*` to that role manually pending
+a follow-up.
+
 **Known gap, not fixed by this change:** the `t/<hash>/enc` key-epoch
 record needs its own IAM read/write grant, which the shipped
 `deploy/iam/*.json` policies do not yet carry — see ADR-0055's 2026-08-12
