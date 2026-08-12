@@ -32,6 +32,14 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The distrib crossover bench (issue #869) spins in-process `tonic` loopback
+# `SeriesFetch` workers to drive the real ADR-0071 distributed fan-out, exactly
+# as ravel-query's own acceptance test does. `tonic` (default features: the
+# server transport plus the client `channel`) is already a workspace pin used by
+# ravel-query/ravel-server; here it is a plain dependency of the standard build,
+# not gated, since the crossover bin and its smoke test are part of the default
+# gate. No new external crate enters the workspace.
+tonic = { workspace = true }
 stats_alloc = "0.1.10"
 # Gated behind `parquet-baseline` (off by default). arrow reuses the
 # workspace pin (identical to ravel-otap's); parquet is pinned lockstep to
@@ -57,7 +65,6 @@ futures = { workspace = true, optional = true }
 # below reuses a workspace pin.
 ravel-sql = { path = "../ravel-sql", version = "0.1.0", optional = true, features = ["flight-sql"] }
 arrow-flight = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
 
 [features]
 # Parquet baseline harness (issue #97). Off by default: the standard build
@@ -75,10 +82,11 @@ parquet-baseline = [
 # Flight SQL vs JSON result-egress bench (issue #154). Off by default: it links
 # ravel-sql/datafusion/arrow-flight on top of the standard build, so the plain
 # gates never compile it or the `flight_sql_egress` bin.
+# `tonic` is a plain (non-optional) dependency now (the distrib crossover bench
+# needs it), so it is no longer listed here as a `dep:` activation.
 flight-egress = [
     "dep:ravel-sql",
     "dep:arrow-flight",
-    "dep:tonic",
     "dep:futures",
 ]
 
@@ -113,6 +121,11 @@ name = "query_latency_bench"
 path = "src/bin/query_latency_bench.rs"
 bench = false
 
+
+[[bin]]
+name = "distrib_crossover_bench"
+path = "src/bin/distrib_crossover_bench.rs"
+bench = false
 
 [[bin]]
 name = "segment_alloc_profile"
@@ -195,6 +208,11 @@ bench = false
 [[test]]
 name = "query_latency_smoke"
 path = "tests/query_latency_smoke.rs"
+bench = false
+
+[[test]]
+name = "distrib_crossover_smoke"
+path = "tests/distrib_crossover_smoke.rs"
 bench = false
 
 [[bench]]

@@ -3,6 +3,7 @@
 
 pub mod codecs;
 pub mod concurrent;
+pub mod distrib_crossover;
 pub mod e2e;
 pub mod generator;
 pub mod harness;
