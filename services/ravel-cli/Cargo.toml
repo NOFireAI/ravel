@@ -42,6 +42,10 @@ bytes = { workspace = true }
 # LIST) needs the same async-trait the trait itself uses. Already a workspace
 # pin; adds no new external crate.
 async-trait = { workspace = true }
+# A real deployment-key file on disk for the `tenant_token` CLI tests (they
+# exercise `--deployment-key-file`, not an in-memory key). Already a
+# workspace pin; adds no new external crate.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

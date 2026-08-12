@@ -7,6 +7,7 @@
 //! spec (the token Secret's tenant-name keys), stamps namespace and owner
 //! references onto the rendered objects, and server-side-applies them.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,13 +18,16 @@ use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
 use kube_runtime::watcher;
+use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::s3::{S3Config, S3Store};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 
-use crate::crd::{Condition, LocalSecretRef, RavelCluster, RavelClusterStatus};
+use crate::crd::{Condition, LocalSecretRef, RavelCluster, RavelClusterSpec, RavelClusterStatus};
 use crate::reconcile::{
-    RenderCtx, desired_gateway_deployment, desired_gateway_service, desired_maintain_deployment,
+    DEPLOYMENT_KEY_SECRET_KEY, RenderCtx, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
+    desired_gateway_deployment, desired_gateway_service, desired_maintain_deployment,
     desired_query_deployment, desired_query_service,
 };
 
@@ -73,6 +77,29 @@ pub enum Error {
     /// Serializing a rendered object for apply failed.
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
+
+    /// A referenced Secret was missing a required key, or the key's value was
+    /// not in the expected shape (a malformed deployment key, or non-UTF-8 S3
+    /// credentials). Surfaced with the Secret name and field so `kubectl
+    /// describe` names exactly what to fix.
+    #[error("secret {name} field {field}: {reason}")]
+    InvalidSecretValue {
+        /// The Secret's name.
+        name: String,
+        /// The field within the Secret that was missing or malformed.
+        field: String,
+        /// Why the value was rejected.
+        reason: String,
+    },
+
+    /// Building the S3 backend for `sys/auth` reconciliation failed.
+    #[error("object store error: {0}")]
+    Store(#[from] ravel_object_store::StoreError),
+
+    /// `sys/auth` reconciliation against the durable bearer-token map failed
+    /// (issue #897 / ADR-0072 decision 4).
+    #[error("sys/auth reconciliation failed: {0}")]
+    Auth(#[from] ravel_catalog::AuthTokenMapError),
 }
 
 /// Shared reconcile context.
@@ -82,7 +109,8 @@ pub struct Context {
 }
 
 /// What the controller resolves from the token Secret: the tenant names (its
-/// keys) and its `resourceVersion` (fed into the secrets checksum).
+/// keys), their live token values, and the Secret's `resourceVersion` (fed
+/// into the secrets checksum).
 struct TokenSecret {
     /// Sorted, deduplicated tenant names (the Secret's keys).
     tenant_names: Vec<String>,
@@ -90,12 +118,33 @@ struct TokenSecret {
     /// configured. Bumps whenever the Secret's content changes, so it is a
     /// cheap change-detection signal for the pod-template checksum.
     resource_version: Option<String>,
+    /// Tenant name to raw token bytes, the Secret's live values. Only read
+    /// into operator memory for `sys/auth` reconciliation (issue #897); the
+    /// Deployment/Service render path never sees these, it only gets
+    /// `tenant_names` (the token values reach pods via `$(VAR)` expansion
+    /// from the Secret directly, see `reconcile::tenant_token_env`).
+    token_values: BTreeMap<String, Vec<u8>>,
 }
 
-/// Read the tenant names (keys) and `resourceVersion` from the token Secret
-/// named by the spec.
+/// Read a single key's raw bytes from a Secret. `data` (already
+/// base64-decoded by the API server into a [`k8s_openapi::ByteString`]) takes
+/// priority; `string_data` is the write-only convenience field some manifests
+/// use instead. `None` when the key is present in neither.
+fn secret_value(secret: &Secret, key: &str) -> Option<Vec<u8>> {
+    if let Some(bytes) = secret.data.as_ref().and_then(|d| d.get(key)) {
+        return Some(bytes.0.clone());
+    }
+    secret
+        .string_data
+        .as_ref()
+        .and_then(|d| d.get(key))
+        .map(|s| s.as_bytes().to_vec())
+}
+
+/// Read the tenant names (keys), live token values, and `resourceVersion` from
+/// the token Secret named by the spec.
 ///
-/// Returns empties when no token Secret is configured. Keys are sorted so the
+/// Returns empties when no token Secret is configured. Names are sorted so the
 /// rendered args and env are deterministic and do not churn the Pod template on
 /// unrelated Secret map reordering. A missing Secret maps to
 /// [`Error::SecretNotFound`] so the reconcile can surface a `Degraded` status.
@@ -108,6 +157,7 @@ async fn resolve_token_secret(
         return Ok(TokenSecret {
             tenant_names: Vec::new(),
             resource_version: None,
+            token_values: BTreeMap::new(),
         });
     };
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
@@ -116,18 +166,22 @@ async fn resolve_token_secret(
         .await
         .map_err(|err| secret_error(err, &secret_ref.name, "tenantTokensSecretRef"))?;
     let resource_version = secret.resource_version();
-    let mut names: Vec<String> = Vec::new();
-    if let Some(data) = secret.data {
-        names.extend(data.into_keys());
+    let mut token_values: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    if let Some(data) = &secret.data {
+        for (name, bytes) in data {
+            token_values.insert(name.clone(), bytes.0.clone());
+        }
     }
-    if let Some(string_data) = secret.string_data {
-        names.extend(string_data.into_keys());
+    if let Some(string_data) = &secret.string_data {
+        for (name, value) in string_data {
+            token_values.insert(name.clone(), value.as_bytes().to_vec());
+        }
     }
-    names.sort();
-    names.dedup();
+    let tenant_names: Vec<String> = token_values.keys().cloned().collect();
     Ok(TokenSecret {
-        tenant_names: names,
+        tenant_names,
         resource_version,
+        token_values,
     })
 }
 
@@ -221,6 +275,182 @@ fn secret_error(err: kube::Error, name: &str, field: &str) -> Error {
     }
 }
 
+/// Parse a deployment key from a Secret field: either 64 hex characters or
+/// exactly 32 raw bytes. Duplicated from `ravel-cli`'s `tenancy::
+/// parse_deployment_key` (that crate is out of this task's scope to edit;
+/// `ravel-types` exposes no public parser to share instead) rather than
+/// imported, since this task's scope is `ravel-catalog`/`ravel-cli`/
+/// `ravel-operator` only.
+fn parse_deployment_key(raw: &[u8]) -> Result<[u8; 32], String> {
+    if let Ok(text) = std::str::from_utf8(raw) {
+        let trimmed = text.trim();
+        if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let bytes = hex::decode(trimmed).map_err(|e| format!("key is not valid hex: {e}"))?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| "hex key did not decode to 32 bytes".to_string())?;
+            return Ok(arr);
+        }
+    }
+    if raw.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(raw);
+        return Ok(key);
+    }
+    Err(format!(
+        "must contain a 32-byte deployment key: either 64 hex characters or exactly 32 raw \
+         bytes (got {} bytes)",
+        raw.len()
+    ))
+}
+
+/// Read and parse the deployment key from `secret_ref`'s
+/// [`DEPLOYMENT_KEY_SECRET_KEY`] field. `None` when no deployment key Secret
+/// is configured -- the CRD's additive-opt-in state (ADR-0072 decision 4):
+/// `sys/auth` reconciliation and the keyed tenant hash both stay off.
+async fn resolve_deployment_key(
+    client: &Client,
+    namespace: &str,
+    secret_ref: Option<&LocalSecretRef>,
+) -> Result<Option<[u8; 32]>, Error> {
+    let Some(secret_ref) = secret_ref else {
+        return Ok(None);
+    };
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret = api
+        .get(&secret_ref.name)
+        .await
+        .map_err(|err| secret_error(err, &secret_ref.name, "deploymentKeySecretRef"))?;
+    let raw = secret_value(&secret, DEPLOYMENT_KEY_SECRET_KEY).ok_or_else(|| {
+        Error::InvalidSecretValue {
+            name: secret_ref.name.clone(),
+            field: DEPLOYMENT_KEY_SECRET_KEY.to_string(),
+            reason: "key not present in Secret".to_string(),
+        }
+    })?;
+    let key = parse_deployment_key(&raw).map_err(|reason| Error::InvalidSecretValue {
+        name: secret_ref.name.clone(),
+        field: DEPLOYMENT_KEY_SECRET_KEY.to_string(),
+        reason,
+    })?;
+    Ok(Some(key))
+}
+
+/// Read the shared `storage.s3.credentialsSecretRef` Secret's live
+/// `accessKeyId`/`secretAccessKey` values (UTF-8 strings), for building the
+/// `sys/auth` reconciliation's own S3 backend. Unlike
+/// [`resolve_credential_resource_versions`], which only reads
+/// `resourceVersion` for the pod-template checksum, this needs the actual
+/// credential values because the operator process itself must authenticate to
+/// S3 here, not just detect that the Secret changed.
+async fn resolve_s3_credentials(
+    client: &Client,
+    namespace: &str,
+    secret_ref: &LocalSecretRef,
+) -> Result<(String, String), Error> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret = api
+        .get(&secret_ref.name)
+        .await
+        .map_err(|err| secret_error(err, &secret_ref.name, "storage.s3.credentialsSecretRef"))?;
+    let field = |key: &str| -> Result<String, Error> {
+        let raw = secret_value(&secret, key).ok_or_else(|| Error::InvalidSecretValue {
+            name: secret_ref.name.clone(),
+            field: key.to_string(),
+            reason: "key not present in Secret".to_string(),
+        })?;
+        String::from_utf8(raw).map_err(|_| Error::InvalidSecretValue {
+            name: secret_ref.name.clone(),
+            field: key.to_string(),
+            reason: "value is not valid UTF-8".to_string(),
+        })
+    };
+    Ok((
+        field(S3_ACCESS_KEY_ID_KEY)?,
+        field(S3_SECRET_ACCESS_KEY_KEY)?,
+    ))
+}
+
+/// Build the S3 backend `sys/auth` reconciliation reads and writes, from
+/// `spec.storage.s3` plus its credential Secret. Mirrors `ravel-server`'s
+/// `build_store` S3 branch: `force_path_style: true` (path-style addressing,
+/// what MinIO/most S3-compatible endpoints expect), `allow_http:
+/// endpoint.is_some()` (only a custom endpoint may be plain HTTP; real AWS S3
+/// always uses TLS), `kms_key_id: None` (no server-side KMS encryption
+/// configured here).
+async fn build_auth_store(
+    client: &Client,
+    namespace: &str,
+    spec: &RavelClusterSpec,
+) -> Result<S3Store, Error> {
+    let (access_key_id, secret_access_key) =
+        resolve_s3_credentials(client, namespace, &spec.storage.s3.credentials_secret_ref).await?;
+    let endpoint = spec.storage.s3.endpoint.clone();
+    let allow_http = endpoint.is_some();
+    let config = S3Config {
+        bucket: spec.storage.s3.bucket.clone(),
+        region: spec.storage.s3.region.clone(),
+        endpoint,
+        access_key_id,
+        secret_access_key,
+        allow_http,
+        force_path_style: true,
+        kms_key_id: None,
+    };
+    S3Store::new(config).map_err(Error::Store)
+}
+
+/// Converge `sys/auth` to the token Secret's current contents (ADR-0072
+/// decision 4, #897): upsert every tenant present in the Secret to exactly its
+/// current token, then remove every tenant present in `sys/auth` but absent
+/// from the Secret.
+///
+/// The remove pass is what makes revocation correct after an operator restart
+/// with zero in-memory history (the #875 regression this closes): it reads
+/// the tenant set to remove from `sys/auth` itself (durable, in object
+/// storage), never from anything this process remembered from a previous
+/// cycle.
+async fn reconcile_sys_auth(
+    deployment_key: &[u8; 32],
+    token_values: &BTreeMap<String, Vec<u8>>,
+    store: &dyn ObjectStoreBackend,
+    now_ns: i64,
+) -> Result<(), Error> {
+    for (tenant_id, token) in token_values {
+        ravel_catalog::replace_tenant_tokens(
+            store,
+            deployment_key,
+            tenant_id,
+            std::slice::from_ref(token),
+            now_ns,
+        )
+        .await?;
+    }
+    let existing_tenants: BTreeSet<String> =
+        match ravel_catalog::read_auth_map(store, deployment_key).await? {
+            Some((map, _version)) => map.entries.into_iter().map(|e| e.tenant_id).collect(),
+            None => BTreeSet::new(),
+        };
+    for tenant_id in existing_tenants {
+        if !token_values.contains_key(&tenant_id) {
+            ravel_catalog::remove_tokens_by_tenant(store, deployment_key, &tenant_id, now_ns)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Current Unix time in nanoseconds, for `sys/auth` CAS-record timestamps.
+/// Direct `SystemTime::now()` use is acceptable here: this is the binary/
+/// wiring layer (analogous to `ravel-cli`'s own `now_ns()`), not the injected-
+/// clock-only "library logic" the testing-patterns rule governs.
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 /// Server-side-apply a typed object. The object's `apiVersion`/`kind` are set
 /// explicitly from its [`Resource`] impl as a defensive belt-and-suspenders
 /// measure: server-side apply requires both, and `k8s-openapi` types do in fact
@@ -299,6 +529,30 @@ async fn reconcile_inner(
         obj.spec.tenant_tokens_secret_ref.as_ref(),
     )
     .await?;
+
+    // Converge sys/auth to the token Secret whenever a deployment key is
+    // configured (ADR-0072 decision 4, #897): this is the first in-process
+    // writer of the durable bearer-token map, and it must run every cycle --
+    // not just on a token Secret change -- so a tenant removed from the
+    // Secret is revoked even after an operator restart wiped any in-memory
+    // history of what used to be there (the #875 regression).
+    if let Some(deployment_key) = resolve_deployment_key(
+        client,
+        namespace,
+        obj.spec.deployment_key_secret_ref.as_ref(),
+    )
+    .await?
+    {
+        let store = build_auth_store(client, namespace, &obj.spec).await?;
+        reconcile_sys_auth(
+            &deployment_key,
+            &token_secret.token_values,
+            &store,
+            now_ns(),
+        )
+        .await?;
+    }
+
     // Read the resourceVersion of every credential Secret the spec references:
     // the shared storage.s3 credential plus any per-tier override (ADR-0055
     // section 5). Each Deployment's pod-template checksum is later computed (in
@@ -510,6 +764,18 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "SecretNotFound".to_string(),
             format!("Secret \"{name}\" not found: {reason}"),
         ),
+        Error::InvalidSecretValue {
+            name,
+            field,
+            reason,
+        } => (
+            "InvalidSecretValue".to_string(),
+            format!("Secret \"{name}\" field \"{field}\": {reason}"),
+        ),
+        Error::Auth(source) => (
+            "SysAuthReconcileFailed".to_string(),
+            format!("sys/auth reconciliation failed: {source}"),
+        ),
         other => ("ReconcileError".to_string(), other.to_string()),
     }
 }
@@ -608,5 +874,145 @@ mod tests {
         let (reason, message) = degraded_reason(&err);
         assert_eq!(reason, "SecretNotFound");
         assert!(message.contains("ravel-tokens"), "message names the Secret");
+    }
+
+    #[test]
+    fn degraded_reason_names_sys_auth_failures() {
+        let err = Error::Auth(ravel_catalog::AuthTokenMapError::EmptyTenantId);
+        let (reason, _message) = degraded_reason(&err);
+        assert_eq!(reason, "SysAuthReconcileFailed");
+    }
+
+    #[test]
+    fn parse_deployment_key_accepts_hex_and_raw_bytes() {
+        let hex_key = "ab".repeat(32);
+        assert_eq!(
+            parse_deployment_key(hex_key.as_bytes()).expect("hex key parses"),
+            [0xab; 32]
+        );
+        assert_eq!(
+            parse_deployment_key(&[7u8; 32]).expect("raw key parses"),
+            [7u8; 32]
+        );
+        assert!(parse_deployment_key(b"too short").is_err());
+    }
+
+    fn memory_store() -> ravel_object_store::memory::MemoryStore {
+        ravel_object_store::memory::MemoryStore::new()
+    }
+
+    #[tokio::test]
+    async fn reconcile_sys_auth_upserts_every_tenant_in_the_secret() {
+        let store = memory_store();
+        let deployment_key = [1u8; 32];
+        let mut token_values = BTreeMap::new();
+        token_values.insert("tenant-a".to_string(), b"token-a".to_vec());
+        token_values.insert("tenant-b".to_string(), b"token-b".to_vec());
+
+        reconcile_sys_auth(&deployment_key, &token_values, &store, 1_000)
+            .await
+            .expect("reconcile succeeds");
+
+        let (map, _version) = ravel_catalog::read_auth_map(&store, &deployment_key)
+            .await
+            .expect("read succeeds")
+            .expect("map exists");
+        let mut tenants: Vec<&str> = map.entries.iter().map(|e| e.tenant_id.as_str()).collect();
+        tenants.sort();
+        assert_eq!(tenants, vec!["tenant-a", "tenant-b"]);
+    }
+
+    /// #875 regression pin: a tenant present in `sys/auth` (written here to
+    /// simulate a token upserted in a *previous* reconcile cycle, by a
+    /// process that has since restarted) but absent from the current token
+    /// Secret must be revoked. This runs against a freshly constructed
+    /// `MemoryStore` with no reconcile history in this test's own process
+    /// state -- `reconcile_sys_auth` learns "tenant-gone used to have a
+    /// token" only by reading `sys/auth` itself, never from anything an
+    /// earlier call left in memory, which is what makes this correct after an
+    /// operator restart.
+    #[tokio::test]
+    async fn reconcile_sys_auth_revokes_a_tenant_missing_from_a_fresh_secret_read() {
+        let store = memory_store();
+        let deployment_key = [2u8; 32];
+
+        // Simulate a previous cycle's write: tenant-gone had a token, before
+        // this (fresh) process ever ran.
+        ravel_catalog::upsert_token(&store, &deployment_key, b"stale-token", "tenant-gone", 500)
+            .await
+            .expect("seed write succeeds");
+
+        // The current token Secret no longer mentions tenant-gone.
+        let mut token_values = BTreeMap::new();
+        token_values.insert("tenant-still-here".to_string(), b"token-x".to_vec());
+
+        reconcile_sys_auth(&deployment_key, &token_values, &store, 1_000)
+            .await
+            .expect("reconcile succeeds");
+
+        let (map, _version) = ravel_catalog::read_auth_map(&store, &deployment_key)
+            .await
+            .expect("read succeeds")
+            .expect("map exists");
+        assert!(
+            map.entries.iter().all(|e| e.tenant_id != "tenant-gone"),
+            "tenant-gone must be revoked even though this process never saw its token \
+             upserted"
+        );
+        assert!(
+            map.entries
+                .iter()
+                .any(|e| e.tenant_id == "tenant-still-here"),
+            "tenant-still-here must remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_sys_auth_rotates_a_tenants_token() {
+        let store = memory_store();
+        let deployment_key = [3u8; 32];
+
+        let mut first = BTreeMap::new();
+        first.insert("tenant-a".to_string(), b"old-token".to_vec());
+        reconcile_sys_auth(&deployment_key, &first, &store, 1_000)
+            .await
+            .expect("first reconcile succeeds");
+
+        let mut rotated = BTreeMap::new();
+        rotated.insert("tenant-a".to_string(), b"new-token".to_vec());
+        reconcile_sys_auth(&deployment_key, &rotated, &store, 2_000)
+            .await
+            .expect("second reconcile succeeds");
+
+        let (map, _version) = ravel_catalog::read_auth_map(&store, &deployment_key)
+            .await
+            .expect("read succeeds")
+            .expect("map exists");
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "old token must be gone, not just supplemented"
+        );
+        let old_hash = ravel_catalog::token_hash(&deployment_key, b"old-token");
+        let new_hash = ravel_catalog::token_hash(&deployment_key, b"new-token");
+        assert!(map.entries.iter().all(|e| e.token_hash != old_hash));
+        assert!(map.entries.iter().any(|e| e.token_hash == new_hash));
+    }
+
+    #[test]
+    fn secret_value_prefers_data_over_string_data() {
+        let mut secret = Secret::default();
+        let mut data = BTreeMap::new();
+        data.insert(
+            "key".to_string(),
+            k8s_openapi::ByteString(b"from-data".to_vec()),
+        );
+        secret.data = Some(data);
+        let mut string_data = BTreeMap::new();
+        string_data.insert("key".to_string(), "from-string-data".to_string());
+        secret.string_data = Some(string_data);
+
+        assert_eq!(secret_value(&secret, "key"), Some(b"from-data".to_vec()));
+        assert_eq!(secret_value(&secret, "missing"), None);
     }
 }

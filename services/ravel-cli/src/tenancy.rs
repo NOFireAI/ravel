@@ -180,7 +180,10 @@ pub async fn show(
 /// Parse a 32-byte deployment key from a key file's raw bytes: 64 hex
 /// characters (whitespace-trimmed) or exactly 32 raw bytes. Mirrors the
 /// server's own loader so `tenancy show` verifies the key the server would.
-fn parse_deployment_key(raw: &[u8]) -> anyhow::Result<[u8; 32]> {
+/// `pub(crate)` so `tenant_token` can parse the same deployment key file
+/// format for `sys/auth` (the same 32-byte key doubles as the v2-keyed
+/// tenant-hash key and the `sys/auth` token-hashing key).
+pub(crate) fn parse_deployment_key(raw: &[u8]) -> anyhow::Result<[u8; 32]> {
     if let Ok(text) = std::str::from_utf8(raw) {
         let trimmed = text.trim();
         if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {

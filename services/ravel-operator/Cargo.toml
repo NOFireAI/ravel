@@ -23,6 +23,16 @@ ravel-tracing-export = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true, features = ["env"] }
+# sys/auth reconciliation (ADR-0072 decision 4, #897): the operator is the
+# first in-process writer of the durable bearer-token map when a
+# deploymentKeySecretRef is configured. Already a workspace pin; adds no new
+# external crate.
+ravel-catalog = { workspace = true }
+# Builds the S3 backend sys/auth reconciliation reads and writes, from the
+# same spec.storage.s3 fields ravel-server itself uses. Already a workspace
+# pin; adds no new external crate.
+ravel-object-store = { workspace = true }
+hex = { workspace = true }
 
 [lints]
 workspace = true

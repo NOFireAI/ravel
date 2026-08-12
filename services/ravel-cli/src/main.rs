@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
-use ravel_cli::{catalog, hold, idem, maintain, now_ns, store, tenancy};
+use ravel_cli::{catalog, hold, idem, maintain, now_ns, store, tenancy, tenant_token};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, kind};
@@ -98,8 +98,11 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Idem { .. }
         | Command::Tenancy { .. }
         // sys/gc is a bucket-root object, not under any tenant prefix, so
-        // gc-config never hashes a tenant.
-        | Command::GcConfig { .. } => false,
+        // gc-config never hashes a tenant. sys/auth (ADR-0072 decision 4) is
+        // the same shape: deployment-wide, at the bucket root, never under a
+        // tenant prefix, so `tenant token` never hashes a tenant either.
+        | Command::GcConfig { .. }
+        | Command::Tenant { .. } => false,
     }
 }
 
@@ -174,6 +177,60 @@ enum Command {
     GcConfig {
         #[command(subcommand)]
         command: GcConfigCommand,
+    },
+    /// Manage the durable deployment-wide bearer-token map `sys/auth`
+    /// (ADR-0072 decision 4, #875): the first shipped writer of `sys/auth`.
+    Tenant {
+        #[command(subcommand)]
+        command: TenantCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TenantCommand {
+    /// Manage bearer tokens in `sys/auth`.
+    Token {
+        #[command(subcommand)]
+        command: TenantTokenCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TenantTokenCommand {
+    /// Map a bearer token to a tenant, hashing it under the deployment key.
+    /// The plaintext is hashed and dropped, never persisted.
+    Upsert {
+        /// Path to the bucket's 32-byte deployment key (64 hex characters or
+        /// 32 raw bytes); the same key used for `--tenant-hash-key-file`.
+        #[arg(long, value_name = "PATH")]
+        deployment_key_file: std::path::PathBuf,
+        /// The bearer token, in the clear. Prefer a shell mechanism that
+        /// avoids process-list/history exposure (e.g. `--token "$(cat f)"`).
+        #[arg(long)]
+        token: String,
+        /// The tenant this token authenticates as.
+        #[arg(long)]
+        tenant: String,
+    },
+    /// Remove every token mapped to a tenant. Needs no plaintext token:
+    /// entries carry the tenant id in the clear, so this is correct even when
+    /// the caller has never seen the tenant's tokens.
+    Revoke {
+        /// Path to the bucket's 32-byte deployment key (64 hex characters or
+        /// 32 raw bytes); the same key used for `--tenant-hash-key-file`.
+        #[arg(long, value_name = "PATH")]
+        deployment_key_file: std::path::PathBuf,
+        /// The tenant to revoke every token for.
+        #[arg(long)]
+        tenant: String,
+    },
+    /// List every entry's tenant id and a short token fingerprint. Never
+    /// prints a raw token hash or plaintext.
+    List {
+        /// Path to the bucket's 32-byte deployment key (64 hex characters or
+        /// 32 raw bytes); the same key used for `--tenant-hash-key-file`.
+        #[arg(long, value_name = "PATH")]
+        deployment_key_file: std::path::PathBuf,
     },
 }
 
@@ -912,6 +969,58 @@ async fn main() -> anyhow::Result<()> {
                 now_ns()?,
             )
             .await
+        }
+        Command::Tenant {
+            command:
+                TenantCommand::Token {
+                    command:
+                        TenantTokenCommand::Upsert {
+                            deployment_key_file,
+                            token,
+                            tenant,
+                        },
+                },
+        } => {
+            tenant_token::upsert(
+                store::build_store(&cli.store)?,
+                &deployment_key_file,
+                token.as_bytes(),
+                &tenant,
+                now_ns()?,
+            )
+            .await
+        }
+        Command::Tenant {
+            command:
+                TenantCommand::Token {
+                    command:
+                        TenantTokenCommand::Revoke {
+                            deployment_key_file,
+                            tenant,
+                        },
+                },
+        } => {
+            tenant_token::revoke(
+                store::build_store(&cli.store)?,
+                &deployment_key_file,
+                &tenant,
+                now_ns()?,
+            )
+            .await
+        }
+        Command::Tenant {
+            command:
+                TenantCommand::Token {
+                    command:
+                        TenantTokenCommand::List {
+                            deployment_key_file,
+                        },
+                },
+        } => {
+            let report =
+                tenant_token::list(store::build_store(&cli.store)?, &deployment_key_file).await?;
+            print!("{report}");
+            Ok(())
         }
     }
 }
