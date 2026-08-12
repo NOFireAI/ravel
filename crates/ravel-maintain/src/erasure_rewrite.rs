@@ -2094,10 +2094,18 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig::default();
-        let outcome =
-            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &bucket(), &pending)
-                .await
-                .expect("rewrite");
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
 
         let (parts, publish) = match outcome {
             ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
@@ -2222,6 +2230,7 @@ mod tests {
         let before = list_all(&store, "").await.expect("list before");
 
         let clock = FixedClock::new(sealed_now_ns());
+        let mut memo = MaintainMemo::with_default_interval();
         let outcome = erasure_rewrite_bucket(
             &store,
             &clock,
@@ -2229,6 +2238,7 @@ mod tests {
             &lease,
             &b,
             &pending,
+            &mut memo,
         )
         .await
         .expect("call succeeds even when held");
@@ -2426,10 +2436,18 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig::default();
-        let outcome =
-            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &bucket(), &pending)
-                .await
-                .expect("rewrite must succeed even when >=2 live L0 commits share a series_id");
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite must succeed even when >=2 live L0 commits share a series_id");
 
         let (parts, publish) = match outcome {
             ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
@@ -2490,10 +2508,18 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig::default();
-        let outcome =
-            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &bucket(), &pending)
-                .await
-                .expect("rewrite");
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
 
         let (parts, publish) = match outcome {
             ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
@@ -2556,10 +2582,18 @@ mod tests {
 
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig::default();
-        let outcome =
-            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &bucket(), &pending)
-                .await
-                .expect("rewrite");
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
 
         let (parts, publish) = match outcome {
             ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
@@ -2583,6 +2617,1036 @@ mod tests {
         assert_eq!(
             alpha_after, expected,
             "surviving samples must re-encode bit-identically, including the NaN payload"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // LOGS (RLOG) -- EJ-T4b, issue #754
+    // -----------------------------------------------------------------
+
+    use ravel_logseg::LogRecord;
+    use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
+    use ravel_rspan::writer::ObjectIdentity as SpanObjectIdentity;
+    use ravel_rspan::{SpanRecord, StatusCode};
+
+    fn logs_bucket() -> Bucket {
+        Bucket::new(tenant_hash(), Signal::Logs, SHARD, HOUR)
+    }
+
+    fn spans_bucket() -> Bucket {
+        Bucket::new(tenant_hash(), Signal::Spans, SHARD, HOUR)
+    }
+
+    /// A synthetic log stream's id and canonical resource+scope blob,
+    /// identical in shape to `rlog.rs`'s own `stream_ident` test fixture.
+    fn log_stream_ident(n: u32) -> (LogStreamId, Vec<u8>) {
+        let res = vec![(
+            "service.name".to_string(),
+            LogAttrValue::Str(format!("svc{n}")),
+        )];
+        let id = ravel_types::logstream::log_stream_id(&res, "scope", "1", &[]);
+        let blob = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]);
+        (id, blob)
+    }
+
+    fn log_record(stream_n: u32, ts: i64, body: &str, attrs: Vec<(String, LogAttrValue)>) -> LogRecord {
+        let (stream_id, stream_attrs) = log_stream_ident(stream_n);
+        LogRecord {
+            stream_id,
+            stream_attrs,
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: body.into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs,
+        }
+    }
+
+    fn logs_erasure_request(id_seed: u128, key: &str, value: &str) -> ErasureRequest {
+        ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Logs) as i32,
+            request_id: Uuid::from_u128(id_seed).to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: key.to_string(),
+                value: value.to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        }
+    }
+
+    /// Seed one L0 `.rlog` input (data object + commit record), matching the
+    /// shape `rlog.rs`'s own test module writes for a real ingest shard.
+    async fn seed_logs(store: &dyn ObjectStoreBackend, seq: u64, records: &[LogRecord]) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(u128::from(seq));
+        let identity = LogObjectIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+        };
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        for r in records {
+            w.push(r.clone()).expect("push log record");
+        }
+        let bytes = Bytes::from(w.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key =
+            keys::data_key(&th, Signal::Logs, SHARD, writer_id, EPOCH, seq, &content_hash)
+                .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+
+        let mut ids: HashSet<LogStreamId> = HashSet::new();
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for r in records {
+            ids.insert(r.stream_id);
+            min_ts = min_ts.min(r.ts_ns);
+            max_ts = max_ts.max(r.ts_ns);
+        }
+        let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Logs,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: ids.len() as u64,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    /// [`read_rewrite_record`]'s generalization to any bucket, needed once
+    /// this module's tests span three buckets (metrics/logs/spans) instead
+    /// of the one hardcoded metrics `bucket()` the original helper reads.
+    async fn read_rewrite_record_for(store: &dyn ObjectStoreBackend, b: &Bucket) -> RewriteRecord {
+        let listing = crate::read::list_bucket(store, b).await.expect("list bucket");
+        assert_eq!(
+            listing.rewrite_record_keys.len(),
+            1,
+            "expected exactly one rewrite record"
+        );
+        let got = store
+            .get(&listing.rewrite_record_keys[0], GetRange::Full)
+            .await
+            .expect("get record");
+        RewriteRecord::decode(got.data.as_ref()).expect("decode record")
+    }
+
+    async fn decode_logs_part(store: &dyn ObjectStoreBackend, object_key: &str) -> Vec<LogRecord> {
+        let got = store
+            .get(object_key, GetRange::Full)
+            .await
+            .expect("get part");
+        let reader = RlogReader::new(got.data.as_ref(), &RlogConfig::default()).expect("open");
+        let (records, _stats) = reader.scan(&LogPredicate::And(Vec::new())).expect("scan");
+        records
+    }
+
+    /// Drops exactly the log record matched by the erasure predicate and
+    /// leaves every other record in the bucket byte-for-byte (via
+    /// `LogRecord`'s own `PartialEq`) intact. Flip-line proof:
+    /// `LogErasureMatcher::matches_attrs` returning `false`
+    /// unconditionally makes the "checkout" record survive, growing the
+    /// survivor set to two records and failing the `assert_eq!(survivors,
+    /// vec![kept])` below.
+    #[tokio::test]
+    async fn logs_rewrite_drops_matching_preserves_others_bit_identically() {
+        let store = MemoryStore::new();
+        let dropped = log_record(
+            1,
+            10,
+            "checkout failed",
+            vec![(
+                "service".to_string(),
+                LogAttrValue::Str("checkout".to_string()),
+            )],
+        );
+        let kept = log_record(
+            2,
+            20,
+            "shipping ok",
+            vec![(
+                "service".to_string(),
+                LogAttrValue::Str("shipping".to_string()),
+            )],
+        );
+        seed_logs(&store, 1, &[dropped.clone(), kept.clone()]).await;
+
+        let request = logs_erasure_request(1, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &logs_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(parts, 1);
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record_for(&store, &logs_bucket()).await;
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(
+            record.drops[0].dropped_count, 1,
+            "only the checkout record is dropped"
+        );
+
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let survivors = decode_logs_part(&store, &part_key).await;
+        assert_eq!(
+            survivors,
+            vec![kept],
+            "the shipping record must survive bit-identically and alone"
+        );
+    }
+
+    /// A hand-built `RewriteBuild` for a LOGS bucket whose
+    /// `output_sample_count + dropped_count` (1 + 1 = 2) does not equal
+    /// `input_sample_count` (5) must abort before any write -- the same
+    /// gate the metrics test above exercises, proving it is not
+    /// accidentally scoped to metrics-shaped buckets. Flip-line proof: `if
+    /// reconstructed != build.input_sample_count` in
+    /// `publish_rewrite_record` flipped to `==` (or deleted) lets this
+    /// publish `Ok`, failing the `expect_err`.
+    #[tokio::test]
+    async fn logs_conservation_mismatch_aborts_rewrite_publish() {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(0);
+        let config = CompactorConfig::default();
+        let build = RewriteBuild {
+            parts: Vec::new(),
+            input_sample_count: 5,
+            output_sample_count: 1,
+            drops: vec![RewriteDrop {
+                request_id: Uuid::from_u128(9).to_string(),
+                dropped_count: 1,
+            }],
+        };
+
+        let err = publish_rewrite_record(
+            &store,
+            &config,
+            &clock,
+            &logs_bucket(),
+            RewriteSupersession::RawL0(Vec::new()),
+            build,
+            0,
+        )
+        .await
+        .expect_err("mismatched conservation must abort");
+
+        assert!(
+            matches!(err, MaintainError::ErasureConservationViolation { .. }),
+            "expected ErasureConservationViolation, got {err:?}"
+        );
+        assert!(
+            list_all(&store, "").await.expect("list").is_empty(),
+            "an aborted rewrite must publish nothing, not even the record"
+        );
+    }
+
+    /// A LOGS bucket under legal hold is skipped outright, same as the
+    /// metrics case above -- `bucket_is_held` gates every signal's rewrite
+    /// before any signal-specific dispatch runs. Flip-line proof: removing
+    /// the `if bucket_is_held(&listing, lease) { return
+    /// Ok(ErasureRewriteOutcome::Held); }` gate makes this proceed to
+    /// `Rewritten`, failing `assert_eq!(outcome, ErasureRewriteOutcome::Held)`.
+    #[tokio::test]
+    async fn logs_legal_hold_skips_bucket_leaves_dreq_pending() {
+        let store = MemoryStore::new();
+        seed_logs(
+            &store,
+            1,
+            &[log_record(
+                1,
+                10,
+                "checkout failed",
+                vec![(
+                    "service".to_string(),
+                    LogAttrValue::Str("checkout".to_string()),
+                )],
+            )],
+        )
+        .await;
+
+        let request = logs_erasure_request(1, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let b = logs_bucket();
+        let prefix =
+            keys::commit_shard_hour_prefix(&b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket)
+                .expect("prefix");
+        let lease = HoldPrefix(prefix);
+
+        let before = list_all(&store, "").await.expect("list before");
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &lease,
+            &b,
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("call succeeds even when held");
+        assert_eq!(outcome, ErasureRewriteOutcome::Held);
+
+        let after = list_all(&store, "").await.expect("list after");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "held bucket must be left untouched"
+        );
+    }
+
+    /// A sealed LOGS bucket's live input set is normally >=2 L0 commits (one
+    /// per ingest flush); `build_rewrite_logs` must merge every input's
+    /// surviving records into ONE output part, not one part per input.
+    /// Flip-line proof: moving `RlogWriter::new(read_cfg, identity)` inside
+    /// the `for object_key in object_keys` loop (instead of once before it)
+    /// would finish and push a part per input, making `parts` come out `2`
+    /// instead of `1`, failing `assert_eq!(parts, 1, ...)`.
+    #[tokio::test]
+    async fn logs_rewrite_merges_records_across_multiple_l0_inputs_into_one_part() {
+        let store = MemoryStore::new();
+        seed_logs(&store, 1, &[log_record(1, 10, "a", vec![])]).await;
+        seed_logs(&store, 2, &[log_record(2, 20, "b", vec![])]).await;
+
+        // Matches nothing: the merge bug reproduces even with zero drops.
+        let request = logs_erasure_request(1, "service", "unrelated");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &logs_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite must merge >=2 live L0 inputs into one part");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(
+            parts, 1,
+            "both L0 inputs must merge into a single output part"
+        );
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record_for(&store, &logs_bucket()).await;
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let survivors = decode_logs_part(&store, &part_key).await;
+        assert_eq!(
+            survivors.len(),
+            2,
+            "records from both inputs must survive in the one merged part"
+        );
+    }
+
+    /// Running the same LOGS rewrite twice from the same pre-publish state
+    /// converges on one `RewriteRecord`, never a double count of dropped
+    /// records -- the LOGS sibling of the metrics
+    /// `republishing_the_same_rewrite_converges_without_double_counting`
+    /// test above. Flip-line proof: in `publish_rewrite_record`, routing
+    /// `Err(StoreError::AlreadyExists)` to a hard `Err` instead of
+    /// `resolve_already_exists_rewrite` makes the second
+    /// `publish_rewrite_record` call return `Err`, failing
+    /// `.expect("publish 2")`.
+    #[tokio::test]
+    async fn logs_republishing_same_rewrite_converges_without_double_counting() {
+        let store = MemoryStore::new();
+        let dropped = log_record(
+            1,
+            10,
+            "checkout failed",
+            vec![(
+                "service".to_string(),
+                LogAttrValue::Str("checkout".to_string()),
+            )],
+        );
+        let kept = log_record(
+            2,
+            20,
+            "shipping ok",
+            vec![(
+                "service".to_string(),
+                LogAttrValue::Str("shipping".to_string()),
+            )],
+        );
+        seed_logs(&store, 1, &[dropped, kept]).await;
+
+        let request = logs_erasure_request(2, "service", "checkout");
+        let applicable = vec![ApplicableLogRequest {
+            request_id: request.request_id.clone(),
+            matcher: LogErasureMatcher::from_request(&request),
+        }];
+
+        let b = logs_bucket();
+        let config = CompactorConfig::default();
+        let listing = crate::read::list_bucket(&store, &b)
+            .await
+            .expect("list bucket");
+        let live = resolve_live_inputs(&store, &b, &listing)
+            .await
+            .expect("resolve live inputs");
+        let (object_keys, supersession) =
+            live_input_object_keys_and_target(live).expect("object keys");
+
+        let mut ids: Vec<String> = applicable.iter().map(|r| r.request_id.clone()).collect();
+        ids.sort();
+        let input_set_hash = match &supersession {
+            RewriteSupersession::RawL0(idents) => {
+                erasure::compute_rewrite_input_set_hash(idents, None, &ids)
+            }
+            RewriteSupersession::Existing(key) => {
+                erasure::compute_rewrite_input_set_hash(&[], Some(key.as_str()), &ids)
+            }
+        };
+
+        let clock = FixedClock::new(0);
+
+        let build1 = build_rewrite_logs(
+            &store,
+            &b,
+            &config,
+            &object_keys,
+            &applicable,
+            &input_set_hash,
+        )
+        .await
+        .expect("build 1");
+        let outcome1 =
+            publish_rewrite_record(&store, &config, &clock, &b, supersession.clone(), build1, 0)
+                .await
+                .expect("publish 1");
+        assert_eq!(outcome1, PublishOutcome::Published);
+
+        let build2 = build_rewrite_logs(
+            &store,
+            &b,
+            &config,
+            &object_keys,
+            &applicable,
+            &input_set_hash,
+        )
+        .await
+        .expect("build 2");
+        let outcome2 = publish_rewrite_record(&store, &config, &clock, &b, supersession, build2, 0)
+            .await
+            .expect("publish 2");
+        assert_eq!(
+            outcome2,
+            PublishOutcome::Converged { parts_repaired: 0 },
+            "second identical rewrite converges, does not republish"
+        );
+
+        let record = read_rewrite_record_for(&store, &b).await;
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(
+            record.drops[0].dropped_count, 1,
+            "dropped_count must not double-count across the two runs"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // SPANS (RSPAN) -- EJ-T4b, issue #754
+    // -----------------------------------------------------------------
+
+    fn span_record(t: u8, s: u8, start: i64, end: i64, attrs: Vec<(String, String)>) -> SpanRecord {
+        SpanRecord {
+            trace_id: [t; 16],
+            span_id: [s; 8],
+            parent_span_id: None,
+            name: format!("op-{s}"),
+            start_ts_ns: start,
+            end_ts_ns: end,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs,
+        }
+    }
+
+    fn spans_erasure_request(id_seed: u128, key: &str, value: &str) -> ErasureRequest {
+        ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Spans) as i32,
+            request_id: Uuid::from_u128(id_seed).to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: key.to_string(),
+                value: value.to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        }
+    }
+
+    /// Seed one L0 `.rspan` input (data object + commit record), matching
+    /// the shape `rspan_codec.rs`'s own test module writes for a real span
+    /// ingest shard.
+    async fn seed_spans(store: &dyn ObjectStoreBackend, seq: u64, records: &[SpanRecord]) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(u128::from(seq));
+        let identity = SpanObjectIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+        };
+        let mut w = RspanWriter::new(RspanConfig::default(), identity);
+        for r in records {
+            w.push(r.clone());
+        }
+        let bytes = Bytes::from(w.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key =
+            keys::data_key(&th, Signal::Spans, SHARD, writer_id, EPOCH, seq, &content_hash)
+                .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+
+        let mut traces: HashSet<[u8; 16]> = HashSet::new();
+        let mut min_start = i64::MAX;
+        let mut max_end = i64::MIN;
+        for r in records {
+            traces.insert(r.trace_id);
+            min_start = min_start.min(r.start_ts_ns);
+            max_end = max_end.max(r.end_ts_ns);
+        }
+        let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Spans,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: traces.len() as u64,
+            min_event_ts_ns: min_start,
+            max_event_ts_ns: max_end,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    async fn decode_spans_part(store: &dyn ObjectStoreBackend, object_key: &str) -> Vec<SpanRecord> {
+        let got = store
+            .get(object_key, GetRange::Full)
+            .await
+            .expect("get part");
+        let reader = RspanReader::new(got.data.as_ref(), &RspanConfig::default()).expect("open");
+        let (records, _stats) = reader
+            .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
+            .expect("scan");
+        records
+    }
+
+    /// Drops exactly the span matched by the erasure predicate and leaves
+    /// every other span in the bucket byte-for-byte (via `SpanRecord`'s own
+    /// `PartialEq`) intact -- the SPANS sibling of the LOGS drop test
+    /// above. Flip-line proof: `SpanErasureMatcher::matches_attrs`
+    /// returning `false` unconditionally makes the matched span survive,
+    /// failing the `assert_eq!(survivors, vec![kept])` below.
+    #[tokio::test]
+    async fn spans_rewrite_drops_matching_preserves_others_bit_identically() {
+        let store = MemoryStore::new();
+        let dropped = span_record(
+            1,
+            1,
+            10,
+            15,
+            vec![("service".to_string(), "checkout".to_string())],
+        );
+        let kept = span_record(
+            2,
+            1,
+            20,
+            25,
+            vec![("service".to_string(), "shipping".to_string())],
+        );
+        seed_spans(&store, 1, &[dropped.clone(), kept.clone()]).await;
+
+        let request = spans_erasure_request(1, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &spans_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(parts, 1);
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record_for(&store, &spans_bucket()).await;
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(
+            record.drops[0].dropped_count, 1,
+            "only the checkout span is dropped"
+        );
+
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let survivors = decode_spans_part(&store, &part_key).await;
+        assert_eq!(
+            survivors,
+            vec![kept],
+            "the shipping span must survive bit-identically and alone"
+        );
+    }
+
+    /// A hand-built `RewriteBuild` for a SPANS bucket whose
+    /// `output_sample_count + dropped_count` (1 + 1 = 2) does not equal
+    /// `input_sample_count` (5) must abort before any write -- the SPANS
+    /// sibling of the LOGS/metrics conservation-abort tests above,
+    /// confirming the shared gate is not scoped to any one signal.
+    /// Flip-line proof: `if reconstructed != build.input_sample_count` in
+    /// `publish_rewrite_record` flipped to `==` (or deleted) lets this
+    /// publish `Ok`, failing the `expect_err`.
+    #[tokio::test]
+    async fn spans_conservation_mismatch_aborts_rewrite_publish() {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(0);
+        let config = CompactorConfig::default();
+        let build = RewriteBuild {
+            parts: Vec::new(),
+            input_sample_count: 5,
+            output_sample_count: 1,
+            drops: vec![RewriteDrop {
+                request_id: Uuid::from_u128(9).to_string(),
+                dropped_count: 1,
+            }],
+        };
+
+        let err = publish_rewrite_record(
+            &store,
+            &config,
+            &clock,
+            &spans_bucket(),
+            RewriteSupersession::RawL0(Vec::new()),
+            build,
+            0,
+        )
+        .await
+        .expect_err("mismatched conservation must abort");
+
+        assert!(
+            matches!(err, MaintainError::ErasureConservationViolation { .. }),
+            "expected ErasureConservationViolation, got {err:?}"
+        );
+        assert!(
+            list_all(&store, "").await.expect("list").is_empty(),
+            "an aborted rewrite must publish nothing, not even the record"
+        );
+    }
+
+    /// A SPANS bucket under legal hold is skipped outright, same as the
+    /// LOGS/metrics cases above. Flip-line proof: removing the `if
+    /// bucket_is_held(&listing, lease) { return
+    /// Ok(ErasureRewriteOutcome::Held); }` gate makes this proceed to
+    /// `Rewritten`, failing `assert_eq!(outcome, ErasureRewriteOutcome::Held)`.
+    #[tokio::test]
+    async fn spans_legal_hold_skips_bucket_leaves_dreq_pending() {
+        let store = MemoryStore::new();
+        seed_spans(
+            &store,
+            1,
+            &[span_record(
+                1,
+                1,
+                10,
+                15,
+                vec![("service".to_string(), "checkout".to_string())],
+            )],
+        )
+        .await;
+
+        let request = spans_erasure_request(1, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let b = spans_bucket();
+        let prefix =
+            keys::commit_shard_hour_prefix(&b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket)
+                .expect("prefix");
+        let lease = HoldPrefix(prefix);
+
+        let before = list_all(&store, "").await.expect("list before");
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &lease,
+            &b,
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("call succeeds even when held");
+        assert_eq!(outcome, ErasureRewriteOutcome::Held);
+
+        let after = list_all(&store, "").await.expect("list after");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "held bucket must be left untouched"
+        );
+    }
+
+    /// A sealed SPANS bucket's live input set is normally >=2 L0 commits;
+    /// `build_rewrite_spans` must merge every input's surviving spans into
+    /// ONE output part, not one part per input -- the SPANS sibling of the
+    /// LOGS merge test above. Flip-line proof: moving `RspanWriter::new(read_cfg,
+    /// identity)` inside the `for object_key in object_keys` loop (instead
+    /// of once before it) would finish and push a part per input, making
+    /// `parts` come out `2` instead of `1`, failing `assert_eq!(parts, 1, ...)`.
+    #[tokio::test]
+    async fn spans_rewrite_merges_records_across_multiple_l0_inputs_into_one_part() {
+        let store = MemoryStore::new();
+        seed_spans(&store, 1, &[span_record(1, 1, 10, 15, vec![])]).await;
+        seed_spans(&store, 2, &[span_record(2, 1, 20, 25, vec![])]).await;
+
+        // Matches nothing: the merge bug reproduces even with zero drops.
+        let request = spans_erasure_request(1, "service", "unrelated");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &spans_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite must merge >=2 live L0 inputs into one part");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(
+            parts, 1,
+            "both L0 inputs must merge into a single output part"
+        );
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record_for(&store, &spans_bucket()).await;
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let survivors = decode_spans_part(&store, &part_key).await;
+        assert_eq!(
+            survivors.len(),
+            2,
+            "spans from both inputs must survive in the one merged part"
+        );
+    }
+
+    /// Running the same SPANS rewrite twice from the same pre-publish state
+    /// converges on one `RewriteRecord`, never a double count of dropped
+    /// spans -- the SPANS sibling of the LOGS/metrics idempotence tests
+    /// above. Flip-line proof: in `publish_rewrite_record`, routing
+    /// `Err(StoreError::AlreadyExists)` to a hard `Err` instead of
+    /// `resolve_already_exists_rewrite` makes the second
+    /// `publish_rewrite_record` call return `Err`, failing
+    /// `.expect("publish 2")`.
+    #[tokio::test]
+    async fn spans_republishing_same_rewrite_converges_without_double_counting() {
+        let store = MemoryStore::new();
+        let dropped = span_record(
+            1,
+            1,
+            10,
+            15,
+            vec![("service".to_string(), "checkout".to_string())],
+        );
+        let kept = span_record(
+            2,
+            1,
+            20,
+            25,
+            vec![("service".to_string(), "shipping".to_string())],
+        );
+        seed_spans(&store, 1, &[dropped, kept]).await;
+
+        let request = spans_erasure_request(2, "service", "checkout");
+        let applicable = vec![ApplicableSpanRequest {
+            request_id: request.request_id.clone(),
+            matcher: SpanErasureMatcher::from_request(&request),
+        }];
+
+        let b = spans_bucket();
+        let config = CompactorConfig::default();
+        let listing = crate::read::list_bucket(&store, &b)
+            .await
+            .expect("list bucket");
+        let live = resolve_live_inputs(&store, &b, &listing)
+            .await
+            .expect("resolve live inputs");
+        let (object_keys, supersession) =
+            live_input_object_keys_and_target(live).expect("object keys");
+
+        let mut ids: Vec<String> = applicable.iter().map(|r| r.request_id.clone()).collect();
+        ids.sort();
+        let input_set_hash = match &supersession {
+            RewriteSupersession::RawL0(idents) => {
+                erasure::compute_rewrite_input_set_hash(idents, None, &ids)
+            }
+            RewriteSupersession::Existing(key) => {
+                erasure::compute_rewrite_input_set_hash(&[], Some(key.as_str()), &ids)
+            }
+        };
+
+        let clock = FixedClock::new(0);
+
+        let build1 = build_rewrite_spans(
+            &store,
+            &b,
+            &config,
+            &object_keys,
+            &applicable,
+            &input_set_hash,
+        )
+        .await
+        .expect("build 1");
+        let outcome1 =
+            publish_rewrite_record(&store, &config, &clock, &b, supersession.clone(), build1, 0)
+                .await
+                .expect("publish 1");
+        assert_eq!(outcome1, PublishOutcome::Published);
+
+        let build2 = build_rewrite_spans(
+            &store,
+            &b,
+            &config,
+            &object_keys,
+            &applicable,
+            &input_set_hash,
+        )
+        .await
+        .expect("build 2");
+        let outcome2 = publish_rewrite_record(&store, &config, &clock, &b, supersession, build2, 0)
+            .await
+            .expect("publish 2");
+        assert_eq!(
+            outcome2,
+            PublishOutcome::Converged { parts_repaired: 0 },
+            "second identical rewrite converges, does not republish"
+        );
+
+        let record = read_rewrite_record_for(&store, &b).await;
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(
+            record.drops[0].dropped_count, 1,
+            "dropped_count must not double-count across the two runs"
+        );
+    }
+
+    /// Span links/events have no dedicated columns in this format (per
+    /// `SpanRecord`'s own doc comment, they live only as an opaque blob
+    /// entry inside `attrs`, never as separate fields), so
+    /// `build_rewrite_spans` cannot partially strip a span: it decodes,
+    /// tests, and either pushes the WHOLE record or drops the WHOLE
+    /// record, never a record with some attrs removed. This seeds a
+    /// surviving span whose `attrs` carries such a blob entry, and asserts
+    /// it comes through byte-for-byte alongside the rest of the record.
+    /// Flip-line proof: `build_rewrite_spans`'s survivor arm (`None =>
+    /// {...; writer.push(record)}`) pushing anything other than the
+    /// original, unmodified `record` -- e.g. a copy with `attrs` filtered
+    /// down to just the matched key -- would still satisfy every other
+    /// assertion here but drop the blob entry, failing the
+    /// `assert_eq!(survivors, vec![kept])` below.
+    #[tokio::test]
+    async fn spans_links_events_survive_or_drop_atomically_with_whole_record() {
+        let store = MemoryStore::new();
+        let dropped = span_record(
+            1,
+            1,
+            10,
+            15,
+            vec![
+                ("service".to_string(), "checkout".to_string()),
+                ("otel.span.links.blob".to_string(), "linkblobA".to_string()),
+            ],
+        );
+        let kept = span_record(
+            2,
+            1,
+            20,
+            25,
+            vec![
+                ("service".to_string(), "shipping".to_string()),
+                (
+                    "otel.span.events.blob".to_string(),
+                    "eventblobB".to_string(),
+                ),
+            ],
+        );
+        seed_spans(&store, 1, &[dropped.clone(), kept.clone()]).await;
+
+        let request = spans_erasure_request(1, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &spans_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(parts, 1);
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record_for(&store, &spans_bucket()).await;
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let mut survivors = decode_spans_part(&store, &part_key).await;
+        // The codec canonicalizes attr order on encode (a column-oriented
+        // detail orthogonal to what this test proves), so compare with attrs
+        // sorted on both sides rather than requiring the original push order.
+        for s in &mut survivors {
+            s.attrs.sort();
+        }
+        let mut expected = kept;
+        expected.attrs.sort();
+        assert_eq!(
+            survivors,
+            vec![expected],
+            "the surviving span's events/links blob attr must come through whole, unstripped"
+        );
+
+        let leaked_links = survivors
+            .iter()
+            .any(|s| s.attrs.iter().any(|(k, _)| k == "otel.span.links.blob"));
+        assert!(
+            !leaked_links,
+            "the dropped span's links blob must not survive in any partial form"
         );
     }
 }
