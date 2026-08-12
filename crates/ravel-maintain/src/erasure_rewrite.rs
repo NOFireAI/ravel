@@ -63,7 +63,7 @@
 //! adopting its batching complexity too, which the scope reduction above
 //! deliberately avoids. Flagged here and in the task's final report.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bytes::Bytes;
 use prost::Message;
@@ -89,7 +89,7 @@ use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
-use crate::read::{BucketListing, InputCatalog, RunPlan};
+use crate::read::{BucketListing, InputCatalog, RunPlan, SeriesPlan};
 use crate::sweep::LeaseCheck;
 
 /// One pending selective-erasure request: its `.dreq` key and decoded body.
@@ -217,28 +217,47 @@ impl ErasureMatcher {
     }
 }
 
-/// Cheap, key-derived prefilter: could `bucket`'s ingest-hour range overlap
-/// `request`'s event-time window at all? Mirrors the sweep's own
-/// age/horizon-gate prefilters (`object_age_ns` and friends in
-/// `sweep.rs`) in spirit: reject on cheap metadata before any GET.
+/// Record-derived prefilter: could the bucket's *live* records' actual
+/// event-time span, `[min_event_ts_ns, max_event_ts_ns]`, overlap
+/// `request`'s event-time window at all? Rejects before the expensive
+/// whole-object data GETs `build_rewrite` pays for, but -- unlike a
+/// key-derived check -- only after the cheap record-level metadata
+/// ([`live_input_event_bounds`]) is in hand, mirroring the sweep's own
+/// age/horizon-gate prefilters (`object_age_ns` and friends in `sweep.rs`)
+/// in spirit: reject on the cheapest metadata that can answer the question
+/// correctly, not the cheapest metadata available at all.
 ///
-/// A windowless request (`has_window() == false`) can match a series from
-/// any ingest hour (labels carry no time restriction), so it overlaps every
-/// bucket; this prefilter can only ever exclude a bucket for a *windowed*
-/// request whose window falls entirely outside the bucket's
-/// `[start_ns, end_ns)`.
-pub fn bucket_may_overlap(bucket: &Bucket, request: &ErasureRequest) -> bool {
+/// This deliberately does NOT use `bucket.start_ns()/end_ns()` (the
+/// bucket's *ingest*-hour range, derived from the flush-open clock): ingest
+/// time and sample event time are decoupled for backfilled or
+/// clock-skewed writes, so a windowed request's event-time window can miss
+/// a bucket's ingest hour while still matching samples the bucket
+/// physically stores. Using ingest bounds here previously produced
+/// physical under-erasure that diverged from EJ-T3's scan-time exclusion
+/// (which always filters on the real sample `ts_ns`): the query path would
+/// correctly hide the matching samples while this prefilter skipped the
+/// bucket that should have erased them (a GDPR gap, ADR-0064).
+///
+/// A windowless request (`has_window() == false`) can match a series
+/// regardless of when its samples were recorded, so it overlaps every
+/// bucket that has any live record at all. A bucket whose live record set
+/// carries no samples (`min_event_ts_ns > max_event_ts_ns`, the empty-parts
+/// sentinel [`live_input_event_bounds`] returns) has nothing left to
+/// physically erase, so this always returns `false` for a windowed
+/// request in that case regardless of the window.
+pub fn bucket_may_overlap(min_event_ts_ns: i64, max_event_ts_ns: i64, request: &ErasureRequest) -> bool {
     let has_window = request.window_start_ns != 0 || request.window_end_ns != 0;
     if !has_window {
         return true;
     }
-    let bucket_start = bucket.start_ns();
-    let bucket_end = bucket.end_ns();
-    let starts_before_bucket_ends =
-        request.window_start_ns == 0 || request.window_start_ns < bucket_end;
-    let ends_after_bucket_starts =
-        request.window_end_ns == 0 || request.window_end_ns > bucket_start;
-    starts_before_bucket_ends && ends_after_bucket_starts
+    if min_event_ts_ns > max_event_ts_ns {
+        return false;
+    }
+    let starts_before_records_end =
+        request.window_start_ns == 0 || request.window_start_ns <= max_event_ts_ns;
+    let ends_after_records_start =
+        request.window_end_ns == 0 || request.window_end_ns > min_event_ts_ns;
+    starts_before_records_end && ends_after_records_start
 }
 
 /// GET, decode, and key-verify a compaction record (ADR-0010 §7). Duplicated
@@ -407,26 +426,82 @@ fn bucket_is_held(listing: &BucketListing, lease: &dyn LeaseCheck) -> bool {
             .any(|k| lease.is_protected(k))
 }
 
-/// Resolve a bucket's live record set (via [`resolve_live_record`]) down to
-/// both the [`InputCatalog`]s [`build_rewrite`] decodes and the
-/// [`RewriteSupersession`] target the eventual `RewriteRecord` names: the raw
-/// L0 inputs' own catalogs plus their identities if the bucket was never
-/// compacted, or the live compaction/rewrite record's own parts' catalogs
-/// plus its own key otherwise (one hop, never a predecessor chase, per
-/// [`resolve_live_record`]'s doc). An L1/rewrite part carries no writer
-/// identity of its own, so its catalog's runs are stamped with the live
-/// record's `created_unix_ns` and zeroed epoch/seq -- the same
-/// nil-writer-identity convention [`crate::read::load_catalog_from_object`]'s
-/// own doc comment names.
-async fn load_live_catalogs_and_target(
+/// A bucket's live record set, resolved (via [`resolve_live_record`]) down
+/// to whatever cheap per-record metadata already carries real event-time
+/// bounds -- stopping short of the per-input catalog fetch
+/// [`load_live_catalogs_and_target`] pays for, so [`erasure_rewrite_bucket`]
+/// can apply [`bucket_may_overlap`] and bail out before that heavier GET.
+#[derive(Debug)]
+enum LiveInputs {
+    /// The bucket has never been compacted or rewritten: every raw L0
+    /// input's own decoded [`ravel_commit::record`] (a small, already-GET
+    /// metadata object, not the segment data object it names).
+    RawL0(Vec<crate::read::InputRecord>),
+    /// `key` is the live compaction/rewrite record, decoded as `body`; its
+    /// `parts()` already carry each part's `min_event_ts_ns`/
+    /// `max_event_ts_ns` (`ravel_proto::commit::v1::CompactionPart`).
+    Existing { key: String, body: LiveRecordBody },
+}
+
+/// Resolve [`LiveInputs`], paying for the small per-record metadata GET
+/// (raw L0 commit records, or the single already-required compaction/rewrite
+/// record) but not yet the larger per-input catalog fetch.
+async fn resolve_live_inputs(
     store: &dyn ObjectStoreBackend,
-    config: &CompactorConfig,
     bucket: &Bucket,
     listing: &BucketListing,
-) -> Result<(Vec<InputCatalog>, RewriteSupersession)> {
+) -> Result<LiveInputs> {
     match resolve_live_record(store, bucket, listing).await? {
         LiveRecord::RawL0 => {
             let inputs = crate::read::load_inputs(store, bucket, &listing.commit_keys).await?;
+            Ok(LiveInputs::RawL0(inputs))
+        }
+        LiveRecord::Existing { key, body } => Ok(LiveInputs::Existing { key, body }),
+    }
+}
+
+/// `[min_event_ts_ns, max_event_ts_ns]` spanning every record in `live` --
+/// the real event-time bounds [`bucket_may_overlap`]'s GDPR fix needs,
+/// since ingest hour and event time are decoupled for backfilled or
+/// clock-skewed samples. An empty live record set (a bucket rewritten down
+/// to zero parts) returns the `min > max` empty-range sentinel
+/// [`bucket_may_overlap`] treats as "nothing here to overlap."
+fn live_input_event_bounds(live: &LiveInputs) -> (i64, i64) {
+    let mut min_event_ts_ns = i64::MAX;
+    let mut max_event_ts_ns = i64::MIN;
+    match live {
+        LiveInputs::RawL0(inputs) => {
+            for input in inputs {
+                min_event_ts_ns = min_event_ts_ns.min(input.record.min_event_ts_ns);
+                max_event_ts_ns = max_event_ts_ns.max(input.record.max_event_ts_ns);
+            }
+        }
+        LiveInputs::Existing { body, .. } => {
+            for part in body.parts() {
+                min_event_ts_ns = min_event_ts_ns.min(part.min_event_ts_ns);
+                max_event_ts_ns = max_event_ts_ns.max(part.max_event_ts_ns);
+            }
+        }
+    }
+    (min_event_ts_ns, max_event_ts_ns)
+}
+
+/// Resolve `live` down to both the [`InputCatalog`]s [`build_rewrite`]
+/// decodes and the [`RewriteSupersession`] target the eventual
+/// `RewriteRecord` names: the raw L0 inputs' own catalogs plus their
+/// identities if the bucket was never compacted, or the live
+/// compaction/rewrite record's own parts' catalogs plus its own key
+/// otherwise. An L1/rewrite part carries no writer identity of its own, so
+/// its catalog's runs are stamped with the live record's `created_unix_ns`
+/// and zeroed epoch/seq -- the same nil-writer-identity convention
+/// [`crate::read::load_catalog_from_object`]'s own doc comment names.
+async fn load_live_catalogs_and_target(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    live: LiveInputs,
+) -> Result<(Vec<InputCatalog>, RewriteSupersession)> {
+    match live {
+        LiveInputs::RawL0(inputs) => {
             let mut catalogs = Vec::with_capacity(inputs.len());
             for input in &inputs {
                 catalogs.push(crate::read::load_input_catalog(store, config, input).await?);
@@ -441,7 +516,7 @@ async fn load_live_catalogs_and_target(
                 .collect();
             Ok((catalogs, RewriteSupersession::RawL0(identities)))
         }
-        LiveRecord::Existing { key, body } => {
+        LiveInputs::Existing { key, body } => {
             let created_unix_ns = body.created_unix_ns();
             let mut catalogs = Vec::with_capacity(body.parts().len());
             for part in body.parts() {
@@ -607,27 +682,61 @@ pub async fn build_rewrite(
     let mut input_sample_count: u64 = 0;
     let mut output_sample_count: u64 = 0;
     let mut dropped_counts = vec![0u64; requests.len()];
-    let mut series_out: Vec<SeriesInputV4> = Vec::new();
 
-    for catalog in catalogs {
-        let object = whole.get(&catalog.object_key).ok_or_else(|| {
-            MaintainError::Invariant(format!("no fetched object for {}", catalog.object_key))
-        })?;
+    // Group every series across every input catalog by id before encoding,
+    // mirroring build.rs::build_parts's cross-input grouping (canonical
+    // input order, then each object's own run order). A sealed bucket's
+    // live RawL0 input set is normally >=2 commits sharing a series_id --
+    // every metrics flush is its own L0 commit repeating the same series --
+    // so processing catalogs one at a time and pushing a fresh
+    // `SeriesInputV4` per (catalog, series) pair, as this loop used to,
+    // produces a duplicate series_id in series_out and aborts the whole
+    // bucket with `DuplicateSeriesId` in `assemble_v4_body`.
+    let mut by_series: BTreeMap<[u8; 16], Vec<(usize, &SeriesPlan)>> = BTreeMap::new();
+    for (idx, catalog) in catalogs.iter().enumerate() {
         for series in &catalog.series {
-            let applicable: Vec<usize> = requests
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.matcher.matches_labels(&series.labels))
-                .map(|(i, _)| i)
-                .collect();
+            by_series
+                .entry(series.series_id.0)
+                .or_default()
+                .push((idx, series));
+        }
+    }
 
-            let mut runs_out = Vec::with_capacity(series.runs.len());
+    let mut series_out: Vec<SeriesInputV4> = Vec::with_capacity(by_series.len());
+
+    for (_id, contributions) in by_series {
+        let (_, first) = contributions[0];
+        let series_id = first.series_id;
+        let labels = first.labels.clone();
+
+        let applicable: Vec<usize> = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.matcher.matches_labels(&labels))
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut runs_out = Vec::new();
+        for (idx, series) in &contributions {
+            let catalog = &catalogs[*idx];
+            let object = whole.get(&catalog.object_key).ok_or_else(|| {
+                MaintainError::Invariant(format!("no fetched object for {}", catalog.object_key))
+            })?;
             for run in &series.runs {
-                input_sample_count = input_sample_count.saturating_add(u64::from(run.sample_count));
+                input_sample_count = input_sample_count
+                    .checked_add(u64::from(run.sample_count))
+                    .ok_or_else(|| {
+                        MaintainError::Invariant("input_sample_count sum overflowed u64".to_string())
+                    })?;
 
                 if applicable.is_empty() {
-                    output_sample_count =
-                        output_sample_count.saturating_add(u64::from(run.sample_count));
+                    output_sample_count = output_sample_count
+                        .checked_add(u64::from(run.sample_count))
+                        .ok_or_else(|| {
+                            MaintainError::Invariant(
+                                "output_sample_count sum overflowed u64".to_string(),
+                            )
+                        })?;
                     runs_out.push(copy_run_verbatim(object, run)?);
                     continue;
                 }
@@ -652,7 +761,7 @@ pub async fn build_rewrite(
                         let mut timestamps = Vec::new();
                         let mut values = Vec::new();
                         decode_run_pages_soa(
-                            &series.series_id,
+                            &series_id,
                             &entry,
                             ts_page.as_ref(),
                             val_page.as_ref(),
@@ -663,17 +772,21 @@ pub async fn build_rewrite(
                         )?;
                         let mut survivors = Vec::with_capacity(timestamps.len());
                         for (ts, value) in timestamps.into_iter().zip(values) {
-                            match first_dropping_request(&applicable, requests, &series.labels, ts)
-                            {
+                            match first_dropping_request(&applicable, requests, &labels, ts) {
                                 Some(i) => dropped_counts[i] += 1,
                                 None => survivors.push(Sample { ts_ns: ts, value }),
                             }
                         }
                         if !survivors.is_empty() {
-                            output_sample_count =
-                                output_sample_count.saturating_add(survivors.len() as u64);
+                            output_sample_count = output_sample_count
+                                .checked_add(survivors.len() as u64)
+                                .ok_or_else(|| {
+                                    MaintainError::Invariant(
+                                        "output_sample_count sum overflowed u64".to_string(),
+                                    )
+                                })?;
                             runs_out.push(encode_run_v4(
-                                &series.series_id,
+                                &series_id,
                                 run.created_unix_ns,
                                 run.writer_epoch,
                                 run.writer_seq,
@@ -683,7 +796,7 @@ pub async fn build_rewrite(
                     }
                     ValueKind::Histogram => {
                         let samples = decode_run_histogram_pages(
-                            &series.series_id,
+                            &series_id,
                             &entry,
                             ts_page.as_ref(),
                             val_page.as_ref(),
@@ -691,21 +804,21 @@ pub async fn build_rewrite(
                         )?;
                         let mut survivors = Vec::with_capacity(samples.len());
                         for s in samples {
-                            match first_dropping_request(
-                                &applicable,
-                                requests,
-                                &series.labels,
-                                s.ts_ns,
-                            ) {
+                            match first_dropping_request(&applicable, requests, &labels, s.ts_ns) {
                                 Some(i) => dropped_counts[i] += 1,
                                 None => survivors.push(s),
                             }
                         }
                         if !survivors.is_empty() {
-                            output_sample_count =
-                                output_sample_count.saturating_add(survivors.len() as u64);
+                            output_sample_count = output_sample_count
+                                .checked_add(survivors.len() as u64)
+                                .ok_or_else(|| {
+                                    MaintainError::Invariant(
+                                        "output_sample_count sum overflowed u64".to_string(),
+                                    )
+                                })?;
                             runs_out.push(encode_run_v4(
-                                &series.series_id,
+                                &series_id,
                                 run.created_unix_ns,
                                 run.writer_epoch,
                                 run.writer_seq,
@@ -715,14 +828,14 @@ pub async fn build_rewrite(
                     }
                 }
             }
+        }
 
-            if !runs_out.is_empty() {
-                series_out.push(SeriesInputV4 {
-                    series_id: series.series_id,
-                    labels: series.labels.clone(),
-                    runs: runs_out,
-                });
-            }
+        if !runs_out.is_empty() {
+            series_out.push(SeriesInputV4 {
+                series_id,
+                labels,
+                runs: runs_out,
+            });
         }
     }
 
@@ -907,6 +1020,23 @@ pub async fn publish_rewrite_record(
             output_sample_count: build.output_sample_count,
             dropped_sample_count,
         });
+    }
+
+    // Encode reconciliation: the conservation gate above only proves the
+    // decode/filter tally didn't lose or duplicate a sample -- it says
+    // nothing about whether the bytes this run is about to publish actually
+    // contain those `output_sample_count` survivors. Recount from the
+    // *encoded* parts' own summaries and abort before the first byte is
+    // written if they disagree, closing that gap.
+    let encoded_sample_count = checked_sample_sum(build.parts.iter().map(|p| p.part.sample_count))?;
+    if encoded_sample_count != build.output_sample_count {
+        return Err(MaintainError::Invariant(format!(
+            "erasure rewrite encode reconciliation failed: output_sample_count {} does not \
+             match sum(part.sample_count) {} across {} written part(s)",
+            build.output_sample_count,
+            encoded_sample_count,
+            build.parts.len()
+        )));
     }
 
     let (inputs, superseded_record_key) = match &supersession {
@@ -1097,12 +1227,7 @@ pub async fn erasure_rewrite_bucket(
     if !bucket.is_sealed(start_ns, config) {
         return Ok(ErasureRewriteOutcome::NotSealed);
     }
-
-    let overlapping: Vec<&PendingErasureRequest> = pending
-        .iter()
-        .filter(|p| bucket_may_overlap(bucket, &p.request))
-        .collect();
-    if overlapping.is_empty() {
+    if pending.is_empty() {
         return Ok(ErasureRewriteOutcome::NoApplicableRequests);
     }
 
@@ -1114,6 +1239,20 @@ pub async fn erasure_rewrite_bucket(
         return Ok(ErasureRewriteOutcome::Held);
     }
 
+    // Record-derived overlap check (ADR-0064 GDPR fix): this needs the live
+    // record set's actual event-time bounds, not the bucket's ingest-hour
+    // key, so it can only run after `resolve_live_inputs`'s cheap metadata
+    // GET, unlike the old purely key-derived prefilter this replaced.
+    let live = resolve_live_inputs(store, bucket, &listing).await?;
+    let (min_event_ts_ns, max_event_ts_ns) = live_input_event_bounds(&live);
+    let overlapping: Vec<&PendingErasureRequest> = pending
+        .iter()
+        .filter(|p| bucket_may_overlap(min_event_ts_ns, max_event_ts_ns, &p.request))
+        .collect();
+    if overlapping.is_empty() {
+        return Ok(ErasureRewriteOutcome::NoApplicableRequests);
+    }
+
     let applicable: Vec<ApplicableRequest> = overlapping
         .iter()
         .map(|p| ApplicableRequest {
@@ -1122,8 +1261,7 @@ pub async fn erasure_rewrite_bucket(
         })
         .collect();
 
-    let (catalogs, supersession) =
-        load_live_catalogs_and_target(store, config, bucket, &listing).await?;
+    let (catalogs, supersession) = load_live_catalogs_and_target(store, config, live).await?;
 
     let mut applied_request_ids: Vec<String> =
         applicable.iter().map(|r| r.request_id.clone()).collect();
@@ -1155,10 +1293,13 @@ pub async fn erasure_rewrite_bucket(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    //! Five required tests (EJ-T4, issue #754): drop-exact-preserve-others,
+    //! Eight required tests (EJ-T4, issue #754): drop-exact-preserve-others,
     //! conservation-abort, legal-hold-skip, idempotence (no double-count on
-    //! resolve), and corrupt/truncated input. Each test's doc comment names
-    //! the exact line whose flip breaks it, per the task's "prove-the-test"
+    //! resolve), corrupt/truncated input, cross-input same-series merge
+    //! (review blocker 1), backfilled/clock-skewed windowed selection
+    //! (review blocker 2), and partial-survival re-encode bit-identity
+    //! (review hardening item 4). Each test's doc comment names the exact
+    //! line whose flip breaks it, per the task's "prove-the-test"
     //! discipline.
     //!
     //! Neither `build_rewrite`/`publish_rewrite_record`/`erasure_rewrite_bucket`
@@ -1584,7 +1725,10 @@ mod tests {
         let listing = crate::read::list_bucket(&store, &b)
             .await
             .expect("list bucket");
-        let (catalogs, supersession) = load_live_catalogs_and_target(&store, &config, &b, &listing)
+        let live = resolve_live_inputs(&store, &b, &listing)
+            .await
+            .expect("resolve live inputs");
+        let (catalogs, supersession) = load_live_catalogs_and_target(&store, &config, live)
             .await
             .expect("load live catalogs");
 
@@ -1701,6 +1845,196 @@ mod tests {
             after.len(),
             1,
             "a failed rewrite must not publish anything, not even a partial part"
+        );
+    }
+
+    /// Review blocker 1: a sealed bucket's live RawL0 input set is normally
+    /// >=2 commits that each repeat the same series (every metrics flush is
+    /// its own L0 commit), so `build_rewrite` must merge same-`series_id`
+    /// runs across every input catalog into one `SeriesInputV4`, not one per
+    /// (catalog, series) pair. Flip-line proof: reverting `build_rewrite`'s
+    /// `by_series` cross-input grouping to the old per-catalog loop (push a
+    /// fresh `SeriesInputV4` for every catalog's own `series_id`, `runs:
+    /// runs_out` scoped to that one catalog) reintroduces a duplicate
+    /// `series_id` in `series_out` for the `alpha` series seeded twice below,
+    /// so `assemble_v4_body` (crates/ravel-segment/src/writer.rs) returns
+    /// `Err(WriteError::DuplicateSeriesId)` and this call's `.expect(...)`
+    /// panics instead of returning `Rewritten`.
+    #[tokio::test]
+    async fn rewrite_merges_same_series_runs_across_multiple_l0_inputs() {
+        let store = MemoryStore::new();
+        seed(&store, 1, vec![series("alpha", &[(10, 1.0), (20, 2.0)])]).await;
+        seed(&store, 2, vec![series("alpha", &[(30, 3.0), (40, 4.0)])]).await;
+
+        // A request that matches no series in this bucket at all: the bug
+        // reproduces even when nothing is dropped, because the old code
+        // pushed a duplicate `SeriesInputV4` for every catalog regardless of
+        // whether any request applied to it.
+        let request = erasure_request(1, "unrelated-metric");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome =
+            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &bucket(), &pending)
+                .await
+                .expect("rewrite must succeed even when >=2 live L0 commits share a series_id");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(parts, 1);
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record(&store).await;
+        assert_eq!(record.parts.len(), 1);
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+
+        let alpha_after =
+            decode_series_samples(&store, &config, &part_key, series_id("alpha")).await;
+        let mut expected = vec![
+            (10, 1.0f64.to_bits()),
+            (20, 2.0f64.to_bits()),
+            (30, 3.0f64.to_bits()),
+            (40, 4.0f64.to_bits()),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            alpha_after, expected,
+            "alpha's samples from both L0 inputs must survive bit-identically, \
+             merged under one series entry"
+        );
+    }
+
+    /// Review blocker 2 (GDPR physical under-erasure): a windowed erasure
+    /// request's event-time window is checked against `bucket_may_overlap`,
+    /// which must overlap against the live records' real
+    /// `[min_event_ts_ns, max_event_ts_ns]`, not the bucket's ingest-hour
+    /// range -- the two are decoupled for a backfilled or clock-skewed
+    /// write. This fixture's samples (event ts 10 and 20) are, like every
+    /// other fixture in this module, nowhere near the bucket's own
+    /// astronomically large ingest-hour bounds (`HOUR = 495_000`), which is
+    /// exactly the backfill/clock-skew shape this bug needs. Flip-line
+    /// proof: reverting `bucket_may_overlap` to compare
+    /// `request.window_start_ns`/`window_end_ns` against
+    /// `bucket.start_ns()`/`bucket.end_ns()` instead of
+    /// `min_event_ts_ns`/`max_event_ts_ns` makes the prefilter in
+    /// `erasure_rewrite_bucket` reject this request (window `[0, 25)` is
+    /// nowhere near the bucket's ingest-hour bounds), yielding
+    /// `NoApplicableRequests` and failing the `Rewritten` match below.
+    #[tokio::test]
+    async fn windowed_request_matches_backfilled_samples_outside_ingest_hour() {
+        let store = MemoryStore::new();
+        seed(&store, 1, vec![series("alpha", &[(10, 1.0), (20, 2.0)])]).await;
+
+        let mut request = erasure_request(1, "alpha");
+        request.window_start_ns = 0;
+        request.window_end_ns = 25;
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome =
+            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &bucket(), &pending)
+                .await
+                .expect("rewrite");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!(
+                "expected Rewritten -- a windowed request matching physically-stored \
+                 event timestamps must select the bucket even when those timestamps \
+                 fall outside its ingest hour, got {other:?}"
+            ),
+        };
+        assert_eq!(
+            parts, 0,
+            "alpha is the bucket's only series and both its samples fall in the \
+             erasure window, so nothing survives to write"
+        );
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record(&store).await;
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(
+            record.drops[0].dropped_count, 2,
+            "both alpha samples fall inside the erasure window and are physically erased"
+        );
+        assert!(
+            record.parts.is_empty(),
+            "alpha fully erased leaves zero output parts"
+        );
+    }
+
+    /// Review hardening item 4: the existing drop tests each exercise either
+    /// `copy_run_verbatim` (a series matching no request survives whole) or
+    /// full-series erasure (every sample of a matched series is dropped).
+    /// Neither exercises a matched series that PARTIALLY survives, which is
+    /// the one path that actually goes through
+    /// `decode_run_pages_soa`/`encode_run_v4` with a mixed keep/drop
+    /// outcome. Flip-line proof: in `build_rewrite`'s `ValueKind::Scalar`
+    /// arm, swapping `first_dropping_request(...).is_some()`'s branches
+    /// (treat a match as "keep" and a non-match as "drop") flips which
+    /// samples survive, failing the bit-identity assertion below (and would
+    /// also flip which two samples the `dropped_count` covers).
+    #[tokio::test]
+    async fn rewrite_reencodes_partially_surviving_series_bit_identically() {
+        let store = MemoryStore::new();
+        seed(
+            &store,
+            1,
+            vec![series(
+                "alpha",
+                &[(10, 1.0), (20, 2.0), (30, -0.0), (40, f64::NAN)],
+            )],
+        )
+        .await;
+
+        let mut request = erasure_request(1, "alpha");
+        request.window_start_ns = 15;
+        request.window_end_ns = 35;
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome =
+            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &bucket(), &pending)
+                .await
+                .expect("rewrite");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(parts, 1);
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record(&store).await;
+        assert_eq!(
+            record.drops[0].dropped_count, 2,
+            "only the two in-window samples (20, 30) are dropped"
+        );
+
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let alpha_after =
+            decode_series_samples(&store, &config, &part_key, series_id("alpha")).await;
+        let mut expected = vec![(10, 1.0f64.to_bits()), (40, f64::NAN.to_bits())];
+        expected.sort_unstable();
+        assert_eq!(
+            alpha_after, expected,
+            "surviving samples must re-encode bit-identically, including the NaN payload"
         );
     }
 }
