@@ -111,6 +111,29 @@ piece, see [docs/adrs/](docs/adrs/).
   the same duplicate-sample resolution as PromQL so the two agree on
   results. **Flight SQL** exposes the same query path over Arrow Flight's
   gRPC surface.
+- **Distributed query** ([ADR-0071](docs/adrs/0071-distributed-read-fanout.md)),
+  off by default, two capabilities that change *where* bytes are fetched,
+  never *what* a query computes (results stay byte-identical to local
+  execution, enforced by a differential test):
+  - **Multi-process fan-out** within one cluster, enabled per query node
+    with `--distributed-query` plus a fragment-credential file. The node
+    that receives a request coordinates it: it resolves one pinned snapshot,
+    and when a cost estimate clears the gate (256 MiB of estimated store
+    bytes or 64 segments), it partitions that snapshot shard-major and
+    dispatches each slice to a peer query node over an internal gRPC
+    surface (a `SeriesFetch` service for PromQL, Arrow Flight for SQL).
+    Workers self-register by heartbeat; the coordinator k-way merges the
+    slices and runs the unchanged evaluator. A cheap query runs the local
+    path untouched.
+  - **Cross-cluster federation**, configured per remote with repeatable
+    `--remote-cluster`. The coordinator asks each remote cluster to resolve
+    its own snapshot over matchers and a window and unions the returned
+    series; segment references and S3 credentials never cross a trust
+    boundary, and the coordinator authenticates with a per-remote operator
+    credential (a client's own credential is never forwarded). A remote
+    failure fails the query by default; per-remote `skip_unavailable`
+    instead returns partial results, marked with `partial: true` and one
+    `warnings` entry naming each skipped cluster.
 - **Analytics**: `POST /api/v1/analytics` runs a range query, then applies
   change point detection (PELT) or exact summary statistics (median, MAD,
   percentiles, standard deviation, variance) to each series.

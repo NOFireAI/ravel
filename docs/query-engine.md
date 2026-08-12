@@ -284,6 +284,91 @@ output size: every matched series in every matched segment is still fully
 fetched and SoA-decoded before the merge runs, so peak fetch/decode memory
 scales with the query's matched input, not with `max_samples`.
 
+## Intra-cluster read fan-out (ADR-0071)
+
+Within one cluster, a read can be spread across peer query nodes so more than
+one process's NIC, CPU, and memory serve it. This is off by default: a
+`QueryEngine` built without a distributed context runs the byte-identical
+local path, and `--distributed-query` (plus a fragment-credential file) is
+what attaches one. The fan-out changes only *where* bytes are fetched and
+decoded; aggregation and evaluation do not move, so the coordinator-merged
+result is bit-for-bit identical to local execution, enforced by the
+`distributed_merge_equals_local_bitwise` differential test over arbitrary
+corpora and slice partitions.
+
+### Coordinator, cost gate, and slices
+
+The query node that receives a request is that query's coordinator (a
+per-query role, not a process type). It resolves ONE pinned snapshot exactly
+as the local path does, then consults the same pre-execution `CostEstimate`
+the accounting layer already computes: distribution trips only when the
+estimate reaches 256 MiB of estimated store bytes **or** 64 segments (either
+axis, `DistribThresholds`). A query below both stays fully local, so a cheap
+query pays nothing for the machinery. When the gate trips, the coordinator
+partitions the snapshot **shard-major** (`partition_snapshot`): a segment's
+ingest shard is the primary grouping key, a shard's segments are never split
+across slices, and whole shard groups are packed so the slice count never
+exceeds `max_parallel_slices`. Partitioning is total and disjoint — every
+segment lands in exactly one non-empty slice — and because the k-way merge is
+order-insensitive over the flat pool of decoded runs, the specific
+shard-to-slice assignment never changes the result.
+
+Each slice is dispatched to a worker over the internal `SeriesFetch` gRPC
+service. The worker executes the existing fetch path over only its listed
+segments (reconstructing each `SegmentRef` from the shipped durable identity,
+never trusting a wire key), applies the request's erasure predicates exactly
+as the local path would, pre-merges its slice, and streams series runs back
+(f64 values as raw bit patterns, so NaN payloads, -0.0, and the staleness
+marker survive) ending with one terminal summary frame. A slice contributes
+to the merge only after its summary arrives; partial frames from a failed
+attempt are discarded whole, which is what makes re-dispatch safe with no
+dedup bookkeeping. Worker membership is a heartbeat key per process with
+rendezvous hashing of `(tenant_hash, signal, shard)` over the live set — no
+leader, no assignment object, no new durable state — and the per-process
+content-addressed read caches behave as one aggregate cache because segments
+are immutable.
+
+### Budgets and the fault matrix
+
+The coordinator re-enforces the query's budgets over the folded per-slice
+accounting, so a worker that under-reports or lies about its own spend cannot
+overrun the caps: the distinct-series cap is checked as each slice's series
+arrive, and the bytes-scanned cap is checked against the saturating fold of
+every slice's reported cost (saturating, never wrapping, so a counter near
+`u64::MAX` clamps rather than slipping under the cap). Every slice's real
+spend is folded into the query's live accounting handle before any failure or
+fallback, so the reported cost reflects work already paid for — a
+histogram-bearing query that fetches remotely and then re-runs locally
+reports both, never one.
+
+Failures map to the same typed outcomes the local path produces:
+
+- **Worker unreachable or mid-stream loss:** re-dispatch the slice to the
+  next rendezvous worker once, then run it on the coordinator, then fail
+  typed. Never a partial merge.
+- **`SnapshotInvalidated`** (a pinned segment vanished under concurrent
+  GC/compaction): all invalidated slices collapse to the single retryable
+  error the local path raises for a vanished segment, so the engine
+  re-resolves the snapshot and re-dispatches the whole query once, not once
+  per slice; a second occurrence fails.
+- **`Corrupt`:** terminal immediately, no retry, matching local semantics
+  (retrying could mask corruption behind a clean local read).
+- **Budget trip** on a slice or on the folded total: the same typed
+  `TooManySeries` / `TooManyBytesScanned` errors the local path produces.
+- **Deadline:** the coordinator deadline (already bounded by the `sys/gc`
+  `max_query_duration` that keeps workers inside the GC protection horizon)
+  cancels the fan-out; stream teardown reaches workers and drop-based
+  cancellation frees their GETs and permits.
+- **Protocol version mismatch** (rolling deploy) or a **non-metrics signal**
+  or a **histogram-bearing slice:** the worker answers `Unsupported`, and the
+  coordinator silently falls back to fully local execution for the whole
+  query — never an error, never a partial result. Intra-cluster execution is
+  all-or-nothing; only cross-cluster federation (below) ever returns partial.
+
+Fragment admission runs under a separate internal workload class with its own
+cap, so a coordinator holding a client-query permit can never deadlock
+waiting on fragments that need the same pool.
+
 ## Cross-cluster federation (ADR-0071)
 
 A coordinator can fan a read out to remote clusters and merge their series
