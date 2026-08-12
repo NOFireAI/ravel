@@ -44,6 +44,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Context;
 use ravel_object_store::conformance::{
     BucketConfigProbeSource, ObjectLockProbeSource, ObjectLockStatus, bucket_config_alarms,
     probe_bucket_config, probe_object_lock,
@@ -167,6 +168,32 @@ where
         return Ok(None);
     }
     enforce(source).await.map(Some)
+}
+
+/// The exact statement `main.rs` runs at its bucket-protection call site:
+/// [`enforce_if_required`] wrapped in the same `.context(...)` and `?` the
+/// binary uses. Extracted so a test can call this one function generically
+/// (a `Fixture` reporting `Disabled`, or a real store reporting `Unknown`)
+/// and exercise the literal code `main.rs` executes, rather than a
+/// reimplementation of it that could drift from the real call site.
+///
+/// Before this extraction, the binary's `main()` inlined
+/// `enforce_if_required(...).context(...)?` directly, monomorphized only
+/// over `&dyn ObjectStoreBackend` (which `probe_object_lock` always reports
+/// `Unknown` for, by design -- see the module doc). That left the
+/// `Disabled`/alarm refusal branch of this gate completely untested: no
+/// test file could reach `main()`'s `?` at all, and the only type production
+/// ever calls this with can never produce the error it exists to return.
+pub async fn enforce_at_startup<S>(
+    required: bool,
+    source: &S,
+) -> anyhow::Result<Option<BucketProtectionOutcome>>
+where
+    S: ObjectLockProbeSource + BucketConfigProbeSource + ?Sized,
+{
+    enforce_if_required(required, source)
+        .await
+        .context("bucket-protection contract check failed; refusing to start")
 }
 
 #[cfg(test)]

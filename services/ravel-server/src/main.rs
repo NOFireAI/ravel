@@ -87,12 +87,11 @@ async fn main() -> anyhow::Result<()> {
     // backend reachable only through `ObjectStoreBackend` today) logs one
     // warning and sets the `ravel_bucket_protection_unknown` gauge instead
     // of blocking.
-    ravel_server::bucket_protection::enforce_if_required(
+    ravel_server::bucket_protection::enforce_at_startup(
         cli.require_bucket_protection,
         store.as_ref(),
     )
-    .await
-    .context("bucket-protection contract check failed; refusing to start")?;
+    .await?;
 
     // Tenant-hash scheme pinning (ADR-0050 section 3). Resolve the bucket's
     // scheme from `sys/tenancy` (writing the marker for a fresh or pre-ADR

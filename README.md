@@ -385,6 +385,31 @@ template, and the ADR-0055 2026-08-12 amendment for a known gap: the
 `t/*/enc` key, a required follow-up before this ships against an
 already-provisioned bucket.
 
+## Bucket protection
+
+`--require-bucket-protection` (ADR-0072 decision 3, default off) gates
+startup on the bucket's own Object Lock and versioning configuration
+instead of only warning about it: a backend that affirmatively reports
+Object Lock disabled, or a versioning-without-expiration alarm (ADR-0064
+section 7), refuses to start. Every backend reachable only through
+`ObjectStoreBackend` today reports the status as unknown rather than
+disabled or enabled -- no adapter queries this yet -- so on today's real
+backends the flag is observability, not an accidental universal refusal:
+it logs one warning and sets the `ravel_bucket_protection_unknown` gauge
+instead of blocking startup. `ravel-operator` sets this flag
+unconditionally for every `RavelCluster` it reconciles. See
+[docs/guides/operations.md](docs/guides/operations.md)'s "Bucket
+protection contract" section for the full state table.
+
+Together with tenant tokens and per-tenant encryption above, this is the
+ADR-0072 tenant trust boundary: per-tenant SSE-KMS routing keeps a leaked
+role credential from decrypting another tenant's data, the durable
+`sys/auth` revoke-by-tenant path lets an operator cut off a tenant's
+access without a restart, and this startup gate keeps a bucket without
+Object Lock/versioning from serving traffic at all. The IAM role policies
+both mechanisms depend on are in [`deploy/iam/`](deploy/iam/), documented
+in operations.md's "Storage credential roles" section.
+
 ## Container images
 
 ```sh

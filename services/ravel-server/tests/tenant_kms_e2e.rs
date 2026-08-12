@@ -340,6 +340,30 @@ fn s3_cli(endpoint: &str, tenant_kms_path: Option<&str>) -> Cli {
     Cli::try_parse_from(args).expect("flags parse")
 }
 
+/// Same base flags as [`s3_cli`], but with `--s3-kms-key` instead of
+/// `--tenant-kms-config`: the other, independent SSE-KMS mechanism
+/// (ADR-0062 decision 1c, `S3Config::kms_key_id`) that `build_store` applies
+/// unconditionally to the default `S3Store`, regardless of per-tenant
+/// routing.
+fn s3_cli_with_single_kms_key(endpoint: &str, kms_key: &str) -> Cli {
+    let args = vec![
+        "ravel-server".to_string(),
+        "--store".to_string(),
+        "s3".to_string(),
+        "--s3-bucket".to_string(),
+        BUCKET.to_string(),
+        "--s3-endpoint".to_string(),
+        endpoint.to_string(),
+        "--s3-access-key".to_string(),
+        "test".to_string(),
+        "--s3-secret-key".to_string(),
+        "test".to_string(),
+        "--s3-kms-key".to_string(),
+        kms_key.to_string(),
+    ];
+    Cli::try_parse_from(args).expect("flags parse")
+}
+
 /// The reachability proof: booting `ravel-server` with `--tenant-kms-config`
 /// naming two tenants' keys routes each tenant's data-object PUTs to that
 /// tenant's own key ARN, all the way through the real startup path
@@ -440,6 +464,47 @@ async fn tenant_kms_config_routes_each_tenants_puts_to_its_own_key() {
     assert!(
         acme_epochs[0].activated_ns <= acme_epochs[1].activated_ns,
         "epoch history must be monotonically activated: {acme_epochs:?}"
+    );
+
+    mock.stop().await;
+}
+
+/// EE-T6 1b (issue #933): reachability proof for the OTHER SSE-KMS
+/// mechanism `build_store` wires up -- `--s3-kms-key`, a single deployment-
+/// wide key applied to the default `S3Store` unconditionally
+/// (`services/ravel-server/src/store.rs`'s `kms_key_id: cli.s3_kms_key.clone()`),
+/// independent of and reachable with no `--tenant-kms-config` at all. Before
+/// this test, `--s3-kms-key` had unit coverage nowhere: `store.rs` has no
+/// `#[cfg(test)]` module exercising the field, and this file's existing two
+/// tests only ever drive `--tenant-kms-config`'s `KmsRoutingStore` path. A
+/// typo turning `kms_key_id: cli.s3_kms_key.clone()` into
+/// `kms_key_id: None` (or dropping the field from the built `S3Config`
+/// entirely) would leave every real PUT unencrypted under this flag with no
+/// test anywhere failing.
+#[tokio::test]
+async fn s3_kms_key_applies_to_every_put_with_no_tenant_kms_config() {
+    let mock = MockS3Server::start().await;
+    let key = "arn:aws:kms:us-east-1:111122223333:key/deployment-key";
+    let cli = s3_cli_with_single_kms_key(&mock.base_url, key);
+    assert_eq!(cli.store, StoreKind::S3);
+
+    let (store, _metrics, _cache, kms) =
+        build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    assert!(
+        kms.is_none(),
+        "--s3-kms-key alone must not construct a KmsRoutingStore; it is a plain S3Config field"
+    );
+
+    ingest_one(store.clone(), "acme", "checkout completed").await;
+
+    let all_puts = mock.state.puts.lock().expect("mock puts lock").clone();
+    assert!(!all_puts.is_empty(), "the ingest wrote nothing");
+    assert!(
+        all_puts
+            .iter()
+            .all(|p| p.sse_kms_key_id.as_deref() == Some(key)),
+        "every PUT this process makes, including the key-epoch bootstrap record, must carry \
+         --s3-kms-key's ARN when no per-tenant routing overrides it: {all_puts:?}"
     );
 
     mock.stop().await;
