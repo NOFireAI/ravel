@@ -87,7 +87,9 @@
 //! `EXEMPLARS` section return early after the catalog check. Every `GET`, its
 //! bytes, and the decoded section bytes are recorded into `QueryAccounting`
 //! like any other fetch, and the whole request runs under the same wall
-//! deadline and `max_segments` budget as `/api/v1/query`.
+//! deadline, `max_segments` sealed-set budget, and `max_s3_requests` budget
+//! as `/api/v1/query`, enforced through the shared `ravel_query::admit`/
+//! `request_budget_exceeded` seam (RH-T2, issue #902, ADR-0073 decision 4).
 //!
 //! Those two bound the *input*. The result itself is bounded by
 //! [`DEFAULT_MAX_EXEMPLARS`], this endpoint's analogue of the engine's
@@ -110,7 +112,7 @@ use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, MatchOp, matches_series, plan_selectors};
 use ravel_query::http::{QueryErrorResponse, TenantResolver};
-use ravel_query::{QueryEngine, QueryError};
+use ravel_query::{EngineConfig, QueryEngine, QueryError, admit, request_budget_exceeded};
 use ravel_segment::{
     ExemplarRecord, ExpectedIdentity, Footer, ReaderLimits, SeriesEntryV4, check_identity,
     decode_catalog_v5, decode_exemplars_section, open_from_full,
@@ -167,9 +169,11 @@ const DEFAULT_MAX_EXEMPLARS: usize = 100_000;
 /// store handles (the same instances the PromQL engine uses, so an exemplar
 /// query resolves byte-for-byte the snapshot a sample query would over the
 /// same `[start, end]` window; `offset`/`@` do not apply here, see the module
-/// doc data fact 1), plus the
-/// query engine's own budget knobs read from its [`EngineConfig`] so this
-/// endpoint honors the identical deadline and `max_segments` ceiling.
+/// doc data fact 1), plus the query engine's own [`EngineConfig`] so this
+/// endpoint honors the identical deadline, `max_segments` sealed-set ceiling,
+/// and `max_s3_requests` budget by calling `ravel_query::admit` and
+/// `ravel_query::request_budget_exceeded` directly (RH-T2, issue #902,
+/// ADR-0073 decision 4) rather than keeping its own copy of the check.
 #[derive(Clone)]
 pub struct ExemplarsState {
     pub catalog: Arc<Catalog>,
@@ -179,9 +183,10 @@ pub struct ExemplarsState {
     /// Server wall deadline (`EngineConfig::deadline`); a client `timeout` can
     /// only lower it.
     pub deadline: Duration,
-    /// `EngineConfig::max_segments`: the same snapshot-size ceiling
-    /// `/api/v1/query` enforces after resolve.
-    pub max_segments: usize,
+    /// The query engine's resource limits, consumed through the shared
+    /// `ravel_query::admit`/`request_budget_exceeded` seam rather than a
+    /// private copy of either check (RH-T2, issue #902).
+    pub engine_config: EngineConfig,
     /// Cap on the exemplars one request may materialize, enforced
     /// incrementally so the accumulation never grows past it. Defaults to
     /// [`DEFAULT_MAX_EXEMPLARS`]; `EngineConfig` has no exemplar knob to read
@@ -215,7 +220,7 @@ impl ExemplarsState {
             tenant_resolver,
             clock,
             deadline: config.deadline,
-            max_segments: config.max_segments,
+            engine_config: *config,
             max_exemplars: DEFAULT_MAX_EXEMPLARS,
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
         }
@@ -398,12 +403,14 @@ async fn collect_exemplars(
     }
 }
 
-/// One resolve-and-read attempt: resolve the snapshot, enforce `max_segments`,
-/// read every matched segment's exemplars, and build this attempt's stats.
-/// Returns [`CollectError::SnapshotStale`] when a pinned object GET returns
-/// `NotFound` mid-flight, which [`collect_exemplars`] retries once; every other
-/// failure is a fatal [`CollectError::Api`]. A fresh [`QueryAccounting`] is
-/// created here so a retried attempt starts from zero counters.
+/// One resolve-and-read attempt: resolve the snapshot, admit it through the
+/// shared `ravel_query::admit` seam, read every matched segment's exemplars
+/// (checking the S3 request budget incrementally as they're read), and build
+/// this attempt's stats. Returns [`CollectError::SnapshotStale`] when a
+/// pinned object GET returns `NotFound` mid-flight, which
+/// [`collect_exemplars`] retries once; every other failure is a fatal
+/// [`CollectError::Api`]. A fresh [`QueryAccounting`] is created here so a
+/// retried attempt starts from zero counters.
 #[allow(clippy::too_many_arguments)]
 async fn collect_once(
     state: &ExemplarsState,
@@ -417,9 +424,9 @@ async fn collect_once(
     now_ns: i64,
 ) -> Result<(Vec<ExemplarSeriesJson>, QueryStatsJson), CollectError> {
     let accounting = QueryAccounting::new();
-    let snapshot = state
+    let (snapshot, origins) = state
         .catalog
-        .resolve_pruned_with_accounting(
+        .resolve_pruned_with_admission(
             &tenant_hash,
             Signal::Metrics,
             window,
@@ -431,15 +438,13 @@ async fn collect_once(
         .await
         .map_err(|e| CollectError::Api(ApiError::from_query(QueryError::from(e))))?;
 
-    // The same snapshot-size ceiling `/api/v1/query` enforces after resolve.
-    if snapshot.segments.len() > state.max_segments {
-        return Err(CollectError::Api(ApiError::from_query(
-            QueryError::TooManySegments {
-                count: snapshot.segments.len(),
-                max: state.max_segments,
-            },
-        )));
-    }
+    // The same admission seam `/api/v1/query` and SQL enforce after resolve
+    // (RH-T2, issue #902, ADR-0073 decision 4): the sealed-set count against
+    // `max_segments`, recent and token-resolved segments exempt (decision 2).
+    // Their cost is bounded below instead, incrementally, by the S3 request
+    // budget (decision 3).
+    admit(&snapshot, &origins, &state.engine_config)
+        .map_err(|e| CollectError::Api(ApiError::from_query(e)))?;
 
     // Segments are read sequentially. The sample path fans this out under a
     // concurrency bound; here correctness and staying inside `ravel-server`'s
@@ -464,6 +469,16 @@ async fn collect_once(
             &mut collected,
         )
         .await?;
+        // Per-tenant S3 request budget (RH-T2, issue #902, ADR-0073 decision
+        // 4): checked once per completed segment, the same checkpoint the SQL
+        // metrics scan path and PromQL's engine use, so a trip here also
+        // means the remaining segments' GETs never happen.
+        if let Some(err) = request_budget_exceeded(
+            accounting.snapshot().total_s3_requests(),
+            state.engine_config.max_s3_requests,
+        ) {
+            return Err(CollectError::Api(ApiError::from_query(err)));
+        }
     }
 
     let stats = QueryStatsJson {
@@ -1344,6 +1359,7 @@ mod tests {
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
     use ravel_object_store::memory::MemoryStore;
+    use ravel_query::RequestLimit;
     use ravel_query::http::StaticBearerTokenResolver;
     use ravel_segment::{
         ExemplarInput, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues,
@@ -1465,10 +1481,28 @@ mod tests {
         series: Vec<SeriesInputV3>,
         exemplars: Vec<ExemplarInput>,
     ) {
+        let hour_bucket = u32::try_from(NOW / NS_PER_HOUR).expect("hour bucket");
+        publish_segment_at_hour(store, tenant_id, writer_seq, series, exemplars, hour_bucket).await
+    }
+
+    /// As `publish_segment_for`, but with an explicit `ingest_hour_bucket`
+    /// (RH-T2, issue #902). Admission's sealed/recent split (ADR-0073
+    /// decision 2) is decided from the commit record's hour bucket against
+    /// the fixed test clock, never from the sample timestamps inside the
+    /// segment, so this lets a test put a segment on either side of the seal
+    /// boundary while its exemplars still land inside whatever `[start, end]`
+    /// window `query` resolves.
+    async fn publish_segment_at_hour(
+        store: &MemoryStore,
+        tenant_id: &TenantId,
+        writer_seq: u64,
+        series: Vec<SeriesInputV3>,
+        exemplars: Vec<ExemplarInput>,
+        hour_bucket: u32,
+    ) {
         let tenant_hash = tenant_id.hash();
         let shard = 0u32;
         let writer_id = Uuid::new_v4();
-        let hour_bucket = u32::try_from(NOW / NS_PER_HOUR).expect("hour bucket");
 
         let identity = SegmentIdentity {
             tenant_hash: tenant_hash.0,
@@ -1650,6 +1684,22 @@ mod tests {
         max_segments: usize,
         max_exemplars: usize,
     ) -> Router {
+        let engine_config = EngineConfig {
+            max_segments,
+            ..EngineConfig::default()
+        };
+        build_router_with_engine_config(backend, deadline, engine_config, max_exemplars)
+    }
+
+    /// As `build_router_full`, but with a caller-supplied `EngineConfig` so a
+    /// test can exercise `max_s3_requests` (RH-T2, issue #902) alongside or
+    /// instead of `max_segments`.
+    fn build_router_with_engine_config(
+        backend: Arc<dyn ObjectStoreBackend>,
+        deadline: Duration,
+        engine_config: EngineConfig,
+        max_exemplars: usize,
+    ) -> Router {
         let catalog =
             Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
         let mut tokens = HashMap::new();
@@ -1661,7 +1711,7 @@ mod tests {
             tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
             clock: Arc::new(FixedClock(NOW)),
             deadline,
-            max_segments,
+            engine_config,
             max_exemplars,
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
         };
@@ -1704,7 +1754,10 @@ mod tests {
             tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
             clock: Arc::new(FixedClock(NOW)),
             deadline: Duration::from_secs(30),
-            max_segments: 1000,
+            engine_config: EngineConfig {
+                max_segments: 1000,
+                ..EngineConfig::default()
+            },
             max_exemplars: DEFAULT_MAX_EXEMPLARS,
             audit_sink: Arc::new(RecordingSink {
                 events: Arc::clone(&events),
@@ -1747,7 +1800,20 @@ mod tests {
     /// Issues the query as the holder of `token`, or with no `Authorization`
     /// header at all when `token` is `None`.
     async fn query_as(app: &Router, promql: &str, token: Option<&str>) -> (StatusCode, Value) {
-        let start = NOW - NS_PER_HOUR;
+        query_as_with_start(app, promql, token, NOW - NS_PER_HOUR).await
+    }
+
+    /// As `query_as`, but with a caller-supplied `start` (RH-T2, issue #902):
+    /// the default last-hour window every other test uses is narrower than
+    /// the ~80-minute seal margin (`fold.rs`'s `MARGIN_NS`), so it can never
+    /// reach a genuinely sealed hour. A sealed-segment admission test needs a
+    /// wider window that actually lists that hour.
+    async fn query_as_with_start(
+        app: &Router,
+        promql: &str,
+        token: Option<&str>,
+        start: i64,
+    ) -> (StatusCode, Value) {
         let uri = format!(
             "/api/v1/query_exemplars?query={}&start={}&end={}",
             encode(promql),
@@ -1996,16 +2062,92 @@ mod tests {
     }
 
     /// The budget path behaves as it does for `/api/v1/query`: a resolved
-    /// snapshot larger than `max_segments` is a 422, the same
-    /// `TooManySegments` mapping, before any exemplar is read.
+    /// snapshot whose sealed segment count exceeds `max_segments` is a 422,
+    /// the same `TooManySegments` mapping, before any exemplar is read. Uses
+    /// a segment sealed 10 hours before `NOW` (see `publish_segment_at_hour`)
+    /// rather than `publish_segment`'s current-hour default: since this
+    /// endpoint moved onto `ravel_query::admit` (RH-T2, issue #902), a
+    /// current-hour segment is exempt from `max_segments` (ADR-0073 decision
+    /// 2) and this test would otherwise flip from a 422 to a 200 for the
+    /// wrong reason (exemption, not a raised budget).
     #[tokio::test]
     async fn max_segments_budget_is_enforced() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        let sealed_hour = u32::try_from(NOW / NS_PER_HOUR).expect("hour bucket") - 10;
+        publish_segment_at_hour(&store, &tenant(), 1, vec![series], vec![ex], sealed_hour).await;
+
+        // A segment's `ingest_hour_bucket` alone does not make it sealed: the
+        // catalog only classifies a segment as `SealedBelowWatermark` (and
+        // thus countable against `max_segments`) once a fold has actually run
+        // past it (ADR-0073 decision 1). Without this, `resolve` lists it live
+        // and tags it `Recent`, exempt regardless of how old its hour bucket
+        // is -- fold on a throwaway `Catalog` over the same store first, the
+        // same two-instance pattern `exactness_stable_across_fold` uses.
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fold_catalog =
+            Catalog::new(backend, CatalogConfig::default()).expect("catalog for fold");
+        fold_catalog
+            .fold(&tenant().hash(), Signal::Metrics, Uuid::new_v4(), NOW, &[])
+            .await
+            .expect("fold seals sealed_hour");
+
+        // The default `query()` window (last hour) is narrower than the
+        // ~80-minute seal margin and could never reach an hour that fold
+        // just sealed: widen the window's start back to the sealed hour so
+        // the per-hour listing loop actually lists it.
+        let app = build_router(store, Duration::from_secs(30), 0);
+        let (status, body) =
+            query_as_with_start(&app, "m", Some(TOKEN), i64::from(sealed_hour) * NS_PER_HOUR).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["status"], "error");
+    }
+
+    /// The recent-hour exemption (ADR-0073 decision 2) applies to this
+    /// endpoint exactly as it does to `/api/v1/query`: a current-hour
+    /// segment is exempt from `max_segments` and a `max_segments: 0` query
+    /// still succeeds, bounded instead by the S3 request budget (proven
+    /// separately in `request_budget_is_enforced_on_recent_segments`).
+    #[tokio::test]
+    async fn recent_hour_segment_is_exempt_from_max_segments() {
         let store = Arc::new(MemoryStore::new());
         let (sid, series) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
         let ex = exemplar(sid, NOW - 30 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
         publish_segment(&store, 1, vec![series], vec![ex]).await;
 
         let app = build_router(store, Duration::from_secs(30), 0);
+        let (status, _body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The per-tenant S3 request budget (RH-T2, issue #902, ADR-0073 decision
+    /// 3) still bounds a query over current-hour segments once `max_segments`
+    /// no longer does: two recent segments under `max_s3_requests:
+    /// Bounded(1)` trip the budget on the second segment's `GET`, the same
+    /// typed rejection SQL's metrics scan path and PromQL trip.
+    #[tokio::test]
+    async fn request_budget_is_enforced_on_recent_segments() {
+        let store = Arc::new(MemoryStore::new());
+        let (sid1, series1) = scalar_series(&tenant(), "m", &[], &[(NOW - 60 * NS_PER_SEC, 1.0)]);
+        let ex1 = exemplar(sid1, NOW - 50 * NS_PER_SEC, 1.0, TRACE_ID, SPAN_ID, &[]);
+        publish_segment(&store, 1, vec![series1], vec![ex1]).await;
+
+        let (sid2, series2) = scalar_series(&tenant(), "m", &[], &[(NOW - 40 * NS_PER_SEC, 2.0)]);
+        let ex2 = exemplar(sid2, NOW - 30 * NS_PER_SEC, 2.0, [0x02; 16], SPAN_ID, &[]);
+        publish_segment(&store, 2, vec![series2], vec![ex2]).await;
+
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let engine_config = EngineConfig {
+            max_s3_requests: RequestLimit::Bounded(1),
+            ..EngineConfig::default()
+        };
+        let app = build_router_with_engine_config(
+            backend,
+            Duration::from_secs(30),
+            engine_config,
+            DEFAULT_MAX_EXEMPLARS,
+        );
         let (status, body) = query(&app, "m").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["status"], "error");
