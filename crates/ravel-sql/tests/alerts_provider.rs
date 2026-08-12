@@ -104,6 +104,24 @@ fn alert_record(
     }
 }
 
+/// [`alert_record`] whose alert stream carries `resource` attributes in its
+/// `stream_attrs` (the RESOURCE position) rather than only per-record `attrs`.
+/// Used to prove selective erasure catches a subject named only at the merged
+/// resource/scope level (issue #928).
+fn alert_record_on_resource(
+    resource: &[(String, AttrValue)],
+    ts: i64,
+    alert_id: &str,
+    rule_id: &str,
+    state: &str,
+    generation: i64,
+) -> LogRecord {
+    let mut r = alert_record(ts, alert_id, rule_id, state, generation, &[]);
+    r.stream_id = ravel_types::logstream::log_stream_id(resource, "alerts", "1", &[]);
+    r.stream_attrs = stream_attrs_bytes(resource, "alerts", "1", &[]);
+    r
+}
+
 /// Write one RLOG object from `records`, put it at `key`, and return a matching
 /// L0 [`SegmentRef`] carrying the object's true ts span.
 async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> SegmentRef {
@@ -550,6 +568,70 @@ async fn pending_erasure_excludes_matching_rows() {
         got,
         BTreeSet::from([expected_row(&keep)]),
         "the erased alert_id is excluded; the other row survives"
+    );
+}
+
+/// Issue #928 (ADR-0064): a subject named ONLY in a RESOURCE/scope
+/// (`stream_attrs`) attribute must also be excluded from the `alerts` table.
+/// The `attrs` column materializes the merged resource + scope + record view, so
+/// `user_id` is queryable, yet the fetcher-level filter matches per-record
+/// attributes alone and never sees it. Before the scan-layer `retain_unerased`
+/// in `alerts_scan.rs::prepare_partition`, this row leaked; removing that call
+/// reintroduces the leak.
+#[tokio::test]
+async fn pending_erasure_excludes_resource_attribute_rows() {
+    let store = MemoryStore::new();
+    // `user_id` lives in the RESOURCE position (stream_attrs), not per-record.
+    let keep = alert_record_on_resource(
+        &[("user_id".to_string(), AttrValue::Str("u2".to_string()))],
+        1,
+        "id-keep",
+        "cpu-high",
+        "firing",
+        1,
+    );
+    let erase = alert_record_on_resource(
+        &[("user_id".to_string(), AttrValue::Str("u1".to_string()))],
+        2,
+        "id-erase",
+        "cpu-high",
+        "firing",
+        1,
+    );
+    let seg = write_object(
+        &store,
+        "alerts/erasure-resource.rlog",
+        &[keep.clone(), erase],
+    )
+    .await;
+
+    let request = ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "user_id".to_string(),
+            value: "u1".to_string(),
+        }],
+        ..Default::default()
+    };
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = LogSegmentFetcher::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: vec![request],
+    };
+    let provider = AlertsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
+
+    let got = batches_to_rows(&collect_plan(provider.plan(1).expect("build plan")).await);
+    assert_eq!(
+        got,
+        BTreeSet::from([expected_row(&keep)]),
+        "the resource-only subject u1 is excluded; u2's row survives"
     );
 }
 

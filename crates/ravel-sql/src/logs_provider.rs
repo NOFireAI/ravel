@@ -1036,4 +1036,114 @@ mod tests {
             "u1's row is erased; u2's row survives"
         );
     }
+
+    /// Issue #928 (ADR-0064): a subject named ONLY in a RESOURCE/scope
+    /// (`stream_attrs`) attribute must also be excluded. The `attrs` column
+    /// materializes the merged resource + scope + record view, so `user_id` is
+    /// queryable, yet the fetcher-level filter (`retain_log_records`) matches
+    /// per-record attributes alone and never sees it. Before the scan-layer
+    /// `retain_unerased` in `logs_scan.rs::prepare_partition`, the erased row
+    /// leaked through this `SELECT`; removing that call reintroduces the leak.
+    #[tokio::test]
+    async fn pending_erasure_excludes_resource_attribute_rows_on_the_sql_path() {
+        let store = MemoryStore::new();
+        // `user_id` lives in the RESOURCE position (stream_attrs), not the
+        // per-record `attrs`, on two distinct streams.
+        let erased_resource = vec![
+            ("service.name".to_string(), s("worker")),
+            ("user_id".to_string(), s("u1")),
+        ];
+        let kept_resource = vec![
+            ("service.name".to_string(), s("worker")),
+            ("user_id".to_string(), s("u2")),
+        ];
+        let records = vec![
+            record(&erased_resource, &[], 1, "erase me"),
+            record(&kept_resource, &[], 2, "keep me"),
+        ];
+        let seg = write_object(&store, "logs/erasure-resource.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+
+        let request = ravel_proto::commit::v1::ErasureRequest {
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: "user_id".to_string(),
+                value: "u1".to_string(),
+            }],
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: vec![request],
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
+        let ctx = logs_session(provider).expect("build session");
+        let df = ctx.sql("SELECT ts, body FROM logs").await.expect("plan");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(
+            rows(&batches),
+            BTreeSet::from([(2, "keep me".to_string())]),
+            "the resource-only subject u1 is erased; u2's row survives"
+        );
+    }
+
+    /// A window-scoped resource-attribute erasure: the predicate carries a
+    /// half-open `[start, end)` event-time window, so only the in-window record
+    /// of the matching stream is excluded and the out-of-window record on the
+    /// same stream survives. Exercises the `p.ts_in_window(r.ts_ns)` arm of the
+    /// scan-layer filter against the merged (resource) attribute view.
+    #[tokio::test]
+    async fn windowed_erasure_on_resource_attribute_excludes_only_in_window_rows() {
+        let store = MemoryStore::new();
+        let resource = vec![
+            ("service.name".to_string(), s("worker")),
+            ("user_id".to_string(), s("u1")),
+        ];
+        // ts=5 falls inside [2, 8); ts=10 falls outside it. Both carry the same
+        // resource-level user_id=u1.
+        let records = vec![
+            record(&resource, &[], 5, "in window"),
+            record(&resource, &[], 10, "out of window"),
+        ];
+        let seg = write_object(&store, "logs/erasure-window.rlog", &records).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+
+        let request = ravel_proto::commit::v1::ErasureRequest {
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: "user_id".to_string(),
+                value: "u1".to_string(),
+            }],
+            window_start_ns: 2,
+            window_end_ns: 8,
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: vec![request],
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            EngineConfig::default(),
+            QueryAccounting::new(),
+        );
+        let ctx = logs_session(provider).expect("build session");
+        let df = ctx.sql("SELECT ts, body FROM logs").await.expect("plan");
+        let batches = df.collect().await.expect("collect");
+        assert_eq!(
+            rows(&batches),
+            BTreeSet::from([(10, "out of window".to_string())]),
+            "only the in-window (ts=5) row is erased; ts=10 survives"
+        );
+    }
 }

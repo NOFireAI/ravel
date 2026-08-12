@@ -52,7 +52,7 @@ use ravel_types::accounting::QueryAccounting;
 
 use crate::alerts_schema::{ALERT_ID_KEY, GENERATION_KEY, RULE_ID_KEY, STATE_KEY, alerts_schema};
 use crate::error::SqlError;
-use crate::rlog_attrs::{attr_value_to_string, find_attr, merged_attrs};
+use crate::rlog_attrs::{attr_value_to_string, find_attr, merged_attrs, retain_unerased};
 
 /// Rows accumulated into one output batch before it is emitted.
 const BATCH_ROWS: usize = 8192;
@@ -243,6 +243,12 @@ async fn prepare_partition(
         };
         out.extend(output.records);
     }
+    // Scan-layer selective-erasure exclusion (ADR-0064, issue #928). This is the
+    // authoritative exclusion because it sees the same merged `attrs` view the
+    // surface returns (resource + scope + record), so a subject named only in a
+    // resource/scope attribute is dropped; the fetcher-level filter matches
+    // per-record attributes alone and cannot see it.
+    retain_unerased(&mut out, &erasure)?;
     // Stable sort so records with equal ts keep the reader's emission order.
     out.sort_by_key(|r| r.ts_ns);
     Ok(out)

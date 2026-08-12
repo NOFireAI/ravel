@@ -17,6 +17,7 @@
 use datafusion::error::DataFusionError;
 use datafusion::error::Result as DFResult;
 use ravel_logseg::LogRecord;
+use ravel_query::erasure::ErasurePredicate;
 use ravel_types::logstream::{AttrValue, canonical_attr_bytes};
 
 use crate::error::SqlError;
@@ -46,6 +47,43 @@ pub(crate) fn merged_attrs(r: &LogRecord) -> DFResult<Vec<(String, AttrValue)>> 
         }
     }
     Ok(merged)
+}
+
+/// Scan-layer selective-erasure exclusion for the RLOG-backed tables
+/// (`logs`/`alerts`/`audit`), ADR-0064 decision 2. Drops every record erased by
+/// any predicate in `erasure`, matching against the **same** merged
+/// resource + scope + record attribute view ([`merged_attrs`]) that the `attrs`
+/// column exposes to the query surface. That is the authoritative exclusion: a
+/// subject named only in a resource or scope attribute (`user_id`, `host.name`,
+/// `service.instance.id`) is queryable through `attrs` yet invisible to a
+/// record-attribute-only filter, so it must be matched here (issue #928). This
+/// mirrors [`ravel_query::erasure::is_erased_span`] but over the
+/// [`AttrValue`]-typed merged map.
+///
+/// A no-op when `erasure` is empty. Fallible because the decode is fallible: a
+/// corrupt `stream_attrs` blob must still error the query, exactly as
+/// [`merged_attrs`] does inside `build_batch`, never silently drop or leak the
+/// row. A `Vec::retain` closure cannot propagate an error, so the survivor set
+/// is built explicitly.
+pub(crate) fn retain_unerased(
+    records: &mut Vec<LogRecord>,
+    erasure: &[ErasurePredicate],
+) -> DFResult<()> {
+    if erasure.is_empty() {
+        return Ok(());
+    }
+    let mut survivors = Vec::with_capacity(records.len());
+    for r in std::mem::take(records) {
+        let merged = merged_attrs(&r)?;
+        let erased = erasure
+            .iter()
+            .any(|p| p.matches_log_attrs(&merged) && (!p.has_window() || p.ts_in_window(r.ts_ns)));
+        if !erased {
+            survivors.push(r);
+        }
+    }
+    *records = survivors;
+    Ok(())
 }
 
 /// Look up one key in a [`merged_attrs`] result, for tables that promote a
