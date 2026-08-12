@@ -585,6 +585,14 @@ mod tests {
 
         use ravel_promql::Error as PromErr;
 
+        // An internal identifier a distributed/federated error's `reason` may
+        // carry (a remote endpoint, transport text, a cluster-internal cause).
+        // The `Distrib`/`Federation` arms redact to the fixed `MSG_UNAVAILABLE`,
+        // so this string must never survive into the client-facing message. The
+        // per-case redaction assertion below pins that: interpolating `reason`
+        // into either arm's public message makes it leak and fails the test.
+        const REASON_LEAK: &str = "10.9.8.7:9443 cluster-internal cause";
+
         let cases: Vec<fn() -> QueryError> = vec![
             || QueryError::Parse("bad".to_string()),
             || QueryError::Unsupported {
@@ -679,6 +687,18 @@ mod tests {
                     label: "1bad".to_string(),
                 })
             },
+            // Distributed/federated outages: their `reason` carries internal
+            // detail (endpoint, transport text) that must be redacted to the
+            // fixed MSG_UNAVAILABLE at this boundary, exactly like the storage
+            // faults above. Both arms drop `reason` entirely; the redaction
+            // assertion in the loop proves interpolating it back would leak.
+            || QueryError::Distrib {
+                reason: REASON_LEAK.to_string(),
+            },
+            || QueryError::Federation {
+                cluster: "eu-west".to_string(),
+                reason: REASON_LEAK.to_string(),
+            },
         ];
 
         for make in cases {
@@ -706,6 +726,18 @@ mod tests {
                 public.message,
                 "message disagreed for {:?}",
                 make()
+            );
+
+            // Redaction is pinned per variant: no case's client-facing message
+            // may carry an internal `reason` identifier. Only the
+            // Distrib/Federation cases embed REASON_LEAK, and both redact it
+            // away, so this holds for every case; a mutation interpolating
+            // `reason` into either public message reintroduces the leak here.
+            assert!(
+                !public.message.contains(REASON_LEAK),
+                "redaction leaked an internal reason into the client message for {:?}: {}",
+                make(),
+                public.message
             );
         }
     }
