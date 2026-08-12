@@ -45,6 +45,7 @@ pub mod codec;
 pub mod compact;
 pub mod config;
 pub mod discover;
+pub mod erasure_rewrite;
 pub mod error;
 pub mod gc_config;
 pub mod legal_hold;
@@ -77,6 +78,11 @@ pub use config::{
     RetentionConfigError, RetentionPolicy,
 };
 pub use discover::discover_tenants;
+pub use erasure_rewrite::{
+    ApplicableRequest, ErasureMatcher, ErasureRewriteOutcome, PendingErasureRequest, RewriteBuild,
+    RewriteSupersession, bucket_may_overlap, build_rewrite, erasure_rewrite_bucket,
+    pending_erasure_requests, publish_rewrite_record,
+};
 pub use error::{MaintainError, Result};
 pub use gc_config::{
     GC_CONFIG_KEY, GcConfigError, GcConfigValues, SetOutcome, bootstrap_gc_config, read_gc_config,
