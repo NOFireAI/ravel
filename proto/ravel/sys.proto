@@ -420,7 +420,7 @@ message TokenHashEntry {
   // Which writer owns this entry's lifecycle, added in format_version 2
   // (ADR-0072 decision 4 amendment, #897). "operator" for an entry the
   // Kubernetes operator's reconcile loop provisioned from a
-  // tenantTokensSecretRef Secret; "cli" for one `ravel-cli tenant-token
+  // tenantTokensSecretRef Secret; "cli" for one `ravel-cli tenant token
   // upsert` wrote (directly, or via its own --managed-by override). Absent
   // (proto3 default on an unset `optional`) means unmanaged: every entry a
   // format_version 1 writer ever wrote, and any entry a v2+ writer creates
@@ -456,15 +456,27 @@ message TokenHashEntry {
 message AuthTokenMap {
   // Format floor: the minimum reader version that understands this object. A
   // reader that only knows a lower version refuses rather than misread a future
-  // layout, matching every other durable object's version guard. = 1 for a map
-  // with no entry carrying `managed_by` (TokenHashEntry field 3); = 2 once a
-  // writer that understands ownership (ADR-0072 decision 4 amendment, #897)
-  // has touched the map. The bump is a version-floor signal, not a wire
-  // necessity: `managed_by` is `optional` and additive, so a v1 reader that
-  // has never heard of it already skips the unknown field safely. A v2+
-  // reader accepts both a stored 1 and a stored 2 unconditionally (every
-  // entry decodes the same either way; an absent `managed_by` just means
-  // unmanaged) and always writes 2 going forward.
+  // layout, matching every other durable object's version guard. Any writer
+  // that understands ownership (ADR-0072 decision 4 amendment, #897) always
+  // writes 2, unconditionally -- not content-dependent on whether an entry
+  // actually carries `managed_by`, since deciding that would mean the version
+  // a write stamps can flip depending on which other entries happen to be in
+  // the map at that moment (a `managed_by`-carrying entry added, then removed,
+  // then re-added by an unrelated tenant elsewhere in the map). The bump is a
+  // version-floor signal, not a wire necessity: `managed_by` is `optional` and
+  // additive, so a v1-only reader (a pre-amendment `ravel-server` build) that
+  // has never heard of it would decode the entries fine, but its version guard
+  // rejects a stored 2 outright as a future format it does not understand --
+  // this is deliberate fail-closed behavior, not a bug, but it means every
+  // `ravel-server` in a deployment MUST be upgraded to a build that
+  // understands format_version 2 before ANY writer (the operator or
+  // `ravel-cli tenant token`) that understands ownership performs its first
+  // write to `sys/auth`, even one with no `managed_by`-carrying entries at
+  // all: the object is stamped 2 from that write onward, and a lagging old
+  // server then refuses to read `sys/auth` entirely (fail-closed) until it is
+  // upgraded too. A v2+ reader accepts both a stored 1 and a stored 2
+  // (every entry decodes the same either way; an absent `managed_by` just
+  // means unmanaged).
   uint32 format_version = 1;
   // A 16-byte fingerprint of the deployment key the token hashes are keyed
   // under: blake3::derive_key("ravel-auth-v1-fingerprint", deployment_key)

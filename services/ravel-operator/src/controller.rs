@@ -457,7 +457,7 @@ where
 ///
 /// Every write and removal here carries or is filtered by
 /// [`ravel_catalog::MANAGED_BY_OPERATOR`] (ADR-0072 decision 4 amendment,
-/// review blocker 1): a tenant `ravel-cli tenant-token upsert` provisioned
+/// review blocker 1): a tenant `ravel-cli tenant token upsert` provisioned
 /// (or an operator-adjacent tool tagged with its own `--managed-by`), and any
 /// pre-amendment entry with no ownership marker at all, is never touched by
 /// this pass even when absent from the Secret -- only a tenant this same
