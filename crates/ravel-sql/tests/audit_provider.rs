@@ -28,7 +28,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{EngineConfig, LogSegmentFetcher};
+use ravel_query::LogSegmentFetcher;
 use ravel_sql::AuditTableProvider;
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -184,7 +184,6 @@ fn provider(store: MemoryStore, segments: Vec<SegmentRef>) -> AuditTableProvider
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        EngineConfig::default(),
         QueryAccounting::new(),
     )
 }
@@ -342,7 +341,6 @@ async fn pending_erasure_excludes_matching_rows() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        EngineConfig::default(),
         QueryAccounting::new(),
     );
 
@@ -398,7 +396,6 @@ async fn pending_erasure_excludes_resource_attribute_rows() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        EngineConfig::default(),
         QueryAccounting::new(),
     );
 

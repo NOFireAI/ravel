@@ -40,8 +40,6 @@ use ravel_types::accounting::QueryAccounting;
 use crate::alerts_pushdown::{AlertsPushdown, extract_alerts};
 use crate::alerts_scan::AlertsScanExec;
 use crate::alerts_schema::alerts_schema;
-use crate::config::SqlConfig;
-use crate::error::SqlError;
 
 /// The `alerts` table provider for one tenant over one pinned `Signal::Alerts`
 /// snapshot.
@@ -49,7 +47,6 @@ pub struct AlertsTableProvider {
     snapshot: Arc<Snapshot>,
     tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
-    config: SqlConfig,
     schema: SchemaRef,
     /// This query's accounting handle (ADR-0044), cloned into every
     /// `AlertsScanExec` the provider builds.
@@ -62,13 +59,13 @@ pub struct AlertsTableProvider {
 
 impl AlertsTableProvider {
     /// Build a provider around an owned, already-resolved `Signal::Alerts`
-    /// snapshot. `config` accepts anything `Into<SqlConfig>` (an `EngineConfig`
-    /// alone works), matching the `logs` provider's constructor shape.
+    /// snapshot. Admission and budget config live on the resolve-time seam
+    /// (RH-T2, issue #902), not on the provider, so this no longer takes a
+    /// config parameter.
     pub fn new(
         snapshot: Snapshot,
         tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
-        config: impl Into<SqlConfig>,
         accounting: QueryAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
@@ -76,7 +73,6 @@ impl AlertsTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
             fetcher,
-            config: config.into(),
             schema: alerts_schema(),
             accounting,
             erasure,
@@ -101,19 +97,21 @@ impl AlertsTableProvider {
         self.build_scan(target_partitions, &extract_alerts(filters))
     }
 
+    /// Admission (the sealed-segment cap) is decided exactly once, at
+    /// resolve time, by whichever endpoint resolves this table's snapshot,
+    /// calling `ravel_query::admit` over the full snapshot and its
+    /// `SegmentOrigins` (RH-T2, issue #902) -- the same pattern
+    /// `SqlExecutor::resolve` uses for the two wired tables. No such endpoint
+    /// exists yet for alerts; `pruned_segments` below is a further,
+    /// client-side, widen-only ts subset, so re-checking a count against it
+    /// here would be a second, weaker check over the wrong set; it is not
+    /// reimplemented.
     fn build_scan(
         &self,
         target_partitions: usize,
         pushdown: &AlertsPushdown,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
-        if segments.len() > self.config.engine.max_segments {
-            return Err(SqlError::TooManySegments {
-                count: segments.len(),
-                max: self.config.engine.max_segments,
-            }
-            .into());
-        }
         let scan = AlertsScanExec::new(
             self.tenant_hash,
             self.fetcher.clone(),

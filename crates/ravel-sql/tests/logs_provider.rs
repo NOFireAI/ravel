@@ -42,7 +42,7 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{EngineConfig, LogSegmentFetcher};
+use ravel_query::LogSegmentFetcher;
 use ravel_sql::{LogsTableProvider, has_word_udf};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -248,7 +248,6 @@ async fn scan_prunes_by_ts_and_word_returns_exact_rows() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        EngineConfig::default(),
         QueryAccounting::new(),
     );
 
@@ -350,7 +349,6 @@ async fn stream_attr_equality_is_resolved_by_the_residual() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        EngineConfig::default(),
         QueryAccounting::new(),
     );
 
@@ -537,7 +535,6 @@ async fn residual_recheck_keeps_resource_only_stream_attr_match() {
         snapshot,
         TenantHash([7u8; 16]),
         fetcher,
-        EngineConfig::default(),
         QueryAccounting::new(),
     );
 

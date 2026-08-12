@@ -45,7 +45,6 @@ use ravel_types::accounting::QueryAccounting;
 
 use crate::config::SqlConfig;
 use crate::dedup::RsegDedupExec;
-use crate::error::SqlError;
 use crate::pushdown::{Pushdown, extract};
 use crate::scan::RsegScanExec;
 use crate::schema::public_schema;
@@ -168,6 +167,14 @@ impl RavelTableProvider {
     /// [`RsegDedupExec`]; the distributed worker fragment
     /// ([`Self::worker_fragment`]) returns it as-is, because dedup stays
     /// authoritative at the coordinator (ADR-0071, crate::distributed).
+    ///
+    /// Admission (the sealed-segment cap) is decided exactly once, at resolve
+    /// time, by `SqlExecutor::resolve` calling `ravel_query::admit` over the
+    /// full, unpruned snapshot and its `SegmentOrigins` (RH-T2, issue #902).
+    /// `segments` here is a `pruned_segments()` subset of that already-admitted
+    /// snapshot, so re-checking a count against it here would be a second,
+    /// weaker check over the wrong set (post-prune, origin-blind); it is not
+    /// reimplemented.
     fn build_merge(
         &self,
         target_partitions: usize,
@@ -175,14 +182,6 @@ impl RavelTableProvider {
         matchers: Arc<Vec<LabelMatcher>>,
         series_ids: Option<Arc<HashSet<[u8; 16]>>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if segments.len() > self.config.engine.max_segments {
-            return Err(SqlError::TooManySegments {
-                count: segments.len(),
-                max: self.config.engine.max_segments,
-            }
-            .into());
-        }
-
         let scan = Arc::new(RsegScanExec::new(
             self.tenant_hash,
             self.fetcher.clone(),

@@ -475,7 +475,6 @@ mod tests {
     use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
-    use ravel_query::EngineConfig;
     use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode};
     use uuid::Uuid;
 
@@ -580,7 +579,7 @@ mod tests {
             segments_pruned: 0,
             pending_erasure: Vec::new(),
         };
-        let provider = SpansTableProvider::new(snapshot, fetcher.clone(), EngineConfig::default());
+        let provider = SpansTableProvider::new(snapshot, fetcher.clone());
 
         // (1) Correctness through the real provider scan entry point.
         let filters = vec![col("service_name").eq(lit("checkout"))];
