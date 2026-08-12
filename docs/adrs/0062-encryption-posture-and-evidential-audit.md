@@ -69,7 +69,7 @@ Cost and latency: the response tail gains up to `max_age` plus one dual-PUT roun
 
 **2c. Bounded keyspace: maintain the query-audit shard.** `Signal::Audit` shard `QUERY_AUDIT_SHARD=1` joins the maintained set as a fourth maintenance target with its own policy knob: RLOG compaction (existing machinery, new signal/shard parameter) and a dedicated `audit_retention` window (default 90 d, configurable; deployments with regulatory retention set it to their obligation). Sweep remains horizon-gated and passes through `LegalHoldCheck`, so a placed legal hold protects audit evidence exactly as it protects data. Legal-hold shard 0 stays excluded from maintenance (its growth is per operator action, not per query) and stays deny-delete forever.
 
-**2d. ADR-0055 amendment (required by 2c).** The deny-delete prefix `t/<hash>/u/**` narrows to the legal-hold shard's prefix (`t/<hash>/u/0/**` in prefix terms); Maintain's delete grant gains the query-audit shard's objects, which the retention sweep — the same code path, same role, same horizon gating as every other signal — now legitimately deletes. No other role gains anything; Query's grant remains append-only `Put` on the query-audit shard. The amendment is narrow and mechanical, and this ADR records it rather than leaving ADR-0055 contradicted in place.
+**2d. ADR-0055 amendment (required by 2c).** The deny-delete prefix `t/<hash>/u/**` narrows to the legal-hold shard's prefix. Real audit object keys carry their shard as a four-digit segment (`t/<hash>/u/<l0|c|l1>/<shard:04>/…`), so in prefix terms that narrowing is `t/<hash>/u/*/0000/**`, not `t/<hash>/u/0/**` — see the 2026-08-12 amendment below, which corrects this section's original text. Maintain's delete grant gains the query-audit shard's objects, which the retention sweep — the same code path, same role, same horizon gating as every other signal — now legitimately deletes. No other role gains anything; Query's grant remains append-only `Put` on the query-audit shard. The amendment is narrow and mechanical, and this ADR records it rather than leaving ADR-0055 contradicted in place.
 
 **2e. PII policy: keyed tokenization, plaintext by explicit opt-in.**
 
@@ -129,3 +129,29 @@ The epic splits cleanly into an **encryption track** (ravel-object-store + serve
 End-to-end reachability (per deliver-epic Stage 2): EL-7 carries a test that boots the server against `MemoryStore`/MinIO, runs one PromQL and one SQL query, and asserts (a) a durable audit record with tokenized text exists before the response is observed, and (b) with a `FaultStore` blocking audit PUTs, the query fails in `required` mode with the fault counter fired. EL-1's acceptance includes a two-tenant test asserting writes route to differently configured builders while reads hit the default store.
 
 Suggested waves: W1 = EL-1 + EL-3 (different crates, both high-risk — if the solo-wave rule is applied strictly, W1a=EL-1, W1b=EL-3); W2 = EL-2 + EL-4; W3 = EL-5; W4 = EL-6; W5 = EL-7.
+
+## Amendment (2026-08-12): correct section 2d's audit-prefix transcription
+
+ADR-0072 (issue #899) found that section 2d wrote the legal-hold shard's
+deny-delete prefix as `t/<hash>/u/0/**`. That form is wrong: the shard is
+not a bare path segment, it is a four-digit zero-padded segment nested
+under the signal directory, exactly as `docs/catalog-and-mvcc.md` and
+`crates/ravel-commit/src/keys.rs` (`data_key`, `commit_key`, and every
+sibling builder) define for every signal. A real legal-hold audit key
+looks like `t/<hash>/u/l0/0000/<writer_id>.<epoch>.<seq>.<hash16>.rseg` or
+`t/<hash>/u/c/0000/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt`, never
+`t/<hash>/u/0/...`. The correct prefix, in wildcard terms, is
+`t/*/u/*/0000/*`.
+
+This was a transcription error in this ADR's prose only: ADR-0055's own
+2026-08-09 amendment (the one that actually specifies the deny-delete and
+`MaintainDelete` wildcards) already used the correct `t/*/u/*/0000/*` /
+`t/*/u/*/0001/*` forms, and `docs/guides/operations.md`'s shipped IAM
+policies were never generated from this ADR's wrong text, so no policy
+ever carried the error. The risk was transcription forward, not backward:
+anyone implementing an IAM prefix directly from this ADR's section 2d
+would have written a pattern matching no real key. Section 2d above is
+corrected in place; `crates/ravel-commit/tests/iam_templates.rs` (added by
+ADR-0072) now checks every shipped policy prefix against real key shapes
+built by `ravel-commit`'s own constructors, so a future recurrence of this
+mismatch fails CI instead of shipping silently.

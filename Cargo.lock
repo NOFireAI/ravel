@@ -4408,6 +4408,8 @@ dependencies = [
  "ravel-object-store",
  "ravel-proto",
  "ravel-types",
+ "regex",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
