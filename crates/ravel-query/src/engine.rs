@@ -23,13 +23,14 @@ use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
 };
 
-use crate::config::{ByteLimit, EngineConfig};
+use crate::config::{ByteLimit, EngineConfig, RequestLimit};
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
     SegmentFetcher,
 };
+use crate::segment_admission;
 
 /// Which evaluation shape a prefetch is being computed for: an instant
 /// query has one lookup instant, a range query spans a step grid whose
@@ -576,6 +577,7 @@ impl QueryEngine {
                     matchers,
                     &accounting,
                     self.config.max_bytes_scanned,
+                    self.config.max_s3_requests,
                 )
                 .await?;
             // Cross-cluster federation for the discovery path (ADR-0071, issue
@@ -748,6 +750,7 @@ impl QueryEngine {
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
         let max_bytes_scanned = self.config.max_bytes_scanned;
+        let max_s3_requests = self.config.max_s3_requests;
         let concurrency = self.config.fetch_concurrency.max(1);
         // One independent fetch per selector against the same snapshot
         // (below): an N-selector query re-opens every snapshot segment up to
@@ -800,6 +803,7 @@ impl QueryEngine {
                                 &plan.matchers,
                                 accounting,
                                 max_bytes_scanned,
+                                max_s3_requests,
                             )
                             .await?;
                         let histograms =
@@ -1037,9 +1041,9 @@ impl QueryEngine {
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
     ) -> Result<Snapshot, QueryError> {
-        let snapshot = self
+        let (snapshot, origins) = self
             .catalog
-            .resolve_pruned_with_accounting(
+            .resolve_pruned_with_admission(
                 &tenant_hash,
                 Signal::Metrics,
                 window,
@@ -1049,12 +1053,11 @@ impl QueryEngine {
                 accounting,
             )
             .await?;
-        if snapshot.segments.len() > self.config.max_segments {
-            return Err(QueryError::TooManySegments {
-                count: snapshot.segments.len(),
-                max: self.config.max_segments,
-            });
-        }
+        // Sealed, below-watermark segments count against `max_segments`;
+        // recent and token-resolved segments are exempt (ADR-0073 decision
+        // 2). Their cost is bounded separately by the request budget
+        // checked incrementally during fetch, below.
+        segment_admission::admit(&snapshot, &origins, &self.config)?;
         Ok(snapshot)
     }
 
@@ -1073,6 +1076,7 @@ impl QueryEngine {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
         max_bytes_scanned: ByteLimit,
+        max_s3_requests: RequestLimit,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -1121,6 +1125,12 @@ impl QueryEngine {
             {
                 return Err(err);
             }
+            if let Some(err) = segment_admission::request_budget_exceeded(
+                accounting.snapshot().total_s3_requests(),
+                max_s3_requests,
+            ) {
+                return Err(err);
+            }
         }
         // Selective-erasure exclusion (ADR-0064 decision 2, EJ-T3): drop
         // erased series/samples from every segment's decoded results, after the
@@ -1158,6 +1168,7 @@ impl QueryEngine {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
         max_bytes_scanned: ByteLimit,
+        max_s3_requests: RequestLimit,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -1200,6 +1211,12 @@ impl QueryEngine {
                     ) {
                         return Err(err);
                     }
+                    if let Some(err) = segment_admission::request_budget_exceeded(
+                        accounting.snapshot().total_s3_requests(),
+                        max_s3_requests,
+                    ) {
+                        return Err(err);
+                    }
                     return Ok(triple);
                 }
                 // `None`: a worker asked for local fallback (version skew, a
@@ -1219,6 +1236,7 @@ impl QueryEngine {
             matchers,
             accounting,
             max_bytes_scanned,
+            max_s3_requests,
         )
         .await
     }
@@ -1280,6 +1298,12 @@ impl QueryEngine {
             ) {
                 return Err(err);
             }
+            if let Some(err) = segment_admission::request_budget_exceeded(
+                accounting.snapshot().total_s3_requests(),
+                self.config.max_s3_requests,
+            ) {
+                return Err(err);
+            }
             // `outcome.stats` came back from a remote cluster over the wire;
             // saturate rather than `+=` so a remote reporting an overflowing
             // count cannot panic (debug) or wrap (release) this diagnostic
@@ -1308,6 +1332,7 @@ impl QueryEngine {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
         max_bytes_scanned: ByteLimit,
+        max_s3_requests: RequestLimit,
     ) -> Result<Vec<Vec<ravel_segment::SeriesEntry>>, QueryError> {
         let concurrency = self.config.fetch_concurrency.max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
@@ -1341,6 +1366,12 @@ impl QueryEngine {
             if let Some(err) =
                 bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), max_bytes_scanned)
             {
+                return Err(err);
+            }
+            if let Some(err) = segment_admission::request_budget_exceeded(
+                accounting.snapshot().total_s3_requests(),
+                max_s3_requests,
+            ) {
                 return Err(err);
             }
         }

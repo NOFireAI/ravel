@@ -100,7 +100,8 @@ impl From<QueryError> for ApiError {
             QueryError::TooManySegments { .. }
             | QueryError::TooManySeries { .. }
             | QueryError::TooManySamples { .. }
-            | QueryError::TooManyBytesScanned { .. } => ApiError::Unsupported(e.to_string()),
+            | QueryError::TooManyBytesScanned { .. }
+            | QueryError::RequestBudgetExceeded { .. } => ApiError::Unsupported(e.to_string()),
             // An over-wide window refused before any LIST (issue #635) is a
             // resource-budget rejection, grouped with the budget classes above
             // under the same 422 "execution" mapping. Its text carries only the

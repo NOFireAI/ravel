@@ -16,6 +16,11 @@ pub const DEFAULT_FETCH_CONCURRENCY: usize = 8;
 /// Default step for a subquery that omits its own (`expr[5m:]`), matching
 /// Prometheus' global `evaluation_interval` default.
 pub const DEFAULT_EVALUATION_INTERVAL: Duration = Duration::from_secs(60);
+/// Default cap on total S3 requests a single query may issue (ADR-0073
+/// decision 3). Admits the worst legitimate open hour (~7,200 GETs per
+/// shard-hour plus resolve and sealed fetch) with headroom, while bounding a
+/// runaway query to a knowable spend.
+pub const DEFAULT_MAX_S3_REQUESTS: u64 = 25_000;
 
 /// A per-tenant cap on the total S3 bytes a single query may scan, or an
 /// explicit opt-in to no cap at all (ADR-0061 decision 1).
@@ -43,6 +48,29 @@ impl ByteLimit {
     }
 }
 
+/// A per-tenant cap on the total S3 requests a single query may issue, or an
+/// explicit opt-in to no cap at all (ADR-0073 decision 3). Mirrors
+/// [`ByteLimit`]'s shape: the recent-hour exemption from `max_segments`
+/// (ADR-0073 decision 2) needs a governor that is not a count check, and this
+/// is that governor, enforced the same incremental way the bytes-scanned
+/// budget already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLimit {
+    Bounded(u64),
+    Unlimited,
+}
+
+impl RequestLimit {
+    /// True when `requests` has passed a bounded cap. `Unlimited` never
+    /// trips.
+    pub fn is_exceeded_by(self, requests: u64) -> bool {
+        match self {
+            RequestLimit::Bounded(max) => requests > max,
+            RequestLimit::Unlimited => false,
+        }
+    }
+}
+
 /// [`crate::QueryEngine`] resource limits and concurrency. Every limit is
 /// enforced as a typed error (docs/query-engine.md "never silent partial
 /// results"), never a truncation.
@@ -60,6 +88,12 @@ pub struct EngineConfig {
     /// rejecting existing deployments' large-but-legitimate queries on
     /// upgrade with no config change, so opting in is explicit.
     pub max_bytes_scanned: ByteLimit,
+    /// Per-tenant cap on total S3 requests a single query may issue, checked
+    /// at the same incremental points as `max_bytes_scanned` (ADR-0073
+    /// decision 3). Governs the cost of segments exempted from
+    /// `max_segments` by decision 2 (recent and token-resolved); defaults to
+    /// [`RequestLimit::Bounded(DEFAULT_MAX_S3_REQUESTS)`].
+    pub max_s3_requests: RequestLimit,
     pub deadline: Duration,
     pub fetch_concurrency: usize,
     /// Step for a subquery that does not specify its own (`expr[5m:]`).
@@ -73,6 +107,7 @@ impl Default for EngineConfig {
             max_series: DEFAULT_MAX_SERIES,
             max_samples: DEFAULT_MAX_SAMPLES,
             max_bytes_scanned: ByteLimit::Unlimited,
+            max_s3_requests: RequestLimit::Bounded(DEFAULT_MAX_S3_REQUESTS),
             deadline: DEFAULT_DEADLINE,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
             default_evaluation_interval: DEFAULT_EVALUATION_INTERVAL,
