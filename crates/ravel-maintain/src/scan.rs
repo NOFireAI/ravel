@@ -1697,14 +1697,18 @@ mod invalidate_tests {
     use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
     use ravel_rspan::writer::ObjectIdentity as SpanObjectIdentity;
     use ravel_rspan::{RspanConfig, RspanWriter, SpanRecord, StatusCode};
-    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V6};
+    use ravel_segment::{
+        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V6,
+    };
     use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
     use uuid::Uuid;
 
     use super::*;
     use crate::build::OUTPUT_FORMAT_VERSION;
     use crate::clock::FixedClock;
-    use crate::erasure_rewrite::{ErasureRewriteOutcome, PendingErasureRequest, erasure_rewrite_bucket};
+    use crate::erasure_rewrite::{
+        ErasureRewriteOutcome, PendingErasureRequest, erasure_rewrite_bucket,
+    };
     use crate::publish::PublishOutcome;
     use crate::sweep::NoLeases;
 
@@ -1776,8 +1780,16 @@ mod invalidate_tests {
         )
         .expect("write L0");
         let content_hash = written.summary.blake3;
-        let data_key = keys::data_key(&th, Signal::Metrics, SHARD, writer_id, EPOCH, 1, &content_hash)
-            .expect("data key");
+        let data_key = keys::data_key(
+            &th,
+            Signal::Metrics,
+            SHARD,
+            writer_id,
+            EPOCH,
+            1,
+            &content_hash,
+        )
+        .expect("data key");
         store
             .put(&data_key, written.bytes.clone(), PutOptions::default())
             .await
@@ -1905,8 +1917,16 @@ mod invalidate_tests {
         w.push(record);
         let bytes = Bytes::from(w.finish().expect("finish L0"));
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
-        let data_key = keys::data_key(&th, Signal::Spans, SHARD, writer_id, EPOCH, 1, &content_hash)
-            .expect("data key");
+        let data_key = keys::data_key(
+            &th,
+            Signal::Spans,
+            SHARD,
+            writer_id,
+            EPOCH,
+            1,
+            &content_hash,
+        )
+        .expect("data key");
         store
             .put(&data_key, bytes.clone(), PutOptions::default())
             .await
@@ -1953,7 +1973,11 @@ mod invalidate_tests {
         seed_metrics(&store).await;
         let t = tenant_hash();
         let mut memo = MaintainMemo::with_default_interval();
-        memo.mark_terminal((t, Signal::Metrics, SHARD, HOUR), TerminalState::Compacted, 0);
+        memo.mark_terminal(
+            (t, Signal::Metrics, SHARD, HOUR),
+            TerminalState::Compacted,
+            0,
+        );
         assert_eq!(
             memo.terminal_state(t, Signal::Metrics, SHARD, HOUR),
             Some(TerminalState::Compacted)
@@ -1968,13 +1992,7 @@ mod invalidate_tests {
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig::default();
         let outcome = erasure_rewrite_bucket(
-            &store,
-            &clock,
-            &config,
-            &NoLeases,
-            &bucket,
-            &pending,
-            &mut memo,
+            &store, &clock, &config, &NoLeases, &bucket, &pending, &mut memo,
         )
         .await
         .expect("rewrite");
@@ -2015,13 +2033,7 @@ mod invalidate_tests {
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig::default();
         let outcome = erasure_rewrite_bucket(
-            &store,
-            &clock,
-            &config,
-            &NoLeases,
-            &bucket,
-            &pending,
-            &mut memo,
+            &store, &clock, &config, &NoLeases, &bucket, &pending, &mut memo,
         )
         .await
         .expect("rewrite");
@@ -2062,13 +2074,7 @@ mod invalidate_tests {
         let clock = FixedClock::new(sealed_now_ns());
         let config = CompactorConfig::default();
         let outcome = erasure_rewrite_bucket(
-            &store,
-            &clock,
-            &config,
-            &NoLeases,
-            &bucket,
-            &pending,
-            &mut memo,
+            &store, &clock, &config, &NoLeases, &bucket, &pending, &mut memo,
         )
         .await
         .expect("rewrite");

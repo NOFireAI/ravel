@@ -1695,7 +1695,8 @@ pub async fn erasure_rewrite_bucket(
                 })
                 .collect();
 
-            let (catalogs, supersession) = load_live_catalogs_and_target(store, config, live).await?;
+            let (catalogs, supersession) =
+                load_live_catalogs_and_target(store, config, live).await?;
 
             let mut applied_request_ids: Vec<String> =
                 applicable.iter().map(|r| r.request_id.clone()).collect();
@@ -1721,16 +1722,9 @@ pub async fn erasure_rewrite_bucket(
             )
             .await?;
             let parts = build.parts.len();
-            let publish = publish_rewrite_record(
-                store,
-                config,
-                clock,
-                bucket,
-                supersession,
-                build,
-                start_ns,
-            )
-            .await?;
+            let publish =
+                publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
+                    .await?;
             (parts, publish)
         }
         Signal::Logs => {
@@ -1768,16 +1762,9 @@ pub async fn erasure_rewrite_bucket(
             )
             .await?;
             let parts = build.parts.len();
-            let publish = publish_rewrite_record(
-                store,
-                config,
-                clock,
-                bucket,
-                supersession,
-                build,
-                start_ns,
-            )
-            .await?;
+            let publish =
+                publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
+                    .await?;
             (parts, publish)
         }
         Signal::Spans => {
@@ -1815,16 +1802,9 @@ pub async fn erasure_rewrite_bucket(
             )
             .await?;
             let parts = build.parts.len();
-            let publish = publish_rewrite_record(
-                store,
-                config,
-                clock,
-                bucket,
-                supersession,
-                build,
-                start_ns,
-            )
-            .await?;
+            let publish =
+                publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
+                    .await?;
             (parts, publish)
         }
         other => {
@@ -2649,7 +2629,12 @@ mod tests {
         (id, blob)
     }
 
-    fn log_record(stream_n: u32, ts: i64, body: &str, attrs: Vec<(String, LogAttrValue)>) -> LogRecord {
+    fn log_record(
+        stream_n: u32,
+        ts: i64,
+        body: &str,
+        attrs: Vec<(String, LogAttrValue)>,
+    ) -> LogRecord {
         let (stream_id, stream_attrs) = log_stream_ident(stream_n);
         LogRecord {
             stream_id,
@@ -2701,9 +2686,16 @@ mod tests {
         }
         let bytes = Bytes::from(w.finish().expect("finish L0"));
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
-        let data_key =
-            keys::data_key(&th, Signal::Logs, SHARD, writer_id, EPOCH, seq, &content_hash)
-                .expect("data key");
+        let data_key = keys::data_key(
+            &th,
+            Signal::Logs,
+            SHARD,
+            writer_id,
+            EPOCH,
+            seq,
+            &content_hash,
+        )
+        .expect("data key");
         store
             .put(&data_key, bytes.clone(), PutOptions::default())
             .await
@@ -2749,7 +2741,9 @@ mod tests {
     /// this module's tests span three buckets (metrics/logs/spans) instead
     /// of the one hardcoded metrics `bucket()` the original helper reads.
     async fn read_rewrite_record_for(store: &dyn ObjectStoreBackend, b: &Bucket) -> RewriteRecord {
-        let listing = crate::read::list_bucket(store, b).await.expect("list bucket");
+        let listing = crate::read::list_bucket(store, b)
+            .await
+            .expect("list bucket");
         assert_eq!(
             listing.rewrite_record_keys.len(),
             1,
@@ -3168,9 +3162,16 @@ mod tests {
         }
         let bytes = Bytes::from(w.finish().expect("finish L0"));
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
-        let data_key =
-            keys::data_key(&th, Signal::Spans, SHARD, writer_id, EPOCH, seq, &content_hash)
-                .expect("data key");
+        let data_key = keys::data_key(
+            &th,
+            Signal::Spans,
+            SHARD,
+            writer_id,
+            EPOCH,
+            seq,
+            &content_hash,
+        )
+        .expect("data key");
         store
             .put(&data_key, bytes.clone(), PutOptions::default())
             .await
@@ -3212,7 +3213,10 @@ mod tests {
             .expect("put commit record");
     }
 
-    async fn decode_spans_part(store: &dyn ObjectStoreBackend, object_key: &str) -> Vec<SpanRecord> {
+    async fn decode_spans_part(
+        store: &dyn ObjectStoreBackend,
+        object_key: &str,
+    ) -> Vec<SpanRecord> {
         let got = store
             .get(object_key, GetRange::Full)
             .await
