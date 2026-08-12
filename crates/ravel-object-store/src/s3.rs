@@ -1009,4 +1009,52 @@ mod tests {
             "Some kms_key_id must change the builder"
         );
     }
+
+    #[test]
+    fn session_token_reaches_the_builder() {
+        let baseline = test_config();
+        let mut with_token = baseline.clone();
+        with_token.session_token = Some("FwoGZXIvYXdzEBc".to_string());
+        assert_ne!(
+            format!(
+                "{:?}",
+                S3Store::builder(&with_token)
+                    .expect("no credentials file")
+                    .0
+            ),
+            format!(
+                "{:?}",
+                S3Store::builder(&baseline).expect("no credentials file").0
+            ),
+            "a session token must change the builder"
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_file_wins_over_inline_credentials_and_token() {
+        use object_store::CredentialProvider as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("creds.json");
+        std::fs::write(
+            &path,
+            r#"{"access_key_id":"AKIA_FILE","secret_access_key":"file-secret"}"#,
+        )
+        .expect("write creds");
+
+        let mut config = test_config();
+        config.session_token = Some("inline-token".to_string());
+        config.credentials_file = Some(path);
+        let (_, provider) = S3Store::builder(&config).expect("valid credentials file");
+        let provider = provider.expect("a credentials file must produce a provider");
+        let credential = provider.get_credential().await.expect("file credentials");
+        assert_eq!(
+            credential.key_id, "AKIA_FILE",
+            "the file's credentials must win over inline ones"
+        );
+        assert_eq!(
+            credential.token, None,
+            "a token comes from the file, never mixed in from inline config"
+        );
+    }
 }

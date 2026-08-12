@@ -184,9 +184,15 @@ impl FileCredentialProvider {
 
     fn warn_rate_limited(&self, message: &str) {
         self.rotation_failures.fetch_add(1, Ordering::Relaxed);
-        let now = self.clock.now_nanos();
+        // `last == 0` is the never-warned sentinel: without it, a provider
+        // younger than the interval (clock nanos count from construction)
+        // suppresses the very first warning, which is exactly the
+        // broken-at-startup case an operator most needs to see. `now` is
+        // clamped to 1 so a warning fired at instant zero still leaves the
+        // sentinel state.
+        let now = self.clock.now_nanos().max(1);
         let last = self.last_warned_nanos.load(Ordering::Relaxed);
-        let due = now.saturating_sub(last) >= WARNING_INTERVAL_NANOS;
+        let due = last == 0 || now.saturating_sub(last) >= WARNING_INTERVAL_NANOS;
         if due
             && self
                 .last_warned_nanos

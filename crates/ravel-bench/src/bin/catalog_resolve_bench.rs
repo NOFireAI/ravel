@@ -99,6 +99,8 @@ fn s3_config_from_env() -> S3Config {
         allow_http: std::env::var("RAVEL_S3_ALLOW_HTTP").as_deref() == Ok("true"),
         force_path_style: std::env::var("RAVEL_S3_FORCE_PATH_STYLE").as_deref() != Ok("false"),
         kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
     }
 }
 
