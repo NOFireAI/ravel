@@ -77,6 +77,22 @@ fn audit_record(ts: i64, severity: &str, body: &str, attrs: &[(&str, &str)]) -> 
     }
 }
 
+/// [`audit_record`] whose stream carries `resource` attributes in its
+/// `stream_attrs` (the RESOURCE position) rather than only per-record `attrs`.
+/// Used to prove selective erasure catches a subject named only at the merged
+/// resource/scope level (issue #928).
+fn audit_record_on_resource(
+    resource: &[(String, AttrValue)],
+    ts: i64,
+    severity: &str,
+    body: &str,
+) -> LogRecord {
+    let mut r = audit_record(ts, severity, body, &[]);
+    r.stream_id = ravel_types::logstream::log_stream_id(resource, "audit", "1", &[]);
+    r.stream_attrs = stream_attrs_bytes(resource, "audit", "1", &[]);
+    r
+}
+
 async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> SegmentRef {
     let mut w = RlogWriter::new(small_blocks(), identity());
     for r in records {
@@ -336,6 +352,62 @@ async fn pending_erasure_excludes_matching_rows() {
         got,
         BTreeSet::from([(2, "INFO".to_string(), "keep me".to_string())]),
         "the erased row is excluded; the other row survives"
+    );
+}
+
+/// Issue #928 (ADR-0064): a subject named ONLY in a RESOURCE/scope
+/// (`stream_attrs`) attribute must also be excluded from the `audit` table. The
+/// `attrs` column materializes the merged resource + scope + record view, so
+/// `actor` is queryable, yet the fetcher-level filter matches per-record
+/// attributes alone and never sees it. Before the scan-layer `retain_unerased`
+/// in `audit_scan.rs::prepare_partition`, this row leaked; removing that call
+/// reintroduces the leak.
+#[tokio::test]
+async fn pending_erasure_excludes_resource_attribute_rows() {
+    let store = MemoryStore::new();
+    // `actor` lives in the RESOURCE position (stream_attrs), not per-record.
+    let erase = audit_record_on_resource(
+        &[("actor".to_string(), AttrValue::Str("svc/erase".to_string()))],
+        1,
+        "NOTICE",
+        "erase me",
+    );
+    let keep = audit_record_on_resource(
+        &[("actor".to_string(), AttrValue::Str("svc/keep".to_string()))],
+        2,
+        "INFO",
+        "keep me",
+    );
+    let seg = write_object(&store, "audit/erasure-resource.rlog", &[erase, keep]).await;
+
+    let request = ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "actor".to_string(),
+            value: "svc/erase".to_string(),
+        }],
+        ..Default::default()
+    };
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = LogSegmentFetcher::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: vec![request],
+    };
+    let provider = AuditTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        EngineConfig::default(),
+        QueryAccounting::new(),
+    );
+
+    let batches = collect_plan(provider.plan(1).expect("build plan")).await;
+    let got = batches_to_rows(&batches);
+    assert_eq!(
+        got,
+        BTreeSet::from([(2, "INFO".to_string(), "keep me".to_string())]),
+        "the resource-only subject svc/erase is excluded; the other row survives"
     );
 }
 
