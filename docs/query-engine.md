@@ -208,10 +208,21 @@ the same points `max_bytes_scanned` already is, and reported as
 `crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
 `request_budget_exceeded(requests, max_s3_requests)` for the incremental
-budget check. `QueryEngine::resolve_bounded` (`engine.rs`) is the only call
-site wired up as of RH-T1 (#901). The SQL executor, the five SQL table
-providers, and the exemplars state still run their own pre-ADR-0073 checks;
-moving those eight sites onto this seam is RH-T2 (#902).
+budget check. `QueryEngine::resolve_bounded` (`engine.rs`) is the call site
+for PromQL as of RH-T1 (#901); the SQL executor, the five SQL table
+providers, and the exemplars state moved onto the same seam under RH-T2
+(#902) — no site still runs a pre-ADR-0073 per-surface check.
+
+RH-T3 (#903) proves this seam end-to-end through both real HTTP query
+surfaces rather than at the seam's own unit level: a real `IngestRouter`
+sustains flushes past `max_segments`-worth of L0 objects in a tenant's
+open hour against `MemoryStore`, and PromQL and SQL reads over that hot
+window keep succeeding, returning results bit-identical
+(`f64::to_bits`) to a post-compaction read of the same data once the hour
+is folded sealed. A deliberately low `max_s3_requests` on the same hot
+data trips the typed `RequestBudgetExceeded` rather than hanging or
+truncating the result
+(`services/ravel-server/tests/recent_hours_reachability_e2e.rs`).
 
 Per-tenant max bytes scanned (`ByteLimit`, default `Unlimited`; ADR-0061
 decision 1, issue #721) bounds the total S3 bytes one query may fetch
