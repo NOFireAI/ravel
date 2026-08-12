@@ -629,6 +629,12 @@ pub fn plan_distributed_slices(
                     deadline_ns: template.deadline_ns,
                     slice_index: k as u32,
                     slice_count: count,
+                    // Copied verbatim from the coordinator's own resolve, same
+                    // as every other template-derived field above: a worker
+                    // never independently resolves a snapshot, so this is the
+                    // only way its slice excludes what the coordinator saw
+                    // pending (ADR-0064 decision 3, issue #829).
+                    pending_erasure: template.pending_erasure.clone(),
                 };
                 WorkerSlice { location, ticket }
             })
