@@ -786,7 +786,27 @@ impl QueryEngine {
                 Vec<HistogramSeriesData>,
                 FetchStats,
             );
-            let results: Vec<Result<PerPlan, QueryError>> = stream::iter(plans.to_vec())
+            // Two plans with equal `matchers` fetch byte-identical results
+            // off the same snapshot: the fetch is matchers-only with no
+            // per-plan window trim (this method's own doc comment), so its
+            // output is a pure function of (snapshot, matchers). A query
+            // whose plans share a matcher set (`up + up offset 5m`: same
+            // selector, two `SelectorPlan`s with different `offset_ns`)
+            // would otherwise pay for -- and account -- the same segment
+            // fetch once per plan even though a cache/single-flight layer
+            // underneath never re-hits the store for the repeat. Dedup by
+            // matcher equality (`LabelMatcher` has no `Hash`, only a
+            // structural `Eq`, hence a linear scan rather than a set; a
+            // query's selector count is small enough that this stays cheap)
+            // so each distinct matcher set is fetched, decoded, and counted
+            // exactly once, however many plans reference it.
+            let mut distinct_plans: Vec<SelectorPlan> = Vec::with_capacity(plans.len());
+            for plan in plans {
+                if !distinct_plans.iter().any(|p| p.matchers == plan.matchers) {
+                    distinct_plans.push(plan.clone());
+                }
+            }
+            let results: Vec<Result<PerPlan, QueryError>> = stream::iter(distinct_plans)
                 .map(|plan| {
                     let snapshot = &snapshot;
                     let accounting = &accounting;
@@ -823,9 +843,10 @@ impl QueryEngine {
                 .collect()
                 .await;
 
-            // Collect every plan's raw scalar runs into one pool and every
-            // plan's histogram series into one deduplicated map. Scalar runs
-            // are merged once, below, after federation has appended its runs,
+            // Collect every distinct matcher set's raw scalar runs into one
+            // pool and every distinct matcher set's histogram series into one
+            // deduplicated map. Scalar runs are merged once, below, after
+            // federation has appended its runs,
             // so a single k-way `merge_soa_runs` unions across selectors,
             // segments, AND clusters with the one deterministic `is_greater`
             // total order. Two plans that select the same series decode
@@ -3808,6 +3829,13 @@ mod prefetch_tests {
         QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default())
     }
 
+    fn engine_with_config(store: Arc<MemoryStore>, config: EngineConfig) -> QueryEngine {
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        QueryEngine::new(Arc::new(catalog), backend, config)
+    }
+
     /// A slice fetcher double that reports `SnapshotInvalidated` for every
     /// slice and counts its dispatches, so the seam test can assert exactly
     /// one whole-query re-resolve (two dispatches for a one-slice snapshot).
@@ -4276,5 +4304,129 @@ mod prefetch_tests {
             "no segment published for this metric"
         );
         assert_estimate_covers_actual("wide window multi-shard query", &stats);
+    }
+
+    /// Issue #825: two plans that share the same matcher set (`up + up
+    /// offset 5m` is exactly this shape -- one selector, two `SelectorPlan`s
+    /// that differ only in `offset_ns`) fetch byte-identical results off the
+    /// shared snapshot: `fetch_all_samples_and_histograms`'s own doc comment
+    /// says the fetch is matchers-only, with no per-plan window trim. Before
+    /// the fix, `prefetch`'s per-plan loop called
+    /// `fetch_samples_and_histograms_maybe_distributed` once per plan
+    /// unconditionally and summed every plan's own `FetchStats` into
+    /// `QueryStats.page_stats`, so the second, matcher-identical plan added a
+    /// second copy of the same page counts. This test proves the two-plan
+    /// case reports the same `page_stats` as the one-plan case, not double.
+    #[tokio::test]
+    async fn shared_matcher_plans_do_not_double_count_page_stats() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+
+        let eng = engine(Arc::clone(&store));
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+
+        let single_plan = vec![window_plan("metric_a")];
+        let (_source, single_stats) = eng
+            .prefetch(tenant_hash, &single_plan, &eval_window, &[], BASE_NS)
+            .await
+            .expect("single-plan prefetch");
+        assert!(
+            single_stats.page_stats.raw_f64_bytes > 0,
+            "the fixture must actually decode a raw f64 page"
+        );
+
+        // Two plans, one matcher set: mirrors `up + up offset 5m`. Real
+        // query text can only ever plan 0 or 1 selectors today (see this
+        // module's doc comment), so the second plan is built by hand with a
+        // distinct `offset_ns`, exactly as a future multi-selector planner
+        // would for two references to the same selector.
+        let mut plan_b = window_plan("metric_a");
+        plan_b.offset_ns = NS_PER_MIN * 5;
+        let shared_plans = vec![window_plan("metric_a"), plan_b];
+        let (_source, shared_stats) = eng
+            .prefetch(tenant_hash, &shared_plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("shared-matcher prefetch");
+
+        assert_eq!(
+            shared_stats.page_stats.raw_f64_bytes, single_stats.page_stats.raw_f64_bytes,
+            "two plans sharing a matcher set must report the same raw_f64_bytes as one \
+             plan, not the per-plan sum"
+        );
+        assert_eq!(
+            shared_stats.page_stats.raw_f64_pages, single_stats.page_stats.raw_f64_pages,
+            "two plans sharing a matcher set must report the same raw_f64_pages as one \
+             plan, not the per-plan sum"
+        );
+    }
+
+    /// Issue #825 part 2: the ADR-0061 bytes-scanned budget
+    /// (`bytes_scanned_exceeded`) is checked against the same shared
+    /// `QueryAccounting` handle every plan's fetch charges into
+    /// (`fetch_all_samples_and_histograms`). Before the fix, a second plan
+    /// with the same matchers as an earlier plan issued its own independent
+    /// fetch of the same segments, adding a second real charge against that
+    /// handle for bytes the query never scans twice -- so a shared-matcher
+    /// query could trip the budget at roughly half the real threshold. This
+    /// test sets the budget to exactly the real single-fetch cost and proves
+    /// a two-plan, one-matcher query still succeeds under it.
+    #[tokio::test]
+    async fn shared_matcher_query_does_not_double_charge_bytes_scanned_budget() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+
+        // Learn the real cost of fetching "metric_a" once, under an
+        // unbounded budget.
+        let unbounded = engine(Arc::clone(&store));
+        let single_plan = vec![window_plan("metric_a")];
+        let (_source, single_stats) = unbounded
+            .prefetch(tenant_hash, &single_plan, &eval_window, &[], BASE_NS)
+            .await
+            .expect("single-plan prefetch");
+        let real_bytes = single_stats.accounting.total_s3_bytes();
+        assert!(real_bytes > 0, "the fetch must have scanned some real bytes");
+
+        // A budget bounded at exactly the real single-fetch cost, run
+        // against two plans that share "metric_a"'s matcher set.
+        let bounded = engine_with_config(
+            Arc::clone(&store),
+            EngineConfig {
+                max_bytes_scanned: ByteLimit::Bounded(real_bytes),
+                ..EngineConfig::default()
+            },
+        );
+        let mut plan_b = window_plan("metric_a");
+        plan_b.offset_ns = NS_PER_MIN * 5;
+        let shared_plans = vec![window_plan("metric_a"), plan_b];
+        let result = bounded
+            .prefetch(tenant_hash, &shared_plans, &eval_window, &[], BASE_NS)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a shared-matcher query scans exactly the real single-fetch bytes, so it must \
+             not trip a budget set at that exact real cost: {:?}",
+            result.err()
+        );
     }
 }
