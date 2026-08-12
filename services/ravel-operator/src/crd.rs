@@ -67,6 +67,18 @@ pub struct RavelClusterSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_tokens_secret_ref: Option<LocalSecretRef>,
 
+    /// Secret with a single key `key` holding the deployment's 32-byte
+    /// deployment key (64 hex characters or 32 raw bytes, the same format
+    /// `--tenant-hash-key-file` reads). This one key doubles as the v2-keyed
+    /// tenant-hash key and the `sys/auth` token-hashing key (ADR-0072
+    /// decision 4): when set, the operator mounts it and renders
+    /// `--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and
+    /// reconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive
+    /// opt-in, not a migration of existing unkeyed clusters (EM-T10 #773 owns
+    /// that story); omit to keep today's unkeyed behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_key_secret_ref: Option<LocalSecretRef>,
+
     /// Gateway (ingest + query API) tier.
     #[serde(default)]
     pub gateway: GatewaySpec,
@@ -590,6 +602,44 @@ mod tests {
         assert_eq!(spec.gateway.credentials_secret_ref, None);
         assert_eq!(spec.query.credentials_secret_ref, None);
         assert_eq!(spec.maintain.credentials_secret_ref, None);
+    }
+
+    #[test]
+    fn deployment_key_secret_ref_is_in_the_schema_and_optional() {
+        // ADR-0072 decision 4 / #897: the CRD gains an optional
+        // deploymentKeySecretRef at the top level (sibling of
+        // tenantTokensSecretRef, not per-tier: one deployment key covers the
+        // whole cluster). Must be visible in the schema and default to None so
+        // an existing keyless spec still deserializes unchanged.
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let spec_props = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        assert!(
+            spec_props.contains_key("deploymentKeySecretRef"),
+            "spec must expose deploymentKeySecretRef in its schema"
+        );
+
+        let json = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(spec.deployment_key_secret_ref, None);
     }
 
     #[test]

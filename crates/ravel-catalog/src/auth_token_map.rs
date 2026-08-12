@@ -419,6 +419,73 @@ pub async fn remove_token(
     write_map(store, &map, Some(version), now_ns).await
 }
 
+/// Remove every token mapped to `tenant_id` (a tenant-wide revocation),
+/// whole-record CAS-replace. Needs no plaintext and no per-token knowledge:
+/// entries carry their `tenant_id` in the clear, so this filters on that field
+/// alone. This is what makes revocation correct after a restart with no
+/// in-memory history — the caller need not have ever seen this tenant's
+/// tokens, only its name (ADR-0072 decision 4, #875). Returns
+/// [`SetOutcome::Unchanged`] (issuing no write) when no object exists or no
+/// entry matches `tenant_id`. A concurrent write to an existing object is a
+/// [`AuthTokenMapError::CasConflict`].
+pub async fn remove_tokens_by_tenant(
+    store: &dyn ObjectStoreBackend,
+    deployment_key: &[u8; 32],
+    tenant_id: &str,
+    now_ns: i64,
+) -> Result<SetOutcome, AuthTokenMapError> {
+    let (mut map, version) = match read_auth_map(store, deployment_key).await? {
+        Some((map, version)) => (map, version),
+        None => return Ok(SetOutcome::Unchanged),
+    };
+    let before = map.entries.len();
+    map.entries.retain(|e| e.tenant_id != tenant_id);
+    if map.entries.len() == before {
+        return Ok(SetOutcome::Unchanged);
+    }
+    write_map(store, &map, Some(version), now_ns).await
+}
+
+/// Replace `tenant_id`'s entire token set with `plaintext_tokens`,
+/// whole-record CAS-replace. Every existing entry for `tenant_id` is dropped
+/// and one entry per token in `plaintext_tokens` is written in its place;
+/// entries belonging to other tenants are untouched. Each token is hashed
+/// under `deployment_key` before being stored; the plaintext is never
+/// persisted. This is the primitive a Secret-driven reconcile loop uses: the
+/// Secret is the tenant's whole desired token set, so converging to it is a
+/// replace, not an incremental upsert/remove pair. On a fresh bucket the
+/// object is created with `CreateIfAbsent`; a concurrent write is a
+/// [`AuthTokenMapError::CasConflict`] the caller re-reads and retries on.
+pub async fn replace_tenant_tokens(
+    store: &dyn ObjectStoreBackend,
+    deployment_key: &[u8; 32],
+    tenant_id: &str,
+    plaintext_tokens: &[Vec<u8>],
+    now_ns: i64,
+) -> Result<SetOutcome, AuthTokenMapError> {
+    if tenant_id.is_empty() {
+        return Err(AuthTokenMapError::EmptyTenantId);
+    }
+    let (mut map, version) = match read_auth_map(store, deployment_key).await? {
+        Some((map, version)) => (map, Some(version)),
+        None => (
+            AuthTokenMap {
+                key_fingerprint: key_fingerprint(deployment_key),
+                entries: Vec::new(),
+            },
+            None,
+        ),
+    };
+    map.entries.retain(|e| e.tenant_id != tenant_id);
+    for token in plaintext_tokens {
+        map.entries.push(TokenEntry {
+            token_hash: token_hash(deployment_key, token),
+            tenant_id: tenant_id.to_string(),
+        });
+    }
+    write_map(store, &map, version, now_ns).await
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -820,6 +887,195 @@ mod tests {
             matches!(err, AuthTokenMapError::Decode { .. }),
             "got: {err}"
         );
+    }
+
+    /// `remove_tokens_by_tenant` drops every entry for the named tenant and
+    /// leaves other tenants' entries untouched, given no plaintext at all.
+    #[tokio::test]
+    async fn remove_tokens_by_tenant_revokes_only_that_tenant() {
+        let store = mem();
+        upsert_token(store.as_ref(), KEY, b"a1", "tenant-a", 1)
+            .await
+            .expect("create a1");
+        upsert_token(store.as_ref(), KEY, b"a2", "tenant-a", 2)
+            .await
+            .expect("create a2");
+        upsert_token(store.as_ref(), KEY, b"b1", "tenant-b", 3)
+            .await
+            .expect("create b1");
+
+        let outcome = remove_tokens_by_tenant(store.as_ref(), KEY, "tenant-a", 4)
+            .await
+            .expect("remove by tenant");
+        assert_eq!(outcome, SetOutcome::Updated);
+
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(map.entries.len(), 1, "only tenant-b's entry survives");
+        assert_eq!(tenant_for_token(&map, KEY, b"a1"), None);
+        assert_eq!(tenant_for_token(&map, KEY, b"a2"), None);
+        assert_eq!(tenant_for_token(&map, KEY, b"b1"), Some("tenant-b"));
+    }
+
+    /// A tenant with no entries (or no object at all) is a clean no-op.
+    #[tokio::test]
+    async fn remove_tokens_by_tenant_absent_is_unchanged() {
+        let store = mem();
+        let outcome = remove_tokens_by_tenant(store.as_ref(), KEY, "tenant-a", 1)
+            .await
+            .expect("remove on empty bucket");
+        assert_eq!(outcome, SetOutcome::Unchanged);
+
+        upsert_token(store.as_ref(), KEY, b"tok", "tenant-b", 2)
+            .await
+            .expect("create tenant-b entry");
+        let outcome = remove_tokens_by_tenant(store.as_ref(), KEY, "tenant-a", 3)
+            .await
+            .expect("remove a tenant with no entries");
+        assert_eq!(outcome, SetOutcome::Unchanged);
+    }
+
+    /// A concurrent update racing `remove_tokens_by_tenant` surfaces as a typed
+    /// `CasConflict`, never a silent overwrite.
+    #[tokio::test]
+    async fn remove_tokens_by_tenant_cas_conflict_on_concurrent_update() {
+        let inner = MemoryStore::new();
+        let seed = build_proto(
+            &AuthTokenMap {
+                key_fingerprint: key_fingerprint(KEY),
+                entries: vec![TokenEntry {
+                    token_hash: token_hash(KEY, b"tok"),
+                    tenant_id: "tenant-a".into(),
+                }],
+            },
+            1,
+        );
+        inner
+            .put(
+                AUTH_KEY,
+                seed.encode_to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("seed");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains("sys/auth"),
+        );
+        let store = FaultStore::new(inner, plan);
+        let err = remove_tokens_by_tenant(&store, KEY, "tenant-a", 2)
+            .await
+            .expect_err("a CAS precondition failure must surface as a typed conflict");
+        assert!(matches!(err, AuthTokenMapError::CasConflict), "got: {err}");
+        assert_eq!(
+            store.fault_count(
+                Op::Put,
+                ravel_object_store::fault::FaultKind::FailedConditionalWrite
+            ),
+            1,
+            "the injected precondition failure must have fired"
+        );
+    }
+
+    /// `replace_tenant_tokens` swaps in exactly the given token set for the
+    /// named tenant, leaving other tenants' entries untouched, and drops
+    /// whatever the tenant held before.
+    #[tokio::test]
+    async fn replace_tenant_tokens_replaces_exactly_that_tenant() {
+        let store = mem();
+        upsert_token(store.as_ref(), KEY, b"a-old", "tenant-a", 1)
+            .await
+            .expect("seed old tenant-a token");
+        upsert_token(store.as_ref(), KEY, b"b1", "tenant-b", 2)
+            .await
+            .expect("seed tenant-b token");
+
+        let outcome = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "tenant-a",
+            &[b"a-new-1".to_vec(), b"a-new-2".to_vec()],
+            3,
+        )
+        .await
+        .expect("replace");
+        assert_eq!(outcome, SetOutcome::Updated);
+
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            map.entries.len(),
+            3,
+            "two new tenant-a entries, one tenant-b"
+        );
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"a-old"),
+            None,
+            "the old token was dropped"
+        );
+        assert_eq!(tenant_for_token(&map, KEY, b"a-new-1"), Some("tenant-a"));
+        assert_eq!(tenant_for_token(&map, KEY, b"a-new-2"), Some("tenant-a"));
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"b1"),
+            Some("tenant-b"),
+            "tenant-b's entry is untouched"
+        );
+    }
+
+    /// `replace_tenant_tokens` on a fresh bucket creates the object.
+    #[tokio::test]
+    async fn replace_tenant_tokens_creates_on_fresh_bucket() {
+        let store = mem();
+        let outcome = replace_tenant_tokens(store.as_ref(), KEY, "tenant-a", &[b"tok".to_vec()], 1)
+            .await
+            .expect("replace on fresh bucket");
+        assert_eq!(outcome, SetOutcome::Created);
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(tenant_for_token(&map, KEY, b"tok"), Some("tenant-a"));
+    }
+
+    /// An empty tenant_id is refused before any write, matching `upsert_token`.
+    #[tokio::test]
+    async fn replace_tenant_tokens_empty_tenant_is_refused() {
+        let store = mem();
+        let err = replace_tenant_tokens(store.as_ref(), KEY, "", &[b"tok".to_vec()], 1)
+            .await
+            .expect_err("an empty tenant_id must be refused");
+        assert!(
+            matches!(err, AuthTokenMapError::EmptyTenantId),
+            "got: {err}"
+        );
+        assert!(
+            read_auth_map(store.as_ref(), KEY)
+                .await
+                .expect("read")
+                .is_none(),
+            "a refused replace writes nothing"
+        );
+    }
+
+    /// A concurrent create race on `replace_tenant_tokens` surfaces as a typed
+    /// conflict, matching `upsert_token`'s create path.
+    #[tokio::test]
+    async fn replace_tenant_tokens_cas_conflict_on_concurrent_create() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains("sys/auth"),
+        );
+        let store = FaultStore::new(inner, plan);
+        let err = replace_tenant_tokens(&store, KEY, "tenant-a", &[b"tok".to_vec()], 1)
+            .await
+            .expect_err("a losing CreateIfAbsent race must surface as a typed conflict");
+        assert!(matches!(err, AuthTokenMapError::CasConflict), "got: {err}");
     }
 
     /// Byte-subslice search helper for the plaintext-never-stored assertion.

@@ -14,8 +14,9 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction, PodSpec, PodTemplateSpec, Probe,
-    ResourceRequirements, SecretKeySelector, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction, KeyToPath, PodSpec,
+    PodTemplateSpec, Probe, ResourceRequirements, SecretKeySelector, SecretVolumeSource, Service,
+    ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -31,9 +32,9 @@ pub const HTTP_PORT: i32 = 4318;
 pub const GRPC_PORT: i32 = 4317;
 
 /// Secret key holding the S3 access key id.
-const S3_ACCESS_KEY_ID_KEY: &str = "accessKeyId";
+pub(crate) const S3_ACCESS_KEY_ID_KEY: &str = "accessKeyId";
 /// Secret key holding the S3 secret access key.
-const S3_SECRET_ACCESS_KEY_KEY: &str = "secretAccessKey";
+pub(crate) const S3_SECRET_ACCESS_KEY_KEY: &str = "secretAccessKey";
 
 /// Pod-template annotation carrying a checksum of the Secrets the pod depends
 /// on (credentials and, where applicable, tenant tokens). Changing it changes
@@ -245,19 +246,35 @@ fn tenant_token_args(spec: &RavelClusterSpec, ctx: &RenderCtx) -> Vec<String> {
     args
 }
 
+/// Name of the Volume mounting the `deploymentKeySecretRef` Secret, when
+/// configured.
+const DEPLOYMENT_KEY_VOLUME_NAME: &str = "deployment-key";
+
+/// Directory the deployment-key Secret is mounted at.
+pub(crate) const DEPLOYMENT_KEY_MOUNT_DIR: &str = "/etc/ravel/deployment-key";
+
+/// Key within the deployment-key Secret holding the 32-byte key, and the
+/// filename it is projected to inside [`DEPLOYMENT_KEY_MOUNT_DIR`]. Also the
+/// key [`crate::controller`] reads to get the live value for `sys/auth`
+/// reconciliation, so the mounted path and the value the operator hashes
+/// with can never name two different Secret keys.
+pub(crate) const DEPLOYMENT_KEY_SECRET_KEY: &str = "key";
+
 /// Args shared by every mode: store selection, shard count, and the S3
 /// bucket/region/endpoint flags. Access/secret keys are NOT here (they are env
 /// vars, see [`s3_credential_env`]).
 ///
-/// Also carries `--tenant-hash-unkeyed` (ADR-0050 section 3): a fresh bucket
-/// now refuses to start unless it is told a scheme, and the CRD has no field
-/// yet for an operator-managed deployment to opt into the keyed variant (that
-/// needs a `--tenant-hash-key-file` sourced from a Secret, which is a real
-/// design task, not a one-line addition). Passing the unkeyed flag here keeps
-/// every existing and new `RavelCluster` on today's behavior -- the same
-/// v1-unkeyed derivation it has always used -- rather than silently becoming
-/// keyed-by-default and refusing to start. Revisit once the CRD grows a
-/// tenant-hash-key field.
+/// Also carries the tenant-hash scheme flag (ADR-0050 section 3 / ADR-0072
+/// decision 4): a fresh bucket refuses to start unless it is told a scheme.
+/// When `spec.deployment_key_secret_ref` is set, this renders
+/// `--tenant-hash-key-file` pointed at the mounted Secret (see
+/// [`deployment_key_volume`]/[`deployment_key_volume_mount`]) so the cluster
+/// runs the keyed derivation and the operator's own `sys/auth`
+/// reconciliation (issue #897) has the same key available. Otherwise it
+/// renders `--tenant-hash-unkeyed`, keeping every existing and new
+/// keyless `RavelCluster` on today's v1-unkeyed derivation. This is an
+/// additive opt-in, not a migration of existing unkeyed clusters (EM-T10
+/// #773 owns that story).
 fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
     let mut args = vec![
         "--store".to_string(),
@@ -268,13 +285,52 @@ fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
         spec.storage.s3.bucket.clone(),
         "--s3-region".to_string(),
         spec.storage.s3.region.clone(),
-        "--tenant-hash-unkeyed".to_string(),
     ];
+    if spec.deployment_key_secret_ref.is_some() {
+        args.push("--tenant-hash-key-file".to_string());
+        args.push(format!(
+            "{DEPLOYMENT_KEY_MOUNT_DIR}/{DEPLOYMENT_KEY_SECRET_KEY}"
+        ));
+    } else {
+        args.push("--tenant-hash-unkeyed".to_string());
+    }
     if let Some(endpoint) = &spec.storage.s3.endpoint {
         args.push("--s3-endpoint".to_string());
         args.push(endpoint.clone());
     }
     args
+}
+
+/// The Volume projecting the `deploymentKeySecretRef` Secret's `key` entry
+/// into the pod, or `None` when the spec carries no deployment key.
+fn deployment_key_volume(spec: &RavelClusterSpec) -> Option<Volume> {
+    let secret_ref = spec.deployment_key_secret_ref.as_ref()?;
+    Some(Volume {
+        name: DEPLOYMENT_KEY_VOLUME_NAME.to_string(),
+        secret: Some(SecretVolumeSource {
+            secret_name: Some(secret_ref.name.clone()),
+            items: Some(vec![KeyToPath {
+                key: DEPLOYMENT_KEY_SECRET_KEY.to_string(),
+                path: DEPLOYMENT_KEY_SECRET_KEY.to_string(),
+                ..Default::default()
+            }]),
+            optional: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// The container's mount of [`deployment_key_volume`], read-only, or `None`
+/// when the spec carries no deployment key.
+fn deployment_key_volume_mount(spec: &RavelClusterSpec) -> Option<VolumeMount> {
+    spec.deployment_key_secret_ref.as_ref()?;
+    Some(VolumeMount {
+        name: DEPLOYMENT_KEY_VOLUME_NAME.to_string(),
+        mount_path: DEPLOYMENT_KEY_MOUNT_DIR.to_string(),
+        read_only: Some(true),
+        ..Default::default()
+    })
 }
 
 /// Convert the CRD resource spec into a Kubernetes `ResourceRequirements`.
@@ -341,6 +397,8 @@ fn deployment(
 ) -> Deployment {
     let labels = labels(instance, component);
     let (liveness, readiness) = probes();
+    let volume_mount = deployment_key_volume_mount(spec);
+    let volume = deployment_key_volume(spec);
     let container = Container {
         name: "ravel-server".to_string(),
         image: Some(spec.image.clone()),
@@ -351,6 +409,7 @@ fn deployment(
         liveness_probe: Some(liveness),
         readiness_probe: Some(readiness),
         resources: resources(resources_spec),
+        volume_mounts: volume_mount.map(|m| vec![m]),
         ..Default::default()
     };
     Deployment {
@@ -382,6 +441,7 @@ fn deployment(
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
+                    volumes: volume.map(|v| vec![v]),
                     ..Default::default()
                 }),
             },
@@ -647,6 +707,7 @@ mod tests {
             tenant_tokens_secret_ref: Some(LocalSecretRef {
                 name: "ravel-tokens".to_string(),
             }),
+            deployment_key_secret_ref: None,
             gateway: GatewaySpec {
                 replicas: 3,
                 resources: None,
@@ -754,21 +815,87 @@ mod tests {
     }
 
     #[test]
-    fn every_deployment_carries_tenant_hash_unkeyed() {
+    fn keyless_spec_every_deployment_carries_tenant_hash_unkeyed() {
         // ADR-0050 section 3: a fresh bucket refuses to start unless told a
-        // scheme, and the CRD has no field yet to opt an operator-managed
-        // deployment into the keyed variant. Every deployment must pass
-        // --tenant-hash-unkeyed so a RavelCluster keeps starting on today's
-        // v1-unkeyed behavior instead of refusing on a fresh bucket.
+        // scheme. A spec with no deploymentKeySecretRef must keep every
+        // deployment on --tenant-hash-unkeyed (today's v1-unkeyed behavior),
+        // never silently switching to keyed.
         let spec = base_spec();
+        assert!(spec.deployment_key_secret_ref.is_none());
         let g = desired_gateway_deployment(&spec, "prod", &ctx());
         let q = desired_query_deployment(&spec, "prod", &ctx());
         let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("maintain enabled");
-        for args in [args_of(&g), args_of(&q), args_of(&m)] {
+        for dep in [&g, &q, &m] {
+            let args = args_of(dep);
             assert!(
                 args.iter().any(|a| a == "--tenant-hash-unkeyed"),
                 "missing --tenant-hash-unkeyed in {args:?}"
             );
+            assert!(
+                !args.iter().any(|a| a == "--tenant-hash-key-file"),
+                "keyless spec must not render --tenant-hash-key-file: {args:?}"
+            );
+            let pod_spec = dep
+                .spec
+                .as_ref()
+                .expect("spec")
+                .template
+                .spec
+                .as_ref()
+                .expect("pod spec");
+            assert!(
+                pod_spec.volumes.is_none(),
+                "keyless spec must mount no deployment-key volume"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_key_spec_renders_tenant_hash_key_file_and_mounts_the_secret() {
+        // ADR-0072 decision 4 / #897: when deploymentKeySecretRef is set, every
+        // deployment must render --tenant-hash-key-file pointed at the mounted
+        // Secret instead of --tenant-hash-unkeyed, and the pod must carry a
+        // read-only Volume/VolumeMount sourcing that Secret's `key` entry.
+        let mut spec = base_spec();
+        spec.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "ravel-deployment-key".to_string(),
+        });
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("maintain enabled");
+        for dep in [&g, &q, &m] {
+            let args = args_of(dep);
+            assert!(
+                !args.iter().any(|a| a == "--tenant-hash-unkeyed"),
+                "deployment-key spec must not render --tenant-hash-unkeyed: {args:?}"
+            );
+            assert_eq!(
+                arg_value(&args, "--tenant-hash-key-file").as_deref(),
+                Some("/etc/ravel/deployment-key/key"),
+                "args: {args:?}"
+            );
+
+            let pod_spec = dep
+                .spec
+                .as_ref()
+                .expect("spec")
+                .template
+                .spec
+                .as_ref()
+                .expect("pod spec");
+            let volumes = pod_spec.volumes.as_ref().expect("volumes");
+            assert_eq!(volumes.len(), 1);
+            let secret = volumes[0].secret.as_ref().expect("secret volume source");
+            assert_eq!(secret.secret_name.as_deref(), Some("ravel-deployment-key"));
+            let items = secret.items.as_ref().expect("items");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].key, "key");
+            assert_eq!(items[0].path, "key");
+
+            let mounts = container_of(dep).volume_mounts.as_ref().expect("mounts");
+            assert_eq!(mounts.len(), 1);
+            assert_eq!(mounts[0].mount_path, "/etc/ravel/deployment-key");
+            assert_eq!(mounts[0].read_only, Some(true));
         }
     }
 

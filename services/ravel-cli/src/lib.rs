@@ -16,6 +16,7 @@ pub mod qualify;
 pub mod reconstruct;
 pub mod store;
 pub mod tenancy;
+pub mod tenant_token;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
