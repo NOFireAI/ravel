@@ -513,6 +513,9 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
         FRAGMENT_TOKEN.to_string(),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        )),
         admission,
         local_catalog,
         store.clone(),
@@ -1169,6 +1172,9 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
         FRAGMENT_TOKEN.to_string(),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        )),
         admission,
         local_catalog,
         store.clone(),
@@ -1295,6 +1301,9 @@ async fn version_mismatch_falls_back_to_local() {
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
         FRAGMENT_TOKEN.to_string(),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        )),
         admission,
         local_catalog,
         store.clone(),
@@ -1449,6 +1458,9 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
         FRAGMENT_TOKEN.to_string(),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        )),
         admission,
         local_catalog,
         store.clone(),
@@ -1570,6 +1582,9 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
         FRAGMENT_TOKEN.to_string(),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        )),
         admission,
         local_catalog,
         coord_store.clone(),
@@ -1740,6 +1755,9 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
         FRAGMENT_TOKEN.to_string(),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        )),
         admission,
         local_catalog,
         store.clone(),

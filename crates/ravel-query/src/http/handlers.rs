@@ -196,7 +196,19 @@ async fn handle_query(
         exec,
     )
     .await?;
-    let (warnings, infos) = annotations.into_parts();
+    let (mut warnings, infos) = annotations.into_parts();
+    // Merge the federation fan-out's partial-coverage warnings (ADR-0071, issue
+    // #868) into the top-level `warnings` array alongside the evaluator's own
+    // annotations, so a `skip_unavailable=true` federated query returns a
+    // response a client can tell is partial (the `partial` stats marker) and
+    // that names the skipped cluster. These are already redacted at the
+    // federation seam: they name the operator-facing cluster only, never its
+    // endpoint or transport error text.
+    for w in &stats.warnings {
+        if !warnings.contains(w) {
+            warnings.push(w.clone());
+        }
+    }
     // Copy the counters out before `stats` is moved into the response body, so
     // the numbers folded into /metrics are exactly the numbers the response
     // reports; recording after the JSON render succeeds means a completed,
@@ -269,7 +281,15 @@ async fn handle_query_range(
         exec,
     )
     .await?;
-    let (warnings, infos) = annotations.into_parts();
+    let (mut warnings, infos) = annotations.into_parts();
+    // Merge the federation fan-out's partial-coverage warnings (ADR-0071, issue
+    // #868) into the top-level `warnings` array, same as handle_query. Already
+    // redacted at the federation seam (cluster name only, no endpoint/errno).
+    for w in &stats.warnings {
+        if !warnings.contains(w) {
+            warnings.push(w.clone());
+        }
+    }
     // See handle_query: record the same counters the response reports, once
     // the range payload has rendered.
     let accounting = stats.accounting;

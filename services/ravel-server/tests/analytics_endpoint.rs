@@ -180,6 +180,9 @@ fn build_router_distributed(
     let clock: Arc<dyn Clock> = Arc::new(FixedClock);
     let service = FragmentService::new(
         "cluster-token".to_string(),
+        Arc::new(StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        )),
         FragmentAdmission::new(8, metrics.clone()),
         catalog.clone(),
         Arc::clone(&store),
