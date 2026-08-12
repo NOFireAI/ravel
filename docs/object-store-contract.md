@@ -265,6 +265,24 @@ leases. MinIO supports the full mandatory set; like AWS S3, its
 server-side upload checksums are unreachable through `object_store`'s
 client, which is why `S3Store` reports `upload_checksum: false` for both.
 
+### Credentials
+
+`S3Config` (ADR-0072 decision 1) takes long-lived `access_key_id` /
+`secret_access_key`, an optional temporary `session_token` for STS-issued or
+IRSA-style credentials, and an optional `credentials_file` for credentials
+an external process rotates on disk (a Kubernetes secret mount, an STS
+sidecar). Ravel never calls STS itself; `credentials_file` only makes an
+externally-minted rotating credential expressible. When both are set, the
+file wins. The file is read once at `S3Store::new`, eagerly: an unreadable
+or malformed file fails construction with a typed `StoreError` (fail fast at
+startup). After that it is re-read lazily, only on request-path credential
+access, and only when its mtime has changed since the last read; there is no
+background thread and no timer. A successful re-read swaps the cached
+credential atomically, so a request already in flight finishes on whatever
+credential it already obtained. A read or parse failure while rotating
+never fails the request: the last-good credential is kept and a
+rate-limited warning is logged, never a panic.
+
 ## Runtime qualification (executable contract)
 
 `Capabilities` is self-reported: a backend declares `consistent_list: true`
