@@ -128,6 +128,15 @@ pub struct IngestMetrics {
     /// background refresher is not keeping views current and writes are being
     /// refused rather than routed on a possibly-missed activation.
     stale_provisioning_flushes: AtomicU64,
+    /// Flushes routed on a last-known-good provisioning view past the refresh
+    /// interval `C`, inside the bounded NF-2 grace window, because the
+    /// provisioning re-read could not complete but the cached view's validity
+    /// horizon had not been crossed (`GenerationSwitch::try_grace_extend`).
+    /// Degraded, not failed: distinct from `stale_provisioning_flushes`, which
+    /// counts a flush that failed closed outright. A sustained rise here means
+    /// the store is slow/throttled and this router is degraded-but-available
+    /// rather than fleet-wide-outed.
+    grace_extended_stale_flushes: AtomicU64,
     /// Per-shard count of flushes whose flush task has been spawned but has
     /// not yet acked its waiters (ADR-0067 decision 2 consequence: pipelining
     /// raises per-shard memory by up to `(max_inflight_flushes - 1)` flush
@@ -160,6 +169,7 @@ pub struct IngestMetricsSnapshot {
     pub exemplars_written_total: u64,
     pub exemplars_dropped_total: u64,
     pub stale_provisioning_flushes: u64,
+    pub grace_extended_stale_flushes: u64,
     /// Sum across shards of [`IngestMetrics::in_flight_flushes_by_shard`] at
     /// snapshot time. The per-shard breakdown does not fit this struct's flat
     /// Copy shape; call `in_flight_flushes_by_shard` directly for that.
@@ -263,6 +273,13 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush routed on a last-known-good provisioning view inside the
+    /// bounded NF-2 grace window (ADR-0052 degraded-safe fallback).
+    pub(crate) fn record_grace_extended_stale_flush(&self) {
+        self.grace_extended_stale_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> IngestMetricsSnapshot {
         IngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
@@ -281,6 +298,7 @@ impl IngestMetrics {
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
+            grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
             in_flight_flushes_total: self
                 .in_flight_flushes_by_shard()
                 .into_iter()

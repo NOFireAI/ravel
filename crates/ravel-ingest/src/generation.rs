@@ -67,6 +67,26 @@ fn hour_of(now_ns: i64) -> u32 {
     u32::try_from(now_ns.div_euclid(NS_PER_HOUR).max(0)).unwrap_or(u32::MAX)
 }
 
+/// Ceiling of `ns` in whole hours, mirroring the ADR-0052 section 3 lead-time
+/// floor `L >= ceil(C) + 1`. Zero or negative maps to zero hours.
+fn ceil_hours(ns: i64) -> u32 {
+    if ns <= 0 {
+        return 0;
+    }
+    u32::try_from((ns + NS_PER_HOUR - 1) / NS_PER_HOUR).unwrap_or(u32::MAX)
+}
+
+/// The ADR-0052 section 3 minimum reshard lead time `L >= ceil(C) + 1` for a
+/// refresh interval `C`, in hours. The NF-2 grace window (issue #655) reuses
+/// this exact bound in reverse: a generation appended after a router's last
+/// successful refresh cannot activate within `min_lead_hours(C)` hours of that
+/// refresh, so a cached view stays provably authoritative for any wall-clock
+/// hour strictly before that horizon, even once the view is older than `C`
+/// itself. See [`GenerationSwitch::try_grace_extend`].
+fn min_lead_hours(refresh_interval_ns: i64) -> u32 {
+    ceil_hours(refresh_interval_ns) + 1
+}
+
 /// A tenant's cached view of its provisioning record's generation history, plus
 /// when the router last refreshed it. `refreshed_at_ns` is what the staleness
 /// guard compares against `C`.
@@ -208,6 +228,53 @@ impl<H> GenerationSwitch<H> {
             Some(_) | None => return Routed::Stale,
         };
         Routed::Fresh(self.ensure_set(&mut inner, count))
+    }
+
+    /// NF-2 bounded degraded-safe fallback (ADR-0052 sections 2-3, issue #655):
+    /// called by a router whose provisioning re-read could not complete after
+    /// [`GenerationSwitch::route_cached`] returned [`Routed::Stale`], so it can
+    /// continue routing on the last-known-good view instead of failing every
+    /// flush closed for as long as the store stays slow or unreachable — but
+    /// only inside a bounded grace window where doing so is still provably
+    /// correct, never as a general staleness override.
+    ///
+    /// Safety predicate: continue-on-stale is safe only when the cached
+    /// generation's validity horizon has not been crossed AND no pending
+    /// generation change is knowable. Concretely, this returns a set only when
+    /// `hour_of(now_ns) < hour_of(view.refreshed_at_ns) + min_lead_hours(C)`.
+    /// The ADR's own lead-time floor `L >= ceil(C) + 1` guarantees a generation
+    /// appended after `refreshed_at_ns` cannot activate before
+    /// `hour_of(refreshed_at_ns) + min_lead_hours(C)`; while `now_ns` maps to an
+    /// hour strictly before that horizon, no unseen append could have already
+    /// activated, so `active_shard_count` computed against the *cached* history
+    /// is exactly what a fresh read would also return — the cached view is not
+    /// approximated, it is proven current. A genuine, already-visible future
+    /// generation already in the cached history is not a risk either way, since
+    /// `active_shard_count` accounts for it regardless of staleness; the only
+    /// risk this predicate rules out is an append this router has never seen.
+    /// Once the horizon is crossed an unseen append becomes possible and this
+    /// returns `None`, so the caller fails closed exactly as it does today —
+    /// correctness beats availability once the bound cannot be proven.
+    ///
+    /// Returns `None` for a tenant never resolved from a real read (no cached
+    /// view exists to extend) and once the horizon above is crossed. The
+    /// caller is responsible for emitting the "routing on grace-extended stale
+    /// view" metric on `Some` and the ordinary stale-flush metric on `None`;
+    /// this method only decides, it does not record.
+    pub fn try_grace_extend(&self, tenant: TenantHash, now_ns: i64) -> Option<Arc<Vec<H>>> {
+        let mut inner = self.lock();
+        let refreshed_at_ns = inner.views.get(&tenant)?.refreshed_at_ns;
+        let horizon =
+            hour_of(refreshed_at_ns).saturating_add(min_lead_hours(self.refresh_interval_ns));
+        if hour_of(now_ns) >= horizon {
+            return None;
+        }
+        let count = {
+            let view = inner.views.get_mut(&tenant)?;
+            view.last_touched_ns = now_ns;
+            active_shard_count(&view.generations, hour_of(now_ns))
+        };
+        Some(self.ensure_set(&mut inner, count))
     }
 
     /// Install a freshly-read generation history for a tenant, stamp the refresh
@@ -500,6 +567,115 @@ mod tests {
         assert!(
             matches!(sw.route_cached(idle, sweep_ns), Routed::Fresh(_)),
             "after re-derivation the idle tenant routes from cache again"
+        );
+    }
+
+    /// `min_lead_hours` mirrors the ADR-0052 section 3 lead-time floor `L >=
+    /// ceil(C) + 1` for a range of refresh intervals, including the default and
+    /// a non-hour-aligned one, and is deterministic (repeat calls agree).
+    #[test]
+    fn min_lead_hours_matches_ceil_c_plus_one() {
+        assert_eq!(min_lead_hours(0), 1, "C = 0 still requires 1 hour of lead");
+        assert_eq!(min_lead_hours(DEFAULT_REFRESH_INTERVAL_NS), 2, "C = 60s");
+        assert_eq!(
+            min_lead_hours(NS_PER_HOUR + 1),
+            3,
+            "C just over 1h ceils to 2h, plus 1"
+        );
+        assert_eq!(
+            min_lead_hours(DEFAULT_REFRESH_INTERVAL_NS),
+            min_lead_hours(DEFAULT_REFRESH_INTERVAL_NS),
+            "deterministic: no clock read, repeat calls agree"
+        );
+    }
+
+    /// NF-2 (issue #655): a router whose cached view has gone stale by `C` but
+    /// whose `shard_count` provably has not (and cannot have) changed continues
+    /// routing inside the bounded grace window, rather than failing every flush
+    /// closed. `min_lead_hours(C) = 2` for the default `C`, so the grace window
+    /// here spans wall-clock hours `[10, 12)` from a refresh at hour 10.
+    #[test]
+    fn try_grace_extend_continues_routing_within_horizon() {
+        let c = DEFAULT_REFRESH_INTERVAL_NS;
+        let sw = index_switch(4, c);
+        let t = tenant(5);
+        let t0 = 10 * NS_PER_HOUR;
+        sw.refresh(t, vec![gen0(4)], t0);
+
+        // Past C (a store re-read could not complete), but still inside the
+        // horizon: continues routing on the cached view.
+        let still_within_horizon_ns = 11 * NS_PER_HOUR;
+        let set = sw
+            .try_grace_extend(t, still_within_horizon_ns)
+            .expect("within the horizon, grace-extension continues routing");
+        assert_eq!(
+            set.len(),
+            4,
+            "routes with the cached, unchanged shard_count"
+        );
+    }
+
+    /// NF-2: once the grace horizon is crossed, an unseen generation append
+    /// becomes possible, so the switch refuses to extend and the caller must
+    /// fail the flush closed exactly as it did before this fallback existed.
+    #[test]
+    fn try_grace_extend_refuses_once_horizon_crossed() {
+        let c = DEFAULT_REFRESH_INTERVAL_NS;
+        let sw = index_switch(4, c);
+        let t = tenant(6);
+        let t0 = 10 * NS_PER_HOUR;
+        sw.refresh(t, vec![gen0(4)], t0);
+
+        // Horizon is hour 10 + min_lead_hours(C) = hour 12. At hour 12 an
+        // append this router never saw could already have activated, so no
+        // amount of "shard_count looks unchanged in the cached view" is provable
+        // any more.
+        let horizon_crossed_ns = 12 * NS_PER_HOUR;
+        assert!(
+            sw.try_grace_extend(t, horizon_crossed_ns).is_none(),
+            "past the horizon, grace-extension must refuse (fail closed)"
+        );
+    }
+
+    /// NF-2: a tenant never resolved from a real read has no cached view to
+    /// extend, so grace-extension cannot help it either -- it must go through
+    /// the normal re-read (and fail closed if that fails), identically to a
+    /// tenant whose view has gone stale.
+    #[test]
+    fn try_grace_extend_refuses_for_a_never_resolved_tenant() {
+        let sw = index_switch(4, DEFAULT_REFRESH_INTERVAL_NS);
+        let t = tenant(7);
+        assert!(
+            sw.try_grace_extend(t, 10 * NS_PER_HOUR).is_none(),
+            "no cached view exists yet, so there is nothing provable to extend"
+        );
+    }
+
+    /// NF-2: grace-extension is exactly as safe when a future generation change
+    /// is already visible in the cached view -- `active_shard_count` accounts
+    /// for it regardless of staleness, so routing through the grace window on a
+    /// tenant with a known upcoming reshard still returns the count that will
+    /// actually be active at `now_ns`, not a stale pre-reshard count.
+    #[test]
+    fn try_grace_extend_honors_a_known_future_generation() {
+        let c = DEFAULT_REFRESH_INTERVAL_NS;
+        let sw = index_switch(4, c);
+        let t = tenant(8);
+        let t0 = 10 * NS_PER_HOUR;
+        // The cached view already knows about a reshard to 8 shards activating
+        // at hour 11, refreshed at hour 10.
+        sw.refresh(t, vec![gen0(4), gen1(8, 11)], t0);
+
+        // Still within the grace horizon (hour 10 + 2 = 12), and past the known
+        // activation: routes at the new count, not the stale old one.
+        let after_known_activation_ns = 11 * NS_PER_HOUR;
+        let set = sw
+            .try_grace_extend(t, after_known_activation_ns)
+            .expect("within the horizon, grace-extension continues routing");
+        assert_eq!(
+            set.len(),
+            8,
+            "a known future generation is honored even through the grace window"
         );
     }
 

@@ -177,8 +177,12 @@ impl LogIngestRouter {
 
     /// Resolve the tenant's active shard-actor set for a write at `now_ns`,
     /// re-reading the provisioning record when the cached view is older than the
-    /// refresh interval `C` (ADR-0052 section 3). Fails closed on an
-    /// unreadable/untrusted record rather than routing on a stale view.
+    /// refresh interval `C` (ADR-0052 section 3). When the re-read cannot
+    /// complete, falls back to [`GenerationSwitch::try_grace_extend`]'s bounded
+    /// NF-2 grace window (issue #655) before failing closed: continuing on the
+    /// last-known-good view is only safe while that method's horizon predicate
+    /// holds, so a genuinely unknowable generation change still fails the flush
+    /// exactly as before.
     async fn active_set(
         &self,
         tenant: ravel_types::TenantHash,
@@ -196,10 +200,16 @@ impl LogIngestRouter {
                 .await
                 {
                     Ok(generations) => Ok(self.switch.refresh(tenant, generations, now_ns)),
-                    Err(_) => {
-                        self.metrics.record_stale_provisioning_flush();
-                        Err(LogWriteError::StaleProvisioningView)
-                    }
+                    Err(_) => match self.switch.try_grace_extend(tenant, now_ns) {
+                        Some(set) => {
+                            self.metrics.record_grace_extended_stale_flush();
+                            Ok(set)
+                        }
+                        None => {
+                            self.metrics.record_stale_provisioning_flush();
+                            Err(LogWriteError::StaleProvisioningView)
+                        }
+                    },
                 }
             }
         }
@@ -383,5 +393,157 @@ impl LogIngestRouter {
         for rx in dones {
             let _ = rx.await;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::TenantHash;
+
+    use super::*;
+
+    /// Nanoseconds per unix hour, matching `generation.rs`'s private constant
+    /// of the same value (`activation_hour`'s unit).
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    fn tenant(byte: u8) -> TenantHash {
+        TenantHash([byte; 16])
+    }
+
+    /// A store wrapped in [`FaultStore`] whose every `get` (the provisioning
+    /// re-read `active_set` issues on a stale cache) returns a transient error,
+    /// modeling sustained store latency/unreachability rather than a one-off
+    /// blip: the re-read never completes for as long as the fault is active.
+    fn always_failing_get_store() -> Arc<dyn ObjectStoreBackend> {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("simulated sustained store latency".into()),
+            )
+            .with_occurrence(Occurrence::Always),
+        );
+        Arc::new(FaultStore::new(MemoryStore::new(), plan))
+    }
+
+    fn test_router(store: Arc<dyn ObjectStoreBackend>) -> LogIngestRouter {
+        LogIngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            },
+            store,
+            Arc::new(crate::clock::SystemClock),
+        )
+    }
+
+    /// NF-2 (issue #655): under sustained store latency, a router whose cached
+    /// view has gone stale by `C` keeps routing every flush inside the bounded
+    /// grace window rather than failing all of them closed, and still fails
+    /// closed once the horizon is crossed.
+    ///
+    /// The flipped line: before this fix, `active_set`'s `Err(_)` arm on a
+    /// failed re-read went straight to `record_stale_provisioning_flush` +
+    /// `Err(LogWriteError::StaleProvisioningView)`, with no `try_grace_extend`
+    /// call in between. Under this test's `always_failing_get_store` (every
+    /// re-read fails, modeling sustained latency), that pre-fix arm means every
+    /// single one of the three `active_set` calls below -- at t0+C, well within
+    /// the grace horizon, and past it -- would return `Err`: a total ingest
+    /// outage for this tenant for as long as the store stays slow, exactly the
+    /// NF-2 finding. This test proves the fix: the first two calls succeed
+    /// (degraded, metered), and only the third -- past the horizon, where an
+    /// unseen generation change becomes possible -- fails closed.
+    #[tokio::test]
+    async fn nf2_grace_window_survives_sustained_store_latency_then_fails_closed() {
+        let store = always_failing_get_store();
+        let router = test_router(Arc::clone(&store));
+        let t = tenant(9);
+        let c = router.switch.refresh_interval_ns();
+
+        // Seed a fresh cached view the ordinary way (no fault on this refresh;
+        // the refresh call itself never touches the store).
+        let t0 = 10 * NS_PER_HOUR;
+        router.refresh_generations(t, vec![], t0);
+
+        // Just past C: the cache is stale, the re-read fails (sustained
+        // latency), but the grace horizon (t0 + min_lead_hours(C) = hour 12 for
+        // the default C) has not been reached. Routes on the last-known-good
+        // view instead of failing closed.
+        let past_c_ns = t0 + c + 1;
+        let set = router
+            .active_set(t, past_c_ns)
+            .await
+            .expect("within the grace horizon, routes on the last-known-good view");
+        assert_eq!(set.len(), 4);
+        assert_eq!(
+            router.metrics.snapshot().grace_extended_stale_flushes,
+            1,
+            "the degraded-routing counter fires exactly once so far"
+        );
+
+        // Still well within the horizon (hour 11 < hour 12): another flush,
+        // still degraded rather than failed.
+        let still_within_horizon_ns = 11 * NS_PER_HOUR;
+        router
+            .active_set(t, still_within_horizon_ns)
+            .await
+            .expect("still within the grace horizon");
+        assert_eq!(router.metrics.snapshot().grace_extended_stale_flushes, 2);
+        assert_eq!(
+            router.metrics.snapshot().stale_provisioning_flushes,
+            0,
+            "no flush has failed closed yet"
+        );
+
+        // Past the horizon (hour 12): an unseen generation change becomes
+        // possible, so this must fail closed exactly as the pre-fix behavior
+        // did for every call in this test.
+        let horizon_crossed_ns = 12 * NS_PER_HOUR;
+        match router.active_set(t, horizon_crossed_ns).await {
+            Err(LogWriteError::StaleProvisioningView) => {}
+            Ok(_) => panic!("past the grace horizon, must fail closed, not route"),
+            Err(other) => panic!("past the grace horizon, wrong error: {other:?}"),
+        }
+        assert_eq!(
+            router.metrics.snapshot().stale_provisioning_flushes,
+            1,
+            "the fail-closed counter fires exactly once, only past the horizon"
+        );
+        assert_eq!(
+            router.metrics.snapshot().grace_extended_stale_flushes,
+            2,
+            "the degraded counter does not move on the fail-closed call"
+        );
+    }
+
+    /// NF-2: a tenant whose cached view has genuinely changed `shard_count`
+    /// (observed via a successful refresh, not grace-extension) routes at the
+    /// new count immediately -- grace-extension is never on this router's path
+    /// when the store is healthy, since `route_cached`/a successful re-read
+    /// always wins first.
+    #[tokio::test]
+    async fn nf2_healthy_store_never_takes_the_grace_path() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = test_router(Arc::clone(&store));
+        let t = tenant(10);
+        let c = router.switch.refresh_interval_ns();
+
+        let t0 = 10 * NS_PER_HOUR;
+        router.refresh_generations(t, vec![], t0);
+
+        // Past C, but the store is healthy: the re-read succeeds, so this
+        // routes via the ordinary refresh path, not grace-extension.
+        let set = router
+            .active_set(t, t0 + c + 1)
+            .await
+            .expect("a healthy store's re-read succeeds");
+        assert_eq!(set.len(), 4);
+        assert_eq!(
+            router.metrics.snapshot().grace_extended_stale_flushes,
+            0,
+            "no degraded routing when the store is healthy"
+        );
     }
 }

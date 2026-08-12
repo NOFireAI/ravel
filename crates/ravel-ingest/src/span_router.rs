@@ -170,8 +170,12 @@ impl SpanIngestRouter {
 
     /// Resolve the tenant's active shard-actor set for a write at `now_ns`,
     /// re-reading the provisioning record when the cached view is older than the
-    /// refresh interval `C` (ADR-0052 section 3). Fails closed on an
-    /// unreadable/untrusted record rather than routing on a stale view.
+    /// refresh interval `C` (ADR-0052 section 3). When the re-read cannot
+    /// complete, falls back to [`GenerationSwitch::try_grace_extend`]'s bounded
+    /// NF-2 grace window (issue #655) before failing closed: continuing on the
+    /// last-known-good view is only safe while that method's horizon predicate
+    /// holds, so a genuinely unknowable generation change still fails the flush
+    /// exactly as before.
     async fn active_set(
         &self,
         tenant: ravel_types::TenantHash,
@@ -189,10 +193,16 @@ impl SpanIngestRouter {
                 .await
                 {
                     Ok(generations) => Ok(self.switch.refresh(tenant, generations, now_ns)),
-                    Err(_) => {
-                        self.metrics.record_stale_provisioning_flush();
-                        Err(SpanWriteError::StaleProvisioningView)
-                    }
+                    Err(_) => match self.switch.try_grace_extend(tenant, now_ns) {
+                        Some(set) => {
+                            self.metrics.record_grace_extended_stale_flush();
+                            Ok(set)
+                        }
+                        None => {
+                            self.metrics.record_stale_provisioning_flush();
+                            Err(SpanWriteError::StaleProvisioningView)
+                        }
+                    },
                 }
             }
         }
@@ -711,13 +721,23 @@ mod tests {
         );
     }
 
-    /// Staleness fail-closed: once the router's cached view for a tenant ages
-    /// past `C`, the router re-reads the provisioning record before routing; if
-    /// that re-read cannot complete (here a store fault on the record GET), the
-    /// write fails closed with the typed error and the metrics counter
-    /// increments, rather than routing on a stale view (ADR-0052 section 3).
+    /// Staleness fail-closed, with the NF-2 bounded grace window (issue #655):
+    /// once the router's cached view for a tenant ages past `C`, the router
+    /// re-reads the provisioning record before routing; if that re-read
+    /// cannot complete (here a store fault on the record GET), the router
+    /// falls back to [`crate::generation::GenerationSwitch::try_grace_extend`]
+    /// rather than failing the flush immediately. Inside the grace horizon
+    /// (`hour_of(now_ns) < hour_of(refreshed_at_ns) + min_lead_hours(C)`) the
+    /// write still routes, on the last-known-good view, and the
+    /// grace-extended counter increments; only once the horizon is crossed
+    /// does the write fail closed with the typed error and the ordinary
+    /// stale-flush counter (ADR-0052 section 3). Before the grace window
+    /// existed, this test's first assertion was `expect_err` on the
+    /// still-within-horizon write -- that is the exact behavior issue #655
+    /// NF-2 replaces, since it turned any sustained store latency into a
+    /// total outage instead of a degraded-but-available router.
     #[tokio::test]
-    async fn stale_view_fails_flush_closed() {
+    async fn stale_view_routes_via_grace_window_then_fails_closed_past_horizon() {
         use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 
         // The record GET always faults, so a stale view can never be refreshed.
@@ -740,9 +760,34 @@ mod tests {
         let tenant = TenantId::new("acme");
         router.refresh_generations(tenant.hash(), vec![sg(0, 4, 0)], t0);
 
-        // Age the cached view past C: the next write must re-read, which faults,
-        // so it fails closed.
+        // Age the cached view past C: the next write must re-read, which
+        // faults, but the horizon (hour 12, since min_lead_hours(C) = 2 for
+        // the default C) has not been crossed, so it routes on the cached
+        // view instead of failing closed.
         clock.set(t0 + DEFAULT_REFRESH_INTERVAL_NS + 1);
+        router
+            .write(
+                tenant.clone(),
+                vec![norm_span(trace_id(1), 1, 1_000)],
+                WriteMode::Strict,
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("within the grace horizon, a stale view still routes");
+        assert_eq!(
+            router.metrics().snapshot().grace_extended_stale_flushes,
+            1,
+            "the grace-extended counter must increment"
+        );
+        assert_eq!(
+            router.metrics().snapshot().stale_provisioning_flushes,
+            0,
+            "no flush has failed closed yet"
+        );
+
+        // Cross the horizon (hour 12): the same unreachable store now fails
+        // the write closed rather than extending the grace window further.
+        clock.set(12 * NS_PER_HOUR);
         let err = router
             .write(
                 tenant.clone(),
@@ -751,7 +796,9 @@ mod tests {
                 Duration::from_secs(10),
             )
             .await
-            .expect_err("a stale view whose record re-read fails must fail closed");
+            .expect_err(
+                "past the grace horizon, a stale view whose re-read fails must fail closed",
+            );
         assert!(
             matches!(err, SpanWriteError::StaleProvisioningView),
             "got: {err:?}"

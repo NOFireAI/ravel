@@ -87,6 +87,32 @@ complete, so it never routes on a stale view. Operators append a generation with
 `ravel-cli provision reshard`; the record enforces the append-only,
 future-activation mutation model. See ADR-0052 for the full design.
 
+#### Bounded grace window on a stuck re-read (NF-2)
+
+Fail-closed staleness has an availability failure mode: if the store is slow
+or unreachable for longer than `C`, every re-read attempt fails and the router
+fails every subsequent flush closed for as long as that lasts -- under
+sustained store latency, a total ingest outage rather than a degraded one.
+`GenerationSwitch::try_grace_extend` bounds that cost. When a re-read cannot
+complete, the router does not immediately fail the flush; it asks the switch
+whether continuing to route on the last-known-good cached view is still
+provably correct. Continue-on-stale is safe only when the cached generation's
+validity horizon has not been crossed AND no pending generation change is
+knowable: concretely, `hour_of(now_ns) < hour_of(view.refreshed_at_ns) +
+min_lead_hours(C)`, where `min_lead_hours(C) = ceil(C) + 1` reuses the ADR's
+own reshard lead-time floor in reverse -- a generation appended after the
+router's last successful refresh cannot activate before that horizon, so a
+cached view is provably still exactly what a fresh read would return for any
+hour strictly before it. Once the horizon is crossed, an unseen append becomes
+possible and the switch returns no set, so the flush fails closed exactly as
+it did before this fallback existed: the grace window degrades cost under
+store latency, it never converts a genuine shard-count change into silent
+wrong-routing. A router routing through this window increments
+`ravel_ingest_grace_extended_stale_flushes_total`, distinct from
+`ravel_ingest_stale_provisioning_flushes_total` (which counts a flush that
+still failed closed), so sustained store degradation is visible as "degraded
+but available" rather than indistinguishable from an outage.
+
 #### Decrease and the straggler slack window `S`
 
 On a decrease (say 8 shards down to 4), a write routed under the retiring,
@@ -98,10 +124,17 @@ clock skew, so a write routed just before the activation can land in an
 ingest-hour bucket just after it. The read side keeps the retiring generation's
 count in the scan set for `S = ceil(max_flush_delay + max_flush_lifetime + max
 clock skew)` hours past the successor's activation
-(`ravel_catalog::DEFAULT_SCAN_SLACK_HOURS`, `S = 2` with today's defaults), so a
-straggler that lands within `S` hours of the activation is still scanned and
-returned. On an increase no slack is needed: the old, smaller range is a subset
-of the new one.
+(`ravel_catalog::DEFAULT_SCAN_SLACK_HOURS`, `S = 3` with today's defaults:
+`ravel_catalog::FLUSH_BOUND_SLACK_HOURS` = 2 from flush timing plus
+`ravel_catalog::TOLERATED_CLOCK_SKEW_HOURS` = 1 of tolerated inter-writer clock
+skew, NF-3), so a straggler that lands within `S` hours of the activation is
+still scanned and returned, for any writer whose clock skew stays within
+`TOLERATED_CLOCK_SKEW_HOURS`. A writer skewed beyond that bound has no
+read-side fix -- no finite slack covers unbounded skew -- and is a distinct,
+open hazard: routing itself has no local signal to detect its own clock's
+disagreement with the fleet's shared notion of "now", so it cannot clamp or
+reject on skew it cannot observe. On an increase no slack is needed: the old,
+smaller range is a subset of the new one.
 
 Operationally: do **not** decrease `shard_count` and immediately assume every
 prior write is now under the new, narrower range. For `S` hours past the
