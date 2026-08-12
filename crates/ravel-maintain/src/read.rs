@@ -267,8 +267,37 @@ pub async fn load_input_catalog(
     config: &CompactorConfig,
     input: &InputRecord,
 ) -> Result<InputCatalog> {
-    let limits = ReaderLimits::default();
     let object_key = keys::reconstruct_data_key(&input.record)?;
+    load_catalog_from_object(
+        store,
+        config,
+        object_key,
+        input.record.created_unix_ns,
+        input.record.writer_epoch,
+        input.record.writer_seq,
+    )
+    .await
+}
+
+/// The object-key-parametrized core of [`load_input_catalog`], generalized so
+/// a caller with an object key from something other than an L0
+/// [`InputRecord`] (an L1 compaction or rewrite part, which carries no
+/// writer identity of its own) can still decode a catalog. `created_unix_ns`,
+/// `writer_epoch`, and `writer_seq` stamp every [`RunPlan`]'s provenance
+/// fields exactly as [`load_input_catalog`] does from its `InputRecord`; an
+/// L1-part caller with no meaningful per-run writer identity passes the
+/// record's own `created_unix_ns` and zeros for epoch/seq, the same
+/// nil-writer-identity convention `ravel-catalog`'s `build_l1_segment_ref`
+/// uses for L1-level refs.
+pub async fn load_catalog_from_object(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    object_key: String,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+) -> Result<InputCatalog> {
+    let limits = ReaderLimits::default();
 
     // Locate the footer from a suffix probe.
     let probe = store
@@ -329,9 +358,9 @@ pub async fn load_input_catalog(
                 ValueKind::Histogram => range.hist_range,
             };
             runs.push(RunPlan {
-                created_unix_ns: input.record.created_unix_ns,
-                writer_epoch: input.record.writer_epoch,
-                writer_seq: input.record.writer_seq,
+                created_unix_ns,
+                writer_epoch,
+                writer_seq,
                 min_ts_ns: run.min_ts_ns,
                 max_ts_ns: run.max_ts_ns,
                 sample_count: run.sample_count,

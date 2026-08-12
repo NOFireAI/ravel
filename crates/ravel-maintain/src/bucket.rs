@@ -40,6 +40,11 @@ impl Bucket {
             .saturating_mul(NS_PER_HOUR)
     }
 
+    /// Inclusive start of this bucket's ingest hour, in unix nanoseconds.
+    pub fn start_ns(&self) -> i64 {
+        i64::from(self.ingest_hour_bucket).saturating_mul(NS_PER_HOUR)
+    }
+
     /// A bucket is sealed once `now_ns >= end_ns + seal_margin` (plan §3.2):
     /// the writer interlock then guarantees no further commit record can ever
     /// appear, making one strongly consistent LIST a complete input set.
