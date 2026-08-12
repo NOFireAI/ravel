@@ -473,7 +473,7 @@ impl<'a> BlockCursor<'a> {
 /// `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
 /// `CreateIfAbsent`. The part's summary stats are read back from the produced
 /// object's own footer, so they describe exactly what was written.
-async fn finalize_part(
+pub(crate) async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
     writer: RspanWriter,
@@ -537,7 +537,7 @@ async fn finalize_part(
 /// are zero and `writer_id` is the compactor's uuid: informational only, never
 /// part of any identity or dedup order (RSPAN has none), matching the RSEG/RLOG
 /// L1 writer identity convention.
-fn compactor_identity(bucket: &Bucket, config: &CompactorConfig) -> ObjectIdentity {
+pub(crate) fn compactor_identity(bucket: &Bucket, config: &CompactorConfig) -> ObjectIdentity {
     ObjectIdentity {
         tenant_hash: bucket.tenant_hash.0,
         shard: bucket.shard,

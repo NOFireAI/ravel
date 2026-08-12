@@ -1,9 +1,14 @@
-//! Selective-erasure rewrite pass for the metrics (RSEG) signal (ADR-0064
-//! decision 3, epic EJ, issue #754). Logs and spans are EJ-T4b, a follow-up;
-//! [`crate::memo_snapshot`] promptness invalidation on publish is also a
-//! follow-up (deferred per this task's scope) -- without it a rewritten
-//! bucket's interior zone re-verifies on the normal cadence rather than
-//! immediately, which is correct, just slower.
+//! Selective-erasure rewrite pass for the metrics (RSEG), logs (RLOG), and
+//! spans (RSPAN) signals (ADR-0064 decision 3, epic EJ, issues #754/#460).
+//! [`build_rewrite`] is the metrics (RSEG) driver; [`build_rewrite_logs`] and
+//! [`build_rewrite_spans`] are its EJ-T4b logs/spans siblings, decoding whole
+//! `.rlog`/`.rspan` objects rather than RSEG's per-run catalogs (see
+//! [`build_rewrite_logs`]'s doc for why). [`erasure_rewrite_bucket`] dispatches
+//! to whichever of the three applies by `bucket.signal` and, on a successful
+//! publish, calls [`crate::scan::MaintainMemo::invalidate`] for the rewritten
+//! bucket's hour so the interior zone re-verifies immediately instead of
+//! waiting for the next re-verify cadence -- for all three signals, closing
+//! the gap EJ-T4a left open for metrics too.
 //!
 //! ## Why this is not [`crate::rewrite::rewrite_and_publish`]
 //!
@@ -69,6 +74,10 @@ use bytes::Bytes;
 use prost::Message;
 use ravel_commit::erasure;
 use ravel_commit::keys;
+use ravel_logseg::{
+    AttrValue as LogAttrValue, LogStreamId, Predicate as LogPredicate, RlogConfig, RlogReader,
+    RlogWriter,
+};
 use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
 };
@@ -76,6 +85,7 @@ use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, ErasurePredicateMatcher,
     ErasureRequest, RewriteDrop, RewriteRecord,
 };
+use ravel_rspan::{RspanConfig, RspanReader, RspanWriter, SpanQuery};
 use ravel_segment::{
     CompactionMetaV4, IngestBounds, ReaderLimits, RunEntry, RunInputV4, RunValuePageV4,
     SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
@@ -90,7 +100,9 @@ use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
 use crate::read::{BucketListing, InputCatalog, RunPlan, SeriesPlan};
+use crate::scan::MaintainMemo;
 use crate::sweep::LeaseCheck;
+use crate::{rlog, rspan_codec};
 
 /// One pending selective-erasure request: its `.dreq` key and decoded body.
 #[derive(Debug, Clone)]
@@ -214,6 +226,117 @@ impl ErasureMatcher {
     /// series with `labels`.
     pub fn drops_sample(&self, labels: &LabelSet, ts_ns: i64) -> bool {
         self.matches_labels(labels) && self.ts_in_window(ts_ns)
+    }
+}
+
+/// A minimal, semantically-faithful duplicate of
+/// `ravel_query::erasure::ErasurePredicate::matches_log_attrs`, reimplemented
+/// here for the same dependency-direction reason as [`ErasureMatcher`]. A log
+/// record's own `attrs` field is matched (never `stream_attrs`/resource, EJ-T3
+/// parity), and only [`LogAttrValue::Str`] values can satisfy a matcher --
+/// any other attribute-value variant never matches, mirroring
+/// `ravel-query`'s `logs_non_string_attr_never_matches` test.
+#[derive(Debug, Clone)]
+pub struct LogErasureMatcher {
+    matchers: Vec<(String, String)>,
+    window_start_ns: i64,
+    window_end_ns: i64,
+}
+
+impl LogErasureMatcher {
+    pub fn from_request(request: &ErasureRequest) -> Self {
+        LogErasureMatcher {
+            matchers: request
+                .predicate
+                .iter()
+                .map(|m: &ErasurePredicateMatcher| (m.key.clone(), m.value.clone()))
+                .collect(),
+            window_start_ns: request.window_start_ns,
+            window_end_ns: request.window_end_ns,
+        }
+    }
+
+    /// Conjunction of exact-match matchers against a log record's `attrs`.
+    /// Empty matchers matches nothing (fail-safe, same as [`ErasureMatcher`]).
+    pub fn matches_attrs(&self, attrs: &[(String, LogAttrValue)]) -> bool {
+        if self.matchers.is_empty() {
+            return false;
+        }
+        self.matchers.iter().all(|(k, v)| {
+            attrs.iter().any(|(ak, av)| {
+                ak == k && matches!(av, LogAttrValue::Str(s) if s.as_str() == v.as_str())
+            })
+        })
+    }
+
+    /// Half-open `[window_start_ns, window_end_ns)`; zero on either side is
+    /// unset, identical to [`ErasureMatcher::ts_in_window`].
+    pub fn ts_in_window(&self, ts_ns: i64) -> bool {
+        let after_start = self.window_start_ns == 0 || ts_ns >= self.window_start_ns;
+        let before_end = self.window_end_ns == 0 || ts_ns < self.window_end_ns;
+        after_start && before_end
+    }
+
+    /// Whether this predicate drops a log record with `attrs` recorded at
+    /// `ts_ns`.
+    pub fn drops_record(&self, attrs: &[(String, LogAttrValue)], ts_ns: i64) -> bool {
+        self.matches_attrs(attrs) && self.ts_in_window(ts_ns)
+    }
+}
+
+/// A minimal, semantically-faithful duplicate of
+/// `ravel_query::erasure::ErasurePredicate::matches_str_attrs`/
+/// `is_erased_span`, reimplemented here for the same dependency-direction
+/// reason as [`ErasureMatcher`]. Spans carry no separate resource/scope
+/// attribute set to exclude: [`ravel_rspan::merge_attrs`] already folds
+/// resource+scope+span attributes into [`ravel_rspan::SpanRecord::attrs`] at
+/// ingest time, so matching that one field is matching the full merged set
+/// EJ-T3 matches too.
+#[derive(Debug, Clone)]
+pub struct SpanErasureMatcher {
+    matchers: Vec<(String, String)>,
+    window_start_ns: i64,
+    window_end_ns: i64,
+}
+
+impl SpanErasureMatcher {
+    pub fn from_request(request: &ErasureRequest) -> Self {
+        SpanErasureMatcher {
+            matchers: request
+                .predicate
+                .iter()
+                .map(|m: &ErasurePredicateMatcher| (m.key.clone(), m.value.clone()))
+                .collect(),
+            window_start_ns: request.window_start_ns,
+            window_end_ns: request.window_end_ns,
+        }
+    }
+
+    /// Conjunction of exact-match matchers against a span's merged string
+    /// attributes. Empty matchers matches nothing (fail-safe).
+    pub fn matches_attrs(&self, attrs: &[(String, String)]) -> bool {
+        if self.matchers.is_empty() {
+            return false;
+        }
+        self.matchers
+            .iter()
+            .all(|(k, v)| attrs.iter().any(|(ak, av)| ak == k && av == v))
+    }
+
+    /// Half-open `[window_start_ns, window_end_ns)`; zero on either side is
+    /// unset, identical to [`ErasureMatcher::ts_in_window`].
+    pub fn ts_in_window(&self, ts_ns: i64) -> bool {
+        let after_start = self.window_start_ns == 0 || ts_ns >= self.window_start_ns;
+        let before_end = self.window_end_ns == 0 || ts_ns < self.window_end_ns;
+        after_start && before_end
+    }
+
+    /// Whether this predicate drops a span whose merged attributes are
+    /// `attrs`, using its `start_ts_ns` as the event time (EJ-T3 parity: the
+    /// span query surface passes `start_ts_ns` to `is_erased_span` as
+    /// `event_ts_ns`).
+    pub fn drops_record(&self, attrs: &[(String, String)], ts_ns: i64) -> bool {
+        self.matches_attrs(attrs) && self.ts_in_window(ts_ns)
     }
 }
 
@@ -541,6 +664,43 @@ async fn load_live_catalogs_and_target(
     }
 }
 
+/// Resolve `live` down to the whole-object keys [`build_rewrite_logs`] /
+/// [`build_rewrite_spans`] GET-and-decode-in-full and the [`RewriteSupersession`]
+/// target the eventual `RewriteRecord` names -- the LOGS/SPANS sibling of
+/// [`load_live_catalogs_and_target`], stopping short of that function's
+/// per-run [`InputCatalog`] fetch because the logs/spans rewrite path (module
+/// doc's scope reduction) decodes every live object whole rather than through
+/// ranged per-run catalogs, so there is no catalog to build here at all.
+fn live_input_object_keys_and_target(
+    live: LiveInputs,
+) -> Result<(Vec<String>, RewriteSupersession)> {
+    match live {
+        LiveInputs::RawL0(inputs) => {
+            let object_keys = inputs
+                .iter()
+                .map(|i| keys::reconstruct_data_key(&i.record).map_err(MaintainError::from))
+                .collect::<Result<Vec<_>>>()?;
+            let identities = inputs
+                .iter()
+                .map(|i| CompactionInputIdentity {
+                    writer_id: i.record.writer_id.clone(),
+                    writer_epoch: i.record.writer_epoch,
+                    writer_seq: i.record.writer_seq,
+                })
+                .collect();
+            Ok((object_keys, RewriteSupersession::RawL0(identities)))
+        }
+        LiveInputs::Existing { key, body } => {
+            let object_keys = body
+                .parts()
+                .iter()
+                .map(|p| body.reconstruct_part_key(p))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((object_keys, RewriteSupersession::Existing(key)))
+        }
+    }
+}
+
 /// One pending erasure request whose prefilter overlaps the bucket being
 /// rewritten, paired with the label/window matcher built from its predicate.
 /// ADR-0064 §4's "sibling case" rule requires every request in this slice --
@@ -554,6 +714,23 @@ async fn load_live_catalogs_and_target(
 pub struct ApplicableRequest {
     pub request_id: String,
     pub matcher: ErasureMatcher,
+}
+
+/// [`ApplicableRequest`]'s LOGS sibling: same batching contract (every
+/// prefilter-overlapping pending request, never one call per request), paired
+/// with a [`LogErasureMatcher`] instead.
+#[derive(Debug, Clone)]
+pub struct ApplicableLogRequest {
+    pub request_id: String,
+    pub matcher: LogErasureMatcher,
+}
+
+/// [`ApplicableRequest`]'s SPANS sibling: same batching contract, paired with
+/// a [`SpanErasureMatcher`] instead.
+#[derive(Debug, Clone)]
+pub struct ApplicableSpanRequest {
+    pub request_id: String,
+    pub matcher: SpanErasureMatcher,
 }
 
 /// Fetch every distinct input object referenced by `catalogs` exactly once,
@@ -945,6 +1122,218 @@ fn build_rewrite_part(
     })
 }
 
+/// The first request in `requests` (fixed order, first-match-wins, same
+/// tie-break rationale as [`first_dropping_request`]) whose matcher drops a
+/// log record with `attrs` at `ts_ns`, if any.
+fn first_dropping_log_request(
+    requests: &[ApplicableLogRequest],
+    attrs: &[(String, LogAttrValue)],
+    ts_ns: i64,
+) -> Option<usize> {
+    requests
+        .iter()
+        .position(|r| r.matcher.drops_record(attrs, ts_ns))
+}
+
+/// Decode-filter-reencode one LOGS bucket's live record set against every
+/// applicable request's matcher, mirroring [`build_rewrite`]'s batching
+/// contract (every request in `requests` gets a `drops[]` entry, even a zero
+/// one) but not its per-run catalog machinery: this module's "single
+/// whole-object GET" scope reduction (top-of-module doc) means every object
+/// named by `object_keys` is fetched whole and every one of its records is
+/// decoded via [`RlogReader::scan`] with an unbounded [`LogPredicate::TsRange`],
+/// rather than range-fetching individual blocks. Records are pushed into one
+/// [`RlogWriter`] with no indexed fields at all -- POSTINGS is a widen-only
+/// pruning index (ADR-0013), so a rewritten part carrying none loses a rare
+/// maintenance pass some query pruning, never correctness, the same shape of
+/// tradeoff as this module's documented exemplar-drop for metrics.
+pub async fn build_rewrite_logs(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    config: &CompactorConfig,
+    object_keys: &[String],
+    requests: &[ApplicableLogRequest],
+    input_set_hash: &[u8; 32],
+) -> Result<RewriteBuild> {
+    let read_cfg = RlogConfig::default();
+    let full_range = LogPredicate::TsRange {
+        min_ns: i64::MIN,
+        max_ns: i64::MAX,
+    };
+
+    let mut input_sample_count: u64 = 0;
+    let mut output_sample_count: u64 = 0;
+    let mut dropped_counts = vec![0u64; requests.len()];
+
+    let identity = rlog::compactor_identity(bucket, config);
+    let mut writer = RlogWriter::new(read_cfg, identity);
+    let mut first_stream_id: Option<LogStreamId> = None;
+    let mut last_stream_id: Option<LogStreamId> = None;
+    let mut any_survivor = false;
+
+    for object_key in object_keys {
+        let got = store.get(object_key, GetRange::Full).await?;
+        let reader = RlogReader::new(got.data.as_ref(), &read_cfg)?;
+        let (records, _stats) = reader.scan(&full_range)?;
+        for record in records {
+            input_sample_count = input_sample_count.checked_add(1).ok_or_else(|| {
+                MaintainError::Invariant("input_sample_count sum overflowed u64".to_string())
+            })?;
+            match first_dropping_log_request(requests, &record.attrs, record.ts_ns) {
+                Some(i) => dropped_counts[i] += 1,
+                None => {
+                    output_sample_count = output_sample_count.checked_add(1).ok_or_else(|| {
+                        MaintainError::Invariant(
+                            "output_sample_count sum overflowed u64".to_string(),
+                        )
+                    })?;
+                    let sid = record.stream_id;
+                    first_stream_id = Some(first_stream_id.map_or(sid, |f| f.min(sid)));
+                    last_stream_id = Some(last_stream_id.map_or(sid, |l| l.max(sid)));
+                    any_survivor = true;
+                    writer.push(record)?;
+                }
+            }
+        }
+    }
+
+    let parts = if any_survivor {
+        // dry_run: true -- `publish_rewrite_record` PUTs `build.parts` itself,
+        // only after its conservation gate passes, mirroring how
+        // `build_rewrite_part` (metrics) also defers the PUT to that shared
+        // publish path instead of writing here.
+        let built = rlog::finalize_part(
+            store,
+            bucket,
+            writer,
+            first_stream_id,
+            last_stream_id,
+            input_set_hash,
+            0,
+            true,
+        )
+        .await?;
+        vec![built]
+    } else {
+        Vec::new()
+    };
+
+    let drops = requests
+        .iter()
+        .zip(dropped_counts)
+        .map(|(r, dropped_count)| RewriteDrop {
+            request_id: r.request_id.clone(),
+            dropped_count,
+        })
+        .collect();
+
+    Ok(RewriteBuild {
+        parts,
+        input_sample_count,
+        output_sample_count,
+        drops,
+    })
+}
+
+/// The first request in `requests` whose matcher drops a span with `attrs`
+/// at `ts_ns`, if any -- the SPANS sibling of [`first_dropping_log_request`].
+fn first_dropping_span_request(
+    requests: &[ApplicableSpanRequest],
+    attrs: &[(String, String)],
+    ts_ns: i64,
+) -> Option<usize> {
+    requests
+        .iter()
+        .position(|r| r.matcher.drops_record(attrs, ts_ns))
+}
+
+/// Decode-filter-reencode one SPANS bucket's live record set against every
+/// applicable request's matcher -- the SPANS sibling of [`build_rewrite_logs`],
+/// same whole-object-GET scope reduction, [`RspanReader::scan`] with an
+/// unbounded [`SpanQuery::ts_range`]. A span's whole [`ravel_rspan::SpanRecord`]
+/// (including any links/events, which per that type's own field-shape and doc
+/// comment live only as opaque blob entries inside `attrs`, never as separate
+/// columns) is decoded, tested, and either pushed to the output writer intact
+/// or dropped intact -- there is no per-field split that could leave a partial
+/// span behind.
+pub async fn build_rewrite_spans(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    config: &CompactorConfig,
+    object_keys: &[String],
+    requests: &[ApplicableSpanRequest],
+    input_set_hash: &[u8; 32],
+) -> Result<RewriteBuild> {
+    let read_cfg = RspanConfig::default();
+    let full_range = SpanQuery::ts_range(i64::MIN, i64::MAX);
+
+    let mut input_sample_count: u64 = 0;
+    let mut output_sample_count: u64 = 0;
+    let mut dropped_counts = vec![0u64; requests.len()];
+
+    let identity = rspan_codec::compactor_identity(bucket, config);
+    let mut writer = RspanWriter::new(read_cfg, identity);
+    let mut trace_ids: HashSet<[u8; 16]> = HashSet::new();
+    let mut any_survivor = false;
+
+    for object_key in object_keys {
+        let got = store.get(object_key, GetRange::Full).await?;
+        let reader = RspanReader::new(got.data.as_ref(), &read_cfg)?;
+        let (records, _stats) = reader.scan(&full_range)?;
+        for record in records {
+            input_sample_count = input_sample_count.checked_add(1).ok_or_else(|| {
+                MaintainError::Invariant("input_sample_count sum overflowed u64".to_string())
+            })?;
+            match first_dropping_span_request(requests, &record.attrs, record.start_ts_ns) {
+                Some(i) => dropped_counts[i] += 1,
+                None => {
+                    output_sample_count = output_sample_count.checked_add(1).ok_or_else(|| {
+                        MaintainError::Invariant(
+                            "output_sample_count sum overflowed u64".to_string(),
+                        )
+                    })?;
+                    trace_ids.insert(record.trace_id);
+                    any_survivor = true;
+                    writer.push(record);
+                }
+            }
+        }
+    }
+
+    let parts = if any_survivor {
+        // dry_run: true, same reason as build_rewrite_logs.
+        let built = rspan_codec::finalize_part(
+            store,
+            bucket,
+            writer,
+            input_set_hash,
+            0,
+            trace_ids.len() as u64,
+            true,
+        )
+        .await?;
+        vec![built]
+    } else {
+        Vec::new()
+    };
+
+    let drops = requests
+        .iter()
+        .zip(dropped_counts)
+        .map(|(r, dropped_count)| RewriteDrop {
+            request_id: r.request_id.clone(),
+            dropped_count,
+        })
+        .collect();
+
+    Ok(RewriteBuild {
+        parts,
+        input_sample_count,
+        output_sample_count,
+        drops,
+    })
+}
+
 /// What one rewrite's `RewriteRecord` supersedes: either the raw L0 commit
 /// records themselves (the bucket has never been compacted, mirroring
 /// `CompactionRecord.inputs`), or a whole prior compaction/rewrite record
@@ -1215,12 +1604,48 @@ pub enum ErasureRewriteOutcome {
 /// `drops[]` entry (possibly `dropped_count: 0`) for every applicable
 /// request.
 ///
-/// [`crate::memo_snapshot`] promptness invalidation is deliberately not
-/// called here (deferred to the EJ-T4b/invalidate follow-up per this
-/// function's module doc): a caller wiring that in later adds one call after
-/// a `Rewritten` outcome with `publish: PublishOutcome::Published`, using the
-/// bucket's own identity to invalidate the interior zone -- nothing else in
-/// this function's structure needs to change for that wiring.
+/// On a successful publish, invalidates [`MaintainMemo`]'s memoized terminal
+/// state for the rewritten bucket's hour ([`MaintainMemo::invalidate`],
+/// ADR-0065's "public invalidate seam"), so the interior zone re-evaluates on
+/// the next tick instead of waiting for the re-verify cadence. This is the
+/// EJ-T4b wiring this function's doc used to defer -- applied uniformly after
+/// every signal's publish, including metrics, which EJ-T4a left un-invalidated.
+/// Scoped to [`PublishOutcome::Published`] only (not `Converged`/`Abandoned`):
+/// a converged run observed a record that already existed, so whichever run
+/// actually published it already invalidated the memo; an abandoned run wrote
+/// nothing.
+fn invalidate_after_publish(memo: &mut MaintainMemo, bucket: &Bucket, publish: &PublishOutcome) {
+    if matches!(publish, PublishOutcome::Published) {
+        memo.invalidate(
+            bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+            &[bucket.ingest_hour_bucket],
+        );
+    }
+}
+
+/// Rewrite one sealed bucket against every pending erasure request that
+/// applies to it (ADR-0064 decision 3, EJ-T4/EJ-T4b). `pending` MUST already be
+/// every request pending on this bucket's `(tenant_hash, signal)`
+/// ([`pending_erasure_requests`]); this function does the per-bucket
+/// [`bucket_may_overlap`] prefiltering itself, so the same `pending` slice is
+/// reusable across every bucket a scan visits without re-listing `.dreq`s per
+/// bucket.
+///
+/// This is the ADR-0064 section 4 "sibling case" entry point: every request
+/// that overlaps the bucket is batched into one build/publish call, so a
+/// bucket is never rewritten once per request -- one `RewriteRecord` per
+/// bucket per rewrite generation, with a `drops[]` entry (possibly
+/// `dropped_count: 0`) for every applicable request.
+///
+/// Every step through `overlapping` is signal-generic; only the
+/// matcher/build step below dispatches on `bucket.signal` to the metrics
+/// ([`build_rewrite`]), logs ([`build_rewrite_logs`]), or spans
+/// ([`build_rewrite_spans`]) driver. [`MaintainError::Invariant`] surfaces
+/// for any other signal: this task's dispatch (EJ-T4/EJ-T4b) scopes erasure
+/// rewrite to metrics/logs/spans only, and profiles/alerts/audit have no
+/// driver here to dispatch to.
 pub async fn erasure_rewrite_bucket(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -1228,6 +1653,7 @@ pub async fn erasure_rewrite_bucket(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
     pending: &[PendingErasureRequest],
+    memo: &mut MaintainMemo,
 ) -> Result<ErasureRewriteOutcome> {
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
@@ -1259,40 +1685,156 @@ pub async fn erasure_rewrite_bucket(
         return Ok(ErasureRewriteOutcome::NoApplicableRequests);
     }
 
-    let applicable: Vec<ApplicableRequest> = overlapping
-        .iter()
-        .map(|p| ApplicableRequest {
-            request_id: p.request.request_id.clone(),
-            matcher: ErasureMatcher::from_request(&p.request),
-        })
-        .collect();
+    let (parts, publish) = match bucket.signal {
+        Signal::Metrics => {
+            let applicable: Vec<ApplicableRequest> = overlapping
+                .iter()
+                .map(|p| ApplicableRequest {
+                    request_id: p.request.request_id.clone(),
+                    matcher: ErasureMatcher::from_request(&p.request),
+                })
+                .collect();
 
-    let (catalogs, supersession) = load_live_catalogs_and_target(store, config, live).await?;
+            let (catalogs, supersession) = load_live_catalogs_and_target(store, config, live).await?;
 
-    let mut applied_request_ids: Vec<String> =
-        applicable.iter().map(|r| r.request_id.clone()).collect();
-    applied_request_ids.sort();
-    let input_set_hash = match &supersession {
-        RewriteSupersession::RawL0(ids) => {
-            erasure::compute_rewrite_input_set_hash(ids, None, &applied_request_ids)
+            let mut applied_request_ids: Vec<String> =
+                applicable.iter().map(|r| r.request_id.clone()).collect();
+            applied_request_ids.sort();
+            let input_set_hash = match &supersession {
+                RewriteSupersession::RawL0(ids) => {
+                    erasure::compute_rewrite_input_set_hash(ids, None, &applied_request_ids)
+                }
+                RewriteSupersession::Existing(key) => erasure::compute_rewrite_input_set_hash(
+                    &[],
+                    Some(key.as_str()),
+                    &applied_request_ids,
+                ),
+            };
+
+            let build = build_rewrite(
+                store,
+                bucket,
+                config,
+                &catalogs,
+                &applicable,
+                &input_set_hash,
+            )
+            .await?;
+            let parts = build.parts.len();
+            let publish = publish_rewrite_record(
+                store,
+                config,
+                clock,
+                bucket,
+                supersession,
+                build,
+                start_ns,
+            )
+            .await?;
+            (parts, publish)
         }
-        RewriteSupersession::Existing(key) => {
-            erasure::compute_rewrite_input_set_hash(&[], Some(key.as_str()), &applied_request_ids)
+        Signal::Logs => {
+            let applicable: Vec<ApplicableLogRequest> = overlapping
+                .iter()
+                .map(|p| ApplicableLogRequest {
+                    request_id: p.request.request_id.clone(),
+                    matcher: LogErasureMatcher::from_request(&p.request),
+                })
+                .collect();
+
+            let (object_keys, supersession) = live_input_object_keys_and_target(live)?;
+
+            let mut applied_request_ids: Vec<String> =
+                applicable.iter().map(|r| r.request_id.clone()).collect();
+            applied_request_ids.sort();
+            let input_set_hash = match &supersession {
+                RewriteSupersession::RawL0(ids) => {
+                    erasure::compute_rewrite_input_set_hash(ids, None, &applied_request_ids)
+                }
+                RewriteSupersession::Existing(key) => erasure::compute_rewrite_input_set_hash(
+                    &[],
+                    Some(key.as_str()),
+                    &applied_request_ids,
+                ),
+            };
+
+            let build = build_rewrite_logs(
+                store,
+                bucket,
+                config,
+                &object_keys,
+                &applicable,
+                &input_set_hash,
+            )
+            .await?;
+            let parts = build.parts.len();
+            let publish = publish_rewrite_record(
+                store,
+                config,
+                clock,
+                bucket,
+                supersession,
+                build,
+                start_ns,
+            )
+            .await?;
+            (parts, publish)
+        }
+        Signal::Spans => {
+            let applicable: Vec<ApplicableSpanRequest> = overlapping
+                .iter()
+                .map(|p| ApplicableSpanRequest {
+                    request_id: p.request.request_id.clone(),
+                    matcher: SpanErasureMatcher::from_request(&p.request),
+                })
+                .collect();
+
+            let (object_keys, supersession) = live_input_object_keys_and_target(live)?;
+
+            let mut applied_request_ids: Vec<String> =
+                applicable.iter().map(|r| r.request_id.clone()).collect();
+            applied_request_ids.sort();
+            let input_set_hash = match &supersession {
+                RewriteSupersession::RawL0(ids) => {
+                    erasure::compute_rewrite_input_set_hash(ids, None, &applied_request_ids)
+                }
+                RewriteSupersession::Existing(key) => erasure::compute_rewrite_input_set_hash(
+                    &[],
+                    Some(key.as_str()),
+                    &applied_request_ids,
+                ),
+            };
+
+            let build = build_rewrite_spans(
+                store,
+                bucket,
+                config,
+                &object_keys,
+                &applicable,
+                &input_set_hash,
+            )
+            .await?;
+            let parts = build.parts.len();
+            let publish = publish_rewrite_record(
+                store,
+                config,
+                clock,
+                bucket,
+                supersession,
+                build,
+                start_ns,
+            )
+            .await?;
+            (parts, publish)
+        }
+        other => {
+            return Err(MaintainError::Invariant(format!(
+                "erasure rewrite has no driver for signal {other:?} (EJ-T4/EJ-T4b scope metrics/logs/spans only)"
+            )));
         }
     };
 
-    let build = build_rewrite(
-        store,
-        bucket,
-        config,
-        &catalogs,
-        &applicable,
-        &input_set_hash,
-    )
-    .await?;
-    let parts = build.parts.len();
-    let publish =
-        publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns).await?;
+    invalidate_after_publish(memo, bucket, &publish);
     Ok(ErasureRewriteOutcome::Rewritten { parts, publish })
 }
 
