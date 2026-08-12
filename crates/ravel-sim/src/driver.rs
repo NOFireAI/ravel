@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rand::RngExt;
@@ -43,7 +43,7 @@ use ravel_maintain::{
     compact_bucket, sweep_shard,
 };
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::fault::{FaultKind, FaultStore, Op};
+use ravel_object_store::fault::{FaultKind, FaultStore, GateHandle, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine, QueryError};
@@ -81,9 +81,69 @@ pub struct CycleConfig {
     /// Config for the seed-derived fault-schedule generator (deliverable 1).
     pub fault_schedule: FaultScheduleConfig,
     /// Whether to arm the schedule's hold/release gates on the store. Off by
-    /// default: a held call needs the driver's background releaser to make
-    /// progress, so it is only meaningful under [`run_cycle`]'s own runtime.
+    /// default: a held call needs a releaser to make progress -- either the
+    /// built-in one ([`GateRelease::Immediate`]) or a caller-driven one
+    /// ([`GateRelease::Manual`]) -- so it is only meaningful under
+    /// [`run_cycle`]'s own runtime.
     pub enable_gates: bool,
+    /// How a held call gets released when `enable_gates` arms the schedule's
+    /// gates. Ignored when `enable_gates` is false or the schedule armed no
+    /// gates.
+    pub gate_release: GateRelease,
+    /// When set, bypasses both `inject_faults` and the seed-derived
+    /// generator ([`crate::fault_plan::generate`]) and uses this
+    /// [`FaultSchedule`] verbatim instead. `None` (the default) keeps the
+    /// normal seed-derived plan and gates. This exists so a test can arm a
+    /// gate with a matcher it knows the exact reachability of (a specific
+    /// `Nth`, or one that can never match), rather than searching the
+    /// generator's random output for a seed that happens to produce one --
+    /// issue #878 deliverables 2 and 3.
+    pub fault_schedule_override: Option<FaultSchedule>,
+    /// Whether the driver's own tokio runtime pauses virtual time (the
+    /// default) or runs on real wall-clock time. A paused clock makes every
+    /// `SimClock` sleep and every `ack_deadline`/`query_deadline` timeout
+    /// resolve instantly via tokio's auto-advance-on-idle, which is what
+    /// keeps the normal seeded cycle fast and deterministic. That same
+    /// auto-advance defeats an indefinitely held gate call once it sits
+    /// inside a deadline-guarded wait (`IngestRouter::write_values`'s ack
+    /// wait, for the `L0_DATA_SUBSTR` target every armed gate matches): the
+    /// instant the runtime goes idle parked on the held call, tokio jumps
+    /// straight past `ack_deadline` and the wait fails with a timeout
+    /// instead of staying observably blocked. Set this to `false` only for
+    /// a test that must prove a held call is still blocking the cycle
+    /// (issue #878 deliverable 2) -- real wall-clock time then makes
+    /// `ack_deadline` mean what it says, at the cost of the cycle no
+    /// longer being instant.
+    pub paused_clock: bool,
+}
+
+/// How [`run_cycle`] releases a call held by one of the schedule's
+/// hold/release gates (ADR-0059 decision 5), when `CycleConfig::enable_gates`
+/// is set.
+#[derive(Clone, Default)]
+pub enum GateRelease {
+    /// Release each held call the instant it is held. Exercises the
+    /// hold/release code path without ever deadlocking, but -- because
+    /// release happens before anything outside the cycle can observe the
+    /// held state -- proves nothing about the call having actually blocked.
+    #[default]
+    Immediate,
+    /// Hand the armed gate to `hook` exactly once, right after arming, as a
+    /// [`CountingGateHandle`], and release nothing automatically: the caller
+    /// owns release timing and can observe the cycle genuinely blocked
+    /// before choosing to release it. A hook that never releases every held
+    /// call deadlocks the cycle by design -- this is a test-control seam,
+    /// not a production mode.
+    Manual(Arc<dyn Fn(CountingGateHandle) + Send + Sync>),
+}
+
+impl std::fmt::Debug for GateRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GateRelease::Immediate => write!(f, "GateRelease::Immediate"),
+            GateRelease::Manual(_) => write!(f, "GateRelease::Manual(..)"),
+        }
+    }
 }
 
 impl Default for CycleConfig {
@@ -97,7 +157,54 @@ impl Default for CycleConfig {
             inject_faults: true,
             fault_schedule: FaultScheduleConfig::default(),
             enable_gates: false,
+            gate_release: GateRelease::default(),
+            fault_schedule_override: None,
+            paused_clock: true,
         }
+    }
+}
+
+/// A [`GateHandle`] wrapper that counts every call actually released through
+/// it (issue #878 deliverable 1). `GateHandle` itself has no notion of
+/// cumulative holds -- `held()`/`held_count()` only report calls currently
+/// parked, which a released call immediately drops out of -- so a cycle has
+/// no way to prove after the fact that a gate ever held anything. Routing
+/// every release (the built-in [`GateRelease::Immediate`] releaser and any
+/// [`GateRelease::Manual`] hook) through this wrapper's `release` gives
+/// [`CycleOutcome::gates_held`] and the never-hit check in [`run_cycle`] a
+/// single, always-accurate source for that count.
+#[derive(Clone)]
+pub struct CountingGateHandle {
+    handle: GateHandle,
+    held_total: Arc<AtomicUsize>,
+}
+
+impl CountingGateHandle {
+    /// Waits until at least `n` calls are held simultaneously. See
+    /// [`GateHandle::wait_until_held`].
+    pub async fn wait_until_held(&self, n: usize) {
+        self.handle.wait_until_held(n).await;
+    }
+
+    /// Ids of the calls currently held. See [`GateHandle::held`].
+    pub fn held(&self) -> Vec<u64> {
+        self.handle.held()
+    }
+
+    /// How many calls are held right now. See [`GateHandle::held_count`].
+    pub fn held_count(&self) -> usize {
+        self.handle.held_count()
+    }
+
+    /// Releases the held call `id`, exactly as [`GateHandle::release`], and
+    /// -- only on a genuine release -- counts it toward the cumulative total
+    /// this cycle's [`CycleOutcome::gates_held`] reports.
+    pub fn release(&self, id: u64) -> bool {
+        let released = self.handle.release(id);
+        if released {
+            self.held_total.fetch_add(1, Ordering::SeqCst);
+        }
+        released
     }
 }
 
@@ -122,6 +229,20 @@ pub struct CycleOutcome {
     /// The `(Op, FaultKind)` pairs the schedule intended to inject. A test
     /// asserts each has a positive `fault_counters` entry.
     pub expected_faults: Vec<(Op, FaultKind)>,
+    /// How many hold/release gates the schedule armed on the store. Zero
+    /// when `enable_gates` is false or the schedule (or its
+    /// `fault_schedule_override`) carried none.
+    pub gates_armed: usize,
+    /// Cumulative count of calls actually released through the armed gate's
+    /// [`CountingGateHandle`] this cycle (issue #878 deliverable 1). A test
+    /// with `gates_armed > 0` asserts this is also positive to prove a call
+    /// was genuinely held, not just that a gate was configured. `run_cycle`
+    /// itself already enforces this -- see [`CycleError::GateNeverHit`] --
+    /// so a successful [`Ok`] outcome with `gates_armed > 0` implies this is
+    /// positive; the field is exposed for the exact count and for
+    /// [`GateRelease::Manual`] callers that want the number without an
+    /// error path.
+    pub gates_held: usize,
 }
 
 /// Every variant carries the master seed so a failure message alone is
@@ -201,6 +322,13 @@ pub enum CycleError {
         shard: u32,
         report: String,
     },
+    #[error(
+        "seed {seed}: {armed} hold/release gate(s) were armed but none ever held a call over \
+         the whole cycle -- a matcher that never fires (wrong Nth, too few matching calls) must \
+         fail the cycle, not silently pass with the parked waiter aborted. \
+         replay: RAVEL_SIM_SEED={seed} cargo test -p ravel-sim"
+    )]
+    GateNeverHit { seed: u64, armed: usize },
 }
 
 /// Clock the driver hands to `IngestRouter`: `now_ns` is a plain atomic
@@ -406,7 +534,7 @@ pub fn run_cycle(
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
-        .start_paused(true)
+        .start_paused(config.paused_clock)
         .build()
         .map_err(|source| CycleError::Runtime { seed, source })?;
 
@@ -422,7 +550,9 @@ async fn run_cycle_async(
     // The seed-derived fault schedule (deliverable 1): the same seed yields
     // the same plan and gates. Wrap the MemoryStore oracle in a FaultStore so
     // ingest, fold, compaction, and sweep all run through the injected faults.
-    let schedule = if config.inject_faults {
+    let schedule = if let Some(override_schedule) = &config.fault_schedule_override {
+        override_schedule.clone()
+    } else if config.inject_faults {
         crate::fault_plan::generate(&master_seed, &config.fault_schedule)
     } else {
         FaultSchedule::none()
@@ -435,26 +565,67 @@ async fn run_cycle_async(
     let store: Arc<dyn ObjectStoreBackend> =
         Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>;
 
-    // Optionally arm the schedule's hold/release gates, with a background
-    // releaser that frees each held call as soon as it is held. Under the
-    // single-threaded paused runtime the releaser runs whenever a gated call
-    // parks on its release channel, so the hold/release path is exercised
-    // without ever deadlocking. Aborted at the end of the cycle.
-    let gate_releaser = if config.enable_gates && !schedule.gates.is_empty() {
-        let handles = schedule.arm_gates(fault_store.as_ref());
-        handles.into_iter().next().map(|handle| {
-            tokio::spawn(async move {
-                loop {
-                    handle.wait_until_held(1).await;
-                    for id in handle.held() {
-                        handle.release(id);
-                    }
-                }
-            })
-        })
+    // Optionally arm the schedule's hold/release gates. Every armed gate's
+    // handle shares the store's single held-call registry (see
+    // `GateHandle`'s docs), so one `CountingGateHandle` built from the first
+    // handle observes and can release calls held by any of them.
+    //
+    // `GateRelease::Immediate` spawns a background releaser that frees each
+    // held call as soon as it is held: under the single-threaded paused
+    // runtime it runs whenever a gated call parks on its release channel, so
+    // the hold/release path is exercised without ever deadlocking. Aborted
+    // at the end of the cycle. `GateRelease::Manual` hands the handle to the
+    // caller's hook instead and spawns nothing: the caller owns release
+    // timing (issue #878 deliverable 2).
+    //
+    // Either way, every release is counted (`CountingGateHandle::release`),
+    // so `gates_armed > 0` with a total of zero releases at cycle end is
+    // fail-loud (`CycleError::GateNeverHit`) rather than the previous
+    // silent pass with the parked waiter aborted (issue #878 deliverable 3).
+    // Zero, not `schedule.gates.len()`, when `enable_gates` is off: the
+    // seed-derived generator emits a gate independently of `enable_gates`
+    // (`fault_plan::generate_gates`), and a gate never armed on the store
+    // can never be held -- counting it here would make `GateNeverHit` fire
+    // for every cycle whose schedule happened to include one, regardless of
+    // whether gates were ever meant to be exercised.
+    let gates_armed = if config.enable_gates {
+        schedule.gates.len()
     } else {
-        None
+        0
     };
+    let held_total = Arc::new(AtomicUsize::new(0));
+    let gate_releaser: Option<tokio::task::JoinHandle<()>> =
+        if config.enable_gates && gates_armed > 0 {
+            schedule
+                .arm_gates(fault_store.as_ref())
+                .into_iter()
+                .next()
+                .and_then(|handle| {
+                    let counting = CountingGateHandle {
+                        handle,
+                        held_total: Arc::clone(&held_total),
+                    };
+                    match &config.gate_release {
+                        GateRelease::Immediate => {
+                            let releaser = counting.clone();
+                            Some(tokio::spawn(async move {
+                                loop {
+                                    releaser.wait_until_held(1).await;
+                                    for id in releaser.held() {
+                                        releaser.release(id);
+                                    }
+                                }
+                            }))
+                        }
+                        GateRelease::Manual(hook) => {
+                            hook(counting);
+                            None
+                        }
+                    }
+                })
+        } else {
+            None
+        };
 
     let sim_clock = Arc::new(SimClock::new(workload.start_ts_ns));
     let clock: Arc<dyn Clock> = Arc::clone(&sim_clock) as Arc<dyn Clock>;
@@ -844,6 +1015,14 @@ async fn run_cycle_async(
         task.abort();
     }
 
+    let gates_held = held_total.load(Ordering::SeqCst);
+    if gates_armed > 0 && gates_held == 0 {
+        return Err(CycleError::GateNeverHit {
+            seed,
+            armed: gates_armed,
+        });
+    }
+
     Ok(CycleOutcome {
         master_seed,
         digest: digest_builder.finish(),
@@ -854,6 +1033,8 @@ async fn run_cycle_async(
         records_conserved,
         fault_counters: fault_store.counters_snapshot(),
         expected_faults: schedule.expected_faults,
+        gates_armed,
+        gates_held,
     })
 }
 
