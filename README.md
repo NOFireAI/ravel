@@ -337,6 +337,33 @@ process restart (the evaluator re-queues every still-open alert for one
 delivery attempt the first tick after it starts). Sinks are optional: with
 none configured, transitions are still recorded durably.
 
+## Tenant tokens
+
+Bearer tokens can live in a durable, deployment-wide map (`sys/auth`) instead
+of only on the command line: `ravel-server`'s `--tenant-token` stays the
+static, process-local source, and `sys/auth` is an additional, hot-reloaded
+source keyed by the bucket's ADR-0072 deployment key. `ravel-cli tenant
+token` manages it directly:
+
+```sh
+ravel-cli tenant token upsert \
+  --deployment-key-file deployment.key \
+  --token "$(cat token.txt)" \
+  --tenant acme
+ravel-cli tenant token list --deployment-key-file deployment.key
+ravel-cli tenant token revoke --deployment-key-file deployment.key --tenant acme
+```
+
+`upsert` hashes the token under the deployment key and drops the plaintext;
+`list` prints each entry's tenant id and a short token-hash fingerprint,
+never the plaintext or the full hash. Every entry is tagged `--managed-by`
+(default `cli`) to record which writer owns its lifecycle: the Kubernetes
+operator's own reconcile loop (see
+[docs/guides/kubernetes.md](docs/guides/kubernetes.md)) tags the entries it
+writes `operator` and only ever removes entries carrying that same tag, so a
+tenant provisioned by this command survives an operator reconcile even when
+its Secret does not name that tenant.
+
 ## Container images
 
 ```sh
@@ -361,7 +388,9 @@ Pull the published image, or build natively on an amd64 host, instead.
   OTLP/OTAP/Remote Write decode, ingest actors, PromQL, query engine, and
   `ravel-sql` (DataFusion-backed SQL and Flight SQL)
 - `services/`: `ravel-server` (gateway, ingest, query, and maintain modes
-  in one binary) and `ravel-cli` (segment, commit, and catalog inspector)
+  in one binary) and `ravel-cli` (segment, commit, and catalog inspector;
+  also manages the durable `sys/auth` tenant-token map, see "Tenant
+  tokens" above)
 - `docs/`: specs, ADRs, diagrams, and the user guides in `docs/guides/`
 - `proto/`: protobuf schemas, vendored OTAP protos
 - `deploy/docker-compose/`: local MinIO stack

@@ -211,6 +211,13 @@ enum TenantTokenCommand {
         /// The tenant this token authenticates as.
         #[arg(long)]
         tenant: String,
+        /// Which writer owns this entry's lifecycle, stamped onto it
+        /// (ADR-0072 decision 4 amendment, #897). The operator's
+        /// reconcile loop only ever removes or replaces entries tagged
+        /// "operator"; anything else (the "cli" default, or a caller's own
+        /// tag) is never touched by an operator reconcile.
+        #[arg(long, default_value = "cli")]
+        managed_by: String,
     },
     /// Remove every token mapped to a tenant. Needs no plaintext token:
     /// entries carry the tenant id in the clear, so this is correct even when
@@ -978,6 +985,7 @@ async fn main() -> anyhow::Result<()> {
                             deployment_key_file,
                             token,
                             tenant,
+                            managed_by,
                         },
                 },
         } => {
@@ -986,6 +994,7 @@ async fn main() -> anyhow::Result<()> {
                 &deployment_key_file,
                 token.as_bytes(),
                 &tenant,
+                &managed_by,
                 now_ns()?,
             )
             .await

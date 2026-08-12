@@ -46,7 +46,24 @@ pub const AUTH_KEY: &str = "sys/auth";
 /// under the v1 layout, matching the `prov` / `enc` / `t/<hash>/config` records'
 /// fail-closed-on-newer guard (each uses its own comparison operator; see each
 /// module for its exact check).
-pub const AUTH_TOKEN_MAP_FORMAT_VERSION: u32 = 1;
+///
+/// Bumped 1 -> 2 for the `managed_by` ownership marker (ADR-0072 decision 4
+/// amendment, #897): `TokenHashEntry.managed_by` is `optional` and additive,
+/// so the bump is a floor signal, not a wire necessity. This build accepts a
+/// stored 1 or 2 unconditionally -- an absent `managed_by` decodes the same
+/// way under either version, as unmanaged -- and always writes 2.
+pub const AUTH_TOKEN_MAP_FORMAT_VERSION: u32 = 2;
+
+/// [`TokenEntry::managed_by`] value the operator's reconcile loop stamps on
+/// every entry it writes from a `tenantTokensSecretRef` Secret (ADR-0072
+/// decision 4 amendment, #897). The operator's remove/replace pass touches
+/// only entries carrying this exact tag.
+pub const MANAGED_BY_OPERATOR: &str = "operator";
+
+/// [`TokenEntry::managed_by`] value `ravel-cli tenant-token upsert` stamps by
+/// default (ADR-0072 decision 4 amendment, #897). Overridable at the CLI with
+/// `--managed-by` for a caller that wants a different owner tag.
+pub const MANAGED_BY_CLI: &str = "cli";
 
 /// Width of a token hash: a full blake3 output, 32 bytes.
 pub const TOKEN_HASH_LEN: usize = 32;
@@ -92,6 +109,14 @@ pub struct TokenEntry {
     pub token_hash: [u8; TOKEN_HASH_LEN],
     /// The tenant this token authenticates as.
     pub tenant_id: String,
+    /// Which writer owns this entry's lifecycle: [`MANAGED_BY_OPERATOR`],
+    /// [`MANAGED_BY_CLI`], or a caller-chosen tag; `None` for unmanaged
+    /// (every entry a pre-amendment writer wrote, and any entry a
+    /// post-amendment writer creates without declaring an owner). The
+    /// operator's remove/replace pass touches only entries whose
+    /// `managed_by` is exactly `Some(MANAGED_BY_OPERATOR)` (ADR-0072
+    /// decision 4 amendment, #897).
+    pub managed_by: Option<String>,
 }
 
 /// A deployment's decoded auth map: the deployment-key fingerprint it was written
@@ -258,6 +283,7 @@ fn decode_map(
         entries.push(TokenEntry {
             token_hash: hash,
             tenant_id: e.tenant_id.clone(),
+            managed_by: e.managed_by.clone(),
         });
     }
     Ok(AuthTokenMap {
@@ -277,6 +303,7 @@ fn build_proto(map: &AuthTokenMap, updated_unix_ns: i64) -> ProtoAuthTokenMap {
             .map(|e| ProtoTokenHashEntry {
                 token_hash: e.token_hash.to_vec(),
                 tenant_id: e.tenant_id.clone(),
+                managed_by: e.managed_by.clone(),
             })
             .collect(),
         updated_unix_ns,
@@ -370,6 +397,23 @@ pub async fn upsert_token(
     tenant_id: &str,
     now_ns: i64,
 ) -> Result<SetOutcome, AuthTokenMapError> {
+    upsert_token_owned(store, deployment_key, token, tenant_id, None, now_ns).await
+}
+
+/// Same as [`upsert_token`], but stamps `managed_by` onto the entry
+/// (overwriting whatever it carried before), so a later scoped remove/replace
+/// pass ([`remove_tokens_by_tenant_owned_by`], [`replace_tenant_tokens`]) can
+/// tell this write's owner from another writer's (ADR-0072 decision 4
+/// amendment, #897). `None` marks the entry unmanaged, matching every entry
+/// [`upsert_token`] writes.
+pub async fn upsert_token_owned(
+    store: &dyn ObjectStoreBackend,
+    deployment_key: &[u8; 32],
+    token: &[u8],
+    tenant_id: &str,
+    managed_by: Option<&str>,
+    now_ns: i64,
+) -> Result<SetOutcome, AuthTokenMapError> {
     if tenant_id.is_empty() {
         return Err(AuthTokenMapError::EmptyTenantId);
     }
@@ -385,10 +429,14 @@ pub async fn upsert_token(
         ),
     };
     match map.entries.iter_mut().find(|e| e.token_hash == hash) {
-        Some(entry) => entry.tenant_id = tenant_id.to_string(),
+        Some(entry) => {
+            entry.tenant_id = tenant_id.to_string();
+            entry.managed_by = managed_by.map(str::to_string);
+        }
         None => map.entries.push(TokenEntry {
             token_hash: hash,
             tenant_id: tenant_id.to_string(),
+            managed_by: managed_by.map(str::to_string),
         }),
     }
     write_map(store, &map, version, now_ns).await
@@ -446,21 +494,64 @@ pub async fn remove_tokens_by_tenant(
     write_map(store, &map, Some(version), now_ns).await
 }
 
-/// Replace `tenant_id`'s entire token set with `plaintext_tokens`,
-/// whole-record CAS-replace. Every existing entry for `tenant_id` is dropped
-/// and one entry per token in `plaintext_tokens` is written in its place;
-/// entries belonging to other tenants are untouched. Each token is hashed
-/// under `deployment_key` before being stored; the plaintext is never
-/// persisted. This is the primitive a Secret-driven reconcile loop uses: the
-/// Secret is the tenant's whole desired token set, so converging to it is a
-/// replace, not an incremental upsert/remove pair. On a fresh bucket the
-/// object is created with `CreateIfAbsent`; a concurrent write is a
+/// Remove every token mapped to `tenant_id` AND owned by `managed_by` (a
+/// scoped tenant-wide revocation), whole-record CAS-replace. Unlike
+/// [`remove_tokens_by_tenant`], an entry for the same tenant owned by a
+/// different writer (a different `managed_by` tag, or unmanaged/absent) is
+/// left untouched: the primitive the operator's reconcile loop uses so its
+/// remove pass never revokes a CLI-provisioned or v1-shaped unmanaged entry
+/// it never wrote (ADR-0072 decision 4 amendment, #897). Returns
+/// [`SetOutcome::Unchanged`] (issuing no write) when no object exists or no
+/// entry matches both `tenant_id` and `managed_by`. A concurrent write to an
+/// existing object is a [`AuthTokenMapError::CasConflict`].
+pub async fn remove_tokens_by_tenant_owned_by(
+    store: &dyn ObjectStoreBackend,
+    deployment_key: &[u8; 32],
+    tenant_id: &str,
+    managed_by: &str,
+    now_ns: i64,
+) -> Result<SetOutcome, AuthTokenMapError> {
+    let (mut map, version) = match read_auth_map(store, deployment_key).await? {
+        Some((map, version)) => (map, version),
+        None => return Ok(SetOutcome::Unchanged),
+    };
+    let before = map.entries.len();
+    map.entries
+        .retain(|e| !(e.tenant_id == tenant_id && e.managed_by.as_deref() == Some(managed_by)));
+    if map.entries.len() == before {
+        return Ok(SetOutcome::Unchanged);
+    }
+    write_map(store, &map, Some(version), now_ns).await
+}
+
+/// Replace `tenant_id`'s token set owned by `managed_by` with
+/// `plaintext_tokens`, whole-record CAS-replace. Only entries for
+/// `tenant_id` whose `managed_by` matches exactly are dropped and
+/// replaced; entries for other tenants, and entries for the same tenant
+/// owned by a different writer (a different tag, or unmanaged), are
+/// untouched (ADR-0072 decision 4 amendment, #897) -- a CLI-provisioned
+/// token for a tenant the operator also manages via Secret survives an
+/// operator reconcile. Each new entry is stamped with `managed_by`. Each
+/// token is hashed under `deployment_key` before being stored; the
+/// plaintext is never persisted. This is the primitive a Secret-driven
+/// reconcile loop uses: the Secret is the tenant's whole desired token set
+/// for that owner, so converging to it is a scoped replace, not an
+/// incremental upsert/remove pair.
+///
+/// Returns [`SetOutcome::Unchanged`] (issuing no write) when the resulting
+/// scoped entry set is byte-for-byte identical to the current one --
+/// including on a fresh bucket with an empty `plaintext_tokens`, which
+/// creates nothing. Converged reconciles must cost zero writes (ADR-0072
+/// decision 3's Object Lock versioning makes a needless PUT expensive, not
+/// just wasteful). On a fresh bucket with a non-empty result the object is
+/// created with `CreateIfAbsent`; a concurrent write is a
 /// [`AuthTokenMapError::CasConflict`] the caller re-reads and retries on.
 pub async fn replace_tenant_tokens(
     store: &dyn ObjectStoreBackend,
     deployment_key: &[u8; 32],
     tenant_id: &str,
     plaintext_tokens: &[Vec<u8>],
+    managed_by: Option<&str>,
     now_ns: i64,
 ) -> Result<SetOutcome, AuthTokenMapError> {
     if tenant_id.is_empty() {
@@ -476,13 +567,33 @@ pub async fn replace_tenant_tokens(
             None,
         ),
     };
-    map.entries.retain(|e| e.tenant_id != tenant_id);
-    for token in plaintext_tokens {
-        map.entries.push(TokenEntry {
+
+    let desired_entries: Vec<TokenEntry> = plaintext_tokens
+        .iter()
+        .map(|token| TokenEntry {
             token_hash: token_hash(deployment_key, token),
             tenant_id: tenant_id.to_string(),
-        });
+            managed_by: managed_by.map(str::to_string),
+        })
+        .collect();
+    let mut desired_hashes: Vec<_> = desired_entries.iter().map(|e| e.token_hash).collect();
+    desired_hashes.sort_unstable();
+
+    let mut current_hashes: Vec<_> = map
+        .entries
+        .iter()
+        .filter(|e| e.tenant_id == tenant_id && e.managed_by.as_deref() == managed_by)
+        .map(|e| e.token_hash)
+        .collect();
+    current_hashes.sort_unstable();
+
+    if current_hashes == desired_hashes {
+        return Ok(SetOutcome::Unchanged);
     }
+
+    map.entries
+        .retain(|e| !(e.tenant_id == tenant_id && e.managed_by.as_deref() == managed_by));
+    map.entries.extend(desired_entries);
     write_map(store, &map, version, now_ns).await
 }
 
@@ -774,10 +885,12 @@ mod tests {
                     TokenEntry {
                         token_hash: hash,
                         tenant_id: "tenant-a".into(),
+                        managed_by: None,
                     },
                     TokenEntry {
                         token_hash: hash,
                         tenant_id: "tenant-b".into(),
+                        managed_by: None,
                     },
                 ],
             },
@@ -815,6 +928,7 @@ mod tests {
             entries: vec![ProtoTokenHashEntry {
                 token_hash: vec![0u8; 16], // too short
                 tenant_id: "tenant-a".into(),
+                managed_by: None,
             }],
             updated_unix_ns: 1,
         };
@@ -948,6 +1062,7 @@ mod tests {
                 entries: vec![TokenEntry {
                     token_hash: token_hash(KEY, b"tok"),
                     tenant_id: "tenant-a".into(),
+                    managed_by: None,
                 }],
             },
             1,
@@ -999,6 +1114,7 @@ mod tests {
             KEY,
             "tenant-a",
             &[b"a-new-1".to_vec(), b"a-new-2".to_vec()],
+            None,
             3,
         )
         .await
@@ -1032,9 +1148,10 @@ mod tests {
     #[tokio::test]
     async fn replace_tenant_tokens_creates_on_fresh_bucket() {
         let store = mem();
-        let outcome = replace_tenant_tokens(store.as_ref(), KEY, "tenant-a", &[b"tok".to_vec()], 1)
-            .await
-            .expect("replace on fresh bucket");
+        let outcome =
+            replace_tenant_tokens(store.as_ref(), KEY, "tenant-a", &[b"tok".to_vec()], None, 1)
+                .await
+                .expect("replace on fresh bucket");
         assert_eq!(outcome, SetOutcome::Created);
         let (map, _v) = read_auth_map(store.as_ref(), KEY)
             .await
@@ -1047,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn replace_tenant_tokens_empty_tenant_is_refused() {
         let store = mem();
-        let err = replace_tenant_tokens(store.as_ref(), KEY, "", &[b"tok".to_vec()], 1)
+        let err = replace_tenant_tokens(store.as_ref(), KEY, "", &[b"tok".to_vec()], None, 1)
             .await
             .expect_err("an empty tenant_id must be refused");
         assert!(
@@ -1072,10 +1189,182 @@ mod tests {
             Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains("sys/auth"),
         );
         let store = FaultStore::new(inner, plan);
-        let err = replace_tenant_tokens(&store, KEY, "tenant-a", &[b"tok".to_vec()], 1)
+        let err = replace_tenant_tokens(&store, KEY, "tenant-a", &[b"tok".to_vec()], None, 1)
             .await
             .expect_err("a losing CreateIfAbsent race must surface as a typed conflict");
         assert!(matches!(err, AuthTokenMapError::CasConflict), "got: {err}");
+    }
+
+    /// `replace_tenant_tokens` is a no-op -- no write issued -- when the
+    /// tenant's resulting scoped entry set already matches the desired one
+    /// (review blocker 3, #897): a converged Secret-driven reconcile must
+    /// cost zero PUTs, not rewrite the whole map every interval.
+    #[tokio::test]
+    async fn replace_tenant_tokens_converged_is_unchanged() {
+        let store = mem();
+        let first = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "tenant-a",
+            &[b"a1".to_vec(), b"a2".to_vec()],
+            Some(MANAGED_BY_OPERATOR),
+            1,
+        )
+        .await
+        .expect("first replace creates the object");
+        assert_eq!(first, SetOutcome::Created);
+
+        let second = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "tenant-a",
+            &[b"a1".to_vec(), b"a2".to_vec()],
+            Some(MANAGED_BY_OPERATOR),
+            2,
+        )
+        .await
+        .expect("second replace with the same set");
+        assert_eq!(
+            second,
+            SetOutcome::Unchanged,
+            "an identical desired set must not rewrite the map"
+        );
+    }
+
+    /// `replace_tenant_tokens` on a fresh bucket with an empty desired set is
+    /// also `Unchanged`: nothing exists and nothing is wanted, so no object
+    /// is created.
+    #[tokio::test]
+    async fn replace_tenant_tokens_empty_desired_on_fresh_bucket_is_unchanged() {
+        let store = mem();
+        let outcome = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "tenant-a",
+            &[],
+            Some(MANAGED_BY_OPERATOR),
+            1,
+        )
+        .await
+        .expect("replace with nothing to converge to");
+        assert_eq!(outcome, SetOutcome::Unchanged);
+        assert!(
+            read_auth_map(store.as_ref(), KEY)
+                .await
+                .expect("read")
+                .is_none(),
+            "no object was created by a converged empty replace"
+        );
+    }
+
+    /// `replace_tenant_tokens` is scoped by `managed_by`: replacing the
+    /// operator-owned set for a tenant leaves that same tenant's
+    /// CLI-provisioned entries untouched (review blocker 1, #897) -- the
+    /// operator's remove/replace pass must never revoke a token it did not
+    /// write.
+    #[tokio::test]
+    async fn replace_tenant_tokens_is_scoped_to_its_managed_by_owner() {
+        let store = mem();
+        upsert_token_owned(
+            store.as_ref(),
+            KEY,
+            b"cli-tok",
+            "tenant-a",
+            Some(MANAGED_BY_CLI),
+            1,
+        )
+        .await
+        .expect("seed a CLI-provisioned token for tenant-a");
+
+        let outcome = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "tenant-a",
+            &[b"op-tok".to_vec()],
+            Some(MANAGED_BY_OPERATOR),
+            2,
+        )
+        .await
+        .expect("operator replace");
+        assert_eq!(outcome, SetOutcome::Updated);
+
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"cli-tok"),
+            Some("tenant-a"),
+            "the CLI-provisioned entry survives an operator-scoped replace for the same tenant"
+        );
+        assert_eq!(tenant_for_token(&map, KEY, b"op-tok"), Some("tenant-a"));
+    }
+
+    /// `remove_tokens_by_tenant_owned_by` only removes entries owned by the
+    /// given `managed_by` tag: a CLI-provisioned tenant and a v1-shaped
+    /// unmanaged entry both survive an operator-scoped remove for the same
+    /// tenant name (review blocker 1, #897); an operator-managed entry for
+    /// that tenant is still removed.
+    #[tokio::test]
+    async fn remove_tokens_by_tenant_owned_by_spares_other_owners() {
+        let store = mem();
+        // A v1-shaped unmanaged entry (no managed_by field at all).
+        upsert_token(store.as_ref(), KEY, b"legacy-tok", "tenant-a", 1)
+            .await
+            .expect("seed unmanaged (v1) entry");
+        // A CLI-provisioned entry for the SAME tenant name.
+        upsert_token_owned(
+            store.as_ref(),
+            KEY,
+            b"cli-tok",
+            "tenant-a",
+            Some(MANAGED_BY_CLI),
+            2,
+        )
+        .await
+        .expect("seed CLI-owned entry");
+        // An operator-managed entry for the same tenant.
+        upsert_token_owned(
+            store.as_ref(),
+            KEY,
+            b"op-tok",
+            "tenant-a",
+            Some(MANAGED_BY_OPERATOR),
+            3,
+        )
+        .await
+        .expect("seed operator-owned entry");
+
+        let outcome = remove_tokens_by_tenant_owned_by(
+            store.as_ref(),
+            KEY,
+            "tenant-a",
+            MANAGED_BY_OPERATOR,
+            4,
+        )
+        .await
+        .expect("operator-scoped remove");
+        assert_eq!(outcome, SetOutcome::Updated);
+
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"legacy-tok"),
+            Some("tenant-a"),
+            "an unmanaged (v1) entry must survive an operator-scoped remove"
+        );
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"cli-tok"),
+            Some("tenant-a"),
+            "a CLI-owned entry must survive an operator-scoped remove"
+        );
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"op-tok"),
+            None,
+            "the operator-owned entry for the same tenant is revoked"
+        );
     }
 
     /// Byte-subslice search helper for the plaintext-never-stored assertion.

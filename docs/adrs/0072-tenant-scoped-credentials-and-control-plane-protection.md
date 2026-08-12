@@ -190,3 +190,45 @@ breaks a real key shape fails CI instead of a production deployment.
 - Deliberately out of scope: per-tenant credentials (rejected), rekey
   migration for legacy unkeyed-hash buckets (tracked separately),
   audit-log export off-bucket.
+
+## Amendment (2026-08-12): `sys/auth` entries get an ownership marker
+
+Decision 4's `remove_tokens_by_tenant` reconcile was unsafe as shipped:
+the operator's remove pass ran over every tenant absent from its Secret,
+including a tenant `ravel-cli tenant token upsert` had provisioned by
+hand and the operator never managed. A hash-only `sys/auth` entry carries
+no plaintext to recover, so that revocation was unrecoverable, not just
+wrong.
+
+`TokenHashEntry` (proto/ravel/sys.proto) gains field 3,
+`optional string managed_by`: additive, new field number, no existing
+field renumbered. `"operator"` marks an entry the operator's reconcile
+loop wrote from a `tenantTokensSecretRef` Secret; `"cli"` marks one
+`ravel-cli tenant-token upsert` wrote (the CLI's default, overridable
+with `--managed-by` for an operator-adjacent workflow that wants a
+different tag). Absent is unmanaged: every entry a pre-amendment writer
+ever wrote, and any entry a post-amendment writer creates without
+declaring an owner.
+
+The operator's remove/replace pass is scoped to `managed_by == "operator"`
+only. A CLI-provisioned tenant and an unmanaged (absent-marker) tenant
+both survive a reconcile whose Secret does not name them; an
+operator-managed tenant absent from the Secret is still revoked. This is
+the load-bearing compatibility rule, not the field's mere presence: an
+operator that filtered on "absent OR operator" instead would still wipe
+every pre-amendment entry on its next reconcile.
+
+`AUTH_TOKEN_MAP_FORMAT_VERSION` moves 1 -> 2. The bump is a floor signal,
+not a wire necessity -- `managed_by` is `optional` and additive, so a
+version-1-only reader already skips the unknown field safely, and a v2+
+reader accepts a stored 1 or 2 unconditionally (an absent marker decodes
+identically either way: unmanaged). Every writer now writes 2.
+
+Also fixed in the same change: `replace_tenant_tokens` compares the
+tenant's resulting entry set against its current one and returns
+`SetOutcome::Unchanged` without writing when they match (it previously
+rewrote the whole map every call), and the operator wraps each `sys/auth`
+primitive call in a bounded CAS retry and no longer aborts Deployment/
+Service reconciliation on a sys/auth failure -- both were reconcile-loop
+defects the ownership marker didn't by itself fix, found by the same
+review. See PROGRESS.md for the full defect list.

@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ravel_catalog::{AuthSetOutcome, read_auth_map, remove_tokens_by_tenant, upsert_token};
+use ravel_catalog::{AuthSetOutcome, read_auth_map, remove_tokens_by_tenant, upsert_token_owned};
 use ravel_object_store::ObjectStoreBackend;
 
 use crate::tenancy::parse_deployment_key;
@@ -34,16 +34,29 @@ fn load_deployment_key(path: &Path) -> anyhow::Result<[u8; 32]> {
 
 /// `tenant token upsert`: map `token` to `tenant_id` in `sys/auth`, hashing it
 /// under the deployment key. The plaintext is hashed and dropped, never
-/// persisted or printed.
+/// persisted or printed. `managed_by` is stamped onto the entry (ADR-0072
+/// decision 4 amendment, #897); the CLI defaults it to `"cli"`, distinct
+/// from the operator's `"operator"` tag, so the operator's reconcile loop
+/// never revokes a token this command provisioned.
 pub async fn upsert(
     store: Arc<dyn ObjectStoreBackend>,
     deployment_key_file: &Path,
     token: &[u8],
     tenant_id: &str,
+    managed_by: &str,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     let key = load_deployment_key(deployment_key_file)?;
-    match upsert_token(store.as_ref(), &key, token, tenant_id, now_ns).await? {
+    match upsert_token_owned(
+        store.as_ref(),
+        &key,
+        token,
+        tenant_id,
+        Some(managed_by),
+        now_ns,
+    )
+    .await?
+    {
         AuthSetOutcome::Created => println!("sys/auth created; token mapped to {tenant_id}"),
         AuthSetOutcome::Updated => println!("sys/auth updated; token mapped to {tenant_id}"),
         AuthSetOutcome::Unchanged => println!("no change"),
@@ -94,9 +107,10 @@ pub async fn list(
             ));
             for entry in &map.entries {
                 out.push_str(&format!(
-                    "tenant_id: {}  token_fingerprint: {}\n",
+                    "tenant_id: {}  token_fingerprint: {}  managed_by: {}\n",
                     entry.tenant_id,
-                    hex::encode(&entry.token_hash[..TOKEN_FINGERPRINT_LEN])
+                    hex::encode(&entry.token_hash[..TOKEN_FINGERPRINT_LEN]),
+                    entry.managed_by.as_deref().unwrap_or("(unmanaged)")
                 ));
             }
         }
@@ -129,13 +143,17 @@ mod tests {
         let store = store();
         let kf = key_file();
 
-        upsert(store.clone(), kf.path(), b"tok-a", "tenant-a", 1)
+        upsert(store.clone(), kf.path(), b"tok-a", "tenant-a", "cli", 1)
             .await
             .expect("upsert");
         let listing = list(store.clone(), kf.path()).await.expect("list");
         assert!(
             listing.contains("tenant_id: tenant-a"),
             "listing: {listing}"
+        );
+        assert!(
+            listing.contains("managed_by: cli"),
+            "listing must print the ownership tag: {listing}"
         );
         assert!(
             !listing.contains("tok-a"),
@@ -159,9 +177,16 @@ mod tests {
     async fn list_never_prints_full_token_hash() {
         let store = store();
         let kf = key_file();
-        upsert(store.clone(), kf.path(), b"secret-token", "tenant-a", 1)
-            .await
-            .expect("upsert");
+        upsert(
+            store.clone(),
+            kf.path(),
+            b"secret-token",
+            "tenant-a",
+            "cli",
+            1,
+        )
+        .await
+        .expect("upsert");
 
         let key = load_deployment_key(kf.path()).expect("parse key");
         let full_hash = ravel_catalog::token_hash(&key, b"secret-token");
