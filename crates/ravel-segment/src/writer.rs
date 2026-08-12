@@ -278,45 +278,18 @@ impl SegmentWriter {
             u32::try_from(created_unix_ns.div_euclid(NS_PER_HOUR)).unwrap_or(0);
 
         let mut v4_series = Vec::with_capacity(series.len());
-        let mut scratch = WriteScratch::default();
         for s in series {
-            let sample_count =
-                u32::try_from(s.values.len()).map_err(|_| WriteError::TooManySamples)?;
-            let min_ts_ns = s.values.first_ts().unwrap_or(0);
-            let max_ts_ns = s.values.last_ts().unwrap_or(0);
-            s.values.extend_ts_values_into(&mut scratch.ts_values);
-            let ts_page = frame_ts_page(&s.series_id, &scratch.ts_values, &mut scratch.payload)?;
-            let value_page = match &s.values {
-                SeriesValues::Scalar(samples) => {
-                    scratch.scalar_values.clear();
-                    scratch
-                        .scalar_values
-                        .extend(samples.iter().map(|sm| sm.value));
-                    RunValuePageV4::Scalar(frame_val_page(
-                        &s.series_id,
-                        &scratch.scalar_values,
-                        &mut scratch.payload,
-                    ))
-                }
-                SeriesValues::Histogram(hist) => RunValuePageV4::Histogram(frame_hist_page(
-                    &s.series_id,
-                    hist,
-                    &mut scratch.payload,
-                )?),
-            };
+            let run = encode_run_v4(
+                &s.series_id,
+                created_unix_ns,
+                identity.writer_epoch,
+                identity.writer_seq,
+                &s.values,
+            )?;
             v4_series.push(SeriesInputV4 {
                 series_id: s.series_id,
                 labels: s.labels,
-                runs: vec![RunInputV4 {
-                    created_unix_ns,
-                    writer_epoch: identity.writer_epoch,
-                    writer_seq: identity.writer_seq,
-                    min_ts_ns,
-                    max_ts_ns,
-                    sample_count,
-                    ts_page,
-                    value_page,
-                }],
+                runs: vec![run],
             });
         }
 
@@ -750,16 +723,59 @@ impl SegmentWriter {
     }
 }
 
-/// Per-writer encode scratch reused across series within one flush (issue
-/// #813): each buffer is cleared, not reallocated, between series, so a
-/// flush of N series pays for growth once (amortized) instead of N fresh
-/// heap allocations for values extracted from samples and for page payload
-/// bytes.
-#[derive(Default)]
-struct WriteScratch {
-    ts_values: Vec<i64>,
-    scalar_values: Vec<f64>,
-    payload: Vec<u8>,
+/// Encodes one run's already-decoded, ts-sorted samples into a pre-framed v4
+/// [`RunInputV4`]: the same TS/VAL/HIST framing
+/// [`SegmentWriter::write_histograms_with_exemplars`] applies to a whole L0
+/// batch, exposed at single-run granularity.
+///
+/// This is the encode half of a decode-filter-reencode rewrite (ADR-0064
+/// decision 3, the selective-erasure rewrite pass): a caller decodes one run
+/// via [`crate::reader::decode_run_pages_soa`] or
+/// [`crate::reader::decode_run_histogram_pages`], drops the samples matching
+/// an erasure predicate, and re-encodes the survivors back into a run of the
+/// same frozen v4 grammar (`crate::writer::SeriesInputV4`/`RunInputV4`) for
+/// [`SegmentWriter::write_v5_with_exemplars`]'s multi-run L1 shape. No format
+/// change: identical page bytes to what the raw-sample adapters above would
+/// produce for the same (now-filtered) sample set.
+///
+/// `values` must already be sorted by `ts_ns` (true of every run decoded from
+/// a stored object, and preserved by a predicate filter over it) and the
+/// caller's own `writer_epoch`/`writer_seq`/`created_unix_ns` provenance for
+/// this run is passed through unchanged: a rewrite narrows a run's sample set,
+/// it never re-derives the run's dedup-priority identity.
+pub fn encode_run_v4(
+    series_id: &SeriesId,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+    values: &SeriesValues,
+) -> Result<RunInputV4, WriteError> {
+    let sample_count = u32::try_from(values.len()).map_err(|_| WriteError::TooManySamples)?;
+    let min_ts_ns = values.first_ts().unwrap_or(0);
+    let max_ts_ns = values.last_ts().unwrap_or(0);
+    let mut ts_values = Vec::new();
+    values.extend_ts_values_into(&mut ts_values);
+    let mut payload = Vec::new();
+    let ts_page = frame_ts_page(series_id, &ts_values, &mut payload)?;
+    let value_page = match values {
+        SeriesValues::Scalar(samples) => {
+            let scalar_values: Vec<f64> = samples.iter().map(|sm| sm.value).collect();
+            RunValuePageV4::Scalar(frame_val_page(series_id, &scalar_values, &mut payload))
+        }
+        SeriesValues::Histogram(hist) => {
+            RunValuePageV4::Histogram(frame_hist_page(series_id, hist, &mut payload)?)
+        }
+    };
+    Ok(RunInputV4 {
+        created_unix_ns,
+        writer_epoch,
+        writer_seq,
+        min_ts_ns,
+        max_ts_ns,
+        sample_count,
+        ts_page,
+        value_page,
+    })
 }
 
 /// Frames one series' TS page (6-byte header + payload) into a fresh buffer

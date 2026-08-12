@@ -46,7 +46,7 @@ pub use sparse::{
 pub use writer::{
     CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunValuePageV4, SegmentIdentity,
     SegmentSummary, SegmentWriter, SeriesInput, SeriesInputV3, SeriesInputV4, SeriesValues,
-    WrittenSegment,
+    WrittenSegment, encode_run_v4,
 };
 
 pub use ravel_proto::segment::v1::Footer;
