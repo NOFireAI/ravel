@@ -77,6 +77,23 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("store backend is not qualified (sys/qualification); refusing to start")?;
 
+    // Bucket-protection contract gate (ADR-0072 decision 3), off by default:
+    // see docs/object-store-contract.md's "Required bucket configuration"
+    // section. `--require-bucket-protection` unset leaves this call a no-op
+    // (`enforce_if_required` returns `Ok(None)` without touching either
+    // probe), so the default path is unchanged from before this gate
+    // existed. When set, `ObjectLockStatus::Disabled` or an ADR-0064 section
+    // 7 bucket-configuration alarm refuses to start; `Unknown` (every
+    // backend reachable only through `ObjectStoreBackend` today) logs one
+    // warning and sets the `ravel_bucket_protection_unknown` gauge instead
+    // of blocking.
+    ravel_server::bucket_protection::enforce_if_required(
+        cli.require_bucket_protection,
+        store.as_ref(),
+    )
+    .await
+    .context("bucket-protection contract check failed; refusing to start")?;
+
     // Tenant-hash scheme pinning (ADR-0050 section 3). Resolve the bucket's
     // scheme from `sys/tenancy` (writing the marker for a fresh or pre-ADR
     // bucket) and install it process-wide. A configured scheme or key that

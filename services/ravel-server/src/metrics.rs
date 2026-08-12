@@ -1172,6 +1172,28 @@ fn render_store_probe_family(out: &mut String, mode: Mode, reachable: bool, fail
     );
 }
 
+/// The `ravel_bucket_protection_unknown` gauge (ADR-0072 decision 3): 1 when
+/// the last `--require-bucket-protection` startup check observed
+/// [`crate::bucket_protection::BucketProtectionOutcome::Unknown`] (every
+/// backend reachable only through `ObjectStoreBackend` today), 0 otherwise,
+/// including when the flag is off. Single source, no labels, the same shape
+/// as [`render_store_probe_family`]; exported unconditionally so a fleet can
+/// alarm on it from a metrics-only monitoring setup.
+fn render_bucket_protection_family(out: &mut String, mode: Mode, unknown: u64) {
+    write_header(
+        out,
+        "ravel_bucket_protection_unknown",
+        "Whether the --require-bucket-protection startup check (ADR-0072 decision 3) could not confirm Object Lock / versioning status for this backend (1), or was off or confirmed Enabled (0).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_bucket_protection_unknown",
+        &[Label::Mode(mode)],
+        unknown,
+    );
+}
+
 /// Storage-derived tenant discovery counters for the maintenance driver
 /// (ADR-0048 decision 3, issue #504), decoupled from
 /// [`crate::tenant_discovery::TenantDiscoveryMetrics`] so the renderer is
@@ -2435,6 +2457,11 @@ pub fn render(
         mode,
         crate::store_probe::store_reachable(),
         crate::store_probe::probe_failures_total(),
+    );
+    render_bucket_protection_family(
+        &mut out,
+        mode,
+        crate::bucket_protection::bucket_protection_unknown(),
     );
     render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
     if let Some(snapshot) = maintain {

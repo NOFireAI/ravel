@@ -355,6 +355,85 @@ issue) and the single `sys/qualification` key; it never reads, lists, or
 writes any tenant-prefixed key, so it is safe to run against a bucket that
 already holds production data.
 
+## Required bucket configuration (ADR-0064 §7, ADR-0072 decision 3)
+
+Everything above is a property of the `ObjectStoreBackend` *adapter*.
+ADR-0064 §7 (S2-16, S4-12) additionally names bucket-level *configuration*
+Ravel's deletion and retention guarantees depend on, orthogonal to the
+adapter contract:
+
+1. **Versioning.** Object versioning must be either OFF, or ON and paired
+   with a noncurrent-version expiration rule (plus expired-delete-marker
+   cleanup) on every `t/` prefix. Versioning ON without that pairing is an
+   unsupported configuration: it silently turns every Ravel delete
+   (retention sweep, ADR-0064 selective erasure) into a soft delete,
+   inverting the system's deletion guarantees while everything above this
+   layer keeps reporting success.
+2. **No other lifecycle expiration or archival-transition rule** may target
+   any Ravel-owned prefix. A storage-class transition or an expiration rule
+   added for cost reasons can silently delete or relocate a commit record,
+   a manifest, or provenance data outside any path Ravel's own retention
+   logic controls.
+3. **Two sanctioned lifecycle rules**, and only these:
+   - `AbortIncompleteMultipartUpload` (recommended, 7 days) — cleans up
+     abandoned multipart uploads; absence does not violate the contract,
+     it just lets incomplete uploads accumulate.
+   - The noncurrent-version expiration rule required by point 1 when
+     versioning is ON.
+4. **Object Lock, compliance mode**, on the protected prefixes: `sys/*`,
+   `t/*/*/prov`, commit records `t/*/*/c/*`, and `t/*/catalog/*/*` HEAD
+   history. These are the objects whose immutability the commit and
+   catalog layers assume as a given (see "Data objects, commit records,
+   manifests, and index objects are immutable" — this section is that
+   invariant's bucket-level enforcement point). Object Lock is what makes
+   that assumption hold even against a compromised or misconfigured
+   credential that can otherwise issue deletes: compliance mode refuses
+   deletion or overwrite for the configured retention period, with no
+   principal (including the bucket owner) able to shorten or remove it.
+   Subject identifiers that must remain erasable under ADR-0064 live in
+   *values*, never in *object keys or names*, precisely so Object Lock on
+   these prefixes never conflicts with a legitimate erasure request.
+
+Enforcement stays at the bucket/IAM layer (ADR-0042 decision 3): nothing
+in this crate can configure or verify Object Lock or lifecycle policy
+in-process, because `object_store` 0.14 exposes no such API and this crate
+never opens a second, direct-SDK side channel. What this crate *can* do is
+report what a backend affirmatively discloses, via
+[`ObjectLockProbeSource`]/`probe_object_lock` and
+[`BucketConfigProbeSource`]/`probe_bucket_config` (see "Runtime
+qualification" above) plus `bucket_config_alarms`, which turns an observed
+[`BucketConfigProbe`] into `"ALARM:"`-prefixed strings for a genuine
+contract violation (point 1's versioning/expiration pairing) and
+`"NOTE:"`-prefixed strings for an advisory gap (the recommended
+multipart-abort rule). Every production backend reports
+[`ObjectLockStatus::Unknown`] and every `BucketConfigProbe` field
+`Unknown` through these traits today — there is no vendor API this crate
+calls to populate anything else — so today these probes are informational
+only, exactly as ADR-0055 §3 designed them, and their reporting stays
+that way regardless of the flag below.
+
+`ravel-server --require-bucket-protection` (ADR-0072 decision 3, default
+OFF, env `RAVEL_REQUIRE_BUCKET_PROTECTION`) turns the same probes into a
+startup gate instead of a print statement, so a deployment cannot go into
+production silently unprotected:
+
+- `ObjectLockStatus::Disabled`, or a `bucket_config_alarms` `"ALARM:"`
+  entry (the versioning-without-expiration misconfiguration), is fatal:
+  the server refuses to start with a typed error.
+- `ObjectLockStatus::Unknown` — the case every backend reachable only
+  through `ObjectStoreBackend` reports today, since no adapter can
+  actually answer this query — logs one warning and sets the
+  `ravel_bucket_protection_unknown` gauge to `1`, so a fleet can alarm on
+  it without being blocked by it.
+- `ObjectLockStatus::Enabled` with no alarms starts clean, gauge at `0`.
+
+With the flag off (the default), none of this runs, and startup behavior
+is unchanged from before this gate existed. The flag makes an
+unprotected production deployment *visible and refusable*; it does not
+and cannot make Object Lock or lifecycle policy real in-process — that
+capability is still reserved for its own trait-extending ADR per
+ADR-0042 decision 3.
+
 ## Implementations
 
 1. `MemoryStore`: reference implementation and semantics oracle; strong
