@@ -271,6 +271,23 @@ impl UnitStallTracker {
             .filter(|&&count| count >= self.threshold)
             .count() as u64
     }
+
+    /// Drops every entry not present in `owned` and returns the recomputed
+    /// stall count over what remains. A unit only accrues failures here while
+    /// `observe` is called for it, i.e. while this process owns it; once it
+    /// leaves the owned set (rendezvous re-partition, tenant deprovision, a
+    /// shard-count reduction) `observe` is never called for it again, so
+    /// without this its entry is stranded and keeps counting toward the
+    /// gauge forever. If the unit returns to this process's ownership later
+    /// and fails again, it re-accumulates from zero.
+    fn retain_owned(&self, owned: &std::collections::HashSet<(TenantHash, Signal, u32)>) -> u64 {
+        let mut failures = self.failures.lock();
+        failures.retain(|unit, _| owned.contains(unit));
+        failures
+            .values()
+            .filter(|&&count| count >= self.threshold)
+            .count() as u64
+    }
 }
 
 /// New metrics for ADR-0065's stuck-owner mitigation: how many owned units
@@ -286,6 +303,10 @@ pub struct MaintenanceOwnershipMetrics {
     full_sweep_passes_total: AtomicU64,
     units_stalled: AtomicU64,
     stalls: UnitStallTracker,
+    /// This cycle's owned-unit accumulator, paired with `set_units_owned(0)`:
+    /// cleared in `begin_cycle`, filled by `note_owned_unit` as `run_tick`
+    /// walks each tenant, then consumed by `end_cycle` to prune `stalls`.
+    owned_this_cycle: parking_lot::Mutex<std::collections::HashSet<(TenantHash, Signal, u32)>>,
 }
 
 impl MaintenanceOwnershipMetrics {
@@ -297,7 +318,30 @@ impl MaintenanceOwnershipMetrics {
             full_sweep_passes_total: AtomicU64::new(0),
             units_stalled: AtomicU64::new(0),
             stalls: UnitStallTracker::new(stalled_after_intervals),
+            owned_this_cycle: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Clears the per-cycle owned-unit accumulator. Call once at the top of a
+    /// discovery cycle, alongside `set_units_owned(0)`.
+    fn begin_cycle(&self) {
+        self.owned_this_cycle.lock().clear();
+    }
+
+    /// Records that `(tenant, signal, shard)` is owned by this process this
+    /// cycle. Call alongside `add_units_owned` for every unit in an owned
+    /// set, whether inside a discovery cycle or a standalone `run_tick`.
+    fn note_owned_unit(&self, tenant: TenantHash, signal: Signal, shard: u32) {
+        self.owned_this_cycle.lock().insert((tenant, signal, shard));
+    }
+
+    /// Prunes stall history to this cycle's owned set and recomputes
+    /// `units_stalled` over what remains. Call once at the end of a
+    /// discovery cycle, after every tenant's tick has run.
+    fn end_cycle(&self) {
+        let owned = self.owned_this_cycle.lock();
+        let stalled = self.stalls.retain_owned(&owned);
+        self.units_stalled.store(stalled, Ordering::Relaxed);
     }
 
     fn set_workers_live(&self, count: u64) {
@@ -701,6 +745,7 @@ pub async fn run_discovery_cycle(
     // gauge always reflects the current cycle's ownership, not a running
     // total across cycles.
     ownership.set_units_owned(0);
+    ownership.begin_cycle();
 
     let mut total = MaintainReport::default();
     for tenant in &outcome.maintained {
@@ -723,6 +768,14 @@ pub async fn run_discovery_cycle(
         total.not_sealed += report.not_sealed;
         total.skipped_terminal += report.skipped_terminal;
     }
+
+    // Prune stall history to exactly this cycle's owned set (ADR-0065
+    // stuck-owner mitigation): a unit dropped entirely out of
+    // `outcome.maintained` (tenant deprovisioned) or reassigned to a peer
+    // (rendezvous re-partition) never calls `observe_unit_tick` again, so
+    // without this its failure entry -- and its contribution to
+    // `units_stalled` -- would be stranded forever.
+    ownership.end_cycle();
     total
 }
 
@@ -872,6 +925,9 @@ pub async fn run_tick(
             .filter(|shard| worker.owns_unit(live_set, tenant, signal, *shard))
             .collect();
         ownership.add_units_owned(owned_shards.len() as u64);
+        for &shard in &owned_shards {
+            ownership.note_owned_unit(*tenant, signal, shard);
+        }
 
         // Carve each owned unit's memo slice out of the shared memo so its
         // concurrent future can mutate it without aliasing another unit's
@@ -2991,6 +3047,116 @@ mod tests {
             ownership.units_stalled(),
             0,
             "a single success resets the unit's consecutive-failure streak"
+        );
+    }
+
+    /// A unit that reaches the stall threshold and then LEAVES this process's
+    /// owned set entirely -- a rendezvous re-partition when a peer joins,
+    /// here -- must not keep pinning `units_stalled` (ADR-0065). Drives
+    /// `(tenant, Metrics, shard 0)` to the threshold under a solo live set,
+    /// then runs one more discovery cycle under a two-worker live set chosen
+    /// so shard 0's rendezvous owner moves to the peer. This process's
+    /// `run_tick` then never evaluates shard 0 at all, so
+    /// `observe_unit_tick` is never called for it again; only
+    /// `run_discovery_cycle`'s per-cycle `ownership.end_cycle()` (which
+    /// prunes `UnitStallTracker.failures` to the current owned set) can
+    /// clear its stranded entry. Reverting that call -- or reverting
+    /// `UnitStallTracker::retain_owned`'s body to a no-op -- leaves the final
+    /// assertion at 1 forever instead of 0.
+    #[tokio::test]
+    async fn units_stalled_drops_a_unit_that_leaves_the_owned_set() {
+        const THRESHOLD: u32 = 3;
+
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let discovery_metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(THRESHOLD);
+        let worker = solo_worker();
+        let live_solo = worker.solo_live_set();
+
+        // A deterministic peer id whose presence in the live set flips shard
+        // 0's rendezvous owner away from `worker` (the argmax is a function
+        // of both ids, so some peer id must exist that outweighs `worker`'s
+        // own weight for this specific unit key).
+        let peer_id = (1u128..10_000)
+            .map(Uuid::from_u128)
+            .find(|candidate| {
+                let live = vec![worker.process_id(), *candidate];
+                !worker.owns_unit(&live, &tenant, Signal::Metrics, 0)
+            })
+            .expect("some peer id flips shard 0's rendezvous owner away from the solo worker");
+        let live_ab = vec![worker.process_id(), peer_id];
+
+        let inner = MemoryStore::new();
+        publish_terminal_bucket(&inner, &tenant_id).await;
+
+        // Faults only (tenant, Metrics, shard 0)'s own listing, exactly as
+        // `units_stalled_fires_after_threshold_consecutive_failures_and_resets_on_success`
+        // does: tenant discovery's `list_delimited("t/")` and the legal-hold
+        // refresh (a different shard, Signal::Audit) stay clean.
+        let shard_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid metrics shard prefix");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("scan unavailable".into()),
+            )
+            .with_key_contains(shard_prefix),
+        );
+        let store = FaultStore::new(inner, plan);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Three consecutive faulted cycles while shard 0 is still owned:
+        // drives its failure streak to the threshold.
+        for _ in 0..THRESHOLD {
+            let _report = run_discovery_cycle(
+                &store,
+                None,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &discovery_metrics,
+                &safety,
+                &ownership,
+                &worker,
+                &live_solo,
+            )
+            .await;
+        }
+        assert_eq!(
+            ownership.units_stalled(),
+            1,
+            "shard 0 must cross the stall threshold while still owned"
+        );
+
+        // The peer joins: shard 0's rendezvous owner moves to it, so
+        // `worker`'s owned set for this cycle no longer includes shard 0 at
+        // all. Its failing entry is never observed again by this process.
+        let _report = run_discovery_cycle(
+            &store,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &discovery_metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &live_ab,
+        )
+        .await;
+
+        assert_eq!(
+            ownership.units_stalled(),
+            0,
+            "a unit that leaves the owned set must not keep pinning units_stalled \
+             forever -- without pruning stall history to the current cycle's \
+             owned set, this stays at 1 even though the unit no longer ticks here"
         );
     }
 }
