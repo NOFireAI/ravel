@@ -526,3 +526,60 @@ not yet been provisioned against a narrower credential, so no deployed policy
 predates this change. The matching IAM policy JSON in
 `docs/guides/operations.md` (`MaintainDelete` and all four `DenyDeleteProtected`
 blocks) is updated in the same change.
+
+## Amendment (2026-08-12): the `t/<hash>/enc` key-epoch record needs a read/write grant
+
+EL-7 (issue #764, epic #462, ADR-0062 decision 1, ADR-0072 decision 2) wires
+`KmsRoutingStore` into `ravel-server`'s single store-construction site behind
+`--tenant-kms-config`. On first configuration of a tenant's key (and on every
+later rotation), the same process bootstraps that tenant's key-epoch history
+by reading, then `CreateIfAbsent`/`CasVersion`-appending, the object
+`t/<hash>/enc` (`crates/ravel-catalog/src/key_epoch.rs`) — a per-tenant,
+bucket-root-relative key with no `<sig>` segment, so none of §1's existing
+`t/<hash>/<sig>/…` wildcards cover it. §1's original table grants no role any
+access to this prefix at all, because it did not exist when this ADR was
+written.
+
+This bootstrap runs from whichever `--mode` a deployment happens to set
+`--tenant-kms-config` on — the flag is process-wide, not mode-scoped, and
+`ravel-server`'s startup sequence calls it unconditionally whenever the flag
+is present, the same "first process up wins the `CreateIfAbsent`, everyone
+else safely appends or no-ops" race §1 already documents for
+`sys/tenancy` (§4). Gateway and Query are the roles that write tenant data
+under a routed key today (Gateway's L0/idempotency/commit writes, Query's
+fold and query-audit writes), so both need the grant on the same
+"first-boot race" basis as `sys/tenancy`. Maintain writes L1 parts and
+compaction/tombstone records under the same tenant prefix, so a deployment
+that also enables per-tenant KMS on Maintain needs it there too, for the
+same reason. Admin needs at least read: `ravel-cli`'s `verify-custody`
+(already shipped, extended by ADR-0062's epoch-consistency check) reads the
+epoch history to validate it.
+
+The needed grant, once provisioned:
+
+- **Gateway, Query, Maintain**: `GetObject` + `PutObject` on `t/*/enc`
+  (`CreateIfAbsent` for the bootstrap epoch 0, `CasVersion` for every
+  later rotation — both are plain `s3:PutObject` at the IAM layer per §1's
+  existing note on `CreateIfAbsent`/`CasVersion`/`Put`). Add `t/*/enc` to
+  each role's `ListBucket` `s3:prefix` condition alongside the existing
+  per-key wildcards, the same way the bare `t/` discovery entry is added
+  (ADR-0072 decision 5).
+- **Admin**: `GetObject` on `t/*/enc` only, alongside its existing broad
+  read grant.
+- **No role gains delete.** `t/<hash>/enc` is an append-only CAS history,
+  the same durability class as `sys/tenancy`/`prov`/`catalog/*`: it belongs
+  in `DenyDeleteProtected` for every role, including Maintain, not left
+  outside it by omission.
+
+**This amendment is documentation only.** EL-7's task scope is
+`services/ravel-server/` and `docs/`; the actual policy files
+(`deploy/iam/gateway.json`, `query.json`, `maintain.json`, `admin.json`) and
+`crates/ravel-commit`'s `tests/iam_templates.rs` CI check that verifies them
+against the object-key layout both live outside that scope and are **not**
+updated by this change, unlike every prior amendment's practice of updating
+the JSON in the same commit. A deployment that turns on
+`--tenant-kms-config` against a bucket already provisioned with the ADR-0055
+per-role credentials, without the follow-up above, will see the epoch
+bootstrap fail closed with an access-denied error on every affected role's
+first `--tenant-kms-config` startup — this is flagged as a required
+follow-up, not fixed here.

@@ -25,6 +25,8 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--s3-region <region>` | `RAVEL_S3_REGION` | `us-east-1` | |
 | `--s3-access-key <key>` | `RAVEL_S3_ACCESS_KEY` | none | Required when `--store s3`. |
 | `--s3-secret-key <secret>` | `RAVEL_S3_SECRET_KEY` | none | Required when `--store s3`. |
+| `--s3-kms-key <arn>` | `RAVEL_S3_KMS_KEY` | none | Single-key SSE-KMS (ADR-0062 decision 1c): every PUT the default store makes is encrypted with this KMS key ARN, applied to `S3Config.kms_key_id`. Off by default: unset, the store's SSE behavior is unchanged from before this flag existed (whatever bucket-default SSE the deployment has). |
+| `--tenant-kms-config <path>` | `RAVEL_TENANT_KMS_CONFIG` | none | TOML file mapping tenant name to KMS key ARN (`[tenants]` table, ADR-0062 decision 1, ADR-0072 decision 2), EL-7 (issue #764). Requires `--store s3` — refuses to start under `--store memory`, since the per-tenant routing decorator always constructs a real `S3Store`. Off by default: unset, `build_store` produces exactly the store it always has, with no per-tenant routing decorator in the chain at all. See "Per-tenant SSE-KMS routing" below. |
 | `--disable-fold` | | off | Disables the per-(tenant, signal) background catalog fold task (docs/metric-index-plan.md section 4). Folding only lowers query resolve cost; disabling it never changes query results. |
 | `--fold-interval-secs <n>` | | `300` | How often each tenant's fold task wakes up to check for newly sealed hours. |
 | `--maintain-interval-secs <n>` | | `300` | Used only in `--mode maintain`. How often each tenant's maintenance task wakes to run retention, compaction, and the sweeper over every shard of both signals. |
@@ -754,6 +756,96 @@ overwriting an existing record), and it grants no delete: `c/` is not one of
 the deny-delete prefixes (Maintain legitimately sweeps superseded records
 there), so Admin's continued absence from any delete grant is unchanged. See
 ADR-0055's 2026-08-07 amendment for the rationale.
+
+### Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072 decision 2)
+
+EL-7 (issue #764, epic #462) wires the `KmsRoutingStore` decorator
+(`crates/ravel-object-store/src/kms_routing.rs`) into `ravel-server`'s single
+store-construction site. Two independent flags, both off by default:
+
+- `--s3-kms-key <arn>`: single-key SSE-KMS on the one default `S3Store`
+  every deployment already builds (ADR-0062 decision 1c). No routing, no
+  new object key, no `KmsRoutingStore` — every PUT this process makes is
+  simply encrypted with this one key.
+- `--tenant-kms-config <path>`: a TOML file naming per-tenant keys. Only
+  when this is set does `build_store` insert `KmsRoutingStore` between the
+  default `S3Store` and `InstrumentedStore`. It routes `put`/`put_multipart`
+  for a configured tenant's `t/<hash>/` keys to a lazily-built `S3Store`
+  constructed with that tenant's own `kms_key_id`; every other tenant, and
+  every non-write operation, falls through to the default store unchanged.
+
+```toml
+# --tenant-kms-config kms-tenants.toml
+[tenants]
+acme = "arn:aws:kms:us-east-1:111122223333:key/acme-key"
+other = "arn:aws:kms:us-east-1:111122223333:key/other-key"
+```
+
+On first configuration of a tenant's key (and on every later rotation to a
+different key), the same startup path bootstraps that tenant's key-epoch
+history at `t/<hash>/enc` (`crates/ravel-catalog/src/key_epoch.rs`): epoch 0
+is recorded with an empty `key_arn` (the deployment-default-key convention,
+ADR-0062 decision 1c) and `activated_ns = 0` — the start of Unix time, which
+is trivially at or before any tenant's actual earliest live object, so
+`verify-custody`'s epoch-consistency check never sees a pre-existing object
+that predates epoch 0. Epoch 1 follows immediately with the operator's real
+key ARN and `activated_ns` set to the moment of configuration. A restart
+with the same key is a no-op (the last recorded epoch already names it); a
+restart with a different key appends a new epoch, the rotation record.
+
+The `t/<hash>/enc` bootstrap write happens *before* `KmsRoutingStore` is told
+to route that tenant's data through the new key (never the other way
+around, so a crash between the two can never leave data flowing through a
+key with no epoch record), which means the epoch record itself is written
+through whichever key was in effect a moment earlier, not the key it is
+in the process of establishing.
+
+**KMS key policy.** ADR-0072 decision 2's posture: in a hostile
+multi-tenant deployment, each tenant's KMS key policy should grant decrypt
+only to the Ravel role principals of that specific deployment, so a leaked
+role credential alone yields ciphertext — compromise requires the
+credential *and* the KMS grant. A minimal per-tenant key policy, alongside
+the IAM role templates above:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RavelRolesMayUseThisKey",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": [
+          "arn:aws:iam::111122223333:role/ravel-gateway",
+          "arn:aws:iam::111122223333:role/ravel-query",
+          "arn:aws:iam::111122223333:role/ravel-maintain"
+        ]
+      },
+      "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KeyAdministration",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/ravel-admin" },
+      "Action": ["kms:*"],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Scope `RavelRolesMayUseThisKey`'s principal list to only the roles a given
+deployment actually runs with `--tenant-kms-config` set (§"Storage
+credential roles" above) — a role that never routes writes through this key
+gains nothing from being able to decrypt it, and every principal added here
+widens the compromise blast radius this key policy exists to narrow.
+
+**Known gap, not fixed by this change:** the `t/<hash>/enc` key-epoch
+record needs its own IAM read/write grant, which the shipped
+`deploy/iam/*.json` policies do not yet carry — see ADR-0055's 2026-08-12
+amendment for the exact grant and why updating those policy files is
+out of this change's scope.
 
 ### MinIO policies (dev / CI)
 

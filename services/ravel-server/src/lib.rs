@@ -45,6 +45,7 @@ pub mod store_probe;
 pub mod tenancy;
 pub mod tenant;
 pub mod tenant_discovery;
+pub mod tenant_kms;
 #[cfg(all(test, feature = "sql"))]
 mod tests;
 pub mod traces_ingest;

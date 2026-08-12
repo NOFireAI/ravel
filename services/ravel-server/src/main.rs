@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     // here, before any tenant is hashed, because the tenancy scheme is resolved
     // from `sys/tenancy` on this store and must be installed before the first
     // `TenantId::hash()` (which `merge_fold_tenants` below performs).
-    let (store, store_metrics, cache) =
+    let (store, store_metrics, cache, tenant_kms) =
         ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
 
     // Store-backend qualification gate (ADR-0050 section 6, EC7). On any
@@ -94,6 +94,25 @@ async fn main() -> anyhow::Result<()> {
     // only on a keyed bucket. `start` builds the writer from it and wires it
     // into every ingest path.
     let deployment_key = resolved_tenancy.deployment_key;
+
+    // Per-tenant SSE-KMS routing (EL-7, issue #764, ADR-0062 decision 1,
+    // ADR-0072 decision 2). Deferred to here, not folded into `build_store`
+    // above: registering a tenant's key needs `TenantId::hash()`, which is
+    // not valid to call until the tenant-hash scheme installed just above is
+    // in place. `tenant_kms` is `None` unless `--tenant-kms-config` was set
+    // (and `Cli::validate` already refused that combined with `--store
+    // memory`), so this is a no-op on every deployment that has not opted in.
+    let tenant_kms_config = cli.parse_tenant_kms_config()?;
+    if let Some(kms) = tenant_kms.as_deref() {
+        ravel_server::tenant_kms::configure_tenant_kms(
+            kms,
+            store.as_ref(),
+            &tenant_kms_config,
+            now_unix_ns(),
+        )
+        .await
+        .context("failed to configure per-tenant SSE-KMS routing (--tenant-kms-config)")?;
+    }
 
     let tenant_tokens = cli.parse_tenant_tokens()?;
     // Fold and maintenance derive their tenant set from storage each cycle

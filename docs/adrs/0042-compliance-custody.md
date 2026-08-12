@@ -137,3 +137,36 @@ pinned `object_store` version cannot close:
 - `S3Config`'s new `kms_key_id` is optional and per-tenant; a tenant
   with none configured gets today's behavior (whatever bucket-default
   SSE the deployment has) unchanged.
+
+## Amendment (2026-08-12): decision 1's mechanism is key-prefix routing, not a per-tenant `S3Config` field
+
+Decision 1 as originally written says "`S3Config` gains an optional
+`kms_key_id: Option<String>` (per-tenant, sourced the same way tenant
+tokens are configured today...)". EL-7 (issue #764, epic #462, ADR-0062
+decision 1, ADR-0072 decision 2) is the change that actually wires this
+into a running `ravel-server`, and the mechanism it ships is not that:
+`S3Config.kms_key_id` stays a single, process-wide field (ADR-0062
+decision 1c's single-key posture, `--s3-kms-key`) applied to the one
+default `S3Store` every deployment already builds.
+
+Per-tenant routing is a separate decorator, `KmsRoutingStore`
+(`crates/ravel-object-store/src/kms_routing.rs`, already implemented and
+unit-tested before this ADR was written), inserted between the default
+`S3Store` and `InstrumentedStore` only when `--tenant-kms-config` names at
+least one tenant. It intercepts `put`/`put_multipart` for keys under a
+tenant's `t/<hash>/` prefix and routes them to a lazily-built, per-tenant
+`S3Store` constructed with that tenant's own `kms_key_id`; every other
+operation (`get`/`head`/`list`/`list_delimited`/`delete`) and every
+non-configured tenant's writes fall through unchanged to the default
+store. There is no per-tenant field on `S3Config` itself — there is one
+`S3Config` per tenant, each a full clone of the default config with only
+`kms_key_id` swapped, built on demand.
+
+This is additive, not a reversal: decision 1's actual intent (BYOK, "the
+tenant supplies their own `kms_key_id`") is unchanged, and the object-key
+layout gains nothing beyond the already-authorized `t/<hash>/enc`
+key-epoch record (ADR-0062 decision 1b, EL-2). Only the "how" — a
+per-tenant `S3Config` field versus a routing decorator over per-tenant
+`S3Store` instances keyed by prefix — was wrong in the original text, and
+is corrected here rather than left to mislead a future reader of decision
+1 in isolation.
