@@ -196,6 +196,11 @@ base64 = { workspace = true }
 # check that the IPC bytes the endpoint emits are readable by an independent
 # arrow version rather than only by the one that wrote them.
 arrow = { workspace = true }
+# Test-only: --tenant-kms-config unit tests (src/store.rs) need a real path on
+# disk; a unique NamedTempFile avoids the cross-test collision a hand-rolled
+# std::process::id()-keyed path would risk when tests run on threads within
+# one test binary.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

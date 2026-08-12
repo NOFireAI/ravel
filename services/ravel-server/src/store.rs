@@ -3,10 +3,15 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
-use ravel_object_store::{Capabilities, InstrumentedStore, ObjectStoreBackend, StoreMetrics};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, KmsRoutingStore,
+    ListPage, MultipartUpload, ObjectMeta, ObjectStoreBackend, PageToken, PutOptions, PutOutcome,
+    StoreError, StoreMetrics,
+};
 use ravel_query::CacheFetchError;
 
 use crate::config::{Cli, Mode, StoreKind};
@@ -167,20 +172,87 @@ pub fn check_mandatory_capabilities(
 /// returned so the caller can hold it for that later work. The cache is
 /// exposed: the caller attaches it to the query fetchers via their existing
 /// `with_cache` builders.
-/// Backend, its metrics handle, and the optional ADR-0046 read cache, as
-/// built by [`build_store`].
+/// Backend, its metrics handle, the optional ADR-0046 read cache, and (only
+/// when `--tenant-kms-config` is set) a handle onto the live
+/// [`KmsRoutingStore`] embedded in the backend chain, as built by
+/// [`build_store`].
+///
+/// The fourth element exists because `build_store` runs before the
+/// tenant-hash scheme is installed (see `main.rs`'s ordering note on its
+/// `build_store` call): hashing a tenant name to register its key with
+/// `KmsRoutingStore::set_tenant_key` needs `TenantId::hash()`, which is not
+/// valid to call yet at this point in startup. `main.rs` holds this handle
+/// and calls [`crate::tenant_kms::configure_tenant_kms`] on it once the
+/// scheme is installed. `None` when no `KmsRoutingStore` was inserted at all
+/// (either `--store memory`, or `--store s3` with no `--tenant-kms-config`).
 pub type BuiltStore = (
     Arc<dyn ObjectStoreBackend>,
     Arc<StoreMetrics>,
     Option<Arc<Cache<CacheFetchError>>>,
+    Option<Arc<KmsRoutingStore>>,
 );
 
+/// Delegates every [`ObjectStoreBackend`] method to a shared handle. Exists
+/// only so the same [`KmsRoutingStore`] instance can be both the backend
+/// [`InstrumentedStore`] wraps for live traffic, and a handle `build_store`
+/// returns separately for `main.rs` to call `set_tenant_key` on later:
+/// `InstrumentedStore<S>` owns its `S` by value, so wrapping `KmsRoutingStore`
+/// directly would leave no other way to reach the same instance afterward.
+struct SharedKmsStore(Arc<KmsRoutingStore>);
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for SharedKmsStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.0.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.0.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.0.put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.0.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.0.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.0.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.0.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.0.capabilities()
+    }
+}
+
 pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
-    let (store, metrics): (Arc<dyn ObjectStoreBackend>, Arc<StoreMetrics>) = match cli.store {
+    let (store, metrics, kms): (
+        Arc<dyn ObjectStoreBackend>,
+        Arc<StoreMetrics>,
+        Option<Arc<KmsRoutingStore>>,
+    ) = match cli.store {
         StoreKind::Memory => {
             let instrumented = InstrumentedStore::new(MemoryStore::new());
             let metrics = instrumented.metrics();
-            (Arc::new(instrumented), metrics)
+            (Arc::new(instrumented), metrics, None)
         }
         StoreKind::S3 => {
             let bucket = cli
@@ -210,15 +282,29 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
                 secret_access_key,
                 allow_http,
                 force_path_style: true,
-                kms_key_id: None,
+                kms_key_id: cli.s3_kms_key.clone(),
                 session_token: None,
                 credentials_file: None,
             };
-            let store = S3Store::new(config)
+            let store = S3Store::new(config.clone())
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
-            let instrumented = InstrumentedStore::new(store);
-            let metrics = instrumented.metrics();
-            (Arc::new(instrumented), metrics)
+
+            // EL-7 (issue #764, ADR-0062 decision 1, ADR-0072 decision 2): off
+            // by default. Without --tenant-kms-config this builds exactly
+            // today's store, byte-for-byte, no KmsRoutingStore in the chain.
+            if cli.tenant_kms_config.is_some() {
+                let kms = Arc::new(KmsRoutingStore::new(
+                    Arc::new(store) as Arc<dyn ObjectStoreBackend>,
+                    config,
+                ));
+                let instrumented = InstrumentedStore::new(SharedKmsStore(kms.clone()));
+                let metrics = instrumented.metrics();
+                (Arc::new(instrumented), metrics, Some(kms))
+            } else {
+                let instrumented = InstrumentedStore::new(store);
+                let metrics = instrumented.metrics();
+                (Arc::new(instrumented), metrics, None)
+            }
         }
     };
 
@@ -226,7 +312,7 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
     // through, so this still gates on the wrapped backend's own declaration.
     check_capabilities(store.as_ref(), cli.mode)?;
     let cache = build_cache(cli);
-    Ok((store, metrics, cache))
+    Ok((store, metrics, cache, kms))
 }
 
 #[cfg(test)]
@@ -477,7 +563,11 @@ mod tests {
         use ravel_object_store::PutOptions;
 
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
-        let (store, metrics, _cache) = build_store(&cli).expect("memory backend must build");
+        let (store, metrics, _cache, kms) = build_store(&cli).expect("memory backend must build");
+        assert!(
+            kms.is_none(),
+            "no --tenant-kms-config means no KmsRoutingStore handle"
+        );
         assert_eq!(
             store.capabilities(),
             MemoryStore::new().capabilities(),
@@ -500,5 +590,80 @@ mod tests {
         );
         assert_eq!(snap.put.ok, 1);
         assert_eq!(snap.put.bytes, 3);
+    }
+
+    /// EL-7's off-by-default guarantee: `--store s3` with no
+    /// `--tenant-kms-config` builds exactly today's chain, no
+    /// `KmsRoutingStore` anywhere in it.
+    #[test]
+    fn build_store_s3_without_tenant_kms_config_inserts_no_kms_routing() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ])
+        .expect("flags parse");
+        let (_store, _metrics, _cache, kms) =
+            build_store(&cli).expect("dummy S3 config must build without network access");
+        assert!(
+            kms.is_none(),
+            "no --tenant-kms-config must yield no KmsRoutingStore handle"
+        );
+    }
+
+    /// EL-7's reachability: `--tenant-kms-config` on `--store s3` inserts a
+    /// live `KmsRoutingStore` between the raw `S3Store` and the outermost
+    /// `InstrumentedStore`, and the returned handle is that same instance
+    /// (proven by `set_tenant_key` on the handle changing routing decisions
+    /// the returned `store` handle's `put` calls make).
+    #[tokio::test]
+    async fn build_store_s3_with_tenant_kms_config_inserts_kms_routing() {
+        use clap::Parser;
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp tenant-kms-config file");
+        file.write_all(
+            br#"
+                [tenants]
+                acme = "arn:aws:kms:us-east-1:111122223333:key/acme"
+            "#,
+        )
+        .expect("write temp file");
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+            "--tenant-kms-config",
+            file.path().to_str().expect("temp path is valid utf-8"),
+        ])
+        .expect("flags parse");
+        let (store, _metrics, _cache, kms) =
+            build_store(&cli).expect("dummy S3 config must build without network access");
+        let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
+
+        assert_eq!(
+            store.capabilities(),
+            kms.capabilities(),
+            "the returned store handle must be (or wrap) the same KmsRoutingStore instance"
+        );
     }
 }

@@ -86,6 +86,36 @@ pub struct Cli {
     #[arg(long, env = "RAVEL_S3_SECRET_KEY")]
     pub s3_secret_key: Option<String>,
 
+    /// Single-key SSE-KMS (ADR-0062 decision 1c): every PUT this process
+    /// makes through the default store is encrypted with this KMS key ARN,
+    /// applied via `S3Config::kms_key_id`. Mutually exclusive in practice
+    /// with `--tenant-kms-config`'s per-tenant posture, though nothing here
+    /// enforces that; the two are independent knobs on independent stores
+    /// (this one on the default `S3Store`, that one on the `KmsRoutingStore`
+    /// wrapping it) and setting both is meaningful (a per-tenant key for
+    /// configured tenants, this key for every other tenant's writes, since
+    /// `KmsRoutingStore` routes an unconfigured tenant's writes to the
+    /// default store verbatim). Absent (the default): no behavior change,
+    /// whatever bucket-default SSE the deployment has continues to apply.
+    #[arg(long, env = "RAVEL_S3_KMS_KEY")]
+    pub s3_kms_key: Option<String>,
+
+    /// Path to a TOML per-tenant SSE-KMS file (ADR-0062 decision 1,
+    /// ADR-0072 decision 2): a `[tenants]` table mapping tenant name to KMS
+    /// key ARN. Requires `--store s3` (`KmsRoutingStore`'s per-tenant
+    /// builder always constructs a real `S3Store`; there is no sensible
+    /// `S3Config` to build one from under `--store memory`). Absent (the
+    /// default): no `KmsRoutingStore` in the chain at all, byte-for-byte
+    /// today's store. See [`crate::tenant_kms`] for the file format and the
+    /// key-epoch bootstrap this triggers on first configuration of a
+    /// tenant's key.
+    #[arg(
+        long = "tenant-kms-config",
+        env = "RAVEL_TENANT_KMS_CONFIG",
+        value_name = "PATH"
+    )]
+    pub tenant_kms_config: Option<PathBuf>,
+
     /// Disables the per-(tenant, signal) background catalog fold task
     /// (docs/metric-index-plan.md section 4). Folding is a pure optimization
     /// for query resolve cost; disabling it never changes query results, only
@@ -1413,6 +1443,18 @@ impl Cli {
             }
         }
 
+        // `KmsRoutingStore`'s per-tenant builder always constructs a real
+        // `S3Store` (crates/ravel-object-store/src/kms_routing.rs); under
+        // `--store memory` there is no `S3Config` to build one from, so the
+        // flag would be silently inert. Fail startup instead.
+        if self.tenant_kms_config.is_some() && !matches!(self.store, StoreKind::S3) {
+            anyhow::bail!(
+                "--tenant-kms-config requires --store s3: KmsRoutingStore's per-tenant builder \
+                 always constructs a real S3Store, which --store memory has no S3Config to build \
+                 one from."
+            );
+        }
+
         Ok(())
     }
 
@@ -1502,6 +1544,21 @@ impl Cli {
             .map_err(|e| anyhow::anyhow!("could not read --limits-file {path:?}: {e}"))?;
         limits::parse_limits_file(&text)
             .map_err(|e| anyhow::anyhow!("invalid --limits-file {}: {e}", path.display()))
+    }
+
+    /// Load and validate `--tenant-kms-config` (ADR-0062 decision 1,
+    /// ADR-0072 decision 2). Absent flag means no per-tenant KMS routing at
+    /// all: [`crate::tenant_kms::TenantKmsConfig::is_empty`] is `true`, and
+    /// `build_store` inserts no `KmsRoutingStore`. `Cli::validate` already
+    /// refused this flag under `--store memory`.
+    pub fn parse_tenant_kms_config(&self) -> anyhow::Result<crate::tenant_kms::TenantKmsConfig> {
+        let Some(path) = self.tenant_kms_config.as_deref() else {
+            return Ok(crate::tenant_kms::TenantKmsConfig::default());
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("could not read --tenant-kms-config {path:?}: {e}"))?;
+        crate::tenant_kms::parse_tenant_kms_config(&text)
+            .map_err(|e| anyhow::anyhow!("invalid --tenant-kms-config {}: {e}", path.display()))
     }
 }
 
@@ -2587,6 +2644,43 @@ mod tests {
             err.to_string().contains("--mtls-listener"),
             "error names the missing flag: {err}"
         );
+    }
+
+    #[test]
+    fn tenant_kms_config_under_memory_store_fails_validate() {
+        let err = cli(&["--tenant-kms-config", "/dev/null"])
+            .validate()
+            .expect_err("--tenant-kms-config requires --store s3");
+        assert!(
+            err.to_string().contains("--tenant-kms-config"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn tenant_kms_config_under_s3_store_validates() {
+        cli(&[
+            "--store",
+            "s3",
+            "--tenant-kms-config",
+            "/dev/null",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ])
+        .validate()
+        .expect("--tenant-kms-config under --store s3 must validate");
+    }
+
+    #[test]
+    fn absent_tenant_kms_config_yields_no_tenants() {
+        let parsed = cli(&[])
+            .parse_tenant_kms_config()
+            .expect("no --tenant-kms-config parses to an empty config");
+        assert!(parsed.is_empty());
     }
 
     #[test]

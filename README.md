@@ -364,6 +364,27 @@ writes `operator` and only ever removes entries carrying that same tag, so a
 tenant provisioned by this command survives an operator reconcile even when
 its Secret does not name that tenant.
 
+## Per-tenant encryption (SSE-KMS)
+
+Every data-object PUT can be encrypted with a KMS key, either one key for
+the whole deployment (`--s3-kms-key`) or one key per tenant
+(`--tenant-kms-config <path>`, a TOML file mapping tenant name to KMS key
+ARN, ADR-0062 decision 1 / ADR-0072 decision 2). Per-tenant routing is a
+storage-layer decorator (`KmsRoutingStore`) that sends a tenant's writes to
+a `S3Store` built with that tenant's own key; every other tenant, and every
+non-PUT operation, is unaffected. Both flags are off by default: without
+them `ravel-server` builds exactly the store it always has. The first time
+a tenant's key is configured, `ravel-server` records the key's activation
+as an immutable, append-only epoch history (`t/<hash>/enc`) that
+`ravel-cli verify-custody` reads back to confirm every object under that
+tenant predates or postdates the right key. See
+[docs/guides/operations.md](docs/guides/operations.md)'s "Per-tenant
+SSE-KMS routing" section for the config shape and the KMS key policy
+template, and the ADR-0055 2026-08-12 amendment for a known gap: the
+`deploy/iam/*.json` role policies do not yet grant access to the new
+`t/*/enc` key, a required follow-up before this ships against an
+already-provisioned bucket.
+
 ## Container images
 
 ```sh
