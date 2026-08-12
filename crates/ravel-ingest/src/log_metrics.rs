@@ -87,6 +87,16 @@ pub struct LogIngestMetrics {
     /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
     /// the log-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
     stale_provisioning_flushes: AtomicU64,
+    /// Flushes routed on a last-known-good provisioning view past the refresh
+    /// interval `C`, inside the bounded NF-2 grace window, because the
+    /// provisioning re-read could not complete but the cached view's validity
+    /// horizon had not been crossed (`GenerationSwitch::try_grace_extend`).
+    /// Degraded, not failed: distinct from `stale_provisioning_flushes`, which
+    /// counts a flush that failed closed outright. A sustained rise here means
+    /// the store is slow/throttled and this router is degraded-but-available
+    /// rather than fleet-wide-outed; the log-pipeline counterpart of
+    /// `IngestMetrics::grace_extended_stale_flushes`.
+    grace_extended_stale_flushes: AtomicU64,
     /// Objects flushed carrying a non-empty POSTINGS section (ADR-0049, issue
     /// #511). The denominator for average section bytes per indexed object; an
     /// object whose resolved indexed-field list produced no section is not
@@ -124,6 +134,7 @@ pub struct LogIngestMetricsSnapshot {
     pub stream_id_collisions: u64,
     pub shard_deaths: u64,
     pub stale_provisioning_flushes: u64,
+    pub grace_extended_stale_flushes: u64,
     pub postings_objects: u64,
     pub postings_bytes_total: u64,
     pub postings_indexed_fields_total: u64,
@@ -189,6 +200,11 @@ impl LogIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_grace_extended_stale_flush(&self) {
+        self.grace_extended_stale_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Fold one flushed object's write-side POSTINGS counters
     /// ([`ravel_logseg::writer::WriteStats`]) into the cumulative totals
     /// (ADR-0049, issue #511). An object with no POSTINGS section
@@ -225,6 +241,7 @@ impl LogIngestMetrics {
             stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
+            grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
             postings_objects: self.postings_objects.load(Ordering::Relaxed),
             postings_bytes_total: self.postings_bytes_total.load(Ordering::Relaxed),
             postings_indexed_fields_total: self

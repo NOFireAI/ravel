@@ -67,6 +67,10 @@ pub struct SpanIngestMetrics {
     /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
     /// the span-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
     stale_provisioning_flushes: AtomicU64,
+    /// Flushes routed on a last-known-good provisioning view inside the
+    /// bounded NF-2 grace window (ADR-0052 degraded-safe fallback), the
+    /// span-pipeline counterpart of `IngestMetrics::grace_extended_stale_flushes`.
+    grace_extended_stale_flushes: AtomicU64,
 }
 
 /// Point-in-time copy of [`SpanIngestMetrics`] for scraping. See the
@@ -85,6 +89,7 @@ pub struct SpanIngestMetricsSnapshot {
     pub acks_err: u64,
     pub shard_deaths: u64,
     pub stale_provisioning_flushes: u64,
+    pub grace_extended_stale_flushes: u64,
 }
 
 impl SpanIngestMetrics {
@@ -141,6 +146,13 @@ impl SpanIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush routed on a last-known-good provisioning view inside the
+    /// bounded NF-2 grace window (ADR-0052 degraded-safe fallback).
+    pub(crate) fn record_grace_extended_stale_flush(&self) {
+        self.grace_extended_stale_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> SpanIngestMetricsSnapshot {
         SpanIngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
@@ -155,6 +167,7 @@ impl SpanIngestMetrics {
             acks_err: self.acks_err.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
+            grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
         }
     }
 }

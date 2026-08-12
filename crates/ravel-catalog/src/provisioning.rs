@@ -341,17 +341,12 @@ impl std::fmt::Display for FloorDefect {
 /// shard key field (ADR-0052 section 7; `l0/0000/`..`l0/9999/`).
 pub const MAX_SHARD_COUNT: u32 = 10_000;
 
-/// The read-side scan slack window `S`, in ingest hours (ADR-0052 sections 3
-/// and 4). A flush pins its ingest-hour bucket `h` at wall-clock time `t`, but
-/// its records were routed up to `max_flush_delay` earlier and the flush lives
-/// at most `max_flush_lifetime`, plus inter-writer clock skew; ADR-0052 section
-/// 3 defines `S = ceil(max_flush_delay + max_flush_lifetime + max tolerated
-/// clock skew)` in hours. A straggler routed under a retiring (larger) count
-/// into an early hour of the successor generation therefore lands in a shard
-/// index above the successor's range, and the scan rule ([`scan_count`]) must
-/// keep the retiring generation's count in the scan set for `S` hours past the
-/// successor's activation so that straggler is still found. With today's ingest
-/// defaults (`max_flush_delay` 500ms + `max_flush_lifetime` 3600s), `S = 2`.
+/// The flush-timing component of the read-side scan slack `S`, in ingest
+/// hours: `ceil(max_flush_delay + max_flush_lifetime)` with today's ingest
+/// defaults (`max_flush_delay` 500ms + `max_flush_lifetime` 3600s) = 2. Held
+/// separately from [`TOLERATED_CLOCK_SKEW_HOURS`] so the two components of the
+/// ADR-0052 section 3 formula (below) are each named and independently
+/// reviewable, rather than folded into one unexplained literal.
 ///
 /// This is a manually-chosen constant local to `ravel-catalog`, deliberately
 /// not a cross-crate reference to `ravel-ingest`'s flush config:
@@ -359,7 +354,48 @@ pub const MAX_SHARD_COUNT: u32 = 10_000;
 /// other way). If ingest's flush bounds ever change materially, this constant
 /// must be revisited in lockstep; the derivation above is recorded so that
 /// review is possible.
-pub const DEFAULT_SCAN_SLACK_HOURS: u32 = 2;
+pub const FLUSH_BOUND_SLACK_HOURS: u32 = 2;
+
+/// The tolerated inter-writer/reader clock skew folded into the read-side scan
+/// slack `S` (ADR-0052 section 3, finding NF-3). ADR-0052 section 3 always
+/// named "max tolerated clock skew" as a term of `S = ceil(max_flush_delay +
+/// max_flush_lifetime + max tolerated clock skew)`, but the shipped constant
+/// (`DEFAULT_SCAN_SLACK_HOURS = 2`, pre-NF-3) omitted it -- the formula's own
+/// worked example added no nonzero skew term, so a writer clock skewed by more
+/// than a few minutes past the flush-timing bound routed a decrease straggler
+/// into a shard index outside the scan set: silent invisibility, worst on a
+/// shard-count decrease (the load-bearing NF-3 fix this constant closes).
+///
+/// One hour, mirroring [`crate::idempotency`]'s
+/// `IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` (`crates/ravel-ingest/src/
+/// idempotency.rs`) rather than inventing a second, disagreeing fleet-wide
+/// clock-skew tolerance: both constants bound the same class of assumption
+/// (one writer's clock may run up to this far ahead of the fleet's shared
+/// notion of "now") applied to a different keyspace. ADR-0052 fixed the
+/// formula but never a concrete number for this term (open question 2 fixes
+/// `C`/`L`'s inequality, not `S`'s skew term); a future ADR-0052 amendment
+/// should record this value normatively so it cannot silently drift back to
+/// zero the way the pre-NF-3 constant did.
+pub const TOLERATED_CLOCK_SKEW_HOURS: u32 = 1;
+
+/// The read-side scan slack window `S`, in ingest hours (ADR-0052 sections 3
+/// and 4): `S = ceil(max_flush_delay + max_flush_lifetime + max tolerated
+/// clock skew)`, i.e. [`FLUSH_BOUND_SLACK_HOURS`] +
+/// [`TOLERATED_CLOCK_SKEW_HOURS`]. A flush pins its ingest-hour bucket `h` at
+/// wall-clock time `t`, but its records were routed up to `max_flush_delay`
+/// earlier and the flush lives at most `max_flush_lifetime`, plus
+/// inter-writer clock skew. A straggler routed under a retiring (larger)
+/// count into an early hour of the successor generation therefore lands in a
+/// shard index above the successor's range, and the scan rule
+/// ([`scan_count`]) must keep the retiring generation's count in the scan set
+/// for `S` hours past the successor's activation so that straggler is still
+/// found, for any writer whose clock skew stays within
+/// [`TOLERATED_CLOCK_SKEW_HOURS`]. A writer skewed beyond that bound is a
+/// distinct, unclosed hazard (see NF-3 in
+/// docs/reviews/2026-08-adversarial-program/RAVEL-ADVERSARIAL-REVIEW-V2.md):
+/// no finite read-side slack can cover unbounded skew, so the bound must be
+/// tolerated-but-finite and documented, not silently assumed zero.
+pub const DEFAULT_SCAN_SLACK_HOURS: u32 = FLUSH_BOUND_SLACK_HOURS + TOLERATED_CLOCK_SKEW_HOURS;
 
 /// Nanoseconds per unix hour, the unit `activation_hour` and `ingest_hour_bucket`
 /// count in. Held here so the reshard append can derive the current hour from a
@@ -1967,6 +2003,116 @@ mod tests {
         );
         assert_eq!(scan_count(&gens, 201, 2), 8, "still inside gen1's slack");
         assert_eq!(scan_count(&gens, 202, 2), 2, "slack closed: gen2's count");
+    }
+
+    /// NF-3 (issue #655): `DEFAULT_SCAN_SLACK_HOURS` is the sum of
+    /// `FLUSH_BOUND_SLACK_HOURS` and `TOLERATED_CLOCK_SKEW_HOURS`, not the
+    /// flush-timing term alone. Pins the composition so a future edit to
+    /// either summand cannot silently drop the clock-skew term back to the
+    /// pre-NF-3 omission this issue fixed.
+    #[test]
+    fn nf3_default_scan_slack_hours_includes_clock_skew_term() {
+        assert_eq!(
+            DEFAULT_SCAN_SLACK_HOURS,
+            FLUSH_BOUND_SLACK_HOURS + TOLERATED_CLOCK_SKEW_HOURS
+        );
+        assert_eq!(TOLERATED_CLOCK_SKEW_HOURS, 1);
+        assert_eq!(DEFAULT_SCAN_SLACK_HOURS, 3);
+    }
+
+    /// NF-3 load-bearing test (issue #655): a decrease straggler whose writer
+    /// clock lags true time by exactly `TOLERATED_CLOCK_SKEW_HOURS` lands in an
+    /// ingest-hour bucket the pre-NF-3 slack window did not scan, and the
+    /// widened window scans it.
+    ///
+    /// Setup: gen0 count 8 (shards 0..8) from hour 0, gen1 count 4 (shards
+    /// 0..4) from hour 100. A straggler routed under gen0 into shard 6 has its
+    /// flush pinned at ingest-hour bucket 102: `activation_hour (100) +
+    /// FLUSH_BOUND_SLACK_HOURS (2)`, the latest hour flush-timing alone
+    /// accounts for, plus this writer's clock running
+    /// `TOLERATED_CLOCK_SKEW_HOURS` (1) behind true time -- exactly the
+    /// tolerated bound, not beyond it.
+    ///
+    /// The flipped line is `DEFAULT_SCAN_SLACK_HOURS`'s pre-NF-3 definition,
+    /// `pub const DEFAULT_SCAN_SLACK_HOURS: u32 = 2;` (the flush-timing term
+    /// alone, skew omitted): with that value, `scan_count` at hour 102 excludes
+    /// generation 0 (`102 < 100 + 2` is false), so the reader's scan domain is
+    /// `0..4` and never visits shard 6 -- the straggler is silently invisible,
+    /// even though its write was acknowledged. With the fixed value 3
+    /// (`FLUSH_BOUND_SLACK_HOURS + TOLERATED_CLOCK_SKEW_HOURS`), `102 < 100 + 3`
+    /// holds, so generation 0's count of 8 is still in the scan set, the
+    /// reader's domain is `0..8`, and shard 6 -- and the straggler in it -- is
+    /// found. This is exactly the invariant the fix protects: no acknowledged
+    /// write is ever routed to a shard index the read-side scan set for its
+    /// hour does not cover, for any writer within the tolerated skew bound.
+    #[test]
+    fn nf3_clock_skewed_straggler_visible_only_after_slack_widening() {
+        let gens = [sg(0, 8, 0), sg(1, 4, 100)];
+        let straggler_shard = 6u32;
+        let straggler_hour = 102;
+
+        let pre_fix_slack_hours = 2; // the flipped line: the old, skew-omitting DEFAULT_SCAN_SLACK_HOURS.
+        let pre_fix_scan_count = scan_count(&gens, straggler_hour, pre_fix_slack_hours);
+        assert_eq!(
+            pre_fix_scan_count, 4,
+            "pre-fix: the scan domain shrinks to 0..4 before the straggler's hour is reached"
+        );
+        assert!(
+            straggler_shard >= pre_fix_scan_count,
+            "pre-fix: shard 6 is outside the 0..{pre_fix_scan_count} scan domain -- silently invisible"
+        );
+
+        let post_fix_scan_count = scan_count(&gens, straggler_hour, DEFAULT_SCAN_SLACK_HOURS);
+        assert_eq!(
+            post_fix_scan_count, 8,
+            "post-fix: the widened slack keeps generation 0's count in the scan set"
+        );
+        assert!(
+            straggler_shard < post_fix_scan_count,
+            "post-fix: shard 6 is inside the 0..{post_fix_scan_count} scan domain -- found"
+        );
+    }
+
+    /// NF-3 boundary case: a straggler exactly at the tolerated skew bound (this
+    /// test) is covered; one hour further -- a writer skewed *beyond* the
+    /// tolerated bound -- is the documented, unclosed hazard (no finite slack
+    /// covers unbounded skew) and is correctly not covered. Also a determinism
+    /// check: repeated calls with identical inputs (pure functions, no clock
+    /// read) agree, and `max_scan_count_over_range` collapsed to a single hour
+    /// agrees with `scan_count` at that hour.
+    #[test]
+    fn nf3_straggler_exactly_at_skew_boundary_is_handled() {
+        let gens = [sg(0, 8, 0), sg(1, 4, 100)];
+        let last_covered_hour = 102; // activation(100) + FLUSH_BOUND_SLACK_HOURS(2) + TOLERATED_CLOCK_SKEW_HOURS(1) - 1.
+        let first_uncovered_hour = 103; // one hour beyond the tolerated skew bound.
+
+        assert_eq!(
+            scan_count(&gens, last_covered_hour, DEFAULT_SCAN_SLACK_HOURS),
+            8,
+            "at the tolerated skew boundary: still covered"
+        );
+        assert_eq!(
+            scan_count(&gens, first_uncovered_hour, DEFAULT_SCAN_SLACK_HOURS),
+            4,
+            "one hour past the tolerated skew bound: the documented open hazard, not covered"
+        );
+
+        // Determinism: identical inputs agree on repeat, and the range form
+        // round-trips against the per-hour form for a single-hour range.
+        assert_eq!(
+            scan_count(&gens, last_covered_hour, DEFAULT_SCAN_SLACK_HOURS),
+            scan_count(&gens, last_covered_hour, DEFAULT_SCAN_SLACK_HOURS),
+        );
+        assert_eq!(
+            max_scan_count_over_range(
+                &gens,
+                last_covered_hour,
+                last_covered_hour,
+                DEFAULT_SCAN_SLACK_HOURS
+            ),
+            scan_count(&gens, last_covered_hour, DEFAULT_SCAN_SLACK_HOURS),
+            "a single-hour range agrees with the per-hour rule"
+        );
     }
 
     /// `max_scan_count_over_range`: a single implicit generation scans its
