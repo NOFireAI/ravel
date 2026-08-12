@@ -7,8 +7,9 @@
 //!   `SeriesFetch` gRPC service, guarding every call with a shared
 //!   cluster-internal bearer token and admitting it against a distinct
 //!   [`FragmentAdmission`] class (never the client-query cap). Per request it
-//!   resolves a full-window snapshot for the request's tenant, builds an interim
-//!   content-hash [`SnapshotSegmentResolver`], and delegates to the in-crate
+//!   resolves a snapshot for the request's tenant over the request's event-time
+//!   window (issue #885 item 1), builds an interim content-hash
+//!   [`SnapshotSegmentResolver`], and delegates to the in-crate
 //!   [`SeriesFetchService`] so a fragment fetch is byte-identical to what the
 //!   local path would read.
 //! * [`RoutingSliceFetcher`] -- the coordinator side. It implements the
@@ -63,8 +64,10 @@ use ravel_object_store::instrument::{LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKE
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_query::CacheFetchError;
 use ravel_query::SegmentFetcher;
-use ravel_query::distrib::client::{DistribError, SliceFetcher, SliceResponse};
-use ravel_query::distrib::codec::{self, CodecError};
+use ravel_query::distrib::client::{
+    DistribError, SliceFetcher, SliceResponse, decode_slice_frames,
+};
+use ravel_query::distrib::codec;
 use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use ravel_query::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
@@ -72,15 +75,6 @@ use ravel_query::http::TenantResolver;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use tonic::transport::Channel;
 use uuid::Uuid;
-
-/// The frozen full-time-window a worker resolves a snapshot over (see
-/// [`FragmentService::build_resolver`]): the whole possible timestamp domain, so
-/// the resolved snapshot is a superset of whatever pinned window the coordinator
-/// dispatched from, and every shipped content hash resolves.
-const FULL_WINDOW: TimeRange = TimeRange {
-    start_ns: i64::MIN,
-    end_ns: i64::MAX,
-};
 
 /// Bound on establishing a channel to a remote worker. A dead or unreachable
 /// worker must never stall a query: the coordinator times out here and falls
@@ -408,13 +402,22 @@ impl FragmentService {
     }
 
     /// Build the interim content-hash resolver for one request by resolving a
-    /// full-window snapshot for the request's tenant and metrics signal. The
-    /// full window is a superset of the coordinator's pinned window, so every
-    /// pinned content hash resolves and the fetch reads exactly the pinned
-    /// segments (byte-identical to the local path). A tenant we cannot decode,
-    /// or a signal other than metrics, yields an empty resolver: the delegate
-    /// service then returns the same typed status (`BadData`/`Unsupported`) it
-    /// would for any such request, which the coordinator handles.
+    /// snapshot for the request's tenant and metrics signal over the request's
+    /// event-time window (issue #885 item 1).
+    ///
+    /// The coordinator carries the event-time envelope of the slice's pinned
+    /// segments in `window_start_ns`/`window_end_ns` (see
+    /// [`ravel_query::distrib`]'s `slice_event_window`). That envelope contains
+    /// every pinned segment's own event range, so a resolve bounded to it still
+    /// returns every pinned segment (a `Catalog::resolve` over a window returns
+    /// every segment whose events overlap it): the resolved snapshot stays a
+    /// superset of the dispatched pins, and the fetch reads exactly the pinned
+    /// segments (byte-identical to the local path), while no longer paying a
+    /// whole-history catalog resolve on the query critical path. A tenant we
+    /// cannot decode, or a signal other than metrics, yields an empty resolver:
+    /// the delegate service then returns the same typed status
+    /// (`BadData`/`Unsupported`) it would for any such request, which the
+    /// coordinator handles.
     async fn build_resolver(&self, request: &pb::FetchRequest) -> Arc<SnapshotSegmentResolver> {
         let Some(tenant_hash) = decode_tenant_hash(&request.tenant_hash) else {
             return Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
@@ -424,11 +427,15 @@ impl FragmentService {
         if codec::signal_from_u32(request.signal) != Ok(Signal::Metrics) {
             return Arc::new(SnapshotSegmentResolver::new(std::iter::empty()));
         }
+        let window = TimeRange {
+            start_ns: request.window_start_ns,
+            end_ns: request.window_end_ns,
+        };
         let now_ns = self.inner.clock.now_ns();
         match self
             .inner
             .catalog
-            .resolve(&tenant_hash, Signal::Metrics, FULL_WINDOW, &[], now_ns)
+            .resolve(&tenant_hash, Signal::Metrics, window, &[], now_ns)
             .await
         {
             Ok(snapshot) => Arc::new(SnapshotSegmentResolver::new(snapshot.segments)),
@@ -569,7 +576,7 @@ impl FragmentService {
     /// permit, not an inbound request from another coordinator.
     async fn run_local(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
         let frames = self.resolve_and_run(request).await;
-        decode_frames(frames)
+        decode_slice_frames(frames)
     }
 }
 
@@ -901,7 +908,7 @@ impl RoutingSliceFetcher {
         {
             frames.push(frame);
         }
-        decode_frames(frames)
+        decode_slice_frames(frames)
     }
 }
 
@@ -1012,52 +1019,6 @@ fn rendezvous_unit(request: &pb::FetchRequest) -> Option<(TenantHash, Signal, u3
 fn decode_tenant_hash(bytes: &[u8]) -> Option<TenantHash> {
     let arr: [u8; 16] = bytes.try_into().ok()?;
     Some(TenantHash(arr))
-}
-
-/// Decode a slice's frame sequence into a [`SliceResponse`], the same decode
-/// [`ravel_query::distrib::client::RemoteSliceFetcher`] applies to a live gRPC
-/// stream, shared here so the local and remote paths produce identical shapes.
-fn decode_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceResponse, DistribError> {
-    let mut scalar = Vec::new();
-    let mut summary: Option<pb::Summary> = None;
-    for frame in frames {
-        match frame.frame {
-            Some(pb::fetch_response::Frame::Series(series)) => {
-                scalar.extend(codec::decode_series_frame(series)?);
-            }
-            Some(pb::fetch_response::Frame::Hist(_)) => {
-                return Err(DistribError::Codec(CodecError::EmptyFrame));
-            }
-            Some(pb::fetch_response::Frame::Summary(s)) => {
-                if summary.is_some() {
-                    return Err(DistribError::MultipleSummaries);
-                }
-                summary = Some(s);
-            }
-            None => return Err(DistribError::EmptyFrame),
-        }
-    }
-    let summary = summary.ok_or(DistribError::NoSummary)?;
-    let status = summary
-        .status
-        .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
-    let code = codec::decode_status_code(status.code)?;
-    let accounting = summary
-        .accounting
-        .map(codec::decode_accounting)
-        .unwrap_or_default();
-    Ok(SliceResponse {
-        scalar,
-        accounting,
-        stats: ravel_query::FetchStats {
-            raw_f64_pages: summary.raw_f64_pages,
-            raw_f64_bytes: summary.raw_f64_bytes,
-        },
-        series_returned: summary.series_returned,
-        samples_returned: summary.samples_returned,
-        status: code,
-        status_message: status.message,
-    })
 }
 
 /// Spawn the query-worker heartbeat loop (ADR-0071 deliverable 3). Writes this
@@ -1183,7 +1144,7 @@ impl SliceFetcher for FederationSliceFetcher {
         // A remote's frames get the same decode validation as an intra-cluster
         // slice's (ADR-0071 trust boundary): a malformed frame is a typed
         // DistribError, never a panic and never silently dropped data.
-        decode_frames(frames)
+        decode_slice_frames(frames)
     }
 }
 
@@ -1841,7 +1802,7 @@ mod tests {
         while let Some(frame) = stream.next().await {
             frames.push(frame.expect("in-crate stream never errors"));
         }
-        Ok(decode_frames(frames).expect("frames decode to a slice response"))
+        Ok(decode_slice_frames(frames).expect("frames decode to a slice response"))
     }
 
     const HOUR_NS: i64 = 3_600_000_000_000;
@@ -1929,5 +1890,165 @@ mod tests {
             .err()
             .expect("the fragment token is not a tenant credential");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    // --- Windowed fragment resolve (issue #885 item 1) ----------------------
+
+    /// A `FragmentService` over `store` on the intra-cluster pinned path: a
+    /// fixed clock and no tenant credentials (the pinned path only checks the
+    /// shared fragment token).
+    fn pinned_service(store: Arc<dyn ObjectStoreBackend>, now_ns: i64) -> FragmentService {
+        let metrics = Arc::new(FragmentMetrics::new());
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        FragmentService::new(
+            "cluster-token".to_string(),
+            empty_resolver(),
+            FragmentAdmission::new(8, metrics.clone()),
+            catalog,
+            store,
+            None,
+            Arc::new(FixedClock(now_ns)),
+            metrics,
+        )
+    }
+
+    /// Resolve the tenant's single published segment (over the full window) so a
+    /// test can pin it by its real content-hash identity, exactly as the
+    /// coordinator would.
+    async fn only_segment(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant_hash: TenantHash,
+        now_ns: i64,
+    ) -> ravel_catalog::SegmentRef {
+        let catalog = Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog");
+        let snapshot = catalog
+            .resolve(&tenant_hash, Signal::Metrics, FULL, &[], now_ns)
+            .await
+            .expect("resolve");
+        snapshot
+            .segments
+            .into_iter()
+            .next()
+            .expect("one published segment")
+    }
+
+    /// The whole timestamp domain, the window the worker used to resolve over
+    /// before issue #885 item 1 narrowed it. Used here only as the test oracle
+    /// (a full-window resolve) and to name a disjoint window.
+    const FULL: TimeRange = TimeRange {
+        start_ns: i64::MIN,
+        end_ns: i64::MAX,
+    };
+
+    /// A pinned single-segment request carrying `window`, mirroring what
+    /// [`ravel_query::distrib`]'s coordinator dispatches.
+    fn pinned_over_window(
+        tenant_hash: TenantHash,
+        seg: &ravel_catalog::SegmentRef,
+        window: TimeRange,
+    ) -> pb::FetchRequest {
+        pb::FetchRequest {
+            protocol_version: codec::PROTOCOL_VERSION,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: metrics_signal(),
+            scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+                segments: vec![codec::encode_segment_identity(seg)],
+            })),
+            window_start_ns: window.start_ns,
+            window_end_ns: window.end_ns,
+            ..Default::default()
+        }
+    }
+
+    /// The worker resolves its content-hash resolver over the request's window,
+    /// not the whole history: a window disjoint from a pinned segment's event
+    /// range bounds the resolve away from it, so the pin no longer resolves and
+    /// the slice reports `SnapshotInvalidated`. A covering window (the segment's
+    /// own event envelope, what the coordinator ships) still finds it. Under the
+    /// old whole-history resolve the disjoint window would have found the segment
+    /// too, so this proves the resolve is bounded to the query window.
+    #[tokio::test]
+    async fn windowed_resolve_is_bounded_to_the_request_window() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("windowed-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let service = pinned_service(store, now);
+
+        // Covering window = the segment's own event envelope: the pin resolves.
+        let envelope = TimeRange {
+            start_ns: seg.min_event_ts_ns,
+            end_ns: seg.max_event_ts_ns,
+        };
+        let covering = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, envelope))
+            .await
+            .expect("local run");
+        assert_eq!(covering.status, pb::status::Code::Ok);
+        assert_eq!(covering.series_returned, 1);
+
+        // A window entirely after the segment's event range: the resolve is
+        // bounded away from it, so the pin is not found.
+        let disjoint = TimeRange {
+            start_ns: 3 * HOUR_NS,
+            end_ns: 4 * HOUR_NS,
+        };
+        let missed = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, disjoint))
+            .await
+            .expect("local run");
+        assert_eq!(
+            missed.status,
+            pb::status::Code::SnapshotInvalidated,
+            "a window disjoint from the pin bounds the resolve away from it"
+        );
+    }
+
+    /// The narrowed windowed resolve loses no pinned segment: a slice over the
+    /// segment's event envelope returns byte-identical rows to the same slice
+    /// resolved over the whole history.
+    ///
+    /// Flip-line proof: in [`FragmentService::build_resolver`], narrow the
+    /// `window` passed to `catalog.resolve(..)` so it drops the pin -- e.g.
+    /// change `end_ns: request.window_end_ns` to
+    /// `end_ns: request.window_start_ns.saturating_sub(1)`. The windowed run then
+    /// resolves to `SnapshotInvalidated` with zero rows while the full-window
+    /// oracle still returns the sample, so the row assertions below fail.
+    #[tokio::test]
+    async fn windowed_fragment_returns_same_rows_as_full_window() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("same-rows-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let service = pinned_service(store, now);
+
+        let envelope = TimeRange {
+            start_ns: seg.min_event_ts_ns,
+            end_ns: seg.max_event_ts_ns,
+        };
+        let windowed = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, envelope))
+            .await
+            .expect("windowed local run");
+        let full = service
+            .run_local(pinned_over_window(tenant.hash(), &seg, FULL))
+            .await
+            .expect("full-window local run");
+
+        assert_eq!(windowed.status, pb::status::Code::Ok);
+        assert_eq!(full.status, pb::status::Code::Ok);
+        assert_eq!(windowed.series_returned, full.series_returned);
+        assert_eq!(windowed.samples_returned, full.samples_returned);
+        assert_eq!(windowed.scalar.len(), full.scalar.len());
+        for (w, f) in windowed.scalar.iter().zip(full.scalar.iter()) {
+            assert_eq!(w.series_id, f.series_id, "series id differs");
+            assert_eq!(w.timestamps, f.timestamps, "timestamps differ");
+            let wb: Vec<u64> = w.values.iter().map(|v| v.to_bits()).collect();
+            let fb: Vec<u64> = f.values.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(wb, fb, "value bit patterns differ");
+        }
     }
 }

@@ -103,57 +103,267 @@ impl SliceFetcher for RemoteSliceFetcher {
             .await
             .map_err(|s| DistribError::Transport(s.to_string()))?;
         let mut stream = response.into_inner();
-
-        let mut scalar = Vec::new();
-        let mut summary: Option<pb::Summary> = None;
+        let mut frames = Vec::new();
         while let Some(frame) = stream
             .message()
             .await
             .map_err(|s| DistribError::Transport(s.to_string()))?
         {
-            match frame.frame {
-                Some(pb::fetch_response::Frame::Series(sf)) => {
-                    scalar.extend(codec::decode_series_frame(sf)?);
-                }
-                // A native-histogram frame: this build cannot decode worker
-                // histogram runs across the slice boundary yet (a later ticket).
-                // It is well-formed, not corruption, so surface a distinct typed
-                // error the federation layer can treat as a coverage gap
-                // (skippable under `skip_unavailable`) rather than mislabel it a
-                // malformed response -- and never silently drop the data.
-                Some(pb::fetch_response::Frame::Hist(_)) => {
-                    return Err(DistribError::HistogramUnsupported);
-                }
-                Some(pb::fetch_response::Frame::Summary(s)) => {
-                    if summary.is_some() {
-                        return Err(DistribError::MultipleSummaries);
-                    }
-                    summary = Some(s);
-                }
-                None => return Err(DistribError::EmptyFrame),
-            }
+            frames.push(frame);
         }
+        decode_slice_frames(frames)
+    }
+}
 
-        let summary = summary.ok_or(DistribError::NoSummary)?;
-        let status = summary
-            .status
-            .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
-        let code = codec::decode_status_code(status.code)?;
-        let accounting = summary
-            .accounting
-            .map(codec::decode_accounting)
-            .unwrap_or_default();
-        Ok(SliceResponse {
-            scalar,
-            accounting,
-            stats: FetchStats {
-                raw_f64_pages: summary.raw_f64_pages,
-                raw_f64_bytes: summary.raw_f64_bytes,
-            },
-            series_returned: summary.series_returned,
-            samples_returned: summary.samples_returned,
-            status: code,
-            status_message: status.message,
-        })
+/// Decode a slice's full frame sequence into a [`SliceResponse`].
+///
+/// This is the single decode implementation for a slice's frames (issue #885
+/// item 2). [`RemoteSliceFetcher`] drains its gRPC stream into a `Vec` and
+/// calls this; the server-side coordinator paths in `services/ravel-server`
+/// (the local no-hop fetch, an intra-cluster remote dispatch, and cross-cluster
+/// federation) collect their frames and call the same function, so the two
+/// sites cannot drift.
+///
+/// Every malformation is a typed [`DistribError`], never a panic: a series
+/// frame that fails to decode ([`DistribError::Codec`]), a native-histogram
+/// frame this build cannot decode across the slice boundary
+/// ([`DistribError::HistogramUnsupported`] -- well-formed, not corruption, so
+/// the federation layer treats it as a coverage gap skippable under
+/// `skip_unavailable` rather than a malformed response, and the data is never
+/// silently dropped), a frame carrying no oneof variant
+/// ([`DistribError::EmptyFrame`]), a second summary
+/// ([`DistribError::MultipleSummaries`]), a stream that ended with no summary
+/// ([`DistribError::NoSummary`]), a summary with no status, or an unknown
+/// status code.
+pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceResponse, DistribError> {
+    let mut scalar = Vec::new();
+    let mut summary: Option<pb::Summary> = None;
+    for frame in frames {
+        match frame.frame {
+            Some(pb::fetch_response::Frame::Series(sf)) => {
+                scalar.extend(codec::decode_series_frame(sf)?);
+            }
+            Some(pb::fetch_response::Frame::Hist(_)) => {
+                return Err(DistribError::HistogramUnsupported);
+            }
+            Some(pb::fetch_response::Frame::Summary(s)) => {
+                if summary.is_some() {
+                    return Err(DistribError::MultipleSummaries);
+                }
+                summary = Some(s);
+            }
+            None => return Err(DistribError::EmptyFrame),
+        }
+    }
+
+    let summary = summary.ok_or(DistribError::NoSummary)?;
+    let status = summary
+        .status
+        .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
+    let code = codec::decode_status_code(status.code)?;
+    let accounting = summary
+        .accounting
+        .map(codec::decode_accounting)
+        .unwrap_or_default();
+    Ok(SliceResponse {
+        scalar,
+        accounting,
+        stats: FetchStats {
+            raw_f64_pages: summary.raw_f64_pages,
+            raw_f64_bytes: summary.raw_f64_bytes,
+        },
+        series_returned: summary.series_returned,
+        samples_returned: summary.samples_returned,
+        status: code,
+        status_message: status.message,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_types::accounting::{AccountedOp, QueryAccountingSnapshot};
+    use ravel_types::{Label, LabelSet, SeriesId};
+
+    use super::*;
+    use crate::distrib::codec::{self, CodecError};
+
+    fn label_set() -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "m".to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    fn series_soa() -> FetchedSeriesSoa {
+        FetchedSeriesSoa {
+            series_id: SeriesId([1u8; 16]),
+            labels: label_set(),
+            timestamps: vec![10, 20, 30],
+            values: vec![1.0, 2.0, 3.0],
+            created_unix_ns: 7,
+            writer_epoch: 1,
+            writer_seq: 2,
+        }
+    }
+
+    fn series_frame(soa: &FetchedSeriesSoa) -> pb::FetchResponse {
+        pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Series(
+                codec::encode_series_frame(soa),
+            )),
+        }
+    }
+
+    /// A well-formed terminal summary carrying `code`, real accounting, and the
+    /// given counts.
+    fn summary_frame(code: pb::status::Code) -> pb::FetchResponse {
+        let mut snap = QueryAccountingSnapshot::default();
+        snap.s3_requests[AccountedOp::Get.index()] = 3;
+        snap.s3_bytes[AccountedOp::Get.index()] = 99;
+        pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                accounting: Some(codec::encode_accounting(&snap)),
+                series_returned: 1,
+                samples_returned: 3,
+                status: Some(pb::Status {
+                    code: code as i32,
+                    message: String::new(),
+                }),
+                raw_f64_pages: 5,
+                raw_f64_bytes: 40,
+            })),
+        }
+    }
+
+    /// The happy path: a series frame plus one terminal summary decodes to a
+    /// `SliceResponse` carrying the decoded series and folded summary fields.
+    #[test]
+    fn series_then_summary_decodes() {
+        let soa = series_soa();
+        let response = decode_slice_frames(vec![
+            series_frame(&soa),
+            summary_frame(pb::status::Code::Ok),
+        ])
+        .expect("valid frame sequence decodes");
+        assert_eq!(response.scalar.len(), 1);
+        assert_eq!(response.scalar[0].timestamps, soa.timestamps);
+        assert_eq!(response.status, pb::status::Code::Ok);
+        assert_eq!(response.series_returned, 1);
+        assert_eq!(response.samples_returned, 3);
+        assert_eq!(response.stats.raw_f64_pages, 5);
+        assert_eq!(response.accounting.s3_requests(AccountedOp::Get), 3);
+    }
+
+    /// A malformed series frame (a 15-byte series id) is a typed `Codec` error,
+    /// never a panic and never a truncated series.
+    #[test]
+    fn malformed_series_frame_is_typed_codec_error() {
+        let bad = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Series(pb::SeriesFrame {
+                series_id: vec![0u8; 15],
+                labels: vec![pb::Label {
+                    name: "__name__".to_string(),
+                    value: "m".to_string(),
+                }],
+                runs: Vec::new(),
+            })),
+        };
+        assert!(matches!(
+            decode_slice_frames(vec![bad, summary_frame(pb::status::Code::Ok)]),
+            Err(DistribError::Codec(CodecError::BadSeriesId { got: 15 }))
+        ));
+    }
+
+    /// A stream that never sent its mandatory terminal summary is `NoSummary`.
+    #[test]
+    fn missing_summary_is_typed_error() {
+        let soa = series_soa();
+        assert!(matches!(
+            decode_slice_frames(vec![series_frame(&soa)]),
+            Err(DistribError::NoSummary)
+        ));
+    }
+
+    /// Two summary frames violate the exactly-one-summary rule.
+    #[test]
+    fn duplicate_summary_is_typed_error() {
+        assert!(matches!(
+            decode_slice_frames(vec![
+                summary_frame(pb::status::Code::Ok),
+                summary_frame(pb::status::Code::Ok),
+            ]),
+            Err(DistribError::MultipleSummaries)
+        ));
+    }
+
+    /// A frame carrying no `frame` oneof variant is `EmptyFrame`.
+    #[test]
+    fn empty_frame_is_typed_error() {
+        assert!(matches!(
+            decode_slice_frames(vec![pb::FetchResponse { frame: None }]),
+            Err(DistribError::EmptyFrame)
+        ));
+    }
+
+    /// A native-histogram frame this build cannot decode across the slice
+    /// boundary is the distinct `HistogramUnsupported` coverage-gap error, never
+    /// a generic malformed-frame error and never a panic.
+    #[test]
+    fn histogram_frame_is_histogram_unsupported() {
+        let hist = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Hist(pb::HistogramFrame {
+                series_id: vec![0u8; 16],
+                labels: Vec::new(),
+                runs: Vec::new(),
+            })),
+        };
+        assert!(matches!(
+            decode_slice_frames(vec![hist]),
+            Err(DistribError::HistogramUnsupported)
+        ));
+    }
+
+    /// A summary that carries no status is a typed `MissingStatus` codec error.
+    #[test]
+    fn summary_without_status_is_typed_error() {
+        let no_status = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                accounting: None,
+                series_returned: 0,
+                samples_returned: 0,
+                status: None,
+                raw_f64_pages: 0,
+                raw_f64_bytes: 0,
+            })),
+        };
+        assert!(matches!(
+            decode_slice_frames(vec![no_status]),
+            Err(DistribError::Codec(CodecError::MissingStatus))
+        ));
+    }
+
+    /// A summary naming a status code discriminant this build does not model is
+    /// a typed error, never a silent success.
+    #[test]
+    fn unknown_status_code_is_typed_error() {
+        let bad_code = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                accounting: None,
+                series_returned: 0,
+                samples_returned: 0,
+                status: Some(pb::Status {
+                    code: -1,
+                    message: String::new(),
+                }),
+                raw_f64_pages: 0,
+                raw_f64_bytes: 0,
+            })),
+        };
+        assert!(matches!(
+            decode_slice_frames(vec![bad_code]),
+            Err(DistribError::Codec(CodecError::UnknownStatusCode(-1)))
+        ));
     }
 }

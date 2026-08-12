@@ -36,7 +36,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::{StreamExt, stream};
-use ravel_catalog::Snapshot;
+use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_promql::LabelMatcher;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
@@ -60,6 +60,31 @@ pub type FetchedTriple = (
     FetchStats,
     Vec<Vec<FetchedHistogramSeries>>,
 );
+
+/// The closed event-time envelope `[min, max]` of a slice's pinned segments,
+/// carried on the fragment request so the worker resolves its interim
+/// content-hash resolver over just this window (issue #885 item 1) instead of
+/// the whole timestamp domain.
+///
+/// The envelope contains every pinned segment's own `[min_event_ts_ns,
+/// max_event_ts_ns]` range, so a `Catalog::resolve` bounded to it still returns
+/// every pinned segment (resolve returns every segment whose events overlap the
+/// window): the resolved snapshot stays a superset of the dispatched pins and
+/// single-snapshot isolation is preserved. `partition_snapshot` never emits an
+/// empty slice; the empty fallback keeps the full window (the old behavior) so
+/// the superset property holds unconditionally.
+fn slice_event_window(segments: &[SegmentRef]) -> (i64, i64) {
+    if segments.is_empty() {
+        return (i64::MIN, i64::MAX);
+    }
+    let mut start = i64::MAX;
+    let mut end = i64::MIN;
+    for seg in segments {
+        start = start.min(seg.min_event_ts_ns);
+        end = end.max(seg.max_event_ts_ns);
+    }
+    (start, end)
+}
 
 /// The engine's distributed-execution context: the cost gate/fan-out width and
 /// the slice-fetcher seam. Held in an `Option` on the engine; `None` (the
@@ -128,6 +153,18 @@ impl Distributed {
         let concurrency = self.thresholds.max_parallel_slices.max(1);
         let mut stream = stream::iter(slices)
             .map(|slice| {
+                // Carry the event-time envelope of this slice's pinned segments
+                // (issue #885 item 1). The worker resolves its interim
+                // content-hash resolver over exactly this window instead of the
+                // whole timestamp domain, so a self-mapped or dispatched slice
+                // no longer pays a whole-history catalog resolve on the query
+                // critical path. The envelope is a superset of every pinned
+                // segment's own event range by construction, so a resolve
+                // bounded to it still finds every pinned content hash (a
+                // `Catalog::resolve` over a window returns every segment whose
+                // events overlap that window); single-snapshot isolation is
+                // preserved exactly.
+                let (window_start_ns, window_end_ns) = slice_event_window(&slice.segments);
                 let request = pb::FetchRequest {
                     protocol_version: codec::PROTOCOL_VERSION,
                     query_id: Vec::new(),
@@ -141,8 +178,8 @@ impl Distributed {
                             .collect(),
                     })),
                     matchers: encoded_matchers.clone(),
-                    window_start_ns: 0,
-                    window_end_ns: 0,
+                    window_start_ns,
+                    window_end_ns,
                     budgets: Some(budgets),
                     deadline_unix_ns: 0,
                     erasure: encoded_erasure.clone(),
