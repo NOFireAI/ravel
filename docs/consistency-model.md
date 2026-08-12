@@ -89,11 +89,19 @@ rejected point counts and reasons.
 - This changes only which segments are admitted into a resolved snapshot.
   Visibility, ordering, erasure, and the listing-immediate freshness of the
   open hour above are unchanged.
-- As of RH-T1 (#901), the PromQL query engine enforces this through one
-  admission seam (`ravel-query`'s `segment_admission` module). The SQL
-  executor, the five SQL table providers, and the exemplars state still run
-  the pre-ADR-0073 per-surface checks; moving them onto the same seam is
-  RH-T2 (#902).
+- Both query surfaces enforce this through one admission seam
+  (`ravel-query`'s `segment_admission` module): the PromQL engine as of
+  RH-T1 (#901), and the SQL executor, the five SQL table providers, and the
+  exemplars state as of RH-T2 (#902) — no per-surface check remains outside
+  it.
+- RH-T3 (#903) is the end-to-end reachability proof: a real `IngestRouter`
+  sustains flushes past `max_segments`-worth of L0 objects in the open
+  hour, and both real HTTP query surfaces (PromQL and SQL) keep serving
+  results bit-identical to a post-compaction read of the same data, while a
+  deliberately low request budget still trips the typed
+  `RequestBudgetExceeded` rather than hanging or truncating
+  (`services/ravel-server/tests/recent_hours_reachability_e2e.rs`). This
+  closes the S1-13 finding from the adversarial review.
 
 ## Snapshot isolation
 
