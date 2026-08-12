@@ -13,6 +13,8 @@ pub mod exemplars;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
 pub mod flight_auth;
+#[cfg(feature = "flight-sql")]
+pub mod flight_deadline;
 pub mod fold;
 pub mod gc_config;
 pub mod health;

@@ -34,6 +34,7 @@ use tonic::Status;
 use tonic::metadata::MetadataMap;
 
 use crate::flight_auth;
+use crate::flight_deadline::DeadlineBoundedFlightService;
 use crate::sql::SqlState;
 
 /// Resolves the authoritative tenant and read-your-write tokens for a Flight
@@ -92,7 +93,7 @@ pub fn service(
     state: &SqlState,
     gc_ticket_ceiling: std::time::Duration,
     distributed: Option<DistributedFlightConfig>,
-) -> FlightServiceServer<RavelFlightSqlService> {
+) -> FlightServiceServer<DeadlineBoundedFlightService<RavelFlightSqlService>> {
     let auth = Arc::new(ResolverFlightAuth {
         tenant_resolver: Arc::clone(&state.tenant_resolver),
     });
@@ -130,5 +131,14 @@ pub fn service(
     if let Some(config) = distributed {
         service = service.with_distributed_scan(config);
     }
-    FlightServiceServer::new(service)
+    // Bound every DoGet stream by the server ceiling so a client that opens the
+    // stream and then reads nothing cannot pin its query-concurrency permit
+    // indefinitely (issue #785). `max_deadline` is the same bound the per-ticket
+    // effective deadline is already clamped against, so this never shortens a
+    // within-ticket consumer's budget; it only breaks the transport-level stall
+    // the per-batch deadline check inside the stream cannot reach.
+    FlightServiceServer::new(DeadlineBoundedFlightService::new(
+        service,
+        state.max_deadline,
+    ))
 }
