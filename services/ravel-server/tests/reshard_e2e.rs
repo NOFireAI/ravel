@@ -691,7 +691,7 @@ async fn decrease_straggler_write_inside_slack_window_is_found() {
     .await;
     assert_eq!(outcome.generations[1].activation_hour, BASE_HOUR);
 
-    let slack = DEFAULT_SCAN_SLACK_HOURS; // S = 2
+    let slack = DEFAULT_SCAN_SLACK_HOURS; // S = 3
 
     // The pre-reshard generation view a lagging writer still holds: generation 0
     // only, count 8. Priming this fresh as of each write makes the real router
@@ -964,17 +964,20 @@ async fn read_your_write_token_resolves_after_decrease() {
         .expect("the write minted a token in shard >= 4");
     router.flush_all().await;
 
-    // Decrease 8 -> 4 activating at BASE-2 (now_hour BASE-4, lead 2), so the
-    // write's ingest hour (BASE) is past activation + S: scan_count(BASE) = 4
-    // and shard >= 4 is not scanned.
+    // Decrease 8 -> 4 activating at BASE-5 (now_hour BASE-7, lead 2). With
+    // S = 3 (NF-3), activation + S = BASE-2, comfortably before the write's
+    // ingest hour (BASE): scan_count(BASE) = 4 and shard >= 4 is not scanned.
+    // (Activating at BASE-2, the pre-NF-3 timing, would put the write inside
+    // the widened S = 3 slack and destroy the test's purpose -- see the
+    // ADR-0052 2026-08-12 amendment.)
     let outcome = reshard(
         store.as_ref(),
         4,
         MIN_LEAD_HOURS,
-        (BASE_HOUR as i64 - 4) * NS_PER_HOUR,
+        (BASE_HOUR as i64 - 7) * NS_PER_HOUR,
     )
     .await;
-    assert_eq!(outcome.generations[1].activation_hour, BASE_HOUR - 2);
+    assert_eq!(outcome.generations[1].activation_hour, BASE_HOUR - 5);
 
     let (_catalog, engine) = engine(store.clone(), 8);
     let t_ms = sample_ts / 1_000_000;
@@ -1008,16 +1011,27 @@ async fn read_your_write_token_resolves_after_decrease() {
 // Acceptance property 5: stale writer fails closed.
 // --------------------------------------------------------------------------
 
-/// A router whose cached provisioning view has aged past `C` and whose record
-/// re-read cannot complete fails the write closed with the typed
-/// [`WriteError::StaleProvisioningView`] and increments the stale-flush counter,
-/// rather than routing on a stale view (ADR-0052 section 3). Tested at the router
-/// level, per the ticket's explicit allowance: forcing the record re-read to fail
-/// deterministically needs a `FaultStore` on the record GET, which live HTTP
-/// ingest offers no clean seam for, and the `IngestRouter` is the exact component
-/// that enforces this fail-closed posture.
+/// Staleness fail-closed, with the NF-2 bounded grace window (ADR-0052
+/// amendment 2026-08-12, issue #655): once the router's cached view for a
+/// tenant ages past `C`, the router re-reads the provisioning record before
+/// routing; if that re-read cannot complete (here a store fault on the record
+/// GET), the router falls back to
+/// [`ravel_ingest::GenerationSwitch::try_grace_extend`] rather than failing
+/// the flush immediately. Inside the grace horizon
+/// (`hour_of(now_ns) < hour_of(refreshed_at_ns) + min_lead_hours(C)`) the
+/// write still routes, on the last-known-good view, and the grace-extended
+/// counter increments; only once the horizon is crossed does the write fail
+/// closed with the typed [`WriteError::StaleProvisioningView`] and the
+/// ordinary stale-flush counter (ADR-0052 section 3). Before the grace window
+/// existed, this test's first write asserted `expect_err` at exactly the
+/// still-within-horizon point -- that is the total outage NF-2 replaces with
+/// bounded degraded routing. Tested at the router level, per the ticket's
+/// explicit allowance: forcing the record re-read to fail deterministically
+/// needs a `FaultStore` on the record GET, which live HTTP ingest offers no
+/// clean seam for, and the `IngestRouter` is the exact component that
+/// enforces this posture.
 #[tokio::test]
-async fn stale_provisioning_view_fails_write_closed() {
+async fn stale_view_routes_via_grace_window_then_fails_closed_past_horizon() {
     // Every GET of the provisioning record faults, so a stale view can never be
     // refreshed.
     let plan = FaultPlan::empty().with_rule(
@@ -1042,10 +1056,35 @@ async fn stale_provisioning_view_fails_write_closed() {
         t0,
     );
 
-    // Age the cached view past C: the next write must re-read, which faults, so
-    // it fails closed.
+    // Age the cached view past C: the next write must re-read, which faults,
+    // but the horizon (hour BASE_HOUR + min_lead_hours(C) = BASE_HOUR + 2 for
+    // the default C) has not been crossed, so it routes on the cached view
+    // instead of failing closed.
     clock.set(t0 + DEFAULT_REFRESH_INTERVAL_NS + 1);
     let sample_ts = t0 + 5 * NS_PER_MIN;
+    router
+        .write(
+            tenant(),
+            vec![point("stale_series", sample_ts, 1.0)],
+            WriteMode::Strict,
+            ACK,
+        )
+        .await
+        .expect("within the grace horizon, a stale view still routes");
+    assert_eq!(
+        router.metrics().snapshot().grace_extended_stale_flushes,
+        1,
+        "the grace-extended counter must increment"
+    );
+    assert_eq!(
+        router.metrics().snapshot().stale_provisioning_flushes,
+        0,
+        "no flush has failed closed yet"
+    );
+
+    // Cross the horizon (hour BASE_HOUR + 2): the same unreachable store now
+    // fails the write closed rather than extending the grace window further.
+    clock.set((BASE_HOUR as i64 + 2) * NS_PER_HOUR);
     let err = router
         .write(
             tenant(),
@@ -1054,7 +1093,7 @@ async fn stale_provisioning_view_fails_write_closed() {
             ACK,
         )
         .await
-        .expect_err("a stale view whose record re-read fails must fail closed");
+        .expect_err("past the grace horizon, a stale view whose re-read fails must fail closed");
     assert!(
         matches!(err, WriteError::StaleProvisioningView),
         "expected StaleProvisioningView, got: {err:?}"
@@ -1086,4 +1125,122 @@ async fn stale_provisioning_view_fails_write_closed() {
         )
         .await
         .expect("a refreshed view routes again");
+}
+
+// --------------------------------------------------------------------------
+// Acceptance property 6: NF-2/NF-3 coupling (ADR-0052 amendment 2026-08-12).
+// --------------------------------------------------------------------------
+
+/// Pins the exact coupling the amendment's safety argument depends on: a
+/// write that NF-2's grace window routes under a stale, retiring-generation
+/// view (count 8) into an hour the successor decrease generation (count 4)
+/// already nominally owns on the real record -- possible under the
+/// amendment's new assumption that the reshard-append process's clock may
+/// lead the router's by up to `TOLERATED_CLOCK_SKEW_HOURS` -- must still be
+/// found on read, because NF-3 widens the read-side slack `S` to cover
+/// exactly that overshoot.
+///
+/// The reshard (8 -> 4, activating at `BASE_HOUR`) is appended for real
+/// before the store is wrapped in a `FaultStore`, so the record the router
+/// later fails to re-read genuinely holds both generations. The router's
+/// cached view (generation 0 only, count 8) is then primed one hour after
+/// that real activation and aged past `C`, so the write at hour
+/// `activation + 2` goes through `try_grace_extend` (still inside the grace
+/// horizon relative to the cache's own refresh time) rather than a fresh
+/// read, landing in a shard only the retiring count-8 generation ever wrote.
+///
+/// Flipped-line proof: with `DEFAULT_SCAN_SLACK_HOURS` reverted to its
+/// pre-NF-3 value of 2 (`crates/ravel-catalog/src/provisioning.rs:398`,
+/// `pub const DEFAULT_SCAN_SLACK_HOURS: u32 = FLUSH_BOUND_SLACK_HOURS +
+/// TOLERATED_CLOCK_SKEW_HOURS;`, which evaluates to 2 instead of 3),
+/// `scan_count` at `activation + 2` would exclude the retiring generation
+/// (`h < activation_hour(successor) + S` becomes `activation + 2 <
+/// activation + 2`, false), and the final assertion below (`Some(99.0)`)
+/// would fail with `None`.
+#[tokio::test]
+async fn grace_routed_decrease_straggler_is_covered_by_widened_slack() {
+    let store = MemoryStore::new();
+    seed_gen0_record(&store, 8).await;
+
+    // Decrease 8 -> 4 activating at BASE_HOUR (now_hour BASE_HOUR-2, lead 2).
+    let outcome = reshard(
+        &store,
+        4,
+        MIN_LEAD_HOURS,
+        (BASE_HOUR as i64 - 2) * NS_PER_HOUR,
+    )
+    .await;
+    assert_eq!(outcome.generations[1].activation_hour, BASE_HOUR);
+
+    // Only now wrap the store in a FaultStore: seeding and the reshard above
+    // must succeed for real first. Only the router's own stale-view re-read
+    // (the first post-wrap GET of the record) faults; the query below reads
+    // the same record for provisioning enforcement and must see it for real.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::Transient("prov unavailable".into()))
+            .with_key_contains("/prov")
+            .with_occurrence(ravel_object_store::fault::Occurrence::Nth(1)),
+    );
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(store, plan));
+
+    let clock = ManualClock::new((BASE_HOUR as i64 + 1) * NS_PER_HOUR);
+    let router = build_router(store.clone(), 8, clock.clone());
+    // The router's last-known-good view: generation 0 only, count 8 -- stale
+    // relative to the real record, which already has the decrease active as
+    // of BASE_HOUR, simulating a router whose refresh predates that knowledge
+    // under clock skew (the amendment's new assumption).
+    router.refresh_generations(
+        tenant_hash(),
+        vec![ShardGeneration {
+            generation: 0,
+            shard_count: 8,
+            activation_hour: 0,
+            appended_unix_ns: 0,
+        }],
+        clock.now_ns(),
+    );
+
+    // Age past C with the re-read faulted, at hour activation + 2 =
+    // BASE_HOUR + 2: inside the grace horizon (refreshed_at hour BASE_HOUR+1
+    // + min_lead_hours(C) = BASE_HOUR+3), so the write routes via grace on
+    // the stale count-8 view instead of failing closed.
+    let write_hour = BASE_HOUR + 2;
+    let write_ts = write_hour as i64 * NS_PER_HOUR + 5 * NS_PER_MIN;
+    clock.set(write_ts);
+    let straggler_metric = metric_in_shard("coupling", 8, |s| s >= 4);
+    let receipt = router
+        .write(
+            tenant(),
+            vec![point(&straggler_metric, write_ts, 99.0)],
+            WriteMode::Strict,
+            ACK,
+        )
+        .await
+        .expect("grace routes the write on the stale count-8 view");
+    assert!(
+        receipt.tokens.iter().any(|t| t.shard >= 4),
+        "the write landed in a shard only the retiring count-8 generation writes"
+    );
+    assert_eq!(
+        router.metrics().snapshot().grace_extended_stale_flushes,
+        1,
+        "the write must have gone through NF-2's grace path, not a fresh read"
+    );
+    router.flush_all().await;
+
+    let (_catalog, engine) = engine(store.clone(), 8);
+    let value = instant(
+        &engine,
+        &straggler_metric,
+        write_ts / 1_000_000,
+        &[],
+        write_hour as i64 * NS_PER_HOUR + 10 * NS_PER_MIN,
+    )
+    .await;
+    assert_eq!(
+        value_of(&value, &straggler_metric),
+        Some(99.0),
+        "NF-3's widened slack (S = 3) still scans the retiring generation's \
+         shards at activation + 2, so the grace-routed straggler is found"
+    );
 }
