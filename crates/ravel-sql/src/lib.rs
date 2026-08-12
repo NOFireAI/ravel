@@ -98,8 +98,9 @@ pub use audit_schema::{
 pub use config::{DEFAULT_MAX_QUERY_BYTES, SqlConfig};
 #[cfg(feature = "flight-sql")]
 pub use distributed::{
-    DistributedFlightConfig, DistributedScanExec, StaticWorkerEndpoints, WorkerEndpoints,
-    WorkerSlice, WorkerSliceClient, distributed_samples_plan, plan_distributed_slices,
+    DistributedFlightConfig, DistributedScanExec, FlightWorkerSliceClient, StaticWorkerEndpoints,
+    WorkerEndpoints, WorkerSlice, WorkerSliceClient, distributed_samples_plan,
+    plan_distributed_slices,
 };
 pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_UNAVAILABLE,

@@ -60,7 +60,13 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
+use arrow_flight::Ticket;
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::{ProstMessageExt, TicketStatementQuery};
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -74,15 +80,19 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
+use prost::Message as _;
 use ravel_catalog::Snapshot;
 use ravel_query::ByteLimit;
 use ravel_query::distrib::partition::{partition_snapshot, should_distribute};
 use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccounting};
+use tonic::Request;
+use tonic::metadata::MetadataMap;
+use tonic::transport::Channel;
 
 use crate::dedup::RsegDedupExec;
 use crate::error::SqlError;
-use crate::flight_ticket::{FlightTicket, SegmentPin};
+use crate::flight_ticket::{FlightTicket, SegmentPin, TicketKey};
 use crate::schema::internal_schema;
 
 /// Advertised worker Flight locations for a distributed query.
@@ -158,6 +168,115 @@ pub trait WorkerSliceClient: Send + Sync + fmt::Debug {
         ticket: &FlightTicket,
         limit: Option<usize>,
     ) -> DFResult<SendableRecordBatchStream>;
+}
+
+/// The production [`WorkerSliceClient`]: dials a worker's Arrow Flight location
+/// over tonic and redeems a slice ticket through its `DoGet`, decoding the
+/// internal-schema record batches the worker's scan-only fragment path streams
+/// back (ADR-0071, issue #868).
+///
+/// This is the real-wire twin of the acceptance tests' in-process worker
+/// (`tests/flight_distributed.rs`): the encode/redeem/decode steps are
+/// identical, only the transport differs -- here a real
+/// [`FlightServiceClient`] over a [`Channel`] rather than an in-process
+/// `do_get_statement` call. Every failure -- an unparseable location, a ticket
+/// that will not encode, a transport or `DoGet` `Status`, a decode error --
+/// surfaces as the trait's typed [`DataFusionError`]; nothing panics.
+///
+/// The coordinator forwards the inbound request's gRPC metadata (the tenant
+/// credential) to each worker unchanged, so a worker's own `FlightAuth`
+/// resolves the same tenant the slice ticket pins. `ticket_key` is the
+/// coordinator's per-service ticket MAC key; a worker only accepts a slice
+/// ticket signed by a key it shares (single process today; cross-process key
+/// distribution is the ADR-0071 follow-up).
+#[derive(Clone)]
+pub struct FlightWorkerSliceClient {
+    /// The coordinator's ticket MAC key, used to sign each slice ticket the
+    /// worker will verify.
+    ticket_key: TicketKey,
+    /// The inbound request's gRPC metadata, forwarded verbatim to every worker
+    /// so the worker resolves the same tenant credential.
+    credentials: MetadataMap,
+    /// Bounded connect timeout for dialing a worker location. The channel is
+    /// built lazily; this caps how long the first `DoGet` waits for the TCP and
+    /// HTTP/2 handshake before failing with a typed error.
+    connect_timeout: Duration,
+}
+
+impl fmt::Debug for FlightWorkerSliceClient {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Deliberately opaque: `credentials` carries the tenant bearer token,
+        // and `MetadataMap`'s own `Debug` would print it. Never widen this to
+        // derive `Debug`.
+        f.debug_struct("FlightWorkerSliceClient")
+            .field("connect_timeout", &self.connect_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FlightWorkerSliceClient {
+    /// Build a client that signs slice tickets with `ticket_key`, forwards
+    /// `credentials` to every worker, and bounds each dial by `connect_timeout`.
+    pub fn new(ticket_key: TicketKey, credentials: MetadataMap, connect_timeout: Duration) -> Self {
+        FlightWorkerSliceClient {
+            ticket_key,
+            credentials,
+            connect_timeout,
+        }
+    }
+}
+
+impl WorkerSliceClient for FlightWorkerSliceClient {
+    fn fetch_slice(
+        &self,
+        location: &str,
+        ticket: &FlightTicket,
+        _limit: Option<usize>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        // Encode the slice ticket exactly as the in-process path does. A
+        // `slice_count > 1` ticket routes to the worker's scan-only fragment
+        // branch, which streams the internal, provenance-carrying schema for the
+        // coordinator to merge and dedup.
+        let handle = ticket
+            .encode(&self.ticket_key)
+            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
+        // Build the channel eagerly so an unparseable location fails here, as a
+        // typed error, rather than inside the stream. `connect_lazy` defers the
+        // actual TCP/HTTP2 handshake to the first `DoGet`, bounded by
+        // `connect_timeout`.
+        let channel = Channel::from_shared(location.to_string())
+            .map_err(|err| {
+                DataFusionError::Internal(format!("invalid worker location {location:?}: {err}"))
+            })?
+            .connect_timeout(self.connect_timeout)
+            .connect_lazy();
+        let credentials = self.credentials.clone();
+        let setup = async move {
+            let tsq = TicketStatementQuery {
+                statement_handle: handle.into(),
+            };
+            let raw = Ticket::new(tsq.as_any().encode_to_vec());
+            let mut req = Request::new(raw);
+            // Forward the inbound tenant credential unchanged so the worker's
+            // own `FlightAuth` resolves the same tenant the ticket pins.
+            *req.metadata_mut() = credentials;
+            let response = FlightServiceClient::new(channel)
+                .do_get(req)
+                .await
+                .map_err(|status| FlightError::Tonic(Box::new(status)))?;
+            let flight_data = response
+                .into_inner()
+                .map_err(|status| FlightError::Tonic(Box::new(status)));
+            Ok::<_, FlightError>(FlightRecordBatchStream::new_from_flight_data(flight_data))
+        };
+        let batches = futures::stream::once(setup)
+            .try_flatten()
+            .map_err(|err| DataFusionError::Internal(err.to_string()));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            internal_schema(),
+            batches,
+        )))
+    }
 }
 
 /// The leaf of the coordinator's distributed samples pipeline: one DataFusion

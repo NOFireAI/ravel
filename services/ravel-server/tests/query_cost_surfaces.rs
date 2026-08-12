@@ -467,7 +467,9 @@ mod flight {
         let ceiling = ravel_server::gc_config::flight_ceiling(
             &ravel_maintain::GcConfigValues::maintain_defaults(),
         );
-        let service = ravel_server::flight::service(state, ceiling);
+        // This surface does not exercise the ADR-0071 distributed scan; run
+        // every statement whole-set on the coordinator (issue #868).
+        let service = ravel_server::flight::service(state, ceiling, None);
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)

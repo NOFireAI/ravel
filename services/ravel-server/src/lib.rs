@@ -1214,9 +1214,29 @@ pub async fn start(
         let ceiling = gc_config::flight_ceiling(&config.gc);
         gc_config::validate_flight(&config.gc, ceiling)
             .map_err(|e| anyhow::anyhow!("Flight SQL ticket-TTL ceiling violates sys/gc: {e}"))?;
+        // ADR-0071 (issue #868): build the coordinator-side distributed scan
+        // config from the same live query-worker roster and cost thresholds the
+        // PromQL distributed lane installs above, so both lanes gate
+        // distribution on identical estimate semantics. Built only when
+        // `--distributed-query` is on in a query-serving mode (the same gate the
+        // PromQL router uses); `None` otherwise leaves the Flight service running
+        // every statement whole-set on this coordinator, byte-identical to the
+        // pre-distribution build. The roster resolves per query, so until the
+        // first heartbeat fills `distrib_live_workers` the coordinator sees no
+        // workers and every statement stays local, which is always correct.
+        let distributed = config
+            .distrib
+            .as_ref()
+            .filter(|_| matches!(config.mode, Mode::All | Mode::Query))
+            .map(|settings| {
+                sql_distrib::distributed_flight_config(
+                    distrib_live_workers.clone(),
+                    settings.thresholds,
+                )
+            });
         sql_state
             .as_ref()
-            .map(|state| flight::service(state, ceiling))
+            .map(|state| flight::service(state, ceiling, distributed))
     };
     // The ADR-0071 fragment `SeriesFetch` service (issue #865) is a
     // cluster-internal query surface: it binds this listener too, so a

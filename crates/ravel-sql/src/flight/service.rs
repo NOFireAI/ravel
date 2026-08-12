@@ -47,6 +47,7 @@ use tracing::Instrument as _;
 
 use rand::Rng as _;
 
+use crate::distributed::{DistributedFlightConfig, FlightWorkerSliceClient, WorkerSliceClient};
 use crate::executor::SqlExecutor;
 use crate::flight::request::{sql_request, status_from_sql};
 use crate::flight::stream::{DoGetStream, audited_stream, fragment_stream, statement_stream};
@@ -108,7 +109,24 @@ pub struct RavelFlightSqlService {
     /// lifetime). The `do_get_statement` gate is the one that bounds the actual
     /// scan work -- see that method.
     query_admission: Arc<QueryAdmissionController>,
+    /// The coordinator-side distributed scan config (ADR-0071, issue #868), or
+    /// `None` when the deployment did not install one. `None` is byte-identical
+    /// to the pre-distribution service: every statement runs whole-set on this
+    /// coordinator. When `Some`, `do_get_statement` gates each whole-set
+    /// statement through the same cost estimate `get_flight_info_statement`
+    /// used, and on a positive gate fans the samples scan out to workers for
+    /// THAT query only. Installed out of `new`, through
+    /// [`with_distributed_scan`](Self::with_distributed_scan), so existing call
+    /// sites stay unchanged.
+    distributed: Option<Arc<DistributedFlightConfig>>,
 }
+
+/// The bounded connect timeout the coordinator dials each worker slice with
+/// (ADR-0071, issue #868). A worker that does not complete the TCP + HTTP/2
+/// handshake within this window fails the slice fetch with a typed error rather
+/// than hanging the whole distributed query; the ticket's own deadline still
+/// bounds the streaming phase after connect.
+const DISTRIB_SLICE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl RavelFlightSqlService {
     /// Build the service.
@@ -142,6 +160,7 @@ impl RavelFlightSqlService {
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
             recorder,
             query_admission,
+            distributed: None,
         }
     }
 
@@ -149,6 +168,23 @@ impl RavelFlightSqlService {
     /// so it chains off [`new`](Self::new).
     pub fn with_audit_sink(mut self, audit_sink: Arc<dyn QueryAuditSink>) -> Self {
         self.audit_sink = audit_sink;
+        self
+    }
+
+    /// Install the coordinator-side distributed scan (ADR-0071, issue #868).
+    /// Returns `self` so it chains off [`new`](Self::new), mirroring
+    /// [`with_audit_sink`](Self::with_audit_sink).
+    ///
+    /// With a config installed, a whole-set statement's `DoGet` recomputes the
+    /// cost estimate for the ticket-pinned snapshot and, when it clears the same
+    /// gate `get_flight_info_statement` applied, mints slice tickets and fans the
+    /// samples scan out to workers for that one query. The external Flight SQL
+    /// contract is untouched: `get_flight_info_statement` still advertises
+    /// exactly one endpoint, and the streamed result is byte-identical to the
+    /// whole-set local execution. Not installing one leaves the service
+    /// byte-identical to before this seam existed.
+    pub fn with_distributed_scan(mut self, config: DistributedFlightConfig) -> Self {
+        self.distributed = Some(Arc::new(config));
         self
     }
 
@@ -472,6 +508,44 @@ impl FlightSqlService for RavelFlightSqlService {
         let now_ns = self.clock.now_ns();
         let query_text = decoded.statement.clone();
 
+        // ADR-0071 (issue #868): the ENGAGE decision for this whole-set
+        // statement. With a distributed config installed, recompute the cost
+        // estimate for this ticket's pinned snapshot and gate on it, then mint
+        // slice tickets and build the production worker client for THIS query
+        // only. The estimate is recomputed with `catalog_requests = 0`: the
+        // coordinator does not re-run `Catalog::resolve` at DoGet, and
+        // `should_distribute` reads only the snapshot-derived store-bytes and
+        // segment terms, so this reproduces the exact distribute/local decision
+        // `get_flight_info_statement` made when it minted the ticket
+        // (SqlExecutor::plan_distributed_slices_for). `None` config, a negative
+        // gate, a logs-target query, a single-slice snapshot, or no advertised
+        // worker all leave this `None`, and the statement runs whole-set on this
+        // coordinator, byte-identical to before this seam existed. The client
+        // forwards this request's inbound tenant credential to every worker so a
+        // worker's own `FlightAuth` resolves the same tenant the slice ticket
+        // pins, and signs each slice ticket with this coordinator's ticket key
+        // (the worker verifies it with the key it shares -- the same process
+        // today; cross-process key distribution is the ADR-0071 follow-up).
+        let distributed = self.distributed.as_ref().and_then(|config| {
+            let snapshot = decoded.snapshot();
+            self.executor
+                .plan_distributed_slices_for(
+                    &snapshot,
+                    &decoded.statement,
+                    config.as_ref(),
+                    &decoded,
+                )
+                .map(|slices| {
+                    let client: Arc<dyn WorkerSliceClient> =
+                        Arc::new(FlightWorkerSliceClient::new(
+                            *self.ticket_key(),
+                            request.metadata().clone(),
+                            DISTRIB_SLICE_CONNECT_TIMEOUT,
+                        ));
+                    (slices, client)
+                })
+        });
+
         // A request-level span carrying only bounded values (ADR-0044 section
         // 5), the Flight SQL counterpart of the `sql_query`/`analytics_query`
         // spans the HTTP handlers build: the tenant hash, the workload class,
@@ -515,6 +589,7 @@ impl FlightSqlService for RavelFlightSqlService {
             Arc::clone(&self.recorder),
             span.clone(),
             permit,
+            distributed,
         )
         .instrument(span.clone())
         .await;
