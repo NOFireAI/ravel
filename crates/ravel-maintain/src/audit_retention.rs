@@ -40,6 +40,17 @@
 //!   record's recent `created_unix_ns` keeps its parts for the horizon even
 //!   though the events they hold are already past the window.
 //!
+//! # The hour prefilter (issue #850)
+//!
+//! An L0 commit record's key-derived `ingest_hour_bucket` lower-bounds its
+//! `max_event_ts_ns` exactly (see `hour_certainly_not_expired`), so before
+//! GETting and decoding a commit record the sweep first checks whether that
+//! bound alone already proves the record cannot be expired. At the default
+//! 90-day window, almost every record on a healthy shard clears this check
+//! on the key alone; only records in hours near or past the retention
+//! horizon still pay for a GET, decode, and the authoritative
+//! [`expired_and_past_horizon`] check.
+//!
 //! # Shard 0 (legal hold) is unreachable, forever
 //!
 //! This sweep is hard-scoped to [`QUERY_AUDIT_SHARD`]: it lists only that
@@ -58,7 +69,7 @@ use ravel_types::{Signal, TenantHash};
 use prost::Message;
 
 use crate::clock::Clock;
-use crate::config::CompactorConfig;
+use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
 use crate::query_audit::QUERY_AUDIT_SHARD;
 use crate::read::verify_commit_key;
@@ -77,6 +88,10 @@ pub struct AuditRetentionOutcome {
     /// Records left in place: not yet expired, still within the protection
     /// horizon, or lease/legal-hold protected.
     pub kept: usize,
+    /// L0 commit records whose GET+decode was skipped because the key's
+    /// `ingest_hour_bucket` alone proved the record cannot be expired (issue
+    /// #850). A subset of `kept`.
+    pub gets_skipped_by_hour_prefilter: usize,
 }
 
 /// Sweep expired query-audit records from a tenant's
@@ -114,7 +129,17 @@ pub async fn sweep_audit_retention(
     let mut outcome = AuditRetentionOutcome::default();
     for meta in metas {
         match keys::partition_bucket_entry(&meta.key) {
-            Ok(BucketEntry::CommitRecord(_)) => {
+            Ok(BucketEntry::CommitRecord(parsed)) => {
+                // Every writer onto this shard (`audit_write::write_audit_batch`,
+                // the sole place `ingest_hour_bucket` is minted for an audit L0
+                // record) sets it to `floor(max_event_ts_ns / NS_PER_HOUR)`
+                // exactly, so the key alone lower-bounds the record's newest
+                // event without a GET. See `hour_certainly_not_expired`.
+                if hour_certainly_not_expired(parsed.ingest_hour_bucket, expiry_floor) {
+                    outcome.kept += 1;
+                    outcome.gets_skipped_by_hour_prefilter += 1;
+                    continue;
+                }
                 let commit = record::decode(&store.get(&meta.key, GetRange::Full).await?.data)?;
                 // The record's key must reconstruct to the key we listed it at
                 // (ADR-0010 §7): a corrupted-but-decodable record's own fields,
@@ -196,6 +221,36 @@ pub async fn sweep_audit_retention(
     Ok(outcome)
 }
 
+/// Conservative, GET-free prefilter (issue #850): true only when the key's
+/// `ingest_hour_bucket` alone *proves* an L0 commit record cannot be expired,
+/// so the caller may skip fetching and decoding it.
+///
+/// `audit_write::write_audit_batch` is the only place that mints
+/// `ingest_hour_bucket` for a record on this shard, and it sets it to
+/// `u32::try_from(max_ts_ns / NS_PER_HOUR)` where `max_ts_ns` is exactly the
+/// record's `max_event_ts_ns` (event time is never later than the hour that
+/// name derives from -- there is no separate "ingest time" for audit records
+/// to diverge against, `created_unix_ns` and `max_event_ts_ns` are the same
+/// `now_ns`). Integer floor division gives
+/// `ingest_hour_bucket * NS_PER_HOUR <= max_event_ts_ns`, unconditionally, for
+/// every record ever written to this shard -- so the bucket's lower edge is a
+/// sound (not approximate) lower bound on the record's newest event, and no
+/// extra margin is needed on top of it.
+///
+/// A record is expired when `max_event_ts_ns < expiry_floor` (see
+/// [`expired_and_past_horizon`]). If the bucket's lower edge already clears
+/// `expiry_floor`, then `max_event_ts_ns >= bucket_start_ns >= expiry_floor`,
+/// so the record cannot be expired regardless of where exactly its event
+/// falls inside the hour, and regardless of the horizon gate (not-expired
+/// alone is enough to keep it). When the bucket's lower edge is still below
+/// `expiry_floor`, the record's exact event time could fall on either side,
+/// so this returns `false` and the caller must GET, decode, and run the
+/// authoritative per-record check.
+fn hour_certainly_not_expired(ingest_hour_bucket: u32, expiry_floor: i64) -> bool {
+    let bucket_start_ns = i64::from(ingest_hour_bucket).saturating_mul(NS_PER_HOUR);
+    bucket_start_ns >= expiry_floor
+}
+
 /// A record is a delete candidate when it is expired (its newest event is
 /// strictly older than `expiry_floor`) AND past the protection horizon
 /// (`now >= created_unix_ns + horizon`). Both gates, both anchored on durable
@@ -231,6 +286,8 @@ mod tests {
     use super::*;
 
     use ravel_logseg::{LogRecord, Predicate, RlogConfig, RlogReader};
+    use ravel_object_store::InstrumentedStore;
+    use ravel_object_store::instrument::StoreOp;
     use ravel_object_store::memory::MemoryStore;
     use uuid::Uuid;
 
@@ -388,6 +445,165 @@ mod tests {
             "the expired record's data object is gone; the recent one remains"
         );
         assert_eq!(commit_count(&store, &tenant).await, 1);
+    }
+
+    /// Issue #850: on a shard with many hours of retained-but-unexpired audit
+    /// records, the sweep must not GET or decode any of them -- the key's
+    /// `ingest_hour_bucket` alone proves every one of them is still within
+    /// the 90-day window. Before the fix, `sweep_audit_retention` GET'd and
+    /// decoded every commit record to read `max_event_ts_ns`; this asserts
+    /// the GET counter directly, not just the (unchanged) outcome, so a
+    /// regression that starts GETting again fails here even though every
+    /// other assertion in this file would still pass.
+    #[tokio::test]
+    async fn hour_prefilter_skips_every_get_when_all_records_are_within_window() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant = tenant();
+        const NUM_HOURS: i64 = 60;
+        let now_hour = 5_000i64;
+        let now = now_hour * NS_PER_HOUR;
+        let config = CompactorConfig::default(); // 90-day window >> 60h spread
+
+        // 60 records, one per hour, all recent (well within the window).
+        for i in 0..NUM_HOURS {
+            let ts = (now_hour - 1 - i) * NS_PER_HOUR + 1;
+            seed_audit(&store, &tenant, ts, &format!("query {i}")).await;
+        }
+        assert_eq!(commit_count(&store, &tenant).await, NUM_HOURS as usize);
+
+        let gets_before = store.metrics().snapshot().op(StoreOp::Get).calls;
+        let clock = FixedClock::new(now);
+        let outcome = sweep_audit_retention(&store, &clock, &config, &NoLeases, &tenant)
+            .await
+            .expect("sweep");
+        let gets_after = store.metrics().snapshot().op(StoreOp::Get).calls;
+
+        assert_eq!(
+            gets_after - gets_before,
+            0,
+            "the hour prefilter must clear every record without a single GET"
+        );
+        assert_eq!(outcome.kept, NUM_HOURS as usize);
+        assert_eq!(outcome.gets_skipped_by_hour_prefilter, NUM_HOURS as usize);
+        assert_eq!(outcome.records_deleted, 0);
+    }
+
+    /// Issue #850: GET volume must scale with the number of records whose
+    /// hour could plausibly hold expired data, not with the total record
+    /// count. 50 recent (unexpired) records plus 3 genuinely-expired records
+    /// (past both the window and the horizon) must cost exactly 3 GETs, and
+    /// the 3 expired records must still be swept -- exact retention
+    /// semantics are preserved, the prefilter only removes wasted GETs.
+    #[tokio::test]
+    async fn hour_prefilter_get_count_bounded_by_expired_hours_not_total_records() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant = tenant();
+        let now_hour = 5_000i64;
+        let now = now_hour * NS_PER_HOUR;
+        let config = CompactorConfig::default(); // 90-day window (2160h)
+
+        const RECENT: i64 = 50;
+        for i in 0..RECENT {
+            let ts = (now_hour - 1 - i) * NS_PER_HOUR + 1;
+            seed_audit(&store, &tenant, ts, &format!("recent {i}")).await;
+        }
+
+        const EXPIRED: i64 = 3;
+        // 2200h ago: past the 2160h (90-day) window and far past the 25h
+        // horizon, in three distinct hours so each needs its own GET.
+        for i in 0..EXPIRED {
+            let ts = (now_hour - 2_200 - i) * NS_PER_HOUR + 1;
+            seed_audit(&store, &tenant, ts, &format!("expired {i}")).await;
+        }
+        assert_eq!(
+            commit_count(&store, &tenant).await,
+            (RECENT + EXPIRED) as usize
+        );
+
+        let gets_before = store.metrics().snapshot().op(StoreOp::Get).calls;
+        let clock = FixedClock::new(now);
+        let outcome = sweep_audit_retention(&store, &clock, &config, &NoLeases, &tenant)
+            .await
+            .expect("sweep");
+        let gets_after = store.metrics().snapshot().op(StoreOp::Get).calls;
+
+        assert_eq!(
+            gets_after - gets_before,
+            EXPIRED as u64,
+            "GET count must equal the boundary/expired-hour records, not all {} records",
+            RECENT + EXPIRED
+        );
+        assert_eq!(outcome.kept, RECENT as usize);
+        assert_eq!(outcome.gets_skipped_by_hour_prefilter, RECENT as usize);
+        assert_eq!(
+            outcome.records_deleted, EXPIRED as usize,
+            "every genuinely expired record is still swept"
+        );
+    }
+
+    /// Issue #850: a record whose hour straddles `expiry_floor` (the hour's
+    /// start is before the floor, so the prefilter cannot clear it, but the
+    /// record's own timestamp may fall on either side) must be resolved by
+    /// the authoritative GET+decode check, never by the hour alone. Two
+    /// records share one ambiguous hour: one just past `expiry_floor` (not
+    /// expired, must be kept) and one just before it (expired, must be
+    /// swept). Both must cost a GET; neither may be decided by the prefilter.
+    #[tokio::test]
+    async fn hour_prefilter_boundary_hour_defers_to_authoritative_get_check() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant = tenant();
+        let now_hour = 5_000i64;
+        let now = now_hour * NS_PER_HOUR;
+
+        // A window that puts `expiry_floor` 30 minutes into hour (now_hour -
+        // 10), not on an hour boundary, so both records below land in the
+        // same `ingest_hour_bucket` as each other and as the floor. The
+        // horizon is zeroed out so it cannot mask the window boundary this
+        // test is about: both records are only ~10h old, well under the
+        // default 25h horizon, which would otherwise spare the expired one
+        // regardless of the window check under test here.
+        let config = CompactorConfig {
+            audit_retention_window_ns: 10 * NS_PER_HOUR - 30 * 60_000_000_000,
+            protection_horizon_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let expiry_floor = now.saturating_sub(config.audit_retention_window_ns);
+
+        let ts_kept = expiry_floor + 1_000; // not expired, same hour
+        let ts_deleted = expiry_floor - 1_000; // expired, same hour
+        assert_eq!(
+            ts_kept / NS_PER_HOUR,
+            ts_deleted / NS_PER_HOUR,
+            "both timestamps must land in the same ingest_hour_bucket for this to test the boundary"
+        );
+
+        seed_audit(&store, &tenant, ts_kept, "boundary kept").await;
+        seed_audit(&store, &tenant, ts_deleted, "boundary deleted").await;
+
+        let gets_before = store.metrics().snapshot().op(StoreOp::Get).calls;
+        let clock = FixedClock::new(now);
+        let outcome = sweep_audit_retention(&store, &clock, &config, &NoLeases, &tenant)
+            .await
+            .expect("sweep");
+        let gets_after = store.metrics().snapshot().op(StoreOp::Get).calls;
+
+        assert_eq!(
+            gets_after - gets_before,
+            2,
+            "the ambiguous hour cannot be cleared by the prefilter; both records need a GET"
+        );
+        assert_eq!(
+            outcome.gets_skipped_by_hour_prefilter, 0,
+            "the boundary hour must never be decided by the prefilter alone"
+        );
+        assert_eq!(
+            outcome.kept, 1,
+            "the not-yet-expired boundary record survives"
+        );
+        assert_eq!(
+            outcome.records_deleted, 1,
+            "the genuinely expired boundary record is still swept"
+        );
     }
 
     /// The horizon gate is real: a record whose events are past the window but
