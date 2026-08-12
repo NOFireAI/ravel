@@ -191,6 +191,22 @@ pub const DEFAULT_AUDIT_RETENTION_NS: i64 = 90 * 24 * NS_PER_HOUR;
 /// the sweep's own `min_hour` calculation (`crate::sweep`).
 pub const DEFAULT_IDEM_DEDUP_WINDOW_HOURS: u32 = 24;
 
+/// Default `interior_reverify_ns` (ADR-0065 decision 3, config name
+/// `maintain_interior_reverify`): the slow safety-net cadence for the
+/// interior zone's terminal buckets, replacing the flat
+/// [`crate::scan::DEFAULT_MEMO_REVERIFY_INTERVAL_NS`] (1 h) for that zone
+/// only. Head and tail keep tick-cadence evaluation regardless of this
+/// value. The same knob also gates how often the maintain driver runs a
+/// full-keyspace [`crate::sweep::sweep_shard`] pass instead of the per-tick
+/// [`crate::sweep::sweep_shard_zoned`] pass, via
+/// [`crate::scan::MaintainMemo::full_sweep_due`]: one cadence, one operator
+/// knob, for both halves of the zone split. 6 h is far below any retention
+/// window or protection horizon, so the promptness this bounds (a
+/// tombstoned interior bucket's physical sweep, an operator hold) is a
+/// documented latency, never a correctness gap (docs/consistency-model.md
+/// "Deletion and GC").
+pub const DEFAULT_INTERIOR_REVERIFY_NS: i64 = 6 * NS_PER_HOUR;
+
 /// Default `max_batch` for the group-commit [`crate::audit_pipeline::AuditPipeline`]:
 /// the buffered-record count that forces a flush before `max_age` elapses.
 pub const DEFAULT_AUDIT_MAX_BATCH: usize = 256;
@@ -355,6 +371,15 @@ pub struct CompactorConfig {
     /// other merge knob, so `..CompactorConfig::default()` call sites are
     /// unaffected. Default `None`.
     pub merge_memory_tracker: Option<MergeMemoryTracker>,
+    /// Slow safety-net re-verify cadence for the interior zone (ADR-0065
+    /// decision 3, config `maintain_interior_reverify`). A terminal interior
+    /// bucket is re-evaluated no later than this after its last verification,
+    /// or sooner if its computed retention expiry arrives first
+    /// ([`crate::scan::classify_zone`], [`crate::scan::MaintainMemo`]). Head
+    /// and tail hours ignore this and are evaluated every tick. Default
+    /// [`DEFAULT_INTERIOR_REVERIFY_NS`] (6 h); non-positive disables the
+    /// safety net (every interior bucket is always due).
+    pub interior_reverify_ns: i64,
 }
 
 impl Default for CompactorConfig {
@@ -376,6 +401,7 @@ impl Default for CompactorConfig {
             audit_retention_window_ns: DEFAULT_AUDIT_RETENTION_NS,
             dry_run: false,
             merge_memory_tracker: None,
+            interior_reverify_ns: DEFAULT_INTERIOR_REVERIFY_NS,
         }
     }
 }

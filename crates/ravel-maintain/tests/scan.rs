@@ -10,7 +10,7 @@ use ravel_commit::keys;
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
 use ravel_maintain::scan::{
     DEFAULT_MEMO_REVERIFY_INTERVAL_NS, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MaintainMemo,
-    TerminalState, scan_and_maintain_with_memo,
+    TerminalState, Zone, classify_zone, scan_and_maintain_with_memo,
 };
 use ravel_maintain::{
     Bucket, CompactorConfig, FixedClock, NoLeases, RetentionConfig, RetentionPolicy,
@@ -774,4 +774,362 @@ async fn ownership_handoff_seeds_successor_from_predecessor_snapshot() {
         0,
         "no per-bucket LISTs on handoff warm start"
     );
+}
+
+// --- Zone-scheduled maintenance (ADR-0065 decision 3, issue #748) ----------
+//
+// The unit scan splits a unit's ingest hours into head/tail (evaluated every
+// tick, exactly as before this split existed) and interior (memo-gated,
+// re-verified only on `CompactorConfig::interior_reverify_ns`, default 6h, or
+// immediately on the hour's own zone transition into `Tail` at its computed
+// retention expiry). These tests pin the differentiator from the flat,
+// pre-split re-verify interval (`DEFAULT_MEMO_REVERIFY_INTERVAL_NS`, 1h): an
+// interior bucket memoized terminal must survive well past that 1h bound
+// without being re-listed, skipping only while the interior zone's own 6h
+// cadence has not yet elapsed.
+
+/// The named acceptance test (ADR-0065 decision 3, issue #748): an interior
+/// hour memoized terminal is NOT re-listed on a tick 3h later, even though
+/// that is past the old flat 1h re-verify interval -- only the interior
+/// zone's own 6h cadence governs it now. Proven by an exact LIST-count
+/// assertion (`list_delta == 0`), not just the report's `skipped_terminal`
+/// count.
+#[tokio::test]
+async fn interior_zone_scheduled_not_rescanned() {
+    let store = InstrumentedStore::new(MemoryStore::new());
+    for s in compactable_at(HOUR, 700) {
+        seed_input(&store, &s).await;
+    }
+    let config = CompactorConfig::default();
+    let retention = retention_window(30 * DAY_NS);
+    let mut memo = MaintainMemo::new(config.interior_reverify_ns);
+
+    let t1 = sealed_now_ns(); // hour_start + 3h: sealed, still Head.
+    scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(t1),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("compact");
+    let t2 = t1 + 1_000_000;
+    scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(t2),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("memoize");
+    assert_eq!(
+        memo.terminal_state(tenant_hash(), Signal::Metrics, SHARD, HOUR),
+        Some(TerminalState::Compacted),
+    );
+
+    // t3 is 3h past t2: past the old flat 1h re-verify interval, but well
+    // inside the interior zone's 6h cadence. The hour has also left Head by
+    // now (it's been ~6h since the hour started).
+    let t3 = t2 + 3 * NS_PER_HOUR;
+    assert_eq!(
+        classify_zone(HOUR, t3, &config, retention.window_for(&tenant_hash())),
+        Zone::Interior,
+        "3h past sealing, 30 days from expiry: neither head nor tail"
+    );
+    let before = store.metrics().snapshot();
+    let report = scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(t3),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("interior tick");
+    let after = store.metrics().snapshot();
+    assert_eq!(report.skipped_terminal, 1, "the interior hour is skipped");
+    assert_eq!(
+        list_delta(&before, &after),
+        0,
+        "an interior hour within its 6h cadence issues no per-bucket LIST"
+    );
+    assert!(
+        report.head_tail_hours.is_empty(),
+        "the hour is Interior, not Head or Tail"
+    );
+}
+
+/// Interior -> Tail zone transition forces re-evaluation before the interior
+/// cadence would have: even though the memoized entry is still well within
+/// `interior_reverify_ns` of its last verification, the bucket's own
+/// retention expiry moves it into the tail window, and tail hours bypass the
+/// memo unconditionally (ADR-0065 decision 3). This is what catches an
+/// expiry the interior cadence alone would have deferred.
+#[tokio::test]
+async fn interior_zone_expiry_transition_forces_reevaluation() {
+    let store = InstrumentedStore::new(MemoryStore::new());
+    for s in compactable_at(HOUR, 710) {
+        seed_input(&store, &s).await;
+    }
+    let config = CompactorConfig::default();
+    let window = 5 * NS_PER_HOUR; // above the default retention floor (~4h05m)
+    let retention = retention_window(window);
+    let mut memo = MaintainMemo::new(config.interior_reverify_ns);
+    let hour_start = i64::from(HOUR) * NS_PER_HOUR;
+
+    // now1: sealed, past Head (>~3h05m old), well before expiry (hour_start +
+    // 5h).
+    let now1 = hour_start + 4 * NS_PER_HOUR;
+    scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(now1),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("compact");
+    let now2 = now1 + 1_000_000;
+    scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(now2),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("memoize");
+    assert_eq!(
+        classify_zone(HOUR, now2, &config, retention.window_for(&tenant_hash())),
+        Zone::Interior,
+    );
+    assert_eq!(
+        memo.terminal_state(tenant_hash(), Signal::Metrics, SHARD, HOUR),
+        Some(TerminalState::Compacted),
+    );
+
+    // now3: ~2h after now2 -- well inside the 6h interior cadence, so a
+    // cadence-only check would still call this entry fresh -- but past the
+    // bucket's computed expiry (hour_start + window), so the zone is now
+    // Tail.
+    let now3 = hour_start + window + NS_PER_HOUR;
+    assert!(
+        now3 - now2 < config.interior_reverify_ns,
+        "well inside the interior cadence"
+    );
+    assert_eq!(
+        classify_zone(HOUR, now3, &config, retention.window_for(&tenant_hash())),
+        Zone::Tail,
+        "past the computed expiry, within the protection horizon"
+    );
+    let before = store.metrics().snapshot();
+    let report = scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(now3),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("tail tick");
+    let after = store.metrics().snapshot();
+    assert_eq!(
+        report.retired, 1,
+        "the tail-zone re-evaluation catches the now-expired bucket"
+    );
+    assert!(
+        list_delta(&before, &after) >= 1,
+        "the tail zone bypasses the memo and re-lists the bucket"
+    );
+    assert_eq!(
+        report.head_tail_hours,
+        vec![HOUR],
+        "the hour is classified Tail this tick"
+    );
+    assert_eq!(
+        memo.terminal_state(tenant_hash(), Signal::Metrics, SHARD, HOUR),
+        None,
+        "a tombstoned-pending bucket is not memoized terminal"
+    );
+    assert!(has_tombstone(&store, &bucket_at(HOUR)).await);
+}
+
+/// `MaintainMemo::invalidate` (ADR-0065 decision 3, issue #748) marks an
+/// interior hour due for re-evaluation on the next tick regardless of the
+/// interior cadence, and the invalidation survives a memo snapshot save/load
+/// round trip: because it works by forgetting the entry (there is nothing to
+/// encode), a snapshot taken after `invalidate()` carries no terminal verdict
+/// for that hour, so a fresh memo seeded from it treats the hour as due, not
+/// as freshly terminal. `invalidate()` has no production caller yet in this
+/// crate: EJ-T4 (issue #754) is what wires the erasure-rewrite work orders to
+/// call it.
+#[tokio::test]
+async fn invalidate_forces_reevaluation_and_survives_snapshot_round_trip() {
+    let store = InstrumentedStore::new(MemoryStore::new());
+    for s in compactable_at(HOUR, 720) {
+        seed_input(&store, &s).await;
+    }
+    let config = CompactorConfig::default();
+    let retention = retention_window(30 * DAY_NS);
+    let mut memo = MaintainMemo::new(config.interior_reverify_ns);
+
+    let t1 = sealed_now_ns();
+    scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(t1),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("compact");
+    let t2 = t1 + 1_000_000;
+    scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(t2),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("memoize");
+    let t3 = t2 + 3 * NS_PER_HOUR;
+    assert_eq!(
+        classify_zone(HOUR, t3, &config, retention.window_for(&tenant_hash())),
+        Zone::Interior,
+    );
+    assert_eq!(
+        memo.terminal_state(tenant_hash(), Signal::Metrics, SHARD, HOUR),
+        Some(TerminalState::Compacted),
+    );
+
+    // Invalidate at t3, still well inside the 6h interior cadence -- a
+    // cadence-only check would skip this hour.
+    memo.invalidate(tenant_hash(), Signal::Metrics, SHARD, &[HOUR]);
+    assert_eq!(
+        memo.terminal_state(tenant_hash(), Signal::Metrics, SHARD, HOUR),
+        None,
+        "invalidate forgets the memoized verdict"
+    );
+
+    // The very next tick re-evaluates the hour: no skip, a real LIST.
+    let before = store.metrics().snapshot();
+    let report = scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(t3),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("post-invalidate tick");
+    let after = store.metrics().snapshot();
+    assert_eq!(
+        report.skipped_terminal, 0,
+        "the invalidated hour is not skipped"
+    );
+    assert!(
+        list_delta(&before, &after) >= 1,
+        "the invalidated hour is re-listed"
+    );
+
+    // Snapshot round trip: invalidate again on a freshly re-memoized entry,
+    // then encode and seed a fresh memo from the snapshot bytes. The
+    // invalidated hour must come back due, not freshly terminal.
+    let t4 = t3 + 1_000_000;
+    scan_and_maintain_with_memo(
+        &mut memo,
+        &store,
+        &FixedClock::new(t4),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("re-memoize");
+    assert_eq!(
+        memo.terminal_state(tenant_hash(), Signal::Metrics, SHARD, HOUR),
+        Some(TerminalState::Compacted),
+    );
+    memo.invalidate(tenant_hash(), Signal::Metrics, SHARD, &[HOUR]);
+    let snapshot_bytes = memo.encode_snapshot(t4);
+    let mut seeded = MaintainMemo::new(config.interior_reverify_ns);
+    let stats = seeded
+        .seed_from_snapshot(
+            &snapshot_bytes,
+            t4,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("seed from post-invalidate snapshot");
+    assert_eq!(
+        stats.seeded_buckets, 0,
+        "the invalidated hour carries no terminal verdict to seed"
+    );
+    assert_eq!(
+        seeded.terminal_state(tenant_hash(), Signal::Metrics, SHARD, HOUR),
+        None,
+        "the invalidated hour stays due after a snapshot save/load round trip"
+    );
+
+    // The warm-started worker's first tick re-evaluates the hour rather than
+    // skipping it straight from the seed.
+    let before2 = store.metrics().snapshot();
+    let report2 = scan_and_maintain_with_memo(
+        &mut seeded,
+        &store,
+        &FixedClock::new(t4),
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("warm-started tick after invalidate");
+    let after2 = store.metrics().snapshot();
+    assert_eq!(report2.skipped_terminal, 0);
+    assert!(list_delta(&before2, &after2) >= 1);
 }

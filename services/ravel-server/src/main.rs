@@ -186,10 +186,14 @@ async fn main() -> anyhow::Result<()> {
     let gc_runtime = cli
         .resolve_gc_runtime()
         .context("failed to parse the --gc-* GC-config flags")?;
+    let interior_reverify_ns = cli
+        .parse_maintain_interior_reverify()
+        .context("failed to parse --maintain-interior-reverify")?;
     let compactor = CompactorConfig {
         protection_horizon_ns: gc_runtime.protection_horizon_ns,
         grace_ns: gc_runtime.grace_ns,
         max_flush_lifetime_ns: gc_runtime.max_flush_lifetime_ns,
+        interior_reverify_ns,
         ..CompactorConfig::default()
     };
     let catalog_max_ingest_lag_ns = ravel_catalog::CatalogConfig::default().max_ingest_lag_ns;

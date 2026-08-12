@@ -21,7 +21,7 @@ use prost::Message;
 use ravel_commit::keys;
 use ravel_maintain::{
     Bucket, Clock, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, PublishOutcome,
-    compact_bucket, sweep_orphans, sweep_shard, sweep_superseded,
+    compact_bucket, sweep_orphans, sweep_shard, sweep_shard_zoned, sweep_superseded,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -216,7 +216,14 @@ async fn row7_partial_input_records_deleted_reswept_converges() {
         )
         .await
         .expect("re-sweep");
-        assert_eq!(again, ravel_maintain::SweepReport::default(), "converged");
+        assert_eq!(
+            again,
+            ravel_maintain::SweepReport {
+                full_pass: true,
+                ..ravel_maintain::SweepReport::default()
+            },
+            "converged: nothing left to delete, but sweep_shard always ran a full pass"
+        );
     }
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
@@ -1073,4 +1080,157 @@ async fn dry_run_sweep_reports_eligible_set_but_deletes_nothing() {
     run(Sig::Metrics).await;
     run(Sig::Logs).await;
     run(Sig::Spans).await;
+}
+
+// --- Zone-scoped sweep and the full-pass safety net (ADR-0065 decision 3,
+//     issue #748) --------------------------------------------------------------
+//
+// `sweep_shard_zoned` scopes the superseded-input and unreferenced-part rules
+// to the caller's per-tick hour set (typically the unit scan's head+tail
+// hours). An hour classified Interior this tick is excluded from that set,
+// and a full-keyspace `sweep_shard` pass -- the slow safety net -- is what
+// eventually covers it. These tests pin that deferral-then-guarantee at the
+// sweep primitives directly (the maintain driver's cadence decision lives in
+// `services/ravel-server`, out of this crate's scope).
+
+/// The safety-net case: an hour excluded from `sweep_shard_zoned`'s scope
+/// (this tick's Interior classification) keeps its superseded input past the
+/// protection horizon, but a full `sweep_shard` pass -- the slow cadence's
+/// safety net -- still collects it.
+#[tokio::test]
+async fn sweep_shard_zoned_defers_out_of_scope_hour_to_full_sweep() {
+    let store = MemoryStore::new();
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = seed_and_compact(&store, &clock, Sig::Metrics).await;
+    clock.set(past_horizon(created, &cfg()));
+
+    // The bucket's hour is excluded from this tick's scope (classified
+    // Interior, not head or tail).
+    let zoned = sweep_shard_zoned(
+        &store,
+        &clock,
+        &cfg(),
+        &NoLeases,
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        &[],
+    )
+    .await
+    .expect("zoned sweep");
+    assert!(!zoned.full_pass);
+    assert_eq!(
+        zoned.superseded_records_deleted, 0,
+        "an out-of-scope hour is left untouched by the zoned pass"
+    );
+    assert_eq!(
+        l0_commit_count(&store, &bucket).await,
+        2,
+        "inputs still present"
+    );
+    assert_l1_intact(&store, &bucket).await;
+
+    // The safety-net full pass covers it.
+    let full = sweep_shard(
+        &store,
+        &clock,
+        &cfg(),
+        &NoLeases,
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+    )
+    .await
+    .expect("full sweep");
+    assert!(full.full_pass);
+    assert!(
+        full.superseded_records_deleted >= 1,
+        "the safety-net pass sweeps what the zoned pass deferred"
+    );
+    assert_eq!(l0_commit_count(&store, &bucket).await, 0);
+    assert_eq!(l0_data_count(&store, &bucket).await, 0);
+    assert_l1_intact(&store, &bucket).await;
+}
+
+/// Deletion promptness bound (ADR-0065 decision 3): a tombstoned interior
+/// bucket's record-less `l1/` residue is not collected by the per-tick zoned
+/// pass while the hour is out of scope, but it is collected no later than the
+/// next full safety-net pass -- the explicit bound this test pins, rather than
+/// leaving it as an unstated property of the age gate.
+#[tokio::test]
+async fn tombstoned_interior_bucket_swept_no_later_than_full_pass() {
+    let store = MemoryStore::new();
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = seed_and_compact(&store, &clock, Sig::Metrics).await;
+    seed_tombstone(&store, &bucket).await;
+
+    // A record-less, unreferenced `l1/` part (a losing compactor's leftover),
+    // planted at store time 0.
+    let stray_hash16 = hex::encode([0xEEu8; 8]);
+    let record = fetch_compaction_record(&store, &bucket).await;
+    let input_set_hash16 = hex::encode(&record.input_set_hash[..8]);
+    let stray_key = keys::l1_part_key(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+        &input_set_hash16,
+        9,
+        &stray_hash16,
+    )
+    .unwrap();
+    store
+        .put(
+            &stray_key,
+            bytes::Bytes::from_static(b"stray-l1-part"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let config = cfg();
+    clock.set(config.unreferenced_part_age_gate_ns() + 1);
+
+    // Out of this tick's scope: the stray part survives.
+    let zoned = sweep_shard_zoned(
+        &store,
+        &clock,
+        &config,
+        &NoLeases,
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        &[],
+    )
+    .await
+    .expect("zoned sweep");
+    assert!(!zoned.full_pass);
+    assert_eq!(zoned.unreferenced_parts_deleted, 0);
+    store
+        .head(&stray_key)
+        .await
+        .expect("stray part survives the zoned pass");
+
+    // The full safety-net pass collects it -- the promptness bound: no later
+    // than this cadence.
+    let full = sweep_shard(
+        &store,
+        &clock,
+        &config,
+        &NoLeases,
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+    )
+    .await
+    .expect("full sweep");
+    assert!(full.full_pass);
+    assert_eq!(full.unreferenced_parts_deleted, 1);
+    assert!(matches!(
+        store.head(&stray_key).await,
+        Err(StoreError::NotFound)
+    ));
+    assert_l1_intact(&store, &bucket).await;
 }

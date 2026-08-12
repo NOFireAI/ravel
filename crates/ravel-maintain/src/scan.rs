@@ -118,6 +118,12 @@ pub struct MaintainReport {
     /// Always zero on a cold pass and for the non-memoized
     /// [`scan_and_maintain`] entry point.
     pub skipped_terminal: usize,
+    /// Hours this pass classified as [`Zone::Head`] or [`Zone::Tail`], i.e.
+    /// evaluated every tick regardless of the memo. The maintain driver reuses
+    /// this set as the hour scope for the same tick's [`crate::sweep::sweep_shard_zoned`]
+    /// call (ADR-0065 decision 3), so the sweep never issues a second LIST of
+    /// the shard's hours to compute it.
+    pub head_tail_hours: Vec<u32>,
 }
 
 /// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
@@ -145,6 +151,78 @@ async fn list_shard_hours(
     }
     hours.sort_unstable();
     Ok(hours)
+}
+
+/// A unit's hour zone (ADR-0065 decision 3). Recomputed fresh every tick
+/// from `now_ns` and the tenant's config by [`classify_zone`] -- never
+/// stored -- because both the head frontier and, when a retention policy
+/// exists, the tail window move with the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zone {
+    /// Newer than the seal margin plus one hour of slack: sealing and first
+    /// compaction still happen here. Evaluated every tick, bypassing
+    /// [`MaintainMemo`] entirely, exactly as before this zone split existed.
+    Head,
+    /// From the bucket's computed retention expiry through the protection
+    /// horizon past it: tombstoning and the horizon-gated physical sweep
+    /// both happen in this window. Evaluated every tick, bypassing the
+    /// memo, same as `Head`. Unreachable when the tenant has no retention
+    /// policy (nothing ever expires, so there is no tail).
+    Tail,
+    /// Below the head frontier and before its computed retention expiry (or
+    /// the tenant has no retention policy at all): nothing can change a
+    /// terminal bucket here except that future expiry, an operator action
+    /// (tombstone, hold), or a future EJ erasure order
+    /// ([`MaintainMemo::invalidate`] is the seam for the latter two).
+    /// Memo-gated: skipped while a terminal entry is fresh, re-verified once
+    /// `CompactorConfig::interior_reverify_ns` has elapsed since the last
+    /// verification, or immediately once the zone recomputes to `Tail` at
+    /// the bucket's actual expiry.
+    Interior,
+}
+
+/// Classify `hour` into a [`Zone`] for `now_ns` (ADR-0065 decision 3).
+/// `retention_window_ns` is `None` when the tenant has no retention policy,
+/// in which case no hour is ever `Tail`.
+///
+/// The tail window anchors on `hour`'s own nominal bucket-end timestamp
+/// (`(hour + 1) * NS_PER_HOUR`) plus the window, not on the bucket's actual
+/// maximum event timestamp: the real expiry check
+/// ([`crate::retention::is_expired`]) reads decoded commit and compaction
+/// records and is only exact at evaluation time inside `maintain_bucket`,
+/// but this function is a scheduling heuristic, not a correctness gate --
+/// it only decides when to look, never whether to delete. Because a sealed
+/// bucket's events fall inside its own hour
+/// (`max_event_ts <= bucket_end_ns`, modulo the clock-skew allowance already
+/// folded into the seal margin), this heuristic's computed expiry instant is
+/// always at or after the bucket's true expiry, so the zone transition into
+/// `Tail` -- and thus tick-cadence evaluation -- can lag the true expiry by
+/// at most about one hour. That lag is bounded well inside
+/// `protection_horizon_ns` (which must clear `max_query_duration + grace`),
+/// so it costs a small, documented scheduling delay, never a promptness or
+/// safety violation.
+pub fn classify_zone(
+    hour: u32,
+    now_ns: i64,
+    config: &CompactorConfig,
+    retention_window_ns: Option<i64>,
+) -> Zone {
+    let bucket_end_ns = i64::from(hour)
+        .saturating_add(1)
+        .saturating_mul(NS_PER_HOUR);
+    let head_frontier_ns =
+        now_ns.saturating_sub(config.seal_margin_ns().saturating_add(NS_PER_HOUR));
+    if bucket_end_ns > head_frontier_ns {
+        return Zone::Head;
+    }
+    if let Some(window_ns) = retention_window_ns {
+        let expiry_ns = bucket_end_ns.saturating_add(window_ns);
+        let tail_hi = expiry_ns.saturating_add(config.protection_horizon_ns);
+        if now_ns >= expiry_ns && now_ns <= tail_hi {
+            return Zone::Tail;
+        }
+    }
+    Zone::Interior
 }
 
 /// Default full re-verify interval for [`MaintainMemo`] (1 hour). A bucket the
@@ -283,6 +361,14 @@ struct MemoEntry {
 pub struct MaintainMemo {
     entries: HashMap<BucketKey, MemoEntry>,
     reverify_interval_ns: i64,
+    /// When [`crate::sweep::sweep_shard`] (the full-keyspace safety-net pass,
+    /// not [`crate::sweep::sweep_shard_zoned`]) last ran for a `(tenant,
+    /// signal, shard)` unit, keyed the same way [`Self::split_unit`] and
+    /// [`Self::merge_unit`] already partition entries, so it rides the same
+    /// per-unit split/merge without its own concurrency plumbing. Absent means
+    /// never (a cold worker's first tick), which [`Self::full_sweep_due`]
+    /// treats as due, matching this memo's own cold-start behavior.
+    last_full_sweep_ns: HashMap<(TenantHash, Signal, u32), i64>,
 }
 
 impl MaintainMemo {
@@ -294,6 +380,7 @@ impl MaintainMemo {
         MaintainMemo {
             entries: HashMap::new(),
             reverify_interval_ns,
+            last_full_sweep_ns: HashMap::new(),
         }
     }
 
@@ -362,6 +449,33 @@ impl MaintainMemo {
         self.entries.remove(key);
     }
 
+    /// Mark `hours` of `(tenant, signal, shard)` as due for re-evaluation on
+    /// the next tick, regardless of interior re-verify cadence.
+    ///
+    /// This is the public invalidate seam named in ADR-0065: callers outside
+    /// this crate (the erasure rewrite work orders in EJ-T4, issue #754) use
+    /// it to force a specific interior hour back through `maintain_bucket`
+    /// without waiting for the slow safety-net sweep or the interior
+    /// re-verify interval to elapse. It is a thin wrapper over [`Self::forget`]:
+    /// a forgotten entry has no memoized verdict, so `is_fresh_terminal`
+    /// reports it as not fresh and the next tick re-evaluates it. Because
+    /// there is nothing to encode, this trivially survives a memo snapshot
+    /// save/load round-trip (there's no stale entry to reseed).
+    ///
+    /// Known gap, not addressed here: if a sibling worker's own snapshot
+    /// (taken before the invalidation, but merged in after it) re-seeds this
+    /// key as terminal via `seed_from_snapshot`'s freshest-verdict-wins rule,
+    /// and that snapshot's `verified_at_ns` is later than this invalidation
+    /// event, the entry can come back fresh before its next natural tick.
+    /// Closing this needs a durable invalidation marker (a tombstone with its
+    /// own timestamp) in the snapshot format, which is out of scope for this
+    /// task.
+    pub fn invalidate(&mut self, tenant: TenantHash, signal: Signal, shard: u32, hours: &[u32]) {
+        for hour in hours {
+            self.forget(&(tenant, signal, shard, *hour));
+        }
+    }
+
     /// Split off the memo entries for one `(tenant, signal, shard)` unit into a
     /// standalone memo carrying the same re-verify interval, removing them from
     /// `self`. For the bounded-concurrent per-unit walk (ADR-0065 decision 2):
@@ -379,9 +493,14 @@ impl MaintainMemo {
                 true
             }
         });
+        let mut moved_sweep = HashMap::new();
+        if let Some(ns) = self.last_full_sweep_ns.remove(&(tenant, signal, shard)) {
+            moved_sweep.insert((tenant, signal, shard), ns);
+        }
         MaintainMemo {
             entries: moved,
             reverify_interval_ns: self.reverify_interval_ns,
+            last_full_sweep_ns: moved_sweep,
         }
     }
 
@@ -390,6 +509,42 @@ impl MaintainMemo {
     /// this never overwrites another unit's entry.
     pub fn merge_unit(&mut self, unit: MaintainMemo) {
         self.entries.extend(unit.entries);
+        self.last_full_sweep_ns.extend(unit.last_full_sweep_ns);
+    }
+
+    /// Whether a full-keyspace sweep pass ([`crate::sweep::sweep_shard`]) is
+    /// due for `(tenant, signal, shard)` at `now_ns`, i.e. it has never run or
+    /// last ran at least `cadence_ns` ago. A non-positive `cadence_ns` is
+    /// always due, mirroring [`Self::is_fresh_terminal`]'s non-positive-
+    /// interval convention.
+    pub fn full_sweep_due(
+        &self,
+        tenant: TenantHash,
+        signal: Signal,
+        shard: u32,
+        now_ns: i64,
+        cadence_ns: i64,
+    ) -> bool {
+        if cadence_ns <= 0 {
+            return true;
+        }
+        match self.last_full_sweep_ns.get(&(tenant, signal, shard)) {
+            Some(last_ns) => now_ns.saturating_sub(*last_ns) >= cadence_ns,
+            None => true,
+        }
+    }
+
+    /// Record that a full-keyspace sweep pass ran for `(tenant, signal,
+    /// shard)` at `now_ns`, resetting [`Self::full_sweep_due`]'s clock.
+    pub fn record_full_sweep(
+        &mut self,
+        tenant: TenantHash,
+        signal: Signal,
+        shard: u32,
+        now_ns: i64,
+    ) {
+        self.last_full_sweep_ns
+            .insert((tenant, signal, shard), now_ns);
     }
 
     /// Drop entries for `(tenant, signal, shard)` whose hour is absent from
@@ -965,14 +1120,22 @@ pub async fn scan_and_maintain_with_memo(
     let now = clock.now_ns();
     let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
     let present: HashSet<u32> = hours.iter().copied().collect();
+    let retention_window_ns = retention.window_for(&tenant_hash);
 
     let mut report = MaintainReport::default();
     for hour in hours {
         let key: BucketKey = (tenant_hash, signal, shard, hour);
 
-        // Steady state: the memo already proved this bucket terminal and the
-        // entry is still fresh, so skip it without listing or reading anything.
-        if memo.is_fresh_terminal(&key, now) {
+        // Head and tail hours evaluate every tick, exactly as before this
+        // zone split existed (ADR-0065 decision 3): only an interior hour
+        // ever consults the memo. Steady state: the memo already proved an
+        // interior bucket terminal and the entry is still fresh (within
+        // `CompactorConfig::interior_reverify_ns`), so skip it without
+        // listing or reading anything.
+        let zone = classify_zone(hour, now, config, retention_window_ns);
+        if zone != Zone::Interior {
+            report.head_tail_hours.push(hour);
+        } else if memo.is_fresh_terminal(&key, now) {
             report.skipped_terminal += 1;
             continue;
         }
