@@ -181,6 +181,8 @@ impl Minio {
             allow_http: true,
             force_path_style: true,
             kms_key_id: None,
+            session_token: None,
+            credentials_file: None,
         }
     }
 }
