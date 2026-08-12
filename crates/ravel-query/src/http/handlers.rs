@@ -64,13 +64,11 @@ fn now_ns() -> i64 {
     i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX)
 }
 
-fn success<T: serde::Serialize>(data: T) -> Response {
-    (StatusCode::OK, Json(ApiResponse::success(data))).into_response()
-}
-
-/// Like [`success`], but carries the query's evaluation annotations into the
-/// envelope's separate `warnings` and `infos` arrays (issue #178). Both are
-/// omitted from the wire when empty (Prometheus' `omitempty`).
+/// Carries a successful response's data into the Prometheus JSON envelope, with
+/// the query's evaluation and federation annotations in the separate `warnings`
+/// and `infos` arrays (issue #178, ADR-0071). Both are omitted from the wire
+/// when empty (Prometheus' `omitempty`), so an unannotated response is
+/// byte-identical to a bare `{"status":"success","data":...}`.
 fn success_annotated<T: serde::Serialize>(
     data: T,
     warnings: Vec<String>,
@@ -318,16 +316,20 @@ pub async fn labels(State(state): State<AppState>, req: Request<Body>) -> Respon
         Err(_) => return concurrency_rejected_response(),
     };
     match handle_labels(&state, req).await {
-        Ok(data) => success(data),
+        Ok((data, warnings)) => success_annotated(data, warnings, Vec::new()),
         Err(e) => e.into_response(),
     }
 }
 
-async fn handle_labels(state: &AppState, req: Request<Body>) -> Result<Vec<String>, ApiError> {
+async fn handle_labels(
+    state: &AppState,
+    req: Request<Body>,
+) -> Result<(Vec<String>, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
-    let series = resolve_and_audit_series(state, tenant_hash, &params, "labels").await?;
+    let (series, warnings) =
+        resolve_and_audit_series(state, tenant_hash, &params, "labels").await?;
 
     let mut names: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &series {
@@ -335,7 +337,7 @@ async fn handle_labels(state: &AppState, req: Request<Body>) -> Result<Vec<Strin
             names.insert(label.name.clone());
         }
     }
-    Ok(names.into_iter().collect())
+    Ok((names.into_iter().collect(), warnings))
 }
 
 pub async fn label_values(
@@ -348,7 +350,7 @@ pub async fn label_values(
         Err(_) => return concurrency_rejected_response(),
     };
     match handle_label_values(&state, name, req).await {
-        Ok(data) => success(data),
+        Ok((data, warnings)) => success_annotated(data, warnings, Vec::new()),
         Err(e) => e.into_response(),
     }
 }
@@ -357,11 +359,12 @@ async fn handle_label_values(
     state: &AppState,
     name: String,
     req: Request<Body>,
-) -> Result<Vec<String>, ApiError> {
+) -> Result<(Vec<String>, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
-    let series = resolve_and_audit_series(state, tenant_hash, &params, "labels").await?;
+    let (series, warnings) =
+        resolve_and_audit_series(state, tenant_hash, &params, "labels").await?;
 
     let mut values: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &series {
@@ -369,7 +372,7 @@ async fn handle_label_values(
             values.insert(v.to_string());
         }
     }
-    Ok(values.into_iter().collect())
+    Ok((values.into_iter().collect(), warnings))
 }
 
 pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -378,7 +381,7 @@ pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Respon
         Err(_) => return concurrency_rejected_response(),
     };
     match handle_series(&state, req).await {
-        Ok(data) => success(data),
+        Ok((data, warnings)) => success_annotated(data, warnings, Vec::new()),
         Err(e) => e.into_response(),
     }
 }
@@ -386,7 +389,7 @@ pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Respon
 async fn handle_series(
     state: &AppState,
     req: Request<Body>,
-) -> Result<Vec<HashMap<String, String>>, ApiError> {
+) -> Result<(Vec<HashMap<String, String>>, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
@@ -395,8 +398,9 @@ async fn handle_series(
             "missing required parameter \"match[]\"".to_string(),
         ));
     }
-    let series = resolve_and_audit_series(state, tenant_hash, &params, "series").await?;
-    Ok(series_to_json(series))
+    let (series, warnings) =
+        resolve_and_audit_series(state, tenant_hash, &params, "series").await?;
+    Ok((series_to_json(series), warnings))
 }
 
 fn resolve_window(params: &Params, now: i64) -> Result<TimeRange, ApiError> {
@@ -426,7 +430,7 @@ async fn resolve_and_audit_series(
     tenant_hash: TenantHash,
     params: &Params,
     language: &str,
-) -> Result<Vec<(SeriesId, LabelSet)>, ApiError> {
+) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>), ApiError> {
     // Window bounds parse before any read; a bad `start`/`end` is a request
     // error, not an executed read, so it is not audited (it returns here).
     let now = now_ns();
@@ -449,7 +453,7 @@ async fn resolve_matched_series(
     state: &AppState,
     tenant_hash: ravel_types::TenantHash,
     params: &Params,
-) -> Result<Vec<(SeriesId, LabelSet)>, ApiError> {
+) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>), ApiError> {
     let now = now_ns();
     let window = resolve_window(params, now)?;
     let min_tokens = decode_commit_tokens(params.all("min_commit_token"))?;
@@ -474,6 +478,14 @@ async fn resolve_matched_series(
     // Recording once per request, not once per selector, keeps
     // ravel_query_queries_total counting requests.
     let mut combined: Option<(QueryAccountingSnapshot, CostEstimate)> = None;
+    // Cross-cluster federation partial-coverage warnings (ADR-0071, issue #891),
+    // accumulated across selectors and surfaced in the Prometheus envelope's
+    // top-level `warnings` array -- the same surface the query path uses. Each
+    // per-selector resolve federates independently, so a skipped remote can be
+    // named once per selector; dedup here so the client sees one warning per
+    // skipped cluster regardless of how many `match[]` selectors the request
+    // carried.
+    let mut warnings: Vec<String> = Vec::new();
 
     if selectors.is_empty() {
         let remaining = remaining_budget(request_deadline, deadline)?;
@@ -482,8 +494,13 @@ async fn resolve_matched_series(
             .resolve_series_with_stats(tenant_hash, &[], window, &min_tokens, now, remaining)
             .await?;
         accumulate_cost(&mut combined, &stats);
+        for w in stats.warnings {
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+        }
         record_combined(state, tenant_hash, combined);
-        return Ok(series);
+        return Ok((series, warnings));
     }
 
     // Deliberate deviation: each match[] selector resolves its own
@@ -507,12 +524,17 @@ async fn resolve_matched_series(
             .resolve_series_with_stats(tenant_hash, &matchers, window, &min_tokens, now, remaining)
             .await?;
         accumulate_cost(&mut combined, &stats);
+        for w in stats.warnings {
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+        }
         for (id, labels) in series {
             by_id.entry(id).or_insert(labels);
         }
     }
     record_combined(state, tenant_hash, combined);
-    Ok(by_id.into_iter().collect())
+    Ok((by_id.into_iter().collect(), warnings))
 }
 
 /// Fold one sub-query's [`QueryStats`](crate::QueryStats) into the request's

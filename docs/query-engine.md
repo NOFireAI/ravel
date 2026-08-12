@@ -148,8 +148,11 @@ The within-segment GET/byte model is the `selective_read_accounting` bench.
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.
 - `POST/GET /api/v1/query_range` (query, start, end, step, timeout).
 - `GET /api/v1/labels`, `/api/v1/label/{name}/values` (match[] optional,
-  start/end optional): from snapshot SERIES_META label dictionaries.
-- `GET/POST /api/v1/series` (match[] required, start/end).
+  start/end optional): from snapshot SERIES_META label dictionaries, unioned
+  across configured remote clusters when federation is on (see Cross-cluster
+  federation).
+- `GET/POST /api/v1/series` (match[] required, start/end): likewise unioned
+  across remote clusters under federation.
 - `GET /api/v1/status/buildinfo`: Ravel's own crate version under `version`,
   never a Prometheus version string. `revision` carries the build's git SHA
   when the build environment exported `RAVEL_GIT_SHA`, otherwise it is empty,
@@ -380,6 +383,24 @@ long the coordinator waits on that one remote before treating it as
 partially unavailable. A deployment with no `--remote-cluster` flag runs
 exactly the single-cluster path.
 
+Both the value-bearing endpoints (`/api/v1/query`, `/api/v1/query_range`)
+and the discovery endpoints (`/api/v1/series`, `/api/v1/labels`,
+`/api/v1/label/<name>/values`) federate, through the SAME `Federation`
+coordinator and with identical semantics (issue #891). A discovery request
+sends its matchers and window to each remote; the remote resolves under its
+own tenant auth, enforces its own admission/limits/erasure, and returns
+series whose identities are unioned into the local discovery pool. The only
+difference is what each keeps from the remote's response: the query path
+keeps sample runs and merges them per timestamp, while the discovery path
+keeps only `(series_id, labels)` identities (it enumerates series, not
+samples). `skip_unavailable`, the skipped-cluster warnings, and the partial
+marker behave identically on both paths: `skip_unavailable=false` fails the
+request typed on a remote failure or timeout, and `=true` continues, names
+the skipped cluster in the response envelope's `warnings`, and sets the
+partial-coverage marker on the query stats. A single-cluster deployment runs
+the byte-identical local discovery path (`fetch_all_series`); no federation
+context means an empty, cheap fan-out.
+
 ### Two credential models, one wire type
 
 ADR-0071 fetches carry a `Scope` on the `FetchRequest`. The two values are
@@ -435,6 +456,22 @@ unspecified (whichever the total order happens to order first); the merge
 still emits exactly one sample per timestamp and never duplicates or
 crashes. Making a cross-cluster tie-break deterministic on value would need
 a cluster-identity component in the order and is out of scope for this wave.
+Inventing a cross-cluster provenance scheme is a separate ADR, deliberately
+not attempted here (issue #891): the behavior above is *defined* only for
+disjoint cross-cluster series identity, and this limitation is recorded both
+here and as a code comment at the merge site (`is_greater` in
+crates/ravel-query/src/engine.rs).
+
+The discovery endpoints (`/api/v1/series`, `/api/v1/labels`,
+`/api/v1/label/<name>/values`) federate too (issue #891), but their
+cross-cluster union carries no such ambiguity. Discovery enumerates series
+*identity*, and a `SeriesId` is a canonical function of a series' labels, so
+the same id from two clusters always carries the same `LabelSet`: the union
+is a plain set union of identities with no per-sample provenance to tie-break
+on, and duplicate cross-cluster identities collapse cleanly regardless of
+which cluster's writers minted the samples. The provenance-tuple limitation
+above is therefore specific to the sample-merge path; the discovery union is
+well-defined even for mirrored-ingest deployments.
 
 ## Query cost accounting and estimate (ADR-0044)
 
