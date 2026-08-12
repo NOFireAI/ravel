@@ -102,7 +102,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_promql::LabelMatcher;
 use ravel_query::erasure::{ErasurePredicate, retain_series_soa};
-use ravel_query::{ByteLimit, SegmentFetcher};
+use ravel_query::{ByteLimit, RequestLimit, SegmentFetcher, request_budget_exceeded};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, TenantHash};
 
@@ -165,6 +165,12 @@ pub struct RsegScanExec {
     /// `QueryAccounting` total. `Unlimited` never trips, so a caller that does
     /// not opt in behaves exactly as before this budget existed.
     max_bytes_scanned: ByteLimit,
+    /// Per-tenant S3 request budget (RH-T2, issue #902, ADR-0073 decision 4),
+    /// checked once per completed segment fetch against the running
+    /// `QueryAccounting` total, the same checkpoint as `max_bytes_scanned`.
+    /// Mirrors `ravel_query::engine`'s PromQL enforcement so both query
+    /// languages trip the same budget the same way.
+    max_s3_requests: RequestLimit,
     /// Pending selective-erasure predicates from the resolved snapshot
     /// (ADR-0064 decision 2, issue #829). Applied to each segment's decoded
     /// `FetchedSeriesSoa` series via [`retain_series_soa`] immediately after
@@ -194,6 +200,7 @@ impl RsegScanExec {
         series_ids: Option<Arc<HashSet<[u8; 16]>>>,
         max_series: usize,
         max_bytes_scanned: ByteLimit,
+        max_s3_requests: RequestLimit,
         erasure: Arc<Vec<ErasurePredicate>>,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
@@ -212,6 +219,7 @@ impl RsegScanExec {
             series_ids,
             max_series,
             max_bytes_scanned,
+            max_s3_requests,
             erasure,
             schema,
             properties,
@@ -317,6 +325,7 @@ impl ExecutionPlan for RsegScanExec {
             series_ids,
             self.max_series,
             self.max_bytes_scanned,
+            self.max_s3_requests,
             erasure,
             reservation,
             self.accounting.clone(),
@@ -339,13 +348,14 @@ struct Prepared {
 /// decode each into its own ts/provenance-sorted run, and collect per-series
 /// labels. Applies the `series_id` allow-set as a post-fetch row filter.
 ///
-/// Enforces three budgets before the next segment is ever fetched: the
+/// Enforces four budgets before the next segment is ever fetched: the
 /// per-tenant bytes-scanned budget against the running `QueryAccounting`
-/// total (ADR-0061 decision 1, issue #722), the distinct-series count against
-/// `max_series` (issue #187), and the reservation's byte budget against this
-/// segment's decoded size (issue #188). `reservation` is threaded through and
-/// returned so the caller's batch phase continues growing the same one (see
-/// module doc).
+/// total (ADR-0061 decision 1, issue #722), the per-tenant S3 request budget
+/// against the same running total (RH-T2, issue #902, ADR-0073 decision 4),
+/// the distinct-series count against `max_series` (issue #187), and the
+/// reservation's byte budget against this segment's decoded size (issue
+/// #188). `reservation` is threaded through and returned so the caller's
+/// batch phase continues growing the same one (see module doc).
 #[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: SegmentFetcher,
@@ -355,6 +365,7 @@ async fn prepare_partition(
     series_ids: Option<Arc<HashSet<[u8; 16]>>>,
     max_series: usize,
     max_bytes_scanned: ByteLimit,
+    max_s3_requests: RequestLimit,
     erasure: Arc<Vec<ErasurePredicate>>,
     reservation: MemoryReservation,
     accounting: QueryAccounting,
@@ -385,6 +396,15 @@ async fn prepare_partition(
                 ByteLimit::Unlimited => scanned,
             };
             return Err(SqlError::TooManyBytesScanned { scanned, max }.into());
+        }
+        // Per-tenant S3 request budget (RH-T2, issue #902, ADR-0073 decision
+        // 4): same checkpoint as the bytes-scanned budget above, so a trip
+        // here also means the remaining segments' GETs never happen. Mirrors
+        // `ravel_query::engine`'s PromQL enforcement exactly.
+        if let Some(ravel_query::QueryError::RequestBudgetExceeded { requests, max }) =
+            request_budget_exceeded(accounting.snapshot().total_s3_requests(), max_s3_requests)
+        {
+            return Err(SqlError::RequestBudgetExceeded { requests, max }.into());
         }
         let mut run: Vec<ScanRow> = Vec::new();
         for fs in series {
