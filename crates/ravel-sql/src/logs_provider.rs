@@ -37,8 +37,6 @@ use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
-use crate::config::SqlConfig;
-use crate::error::SqlError;
 use crate::logs_pushdown::{LogsPushdown, extract_logs};
 use crate::logs_scan::LogsScanExec;
 use crate::logs_schema::logs_schema;
@@ -49,7 +47,6 @@ pub struct LogsTableProvider {
     snapshot: Arc<Snapshot>,
     tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
-    config: SqlConfig,
     schema: SchemaRef,
     /// This query's accounting handle (ADR-0044), cloned into every
     /// `LogsScanExec` the provider builds so every store fetch the scan
@@ -63,13 +60,13 @@ pub struct LogsTableProvider {
 
 impl LogsTableProvider {
     /// Build a provider around an owned, already-resolved `Signal::Logs`
-    /// snapshot. `config` accepts anything `Into<SqlConfig>` (an `EngineConfig`
-    /// alone works), matching the metrics provider's constructor shape.
+    /// snapshot. Admission and budget config live on the resolve-time seam
+    /// (RH-T2, issue #902), not on the provider, so this no longer takes a
+    /// config parameter.
     pub fn new(
         snapshot: Snapshot,
         tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
-        config: impl Into<SqlConfig>,
         accounting: QueryAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
@@ -77,7 +74,6 @@ impl LogsTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
             fetcher,
-            config: config.into(),
             schema: logs_schema(),
             accounting,
             erasure,
@@ -101,19 +97,20 @@ impl LogsTableProvider {
         self.build_scan(target_partitions, &extract_logs(filters))
     }
 
+    /// Admission (the sealed-segment cap) is decided exactly once, at
+    /// resolve time, by `SqlExecutor::resolve` calling `ravel_query::admit`
+    /// over the full, unpruned snapshot and its `SegmentOrigins` (RH-T2,
+    /// issue #902). `pruned_segments` below is a further, client-side,
+    /// widen-only ts subset of that already-admitted snapshot, so
+    /// re-checking a count against it here would be a second, weaker check
+    /// over the wrong set (post-prune, origin-blind); it is not
+    /// reimplemented.
     fn build_scan(
         &self,
         target_partitions: usize,
         pushdown: &LogsPushdown,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
-        if segments.len() > self.config.engine.max_segments {
-            return Err(SqlError::TooManySegments {
-                count: segments.len(),
-                max: self.config.engine.max_segments,
-            }
-            .into());
-        }
         let scan = LogsScanExec::new(
             self.tenant_hash,
             self.fetcher.clone(),
@@ -217,10 +214,10 @@ mod tests {
     use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
-    use ravel_query::EngineConfig;
     use uuid::Uuid;
 
     use super::*;
+    use crate::config::SqlConfig;
     use crate::memory::TenantMemoryAccountant;
     use crate::session::{SessionTable, build_session};
 
@@ -476,7 +473,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -555,7 +551,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -626,7 +621,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -705,7 +699,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -786,7 +779,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -861,7 +853,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -904,7 +895,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -961,7 +951,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -1024,7 +1013,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -1081,7 +1069,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");
@@ -1134,7 +1121,6 @@ mod tests {
             snapshot,
             TenantHash([7u8; 16]),
             fetcher,
-            EngineConfig::default(),
             QueryAccounting::new(),
         );
         let ctx = logs_session(provider).expect("build session");

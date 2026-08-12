@@ -39,8 +39,6 @@ use ravel_types::accounting::QueryAccounting;
 use crate::audit_pushdown::{AuditPushdown, extract_audit};
 use crate::audit_scan::AuditScanExec;
 use crate::audit_schema::audit_schema;
-use crate::config::SqlConfig;
-use crate::error::SqlError;
 
 /// The `audit` table provider for one tenant over one pinned `Signal::Audit`
 /// snapshot.
@@ -48,7 +46,6 @@ pub struct AuditTableProvider {
     snapshot: Arc<Snapshot>,
     tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
-    config: SqlConfig,
     schema: SchemaRef,
     /// This query's accounting handle (ADR-0044), cloned into every
     /// `AuditScanExec` the provider builds.
@@ -61,13 +58,13 @@ pub struct AuditTableProvider {
 
 impl AuditTableProvider {
     /// Build a provider around an owned, already-resolved `Signal::Audit`
-    /// snapshot. `config` accepts anything `Into<SqlConfig>` (an `EngineConfig`
-    /// alone works), matching the `logs` provider's constructor shape.
+    /// snapshot. Admission and budget config live on the resolve-time seam
+    /// (RH-T2, issue #902), not on the provider, so this no longer takes a
+    /// config parameter.
     pub fn new(
         snapshot: Snapshot,
         tenant_hash: TenantHash,
         fetcher: LogSegmentFetcher,
-        config: impl Into<SqlConfig>,
         accounting: QueryAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
@@ -75,7 +72,6 @@ impl AuditTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
             fetcher,
-            config: config.into(),
             schema: audit_schema(),
             accounting,
             erasure,
@@ -99,19 +95,21 @@ impl AuditTableProvider {
         self.build_scan(target_partitions, &extract_audit(filters))
     }
 
+    /// Admission (the sealed-segment cap) is decided exactly once, at
+    /// resolve time, by whichever endpoint resolves this table's snapshot,
+    /// calling `ravel_query::admit` over the full snapshot and its
+    /// `SegmentOrigins` (RH-T2, issue #902) -- the same pattern
+    /// `SqlExecutor::resolve` uses for the two wired tables. No such endpoint
+    /// exists yet for audit; `pruned_segments` below is a further,
+    /// client-side, widen-only ts subset, so re-checking a count against it
+    /// here would be a second, weaker check over the wrong set; it is not
+    /// reimplemented.
     fn build_scan(
         &self,
         target_partitions: usize,
         pushdown: &AuditPushdown,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
-        if segments.len() > self.config.engine.max_segments {
-            return Err(SqlError::TooManySegments {
-                count: segments.len(),
-                max: self.config.engine.max_segments,
-            }
-            .into());
-        }
         let scan = AuditScanExec::new(
             self.tenant_hash,
             self.fetcher.clone(),

@@ -31,8 +31,6 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 
-use crate::config::SqlConfig;
-use crate::error::SqlError;
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_pushdown::{SpansPushdown, extract_spans};
 use crate::spans_scan::SpansScanExec;
@@ -43,7 +41,6 @@ use crate::spans_schema::spans_schema;
 pub struct SpansTableProvider {
     snapshot: Arc<Snapshot>,
     fetcher: SpanSegmentFetcher,
-    config: SqlConfig,
     schema: SchemaRef,
     /// Pending selective-erasure predicates derived once from
     /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
@@ -53,18 +50,14 @@ pub struct SpansTableProvider {
 
 impl SpansTableProvider {
     /// Build a provider around an owned, already-resolved `Signal::Spans`
-    /// snapshot. `config` accepts anything `Into<SqlConfig>` (an `EngineConfig`
-    /// alone works), matching the logs/metrics providers' constructor shape.
-    pub fn new(
-        snapshot: Snapshot,
-        fetcher: SpanSegmentFetcher,
-        config: impl Into<SqlConfig>,
-    ) -> Self {
+    /// snapshot. Admission and budget config live on the resolve-time seam
+    /// (RH-T2, issue #902), not on the provider, so this no longer takes a
+    /// config parameter.
+    pub fn new(snapshot: Snapshot, fetcher: SpanSegmentFetcher) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
         SpansTableProvider {
             snapshot: Arc::new(snapshot),
             fetcher,
-            config: config.into(),
             schema: spans_schema(),
             erasure,
         }
@@ -90,19 +83,21 @@ impl SpansTableProvider {
         self.build_scan(target_partitions, &extract_spans(filters))
     }
 
+    /// Admission (the sealed-segment cap) is decided exactly once, at
+    /// resolve time, by whichever endpoint resolves this table's snapshot,
+    /// calling `ravel_query::admit` over the full snapshot and its
+    /// `SegmentOrigins` (RH-T2, issue #902) -- the same pattern
+    /// `SqlExecutor::resolve` uses for the two wired tables. No such endpoint
+    /// exists yet for spans (see the module doc); `pruned_segments` below is
+    /// a further, client-side, widen-only ts subset, so re-checking a count
+    /// against it here would be a second, weaker check over the wrong set;
+    /// it is not reimplemented.
     fn build_scan(
         &self,
         target_partitions: usize,
         pushdown: &SpansPushdown,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
-        if segments.len() > self.config.engine.max_segments {
-            return Err(SqlError::TooManySegments {
-                count: segments.len(),
-                max: self.config.engine.max_segments,
-            }
-            .into());
-        }
         let scan = SpansScanExec::new(
             self.fetcher.clone(),
             &segments,

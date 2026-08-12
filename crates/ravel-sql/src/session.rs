@@ -321,8 +321,7 @@ mod tests {
             segments_pruned: 0,
             pending_erasure: Vec::new(),
         };
-        let provider =
-            crate::spans_provider::SpansTableProvider::new(snapshot, fetcher, SqlConfig::default());
+        let provider = crate::spans_provider::SpansTableProvider::new(snapshot, fetcher);
         let ctx = build_session(
             &SqlConfig::default(),
             test_pool(),

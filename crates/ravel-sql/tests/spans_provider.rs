@@ -34,7 +34,6 @@ use datafusion::scalar::ScalarValue;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::EngineConfig;
 use ravel_rspan::{
     ObjectIdentity, RspanConfig, RspanWriter, ScanStats, SpanQuery, SpanRecord, StatusCode,
 };
@@ -223,7 +222,7 @@ async fn scan_prunes_by_ts_window_returns_exact_rows() {
     };
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
     let fetcher = SpanSegmentFetcher::new(store);
-    let provider = SpansTableProvider::new(snapshot, fetcher, EngineConfig::default());
+    let provider = SpansTableProvider::new(snapshot, fetcher);
 
     // WHERE end_ts >= 50 AND start_ts <= 250  (== overlap with the window [50,250])
     let (lo, hi) = (50i64, 250i64);
@@ -289,7 +288,7 @@ async fn trace_id_query_takes_the_cheap_trace_lookup() {
         segments_pruned: 0,
         pending_erasure: Vec::new(),
     };
-    let provider = SpansTableProvider::new(snapshot, fetcher.clone(), EngineConfig::default());
+    let provider = SpansTableProvider::new(snapshot, fetcher.clone());
 
     let target = traces[5];
 
@@ -388,7 +387,7 @@ async fn pending_erasure_excludes_matching_spans() {
         segments_pruned: 0,
         pending_erasure: vec![request],
     };
-    let provider = SpansTableProvider::new(snapshot, fetcher, EngineConfig::default());
+    let provider = SpansTableProvider::new(snapshot, fetcher);
     let plan = provider.plan(1).expect("build plan");
     let batches = collect_plan(plan).await;
     let got = batches_to_rows(&batches);
