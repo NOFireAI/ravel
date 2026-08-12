@@ -204,7 +204,7 @@ wrong.
 `optional string managed_by`: additive, new field number, no existing
 field renumbered. `"operator"` marks an entry the operator's reconcile
 loop wrote from a `tenantTokensSecretRef` Secret; `"cli"` marks one
-`ravel-cli tenant-token upsert` wrote (the CLI's default, overridable
+`ravel-cli tenant token upsert` wrote (the CLI's default, overridable
 with `--managed-by` for an operator-adjacent workflow that wants a
 different tag). Absent is unmanaged: every entry a pre-amendment writer
 ever wrote, and any entry a post-amendment writer creates without
@@ -232,3 +232,86 @@ primitive call in a bounded CAS retry and no longer aborts Deployment/
 Service reconciliation on a sys/auth failure -- both were reconcile-loop
 defects the ownership marker didn't by itself fix, found by the same
 review. See PROGRESS.md for the full defect list.
+
+## Amendment (2026-08-12): `token_hash` is globally unique; last writer takes ownership
+
+A follow-up review found the ownership marker above could itself brick
+`sys/auth`: three doors all end with two entries sharing one `token_hash`
+persisted in the same object. `decode_map` already refuses to decode a
+duplicate hash (it always has), so once such an object exists, every
+subsequent read of `sys/auth` -- and therefore every `ravel-server`'s
+bounded-staleness refresh -- fails closed, deployment-wide, until the
+object is hand-repaired out of band.
+
+- Door 1: an unmanaged/v1 entry for `(tenant, token)`, then an
+  operator-scoped `replace_tenant_tokens(tenant, [token], Some("operator"))`
+  for the same pair. The old scoped `retain` only dropped entries matching
+  `(tenant_id, managed_by)` exactly; the unmanaged entry's absent marker
+  never matches `Some("operator")`, so it survived, and `extend` appended a
+  second entry with the identical hash.
+- Door 2: `upsert_token_owned` matches purely on `token_hash` and overwrites
+  `managed_by` in place -- correct, hash-keyed takeover semantics on its
+  own -- but a CLI upsert of an operator-owned token flips that hash's
+  owner to `"cli"`, and the operator's next scoped replace no longer sees
+  it as its own (same bug as door 1, triggered by a legitimate ownership
+  change instead of a pre-amendment entry).
+- Door 3 (pre-existing, predates the ownership marker): two tenants whose
+  Secret-provisioned token values collide, converged one tenant at a time
+  by the operator's per-tenant reconcile loop.
+
+**Decision: `token_hash` is unique across the whole map, globally, not
+just within a `(tenant_id, managed_by)` scope. The last writer of a given
+hash takes ownership of it outright** -- `replace_tenant_tokens` now drops
+any pre-existing entry whose hash collides with a desired entry before
+extending, regardless of that entry's tenant or owner, in addition to its
+existing same-scope drop. Takeover was chosen over refusing a
+cross-scope collision outright because it matches `upsert_token_owned`'s
+existing hash-keyed semantics (already shipped, already the CLI's
+behavior) and never bricks a legitimate migration -- reusing a token
+value across a `managed_by` change, or (door 3) two tenants that happen
+to share a token value, converges to a single readable entry rather than
+failing the reconcile. The tradeoff: door 3's two tenants sharing one
+token value is inherently ambiguous (which tenant does the token
+authenticate as is undefined by the input), and takeover resolves it to
+"whichever call ran last" rather than surfacing it as a caller error --
+acceptable because a shared token value across tenants is an input
+defect the deployer controls (the Secret), not a value this module can
+validate against other tenants' plaintexts without ever storing
+plaintext.
+
+Belt-and-suspenders: `write_map`, the one function every `sys/auth`
+write funnels through, now runs the same duplicate-`token_hash` check
+`decode_map` runs on read, and refuses (before issuing any store call) a
+map that would leave two entries sharing a hash. This makes door 3 safe
+even for a future write path that does not itself de-duplicate by
+hash: it fails the write with a typed `Corrupt(DuplicateTokenHash)`
+error instead of silently persisting an object no one can read back.
+
+### `AUTH_TOKEN_MAP_FORMAT_VERSION` stays unconditional, and what that means for upgrade order
+
+The proto doc for `AuthTokenMap.format_version` previously read "= 1 for
+a map with no entry carrying `managed_by`; ... always writes 2 going
+forward" -- self-contradictory, and not what the code (`auth_token_map.rs`,
+`AUTH_TOKEN_MAP_FORMAT_VERSION = 2` unconditionally) does. Resolved by
+keeping the code's behavior and correcting the doc: every writer built
+after this amendment stamps `format_version = 2` on every write, never 1,
+regardless of whether any entry in the resulting map actually carries
+`managed_by`. Content-dependent versioning was rejected: it would make
+the stamped version depend on which other entries happen to be in the map
+at write time (added, then removed, then re-added by an unrelated
+tenant), a second source of non-obvious behavior on top of the takeover
+rule above.
+
+Consequence for upgrade order: `decode_map`'s guard
+(`proto.format_version > AUTH_TOKEN_MAP_FORMAT_VERSION`) means a
+pre-amendment `ravel-server` build (`AUTH_TOKEN_MAP_FORMAT_VERSION == 1`)
+refuses a stored `format_version = 2` object outright -- fail-closed, the
+same as any other future-format guard in this codebase, not a misread.
+Because the stamp is unconditional, this triggers on the *first* write any
+amended writer (the operator, or `ravel-cli tenant token upsert`) makes to
+`sys/auth`, even one with zero `managed_by`-carrying entries. Every
+`ravel-server` in a deployment must therefore be upgraded to a build that
+understands `format_version = 2` *before* any amended writer's first
+`sys/auth` write, not merely before the first `managed_by`-tagged entry
+appears -- a lagging old server otherwise loses `sys/auth` entirely (its
+bounded-staleness refresh fails closed) until it, too, is upgraded.

@@ -60,7 +60,7 @@ pub const AUTH_TOKEN_MAP_FORMAT_VERSION: u32 = 2;
 /// only entries carrying this exact tag.
 pub const MANAGED_BY_OPERATOR: &str = "operator";
 
-/// [`TokenEntry::managed_by`] value `ravel-cli tenant-token upsert` stamps by
+/// [`TokenEntry::managed_by`] value `ravel-cli tenant token upsert` stamps by
 /// default (ADR-0072 decision 4 amendment, #897). Overridable at the CLI with
 /// `--managed-by` for a caller that wants a different owner tag.
 pub const MANAGED_BY_CLI: &str = "cli";
@@ -126,7 +126,8 @@ pub struct TokenEntry {
 pub struct AuthTokenMap {
     /// Fingerprint of the deployment key the entries' hashes are keyed under.
     pub key_fingerprint: [u8; KEY_FINGERPRINT_LEN],
-    /// The token->tenant entries; no `token_hash` repeats (enforced on decode).
+    /// The token->tenant entries; no `token_hash` repeats (enforced on
+    /// decode, and on every write by [`write_map`]'s duplicate-hash guard).
     pub entries: Vec<TokenEntry>,
 }
 
@@ -344,17 +345,39 @@ pub enum SetOutcome {
     Unchanged,
 }
 
+/// Reject a map containing two entries with the same `token_hash` before it
+/// is ever written. A belt-and-suspenders guard alongside [`decode_map`]'s
+/// read-side check: no code path, present or future, may persist bytes
+/// `decode_map` would then refuse to read back (ADR-0072 decision 4
+/// amendment, #897 data-loss follow-up) -- a duplicate hash written once
+/// bricks every subsequent read of `sys/auth`.
+fn validate_no_duplicate_hashes(map: &AuthTokenMap) -> Result<(), AuthTokenMapError> {
+    let mut seen: std::collections::HashSet<[u8; TOKEN_HASH_LEN]> =
+        std::collections::HashSet::with_capacity(map.entries.len());
+    for e in &map.entries {
+        if !seen.insert(e.token_hash) {
+            return Err(AuthTokenMapError::Corrupt {
+                defect: AuthMapDefect::DuplicateTokenHash,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Write a new map under `CasVersion` (or create it with `CreateIfAbsent` when
 /// none exists), the whole-record CAS-replace shared by [`upsert_token`] and
 /// [`remove_token`]. `existing_version` is `Some` when a read observed an object
 /// to swap, `None` when the read observed none. A concurrent write is a
-/// [`AuthTokenMapError::CasConflict`], never a silent overwrite.
+/// [`AuthTokenMapError::CasConflict`], never a silent overwrite. Refuses
+/// (before issuing any store call) a map that would leave two entries
+/// sharing a `token_hash` -- see [`validate_no_duplicate_hashes`].
 async fn write_map(
     store: &dyn ObjectStoreBackend,
     map: &AuthTokenMap,
     existing_version: Option<Version>,
     now_ns: i64,
 ) -> Result<SetOutcome, AuthTokenMapError> {
+    validate_no_duplicate_hashes(map)?;
     let bytes = build_proto(map, now_ns).encode_to_vec();
     match existing_version {
         Some(version) => match store
@@ -405,7 +428,10 @@ pub async fn upsert_token(
 /// pass ([`remove_tokens_by_tenant_owned_by`], [`replace_tenant_tokens`]) can
 /// tell this write's owner from another writer's (ADR-0072 decision 4
 /// amendment, #897). `None` marks the entry unmanaged, matching every entry
-/// [`upsert_token`] writes.
+/// [`upsert_token`] writes. Matches purely on `token_hash`: re-upserting a
+/// hash another writer already owns re-tags it to this call's `tenant_id`
+/// and `managed_by` in place -- global last-writer-wins takeover, never a
+/// second entry for the same hash.
 pub async fn upsert_token_owned(
     store: &dyn ObjectStoreBackend,
     deployment_key: &[u8; 32],
@@ -525,18 +551,27 @@ pub async fn remove_tokens_by_tenant_owned_by(
 }
 
 /// Replace `tenant_id`'s token set owned by `managed_by` with
-/// `plaintext_tokens`, whole-record CAS-replace. Only entries for
-/// `tenant_id` whose `managed_by` matches exactly are dropped and
-/// replaced; entries for other tenants, and entries for the same tenant
-/// owned by a different writer (a different tag, or unmanaged), are
-/// untouched (ADR-0072 decision 4 amendment, #897) -- a CLI-provisioned
-/// token for a tenant the operator also manages via Secret survives an
-/// operator reconcile. Each new entry is stamped with `managed_by`. Each
-/// token is hashed under `deployment_key` before being stored; the
-/// plaintext is never persisted. This is the primitive a Secret-driven
-/// reconcile loop uses: the Secret is the tenant's whole desired token set
-/// for that owner, so converging to it is a scoped replace, not an
-/// incremental upsert/remove pair.
+/// `plaintext_tokens`, whole-record CAS-replace. Entries for `tenant_id`
+/// whose `managed_by` matches exactly are dropped and replaced; entries for
+/// other tenants, and entries for the same tenant owned by a different
+/// writer (a different tag, or unmanaged), are otherwise untouched (ADR-0072
+/// decision 4 amendment, #897) -- a CLI-provisioned token for a tenant the
+/// operator also manages via Secret survives an operator reconcile. Each
+/// new entry is stamped with `managed_by`. Each token is hashed under
+/// `deployment_key` before being stored; the plaintext is never persisted.
+/// This is the primitive a Secret-driven reconcile loop uses: the Secret is
+/// the tenant's whole desired token set for that owner, so converging to it
+/// is a scoped replace, not an incremental upsert/remove pair.
+///
+/// `token_hash` is globally unique across the whole map (ADR-0072 decision
+/// 4 amendment, #897 data-loss follow-up): a `token_hash` colliding with one
+/// of `plaintext_tokens`' hashes is dropped no matter which tenant or
+/// `managed_by` owns it today, and the new entry takes over that hash --
+/// last writer wins. Without this, a caller reusing a token value another
+/// entry already holds (a different tenant, or the same tenant under a
+/// different owner tag) would make this call append a second entry sharing
+/// that hash, which [`write_map`]'s duplicate-hash guard now refuses to
+/// persist, rather than [`decode_map`] refusing every later read.
 ///
 /// Returns [`SetOutcome::Unchanged`] (issuing no write) when the resulting
 /// scoped entry set is byte-for-byte identical to the current one --
@@ -591,8 +626,25 @@ pub async fn replace_tenant_tokens(
         return Ok(SetOutcome::Unchanged);
     }
 
-    map.entries
-        .retain(|e| !(e.tenant_id == tenant_id && e.managed_by.as_deref() == managed_by));
+    // token_hash is globally unique (ADR-0072 decision 4 amendment, #897
+    // data-loss follow-up): the last writer of a hash takes ownership. Drop
+    // this tenant/owner's own prior entries AND any pre-existing entry
+    // anywhere in the map whose hash collides with a desired entry --
+    // regardless of that entry's (tenant_id, managed_by) -- before
+    // extending. Scoping the drop to only this tenant/owner (as a prior
+    // version did) leaves a differently-owned or differently-tenanted
+    // colliding entry in place, so the extend below would append a second
+    // entry with the same hash and `write_map`'s duplicate-hash guard would
+    // then refuse the write outright (previously: `decode_map` would refuse
+    // every subsequent read instead, since the write went through
+    // unguarded).
+    let desired_hash_set: std::collections::HashSet<[u8; TOKEN_HASH_LEN]> =
+        desired_entries.iter().map(|e| e.token_hash).collect();
+    map.entries.retain(|e| {
+        let owned_by_this_scope = e.tenant_id == tenant_id && e.managed_by.as_deref() == managed_by;
+        let collides_with_desired = desired_hash_set.contains(&e.token_hash);
+        !(owned_by_this_scope || collides_with_desired)
+    });
     map.entries.extend(desired_entries);
     write_map(store, &map, version, now_ns).await
 }
@@ -1364,6 +1416,209 @@ mod tests {
             tenant_for_token(&map, KEY, b"op-tok"),
             None,
             "the operator-owned entry for the same tenant is revoked"
+        );
+    }
+
+    /// Door 1 (#897 data-loss follow-up): an unmanaged/v1 entry for
+    /// (tenant, token) followed by an operator-scoped `replace_tenant_tokens`
+    /// for the SAME tenant and token must converge to one readable entry,
+    /// not two sharing a hash. Against the pre-fix `retain` --
+    /// `!(e.tenant_id == tenant_id && e.managed_by.as_deref() == managed_by)`
+    /// -- the unmanaged entry's `managed_by` (`None`) never equals
+    /// `Some("operator")`, so the predicate is false, the old entry survives,
+    /// and `extend` appends a second entry with the identical hash; the
+    /// subsequent `read_auth_map` then fails with
+    /// `Corrupt(DuplicateTokenHash)`.
+    #[tokio::test]
+    async fn replace_tenant_tokens_takes_over_hash_from_unmanaged_entry() {
+        let store = mem();
+        upsert_token(store.as_ref(), KEY, b"shared-tok", "acme", 1)
+            .await
+            .expect("seed unmanaged (v1) entry");
+
+        let outcome = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "acme",
+            &[b"shared-tok".to_vec()],
+            Some(MANAGED_BY_OPERATOR),
+            2,
+        )
+        .await
+        .expect("operator replace must take over the colliding hash, not duplicate it");
+        assert_eq!(outcome, SetOutcome::Updated);
+
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read-back must succeed: the map must stay decodable")
+            .expect("present");
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "the unmanaged entry and the operator entry must converge to one entry, not two \
+             sharing a hash"
+        );
+        assert_eq!(tenant_for_token(&map, KEY, b"shared-tok"), Some("acme"));
+        assert_eq!(
+            map.entries[0].managed_by.as_deref(),
+            Some(MANAGED_BY_OPERATOR),
+            "last writer (the operator replace) takes ownership of the hash"
+        );
+    }
+
+    /// Door 2 (#897 data-loss follow-up): a CLI upsert flips an
+    /// operator-owned token's `managed_by` to `"cli"` in place (expected,
+    /// hash-keyed takeover semantics); the operator's next scoped replace for
+    /// that same tenant/token must still converge to one entry, not append a
+    /// second one tagged `"operator"`. Against the pre-fix `retain`, the
+    /// entry is now owned by `"cli"`, so the operator-scoped predicate
+    /// (`managed_by == Some("operator")`) does not match it, the entry
+    /// survives, and `extend` appends a duplicate-hash `"operator"` entry;
+    /// `read_auth_map` then fails with `Corrupt(DuplicateTokenHash)`.
+    #[tokio::test]
+    async fn replace_tenant_tokens_reclaims_hash_flipped_by_a_cli_upsert() {
+        let store = mem();
+        upsert_token_owned(
+            store.as_ref(),
+            KEY,
+            b"shared-tok",
+            "acme",
+            Some(MANAGED_BY_OPERATOR),
+            1,
+        )
+        .await
+        .expect("seed operator-owned entry");
+        // The CLI upserts the SAME token, flipping its owner to "cli" in place.
+        upsert_token_owned(
+            store.as_ref(),
+            KEY,
+            b"shared-tok",
+            "acme",
+            Some(MANAGED_BY_CLI),
+            2,
+        )
+        .await
+        .expect("cli upsert takes over the hash");
+
+        let outcome = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "acme",
+            &[b"shared-tok".to_vec()],
+            Some(MANAGED_BY_OPERATOR),
+            3,
+        )
+        .await
+        .expect("operator reconcile must reclaim the hash, not duplicate it");
+        assert_eq!(outcome, SetOutcome::Updated);
+
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read-back must succeed: the map must stay decodable")
+            .expect("present");
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "the cli-flipped entry and the operator's replace must converge to one entry"
+        );
+        assert_eq!(
+            map.entries[0].managed_by.as_deref(),
+            Some(MANAGED_BY_OPERATOR),
+            "the operator reclaims ownership on its next reconcile"
+        );
+    }
+
+    /// Door 3 (#897 data-loss follow-up, pre-existing): two tenants sharing
+    /// one token value, each converged via its own `replace_tenant_tokens`
+    /// call (what `reconcile_sys_auth` does, once per tenant key in the
+    /// Secret). The second call must not leave the map holding two entries
+    /// with the same hash: it takes over the hash for its own tenant, and the
+    /// map must stay readable afterward -- never `Corrupt(DuplicateTokenHash)`
+    /// on the very read-back the same reconcile cycle performs next.
+    #[tokio::test]
+    async fn replace_tenant_tokens_across_two_tenants_sharing_a_token_stays_readable() {
+        let store = mem();
+        replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "acme",
+            &[b"shared-tok".to_vec()],
+            Some(MANAGED_BY_OPERATOR),
+            1,
+        )
+        .await
+        .expect("first tenant converges");
+
+        let outcome = replace_tenant_tokens(
+            store.as_ref(),
+            KEY,
+            "globex",
+            &[b"shared-tok".to_vec()],
+            Some(MANAGED_BY_OPERATOR),
+            2,
+        )
+        .await
+        .expect("second tenant's replace must not duplicate the hash");
+        assert_eq!(outcome, SetOutcome::Updated);
+
+        let (map, _v) = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect("read-back must succeed even though two tenants raced for one hash")
+            .expect("present");
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "one hash can only ever resolve to one tenant; the second writer takes it over"
+        );
+        assert_eq!(
+            tenant_for_token(&map, KEY, b"shared-tok"),
+            Some("globex"),
+            "last writer wins the shared hash"
+        );
+    }
+
+    /// Direct unit test on the write-side guard itself (belt-and-suspenders
+    /// alongside `decode_map`'s read-side check): `write_map` must refuse a
+    /// map containing two entries with the same `token_hash` before issuing
+    /// any store call, so no caller can ever persist bytes `decode_map` would
+    /// then refuse to read back. Against the pre-fix `write_map` (no
+    /// `validate_no_duplicate_hashes` call), this `put` would succeed and the
+    /// object would become permanently unreadable.
+    #[tokio::test]
+    async fn write_map_rejects_a_map_with_duplicate_hashes() {
+        let store = mem();
+        let hash = token_hash(KEY, b"tok");
+        let map = AuthTokenMap {
+            key_fingerprint: key_fingerprint(KEY),
+            entries: vec![
+                TokenEntry {
+                    token_hash: hash,
+                    tenant_id: "acme".into(),
+                    managed_by: None,
+                },
+                TokenEntry {
+                    token_hash: hash,
+                    tenant_id: "globex".into(),
+                    managed_by: Some(MANAGED_BY_OPERATOR.to_string()),
+                },
+            ],
+        };
+
+        let err = write_map(store.as_ref(), &map, None, 1)
+            .await
+            .expect_err("a map with a duplicate token_hash must be refused before any write");
+        assert!(
+            matches!(
+                err,
+                AuthTokenMapError::Corrupt {
+                    defect: AuthMapDefect::DuplicateTokenHash
+                }
+            ),
+            "got: {err}"
+        );
+        assert!(
+            store.get(AUTH_KEY, GetRange::Full).await.is_err(),
+            "the rejected write must not have reached the store at all"
         );
     }
 

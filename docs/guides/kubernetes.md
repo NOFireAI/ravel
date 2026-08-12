@@ -204,13 +204,13 @@ when either Secret changes.
 When `spec.deploymentKeySecretRef` is set, the operator also converges
 `sys/auth` — the durable, deployment-wide bearer-token map at the bucket root
 — to `spec.tenantTokensSecretRef`'s current contents, every reconcile cycle.
-This runs alongside, not instead of, `ravel-cli tenant-token upsert|revoke`:
+This runs alongside, not instead of, `ravel-cli tenant token upsert|revoke`:
 the two writers share the map, and each entry is tagged with who owns it.
 
 - Every tenant present in the token Secret is upserted with
   `managed_by=operator`. A tenant present in `sys/auth` but absent from the
   Secret is revoked, but **only if** its entry is tagged
-  `managed_by=operator`. A tenant provisioned by `ravel-cli tenant-token
+  `managed_by=operator`. A tenant provisioned by `ravel-cli tenant token
   upsert` (tagged `managed_by=cli` by default, or a value passed via
   `--managed-by`) is never touched by this pass, and neither is a v1-shaped
   entry with no `managed_by` field at all (unmanaged — written before this
@@ -237,7 +237,7 @@ the two writers share the map, and each entry is tagged with who owns it.
 
 See [operations.md](operations.md) and
 [../adrs/0072-tenant-scoped-credentials-and-control-plane-protection.md](../adrs/0072-tenant-scoped-credentials-and-control-plane-protection.md)
-for the `sys/auth` format itself and `ravel-cli tenant-token`'s own
+for the `sys/auth` format itself and `ravel-cli tenant token`'s own
 subcommands.
 
 ### Managed objects
