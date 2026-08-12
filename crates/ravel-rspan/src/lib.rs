@@ -38,8 +38,8 @@ pub(crate) mod pb {
 }
 
 pub use error::SpanSegError;
-pub use footer::{SpanFooter, SuffixOutcome, open, open_from_suffix, read_section};
-pub use ranged::{RspanRangeReader, TraceBlockSpan};
+pub use footer::{SpanFooter, SuffixOutcome, decode_section, open, open_from_suffix, read_section};
+pub use ranged::{BlockLoc, RspanRangeReader, TraceBlockSpan};
 pub use reader::{RspanReader, ScanStats, SpanQuery};
 pub use record::{COL_NAME, COL_SERVICE_NAME, SpanRecord, StatusCode, merge_attrs};
 pub use skip_index::{BloomPredicate, SkipIndex};

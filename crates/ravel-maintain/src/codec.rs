@@ -32,16 +32,12 @@
 //! had no ranged `.rlog` section reader); that gap is now closed.
 //!
 //! [`crate::rspan_codec::SpanCodec`] (RSPAN, spans) is the third
-//! implementation and does NOT yet hold the same bound: `ravel-rspan` has no
-//! ranged reader, so the codec fetches and decodes each input object whole
-//! (raw bytes bounded to one input at a time; *decoded* records for the whole
-//! bucket are held in memory across the merge). This is a named v1 tradeoff
-//! (`rspan_codec.rs`'s own module doc), the same shape the RLOG merge had
-//! before issue #275, not an oversight -- but it means the "bounded decoded
-//! memory" sentence above is a two-codec-out-of-three contract today, not a
-//! trait-wide guarantee. Closing it for RSPAN (a ranged reader over
-//! `ravel-rspan`, mirroring `RlogRangeReader`) is a natural follow-up once
-//! span bucket sizes in practice justify it.
+//! implementation and now holds the same bound (issue #908, mirroring RLOG's
+//! issue #275/#745): `ravel-rspan`'s `RspanRangeReader` fetches SKIP_IDX by
+//! range at catalog load, then the merge streams BLOCKS bytes one block per
+//! input at a time (`rspan_codec.rs`'s own module doc). So "bounded decoded
+//! memory" is now a trait-wide guarantee across all three codecs, not a
+//! two-out-of-three contract.
 //!
 //! [`RsegCodec`] is a behavior-preserving thin wrapper over the existing
 //! `read.rs`/`build.rs` RSEG logic; [`crate::rlog::RlogCodec`] is the RLOG
@@ -87,11 +83,9 @@ pub trait SegmentCodec {
     /// bytes lazily by range, bounding peak *decoded* memory to catalog
     /// metadata plus one in-flight part, and additionally bound raw fetched
     /// bytes via their ranged readers (RSEG's `open_from_suffix`, RLOG's
-    /// `RlogRangeReader`, issue #275) to one part plus one series/stream -- see
-    /// the trait doc above and [`crate::rlog::RlogCodec`]. RSPAN
-    /// ([`crate::rspan_codec::SpanCodec`]) fetches each input whole (raw bytes
-    /// bounded to one input, decoded records unbounded across the merge) --
-    /// see the trait doc's RSPAN paragraph.
+    /// `RlogRangeReader`, issue #275; RSPAN's `RspanRangeReader`, issue #908)
+    /// to one part plus one series/stream/block-per-input -- see the trait doc
+    /// above, [`crate::rlog::RlogCodec`], and [`crate::rspan_codec::SpanCodec`].
     async fn build_parts(
         store: &dyn ObjectStoreBackend,
         config: &CompactorConfig,

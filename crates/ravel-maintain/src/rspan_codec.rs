@@ -6,14 +6,18 @@
 //! An L1 `.rspan` part is the sorted union of its inputs' span records,
 //! re-blocked from scratch. Concretely the merge:
 //!
-//! - decodes every input's span records and groups them by `trace_id`;
-//! - iterates the merged trace set in ascending `trace_id` order, pushing each
-//!   trace's records into a fresh [`RspanWriter`], and splits a part on a
-//!   *trace boundary* once it reaches the size cap (so a trace never straddles
-//!   two parts, giving parts disjoint, ascending `trace_id` ranges -- the span
-//!   analogue of RLOG's stream-boundary split);
-//! - lets the writer re-sort each part by `(trace_id, start_ts)`, re-chunk the
-//!   blocks, and rebuild the interval-aware SKIP_IDX over the merged contents.
+//! - flat k-way merges every input's block stream in physical order (already
+//!   sorted by `(trace_id, start_ts)`) through one [`BlockCursor`] per input,
+//!   picking the minimum `(trace_id, start_ts_ns, input_index)` head at each
+//!   step -- see the `# Memory` section below for why there is no per-trace
+//!   outer loop the way RLOG has a per-stream one;
+//! - pushes the merged records into a fresh [`RspanWriter`] and splits a part
+//!   on a *trace boundary* once it reaches the size cap (so a trace never
+//!   straddles two parts, giving parts disjoint, ascending `trace_id` ranges
+//!   -- the span analogue of RLOG's stream-boundary split);
+//! - lets the writer re-sort each part by `(trace_id, start_ts)` (a no-op on
+//!   already-sorted input), re-chunk the blocks, and rebuild the
+//!   interval-aware SKIP_IDX over the merged contents.
 //!
 //! # No `stream_ref`-equivalent remap (the RLOG departure)
 //!
@@ -34,37 +38,73 @@
 //! Every encode step (sort, block chunking, skip-index build, section framing,
 //! footer/trailer) is exactly what [`RspanWriter`] already does for a
 //! single-object L0 write. The merge does not re-derive any of it: it decodes
-//! each input back to [`SpanRecord`]s with [`RspanReader`], pushes the merged
-//! records into a fresh `RspanWriter`, and calls
+//! each input's blocks back to [`SpanRecord`]s through [`RspanRangeReader`],
+//! pushes the merged records into a fresh `RspanWriter`, and calls
 //! [`RspanWriter::finish_compacted`] to stamp `level = 1`, the compaction
 //! `input_set_hash`, and the `part_index`. An L0 write and an L1 merge share the
 //! one writer implementation and so cannot drift.
 //!
-//! # Memory
+//! # Memory (issue #908, mirroring RLOG's issue #745)
 //!
-//! RSPAN v1's reader ([`RspanReader`]) opens over a whole object; unlike RLOG's
-//! post-#275 `RlogRangeReader`, it has no ranged block API to fetch one trace's
-//! blocks in isolation. So this codec fetches each input object whole, decodes
-//! its records, and drops the raw bytes before fetching the next -- peak *raw*
-//! resident bytes are bounded to one input object at a time, never the whole
-//! bucket. Peak *decoded* data is the bucket's span records grouped by trace
-//! (an L0 span bucket is a handful of small flush objects). This is the v1
-//! analogue of the first RLOG merge, which likewise held decoded records before
-//! RLOG grew a ranged section reader; a ranged `.rspan` reader is the natural
-//! #275-style follow-up if span bucket sizes ever demand it.
-
-use std::collections::BTreeMap;
+//! The read side ([`SpanCodec::load_input_catalog`]) retains only per-input
+//! catalog metadata: an [`RspanRangeReader`] holding the decoded SKIP_IDX plus
+//! the object key and footer, never block bytes.
+//!
+//! The merge itself is a **k-way block-streaming merge**, so its peak resident
+//! memory is bounded independently of any one trace's size, the same fix RLOG
+//! got in #745. Unlike RLOG, there is no per-stream (here, per-trace) outer
+//! loop: RSPAN's SKIP_IDX has no directory of the distinct `trace_id`s an
+//! object holds (a block entry records only its own boundary
+//! `min_trace_id`/`max_trace_id`, not every trace_id that starts inside it),
+//! so "the next trace_id in this object" cannot be discovered without decoding
+//! block contents first -- the point-lookup `trace_block_span`/`decode_trace`
+//! API this crate already had for query pruning cannot drive a merge loop.
+//!
+//! Instead [`build_parts`] walks every input's blocks unconditionally, in
+//! physical (already `(trace_id, start_ts)`-sorted) order, through one
+//! [`BlockCursor`] per input ([`RspanRangeReader::block_count`] +
+//! [`RspanRangeReader::block_loc`] + [`RspanRangeReader::decode_block`]),
+//! fetching the next block's bytes by range only once the previous block is
+//! drained. Because every input's own on-disk record stream is already sorted
+//! by exactly the key the merged output needs, a flat k-way merge over all
+//! inputs' cursors -- comparing `(trace_id, start_ts_ns, input_index)`, no
+//! grouping by stream/trace first -- reproduces byte-for-byte the ordering the
+//! old "gather everything then stable-sort by `(trace_id, start_ts)`" produced:
+//! each input is already sorted on that key, so a stable sort of the
+//! concatenation orders equal-key records by (input, position), exactly what
+//! selecting the minimum `(trace_id, start_ts_ns, input_index)` head does here.
+//! A part still splits only on a trace boundary (never mid-trace); since the
+//! sort key puts `trace_id` first, a trace's records from every input are
+//! contiguous in the merged stream, so the boundary check the old per-trace
+//! loop made once per trace group becomes an inline check on each
+//! `trace_id` transition in the flat loop. Merged records feed straight into
+//! the in-progress part's [`RspanWriter`]; there is no intermediate
+//! `Vec<SpanRecord>` batch or `by_trace` map.
+//!
+//! Peak resident memory is then: per-input catalog metadata (KBs per input),
+//! plus at most one decoded block per input (`O(input_count * block_size)`,
+//! independent of trace size), plus the in-progress part's writer buffer
+//! (bounded by `max_l1_part_bytes`). The [`crate::config::MergeMemoryTracker`]
+//! seam accounts these terms at their real allocation/decode points, the same
+//! seam RLOG's merge feeds.
+//!
+//! RSPAN's [`SpanRecord`] has no first-class span links/events in v1 (see
+//! `record.rs`'s module doc); both, if decoded at all, live as opaque blob
+//! values inside `attrs`, which this merge already carries through verbatim
+//! per record. No special handling beyond that pass-through is needed.
 
 use ravel_commit::keys;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
-use ravel_rspan::footer::{self, SuffixOutcome};
-use ravel_rspan::{ObjectIdentity, RspanConfig, RspanReader, RspanWriter, SpanQuery, SpanRecord};
+use ravel_rspan::footer::{self, SuffixOutcome, kind};
+use ravel_rspan::{
+    BlockLoc, ObjectIdentity, RspanConfig, RspanRangeReader, RspanWriter, SpanRecord,
+};
 
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, put_part};
 use crate::codec::SegmentCodec;
-use crate::config::CompactorConfig;
+use crate::config::{CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
 
@@ -79,16 +119,16 @@ use crate::read::InputRecord;
 /// wrote v2 parts that claimed to be v1.
 pub const OUTPUT_FORMAT_VERSION: u32 = ravel_rspan::footer::VERSION as u32;
 
-/// One RSPAN input's retained catalog metadata: the data-object key and its
-/// decoded footer. The footer is the object's cheap metadata (trace_id/ts
-/// bounds, record/block counts); the block bytes are fetched whole during the
-/// merge (see the module memory note). Retaining the footer lets a corrupt or
-/// missing input fail loud at load time, and its `record_count` cross-checks
-/// the whole-object decode during the merge.
+/// One RSPAN input's retained catalog metadata: the data-object key, its
+/// decoded footer, and an [`RspanRangeReader`] over its SKIP_IDX. Block bytes
+/// are never retained here; the merge fetches them by range one block at a
+/// time (see the module memory note). Retaining the footer lets a corrupt or
+/// missing input fail loud at load time.
 #[derive(Debug, Clone)]
 pub struct SpanInputCatalog {
     pub object_key: String,
     pub footer: footer::SpanFooter,
+    pub reader: RspanRangeReader,
 }
 
 /// The spans codec: implements the [`SegmentCodec`] seam for `.rspan` objects.
@@ -128,9 +168,28 @@ impl SegmentCodec for SpanCodec {
                 }
             }
         };
+        // Fetch and decode the SKIP_IDX section by range. BLOCKS is never
+        // fetched here; the merge streams blocks by range one at a time.
+        let skip_desc = ftr.section(kind::SKIP_IDX).ok_or_else(|| {
+            MaintainError::Invariant("rspan input missing SKIP_IDX section".into())
+        })?;
+        let skip_section = store
+            .get(
+                &object_key,
+                GetRange::Range(skip_desc.offset, skip_desc.offset + skip_desc.len),
+            )
+            .await?;
+        let skip_idx_raw = footer::decode_section(
+            skip_section.data.as_ref(),
+            skip_desc,
+            footer::DEFAULT_MAX_SECTION_UNCOMP,
+        )?;
+        let reader = RspanRangeReader::from_sections(&ftr, &skip_idx_raw)?;
+
         Ok(SpanInputCatalog {
             object_key,
             footer: ftr,
+            reader,
         })
     }
 
@@ -148,111 +207,281 @@ impl SegmentCodec for SpanCodec {
             ));
         }
 
-        // Group every input's span records by trace_id. Inputs are visited in
-        // canonical order (catalogs are aligned one-to-one with the canonically
-        // ordered inputs), and records are appended in that order, so records
-        // tying on the writer's `(trace_id, start_ts)` key keep canonical input
-        // order under the writer's stable sort -- deterministic output that
-        // crash-recovery convergence depends on (plan §3.4). Only one input's
-        // raw bytes are resident at a time (module memory note).
-        let cfg = RspanConfig::default();
-        let mut by_trace: BTreeMap<[u8; 16], Vec<SpanRecord>> = BTreeMap::new();
-        for catalog in &catalogs {
-            let got = store.get(&catalog.object_key, GetRange::Full).await?;
-            let reader = RspanReader::new(got.data.as_ref(), &cfg)?;
-            // A full-range scan prunes nothing and returns every record.
-            let (recs, _stats) = reader.scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))?;
-            // Integrity cross-check: a full scan must return exactly as many
-            // records as the footer claims. A mismatch means a truncated or
-            // inconsistent input; fail loud rather than silently merge less.
-            if recs.len() as u64 != catalog.footer.record_count {
-                return Err(MaintainError::Invariant(format!(
-                    "rspan input {} decoded {} records but its footer claims {}",
-                    catalog.object_key,
-                    recs.len(),
-                    catalog.footer.record_count
-                )));
-            }
-            for r in recs {
-                by_trace.entry(r.trace_id).or_default().push(r);
-            }
+        // No whole-object fetch: the per-input ranged readers are already in
+        // the catalogs. Blocks are fetched by range one at a time in the flat
+        // k-way merge below, so raw resident bytes stay bounded to one block
+        // per input, never a whole object or the whole bucket (issue #908).
+        let identity = compactor_identity(bucket, config);
+        let tracker = config.merge_memory_tracker.as_ref();
+
+        let mut cursors: Vec<BlockCursor> = Vec::with_capacity(catalogs.len());
+        for (idx, catalog) in catalogs.iter().enumerate() {
+            let mut cursor = BlockCursor::open(catalog, idx);
+            cursor.refill(store, tracker).await?;
+            cursors.push(cursor);
         }
 
-        let identity = compactor_identity(bucket, config);
         let mut parts = Vec::new();
         let mut part_index: u32 = 0;
-        let mut batch: Vec<SpanRecord> = Vec::new();
-        let mut batch_bytes: u64 = 0;
-        let mut batch_traces: u64 = 0;
+        let mut current: Option<PartBuilder> = None;
+        let mut current_trace: Option<[u8; 16]> = None;
 
-        // Emit parts trace by trace in ascending trace_id order. A part flushes
-        // on a trace boundary once it reaches the size cap, so a trace never
-        // straddles two parts and adjacent parts' trace_id ranges are disjoint
-        // and ascending (the span analogue of RSEG's series-boundary and RLOG's
-        // stream-boundary split).
-        for (_trace_id, recs) in by_trace {
-            batch_traces += 1;
-            for r in &recs {
-                batch_bytes = batch_bytes.saturating_add(estimate_record(r));
+        // Flat k-way merge over every input's block stream: each input is
+        // already sorted by `(trace_id, start_ts_ns)` (RSPAN's on-disk order),
+        // so selecting the globally-minimum `(trace_id, start_ts_ns,
+        // input_index)` head across all cursors reproduces byte-for-byte the
+        // ordering the old "gather everything then stable-sort" produced (see
+        // the module memory note). A part flushes on a `trace_id` transition
+        // once it reaches the size cap, so a trace never straddles two parts;
+        // since the sort key puts `trace_id` first, all of one trace's records
+        // across every input are contiguous here, so a plain
+        // `last_trace != current` check (inside [`PartBuilder::push`]) counts
+        // distinct traces correctly without a set.
+        loop {
+            let mut best: Option<(usize, [u8; 16], i64, usize)> = None;
+            for (i, cursor) in cursors.iter().enumerate() {
+                if let Some(head) = &cursor.head {
+                    let key = (head.trace_id, head.start_ts_ns, cursor.input_index);
+                    match best {
+                        Some((_, bt, bts, bidx)) if (bt, bts, bidx) <= key => {}
+                        _ => best = Some((i, key.0, key.1, key.2)),
+                    }
+                }
             }
-            batch.extend(recs);
-            if batch_bytes >= config.max_l1_part_bytes && !batch.is_empty() {
-                let part = flush_part(
-                    store,
-                    bucket,
-                    &identity,
-                    input_set_hash,
-                    part_index,
-                    std::mem::take(&mut batch),
-                    batch_traces,
-                    config.dry_run,
-                )
-                .await?;
-                parts.push(part);
-                part_index += 1;
-                batch_bytes = 0;
-                batch_traces = 0;
+            let Some((bi, trace_id, _, _)) = best else {
+                break;
+            };
+            let Some(rec) = cursors[bi].take_head() else {
+                return Err(MaintainError::Invariant(
+                    "rspan merge selected a cursor with no head".into(),
+                ));
+            };
+
+            if current_trace != Some(trace_id) {
+                if let Some(part) = &current {
+                    let over_cap = part.estimate >= config.max_l1_part_bytes && !part.is_empty();
+                    if over_cap && let Some(builder) = current.take() {
+                        let built = builder
+                            .finish(store, bucket, input_set_hash, part_index, config.dry_run)
+                            .await?;
+                        parts.push(built);
+                        part_index += 1;
+                        if let Some(t) = tracker {
+                            t.set_writer_bytes(0);
+                        }
+                    }
+                }
+                current_trace = Some(trace_id);
             }
+
+            let part = current.get_or_insert_with(|| PartBuilder::new(&identity));
+            part.push(rec, tracker);
+            cursors[bi].refill(store, tracker).await?;
         }
-        if !batch.is_empty() {
-            let part = flush_part(
-                store,
-                bucket,
-                &identity,
-                input_set_hash,
-                part_index,
-                batch,
-                batch_traces,
-                config.dry_run,
-            )
-            .await?;
-            parts.push(part);
+
+        if let Some(part) = current
+            && !part.is_empty()
+        {
+            let built = part
+                .finish(store, bucket, input_set_hash, part_index, config.dry_run)
+                .await?;
+            parts.push(built);
+            if let Some(t) = tracker {
+                t.set_writer_bytes(0);
+            }
         }
 
         Ok(parts)
     }
 }
 
-/// Build one L1 part from an accumulated span batch: encode it through the
-/// shared writer via [`RspanWriter::finish_compacted`] (stamping `level = 1`,
-/// the `input_set_hash`, and `part_index`), then PUT it `CreateIfAbsent`. The
-/// part's summary stats are read back from the produced object's own footer, so
-/// they describe exactly what was written.
-#[allow(clippy::too_many_arguments)]
-async fn flush_part(
+/// One in-progress L1 part: the shared [`RspanWriter`] merged records push
+/// into directly, plus the running record-byte estimate that decides where
+/// the part splits (a trace boundary once the estimate reaches
+/// `max_l1_part_bytes`) and feeds the [`MergeMemoryTracker`]'s writer term.
+struct PartBuilder {
+    writer: RspanWriter,
+    estimate: u64,
+    count: usize,
+    trace_count: u64,
+    last_trace: Option<[u8; 16]>,
+}
+
+impl PartBuilder {
+    fn new(identity: &ObjectIdentity) -> Self {
+        PartBuilder {
+            writer: RspanWriter::new(RspanConfig::default(), *identity),
+            estimate: 0,
+            count: 0,
+            trace_count: 0,
+            last_trace: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Push one merged record into the part's writer, updating the running
+    /// estimate and the distinct-trace count. Since the merge feeds records in
+    /// `(trace_id, start_ts_ns)` order, all of one trace's records arrive
+    /// contiguously, so a transition on `last_trace` counts distinct traces
+    /// exactly.
+    fn push(&mut self, r: SpanRecord, tracker: Option<&MergeMemoryTracker>) {
+        if self.last_trace != Some(r.trace_id) {
+            self.trace_count += 1;
+            self.last_trace = Some(r.trace_id);
+        }
+        self.estimate = self.estimate.saturating_add(estimate_record(&r));
+        self.count += 1;
+        self.writer.push(r);
+        if let Some(t) = tracker {
+            t.set_writer_bytes(self.estimate);
+        }
+    }
+
+    /// Encode and PUT the part through the shared writer pipeline. See
+    /// [`finalize_part`] for the encode/summary/PUT detail this reuses.
+    async fn finish(
+        self,
+        store: &dyn ObjectStoreBackend,
+        bucket: &Bucket,
+        input_set_hash: &[u8; 32],
+        part_index: u32,
+        dry_run: bool,
+    ) -> Result<BuiltPart> {
+        finalize_part(
+            store,
+            bucket,
+            self.writer,
+            input_set_hash,
+            part_index,
+            self.trace_count,
+            dry_run,
+        )
+        .await
+    }
+}
+
+/// One input's cursor over its whole block sequence, yielding records in
+/// stored (already `(trace_id, start_ts_ns)`-ascending) order one block at a
+/// time. At most one decoded block is resident: `head` is the next record to
+/// merge, `block` holds the rest of the current block, and the next block's
+/// bytes are fetched by range only once the current block is drained (issue
+/// #908). Unlike RLOG's `StreamCursor`, this walks *every* block of the input
+/// unconditionally -- there is no per-trace filter, because RSPAN has no
+/// directory of which traces a block holds (see the module memory note).
+/// `input_index` is the cursor's canonical position in `catalogs`, the k-way
+/// merge's tie-break on equal `(trace_id, start_ts_ns)`.
+struct BlockCursor<'a> {
+    input_index: usize,
+    object_key: &'a str,
+    reader: &'a RspanRangeReader,
+    next_block: usize,
+    total_blocks: usize,
+    /// Remaining records of the current decoded block.
+    block: std::vec::IntoIter<SpanRecord>,
+    /// The current block's decoded-byte estimate, held live in the tracker
+    /// until the block is released.
+    block_bytes: u64,
+    /// The next record to merge, or `None` once the cursor is exhausted.
+    head: Option<SpanRecord>,
+}
+
+impl<'a> BlockCursor<'a> {
+    /// Open a cursor over every block of `catalog`. Does not fetch yet; call
+    /// [`Self::refill`] once to load the first record.
+    fn open(catalog: &'a SpanInputCatalog, input_index: usize) -> Self {
+        BlockCursor {
+            input_index,
+            object_key: &catalog.object_key,
+            reader: &catalog.reader,
+            next_block: 0,
+            total_blocks: catalog.reader.block_count(),
+            block: Vec::new().into_iter(),
+            block_bytes: 0,
+            head: None,
+        }
+    }
+
+    /// Take the current head record; the caller must [`Self::refill`] before
+    /// the next merge step.
+    fn take_head(&mut self) -> Option<SpanRecord> {
+        self.head.take()
+    }
+
+    /// Release the current decoded block's residency from the tracker.
+    fn release_block(&mut self, tracker: Option<&MergeMemoryTracker>) {
+        if self.block_bytes > 0 {
+            if let Some(t) = tracker {
+                t.block_released(self.block_bytes);
+            }
+            self.block_bytes = 0;
+        }
+    }
+
+    /// Load the next record into `head`: the next record of the current
+    /// block, or the first record of the next block (fetched by range and
+    /// decoded here), or `None` when this input is exhausted. At most one
+    /// block's raw bytes and one decoded block are resident at a time.
+    async fn refill(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tracker: Option<&MergeMemoryTracker>,
+    ) -> Result<()> {
+        if let Some(rec) = self.block.next() {
+            self.head = Some(rec);
+            return Ok(());
+        }
+        self.release_block(tracker);
+        while self.next_block < self.total_blocks {
+            let loc: BlockLoc = self.reader.block_loc(self.next_block)?;
+            self.next_block += 1;
+            let got = store
+                .get(self.object_key, GetRange::Range(loc.start(), loc.end()))
+                .await?;
+            let raw_len = got.data.len() as u64;
+            if let Some(t) = tracker {
+                t.block_fetched(raw_len);
+            }
+            let recs = self.reader.decode_block(&loc, got.data.as_ref())?;
+            let decoded_bytes: u64 = recs.iter().map(estimate_record).sum();
+            if let Some(t) = tracker {
+                // Records both raw and decoded resident at the high-water
+                // instant, then drops the raw buffer.
+                t.block_decoded(raw_len, decoded_bytes);
+            }
+            drop(got);
+            self.block_bytes = decoded_bytes;
+            self.block = recs.into_iter();
+            if let Some(rec) = self.block.next() {
+                self.head = Some(rec);
+                return Ok(());
+            }
+            // An empty block (never produced by this crate's own writer, but
+            // not assumed impossible from an untrusted input): release and
+            // try the next.
+            self.release_block(tracker);
+        }
+        self.head = None;
+        Ok(())
+    }
+}
+
+/// Encode one in-progress part's writer into an L1 object and PUT it: run the
+/// shared writer pipeline via [`RspanWriter::finish_compacted`] (stamping
+/// `level = 1`, the `input_set_hash`, and `part_index`), then PUT it
+/// `CreateIfAbsent`. The part's summary stats are read back from the produced
+/// object's own footer, so they describe exactly what was written.
+async fn finalize_part(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
-    identity: &ObjectIdentity,
+    writer: RspanWriter,
     input_set_hash: &[u8; 32],
     part_index: u32,
-    batch: Vec<SpanRecord>,
     trace_count: u64,
     dry_run: bool,
 ) -> Result<BuiltPart> {
-    let mut writer = RspanWriter::new(RspanConfig::default(), *identity);
-    for r in batch {
-        writer.push(r);
-    }
     let object = writer.finish_compacted(1, input_set_hash.to_vec(), part_index)?;
     let object = bytes::Bytes::from(object);
 
@@ -336,6 +565,8 @@ fn estimate_record(r: &SpanRecord) -> u64 {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use bytes::Bytes;
     use proptest::prelude::*;
     use prost::Message;
@@ -352,6 +583,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::config::MergeMemoryTracker;
     use crate::{Bucket, CompactionOutcome, CompactorConfig, FixedClock, compact_bucket};
 
     const TENANT: &str = "acme";
@@ -398,6 +630,20 @@ mod tests {
         seq: u64,
         records: &[SpanRecord],
     ) -> Bytes {
+        seed_l0(store, writer_id, seq, records, RspanConfig::default()).await
+    }
+
+    /// [`seed`] with the L0 writer's config under test control: `cfg` so an
+    /// input can be blocked differently from the output the compactor always
+    /// writes with `RspanConfig::default()` (the RSPAN analogue of RLOG's
+    /// `seed_l0`).
+    async fn seed_l0(
+        store: &dyn ObjectStoreBackend,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[SpanRecord],
+        cfg: RspanConfig,
+    ) -> Bytes {
         let th = tenant_hash();
         let identity = ObjectIdentity {
             tenant_hash: th.0,
@@ -406,7 +652,7 @@ mod tests {
             writer_epoch: EPOCH,
             writer_seq: seq,
         };
-        let mut w = RspanWriter::new(RspanConfig::default(), identity);
+        let mut w = RspanWriter::new(cfg, identity);
         for r in records {
             w.push(r.clone());
         }
@@ -814,6 +1060,253 @@ mod tests {
             .expect_err("corrupt input must fail the compaction");
         // Any typed error is acceptable; it must not panic or succeed.
         let _ = format!("{err}");
+    }
+
+    // --- issue #908: bounded-memory k-way merge -------------------------------
+
+    /// L0 writer config for the tests below: 1000-record blocks, so an input
+    /// is blocked differently from the 8192-record output (the compactor
+    /// always writes with `RspanConfig::default()`).
+    fn l0_blocked_cfg() -> RspanConfig {
+        RspanConfig {
+            block_target_records: 1000,
+            ..RspanConfig::default()
+        }
+    }
+
+    /// A synthetic span for a hot trace `t`, span `s`, tagged with `tag` so its
+    /// origin is observable in decoded output.
+    fn span_tagged(t: u8, s: u32, start: i64, tag: &str) -> SpanRecord {
+        SpanRecord {
+            trace_id: [t; 16],
+            span_id: (s as u64).to_be_bytes(),
+            parent_span_id: None,
+            name: format!("op-{tag}-{s}"),
+            start_ts_ns: start,
+            end_ts_ns: start + 1,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![("tag".into(), tag.to_string())],
+        }
+    }
+
+    /// Acceptance test for issue #908 (mirroring RLOG's issue #745): the RSPAN
+    /// compaction merge's peak resident decode memory is bounded by block size
+    /// times input count, independent of how large one hot trace grows.
+    ///
+    /// A single hot trace (many spans in one trace, e.g. a fanned-out request)
+    /// is grown 10x across two runs. The [`MergeMemoryTracker`]'s recorded
+    /// *transient* high-water -- the merge's own decode-side buffers, at most
+    /// one fetched raw block plus one decoded block per input -- must stay
+    /// under a fixed bound and must NOT grow with the trace. Flipped-line
+    /// proof: reverting `BlockCursor::refill`'s one-block-at-a-time discipline
+    /// to whole-object decode (the pre-#908 shape, e.g. by making `refill`
+    /// eagerly decode every remaining block into `self.block` on first call
+    /// instead of one block per call) makes `decoded` scale with the trace and
+    /// pushes `transient` over `TRANSIENT_BOUND` at the 10x scale -- this test
+    /// fails against that whole-read shape.
+    ///
+    /// Deterministic: it asserts on the tracker's accounting, never on process
+    /// RSS or allocator hooks, and runs against [`MemoryStore`].
+    #[tokio::test]
+    async fn merge_peak_memory_is_bounded_independently_of_trace_size() {
+        const INPUTS: u32 = 3;
+        // l0_blocked_cfg's block target: each input is re-blocked at 1000
+        // records, so a grown trace spans many blocks per input.
+        const L0_BLOCK: u64 = 1000;
+        // A generous per-record upper bound (estimate_record for these tiny
+        // records is well under 100 bytes); the bound is intentionally loose
+        // so it tracks block size and input count, not the exact estimate.
+        const PER_RECORD_BOUND: u64 = 256;
+        // At most one raw block plus one decoded block resident per input.
+        const TRANSIENT_BOUND: u64 = INPUTS as u64 * 2 * L0_BLOCK * PER_RECORD_BOUND;
+        // Rough bytes-per-record for the "trace size" the peak is compared
+        // against (only used for reporting and the not-scaling assertion).
+        const PER_RECORD_APPROX: i64 = 70;
+
+        // records-per-input at the base scale and 10x, all one hot trace.
+        let scales = [3_000i64, 30_000i64];
+        let mut peaks = Vec::new();
+        for &records_per_input in &scales {
+            let store = MemoryStore::new();
+            for j in 0..INPUTS {
+                // One hot trace (trace 0); start_ts interleaves across inputs
+                // so the k-way merge genuinely interleaves them.
+                let recs: Vec<SpanRecord> = (0..records_per_input)
+                    .map(|i| {
+                        span_tagged(
+                            0,
+                            (i * i64::from(INPUTS) + i64::from(j)) as u32,
+                            i * i64::from(INPUTS) + i64::from(j),
+                            "x",
+                        )
+                    })
+                    .collect();
+                seed_l0(
+                    &store,
+                    Uuid::from_u128(u128::from(j) + 1),
+                    u64::from(j) + 1,
+                    &recs,
+                    l0_blocked_cfg(),
+                )
+                .await;
+            }
+
+            let tracker = MergeMemoryTracker::new();
+            let config = CompactorConfig {
+                merge_memory_tracker: Some(tracker.clone()),
+                ..CompactorConfig::default()
+            };
+            let clock = FixedClock::new(sealed_now_ns());
+            compact_bucket(&store, &clock, &config, &bucket())
+                .await
+                .expect("compact");
+
+            // One hot trace => exactly one part (a trace never straddles).
+            let (_rec, parts) = read_output(&store).await;
+            assert_eq!(parts.len(), 1, "one trace is one part");
+            assert_eq!(
+                decode_all(&parts[0]).len() as i64,
+                records_per_input * i64::from(INPUTS),
+                "every record survived the merge"
+            );
+
+            let transient = tracker.peak_transient_bytes();
+            let total = tracker.peak_total_bytes();
+            let trace_bytes =
+                (records_per_input * i64::from(INPUTS)) as u64 * PER_RECORD_APPROX as u64;
+            println!(
+                "[mem:rspan #908] records/input={records_per_input} trace~={trace_bytes}B \
+                 peak_transient={transient}B peak_total={total}B transient_bound={TRANSIENT_BOUND}B \
+                 part_cap={}B",
+                config.max_l1_part_bytes
+            );
+
+            // The decode-side peak is under the fixed bound.
+            assert!(
+                transient > 0,
+                "the tracker must record real decode residency"
+            );
+            assert!(
+                transient < TRANSIENT_BOUND,
+                "transient peak {transient} exceeded the fixed bound {TRANSIENT_BOUND} \
+                 (block size x input count)"
+            );
+            // The only trace-dependent residency is the writer's in-progress
+            // part, bounded by the part cap (content-addressing needs the
+            // whole part before its key exists).
+            assert!(
+                total < TRANSIENT_BOUND + config.max_l1_part_bytes,
+                "total peak {total} exceeded transient bound + part cap"
+            );
+            peaks.push(transient);
+        }
+
+        // The trace grew 10x; the decode-side peak did not (the same handful
+        // of blocks stay resident regardless of trace size).
+        let (base, ten_x) = (peaks[0], peaks[1]);
+        assert!(
+            ten_x <= base * 2,
+            "decode-side peak scaled with the trace: base={base} 10x={ten_x}"
+        );
+        // And concretely, at 10x the peak is a small fraction of the trace.
+        let trace_bytes_10x = (scales[1] * i64::from(INPUTS)) as u64 * PER_RECORD_APPROX as u64;
+        assert!(
+            ten_x < trace_bytes_10x / 5,
+            "10x peak {ten_x} is not far below the trace size {trace_bytes_10x}"
+        );
+    }
+
+    /// Byte-identical-output test for issue #908: the new k-way streaming
+    /// merge produces the exact same part bytes as the old "concatenate every
+    /// input's decoded records by trace_id in canonical input order, then
+    /// stable sort by (trace_id, start_ts)" path. Parts are content-addressed,
+    /// so a reordering bug would silently change every downstream hash.
+    ///
+    /// The corpus carries the same `(trace_id, start_ts)` in two different
+    /// inputs with *different span names*, so a wrong tie-break would reorder
+    /// those records and change the bytes -- the exact failure this guards
+    /// against.
+    #[tokio::test]
+    async fn streaming_merge_output_is_byte_identical_to_stable_sort_order() {
+        let store = MemoryStore::new();
+        // Three inputs over three traces. `a` and `b` share an even start_ts
+        // grid (cross-input ties on every trace); `c` uses an odd grid (it
+        // interleaves). Names are tagged by input so order is observable.
+        let mk = |tag: &str, odd: i64| -> Vec<SpanRecord> {
+            let mut v = Vec::new();
+            for t in 0..3u8 {
+                for k in 0..40u32 {
+                    v.push(span_tagged(
+                        t,
+                        k,
+                        i64::from(k) * 2 + odd,
+                        &format!("{tag}-{t}-{k}"),
+                    ));
+                }
+            }
+            v
+        };
+        let a = mk("a", 0);
+        let b = mk("b", 0); // same start_ts grid as `a` => cross-input ties
+        let c = mk("c", 1); // odd grid => interleaves
+        // writer_ids 1,2,3 with seqs 1,2,3 sort to canonical order [a, b, c],
+        // the order the merge breaks start_ts ties in.
+        let a_bytes = seed_l0(&store, Uuid::from_u128(1), 1, &a, l0_blocked_cfg()).await;
+        let b_bytes = seed_l0(&store, Uuid::from_u128(2), 2, &b, l0_blocked_cfg()).await;
+        let c_bytes = seed_l0(&store, Uuid::from_u128(3), 3, &c, l0_blocked_cfg()).await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1, "small corpus fits one part");
+        let actual = &parts[0];
+
+        // Reference: the OLD logical order. For each trace in sorted id order,
+        // concatenate each input's records for that trace in canonical (seed)
+        // order, then stable-sort by start_ts; concatenate across traces.
+        let per_input: Vec<Vec<SpanRecord>> = [&a_bytes, &b_bytes, &c_bytes]
+            .iter()
+            .map(|b| decode_all(b))
+            .collect();
+        let mut all_ids: BTreeMap<[u8; 16], ()> = BTreeMap::new();
+        for recs in &per_input {
+            for r in recs {
+                all_ids.insert(r.trace_id, ());
+            }
+        }
+        let mut old_order: Vec<SpanRecord> = Vec::new();
+        for id in all_ids.keys() {
+            let mut recs: Vec<SpanRecord> = Vec::new();
+            for recs_in in &per_input {
+                recs.extend(recs_in.iter().filter(|r| &r.trace_id == id).cloned());
+            }
+            recs.sort_by_key(|r| r.start_ts_ns); // stable: exactly the old path
+            old_order.extend(recs);
+        }
+
+        // Build the reference part through the same writer, identity,
+        // input_set_hash, and part_index the compaction used.
+        let ftr = footer::open(actual).expect("open actual part");
+        assert_eq!(ftr.input_set_hash.len(), 32, "input_set_hash is 32 bytes");
+        let mut ish = [0u8; 32];
+        ish.copy_from_slice(&ftr.input_set_hash);
+        let identity = compactor_identity(&bucket(), &CompactorConfig::default());
+        let mut writer = RspanWriter::new(RspanConfig::default(), identity);
+        for r in old_order {
+            writer.push(r);
+        }
+        let reference = writer
+            .finish_compacted(1, ish.to_vec(), 0)
+            .expect("finish reference part");
+
+        assert_eq!(
+            reference.as_slice(),
+            actual.as_ref(),
+            "streaming merge output must be byte-identical to the stable-sort ordering"
+        );
     }
 
     // --- keystone differential property test ---------------------------------
