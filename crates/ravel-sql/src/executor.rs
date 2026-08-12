@@ -84,7 +84,7 @@ use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_promql::{LabelMatcher, MatchOp};
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{LogSegmentFetcher, QueryError, SegmentFetcher, admit};
 use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
@@ -555,7 +555,6 @@ impl SqlExecutor {
                 snapshot,
                 tenant_hash,
                 self.log_fetcher.clone(),
-                self.config,
                 accounting.clone(),
             ))),
         };
@@ -697,9 +696,9 @@ impl SqlExecutor {
         let catalog_requests = self
             .catalog
             .estimated_catalog_requests(req.window, req.now_ns);
-        let snapshot = self
+        let (snapshot, origins) = self
             .catalog
-            .resolve_pruned_with_accounting(
+            .resolve_pruned_with_admission(
                 &tenant_hash,
                 target.signal(),
                 req.window,
@@ -709,12 +708,12 @@ impl SqlExecutor {
                 accounting,
             )
             .await?;
-        if snapshot.segments.len() > self.config.engine.max_segments {
-            return Err(SqlError::TooManySegments {
-                count: snapshot.segments.len(),
-                max: self.config.engine.max_segments,
-            });
-        }
+        // Sealed, below-watermark segments count against `max_segments`;
+        // recent and token-resolved segments are exempt (ADR-0073 decision
+        // 2), the same seam `ravel_query::engine::resolve_bounded` uses for
+        // PromQL (RH-T2, issue #902). Their cost is bounded separately by the
+        // request budget checked incrementally during fetch (see scan.rs).
+        admit(&snapshot, &origins, &self.config.engine).map_err(admission_error_to_sql)?;
         let estimate = match target {
             TargetSignal::Metrics => estimate_metrics_cost(&snapshot, catalog_requests),
             TargetSignal::Logs => estimate_logs_cost(&snapshot, catalog_requests),
@@ -995,6 +994,18 @@ pub(crate) fn retry_decision(retryable: bool, emitted: usize, attempt: u32) -> R
     } else {
         // Second NotFound: the snapshot is genuinely gone.
         RetryDecision::FailInvalidated
+    }
+}
+
+/// Maps [`admit`]'s error into a [`SqlError`] (RH-T2, issue #902). `admit`
+/// has exactly one failure variant
+/// (`QueryError::TooManySegments`); the wildcard arm exists only because
+/// `QueryError` is not restricted to that variant at the type level, and is
+/// unreachable in practice.
+fn admission_error_to_sql(err: QueryError) -> SqlError {
+    match err {
+        QueryError::TooManySegments { count, max } => SqlError::TooManySegments { count, max },
+        other => SqlError::Internal(format!("unexpected admission error: {other}")),
     }
 }
 
