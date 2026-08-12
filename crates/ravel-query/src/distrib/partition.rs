@@ -29,13 +29,23 @@ use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_types::accounting::CostEstimate;
 
 /// Estimated store bytes at or above which a query is worth distributing
-/// (ADR-0071: 256 MiB). A query cheaper than this on both axes runs fully
-/// locally, exactly as it did before this module existed.
+/// (256 MiB). A query cheaper than this on both axes runs fully locally,
+/// exactly as it did before this module existed. ADR-0074's measured
+/// crossover (16-worker byte win around ~36 MiB estimated store) confirmed
+/// keeping this conservative: `should_distribute` cannot see the worker
+/// count, and at 1 worker the same corpus is ~2.5x slower distributed, so no
+/// single byte threshold in the 36-256 MiB band is correct. A
+/// worker-count-aware gate is tracked as #962.
 pub const DISTRIBUTE_MIN_STORE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Segment count at or above which a query is worth distributing (ADR-0071:
-/// 64). Either axis alone trips the gate.
-pub const DISTRIBUTE_MIN_SEGMENTS: u64 = 64;
+/// Segment count at or above which a query is worth distributing. Either axis
+/// alone trips the gate. ADR-0074 raised this from ADR-0071's estimated 64 to
+/// the measured value: on the reference host distributed p95 first beat local
+/// p95 at 256 tiny segments (75 on the byte axis); per ADR-0074's policy of
+/// taking the conservative (higher) measured crossover per axis, 256 is the
+/// default. The old 64 triggered a case measured ~25% slower distributed even
+/// at 16 workers.
+pub const DISTRIBUTE_MIN_SEGMENTS: u64 = 256;
 
 /// Default ceiling on concurrently dispatched slices. Bounds fan-out width so a
 /// wide snapshot does not spawn an unbounded number of remote fetches.

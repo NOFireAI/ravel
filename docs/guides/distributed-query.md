@@ -67,7 +67,7 @@ when the estimate reaches **either** threshold:
 | Axis | Flag | Default |
 |---|---|---|
 | Estimated store bytes | `--distribute-bytes-threshold` | 256 MiB (268435456) |
-| Segment count | `--distribute-segments-threshold` | 64 |
+| Segment count | `--distribute-segments-threshold` | 256 |
 
 Either axis alone trips the gate; a query below both runs the fully local path,
 byte-identical to a build without the flag. A third flag,
@@ -111,7 +111,7 @@ leaving the defaults in place.
   <path class="a" d="M440,190 L440,212"/>
   <rect class="s" x="280" y="212" width="320" height="46"/>
   <text class="h" x="296" y="230">cost gate: should_distribute</text>
-  <text class="t" x="296" y="246">bytes &gt;= 256 MiB OR segments &gt;= 64</text>
+  <text class="t" x="296" y="246">bytes &gt;= 256 MiB OR segments &gt;= 256</text>
   <path class="a" d="M280,235 L234,235"/>
   <rect class="b" x="30" y="212" width="200" height="46"/>
   <text class="h" x="42" y="230">below gate: local path</text>

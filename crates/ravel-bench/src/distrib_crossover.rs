@@ -82,7 +82,7 @@ pub struct CrossoverConfig {
     /// spread across (`samples_per_series` points at `span / samples` spacing).
     /// A wider span with the same per-series sample count flushes more distinct
     /// segments, so this is the lever that grows a corpus past the gate
-    /// constants (256 MiB / 64 segments) without changing series cardinality.
+    /// constants (256 MiB / 256 segments) without changing series cardinality.
     /// The instant query and the snapshot resolve both cover this whole window.
     pub corpus_span_secs: u64,
     /// Timed instant queries per path, for the wall-time percentiles.

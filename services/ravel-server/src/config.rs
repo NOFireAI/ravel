@@ -599,15 +599,15 @@ pub struct Cli {
     /// query whose pre-fetch cost estimate reaches this many bytes is worth
     /// distributing; a cheaper query on both axes runs fully locally. Feeds
     /// `DistribThresholds::min_store_bytes`. Meaningful only with
-    /// `--distributed-query`. Default 256 MiB (ADR-0071's initial gate,
-    /// `ravel_query::distrib::DISTRIBUTE_MIN_STORE_BYTES`).
+    /// `--distributed-query`. Default 256 MiB (ADR-0074 confirmed this
+    /// conservative value, `ravel_query::distrib::DISTRIBUTE_MIN_STORE_BYTES`).
     #[arg(long = "distribute-bytes-threshold", default_value_t = ravel_query::distrib::DISTRIBUTE_MIN_STORE_BYTES)]
     pub distribute_bytes_threshold: u64,
 
     /// The segment-count axis of the ADR-0071 cost gate (issue #865): either
     /// axis alone trips the gate. Feeds `DistribThresholds::min_segments`.
-    /// Meaningful only with `--distributed-query`. Default 64 (ADR-0071's
-    /// initial gate, `ravel_query::distrib::DISTRIBUTE_MIN_SEGMENTS`).
+    /// Meaningful only with `--distributed-query`. Default 256 (ADR-0074's
+    /// measured crossover, `ravel_query::distrib::DISTRIBUTE_MIN_SEGMENTS`).
     #[arg(long = "distribute-segments-threshold", default_value_t = ravel_query::distrib::DISTRIBUTE_MIN_SEGMENTS)]
     pub distribute_segments_threshold: u64,
 
@@ -2393,6 +2393,76 @@ mod tests {
         let mut argv = vec!["ravel-server"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("flags parse")
+    }
+
+    /// Reachability (ADR-0074, issue #956): the shipped
+    /// `--distribute-*-threshold` flag defaults flow through
+    /// `parse_distrib_settings` into the `DistribThresholds` the live query
+    /// path consults, and the measured defaults gate `should_distribute`
+    /// correctly on both axes. This drives the real config-to-gate path, not a
+    /// restated constant: a wrong default would surface here as a wrong
+    /// threshold value or a gate tripping on the wrong side of an axis.
+    #[test]
+    fn distribute_threshold_defaults_reach_the_cost_gate() {
+        use ravel_query::distrib::partition::should_distribute;
+        use ravel_types::accounting::CostEstimate;
+
+        // A non-empty token file so --distributed-query resolves settings.
+        let token = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(token.path(), "cluster-token").expect("write token");
+
+        // No --distribute-*-threshold flags: the defaults come straight from
+        // the ravel-query constants via `default_value_t`.
+        let thresholds = cli(&[
+            "--distributed-query",
+            "--fragment-auth-token-file",
+            token.path().to_str().expect("utf8 path"),
+        ])
+        .parse_distrib_settings()
+        .expect("distrib settings resolve")
+        .expect("Some when --distributed-query is set")
+        .thresholds;
+
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            thresholds.min_store_bytes,
+            256 * MIB,
+            "byte axis default stays 256 MiB"
+        );
+        assert_eq!(
+            thresholds.min_segments, 256,
+            "segment axis default is the ADR-0074 measured value"
+        );
+
+        // Below both axes: local.
+        assert!(!should_distribute(
+            &thresholds,
+            &CostEstimate::new(
+                0,
+                thresholds.min_store_bytes - 1,
+                0,
+                thresholds.min_segments - 1,
+                1
+            )
+        ));
+        // Segment axis: local just below the bound, distributes at it.
+        assert!(!should_distribute(
+            &thresholds,
+            &CostEstimate::new(0, 0, 0, thresholds.min_segments - 1, 1)
+        ));
+        assert!(should_distribute(
+            &thresholds,
+            &CostEstimate::new(0, 0, 0, thresholds.min_segments, 1)
+        ));
+        // Byte axis: local just below the bound, distributes at it.
+        assert!(!should_distribute(
+            &thresholds,
+            &CostEstimate::new(0, thresholds.min_store_bytes - 1, 0, 1, 1)
+        ));
+        assert!(should_distribute(
+            &thresholds,
+            &CostEstimate::new(0, thresholds.min_store_bytes, 0, 1, 1)
+        ));
     }
 
     #[test]

@@ -279,7 +279,7 @@ Arrow and DataFusion outside `ravel-otap`.
 A read can span more than one process. This is off by default and cost-gated:
 the query node that receives a request coordinates it, resolves one pinned
 snapshot, and only fans out when a pre-execution estimate clears the gate
-(256 MiB of estimated store bytes or 64 segments), so a cheap query runs the
+(256 MiB of estimated store bytes or 256 segments), so a cheap query runs the
 untouched local path. Intra-cluster worker membership needs no new durable
 state — workers self-register with a heartbeat key and are selected by
 rendezvous hashing — and the full slice-partition, budget-re-enforcement, and
