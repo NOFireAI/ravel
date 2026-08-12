@@ -26,7 +26,9 @@ use std::sync::Arc;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use ravel_ingest::Clock;
 use ravel_query::http::TenantResolver;
-use ravel_sql::{FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService};
+use ravel_sql::{
+    DistributedFlightConfig, FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService,
+};
 use ravel_types::{CommitToken, TenantHash};
 use tonic::Status;
 use tonic::metadata::MetadataMap;
@@ -78,9 +80,18 @@ impl FlightClock for IngestClock {
 /// ravel-sql's conservative hardcoded default: this is where the ticket's GC
 /// ceiling becomes the single durable authority the flight_ticket.rs docs
 /// anticipate. The default event-time window still takes ravel-sql's default.
+///
+/// `distributed`, when `Some`, is the ADR-0071 coordinator-side scan config
+/// (issue #868): the fleet worker roster plus the cost gate the process
+/// installs under `--distributed-query`. It engages the SQL-lane distributed
+/// scan for a whole-set statement whose pinned snapshot clears the gate; the
+/// external Flight SQL contract (one endpoint, byte-identical result) is
+/// unchanged. `None` leaves the service running every statement whole-set on
+/// this coordinator, exactly as before this seam existed.
 pub fn service(
     state: &SqlState,
     gc_ticket_ceiling: std::time::Duration,
+    distributed: Option<DistributedFlightConfig>,
 ) -> FlightServiceServer<RavelFlightSqlService> {
     let auth = Arc::new(ResolverFlightAuth {
         tenant_resolver: Arc::clone(&state.tenant_resolver),
@@ -93,27 +104,31 @@ pub fn service(
         gc_protection_horizon: gc_ticket_ceiling,
         ..FlightSqlConfig::default()
     };
-    FlightServiceServer::new(
-        RavelFlightSqlService::new(
-            Arc::clone(&state.executor),
-            auth,
-            clock,
-            config,
-            // The same per-query cost aggregator every other read surface folds
-            // into, cloned out of `SqlState`, so Flight SQL cost reaches the one
-            // process `ravel_query_*` family (ADR-0044 section 4, issue #425).
-            Arc::clone(&state.query_accounting)
-                as Arc<dyn ravel_types::accounting::QueryCostRecorder>,
-            // The one shared fleet-global query concurrency controller (ADR-0061
-            // decision 2), cloned out of `SqlState`, so Flight SQL
-            // `GetFlightInfo` admits against the same process-wide in-flight
-            // count the PromQL and HTTP SQL surfaces do.
-            Arc::clone(&state.query_admission),
-        )
-        // The same evidential audit sink the HTTP SQL endpoint submits through
-        // (ADR-0062 §2a). Flight SQL audits at stream completion through it
-        // (issue #413), so both transports' query-audit trails land through one
-        // seam.
-        .with_audit_sink(Arc::clone(&state.audit_sink)),
+    let mut service = RavelFlightSqlService::new(
+        Arc::clone(&state.executor),
+        auth,
+        clock,
+        config,
+        // The same per-query cost aggregator every other read surface folds
+        // into, cloned out of `SqlState`, so Flight SQL cost reaches the one
+        // process `ravel_query_*` family (ADR-0044 section 4, issue #425).
+        Arc::clone(&state.query_accounting) as Arc<dyn ravel_types::accounting::QueryCostRecorder>,
+        // The one shared fleet-global query concurrency controller (ADR-0061
+        // decision 2), cloned out of `SqlState`, so Flight SQL
+        // `GetFlightInfo` admits against the same process-wide in-flight
+        // count the PromQL and HTTP SQL surfaces do.
+        Arc::clone(&state.query_admission),
     )
+    // The same evidential audit sink the HTTP SQL endpoint submits through
+    // (ADR-0062 §2a). Flight SQL audits at stream completion through it
+    // (issue #413), so both transports' query-audit trails land through one
+    // seam.
+    .with_audit_sink(Arc::clone(&state.audit_sink));
+    // ADR-0071 (issue #868): install the coordinator-side distributed scan when
+    // the deployment built one (`--distributed-query` on a query-serving mode).
+    // Absent it, the service is byte-identical to the pre-distribution build.
+    if let Some(config) = distributed {
+        service = service.with_distributed_scan(config);
+    }
+    FlightServiceServer::new(service)
 }

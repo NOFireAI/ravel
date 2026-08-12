@@ -121,6 +121,29 @@ impl TargetSignal {
     }
 }
 
+/// The coordinator-side distributed samples scan for one query: the minted
+/// worker slices and the client that fetches each (ADR-0071, issue #868).
+/// Cloneable so the pinned retry loop can re-plan without re-minting (the slice
+/// `Vec` and the `Arc` client both clone cheaply).
+#[cfg(feature = "flight-sql")]
+pub(crate) type DistributedScan = (
+    Vec<crate::distributed::WorkerSlice>,
+    Arc<dyn crate::distributed::WorkerSliceClient>,
+);
+
+/// Optional per-query plan inputs threaded into [`SqlExecutor::plan_pinned_with`]
+/// on top of the snapshot and SQL. Kept as a struct (rather than more
+/// positional arguments) so the field set can grow, and so it compiles to a
+/// zero-field value when `flight-sql` is off -- the local-only build carries no
+/// distributed machinery.
+#[derive(Default)]
+struct PlanExtras {
+    /// The coordinator-side distributed samples scan to install for this query,
+    /// or `None` to run the samples scan locally.
+    #[cfg(feature = "flight-sql")]
+    distributed: Option<DistributedScan>,
+}
+
 /// One SQL request, fully resolved from its transport.
 #[derive(Debug, Clone)]
 pub struct SqlRequest {
@@ -448,6 +471,61 @@ impl SqlExecutor {
         sql: &str,
         accounting: &QueryAccounting,
     ) -> Result<PinnedQuery, SqlError> {
+        self.plan_pinned_with(
+            tenant_hash,
+            snapshot,
+            sql,
+            accounting,
+            PlanExtras::default(),
+        )
+        .await
+    }
+
+    /// [`Self::plan_pinned`] with a coordinator-side distributed scan installed
+    /// on the metrics provider for THIS query only (ADR-0071, issue #868).
+    ///
+    /// `distributed`, when `Some`, carries the minted worker slices and the
+    /// production [`WorkerSliceClient`](crate::distributed::WorkerSliceClient)
+    /// the provider fans the samples scan out over. `None` is byte-identical to
+    /// [`Self::plan_pinned`]. The distribution decision itself is made by the
+    /// caller ([`Self::plan_distributed_slices_for`]); this method only installs
+    /// an already-made decision, so the local and distributed plans share this
+    /// one construction path and cannot drift.
+    #[cfg(feature = "flight-sql")]
+    pub async fn plan_pinned_distributed(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        sql: &str,
+        accounting: &QueryAccounting,
+        distributed: Option<DistributedScan>,
+    ) -> Result<PinnedQuery, SqlError> {
+        self.plan_pinned_with(
+            tenant_hash,
+            snapshot,
+            sql,
+            accounting,
+            PlanExtras { distributed },
+        )
+        .await
+    }
+
+    /// The one body behind [`Self::plan_pinned`] and
+    /// [`Self::plan_pinned_distributed`]. `extras` carries the optional
+    /// coordinator-side distributed scan; with the `flight-sql` feature off it
+    /// is a zero-field struct and the metrics provider is always the local one.
+    async fn plan_pinned_with(
+        &self,
+        tenant_hash: TenantHash,
+        snapshot: Snapshot,
+        sql: &str,
+        accounting: &QueryAccounting,
+        extras: PlanExtras,
+    ) -> Result<PinnedQuery, SqlError> {
+        // With `flight-sql` off, `PlanExtras` has no fields and the distributed
+        // install below is compiled out; keep `extras` from reading unused.
+        #[cfg(not(feature = "flight-sql"))]
+        let _ = extras;
         let (pool, breach) = self
             .config
             .query_pool(self.tenant_budget(tenant_hash), accounting.clone());
@@ -455,13 +533,24 @@ impl SqlExecutor {
         // its signal. `resolve` already resolved `snapshot` against exactly
         // this signal, so the provider and the snapshot always agree.
         let table = match Self::target_signal(sql)? {
-            TargetSignal::Metrics => SessionTable::Metrics(Arc::new(RavelTableProvider::new(
-                snapshot,
-                tenant_hash,
-                self.fetcher.clone(),
-                self.config,
-                accounting.clone(),
-            ))),
+            TargetSignal::Metrics => {
+                #[cfg_attr(not(feature = "flight-sql"), allow(unused_mut))]
+                let mut provider = RavelTableProvider::new(
+                    snapshot,
+                    tenant_hash,
+                    self.fetcher.clone(),
+                    self.config,
+                    accounting.clone(),
+                );
+                // Install the distributed samples scan for this query only, when
+                // the coordinator decided to fan out. `None`/feature-off leaves
+                // the provider byte-identical to the local path.
+                #[cfg(feature = "flight-sql")]
+                if let Some((endpoints, client)) = extras.distributed {
+                    provider = provider.with_distributed_scan(endpoints, client);
+                }
+                SessionTable::Metrics(Arc::new(provider))
+            }
             TargetSignal::Logs => SessionTable::Logs(Arc::new(LogsTableProvider::new(
                 snapshot,
                 tenant_hash,
@@ -480,6 +569,36 @@ impl SqlExecutor {
             schema,
             breach,
         })
+    }
+
+    /// Decide whether THIS pinned statement should distribute its samples scan,
+    /// and if so mint the per-worker slice tickets (ADR-0071, issue #868).
+    ///
+    /// Returns `Some(slices)` only for a metrics-target query whose pinned
+    /// snapshot clears the cost gate, advertises more than one worker slice, and
+    /// has workers to serve them (see
+    /// [`plan_distributed_slices`](crate::distributed::plan_distributed_slices)).
+    /// Logs have no distributed path, so a logs-target query is always `None`.
+    ///
+    /// The gate re-derives the cost estimate from the ticket-pinned snapshot
+    /// with `catalog_requests = 0`. [`should_distribute`] reads only the
+    /// snapshot-derived store-bytes and segment terms of the estimate, never the
+    /// catalog term, so this recomputed estimate makes the identical
+    /// distribute/local decision `get_flight_info` made when it minted the
+    /// ticket -- the coordinator does not re-run `Catalog::resolve` at `DoGet`.
+    #[cfg(feature = "flight-sql")]
+    pub fn plan_distributed_slices_for(
+        &self,
+        snapshot: &Snapshot,
+        sql: &str,
+        config: &crate::distributed::DistributedFlightConfig,
+        template: &crate::flight_ticket::FlightTicket,
+    ) -> Option<Vec<crate::distributed::WorkerSlice>> {
+        if !matches!(Self::target_signal(sql).ok()?, TargetSignal::Metrics) {
+            return None;
+        }
+        let estimate = estimate_metrics_cost(snapshot, 0);
+        crate::distributed::plan_distributed_slices(snapshot, &estimate, config, template)
     }
 
     /// Execute the worker-side scan fragment for one distributed slice (ADR-0071,

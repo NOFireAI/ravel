@@ -20,17 +20,16 @@
 //! where a worker's Flight `DoGet` also lives; the SQL lane needs no separate
 //! endpoint field.
 //!
-//! # Install seam gap (reported, not worked around)
+//! # Install seam
 //!
-//! The trait impl here is complete and testable, but it cannot be INSTALLED on
-//! the Flight SQL service read-only. `ravel_sql::RavelTableProvider` gates its
-//! distributed scan behind `with_distributed_scan(endpoints, client)`, and that
-//! builder is never called anywhere in ravel-sql: neither
-//! `ravel_sql::SqlExecutor::plan_pinned` (which builds the provider) nor
-//! `ravel_sql::RavelFlightSqlService` accepts a [`DistributedFlightConfig`].
-//! Wiring the config through to the provider is a ravel-sql change, and ravel-sql
-//! is out of scope for this task; see the task report for the exact seam a
-//! follow-up needs to add.
+//! The [`DistributedFlightConfig`] this module builds is installed on the
+//! Flight SQL service through `RavelFlightSqlService::with_distributed_scan`
+//! (ADR-0071, issue #868): the server registration site
+//! ([`crate::flight::service`]) passes the config built here when
+//! `--distributed-query` is on in a query-serving mode. On a positive cost
+//! gate, `do_get_statement` mints slice tickets and fans the samples scan out
+//! to the workers this roster resolves. Absent the config, the service runs
+//! every statement whole-set on the coordinator, byte-identical to before.
 
 use std::sync::Arc;
 
@@ -81,14 +80,12 @@ impl WorkerEndpoints for FleetWorkerEndpoints {
     }
 }
 
-/// Build the [`DistributedFlightConfig`] a coordinator would install on the
-/// Flight SQL service under `--distributed-query`: the fleet-backed worker
-/// roster plus the same cost gate/fan-out width the PromQL lane uses, so both
-/// lanes gate distribution on identical estimate semantics.
-///
-/// NOTE: ravel-sql exposes no read-only seam to install the returned value on
-/// its Flight SQL service (see the module docs and the task report). This
-/// builder produces the value a follow-up ravel-sql change would install.
+/// Build the [`DistributedFlightConfig`] a coordinator installs on the Flight
+/// SQL service under `--distributed-query`: the fleet-backed worker roster plus
+/// the same cost gate/fan-out width the PromQL lane uses, so both lanes gate
+/// distribution on identical estimate semantics. [`crate::flight::service`]
+/// installs the returned value through
+/// `RavelFlightSqlService::with_distributed_scan`.
 pub fn distributed_flight_config(
     live_workers: LiveWorkers,
     thresholds: ravel_query::distrib::partition::DistribThresholds,

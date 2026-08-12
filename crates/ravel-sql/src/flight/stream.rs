@@ -71,7 +71,7 @@ use std::sync::Arc;
 use tonic::Status;
 
 use crate::error::SqlError;
-use crate::executor::{PinnedStream, RetryDecision, SqlExecutor, retry_decision};
+use crate::executor::{DistributedScan, PinnedStream, RetryDecision, SqlExecutor, retry_decision};
 use crate::flight::ClockRef;
 use crate::flight::FlightSqlConfig;
 use crate::flight::request::status_from_sql;
@@ -100,6 +100,7 @@ pub(super) async fn statement_stream(
     recorder: Arc<dyn QueryCostRecorder>,
     span: tracing::Span,
     permit: QueryPermit,
+    distributed: Option<DistributedScan>,
 ) -> Result<DoGetStream, Status> {
     // Re-run the security gate on redemption. The statement is carried in
     // bytes a client holds, and the gate is cheap; running it again means a
@@ -123,7 +124,7 @@ pub(super) async fn statement_stream(
     let snapshot = ticket.snapshot();
     let started = tokio::time::timeout(
         budget,
-        start_pinned(executor, tenant, &snapshot, &ticket.statement),
+        start_pinned(executor, tenant, &snapshot, &ticket.statement, distributed),
     )
     .await
     .unwrap_or_else(|_| {
@@ -627,11 +628,14 @@ async fn start_pinned(
     tenant: TenantHash,
     snapshot: &Snapshot,
     sql: &str,
+    distributed: Option<DistributedScan>,
 ) -> Result<(Option<RecordBatch>, PinnedStream, QueryAccounting), SqlError> {
     // At most two passes: the original and the one retry the consistency
-    // model allows.
+    // model allows. Both passes install the same distributed scan; it clones
+    // cheaply (a slice `Vec` and an `Arc` client), so a retry re-plans over
+    // the same fan-out rather than silently falling back to local.
     for attempt in 0..2u32 {
-        match first_batch(executor, tenant, snapshot, sql).await {
+        match first_batch(executor, tenant, snapshot, sql, distributed.clone()).await {
             Ok(started) => return Ok(started),
             Err(err) => match retry_decision(err.is_segment_not_found(), 0, attempt) {
                 RetryDecision::RetryOnce => continue,
@@ -656,6 +660,7 @@ async fn first_batch(
     tenant: TenantHash,
     snapshot: &Snapshot,
     sql: &str,
+    distributed: Option<DistributedScan>,
 ) -> Result<(Option<RecordBatch>, PinnedStream, QueryAccounting), SqlError> {
     // A fresh handle per attempt, matching `SqlExecutor::run`'s per-attempt
     // accounting so a retried attempt's counters never bleed in. Returned to
@@ -664,7 +669,7 @@ async fn first_batch(
     // execution stream, so its counters keep rising as batches are pulled.
     let accounting = QueryAccounting::new();
     let planned = executor
-        .plan_pinned(tenant, snapshot.clone(), sql, &accounting)
+        .plan_pinned_distributed(tenant, snapshot.clone(), sql, &accounting, distributed)
         .await?;
     let mut stream = planned.execute().await?;
     match stream.next().await {
