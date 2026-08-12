@@ -193,6 +193,26 @@ resolution limit; issue #77), wall deadline (server maximum, default
 server maximum are clamped to it (issue #58). Exceeding a budget returns a
 Prometheus-style error, never a partial silent result.
 
+### Segment admission (ADR-0073)
+
+`max_segments` no longer counts every segment in the resolved snapshot. A
+resolve tags each segment with an origin (sealed-below-watermark, recent, or
+token-resolved via an explicit `min_commit_token`) and `max_segments` applies
+to the sealed count only; recent and token-resolved segments are exempt, so a
+hot tenant's open hour and a read-your-write query no longer 422 on count.
+Their cost is bounded instead by a per-query S3 request budget
+(`EngineConfig::max_s3_requests`, default 25,000), checked incrementally at
+the same points `max_bytes_scanned` already is, and reported as
+`RequestBudgetExceeded` (HTTP 422) when tripped.
+
+`crates/ravel-query/src/segment_admission.rs` is the one seam both checks go
+through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
+`request_budget_exceeded(requests, max_s3_requests)` for the incremental
+budget check. `QueryEngine::resolve_bounded` (`engine.rs`) is the only call
+site wired up as of RH-T1 (#901). The SQL executor, the five SQL table
+providers, and the exemplars state still run their own pre-ADR-0073 checks;
+moving those eight sites onto this seam is RH-T2 (#902).
+
 Per-tenant max bytes scanned (`ByteLimit`, default `Unlimited`; ADR-0061
 decision 1, issue #721) bounds the total S3 bytes one query may fetch
 across every segment its shared snapshot resolves to, protecting against a

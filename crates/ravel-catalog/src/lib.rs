@@ -54,7 +54,7 @@ pub use provisioning::{
 pub use seal_divergence::{
     EntryIdentity, SealDivergenceError, SealDivergenceReport, verify_seal_divergence,
 };
-pub use snapshot::{SegmentLevel, SegmentRef, Snapshot};
+pub use snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 pub use snapshot_format::{
     DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedPart, DecodedPostings,
     HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits, SnapshotFormatError,

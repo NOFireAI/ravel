@@ -73,6 +73,28 @@ rejected point counts and reasons.
   `min_commit_token` (read-your-write) path is unaffected: it always GETs
   its exact commit key directly, never through the snapshot.
 
+## Recent-hours read path (ADR-0073)
+
+- `max_segments` (default 1024) applies only to the sealed, below-watermark
+  set a resolve extracts from snapshot parts. Recent segments (listed live
+  above the fold watermark) and token-resolved segments (from an explicit
+  `min_commit_token`) are exempt from that cap, so a hot tenant's open hour
+  and a read-your-write query holding its own commit token both stay
+  queryable through the compaction lag window instead of 422ing on count.
+- Their cost is bounded separately, by a per-query S3 request budget
+  (`EngineConfig::max_s3_requests`, default 25,000), enforced incrementally
+  at the same checkpoints the existing bytes-scanned budget already checks.
+  Exceeding it returns a typed `RequestBudgetExceeded` (HTTP 422), distinct
+  from `TooManySegments`.
+- This changes only which segments are admitted into a resolved snapshot.
+  Visibility, ordering, erasure, and the listing-immediate freshness of the
+  open hour above are unchanged.
+- As of RH-T1 (#901), the PromQL query engine enforces this through one
+  admission seam (`ravel-query`'s `segment_admission` module). The SQL
+  executor, the five SQL table providers, and the exemplars state still run
+  the pre-ADR-0073 per-surface checks; moving them onto the same seam is
+  RH-T2 (#902).
+
 ## Snapshot isolation
 
 - A query resolves one snapshot (a logical set of immutable segments) and

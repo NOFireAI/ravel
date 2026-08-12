@@ -115,3 +115,53 @@ pub struct Snapshot {
     /// has run.
     pub pending_erasure: Vec<ErasureRequest>,
 }
+
+/// Where one resolved segment came from (ADR-0073 decision 1). Kept as a
+/// sibling of [`Snapshot`]/[`SegmentRef`] rather than a new field on either:
+/// both types are constructed by full field-literal at call sites outside
+/// this crate (`ravel-sql`'s executor, providers, and flight ticket), which
+/// have no `..` update syntax to absorb an added field, so a new field there
+/// would be a breaking change this task's scope (`ravel-catalog`/
+/// `ravel-query` only) cannot land. `Snapshot`'s and `SegmentRef`'s shapes
+/// are unchanged; this enum is produced alongside a `Snapshot`, not inside
+/// it, by [`crate::Catalog::resolve_pruned_with_admission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentOrigin {
+    /// Extracted from a folded snapshot part at or below the fold
+    /// watermark; postings-pruned, and the only origin `max_segments`
+    /// counts against (ADR-0073 decision 2).
+    SealedBelowWatermark,
+    /// Listed live above the fold watermark; never postings-pruned, exempt
+    /// from `max_segments`.
+    Recent,
+    /// Resolved from an explicit `min_commit_token` (read-your-write);
+    /// exempt from `max_segments`.
+    TokenResolved,
+}
+
+/// The per-segment origin breakdown for one resolved [`Snapshot`]
+/// (ADR-0073 decision 1), in the same order as `Snapshot::segments`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SegmentOrigins {
+    /// Parallel to `Snapshot::segments`: `origins[i]` is `segments[i]`'s
+    /// origin.
+    pub origins: Vec<SegmentOrigin>,
+    /// Count of `SegmentOrigin::SealedBelowWatermark` entries: the set
+    /// `max_segments` is checked against.
+    pub sealed_count: u64,
+    /// Count of `Recent` plus `TokenResolved` entries: exempt from
+    /// `max_segments` (ADR-0073 decision 2).
+    pub exempt_count: u64,
+}
+
+impl SegmentOrigins {
+    /// Record one more segment's origin, keeping `sealed_count`/
+    /// `exempt_count` in sync with `origins`.
+    pub fn push(&mut self, origin: SegmentOrigin) {
+        match origin {
+            SegmentOrigin::SealedBelowWatermark => self.sealed_count += 1,
+            SegmentOrigin::Recent | SegmentOrigin::TokenResolved => self.exempt_count += 1,
+        }
+        self.origins.push(origin);
+    }
+}

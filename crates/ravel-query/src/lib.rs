@@ -12,10 +12,11 @@ mod fetcher;
 pub mod http;
 mod log_fetcher;
 mod query_admission;
+mod segment_admission;
 
 pub use config::{
-    ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SAMPLES,
-    DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig,
+    ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_S3_REQUESTS,
+    DEFAULT_MAX_SAMPLES, DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig, RequestLimit,
 };
 pub use engine::{QueryEngine, QueryStats, snapshot_erasure_predicates};
 pub use error::QueryError;
@@ -29,3 +30,4 @@ pub use query_admission::{
     QueryAdmissionController, QueryConcurrencyLimit, QueryPermit, QueryRejected,
     query_admission_snapshot_key, reconcile_query_admission_once,
 };
+pub use segment_admission::{SegmentAdmission, admit, request_budget_exceeded};

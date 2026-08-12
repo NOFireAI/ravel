@@ -37,6 +37,8 @@ pub enum QueryError {
     TooManySamples { count: usize, max: usize },
     #[error("query scanned {scanned} bytes, exceeding the budget of {max}")]
     TooManyBytesScanned { scanned: u64, max: u64 },
+    #[error("query issued {requests} S3 requests, exceeding the budget of {max}")]
+    RequestBudgetExceeded { requests: u64, max: u64 },
     #[error("query exceeded its deadline of {deadline:?}")]
     DeadlineExceeded { deadline: Duration },
     #[error("snapshot invalidated by a concurrent GC/compaction; retry also failed")]

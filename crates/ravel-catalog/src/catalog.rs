@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::cache::{CompactionRecordCache, HeadCache, PartCache, PostingsCache, RecordCache};
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
-use crate::snapshot::{SegmentLevel, SegmentRef, Snapshot};
+use crate::snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// Bound on the object-store requests one resolve keeps in flight at once
@@ -669,6 +669,7 @@ impl Catalog {
     ) -> Result<Snapshot, CatalogError> {
         self.resolve_impl(tenant, signal, range, min_tokens, now_ns, None, accounting)
             .await
+            .map(|(snapshot, _origins)| snapshot)
     }
 
     /// Like [`Catalog::resolve`], but applies postings-based segment pruning
@@ -734,6 +735,40 @@ impl Catalog {
             accounting,
         )
         .await
+        .map(|(snapshot, _origins)| snapshot)
+    }
+
+    /// Like [`Catalog::resolve_pruned_with_accounting`], but also returns the
+    /// per-segment origin breakdown (ADR-0073 decision 1): sealed-below-
+    /// watermark, recent (listed live above the watermark), or
+    /// token-resolved. A separate method rather than an added
+    /// `resolve_pruned_with_accounting` return value, for the same reason
+    /// `resolve_pruned`/`resolve_with_accounting` exist as separate methods
+    /// above: that method's signature and every existing call site
+    /// (`ravel-sql`'s executor calls it directly) stay exactly as they were.
+    /// The recent-hours admission seam (`ravel-query`'s `SegmentAdmission`)
+    /// is the only consumer of the returned [`SegmentOrigins`] today.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_pruned_with_admission(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+    ) -> Result<(Snapshot, SegmentOrigins), CatalogError> {
+        self.resolve_impl(
+            tenant,
+            signal,
+            range,
+            min_tokens,
+            now_ns,
+            name_filter,
+            accounting,
+        )
+        .await
     }
 
     /// Instruments the whole LIST/GET fan-out with the `catalog_resolve` span
@@ -756,7 +791,7 @@ impl Catalog {
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<Snapshot, CatalogError> {
+    ) -> Result<(Snapshot, SegmentOrigins), CatalogError> {
         // Idle-tenant eviction last-touch (ADR-0069 decision 2, issue #820):
         // stamp this tenant's activity with the caller's injected `now_ns`
         // before the fan-out. Every resolve entry point funnels through here,
@@ -802,7 +837,7 @@ impl Catalog {
                 .total_s3_bytes()
                 .saturating_sub(before.total_s3_bytes()),
         );
-        if let Ok(snapshot) = &result {
+        if let Ok((snapshot, _origins)) = &result {
             span.record("segments_pruned", snapshot.segments_pruned);
         }
         result
@@ -818,7 +853,7 @@ impl Catalog {
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<Snapshot, CatalogError> {
+    ) -> Result<(Snapshot, SegmentOrigins), CatalogError> {
         // Durable shard_count enforcement on the read path (ADR-0050 section 5,
         // EC5): fail before the `0..shard_count` listing loop below if this
         // catalog's configured shard_count disagrees with the (tenant, signal)'s
@@ -847,6 +882,13 @@ impl Catalog {
 
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
         let mut segments_pruned = 0u64;
+        // Per-segment origin (ADR-0073 decision 1), keyed the same as
+        // `segments` (`data_object_key`). Tagged at each insertion point
+        // below, gated the same way `segments.entry(..).or_insert(..)` is:
+        // only a genuinely new key gets an origin, so a key already present
+        // from an earlier, higher-precedence source (sealed over recent,
+        // either over token-resolved) keeps its original tag.
+        let mut origin_by_key: HashMap<String, SegmentOrigin> = HashMap::new();
 
         if let Some((window_start_hour, window_end_hour)) = self.window_hour_bounds(range, now_ns) {
             // A snapshot at watermark W serves every window hour <= W
@@ -893,6 +935,13 @@ impl Catalog {
                         &mut segments_pruned,
                         &mut segments,
                     )?;
+                    // `segments` is empty before this call (the first
+                    // population in this branch), so every key it holds
+                    // afterwards came from `extract_into`: sealed-below-
+                    // watermark, postings-pruned (ADR-0073 decision 1).
+                    for key in segments.keys() {
+                        origin_by_key.insert(key.clone(), SegmentOrigin::SealedBelowWatermark);
+                    }
                     window.watermark_hour.saturating_add(1)
                 }
                 _ => window_start_hour,
@@ -948,6 +997,9 @@ impl Catalog {
                     )
                     .await?;
                 for (key, segment_ref) in listed {
+                    if !segments.contains_key(&key) {
+                        origin_by_key.insert(key.clone(), SegmentOrigin::Recent);
+                    }
                     segments.entry(key).or_insert(segment_ref);
                 }
             } else {
@@ -988,6 +1040,9 @@ impl Catalog {
                         .await;
                 for bucket in bucket_maps {
                     for (key, segment_ref) in bucket? {
+                        if !segments.contains_key(&key) {
+                            origin_by_key.insert(key.clone(), SegmentOrigin::Recent);
+                        }
                         segments.entry(key).or_insert(segment_ref);
                     }
                 }
@@ -995,8 +1050,15 @@ impl Catalog {
         }
 
         for token in min_tokens {
-            self.resolve_min_token(tenant, signal, token, &mut segments, accounting)
-                .await?;
+            self.resolve_min_token(
+                tenant,
+                signal,
+                token,
+                &mut segments,
+                &mut origin_by_key,
+                accounting,
+            )
+            .await?;
         }
 
         // One LIST of `t/<th>/<sig>/del/` per resolve (ADR-0064 decision 2):
@@ -1027,11 +1089,26 @@ impl Catalog {
         // separates the two tiebreak families). L0 ordering is unchanged: the
         // appended L1-only key components are constant across L0 refs.
         segments.sort_by_key(segment_sort_key);
-        Ok(Snapshot {
-            segments,
-            segments_pruned,
-            pending_erasure,
-        })
+        // Every key in `segments` was tagged by the exact same insertion
+        // gate that put it there (extract_into's first-population window,
+        // or the `!segments.contains_key` checks above), so the lookup
+        // below always hits; `SealedBelowWatermark` is the fail-closed
+        // default (counted, not exempted) if that invariant is ever wrong.
+        let mut origins = SegmentOrigins::default();
+        for segment in &segments {
+            let origin = origin_by_key
+                .remove(&segment.data_object_key)
+                .unwrap_or(SegmentOrigin::SealedBelowWatermark);
+            origins.push(origin);
+        }
+        Ok((
+            Snapshot {
+                segments,
+                segments_pruned,
+                pending_erasure,
+            },
+            origins,
+        ))
     }
 
     /// Upper bound on the store requests a `resolve`/`resolve_pruned` call
@@ -1775,6 +1852,7 @@ impl Catalog {
         signal: Signal,
         token: &CommitToken,
         out: &mut HashMap<String, SegmentRef>,
+        origin_by_key: &mut HashMap<String, SegmentOrigin>,
         accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
         let key = keys::commit_key_for_token(tenant, signal, token)?;
@@ -1782,6 +1860,12 @@ impl Catalog {
             && validate_expected_fields(self, &cached, tenant, signal, token.shard, &key).is_ok()
         {
             let segment_ref = build_segment_ref(&key, &cached)?;
+            if !out.contains_key(&segment_ref.data_object_key) {
+                origin_by_key.insert(
+                    segment_ref.data_object_key.clone(),
+                    SegmentOrigin::TokenResolved,
+                );
+            }
             out.entry(segment_ref.data_object_key.clone())
                 .or_insert(segment_ref);
             return Ok(());
@@ -1814,6 +1898,12 @@ impl Catalog {
                         self.config.cache_capacity_per_tenant,
                     );
                     let segment_ref = build_segment_ref(&key, &record)?;
+                    if !out.contains_key(&segment_ref.data_object_key) {
+                        origin_by_key.insert(
+                            segment_ref.data_object_key.clone(),
+                            SegmentOrigin::TokenResolved,
+                        );
+                    }
                     out.entry(segment_ref.data_object_key.clone())
                         .or_insert(segment_ref);
                     return Ok(());
@@ -1830,7 +1920,14 @@ impl Catalog {
                     // L1 parts, a tombstoned bucket is satisfied with zero
                     // segments.
                     return self
-                        .resolve_min_token_fallback(tenant, signal, token, out, accounting)
+                        .resolve_min_token_fallback(
+                            tenant,
+                            signal,
+                            token,
+                            out,
+                            origin_by_key,
+                            accounting,
+                        )
                         .await;
                 }
                 Err(e) if e.is_retryable() && transient_retries > 0 => {
@@ -1861,6 +1958,7 @@ impl Catalog {
         signal: Signal,
         token: &CommitToken,
         out: &mut HashMap<String, SegmentRef>,
+        origin_by_key: &mut HashMap<String, SegmentOrigin>,
         accounting: &QueryAccounting,
     ) -> Result<(), CatalogError> {
         let prefix =
@@ -1956,6 +2054,12 @@ impl Catalog {
             if covers {
                 for part in &record.parts {
                     let segment_ref = build_l1_segment_ref(record, part, ckey)?;
+                    if !out.contains_key(&segment_ref.data_object_key) {
+                        origin_by_key.insert(
+                            segment_ref.data_object_key.clone(),
+                            SegmentOrigin::TokenResolved,
+                        );
+                    }
                     out.entry(segment_ref.data_object_key.clone())
                         .or_insert(segment_ref);
                 }
@@ -1985,6 +2089,12 @@ impl Catalog {
             if effective_inputs.contains(&token_identity) {
                 for part in &record.parts {
                     let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
+                    if !out.contains_key(&segment_ref.data_object_key) {
+                        origin_by_key.insert(
+                            segment_ref.data_object_key.clone(),
+                            SegmentOrigin::TokenResolved,
+                        );
+                    }
                     out.entry(segment_ref.data_object_key.clone())
                         .or_insert(segment_ref);
                 }
