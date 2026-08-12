@@ -1290,6 +1290,7 @@ pub fn partition_bucket_entry(key: &str) -> Result<BucketEntry, KeyError> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use ravel_proto::commit::v1::{
         ErasureCompletion, ErasurePredicateMatcher, ErasureRequest, RewriteRecord,
     };
@@ -2073,6 +2074,57 @@ mod tests {
         assert!(parse_rewrite_record_key(&bad_suffix).is_err());
         // Looks like an L0 commit key instead (four dot components).
         assert!(parse_rewrite_record_key(&good.replacen("rw.", "", 1)).is_err());
+    }
+
+    proptest! {
+        // Property/round-trip coverage for the rw. key parser (issue #831):
+        // every well-formed identity tuple must build then parse back to
+        // itself, across the full shard/hour/signal/hash16 domain, not just
+        // the fixed examples above. Bounded to hour buckets that keep the
+        // formatted calendar year within 4 digits (year 9999's epoch-hour
+        // count), matching `ingest_hour_string`'s own fixed-width contract.
+        #[test]
+        fn rewrite_record_key_round_trips_over_arbitrary_identities(
+            tenant_bytes in prop::collection::vec(any::<u8>(), 16),
+            signal in prop::sample::select(vec![
+                Signal::Metrics,
+                Signal::Logs,
+                Signal::Spans,
+                Signal::Profiles,
+                Signal::Alerts,
+                Signal::Audit,
+            ]),
+            shard in 0u32..=9999,
+            ingest_hour_bucket in 0u32..=70_000_000u32,
+            hash_byte in any::<u8>(),
+        ) {
+            let th = TenantHash(tenant_bytes.try_into().expect("16-byte strategy"));
+            let input_set_hash16 = hash16_hex(hash_byte);
+            let key = rewrite_record_key(&th, signal, shard, ingest_hour_bucket, &input_set_hash16)
+                .expect("build");
+            let parsed = parse_rewrite_record_key(&key).expect("parse");
+            prop_assert_eq!(parsed.tenant_hash, th);
+            prop_assert_eq!(parsed.signal, signal);
+            prop_assert_eq!(parsed.shard, shard);
+            prop_assert_eq!(parsed.ingest_hour_bucket, ingest_hour_bucket);
+            prop_assert_eq!(parsed.input_set_hash16, input_set_hash16);
+        }
+
+        // A key produced for one rw. record must never parse as the
+        // differently-tagged compaction record it shares a bucket prefix
+        // with (ADR-0064 decision 3): the two are disjoint by filename tag.
+        #[test]
+        fn rewrite_record_key_never_parses_as_a_compaction_key(
+            shard in 0u32..=9999,
+            ingest_hour_bucket in 0u32..=70_000_000u32,
+            hash_byte in any::<u8>(),
+        ) {
+            let th = tenant_hash();
+            let input_set_hash16 = hash16_hex(hash_byte);
+            let key = rewrite_record_key(&th, Signal::Metrics, shard, ingest_hour_bucket, &input_set_hash16)
+                .expect("build");
+            prop_assert!(parse_compaction_record_key(&key).is_err());
+        }
     }
 
     fn sample_erasure_request(th: &TenantHash, signal: Signal, rid: Uuid) -> ErasureRequest {
