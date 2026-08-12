@@ -216,7 +216,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -251,7 +251,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -301,7 +301,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -350,7 +350,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -395,7 +395,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -456,7 +456,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -510,7 +510,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -681,7 +681,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -773,7 +773,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -878,7 +878,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -1215,7 +1215,7 @@ jobs:
       - name: Install sccache
         id: sccache
         continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: ./.github/actions/setup-sccache
       - name: Disable sccache if its install flaked
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"

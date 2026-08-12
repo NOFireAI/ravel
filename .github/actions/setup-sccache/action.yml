@@ -1,0 +1,25 @@
+name: Setup sccache
+description: >
+  Install sccache with its GitHub Actions cache backend, caching the downloaded
+  binary across runs so the flaky GitHub-releases download runs once per version
+  instead of on every job. mozilla-actions/sccache-action reuses a binary it
+  finds in the runner tool cache (it calls tc.find('sccache', version) before
+  downloading) and still exports the GHA cache tokens sccache needs, so caching
+  the tool-cache dir in front of it keeps full functionality while removing the
+  per-job download. The caller keeps RUSTC_WRAPPER/SCCACHE_GHA_ENABLED in job
+  env, and should wrap this with continue-on-error plus a step that clears
+  RUSTC_WRAPPER on failure, so even a cold-cache download flake degrades to a
+  no-cache build rather than failing the job.
+runs:
+  using: composite
+  steps:
+    # Bump the -action- suffix in this key whenever the sccache-action version
+    # below changes (a new action version installs a new sccache version, which
+    # lands under a new tool-cache path; a stale key would pin the old binary).
+    - name: Cache the sccache tool binary
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/sccache
+        key: sccache-tool-${{ runner.os }}-${{ runner.arch }}-action-v0.0.10
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.10
