@@ -342,6 +342,10 @@ impl FlightSqlService for RavelFlightSqlService {
             .iter()
             .map(SegmentPin::from_segment_ref)
             .collect();
+        // Carried into the ticket below so `DoGet` excludes exactly what this
+        // resolve saw pending (ADR-0064 decision 3, issue #829): `snapshot` is
+        // moved into `plan_pinned` just below, so this must be derived first.
+        let pending_erasure = ravel_query::erasure::snapshot_pending_erasure_predicates(&snapshot);
 
         // Step 3: plan against the pinned snapshot so the FlightInfo can
         // carry the real result schema and so an unplannable query is
@@ -400,6 +404,7 @@ impl FlightSqlService for RavelFlightSqlService {
             deadline_ns,
             slice_index: 0,
             slice_count: 1,
+            pending_erasure,
         };
         let info = info.with_endpoint(
             FlightEndpoint::new().with_ticket(self.encode_statement_ticket(tenant, ticket)?),

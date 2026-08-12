@@ -74,11 +74,14 @@ pub struct RavelTableProvider {
     accounting: QueryAccounting,
     /// Pending selective-erasure predicates derived once from
     /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
-    /// into every `RsegScanExec` the provider builds. The distributed
-    /// coordinator path never reaches `build_merge` (it fans out to workers,
-    /// each of which independently resolves its own snapshot and builds its
-    /// own provider), so this field alone covers the local scan and the
-    /// worker-side fragment.
+    /// into every `RsegScanExec` the provider builds. On the distributed
+    /// coordinator path (ADR-0071, issue #866) a worker never resolves its own
+    /// snapshot: the coordinator resolves once, and `plan_distributed_slices`
+    /// copies the coordinator's decoded predicate set into every slice
+    /// `FlightTicket` it mints (`FlightTicket::pending_erasure`). The
+    /// worker's `RavelTableProvider` is then built from `ticket.snapshot()`,
+    /// which carries that same predicate set, so this field is populated
+    /// identically on both the local scan and the worker-side fragment.
     erasure: Arc<Vec<ErasurePredicate>>,
     /// The coordinator-side distributed fan-out, if this provider is acting as
     /// a distributed coordinator (ADR-0071, issue #866). `None` -- the default,

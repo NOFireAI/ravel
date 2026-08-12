@@ -397,6 +397,62 @@ async fn pending_erasure_excludes_matching_series_on_the_metric_scan_path() {
     );
 }
 
+/// Issue #829 (ADR-0064 decision 3): a **windowed** pending erasure request
+/// drops only the samples inside `[window_start_ns, window_end_ns)`, keeping
+/// the rest of the same series -- the partial-exclusion case the prior review
+/// found unexercised at the SQL seams (every other test here uses a windowless
+/// predicate, which drops the whole series). Covers `retain_series_soa`'s
+/// `compact_parallel` branch (erasure.rs), reached from
+/// `RsegScanExec::prepare_partition` (scan.rs) once a predicate has a window.
+#[tokio::test]
+async fn pending_erasure_with_window_excludes_only_samples_inside_it() {
+    let specs = vec![SegSpec {
+        created_unix_ns: 0,
+        writer_epoch: 1,
+        writer_seq: 1,
+        series: vec![
+            SeriesSpec {
+                metric: "windowed".into(),
+                // ts=50 sits before the window, ts=150 sits inside it,
+                // ts=250 sits at/after the window's exclusive end.
+                samples: vec![(50, 1.0), (150, 2.0), (250, 3.0)],
+            },
+            SeriesSpec {
+                metric: "keep_me".into(),
+                samples: vec![(100, 9.0)],
+            },
+        ],
+    }];
+    let (store, mut snapshot) = build_snapshot(&specs, None).await;
+    snapshot.pending_erasure = vec![ErasureRequest {
+        predicate: vec![ErasurePredicateMatcher {
+            key: "__name__".to_string(),
+            value: "windowed".to_string(),
+        }],
+        window_start_ns: 100,
+        window_end_ns: 200,
+        ..Default::default()
+    }];
+
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let got = run_pipeline(backend, snapshot, 2, EngineConfig::default()).await;
+
+    let windowed_id = series_id_for("windowed");
+    let kept_id = series_id_for("keep_me");
+    assert!(
+        got.contains_key(&kept_id),
+        "the non-matching series survives untouched"
+    );
+    let windowed_samples = got
+        .get(&windowed_id)
+        .expect("the windowed series survives: it has samples outside the window");
+    assert_eq!(
+        windowed_samples.keys().copied().collect::<Vec<_>>(),
+        vec![50, 250],
+        "only the in-window sample (ts=150) is erased; ts=50 and ts=250 survive"
+    );
+}
+
 /// Cache-warm case for the same gap (ADR-0064 decision 2's "after fetch, after
 /// cache" wording): once a segment's bytes are resident in the ADR-0046 read
 /// cache, a second query with pending erasure still excludes the matching

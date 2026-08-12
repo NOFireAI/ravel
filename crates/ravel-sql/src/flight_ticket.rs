@@ -64,7 +64,7 @@
 //!
 //! ```text
 //! magic         4   b"RFT1"
-//! version       1   = 4
+//! version       1   = 5
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
@@ -92,6 +92,16 @@
 //!       if L1:
 //!         input_set_hash 32   [u8; 32]
 //!         part_index      4   u32
+//! erasure_count 4   u32   (pending erasure predicates, ADR-0064 decision 3)
+//!   per predicate:
+//!     matcher_count      4   u32
+//!       per matcher:
+//!         key_len        4   u32
+//!         key            N   matcher key (UTF-8)
+//!         value_len      4   u32
+//!         value          N   matcher value (UTF-8)
+//!     window_start_ns    8   i64
+//!     window_end_ns      8   i64
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
 //! mac          32   keyed BLAKE3-256 over every preceding byte
@@ -173,8 +183,33 @@
 //! (L0 vs L1, with an L1 part's `input_set_hash`/`part_index`) this way, so
 //! [`SegmentPin::to_segment_ref`] reconstructs the level and a rebuilt L1 part
 //! is verified against the v4 footer contract, not read as an L0 segment.
+//!
+//! Version 5 (issue #829, ADR-0064 decision 3) carries the resolved
+//! snapshot's pending selective-erasure predicates
+//! ([`FlightTicket::pending_erasure`]). Earlier versions minted `DoGet`
+//! against a snapshot rebuilt with an always-empty predicate set
+//! ([`FlightTicket::snapshot`] hardcoded `pending_erasure: Vec::new()`),
+//! which meant a query whose snapshot had a pending erasure request still
+//! returned the erased rows over Flight SQL, in violation of ADR-0064's
+//! visibility bound; the HTTP `/api/v1/sql` path, which resolves and scans
+//! without going through this ticket, was never affected. This is a version
+//! bump, not a `.proto` schema change and not an ADR of its own: as stated
+//! above, the ticket is an ephemeral MAC'd blob bounded by `deadline_ns`, not
+//! one of the frozen persistent contracts, so a new field under a bumped
+//! version byte is the correct and sufficient way to add it, exactly as
+//! version 4 added the slice pair. A v4 (or earlier) ticket is rejected with
+//! [`FlightTicketError::UnsupportedVersion`] at the existing version check,
+//! never reinterpreted as a v5 ticket with no erasure predicates -- there is
+//! no silent-downgrade path here. The predicate shape mirrors, at the level
+//! of matchers plus an optional half-open window, the one
+//! `ravel_query::distrib::codec::encode_erasure` already carries in a
+//! distributed `FetchRequest` (`ravel-query/src/distrib/mod.rs`); this codec
+//! stays hand-rolled rather than reusing that proto message, consistent with
+//! this ticket avoiding prost by design.
 
 use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+use ravel_query::erasure::ErasurePredicate;
 use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
@@ -184,7 +219,7 @@ use uuid::Uuid;
 pub const MAX_STATEMENT_LEN: usize = 64 * 1024;
 
 const MAGIC: [u8; 4] = *b"RFT1";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
 /// Length in bytes of the trailing keyed-MAC tag ([`mac`]).
 const MAC_LEN: usize = 32;
@@ -234,8 +269,8 @@ pub fn derive_ticket_key(shared_secret: &[u8]) -> TicketKey {
 
 /// Smallest possible encoded ticket: the fixed header (including the
 /// `slice_index`/`slice_count` pair) plus the trailing MAC, with zero tokens,
-/// zero segments, and an empty statement.
-const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + MAC_LEN;
+/// zero segments, zero pending-erasure predicates, and an empty statement.
+const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + MAC_LEN;
 
 /// One pinned segment inside a [`FlightTicket`]: the wire mirror of a
 /// resolved [`SegmentRef`].
@@ -366,6 +401,12 @@ pub struct FlightTicket {
     /// makes `segments` an identified *slice* of the pinned set rather than
     /// the whole set.
     pub slice_count: u32,
+    /// Pending selective-erasure predicates from the resolved snapshot
+    /// (ADR-0064 decision 3, issue #829): [`FlightTicket::snapshot`] carries
+    /// this set into the rebuilt `Snapshot.pending_erasure` so `DoGet`
+    /// excludes exactly what `GetFlightInfo`'s resolve saw pending, never a
+    /// re-resolution and never an empty set.
+    pub pending_erasure: Vec<ErasurePredicate>,
 }
 
 impl FlightTicket {
@@ -414,6 +455,17 @@ impl FlightTicket {
             buf.extend_from_slice(seg.writer_id.as_bytes());
             write_len_prefixed(&mut buf, seg.data_object_key.as_bytes())?;
             write_segment_level(&mut buf, &seg.level);
+        }
+
+        write_u32(&mut buf, u32_len(self.pending_erasure.len())?);
+        for predicate in &self.pending_erasure {
+            write_u32(&mut buf, u32_len(predicate.matchers().len())?);
+            for (key, value) in predicate.matchers() {
+                write_len_prefixed(&mut buf, key.as_bytes())?;
+                write_len_prefixed(&mut buf, value.as_bytes())?;
+            }
+            buf.extend_from_slice(&predicate.window_start_ns().to_le_bytes());
+            buf.extend_from_slice(&predicate.window_end_ns().to_le_bytes());
         }
 
         write_len_prefixed(&mut buf, self.statement.as_bytes())?;
@@ -501,6 +553,28 @@ impl FlightTicket {
             });
         }
 
+        let erasure_count = cur.read_u32()?;
+        let mut pending_erasure = Vec::new();
+        for _ in 0..erasure_count {
+            let matcher_count = cur.read_u32()?;
+            let mut matchers = Vec::new();
+            for _ in 0..matcher_count {
+                let key = cur.read_len_prefixed()?;
+                let key = std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
+                let value = cur.read_len_prefixed()?;
+                let value =
+                    std::str::from_utf8(value).map_err(|_| FlightTicketError::InvalidUtf8)?;
+                matchers.push((key.to_owned(), value.to_owned()));
+            }
+            let window_start_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+            let window_end_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+            pending_erasure.push(ErasurePredicate::new(
+                matchers,
+                window_start_ns,
+                window_end_ns,
+            ));
+        }
+
         let stmt_len = cur.read_u32()? as usize;
         if stmt_len > MAX_STATEMENT_LEN {
             return Err(FlightTicketError::StatementTooLong {
@@ -525,6 +599,7 @@ impl FlightTicket {
             deadline_ns,
             slice_index,
             slice_count,
+            pending_erasure,
         })
     }
 
@@ -545,6 +620,12 @@ impl FlightTicket {
     /// `segments_pruned` is 0: the ticket carries the segments that survived
     /// the original resolve, and redemption never re-resolves or re-prunes,
     /// so this snapshot excludes nothing of its own.
+    ///
+    /// `pending_erasure` carries [`Self::pending_erasure`] back into the
+    /// proto-shaped `Snapshot` field (ADR-0064 decision 3, issue #829), so
+    /// `RavelTableProvider::new` derives the same predicate set from a
+    /// redeemed ticket that `GetFlightInfo`'s resolve saw pending -- never an
+    /// empty set regardless of what the resolve actually found.
     pub fn snapshot(&self) -> ravel_catalog::Snapshot {
         ravel_catalog::Snapshot {
             segments: self
@@ -553,8 +634,35 @@ impl FlightTicket {
                 .map(SegmentPin::to_segment_ref)
                 .collect(),
             segments_pruned: 0,
-            pending_erasure: Vec::new(),
+            pending_erasure: self
+                .pending_erasure
+                .iter()
+                .map(to_erasure_request)
+                .collect(),
         }
+    }
+}
+
+/// Adapt the ticket's leaner [`ErasurePredicate`] (matchers plus an optional
+/// window) into the proto-shaped [`ErasureRequest`] `Snapshot.pending_erasure`
+/// is typed as. Every other `ErasureRequest` field (`request_id`,
+/// `created_unix_ns`, `reason`, ...) is durable-record metadata that
+/// `ravel_query::erasure::snapshot_pending_erasure_predicates` itself
+/// documents as "play no part in filtering," so this only ever needs to
+/// populate `predicate` and the window bounds.
+fn to_erasure_request(predicate: &ErasurePredicate) -> ErasureRequest {
+    ErasureRequest {
+        predicate: predicate
+            .matchers()
+            .iter()
+            .map(|(key, value)| ErasurePredicateMatcher {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        window_start_ns: predicate.window_start_ns(),
+        window_end_ns: predicate.window_end_ns(),
+        ..Default::default()
     }
 }
 
@@ -763,6 +871,7 @@ mod tests {
             deadline_ns: 2,
             slice_index: 0,
             slice_count: 1,
+            pending_erasure: Vec::new(),
         };
         let encoded = ticket.encode(&a).expect("encode");
         assert!(FlightTicket::decode(&encoded, &b).is_ok());
@@ -826,6 +935,10 @@ mod tests {
             deadline_ns: 1_700_000_030_000_000_000,
             slice_index: 0,
             slice_count: 1,
+            pending_erasure: vec![
+                ErasurePredicate::windowless(vec![("__name__".to_owned(), "erase_me".to_owned())]),
+                ErasurePredicate::new(vec![("region".to_owned(), "us-east".to_owned())], 100, 200),
+            ],
         }
     }
 
@@ -912,6 +1025,7 @@ mod tests {
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
+        write_u32(&mut body, 0); // erasure_count, so this clears MIN_ENCODED_LEN
         // A valid MAC under the real key: the version check, not the MAC,
         // must be what rejects this.
         let tag = mac(&key, &body);
@@ -932,7 +1046,7 @@ mod tests {
     #[test]
     fn a_v3_envelope_is_rejected_as_unsupported_version() {
         let key = test_key();
-        // A v4-sized body (>= MIN_ENCODED_LEN) so the length guard passes and
+        // A v5-sized body (>= MIN_ENCODED_LEN) so the length guard passes and
         // the version check is what fires, but with the v3 version byte.
         let mut body = Vec::new();
         body.extend_from_slice(&MAGIC);
@@ -944,12 +1058,42 @@ mod tests {
         write_u32(&mut body, 0); // slice_count
         write_u32(&mut body, 0); // tokens
         write_u32(&mut body, 0); // segments
+        write_u32(&mut body, 0); // erasure_count
         write_u32(&mut body, 0); // stmt_len
         let tag = mac(&key, &body);
         body.extend_from_slice(&tag);
         assert_eq!(
             FlightTicket::decode(&body, &key),
             Err(FlightTicketError::UnsupportedVersion(3))
+        );
+    }
+
+    /// v4 (the predecessor of this ticket's `pending_erasure` field, ADR-0064
+    /// decision 3 / issue #829) is rejected the same way v3 is: a v4-shaped
+    /// envelope carrying a valid MAC under this process's key still fails on
+    /// the version byte, never reinterpreted under the v5 layout -- which
+    /// would otherwise silently read v4's `stmt_len` as `erasure_count` and
+    /// desync every field after it instead of refusing outright.
+    #[test]
+    fn a_v4_envelope_is_rejected_as_unsupported_version() {
+        let key = test_key();
+        let mut body = Vec::new();
+        body.extend_from_slice(&MAGIC);
+        body.push(4); // the predecessor version, before pending_erasure
+        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0i64.to_le_bytes());
+        write_u32(&mut body, 0); // slice_index
+        write_u32(&mut body, 0); // slice_count
+        write_u32(&mut body, 0); // tokens
+        write_u32(&mut body, 0); // segments
+        write_u32(&mut body, 0); // erasure_count, padding to v5's MIN_ENCODED_LEN
+        write_u32(&mut body, 0); // stmt_len
+        let tag = mac(&key, &body);
+        body.extend_from_slice(&tag);
+        assert_eq!(
+            FlightTicket::decode(&body, &key),
+            Err(FlightTicketError::UnsupportedVersion(4))
         );
     }
 
@@ -1002,6 +1146,7 @@ mod tests {
             deadline_ns: 0,
             slice_index: 0,
             slice_count: 1,
+            pending_erasure: vec![],
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(bytes.len(), MIN_ENCODED_LEN);
@@ -1037,6 +1182,15 @@ mod tests {
             deadline_ns: 99,
             slice_index: 3,
             slice_count: 8,
+            pending_erasure: (0..8)
+                .map(|i| {
+                    ErasurePredicate::new(
+                        vec![(format!("k{i}"), format!("v{i}"))],
+                        i as i64,
+                        i as i64 + 1,
+                    )
+                })
+                .collect(),
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(
@@ -1080,6 +1234,7 @@ mod tests {
         write_u32(&mut body, 0); // slice_count
         write_u32(&mut body, 0); // tokens
         write_u32(&mut body, 0); // segments
+        write_u32(&mut body, 0); // erasure_count
         write_u32(&mut body, (MAX_STATEMENT_LEN + 1) as u32); // stmt_len
         // No stmt bytes follow, but the length check fires before the read.
         let tag = mac(&key, &body);
@@ -1190,6 +1345,7 @@ mod tests {
             deadline_ns: 6,
             slice_index: 0,
             slice_count: 1,
+            pending_erasure: vec![],
         };
         let mut bytes = ticket.encode(&key).expect("encode");
         // The level tag sits right after the per-segment fixed fields and the
@@ -1299,6 +1455,17 @@ mod tests {
             })
     }
 
+    fn erasure_predicate_strategy() -> impl Strategy<Value = ErasurePredicate> {
+        (
+            prop::collection::vec((".{0,16}", ".{0,16}"), 1..4),
+            any::<i64>(),
+            any::<i64>(),
+        )
+            .prop_map(|(matchers, window_start_ns, window_end_ns)| {
+                ErasurePredicate::new(matchers, window_start_ns, window_end_ns)
+            })
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -1316,6 +1483,7 @@ mod tests {
             deadline_ns in any::<i64>(),
             slice_index in any::<u32>(),
             slice_count in any::<u32>(),
+            pending_erasure in prop::collection::vec(erasure_predicate_strategy(), 0..8),
         ) {
             let ticket = FlightTicket {
                 tenant: TenantHash(tenant),
@@ -1326,6 +1494,7 @@ mod tests {
                 deadline_ns,
                 slice_index,
                 slice_count,
+                pending_erasure,
             };
             let key = test_key();
             let bytes = ticket.encode(&key).expect("encode");
