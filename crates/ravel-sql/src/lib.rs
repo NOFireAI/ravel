@@ -114,6 +114,7 @@ pub use flight::{
 #[cfg(feature = "flight-sql")]
 pub use flight_ticket::{
     FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, TICKET_KEY_LEN, TicketKey,
+    derive_ticket_key,
 };
 pub use logs_provider::LogsTableProvider;
 pub use logs_pushdown::{LogsPushdown, extract_logs};

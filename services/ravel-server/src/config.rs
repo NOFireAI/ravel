@@ -653,7 +653,7 @@ pub struct DistribSettings {
 /// #868). The credential has already been read from its file and trimmed, so
 /// this struct carries the operator principal directly; the secret never
 /// appears in a process listing because the flag names a file, not a value.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RemoteClusterConfig {
     /// The remote's stable label, surfaced by name in the Prometheus-compatible
     /// `warnings` field when the cluster is skipped.
@@ -675,6 +675,23 @@ pub struct RemoteClusterConfig {
     pub skip_unavailable: bool,
     /// The soft timeout beyond which this remote is treated as unavailable.
     pub soft_timeout: Duration,
+}
+
+impl std::fmt::Debug for RemoteClusterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `credential` is the bearer token this coordinator presents to the
+        // remote; a derived `Debug` would print it into any log or error that
+        // formats the config. Redact it and never widen this back to a derive.
+        f.debug_struct("RemoteClusterConfig")
+            .field("name", &self.name)
+            .field("endpoint", &self.endpoint)
+            .field("credential", &"<redacted>")
+            .field("tls", &self.tls)
+            .field("tls_ca_file", &self.tls_ca_file)
+            .field("skip_unavailable", &self.skip_unavailable)
+            .field("soft_timeout", &self.soft_timeout)
+            .finish()
+    }
 }
 
 /// Parse a `true`/`false` value from a `--remote-cluster` boolean field,
@@ -2205,6 +2222,34 @@ pub mod limits {
 mod tests {
     use super::*;
     use ravel_ingest::{CountLimit, RateLimit};
+
+    /// `RemoteClusterConfig`'s `Debug` must never print the bearer credential:
+    /// the config flows into startup logs and error contexts, and a derived
+    /// `Debug` would leak the operator token there.
+    #[test]
+    fn remote_cluster_debug_redacts_the_credential() {
+        let config = RemoteClusterConfig {
+            name: "beta".to_string(),
+            endpoint: "beta.internal:9443".to_string(),
+            credential: "super-secret-operator-token".to_string(),
+            tls: true,
+            tls_ca_file: None,
+            skip_unavailable: true,
+            soft_timeout: Duration::from_secs(5),
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("super-secret-operator-token"),
+            "Debug must not leak the credential: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug must mark the credential redacted: {rendered}"
+        );
+        // The non-secret fields are still present, so the redaction did not
+        // blank the whole struct.
+        assert!(rendered.contains("beta") && rendered.contains("beta.internal:9443"));
+    }
 
     /// A zero (or negative) `--gc-*` duration must be rejected at parse time,
     /// not resolved to a 0 ns value: the same all-zero bricking scenario

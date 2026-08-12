@@ -86,13 +86,21 @@ impl WorkerEndpoints for FleetWorkerEndpoints {
 /// distribution on identical estimate semantics. [`crate::flight::service`]
 /// installs the returned value through
 /// `RavelFlightSqlService::with_distributed_scan`.
+///
+/// `auth_token` is the cluster-internal fragment secret every process in the
+/// deployment already shares (`DistribSettings::auth_token`). The Flight ticket
+/// MAC key is derived from it (ADR-0071, issue #868) so a coordinator's slice
+/// ticket verifies on the worker process that redeems it; without a shared key,
+/// cross-process slice fan-out would fail every ticket MAC.
 pub fn distributed_flight_config(
     live_workers: LiveWorkers,
     thresholds: ravel_query::distrib::partition::DistribThresholds,
+    auth_token: &str,
 ) -> DistributedFlightConfig {
     DistributedFlightConfig {
         workers: Arc::new(FleetWorkerEndpoints::new(live_workers)),
         thresholds,
+        shared_ticket_key: Some(ravel_sql::derive_ticket_key(auth_token.as_bytes())),
     }
 }
 
@@ -160,11 +168,17 @@ mod tests {
             min_segments: 0,
             max_parallel_slices: 4,
         };
-        let config = distributed_flight_config(live, thresholds);
+        let config = distributed_flight_config(live, thresholds, "cluster-secret");
         assert_eq!(
             config.workers.endpoints(),
             vec!["http://10.0.0.1:9000".to_string()]
         );
         assert_eq!(config.thresholds.max_parallel_slices, 4);
+        // The ticket key is derived from the shared secret, deterministically.
+        assert_eq!(
+            config.shared_ticket_key,
+            Some(ravel_sql::derive_ticket_key(b"cluster-secret")),
+            "distributed config must carry the derived shared ticket key"
+        );
     }
 }

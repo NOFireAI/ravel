@@ -21,21 +21,33 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
             LABEL_DICT)
          -> plan page ranges, coalesce adjacent (gap <= 64 KiB)
          -> ranged GETs -> decode pages -> per-series samples
-       -> lazy k-way merge of that selector's per-segment SoA runs per
-          series id (each run already ascending by ts; the merge emits
-          ascending, one sample per ts, no final sort). Duplicate
-          timestamps (across segments and within one run) resolve under
-          the total order in docs/catalog-and-mvcc.md, not by arrival
-          order; max_series/max_samples are enforced independently per
-          selector (each selector gets the full budget, not a shared
-          split; max_segments stays a per-query cap on the shared
-          snapshot)
        -> selective-erasure exclusion: every series or sample matching a
           predicate the snapshot carries in `pending_erasure` is dropped
           from the decoded per-segment results (ADR-0064 decision 2)
-  -> every selector's already-merged series combined into one flat
-     SeriesSource (later selectors sharing a series id keep the first
-     merge seen; a later per-selector SeriesSource::query call still clips
+       -> the selector's per-segment scalar SoA runs are kept UNMERGED
+          (native-histogram runs are merged per selector here); the raw
+          scalar runs join a single query-wide pool so the one k-way merge
+          below unions across selectors AND cross-cluster federation runs
+          (ADR-0071) under one total order
+  -> all selectors' raw scalar runs (plus every remote cluster's federated
+     runs) pooled and merged once by series id: one lazy k-way merge (each
+     run already ascending by ts; emits ascending, one sample per ts, no
+     final sort). Duplicate timestamps (across segments, within one run,
+     and across clusters) resolve under the total order in
+     docs/catalog-and-mvcc.md, not by arrival order. max_series/max_samples
+     are enforced ONCE over this pooled union -- a query-wide bound, not a
+     per-selector budget: the caps guard the coordinator's peak memory for
+     the whole query, so a multi-selector (or federated) query cannot hold
+     N times the cap. Pooling is loss-free: two selectors sharing a series
+     id decode byte-identical raw runs (the decode is a pure function of
+     segment bytes + series id, with no per-selector window trim), so
+     merging them once yields exactly what merging each alone would, and
+     per-selector window clipping still happens downstream in
+     `SeriesSource::query`. max_segments stays a per-query cap on the shared
+     snapshot.
+  -> every merged series combined into one flat SeriesSource (later
+     selectors sharing a series id keep the first merge seen; a later
+     per-selector SeriesSource::query call still clips
      to that selector's own window, so which selector "wins" a shared
      series id in the combine step does not affect any single selector's
      result -- and since every selector in one query fetches against the
@@ -271,6 +283,73 @@ series iteration order, so the error is deterministic. It bounds only the
 output size: every matched series in every matched segment is still fully
 fetched and SoA-decoded before the merge runs, so peak fetch/decode memory
 scales with the query's matched input, not with `max_samples`.
+
+## Cross-cluster federation (ADR-0071)
+
+A coordinator can fan a read out to remote clusters and merge their series
+into the same k-way merge that unions its own selectors (the pool described
+under Flow). Federation is opt-in per deployment: each remote is one
+`--remote-cluster <name>=<endpoint>` flag on `ravel-server`, with an
+optional `--remote-cluster-soft-timeout <name>=<duration>` that bounds how
+long the coordinator waits on that one remote before treating it as
+partially unavailable. A deployment with no `--remote-cluster` flag runs
+exactly the single-cluster path.
+
+### Two credential models, one wire type
+
+ADR-0071 fetches carry a `Scope` on the `FetchRequest`. The two values are
+not two transports; they are two trust boundaries over the same gRPC
+service, and the distinction is a security invariant, not an optimization:
+
+- **`Pinned` (intra-cluster slice).** A worker inside the coordinator's own
+  cluster is handed a short-lived fragment token and the already-resolved
+  `tenant_hash` on the wire. The worker trusts the coordinator: it uses the
+  wire `tenant_hash` directly. This token is a slice credential, never a
+  cross-cluster credential — a remote cluster must reject it (see the
+  `federation_rejects_the_fragment_token` test in `distrib.rs`).
+- **`Resolve` (cross-cluster federation).** A remote cluster is a separate
+  trust domain. The coordinator authenticates to it with an ordinary
+  per-remote tenant credential (the `credential` on `RemoteClusterConfig`),
+  and the remote resolves the tenant from *its own* `TenantResolver` applied
+  to that credential — never from the wire `tenant_hash`, which it
+  overwrites with the locally resolved value. A federated request therefore
+  cannot name a tenant the presented credential does not authorize on the
+  remote, exactly as a direct client request to that remote could not.
+
+`RemoteClusterConfig`'s `Debug` is hand-written to print `credential:
+<redacted>` so a config dump never leaks the operator secret.
+
+### Partial coverage is always surfaced, never silent
+
+A federated query can return a correct-but-incomplete result when a remote
+is slow (soft-timeout) or unreachable (`skip_unavailable`). This is never
+silent: the query stats carry `partial: true` and one operator-facing
+warning per degraded remote, merged into the Prometheus JSON envelope's
+`warnings`. The warnings name only the operator-facing cluster name; remote
+IP:port and errno are redacted out, because a client that reads the envelope
+is not entitled to the coordinator's internal topology.
+
+A remote that streams native-histogram frames this build cannot decode
+across the slice boundary is treated as a coverage gap, not a hard fault:
+under `skip_unavailable` it degrades to partial coverage with a truthful
+warning (the remote returned a data kind this build cannot federate yet),
+and without `skip_unavailable` it fails with that same typed reason rather
+than a generic transport error.
+
+### Cross-cluster duplicate tie-break limitation
+
+The merge resolves a duplicate `(series_id, ts)` under the total order in
+docs/catalog-and-mvcc.md (created_unix_ns, writer_epoch, writer_seq,
+in-page index). Those provenance fields are meaningful only *within* one
+cluster: two clusters can mint the same `(writer_epoch, writer_seq)` for
+unrelated writes. Federation therefore assumes disjoint series identity
+across clusters — the intended deployment is region- or tenant-sharded, so
+one series lives in exactly one cluster. When the same `(series_id, ts)`
+does arrive from two clusters with different values, the winner is
+unspecified (whichever the total order happens to order first); the merge
+still emits exactly one sample per timestamp and never duplicates or
+crashes. Making a cross-cluster tie-break deterministic on value would need
+a cluster-identity component in the order and is out of scope for this wave.
 
 ## Query cost accounting and estimate (ADR-0044)
 

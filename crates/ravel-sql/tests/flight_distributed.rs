@@ -895,6 +895,7 @@ fn two_worker_config() -> DistributedFlightConfig {
             min_segments: 2,
             max_parallel_slices: 8,
         },
+        shared_ticket_key: None,
     }
 }
 

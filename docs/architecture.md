@@ -217,6 +217,36 @@ oracle. Not yet built: the HTTP endpoint (`POST /api/v1/sql`, feature
 same epic, gated behind cargo features so the default build stays free of
 Arrow and DataFusion outside `ravel-otap`.
 
+## Distributed reads and cross-cluster federation (ADR-0071)
+
+A read can span more than one process. Two topologies share the one gRPC
+`SeriesFetch` service and one `SliceFetcher` seam the merge layer holds, so
+the coordinator's k-way merge cannot tell a remote slice from a local one:
+
+- **Intra-cluster slices** (`Scope::Pinned`): the coordinator hands a worker
+  in its own cluster a short-lived fragment token and the already-resolved
+  `tenant_hash`, which the worker trusts and uses directly.
+- **Cross-cluster federation** (`Scope::Resolve`): each remote is a separate
+  trust domain configured with `--remote-cluster <name>=<endpoint>` (and an
+  optional `--remote-cluster-soft-timeout`). The coordinator presents an
+  ordinary per-remote tenant credential; the remote resolves the tenant from
+  its own `TenantResolver` and ignores the wire `tenant_hash`, so a federated
+  request can reach exactly the tenants that credential authorizes there and
+  no more. A remote rejects the intra-cluster fragment token outright.
+
+A slow or unreachable remote degrades to partial coverage rather than
+failing the whole query (`skip_unavailable`, per-remote soft timeout). That
+partial state is always surfaced in the query's stats (`partial: true`) and
+warnings, naming only the operator-facing cluster; internal endpoints and
+errnos are redacted. Federation assumes disjoint series identity across
+clusters (region- or tenant-sharded); the design and its cross-cluster
+duplicate tie-break limitation are specified in docs/query-engine.md.
+
+The Flight SQL distributed scan (feature `flight-sql`) derives its ticket
+MAC key from the shared cluster secret via a domain-separated BLAKE3 KDF, so
+coordinator and worker validate tickets under the same key without a
+separate key-distribution channel.
+
 ## Analytics stage
 
 `ravel-analytics` (ADR-0028, docs/analytics.md) is a post-evaluation stage of

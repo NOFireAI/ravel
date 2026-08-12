@@ -36,6 +36,16 @@ pub enum DistribError {
     /// A frame carried no `frame` oneof variant.
     #[error("slice stream carried an empty frame")]
     EmptyFrame,
+    /// The remote streamed a native-histogram frame, which this build cannot
+    /// decode across the slice boundary yet (worker histogram decode is a later
+    /// ticket). This is NOT corruption: the frame is well-formed, the remote
+    /// simply carries data kind this coordinator cannot consume. The federation
+    /// layer treats it as a coverage gap (skippable under `skip_unavailable`),
+    /// never a malformed-response hard fault.
+    #[error(
+        "remote returned native-histogram data this build cannot decode across the slice boundary"
+    )]
+    HistogramUnsupported,
 }
 
 /// One slice's fully-decoded response, in the same in-memory shapes the local
@@ -105,12 +115,14 @@ impl SliceFetcher for RemoteSliceFetcher {
                 Some(pb::fetch_response::Frame::Series(sf)) => {
                     scalar.extend(codec::decode_series_frame(sf)?);
                 }
-                // A histogram frame from a worker means it did not fall back to
-                // Unsupported; this build never emits one, but decoding it is a
-                // later ticket, so treat it as framing breakage rather than
-                // silently dropping data.
+                // A native-histogram frame: this build cannot decode worker
+                // histogram runs across the slice boundary yet (a later ticket).
+                // It is well-formed, not corruption, so surface a distinct typed
+                // error the federation layer can treat as a coverage gap
+                // (skippable under `skip_unavailable`) rather than mislabel it a
+                // malformed response -- and never silently drop the data.
                 Some(pb::fetch_response::Frame::Hist(_)) => {
-                    return Err(DistribError::Codec(CodecError::EmptyFrame));
+                    return Err(DistribError::HistogramUnsupported);
                 }
                 Some(pb::fetch_response::Frame::Summary(s)) => {
                     if summary.is_some() {

@@ -161,6 +161,27 @@ credentials lacks. Remote endpoints come only from operator config, never
 from query text. Remote responses are size- and shape-validated data; a
 remote cannot escalate through the coordinator.
 
+**Implementation note (issue #868): the two credential models are one wire
+type with two trust boundaries.** The `FetchRequest` carries a `Scope`. A
+`Pinned` fetch is an intra-cluster slice: the worker trusts the coordinator
+and uses the already-resolved `tenant_hash` on the wire directly. A
+`Resolve` fetch is cross-cluster federation: the remote treats the presented
+credential as an ordinary tenant credential, resolves the tenant from its
+own `TenantResolver`, and overwrites (never reads) the wire `tenant_hash`,
+so a federated request reaches exactly the tenants that credential
+authorizes there. A remote rejects the intra-cluster fragment token
+outright — it is a slice credential, never a federation credential. This
+distinction is a security invariant: collapsing the two would let a
+coordinator name any tenant on a remote it holds one credential for.
+
+Partial coverage (a soft-timed-out or skipped remote, or a remote that
+returned a data kind this build cannot decode, such as native histograms
+across the slice boundary) is never silent. The query stats carry
+`partial: true` and one warning per degraded remote, merged into the
+Prometheus JSON envelope. Warnings name only the operator-facing cluster
+name; remote IP:port and errno are redacted, and `RemoteClusterConfig`'s
+`Debug` redacts the configured credential.
+
 ## Performance
 
 Fetch and decode scale near-linearly in workers until coordinator-side

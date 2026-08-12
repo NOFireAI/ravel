@@ -1233,6 +1233,7 @@ pub async fn start(
                 sql_distrib::distributed_flight_config(
                     distrib_live_workers.clone(),
                     settings.thresholds,
+                    &settings.auth_token,
                 )
             });
         sql_state

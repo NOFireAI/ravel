@@ -100,8 +100,11 @@
 //! # Integrity: a keyed MAC, not a checksum
 //!
 //! [`FlightTicket::encode`] and [`FlightTicket::decode`] both take a
-//! [`TicketKey`]: a 32-byte secret generated once, in memory, when the
-//! `FlightSqlService` is constructed, and never sent to a client or persisted.
+//! [`TicketKey`]: a 32-byte secret, never sent to a client or persisted. A
+//! single-process deployment generates it once in memory; a distributed
+//! deployment derives it from the shared cluster secret so a coordinator and a
+//! worker verify with the same key (see [`TicketKey`] and
+//! [`derive_ticket_key`]).
 //! The trailing tag is `blake3::keyed_hash(key, payload)`, not a plain hash of
 //! the payload, so recomputing it requires the key. A client can still read
 //! and replay a ticket verbatim (that is the protocol), but cannot flip a
@@ -190,14 +193,44 @@ const MAC_LEN: usize = 32;
 /// [`FlightTicket::decode`] are keyed by.
 pub const TICKET_KEY_LEN: usize = 32;
 
-/// The secret, in-process MAC key a ticket is signed and verified with.
+/// The secret MAC key a ticket is signed and verified with.
 ///
-/// Generated once when the `FlightSqlService` is constructed (see
-/// `crate::flight::service`) and held only in memory: it is never logged,
-/// sent to a client, or persisted. A process restart mints a fresh key, which
-/// is safe because a ticket is ephemeral by construction and never expected
-/// to outlive the process that minted it.
+/// In a single-process deployment this is generated once when the
+/// `FlightSqlService` is constructed (see `crate::flight::service`) and held
+/// only in memory: it is never logged, sent to a client, or persisted. A
+/// process restart mints a fresh key, which is safe because a ticket is
+/// ephemeral by construction and never expected to outlive the process that
+/// minted it.
+///
+/// A distributed deployment (ADR-0071, issue #868) cannot use a per-process
+/// random key: a coordinator mints a slice ticket that a *different* worker
+/// process must verify, so every process in the cluster must agree on the key.
+/// There the key is derived deterministically from the shared cluster secret
+/// with [`derive_ticket_key`]; see its docs.
 pub type TicketKey = [u8; TICKET_KEY_LEN];
+
+/// BLAKE3 domain-separation context for [`derive_ticket_key`]. Changing this
+/// string rotates every cluster's derived key; it is versioned with the codec.
+const TICKET_KEY_DERIVATION_CONTEXT: &str =
+    "ravel-sql flight ticket MAC key 2026-08 (RFT1 v4, ADR-0071)";
+
+/// Derive a deterministic [`TicketKey`] from a cluster-shared secret.
+///
+/// A single-process deployment mints a random key. A distributed deployment
+/// cannot: a coordinator signs a slice ticket that a *different* worker process
+/// redeems, so all processes must key their MAC identically. Every process in an
+/// ADR-0071 cluster already holds one shared secret — the cluster-internal
+/// fragment auth token (`DistribSettings::auth_token`) — so deriving the ticket
+/// key from it gives cluster-wide agreement with no new key-distribution
+/// channel. `blake3::derive_key` with a fixed context is a proper KDF: it maps
+/// the arbitrary-length secret to a 32-byte key and never uses the secret as a
+/// MAC key directly, so the token and the ticket key are cryptographically
+/// independent. The result is still secret (never logged, sent, or persisted);
+/// it is merely reproducible across processes and restarts, which a distributed
+/// ticket requires.
+pub fn derive_ticket_key(shared_secret: &[u8]) -> TicketKey {
+    blake3::derive_key(TICKET_KEY_DERIVATION_CONTEXT, shared_secret)
+}
 
 /// Smallest possible encoded ticket: the fixed header (including the
 /// `slice_index`/`slice_count` pair) plus the trailing MAC, with zero tokens,
@@ -694,6 +727,46 @@ mod tests {
     /// that encode/decode agree on one.
     fn test_key() -> TicketKey {
         [0x42u8; TICKET_KEY_LEN]
+    }
+
+    /// The derived key is a deterministic function of the shared secret, so two
+    /// processes deriving from the same cluster secret key their MAC identically
+    /// (the property ADR-0071 cross-process slice tickets require); a different
+    /// secret yields a different key; and the key is never the raw secret bytes
+    /// (BLAKE3 `derive_key` is a real KDF, not a copy).
+    #[test]
+    fn derive_ticket_key_is_deterministic_and_domain_separated() {
+        let a = derive_ticket_key(b"cluster-secret");
+        let b = derive_ticket_key(b"cluster-secret");
+        assert_eq!(
+            a, b,
+            "same secret must derive the same key across processes"
+        );
+
+        let other = derive_ticket_key(b"cluster-secret-2");
+        assert_ne!(a, other, "a different secret must derive a different key");
+
+        assert_ne!(
+            &a[..],
+            b"cluster-secret".as_slice(),
+            "the key must be derived, not the raw secret"
+        );
+
+        // A ticket signed with a derived key verifies with a key derived from the
+        // same secret and is rejected by one derived from a different secret.
+        let ticket = FlightTicket {
+            tenant: TenantHash([7u8; 16]),
+            statement: "SELECT 1".to_string(),
+            segments: Vec::new(),
+            min_commit_tokens: Vec::new(),
+            now_ns: 1,
+            deadline_ns: 2,
+            slice_index: 0,
+            slice_count: 1,
+        };
+        let encoded = ticket.encode(&a).expect("encode");
+        assert!(FlightTicket::decode(&encoded, &b).is_ok());
+        assert!(FlightTicket::decode(&encoded, &other).is_err());
     }
 
     fn sample_token(seed: u64) -> CommitToken {

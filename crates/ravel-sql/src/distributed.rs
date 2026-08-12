@@ -68,7 +68,7 @@ use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::{ProstMessageExt, TicketStatementQuery};
 use datafusion::arrow::compute::SortOptions;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::col;
@@ -137,6 +137,18 @@ pub struct DistributedFlightConfig {
     /// [`DistribThresholds`](ravel_query::distrib::partition::DistribThresholds)
     /// so both lanes gate distribution on the same estimate semantics.
     pub thresholds: ravel_query::distrib::partition::DistribThresholds,
+    /// The cluster-shared ticket MAC key, or `None` to keep the service's own
+    /// key.
+    ///
+    /// A coordinator mints slice tickets a *different* worker process verifies
+    /// (ADR-0071, issue #868), so both must key the MAC identically. A
+    /// multi-process deployment sets this to
+    /// [`derive_ticket_key`](crate::flight_ticket::derive_ticket_key) over the
+    /// shared cluster secret; installing the config then overrides the service's
+    /// per-process random key with it. `None` (the in-process test default)
+    /// leaves the service's own key untouched, so a single-process fixture whose
+    /// coordinator and worker are the same instance stays byte-identical.
+    pub shared_ticket_key: Option<TicketKey>,
 }
 
 /// One worker endpoint for [`DistributedScanExec`]: where to fetch the slice
@@ -269,12 +281,50 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
                 .map_err(|status| FlightError::Tonic(Box::new(status)));
             Ok::<_, FlightError>(FlightRecordBatchStream::new_from_flight_data(flight_data))
         };
+        // Validate every worker batch against the internal scan schema. The
+        // adapter below merely *declares* `internal_schema()`; it does not check
+        // that the frames the worker actually streams carry it. A version-skewed,
+        // buggy, or hostile worker that returns a different layout must fail
+        // typed here, not feed mismatched columns into the coordinator's
+        // `(series_id, ts)` merge/dedup downstream.
+        let expected = internal_schema();
+        let validate = expected.clone();
         let batches = futures::stream::once(setup)
             .try_flatten()
-            .map_err(|err| DataFusionError::Internal(err.to_string()));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            internal_schema(),
-            batches,
+            .map_err(|err| DataFusionError::Internal(err.to_string()))
+            .map(move |item| {
+                let batch = item?;
+                validate_worker_schema(batch.schema().as_ref(), validate.as_ref())?;
+                Ok(batch)
+            });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(expected, batches)))
+    }
+}
+
+/// Verify a worker's slice stream carries the internal scan schema the
+/// coordinator's merge/dedup pipeline requires (ADR-0071, issue #868).
+///
+/// The coordinator declares [`internal_schema`] as the distributed scan's
+/// output, and its `SortPreservingMergeExec`/`RsegDedupExec` reference the
+/// `series_id`/`ts` columns by name and type. A worker that streams a different
+/// layout must fail with a typed error here, not silently feed mismatched
+/// columns into the merge (a panic or a wrong result downstream). Column count,
+/// names, data types, and nullability must match exactly; incidental
+/// schema-level or field-level metadata that Flight encode/decode may carry is
+/// not compared.
+fn validate_worker_schema(actual: &Schema, expected: &Schema) -> DFResult<()> {
+    let same = actual.fields().len() == expected.fields().len()
+        && actual.fields().iter().zip(expected.fields()).all(|(a, e)| {
+            a.name() == e.name()
+                && a.data_type() == e.data_type()
+                && a.is_nullable() == e.is_nullable()
+        });
+    if same {
+        Ok(())
+    } else {
+        Err(DataFusionError::Internal(format!(
+            "worker slice stream schema does not match the expected internal scan schema: \
+             expected {expected:?}, got {actual:?}"
         )))
     }
 }
@@ -584,4 +634,76 @@ pub fn plan_distributed_slices(
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod schema_validation_tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field};
+
+    /// The exact internal scan schema passes.
+    #[test]
+    fn matching_schema_is_accepted() {
+        let expected = internal_schema();
+        validate_worker_schema(expected.as_ref(), expected.as_ref())
+            .expect("the internal schema matches itself");
+    }
+
+    /// A worker that drops a provenance column (wrong field count) is rejected
+    /// with a typed error, not trusted into the `(series_id, ts)` merge.
+    #[test]
+    fn missing_column_is_rejected() {
+        let expected = internal_schema();
+        let mut fields: Vec<Field> = expected
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.pop();
+        let actual = Schema::new(fields);
+        let err = validate_worker_schema(&actual, expected.as_ref())
+            .expect_err("a short schema must be rejected");
+        assert!(matches!(err, DataFusionError::Internal(_)));
+    }
+
+    /// A worker that keeps the column count but changes a column's type (here
+    /// `value` Float64 -> Int64) is rejected.
+    #[test]
+    fn wrong_column_type_is_rejected() {
+        let expected = internal_schema();
+        let fields: Vec<Field> = expected
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == "value" {
+                    Field::new(f.name(), DataType::Int64, f.is_nullable())
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        let actual = Schema::new(fields);
+        validate_worker_schema(&actual, expected.as_ref())
+            .expect_err("a type-mismatched schema must be rejected");
+    }
+
+    /// Incidental schema-level metadata differences do not trip the check: only
+    /// column shape matters.
+    #[test]
+    fn metadata_only_difference_is_accepted() {
+        let expected = internal_schema();
+        let fields: Vec<Field> = expected
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        let actual = Schema::new(fields).with_metadata(
+            [("origin".to_string(), "worker".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        validate_worker_schema(&actual, expected.as_ref())
+            .expect("metadata-only differences are ignored");
+    }
 }

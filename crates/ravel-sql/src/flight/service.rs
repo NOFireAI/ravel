@@ -184,6 +184,14 @@ impl RavelFlightSqlService {
     /// whole-set local execution. Not installing one leaves the service
     /// byte-identical to before this seam existed.
     pub fn with_distributed_scan(mut self, config: DistributedFlightConfig) -> Self {
+        // A multi-process cluster keys every ticket MAC off one shared secret so
+        // a coordinator's slice ticket verifies on a different worker process
+        // (ADR-0071, issue #868). When the config carries that derived key,
+        // override the per-process random key minted in `new`. `None` (the
+        // single-process default) keeps this service's own key.
+        if let Some(key) = config.shared_ticket_key {
+            self.ticket_key = key;
+        }
         self.distributed = Some(Arc::new(config));
         self
     }

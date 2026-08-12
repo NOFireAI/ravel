@@ -694,7 +694,7 @@ async fn distributed_flight_sql_reachable_end_to_end() {
         min_segments: 0,
         max_parallel_slices: 8,
     };
-    let config = distributed_flight_config(live_workers, thresholds);
+    let config = distributed_flight_config(live_workers, thresholds, "cluster-secret");
     assert_eq!(
         config.workers.endpoints(),
         vec![format!("http://{worker_endpoint}")],
@@ -828,6 +828,9 @@ async fn distributed_flight_sql_scan_engages() {
             min_segments: 0,
             max_parallel_slices: 8,
         },
+        // Single process: keep the service's own key; the self-dialed worker is
+        // this same instance, so its ticket MAC verifies without a derived key.
+        shared_ticket_key: None,
     };
     let dist_server = FlightServer::start_distributed(&state, config).await;
     *locations.write() = vec![format!("http://{}", dist_server.addr)];
