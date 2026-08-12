@@ -78,6 +78,13 @@ pub struct CrossoverConfig {
     /// PromQL selector evaluated by every timed query; must match the workload
     /// generator's metric name (`bench_gauge`).
     pub query: String,
+    /// Corpus time span in seconds: the wall-clock window the generated samples
+    /// spread across (`samples_per_series` points at `span / samples` spacing).
+    /// A wider span with the same per-series sample count flushes more distinct
+    /// segments, so this is the lever that grows a corpus past the gate
+    /// constants (256 MiB / 64 segments) without changing series cardinality.
+    /// The instant query and the snapshot resolve both cover this whole window.
+    pub corpus_span_secs: u64,
     /// Timed instant queries per path, for the wall-time percentiles.
     pub query_reps: usize,
     /// Worker counts the distributed path is measured at. One distributed panel
@@ -99,10 +106,48 @@ impl CrossoverConfig {
             batch_size: 128,
             ack_timeout_secs: 10,
             query: "bench_gauge".to_string(),
+            corpus_span_secs: 1,
             query_reps: 5,
             worker_counts: vec![1, 4],
         }
     }
+}
+
+/// Coarse process CPU time (user + system, summed over every thread in this
+/// process) in milliseconds, read from `/proc/self/stat`. The distributed
+/// coordinator, the local engine, and the in-process loopback workers all run
+/// in this one process, so a delta of this figure around a timed loop is the
+/// total CPU the whole crossover consumed, not a single coordinator thread's
+/// share. Granularity is one `USER_HZ` clock tick (10 ms on Linux); a short
+/// loop can read back 0. Returns 0.0 off Linux (the reference host is Linux).
+#[cfg(target_os = "linux")]
+fn process_cpu_ms() -> f64 {
+    // /proc/self/stat: "pid (comm) state ...". `comm` may contain spaces and
+    // parens, so split after the final ')': the remaining whitespace tokens
+    // begin at field 3 (state). utime is field 14, stime field 15, i.e.
+    // offsets 11 and 12 in that post-')' token list.
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0.0;
+    };
+    let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let (Some(utime), Some(stime)) = (
+        fields.get(11).and_then(|v| v.parse::<u64>().ok()),
+        fields.get(12).and_then(|v| v.parse::<u64>().ok()),
+    ) else {
+        return 0.0;
+    };
+    // USER_HZ is 100 on effectively every Linux target (10 ms per tick); the
+    // panel documents this granularity rather than linking libc for sysconf.
+    const USER_HZ: f64 = 100.0;
+    (utime + stime) as f64 * 1000.0 / USER_HZ
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cpu_ms() -> f64 {
+    0.0
 }
 
 /// Wall-time percentiles (ms) plus the cost counters the query accounting
@@ -116,7 +161,16 @@ pub struct PanelReport {
     pub worker_count: usize,
     pub wall_ms_p50: f64,
     pub wall_ms_p95: f64,
+    pub wall_ms_p99: f64,
     pub wall_ms_max: f64,
+    /// Total process CPU time (user + system, all threads) consumed across the
+    /// timed reps, in milliseconds, from a `/proc/self/stat` delta around the
+    /// timed loop (see [`process_cpu_ms`]). Report-only and coarse: one
+    /// `USER_HZ` tick (10 ms) of granularity, so a fast panel can read 0. It is
+    /// whole-process, not a single coordinator thread, because the loopback
+    /// workers share this process; on the distributed panels it therefore
+    /// includes the in-process workers' fetch/serialize CPU.
+    pub coordinator_cpu_ms: f64,
     /// Matched series in the query's instant vector (must equal the local
     /// panel's: distribution changes where bytes are fetched, never what the
     /// query computes).
@@ -145,6 +199,7 @@ pub struct ReportConfig {
     pub samples_per_series: usize,
     pub batch_size: usize,
     pub query: String,
+    pub corpus_span_secs: u64,
     pub query_reps: usize,
     pub worker_counts: Vec<usize>,
 }
@@ -228,11 +283,12 @@ async fn measure_panel(
     t_ms: i64,
     now_ns: i64,
     reps: usize,
-) -> (Vec<u64>, usize, QueryStats) {
+) -> (Vec<u64>, usize, QueryStats, f64) {
     let deadline = Duration::from_secs(30);
     let mut wall_ns = Vec::with_capacity(reps);
     let mut matched = 0usize;
     let mut stats = QueryStats::default();
+    let cpu_start_ms = process_cpu_ms();
     for i in 0..reps {
         let start = Instant::now();
         let (value, s) = engine
@@ -248,7 +304,8 @@ async fn measure_panel(
             stats = s;
         }
     }
-    (wall_ns, matched, stats)
+    let cpu_ms = (process_cpu_ms() - cpu_start_ms).max(0.0);
+    (wall_ns, matched, stats, cpu_ms)
 }
 
 fn panel_report(
@@ -257,6 +314,7 @@ fn panel_report(
     wall_ns: Vec<u64>,
     matched_series: usize,
     stats: &QueryStats,
+    coordinator_cpu_ms: f64,
 ) -> PanelReport {
     let mut sorted = wall_ns;
     sorted.sort_unstable();
@@ -266,7 +324,9 @@ fn panel_report(
         worker_count,
         wall_ms_p50: percentile(&sorted, 0.50) as f64 / 1e6,
         wall_ms_p95: percentile(&sorted, 0.95) as f64 / 1e6,
+        wall_ms_p99: percentile(&sorted, 0.99) as f64 / 1e6,
         wall_ms_max: sorted.last().copied().unwrap_or(0) as f64 / 1e6,
+        coordinator_cpu_ms,
         matched_series,
         segments_fetched: stats.segments_fetched,
         s3_requests: acct.total_s3_requests(),
@@ -307,7 +367,7 @@ pub async fn run(config: &CrossoverConfig) -> Report {
     // Build and ingest a fixed corpus, then flush it durable so the resolved
     // snapshot below sees every accepted point (mirrors `query_latency::run`).
     let run_start_ns = clock.now_ns();
-    let duration_ns = Duration::from_secs(1).as_nanos() as i64;
+    let duration_ns = Duration::from_secs(config.corpus_span_secs.max(1)).as_nanos() as i64;
     let interval_ns = (duration_ns / config.samples_per_series.max(1) as i64).max(1);
     let workload = WorkloadConfig {
         tenant: tenant.as_str().to_string(),
@@ -375,7 +435,7 @@ pub async fn run(config: &CrossoverConfig) -> Report {
             Arc::clone(&store),
             EngineConfig::default(),
         );
-        let (wall_ns, matched, stats) = measure_panel(
+        let (wall_ns, matched, stats, cpu_ms) = measure_panel(
             &engine,
             tenant_hash,
             &config.query,
@@ -384,7 +444,7 @@ pub async fn run(config: &CrossoverConfig) -> Report {
             config.query_reps,
         )
         .await;
-        panels.push(panel_report("local", 0, wall_ns, matched, &stats));
+        panels.push(panel_report("local", 0, wall_ns, matched, &stats, cpu_ms));
     }
 
     // One distributed panel per worker count. Thresholds are zeroed so the cost
@@ -418,7 +478,7 @@ pub async fn run(config: &CrossoverConfig) -> Report {
         )
         .with_distributed(Arc::new(distributed));
 
-        let (wall_ns, matched, stats) = measure_panel(
+        let (wall_ns, matched, stats, cpu_ms) = measure_panel(
             &engine,
             tenant_hash,
             &config.query,
@@ -433,6 +493,7 @@ pub async fn run(config: &CrossoverConfig) -> Report {
             wall_ns,
             matched,
             &stats,
+            cpu_ms,
         ));
 
         for server in servers {
@@ -448,6 +509,7 @@ pub async fn run(config: &CrossoverConfig) -> Report {
             samples_per_series: config.samples_per_series,
             batch_size: config.batch_size,
             query: config.query.clone(),
+            corpus_span_secs: config.corpus_span_secs.max(1),
             query_reps: config.query_reps,
             worker_counts: config.worker_counts.clone(),
         },
