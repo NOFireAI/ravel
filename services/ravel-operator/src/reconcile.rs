@@ -294,6 +294,14 @@ pub(crate) const DEPLOYMENT_KEY_SECRET_KEY: &str = "key";
 /// keyless `RavelCluster` on today's v1-unkeyed derivation. This is an
 /// additive opt-in, not a migration of existing unkeyed clusters (EM-T10
 /// #773 owns that story).
+///
+/// Also unconditionally carries `--require-bucket-protection` (ADR-0072
+/// decision 3): "the operator sets it for production profiles", and every
+/// `RavelCluster` the operator reconciles is a production deployment -- this
+/// CRD has no dev/staging profile field to gate on, so there is nothing to
+/// make it conditional on. `ravel-server`'s own default stays off for the
+/// dev binary and any other direct invocation; only the operator's rendered
+/// command line turns it on.
 fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
     let mut args = vec![
         "--store".to_string(),
@@ -304,6 +312,7 @@ fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
         spec.storage.s3.bucket.clone(),
         "--s3-region".to_string(),
         spec.storage.s3.region.clone(),
+        "--require-bucket-protection".to_string(),
     ];
     if spec.deployment_key_secret_ref.is_some() {
         args.push("--tenant-hash-key-file".to_string());

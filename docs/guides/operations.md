@@ -13,6 +13,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--shards <n>` | | `4` | Ingest shard count. It sets both the ingest router's shard count and the query-side catalog's shard count, so they must agree. There is no separate query-side flag. |
 | `--tenant-token TOKEN=TENANT` | | none, repeatable | Registers one bearer token for the static resolver. Pass it once per tenant. With no `--tenant-token` at all, every request is unauthenticated and rejected. |
 | `--dev-insecure-tenant-header` | | off | Adds tenant resolution through the `x-ravel-tenant` request header, tried only when bearer lookup fails. If `--listen-http` does not bind a loopback address, the process refuses to start with this set. |
+| `--require-bucket-protection` | `RAVEL_REQUIRE_BUCKET_PROTECTION` | off | Gates startup on the ADR-0072 decision 3 bucket-protection contract: an affirmatively-disabled Object Lock/versioning probe, or a bucket-configuration alarm (ADR-0064 section 7), refuses to start; an unknown probe result (every backend today) logs one warning and sets `ravel_bucket_protection_unknown`. Off by default: unset, startup is unchanged from before this flag existed. `ravel-operator` sets this for every `RavelCluster` it reconciles. See "Bucket protection contract" below. |
 | `--oidc-issuer <url>` | | none | OIDC issuer, the exact `iss` every JWT must carry. Set together with `--oidc-jwks-url` to enable the OIDC resolver (ADR-0042 decision 6). Setting only one of the pair refuses to start. |
 | `--oidc-jwks-url <url>` | | none | URL of the issuer's JWKS document (its public signing keys), fetched directly (no OIDC discovery). Enables OIDC together with `--oidc-issuer`. Refuses a plaintext `http://` URL to a non-loopback host at startup. |
 | `--oidc-audience <aud>` | | none, repeatable | Acceptable JWT `aud` value. With none set, audience is not checked. Set without OIDC enabled refuses to start. |
@@ -955,6 +956,37 @@ bootstrap-and-continue case. There is no "assume qualified" path, because a
 never-qualified backend has never been shown to honor the guarantees Ravel's
 durability depends on. `--store memory` (the semantics oracle used in
 development and tests) is exempt and never needs qualification.
+
+## Bucket protection contract (ADR-0072 decision 3)
+
+`docs/object-store-contract.md`'s "Required bucket configuration" section is
+the normative version of this; this is the operational summary. Object
+Lock (compliance mode) on `sys/*`, `t/*/*/prov`, commit records `t/*/*/c/*`,
+and `t/*/catalog/*/*` HEAD history, plus the ADR-0064 section 7 versioning
+and lifecycle-rule requirements, is enforced at the bucket/IAM layer
+(ADR-0042 decision 3) -- nothing in `ravel-server` configures or verifies it
+in-process, because `object_store` 0.14 exposes no such API.
+
+`--require-bucket-protection` turns the existing, previously
+informational-only conformance probes into a startup gate so a deployment
+cannot go into production silently unprotected:
+
+- **Disabled**, or a versioning-without-expiration alarm, refuses to start.
+- **Unknown** -- what every backend reachable only through the
+  `ObjectStoreBackend` contract reports today, since no adapter can answer
+  this query -- logs one warning and sets `ravel_bucket_protection_unknown`
+  to `1` at `GET /metrics`, rather than blocking startup.
+- **Enabled** with no alarms starts clean, gauge at `0`.
+
+Off by default, so a dev/test process (and any other direct invocation that
+does not pass the flag) starts exactly as it did before this gate existed.
+`ravel-operator` sets `--require-bucket-protection` unconditionally for
+every `RavelCluster` it reconciles: the CRD carries no dev/staging profile
+field to gate on, so every cluster the operator manages gets the flag.
+
+| Condition | Query | Why |
+|---|---|---|
+| Bucket protection unknown | `ravel_bucket_protection_unknown == 1` | `--require-bucket-protection` is on and the backend cannot confirm Object Lock/versioning is configured. Not necessarily misconfigured -- most backends have no query for this today -- but it means the platform cannot see the protection it depends on, and an operator should confirm it out of band. |
 
 ## Store reachability probe and `/readyz` (ADR-0050 section 7)
 

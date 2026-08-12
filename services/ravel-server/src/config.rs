@@ -71,6 +71,18 @@ pub struct Cli {
     #[arg(long)]
     pub dev_insecure_tenant_header: bool,
 
+    /// Gate startup on the ADR-0072 decision 3 bucket-protection contract
+    /// (docs/object-store-contract.md "Required bucket configuration"):
+    /// `ObjectLockStatus::Disabled` or a versioning misconfiguration refuses
+    /// to start; `Unknown` warns once and sets the
+    /// `ravel_bucket_protection_unknown` gauge; `Enabled` starts clean.
+    /// Default off: with the flag unset, startup is byte-identical to before
+    /// this gate existed. Enforcement itself stays at the bucket/IAM layer
+    /// (ADR-0042 decision 3); this only makes a silently-unprotected
+    /// production deployment impossible to start.
+    #[arg(long, env = "RAVEL_REQUIRE_BUCKET_PROTECTION")]
+    pub require_bucket_protection: bool,
+
     #[arg(long, env = "RAVEL_S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
 
