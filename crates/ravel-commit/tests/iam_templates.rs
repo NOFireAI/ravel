@@ -209,6 +209,91 @@ fn resource_key_patterns(policy: &Policy) -> Vec<String> {
 const ROLES_WITH_DISCOVERY: [&str; 3] = ["gateway", "query", "maintain"];
 const ALL_ROLES: [&str; 4] = ["gateway", "query", "maintain", "admin"];
 
+/// Roles whose IAM policy writes tenant data through `KmsRoutingStore`
+/// (issue #929): Gateway's ingest PUTs and Maintain's compaction/rewrite
+/// PUTs land under `t/<hash>/...` and, once `--tenant-kms-config` routes
+/// that tenant to its own key, require `kms:GenerateDataKey*`/`kms:Encrypt`
+/// on that key or the PUT fails closed.
+const WRITE_ROLES: [&str; 2] = ["gateway", "maintain"];
+
+/// `kms:*` action strings appearing anywhere in `policy`'s statements
+/// (`Action` as a bare string or an array), regardless of statement Sid.
+fn kms_actions(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy.statements.as_array().unwrap() {
+        let actions: Vec<String> = match &stmt["Action"] {
+            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => continue,
+        };
+        out.extend(actions.into_iter().filter(|a| a.starts_with("kms:")));
+    }
+    out
+}
+
+/// Gateway/Maintain write tenant data objects through `KmsRoutingStore`
+/// (ADR-0062 decision 1a): a configured tenant's PUT is delegated to a
+/// per-tenant `S3Store` built with that tenant's SSE-KMS key, which needs
+/// `kms:GenerateDataKey*` (and `kms:Encrypt`) on the caller's IAM policy or
+/// the PUT fails closed with `AccessDenied` -- issue #929. Flip either
+/// role's added `*TenantKms` statement (or narrow its Action list to drop
+/// `kms:GenerateDataKey*`) in `deploy/iam/{gateway,maintain}.json` and this
+/// test fails.
+#[test]
+fn write_roles_have_kms_generate_data_key() {
+    for role in WRITE_ROLES {
+        let policy = load_policy(role);
+        let actions = kms_actions(&policy);
+        assert!(
+            actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
+            "{role}: policy is missing kms:GenerateDataKey* -- its ingest/compaction \
+             PUTs under t/<hash>/... will fail closed against a --tenant-kms-config \
+             tenant (issue #929). Found kms actions: {actions:?}"
+        );
+    }
+}
+
+/// Admin is GetObject-only per ADR-0055 (its only tenant-scoped writes are
+/// narrow, create-only control paths, not routine data-object PUTs), so it
+/// must never carry `kms:GenerateDataKey*`: granting it would widen the
+/// compromise blast radius the ADR-0072 key-policy posture exists to limit.
+/// Flip `deploy/iam/admin.json`'s `AdminTenantKms` statement to include
+/// `kms:GenerateDataKey*` and this test fails.
+#[test]
+fn admin_has_no_kms_generate_data_key() {
+    let policy = load_policy("admin");
+    let actions = kms_actions(&policy);
+    assert!(
+        !actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
+        "admin: policy must not carry kms:GenerateDataKey* (Decrypt-only per ADR-0055). \
+         Found kms actions: {actions:?}"
+    );
+}
+
+/// Every role reads SSE-KMS objects at some point (fold, query resolve,
+/// compaction inputs, `ravel-cli` inspection) and decryption on GET is
+/// server-side but still requires `kms:Decrypt` on the caller's IAM policy
+/// (ADR-0062 section 1a's "reads never select a key" is about client-side
+/// key *selection*, not about needing no grant at all). Remove any role's
+/// `kms:Decrypt` action in `deploy/iam/*.json` and this test fails, naming
+/// that role.
+#[test]
+fn every_role_has_kms_decrypt() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let actions = kms_actions(&policy);
+        assert!(
+            actions.iter().any(|a| a == "kms:Decrypt"),
+            "{role}: policy is missing kms:Decrypt -- its reads of SSE-KMS objects \
+             under a --tenant-kms-config tenant will fail closed (issue #929). \
+             Found kms actions: {actions:?}"
+        );
+    }
+}
+
 #[test]
 fn discovery_prefix_admitted_for_every_discovering_role() {
     for role in ROLES_WITH_DISCOVERY {

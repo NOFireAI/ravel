@@ -53,6 +53,12 @@
       ]
     },
     {
+      "Sid": "MaintainTenantKms",
+      "Effect": "Allow",
+      "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
+      "Resource": "arn:aws:kms:us-east-1:111122223333:key/*"
+    },
+    {
       "Sid": "DenyDeleteProtected",
       "Effect": "Deny",
       "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
