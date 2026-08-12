@@ -21,9 +21,10 @@ mod tenant_config;
 
 pub use auth_token_map::{
     AUTH_KEY, AUTH_TOKEN_MAP_FORMAT_VERSION, AuthMapDefect, AuthTokenMap, AuthTokenMapError,
-    KEY_FINGERPRINT_LEN, SetOutcome as AuthSetOutcome, TOKEN_HASH_LEN, TokenEntry, key_fingerprint,
-    read_auth_map, remove_token, remove_tokens_by_tenant, replace_tenant_tokens, tenant_for_token,
-    token_hash, upsert_token,
+    KEY_FINGERPRINT_LEN, MANAGED_BY_CLI, MANAGED_BY_OPERATOR, SetOutcome as AuthSetOutcome,
+    TOKEN_HASH_LEN, TokenEntry, key_fingerprint, read_auth_map, remove_token,
+    remove_tokens_by_tenant, remove_tokens_by_tenant_owned_by, replace_tenant_tokens,
+    tenant_for_token, token_hash, upsert_token, upsert_token_owned,
 };
 pub use catalog::Catalog;
 pub use config::{

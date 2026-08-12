@@ -173,6 +173,7 @@ A minimal example is in
 | `spec.storage.s3.endpoint` | string | — | Omit for real AWS S3. Path-style addressing is always used. |
 | `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
 | `spec.tenantTokensSecretRef.name` | string | — | Secret whose keys are tenant names and whose values are bearer tokens. |
+| `spec.deploymentKeySecretRef.name` | string | — | Secret with one key, `key` (64 hex characters or 32 raw bytes): the ADR-0072 deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
 | `spec.gateway.replicas` | integer | `1` | |
 | `spec.gateway.resources` | object | — | `requests` / `limits` maps, as in a Pod spec. |
 | `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
@@ -197,6 +198,47 @@ expansion, so token values never appear in the API object. They do still appear
 in process argv on the node. A native env or file token source in `ravel-server`
 is a known follow-up. A checksum annotation on each pod template rolls the pods
 when either Secret changes.
+
+### `sys/auth` ownership (ADR-0072 decision 4)
+
+When `spec.deploymentKeySecretRef` is set, the operator also converges
+`sys/auth` — the durable, deployment-wide bearer-token map at the bucket root
+— to `spec.tenantTokensSecretRef`'s current contents, every reconcile cycle.
+This runs alongside, not instead of, `ravel-cli tenant-token upsert|revoke`:
+the two writers share the map, and each entry is tagged with who owns it.
+
+- Every tenant present in the token Secret is upserted with
+  `managed_by=operator`. A tenant present in `sys/auth` but absent from the
+  Secret is revoked, but **only if** its entry is tagged
+  `managed_by=operator`. A tenant provisioned by `ravel-cli tenant-token
+  upsert` (tagged `managed_by=cli` by default, or a value passed via
+  `--managed-by`) is never touched by this pass, and neither is a v1-shaped
+  entry with no `managed_by` field at all (unmanaged — written before this
+  field existed, or deliberately declared unowned). The operator only ever
+  removes what it itself put there.
+- If the CRD sets a deployment key but no `tenantTokensSecretRef`, or the
+  Secret resolves to zero tenants, the operator skips the whole `sys/auth`
+  pass for that cycle — no upserts, no removals — and logs a warning
+  instead. An empty read is never treated as "revoke every operator-managed
+  tenant."
+- A reconcile against an unchanged token Secret performs zero `sys/auth`
+  writes: each tenant's entry is compared against its current stored value
+  first, and rewritten only on an actual difference.
+- A `sys/auth` write is retried a bounded number of times against a
+  concurrent writer (another operator replica, or a `ravel-cli` call racing
+  it). If it still fails after that budget, the operator logs the failure
+  and continues on to reconcile the Deployments and Services below —
+  `sys/auth` reconciliation never blocks or fails the rest of the cycle.
+- `spec.deploymentKeySecretRef`'s `resourceVersion` feeds the same
+  pod-template secrets checksum as the token and credential Secrets (see
+  "Tenant tokens are injected..." above), so rotating the deployment key
+  rolls every tier's pods, the same as rotating a tenant token or a
+  credential does.
+
+See [operations.md](operations.md) and
+[../adrs/0072-tenant-scoped-credentials-and-control-plane-protection.md](../adrs/0072-tenant-scoped-credentials-and-control-plane-protection.md)
+for the `sys/auth` format itself and `ravel-cli tenant-token`'s own
+subcommands.
 
 ### Managed objects
 

@@ -417,6 +417,23 @@ message TenantConfigRecord {
 message TokenHashEntry {
   bytes token_hash = 1;  // 32 bytes: blake3 keyed hash of the bearer token
   string tenant_id = 2;  // the tenant this token authenticates as
+  // Which writer owns this entry's lifecycle, added in format_version 2
+  // (ADR-0072 decision 4 amendment, #897). "operator" for an entry the
+  // Kubernetes operator's reconcile loop provisioned from a
+  // tenantTokensSecretRef Secret; "cli" for one `ravel-cli tenant-token
+  // upsert` wrote (directly, or via its own --managed-by override). Absent
+  // (proto3 default on an unset `optional`) means unmanaged: every entry a
+  // format_version 1 writer ever wrote, and any entry a v2+ writer creates
+  // without an explicit owner. Additive and optional by design: a
+  // format_version 1 reader that has never heard of this field decodes the
+  // message and simply never sees it, and a v1 map re-read by a v2+ reader
+  // decodes every entry as unmanaged, exactly matching what a v1 writer
+  // intended (nothing claims ownership of an entry it didn't write). This
+  // is the ownership marker the operator's remove/replace pass filters on:
+  // it touches only entries with managed_by == "operator", never an absent
+  // marker or "cli", so an unmanaged or CLI-provisioned tenant survives a
+  // reconcile whose Secret does not name it.
+  optional string managed_by = 3;
 }
 
 // The durable, deployment-wide bearer-token map at the bucket root `sys/auth`
@@ -439,7 +456,15 @@ message TokenHashEntry {
 message AuthTokenMap {
   // Format floor: the minimum reader version that understands this object. A
   // reader that only knows a lower version refuses rather than misread a future
-  // layout, matching every other durable object's version guard. = 1.
+  // layout, matching every other durable object's version guard. = 1 for a map
+  // with no entry carrying `managed_by` (TokenHashEntry field 3); = 2 once a
+  // writer that understands ownership (ADR-0072 decision 4 amendment, #897)
+  // has touched the map. The bump is a version-floor signal, not a wire
+  // necessity: `managed_by` is `optional` and additive, so a v1 reader that
+  // has never heard of it already skips the unknown field safely. A v2+
+  // reader accepts both a stored 1 and a stored 2 unconditionally (every
+  // entry decodes the same either way; an absent `managed_by` just means
+  // unmanaged) and always writes 2 going forward.
   uint32 format_version = 1;
   // A 16-byte fingerprint of the deployment key the token hashes are keyed
   // under: blake3::derive_key("ravel-auth-v1-fingerprint", deployment_key)

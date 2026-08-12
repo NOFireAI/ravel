@@ -77,6 +77,13 @@ pub struct RenderCtx {
     /// could not be read is simply absent from the map (its checksum component
     /// is then the empty string, matching the pre-existing "no version" case).
     pub credential_resource_versions: BTreeMap<String, String>,
+
+    /// `resourceVersion` of the `deploymentKeySecretRef` Secret, or `None` when
+    /// no deployment key is configured. Every pod that mounts the deployment
+    /// key (review finding 8, #897) must roll when it rotates, the same as a
+    /// credential or tenant-token rotation does; folded into
+    /// [`secrets_checksum`] alongside the other two.
+    pub deployment_key_resource_version: Option<String>,
 }
 
 /// Resolve the credential Secret name a tier consumes: its own
@@ -95,29 +102,37 @@ fn tier_credentials_secret_name<'a>(
         .unwrap_or(&spec.storage.s3.credentials_secret_ref.name)
 }
 
-/// A deterministic change-detection checksum over the two Secrets a tier
-/// consumes: the shared token Secret and the tier's resolved credential Secret.
+/// A deterministic change-detection checksum over the Secrets a tier
+/// consumes: the shared token Secret, the tier's resolved credential Secret,
+/// and the deployment-key Secret (every tier mounts the same one, when
+/// configured -- review finding 8, #897).
 ///
 /// Built from their `resourceVersion`s, which change exactly when a Secret's
 /// content changes and are stable otherwise, so this value is stable across
 /// reconciles that see the same Secrets (no pod churn) and changes the moment a
-/// token is rotated or the tier's credential is rewritten. The hash is
-/// `DefaultHasher` (SipHash with fixed keys), deterministic across processes, so
-/// an operator restart does not roll pods. It is not a security boundary, only a
-/// signal. Stamped onto the tier's pod template as
-/// [`SECRETS_CHECKSUM_ANNOTATION`]; when tiers resolve to different credential
-/// Secrets, a change to one rolls only the tier(s) that consume it.
-pub fn secrets_checksum(token_rv: Option<&str>, credentials_rv: Option<&str>) -> String {
+/// token is rotated, the tier's credential is rewritten, or the deployment key
+/// is rotated. The hash is `DefaultHasher` (SipHash with fixed keys),
+/// deterministic across processes, so an operator restart does not roll pods.
+/// It is not a security boundary, only a signal. Stamped onto the tier's pod
+/// template as [`SECRETS_CHECKSUM_ANNOTATION`]; when tiers resolve to
+/// different credential Secrets, a change to one rolls only the tier(s) that
+/// consume it.
+pub fn secrets_checksum(
+    token_rv: Option<&str>,
+    credentials_rv: Option<&str>,
+    deployment_key_rv: Option<&str>,
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     token_rv.unwrap_or("").hash(&mut hasher);
     credentials_rv.unwrap_or("").hash(&mut hasher);
+    deployment_key_rv.unwrap_or("").hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
 /// The [`SECRETS_CHECKSUM_ANNOTATION`] value for a tier, resolving which
 /// credential Secret the tier consumes and hashing its `resourceVersion`
-/// together with the token Secret's.
+/// together with the token Secret's and the deployment-key Secret's.
 fn tier_secrets_checksum(
     spec: &RavelClusterSpec,
     ctx: &RenderCtx,
@@ -128,7 +143,11 @@ fn tier_secrets_checksum(
         .credential_resource_versions
         .get(secret_name)
         .map(String::as_str);
-    secrets_checksum(ctx.token_resource_version.as_deref(), credentials_rv)
+    secrets_checksum(
+        ctx.token_resource_version.as_deref(),
+        credentials_rv,
+        ctx.deployment_key_resource_version.as_deref(),
+    )
 }
 
 /// Standard object labels for a component of a named `RavelCluster`.
@@ -746,6 +765,7 @@ mod tests {
                 "ravel-s3".to_string(),
                 "cred-1".to_string(),
             )]),
+            deployment_key_resource_version: None,
         }
     }
 
@@ -1142,7 +1162,7 @@ mod tests {
         // so all three carry the same checksum (they roll together).
         let spec = base_spec();
         let ctx = ctx();
-        let expected = secrets_checksum(Some("tok-1"), Some("cred-1"));
+        let expected = secrets_checksum(Some("tok-1"), Some("cred-1"), None);
         for dep in [
             desired_gateway_deployment(&spec, "prod", &ctx),
             desired_query_deployment(&spec, "prod", &ctx),
@@ -1244,13 +1264,19 @@ mod tests {
         // The pure hash behind every tier's pod-template annotation (ADR-0055
         // section 5): stable for the same inputs (no pod churn), and changing
         // when either the token or the credential resourceVersion moves.
-        let a = secrets_checksum(Some("100"), Some("200"));
-        assert_eq!(a, secrets_checksum(Some("100"), Some("200")));
-        assert_ne!(a, secrets_checksum(Some("101"), Some("200")));
-        assert_ne!(a, secrets_checksum(Some("100"), Some("201")));
+        let a = secrets_checksum(Some("100"), Some("200"), Some("300"));
+        assert_eq!(a, secrets_checksum(Some("100"), Some("200"), Some("300")));
+        assert_ne!(a, secrets_checksum(Some("101"), Some("200"), Some("300")));
+        assert_ne!(a, secrets_checksum(Some("100"), Some("201"), Some("300")));
+        assert_ne!(
+            a,
+            secrets_checksum(Some("100"), Some("200"), Some("301")),
+            "the deployment-key resourceVersion must also feed the checksum \
+             (review finding 8, #897), so its rotation rolls pods that mount it"
+        );
         // Absent versions collapse to a distinct, stable value.
-        let none = secrets_checksum(None, Some("200"));
-        assert_eq!(none, secrets_checksum(None, Some("200")));
+        let none = secrets_checksum(None, Some("200"), None);
+        assert_eq!(none, secrets_checksum(None, Some("200"), None));
         assert_ne!(none, a);
     }
 
@@ -1281,6 +1307,7 @@ mod tests {
                 ("qy-creds".to_string(), "cred-qy".to_string()),
                 ("mt-creds".to_string(), "cred-mt".to_string()),
             ]),
+            deployment_key_resource_version: None,
         };
 
         let g = desired_gateway_deployment(&spec, "prod", &ctx);
@@ -1359,7 +1386,7 @@ mod tests {
         let g = desired_gateway_deployment(&none_spec, "prod", &ctx);
         let q = desired_query_deployment(&none_spec, "prod", &ctx);
         let m = desired_maintain_deployment(&none_spec, "prod", &ctx).expect("enabled");
-        let shared_checksum = secrets_checksum(Some("tok-1"), Some("cred-1"));
+        let shared_checksum = secrets_checksum(Some("tok-1"), Some("cred-1"), None);
         assert_eq!(checksum_of(&g).as_deref(), Some(shared_checksum.as_str()));
         assert_eq!(checksum_of(&q).as_deref(), Some(shared_checksum.as_str()));
         assert_eq!(checksum_of(&m).as_deref(), Some(shared_checksum.as_str()));
@@ -1392,6 +1419,7 @@ mod tests {
             tenant_names: vec!["acme".to_string()],
             token_resource_version: Some("tok-1".to_string()),
             credential_resource_versions: base_versions.clone(),
+            deployment_key_resource_version: Some("dk-1".to_string()),
         };
         // Rotate ONLY the gateway credential Secret.
         let mut after_versions = base_versions.clone();
@@ -1400,6 +1428,7 @@ mod tests {
             tenant_names: vec!["acme".to_string()],
             token_resource_version: Some("tok-1".to_string()),
             credential_resource_versions: after_versions,
+            deployment_key_resource_version: Some("dk-1".to_string()),
         };
 
         let g_before = desired_gateway_deployment(&over_spec, "prod", &before);
@@ -1434,6 +1463,7 @@ mod tests {
                 "ravel-s3".to_string(),
                 "shared-1".to_string(),
             )]),
+            deployment_key_resource_version: Some("dk-1".to_string()),
         };
         let shared_after = RenderCtx {
             tenant_names: vec!["acme".to_string()],
@@ -1442,6 +1472,7 @@ mod tests {
                 "ravel-s3".to_string(),
                 "shared-2".to_string(),
             )]),
+            deployment_key_resource_version: Some("dk-1".to_string()),
         };
         let gb = desired_gateway_deployment(&shared_spec, "prod", &shared_before);
         let ga = desired_gateway_deployment(&shared_spec, "prod", &shared_after);
@@ -1453,5 +1484,49 @@ mod tests {
         assert_ne!(checksum_of(&gb), checksum_of(&ga), "gateway must roll");
         assert_ne!(checksum_of(&qb), checksum_of(&qa), "query must roll");
         assert_ne!(checksum_of(&mb), checksum_of(&ma), "maintain must roll");
+    }
+
+    #[test]
+    fn deployment_key_secret_rotation_rolls_every_tier() {
+        // Review finding 8 (#897): every tier mounts the SAME
+        // `deploymentKeySecretRef` Secret (unlike per-tier credential
+        // overrides), so its rotation must roll all three, the same as the
+        // shared-credential case above.
+        let spec = base_spec();
+        let before = RenderCtx {
+            tenant_names: vec!["acme".to_string()],
+            token_resource_version: Some("tok-1".to_string()),
+            credential_resource_versions: BTreeMap::from([(
+                "ravel-s3".to_string(),
+                "shared-1".to_string(),
+            )]),
+            deployment_key_resource_version: Some("dk-1".to_string()),
+        };
+        let after = RenderCtx {
+            deployment_key_resource_version: Some("dk-2".to_string()),
+            ..before.clone()
+        };
+
+        let gb = desired_gateway_deployment(&spec, "prod", &before);
+        let ga = desired_gateway_deployment(&spec, "prod", &after);
+        let qb = desired_query_deployment(&spec, "prod", &before);
+        let qa = desired_query_deployment(&spec, "prod", &after);
+        let mb = desired_maintain_deployment(&spec, "prod", &before).expect("enabled");
+        let ma = desired_maintain_deployment(&spec, "prod", &after).expect("enabled");
+        assert_ne!(
+            checksum_of(&gb),
+            checksum_of(&ga),
+            "gateway must roll when the deployment key rotates"
+        );
+        assert_ne!(
+            checksum_of(&qb),
+            checksum_of(&qa),
+            "query must roll when the deployment key rotates"
+        );
+        assert_ne!(
+            checksum_of(&mb),
+            checksum_of(&ma),
+            "maintain must roll when the deployment key rotates"
+        );
     }
 }

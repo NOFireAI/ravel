@@ -95,11 +95,6 @@ pub enum Error {
     /// Building the S3 backend for `sys/auth` reconciliation failed.
     #[error("object store error: {0}")]
     Store(#[from] ravel_object_store::StoreError),
-
-    /// `sys/auth` reconciliation against the durable bearer-token map failed
-    /// (issue #897 / ADR-0072 decision 4).
-    #[error("sys/auth reconciliation failed: {0}")]
-    Auth(#[from] ravel_catalog::AuthTokenMapError),
 }
 
 /// Shared reconcile context.
@@ -304,23 +299,42 @@ fn parse_deployment_key(raw: &[u8]) -> Result<[u8; 32], String> {
     ))
 }
 
+/// What the controller resolves from the deployment key Secret: the parsed
+/// 32-byte key and the Secret's `resourceVersion`. Every tier's pod template
+/// mounts this same Secret, so its `resourceVersion` feeds the shared
+/// secrets checksum alongside the token and credential Secrets (review
+/// finding 8, #897): a key rotation must roll pods the same way a token or
+/// credential rotation does.
+struct DeploymentKeySecret {
+    /// The parsed key, or `None` when no deployment key Secret is configured
+    /// -- the CRD's additive-opt-in state (ADR-0072 decision 4): `sys/auth`
+    /// reconciliation and the keyed tenant hash both stay off.
+    key: Option<[u8; 32]>,
+    /// The Secret's `resourceVersion`, or `None` when no deployment key
+    /// Secret is configured.
+    resource_version: Option<String>,
+}
+
 /// Read and parse the deployment key from `secret_ref`'s
-/// [`DEPLOYMENT_KEY_SECRET_KEY`] field. `None` when no deployment key Secret
-/// is configured -- the CRD's additive-opt-in state (ADR-0072 decision 4):
-/// `sys/auth` reconciliation and the keyed tenant hash both stay off.
+/// [`DEPLOYMENT_KEY_SECRET_KEY`] field, along with the Secret's
+/// `resourceVersion`.
 async fn resolve_deployment_key(
     client: &Client,
     namespace: &str,
     secret_ref: Option<&LocalSecretRef>,
-) -> Result<Option<[u8; 32]>, Error> {
+) -> Result<DeploymentKeySecret, Error> {
     let Some(secret_ref) = secret_ref else {
-        return Ok(None);
+        return Ok(DeploymentKeySecret {
+            key: None,
+            resource_version: None,
+        });
     };
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let secret = api
         .get(&secret_ref.name)
         .await
         .map_err(|err| secret_error(err, &secret_ref.name, "deploymentKeySecretRef"))?;
+    let resource_version = secret.resource_version();
     let raw = secret_value(&secret, DEPLOYMENT_KEY_SECRET_KEY).ok_or_else(|| {
         Error::InvalidSecretValue {
             name: secret_ref.name.clone(),
@@ -333,7 +347,10 @@ async fn resolve_deployment_key(
         field: DEPLOYMENT_KEY_SECRET_KEY.to_string(),
         reason,
     })?;
-    Ok(Some(key))
+    Ok(DeploymentKeySecret {
+        key: Some(key),
+        resource_version,
+    })
 }
 
 /// Read the shared `storage.s3.credentialsSecretRef` Secret's live
@@ -396,48 +413,149 @@ async fn build_auth_store(
         allow_http,
         force_path_style: true,
         kms_key_id: None,
+        session_token: None,
+        credentials_file: None,
     };
     S3Store::new(config).map_err(Error::Store)
 }
 
+/// Bounded retry budget for a `sys/auth` primitive call that can fail with
+/// [`ravel_catalog::AuthTokenMapError::CasConflict`] under a concurrent
+/// writer (another operator replica's own reconcile, or a `ravel-cli` call
+/// racing it): re-read, re-apply, up to this many attempts, before giving up
+/// (review blocker 4, #897).
+const SYS_AUTH_CAS_ATTEMPTS: u32 = 3;
+
+/// Run a `sys/auth` primitive call up to [`SYS_AUTH_CAS_ATTEMPTS`] times,
+/// retrying only on [`ravel_catalog::AuthTokenMapError::CasConflict`]: the
+/// primitive itself already re-reads the map on every call, so calling `op`
+/// again is a fresh read-modify-write, not a blind replay of a stale one.
+/// Any other error, or a conflict on the final attempt, is returned as-is.
+async fn retry_cas<F, Fut, T>(mut op: F) -> Result<T, ravel_catalog::AuthTokenMapError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ravel_catalog::AuthTokenMapError>>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match op().await {
+            Err(ravel_catalog::AuthTokenMapError::CasConflict)
+                if attempt < SYS_AUTH_CAS_ATTEMPTS =>
+            {
+                continue;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Converge `sys/auth` to the token Secret's current contents (ADR-0072
 /// decision 4, #897): upsert every tenant present in the Secret to exactly its
-/// current token, then remove every tenant present in `sys/auth` but absent
-/// from the Secret.
+/// current token, then remove every *operator-managed* tenant present in
+/// `sys/auth` but absent from the Secret.
 ///
-/// The remove pass is what makes revocation correct after an operator restart
-/// with zero in-memory history (the #875 regression this closes): it reads
-/// the tenant set to remove from `sys/auth` itself (durable, in object
-/// storage), never from anything this process remembered from a previous
-/// cycle.
+/// Every write and removal here carries or is filtered by
+/// [`ravel_catalog::MANAGED_BY_OPERATOR`] (ADR-0072 decision 4 amendment,
+/// review blocker 1): a tenant `ravel-cli tenant-token upsert` provisioned
+/// (or an operator-adjacent tool tagged with its own `--managed-by`), and any
+/// pre-amendment entry with no ownership marker at all, is never touched by
+/// this pass even when absent from the Secret -- only a tenant this same
+/// function previously wrote is ever revoked here.
+///
+/// A Secret that resolves to zero tenants -- no `tenantTokensSecretRef`
+/// configured, or one configured but empty -- skips both the upsert and
+/// remove passes entirely (review blocker 2) and logs one warning. Treating
+/// "no tokens observed this cycle" as "revoke every operator-managed tenant"
+/// would turn a missing or misconfigured Secret into a mass revocation;
+/// `reconcile_inner` still reconciles workloads in this case, only `sys/auth`
+/// convergence is skipped.
+///
+/// The remove pass reads the tenant set to remove from `sys/auth` itself
+/// (durable, in object storage), never from anything this process remembered
+/// from a previous cycle -- what makes revocation correct after an operator
+/// restart with zero in-memory history (the #875 regression this closes).
+///
+/// Each primitive call is wrapped in [`retry_cas`]. A tenant whose resulting
+/// entry set is already identical to its stored one resolves to
+/// [`ravel_catalog::AuthSetOutcome::Unchanged`] without a write (review
+/// blocker 3), so a steady-state reconcile of an unchanged Secret issues zero
+/// `sys/auth` PUTs.
 async fn reconcile_sys_auth(
     deployment_key: &[u8; 32],
     token_values: &BTreeMap<String, Vec<u8>>,
     store: &dyn ObjectStoreBackend,
     now_ns: i64,
-) -> Result<(), Error> {
+) -> Result<(), ravel_catalog::AuthTokenMapError> {
+    if token_values.is_empty() {
+        warn!(
+            "sys/auth reconcile skipped: the tenant tokens Secret is absent or resolved to \
+             zero tenants this cycle; an empty read is never treated as \"revoke every \
+             operator-managed tenant\" (ADR-0072 decision 4 amendment, #897)"
+        );
+        return Ok(());
+    }
+
     for (tenant_id, token) in token_values {
-        ravel_catalog::replace_tenant_tokens(
-            store,
-            deployment_key,
-            tenant_id,
-            std::slice::from_ref(token),
-            now_ns,
-        )
+        retry_cas(|| {
+            ravel_catalog::replace_tenant_tokens(
+                store,
+                deployment_key,
+                tenant_id,
+                std::slice::from_ref(token),
+                Some(ravel_catalog::MANAGED_BY_OPERATOR),
+                now_ns,
+            )
+        })
         .await?;
     }
-    let existing_tenants: BTreeSet<String> =
+
+    let operator_managed_tenants: BTreeSet<String> =
         match ravel_catalog::read_auth_map(store, deployment_key).await? {
-            Some((map, _version)) => map.entries.into_iter().map(|e| e.tenant_id).collect(),
+            Some((map, _version)) => map
+                .entries
+                .into_iter()
+                .filter(|e| e.managed_by.as_deref() == Some(ravel_catalog::MANAGED_BY_OPERATOR))
+                .map(|e| e.tenant_id)
+                .collect(),
             None => BTreeSet::new(),
         };
-    for tenant_id in existing_tenants {
+    for tenant_id in operator_managed_tenants {
         if !token_values.contains_key(&tenant_id) {
-            ravel_catalog::remove_tokens_by_tenant(store, deployment_key, &tenant_id, now_ns)
-                .await?;
+            retry_cas(|| {
+                ravel_catalog::remove_tokens_by_tenant_owned_by(
+                    store,
+                    deployment_key,
+                    &tenant_id,
+                    ravel_catalog::MANAGED_BY_OPERATOR,
+                    now_ns,
+                )
+            })
+            .await?;
         }
     }
     Ok(())
+}
+
+/// Best-effort wrapper around [`reconcile_sys_auth`]: a `sys/auth` failure
+/// that survives [`retry_cas`]'s budget is logged and swallowed here, never
+/// propagated (review blocker 4, #897). `reconcile_inner` calls this without
+/// `?` -- the `()` return type is itself the enforcement that a sys/auth
+/// failure cannot abort Deployment/Service reconciliation, not just a
+/// convention a future edit could accidentally break.
+async fn reconcile_sys_auth_best_effort(
+    deployment_key: &[u8; 32],
+    token_values: &BTreeMap<String, Vec<u8>>,
+    store: &dyn ObjectStoreBackend,
+    now_ns: i64,
+) {
+    if let Err(err) = reconcile_sys_auth(deployment_key, token_values, store, now_ns).await {
+        warn!(
+            %err,
+            "sys/auth reconcile failed after exhausting its retry budget; continuing to \
+             Deployment/Service reconciliation without it (review blocker 4, #897)"
+        );
+    }
 }
 
 /// Current Unix time in nanoseconds, for `sys/auth` CAS-record timestamps.
@@ -533,24 +651,27 @@ async fn reconcile_inner(
     // Converge sys/auth to the token Secret whenever a deployment key is
     // configured (ADR-0072 decision 4, #897): this is the first in-process
     // writer of the durable bearer-token map, and it must run every cycle --
-    // not just on a token Secret change -- so a tenant removed from the
-    // Secret is revoked even after an operator restart wiped any in-memory
-    // history of what used to be there (the #875 regression).
-    if let Some(deployment_key) = resolve_deployment_key(
+    // not just on a token Secret change -- so an operator-managed tenant
+    // removed from the Secret is revoked even after an operator restart wiped
+    // any in-memory history of what used to be there (the #875 regression).
+    // Best-effort (review blocker 4): a sys/auth failure that survives its
+    // retry budget is logged, never propagated, so it cannot block the
+    // Deployment/Service reconciliation below.
+    let deployment_key_secret = resolve_deployment_key(
         client,
         namespace,
         obj.spec.deployment_key_secret_ref.as_ref(),
     )
-    .await?
-    {
+    .await?;
+    if let Some(deployment_key) = deployment_key_secret.key {
         let store = build_auth_store(client, namespace, &obj.spec).await?;
-        reconcile_sys_auth(
+        reconcile_sys_auth_best_effort(
             &deployment_key,
             &token_secret.token_values,
             &store,
             now_ns(),
         )
-        .await?;
+        .await;
     }
 
     // Read the resourceVersion of every credential Secret the spec references:
@@ -567,6 +688,7 @@ async fn reconcile_inner(
         tenant_names: token_secret.tenant_names,
         token_resource_version: token_secret.resource_version,
         credential_resource_versions,
+        deployment_key_resource_version: deployment_key_secret.resource_version,
     };
 
     let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
@@ -772,10 +894,6 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "InvalidSecretValue".to_string(),
             format!("Secret \"{name}\" field \"{field}\": {reason}"),
         ),
-        Error::Auth(source) => (
-            "SysAuthReconcileFailed".to_string(),
-            format!("sys/auth reconciliation failed: {source}"),
-        ),
         other => ("ReconcileError".to_string(), other.to_string()),
     }
 }
@@ -877,13 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn degraded_reason_names_sys_auth_failures() {
-        let err = Error::Auth(ravel_catalog::AuthTokenMapError::EmptyTenantId);
-        let (reason, _message) = degraded_reason(&err);
-        assert_eq!(reason, "SysAuthReconcileFailed");
-    }
-
-    #[test]
     fn parse_deployment_key_accepts_hex_and_raw_bytes() {
         let hex_key = "ab".repeat(32);
         assert_eq!(
@@ -923,14 +1034,16 @@ mod tests {
     }
 
     /// #875 regression pin: a tenant present in `sys/auth` (written here to
-    /// simulate a token upserted in a *previous* reconcile cycle, by a
-    /// process that has since restarted) but absent from the current token
-    /// Secret must be revoked. This runs against a freshly constructed
-    /// `MemoryStore` with no reconcile history in this test's own process
-    /// state -- `reconcile_sys_auth` learns "tenant-gone used to have a
-    /// token" only by reading `sys/auth` itself, never from anything an
+    /// simulate a token the operator itself upserted in a *previous* reconcile
+    /// cycle, by a process that has since restarted) but absent from the
+    /// current token Secret must be revoked. This runs against a freshly
+    /// constructed `MemoryStore` with no reconcile history in this test's own
+    /// process state -- `reconcile_sys_auth` learns "tenant-gone used to have
+    /// a token" only by reading `sys/auth` itself, never from anything an
     /// earlier call left in memory, which is what makes this correct after an
-    /// operator restart.
+    /// operator restart. Seeded with `MANAGED_BY_OPERATOR` (review blocker 1,
+    /// #897): only an entry the operator itself owns is ever revoked by this
+    /// pass.
     #[tokio::test]
     async fn reconcile_sys_auth_revokes_a_tenant_missing_from_a_fresh_secret_read() {
         let store = memory_store();
@@ -938,9 +1051,16 @@ mod tests {
 
         // Simulate a previous cycle's write: tenant-gone had a token, before
         // this (fresh) process ever ran.
-        ravel_catalog::upsert_token(&store, &deployment_key, b"stale-token", "tenant-gone", 500)
-            .await
-            .expect("seed write succeeds");
+        ravel_catalog::upsert_token_owned(
+            &store,
+            &deployment_key,
+            b"stale-token",
+            "tenant-gone",
+            Some(ravel_catalog::MANAGED_BY_OPERATOR),
+            500,
+        )
+        .await
+        .expect("seed write succeeds");
 
         // The current token Secret no longer mentions tenant-gone.
         let mut token_values = BTreeMap::new();
@@ -997,6 +1117,214 @@ mod tests {
         let new_hash = ravel_catalog::token_hash(&deployment_key, b"new-token");
         assert!(map.entries.iter().all(|e| e.token_hash != old_hash));
         assert!(map.entries.iter().any(|e| e.token_hash == new_hash));
+    }
+
+    /// Review blocker 1 (#897): the remove pass must touch only entries the
+    /// operator itself manages. A CLI-provisioned tenant and a pre-amendment
+    /// unmanaged entry both survive a reconcile whose Secret does not name
+    /// them; an operator-managed tenant absent from the Secret is still
+    /// revoked.
+    #[tokio::test]
+    async fn reconcile_sys_auth_only_removes_operator_managed_tenants() {
+        let store = memory_store();
+        let deployment_key = [9u8; 32];
+
+        // The operator's own first reconcile: creates tenant-op tagged
+        // MANAGED_BY_OPERATOR.
+        let mut first = BTreeMap::new();
+        first.insert("tenant-op".to_string(), b"op-token".to_vec());
+        reconcile_sys_auth(&deployment_key, &first, &store, 1_000)
+            .await
+            .expect("first reconcile succeeds");
+
+        // A CLI-provisioned tenant the operator never managed.
+        ravel_catalog::upsert_token_owned(
+            &store,
+            &deployment_key,
+            b"cli-token",
+            "tenant-cli",
+            Some(ravel_catalog::MANAGED_BY_CLI),
+            1_000,
+        )
+        .await
+        .expect("cli upsert succeeds");
+
+        // A v1-shaped unmanaged entry (a pre-amendment writer).
+        ravel_catalog::upsert_token(
+            &store,
+            &deployment_key,
+            b"legacy-token",
+            "tenant-legacy",
+            1_000,
+        )
+        .await
+        .expect("legacy upsert succeeds");
+
+        // The next cycle's Secret names none of the three tenants above.
+        let mut second = BTreeMap::new();
+        second.insert("tenant-other".to_string(), b"other-token".to_vec());
+        reconcile_sys_auth(&deployment_key, &second, &store, 2_000)
+            .await
+            .expect("second reconcile succeeds");
+
+        let (map, _version) = ravel_catalog::read_auth_map(&store, &deployment_key)
+            .await
+            .expect("read succeeds")
+            .expect("map exists");
+        let tenants: BTreeSet<&str> = map.entries.iter().map(|e| e.tenant_id.as_str()).collect();
+        assert!(
+            !tenants.contains("tenant-op"),
+            "an operator-managed tenant absent from the Secret must still be revoked"
+        );
+        assert!(
+            tenants.contains("tenant-cli"),
+            "a CLI-provisioned tenant must survive an operator reconcile that never managed it"
+        );
+        assert!(
+            tenants.contains("tenant-legacy"),
+            "an unmanaged (pre-amendment) entry must survive an operator reconcile"
+        );
+        assert!(
+            tenants.contains("tenant-other"),
+            "a tenant present in the current Secret must exist"
+        );
+    }
+
+    /// Review blocker 2 (#897): a deployment key configured with no token
+    /// Secret (or one that resolves to zero tenants) must leave `sys/auth`
+    /// untouched, not wipe every operator-managed tenant.
+    #[tokio::test]
+    async fn reconcile_sys_auth_skips_entirely_on_an_empty_secret() {
+        let store = memory_store();
+        let deployment_key = [11u8; 32];
+
+        let mut first = BTreeMap::new();
+        first.insert("tenant-op".to_string(), b"op-token".to_vec());
+        reconcile_sys_auth(&deployment_key, &first, &store, 1_000)
+            .await
+            .expect("first reconcile succeeds");
+
+        let empty = BTreeMap::new();
+        reconcile_sys_auth(&deployment_key, &empty, &store, 2_000)
+            .await
+            .expect("reconcile against an empty secret is a clean no-op");
+
+        let (map, _version) = ravel_catalog::read_auth_map(&store, &deployment_key)
+            .await
+            .expect("read succeeds")
+            .expect("map exists");
+        assert!(
+            map.entries.iter().any(|e| e.tenant_id == "tenant-op"),
+            "an empty secret read must never wipe sys/auth: {map:?}"
+        );
+    }
+
+    /// Review blocker 3 (#897): two consecutive reconciles against an
+    /// unchanged Secret must perform zero additional `sys/auth` PUTs on the
+    /// second run. A `Sequence` of passthrough steps on `Op::Put` against the
+    /// `sys/auth` key counts every PUT that actually reaches the backend,
+    /// standing in for the request counter `MemoryStore` does not expose
+    /// publicly.
+    #[tokio::test]
+    async fn reconcile_sys_auth_is_a_no_op_write_on_an_unchanged_secret() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence, SequenceStep};
+
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Put)
+                .with_key_contains(ravel_catalog::AUTH_KEY)
+                .with_steps(vec![SequenceStep::Passthrough; 10]),
+        );
+        let store = FaultStore::new(memory_store(), plan);
+        let deployment_key = [12u8; 32];
+
+        let mut tokens = BTreeMap::new();
+        tokens.insert("tenant-a".to_string(), b"token-a".to_vec());
+
+        reconcile_sys_auth(&deployment_key, &tokens, &store, 1_000)
+            .await
+            .expect("first reconcile succeeds");
+        let puts_after_first = store.sequence_progress(0);
+        assert!(
+            puts_after_first > 0,
+            "the first reconcile of a fresh tenant must write at least once"
+        );
+
+        reconcile_sys_auth(&deployment_key, &tokens, &store, 2_000)
+            .await
+            .expect("second reconcile, unchanged secret, succeeds");
+        let puts_after_second = store.sequence_progress(0);
+        assert_eq!(
+            puts_after_second, puts_after_first,
+            "an unchanged secret must perform exactly zero additional sys/auth PUTs"
+        );
+    }
+
+    /// Review blocker 4 (#897): a transient CAS conflict on the first write
+    /// must be absorbed by `retry_cas` and still converge within the retry
+    /// budget.
+    #[tokio::test]
+    async fn reconcile_sys_auth_retries_a_transient_cas_conflict() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite)
+                .with_key_contains(ravel_catalog::AUTH_KEY)
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(memory_store(), plan);
+        let deployment_key = [13u8; 32];
+
+        let mut tokens = BTreeMap::new();
+        tokens.insert("tenant-a".to_string(), b"token-a".to_vec());
+
+        reconcile_sys_auth(&deployment_key, &tokens, &store, 1_000)
+            .await
+            .expect("reconcile converges despite one transient CAS conflict");
+
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+            1,
+            "the injected conflict must actually have fired"
+        );
+        let (map, _version) = ravel_catalog::read_auth_map(&store, &deployment_key)
+            .await
+            .expect("read succeeds")
+            .expect("map exists");
+        assert!(map.entries.iter().any(|e| e.tenant_id == "tenant-a"));
+    }
+
+    /// Review blocker 4 (#897): a persistent CAS conflict (every write fails)
+    /// exhausts the retry budget but `reconcile_sys_auth_best_effort` still
+    /// returns cleanly rather than propagating -- the property that lets
+    /// `reconcile_inner` call it without `?` and keep reconciling
+    /// Deployments/Services regardless of `sys/auth`'s outcome.
+    #[tokio::test]
+    async fn reconcile_sys_auth_best_effort_swallows_a_persistent_cas_conflict() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite)
+                .with_key_contains(ravel_catalog::AUTH_KEY)
+                .with_occurrence(Occurrence::Always),
+        );
+        let store = FaultStore::new(memory_store(), plan);
+        let deployment_key = [14u8; 32];
+
+        let mut tokens = BTreeMap::new();
+        tokens.insert("tenant-a".to_string(), b"token-a".to_vec());
+
+        // Must return () and must not panic: this is the decoupling itself.
+        reconcile_sys_auth_best_effort(&deployment_key, &tokens, &store, 1_000).await;
+
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+            u64::from(SYS_AUTH_CAS_ATTEMPTS),
+            "the full retry budget must be spent, not abandoned early"
+        );
     }
 
     #[test]
