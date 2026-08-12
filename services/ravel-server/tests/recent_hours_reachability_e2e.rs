@@ -183,8 +183,7 @@ fn promql_app(
     tenant_id: &TenantId,
     engine_config: EngineConfig,
 ) -> Router {
-    let catalog =
-        Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+    let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), tenant_id.clone());
     let state = build_app_state(
@@ -208,8 +207,7 @@ fn sql_app(
     tenant_id: &TenantId,
     engine_config: EngineConfig,
 ) -> Router {
-    let catalog =
-        Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+    let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), tenant_id.clone());
     let state = build_sql_state(
@@ -419,9 +417,7 @@ async fn post_compaction_bits(
         ravel_promql::Value::Matrix(m) => {
             let mut out: Vec<(i64, u64)> = m
                 .iter()
-                .flat_map(|(_labels, samples)| {
-                    samples.iter().map(|s| (s.ts_ns, s.value.to_bits()))
-                })
+                .flat_map(|(_labels, samples)| samples.iter().map(|s| (s.ts_ns, s.value.to_bits())))
                 .collect();
             out.sort();
             out
@@ -570,7 +566,10 @@ async fn low_request_budget_trips_typed_error_not_a_hang_or_partial_result() {
         422,
         "a tripped request budget must surface as HTTP 422, got {status}: {body}"
     );
-    assert_eq!(body["status"], "error", "Prometheus-shaped error envelope: {body}");
+    assert_eq!(
+        body["status"], "error",
+        "Prometheus-shaped error envelope: {body}"
+    );
     assert_eq!(
         body["errorType"], "execution",
         "RequestBudgetExceeded maps to the 422 execution error type, not a generic error: {body}"
@@ -601,11 +600,7 @@ async fn read_your_write_resolves_during_the_open_hour_over_cap_window() {
     let window = hot_window(base_ns);
     let last_token = tokens.last().expect("at least one token").encode();
 
-    let promql_router = promql_app(
-        store,
-        &tid,
-        hot_engine_config(RequestLimit::Bounded(1_000)),
-    );
+    let promql_router = promql_app(store, &tid, hot_engine_config(RequestLimit::Bounded(1_000)));
     let query = encode_query_param(&format!("{METRIC}[1h]"));
     let uri = format!(
         "/api/v1/query?query={query}&time={}&min_commit_token={last_token}",
