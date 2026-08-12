@@ -68,6 +68,7 @@ use ravel_query::distrib::codec::{self, CodecError};
 use ravel_query::distrib::proto::series_fetch_client::SeriesFetchClient;
 use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use ravel_query::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
+use ravel_query::http::TenantResolver;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -312,6 +313,12 @@ pub struct FragmentService {
 
 struct FragmentServiceInner {
     auth_token: String,
+    /// The deployment's ordinary tenant resolver chain. Used only for
+    /// cross-cluster federation (resolve-scope) requests, where a federating
+    /// coordinator's credential is an ordinary tenant credential and the tenant
+    /// is derived from it, never from the wire (ADR-0071 security, #868). The
+    /// intra-cluster pinned path never consults it.
+    tenant_resolver: Arc<dyn TenantResolver>,
     admission: FragmentAdmission,
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
@@ -328,6 +335,7 @@ impl FragmentService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth_token: String,
+        tenant_resolver: Arc<dyn TenantResolver>,
         admission: FragmentAdmission,
         catalog: Arc<Catalog>,
         store: Arc<dyn ObjectStoreBackend>,
@@ -338,6 +346,7 @@ impl FragmentService {
         FragmentService {
             inner: Arc::new(FragmentServiceInner {
                 auth_token,
+                tenant_resolver,
                 admission,
                 catalog,
                 store,
@@ -377,6 +386,25 @@ impl FragmentService {
                 "fragment request rejected: missing or invalid bearer token",
             ))
         }
+    }
+
+    /// Authenticate a cross-cluster federation (resolve-scope) request and
+    /// derive its tenant from the presented credential, never from the wire.
+    ///
+    /// ADR-0071 (#868) requires the remote to treat a federating coordinator's
+    /// credential as an ORDINARY TENANT CREDENTIAL: it runs the deployment's
+    /// normal [`TenantResolver`] chain over the request metadata and takes the
+    /// tenant from whatever that credential maps to. The cluster-internal
+    /// fragment token is never accepted here (it is not in the tenant
+    /// registry), and any `tenant_hash` a coordinator set on the wire is
+    /// ignored. A federating cluster therefore reads only the tenant its own
+    /// credential authorizes, never an arbitrary tenant it names.
+    fn resolve_federation_tenant(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<TenantHash, tonic::Status> {
+        crate::flight_auth::resolve_tenant(self.inner.tenant_resolver.as_ref(), metadata)
+            .inspect_err(|_| self.inner.metrics.record_fragment_auth_failure())
     }
 
     /// Build the interim content-hash resolver for one request by resolving a
@@ -421,10 +449,14 @@ impl FragmentService {
     /// A federated coordinator ships matchers and a time window with an empty
     /// [`pb::fetch_request::Scope::Resolve`] scope; the remote resolves its OWN
     /// snapshot over that window, applies its OWN erasure, and enforces its own
-    /// budgets. This is not a trust shortcut: the request's `tenant_hash` is the
-    /// ordinary tenant identity, resolved through the same catalog path a local
-    /// query takes, so a federated fetch reads exactly what a local query on this
-    /// cluster would. We turn the resolve scope into the pinned scope the in-crate
+    /// budgets. This is not a trust shortcut: by the time this runs, the gRPC
+    /// handler has already overwritten `request.tenant_hash` with the tenant its
+    /// own [`TenantResolver`] chain derived from the presented credential (see
+    /// [`FragmentService::resolve_federation_tenant`]), never the value the
+    /// coordinator put on the wire. Resolution then takes the same catalog path a
+    /// local query on this cluster takes, so a federated fetch reads exactly what
+    /// a local query for that credential's tenant would. We turn the resolve scope
+    /// into the pinned scope the in-crate
     /// [`SeriesFetchService`] already fetches from, pinning every segment of the
     /// resolved snapshot and attaching the snapshot's own erasure predicates
     /// (the coordinator never sends erasure for a resolve scope, and never
@@ -549,12 +581,29 @@ impl SeriesFetch for FragmentService {
         &self,
         request: tonic::Request<pb::FetchRequest>,
     ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
-        self.check_auth(request.metadata())?;
+        let (metadata, _extensions, mut inner) = request.into_parts();
+        // Two distinct trust models share this surface (ADR-0071 security):
+        //  - Pinned scope (intra-cluster fan-out): the shared cluster-internal
+        //    fragment token, with the tenant taken from the wire. Coordinator
+        //    and worker are one trust domain, and the token conveys no
+        //    privilege over the bucket's S3 credentials.
+        //  - Resolve scope (cross-cluster federation): the presented credential
+        //    is an ordinary tenant credential. The tenant is resolved from it
+        //    through the normal resolver chain and OVERRIDES any wire
+        //    tenant_hash, so a federating cluster reads only the tenant its
+        //    credential authorizes. The fragment token is never accepted here.
+        match &inner.scope {
+            Some(pb::fetch_request::Scope::Resolve(_)) => {
+                let tenant = self.resolve_federation_tenant(&metadata)?;
+                inner.tenant_hash = tenant.0.to_vec();
+            }
+            _ => self.check_auth(&metadata)?,
+        }
         let Some(_permit) = self.inner.admission.acquire().await else {
             return Err(tonic::Status::unavailable("fragment admission unavailable"));
         };
         self.inner.metrics.record_fragment_request();
-        let frames = self.resolve_and_run(request.into_inner()).await;
+        let frames = self.resolve_and_run(inner).await;
         // The permit (and its in-flight gauge decrement) is held across the
         // eager fetch above, the whole admission window, then released here
         // before the already-built frames replay as a stream.
@@ -1174,6 +1223,15 @@ mod tests {
         }
     }
 
+    /// A resolver that never authenticates any credential: the intra-cluster
+    /// pinned-scope tests only exercise the shared fragment token, never the
+    /// tenant resolver, so an empty one keeps them focused.
+    fn empty_resolver() -> Arc<dyn TenantResolver> {
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        ))
+    }
+
     fn test_service(metrics: Arc<FragmentMetrics>) -> FragmentService {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog =
@@ -1182,6 +1240,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         FragmentService::new(
             "cluster-token".to_string(),
+            empty_resolver(),
             admission,
             catalog,
             store,
@@ -1629,5 +1688,246 @@ mod tests {
             "the fallback entry names the unreachable remote endpoint it tried"
         );
         assert_eq!(fallback.segment_count, 1);
+    }
+
+    // --- Cross-cluster federation auth (ADR-0071 security, #868) ------------
+
+    /// A fixed clock so `Catalog::resolve` over a bounded window is
+    /// deterministic (the same reasoning as `tests::FixedClock`).
+    struct FixedClock(i64);
+    impl Clock for FixedClock {
+        fn now_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    /// Publish one real RSEG segment plus its commit record for `tenant`, so a
+    /// resolve-scope fetch for that tenant reads real data. Mirrors
+    /// `crate::tests::publish_segment`.
+    async fn publish_metric(
+        store: &dyn ObjectStoreBackend,
+        tenant: &ravel_types::TenantId,
+        ts_ns: i64,
+    ) {
+        use ravel_commit::{keys, publish, record};
+        use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+        use ravel_types::{Label, LabelSet, Sample, SeriesId};
+
+        let tenant_hash = tenant.hash();
+        let metric = "m";
+        let label_set = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, metric, &label_set).expect("series id"),
+            labels: label_set,
+            samples: vec![Sample { ts_ns, value: 1.0 }],
+        }];
+        let writer_id = uuid::Uuid::from_u128(2_000);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(record::NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(
+                &data_key,
+                written.bytes,
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &ravel_commit::publish::RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// A `FragmentService` over `store` whose tenant resolver maps each
+    /// `(bearer, TenantId)` in `creds`. The fragment token is `cluster-token`
+    /// (never a valid tenant credential unless also listed in `creds`).
+    fn federation_service(
+        store: Arc<dyn ObjectStoreBackend>,
+        creds: &[(&str, &str)],
+        now_ns: i64,
+    ) -> FragmentService {
+        let metrics = Arc::new(FragmentMetrics::new());
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let tokens: std::collections::HashMap<String, ravel_types::TenantId> = creds
+            .iter()
+            .map(|(tok, tenant)| {
+                (
+                    (*tok).to_string(),
+                    ravel_types::TenantId::new((*tenant).to_string()),
+                )
+            })
+            .collect();
+        let resolver: Arc<dyn TenantResolver> =
+            Arc::new(ravel_query::http::StaticBearerTokenResolver::new(tokens));
+        FragmentService::new(
+            "cluster-token".to_string(),
+            resolver,
+            FragmentAdmission::new(8, metrics.clone()),
+            catalog,
+            store,
+            None,
+            Arc::new(FixedClock(now_ns)),
+            metrics,
+        )
+    }
+
+    /// A resolve-scope request naming `wire_tenant` on the wire, over a window
+    /// that covers `ts_ns`, for the metrics signal.
+    fn resolve_request(wire_tenant: TenantHash, window_end_ns: i64) -> pb::FetchRequest {
+        pb::FetchRequest {
+            protocol_version: codec::PROTOCOL_VERSION,
+            tenant_hash: wire_tenant.0.to_vec(),
+            signal: metrics_signal(),
+            window_start_ns: 0,
+            window_end_ns,
+            scope: Some(pb::fetch_request::Scope::Resolve(pb::ResolveScope {
+                min_commit_token: Vec::new(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Drive `service.fetch` with `bearer` and decode the returned frames.
+    async fn fetch_decoded(
+        service: &FragmentService,
+        request: pb::FetchRequest,
+        bearer: &str,
+    ) -> Result<SliceResponse, tonic::Status> {
+        let mut req = tonic::Request::new(request);
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        let response = service.fetch(req).await?;
+        let mut frames = Vec::new();
+        let mut stream = response.into_inner();
+        while let Some(frame) = stream.next().await {
+            frames.push(frame.expect("in-crate stream never errors"));
+        }
+        Ok(decode_frames(frames).expect("frames decode to a slice response"))
+    }
+
+    const HOUR_NS: i64 = 3_600_000_000_000;
+
+    /// A federated resolve-scope request reads the tenant its CREDENTIAL maps to,
+    /// never the tenant it names on the wire. The credential maps to the
+    /// data-bearing tenant while the wire names a different, empty tenant: the
+    /// remote must serve the credential's data.
+    ///
+    /// Flip-line proof: delete the `inner.tenant_hash = tenant.0.to_vec()`
+    /// override in `FragmentService::fetch` and this returns zero series
+    /// (the wire tenant has no data), so the assertion fails.
+    #[tokio::test]
+    async fn federation_resolves_tenant_from_credential_not_wire() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let has_data = ravel_types::TenantId::new("remote-tenant".to_string());
+        publish_metric(store.as_ref(), &has_data, HOUR_NS).await;
+
+        // Credential -> the data-bearing tenant; wire names a DIFFERENT tenant
+        // that holds no data.
+        let service = federation_service(store, &[("operator-cred", "remote-tenant")], 4 * HOUR_NS);
+        let other = ravel_types::TenantId::new("wire-named-other".to_string()).hash();
+        let response = fetch_decoded(
+            &service,
+            resolve_request(other, 4 * HOUR_NS),
+            "operator-cred",
+        )
+        .await
+        .expect("valid tenant credential is accepted");
+
+        assert!(
+            response.series_returned > 0 && response.samples_returned > 0,
+            "the remote served the credential's tenant data, not the wire tenant's \
+             (got {} series)",
+            response.series_returned
+        );
+    }
+
+    /// Naming a data-bearing tenant on the wire does NOT read it when the
+    /// credential maps to a different, empty tenant: the coordinator cannot
+    /// reach across tenants by setting `tenant_hash`.
+    #[tokio::test]
+    async fn federation_wire_tenant_cannot_cross_to_another_tenant() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let victim = ravel_types::TenantId::new("victim-tenant".to_string());
+        publish_metric(store.as_ref(), &victim, HOUR_NS).await;
+
+        // Credential -> an empty tenant; wire names the victim tenant that DOES
+        // hold data. The remote must serve the credential's (empty) tenant.
+        let service = federation_service(store, &[("cred-empty", "empty-tenant")], 4 * HOUR_NS);
+        let response = fetch_decoded(
+            &service,
+            resolve_request(victim.hash(), 4 * HOUR_NS),
+            "cred-empty",
+        )
+        .await
+        .expect("valid tenant credential is accepted");
+
+        assert_eq!(
+            response.series_returned, 0,
+            "the wire tenant_hash must not let a credential read another tenant's data"
+        );
+    }
+
+    /// The cluster-internal fragment token is NOT a tenant credential: a
+    /// resolve-scope (federation) request presenting it is rejected, because the
+    /// tenant resolver does not map it. This is the trust-boundary property that
+    /// federation authenticates through ordinary tenant auth, never the shared
+    /// fragment token.
+    #[tokio::test]
+    async fn federation_rejects_the_fragment_token() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let service = federation_service(store, &[("operator-cred", "remote-tenant")], 4 * HOUR_NS);
+        let tenant = ravel_types::TenantId::new("remote-tenant".to_string()).hash();
+
+        // `cluster-token` is the fragment token; it is not in the tenant map.
+        let mut req = tonic::Request::new(resolve_request(tenant, 4 * HOUR_NS));
+        req.metadata_mut().insert(
+            "authorization",
+            "Bearer cluster-token".parse().expect("valid header value"),
+        );
+        let err = service
+            .fetch(req)
+            .await
+            .err()
+            .expect("the fragment token is not a tenant credential");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 }

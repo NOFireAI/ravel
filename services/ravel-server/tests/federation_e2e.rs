@@ -40,6 +40,7 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::Value;
 use ravel_query::distrib::proto::series_fetch_server::SeriesFetchServer;
 use ravel_query::distrib::{Federation, RemoteCluster};
+use ravel_query::http::{StaticBearerTokenResolver, TenantResolver};
 use ravel_query::{ByteLimit, EngineConfig, QueryEngine, QueryError};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::config::RemoteClusterConfig;
@@ -172,15 +173,26 @@ impl Remote {
     }
 }
 
-/// Stand up a real `FragmentService` gRPC server over `store`, guarded by
-/// `credential`, recording every `authorization` metadata value it is presented.
-async fn spawn_remote(store: Arc<dyn ObjectStoreBackend>, credential: &str) -> Remote {
+/// Stand up a real `FragmentService` gRPC server over `store`, recording every
+/// `authorization` metadata value it is presented. `credential` is the ordinary
+/// tenant credential the remote resolves to `tenant` (ADR-0071 #868: a federated
+/// resolve-scope request authenticates through the remote's normal tenant
+/// resolver, not the shared fragment token, and the tenant comes from the
+/// credential, never the wire).
+async fn spawn_remote(
+    store: Arc<dyn ObjectStoreBackend>,
+    credential: &str,
+    tenant: &TenantId,
+) -> Remote {
     let catalog = build_catalog(store.clone(), 1, true, 0).expect("catalog");
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = FragmentAdmission::new(8, metrics.clone());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let tokens = std::collections::HashMap::from([(credential.to_string(), tenant.clone())]);
+    let resolver: Arc<dyn TenantResolver> = Arc::new(StaticBearerTokenResolver::new(tokens));
     let service = FragmentService::new(
         credential.to_string(),
+        resolver,
         admission,
         catalog,
         store,
@@ -307,7 +319,7 @@ async fn remote_failure_fails_query_by_default() {
     let beta = TenantId::new("beta");
     let remote_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     publish_series(remote_store.as_ref(), &beta, base, "remote", 20.0, 1).await;
-    let remote = spawn_remote(remote_store, OPERATOR_CRED).await;
+    let remote = spawn_remote(remote_store, OPERATOR_CRED, &beta).await;
     let endpoint = remote.endpoint.clone();
     remote.stop().await;
 
@@ -354,7 +366,7 @@ async fn federated_query_marks_skipped_cluster_in_warnings() {
     // series), recording every principal presented to it.
     let east_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     publish_series(east_store.as_ref(), &acme, base, "east", 2.0, 1).await;
-    let east = spawn_remote(east_store, OPERATOR_CRED).await;
+    let east = spawn_remote(east_store, OPERATOR_CRED, &acme).await;
 
     // A dead cluster "west", also skip_unavailable=true.
     let west_endpoint = dead_endpoint().await;
@@ -444,7 +456,7 @@ async fn federated_query_merges_remote_series() {
     publish_series(local_store.as_ref(), &acme, base, "local", 10.0, 1).await;
     let remote_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     publish_series(remote_store.as_ref(), &acme, base, "remote", 20.0, 1).await;
-    let remote = spawn_remote(remote_store, OPERATOR_CRED).await;
+    let remote = spawn_remote(remote_store, OPERATOR_CRED, &acme).await;
 
     // Oracle: one store holding BOTH datasets, queried with no federation.
     let oracle_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

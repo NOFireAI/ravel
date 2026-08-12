@@ -74,6 +74,28 @@ pub struct RemoteCluster {
     pub soft_timeout: Duration,
 }
 
+/// The joined result of one spawned remote-dispatch task: the inner
+/// `Result` is the fetch outcome, the outer the soft-timeout verdict.
+type Joined = Result<Result<SliceResponse, DistribError>, tokio::time::error::Elapsed>;
+
+/// Owns the spawned remote-dispatch tasks and aborts any still running when the
+/// fan-out returns early (a fatal remote, a tripped budget, or this future being
+/// cancelled). Dropping a bare `JoinHandle` only *detaches* its task, which
+/// would leave in-flight remote fetches running against a query that has already
+/// failed; aborting stops them. Aborting an already-finished handle is a no-op,
+/// so aborting the whole set on drop is safe even after every task was joined.
+struct DispatchGuard {
+    handles: Vec<tokio::task::JoinHandle<Joined>>,
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 /// The federation execution context: the set of remote clusters to fan a
 /// federated read out to. Held in an `Option` on the engine; `None` (the
 /// default) means no federation and a fully cluster-local query.
@@ -177,9 +199,13 @@ impl Federation {
         // (it owns its `Arc`-cloned fetcher and request), so this future only
         // ever holds `JoinHandle`s across an await, and the lifetime-bearing
         // fetch future stays encapsulated in the task.
-        type Joined = Result<Result<SliceResponse, DistribError>, tokio::time::error::Elapsed>;
-        let mut handles: Vec<(String, bool, Duration, tokio::task::JoinHandle<Joined>)> =
-            Vec::with_capacity(self.remotes.len());
+        let mut guard = DispatchGuard {
+            handles: Vec::with_capacity(self.remotes.len()),
+        };
+        // Metadata parallel to `guard.handles` by index: the tasks own their
+        // request/fetcher, so the lifetime-bearing fetch future stays inside the
+        // task and this future only ever holds `JoinHandle`s across an await.
+        let mut meta: Vec<(String, bool, Duration)> = Vec::with_capacity(self.remotes.len());
         for remote in &self.remotes {
             let name = remote.name.clone();
             let skip_unavailable = remote.skip_unavailable;
@@ -205,18 +231,25 @@ impl Federation {
                 tokio::spawn(
                     async move { tokio::time::timeout(timeout, fetcher.fetch(request)).await },
                 );
-            handles.push((name, skip_unavailable, timeout, handle));
+            guard.handles.push(handle);
+            meta.push((name, skip_unavailable, timeout));
         }
 
         let mut distinct: HashSet<SeriesId> = HashSet::new();
         let mut running = QueryAccountingSnapshot::default();
 
-        for (name, skip_unavailable, timeout, handle) in handles {
-            // Join the spawned task. A `JoinError` means the task panicked (or
-            // was aborted): a panic is a coordinator-side bug, not a remote
-            // availability signal, so it fails the query typed regardless of
-            // `skip_unavailable` -- never silently dropped.
-            let dispatched = match handle.await {
+        for (i, (name, skip_unavailable, timeout)) in meta.into_iter().enumerate() {
+            // Join the spawned task by unique index. A `JoinError` means the
+            // task panicked (or was aborted): a panic is a coordinator-side bug,
+            // not a remote availability signal, so it fails the query typed
+            // regardless of `skip_unavailable` -- never silently dropped. On any
+            // early return below, `guard` drops and aborts the tasks not yet
+            // joined, so a failed query leaves no remote fetch running.
+            // Bind the awaited value on its own statement so the `&mut` borrow
+            // of `guard.handles` ends here: a later early return in this arm
+            // must be free to drop (and thus abort) `guard`.
+            let joined = (&mut guard.handles[i]).await;
+            let dispatched = match joined {
                 Ok(dispatched) => dispatched,
                 Err(join_err) => {
                     return Err(QueryError::Federation {
@@ -330,6 +363,15 @@ impl Federation {
 /// `skip_unavailable` is set, otherwise fail the query typed. A free function
 /// (not a method) so it never re-borrows `&self`, keeping the fan-out future
 /// free of borrows that would break the upstream `Send` bound.
+///
+/// `reason` carries the raw transport/timeout detail (remote endpoint IP:port,
+/// errno, remote-supplied status text). That detail is an internal identifier
+/// that must never reach a client body, exactly like the object keys and tenant
+/// hashes redacted at the `QueryError` HTTP boundary (http/error.rs, a7-F02):
+/// it is logged server-side and, on the fatal path, carried in the typed
+/// `QueryError::Federation` (which http/error.rs redacts to `MSG_UNAVAILABLE`),
+/// but the client-facing `skip_unavailable` warning is a stable message naming
+/// only the operator-facing cluster.
 fn handle_unavailable(
     name: &str,
     skip_unavailable: bool,
@@ -337,9 +379,14 @@ fn handle_unavailable(
     outcome: &mut FederationOutcome,
 ) -> Result<(), QueryError> {
     if skip_unavailable {
-        outcome
-            .warnings
-            .push(format!("remote cluster {name} skipped: {reason}"));
+        // Log the full reason (endpoint/errno) for operator diagnosis, but keep
+        // it out of the client-facing warning.
+        tracing::warn!(
+            cluster = %name,
+            reason = %reason,
+            "federated remote unavailable; skipped (skip_unavailable), coverage partial"
+        );
+        outcome.warnings.push(skipped_cluster_warning(name));
         outcome.skipped.push(name.to_string());
         outcome.partial = true;
         Ok(())
@@ -349,6 +396,13 @@ fn handle_unavailable(
             reason,
         })
     }
+}
+
+/// The stable, redacted client-facing warning for a skipped remote cluster. It
+/// names the operator-facing cluster (so a client and operator can tell which
+/// data is missing) but carries no endpoint, errno, or remote-supplied text.
+fn skipped_cluster_warning(name: &str) -> String {
+    format!("remote cluster {name} unavailable; results are partial")
 }
 
 /// Folds one healthy remote's reported cost into the query's live accounting
@@ -369,4 +423,152 @@ fn fold_remote(
     stats.raw_f64_bytes = stats
         .raw_f64_bytes
         .saturating_add(response.stats.raw_f64_bytes);
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    /// A remote whose fetch always fails at transport, carrying a message that
+    /// embeds internal identifiers (IP:port, errno) exactly as a real tonic
+    /// transport error would. The redaction boundary must keep all of it out of
+    /// any client-facing warning.
+    struct TransportErrFetcher(String);
+
+    #[async_trait]
+    impl SliceFetcher for TransportErrFetcher {
+        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            Err(DistribError::Transport(self.0.clone()))
+        }
+    }
+
+    /// A remote that never answers within any soft timeout.
+    struct SlowFetcher;
+
+    #[async_trait]
+    impl SliceFetcher for SlowFetcher {
+        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            unreachable!("the soft timeout fires long before this")
+        }
+    }
+
+    fn one_remote(fetcher: Arc<dyn SliceFetcher>, skip: bool, timeout: Duration) -> Federation {
+        Federation::new(vec![RemoteCluster {
+            name: "eu-west".to_string(),
+            fetcher,
+            skip_unavailable: skip,
+            soft_timeout: timeout,
+        }])
+    }
+
+    async fn run(fed: &Federation) -> Result<FederationOutcome, QueryError> {
+        fed.fetch(
+            TenantHash([1u8; 16]),
+            Signal::Metrics,
+            Vec::new(),
+            Vec::new(),
+            0,
+            1_000,
+            Vec::new(),
+            QueryAccounting::new(),
+            EngineConfig::default(),
+        )
+        .await
+    }
+
+    /// The internal identifiers a client-facing warning must never carry.
+    const LEAKS: &[&str] = &[
+        "10.1.2.3",
+        "9443",
+        "111",
+        "os error",
+        "connection refused",
+        "transport",
+    ];
+
+    /// BLOCK 1: `skip_unavailable = true` over an unavailable remote returns a
+    /// partial result whose warning names the skipped cluster and leaks no
+    /// endpoint/errno.
+    ///
+    /// Flip-line proof: change `handle_unavailable` to push the raw `reason`
+    /// (`outcome.warnings.push(reason)`) instead of `skipped_cluster_warning`,
+    /// and the leak assertions below fire.
+    #[tokio::test]
+    async fn skip_unavailable_marks_partial_and_redacts_the_warning() {
+        let fetcher = Arc::new(TransportErrFetcher(
+            "connection refused (os error 111) dialing 10.1.2.3:9443".to_string(),
+        ));
+        let fed = one_remote(fetcher, true, Duration::from_secs(5));
+        let outcome = run(&fed)
+            .await
+            .expect("skip_unavailable keeps the query alive");
+
+        assert!(
+            outcome.partial,
+            "coverage is partial when a remote is skipped"
+        );
+        assert_eq!(outcome.skipped, vec!["eu-west".to_string()]);
+        assert_eq!(outcome.warnings.len(), 1, "one warning per skipped cluster");
+        let w = &outcome.warnings[0];
+        assert!(
+            w.contains("eu-west"),
+            "warning names the operator-facing cluster: {w}"
+        );
+        for leak in LEAKS {
+            assert!(
+                !w.contains(leak),
+                "client warning leaked internal identifier {leak:?}: {w}"
+            );
+        }
+    }
+
+    /// BLOCK 1 / S2: the same redaction holds on the soft-timeout path (S3: the
+    /// skipped-cluster warning names the cluster there too).
+    #[tokio::test]
+    async fn soft_timeout_marks_partial_and_redacts_the_warning() {
+        let fed = one_remote(Arc::new(SlowFetcher), true, Duration::from_millis(20));
+        let outcome = run(&fed)
+            .await
+            .expect("skip_unavailable keeps the query alive");
+
+        assert!(outcome.partial);
+        assert_eq!(outcome.skipped, vec!["eu-west".to_string()]);
+        assert_eq!(outcome.warnings.len(), 1);
+        let w = &outcome.warnings[0];
+        assert!(
+            w.contains("eu-west"),
+            "timeout warning names the cluster: {w}"
+        );
+        // The reason string ("soft timeout of ... elapsed") must not reach it.
+        assert!(
+            !w.contains("timeout"),
+            "timeout warning is the stable redacted message: {w}"
+        );
+        assert!(
+            !w.contains("elapsed"),
+            "timeout warning is the stable redacted message: {w}"
+        );
+    }
+
+    /// BLOCK 1: with `skip_unavailable = false` (the default), an unavailable
+    /// remote fails the query typed and never returns a partial result. The
+    /// typed error names the cluster; the raw reason it carries is redacted at
+    /// the HTTP boundary (http/error.rs), not here.
+    #[tokio::test]
+    async fn fatal_without_skip_unavailable() {
+        let fetcher = Arc::new(TransportErrFetcher(
+            "connection refused (os error 111) dialing 10.1.2.3:9443".to_string(),
+        ));
+        let fed = one_remote(fetcher, false, Duration::from_secs(5));
+        let err = run(&fed)
+            .await
+            .expect_err("an unavailable remote fails the query");
+        match err {
+            QueryError::Federation { cluster, .. } => assert_eq!(cluster, "eu-west"),
+            other => panic!("expected QueryError::Federation, got {other:?}"),
+        }
+    }
 }

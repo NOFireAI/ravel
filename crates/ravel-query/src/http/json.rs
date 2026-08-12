@@ -71,6 +71,20 @@ pub struct QueryStatsJson {
     pub segments_pruned: u64,
     pub accounting: QueryAccountingJson,
     pub estimate: CostEstimateJson,
+    /// True when at least one federated remote cluster was skipped because it
+    /// was unavailable and its `skip_unavailable` opt-in was set (ADR-0071,
+    /// issue #868), so the query's coverage is partial. Always `false` for a
+    /// fully cluster-local query. A client can read this marker to tell a
+    /// partial federated result apart from a complete one; the skipped
+    /// cluster(s) are named in the top-level `warnings` array.
+    pub partial: bool,
+    /// The federation fan-out's Prometheus-compatible `warnings` (one per
+    /// skipped cluster). Also merged into the response envelope's top-level
+    /// `warnings` array by the handler; carried here too so the stats block is
+    /// self-describing. Each names the operator-facing cluster only, never its
+    /// endpoint or transport error detail (redacted at the federation seam).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl From<crate::QueryStats> for QueryStatsJson {
@@ -80,6 +94,8 @@ impl From<crate::QueryStats> for QueryStatsJson {
             segments_pruned: stats.segments_pruned,
             accounting: QueryAccountingJson::from_snapshot(&stats.accounting, &stats.page_stats),
             estimate: stats.estimate.into(),
+            partial: stats.partial,
+            warnings: stats.warnings.clone(),
         }
     }
 }
@@ -653,6 +669,47 @@ mod tests {
         let json = serde_json::to_value(&resp).expect("serializes");
         assert!(json.get("warnings").is_none(), "empty warnings omitted");
         assert!(json.get("infos").is_none(), "empty infos omitted");
+    }
+
+    #[test]
+    fn stats_json_carries_partial_and_warnings() {
+        // BLOCK 1 (ADR-0071, issue #868): the partial-coverage marker and the
+        // per-skipped-cluster warnings must survive `QueryStats ->
+        // QueryStatsJson`, never be silently dropped.
+        //
+        // Flip-line proof: drop `partial`/`warnings` from the `From` impl and
+        // both assertions below fail (partial reads false, warnings empty).
+        let stats = crate::QueryStats {
+            partial: true,
+            warnings: vec!["remote cluster eu-west unavailable; results are partial".to_string()],
+            ..Default::default()
+        };
+        let json = QueryStatsJson::from(stats);
+        assert!(json.partial, "partial marker carried through");
+        assert_eq!(
+            json.warnings,
+            vec!["remote cluster eu-west unavailable; results are partial".to_string()],
+            "skipped-cluster warnings carried through"
+        );
+
+        let value = serde_json::to_value(&json).expect("serializes");
+        assert_eq!(value["partial"], serde_json::json!(true));
+        assert_eq!(
+            value["warnings"],
+            serde_json::json!(["remote cluster eu-west unavailable; results are partial"])
+        );
+    }
+
+    #[test]
+    fn stats_json_omits_empty_warnings_and_defaults_partial_false() {
+        let json = QueryStatsJson::from(crate::QueryStats::default());
+        assert!(!json.partial, "a cluster-local query is never partial");
+        let value = serde_json::to_value(&json).expect("serializes");
+        assert_eq!(value["partial"], serde_json::json!(false));
+        assert!(
+            value.get("warnings").is_none(),
+            "empty warnings array omitted"
+        );
     }
 
     #[test]

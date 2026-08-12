@@ -827,6 +827,7 @@ pub async fn start(
             distrib::FragmentAdmission::new(settings.max_inflight_fragments, metrics.clone());
         let service = distrib::FragmentService::new(
             settings.auth_token.clone(),
+            config.tenant_resolver.clone(),
             admission,
             catalog.clone(),
             store.clone(),
