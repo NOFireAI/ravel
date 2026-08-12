@@ -4404,7 +4404,10 @@ mod prefetch_tests {
             .await
             .expect("single-plan prefetch");
         let real_bytes = single_stats.accounting.total_s3_bytes();
-        assert!(real_bytes > 0, "the fetch must have scanned some real bytes");
+        assert!(
+            real_bytes > 0,
+            "the fetch must have scanned some real bytes"
+        );
 
         // A budget bounded at exactly the real single-fetch cost, run
         // against two plans that share "metric_a"'s matcher set.
