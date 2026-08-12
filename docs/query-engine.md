@@ -325,7 +325,7 @@ The query node that receives a request is that query's coordinator (a
 per-query role, not a process type). It resolves ONE pinned snapshot exactly
 as the local path does, then consults the same pre-execution `CostEstimate`
 the accounting layer already computes: distribution trips only when the
-estimate reaches 256 MiB of estimated store bytes **or** 64 segments (either
+estimate reaches 256 MiB of estimated store bytes **or** 256 segments (either
 axis, `DistribThresholds`). A query below both stays fully local, so a cheap
 query pays nothing for the machinery. When the gate trips, the coordinator
 partitions the snapshot **shard-major** (`partition_snapshot`): a segment's

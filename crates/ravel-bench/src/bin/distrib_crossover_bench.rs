@@ -35,7 +35,7 @@ struct Args {
     #[arg(long, default_value = "bench_gauge")]
     query: String,
     /// Corpus time span in seconds: widens the window the samples spread across
-    /// so a sweep can grow the corpus past the gate constants (256 MiB / 64
+    /// so a sweep can grow the corpus past the gate constants (256 MiB / 256
     /// segments) without changing series cardinality. Default 1 preserves the
     /// original one-second corpus.
     #[arg(long, default_value_t = 1)]

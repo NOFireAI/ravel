@@ -120,9 +120,50 @@ so the gate never distributes a query that local execution would serve
 faster; a query above every shape's crossover distributes. Either axis
 tripping is enough, matching `should_distribute`'s existing OR.
 
-The measurement may land on the current 256 MiB / 64-segment constants.
+The measurement may land on the ADR-0071 256 MiB / 64-segment constants.
 Confirming them with data is a valid outcome and is recorded as such; the
-point is that the default is backed by a measurement, not that it changes.
+point is that the default is backed by a measurement, not that it changes. The
+measured result (below) confirmed the byte axis and moved the segment axis.
+
+## Measured result and resulting defaults (2026-08-12)
+
+The crossover was measured over native loopback MinIO through `S3Store` on the
+reference host `ci-16gb-fsn1-1`, swept across corpus size at worker counts 1,
+4, 16. Full panel and raw per-cell JSON: `BENCHMARKS.md` "Distributed read
+crossover (S3/MinIO, ci-16gb-fsn1-1)" and
+`bench/reports/2026-08-12-distrib-crossover-s3/`.
+
+Distributed p95 beats local p95 by the 10% margin **only at 16 workers**,
+first at ~35.8 MiB estimated store / 75 segments on the byte axis and at 256
+segments on the tiny-segment axis. At 1 and 4 workers distribution never wins
+in the swept range. At the 35.8 MiB cell, 1 worker is ~2.5x slower than local
+while 16 workers is ~12% faster.
+
+Resulting defaults, per this ADR's conservative-crossover policy:
+
+1. `DISTRIBUTE_MIN_SEGMENTS`: **64 -> 256**. The measured segment crossovers
+   are 75 (byte axis) and 256 (tiny-segment axis); the conservative (higher)
+   value per this ADR's policy is 256. The old 64 had to move regardless: it
+   triggered a case measured ~25% slower distributed even at 16 workers.
+
+2. `DISTRIBUTE_MIN_STORE_BYTES`: **256 MiB, unchanged.** The reason is outcome
+   asymmetry, not the untested range. `should_distribute(thresholds, cost)`
+   cannot see the worker count, so in the 36-256 MiB band no single byte
+   threshold is correct: at 35.8 MiB, 1 worker is 2.5x slower and 16 workers
+   is 12% faster. Keeping the conservative 256 MiB deliberately avoids the
+   2.5x downside at the cost of leaving measured 16-worker wins on the table.
+
+Caveats. These are single-host loopback numbers and so an **upper bound** on
+the true cross-host crossover. The `DISTRIBUTE_MIN_STORE_BYTES` axis was not
+reachable directly: the in-process generator materializes every batch in RAM
+(~1 KiB/point), capping the corpus near ~146 MiB estimated store before OOM,
+so the byte crossover (~36 MiB at 16 workers) was observed well below the
+256 MiB default rather than at it.
+
+Follow-ups tracked separately: #959 (warm-affinity cache measurement), #960
+(corpus-span generator bug), #961 (generator RAM cap), and #962
+(worker-count-aware gate plus a multi-host measurement, which is what would
+let the byte threshold drop below 256 MiB safely).
 
 ## Rejected alternatives
 

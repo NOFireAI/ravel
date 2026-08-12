@@ -121,7 +121,7 @@ piece, see [docs/adrs/](docs/adrs/).
     with `--distributed-query` plus a fragment-credential file. The node
     that receives a request coordinates it: it resolves one pinned snapshot,
     and when a cost estimate clears the gate (256 MiB of estimated store
-    bytes or 64 segments), it partitions that snapshot shard-major and
+    bytes or 256 segments), it partitions that snapshot shard-major and
     dispatches each slice to a peer query node over an internal gRPC
     surface (a `SeriesFetch` service for PromQL, Arrow Flight for SQL).
     Workers self-register by heartbeat; the coordinator k-way merges the
