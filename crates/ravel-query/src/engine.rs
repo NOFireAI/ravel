@@ -719,6 +719,19 @@ impl QueryEngine {
             // window clipping happens downstream in `MergedSource::query`), so
             // pooling their runs is loss-free -- documented in
             // docs/query-engine.md.
+            //
+            // Enforcement scope: because the runs are pooled, the single
+            // `merge_soa_runs` below enforces `max_series`/`max_samples` ONCE
+            // over the union of every selector's (and every remote cluster's)
+            // runs. That makes the caps a query-wide bound on the
+            // coordinator's peak memory, not a per-selector budget: a
+            // multi-selector or federated query is bounded by the cap as a
+            // whole rather than by cap-times-selectors. This is intentional --
+            // the caps exist to bound this process's memory for the whole
+            // query -- and it is why the merge must be the one reachable place
+            // the scalar caps are checked (the per-selector loop above
+            // deliberately does not check them for scalars; histograms, merged
+            // per selector, still check there).
             let mut all_scalar_runs: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
             let mut combined_histograms: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
             let mut page_stats = FetchStats::default();
@@ -764,8 +777,17 @@ impl QueryEngine {
                 .federate_scalar(tenant_hash, fed_plans, &accounting)
                 .await?;
             all_scalar_runs.extend(fed_runs);
-            page_stats.raw_f64_pages += fed_stats.raw_f64_pages;
-            page_stats.raw_f64_bytes += fed_stats.raw_f64_bytes;
+            // `fed_stats` is reported by a remote cluster over the wire, so a
+            // buggy or hostile remote could report values that overflow a plain
+            // `+=` (a debug-build panic, a release-build wrap). Saturate instead:
+            // these are diagnostic page/byte counters, so pinning at u64::MAX is
+            // correct and never affects query results.
+            page_stats.raw_f64_pages = page_stats
+                .raw_f64_pages
+                .saturating_add(fed_stats.raw_f64_pages);
+            page_stats.raw_f64_bytes = page_stats
+                .raw_f64_bytes
+                .saturating_add(fed_stats.raw_f64_bytes);
 
             let mut series = merge_soa_runs(all_scalar_runs, max_series, max_samples)?;
             series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
@@ -1155,8 +1177,16 @@ impl QueryEngine {
             ) {
                 return Err(err);
             }
-            stats.raw_f64_pages += outcome.stats.raw_f64_pages;
-            stats.raw_f64_bytes += outcome.stats.raw_f64_bytes;
+            // `outcome.stats` came back from a remote cluster over the wire;
+            // saturate rather than `+=` so a remote reporting an overflowing
+            // count cannot panic (debug) or wrap (release) this diagnostic
+            // accumulator. Pinning at u64::MAX never affects query results.
+            stats.raw_f64_pages = stats
+                .raw_f64_pages
+                .saturating_add(outcome.stats.raw_f64_pages);
+            stats.raw_f64_bytes = stats
+                .raw_f64_bytes
+                .saturating_add(outcome.stats.raw_f64_bytes);
             partial |= outcome.partial;
             for w in outcome.warnings {
                 if !warnings.contains(&w) {

@@ -31,6 +31,29 @@
 //! skippable: the coordinator re-enforces `max_bytes_scanned` over the folded
 //! remote spend and fails typed regardless of `skip_unavailable`, because a
 //! budget cap is a correctness bound, not an availability property.
+//!
+//! # Merge semantics and the cross-cluster tie-break limitation
+//!
+//! Federated runs join the same k-way merge the local fetch feeds, keyed by
+//! `(series_id, ts)`. Within one cluster, two samples at the same
+//! `(series_id, ts)` resolve under the deterministic total order in
+//! `is_greater` (`created_unix_ns`, `writer_epoch`, `writer_seq`, in-page
+//! index) -- a globally meaningful order because those provenance fields are
+//! assigned by one cluster's writers.
+//!
+//! Across clusters that order is NOT globally meaningful: two clusters assign
+//! `writer_epoch`/`writer_seq` independently, so if the same `(series_id, ts)`
+//! is present in two clusters with different values, which one wins is decided
+//! by provenance fields that are only comparable within a cluster. Federation
+//! therefore assumes each cluster owns a DISJOINT slice of series identity (the
+//! intended cross-cluster deployment: one tenant's data lives in exactly one
+//! cluster, or clusters hold non-overlapping series). When that holds, every
+//! `(series_id, ts)` comes from exactly one cluster and the tie-break never
+//! fires across the boundary. When it does not hold, the result is still
+//! deterministic for a fixed set of inputs but the choice of winner between two
+//! clusters' conflicting samples is unspecified. This is a known limitation of
+//! ADR-0071 wave 5, documented in docs/query-engine.md; a globally meaningful
+//! cross-cluster ordering is out of scope here.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -290,6 +313,25 @@ impl Federation {
                     )?;
                     continue;
                 }
+                // A remote carrying native-histogram data this build cannot
+                // decode yet is a coverage gap, not corruption: the frame is
+                // well-formed, the remote simply serves a data kind the
+                // coordinator cannot consume across the boundary. Route it
+                // through the same skip_unavailable path an unavailable remote
+                // takes, with a truthful reason -- never the "malformed
+                // response" hard fault, which would be both untrue and
+                // non-skippable.
+                Err(DistribError::HistogramUnsupported) => {
+                    handle_unavailable(
+                        &name,
+                        skip_unavailable,
+                        "remote returned native-histogram data this build cannot decode across \
+                         clusters yet"
+                            .to_string(),
+                        &mut outcome,
+                    )?;
+                    continue;
+                }
                 Err(err) => {
                     return Err(QueryError::Federation {
                         cluster: name.clone(),
@@ -455,6 +497,17 @@ mod tests {
         }
     }
 
+    /// A remote that streams native-histogram data this build cannot decode
+    /// across the slice boundary (S5). Well-formed, not corruption.
+    struct HistUnsupportedFetcher;
+
+    #[async_trait]
+    impl SliceFetcher for HistUnsupportedFetcher {
+        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            Err(DistribError::HistogramUnsupported)
+        }
+    }
+
     fn one_remote(fetcher: Arc<dyn SliceFetcher>, skip: bool, timeout: Duration) -> Federation {
         Federation::new(vec![RemoteCluster {
             name: "eu-west".to_string(),
@@ -566,6 +619,53 @@ mod tests {
         let err = run(&fed)
             .await
             .expect_err("an unavailable remote fails the query");
+        match err {
+            QueryError::Federation { cluster, .. } => assert_eq!(cluster, "eu-west"),
+            other => panic!("expected QueryError::Federation, got {other:?}"),
+        }
+    }
+
+    /// S5: a histogram-bearing remote is a coverage gap, not corruption. With
+    /// `skip_unavailable = true` it is skipped (partial + a warning naming the
+    /// cluster and nothing internal), exactly like an unavailable remote --
+    /// never the non-skippable "malformed response" hard fault.
+    #[tokio::test]
+    async fn histogram_remote_is_skippable_not_a_hard_fault() {
+        let fed = one_remote(
+            Arc::new(HistUnsupportedFetcher),
+            true,
+            Duration::from_secs(5),
+        );
+        let outcome = run(&fed)
+            .await
+            .expect("a histogram remote is skippable under skip_unavailable");
+        assert!(
+            outcome.partial,
+            "coverage is partial when the remote is skipped"
+        );
+        assert_eq!(outcome.skipped, vec!["eu-west".to_string()]);
+        assert_eq!(outcome.warnings.len(), 1);
+        let w = &outcome.warnings[0];
+        assert!(w.contains("eu-west"), "warning names the cluster: {w}");
+        assert!(
+            !w.contains("histogram"),
+            "client warning is the stable redacted message, not the internal reason: {w}"
+        );
+    }
+
+    /// S5: with `skip_unavailable = false` the histogram remote still fails the
+    /// query typed (never silently dropped), but as a `Federation` error naming
+    /// the cluster -- the truthful skippable path -- not a masked drop.
+    #[tokio::test]
+    async fn histogram_remote_without_skip_fails_typed() {
+        let fed = one_remote(
+            Arc::new(HistUnsupportedFetcher),
+            false,
+            Duration::from_secs(5),
+        );
+        let err = run(&fed)
+            .await
+            .expect_err("a histogram remote fails the query when not skippable");
         match err {
             QueryError::Federation { cluster, .. } => assert_eq!(cluster, "eu-west"),
             other => panic!("expected QueryError::Federation, got {other:?}"),
