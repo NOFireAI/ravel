@@ -245,7 +245,11 @@ impl ErasureMatcher {
 /// sentinel [`live_input_event_bounds`] returns) has nothing left to
 /// physically erase, so this always returns `false` for a windowed
 /// request in that case regardless of the window.
-pub fn bucket_may_overlap(min_event_ts_ns: i64, max_event_ts_ns: i64, request: &ErasureRequest) -> bool {
+pub fn bucket_may_overlap(
+    min_event_ts_ns: i64,
+    max_event_ts_ns: i64,
+    request: &ErasureRequest,
+) -> bool {
     let has_window = request.window_start_ns != 0 || request.window_end_ns != 0;
     if !has_window {
         return true;
@@ -726,7 +730,9 @@ pub async fn build_rewrite(
                 input_sample_count = input_sample_count
                     .checked_add(u64::from(run.sample_count))
                     .ok_or_else(|| {
-                        MaintainError::Invariant("input_sample_count sum overflowed u64".to_string())
+                        MaintainError::Invariant(
+                            "input_sample_count sum overflowed u64".to_string(),
+                        )
                     })?;
 
                 if applicable.is_empty() {
