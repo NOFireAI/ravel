@@ -369,6 +369,21 @@ impl StoreMetrics {
         self.op(op).record(elapsed_nanos, bytes, err);
     }
 
+    /// Record one completed call from outside this module, using the same
+    /// accounting [`InstrumentedStore`] applies internally.
+    ///
+    /// This is the seam the per-class request scheduler
+    /// ([`crate::scheduling::ClassedStore`], ADR-0070 decision 1) records
+    /// through: it holds one [`StoreMetrics`] per request class and calls this
+    /// with the class's block, so per-class metrics reuse this exact metric
+    /// family with a `{class}` dimension rather than a parallel one. `bytes`
+    /// follows the module conventions (payload length for `put`, returned data
+    /// length for a successful `get`, 0 otherwise); `elapsed_nanos` is measured
+    /// around the inner call only.
+    pub fn record_op(&self, op: StoreOp, elapsed_nanos: u64, bytes: u64, err: Option<&StoreError>) {
+        self.record(op, elapsed_nanos, bytes, err);
+    }
+
     /// Point-in-time copy of every counter. Not atomic across operation
     /// kinds: concurrent calls may land between two fields, so a snapshot can
     /// show `put` from a hair later than `get`. It is a scrape, not a
