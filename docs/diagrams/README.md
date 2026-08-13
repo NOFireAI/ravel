@@ -119,3 +119,22 @@ Last verified against the code: 2026-08-08 (epic #702 landed the OTLP export
 crate and both binaries' wiring; follow-ups #711 and #720 landed the
 runtime-export-failure warning and the logs-decode-span field parity this
 diagram documents).
+
+## ingest-plausibility-window.svg
+
+The fail-closed ingest-timestamp plausibility window from the ADR-0051
+amendment (2026-08-13, issue #905): the accept region
+`[now - max_ingest_lag, now + max_future_skew]` on the event-time axis,
+with both reject zones and the typed rejections they produce (`TooOld`,
+`FutureSkew`), the per-signal bounded timestamps (metric sample ts, log
+record ts, span end), and a long-running span whose start precedes the
+window but is admitted because only its end is bounded. Footnotes carry
+the boundary-inclusivity rule (equality admits) and the receiver-clock
+floor (`MIN_PLAUSIBLE_INGEST_CLOCK_NS`, whole-request 503 on failure).
+
+Illustrates: docs/adrs/0051-tenant-admission-control.md (amendment
+2026-08-13), docs/adrs/0010-spec-amendments-review-1.md (item 8),
+docs/consistency-model.md "Late and skewed data".
+
+Drawn 2026-08-13 against the amendment's decision; the span-end rule and
+clock floor describe the decided behavior, which issue #905 implements.
