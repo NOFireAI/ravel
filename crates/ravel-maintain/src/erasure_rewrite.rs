@@ -2185,10 +2185,13 @@ mod tests {
     //! exactly, since this module reads L0 buckets through the identical
     //! `read.rs` pipeline.
 
+    use std::sync::Arc;
+
+    use ravel_catalog::{Catalog, CatalogConfig};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{SeriesInputV3, VERSION_V6};
-    use ravel_types::{Label, METRIC_NAME_LABEL, SeriesId, TenantId};
+    use ravel_types::{Label, METRIC_NAME_LABEL, SeriesId, TenantId, TimeRange};
     use uuid::Uuid;
 
     use super::*;
@@ -3112,6 +3115,18 @@ mod tests {
     /// Seed one L0 `.rlog` input (data object + commit record), matching the
     /// shape `rlog.rs`'s own test module writes for a real ingest shard.
     async fn seed_logs(store: &dyn ObjectStoreBackend, seq: u64, records: &[LogRecord]) {
+        seed_logs_indexed(store, seq, records, &[]).await;
+    }
+
+    /// [`seed_logs`] with an explicit POSTINGS indexed-field list, so a fixture
+    /// can seed an input that really carries a POSTINGS section
+    /// (ADR-0049 decision 3: opt-in per field, never automatic).
+    async fn seed_logs_indexed(
+        store: &dyn ObjectStoreBackend,
+        seq: u64,
+        records: &[LogRecord],
+        indexed_fields: &[&str],
+    ) {
         let th = tenant_hash();
         let writer_id = Uuid::from_u128(u128::from(seq));
         let identity = LogObjectIdentity {
@@ -3121,7 +3136,8 @@ mod tests {
             writer_epoch: EPOCH,
             writer_seq: seq,
         };
-        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        let mut w = RlogWriter::new(RlogConfig::default(), identity)
+            .with_indexed_fields(indexed_fields.iter().map(|f| (*f).to_string()).collect());
         for r in records {
             w.push(r.clone()).expect("push log record");
         }
@@ -4450,6 +4466,523 @@ mod tests {
             listing.commit_keys.len(),
             1,
             "the original L0 commit (and its data object) must be preserved"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `.done` completion soundness regressions (issue #1015)
+    // -----------------------------------------------------------------
+
+    /// Event-time base for the fidelity fixture below: the start of the
+    /// fixture bucket's own ingest hour, so every seeded sample's event time
+    /// sits inside the hour its bucket is keyed by (the ordinary,
+    /// non-backfilled shape) and the catalog's listing window covers it.
+    const FIDELITY_BASE_NS: i64 = HOUR as i64 * NS_PER_HOUR;
+    /// Width of one fidelity probe slot. Every object in the fixture carries
+    /// its samples inside exactly one slot, and no two live objects share a
+    /// slot, so "does this bucket serve anything in slot k" identifies one
+    /// object rather than a set.
+    const FIDELITY_SLOT_NS: i64 = 1_000_000_000;
+
+    /// The half-open event-time window of probe slot `k`.
+    fn fidelity_slot(k: i64) -> (i64, i64) {
+        let start = FIDELITY_BASE_NS + k * FIDELITY_SLOT_NS;
+        (start, start + FIDELITY_SLOT_NS)
+    }
+
+    /// A sample timestamp in the middle of slot `k` -- never on a boundary, so
+    /// the catalog's inclusive-end [`TimeRange::overlaps`] and the erasure
+    /// window's half-open [`bucket_may_overlap`] select the same objects.
+    fn fidelity_slot_mid(k: i64) -> i64 {
+        let (start, _) = fidelity_slot(k);
+        start + FIDELITY_SLOT_NS / 2
+    }
+
+    /// A windowed erasure request used purely as a probe: its window is one
+    /// fidelity slot, and its `request_id` is deliberately one no rewrite
+    /// record in the fixture names in its `drops`. That second property is
+    /// what makes [`bucket_erasure_completion`]'s answer a pure "does the
+    /// catalog-resolved live view still serve an object overlapping this
+    /// window" question -- the sibling-rewrite exemption
+    /// (`!names_request && ...`) can never fire for an unknown request id.
+    fn fidelity_probe_request(id_seed: u128, window: (i64, i64)) -> ErasureRequest {
+        ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            request_id: Uuid::from_u128(id_seed).to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: METRIC_NAME_LABEL.to_string(),
+                value: "no-such-metric".to_string(),
+            }],
+            window_start_ns: window.0,
+            window_end_ns: window.1,
+            reason: String::new(),
+        }
+    }
+
+    /// The data object keys the QUERY path serves for `range`, resolved through
+    /// the real [`ravel_catalog::Catalog`] -- `Catalog::resolve` funnels every
+    /// bucket through `Catalog::process_bucket`, the served-set logic
+    /// [`bucket_erasure_completion`] reconstructs.
+    async fn query_served_keys(
+        store: &Arc<MemoryStore>,
+        range: TimeRange,
+    ) -> std::collections::BTreeSet<String> {
+        let catalog = Catalog::new(
+            Arc::clone(store) as Arc<dyn ObjectStoreBackend>,
+            CatalogConfig {
+                // The fixture bucket lives on shard SHARD; the resolve must
+                // list at least that many shards to see it at all.
+                shard_count: SHARD + 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog");
+        catalog
+            .resolve(&tenant_hash(), Signal::Metrics, range, &[], sealed_now_ns())
+            .await
+            .expect("resolve")
+            .segments
+            .into_iter()
+            .map(|s| s.data_object_key)
+            .collect()
+    }
+
+    /// Build the shared fidelity fixture in one bucket, through the real
+    /// production passes only:
+    ///
+    /// - four L0 inputs, each carrying one series in its own event-time slot;
+    /// - a real [`crate::compact::compact_bucket`] over the first two, so the
+    ///   bucket holds a genuine `CompactionRecord` naming them as inputs;
+    /// - two more L0 inputs seeded AFTER that compaction (the interlock shape
+    ///   the catalog resolves by including them: they are named by no record's
+    ///   input list, so a snapshot still serves them);
+    /// - a real [`erasure_rewrite_bucket`] pass, which resolves its own inputs
+    ///   ONE-HOP, sees only the compaction record, and publishes a
+    ///   `RewriteRecord` superseding it -- blind to the two later L0s.
+    ///
+    /// The result exercises all three exclusion mechanisms at once:
+    /// compaction-input exclusion, whole-record supersession through
+    /// `resolve_rewrite_supersession`, and live raw-L0 inclusion.
+    ///
+    /// Returns the erased request's id and the rewrite record's part key.
+    async fn build_fidelity_fixture(store: &Arc<MemoryStore>) -> (String, String) {
+        // Slot 0: the erasure subject. Slot 1: an unrelated series. Both are
+        // compacted, then rewritten, so the rewrite output must cover slot 1
+        // only.
+        seed(
+            store.as_ref(),
+            1,
+            vec![series("alpha", &[(fidelity_slot_mid(0), 1.0)])],
+        )
+        .await;
+        seed(
+            store.as_ref(),
+            2,
+            vec![series("beta", &[(fidelity_slot_mid(1), 2.0)])],
+        )
+        .await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let outcome = crate::compact::compact_bucket(store.as_ref(), &clock, &config, &bucket())
+            .await
+            .expect("compact");
+        assert!(
+            matches!(outcome, crate::compact::CompactionOutcome::Compacted { .. }),
+            "fixture needs a real compaction record, got {outcome:?}"
+        );
+
+        // Slots 2 and 3: raw L0s no record names. The one-hop resolver the
+        // rewrite pass uses never sees these; the catalog resolver serves them.
+        seed(
+            store.as_ref(),
+            3,
+            vec![series("gamma", &[(fidelity_slot_mid(2), 3.0)])],
+        )
+        .await;
+        seed(
+            store.as_ref(),
+            4,
+            vec![series("delta", &[(fidelity_slot_mid(3), 4.0)])],
+        )
+        .await;
+
+        let request = erasure_request(0xA11, "alpha");
+        let request_id = request.request_id.clone();
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            store.as_ref(),
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(
+                outcome,
+                ErasureRewriteOutcome::Rewritten {
+                    publish: PublishOutcome::Published,
+                    ..
+                }
+            ),
+            "fixture needs a published rewrite, got {outcome:?}"
+        );
+
+        let record = read_rewrite_record(store.as_ref()).await;
+        assert!(
+            !record.superseded_record_key.is_empty(),
+            "the rewrite must supersede the compaction record as a whole, which is what makes \
+             the supersession chase (not a one-hop lookup) load-bearing here"
+        );
+        assert_eq!(record.parts.len(), 1);
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        (request_id, part_key)
+    }
+
+    /// ADR-0064 §4 (2026-08-08 F1 correction, #1000): `bucket_erasure_completion`
+    /// reconstructs `Catalog::process_bucket`'s served set -- compaction-input
+    /// exclusion, `resolve_rewrite_supersession`, and the live
+    /// L0/compaction-part/rewrite-part filtering -- on a fresh per-bucket
+    /// listing. That reconstruction is a SECOND COPY of the query path's logic,
+    /// and `.done` soundness rests entirely on the two copies agreeing: a
+    /// refactor of `process_bucket` that widens what a query serves, without a
+    /// matching change here, makes `.done` over-complete and permanently
+    /// resurrects an erased subject (§4's "writing `.done` from a fresh-LIST
+    /// check alone is not acceptable" failure, one level up).
+    ///
+    /// One shared fixture bucket (see [`build_fidelity_fixture`]) is run
+    /// through BOTH paths and they must agree on exactly which objects the
+    /// bucket serves:
+    ///
+    /// - the full-range query served set is pinned object-key by object-key
+    ///   (the rewrite output plus the two live raw L0s -- never the compacted
+    ///   L0s, never the superseded compaction part);
+    /// - per event-time slot, "the query serves something here" must equal
+    ///   "the reconstruction still considers the subject servable here", with
+    ///   the expected served/not-served pattern pinned so agreement-on-empty
+    ///   cannot pass the test.
+    ///
+    /// Flip-line proof (each flipped alone in `bucket_erasure_completion`,
+    /// re-run, assert fires):
+    ///
+    /// - the live-L0 filter `!excluded.contains(&(...))` with its `!` removed:
+    ///   the compacted-away L0 in slot 0 becomes live, the reconstruction
+    ///   blocks slot 0, the query serves nothing there, and the slot-0
+    ///   `assert_eq!` fails.
+    /// - the live-compaction filter `!superseded_records.contains(key)` with
+    ///   its `!` removed: the rewrite-superseded compaction part (slots 0-1)
+    ///   comes back, and slot 0 fails the same way.
+    #[tokio::test]
+    async fn maintain_reconstruction_agrees_with_the_query_served_set() {
+        let store = Arc::new(MemoryStore::new());
+        let (_request_id, rewrite_part_key) = build_fidelity_fixture(&store).await;
+
+        // Every object ever written to the bucket, so the served set can be
+        // asserted by identity rather than by count.
+        let listing = crate::read::list_bucket(store.as_ref(), &bucket())
+            .await
+            .expect("list bucket");
+        let inputs = crate::read::load_inputs(store.as_ref(), &bucket(), &listing.commit_keys)
+            .await
+            .expect("load inputs");
+        let l0_key_by_seq: HashMap<u64, String> = inputs
+            .iter()
+            .map(|i| {
+                (
+                    i.record.writer_seq,
+                    keys::reconstruct_data_key(&i.record).expect("data key"),
+                )
+            })
+            .collect();
+
+        // 1. The query path's served set over the whole fixture range, by key.
+        let (full_start, _) = fidelity_slot(0);
+        let (_, full_end) = fidelity_slot(5);
+        let served = query_served_keys(
+            &store,
+            TimeRange {
+                start_ns: full_start,
+                end_ns: full_end,
+            },
+        )
+        .await;
+        let expected: std::collections::BTreeSet<String> = [
+            rewrite_part_key.clone(),
+            l0_key_by_seq[&3].clone(),
+            l0_key_by_seq[&4].clone(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            served, expected,
+            "the query serves exactly the rewrite output and the two raw L0s no record names; \
+             the compacted L0s are excluded and the compaction part is superseded"
+        );
+
+        // 2. Slot by slot, the two paths must agree. The expected pattern is
+        // pinned so a fixture that degenerated to "nothing anywhere" (which
+        // both paths would agree on) cannot pass.
+        let expected_served = [false, true, true, true, false];
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        for (k, expect) in expected_served.iter().enumerate() {
+            let k = k as i64;
+            let (start, end) = fidelity_slot(k);
+            let query_serves = !query_served_keys(
+                &store,
+                TimeRange {
+                    start_ns: start,
+                    // Inclusive end (`TimeRange::overlaps`), so stop one ns
+                    // short of the next slot's first ns.
+                    end_ns: end - 1,
+                },
+            )
+            .await
+            .is_empty();
+            assert_eq!(
+                query_serves, *expect,
+                "fixture shape changed: slot {k} query-served expectation"
+            );
+
+            let probe = PendingErasureRequest {
+                request_key: "unused-in-memory-only".to_string(),
+                request: fidelity_probe_request(0x9000 + k as u128, (start, end)),
+            };
+            let completion = bucket_erasure_completion(
+                store.as_ref(),
+                &clock,
+                &config,
+                &NoLeases,
+                &bucket(),
+                std::slice::from_ref(&probe),
+            )
+            .await
+            .expect("completion");
+            let reconstruction_serves = completion.blocked.contains(&probe.request.request_id);
+
+            assert_eq!(
+                query_serves, reconstruction_serves,
+                "slot {k}: the maintain-side reconstruction and Catalog::process_bucket disagree \
+                 about what this bucket serves. A `.done` written on a reconstruction that serves \
+                 LESS than the query path resurrects the erased subject permanently (ADR-0064 §4)."
+            );
+        }
+    }
+
+    /// The subject value carried by the log records the erasure request names.
+    const ERASED_SUBJECT: &str = "u123";
+    /// A second subject value in the same indexed field that must survive.
+    const SURVIVING_SUBJECT: &str = "u999";
+    /// Column ids probed when asking whether an object's POSTINGS/BLOOM still
+    /// resolve a value. Both sections are keyed by column id, and a rewritten
+    /// object may assign different ids than its input did (the surviving
+    /// records' distinct column set differs), so every plausible id is probed
+    /// rather than the one the input happened to use: "no column resolves the
+    /// subject" is the claim, not "one particular column does not".
+    const PROBE_COLUMN_IDS: std::ops::Range<u32> = 0..48;
+
+    /// Whether an RLOG object's POSTINGS (footer kind 6) and BLOOM (footer
+    /// kind 5) sections still resolve `value`, as `(postings_hit, bloom_hit)`.
+    ///
+    /// A missing POSTINGS section resolves nothing (ADR-0049 decision 5:
+    /// absence is always legal, and it is exactly a "this object cannot prove
+    /// the term present" answer). A missing BLOOM section is not tolerated:
+    /// every RLOG object carries one, so its absence would silently turn the
+    /// bloom half of this check into a vacuous pass.
+    fn rlog_index_resolves(bytes: &[u8], value: &str) -> (bool, bool) {
+        use ravel_logseg::bloom_section::BloomSection;
+        use ravel_logseg::footer::kind;
+        use ravel_logseg::postings::PostingsSection;
+
+        let cfg = RlogConfig::default();
+        let footer = ravel_logseg::footer::open(bytes).expect("open RLOG footer");
+
+        let postings_hit = match footer.section(kind::POSTINGS) {
+            None => false,
+            Some(desc) => {
+                let raw =
+                    ravel_logseg::read_section(bytes, desc, &cfg).expect("read POSTINGS section");
+                let section = PostingsSection::parse(&raw).expect("parse POSTINGS section");
+                PROBE_COLUMN_IDS.into_iter().any(|cid| {
+                    matches!(
+                        section.probe(cid, value.as_bytes()),
+                        Ok(Some(blocks)) if !blocks.is_empty()
+                    )
+                })
+            }
+        };
+
+        let bloom_desc = footer
+            .section(kind::BLOOM)
+            .expect("every RLOG object carries a BLOOM section");
+        let raw = ravel_logseg::read_section(bytes, bloom_desc, &cfg).expect("read BLOOM section");
+        let section = BloomSection::parse(&raw).expect("parse BLOOM section");
+        let bloom_hit = (0..section.len()).any(|i| {
+            let view = section.entry(i).expect("bloom entry");
+            PROBE_COLUMN_IDS
+                .into_iter()
+                .any(|cid| view.may_contain(cid, value.as_bytes()))
+        });
+
+        (postings_hit, bloom_hit)
+    }
+
+    /// ADR-0064 §4 as narrowed by the 2026-08-13 amendment (#1000 finding F3):
+    /// the `.done` record asserts every live segment and index entry is free of
+    /// the erased subject, while the pass itself only walks commit records. For
+    /// a rewritten LOG segment that claim rests on the rewrite REGENERATING the
+    /// segment's own index sections from the surviving records -- POSTINGS
+    /// (footer kind 6) and BLOOM (kind 5) are inside the data object, so they
+    /// are not "index objects that cannot hold a subject value"; a rewrite that
+    /// carried its inputs' index sections through would leave the erased
+    /// subject's field-term values resolvable inside a live object after
+    /// `.done`.
+    ///
+    /// Drive the real `erasure_rewrite_bucket` over an L0 whose POSTINGS and
+    /// BLOOM demonstrably do resolve the subject, and assert the rewritten
+    /// part's do not, while still resolving the surviving subject.
+    ///
+    /// Non-vacuity is built in two ways. The same probe run against the
+    /// pre-rewrite INPUT object -- which is exactly "an object whose postings
+    /// and bloom carry the erased terms unfiltered" -- must return `true` on
+    /// both channels; and the surviving value must still be resolvable in the
+    /// OUTPUT, so a bloom that is merely empty or unparseable cannot pass.
+    ///
+    /// Flip-line proof: in `build_rewrite_logs`, make
+    /// `first_dropping_log_request(requests, &record.attrs, record.ts_ns)`
+    /// return `None` unconditionally (equivalently, flip
+    /// `LogErasureMatcher::drops_record` to `false`). The erased record is then
+    /// re-encoded into the output, its `user_id` value is inserted into the
+    /// output block's bloom, and the `!out_bloom` assertion below fires.
+    #[tokio::test]
+    async fn rewritten_log_segment_index_no_longer_resolves_the_erased_subject() {
+        let store = MemoryStore::new();
+        let erased = log_record(
+            1,
+            10,
+            "checkout failed",
+            vec![(
+                "user_id".to_string(),
+                LogAttrValue::Str(ERASED_SUBJECT.to_string()),
+            )],
+        );
+        let kept = log_record(
+            2,
+            20,
+            "shipping ok",
+            vec![(
+                "user_id".to_string(),
+                LogAttrValue::Str(SURVIVING_SUBJECT.to_string()),
+            )],
+        );
+        // `user_id` indexed, so the input carries a real POSTINGS section
+        // holding the erased subject's term (ADR-0049 decision 3: opt-in).
+        seed_logs_indexed(&store, 1, &[erased, kept.clone()], &["user_id"]).await;
+
+        let listing = crate::read::list_bucket(&store, &logs_bucket())
+            .await
+            .expect("list bucket");
+        let inputs = crate::read::load_inputs(&store, &logs_bucket(), &listing.commit_keys)
+            .await
+            .expect("load inputs");
+        assert_eq!(inputs.len(), 1);
+        let input_key = keys::reconstruct_data_key(&inputs[0].record).expect("input data key");
+        let input_bytes = store
+            .get(&input_key, GetRange::Full)
+            .await
+            .expect("get input")
+            .data;
+
+        let (in_postings, in_bloom) = rlog_index_resolves(input_bytes.as_ref(), ERASED_SUBJECT);
+        assert!(
+            in_postings,
+            "fixture is meaningless unless the INPUT's POSTINGS resolves the subject: this is the \
+             unfiltered-index state the rewrite has to eliminate"
+        );
+        assert!(
+            in_bloom,
+            "fixture is meaningless unless the INPUT's BLOOM resolves the subject"
+        );
+
+        let request = logs_erasure_request(1, "user_id", ERASED_SUBJECT);
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &logs_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(
+                outcome,
+                ErasureRewriteOutcome::Rewritten {
+                    publish: PublishOutcome::Published,
+                    ..
+                }
+            ),
+            "expected a published rewrite, got {outcome:?}"
+        );
+
+        let record = read_rewrite_record_for(&store, &logs_bucket()).await;
+        assert_eq!(record.parts.len(), 1);
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let part_bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data;
+
+        // The record itself is gone.
+        assert_eq!(
+            decode_logs_part(&store, &part_key).await,
+            vec![kept],
+            "only the surviving record may remain in the rewritten part"
+        );
+
+        // ... and so are its terms in both index sections of that same object.
+        let (out_postings, out_bloom) = rlog_index_resolves(part_bytes.as_ref(), ERASED_SUBJECT);
+        assert!(
+            !out_postings,
+            "the rewritten part's POSTINGS still resolves the erased subject's term: `.done` \
+             would claim an object free of the subject while a live index inside it names it"
+        );
+        assert!(
+            !out_bloom,
+            "the rewritten part's BLOOM still resolves the erased subject's value: the rewrite \
+             carried its input's index through instead of regenerating it from survivors"
+        );
+
+        // The negative above is only meaningful if the rewritten object's index
+        // is populated at all.
+        let (_, survivor_bloom) = rlog_index_resolves(part_bytes.as_ref(), SURVIVING_SUBJECT);
+        assert!(
+            survivor_bloom,
+            "the rewritten BLOOM must still resolve the SURVIVING subject: an empty or \
+             unpopulated bloom would make the erased-subject assertion above vacuous"
         );
     }
 }
