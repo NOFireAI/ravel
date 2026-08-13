@@ -503,7 +503,20 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     // Immediate exclusion from the WARM cache: the scan-time filter runs
     // post-cache, so the subject is gone even though its bytes are still cached
     // AND still physically present in the durable input objects.
+    //
+    // Snapshot the cache's hit counter before the post-erase query so the
+    // assertion after it proves the exclusion held ON A CACHE HIT: the query
+    // served the segment bytes from the warm cache (not a re-fetch from store)
+    // and STILL filtered the subject, direct evidence the ADR-0064 scan-time
+    // filter runs after the cache, not that the cache was merely warm.
+    let hits_before = cache.metrics().snapshot().hits;
     let after = query_metric_subjects(&app).await;
+    assert!(
+        cache.metrics().snapshot().hits > hits_before,
+        "the post-erase query must be served FROM the warm cache (a cache hit), not re-fetched \
+         from store: only then does its exclusion of the subject prove the scan-time filter runs \
+         post-cache"
+    );
     assert_eq!(
         user_ids(&after),
         vec![SURVIVING_SUBJECT.to_string()],
@@ -830,8 +843,19 @@ mod logs {
             keys::erasure_completion_key(&tenant, Signal::Logs, request_id).expect("done key");
 
         // Immediate exclusion from the warm cache while the input still holds
-        // the subject's bytes.
+        // the subject's bytes. Snapshot the hit counter first so the assertion
+        // proves the exclusion held ON A CACHE HIT: the post-erase SQL query
+        // served the RLOG bytes from the warm cache (not a re-fetch) and STILL
+        // filtered the subject, direct evidence the scan-time filter runs
+        // post-cache.
+        let hits_before = cache.metrics().snapshot().hits;
         let after = query_log_bodies(&app).await;
+        assert!(
+            cache.metrics().snapshot().hits > hits_before,
+            "the post-erase SQL query must be served FROM the warm cache (a cache hit), not \
+             re-fetched from store: only then does its exclusion of the subject prove the \
+             scan-time filter runs post-cache"
+        );
         assert_eq!(
             after,
             vec![SURVIVOR_BODY.to_string()],
