@@ -2128,10 +2128,13 @@ fn bucket_serves_subject(
     // A live raw L0 record overlapping the window: un-rewritten input a
     // snapshot still resolves (the F1 blindness -- the one-hop resolver never
     // saw this, because it only inspects compaction/rewrite records).
-    if live_l0
-        .iter()
-        .any(|ir| bucket_may_overlap(ir.record.min_event_ts_ns, ir.record.max_event_ts_ns, request))
-    {
+    if live_l0.iter().any(|ir| {
+        bucket_may_overlap(
+            ir.record.min_event_ts_ns,
+            ir.record.max_event_ts_ns,
+            request,
+        )
+    }) {
         return true;
     }
     // A live compaction part overlapping the window: un-rewritten L1 data.
