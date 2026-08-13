@@ -22,7 +22,14 @@
 //! and has a constructor, [`Cache::with_corruption`], that makes every
 //! hit return deliberately corrupted bytes -- the supported
 //! acceptance-gate mode for the whole epic (decision 4), not a test
-//! fixture.
+//! fixture. Like the disk tier, each RAM entry carries a stamped write
+//! time and a configured per-entry max-age ([`DEFAULT_MAX_ENTRY_AGE_NS`]):
+//! an entry older than the max-age is treated as a miss on `get`, and a
+//! background sweep drops over-age idle entries on [`DEFAULT_SWEEP_INTERVAL_NS`]
+//! regardless of access, so raw bytes of a subject erased by ADR-0064's sweep
+//! persist in a query node's RAM at most that long past the sweep (issue #988).
+//! The maintain node's erasure sweep cannot reach a query node's memory, so the
+//! bound is enforced locally, exactly as issue #998 did for the disk tier.
 //!
 //! [`disk::DiskCache`] is the local-disk tier: content-addressed raw byte
 //! ranges under a configured directory, opt-in (no directory, no disk
