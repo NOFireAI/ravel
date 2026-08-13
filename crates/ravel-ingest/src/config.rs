@@ -67,7 +67,9 @@ pub fn plausible_ingest_clock(now_ns: i64) -> Result<(), String> {
     u32::try_from(now_ns.div_euclid(NS_PER_HOUR))
         .map(|_| ())
         .map_err(|_| {
-            format!("receiver clock reading yields a non-representable hour bucket: now_ns={now_ns}")
+            format!(
+                "receiver clock reading yields a non-representable hour bucket: now_ns={now_ns}"
+            )
         })
 }
 

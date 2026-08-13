@@ -286,7 +286,11 @@ async fn long_running_span_is_admitted_and_discoverable_by_an_overlapping_query(
         .send()
         .await
         .expect("export request succeeds");
-    assert_eq!(response.status(), 200, "long-running span export should succeed");
+    assert_eq!(
+        response.status(),
+        200,
+        "long-running span export should succeed"
+    );
     let body = response.bytes().await.expect("response body");
     let decoded = ExportTraceServiceResponse::decode(body.as_ref())
         .expect("response is an ExportTraceServiceResponse");
@@ -317,8 +321,7 @@ async fn long_running_span_is_admitted_and_discoverable_by_an_overlapping_query(
             .await
             .expect("get span data object")
             .data;
-        let reader =
-            RspanReader::new(&bytes, &RspanConfig::default()).expect("open RSPAN object");
+        let reader = RspanReader::new(&bytes, &RspanConfig::default()).expect("open RSPAN object");
         let (mut scanned, _stats) = reader
             .scan(&SpanQuery::ts_range(query_start, query_end))
             .expect("scan RSPAN object");
