@@ -4860,12 +4860,19 @@ mod tests {
     /// both channels; and the surviving value must still be resolvable in the
     /// OUTPUT, so a bloom that is merely empty or unparseable cannot pass.
     ///
-    /// Flip-line proof: in `build_rewrite_logs`, make
-    /// `first_dropping_log_request(requests, &record.attrs, record.ts_ns)`
-    /// return `None` unconditionally (equivalently, flip
-    /// `LogErasureMatcher::drops_record` to `false`). The erased record is then
-    /// re-encoded into the output, its `user_id` value is inserted into the
-    /// output block's bloom, and the `!out_bloom` assertion below fires.
+    /// Flip-line proof, both verified:
+    ///
+    /// - make `first_dropping_log_request`'s body `None` unconditionally
+    ///   (equivalently, flip `LogErasureMatcher::drops_record` to `false`).
+    ///   The erased record is re-encoded into the output, its `user_id` value
+    ///   goes into the output block's bloom, and `!out_bloom` fires.
+    /// - additionally build `build_rewrite_logs`'s writer as
+    ///   `RlogWriter::new(read_cfg, identity).with_indexed_fields(vec!["user_id"
+    ///   .to_string()])`, and `!out_postings` fires first: the output then also
+    ///   carries a POSTINGS section naming the erased term.
+    ///
+    /// The index assertions deliberately precede the record-level check below,
+    /// so an unsound rewrite fails on the index claim this test exists for.
     #[tokio::test]
     async fn rewritten_log_segment_index_no_longer_resolves_the_erased_subject() {
         let store = MemoryStore::new();
@@ -4956,14 +4963,9 @@ mod tests {
             .expect("get part")
             .data;
 
-        // The record itself is gone.
-        assert_eq!(
-            decode_logs_part(&store, &part_key).await,
-            vec![kept],
-            "only the surviving record may remain in the rewritten part"
-        );
-
-        // ... and so are its terms in both index sections of that same object.
+        // The subject's terms are gone from both index sections of the
+        // rewritten object. Asserted before the record-level check below so
+        // that an unsound rewrite fails on the claim this test exists for.
         let (out_postings, out_bloom) = rlog_index_resolves(part_bytes.as_ref(), ERASED_SUBJECT);
         assert!(
             !out_postings,
@@ -4983,6 +4985,13 @@ mod tests {
             survivor_bloom,
             "the rewritten BLOOM must still resolve the SURVIVING subject: an empty or \
              unpopulated bloom would make the erased-subject assertion above vacuous"
+        );
+
+        // The record itself is gone too.
+        assert_eq!(
+            decode_logs_part(&store, &part_key).await,
+            vec![kept],
+            "only the surviving record may remain in the rewritten part"
         );
     }
 }
