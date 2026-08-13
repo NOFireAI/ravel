@@ -1492,6 +1492,15 @@ struct ErasureRewritePass {
     /// these makes the completion verification unsound, so no `.done` is
     /// written this tick and every request stays pending.
     deferred: bool,
+    /// `request_id`s the CATALOG resolver
+    /// ([`ravel_maintain::bucket_erasure_completion`], built on
+    /// `ravel_catalog::resolve_rewrite_supersession`) proves are still served
+    /// out of at least one in-scope bucket -- an L0 input, a compaction part,
+    /// or a sibling rewrite the query would resolve but the rewrite pass's
+    /// one-hop `resolve_live_record` was blind to (ADR-0064 §4 F1). Their
+    /// `.done` is withheld even when `deferred` is false: completion follows the
+    /// resolver the query path trusts, not the pass's own live-record hop.
+    catalog_blocked: std::collections::HashSet<String>,
 }
 
 /// Rewrite every bucket of one `(tenant, signal)` against `pending`
@@ -1588,6 +1597,48 @@ async fn erasure_rewrite_pass(
                         hour,
                         error = %err,
                         "maintenance: erasure rewrite of a bucket failed; no completion \
+                         written this tick, retried next tick"
+                    );
+                }
+            }
+
+            // Completion gate (ADR-0064 §4, the 2026-08-08 F1 correction): the
+            // outcome above classified the bucket off ravel-maintain's one-hop
+            // `resolve_live_record`, which is blind to an L0 input a query still
+            // resolves through the full supersession chain. Re-derive "is this
+            // bucket's contribution to every pending request current" through
+            // the SAME resolver the query path runs
+            // (`ravel_catalog::resolve_rewrite_supersession`, via
+            // `bucket_erasure_completion`), on a fresh listing that reflects any
+            // rewrite just published, so a `.done` can never be written while a
+            // resolvable snapshot still serves the subject. This runs for every
+            // bucket regardless of the rewrite outcome: a bucket the pass called
+            // `AlreadyApplied` or `NoApplicableRequests` off its one-hop view is
+            // exactly where the divergence hides.
+            match ravel_maintain::bucket_erasure_completion(
+                store, clock, compactor, hold, &bucket, pending,
+            )
+            .await
+            {
+                Ok(completion) => {
+                    if completion.unresolved {
+                        pass.deferred = true;
+                    }
+                    pass.catalog_blocked.extend(completion.blocked);
+                }
+                Err(err) => {
+                    // The resolver could not establish this bucket's served
+                    // view (list/decode/supersession failure). Treat it exactly
+                    // as a rewrite failure: defer every request this tick rather
+                    // than complete on an unverified view.
+                    pass.deferred = true;
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        hour,
+                        error = %err,
+                        "maintenance: erasure completion resolution failed; no completion \
                          written this tick, retried next tick"
                     );
                 }
@@ -1732,6 +1783,7 @@ async fn run_erasure_pass(
                 out_of_scope = pass.out_of_scope,
                 not_sealed = pass.not_sealed,
                 deferred = pass.deferred,
+                catalog_blocked = pass.catalog_blocked.len(),
                 "maintenance: erasure rewrite pass complete"
             );
 
@@ -1746,6 +1798,26 @@ async fn run_erasure_pass(
                 );
             } else {
                 for entry in &pending {
+                    // Completion follows the CATALOG resolver, not the rewrite
+                    // pass's one-hop live-record classification (ADR-0064 §4
+                    // F1): if `bucket_erasure_completion` proved any in-scope
+                    // bucket still serves this request's subject, its `.done` is
+                    // withheld this tick even though no bucket deferred. This is
+                    // the exact gate the divergence test flips -- drop the
+                    // `contains` guard and a `.done` lands while a snapshot
+                    // still resolves the subject out of an L0 input the one-hop
+                    // resolver never saw.
+                    if pass.catalog_blocked.contains(&entry.request.request_id) {
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            request_id = %entry.request.request_id,
+                            "maintenance: erasure completion withheld; the catalog resolver \
+                             still serves the subject from an in-scope bucket, so no .done is \
+                             written and the request stays pending"
+                        );
+                        continue;
+                    }
                     match write_erasure_completion(
                         store,
                         clock.now_ns(),
