@@ -133,6 +133,34 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
     // name the batch it rejects.
     let batch_id = batch.batch_id;
 
+    // Process-wide in-flight ingest ceiling (issue #802, extended to OTAP by
+    // #835): admit or shed this batch before it does any ingest work -- the
+    // same gate each unary OTLP gRPC export applies via `try_admit`
+    // (otlp_grpc.rs), so a burst of OTAP batches cannot bypass the
+    // admission-shed backpressure OTLP already respects. The `_permit` binding
+    // holds the slot across the rest of this batch (byte-rate accounting,
+    // decode, and the durable write); its RAII drop when `process_batch`
+    // returns releases the slot on every return arm below, including the error
+    // paths. A shed is RESOURCE_EXHAUSTED, matching OTLP's shed status
+    // (`ingest_concurrency_shed_status`) exactly; `IngestShed`'s Display is the
+    // single source of that message string.
+    //
+    // Like the byte-rate rejection below, a shed happens before
+    // `ctx.decoder.decode` ever sees this batch, so it tears the gRPC stream
+    // down (returns `true`): a skipped batch's Schema/DictionaryBatch IPC
+    // messages never reach the stateful per-`DecoderKey` decoder, and every
+    // later batch would then decode against state that silently missed one.
+    // The client re-establishes a fresh stream with fresh decoder state.
+    let _permit = match ctx.state.ingest_concurrency.try_admit() {
+        Ok(permit) => permit,
+        Err(shed) => {
+            return (
+                nack(batch_id, StatusCode::ResourceExhausted, shed.to_string()),
+                true,
+            );
+        }
+    };
+
     // Layer 2 (ADR-0051 section 1, layer 2; issue #803): byte rate on this
     // batch's wire bytes, charged before decode so over-rate bytes cost one
     // buffered body and nothing else. `WireByteCountLayer` parses this
