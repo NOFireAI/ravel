@@ -154,10 +154,15 @@ async fn maintain_starts_after_gc_config_set_and_matching_flags() {
         max_query_duration_ns: NS_PER_HOUR,
         max_flush_lifetime_ns: NS_PER_HOUR,
     };
-    assert!(set.satisfies_constraint());
-    set_gc_config(store.as_ref(), set, 1_000)
-        .await
-        .expect("a constraint-satisfying set writes sys/gc");
+    assert!(set.satisfies_constraint(ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS));
+    set_gc_config(
+        store.as_ref(),
+        set,
+        ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+        1_000,
+    )
+    .await
+    .expect("a constraint-satisfying set writes sys/gc");
 
     // A maintain process started with matching flags: its resolved compactor
     // horizon/grace equal the durable values.
@@ -192,11 +197,16 @@ async fn maintain_still_refuses_on_genuine_mismatch() {
         max_query_duration_ns: NS_PER_HOUR,
         max_flush_lifetime_ns: NS_PER_HOUR,
     };
-    set_gc_config(store.as_ref(), set, 1_000)
-        .await
-        .expect("set writes sys/gc");
+    set_gc_config(
+        store.as_ref(),
+        set,
+        ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+        1_000,
+    )
+    .await
+    .expect("set writes sys/gc");
 
-    // No --gc-* flags: the default 25h/24h compactor, which does not equal the
+    // No --gc-* flags: the default 25h5m/24h compactor, which does not equal the
     // operator's 50h/40h durable values.
     let compactor = compactor_for(&cli(&["--mode", "maintain"]));
 
@@ -227,10 +237,15 @@ async fn query_starts_after_gc_config_set_and_matching_deadline_flag() {
         max_query_duration_ns: 10 * 1_000_000_000,
         max_flush_lifetime_ns: NS_PER_HOUR,
     };
-    assert!(set.satisfies_constraint());
-    set_gc_config(store.as_ref(), set, 1_000)
-        .await
-        .expect("set writes sys/gc");
+    assert!(set.satisfies_constraint(ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS));
+    set_gc_config(
+        store.as_ref(),
+        set,
+        ravel_maintain::config::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+        1_000,
+    )
+    .await
+    .expect("set writes sys/gc");
     let gc = gc_config::bootstrap(store.as_ref(), 2_000)
         .await
         .expect("reads the durable object");

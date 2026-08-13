@@ -331,27 +331,61 @@ precondition is vacuously satisfied everywhere below, via a `LeaseCheck`
 hook that is a constant "unprotected" (a seam for future slow-consumer
 work, not a correctness dependency today). The first four rules anchor on
 durable timestamps (never wall-clock at sweep time); `protection_horizon
->= max_query_duration + grace` and `grace` (default 24 h) are shared
-across those four. The fifth rule (idempotency marker) anchors on the
-marker's own `<ingest_hour>` instead, and its own age gate carries a
-forward-skew tolerance the other four don't need (see below the table).
+>= max_query_duration + grace + clock_skew_allowance` and `grace`
+(default 24 h) are shared across those four. The fifth rule (idempotency
+marker) anchors on the marker's own `<ingest_hour>` instead, and its own age
+gate carries a forward-skew tolerance the other four don't need (see below the
+table).
 
 `protection_horizon`, `grace`, `max_query_duration`, and `max_flush_lifetime`
 are not per-process knobs each component sets independently. They are recorded
 once, deployment-wide, in the durable object `sys/gc` at the bucket root
 (ADR-0050 section 4, EC4). The first process to touch a fresh bucket bootstraps
 `sys/gc` from the maintain defaults via `CreateIfAbsent` (the defaults satisfy
-`protection_horizon >= max_query_duration + grace` by construction; a racing
-loser re-reads the winner's object, so a fresh bucket never fails startup), and
-only `ravel-cli gc-config set` mutates it, enforcing the constraint at write
-time and swapping with `CasVersion`. Every mode then validates itself against
-`sys/gc` at startup and refuses to start on a real violation: maintain's
-configured horizon and grace must equal the stored values; a query engine's
-deadline must be `<= max_query_duration`; a Flight SQL ticket-TTL ceiling must
-be `<= protection_horizon - grace`. A process that can read a bootstrapped
-`sys/gc` and finds a real violation does not start; there is no "assume
-defaults" path, because assumed defaults are precisely the cross-process drift
-this object exists to prevent.
+`protection_horizon >= max_query_duration + grace + clock_skew_allowance` by
+construction; a racing loser re-reads the winner's object, so a fresh bucket
+never fails startup), and only `ravel-cli gc-config set` mutates it, enforcing
+the constraint at write time and swapping with `CasVersion`. Every mode then
+validates itself against `sys/gc` at startup and refuses to start on a real
+violation: maintain's configured horizon and grace must equal the stored
+values; a query engine's deadline must be `<= max_query_duration`; a Flight SQL
+ticket-TTL ceiling must be `<= protection_horizon - grace`. A process that can
+read a bootstrapped `sys/gc` and finds a real violation does not start; there is
+no "assume defaults" path, because assumed defaults are precisely the
+cross-process drift this object exists to prevent.
+
+**The GC/reader interlock is this validated config, and it is a real fence
+(adversarial finding S1-02).** The four horizon-gated rules above enforce a
+reader's pinned snapshot purely by `protection_horizon` arithmetic against a
+durable anchor; there is no store-side lock on the objects a live reader holds.
+What makes that arithmetic sound against a sweeper whose clock disagrees is the
+`clock_skew_allowance` term in the constraint. A reader holds a resolved
+snapshot for at most `max_query_duration`. A sweeper deletes an anchored object
+once its own clock reads `now >= anchor + protection_horizon`; if that clock
+leads true time (and the reader's) by up to `clock_skew_allowance`, the sweeper
+reaches its threshold that much early in true time. So the horizon must budget
+for both: the reader's full hold **and** the sweeper's lead, with `grace`
+absorbing any residual. The bound
+
+```
+protection_horizon >= max_query_duration + grace + clock_skew_allowance
+```
+
+is exactly that budget. Because `ravel-cli gc-config set` (the single `sys/gc`
+mutation path, `ravel_maintain::set_gc_config`) refuses fail-closed any config
+that does not meet it, and the bootstrap defaults meet it by construction, **no
+reachable sweeper config can delete an object a pinned reader still holds**: a
+skew-uncovered horizon cannot be written in the first place. The
+`clock_skew_allowance` is not stored in `sys/gc` (the object's format is a
+frozen contract); it is a write-time input to the constraint, supplied from the
+sweeper's `CompactorConfig::clock_skew_allowance_ns` (default 5 min) via
+`ravel-cli gc-config set --clock-skew-allowance`. Residual not covered by the
+config fence: a sweeper whose real clock skew *exceeds* the deployment's
+declared `clock_skew_allowance`, or a query that runs longer than the declared
+`max_query_duration` (the query engine's own deadline enforcement, validated
+`<= max_query_duration` at startup, is what keeps the latter honest). Both are
+mis-declarations of the deployment's own parameters, not gaps a correctly
+declared config leaves open.
 
 | rule | targets | preconditions (ALL must hold) | anchor |
 |---|---|---|---|
