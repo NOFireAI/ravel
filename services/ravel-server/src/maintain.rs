@@ -470,19 +470,45 @@ impl MaintenanceTasks {
 /// carrying a config record is maintained unconditionally, so no flag can
 /// exclude it. Returns immediately; the task runs until
 /// [`MaintenanceTasks::shutdown`].
+///
+/// `stored_gc` is the durable `sys/gc` object `main` already bootstrapped and
+/// read (ADR-0050 section 4). Before this fail-closed startup RE-ASSERT (issue
+/// #993, closing the #904 gap): the write fence in `ravel-cli gc-config set`
+/// validates a proposed horizon against the *CLI's* declared
+/// `--clock-skew-allowance`, but that knob and THIS running sweeper's
+/// [`CompactorConfig::clock_skew_allowance_ns`] are independent -- a deployment
+/// could write `sys/gc` with a 5 min skew while running sweepers configured with
+/// a larger one, leaving the durable horizon skew-uncovered for the sweeper that
+/// actually deletes. [`ravel_server::gc_config::validate_maintain`] does not
+/// catch it (it only checks that the configured horizon and grace EQUAL the
+/// stored ones; the skew term is in neither). So before spawning the loop that
+/// runs the delete/GC path, re-assert `protection_horizon >= max_query_duration
+/// + grace + clock_skew_allowance` using the running sweeper's OWN skew. On a
+/// violation this returns [`GcConfigError::MaintainSkewUncovered`] and spawns
+/// nothing: FAIL CLOSED. A misconfigured, unsafe GC is an operator error to fix,
+/// strictly better than silently deleting a live reader's snapshot. This is on
+/// the shipping maintain binary's path (`ravel_server::start` -> `spawn` ->
+/// `run_loop`), so no sweep loop is ever entered with a skew-uncovered horizon.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
     fallback_allow: Vec<TenantHash>,
     config: MaintenanceTaskConfig,
+    stored_gc: ravel_maintain::GcConfigValues,
     metrics: Arc<TenantDiscoveryMetrics>,
     safety: Arc<MaintenanceSafetyMetrics>,
     ownership: Arc<MaintenanceOwnershipMetrics>,
     worker: Arc<WorkerSet>,
-) -> MaintenanceTasks {
+) -> Result<MaintenanceTasks, ravel_maintain::GcConfigError> {
     if !config.enabled {
-        return MaintenanceTasks::none();
+        return Ok(MaintenanceTasks::none());
     }
+
+    // Fail-closed skew re-assert (issue #993) BEFORE any delete path can run:
+    // the stored `sys/gc` horizon must cover THIS running sweeper's own
+    // `clock_skew_allowance_ns`, not just the write-time skew the horizon was
+    // authored against. A violation refuses to spawn the sweep loop at all.
+    ravel_maintain::validate_maintain_skew(&stored_gc, config.compactor.clock_skew_allowance_ns)?;
 
     // Production OS-entropy source (ADR-0068 decision 2) for the compactor
     // writer id and the per-tick loop jitter. The server always uses the
@@ -521,10 +547,10 @@ pub fn spawn(
         )
         .await;
     });
-    MaintenanceTasks {
+    Ok(MaintenanceTasks {
         shutdown: vec![tx],
         handles: vec![handle],
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4599,5 +4625,102 @@ mod tests {
             writes_at_stop,
             "the heartbeat task must stop when the loop ends -- no writes after shutdown, no leak"
         );
+    }
+
+    /// Issue #993 fail-closed re-assert (closing the #904 gap): a stored
+    /// `sys/gc` that satisfies its OWN write-time skew is still refused when the
+    /// RUNNING sweeper is configured with a LARGER `clock_skew_allowance`, so the
+    /// sweep loop that actually deletes is never spawned with a skew-uncovered
+    /// horizon. `spawn` returns [`ravel_maintain::GcConfigError::MaintainSkewUncovered`]
+    /// and no supervisor task is started -- no delete/GC path can run.
+    ///
+    /// The mirror: a stored horizon that DOES cover the running sweeper's skew
+    /// spawns normally.
+    ///
+    /// Flip line to watch the fail-closed check pass through (the sweep loop
+    /// would then spawn and delete): in `spawn`, change the re-assert to pass
+    /// `0` instead of `config.compactor.clock_skew_allowance_ns` (drop the
+    /// sweeper-skew term). The stored default horizon then meets the reduced
+    /// bound, `validate_maintain_skew` returns `Ok`, `spawn` returns `Ok`, and
+    /// the `expect_err` below panics.
+    #[tokio::test]
+    async fn spawn_fails_closed_when_running_sweeper_skew_exceeds_stored_horizon() {
+        // The stored durable object: the maintain defaults, whose horizon
+        // covers exactly the default 5m skew (`max_query_duration + grace + 5m`).
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let default_skew = CompactorConfig::default().clock_skew_allowance_ns;
+
+        // A running sweeper configured with a LARGER skew than the stored
+        // horizon budgets for: independent knob, never cross-checked before #993.
+        let over_skew = default_skew + 60_000_000_000; // +1 min
+        let fail_config = MaintenanceTaskConfig {
+            enabled: true,
+            compactor: CompactorConfig {
+                clock_skew_allowance_ns: over_skew,
+                ..CompactorConfig::default()
+            },
+            ..MaintenanceTaskConfig::default()
+        };
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let make_args = || {
+            (
+                Arc::new(TenantDiscoveryMetrics::default()),
+                Arc::new(MaintenanceSafetyMetrics::default()),
+                Arc::new(MaintenanceOwnershipMetrics::new(
+                    DEFAULT_STALLED_AFTER_INTERVALS,
+                )),
+                Arc::new(solo_worker()),
+            )
+        };
+
+        let (metrics, safety, ownership, worker) = make_args();
+        // `MaintenanceTasks` is not `Debug`, so match the Result rather than
+        // `expect_err` (which would need the Ok payload to be printable).
+        match spawn(
+            store.clone(),
+            Vec::new(),
+            fail_config,
+            stored_gc,
+            metrics,
+            safety,
+            ownership,
+            worker,
+        ) {
+            Err(ravel_maintain::GcConfigError::MaintainSkewUncovered {
+                clock_skew_allowance_ns,
+                stored_horizon_ns,
+                ..
+            }) => {
+                assert_eq!(clock_skew_allowance_ns, over_skew);
+                assert_eq!(stored_horizon_ns, stored_gc.protection_horizon_ns);
+            }
+            Err(other) => panic!("expected MaintainSkewUncovered, got: {other}"),
+            Ok(_) => panic!(
+                "a running sweeper skew the stored horizon does not cover must fail spawn, \
+                 not enter the sweep loop"
+            ),
+        }
+
+        // Mirror: the running sweeper's skew equals the default the stored
+        // horizon covers, so spawn succeeds and returns a running supervisor.
+        let ok_config = MaintenanceTaskConfig {
+            enabled: true,
+            compactor: CompactorConfig::default(),
+            ..MaintenanceTaskConfig::default()
+        };
+        let (metrics, safety, ownership, worker) = make_args();
+        let tasks = spawn(
+            store,
+            Vec::new(),
+            ok_config,
+            stored_gc,
+            metrics,
+            safety,
+            ownership,
+            worker,
+        )
+        .expect("a horizon that covers the running sweeper's skew spawns normally");
+        tasks.shutdown().await;
     }
 }

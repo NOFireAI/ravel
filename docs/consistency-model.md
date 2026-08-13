@@ -371,21 +371,43 @@ absorbing any residual. The bound
 protection_horizon >= max_query_duration + grace + clock_skew_allowance
 ```
 
-is exactly that budget. Because `ravel-cli gc-config set` (the single `sys/gc`
-mutation path, `ravel_maintain::set_gc_config`) refuses fail-closed any config
-that does not meet it, and the bootstrap defaults meet it by construction, **no
-reachable sweeper config can delete an object a pinned reader still holds**: a
-skew-uncovered horizon cannot be written in the first place. The
-`clock_skew_allowance` is not stored in `sys/gc` (the object's format is a
-frozen contract); it is a write-time input to the constraint, supplied from the
-sweeper's `CompactorConfig::clock_skew_allowance_ns` (default 5 min) via
-`ravel-cli gc-config set --clock-skew-allowance`. Residual not covered by the
-config fence: a sweeper whose real clock skew *exceeds* the deployment's
-declared `clock_skew_allowance`, or a query that runs longer than the declared
-`max_query_duration` (the query engine's own deadline enforcement, validated
-`<= max_query_duration` at startup, is what keeps the latter honest). Both are
-mis-declarations of the deployment's own parameters, not gaps a correctly
-declared config leaves open.
+is exactly that budget. The `clock_skew_allowance` is not stored in `sys/gc`
+(the object's format is a frozen contract); it is a config input to the
+constraint, supplied from the sweeper's
+`CompactorConfig::clock_skew_allowance_ns` (default 5 min). The fence is
+enforced at two choke points, and needs both to be sound against the sweeper
+that actually deletes:
+
+1. **Write time.** `ravel-cli gc-config set` (the single `sys/gc` mutation path,
+   `ravel_maintain::set_gc_config`) refuses fail-closed any config that does not
+   meet the bound, taking the skew from the CLI's `--clock-skew-allowance`, and
+   the bootstrap defaults meet it by construction. A skew-uncovered horizon
+   cannot be written in the first place.
+2. **Maintain startup.** The write-time skew and the running sweeper's
+   `CompactorConfig::clock_skew_allowance_ns` are independent knobs: a
+   deployment could write `sys/gc` with a 5 min skew while running sweepers
+   configured with a *larger* one, leaving the durable horizon skew-uncovered
+   for the process that actually deletes (the #904 write fence alone did not
+   close this; adversarial finding S1-02 residual). So at maintain startup the
+   server RE-ASSERTS the same bound with the skew taken from THIS running
+   sweeper's config (`ravel_maintain::validate_maintain_skew`, called from
+   `maintain::spawn` on the shipping `start` -> `spawn` -> `run_loop` path,
+   before any delete). A violation fails closed: `spawn` returns
+   `GcConfigError::MaintainSkewUncovered` and the sweep loop is never entered, so
+   startup fails before any listener binds rather than let the sweeper delete a
+   pinned snapshot. (The must-match check `validate_maintain` cannot catch this
+   on its own -- it only requires the configured horizon and grace to EQUAL the
+   stored values; the skew term is in neither field.)
+
+Because both fences hold, **no reachable sweeper config can delete an object a
+pinned reader still holds**: a skew-uncovered horizon can neither be written nor
+run against. Residual not covered by the config fence: a sweeper whose *real*
+clock skew exceeds its OWN declared `clock_skew_allowance` (a mis-measurement of
+the hardware, not a config mismatch the startup re-assert now catches), or a
+query that runs longer than the declared `max_query_duration` (the query
+engine's own deadline enforcement, validated `<= max_query_duration` at startup,
+is what keeps the latter honest). Both are mis-declarations of the deployment's
+own parameters, not gaps a correctly declared config leaves open.
 
 | rule | targets | preconditions (ALL must hold) | anchor |
 |---|---|---|---|
