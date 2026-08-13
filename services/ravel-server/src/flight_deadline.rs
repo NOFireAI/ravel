@@ -44,10 +44,26 @@
 //! Because the driver is polled by the runtime and not by hyper's send window,
 //! the sleep fires even while the client reads nothing. On the deadline arm the
 //! driver stops and drops the inner stream, which drops its `RecordOnStreamEnd`
-//! guard and releases the `QueryPermit`; it also tries (non-blocking) to hand the
-//! client the same typed error ravel-sql maps `SnapshotInvalidated` to, so a
-//! consumer that later starts reading sees a defined failure rather than a bare
-//! stream close.
+//! guard and releases the `QueryPermit`. That permit release is the goal, and it
+//! happens on every deadline exit regardless of what the client observes.
+//!
+//! What the client observes is *not* uniform, because the deadline arm only
+//! attempts a non-blocking `try_send` of the typed error (blocking for channel
+//! room would wait out the very stall this exists to break):
+//!
+//!  - A client still draining the stream leaves the cap-1 channel empty, the
+//!    `try_send` succeeds, and it receives the typed `Unavailable` error as the
+//!    stream's terminal item. This is the case a slow-but-progressing consumer
+//!    that crosses the ceiling lands in.
+//!  - A fully stalled (non-reading) client is stalled *because* the cap-1 channel
+//!    is full -- that is what parks the driver's forwarding `send` -- so the
+//!    `try_send` fails and the error is dropped. Such a client, if it later reads,
+//!    gets the one buffered frame and then a bare stream close with no gRPC error
+//!    status. It cannot distinguish that from a normal end of results.
+//!
+//! So the typed error is best-effort signalling, not a guarantee; only the permit
+//! release is guaranteed. Improving the stalled client's signal would need an
+//! out-of-band path to the trailers rather than a slot in the same full channel.
 //!
 //! # Not a shorter timeout
 //!
@@ -111,10 +127,13 @@ impl<S> DeadlineBoundedFlightService<S> {
     }
 }
 
-/// The deadline error handed to the client, byte-identical to how ravel-sql maps
+/// The deadline error the driver *attempts* to hand the client (see
+/// [`deadline_reached`]: it is a `try_send`, so a stalled client whose full
+/// channel caused the deadline never receives it). When it is delivered it is
+/// byte-identical to how ravel-sql maps
 /// [`SqlError::SnapshotInvalidated`](ravel_sql) through its own Flight status
-/// boundary: a `Unavailable` with the fixed redacted message. A stalled `DoGet`
-/// that crossed the server ceiling is the same class of event as a pin whose GC
+/// boundary: a `Unavailable` with the fixed redacted message. A `DoGet` that
+/// crossed the server ceiling is the same class of event as a pin whose GC
 /// protection window closed mid-stream, so it presents identically and a client
 /// cannot tell the two apart (nor should it: both mean "retry, the snapshot is
 /// no longer being served").
@@ -176,11 +195,17 @@ where
     }
 }
 
-/// The deadline arm shared by both `select!`s in [`drive`]: hand the client the
+/// The deadline arm shared by both `select!`s in [`drive`]: offer the client the
 /// typed error if the channel has room right now -- never block waiting for
 /// room, since a full channel is the very stall this deadline exists to break --
 /// then let the caller `return`, dropping the inner stream and releasing the
 /// permit.
+///
+/// The `try_send` result is deliberately discarded, and it does fail in a real
+/// stall: a non-reading client's un-drained item occupies the single slot, so the
+/// error is dropped and that client sees a bare stream close instead of a status
+/// (module docs, "What the client observes"). A client still draining gets the
+/// error. The permit release below does not depend on either outcome.
 fn deadline_reached(tx: &mpsc::Sender<Result<FlightData, Status>>) {
     let _ = tx.try_send(Err(deadline_status()));
 }
@@ -363,6 +388,48 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "the inner stream (and its permit) is dropped by the deadline"
+        );
+    }
+
+    /// What a fully stalled client actually observes after the deadline, and the
+    /// reason the module docs do not promise it the typed error: the one item it
+    /// never drained is still occupying the cap-1 channel when the deadline arm
+    /// runs, so `try_send` of the error fails and is discarded. Reading the
+    /// channel afterwards yields that buffered frame and then a close, with no
+    /// status anywhere. The permit release (asserted above) is unaffected.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_receiver_gets_the_buffered_frame_then_a_bare_close() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let inner = DropFlagStream {
+            dropped: Arc::clone(&dropped),
+            remaining: None,
+        };
+        let (tx, mut rx) = mpsc::channel::<Result<FlightData, Status>>(DOGET_CHANNEL_CAPACITY);
+        let deadline = Duration::from_secs(30);
+        let handle = tokio::spawn(drive(inner, tx, deadline));
+
+        // Same shape as the test above: let the driver fill the channel and park
+        // on `send` with its sleep armed, then cross the deadline.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(deadline + Duration::from_secs(1)).await;
+        handle.await.expect("driver task joins");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the permit is still released"
+        );
+
+        // Only now does this client read.
+        let first = rx
+            .recv()
+            .await
+            .expect("the one buffered frame is still there");
+        assert!(first.is_ok(), "the buffered item is a frame, not the error");
+        assert!(
+            rx.recv().await.is_none(),
+            "the channel closes with no status: the deadline error's try_send lost \
+             the single slot to the un-drained frame"
         );
     }
 
