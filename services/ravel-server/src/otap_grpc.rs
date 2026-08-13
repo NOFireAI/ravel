@@ -24,7 +24,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use ravel_ingest::{IngestPoint, WriteMode};
+use ravel_ingest::{IngestPoint, WriteMode, plausible_ingest_clock};
 use ravel_otap::normalize::normalize_decoded;
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
@@ -202,6 +202,12 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
                     ),
                     false,
                 ),
+                // Receiver-clock floor (ADR-0051 amendment, S1-12): UNAVAILABLE,
+                // the replica's fault. The batch already decoded cleanly, so the
+                // decoder is unharmed and the stream stays open (false).
+                Err(IngestRequestError::ClockImplausible(msg)) => {
+                    (nack(batch_id, StatusCode::Unavailable, msg), false)
+                }
                 // A hard shard_count provisioning failure (ADR-0050 section 5):
                 // the configured value would resolve over a subset of shards, or
                 // the record is unreadable so the true shard_count is unknown.
@@ -272,6 +278,16 @@ async fn write_batch(
     decoded: &DecodedBatch,
     ingest_ts_ns: i64,
 ) -> Result<WriteOutcome, IngestRequestError> {
+    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): checked before
+    // the normalize window is computed. A nonsense reference clock rejects the
+    // batch UNAVAILABLE (counted reason="clock"); the fault is the replica's.
+    if let Err(msg) = plausible_ingest_clock(ingest_ts_ns) {
+        ingest
+            .admission
+            .record_clock_rejection(tenant, ravel_types::Signal::Metrics);
+        return Err(IngestRequestError::ClockImplausible(msg));
+    }
+
     // Record the tenant's recovery manifest on its first write in this process
     // (ADR-0050 section 3). Best-effort and off the durability path: see
     // `crate::tenancy::ensure_recovery_manifest`. OTAP is a genuinely separate

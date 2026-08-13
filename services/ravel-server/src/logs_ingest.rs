@@ -10,7 +10,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 };
 use ravel_ingest::{
     AdmissionController, IdempotencyReceipt, LogIngestRouter, LogWriteError, LookupOutcome,
-    RequestRejection, WriteMode, read_marker, write_marker,
+    RequestRejection, WriteMode, plausible_ingest_clock, read_marker, write_marker,
 };
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
@@ -71,6 +71,10 @@ pub enum LogIngestRequestError {
     /// A whole-request, retryable-later rejection: stream-creation-rate
     /// exceeded. No tokens are consumed on rejection.
     Admission(RequestRejection),
+    /// The receiver's admission-time clock was implausible (ADR-0051
+    /// amendment, S1-12). Whole-request HTTP 503 / gRPC `UNAVAILABLE`; the
+    /// replica's fault, retryable against a healthy replica.
+    ClockImplausible(String),
     /// The supplied `x-ravel-idempotency-key` exceeds
     /// [`crate::otlp_http::MAX_IDEMPOTENCY_KEY_BYTES`]. Not retryable as-is
     /// (the client must send a shorter key); mapped to HTTP 400 / gRPC
@@ -90,6 +94,7 @@ impl std::fmt::Display for LogIngestRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LogIngestRequestError::Admission(rejection) => write!(f, "{}", rejection.reason),
+            LogIngestRequestError::ClockImplausible(msg) => write!(f, "{msg}"),
             LogIngestRequestError::InvalidIdempotencyKey { len } => write!(
                 f,
                 "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
@@ -108,6 +113,8 @@ impl LogIngestRequestError {
     pub fn is_retryable(&self) -> bool {
         match self {
             LogIngestRequestError::Admission(_) => true,
+            // The bad clock is the replica's; a retry against a healthy one works.
+            LogIngestRequestError::ClockImplausible(_) => true,
             // Retrying the identical over-long key cannot succeed; the client
             // must change it.
             LogIngestRequestError::InvalidIdempotencyKey { .. } => false,
@@ -133,6 +140,16 @@ pub async fn handle_export_logs(
     ingest_ts_ns: i64,
     idempotency_key: Option<Vec<u8>>,
 ) -> Result<LogIngestOutcome, LogIngestRequestError> {
+    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): checked before
+    // any other work, since the hour bucket the marker path and normalize both
+    // derive is nonsense on a bad clock. Whole-request 503 / UNAVAILABLE,
+    // counted reason="clock".
+    if let Err(msg) = plausible_ingest_clock(ingest_ts_ns) {
+        state
+            .admission
+            .record_clock_rejection(&tenant, Signal::Logs);
+        return Err(LogIngestRequestError::ClockImplausible(msg));
+    }
     // Validate the opt-in idempotency key up front: an over-long key is a
     // typed rejection, never truncated (silent truncation would collapse two
     // distinct keys into one dedup identity).
@@ -372,6 +389,13 @@ mod tests {
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
+    /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
+    /// (ADR-0051 amendment, S1-12): the fixture ingest clock and every log
+    /// record timestamp anchor to it so the receiver-clock plausibility floor
+    /// admits the request. Never `SystemTime::now()`, so tests stay
+    /// deterministic.
+    const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
+
     fn state() -> LogIngestState {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router = Arc::new(LogIngestRouter::new(
@@ -424,8 +448,10 @@ mod tests {
 
     fn record(body: &str, attrs: Vec<KeyValue>) -> LogRecord {
         LogRecord {
-            time_unix_nano: 1_000,
-            observed_time_unix_nano: 1_000,
+            // Base-relative so the resolved record ts sits inside the admission
+            // window around the fixture ingest clock (BASE_TS_NS).
+            time_unix_nano: BASE_TS_NS as u64,
+            observed_time_unix_nano: BASE_TS_NS as u64,
             severity_number: 9,
             severity_text: "INFO".to_string(),
             body: Some(AnyValue {
@@ -450,7 +476,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             request,
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -490,7 +516,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             request(vec![rec]),
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -512,7 +538,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Buffered,
             request(vec![record("hello", vec![string_kv("k", "v")])]),
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -535,7 +561,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             request(vec![record("hello", vec![string_kv("k", "v")])]),
-            1_000,
+            BASE_TS_NS,
             Some(key),
         )
         .await
@@ -559,7 +585,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             request(vec![record("hello", vec![string_kv("k", "v")])]),
-            1_000,
+            BASE_TS_NS,
             Some(at_cap),
         )
         .await

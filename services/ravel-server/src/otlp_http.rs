@@ -284,6 +284,11 @@ async fn export_metrics(
             encode_commit_tokens(&outcome.tokens).as_deref(),
         ),
         Err(IngestRequestError::Admission(rejection)) => admission_rejection_response(rejection),
+        // Receiver-clock floor (ADR-0051 amendment, S1-12): 503, the fault is
+        // the replica's and a retry against a healthy one succeeds.
+        Err(err @ IngestRequestError::ClockImplausible(_)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
         Err(err @ IngestRequestError::Provisioning(_)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
@@ -357,6 +362,9 @@ async fn export_logs(
             outcome.commit_token_header().as_deref(),
         ),
         Err(LogIngestRequestError::Admission(rejection)) => admission_rejection_response(rejection),
+        Err(err @ LogIngestRequestError::ClockImplausible(_)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
         Err(err @ LogIngestRequestError::InvalidIdempotencyKey { .. }) => {
             (StatusCode::BAD_REQUEST, err.to_string()).into_response()
         }
@@ -430,6 +438,9 @@ async fn export_traces(
             outcome.response.encode_to_vec(),
             outcome.commit_token_header().as_deref(),
         ),
+        Err(err @ SpanIngestRequestError::ClockImplausible(_)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
         Err(err @ SpanIngestRequestError::InvalidIdempotencyKey { .. }) => {
             (StatusCode::BAD_REQUEST, err.to_string()).into_response()
         }

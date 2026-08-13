@@ -112,13 +112,16 @@ impl Level {
 }
 
 /// The `reason` label on `ravel_admission_rejected_total` (ADR-0051 section
-/// 6). ADR-0051 names a closed set of six reasons
-/// `{body_size, byte_rate, series_rate, series_cap, skew, structural}`; the
-/// three here are exactly the ones `AdmissionController::usage_snapshot`
-/// counts today (`ravel_ingest::TenantUsage`). The other three are enforced
-/// at layers that keep no per-tenant counter in that snapshot yet (body size
-/// at the transport, skew and structural in normalization), so a variant for
-/// them would render samples no data source can fill. They join this enum
+/// 6, extended by the 2026-08-13 amendment). ADR-0051 named a closed set of
+/// six reasons `{body_size, byte_rate, series_rate, series_cap, skew,
+/// structural}`; the amendment adds a seventh, `clock`, for the receiver-clock
+/// floor (S1-12). The four here are exactly the ones
+/// `AdmissionController::usage_snapshot` counts today
+/// (`ravel_ingest::TenantUsage`). The remaining three (body_size, skew,
+/// structural) are enforced at layers that keep no per-tenant counter in that
+/// snapshot yet (body size at the transport, skew and structural in
+/// normalization, surfaced there through OTLP partial success), so a variant
+/// for them would render samples no data source can fill. They join this enum
 /// when their counters do, additively, the same way a new `Signal` variant
 /// joins `signal_name`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,16 +129,21 @@ pub enum RejectReason {
     ByteRate,
     SeriesRate,
     SeriesCap,
+    /// The receiver's admission clock was implausible (below the 2020 floor or
+    /// non-representable), so the whole request was rejected 503 / `UNAVAILABLE`
+    /// (ADR-0051 amendment, S1-12). The fault is the replica's, not the data's.
+    Clock,
 }
 
 impl RejectReason {
-    /// Every reason with a counter, so the rejected family renders all three
+    /// Every reason with a counter, so the rejected family renders all four
     /// series per (tenant, signal) even when some are zero (the same
     /// zero-is-not-absence discipline the other families keep).
-    const ALL: [RejectReason; 3] = [
+    const ALL: [RejectReason; 4] = [
         RejectReason::ByteRate,
         RejectReason::SeriesRate,
         RejectReason::SeriesCap,
+        RejectReason::Clock,
     ];
 
     fn name(self) -> &'static str {
@@ -143,6 +151,7 @@ impl RejectReason {
             RejectReason::ByteRate => "byte_rate",
             RejectReason::SeriesRate => "series_rate",
             RejectReason::SeriesCap => "series_cap",
+            RejectReason::Clock => "clock",
         }
     }
 }
@@ -1770,6 +1779,7 @@ struct AdmissionAcc {
     rejected_byte_rate: u64,
     rejected_series_rate: u64,
     rejected_series_cap: u64,
+    rejected_clock: u64,
     reconciliation_failures: u64,
 }
 
@@ -1779,6 +1789,7 @@ impl AdmissionAcc {
             RejectReason::ByteRate => self.rejected_byte_rate,
             RejectReason::SeriesRate => self.rejected_series_rate,
             RejectReason::SeriesCap => self.rejected_series_cap,
+            RejectReason::Clock => self.rejected_clock,
         }
     }
 }
@@ -1819,6 +1830,9 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
         acc.rejected_series_cap = acc
             .rejected_series_cap
             .saturating_add(row.series_rejected_cap_total);
+        acc.rejected_clock = acc
+            .rejected_clock
+            .saturating_add(row.requests_rejected_clock_total);
         acc.reconciliation_failures = acc
             .reconciliation_failures
             .saturating_add(row.reconciliation_failures_total);
@@ -1895,7 +1909,7 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
     write_header(
         out,
         "ravel_admission_rejected_total",
-        "Admission rejections by tenant, signal, and reason (byte_rate, series_rate, series_cap).",
+        "Admission rejections by tenant, signal, and reason (byte_rate, series_rate, series_cap, clock).",
         "counter",
     );
     for ((hash, signal), acc) in &ordered {
@@ -3969,6 +3983,7 @@ mod tests {
             series_admitted_total: 0,
             requests_rejected_byte_rate_total: 0,
             requests_rejected_series_rate_total: 0,
+            requests_rejected_clock_total: 0,
             series_rejected_cap_total: 0,
             reconciliation_failures_total: 0,
         }
@@ -4141,6 +4156,45 @@ mod tests {
                 hashes[2]
             )),
             "series_cap rejection must render distinctly:\n{body}"
+        );
+    }
+
+    /// The 2026-08-13 amendment's `reason="clock"` series renders from the
+    /// per-tenant clock-rejection counter, and it is present even at zero
+    /// (zero-is-not-absence), so a scraper can alert on it appearing.
+    #[test]
+    fn admission_family_renders_the_clock_reason() {
+        let mut row = tenant_usage("skewed", Signal::Metrics);
+        row.requests_rejected_clock_total = 7;
+        let snapshot = AdmissionCountersSnapshot {
+            usage: vec![row],
+            tenant_labels: true,
+        };
+        let hash = ravel_types::TenantId::new("skewed").hash().to_hex();
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &snapshot,
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"metrics\",reason=\"clock\"}} 7"
+            )),
+            "clock rejection must render distinctly:\n{body}"
         );
     }
 

@@ -79,6 +79,11 @@ impl TraceService for GrpcTraceService {
         )
         .await
         .map_err(|err| match err {
+            // Receiver-clock floor (ADR-0051 amendment, S1-12): UNAVAILABLE,
+            // the replica's fault; a retry against a healthy one succeeds.
+            err @ SpanIngestRequestError::ClockImplausible(_) => {
+                Status::unavailable(err.to_string())
+            }
             err @ SpanIngestRequestError::InvalidIdempotencyKey { .. } => {
                 Status::invalid_argument(err.to_string())
             }

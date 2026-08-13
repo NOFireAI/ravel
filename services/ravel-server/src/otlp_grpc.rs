@@ -104,6 +104,9 @@ impl MetricsService for GrpcMetricsService {
         .await
         .map_err(|err| match err {
             IngestRequestError::Admission(rejection) => admission_rejection_status(rejection),
+            // Receiver-clock floor (ADR-0051 amendment, S1-12): UNAVAILABLE,
+            // the replica's fault; a retry against a healthy one succeeds.
+            err @ IngestRequestError::ClockImplausible(_) => Status::unavailable(err.to_string()),
             IngestRequestError::Provisioning(prov_err) => Status::internal(prov_err.to_string()),
             // The buffer-budget shed (ADR-0069) is RESOURCE_EXHAUSTED, the same
             // status the byte-rate and in-flight sheds use, not the UNAVAILABLE

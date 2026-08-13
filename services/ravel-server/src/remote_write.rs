@@ -20,7 +20,7 @@ use axum::routing::post;
 use bytes::Bytes;
 use ravel_ingest::{
     AdmissionController, IngestPoint, IngestRouter, IngestValue, RequestRejection, WriteError,
-    WriteMode,
+    WriteMode, plausible_ingest_clock,
 };
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
@@ -280,6 +280,22 @@ async fn remote_write(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
+
+    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): checked before
+    // any per-record work and before every other now_ns() reading in this
+    // handler. Whole-request 503, counted reason="clock"; the fault is the
+    // replica's, and a retry against a healthy one succeeds.
+    if let Err(msg) = plausible_ingest_clock(now_ns()) {
+        state
+            .admission
+            .record_clock_rejection(&tenant, Signal::Metrics);
+        state.metrics.record_request_rejected();
+        let mut response = (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
+        if let Ok(value) = HeaderValue::from_str(&RETRY_AFTER_SECONDS.to_string()) {
+            response.headers_mut().insert(RETRY_AFTER_HEADER, value);
+        }
+        return response;
+    }
 
     // Record the tenant's recovery manifest on its first write (ADR-0050
     // section 3), best-effort and off the durability path.

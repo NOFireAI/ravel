@@ -78,6 +78,9 @@ impl LogsService for GrpcLogsService {
         .await
         .map_err(|err| match err {
             LogIngestRequestError::Admission(rejection) => admission_rejection_status(rejection),
+            err @ LogIngestRequestError::ClockImplausible(_) => {
+                Status::unavailable(err.to_string())
+            }
             err @ LogIngestRequestError::InvalidIdempotencyKey { .. } => {
                 Status::invalid_argument(err.to_string())
             }

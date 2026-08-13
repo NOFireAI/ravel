@@ -8,8 +8,8 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 use ravel_ingest::{
-    IdempotencyReceipt, LookupOutcome, SpanIngestRouter, SpanWriteError, WriteMode, read_marker,
-    write_marker,
+    AdmissionController, IdempotencyReceipt, LookupOutcome, SpanIngestRouter, SpanWriteError,
+    WriteMode, plausible_ingest_clock, read_marker, write_marker,
 };
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
@@ -24,6 +24,11 @@ pub struct SpanIngestState {
     pub router: Arc<SpanIngestRouter>,
     pub limits: SpanIngestLimits,
     pub ack_deadline: Duration,
+    /// Tenant admission controller. Spans get no layer-4 series/stream
+    /// admission (ADR-0051 excludes them), so this is used only to record the
+    /// receiver-clock rejection counter (`reason="clock"`, ADR-0051 amendment,
+    /// S1-12); the shared `GatewayState.admission` charges span byte rate.
+    pub admission: Arc<AdmissionController>,
     /// Object store, for the idempotency marker read/write (ADR-0051 section
     /// 5), the span-pipeline counterpart of
     /// [`crate::logs_ingest::LogIngestState::store`].
@@ -60,6 +65,10 @@ impl SpanIngestOutcome {
 /// non-write failure is an invalid idempotency key.
 #[derive(Debug, Clone)]
 pub enum SpanIngestRequestError {
+    /// The receiver's admission-time clock was implausible (ADR-0051
+    /// amendment, S1-12). Whole-request HTTP 503 / gRPC `UNAVAILABLE`; the
+    /// replica's fault, retryable against a healthy replica.
+    ClockImplausible(String),
     /// The supplied `x-ravel-idempotency-key` exceeds
     /// [`crate::otlp_http::MAX_IDEMPOTENCY_KEY_BYTES`]; mapped to HTTP 400 /
     /// gRPC `InvalidArgument`. Rejected rather than truncated.
@@ -76,6 +85,7 @@ pub enum SpanIngestRequestError {
 impl std::fmt::Display for SpanIngestRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SpanIngestRequestError::ClockImplausible(msg) => write!(f, "{msg}"),
             SpanIngestRequestError::InvalidIdempotencyKey { len } => write!(
                 f,
                 "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
@@ -95,6 +105,8 @@ impl SpanIngestRequestError {
     /// misconfiguration and cannot succeed on a naive retry.
     pub fn is_retryable(&self) -> bool {
         match self {
+            // The bad clock is the replica's; a retry against a healthy one works.
+            SpanIngestRequestError::ClockImplausible(_) => true,
             SpanIngestRequestError::InvalidIdempotencyKey { .. } => false,
             SpanIngestRequestError::Provisioning(_) => false,
             SpanIngestRequestError::Write(err) => err.is_retryable(),
@@ -117,6 +129,16 @@ pub async fn handle_export_traces(
     ingest_ts_ns: i64,
     idempotency_key: Option<Vec<u8>>,
 ) -> Result<SpanIngestOutcome, SpanIngestRequestError> {
+    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): checked before
+    // any other work; the hour bucket the marker path and normalize both
+    // derive is nonsense on a bad clock. Whole-request 503 / UNAVAILABLE,
+    // counted reason="clock".
+    if let Err(msg) = plausible_ingest_clock(ingest_ts_ns) {
+        state
+            .admission
+            .record_clock_rejection(&tenant, Signal::Spans);
+        return Err(SpanIngestRequestError::ClockImplausible(msg));
+    }
     // Validate the opt-in idempotency key up front; an over-long key is a
     // typed rejection, never truncated.
     if let Some(key) = &idempotency_key
@@ -315,9 +337,15 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
-    use ravel_ingest::{IngestConfig, SystemClock};
+    use ravel_ingest::{AdmissionController, AdmissionLimits, IngestConfig, SystemClock};
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
+
+    /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
+    /// (ADR-0051 amendment, S1-12): every fixture clock and span timestamp is
+    /// anchored to it so the receiver-clock plausibility floor admits the
+    /// request. Never `SystemTime::now()`, so tests stay deterministic.
+    const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
 
     fn state() -> SpanIngestState {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -333,6 +361,10 @@ mod tests {
             router,
             limits: SpanIngestLimits::default(),
             ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
             store,
             recovery: None,
             provisioning: None,
@@ -370,8 +402,10 @@ mod tests {
             trace_id: vec![7u8; 16],
             span_id: vec![3u8; 8],
             name: name.to_string(),
-            start_time_unix_nano: 1_000,
-            end_time_unix_nano: 2_000,
+            // Base-relative so the span's end sits inside the admission window
+            // around the fixture ingest clock (BASE_TS_NS).
+            start_time_unix_nano: BASE_TS_NS as u64,
+            end_time_unix_nano: (BASE_TS_NS + 1_000) as u64,
             attributes: attrs,
             ..Default::default()
         }
@@ -391,7 +425,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             request,
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -435,7 +469,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             request,
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -467,8 +501,10 @@ mod tests {
         // time range) mixed with clean spans must still report rejected_spans == 1.
         let state = state();
         let mut inverted = span("inverted", Vec::new());
-        inverted.start_time_unix_nano = 5_000;
-        inverted.end_time_unix_nano = 1_000;
+        // end precedes start: an InvalidTimeRange rejection, checked before the
+        // skew bounds. Base-relative like every other fixture timestamp.
+        inverted.start_time_unix_nano = (BASE_TS_NS + 5_000) as u64;
+        inverted.end_time_unix_nano = (BASE_TS_NS + 1_000) as u64;
         let request = request(vec![
             span("GET /checkout", vec![string_kv("k", "v")]),
             inverted,
@@ -479,7 +515,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             request,
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -517,7 +553,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             request(vec![bad]),
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -539,7 +575,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Buffered,
             request(vec![span("GET /checkout", vec![string_kv("k", "v")])]),
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -577,7 +613,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Strict,
             req,
-            1_000,
+            BASE_TS_NS,
             None,
         )
         .await
@@ -607,9 +643,9 @@ mod tests {
 
         let state = state();
         let tenant = TenantId::new("acme");
-        // Matches the span helper's start/end (1_000/2_000), so the event-time
-        // skew bounds admit it; the hour bucket is 0.
-        let ingest_ts_ns: i64 = 2_000;
+        // Just after the span helper's base-relative end (BASE_TS_NS + 1_000),
+        // so the event-time skew bounds admit it and the clock floor passes.
+        let ingest_ts_ns: i64 = BASE_TS_NS + 2_000;
         let key = b"corrupt-key".to_vec();
         let bucket = request_ingest_hour_bucket(ingest_ts_ns).expect("valid bucket");
 
