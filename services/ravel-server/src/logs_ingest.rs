@@ -592,6 +592,66 @@ mod tests {
         .expect("a key exactly at the cap is accepted");
     }
 
+    /// #991: a logs request whose receiver (ingest) clock is below the 2020
+    /// floor must be rejected as the whole-request `ClockImplausible` error
+    /// (retryable, so the transport maps it to gRPC `UNAVAILABLE` / HTTP 503),
+    /// and the `reason="clock"` admission counter for the tenant's Logs signal
+    /// must increment. The clock is a fixed sub-floor timestamp, never
+    /// `SystemTime::now()`.
+    ///
+    /// Non-vacuity: delete the `plausible_ingest_clock` guard at the top of
+    /// `handle_export_logs` (logs_ingest.rs, the `if let Err(msg) = ...` block)
+    /// and this test fails, because the empty request then writes cleanly and
+    /// returns `Ok`, and the counter stays at 0.
+    #[tokio::test]
+    async fn receiver_clock_below_floor_rejects_unavailable_with_reason_clock() {
+        use ravel_ingest::MIN_PLAUSIBLE_INGEST_CLOCK_NS;
+
+        let state = state();
+        let tenant = TenantId::new("acme");
+        // One nanosecond below the 2020 floor: an implausible receiver clock.
+        let sub_floor = MIN_PLAUSIBLE_INGEST_CLOCK_NS - 1;
+
+        // `LogIngestOutcome` is `Debug`, but match to mirror the other surfaces.
+        let err = match handle_export_logs(
+            &state,
+            tenant.clone(),
+            WriteMode::Strict,
+            request(Vec::new()),
+            sub_floor,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a sub-floor receiver clock must reject the whole request"),
+            Err(err) => err,
+        };
+
+        // (a) The typed rejection is ClockImplausible, and it is retryable, so
+        // the transport maps it to gRPC UNAVAILABLE / HTTP 503.
+        assert!(
+            matches!(err, LogIngestRequestError::ClockImplausible(_)),
+            "expected ClockImplausible, got: {err:?}"
+        );
+        assert!(
+            err.is_retryable(),
+            "ClockImplausible is retryable, which the transport maps to UNAVAILABLE/503"
+        );
+
+        // (b) The admission rejected counter increments under reason=\"clock\"
+        // for this tenant's Logs signal.
+        let row = state
+            .admission
+            .usage_snapshot()
+            .into_iter()
+            .find(|r| r.tenant_hash == tenant.hash() && r.signal == Signal::Logs)
+            .expect("a logs usage row exists after the clock rejection");
+        assert_eq!(
+            row.requests_rejected_clock_total, 1,
+            "the reason=\"clock\" rejected counter incremented exactly once"
+        );
+    }
+
     #[test]
     fn build_error_message_collapses_one_grouped_reason_into_one_entry_with_count() {
         let rejected = vec![LogRejection::Grouped {
