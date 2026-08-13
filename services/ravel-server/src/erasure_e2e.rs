@@ -1157,3 +1157,122 @@ mod spans {
         );
     }
 }
+
+// === Failure path: a faulted rewrite-record publish is safe ===============
+
+mod fault {
+    use super::*;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+
+    /// A fault during the rewrite-record publish must leave the system in a safe
+    /// state: the rewrite does not complete, so no `.done` is written and the
+    /// `.dreq` is kept (never removed without its `.done`), and -- critically for
+    /// an irreversible operation -- the pre-rewrite input is NOT deleted (no
+    /// partial erasure), so the subject's data is fully recoverable. A later
+    /// fault-free tick completes the erasure and, past the horizon, physically
+    /// removes the input.
+    ///
+    /// The fault targets the FIRST `Put` whose key contains `/rw.` -- the
+    /// selective-erasure rewrite record. Its output parts may land, but with no
+    /// live rewrite record naming them the input stays live and the request stays
+    /// pending, exactly the state the ordering guarantee promises.
+    #[tokio::test]
+    async fn a_faulted_rewrite_publish_deletes_nothing_and_completes_on_retry() {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let data_key = publish_metrics_bucket(&inner, &tenant_id, 0, "a").await;
+
+        let request_id = Uuid::from_u128(0xE7D0);
+        let dreq_key = submit_erasure_request(
+            &inner,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            ERASED_SUBJECT,
+            TEST_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        // Fault the FIRST publish of a rewrite record (`/rw.`) and nothing else,
+        // so the recovery ticks run against an otherwise untouched store.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Transient("rewrite record publish unavailable".into()),
+            )
+            .with_key_contains("/rw.")
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        let mut harness = TickHarness::new();
+
+        // Tick 1 under the fault: the rewrite publish fails.
+        harness.tick(&store, &tenant, TEST_NOW_NS, 1).await;
+
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Transient),
+            1,
+            "the injected rewrite-publish fault must actually have fired"
+        );
+        assert!(
+            rewrite_records(&store, &tenant, Signal::Metrics, 0, 0)
+                .await
+                .is_empty(),
+            "a faulted rewrite publishes no live rewrite record"
+        );
+        assert!(
+            !object_exists(&store, &done_key).await,
+            "no rewrite completed, so no .done may be written"
+        );
+        assert!(
+            object_exists(&store, &dreq_key).await,
+            "the .dreq is kept: it is never removed without its .done"
+        );
+        assert!(
+            object_exists(&store, &data_key).await,
+            "no partial deletion: the pre-rewrite input still holds the subject's bytes, so the \
+             erasure is fully recoverable after the fault"
+        );
+
+        // Tick 2, past the one-shot fault: the rewrite completes.
+        harness.tick(&store, &tenant, TEST_NOW_NS, 1).await;
+        assert_eq!(
+            rewrite_records(&store, &tenant, Signal::Metrics, 0, 0)
+                .await
+                .len(),
+            1,
+            "the fault-free retry publishes the rewrite record"
+        );
+        assert!(
+            object_exists(&store, &done_key).await,
+            "the fault-free retry completes the request"
+        );
+        assert!(
+            object_exists(&store, &dreq_key).await,
+            ".dreq is kept until protection_horizon elapses past .done"
+        );
+
+        // Tick 3, past the horizon: the request is swept and the input physically
+        // removed -- the erasure the fault deferred is now durably complete.
+        let past_horizon = TEST_NOW_NS + harness.protection_horizon_ns() + 1;
+        harness.tick(&store, &tenant, past_horizon, 1).await;
+        assert!(
+            object_exists(&store, &done_key).await,
+            ".done is permanent erasure evidence"
+        );
+        assert!(
+            !object_exists(&store, &dreq_key).await,
+            ".dreq is swept once its .done is older than protection_horizon"
+        );
+        assert!(
+            !object_exists(&store, &data_key).await,
+            "physical absence: the input the fault preserved is now superseded and swept"
+        );
+    }
+}
