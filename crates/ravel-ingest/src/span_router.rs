@@ -731,6 +731,54 @@ mod tests {
         );
     }
 
+    /// Flush-open floor fail-loud (ADR-0051 amendment §7 extension, S1-12): a
+    /// flush whose open clock reads below `MIN_PLAUSIBLE_INGEST_CLOCK_NS` (here
+    /// hour 100, in 1970) fails the strict write loudly with
+    /// `SegmentBuild`, rather than silently bucketing acked data into a
+    /// far-past ingest hour. Proves the floor propagates from
+    /// `checked_ingest_hour_bucket` through the shard flush to the waiter.
+    #[tokio::test]
+    async fn sub_floor_flush_clock_fails_the_write_loudly() {
+        let store = Arc::new(MemoryStore::new());
+        // A positive but pre-2020 clock: passes the old non-positive guard, the
+        // amendment's floor rejects it.
+        let clock = Arc::new(ManualClock::new(100 * NS_PER_HOUR));
+        let router = SpanIngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 1, // flush every write immediately
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            clock.clone(),
+        );
+        let tenant = TenantId::new("acme");
+        router.refresh_generations(tenant.hash(), vec![sg(0, 1, 0)], clock.now_ns());
+
+        let err = router
+            .write(
+                tenant.clone(),
+                vec![norm_span(trace_id(1), 1, 1_000)],
+                WriteMode::Strict,
+                Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a sub-floor flush clock must fail the write, never bucket 0");
+        assert!(
+            matches!(err, SpanWriteError::SegmentBuild(ref msg) if msg.contains("floor")),
+            "expected a typed SegmentBuild floor failure, got: {err:?}"
+        );
+        // Nothing was published: no data object landed under the span keyspace.
+        router.shutdown().await;
+        let prefix = format!("t/{}/s/l0/", tenant.hash().to_hex());
+        let objects = list_all(store.as_ref(), &prefix).await.expect("list");
+        assert!(
+            objects.is_empty(),
+            "a floor-failed flush must publish nothing, found {} object(s)",
+            objects.len()
+        );
+    }
+
     /// Staleness fail-closed, with the NF-2 bounded grace window (issue #655):
     /// once the router's cached view for a tenant ages past `C`, the router
     /// re-reads the provisioning record before routing; if that re-read
