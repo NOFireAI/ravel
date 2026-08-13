@@ -1037,6 +1037,85 @@ mod tests {
         );
     }
 
+    /// Regression: a background acquire cancelled while parked below the floor
+    /// must release its `bg_committed` reservation.
+    ///
+    /// A below-floor background request claims a `bg_committed` slot *before* it
+    /// enters the un-preemptible `acquire_owned().await` for a global permit.
+    /// Dropping that future is routine (a `select!` timeout, a client
+    /// disconnect, shutdown). With the release on the completing path only,
+    /// `bg_committed` stayed elevated for the life of the process, so the floor
+    /// reservation was consumed forever: a later below-floor background request
+    /// could no longer claim the slot, lost its floor guarantee, and starved
+    /// behind any waiting foreground. Both halves are asserted: the count
+    /// returns to zero, and a fresh below-floor background op still reclaims its
+    /// floor slot and beats a waiting foreground afterwards (the count alone
+    /// could be zeroed while the floor stayed wedged).
+    #[tokio::test]
+    async fn review_bg_committed_leaks_on_cancellation() {
+        // Global cap 2, background sub-cap 4 (so the sub-cap never holds a
+        // background op back), floor 1.
+        let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 4, 1));
+        let fg = cs.foreground();
+        let bg = cs.background();
+
+        // Saturate the global cap so a below-floor background op must park in
+        // the un-preemptible fair wait after claiming its floor slot.
+        let f0 = fg.clone();
+        let f1 = fg.clone();
+        tokio::spawn(async move { f0.get("fg0", GetRange::Full).await });
+        tokio::spawn(async move { f1.get("fg1", GetRange::Full).await });
+        gate.wait_until_held(2).await;
+
+        // A below-floor background op claims its floor reservation and parks
+        // waiting for a global permit. No foreground waits yet, so it takes the
+        // floor path (try_claim + acquire_owned().await), not the yield path.
+        let bcancel = bg.clone();
+        let parked = tokio::spawn(async move { bcancel.get("bgcancel", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).bg_committed.load(Ordering::SeqCst) == 1).await,
+            "the below-floor background op claims its floor reservation and parks"
+        );
+
+        // Cancel it while parked, as a timeout or a disconnect would.
+        parked.abort();
+        let _ = parked.await;
+        assert!(
+            spin_until(|| scheduler(&cs).bg_committed.load(Ordering::SeqCst) == 0).await,
+            "a cancelled below-floor background acquire must release its \
+             bg_committed reservation"
+        );
+
+        // Consequence: the floor slot is reclaimable. A foreground op waits,
+        // then a fresh below-floor background op must still win a freed permit
+        // over that waiting foreground -- the floor guarantee. A leaked
+        // reservation keeps the slot consumed, so the fresh op could not claim
+        // it and would starve behind the foreground waiter (the count alone
+        // could read zero via a decrement that still left the floor wedged).
+        let f2 = fg.clone();
+        tokio::spawn(async move { f2.get("fg2", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).fg_waiters.load(Ordering::SeqCst) == 1).await,
+            "a foreground op is waiting"
+        );
+
+        let b0 = bg.clone();
+        tokio::spawn(async move { b0.get("bg0", GetRange::Full).await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Free one permit. The below-floor background op wins it over the
+        // waiting foreground: the floor is reclaimable after the cancellation.
+        assert!(release_key(&gate, "fg0"));
+        assert!(
+            spin_until(|| held_keys(&gate).contains(&"bg0".to_string())).await,
+            "a fresh below-floor background op must reclaim the floor slot and \
+             beat the waiting foreground: {:?}",
+            held_keys(&gate)
+        );
+    }
+
     /// Regression: a foreground acquire must not be delayed by more than one
     /// in-flight background request, however many background requests entered
     /// the scheduler first.
@@ -1082,6 +1161,15 @@ mod tests {
             gate.held_count(),
             2,
             "neither background op is admitted while foreground holds both permits"
+        );
+        // Pin the reservation during the below-floor window: exactly one
+        // background op holds the floor slot (the other read the floor as full
+        // and parked above it). A floor of one that had become a floor of N
+        // would show a higher count here.
+        assert!(
+            spin_until(|| scheduler(&cs).bg_committed.load(Ordering::SeqCst) == 1).await,
+            "exactly one background op holds the floor reservation: {}",
+            scheduler(&cs).bg_committed.load(Ordering::SeqCst)
         );
 
         // A foreground op arrives and waits, behind both parked background ops.
