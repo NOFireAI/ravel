@@ -499,3 +499,381 @@ impl ObjectStoreBackend for ScheduledHandle {
         self.inner.capabilities()
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+    use crate::memory::MemoryStore;
+    use std::sync::atomic::AtomicU64;
+
+    /// Yield to the current-thread scheduler until `cond` holds, bounded so a
+    /// broken scheduler makes the test fail rather than hang. Under the correct
+    /// code every wait here settles in a handful of turns.
+    async fn spin_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..2000 {
+            if cond() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        cond()
+    }
+
+    /// The scheduler behind a scheduled [`ClassedStore`] (tests reach into the
+    /// private mode; passthrough has none).
+    fn scheduler(cs: &ClassedStore) -> &Arc<RequestScheduler> {
+        match &cs.mode {
+            Mode::Scheduled(s) => &s.scheduler,
+            Mode::Passthrough => panic!("passthrough store has no scheduler"),
+        }
+    }
+
+    /// Held-call keys currently parked in the inner store's gate, i.e. the ops
+    /// that have been admitted through the scheduler and reached the backend.
+    fn held_keys(gate: &GateHandle) -> Vec<String> {
+        gate.held_details().into_iter().map(|(_, _, k)| k).collect()
+    }
+
+    /// Release the held call matching `key`, returning true if one was found.
+    fn release_key(gate: &GateHandle, key: &str) -> bool {
+        match gate.held_details().into_iter().find(|(_, _, k)| k == key) {
+            Some((id, _, _)) => gate.release(id),
+            None => false,
+        }
+    }
+
+    /// An inner store that counts each op and returns fakes, for proving the
+    /// passthrough path issues exactly one inner op per handle op with no
+    /// scheduler involvement.
+    #[derive(Default)]
+    struct CountingStore {
+        gets: AtomicU64,
+        puts: AtomicU64,
+        deletes: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for CountingStore {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            Ok(PutOutcome {
+                etag: crate::Etag("fake".into()),
+                version: crate::Version("fake".into()),
+            })
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(GetOutcome {
+                data: Bytes::new(),
+                etag: crate::Etag("fake".into()),
+                version: crate::Version("fake".into()),
+                total_size: 0,
+            })
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            Ok(ListPage {
+                objects: Vec::new(),
+                next: None,
+            })
+        }
+
+        async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
+            Ok(DelimitedList {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+            })
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::mandatory()
+        }
+    }
+
+    /// Build a scheduled `ClassedStore` over a `FaultStore` whose every `get`
+    /// is held, so a test can freeze admitted ops as "in flight" and control
+    /// their release order. Returns the store and the gate.
+    fn scheduled_rig(config: SchedulerConfig) -> (ClassedStore, GateHandle) {
+        let inner = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = inner.hold(Op::Get, None, Occurrence::Always);
+        let cs = ClassedStore::scheduled(inner as Arc<dyn ObjectStoreBackend>, config);
+        (cs, gate)
+    }
+
+    /// Passthrough (ADR-0070 decision 2, the default) hands out the inner store
+    /// itself: `Arc::ptr_eq` holds, no metrics exist, and N handle ops issue
+    /// exactly N inner ops with no scheduler between them.
+    #[tokio::test]
+    async fn passthrough_is_the_inner_store_verbatim() {
+        let counting = Arc::new(CountingStore::default());
+        let inner: Arc<dyn ObjectStoreBackend> = counting.clone();
+        let cs = ClassedStore::passthrough(Arc::clone(&inner));
+
+        let fg = cs.foreground();
+        let bg = cs.background();
+
+        // Byte-for-byte identical: both handles ARE the inner store, not a
+        // wrapper. This is the "no added latency, no permit" guarantee made
+        // literal -- there is no other object in the call path.
+        assert!(
+            Arc::ptr_eq(&fg, &inner),
+            "foreground must be the inner store"
+        );
+        assert!(
+            Arc::ptr_eq(&bg, &inner),
+            "background must be the inner store"
+        );
+
+        // No metrics in passthrough: nothing new is recorded.
+        assert!(cs.metrics(RequestClass::Foreground).is_none());
+        assert!(cs.metrics(RequestClass::Background).is_none());
+
+        // Exactly one inner op per handle op.
+        for _ in 0..3 {
+            fg.get("k", GetRange::Full).await.expect("get");
+        }
+        for _ in 0..2 {
+            bg.get("k", GetRange::Full).await.expect("get");
+        }
+        bg.delete("k").await.expect("delete");
+
+        assert_eq!(counting.gets.load(Ordering::SeqCst), 5);
+        assert_eq!(counting.deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(counting.puts.load(Ordering::SeqCst), 0);
+    }
+
+    /// Scheduled mode records each class into its own metrics block, so the
+    /// `{class}` dimension is realized as one `StoreMetrics` per class over the
+    /// existing op-label family.
+    #[tokio::test]
+    async fn scheduled_metrics_are_labelled_per_class() {
+        let inner = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let cs = ClassedStore::scheduled(
+            inner as Arc<dyn ObjectStoreBackend>,
+            SchedulerConfig::new(4, 4, 1),
+        );
+        let fg = cs.foreground();
+        let bg = cs.background();
+
+        fg.put("a", Bytes::from_static(b"xy"), PutOptions::default())
+            .await
+            .expect("put");
+        fg.put("b", Bytes::from_static(b"z"), PutOptions::default())
+            .await
+            .expect("put");
+        fg.get("a", GetRange::Full).await.expect("get");
+        bg.delete("a").await.expect("delete");
+
+        let fg_m = cs
+            .metrics(RequestClass::Foreground)
+            .expect("scheduled has metrics")
+            .snapshot();
+        let bg_m = cs
+            .metrics(RequestClass::Background)
+            .expect("scheduled has metrics")
+            .snapshot();
+
+        assert_eq!(fg_m.put.calls, 2, "two foreground puts");
+        assert_eq!(fg_m.put.bytes, 3, "put bytes counted (2 + 1)");
+        assert_eq!(fg_m.get.calls, 1, "one foreground get");
+        assert_eq!(
+            fg_m.delete.calls, 0,
+            "delete was background, not foreground"
+        );
+        assert_eq!(bg_m.delete.calls, 1, "one background delete");
+        assert_eq!(bg_m.put.calls, 0, "no background put");
+    }
+
+    /// Weighted admission, foreground cap: with `fg_permits` foreground ops in
+    /// flight, the `fg_permits + 1`-th foreground op waits until one releases.
+    #[tokio::test]
+    async fn foreground_cap_is_respected() {
+        let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 2, 1));
+        let fg = cs.foreground();
+
+        let f0 = fg.clone();
+        let f1 = fg.clone();
+        tokio::spawn(async move { f0.get("f0", GetRange::Full).await });
+        tokio::spawn(async move { f1.get("f1", GetRange::Full).await });
+        gate.wait_until_held(2).await;
+
+        // The third foreground op cannot be admitted: the cap is 2.
+        let f2 = fg.clone();
+        tokio::spawn(async move { f2.get("f2", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).fg_waiters.load(Ordering::SeqCst) == 1).await,
+            "third foreground op must register as a waiter"
+        );
+        assert_eq!(gate.held_count(), 2, "cap holds the third op out");
+        assert!(!held_keys(&gate).contains(&"f2".to_string()));
+
+        // Releasing one admits the third.
+        assert!(release_key(&gate, "f0"));
+        assert!(
+            spin_until(|| held_keys(&gate).contains(&"f2".to_string())).await,
+            "third op admitted once a permit freed"
+        );
+    }
+
+    /// Weighted admission, background cap: `bg_permits` bounds concurrent
+    /// background ops independently of the (larger) global cap.
+    #[tokio::test]
+    async fn background_cap_is_respected() {
+        // Global cap 4 so the global semaphore is not the limit; bg cap 1.
+        let (cs, gate) = scheduled_rig(SchedulerConfig::new(4, 1, 1));
+        let bg = cs.background();
+
+        let b0 = bg.clone();
+        tokio::spawn(async move { b0.get("b0", GetRange::Full).await });
+        gate.wait_until_held(1).await;
+
+        let b1 = bg.clone();
+        tokio::spawn(async move { b1.get("b1", GetRange::Full).await });
+        // b1 is stuck at the background sub-cap, not admitted, even though the
+        // global cap has room.
+        assert!(spin_until(|| held_keys(&gate).len() == 1).await);
+        assert!(!held_keys(&gate).contains(&"b1".to_string()));
+
+        assert!(release_key(&gate, "b0"));
+        assert!(
+            spin_until(|| held_keys(&gate).contains(&"b1".to_string())).await,
+            "second background op admitted once the first released"
+        );
+    }
+
+    /// Foreground priority: with background saturating the global cap and a
+    /// further background request already parked in the scheduler competing for
+    /// the next permit, a foreground acquire is admitted after exactly one
+    /// in-flight background release -- the parked background request yields
+    /// rather than taking the freed permit.
+    ///
+    /// The load-bearing line is the `fg_waiters` yield in
+    /// `acquire_background`: with `bg2` registered on the wake queue *before*
+    /// `fg0`, removing that guard lets `bg2` take the freed permit first and
+    /// `fg0` starves. The parked `bg2`, not the just-released `bg0`, is what
+    /// makes this bite: without the yield, `bg2` wins the release it is already
+    /// waiting on.
+    #[tokio::test]
+    async fn foreground_preempts_a_parked_background_request() {
+        // Global cap 2, background sub-cap 3 (so a third bg can park in the
+        // scheduler past the sub-cap while two hold the global permits), floor
+        // 1.
+        let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 3, 1));
+        let bg = cs.background();
+        let fg = cs.foreground();
+
+        // Saturate the global cap with two background ops.
+        let b0 = bg.clone();
+        let b1 = bg.clone();
+        tokio::spawn(async move { b0.get("bg0", GetRange::Full).await });
+        tokio::spawn(async move { b1.get("bg1", GetRange::Full).await });
+        gate.wait_until_held(2).await;
+
+        // A third background op enters the scheduler and parks waiting for a
+        // permit, registering on the wake queue while no foreground waits yet.
+        let b2 = bg.clone();
+        tokio::spawn(async move { b2.get("bg2", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).bg_inflight.load(Ordering::SeqCst) == 2).await,
+            "exactly two background ops hold global permits"
+        );
+        // Let bg2 reach its parked wait before the foreground arrives.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Now a foreground op arrives and waits, registered after bg2.
+        let f0 = fg.clone();
+        tokio::spawn(async move { f0.get("fg0", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).fg_waiters.load(Ordering::SeqCst) == 1).await,
+            "foreground registers as a waiter"
+        );
+
+        // Release exactly one in-flight background op.
+        assert!(release_key(&gate, "bg0"));
+
+        // Foreground is admitted; the parked background op yielded and did not
+        // take the freed permit.
+        assert!(
+            spin_until(|| held_keys(&gate).contains(&"fg0".to_string())).await,
+            "foreground admitted after one background release"
+        );
+        let held = held_keys(&gate);
+        assert!(
+            !held.contains(&"bg2".to_string()),
+            "the parked background op must yield, not take the freed permit: {held:?}"
+        );
+        assert!(
+            held.contains(&"bg1".to_string()),
+            "the other bg is still in flight"
+        );
+    }
+
+    /// Background floor: under sustained foreground load with a foreground op
+    /// also waiting, a background op below the floor still makes progress. Its
+    /// fair queue slot beats the waiting foreground for one permit, guaranteeing
+    /// the floor.
+    ///
+    /// The load-bearing line is the below-floor fair `acquire_owned` in
+    /// `acquire_background`: replace it with a yield (as the above-floor path
+    /// does) and the background op starves behind the waiting foreground
+    /// instead of being admitted.
+    #[tokio::test]
+    async fn background_floor_makes_progress_under_foreground_load() {
+        let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 2, 1));
+        let fg = cs.foreground();
+        let bg = cs.background();
+
+        // Saturate the global cap with foreground ops.
+        let f0 = fg.clone();
+        let f1 = fg.clone();
+        tokio::spawn(async move { f0.get("fg0", GetRange::Full).await });
+        tokio::spawn(async move { f1.get("fg1", GetRange::Full).await });
+        gate.wait_until_held(2).await;
+
+        // A third foreground op waits.
+        let f2 = fg.clone();
+        tokio::spawn(async move { f2.get("fg2", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).fg_waiters.load(Ordering::SeqCst) == 1).await,
+            "a foreground op is waiting"
+        );
+
+        // A background op below the floor joins the fair queue for a permit.
+        let b0 = bg.clone();
+        tokio::spawn(async move { b0.get("bg0", GetRange::Full).await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Release one foreground op. The below-floor background op wins the
+        // freed permit over the waiting foreground: the floor is guaranteed.
+        assert!(release_key(&gate, "fg0"));
+        assert!(
+            spin_until(|| held_keys(&gate).contains(&"bg0".to_string())).await,
+            "background floor makes progress even against a waiting foreground"
+        );
+    }
+}
