@@ -21,6 +21,7 @@ pub struct CacheMetrics {
     evictions: AtomicU64,
     single_flight_collapses: AtomicU64,
     disk_errors_degraded_to_misses: AtomicU64,
+    disk_entries_expired_max_age: AtomicU64,
 }
 
 impl CacheMetrics {
@@ -61,6 +62,16 @@ impl CacheMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A disk-tier read (or the startup scan) found a well-formed entry whose
+    /// stamped write time is older than the configured max-age and dropped it
+    /// rather than serving it (ADR-0064, issue #753). Distinct from
+    /// [`Self::record_disk_error`]: the entry was not corrupt or foreign, it
+    /// simply aged out. The dropped read still records a plain miss.
+    pub(crate) fn record_expired_max_age(&self) {
+        self.disk_entries_expired_max_age
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Point-in-time copy of every counter. Not atomic across fields:
     /// concurrent calls may land between two loads, so a snapshot can show
     /// `hits` from a hair later than `misses`. It is a scrape, not a
@@ -77,6 +88,7 @@ impl CacheMetrics {
             disk_errors_degraded_to_misses: self
                 .disk_errors_degraded_to_misses
                 .load(Ordering::Relaxed),
+            disk_entries_expired_max_age: self.disk_entries_expired_max_age.load(Ordering::Relaxed),
         }
     }
 }
@@ -93,4 +105,5 @@ pub struct CacheMetricsSnapshot {
     pub evictions: u64,
     pub single_flight_collapses: u64,
     pub disk_errors_degraded_to_misses: u64,
+    pub disk_entries_expired_max_age: u64,
 }

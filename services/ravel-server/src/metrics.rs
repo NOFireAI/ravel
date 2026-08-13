@@ -3805,6 +3805,7 @@ mod tests {
             evictions: 2,
             single_flight_collapses: 99,
             disk_errors_degraded_to_misses: 3,
+            disk_entries_expired_max_age: 0,
         };
         let catalog = CacheMetricsSnapshot {
             hits: 70,
@@ -3815,6 +3816,7 @@ mod tests {
             evictions: 6,
             single_flight_collapses: 11,
             disk_errors_degraded_to_misses: 0,
+            disk_entries_expired_max_age: 0,
         };
         let body = render(
             Mode::Gateway,
