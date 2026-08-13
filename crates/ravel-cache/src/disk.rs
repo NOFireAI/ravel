@@ -79,8 +79,9 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -210,20 +211,41 @@ fn path_for(dir: &Path, key: &CacheKey) -> PathBuf {
     dir.join(shard).join(name).with_extension(ENTRY_EXTENSION)
 }
 
-/// The disk tier of ADR-0046's read cache. See the [module docs](self) for
-/// the crash-safety, verification, encryption, and eviction rationale.
-pub struct DiskCache {
+/// The shared, `Arc`-held state of a [`DiskCache`]: everything the cache and
+/// its background age-sweep task both touch. Split out from [`DiskCache`] so
+/// the sweeper can hold a [`Weak`] to it rather than a strong reference: the
+/// sweeper never keeps the tier alive, so dropping the [`DiskCache`] frees this
+/// state and the next tick sees a dead `Weak` and exits (see [`spawn_sweeper`]).
+struct Inner {
     dir: PathBuf,
     limits: CacheLimits,
     state: Mutex<S3Fifo<()>>,
     metrics: Arc<CacheMetrics>,
     tmp_counter: AtomicU64,
     instance_id: u64,
-    /// Injected wall clock. Stamped into each entry's header at `insert` and
-    /// read on every `get` to age entries out past `limits.max_entry_age_ns`
-    /// (ADR-0064, issue #753). Injected so tests drive ageing deterministically
-    /// instead of sleeping.
+    /// Injected wall clock. Stamped into each entry's header at `insert`, read
+    /// on every `get`, and read by the periodic sweep to age entries out past
+    /// `limits.max_entry_age_ns` (ADR-0064, issue #753). Injected so tests
+    /// drive ageing deterministically instead of sleeping.
     clock: Arc<dyn Clock>,
+}
+
+/// The disk tier of ADR-0046's read cache. See the [module docs](self) for
+/// the crash-safety, verification, encryption, and eviction rationale.
+///
+/// A per-`get` age check and the startup scan drop entries past
+/// `max_entry_age_ns`, but only ones that are read or that a fresh process
+/// scans. An entry that is never re-read and sees no eviction pressure would
+/// keep its bytes on disk indefinitely; a background sweep (ADR-0064, issue
+/// #753, finding F1) closes that gap by dropping every over-age entry on a
+/// fixed interval, so an idle entry ages out within one
+/// `limits.sweep_interval_ns` past `max_entry_age_ns`.
+pub struct DiskCache {
+    inner: Arc<Inner>,
+    /// Handle to the background age-sweep task, present only when the cache was
+    /// constructed inside a Tokio runtime (production always is). Aborted on
+    /// drop so no sweeper task outlives its cache.
+    sweeper: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DiskCache {
@@ -242,17 +264,22 @@ impl DiskCache {
     /// file, or a valid-looking entry sitting at the wrong path -- is
     /// deleted on sight rather than counted: discard and rebuild, never
     /// repair, applies at startup exactly as it does on a live read.
+    ///
+    /// Constructed inside a Tokio runtime, this also spawns the background
+    /// age-sweep task (ADR-0064, issue #753, finding F1). Constructed outside
+    /// one (a synchronous test, a non-async CLI path), no task is spawned and
+    /// ageing then relies on the per-`get` and startup checks alone.
     pub fn new(dir: PathBuf, limits: CacheLimits) -> Self {
         Self::new_with_clock(dir, limits, Arc::new(SystemClock))
     }
 
     /// Like [`DiskCache::new`], but with an explicit [`Clock`] for the
-    /// per-entry max-age (ADR-0064, issue #753). Production uses
-    /// [`DiskCache::new`], which injects a [`SystemClock`]; tests inject a
-    /// clock they advance across the max-age boundary by hand.
+    /// per-entry max-age and the background sweep (ADR-0064, issue #753).
+    /// Production uses [`DiskCache::new`], which injects a [`SystemClock`];
+    /// tests inject a clock they advance across the max-age boundary by hand.
     pub fn new_with_clock(dir: PathBuf, limits: CacheLimits, clock: Arc<dyn Clock>) -> Self {
-        let state = Self::scan_existing(&dir, limits, clock.now_ns());
-        DiskCache {
+        let state = Inner::scan_existing(&dir, limits, clock.now_ns());
+        let inner = Arc::new(Inner {
             dir,
             limits,
             state: Mutex::new(state),
@@ -260,9 +287,108 @@ impl DiskCache {
             tmp_counter: AtomicU64::new(0),
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             clock,
-        }
+        });
+        let sweeper = spawn_sweeper(&inner);
+        DiskCache { inner, sweeper }
     }
 
+    /// A cloneable handle to this tier's counters, independent of the
+    /// cache's own lifetime.
+    pub fn metrics(&self) -> Arc<CacheMetrics> {
+        self.inner.metrics.clone()
+    }
+
+    /// Current number of resident entries this process knows about.
+    pub fn len(&self) -> usize {
+        self.inner.state.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Current total bytes across every resident entry this process knows
+    /// about.
+    pub fn total_bytes(&self) -> u64 {
+        self.inner.state.lock().total_bytes()
+    }
+
+    /// Look up `key`. Every failure -- the directory or file missing, a
+    /// permission error, a short read, a bad header, a key mismatch, an
+    /// oversized entry, an over-age entry, or a crc32c mismatch -- returns
+    /// `None`. There is no error variant this method can return: that is
+    /// enforced by its signature, not by a convention callers must remember.
+    pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        self.inner.get(key)
+    }
+
+    /// Admit `value` under `key`. Never an error and never partially visible;
+    /// see [`Inner::insert`] and the [module docs](self) for the crash-safety
+    /// and rejection rules.
+    pub fn insert(&self, key: CacheKey, value: &[u8]) {
+        self.inner.insert(key, value);
+    }
+
+    /// Runs one age sweep synchronously: every entry older than
+    /// `max_entry_age_ns` is dropped, exactly as the background task does on
+    /// each tick. The background task is the production driver; this is the
+    /// deterministic hook a test uses to trigger a single sweep without waiting
+    /// on a timer.
+    #[cfg(test)]
+    fn sweep_expired_now(&self) {
+        self.inner.sweep_expired();
+    }
+
+    /// A `Weak` to the shared state, for tests that assert the sweeper leaks no
+    /// strong reference: after the cache is dropped this must not upgrade.
+    #[cfg(test)]
+    fn inner_weak(&self) -> Weak<Inner> {
+        Arc::downgrade(&self.inner)
+    }
+}
+
+impl Drop for DiskCache {
+    /// Aborts the background sweep task so it never outlives the cache. Even
+    /// without this, the sweeper holds only a [`Weak`] and would exit on its
+    /// next tick once this drop frees the last strong reference; the abort just
+    /// makes shutdown prompt rather than up to one interval late.
+    fn drop(&mut self) {
+        if let Some(handle) = self.sweeper.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Spawns the periodic age-sweep task for `inner`, returning its join handle,
+/// or `None` when no Tokio runtime is available (a synchronous construction).
+/// The task holds only a [`Weak`], so it never keeps the tier alive: once the
+/// owning [`DiskCache`] drops, the next `upgrade` fails and the task exits. It
+/// also holds no strong reference across its `await`, so a drop that lands
+/// while the task is parked between ticks frees the state immediately.
+fn spawn_sweeper(inner: &Arc<Inner>) -> Option<tokio::task::JoinHandle<()>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let weak: Weak<Inner> = Arc::downgrade(inner);
+    // Zero would panic `interval`; a sane floor keeps a misconfigured or
+    // test-shrunk value from doing so while staying deterministic.
+    let period = Duration::from_nanos(inner.limits.sweep_interval_ns.max(1));
+    Some(handle.spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        // The first tick fires immediately; consume it so the first real sweep
+        // is one interval out, not at construction time.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match weak.upgrade() {
+                // Scoped so the strong reference is dropped at the end of this
+                // statement, before the next `tick().await`.
+                Some(inner) => inner.sweep_expired(),
+                None => break,
+            }
+        }
+    }))
+}
+
+impl Inner {
     fn scan_existing(dir: &Path, limits: CacheLimits, now_ns: u64) -> S3Fifo<()> {
         let mut fifo = S3Fifo::new(limits);
         let Ok(shards) = fs::read_dir(dir) else {
@@ -331,33 +457,9 @@ impl DiskCache {
         Some((key, header.len, header.written_at_ns))
     }
 
-    /// A cloneable handle to this tier's counters, independent of the
-    /// cache's own lifetime.
-    pub fn metrics(&self) -> Arc<CacheMetrics> {
-        self.metrics.clone()
-    }
-
-    /// Current number of resident entries this process knows about.
-    pub fn len(&self) -> usize {
-        self.state.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Current total bytes across every resident entry this process knows
-    /// about.
-    pub fn total_bytes(&self) -> u64 {
-        self.state.lock().total_bytes()
-    }
-
-    /// Look up `key`. Every failure -- the directory or file missing, a
-    /// permission error, a short read, a bad header, a key mismatch, an
-    /// oversized entry, or a crc32c mismatch -- returns `None`. There is no
-    /// error variant this method can return: that is enforced by its
-    /// signature, not by a convention callers must remember.
-    pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+    /// Look up `key`, the shared-state half of [`DiskCache::get`]. Every
+    /// failure returns `None`; there is no error variant.
+    fn get(&self, key: &CacheKey) -> Option<Bytes> {
         let path = path_for(&self.dir, key);
         match self.read_and_verify(key, &path) {
             Some(bytes) => {
@@ -482,7 +584,7 @@ impl DiskCache {
     /// payload length, so admitting a mismatched `value` would store a
     /// self-contradictory entry that can only ever miss on every future
     /// read while still counting as a successful admission.
-    pub fn insert(&self, key: CacheKey, value: &[u8]) {
+    fn insert(&self, key: CacheKey, value: &[u8]) {
         let size = value.len() as u64;
         if size != key.len {
             self.metrics.record_rejected_size();
@@ -536,6 +638,57 @@ impl DiskCache {
             std::process::id(),
             self.instance_id
         ))
+    }
+
+    /// Drops every entry whose stamped write time is older than
+    /// `max_entry_age_ns`, regardless of whether it was ever re-read. This is
+    /// the periodic driver the background task calls on each tick (ADR-0064,
+    /// issue #753, finding F1): the per-`get` age check only reaches entries
+    /// that are read, and the startup scan only runs at construction, so an
+    /// idle entry under no eviction pressure needs this walk to have its bytes
+    /// physically removed within one sweep interval past the max-age.
+    ///
+    /// The walk mirrors the startup scan but is deliberately narrower: it
+    /// deletes *only* files that parse as a live entry at their own canonical
+    /// path and are over-age. Anything else -- a `.tmp-*` scratch file a
+    /// concurrent `insert` is mid-rename on, a foreign file, a misplaced entry
+    /// -- is left untouched, because a running cache must not race an in-flight
+    /// insert; the startup scan owns cleaning those up. Deleting the file and
+    /// dropping the entry from S3-FIFO accounting is idempotent against a
+    /// concurrent `get`/`insert`: the state lock serialises the accounting
+    /// change, and a redundant `remove_file` on an already-gone path is a
+    /// tolerated miss.
+    fn sweep_expired(&self) {
+        let now_ns = self.clock.now_ns();
+        let Ok(shards) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for shard in shards.flatten() {
+            let Ok(file_type) = shard.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some((key, _size, written_at_ns)) = Self::scan_one(&path)
+                    && path_for(&self.dir, &key) == path
+                    && now_ns.saturating_sub(written_at_ns) > self.limits.max_entry_age_ns
+                {
+                    // Over-age idle entry: delete the bytes and drop the
+                    // accounting. `saturating_sub` keeps a backward clock jump
+                    // (a stamp newer than "now") from wrapping into a huge age,
+                    // matching the per-`get` check.
+                    let _ = fs::remove_file(&path);
+                    self.state.lock().remove(&key);
+                    self.metrics.record_expired_max_age();
+                }
+            }
+        }
     }
 }
 
@@ -1144,23 +1297,37 @@ mod tests {
         );
     }
 
-    /// Deliverable 2: an entry written by an older binary in the previous
-    /// (version-2, no timestamp) header layout must not be served fresh
-    /// forever. The version bump makes `decode_header` reject it, so it
+    /// Deliverable 2 / finding F2: an entry written by an older binary in the
+    /// previous (version-2, no timestamp) header layout must not be served
+    /// fresh forever. The version bump makes `decode_header` reject it, so it
     /// degrades to a miss and is discarded, never read as a headerless entry
     /// with an implicit zero age. Crafted by hand at the canonical path in the
     /// exact 76-byte v2 layout this code used before the stamp was added.
+    ///
+    /// This test uses a `TestClock` (not a real `SystemClock`) precisely so the
+    /// miss isolates the *version gate*, independent of age. A v2 file's total
+    /// length here is exactly `HEADER_LEN`, so the header read succeeds and the
+    /// miss can only come from `decode_header` rejecting version 2 -- the
+    /// header-version/short-read gate. The clock is pinned so the age check is
+    /// provably not what fires: the assertions below require the expiry counter
+    /// to stay zero (an age-driven miss would bump it) and the disk-error
+    /// counter to be exactly the one version-gate rejection.
     #[test]
     fn old_format_entry_without_timestamp_is_a_miss_not_served_forever() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        let cache = DiskCache::new(dir.clone(), generous_limits());
+        // A fixed clock, so the age comparison is deterministic and provably
+        // not the cause of the miss below.
+        let clock = TestClock::new(1_000_000);
+        let cache = DiskCache::new_with_clock(dir.clone(), generous_limits(), clock);
 
         let key = test_key_with_len(1, 8);
         let payload = [0x11u8; 8];
 
         // The old 76-byte header: magic, version 2, the four key fields, then
-        // a payload crc32c -- no written_at field.
+        // a payload crc32c -- no written_at field. With an 8-byte payload the
+        // file is exactly HEADER_LEN (84) bytes, so the header read is not
+        // short: the sole reason it misses is the version-2 gate.
         let mut old_header = Vec::new();
         old_header.extend_from_slice(&MAGIC);
         old_header.extend_from_slice(&2u32.to_le_bytes());
@@ -1169,7 +1336,8 @@ mod tests {
         old_header.extend_from_slice(&key.offset.to_le_bytes());
         old_header.extend_from_slice(&key.len.to_le_bytes());
         old_header.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
-        assert_eq!(old_header.len(), 4 + 4 + 16 + 32 + 8 + 8 + 4);
+        assert_eq!(old_header.len(), 4 + 4 + 16 + 32 + 8 + 8 + 4); // 76, the v2 layout
+        assert_eq!(old_header.len() + payload.len(), HEADER_LEN); // reads as a full header
 
         let path = path_for(&dir, &key);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1180,6 +1348,15 @@ mod tests {
         assert!(
             cache.get(&key).is_none(),
             "a previous-format entry must degrade to a miss, never be served"
+        );
+        let snapshot = cache.metrics().snapshot();
+        assert_eq!(
+            snapshot.disk_entries_expired_max_age, 0,
+            "the miss must come from the version gate, not the age check"
+        );
+        assert_eq!(
+            snapshot.disk_errors_degraded_to_misses, 1,
+            "a foreign/previous-format file is a disk error, and the only one here"
         );
     }
 
@@ -1213,5 +1390,187 @@ mod tests {
                 bytes.len()
             );
         }
+    }
+
+    /// Finding F1, the soundness proof for the periodic sweep: an entry that is
+    /// never re-read (no `get`, no eviction pressure) and ages past
+    /// `max_entry_age_ns` must have its bytes physically removed from disk by
+    /// the sweep, not linger until something happens to touch it. This is the
+    /// idle case the per-`get` and startup checks never reach.
+    ///
+    /// The sweep is triggered directly (`sweep_expired_now`) so the proof is
+    /// deterministic and does not depend on a timer; the spawned periodic task
+    /// drives the same `Inner::sweep_expired` on each tick (see
+    /// `spawned_sweeper_evicts_idle_entry_within_interval`).
+    ///
+    /// FLIP (non-vacuity): in `Inner::sweep_expired`, change
+    /// `now_ns.saturating_sub(written_at_ns) > self.limits.max_entry_age_ns`
+    /// to `... > u64::MAX` (never true). The sweep then deletes nothing, the
+    /// idle file survives, and the `!path.exists()` assertion below fails.
+    #[test]
+    fn idle_entry_past_max_age_is_swept_from_disk() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let max_age = 24 * 60 * 60 * 1_000_000_000u64; // 24h in ns
+        let limits = generous_limits().with_max_entry_age_ns(max_age);
+        let clock = TestClock::new(1_000_000);
+        let cache = DiskCache::new_with_clock(dir.clone(), limits, clock.clone());
+
+        let key = test_key_with_len(1, 5);
+        cache.insert(key, b"hello");
+        let path = path_for(&dir, &key);
+        assert!(path.exists(), "precondition: the entry is on disk");
+        assert_eq!(cache.len(), 1);
+
+        // Never `get`-touched. Advance the injected clock past the max-age and
+        // run exactly one sweep.
+        clock.set(1_000_000 + max_age + 1);
+        cache.sweep_expired_now();
+
+        assert!(
+            !path.exists(),
+            "an idle aged-out entry's bytes must be physically gone after the sweep"
+        );
+        assert!(
+            cache.get(&key).is_none(),
+            "a swept entry is a subsequent miss"
+        );
+        assert_eq!(cache.len(), 0, "the sweep drops S3-FIFO accounting too");
+        assert_eq!(cache.total_bytes(), 0);
+        assert_eq!(cache.metrics().snapshot().disk_entries_expired_max_age, 1);
+
+        // An entry still within the max-age is left alone by the sweep: it is
+        // not an indiscriminate purge.
+        let fresh = test_key_with_len(2, 5);
+        cache.insert(fresh, b"world");
+        cache.sweep_expired_now();
+        assert_eq!(
+            cache.get(&fresh).as_deref(),
+            Some(b"world".as_slice()),
+            "a within-age entry must survive the sweep"
+        );
+    }
+
+    /// Finding F1, wiring proof: the background task spawned at construction
+    /// drives `sweep_expired` on its interval, with no manual trigger. An idle
+    /// entry aged past the max-age is gone within one sweep interval.
+    #[tokio::test]
+    async fn spawned_sweeper_evicts_idle_entry_within_interval() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let max_age = 1_000_000_000u64; // 1s in ns
+        // A short sweep interval so the test does not wait on the 1 h default.
+        let limits = generous_limits()
+            .with_max_entry_age_ns(max_age)
+            .with_sweep_interval_ns(5_000_000); // 5 ms
+        let clock = TestClock::new(10_000_000_000);
+        let cache = DiskCache::new_with_clock(dir.clone(), limits, clock.clone());
+
+        let key = test_key_with_len(1, 5);
+        cache.insert(key, b"hello");
+        let path = path_for(&dir, &key);
+        assert!(path.exists(), "precondition: the entry is on disk");
+
+        // Age it out; the periodic task must notice on its own within a bounded
+        // number of intervals.
+        clock.set(10_000_000_000 + max_age + 1);
+
+        let mut gone = false;
+        for _ in 0..400 {
+            if !path.exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            gone,
+            "the periodic sweeper must physically remove an idle aged-out entry on its own"
+        );
+        assert!(cache.get(&key).is_none());
+    }
+
+    /// Finding F1, clean shutdown: dropping the cache must leave no sweeper
+    /// task holding its state alive. The sweeper holds only a `Weak`, so once
+    /// the sole strong `Arc` (inside `DiskCache`) drops, the shared state is
+    /// freed and a later `upgrade` returns `None`; `Drop` also aborts the task
+    /// so it never wakes again.
+    #[tokio::test]
+    async fn sweeper_task_stops_when_cache_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let limits = generous_limits().with_sweep_interval_ns(5_000_000);
+        let clock = TestClock::new(1);
+        let cache = DiskCache::new_with_clock(tmp.path().to_path_buf(), limits, clock);
+
+        assert!(
+            cache.sweeper.is_some(),
+            "constructed inside a runtime, the sweeper task must exist"
+        );
+        let weak = cache.inner_weak();
+        assert!(weak.upgrade().is_some(), "precondition: state is live");
+
+        drop(cache);
+
+        // Yield so the aborted task is reaped; the state is freed regardless,
+        // since the task never held a strong reference across its await.
+        tokio::task::yield_now().await;
+        assert!(
+            weak.upgrade().is_none(),
+            "dropping the cache must leave no live sweeper holding its state"
+        );
+    }
+
+    /// Finding F4: `max_entry_age_ns == 0` must expire promptly with no u64
+    /// underflow or panic in either age-comparison site (the per-`get` check
+    /// and the sweep). Traced safe in #753 via `saturating_sub` but previously
+    /// unguarded by a test.
+    #[test]
+    fn max_entry_age_zero_expires_promptly_without_underflow() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let limits = generous_limits().with_max_entry_age_ns(0);
+        let clock = TestClock::new(5_000_000);
+        let cache = DiskCache::new_with_clock(dir.clone(), limits, clock.clone());
+
+        let key = test_key_with_len(1, 5);
+        cache.insert(key, b"hello");
+
+        // Same instant: age is 0, and the boundary is strictly-greater-than, so
+        // the entry is not yet expired. No underflow computing `now - written`.
+        assert_eq!(
+            cache.get(&key).as_deref(),
+            Some(b"hello".as_slice()),
+            "at age 0 the strictly-greater-than boundary still serves"
+        );
+
+        // Any forward step past the write instant expires it via the `get`
+        // path, again with no underflow.
+        clock.set(5_000_001);
+        assert!(
+            cache.get(&key).is_none(),
+            "one ns past write, age 0 expires"
+        );
+        assert_eq!(cache.metrics().snapshot().disk_entries_expired_max_age, 1);
+
+        // The sweep path handles `max_entry_age_ns == 0` identically: a fresh
+        // idle entry one ns old is swept, no panic.
+        cache.insert(key, b"hello"); // stamped at now = 5_000_001
+        clock.set(5_000_002);
+        cache.sweep_expired_now();
+        assert!(
+            !path_for(&dir, &key).exists(),
+            "the sweep must drop a one-ns-old entry when max-age is 0"
+        );
+
+        // The startup scan must also survive `max_entry_age_ns == 0` without
+        // underflow: an entry written and immediately reopened one ns later is
+        // dropped, not seeded.
+        let writer_clock = TestClock::new(7_000_000);
+        {
+            let writer = DiskCache::new_with_clock(dir.clone(), limits, writer_clock);
+            writer.insert(test_key_with_len(9, 5), b"world");
+        }
+        let reader = DiskCache::new_with_clock(dir, limits, TestClock::new(7_000_001));
+        assert_eq!(reader.len(), 0, "age-0 startup scan drops the entry");
     }
 }
