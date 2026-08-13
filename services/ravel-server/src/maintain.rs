@@ -568,60 +568,106 @@ async fn run_loop(
     let mut reseed = true;
     let mut last_memo_body: Option<Vec<u8>> = None;
 
-    // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
-    // `H`, independent of the (coarser) discovery interval: the heartbeat must
-    // land well inside the `3 * H` liveness window siblings judge this process
-    // against, so it cannot ride the 5-minute discovery tick. The first tick of
-    // `tokio::time::interval` fires immediately, so the heartbeat is written and
-    // the live set computed before the first discovery cycle runs. The live set
-    // computed here is reused by every discovery cycle until the next heartbeat
-    // refreshes it. A live-set read failure keeps the last-known set (fail-open,
-    // ADR-0065 decision 1): ownership stays stable rather than collapsing.
     let clock = WallClock;
-    let mut live_set = worker.solo_live_set();
-    ownership.set_workers_live(live_set.len() as u64);
-    let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
+    // `H`, independent of the (coarser) discovery interval, and -- since issue
+    // #796 -- in its OWN spawned task rather than as a `select!` arm sharing the
+    // loop with discovery. A discovery cycle walks every tenant sequentially
+    // with no wall-time bound; when the heartbeat was a `select!` arm the macro
+    // did not re-enter while the discovery arm's future ran, so the heartbeat
+    // `interval` arm was never polled (`MissedTickBehavior::Delay` merely defers
+    // the tick). A cycle longer than the `3 * H` liveness window (180s at
+    // defaults) then starved this process's own heartbeat past that window, and
+    // siblings evicted it from their live sets mid-cycle and took over units it
+    // was still working. Running the heartbeat concurrently fires it on cadence
+    // `H` no matter how long a discovery cycle runs.
+    //
+    // The heartbeat task owns the write cadence, the `set_workers_live`
+    // accounting, and the live-set computation; it publishes each freshly
+    // computed live set over a `watch` channel that the discovery loop reads at
+    // the top of every cycle. `interval`'s first tick fires immediately, so the
+    // heartbeat is written and the live set computed before the first discovery
+    // cycle runs. A live-set read failure publishes nothing, so the receiver
+    // keeps the last-known set (fail-open, ADR-0065 decision 1): ownership stays
+    // stable rather than collapsing.
+    let (live_tx, live_rx) = tokio::sync::watch::channel(worker.solo_live_set());
+    ownership.set_workers_live(live_rx.borrow().len() as u64);
+    let (heartbeat_shutdown_tx, mut heartbeat_shutdown_rx) = oneshot::channel::<()>();
+    let heartbeat_handle = {
+        let store = Arc::clone(&store);
+        let worker = Arc::clone(&worker);
+        let ownership = Arc::clone(&ownership);
+        tokio::spawn(async move {
+            let clock = WallClock;
+            let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        let now = clock.now_ns();
+                        if let Err(err) = worker.write_heartbeat(store.as_ref(), now).await {
+                            tracing::warn!(
+                                error = %err,
+                                "maintenance: worker heartbeat write failed; self-corrects next interval"
+                            );
+                        }
+                        match worker.live_set(store.as_ref(), now).await {
+                            Ok(computed) => {
+                                ownership.set_workers_live(computed.len() as u64);
+                                // Publish the latest live set for the discovery
+                                // loop. `send` fails only once the receiver has
+                                // dropped, i.e. the loop is shutting down; there
+                                // is nothing to publish to then.
+                                let _ = live_tx.send(computed);
+                            }
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "maintenance: worker live-set read failed; keeping the last-known \
+                                 live set (fail-open, ADR-0065 decision 1)"
+                            ),
+                        }
+                    }
+                    _ = &mut heartbeat_shutdown_rx => return,
+                }
+            }
+        })
+    };
+
+    // Reseed trigger (ADR-0065 decision 3), evaluated in the discovery loop:
+    // compare the live set this cycle uses against the previous cycle's and
+    // request a warm start when a membership change moved a unit's ownership
+    // onto this process. Seeded from the solo set so the startup `reseed = true`
+    // still fires once in a single-replica deployment (where the computed set
+    // equals the solo set and never changes).
+    let mut prev_live_set = worker.solo_live_set();
+
     // A `tokio::time::sleep(...)` written directly as a `select!` branch is a
-    // fresh expression re-evaluated every time the macro re-polls at the top
-    // of the loop, so any OTHER arm firing (the heartbeat, on its own much
-    // shorter cadence) silently restarts this countdown from zero before it
-    // can ever elapse -- discovery then never runs. Pin one `Sleep` outside
-    // the loop so `select!` only ever polls the same underlying timer across
-    // iterations, and reset it (with a fresh jittered duration) only when it
-    // actually fires.
+    // fresh expression re-evaluated every time the macro re-polls at the top of
+    // the loop, so a spurious wakeup would silently restart this countdown from
+    // zero before it can ever elapse -- discovery would then never run. Pin one
+    // `Sleep` outside the loop so `select!` only ever polls the same underlying
+    // timer across iterations, and reset it (with a fresh jittered duration)
+    // only when it actually fires.
     let discovery_sleep = tokio::time::sleep(jittered(interval, rng.as_ref()));
     tokio::pin!(discovery_sleep);
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => {
-                let now = clock.now_ns();
-                if let Err(err) = worker.write_heartbeat(store.as_ref(), now).await {
-                    tracing::warn!(
-                        error = %err,
-                        "maintenance: worker heartbeat write failed; self-corrects next interval"
-                    );
-                }
-                match worker.live_set(store.as_ref(), now).await {
-                    Ok(computed) => {
-                        // A membership change may have moved ownership of a unit
-                        // to this process; request a warm start so its terminal
-                        // facts are seeded from the departing worker's snapshot
-                        // rather than rescanned cold (ADR-0065 decision 3).
-                        if membership_changed(&live_set, &computed) {
-                            reseed = true;
-                        }
-                        live_set = computed;
-                        ownership.set_workers_live(live_set.len() as u64);
-                    }
-                    Err(err) => tracing::warn!(
-                        error = %err,
-                        "maintenance: worker live-set read failed; keeping the last-known live set \
-                         (fail-open, ADR-0065 decision 1)"
-                    ),
-                }
-            }
             () = &mut discovery_sleep => {
+                // Latest live set from the heartbeat task (fail-open: the
+                // receiver holds the last-known set across a read failure). A
+                // membership change since the previous cycle may have moved a
+                // unit's ownership onto this process; request a warm start so its
+                // terminal facts are seeded from the departing worker's snapshot
+                // rather than rescanned cold (ADR-0065 decision 3). `borrow`
+                // returns a guard, so clone out of it immediately and never hold
+                // it across an await.
+                let live_set = live_rx.borrow().clone();
+                if membership_changed(&prev_live_set, &live_set) {
+                    reseed = true;
+                }
+                prev_live_set = live_set.clone();
+
                 // Warm start / handoff seeding (ADR-0065 decision 3): before a
                 // cycle runs cold, seed the memo from durable snapshots for the
                 // units this process now owns. Fail-open: a read fault logs and
@@ -644,11 +690,12 @@ async fn run_loop(
                             // Clear the pending reseed only on a successful read.
                             // A single transient LIST/GET fault must leave reseed
                             // set so the next cycle retries: in a single-replica
-                            // deployment `computed != live_set` is structurally
-                            // never true (live_set is solo_live_set()), so this
-                            // first-tick reseed is the only warm-start trigger the
-                            // worker ever gets. Clearing it on the Err arm would
-                            // leave that worker cold for its whole process life.
+                            // deployment the live set never changes (it is always
+                            // solo_live_set()), so `membership_changed` is
+                            // structurally never true and this first-cycle reseed
+                            // is the only warm-start trigger the worker ever gets.
+                            // Clearing it on the Err arm would leave that worker
+                            // cold for its whole process life.
                             reseed = false;
                         }
                         Err(err) => tracing::warn!(
@@ -690,9 +737,16 @@ async fn run_loop(
                     .as_mut()
                     .reset(tokio::time::Instant::now() + jittered(interval, rng.as_ref()));
             }
-            _ = &mut shutdown => return,
+            _ = &mut shutdown => break,
         }
     }
+
+    // Stop the heartbeat task so no spawned task outlives this loop (issue
+    // #796): signal it and await its handle. On return the heartbeat task is
+    // guaranteed finished rather than detached, matching
+    // `MaintenanceTasks::shutdown`'s join of the supervisor task itself.
+    let _ = heartbeat_shutdown_tx.send(());
+    let _ = heartbeat_handle.await;
 }
 
 /// One discovery cycle: re-enumerate tenants from storage, narrow by lifecycle
@@ -3157,6 +3211,259 @@ mod tests {
             "a unit that leaves the owned set must not keep pinning units_stalled \
              forever -- without pruning stall history to the current cycle's \
              owned set, this stays at 1 even though the unit no longer ticks here"
+        );
+    }
+
+    /// A store that (1) counts heartbeat PUTs (writes to `sys/maintain/workers/`)
+    /// and (2) blocks tenant discovery: its `list_delimited("t/")` awaits a
+    /// `tokio::time::sleep(block)` before delegating, so a discovery cycle stays
+    /// stuck inside that await for `block` of simulated time. Every other
+    /// operation delegates straight through -- crucially the heartbeat's own
+    /// `live_set` read, which uses `list_all` (`.list`), not `list_delimited`,
+    /// so it is never blocked by this wrapper.
+    struct BlockingDiscoveryStore<S> {
+        inner: S,
+        heartbeat_writes: Arc<AtomicU64>,
+        entered_block: Arc<std::sync::atomic::AtomicBool>,
+        block: Duration,
+    }
+
+    impl<S> BlockingDiscoveryStore<S> {
+        fn new(inner: S, block: Duration) -> Self {
+            BlockingDiscoveryStore {
+                inner,
+                heartbeat_writes: Arc::new(AtomicU64::new(0)),
+                entered_block: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                block,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for BlockingDiscoveryStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            if key.starts_with("sys/maintain/workers/") {
+                self.heartbeat_writes.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            if prefix.starts_with("t/") {
+                self.entered_block.store(true, Ordering::SeqCst);
+                tokio::time::sleep(self.block).await;
+            }
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Issue #796 (the real fix): the heartbeat must keep firing on cadence `H`
+    /// even while a single discovery cycle runs far longer than the `3 * H`
+    /// liveness window. Before the fix the heartbeat was a `select!` arm sharing
+    /// `run_loop` with the discovery arm, so once `run_discovery_cycle(...).await`
+    /// began the macro never re-entered and the heartbeat `interval` arm was
+    /// never polled (`MissedTickBehavior::Delay` merely defers the tick). A cycle
+    /// longer than `3 * H` therefore starved this process's own heartbeat, and
+    /// siblings evicted it from their live sets mid-cycle.
+    ///
+    /// Drives the real `run_loop` under a paused clock with a store whose tenant-
+    /// discovery `list_delimited("t/")` blocks for far longer than the whole test
+    /// window, so every discovery cycle is stuck inside that await. It advances
+    /// simulated time well past `3 * H` and asserts the heartbeat PUT count
+    /// advanced during the blocked cycle.
+    ///
+    /// The flip that proves it bites: move the heartbeat back into `run_loop`'s
+    /// `select!` as a `_ = heartbeat.tick()` arm alongside the (blocked)
+    /// `discovery_sleep` arm. The heartbeat is then never polled while discovery
+    /// awaits, so the write count does not advance during the block and the
+    /// `>= 3` assertion fails at 0.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_continues_during_a_discovery_cycle_longer_than_the_liveness_window() {
+        use std::sync::atomic::Ordering;
+
+        // H = 1s, liveness factor 3 (so the window is 3 * H = 3s), default unit
+        // concurrency. Discovery interval 1s so a cycle starts almost at once;
+        // the blocking LIST then holds it for 3600s -- effectively forever for
+        // this test.
+        let worker = Arc::new(WorkerSet::new(0, Duration::from_secs(1), 3, 4));
+        let store_impl = BlockingDiscoveryStore::new(MemoryStore::new(), Duration::from_secs(3600));
+        let heartbeat_writes = store_impl.heartbeat_writes.clone();
+        let entered_block = store_impl.entered_block.clone();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store_impl);
+
+        let compactor = Arc::new(CompactorConfig::default());
+        let retention = Arc::new(RetentionConfig::default());
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let safety = Arc::new(MaintenanceSafetyMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(run_loop(
+            store,
+            None,
+            compactor,
+            retention,
+            1,
+            Duration::from_secs(1),
+            metrics,
+            safety,
+            ownership,
+            worker,
+            Arc::new(SystemRng),
+            shutdown_rx,
+        ));
+
+        // Advance until the discovery cycle has entered its (blocked) tenant
+        // LIST. The immediate first heartbeat has already fired by now.
+        for _ in 0..60 {
+            if entered_block.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(200)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            entered_block.load(Ordering::SeqCst),
+            "the discovery cycle must have entered its blocked tenant LIST"
+        );
+        let writes_before = heartbeat_writes.load(Ordering::SeqCst);
+
+        // Advance ~5s = 5 * H, well past the 3s liveness window, while discovery
+        // stays blocked. Small steps so the paused runtime actually wakes the
+        // heartbeat task on each 1s boundary.
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        let writes_after = heartbeat_writes.load(Ordering::SeqCst);
+
+        assert!(
+            entered_block.load(Ordering::SeqCst),
+            "the discovery cycle is still blocked (its LIST sleep dwarfs the test window)"
+        );
+        assert!(
+            writes_after - writes_before >= 3,
+            "the heartbeat must keep firing on cadence H (>= 3 writes across a > 3*H window) \
+             while a discovery cycle is blocked, got {} (before={writes_before}, after={writes_after}) \
+             -- the heartbeat is starved again",
+            writes_after - writes_before
+        );
+
+        handle.abort();
+    }
+
+    /// Issue #796 clean shutdown: the heartbeat task `run_loop` spawns must stop
+    /// when the loop ends -- no leaked task. `run_loop` signals and awaits the
+    /// heartbeat handle before returning, so once the loop's own join handle
+    /// resolves the heartbeat task is guaranteed finished, not detached.
+    ///
+    /// Runs `run_loop` (heartbeat H = 1s, discovery interval 300s so no discovery
+    /// cycle fires during the test), lets a few heartbeats write, sends shutdown,
+    /// and joins the loop. It then advances simulated time well past several `H`
+    /// and asserts the heartbeat write count does not move: a detached (leaked)
+    /// task would keep writing.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_joins_the_heartbeat_task_without_leaking_it() {
+        use std::sync::atomic::Ordering;
+
+        let worker = Arc::new(WorkerSet::new(0, Duration::from_secs(1), 3, 4));
+        let store_impl = BlockingDiscoveryStore::new(MemoryStore::new(), Duration::from_secs(3600));
+        let heartbeat_writes = store_impl.heartbeat_writes.clone();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store_impl);
+
+        let compactor = Arc::new(CompactorConfig::default());
+        let retention = Arc::new(RetentionConfig::default());
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let safety = Arc::new(MaintenanceSafetyMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(run_loop(
+            store,
+            None,
+            compactor,
+            retention,
+            1,
+            // Discovery interval far past the test window: only the heartbeat
+            // task runs, so this test isolates its lifecycle.
+            Duration::from_secs(300),
+            metrics,
+            safety,
+            ownership,
+            worker,
+            Arc::new(SystemRng),
+            shutdown_rx,
+        ));
+
+        // Let a few heartbeats fire.
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            heartbeat_writes.load(Ordering::SeqCst) >= 2,
+            "the heartbeat task must fire while the loop runs"
+        );
+
+        // Shut down and join the loop; run_loop must join the heartbeat task
+        // before returning (no time advance is needed: shutdown is a oneshot).
+        shutdown_tx.send(()).expect("send shutdown");
+        handle.await.expect("run_loop joins cleanly on shutdown");
+
+        // No leaked task: past the loop's return, advancing several H produces
+        // no further heartbeat writes.
+        let writes_at_stop = heartbeat_writes.load(Ordering::SeqCst);
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            heartbeat_writes.load(Ordering::SeqCst),
+            writes_at_stop,
+            "the heartbeat task must stop when the loop ends -- no writes after shutdown, no leak"
         );
     }
 }
