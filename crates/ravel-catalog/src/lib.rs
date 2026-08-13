@@ -27,6 +27,7 @@ pub use auth_token_map::{
     tenant_for_token, token_hash, upsert_token, upsert_token_owned,
 };
 pub use catalog::Catalog;
+pub use catalog::resolve_rewrite_supersession;
 pub use config::{
     CatalogConfig, DEFAULT_BYTE_CACHE_MAX_BYTES, DEFAULT_BYTE_CACHE_MAX_ENTRIES,
     DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES, DEFAULT_CACHE_CAPACITY_PER_TENANT,

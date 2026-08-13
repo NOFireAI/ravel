@@ -1929,6 +1929,238 @@ pub async fn erasure_rewrite_bucket(
     Ok(ErasureRewriteOutcome::Rewritten { parts, publish })
 }
 
+/// The catalog-resolver completion verdict for one bucket (ADR-0064 §4 F1).
+///
+/// Every field is derived through [`ravel_catalog::resolve_rewrite_supersession`]
+/// -- the exact supersession chase a snapshot resolve
+/// (`ravel_catalog::Catalog::process_bucket`) and the index fold use -- never
+/// through the one-hop [`resolve_live_record`] the rewrite path uses to decode
+/// its own generation. That is the whole point: completion cannot diverge from
+/// what a query serves, because it is computed by the same code the query runs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BucketErasureCompletion {
+    /// `request_id`s that overlap this bucket's live event range AND for which
+    /// the catalog resolver's live view still serves a record that could carry
+    /// the subject (a live raw L0 input, a live un-rewritten compaction part,
+    /// or a live sibling rewrite whose `drops` do not name the request). Their
+    /// `.done` must not be written.
+    pub blocked: HashSet<String>,
+    /// The catalog view could not be established for a reason that must block
+    /// completion for every pending request, not just the overlapping ones: the
+    /// bucket is under legal hold (ADR-0064 §6 -- the request stays pending
+    /// until the hold clears). A list/decode/resolve failure surfaces as an
+    /// `Err` from [`bucket_erasure_completion`] instead, so the caller can log
+    /// and defer it exactly as the rewrite pass defers its own failures.
+    pub unresolved: bool,
+}
+
+/// Whether one bucket, resolved through the SAME supersession logic the query
+/// path uses, still serves any record that could contain the subject of any
+/// pending erasure request (ADR-0064 §4, the 2026-08-08 F1 correction).
+///
+/// This is the completion gate the ADR requires the rewrite pass to derive
+/// "through `resolve_rewrite_supersession` and `classify_bucket`, not a bucket
+/// LIST in isolation." The rewrite pass classifies a bucket `AlreadyApplied`
+/// off [`resolve_live_record`], which is one hop: it picks the live
+/// compaction/rewrite record and never computes which raw L0 inputs a query
+/// still resolves. So a bucket whose live rewrite names the request but whose
+/// chain fails to exclude an L0 input the query still serves (the
+/// absent-predecessor / partial-input case §4 names, or a live sibling rewrite)
+/// reads "done" to the rewrite pass while a snapshot keeps serving the subject.
+/// This function closes that gap by reconstructing the query's exact served set:
+///
+/// 1. `excluded` (raw L0 identities) and `superseded_records` (whole
+///    compaction/rewrite records whose parts are dropped) are built exactly as
+///    [`ravel_catalog::Catalog::process_bucket`] builds them -- compaction
+///    inputs, then [`ravel_catalog::resolve_rewrite_supersession`] over every
+///    rewrite record.
+/// 2. A request is `blocked` if, restricted to its event-time window, the live
+///    (non-excluded / non-superseded) view still serves: a raw L0 record, a
+///    compaction part, or a rewrite output part from a rewrite that does not
+///    name the request. Each of those is a record a snapshot would resolve and
+///    that could still carry the subject.
+///
+/// A request whose window overlaps nothing live here is not blocked. A `.done`
+/// is safe for a request only when NO in-scope bucket blocks it.
+///
+/// The front gates (`is_sealed`, tombstone, legal hold) mirror
+/// [`erasure_rewrite_bucket`] so this reasons about exactly the buckets the
+/// rewrite pass treats as in scope: an unsealed bucket is out of scope
+/// (ADR-0064 decision 3 point 1, the documented completion gap); a tombstoned
+/// bucket serves nothing; a held bucket keeps every request pending.
+pub async fn bucket_erasure_completion(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+    pending: &[PendingErasureRequest],
+) -> Result<BucketErasureCompletion> {
+    let mut out = BucketErasureCompletion::default();
+    if pending.is_empty() {
+        return Ok(out);
+    }
+    // Unsealed: out of scope, exactly as `erasure_rewrite_bucket` defers it
+    // (ADR-0064 decision 3 point 1). Its data is already unreturnable via the
+    // query-time filter; blocking completion on it would let a continuously
+    // ingesting tenant never complete, retaining the `.dreq` (and its subject)
+    // forever, which is the failure ADR-0064 decision 5 exists to prevent.
+    if !bucket.is_sealed(clock.now_ns(), config) {
+        return Ok(out);
+    }
+    let listing = crate::read::list_bucket(store, bucket).await?;
+    if listing.tombstone_key.is_some() {
+        // A retention tombstone hides the whole bucket from every snapshot, so
+        // it serves nothing and blocks no request.
+        return Ok(out);
+    }
+    if bucket_is_held(&listing, lease) {
+        // Legal hold wins over erasure (ADR-0064 §6): the request stays pending
+        // and the query-time filter keeps hiding the data until the hold clears.
+        out.unresolved = true;
+        return Ok(out);
+    }
+
+    // Decode every compaction and rewrite record present, exactly as
+    // `process_bucket` does before resolving supersession.
+    let mut compaction_records: Vec<(String, CompactionRecord)> =
+        Vec::with_capacity(listing.compaction_record_keys.len());
+    for key in &listing.compaction_record_keys {
+        compaction_records.push((key.clone(), get_compaction_record(store, key).await?));
+    }
+    let mut rewrite_records: Vec<(String, RewriteRecord)> =
+        Vec::with_capacity(listing.rewrite_record_keys.len());
+    for key in &listing.rewrite_record_keys {
+        rewrite_records.push((key.clone(), get_rewrite_record(store, key).await?));
+    }
+
+    // Build the query path's two exclusion sets. `excluded` names raw L0
+    // identities that a compaction or rewrite superseded; `superseded_records`
+    // names whole compaction/rewrite records whose output parts are dropped.
+    let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
+    for (_, record) in &compaction_records {
+        for input in &record.inputs {
+            excluded.insert((
+                input.writer_id.clone(),
+                input.writer_epoch,
+                input.writer_seq,
+            ));
+        }
+    }
+    let mut superseded_records: HashSet<String> = HashSet::new();
+    if !rewrite_records.is_empty() {
+        let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r))
+            .collect();
+        let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r))
+            .collect();
+        let prefix = keys::commit_shard_hour_prefix(
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+            bucket.ingest_hour_bucket,
+        )?;
+        for (rkey, record) in &rewrite_records {
+            ravel_catalog::resolve_rewrite_supersession(
+                rkey,
+                record,
+                &prefix,
+                &compaction_by_key,
+                &rewrite_by_key,
+                &mut excluded,
+                &mut superseded_records,
+            )
+            .map_err(|e| {
+                MaintainError::Invariant(format!(
+                    "erasure completion: catalog supersession resolution failed for {rkey}: {e}"
+                ))
+            })?;
+        }
+    }
+
+    // The live view a snapshot would serve: raw L0 records whose identity no
+    // record excluded, compaction records no rewrite superseded, and rewrite
+    // records no newer rewrite superseded.
+    let l0_inputs = crate::read::load_inputs(store, bucket, &listing.commit_keys).await?;
+    let live_l0: Vec<&crate::read::InputRecord> = l0_inputs
+        .iter()
+        .filter(|ir| {
+            !excluded.contains(&(
+                ir.record.writer_id.to_string(),
+                ir.record.writer_epoch,
+                ir.record.writer_seq,
+            ))
+        })
+        .collect();
+    let live_compactions: Vec<&CompactionRecord> = compaction_records
+        .iter()
+        .filter(|(key, _)| !superseded_records.contains(key))
+        .map(|(_, record)| record)
+        .collect();
+    let live_rewrites: Vec<&RewriteRecord> = rewrite_records
+        .iter()
+        .filter(|(key, _)| !superseded_records.contains(key))
+        .map(|(_, record)| record)
+        .collect();
+
+    for pending_request in pending {
+        let request = &pending_request.request;
+        if bucket_serves_subject(request, &live_l0, &live_compactions, &live_rewrites) {
+            out.blocked.insert(request.request_id.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the catalog-resolved live view still serves any record that could
+/// carry `request`'s subject, restricted to its event-time window. Used only by
+/// [`bucket_erasure_completion`]; a `true` here means the subject is not yet
+/// provably gone from this bucket for this request, so its `.done` is withheld.
+fn bucket_serves_subject(
+    request: &ErasureRequest,
+    live_l0: &[&crate::read::InputRecord],
+    live_compactions: &[&CompactionRecord],
+    live_rewrites: &[&RewriteRecord],
+) -> bool {
+    // A live raw L0 record overlapping the window: un-rewritten input a
+    // snapshot still resolves (the F1 blindness -- the one-hop resolver never
+    // saw this, because it only inspects compaction/rewrite records).
+    if live_l0
+        .iter()
+        .any(|ir| bucket_may_overlap(ir.record.min_event_ts_ns, ir.record.max_event_ts_ns, request))
+    {
+        return true;
+    }
+    // A live compaction part overlapping the window: un-rewritten L1 data.
+    if live_compactions.iter().any(|record| {
+        record
+            .parts
+            .iter()
+            .any(|part| bucket_may_overlap(part.min_event_ts_ns, part.max_event_ts_ns, request))
+    }) {
+        return true;
+    }
+    // A live rewrite that does NOT name this request, with an output part
+    // overlapping the window: the sibling case (ADR-0064 §4). Overlap
+    // harmlessness does not hold across a rewrite, so this output may still
+    // hold the subject this request erases. A live rewrite that DOES name the
+    // request dropped the subject and is safe.
+    live_rewrites.iter().any(|record| {
+        let names_request = record
+            .drops
+            .iter()
+            .any(|drop| drop.request_id == request.request_id);
+        !names_request
+            && record
+                .parts
+                .iter()
+                .any(|part| bucket_may_overlap(part.min_event_ts_ns, part.max_event_ts_ns, request))
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {

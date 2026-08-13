@@ -2478,7 +2478,25 @@ fn build_rewrite_l1_segment_ref(
 /// exactly one of `inputs`/`superseded_record_key` set and that the key parses
 /// and names this same bucket, so this walk trusts those invariants.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_rewrite_supersession(
+/// Resolve one rewrite record's supersession chain into the two exclusion sets
+/// a snapshot resolve uses (ADR-0064 decision 3, amended). `excluded` gains the
+/// rewrite's effective L0 input identities (its own `inputs`, or those reached
+/// by chasing `superseded_record_key`); `superseded_records` gains the keys of
+/// any compaction/rewrite record a rewrite superseded as a whole, whose output
+/// parts must therefore be excluded (overlap harmlessness does NOT hold across
+/// a rewrite). The chase is bounded ([`MAX_REWRITE_SUPERSESSION_DEPTH`]) and
+/// cycle-checked; an over-deep or cyclic chain is a typed error, never a hang.
+///
+/// Exposed for the erasure completion check in `ravel-maintain`: ADR-0064 §4
+/// (2026-08-08 correction) requires the rewrite pass to derive "is this
+/// bucket's contribution current" through the SAME supersession logic a
+/// snapshot resolve and the fold use -- not a bucket LIST resolved in
+/// isolation, and not `ravel-maintain`'s own one-hop `resolve_live_record`,
+/// which cannot see an L0 input the query still serves because this chain
+/// failed to exclude it (the absent-predecessor / partial-input case §4 names).
+/// Routing completion through this exact function is what makes a `.done`
+/// impossible to write while a resolvable snapshot still serves the subject.
+pub fn resolve_rewrite_supersession(
     start_key: &str,
     start_record: &RewriteRecord,
     bucket_prefix: &str,
