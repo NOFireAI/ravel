@@ -252,6 +252,89 @@ async fn http_export_round_trips_to_a_durable_rspan_object() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// Reachability + soundness for the 2026-08-13 amendment (ADR-0051, S1-12): a
+/// long-running span whose start precedes `now - max_ingest_lag` (here 3 h
+/// before ingest, well past the default 2 h lag) but whose end is at `now` is
+/// ADMITTED, becomes durable, and is discoverable by a range query that
+/// overlaps its interval but not the far-past start.
+///
+/// This is the end-to-end guard on the anchor flip in
+/// `ravel_otlp::traces_normalize::checked_span_interval`
+/// (`let lag_ns = ingest_ts_ns.saturating_sub(end_ts_ns)`). Revert that one
+/// line to `.saturating_sub(start_ts_ns)` and the span is rejected `TooOld` at
+/// admission, never becomes durable, and `scan_durable_spans` finds nothing --
+/// this test then fails at "expected exactly one durable long-running span".
+#[tokio::test]
+async fn long_running_span_is_admitted_and_discoverable_by_an_overlapping_query() {
+    let (running, store) = start_test_server().await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let end_ts_ns = now_ns();
+    // Start 3 hours before ingest: beyond the 2 h max_ingest_lag. Under the old
+    // start-anchored bound this was TooOld; under the end-anchored bound it is
+    // admitted because the end is at `now`.
+    let start_ts_ns = end_ts_ns - 3 * 3_600 * 1_000_000_000;
+    let mut request = export_request("long-running", start_ts_ns);
+    request.resource_spans[0].scope_spans[0].spans[0].end_time_unix_nano = end_ts_ns as u64;
+
+    let response = client
+        .post(format!("{base}/v1/traces"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .body(request.encode_to_vec())
+        .send()
+        .await
+        .expect("export request succeeds");
+    assert_eq!(response.status(), 200, "long-running span export should succeed");
+    let body = response.bytes().await.expect("response body");
+    let decoded = ExportTraceServiceResponse::decode(body.as_ref())
+        .expect("response is an ExportTraceServiceResponse");
+    assert!(
+        decoded.partial_success.is_none(),
+        "the long-running span must not be rejected: {:?}",
+        decoded.partial_success
+    );
+
+    // Durable, and discoverable by a range query that overlaps the span's
+    // interval `[now - 3h, now]` at `[now - 1h, now + 10m]` -- crucially a range
+    // that does NOT include the far-past start, proving discovery hangs on
+    // interval overlap, not on the start being in range.
+    let prefix = format!("t/{}/s/l0/", TenantId::new(TENANT).hash().to_hex());
+    let objects = list_all(store.as_ref(), &prefix)
+        .await
+        .expect("list span data objects");
+    assert!(
+        !objects.is_empty(),
+        "the long-running span never became durable: no object under {prefix}"
+    );
+    let query_start = end_ts_ns - 3_600 * 1_000_000_000;
+    let query_end = end_ts_ns + 600 * 1_000_000_000;
+    let mut found = Vec::new();
+    for object in &objects {
+        let bytes = store
+            .get(&object.key, GetRange::Full)
+            .await
+            .expect("get span data object")
+            .data;
+        let reader =
+            RspanReader::new(&bytes, &RspanConfig::default()).expect("open RSPAN object");
+        let (mut scanned, _stats) = reader
+            .scan(&SpanQuery::ts_range(query_start, query_end))
+            .expect("scan RSPAN object");
+        found.append(&mut scanned);
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one durable long-running span discoverable by the overlapping range"
+    );
+    assert_eq!(found[0].start_ts_ns, start_ts_ns);
+    assert_eq!(found[0].end_ts_ns, end_ts_ns);
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 #[tokio::test]
 async fn grpc_export_round_trips_to_a_durable_rspan_object() {
     use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
