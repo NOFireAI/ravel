@@ -402,6 +402,49 @@ record set is rewrite-output-only" check), so T4 must not derive that
 check independently of the same exclusion logic the resolver uses, or this
 net has a hole matching the shape above.
 
+## Amendment (2026-08-13): completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies
+
+Issue #1000 closes the #997 checkpoint's F1 and F3 findings against the
+landed rewrite pass (`services/ravel-server/src/maintain.rs`).
+
+**F1 (completion diverged from the query path).** The pass decided
+completion from its own bucket outcomes, which classify each bucket through
+ravel-maintain's LOCAL one-hop `resolve_live_record` -- it picks a bucket's
+live compaction/rewrite record but never computes which raw L0 inputs a
+query still resolves through the full chain. That is precisely the blindness
+this §4 correction forbids: a bucket whose live rewrite names the request,
+but whose chain fails to exclude an L0 input a snapshot still serves (the
+absent-predecessor / partial-input case, or a live sibling rewrite), read
+"done" to the pass while the query kept serving the subject. Fixed by
+routing completion through the SAME resolver the query runs:
+`resolve_rewrite_supersession` (now `pub`) is called from a new
+`ravel_maintain::bucket_erasure_completion`, which reconstructs
+`Catalog::process_bucket`'s served set on a fresh per-bucket listing and
+blocks a request whose subject is still served by a live L0 record,
+compaction part, or sibling rewrite. `run_erasure_pass` writes a `.done`
+only for a request no in-scope bucket blocks. The pass still resolves its
+own rewrite inputs one-hop (the ADR permits that for the rewrite's own
+decode); the residual is that a genuinely inconsistent bucket the two
+resolvers disagree on is not re-rewritten this tick -- the gate blocks its
+`.done` and the request alarms on `erasure_rewrite_deadline` rather than
+falsely completing. Blocking is the safe failure.
+
+**F3 (the `.done` scope over-asserted).** §4's table row claimed "every live
+segment, index entry, and derived dataset is free of matching records," but
+the pass walks only `c/<shard>/<hour>/` commit records. Determination: index
+objects and ADR-0028 analytics CANNOT hold a record matching an erasure
+subject, so the commit-record pass is sufficient, not under-asserting.
+Index objects (`SnapshotEntry`, `SnapshotPartHeader`, name postings) carry
+identities, hashes, counts, and metric names -- never label/attribute values
+(§7 point 5's requirement). ADR-0028 analytics is a pure query-time stage
+(`ravel-analytics` has no clock/IO/object-store/catalog) that runs *after*
+the query-time exclusion filter and persists nothing durable, so a derived
+result can never surface an erased subject and there is no derived object to
+clear. docs/consistency-model.md's `.done` row and "Scope and interactions"
+section are narrowed to state this proof explicitly. The two honest
+residuals are unchanged and already tracked: the out-of-window folded
+snapshot (§4 open item, above) and the query-audit keyspace (epic EL).
+
 ### 5. Erasing the erasure request itself
 
 The `.dreq` contains the subject identifier, so it must not outlive its

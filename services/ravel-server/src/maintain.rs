@@ -1705,8 +1705,8 @@ async fn write_erasure_completion(
 ///
 /// 1. **Rewrite** every bucket against every pending `.dreq`
 ///    ([`erasure_rewrite_pass`]).
-/// 2. **Complete**: write each pending request's `.done` when the pass proved
-///    every bucket in its scope now carries a live `RewriteRecord` naming it.
+/// 2. **Complete**: write each pending request's `.done` only when the CATALOG
+///    resolver proves every bucket in its scope no longer serves the subject.
 /// 3. **Sweep** the `.dreq`s whose `.done` is older than
 ///    `protection_horizon` ([`sweep_erasure_requests`]).
 ///
@@ -1717,27 +1717,37 @@ async fn write_erasure_completion(
 /// because a request completed by an earlier tick is by definition no longer
 /// pending and its `.dreq` still has to be swept.
 ///
-/// **How completion is computed.** Every bucket of the (tenant, signal) is
-/// classified by the rewrite pass itself, not by a second independent listing:
-/// `Rewritten` and `AlreadyApplied` both mean the bucket's live record now
-/// names every pending request that overlaps it (`erasure_rewrite_bucket`
-/// batches all overlapping requests into one record, and its `AlreadyApplied`
-/// guard fires only when the live record already names all of them);
-/// `NoApplicableRequests` and `Tombstoned` mean the bucket is in no request's
-/// scope. If every bucket lands in those four arms, then for every pending
-/// request, every bucket in that request's scope carries a live
-/// `RewriteRecord` naming it -- ADR-0064 §4's sibling-safe condition ("every
-/// live rewrite record in this bucket names R", not the weaker
-/// "rewrite-output-only") -- and each request's `.done` is written. If any
-/// bucket was held, errored, abandoned its publish, or could not be listed,
-/// `deferred` is set and NO `.done` is written this tick: completion is
-/// verified, never assumed.
+/// **How completion is computed (ADR-0064 §4, the 2026-08-08 F1 correction).**
+/// The rewrite pass classifies each bucket off ravel-maintain's one-hop
+/// `resolve_live_record`, which picks the bucket's live compaction/rewrite
+/// record but never computes which raw L0 inputs a query still resolves through
+/// the full supersession chain. So `AlreadyApplied` (or a clean `Rewritten`)
+/// off that one-hop view can read "done" while a snapshot keeps serving the
+/// subject out of an L0 input the chain failed to exclude -- the
+/// absent-predecessor / partial-input case, or a live sibling rewrite, that §4
+/// names. Completion therefore is NOT derived from the pass's own outcomes.
+/// After the rewrite pass, [`erasure_rewrite_pass`] re-derives each in-scope
+/// bucket's served view through [`ravel_maintain::bucket_erasure_completion`],
+/// which reconstructs exactly what `ravel_catalog::Catalog::process_bucket`
+/// serves via `ravel_catalog::resolve_rewrite_supersession` -- the same
+/// resolver a snapshot resolve and the fold run. A request is recorded in
+/// `pass.catalog_blocked` if any in-scope bucket still serves it (a live L0
+/// record, a live compaction part, or a live sibling rewrite that does not name
+/// it, overlapping its window). A `.done` is written only for a request that is
+/// neither `deferred` nor `catalog_blocked`, so completion can never diverge
+/// from what queries return. If any bucket was held, errored, abandoned its
+/// publish, could not be listed, or could not be resolved through the catalog
+/// resolver, `deferred` is set and NO `.done` is written this tick: completion
+/// is verified against the query path, never assumed.
 ///
-/// Deriving the check from the pass's own outcomes is deliberate: ADR-0064 §4
-/// (2026-08-08 correction) forbids deciding completion from a fresh bucket
-/// LIST taken independently of the exclusion logic, and
-/// `erasure_rewrite_bucket` resolves each bucket's live record through the
-/// same supersession resolution the rewrite itself uses.
+/// **Residual (stated honestly, tracked by ADR-0064 §4's open item).** Because
+/// the rewrite still resolves its own live inputs one-hop, a genuinely
+/// inconsistent bucket where the two resolvers disagree (an L0 input live per
+/// the catalog resolver but invisible to the one-hop view) is not re-rewritten
+/// this tick; the completion gate here blocks its `.done` and the pending
+/// request alarms on `erasure_rewrite_deadline` rather than falsely completing.
+/// Blocking is the safe failure: a stuck-pending request retains its `.dreq`
+/// and query-time exclusion, where a false `.done` would resurrect the subject.
 ///
 /// **Known gap, matching ADR-0064 decision 3 point 1:** an unsealed bucket is
 /// deferred and excluded from scope, so a windowless request can complete
