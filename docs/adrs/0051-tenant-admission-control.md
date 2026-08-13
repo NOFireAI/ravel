@@ -434,3 +434,278 @@ ADR, not this one.
   path, tracked in the review ledger, not to admission control.
 - Read-side cost enforcement (bytes-scanned budgets) remains staged
   behind ADR-0044's measurement, unchanged by this ADR.
+
+## Amendment (2026-08-13): fail-closed ingest-timestamp plausibility
+
+Issue #905, adversarial finding S1-12. This amendment appends to the
+original decision; where it supersedes a sentence of §4 or a Consequences
+bullet, it says so explicitly. Everything else above stands unchanged.
+
+### Context
+
+S1-12's headline was "ingest-hour derivation fails open on nonsense
+clocks". §7 closed half of it: a non-positive or non-representable
+flush-open clock reading now fails the flush loudly instead of writing
+bucket 0. Two fail-open holes remain, and one earlier fix attempt made
+things worse in a different way:
+
+1. **The receiver's clock is never checked at admission.** A
+   positive-but-nonsense clock (a host whose RTC reset to shortly after
+   the epoch, or jumped decades forward) passes
+   `checked_ingest_hour_bucket` and buckets commits in far-past or
+   far-future hours, polluting the hour-partitioned layout and the
+   retention arithmetic anchored on it. Worse, in buffered mode the ack
+   precedes the flush, so a clock that goes bad between admission and
+   flush open strands already-acked data behind a flush §7 will now
+   (correctly) keep failing.
+2. **The span bound from §4 anchors on the wrong end of the interval.**
+   §4 bounds `start_ts` by `max_ingest_lag`, which rejects every
+   legitimate span longer than the lag window; the original Consequences
+   section admitted this ("Long-running spans ... are rejected at
+   admission"). A review of the first #905 implementation blocked on
+   exactly this class of regression.
+3. **The blocked fix invented a second window.** That implementation
+   added a fresh ~2h past-reject bound distinct from `max_ingest_lag`.
+   Review blocked it as a product regression: Prometheus Remote Write
+   replays hours of samples on outage recovery, OTLP client retry
+   backlogs can exceed 2h, and a long-running span starts hours before
+   it ends. A new, undocumented bound either duplicates the existing lag
+   knob or silently tightens the documented late-data contract.
+
+What already exists on `main`, verified against the code: every record
+path enforces the event-time window today. Metrics OTLP
+(`checked_event_ts`, crates/ravel-otlp/src/normalize.rs), OTAP (its
+mirror in crates/ravel-otap/src/normalize.rs), Remote Write
+(`checked_event_ts` over millisecond wire timestamps,
+crates/ravel-remote-write/src/normalize.rs, samples, histograms, and
+exemplars), logs (`checked_record_ts`,
+crates/ravel-otlp/src/logs_normalize.rs), and spans
+(`checked_span_interval`, crates/ravel-otlp/src/traces_normalize.rs).
+Issue #905's "extending to the metric path if it lacks the bound" turns
+out to be moot: no metric surface lacks it. The real gaps are the span
+anchor and the receiver clock, below.
+
+### Decision
+
+**1. The plausibility window is the existing documented bounds. No new
+knob.** A record timestamp is admissible if and only if
+
+```
+now - max_ingest_lag  <=  ts  <=  now + max_future_skew
+```
+
+where `now` is the receiver's admission-time clock reading
+(`ingest_ts_ns`), and `max_ingest_lag` / `max_future_skew` are the §3
+limits (defaults 2 h / 10 m) that ADR-0010 §8 and
+docs/consistency-model.md ("Late and skewed data") already document.
+Both endpoints are inclusive: a timestamp exactly at either edge is
+admitted, and rejection requires strictly exceeding a bound. This
+matches every existing implementation (`skew_ns > max_future_skew_ns`
+rejects, equality passes) and is now the normative statement. Enforcing
+this window is not a new product limit: the catalog listing window
+(crates/ravel-catalog/src/catalog.rs `resolve`) is provably complete
+only under these admission bounds, so admitting a record outside them
+was never a capability, it was the bug — a stored, acked record that no
+non-token query can discover.
+
+**2. Which timestamp is bounded, per signal:**
+
+| Signal | Bounded timestamp | Bound |
+|---|---|---|
+| Metrics (OTLP, OTAP, Remote Write) | each sample's event ts | both edges |
+| Logs | resolved record ts (after observed-time / ingest-time fallbacks) | both edges |
+| Spans | span **end** (`end_ts_ns`) | both edges |
+| Spans | span start (`start_ts_ns`) | only `end_ts >= start_ts`; **never** the lag bound |
+| Exemplars | exemplar ts | both edges (dropped and counted, ADR-0047) |
+
+This **supersedes the §4 span sentence** ("`end_ts_ns` is bounded by
+`max_future_skew` and `start_ts_ns` by `max_ingest_lag`") and the
+Consequences bullet "Long-running spans (duration > `max_ingest_lag`)
+are rejected at admission". The lag bound moves from the span's start to
+its end: a span reported more than `max_ingest_lag` after it *ended* is
+late data, the same contract metrics and logs already have; a span whose
+start precedes `now` by more than the lag but whose end is in window is
+a legitimate long-running span and is admitted.
+
+Why this is correct, not just kinder: the listing-window completeness
+proof never needed the start bound. `resolve` lists ingest hours
+overlapping `[range.start_ns - max_ingest_lag, now_ns +
+clock_skew_allowance]` and then filters by event-time overlap using the
+commit record's advertised `[min start_ts, max end_ts]`. Any span
+overlapping the query range has `end_ts >= range.start`, and the end's
+future bound gives `end_ts <= ingest_ts + max_future_skew`, so
+`ingest_ts >= range.start - max_future_skew`, which is strictly inside
+the listed window (`max_future_skew` 10 m << `max_ingest_lag` 2 h). The
+upper edge is covered because ingest hours never exceed `now` plus the
+tolerated writer skew the `clock_skew_allowance` pad exists for. The
+start bound's only real contribution was capping the advertised
+`min start_ts` (pruning precision — and an uncapped min is merely
+conservative over-inclusion, never wrong results), at the price of
+rejecting real telemetry. `start_ts <= end_ts <= ingest_ts +
+max_future_skew` still bounds the start's future side for free, and
+`end_ts < start_ts` remains rejected outright.
+
+**3. Rejection is fail-closed and typed, through the existing
+partial-success machinery.** An out-of-window record is rejected at
+admission with the existing typed reasons
+(`Rejection::FutureSkew`/`TooOld` for metrics,
+`LogRejection::FutureSkew`/`TooOld`, `SpanRejection::FutureSkew`/
+`TooOld`), earns no commit token, and is never clamped into bounds and
+never mapped into bucket 0 or any other fallback bucket. Within a
+batch, in-window records commit normally and out-of-window records are
+reported rejected, exactly per the §1 status-code table's "Event-time
+skew" row (partial success on OTLP/OTAP; Remote Write returns 2xx with
+the written-count header unless every sample was rejected). This is
+consistent with docs/consistency-model.md's acknowledgement rules: an
+ack covers exactly the records that were committed, and rejected
+records are visibly accounted in the same response. Rejections count
+under the existing per-signal counter
+`ravel_admission_rejected_total{tenant_hash, signal, reason="skew"}`
+(§6).
+
+**4. The receiver's own clock is checked at both points it is read
+(this is the actual S1-12 close-out).** There is no second clock to
+compare against, but a floor is derivable: no host legitimately runs
+Ravel with a clock reading before the system existed. A compiled
+constant
+
+```
+MIN_PLAUSIBLE_INGEST_CLOCK_NS = 1_577_836_800_000_000_000  // 2020-01-01T00:00:00Z
+```
+
+is enforced:
+
+- **At admission:** before the window is computed, the handler's
+  `now_ns()` reading must be at or above the floor and must yield a
+  representable `u32` hour bucket. Failure rejects the whole request
+  with a typed error (HTTP 503, gRPC `UNAVAILABLE`): the fault is the
+  replica's, not the data's, and a retry against a healthy replica will
+  succeed. Whole-request, because no per-record decision is meaningful
+  when the reference clock itself is nonsense. Counted under a new
+  closed reason label variant, `reason="clock"`.
+- **At flush open:** `checked_ingest_hour_bucket` additionally rejects
+  `flush_open_ns < MIN_PLAUSIBLE_INGEST_CLOCK_NS`, extending §7's
+  fail-loud rule (typed `WriteError::SegmentBuild`, waiters errored).
+
+Honest residual: a wrong-but-post-2020 clock cannot be detected against
+any reference. What the window buys in that case is loud failure
+instead of silent pollution — honest clients' genuinely-current
+timestamps fall outside the bad clock's shifted window and are rejected
+with typed errors, producing an attributable rejection spike on
+`reason="skew"`, rather than data landing quietly in a wrong hour
+bucket. Fail-closed means the failure is visible, not that a bad clock
+is impossible.
+
+**5. Backfill and replay.** A client replaying hours of buffered data
+after an outage (Prometheus Remote Write WAL replay, an OTLP retry
+backlog) is bounded by `max_ingest_lag` like all late data: samples
+older than `now - max_ingest_lag` are rejected with `TooOld`. That is
+ADR-0010 §8's existing contract, not a new restriction, and this
+amendment does not shrink it — the accept region is exactly the
+documented one. Deployments that need longer replay raise
+`max_ingest_lag`, together with the catalog listing window, under the
+coordinated-raise rule (docs/consistency-model.md "Late and skewed
+data"; docs/guides/admission-limits.md "Raising max_ingest_lag"): widen
+the catalog window first, then the admission bound. Lowering is always
+safe.
+
+![Ingest-timestamp plausibility window](../diagrams/ingest-plausibility-window.svg)
+
+### Rejected alternatives (amendment)
+
+1. **A fresh ~2h past-reject window (the blocked implementation).**
+   Rejected because any bound tighter than `max_ingest_lag` breaks the
+   documented late-data replay contract (Remote Write outage recovery,
+   OTLP retry backlogs, spans that end hours after they start), and any
+   bound equal to it is a duplicate knob that will drift from the
+   catalog listing window the real knob is coordinated with. The window
+   Ravel already documents is the plausibility window; the work is
+   enforcing it, not inventing a sibling.
+2. **Silently clamping out-of-window timestamps to the nearest edge.**
+   Rejected: retention anchors expiry on advertised event-time bounds,
+   so a clamp corrupts retention arithmetic with fabricated timestamps;
+   it rewrites sender data (the exactness invariant — original
+   Rejected-alternative 3 already refused this for logs and spans); and
+   it hides the client clock bug that a visible typed rejection
+   surfaces.
+3. **Keeping the span-start lag bound (status quo).** Rejected: it
+   rejects legitimate long-running spans, and §2 above shows the
+   listing-window completeness proof never required it.
+4. **Failing readiness (`/readyz`) on an implausible clock instead of
+   per-request 503.** Rejected: per-request rejection already sheds
+   ingest safely, keeps query serving up (reads take `now` from the
+   caller), and recovers instantly when NTP fixes the clock, without
+   readiness flapping.
+
+### Consequences (amendment)
+
+- `checked_span_interval` changes its lag anchor from `start_ts_ns` to
+  `end_ts_ns`. Long-running spans are now admitted; `end_ts < start_ts`
+  is still rejected; span event/link timestamps ride inside the record
+  unbounded, as today.
+- The following prose is superseded and must be updated in the same
+  commit as the code change (documentation stays current): the §4 span
+  sentence and Consequences bullet named above,
+  docs/consistency-model.md "Late and skewed data" ("spans bound
+  `end_ts` by `max_future_skew` and `start_ts` by `max_ingest_lag`"),
+  docs/guides/admission-limits.md "Event-time skew" (the span
+  paragraph), and docs/guides/ingest.md's event-time-skew section.
+- The closed `Label` reason enum (§6) gains one variant, `clock`.
+  Cardinality stays bounded by construction.
+- **Test fixtures re-anchor.** Roughly 14 existing tests across the
+  reverse dependencies drive ingest with epoch-adjacent clock fixtures
+  (`now_ns` values a few hours past 0, `NS_PER_HOUR * 3` style) that
+  the clock floor makes inadmissible. They move to real-clock-relative
+  fixtures: a fixed named base constant comfortably above the floor
+  (e.g. 2026-01-01T00:00:00Z), with offsets from it — never
+  `SystemTime::now()`; time stays injected and tests stay
+  deterministic. Affected: services/ravel-server `logs_ingest` /
+  `traces_ingest` unit fixtures and `admission_reconcile_e2e`,
+  ravel-promql-difftest (documented examples regenerate),
+  ravel-sim (workload injected clock, wide-interval span scenarios),
+  ravel-failure-tests `crash_matrix` common fixtures.
+- A sender with a wrong clock that previously saw silent acceptance
+  into a wrong bucket now sees typed rejections; that is the point, and
+  it is the same behavior change the original ADR already shipped for
+  log/span skew.
+
+### Implementation note (issue #905 executor)
+
+- **Span anchor:** crates/ravel-otlp/src/traces_normalize.rs
+  `checked_span_interval` — move the `max_ingest_lag_ns` check from
+  `start_ts_ns` to `end_ts_ns`; keep the `end < start` rejection and the
+  `end_ts_ns` future-skew check; update its doc comment and the
+  `SpanRejection::TooOld` doc in crates/ravel-otlp/src/traces_limits.rs
+  to say "end", citing this amendment.
+- **Clock floor constant:** `MIN_PLAUSIBLE_INGEST_CLOCK_NS` in
+  `ravel-ingest` (public), next to `checked_ingest_hour_bucket` in
+  crates/ravel-ingest/src/config.rs, which gains the floor check.
+  Admission-side helper (e.g. `plausible_ingest_clock(now_ns) ->
+  Result<(), ...>`) lives beside it; services/ravel-server already
+  depends on ravel-ingest.
+- **Admission call sites:** every handler that reads `now_ns()` to
+  build a normalize context checks the clock first and returns 503 /
+  `UNAVAILABLE` on failure: services/ravel-server/src/ingest.rs (OTLP
+  metrics HTTP and gRPC), logs_ingest.rs, traces_ingest.rs,
+  otlp_grpc_logs.rs, otlp_grpc_traces.rs, remote_write.rs,
+  otap_grpc.rs.
+- **Typed errors:** reuse `Rejection`/`LogRejection`/`SpanRejection`
+  `FutureSkew`/`TooOld` for record-window rejections (no new variants
+  needed there); add one typed clock-implausibility error for the
+  whole-request path; extend the `/metrics` reason `Label` enum
+  (services/ravel-server/src/metrics.rs) with `clock`.
+- **Counters:** record-window rejections keep `reason="skew"`
+  per-signal; clock rejections count `reason="clock"`; flush-side floor
+  failures surface through the existing abandoned-flush accounting.
+- **Tests (prove the fault fires):** per signal, boundary tests both
+  edges (equality admits, one nanosecond past rejects); a span whose
+  start precedes `now - max_ingest_lag` but whose end is in window is
+  admitted, and one whose end is older than the lag is rejected; clock
+  floor rejected per surface with the typed error asserted;
+  ravel-failure-tests `crash_matrix` rows for the flush-open floor with
+  `FaultStore` counter asserts proving injection fired; re-anchor the
+  fixture set listed in Consequences; regenerate
+  ravel-promql-difftest's documented examples.
+- **Docs in the same commit:** the superseded prose list in
+  Consequences, plus docs/guides/admission-limits.md gains the clock
+  floor and 503 semantics.
