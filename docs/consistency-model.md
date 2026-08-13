@@ -560,7 +560,8 @@ Each stage in detail:
   publishes nothing, leaving the inputs live (the ADR-0048 gate rearranged
   for deliberate drops). Unlike compaction, overlap harmlessness does *not*
   hold for a rewrite -- its outputs deliberately lack records the inputs
-  contain -- so the §2 query-time filter stays active for a request's
+  contain -- so the query-time filter (Query exclusion, above) stays active
+  for a request's
   predicate until its `.dreq` is removed, which by construction happens only
   after no resolvable snapshot can still reference a pre-rewrite input.
   Correctness never depends on the per-bucket compaction/rewrite
@@ -623,8 +624,8 @@ into them. An operator with erasure obligations must budget them deliberately.
   explicitly *paused* for held ranges: a hold preserves evidence against
   destruction and wins over erasure until an authorized human clears it via
   the separate Admin-only legal-hold operation (ADR-0042/ADR-0055). Erasure
-  never clears a hold and never re-submission is needed -- the next pass
-  completes once the hold clears. Query-time exclusion (§2) stays active
+  never clears a hold, and no re-submission is needed -- the next pass
+  completes once the hold clears. Query-time exclusion (above) stays active
   throughout: a hold does not oblige Ravel to keep *serving* the data.
 
 ### Scope and interactions
