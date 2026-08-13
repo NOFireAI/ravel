@@ -166,10 +166,34 @@ countable. For the full explanation of why these bounds exist (they are what
 makes the catalog listing window sound), see
 [ingest.md](ingest.md#event-time-skew-bounds).
 
-For spans specifically: `end_ts` is bounded by `max_future_skew` and
-`start_ts` by `max_ingest_lag`, and `end_ts < start_ts` is rejected outright.
-A span longer than `max_ingest_lag`, or reported more than that after it
-started, is rejected at admission under the default 2 h window.
+For spans specifically: the span's `end_ts` is bounded on both edges -- it
+may lead ingest time by at most `max_future_skew` and lag it by at most
+`max_ingest_lag` -- and `end_ts < start_ts` is rejected outright. Both bounds
+anchor on the end, not the start (ADR-0051 amendment, 2026-08-13): a
+long-running span that started more than `max_ingest_lag` ago but ended
+within the window is admitted, and only a span reported more than
+`max_ingest_lag` after it *ended* is rejected as late. This lets a genuine
+long-running span through while keeping the catalog listing window sound (any
+span overlapping a query range has its end at or after the range start, so
+the end's window placement alone keeps its ingest hour listed).
+
+### Receiver-clock floor
+
+Independently of the sender's timestamps, Ravel checks its own admission
+clock (ADR-0051 amendment, S1-12). A reading below a compiled floor
+(2020-01-01T00:00:00Z -- no host legitimately runs Ravel with a clock older
+than the system) or one that yields no representable ingest-hour bucket
+rejects the *whole* request with HTTP 503 / gRPC `UNAVAILABLE`, counted under
+`ravel_admission_rejected_total{reason="clock"}`. The fault is the replica's,
+not the request's, so a retry against a healthy replica succeeds; no per-record
+decision is meaningful when the reference clock itself is nonsense. The same
+floor also extends the fail-loud flush-open check, so a clock that goes bad
+between a buffered-mode ack and the flush fails the flush loudly rather than
+writing acked data into a far-past hour bucket. A wrong-but-post-2020 clock
+still cannot be detected against any reference; what the floor buys there is a
+loud, attributable rejection spike (honest clients' current timestamps fall
+outside the bad clock's shifted window and are rejected `reason="skew"`)
+instead of silent pollution of the hour-partitioned layout.
 
 ## Raising max_ingest_lag: a coordinated change
 

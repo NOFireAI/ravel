@@ -170,6 +170,23 @@ event time close enough to ingest time for this to hold:
 Both bounds are inclusive. A skew or lag exactly equal to the limit is
 accepted; one nanosecond past it is rejected.
 
+Logs and spans enforce the same window at admission (ADR-0051 §4). For a
+**span**, the bounded timestamp is its **end** (`end_ts_ns`), on both edges,
+and `end_ts < start_ts` is rejected outright. The lag bound anchors on the
+end, not the start (ADR-0051 amendment, 2026-08-13): a long-running span that
+started more than `max_ingest_lag_ns` ago but ended within the window is
+admitted; only a span reported more than `max_ingest_lag_ns` after it *ended*
+is `TooOld`. The listing window stays sound because any span overlapping a
+query range has its end at or after the range start.
+
+Ravel also checks its own receiver clock at admission (ADR-0051 amendment,
+S1-12): a reading below a compiled floor (2020-01-01T00:00:00Z) or one that
+yields no representable ingest-hour bucket rejects the whole request with
+`503` / gRPC `UNAVAILABLE`, counted under
+`ravel_admission_rejected_total{reason="clock"}`. This is the replica's
+fault, not the request's, and is retryable against a healthy replica. The
+same floor extends the fail-loud flush-open check.
+
 ## Logs
 
 Everything above about authentication, strict vs. buffered acknowledgement,
