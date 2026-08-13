@@ -312,13 +312,19 @@ async fn trace_id_query_takes_the_cheap_trace_lookup() {
     // (2) The trace lookup scans strictly fewer blocks than the full ts_range
     //     scan over the same object. Spy on the reader via the fetcher's stats.
     let full: ScanStats = fetcher
-        .fetch(&seg, &SpanQuery::ts_range(i64::MIN, i64::MAX), &[])
+        .fetch(
+            &seg,
+            &SpanQuery::ts_range(i64::MIN, i64::MAX),
+            None,
+            None,
+            &[],
+        )
         .await
         .expect("fetch full")
         .expect("relevant")
         .stats;
     let trace_only: ScanStats = fetcher
-        .fetch(&seg, &issued, &[])
+        .fetch(&seg, &issued, None, None, &[])
         .await
         .expect("fetch trace")
         .expect("relevant")

@@ -105,6 +105,8 @@ impl SpansTableProvider {
             pushdown.span_query(),
             pushdown.service_name.clone(),
             pushdown.name.clone(),
+            pushdown.duration_window(),
+            pushdown.status_mask,
             Arc::clone(&self.erasure),
         )?;
         Ok(Arc::new(scan))

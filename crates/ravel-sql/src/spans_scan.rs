@@ -90,6 +90,14 @@ pub struct SpansScanExec {
     service_name: Option<String>,
     /// The `name = <literal>` equality pushed, if any: a `COL_NAME` bloom probe.
     name: Option<String>,
+    /// The inclusive `[min, max]` `duration_ns` window pushed, if any (issue
+    /// #979): a skip-index prune dropping blocks whose duration range cannot
+    /// overlap it. `None` when no duration filter was pushed. Widen-only.
+    duration_ns: Option<(i64, i64)>,
+    /// The `status_code` bitmask pushed, if any (issue #979): a skip-index
+    /// prune dropping blocks that share no status bit with it. `None` when no
+    /// status filter was pushed. Widen-only.
+    status_mask: Option<u8>,
     /// Pending selective-erasure predicates from the resolved snapshot
     /// (ADR-0064 decision 2, issue #829). Applied per decoded [`SpanRow`] via
     /// [`is_erased_span`] immediately after `fetcher.fetch` returns, before
@@ -101,8 +109,11 @@ pub struct SpansScanExec {
 
 impl SpansScanExec {
     /// Build a scan over `segments`, split round-robin into
-    /// `min(target_partitions, segments.len())` partitions, driven by `query`
-    /// and the optional `service_name`/`name` bloom-probe literals.
+    /// `min(target_partitions, segments.len())` partitions, driven by `query`,
+    /// the optional `service_name`/`name` bloom-probe literals, and the
+    /// optional `duration_ns`/`status_mask` skip-index prune shapes (issue
+    /// #979).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fetcher: SpanSegmentFetcher,
         segments: &[SegmentRef],
@@ -110,6 +121,8 @@ impl SpansScanExec {
         query: SpanQuery,
         service_name: Option<String>,
         name: Option<String>,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
         erasure: Arc<Vec<ErasurePredicate>>,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -125,6 +138,8 @@ impl SpansScanExec {
             query,
             service_name,
             name,
+            duration_ns,
+            status_mask,
             erasure,
             schema,
             properties,
@@ -219,6 +234,8 @@ impl ExecutionPlan for SpansScanExec {
             self.query,
             self.service_name.clone(),
             self.name.clone(),
+            self.duration_ns,
+            self.status_mask,
             Arc::clone(&self.erasure),
         ));
         Ok(Box::pin(SpanScanStream {
@@ -234,12 +251,15 @@ impl ExecutionPlan for SpansScanExec {
 /// scan re-checks the ts overlap and trace_id per row); the
 /// `service_name`/`name` bloom probes only ever widened the block read set, so
 /// nothing here narrows beyond what the exact per-row check keeps.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: SpanSegmentFetcher,
     segs: Vec<SegmentRef>,
     query: SpanQuery,
     service_name: Option<String>,
     name: Option<String>,
+    duration_ns: Option<(i64, i64)>,
+    status_mask: Option<u8>,
     erasure: Arc<Vec<ErasurePredicate>>,
 ) -> DFResult<Vec<SpanRow>> {
     // The bloom predicates for this scan: one per pushed literal, field-scoped
@@ -261,7 +281,7 @@ async fn prepare_partition(
     let mut out: Vec<SpanRow> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher
-            .fetch(seg, &query, &predicates)
+            .fetch(seg, &query, duration_ns, status_mask, &predicates)
             .await
             .map_err(SqlError::from)?
         else {
@@ -500,6 +520,268 @@ mod tests {
         }
     }
 
+    /// A span whose `status_code` and `duration_ns` (`end_ts - start_ts`) are
+    /// set independently, so a `status_code = ... AND duration_ns >= ...`
+    /// filter matches or misses it by design. Distinct ascending trace_ids so
+    /// each record lands in its own block under `block_target_records = 1`.
+    fn span_with_status_and_duration(trace: u8, status: StatusCode, duration: i64) -> SpanRecord {
+        SpanRecord {
+            trace_id: [trace; 16],
+            span_id: [trace; 8],
+            parent_span_id: None,
+            name: format!("op-{trace}"),
+            start_ts_ns: 0,
+            end_ts_ns: duration,
+            status_code: status,
+            status_message: None,
+            attrs: vec![("service.name".to_string(), "svc".to_string())],
+        }
+    }
+
+    /// Issue #979 REACHABILITY test: a real SQL `spans` query carrying BOTH a
+    /// `status_code` filter AND a `duration_ns` filter is parsed by DataFusion,
+    /// extracted into `SpansPushdown`, and driven through the same
+    /// provider/fetcher path production uses. It proves the two things #979
+    /// exists to close:
+    ///
+    /// 1. Blocks are ACTUALLY SKIPPED: with the extracted `status_mask` and
+    ///    `duration_window()` fed to the skip index (exactly what
+    ///    `SpansTableProvider::build_scan` now passes into
+    ///    `SpansScanExec::new`), the fetcher decodes strictly fewer blocks than
+    ///    the same scan with both prune shapes disabled (`None, None`, the
+    ///    pre-#979 wire-up).
+    /// 2. Results are UNCHANGED under pruning: the exact set of matching rows
+    ///    is identical whether the skip index prunes or not (the widen-safe
+    ///    invariant), and equals the independently computed oracle. The full
+    ///    SQL query, run end to end through `build_session` so DataFusion's
+    ///    `Inexact` residual re-applies the predicate, returns that same set.
+    ///
+    /// Flip to watch assertion (1) fail: in the `pruned` fetch below, pass
+    /// `None, None` in place of `duration_window`/`status_mask` (equivalently,
+    /// revert `build_scan` to the pre-#979 `None, None`); the skip index then
+    /// keeps every block and `pruned.stats.blocks_scanned < full...` fails.
+    #[tokio::test]
+    async fn status_and_duration_filters_actually_skip_blocks_and_preserve_results() {
+        use crate::config::SqlConfig;
+        use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+        use crate::session::{SessionTable, build_session};
+        use ravel_types::accounting::QueryAccounting;
+
+        // One span per block, so a per-block prune is visible as a block count.
+        let cfg = RspanConfig {
+            block_target_records: 1,
+            ..RspanConfig::default()
+        };
+        // (status, duration_ns). The query keeps status = Error (2) AND
+        // duration_ns >= 500: traces 0, 3, 5 match; 1 fails status, 2 fails
+        // duration, 4 fails status.
+        let specs = [
+            (StatusCode::Error, 1000),
+            (StatusCode::Ok, 1000),
+            (StatusCode::Error, 100),
+            (StatusCode::Error, 1000),
+            (StatusCode::Unset, 1000),
+            (StatusCode::Error, 2000),
+        ];
+        let records: Vec<SpanRecord> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, (status, duration))| {
+                span_with_status_and_duration(i as u8, *status, *duration)
+            })
+            .collect();
+
+        let mut w = RspanWriter::new(
+            cfg,
+            ObjectIdentity {
+                tenant_hash: [1u8; 16],
+                shard: 0,
+                writer_id: [2u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for r in &records {
+            w.push(r.clone());
+        }
+        let bytes = w.finish().expect("finish");
+        let object_size = bytes.len() as u64;
+
+        let store = MemoryStore::new();
+        let key = "spans/status-duration.rspan";
+        store
+            .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+
+        let seg = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 2000,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        };
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = SpanSegmentFetcher::new(Arc::clone(&store));
+
+        // The real SQL filter, parsed and type-coerced by DataFusion, then
+        // extracted into the pushdown production feeds the skip index.
+        let sql = "SELECT trace_id, status_code, duration_ns FROM spans \
+                   WHERE status_code = 2 AND duration_ns >= 500";
+        let snapshot = Snapshot {
+            segments: vec![seg.clone()],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = SpansTableProvider::new(snapshot, fetcher.clone());
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let breach = CeilingBreach::new();
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = Arc::new(
+            TenantDelegatingPool::new(1 << 30, tenant, breach, QueryAccounting::new()),
+        );
+        let ctx = build_session(
+            &SqlConfig::default(),
+            pool,
+            SessionTable::Spans(Arc::new(provider)),
+        )
+        .expect("spans session builds");
+
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("filtered query plans");
+        let mut predicates = Vec::new();
+        collect_filter_predicates(&plan, &mut predicates);
+        let pushdown = extract_spans(&predicates);
+        assert_eq!(
+            pushdown.status_mask,
+            Some(ravel_rspan::skip_index::STATUS_BIT_ERROR),
+            "the WHERE clause must extract the Error status bit"
+        );
+        assert_eq!(
+            pushdown.duration_window(),
+            Some((500, i64::MAX)),
+            "the WHERE clause must extract the [500, MAX] duration window"
+        );
+
+        // (1) Blocks actually skipped. `pruned` passes exactly what build_scan
+        // now forwards; `full` disables both prune shapes (the pre-#979 call).
+        let query = pushdown.span_query();
+        let pruned = fetcher
+            .fetch(
+                &seg,
+                &query,
+                pushdown.duration_window(),
+                pushdown.status_mask,
+                &[],
+            )
+            .await
+            .expect("fetch pruned")
+            .expect("relevant");
+        let full = fetcher
+            .fetch(&seg, &query, None, None, &[])
+            .await
+            .expect("fetch full")
+            .expect("relevant");
+
+        assert_eq!(full.stats.blocks_total, 6, "six blocks total");
+        assert_eq!(
+            full.stats.blocks_scanned, 6,
+            "with pruning disabled every block is decoded"
+        );
+        assert!(
+            pruned.stats.blocks_scanned < full.stats.blocks_scanned,
+            "the status+duration skip-index prune must decode fewer blocks \
+             ({} of {}) than the unpruned scan ({})",
+            pruned.stats.blocks_scanned,
+            pruned.stats.blocks_total,
+            full.stats.blocks_scanned,
+        );
+        assert_eq!(
+            pruned.stats.blocks_scanned, 3,
+            "exactly the three Error/>=500 blocks (traces 0, 3, 5) survive"
+        );
+
+        // (2) Results unchanged under pruning: the exact predicate re-evaluated
+        // over each fetch's rows yields the identical set, and it equals the
+        // oracle. `duration_ns` is computed the same way the scan's
+        // `build_batch` computes it.
+        let matches_predicate = |r: &SpanRecord| {
+            r.status_code.to_u8() == 2 && r.end_ts_ns.saturating_sub(r.start_ts_ns) >= 500
+        };
+        let pruned_rows: BTreeSet<[u8; 16]> = pruned
+            .records
+            .iter()
+            .map(|r| &r.record)
+            .filter(|r| matches_predicate(r))
+            .map(|r| r.trace_id)
+            .collect();
+        let full_rows: BTreeSet<[u8; 16]> = full
+            .records
+            .iter()
+            .map(|r| &r.record)
+            .filter(|r| matches_predicate(r))
+            .map(|r| r.trace_id)
+            .collect();
+        let oracle: BTreeSet<[u8; 16]> = BTreeSet::from([[0u8; 16], [3u8; 16], [5u8; 16]]);
+        assert_eq!(
+            pruned_rows, full_rows,
+            "the matching row set is identical with pruning on vs off"
+        );
+        assert_eq!(pruned_rows, oracle, "and equals the oracle");
+
+        // The full SQL query, end to end through the session (residual applied),
+        // returns exactly the oracle rows.
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect");
+        let mut sql_rows: BTreeSet<[u8; 16]> = BTreeSet::new();
+        for batch in &batches {
+            let trace = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("trace_id col");
+            for i in 0..batch.num_rows() {
+                sql_rows.insert(trace.value(i).try_into().expect("16-byte trace"));
+            }
+        }
+        assert_eq!(
+            sql_rows, oracle,
+            "the real SQL query returns exactly the matching rows under pruning"
+        );
+    }
+
+    /// Collect every `WHERE`/`HAVING` predicate in `plan` as a top-level AND
+    /// conjunct (mirrors `executor::collect_filter_predicates` and the sibling
+    /// helper in `session`'s tests), recursing through inputs.
+    fn collect_filter_predicates(
+        plan: &datafusion::logical_expr::LogicalPlan,
+        out: &mut Vec<datafusion::logical_expr::Expr>,
+    ) {
+        if let datafusion::logical_expr::LogicalPlan::Filter(filter) = plan {
+            out.push(filter.predicate.clone());
+        }
+        for input in plan.inputs() {
+            collect_filter_predicates(input, out);
+        }
+    }
+
     /// Issue #650 acceptance test: a `WHERE service_name = '<literal>'` query
     /// driven through the real [`SpansTableProvider`] (its SQL scan entry point,
     /// not a crate-internal call -- the pattern of PR #555's read-cache test)
@@ -636,12 +918,12 @@ mod tests {
         }];
 
         let full = fetcher
-            .fetch(&seg, &query, &[])
+            .fetch(&seg, &query, None, None, &[])
             .await
             .expect("fetch full")
             .expect("relevant");
         let pruned = fetcher
-            .fetch(&seg, &query, &predicates)
+            .fetch(&seg, &query, None, None, &predicates)
             .await
             .expect("fetch pruned")
             .expect("relevant");

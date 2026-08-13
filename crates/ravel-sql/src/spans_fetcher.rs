@@ -139,13 +139,24 @@ impl SpanSegmentFetcher {
     /// with no GET. Otherwise the whole object is fetched once
     /// ([`GetRange::Full`]) and scanned block by block:
     ///
-    /// - candidate blocks are chosen by the skip index's trace_id/ts prune and,
-    ///   when `predicates` is non-empty, the bloom-backed
+    /// - candidate blocks are chosen by the skip index's trace_id/ts prune,
+    ///   the `duration_ns`/`status_mask` skip-index prune when a duration or
+    ///   status filter was pushed (issue #979), and, when `predicates` is
+    ///   non-empty, the bloom-backed
     ///   [`SkipIndex::candidate_blocks_with_bloom`] prune (a block whose bloom
     ///   proves a predicate's token absent is dropped before decode);
     /// - each surviving block is crc-verified and decoded, its rows
     ///   re-evaluated exactly against the ts window and (when set) trace_id, and
     ///   its `service_name` read straight from the v3 dictionary column.
+    ///
+    /// `duration_ns` and `status_mask` are the widen-only skip-index prune
+    /// shapes the `spans` pushdown extracts (issue #979,
+    /// [`crate::spans_pushdown::SpansPushdown::duration_window`] and
+    /// `status_mask`): `duration_ns` is an inclusive `[min, max]` window a
+    /// block's `[min_duration_ns, max_duration_ns]` must overlap, `status_mask`
+    /// a bitmask a block's `status_mask` must share a bit with. Both `None`
+    /// means unconstrained on that axis. They can only skip blocks that cannot
+    /// hold a matching row, so results are unchanged; only the read set shrinks.
     ///
     /// Every returned row satisfies `query` exactly. The bloom prune is
     /// widen-only (ADR-0013): a bloom false positive costs one wasted block
@@ -159,6 +170,8 @@ impl SpanSegmentFetcher {
         &self,
         seg_ref: &SegmentRef,
         query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
         predicates: &[BloomPredicate<'_>],
     ) -> Result<Option<SpanFetchOutput>, SpanFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
@@ -177,7 +190,7 @@ impl SpanSegmentFetcher {
         let bytes = got.data;
 
         let output = self
-            .scan_object(&bytes, query, predicates)
+            .scan_object(&bytes, query, duration_ns, status_mask, predicates)
             .map_err(|source| corrupt(key, source))?;
         Ok(Some(output))
     }
@@ -189,6 +202,8 @@ impl SpanSegmentFetcher {
         &self,
         bytes: &[u8],
         query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
         predicates: &[BloomPredicate<'_>],
     ) -> Result<SpanFetchOutput, SpanSegError> {
         let reader = RspanReader::new(bytes, &self.cfg)?;
@@ -205,15 +220,16 @@ impl SpanSegmentFetcher {
             });
         }
 
-        // Candidate blocks: the skip index's trace_id/ts prune, plus the
-        // bloom-backed prune when service_name/name predicates were pushed.
+        // Candidate blocks: the skip index's trace_id/ts prune, the
+        // duration_ns/status_mask prune (issue #979), plus the bloom-backed
+        // prune when service_name/name predicates were pushed.
         let candidates = if predicates.is_empty() {
             skip.candidate_blocks(
                 query.trace_id.as_ref(),
                 query.ts_min,
                 query.ts_max,
-                None,
-                None,
+                duration_ns,
+                status_mask,
             )
         } else {
             let bloom = reader.bloom()?;
@@ -221,8 +237,8 @@ impl SpanSegmentFetcher {
                 query.trace_id.as_ref(),
                 query.ts_min,
                 query.ts_max,
-                None,
-                None,
+                duration_ns,
+                status_mask,
                 &bloom,
                 predicates,
             )?
