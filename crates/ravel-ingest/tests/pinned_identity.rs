@@ -20,8 +20,11 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 #[tokio::test]
 async fn retry_across_hour_boundary_keeps_the_pinned_ingest_hour() {
     // Start just before an hour boundary so the clock advance triggered by
-    // the retry crosses it.
-    let start_ns = 20 * NS_PER_HOUR - 10_000_000_000;
+    // the retry crosses it. Anchored above the receiver-clock plausibility
+    // floor (ADR-0051 amendment, S1-12): `checked_ingest_hour_bucket` now
+    // rejects a flush-open reading below `MIN_PLAUSIBLE_INGEST_CLOCK_NS`.
+    let start_ns =
+        ravel_ingest::MIN_PLAUSIBLE_INGEST_CLOCK_NS + 20 * NS_PER_HOUR - 10_000_000_000;
     let opened_hour = u32::try_from(start_ns.div_euclid(NS_PER_HOUR)).expect("fits u32");
 
     let plan = FaultPlan::empty().with_rule(

@@ -78,13 +78,15 @@ pub struct SpanIngestLimits {
     /// make it sound are shared too. The end timestamp is the bounded one
     /// because the commit record advertises `max end_ts`.
     pub max_future_skew_ns: i64,
-    /// Nanoseconds a span's resolved `start_ts_ns` may lag ingest time
-    /// (ADR-0051 §4). Default 2 hours, shared with metrics and logs; the
-    /// start timestamp is the bounded one because the commit record
-    /// advertises `min start_ts`. Consequence: a span longer than this, or
-    /// reported later than this after it started, is rejected at admission.
-    /// Raising it for a tenant is legal only together with the catalog-side
-    /// window config.
+    /// Nanoseconds a span's resolved `end_ts_ns` may lag ingest time
+    /// (ADR-0051 §4 as superseded by the 2026-08-13 amendment). Default 2
+    /// hours, shared with metrics and logs; the end timestamp is the bounded
+    /// one (the amendment moved the anchor from start to end) because the
+    /// listing window stays sound as long as the end is in window.
+    /// Consequence: a span reported more than this after it *ended* is
+    /// rejected as late data, but a long-running span that started earlier and
+    /// ended in window is admitted. Raising it for a tenant is legal only
+    /// together with the catalog-side window config.
     pub max_ingest_lag_ns: i64,
 }
 
@@ -181,13 +183,15 @@ pub enum SpanRejection {
     )]
     FutureSkew { skew_ns: i64, max_ns: i64 },
 
-    /// The span's resolved `start_ts_ns` lags ingest time by more than the
-    /// admission bound (ADR-0051 §4). The start timestamp is the checked one
-    /// because the commit record advertises `min start_ts`; a span longer
-    /// than the bound, or reported later than that after it started, lands
-    /// here. Mirrors [`crate::limits::Rejection::TooOld`].
+    /// The span's resolved `end_ts_ns` lags ingest time by more than the
+    /// admission bound (ADR-0051 §4 as superseded by the 2026-08-13
+    /// amendment). The end timestamp is the checked one because the listing
+    /// window is sound as long as the end is in window; a span reported more
+    /// than the lag after it *ended* is late data and lands here, while a
+    /// long-running span that started earlier but ended in window is admitted.
+    /// Mirrors [`crate::limits::Rejection::TooOld`].
     #[error(
-        "span start timestamp is {lag_ns} ns behind ingest time, more than the max ingest lag of {max_ns} ns"
+        "span end timestamp is {lag_ns} ns behind ingest time, more than the max ingest lag of {max_ns} ns"
     )]
     TooOld { lag_ns: i64, max_ns: i64 },
 

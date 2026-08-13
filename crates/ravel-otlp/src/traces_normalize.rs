@@ -311,7 +311,7 @@ fn normalize_span(
             end_ts_ns,
         });
     }
-    checked_span_interval(start_ts_ns, end_ts_ns, ingest_ts_ns, limits)?;
+    checked_span_interval(end_ts_ns, ingest_ts_ns, limits)?;
 
     let (status_code, status_message) = match span.status.as_ref() {
         None => (StatusCode::Unset, None),
@@ -458,25 +458,30 @@ fn to_i64_ns(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-/// Bound a span's resolved interval at admission (ADR-0051 §4), mirroring
-/// the metrics path's `checked_event_ts`: `end_ts_ns` may lead ingest time
-/// by at most `max_future_skew_ns` and `start_ts_ns` may lag it by at most
-/// `max_ingest_lag_ns`, because the commit record advertises
-/// `[min start_ts, max end_ts]` and the catalog listing window is sound only
-/// if both advertised bounds are admission-bounded. The other side of each
-/// timestamp is implied: `start <= end` is already enforced, so `start`
-/// cannot out-lead `end` and `end` cannot out-lag `start`. The bound itself
-/// passes; only strictly exceeding it rejects. Checked after the zero
-/// fallbacks, so a span whose only timestamps came from the ingest clock is
-/// trivially in bounds.
+/// Bound a span's resolved interval at admission (ADR-0051 §4 as superseded by
+/// the 2026-08-13 amendment), mirroring the metrics path's `checked_event_ts`:
+/// `end_ts_ns` may lead ingest time by at most `max_future_skew_ns`, and
+/// `end_ts_ns` may lag it by at most `max_ingest_lag_ns`. Both bounds anchor on
+/// the span's **end**, not its start: the amendment moved the lag anchor from
+/// `start_ts_ns` to `end_ts_ns` so a legitimate long-running span (one that
+/// started more than `max_ingest_lag_ns` ago but ended within the window) is
+/// admitted, while a span reported more than `max_ingest_lag_ns` after it
+/// *ended* is late data, the same contract metrics and logs already have.
+///
+/// The start's future side is still bounded for free by `start <= end <=
+/// ingest + max_future_skew` (already enforced by the `end < start` rejection
+/// before this call), and the listing-window completeness proof never needed a
+/// start lag bound: any span overlapping a query range has `end_ts >=
+/// range.start`, so the end's window placement alone keeps its ingest hour
+/// inside the resolved listing window (amendment §2). The bound itself passes;
+/// only strictly exceeding it rejects. Checked after the zero fallbacks, so a
+/// span whose only timestamps came from the ingest clock is trivially in
+/// bounds.
 ///
 /// Rejecting, never clamping: rewriting a sender's timestamps is silent
 /// corruption of the plausible-wrong-result class; a typed rejection is
-/// visible and countable. Consequence, stated in ADR-0051: a span longer
-/// than `max_ingest_lag_ns`, or reported later than that after it started,
-/// is rejected at admission.
+/// visible and countable.
 fn checked_span_interval(
-    start_ts_ns: i64,
     end_ts_ns: i64,
     ingest_ts_ns: i64,
     limits: &SpanIngestLimits,
@@ -488,7 +493,11 @@ fn checked_span_interval(
             max_ns: limits.max_future_skew_ns,
         });
     }
-    let lag_ns = ingest_ts_ns.saturating_sub(start_ts_ns);
+    // The lag bound anchors on the span's end (amendment): a long-running span
+    // whose start precedes `now - max_ingest_lag` but whose end is in window is
+    // admitted; only a span reported more than `max_ingest_lag` after it ended
+    // is TooOld.
+    let lag_ns = ingest_ts_ns.saturating_sub(end_ts_ns);
     if lag_ns > limits.max_ingest_lag_ns {
         return Err(SpanRejection::TooOld {
             lag_ns,
@@ -791,11 +800,13 @@ mod tests {
         );
     }
 
-    // --- event-time skew bounds (ADR-0051 §4) ---
+    // --- event-time skew bounds (ADR-0051 §4, 2026-08-13 amendment) ---
     // Convention, shared with the metrics and log paths: the bound itself
-    // passes; one ns past it fails. `end_ts_ns` carries the future bound and
-    // `start_ts_ns` the lag bound, because the commit record advertises
-    // `[min start_ts, max end_ts]`.
+    // passes; one ns past it fails. Both bounds anchor on `end_ts_ns` (the
+    // amendment moved the lag anchor from start to end): the end may lead
+    // ingest time by at most `max_future_skew_ns` and lag it by at most
+    // `max_ingest_lag_ns`. A long-running span whose start precedes the lag
+    // window but whose end is in window is admitted.
 
     /// A realistic ingest clock reading, so the skew arithmetic runs on
     /// full-size nanosecond timestamps rather than tiny test integers.
@@ -832,15 +843,41 @@ mod tests {
         assert_eq!(out.rejected[0].rejected_count(), 1);
     }
 
+    /// The crux of the 2026-08-13 amendment: a long-running span whose start
+    /// precedes `now - max_ingest_lag` but whose end is in window is ADMITTED.
+    /// Under the old start-anchored bound this was rejected `TooOld`; flipping
+    /// the anchor in `checked_span_interval` from `start_ts_ns` to `end_ts_ns`
+    /// (the `let lag_ns = ingest_ts_ns.saturating_sub(end_ts_ns)` line) is what
+    /// makes it pass. Watch it fail against the old bound by reverting that one
+    /// line to `.saturating_sub(start_ts_ns)`.
     #[test]
-    fn rejects_span_starting_older_than_max_ingest_lag() {
+    fn admits_long_running_span_whose_start_precedes_the_lag_window() {
         let limits = SpanIngestLimits::default();
-        let start = INGEST_TS - limits.max_ingest_lag_ns - 1;
+        // Start a full day before ingest (far beyond the 2 h lag), end right
+        // at ingest time. Old rule: start lag = 24 h > 2 h -> TooOld. New rule:
+        // end lag = 0 -> admitted.
+        let start = INGEST_TS - 24 * 3_600 * 1_000_000_000;
         let out = normalize_traces(
             one_span_over(start as u64, INGEST_TS as u64),
             &limits,
             INGEST_TS,
         );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.spans.len(), 1);
+        assert_eq!(out.spans[0].start_ts_ns, start);
+        assert_eq!(out.spans[0].end_ts_ns, INGEST_TS);
+    }
+
+    /// The other side of the amendment: a span whose *end* lags ingest time by
+    /// more than `max_ingest_lag_ns` is late data and is rejected `TooOld`.
+    #[test]
+    fn rejects_span_ending_older_than_max_ingest_lag() {
+        let limits = SpanIngestLimits::default();
+        let end = INGEST_TS - limits.max_ingest_lag_ns - 1;
+        // Start earlier still, so the interval is well-ordered; only the end's
+        // lag matters now.
+        let start = end - 1_000;
+        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -851,10 +888,10 @@ mod tests {
         );
     }
 
-    /// A span whose interval touches both bounds at once (start at the lag
-    /// bound, end at the skew bound) is accepted; the bounds themselves pass.
+    /// A span whose end touches the future-skew bound exactly is accepted; the
+    /// bound itself passes.
     #[test]
-    fn span_exactly_at_both_bounds_is_accepted() {
+    fn span_ending_exactly_at_the_future_skew_bound_is_accepted() {
         let limits = SpanIngestLimits::default();
         let start = INGEST_TS - limits.max_ingest_lag_ns;
         let end = INGEST_TS + limits.max_future_skew_ns;
@@ -863,6 +900,18 @@ mod tests {
         assert_eq!(out.spans.len(), 1);
         assert_eq!(out.spans[0].start_ts_ns, start);
         assert_eq!(out.spans[0].end_ts_ns, end);
+    }
+
+    /// A span whose end touches the lag bound exactly (`end == now - lag`) is
+    /// accepted; one nanosecond earlier on the end rejects.
+    #[test]
+    fn span_ending_exactly_at_the_lag_bound_is_accepted() {
+        let limits = SpanIngestLimits::default();
+        let end = INGEST_TS - limits.max_ingest_lag_ns;
+        let start = end - 5_000;
+        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.spans.len(), 1);
     }
 
     /// The end-timestamp fallback (a zero end resolves to the start) feeds
@@ -905,10 +954,10 @@ mod tests {
 
     proptest::proptest! {
         /// Over arbitrary span intervals, a span is admitted exactly when its
-        /// resolved interval is well-ordered, its end lies at or below
-        /// `ingest + max_future_skew`, and its start at or above
-        /// `ingest - max_ingest_lag`; nothing is ever both admitted and
-        /// rejected, and nothing panics.
+        /// resolved interval is well-ordered and its end lies within
+        /// `[ingest - max_ingest_lag, ingest + max_future_skew]` (both bounds
+        /// anchor on the end after the 2026-08-13 amendment); nothing is ever
+        /// both admitted and rejected, and nothing panics.
         #[test]
         fn skew_bounds_partition_admission(
             start_ns in 1u64..=u64::MAX,
@@ -928,7 +977,7 @@ mod tests {
                 );
                 proptest::prop_assert!(is_inverted_rejection, "{:?}", out.rejected);
             } else if end <= ingest_ts + limits.max_future_skew_ns
-                && start >= ingest_ts - limits.max_ingest_lag_ns
+                && end >= ingest_ts - limits.max_ingest_lag_ns
             {
                 proptest::prop_assert_eq!(out.spans.len(), 1);
                 proptest::prop_assert!(out.rejected.is_empty());

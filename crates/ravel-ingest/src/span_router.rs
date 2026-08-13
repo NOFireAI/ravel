@@ -621,6 +621,15 @@ mod tests {
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
+    /// Base clock reading these tests anchor their relative hour offsets to,
+    /// so a flush-open clock always sits above the plausibility floor
+    /// (ADR-0051 amendment, S1-12): `checked_ingest_hour_bucket` now rejects a
+    /// reading below `MIN_PLAUSIBLE_INGEST_CLOCK_NS`. Equal to that floor
+    /// (2020-01-01T00:00:00Z), which is an exact hour multiple, so `hour N` in
+    /// a test is absolute hour `BASE_HOUR + N`.
+    const BASE_NS: i64 = crate::config::MIN_PLAUSIBLE_INGEST_CLOCK_NS;
+    const BASE_HOUR: u32 = (BASE_NS / NS_PER_HOUR) as u32;
+
     /// A clock whose reading a test sets explicitly, so routing hour and
     /// staleness age are deterministic.
     #[derive(Debug)]
@@ -655,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn activation_routes_to_new_generation_set() {
         let store = Arc::new(MemoryStore::new());
-        let clock = Arc::new(ManualClock::new(50 * NS_PER_HOUR)); // hour 50
+        let clock = Arc::new(ManualClock::new(BASE_NS + 50 * NS_PER_HOUR)); // hour 50
         let router = SpanIngestRouter::new(
             IngestConfig {
                 shard_count: 4,
@@ -666,7 +675,8 @@ mod tests {
             clock.clone(),
         );
         let tenant = TenantId::new("acme");
-        let history = vec![sg(0, 4, 0), sg(1, 8, 100)]; // reshard 4 -> 8 at hour 100
+        // reshard 4 -> 8 at hour 100 (relative to the plausibility-floor base).
+        let history = vec![sg(0, 4, BASE_HOUR), sg(1, 8, BASE_HOUR + 100)];
 
         // Before activation (hour 50): routes at count 4, so every shard index
         // is < 4.
@@ -687,7 +697,7 @@ mod tests {
 
         // Advance past the activation hour and refresh the view (the background
         // refresher's job): routing now uses count 8.
-        clock.set(100 * NS_PER_HOUR);
+        clock.set(BASE_NS + 100 * NS_PER_HOUR);
         router.refresh_generations(tenant.hash(), history, clock.now_ns());
         let after = router
             .write(
@@ -746,7 +756,7 @@ mod tests {
                 .with_key_contains("/prov"),
         );
         let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
-        let t0 = 10 * NS_PER_HOUR;
+        let t0 = BASE_NS + 10 * NS_PER_HOUR;
         let clock = Arc::new(ManualClock::new(t0));
         let router = SpanIngestRouter::new(
             IngestConfig {
@@ -758,7 +768,7 @@ mod tests {
             clock.clone(),
         );
         let tenant = TenantId::new("acme");
-        router.refresh_generations(tenant.hash(), vec![sg(0, 4, 0)], t0);
+        router.refresh_generations(tenant.hash(), vec![sg(0, 4, BASE_HOUR)], t0);
 
         // Age the cached view past C: the next write must re-read, which
         // faults, but the horizon (hour 12, since min_lead_hours(C) = 2 for
@@ -787,7 +797,7 @@ mod tests {
 
         // Cross the horizon (hour 12): the same unreachable store now fails
         // the write closed rather than extending the grace window further.
-        clock.set(12 * NS_PER_HOUR);
+        clock.set(BASE_NS + 12 * NS_PER_HOUR);
         let err = router
             .write(
                 tenant.clone(),
@@ -811,7 +821,7 @@ mod tests {
 
         // A successful refresh (the background refresher's job) clears
         // staleness; the next write routes again without touching the store.
-        router.refresh_generations(tenant.hash(), vec![sg(0, 4, 0)], clock.now_ns());
+        router.refresh_generations(tenant.hash(), vec![sg(0, 4, BASE_HOUR)], clock.now_ns());
         router
             .write(
                 tenant.clone(),

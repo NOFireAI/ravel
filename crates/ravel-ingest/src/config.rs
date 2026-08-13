@@ -34,18 +34,63 @@ pub const SPAN_SEGMENT_FORMAT_VERSION: u16 = ravel_rspan::footer::VERSION;
 /// Nanoseconds per hour, the unit `ingest_hour_bucket` counts in.
 pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
+/// Receiver-clock plausibility floor: 2020-01-01T00:00:00Z in nanoseconds
+/// (ADR-0051 amendment 2026-08-13, S1-12 close-out). No host legitimately
+/// runs Ravel with a clock reading before the system existed, so a reading
+/// below this floor is the replica's own fault, not the request's data. It is
+/// the one floor derivable without a second reference clock: a wrong-but-post-
+/// 2020 clock still cannot be detected against anything, and what the window
+/// buys there is loud, attributable failure instead of silent pollution of the
+/// hour-partitioned layout and the retention arithmetic anchored on it.
+///
+/// Enforced at both points the receiver clock is read: at admission (see
+/// [`plausible_ingest_clock`], whole-request 503 / gRPC `UNAVAILABLE`) and at
+/// flush open (see [`checked_ingest_hour_bucket`]).
+pub const MIN_PLAUSIBLE_INGEST_CLOCK_NS: i64 = 1_577_836_800_000_000_000;
+
+/// Checks a receiver admission-clock reading for plausibility before it is
+/// used to build a normalize context (ADR-0051 amendment, S1-12 close-out).
+///
+/// The reading must sit at or above [`MIN_PLAUSIBLE_INGEST_CLOCK_NS`] and yield
+/// a representable `u32` ingest-hour bucket. A failure is the replica's fault,
+/// not the request's, so the caller rejects the whole request with HTTP 503 /
+/// gRPC `UNAVAILABLE`: no per-record decision is meaningful when the reference
+/// clock itself is nonsense, and a retry against a healthy replica succeeds.
+/// Never clamps a reading into range and never maps it to a fallback bucket.
+pub fn plausible_ingest_clock(now_ns: i64) -> Result<(), String> {
+    if now_ns < MIN_PLAUSIBLE_INGEST_CLOCK_NS {
+        return Err(format!(
+            "receiver clock reading is below the plausibility floor: now_ns={now_ns}, \
+             floor={MIN_PLAUSIBLE_INGEST_CLOCK_NS} (2020-01-01T00:00:00Z)"
+        ));
+    }
+    u32::try_from(now_ns.div_euclid(NS_PER_HOUR))
+        .map(|_| ())
+        .map_err(|_| {
+            format!("receiver clock reading yields a non-representable hour bucket: now_ns={now_ns}")
+        })
+}
+
 /// Derives the commit record's `ingest_hour_bucket` from a flush-open clock
-/// reading, fail-loud (ADR-0051 section 7, S1-12). A non-positive reading
-/// (a clock that reports zero or has gone backwards past the epoch) can
-/// never be a valid hour bucket, and silently mapping it to bucket 0
-/// (the previous `unwrap_or(0)` behavior) wrote data into an undiscoverable
-/// bucket instead of surfacing the bad reading to the caller. Every one of
-/// the three shard actors calls this at the same point `flush_open_ns` is
-/// read, so the check runs once per flush, not per retry.
+/// reading, fail-loud (ADR-0051 section 7 and the 2026-08-13 amendment,
+/// S1-12). A non-positive reading (a clock that reports zero or has gone
+/// backwards past the epoch), or a positive-but-implausible one below
+/// [`MIN_PLAUSIBLE_INGEST_CLOCK_NS`] (a host whose RTC reset to shortly after
+/// the epoch), can never be a valid hour bucket. Silently mapping it to bucket
+/// 0 (the previous `unwrap_or(0)` behavior) wrote data into an undiscoverable
+/// bucket instead of surfacing the bad reading to the caller. Every one of the
+/// three shard actors calls this at the same point `flush_open_ns` is read, so
+/// the check runs once per flush, not per retry.
 pub(crate) fn checked_ingest_hour_bucket(flush_open_ns: i64) -> Result<u32, String> {
     if flush_open_ns <= 0 {
         return Err(format!(
             "flush clock produced a non-positive reading: flush_open_ns={flush_open_ns}"
+        ));
+    }
+    if flush_open_ns < MIN_PLAUSIBLE_INGEST_CLOCK_NS {
+        return Err(format!(
+            "flush clock produced a reading below the plausibility floor: \
+             flush_open_ns={flush_open_ns}, floor={MIN_PLAUSIBLE_INGEST_CLOCK_NS}"
         ));
     }
     u32::try_from(flush_open_ns.div_euclid(NS_PER_HOUR)).map_err(|_| {
@@ -216,6 +261,37 @@ mod tests {
 
     #[test]
     fn checked_ingest_hour_bucket_accepts_a_normal_reading() {
-        assert_eq!(checked_ingest_hour_bucket(NS_PER_HOUR * 3 + 1), Ok(3));
+        // A reading three hours past the 2020 plausibility floor buckets into
+        // that floor's hour plus three. `MIN_PLAUSIBLE_INGEST_CLOCK_NS` is an
+        // exact multiple of `NS_PER_HOUR` (2020-01-01T00:00:00Z is hour
+        // 438288), so the arithmetic is exact.
+        let floor_bucket = (MIN_PLAUSIBLE_INGEST_CLOCK_NS / NS_PER_HOUR) as u32;
+        assert_eq!(
+            checked_ingest_hour_bucket(MIN_PLAUSIBLE_INGEST_CLOCK_NS + NS_PER_HOUR * 3 + 1),
+            Ok(floor_bucket + 3)
+        );
+    }
+
+    #[test]
+    fn checked_ingest_hour_bucket_rejects_a_positive_sub_floor_reading() {
+        // A positive reading below the 2020 floor (a host whose RTC reset to
+        // shortly after the epoch): previously this passed and bucketed into a
+        // far-past hour; the amendment fails it loud. `NS_PER_HOUR * 3` is such
+        // a reading (1970, three hours after the epoch).
+        assert!(checked_ingest_hour_bucket(NS_PER_HOUR * 3 + 1).is_err());
+    }
+
+    #[test]
+    fn plausible_ingest_clock_accepts_a_post_floor_reading() {
+        assert!(plausible_ingest_clock(MIN_PLAUSIBLE_INGEST_CLOCK_NS).is_ok());
+        assert!(plausible_ingest_clock(MIN_PLAUSIBLE_INGEST_CLOCK_NS + NS_PER_HOUR).is_ok());
+    }
+
+    #[test]
+    fn plausible_ingest_clock_rejects_a_sub_floor_reading() {
+        assert!(plausible_ingest_clock(MIN_PLAUSIBLE_INGEST_CLOCK_NS - 1).is_err());
+        assert!(plausible_ingest_clock(NS_PER_HOUR * 3).is_err());
+        assert!(plausible_ingest_clock(0).is_err());
+        assert!(plausible_ingest_clock(-1).is_err());
     }
 }
