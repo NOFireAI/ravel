@@ -278,13 +278,18 @@ impl SegmentWriter {
             u32::try_from(created_unix_ns.div_euclid(NS_PER_HOUR)).unwrap_or(0);
 
         let mut v4_series = Vec::with_capacity(series.len());
+        // One scratch, reused across every series in this flush: the framing
+        // buffers are allocated once here, not once per series (issue #813,
+        // restored after the #976 regression).
+        let mut scratch = WriteScratch::default();
         for s in series {
-            let run = encode_run_v4(
+            let run = encode_run_v4_with_scratch(
                 &s.series_id,
                 created_unix_ns,
                 identity.writer_epoch,
                 identity.writer_seq,
                 &s.values,
+                &mut scratch,
             )?;
             v4_series.push(SeriesInputV4 {
                 series_id: s.series_id,
@@ -750,20 +755,71 @@ pub fn encode_run_v4(
     writer_seq: u64,
     values: &SeriesValues,
 ) -> Result<RunInputV4, WriteError> {
+    // The erasure-rewrite path encodes one bucket at a time and is far cooler
+    // than the L0 flush loop, so it pays a fresh scratch per call rather than
+    // threading one through (issue #976): output is byte-identical either way.
+    let mut scratch = WriteScratch::default();
+    encode_run_v4_with_scratch(
+        series_id,
+        created_unix_ns,
+        writer_epoch,
+        writer_seq,
+        values,
+        &mut scratch,
+    )
+}
+
+/// Framing buffers reused across the series of one L0 flush, so a flush of N
+/// series pays O(1) scratch allocations instead of O(N) (issue #813).
+///
+/// [`encode_run_v4`] framed each series into three fresh `Vec`s (the run
+/// timestamps, the scalar values, and the page-body scratch). The
+/// selective-erasure rewrite (issue #754) extracted that framing into
+/// `encode_run_v4` but kept the per-call allocation, silently dropping #813's
+/// cross-series reuse on the main ingest write hot path (issue #976). The L0
+/// flush adapter now owns exactly one of these and hands it to every series;
+/// each buffer is cleared before use, so reuse never changes the framed bytes:
+/// encode output stays byte-identical to a fresh-scratch encode (proven by the
+/// `direct_v6_emit_bit_parity` module).
+#[derive(Default)]
+pub(crate) struct WriteScratch {
+    ts_values: Vec<i64>,
+    scalar_values: Vec<f64>,
+    payload: Vec<u8>,
+}
+
+/// [`encode_run_v4`] over a caller-owned [`WriteScratch`]. The L0 flush adapter
+/// ([`SegmentWriter::write_histograms_with_exemplars`]) allocates one scratch
+/// and reuses it across every series in the flush, amortizing the
+/// ts_values/scalar_values/payload allocations; the buffers only change where
+/// the framing bytes come from, never their contents (issue #813, #976).
+pub(crate) fn encode_run_v4_with_scratch(
+    series_id: &SeriesId,
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+    values: &SeriesValues,
+    scratch: &mut WriteScratch,
+) -> Result<RunInputV4, WriteError> {
     let sample_count = u32::try_from(values.len()).map_err(|_| WriteError::TooManySamples)?;
     let min_ts_ns = values.first_ts().unwrap_or(0);
     let max_ts_ns = values.last_ts().unwrap_or(0);
-    let mut ts_values = Vec::new();
-    values.extend_ts_values_into(&mut ts_values);
-    let mut payload = Vec::new();
-    let ts_page = frame_ts_page(series_id, &ts_values, &mut payload)?;
+    values.extend_ts_values_into(&mut scratch.ts_values);
+    let ts_page = frame_ts_page(series_id, &scratch.ts_values, &mut scratch.payload)?;
     let value_page = match values {
         SeriesValues::Scalar(samples) => {
-            let scalar_values: Vec<f64> = samples.iter().map(|sm| sm.value).collect();
-            RunValuePageV4::Scalar(frame_val_page(series_id, &scalar_values, &mut payload))
+            scratch.scalar_values.clear();
+            scratch
+                .scalar_values
+                .extend(samples.iter().map(|sm| sm.value));
+            RunValuePageV4::Scalar(frame_val_page(
+                series_id,
+                &scratch.scalar_values,
+                &mut scratch.payload,
+            ))
         }
         SeriesValues::Histogram(hist) => {
-            RunValuePageV4::Histogram(frame_hist_page(series_id, hist, &mut payload)?)
+            RunValuePageV4::Histogram(frame_hist_page(series_id, hist, &mut scratch.payload)?)
         }
     };
     Ok(RunInputV4 {
