@@ -107,16 +107,17 @@ pub use rewrite::{MigrateOutcome, RewriteOutcome, migrate_bucket_format, rewrite
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;
 pub use scan::{
-    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MaintainReport, MemoSnapshotError, ScanReport, SeedStats,
-    scan_and_compact, scan_and_maintain,
+    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MaintainMemo, MaintainReport, MemoSnapshotError,
+    ScanReport, SeedStats, scan_and_compact, scan_and_maintain,
 };
 pub use scrub::{
     CoveringPostings, ScrubBudget, ScrubCursor, ScrubResult, ScrubSlice, ScrubTarget,
     advance_cursor, per_tick_byte_budget, scrub_one_object,
 };
 pub use sweep::{
-    CatalogSweepOutcome, IdemSweepOutcome, LeaseCheck, NoLeases, OrphanSweepOutcome, SweepReport,
-    sweep_idempotency_markers, sweep_orphans, sweep_shard, sweep_shard_zoned, sweep_superseded,
+    CatalogSweepOutcome, ErasureRequestSweepOutcome, IdemSweepOutcome, LeaseCheck, NoLeases,
+    OrphanSweepOutcome, SweepReport, sweep_erasure_requests, sweep_idempotency_markers,
+    sweep_orphans, sweep_shard, sweep_shard_zoned, sweep_superseded,
     sweep_unreferenced_catalog_objects, sweep_unreferenced_parts,
 };
 

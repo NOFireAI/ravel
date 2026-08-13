@@ -613,6 +613,22 @@ fn live_input_event_bounds(live: &LiveInputs) -> (i64, i64) {
     (min_event_ts_ns, max_event_ts_ns)
 }
 
+/// The set of `request_id`s a bucket's live record already names in its
+/// `drops`, when that live record is a [`RewriteRecord`]; `None` when the live
+/// record is raw L0 or a compaction record (nothing has been rewritten yet, so
+/// no request has been applied here). [`erasure_rewrite_bucket`] uses this to
+/// skip a bucket already rewritten for every overlapping request (EJ-T4b
+/// finding-2), so a completed generation never churns a fresh no-op record.
+fn live_rewrite_applied_request_ids(live: &LiveInputs) -> Option<HashSet<String>> {
+    match live {
+        LiveInputs::Existing {
+            body: LiveRecordBody::Rewrite(r),
+            ..
+        } => Some(r.drops.iter().map(|d| d.request_id.clone()).collect()),
+        _ => None,
+    }
+}
+
 /// Resolve `live` down to both the [`InputCatalog`]s [`build_rewrite`]
 /// decodes and the [`RewriteSupersession`] target the eventual
 /// `RewriteRecord` names: the raw L0 inputs' own catalogs plus their
@@ -1581,6 +1597,16 @@ pub enum ErasureRewriteOutcome {
     /// and EJ-T3's scan-time exclusion keeps hiding the held data from
     /// queries in the meantime.
     Held,
+    /// Every pending request that overlaps this bucket is already named in the
+    /// bucket's live [`RewriteRecord`]'s `drops` (EJ-T4b finding-2): the bucket
+    /// has already been rewritten for all of them, so there is nothing new to
+    /// erase. Skipped without any build or publish. Without this skip, a second
+    /// pass over an already-rewritten bucket recomputes a *different*
+    /// `input_set_hash` (its live record set is now the rewrite output -- the
+    /// superseded target -- not the original L0 inputs) and lands a no-op
+    /// `RewriteRecord` (`dropped_count: 0`) superseding the prior one,
+    /// repeatable every pass, churning generations while erasing nothing.
+    AlreadyApplied,
     /// Built and published (or converged / abandoned): `parts` output parts
     /// written, `publish` records how the `RewriteRecord` PUT resolved.
     Rewritten {
@@ -1683,6 +1709,26 @@ pub async fn erasure_rewrite_bucket(
         .collect();
     if overlapping.is_empty() {
         return Ok(ErasureRewriteOutcome::NoApplicableRequests);
+    }
+
+    // EJ-T4b finding-2 (idempotence/termination): if the bucket's live record
+    // is already a RewriteRecord whose `drops` name every overlapping request,
+    // this bucket has already been rewritten for all of them and there is
+    // nothing new to erase. Re-publishing here would recompute a different
+    // input_set_hash -- the live record set is now the rewrite output (the
+    // superseded target), not the original L0 inputs -- and land a no-op
+    // RewriteRecord (dropped_count 0) superseding the prior one, repeatable on
+    // every maintenance pass. Skipping converges the generation instead. A
+    // genuinely new request (one not yet named) still falls through to a
+    // rewrite whose `drops` name every overlapping request, including the
+    // already-applied ones with dropped_count 0, so the sibling-case
+    // completion condition (ADR-0064 §4) stays satisfiable.
+    if let Some(applied) = live_rewrite_applied_request_ids(&live)
+        && overlapping
+            .iter()
+            .all(|p| applied.contains(&p.request.request_id))
+    {
+        return Ok(ErasureRewriteOutcome::AlreadyApplied);
     }
 
     let (parts, publish) = match bucket.signal {
@@ -2318,6 +2364,101 @@ mod tests {
             listing_after.rewrite_record_keys.len(),
             1,
             "exactly one RewriteRecord after two identical publishes"
+        );
+    }
+
+    /// EJ-T4b finding-2 regression (idempotence/termination): a completed
+    /// generation must not churn. After one full `erasure_rewrite_bucket` pass
+    /// publishes a `RewriteRecord` naming the request, a SECOND pass with the
+    /// same still-pending request must return [`ErasureRewriteOutcome::AlreadyApplied`]
+    /// and publish nothing -- the bucket's live rewrite record already names
+    /// the request, so there is nothing new to erase.
+    ///
+    /// The existing `republishing_the_same_rewrite_converges_without_double_counting`
+    /// test does NOT cover this: it drives `build_rewrite`/`publish_rewrite_record`
+    /// twice from the *same* pre-publish snapshot (same L0 inputs, same
+    /// input_set_hash), which converges via `AlreadyExists`. This test instead
+    /// runs the whole driver twice, so the second pass observes the FIRST
+    /// pass's published rewrite record as the live set and would (without the
+    /// guard) recompute a different input_set_hash over that record as the
+    /// superseded target, publishing a genuinely new second-generation no-op
+    /// record rather than colliding with the first.
+    ///
+    /// Flip-line proof: deleting the `live_rewrite_applied_request_ids` skip
+    /// guard in `erasure_rewrite_bucket` makes the second pass publish a second
+    /// `RewriteRecord`, growing `rewrite_record_keys` to 2 and failing the
+    /// `len() == 1` assertion below (and returning `Rewritten`, failing the
+    /// `AlreadyApplied` assertion).
+    #[tokio::test]
+    async fn completed_request_does_not_republish_on_second_pass() {
+        let store = MemoryStore::new();
+        seed(
+            &store,
+            1,
+            vec![
+                series("alpha", &[(10, 1.0), (20, 2.0)]),
+                series("beta", &[(15, 9.5)]),
+            ],
+        )
+        .await;
+
+        let request = erasure_request(7, "alpha");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        let outcome1 = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("pass 1 succeeds");
+        assert!(
+            matches!(outcome1, ErasureRewriteOutcome::Rewritten { .. }),
+            "first pass rewrites the bucket, got {outcome1:?}"
+        );
+        let after1 = crate::read::list_bucket(&store, &bucket())
+            .await
+            .expect("list after pass 1");
+        assert_eq!(
+            after1.rewrite_record_keys.len(),
+            1,
+            "exactly one RewriteRecord after the first pass"
+        );
+
+        let outcome2 = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("pass 2 succeeds");
+        assert_eq!(
+            outcome2,
+            ErasureRewriteOutcome::AlreadyApplied,
+            "second pass over an already-rewritten bucket must skip, not republish"
+        );
+        let after2 = crate::read::list_bucket(&store, &bucket())
+            .await
+            .expect("list after pass 2");
+        assert_eq!(
+            after2.rewrite_record_keys.len(),
+            1,
+            "no new RewriteRecord generation on the second pass (finding-2: no churn)"
         );
     }
 
