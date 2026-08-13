@@ -2669,6 +2669,107 @@ mod v4_tests {
             "both runs' values must survive, in on-disk order"
         );
     }
+
+    fn scalar_series(values: &[(i64, f64)]) -> SeriesValues {
+        SeriesValues::Scalar(
+            values
+                .iter()
+                .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                .collect(),
+        )
+    }
+
+    /// Issue #976 amortization guard. `encode_run_v4_with_scratch` must reuse
+    /// the caller's `WriteScratch` buffers across series, not allocate fresh
+    /// ones per call, so an L0 flush of N series pays O(1) scratch allocations
+    /// (issue #813). Encode a large series first to grow all three buffers,
+    /// then a tiny one through the same scratch: if the buffers are reused, the
+    /// grown capacities survive; if `encode_run_v4_with_scratch` allocated
+    /// fresh `Vec`s internally, the second call would leave capacities at the
+    /// tiny series' size.
+    ///
+    /// Flip line to watch this fail: in `encode_run_v4_with_scratch`, replace
+    /// `&mut scratch.payload` (and the `scratch.ts_values`/`scratch.scalar_values`
+    /// borrows) with fresh `&mut Vec::new()` / `let mut ts_values = Vec::new()`
+    /// -- the per-series re-allocation the #976 regression reintroduced -- and
+    /// the capacity assertions below drop to zero.
+    #[test]
+    fn encode_run_v4_reuses_scratch_across_series() {
+        // -0.0 and a NaN payload exercise the bit-significant float paths while
+        // the scratch is reused (storage float rule); the assertion is on
+        // allocation, but the round trip must not corrupt these bytes.
+        let big: Vec<(i64, f64)> = (0..256i64)
+            .map(|i| (1_000 + i * 11, i as f64 * 0.25))
+            .collect();
+        let small = [(5i64, -0.0f64), (9, f64::NAN)];
+
+        let mut scratch = WriteScratch::default();
+        let big_run = encode_run_v4_with_scratch(
+            &SeriesId([0x01; 16]),
+            0,
+            1,
+            1,
+            &scalar_series(&big),
+            &mut scratch,
+        )
+        .expect("big series encodes");
+
+        let ts_cap = scratch.ts_values.capacity();
+        let scalar_cap = scratch.scalar_values.capacity();
+        let payload_cap = scratch.payload.capacity();
+        assert!(
+            ts_cap >= big.len() && scalar_cap >= big.len(),
+            "big series should have grown the scratch buffers"
+        );
+
+        let small_run = encode_run_v4_with_scratch(
+            &SeriesId([0x02; 16]),
+            0,
+            1,
+            1,
+            &scalar_series(&small),
+            &mut scratch,
+        )
+        .expect("small series encodes");
+
+        // Reuse, not re-allocation: the tiny second series must not have shrunk
+        // any buffer back to its own size.
+        assert_eq!(
+            scratch.ts_values.capacity(),
+            ts_cap,
+            "ts_values buffer must be reused across series, not re-allocated"
+        );
+        assert_eq!(
+            scratch.scalar_values.capacity(),
+            scalar_cap,
+            "scalar_values buffer must be reused across series, not re-allocated"
+        );
+        assert_eq!(
+            scratch.payload.capacity(),
+            payload_cap,
+            "payload buffer must be reused across series, not re-allocated"
+        );
+
+        // Byte-identical to a fresh-scratch encode: reuse changes only where
+        // the buffers come from, never their contents (incl. -0.0/NaN bytes).
+        let big_fresh = encode_run_v4(&SeriesId([0x01; 16]), 0, 1, 1, &scalar_series(&big))
+            .expect("big series encodes fresh");
+        let small_fresh = encode_run_v4(&SeriesId([0x02; 16]), 0, 1, 1, &scalar_series(&small))
+            .expect("small series encodes fresh");
+        assert_eq!(big_run.ts_page, big_fresh.ts_page);
+        assert_eq!(small_run.ts_page, small_fresh.ts_page);
+        let page_bytes = |p: &RunValuePageV4| match p {
+            RunValuePageV4::Scalar(b) | RunValuePageV4::Histogram(b) => b.clone(),
+        };
+        assert_eq!(
+            page_bytes(&big_run.value_page),
+            page_bytes(&big_fresh.value_page)
+        );
+        assert_eq!(
+            page_bytes(&small_run.value_page),
+            page_bytes(&small_fresh.value_page)
+        );
+    }
 }
 
 /// Bit-parity acceptance test for issue #813. The direct-emit writer
