@@ -598,7 +598,7 @@ every bound below is measured.
 | Stage | Guarantee | Worst-case bound (defaults) |
 |---|---|---|
 | Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within `max_query_duration` (30 s) |
-| Rewrite complete (`.done`) | Every live segment, index entry, and derived dataset is free of matching records | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric |
+| Rewrite complete (`.done`) | Every live commit-record segment a snapshot resolves is free of matching records, verified through the catalog resolver (below). Index entries and derived datasets carry no subject values, so they are free of matching records by construction, not by a separate pass -- see "Scope and interactions" for the proof and the one excluded derived store | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric |
 | Physical bytes gone from the bucket | Superseded inputs swept | `.done` + `protection_horizon` (default `max_query_duration` + `grace` = 30 s + 24 h) + one sweep interval -- with defaults, under 4 days end to end |
 | Physical bytes gone from query-node disk caches | Non-durable local copies aged out | sweep + disk-tier entry max-age (24 h); or immediately, by deleting cache directories (ADR-0046: a node with its cache directory deleted mid-flight answers every query correctly) |
 
@@ -645,10 +645,17 @@ Each stage in detail:
   terminal state through ADR-0065's `invalidate` hook. So every in-scope
   bucket is revisited on a cadence far tighter than the 72 h
   `erasure_rewrite_deadline`; the deadline is the outer alarm, not the
-  expected latency. Completion is *verified, not assumed*: the pass writes
-  the `.done` record only when every bucket in the request's scope has a live
-  record set whose every non-superseded rewrite record names this request in
-  its drops.
+  expected latency. Completion is *verified, not assumed*, and verified
+  through the SAME resolver a query runs: the pass writes the `.done` record
+  only when, for every bucket in the request's scope, the catalog resolver
+  (`resolve_rewrite_supersession`, the exact supersession chase a snapshot
+  resolve and the index fold use) serves nothing that could carry the subject
+  -- no live raw L0 input, no un-rewritten compaction part, and no live
+  sibling rewrite whose drops omit this request. Deriving completion from the
+  rewrite pass's own one-hop live-record view instead would let a `.done` land
+  while a snapshot still resolves an L0 input the one hop never excluded
+  (ADR-0064 §4, 2026-08-08 F1 correction); the completion gate blocks exactly
+  that.
 
 - **Physical removal reuses the existing sweep.** A rewrite's superseded
   inputs become inputs to `sweep_superseded`, deleted after
@@ -697,16 +704,34 @@ into them. An operator with erasure obligations must budget them deliberately.
 
 ### Scope and interactions
 
-- **Catalog and derived state carry no subject values.** `SnapshotEntry`,
-  `SnapshotPartHeader`, and name postings hold identities, hashes, counts,
-  and metric names -- never label/attribute *values* -- so the deny-deleted
-  `catalog/`, `prov`, and `sys/*` prefixes are disjoint from subject erasure
-  by construction. This holds *only if* subject identifiers appear as
-  label/attribute values and never inside metric names (a documented
-  requirement; see docs/object-store-contract.md "Required bucket
-  configuration" point 5). Superseded catalog entries resolve to NotFound ->
-  SnapshotInvalidated -> re-resolve and the next fold rebuilds over the
-  rewrite outputs.
+- **Why the `.done` guarantee needs only the commit-record pass (F3).** The
+  completion pass walks `c/<shard>/<hour>/` commit records and verifies the
+  segment data a snapshot resolves is subject-free. It does NOT separately
+  walk index objects or analytics, and it does not need to, because neither
+  can hold a record matching an erasure subject:
+  - **Index objects carry no subject values.** `SnapshotEntry`,
+    `SnapshotPartHeader`, and name postings hold identities, hashes, counts,
+    and metric names -- never label/attribute *values*. So the deny-deleted
+    `catalog/`, `prov`, and `sys/*` prefixes are disjoint from subject
+    erasure by construction. This holds *only if* subject identifiers appear
+    as label/attribute values and never inside metric names (a documented
+    requirement; see docs/object-store-contract.md "Required bucket
+    configuration" point 5). Superseded catalog entries resolve to NotFound
+    -> SnapshotInvalidated -> re-resolve and the next fold rebuilds over the
+    rewrite outputs.
+  - **ADR-0028 analytics/derived datasets are a pure query-time stage, not a
+    persisted store.** `ravel-analytics` carries no clock, IO, object-store,
+    or catalog (docs/analytics.md): every analytic runs in memory over query
+    output, *after* the query-time exclusion filter (Query exclusion, above),
+    and persists nothing durable. A derived result therefore can never
+    surface an erased subject once the `.dreq` is live, and there is no
+    durable derived object for the pass to clear. The only persisted
+    analytics-adjacent store that can retain subject values is the
+    query-audit keyspace, covered next.
+
+  Because index and derived state hold no subject values, the pass verifying
+  only commit-record segments is not under-asserting the `.done` guarantee --
+  it verifies the only place a subject physically lives.
 
 - **The query-audit keyspace is the one excluded derived store.** It may
   retain matcher values from audited query text (S4-13); it is deny-deleted
