@@ -25,15 +25,23 @@
 //!   correct if a future backend behind this same adapter reads `version`),
 //!   but our own `Version`/`Etag` types are always derived from the
 //!   response `e_tag`.
-//! - **Timeout / throttling detection is best-effort.** `object_store`'s
-//!   public `Error` enum does not expose the HTTP status code or timeout
-//!   classification for the common case (a retryable error that exhausted
-//!   the crate's own internal retries surfaces as `Error::Generic` with an
-//!   opaque, crate-private source type). We pattern-match the error's
-//!   `Display` text for well-known signals (`"timed out"`, `"429"`, `"503"`,
-//!   `"too many requests"`, ...). This is not as precise as inspecting a
-//!   status code directly, but it is the only option available outside the
-//!   `object_store` crate itself.
+//! - **Timeout / throttling detection is partly typed, partly best-effort.**
+//!   A retryable error that exhausted `object_store`'s own internal retries
+//!   surfaces as `Error::Generic { source, .. }`, whose concrete `source`
+//!   type is `object_store`'s crate-private `RetryError` (a `pub struct`
+//!   inside `pub(crate) mod client::retry`, so not nameable, and not
+//!   downcastable, from this crate). That type is where the HTTP status code
+//!   (429, 503, ...) lives, so 429/503/throttle classification has no typed
+//!   floor at this layer and stays a `Display`-text heuristic (`"429"`,
+//!   `"503"`, `"too many requests"`, `"throttl"`, ...). Timeouts and
+//!   connection failures are different: the `RetryError`'s own `source()`
+//!   chain contains a publicly nameable [`object_store::client::HttpError`]
+//!   whose [`object_store::client::HttpErrorKind`] is a typed
+//!   transport-failure signal (`Timeout`, `Connect`, `Interrupted`, ...). So
+//!   [`classify_generic`] recovers those by downcast first and only falls
+//!   back to the `Display` heuristic when no `HttpError` is in the chain.
+//!   See [`classify_generic`] for the single, well-documented classification
+//!   path this crate uses for every `Error::Generic`.
 //! - **`upload_checksum` is unsupported (`capabilities().upload_checksum ==
 //!   false`), by contract design, not oversight.** `object_store` 0.14's
 //!   `AmazonS3` client offers only a whole-client, crate-computed checksum
@@ -380,14 +388,84 @@ fn map_get_error(e: object_store::Error) -> StoreError {
     map_error_common(e)
 }
 
-/// Best-effort classification of `Error::Generic`, the catch-all
-/// `object_store` uses once its own retry loop gives up (or for errors with
-/// no dedicated variant). See the module-level doc comment for why this is
-/// necessarily string-based rather than status-code-based.
+/// Walk an error's [`std::error::Error::source`] chain looking for
+/// `object_store`'s publicly nameable [`object_store::client::HttpError`],
+/// returning its [`object_store::client::HttpErrorKind`] if present.
+///
+/// This is the one typed signal recoverable from an `Error::Generic` at this
+/// layer. The `Generic` source is `object_store`'s crate-private `RetryError`
+/// (not nameable, so not directly downcastable), but for transport failures
+/// its `source()` chain carries an `HttpError`, whose `kind()` distinguishes a
+/// timeout from a connection drop without any string matching. HTTP *status*
+/// codes (429/503) are not reachable this way: they live in the crate-private
+/// `RetryError`/`RequestError`, with no `HttpError` in the chain, so
+/// [`classify_generic`] falls back to a `Display` heuristic for those.
+fn typed_http_kind(
+    source: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<object_store::client::HttpErrorKind> {
+    if let Some(http) = source.downcast_ref::<object_store::client::HttpError>() {
+        return Some(http.kind());
+    }
+    let mut current = source.source();
+    while let Some(err) = current {
+        if let Some(http) = err.downcast_ref::<object_store::client::HttpError>() {
+            return Some(http.kind());
+        }
+        current = err.source();
+    }
+    None
+}
+
+/// The single classification path for `Error::Generic`, the catch-all
+/// `object_store` uses once its own retry loop gives up (or for errors with no
+/// dedicated typed variant). Every operation funnels its `Generic` errors here
+/// (via [`map_error_common`], and [`map_put_error`]/[`map_get_error`] which
+/// delegate to it), so this one function decides `Timeout` vs `Throttled` vs
+/// `Transient` for the whole S3/MinIO adapter.
+///
+/// Two tiers, in order:
+///
+/// 1. **Typed transport kind (preferred).** [`typed_http_kind`] downcasts the
+///    source chain to [`object_store::client::HttpError`]. A `Timeout` kind
+///    maps to [`StoreError::Timeout`]; `Connect`/`Request`/`Interrupted` are
+///    retryable transport failures and map to [`StoreError::Transient`]. This
+///    is robust against `object_store` changing its error *text*: it reads the
+///    typed kind, not a substring.
+/// 2. **`Display`-text heuristic (fallback).** When no `HttpError` is in the
+///    chain (notably the 429/503 throttle case, whose status is trapped in
+///    `object_store`'s crate-private `RetryError`), match the lowercased
+///    message for well-known signals: timeout words to [`StoreError::Timeout`],
+///    429/503/throttle words to [`StoreError::Throttled`].
+///
+/// Anything unmatched is [`StoreError::Transient`], never `Permanent`:
+/// `object_store` already retried its own retryable classes (5xx, connection
+/// errors, timeouts) internally with backoff, so a `Generic` that still
+/// surfaces has exhausted those retries; treating it as transient lets the
+/// caller apply its own backoff per the contract's retry classification. The
+/// outcome set ([`StoreError::Timeout`]/[`StoreError::Throttled`]/
+/// [`StoreError::Transient`]) is unchanged from the historical string-only
+/// version, so retry policy is unaffected; only the *precision* of the timeout
+/// case improved.
 fn classify_generic(
     store: &'static str,
-    source: &(dyn std::error::Error + Send + Sync),
+    source: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> StoreError {
+    use object_store::client::HttpErrorKind as Kind;
+    // Tier 1: typed transport-failure kind from the source chain.
+    if let Some(kind) = typed_http_kind(source) {
+        match kind {
+            Kind::Timeout => return StoreError::Timeout,
+            Kind::Connect | Kind::Request | Kind::Interrupted => {
+                return StoreError::Transient(format!("{store}: {source}"));
+            }
+            // Decode/Unknown (and any future non_exhaustive kind) carry no
+            // clear retry signal on their own; fall through to the heuristic.
+            _ => {}
+        }
+    }
+
+    // Tier 2: Display-text heuristic. This is the only floor for 429/503,
+    // whose HTTP status is not reachable through any nameable type here.
     let msg = source.to_string();
     let lower = msg.to_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline") {
@@ -404,11 +482,6 @@ fn classify_generic(
             retry_after_ms: 1000,
         };
     }
-    // `object_store` already retries its own retryable classes (5xx,
-    // connection errors, timeouts) internally with backoff; anything that
-    // still surfaces as Generic has exhausted those retries, so treat it as
-    // transient rather than permanent, letting the caller apply its own
-    // backoff per the contract's retry classification.
     StoreError::Transient(format!("{store}: {msg}"))
 }
 
@@ -1056,5 +1129,239 @@ mod tests {
             credential.token, None,
             "a token comes from the file, never mixed in from inline config"
         );
+    }
+
+    // --- Classification of Error::Generic (issue #906) ---
+    //
+    // These pin the StoreError kind AND retryable() that the S3/MinIO
+    // get/put/list error path produces for each representative error shape.
+    // A future object_store bump that changes error text (tier 2) or the
+    // typed HttpError API (tier 1) fails one of these loudly instead of
+    // silently misclassifying a retryable error as permanent (or vice versa).
+
+    use object_store::client::{HttpError, HttpErrorKind};
+
+    /// A minimal opaque error usable as an `Error::Generic` source when the
+    /// test only cares about the `Display` text (tier-2 heuristic path).
+    #[derive(Debug)]
+    struct TextError(&'static str);
+
+    impl std::fmt::Display for TextError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for TextError {}
+
+    /// An error whose `source()` yields the given boxed error, modeling
+    /// `object_store`'s real nesting (`RetryError` -> `RequestError` ->
+    /// `HttpError`) so the source-chain walk in [`typed_http_kind`] is
+    /// exercised, not just a directly-embedded `HttpError`.
+    #[derive(Debug)]
+    struct WrapError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    }
+
+    impl std::fmt::Display for WrapError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer wrapper: {}", self.source)
+        }
+    }
+
+    impl std::error::Error for WrapError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.source.as_ref())
+        }
+    }
+
+    fn generic(source: impl std::error::Error + Send + Sync + 'static) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(source),
+        }
+    }
+
+    fn http_error(kind: HttpErrorKind) -> HttpError {
+        HttpError::new(kind, std::io::Error::other("injected transport error"))
+    }
+
+    /// Tier 1: a typed `HttpErrorKind::Timeout` in the source chain classifies
+    /// as `Timeout` (retryable) without any string matching -- proven by giving
+    /// the error Display text with no timeout words at all.
+    #[test]
+    fn typed_http_timeout_classifies_without_string_match() {
+        let err = generic(http_error(HttpErrorKind::Timeout));
+        let mapped = map_error_common(err);
+        assert!(matches!(mapped, StoreError::Timeout), "got {mapped:?}");
+        assert!(mapped.is_retryable());
+
+        // And nested one level deeper, as object_store really wraps it.
+        let nested = generic(WrapError {
+            source: Box::new(http_error(HttpErrorKind::Timeout)),
+        });
+        let mapped = map_error_common(nested);
+        assert!(
+            matches!(mapped, StoreError::Timeout),
+            "source-chain walk must find the nested HttpError, got {mapped:?}"
+        );
+    }
+
+    /// Tier 1: typed connection-class transport kinds are retryable and map to
+    /// `Transient` (unchanged outcome, now typed rather than defaulted).
+    #[test]
+    fn typed_http_connection_kinds_classify_as_transient() {
+        for kind in [
+            HttpErrorKind::Connect,
+            HttpErrorKind::Request,
+            HttpErrorKind::Interrupted,
+        ] {
+            let mapped = map_error_common(generic(http_error(kind)));
+            assert!(
+                matches!(mapped, StoreError::Transient(_)),
+                "{kind:?} -> {mapped:?}"
+            );
+            assert!(mapped.is_retryable(), "{kind:?} must be retryable");
+        }
+    }
+
+    /// Tier 2: with no `HttpError` in the chain, the `Display` heuristic is the
+    /// floor. Pins the timeout / 429 / 503 / throttle / opaque shapes.
+    #[test]
+    fn display_heuristic_pins_kind_and_retryability() {
+        struct Case {
+            text: &'static str,
+            expect_throttled: bool,
+            expect_timeout: bool,
+        }
+        let cases = [
+            Case {
+                text: "connection timed out after 30s",
+                expect_throttled: false,
+                expect_timeout: true,
+            },
+            Case {
+                text: "Server returned non-2xx status code: 429 Too Many Requests",
+                expect_throttled: true,
+                expect_timeout: false,
+            },
+            Case {
+                text: "Server returned non-2xx status code: 503 Service Unavailable",
+                expect_throttled: true,
+                expect_timeout: false,
+            },
+            Case {
+                text: "request was throttled by the backend",
+                expect_throttled: true,
+                expect_timeout: false,
+            },
+            // Opaque post-retry failure: retryable Transient, never Permanent.
+            Case {
+                text: "connection reset by peer",
+                expect_throttled: false,
+                expect_timeout: false,
+            },
+        ];
+        for case in cases {
+            let mapped = map_error_common(generic(TextError(case.text)));
+            if case.expect_timeout {
+                assert!(matches!(mapped, StoreError::Timeout), "{}", case.text);
+            } else if case.expect_throttled {
+                assert!(
+                    matches!(mapped, StoreError::Throttled { .. }),
+                    "{}",
+                    case.text
+                );
+            } else {
+                assert!(matches!(mapped, StoreError::Transient(_)), "{}", case.text);
+            }
+            // Every Generic classification outcome is retryable.
+            assert!(mapped.is_retryable(), "{} must be retryable", case.text);
+        }
+    }
+
+    /// The typed variants object_store already surfaces are mapped by variant,
+    /// not by string, and their retryability matches the contract: NotFound /
+    /// AlreadyExists / Precondition are terminal (not retryable).
+    #[test]
+    fn typed_variants_map_by_variant_and_are_not_retryable() {
+        let not_found = map_error_common(object_store::Error::NotFound {
+            path: "k".into(),
+            source: Box::new(TextError("no such key")),
+        });
+        assert!(matches!(not_found, StoreError::NotFound));
+        assert!(!not_found.is_retryable());
+
+        let already = map_error_common(object_store::Error::AlreadyExists {
+            path: "k".into(),
+            source: Box::new(TextError("exists")),
+        });
+        assert!(matches!(already, StoreError::AlreadyExists));
+        assert!(!already.is_retryable());
+
+        let precondition = map_error_common(object_store::Error::Precondition {
+            path: "k".into(),
+            source: Box::new(TextError("if-match failed")),
+        });
+        assert!(matches!(precondition, StoreError::PreconditionFailed));
+        assert!(!precondition.is_retryable());
+    }
+
+    /// `map_put_error` remaps a conditional-write precondition failure by mode,
+    /// regardless of whether object_store reported it as AlreadyExists (409) or
+    /// Precondition (412), and both outcomes are terminal.
+    #[test]
+    fn put_error_maps_conditional_failure_by_mode() {
+        for reported in [
+            object_store::Error::AlreadyExists {
+                path: "k".into(),
+                source: Box::new(TextError("409")),
+            },
+            object_store::Error::Precondition {
+                path: "k".into(),
+                source: Box::new(TextError("412")),
+            },
+        ] {
+            let create = map_put_error(clone_err(&reported), &PutMode::CreateIfAbsent);
+            assert!(matches!(create, StoreError::AlreadyExists), "{create:?}");
+            assert!(!create.is_retryable());
+
+            let cas = map_put_error(reported, &PutMode::CasVersion(crate::Version("v1".into())));
+            assert!(matches!(cas, StoreError::PreconditionFailed), "{cas:?}");
+            assert!(!cas.is_retryable());
+        }
+    }
+
+    /// `map_get_error` recognizes an unsatisfiable range (416) as `InvalidRange`
+    /// (a terminal caller error), before delegating anything else to the shared
+    /// classifier.
+    #[test]
+    fn get_error_maps_unsatisfiable_range() {
+        let err = generic(TextError(
+            "the requested range is not satisfiable: 416 Range Not Satisfiable",
+        ));
+        let mapped = map_get_error(err);
+        assert!(matches!(mapped, StoreError::InvalidRange(_)), "{mapped:?}");
+        assert!(!mapped.is_retryable());
+
+        // A get Generic with no range signal still flows through classify_generic.
+        let timeout = map_get_error(generic(http_error(HttpErrorKind::Timeout)));
+        assert!(matches!(timeout, StoreError::Timeout));
+    }
+
+    /// `object_store::Error` is not `Clone`; rebuild the two conditional-write
+    /// shapes this test needs so each mode gets its own value.
+    fn clone_err(err: &object_store::Error) -> object_store::Error {
+        match err {
+            object_store::Error::AlreadyExists { path, .. } => object_store::Error::AlreadyExists {
+                path: path.clone(),
+                source: Box::new(TextError("409")),
+            },
+            object_store::Error::Precondition { path, .. } => object_store::Error::Precondition {
+                path: path.clone(),
+                source: Box::new(TextError("412")),
+            },
+            _ => unreachable!("clone_err only used for the two conditional-write shapes"),
+        }
     }
 }
