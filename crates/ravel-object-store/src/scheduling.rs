@@ -236,11 +236,9 @@ impl RequestScheduler {
     /// - At or above the floor, with no foreground waiter: takes a global
     ///   permit if one is free, else waits for a release.
     async fn acquire_background(&self) -> Permit {
-        let bg_permit = match Arc::clone(&self.bg_sem).acquire_owned().await {
-            Ok(permit) => Some(permit),
-            // Closed: degrade to unscheduled rather than fail the op.
-            Err(_) => None,
-        };
+        // Closed: degrade to unscheduled rather than fail the op (the semaphore
+        // is never closed in normal operation).
+        let bg_permit = Arc::clone(&self.bg_sem).acquire_owned().await.ok();
         let global = loop {
             let notified = self.wake.notified();
             tokio::pin!(notified);
