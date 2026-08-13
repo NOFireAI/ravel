@@ -319,6 +319,13 @@ struct SignalUsage {
     bytes_admitted_total: u64,
     requests_rejected_byte_rate_total: u64,
     requests_rejected_series_rate_total: u64,
+    /// Whole requests rejected because the receiver's admission clock was
+    /// implausible (below `MIN_PLAUSIBLE_INGEST_CLOCK_NS` or non-representable,
+    /// ADR-0051 amendment 2026-08-13, S1-12). The fault is the replica's, not
+    /// the request's, but the counter is per (tenant, signal) so it renders in
+    /// the `ravel_admission_rejected_total{reason="clock"}` family (§6). See
+    /// [`AdmissionController::record_clock_rejection`].
+    requests_rejected_clock_total: u64,
     series_admitted_total: u64,
     series_rejected_cap_total: u64,
     /// Fleet-admission reconciliation read failures for this (tenant, signal)
@@ -360,6 +367,11 @@ pub struct TenantUsage {
     pub series_admitted_total: u64,
     pub requests_rejected_byte_rate_total: u64,
     pub requests_rejected_series_rate_total: u64,
+    /// Whole requests rejected for an implausible receiver admission clock
+    /// (ADR-0051 amendment, S1-12). Rendered under
+    /// `ravel_admission_rejected_total{reason="clock"}`. See
+    /// [`SignalUsage::requests_rejected_clock_total`].
+    pub requests_rejected_clock_total: u64,
     pub series_rejected_cap_total: u64,
     /// Fleet-admission reconciliation read failures (ADR-0057 section 3),
     /// per (tenant, signal). See [`SignalUsage::reconciliation_failures_total`].
@@ -582,6 +594,25 @@ impl AdmissionController {
         })
     }
 
+    /// Records a whole-request rejection for an implausible receiver admission
+    /// clock (ADR-0051 amendment 2026-08-13, S1-12), so it surfaces under
+    /// `ravel_admission_rejected_total{reason="clock"}` (§6). The gateway calls
+    /// this at admission when [`crate::plausible_ingest_clock`] fails, then
+    /// rejects the whole request with HTTP 503 / gRPC `UNAVAILABLE`.
+    ///
+    /// `now_ns` is the plausibility floor rather than the bad clock reading:
+    /// the reading is by definition nonsense here, and seeding a fresh tenant's
+    /// epoch/token state from it would be worse than a fixed in-range anchor.
+    pub fn record_clock_rejection(&self, tenant: &TenantId, signal: Signal) {
+        self.with_tenant(tenant, crate::MIN_PLAUSIBLE_INGEST_CLOCK_NS, |state| {
+            state
+                .usage
+                .entry(signal)
+                .or_default()
+                .requests_rejected_clock_total += 1;
+        });
+    }
+
     /// Charges the batch's distinct new-series demand against the tenant's
     /// shared series-creation-rate bucket (ADR-0051 section 1, layer 4).
     /// `candidate_series` may repeat ids and may include already-active
@@ -683,6 +714,7 @@ impl AdmissionController {
                     series_admitted_total: usage.series_admitted_total,
                     requests_rejected_byte_rate_total: usage.requests_rejected_byte_rate_total,
                     requests_rejected_series_rate_total: usage.requests_rejected_series_rate_total,
+                    requests_rejected_clock_total: usage.requests_rejected_clock_total,
                     series_rejected_cap_total: usage.series_rejected_cap_total,
                     reconciliation_failures_total: usage.reconciliation_failures_total,
                 });
@@ -1250,5 +1282,28 @@ mod tests {
 
         // Never keyed by anything other than the fixed-width tenant hash.
         assert_eq!(metrics_row.tenant_hash, tenant.hash());
+    }
+
+    #[test]
+    fn record_clock_rejection_counts_per_tenant_and_signal() {
+        let clock = TestClock::new(0);
+        let controller = AdmissionController::new(clock.clone(), AdmissionLimits::default());
+        let tenant = TenantId::new("acme");
+
+        controller.record_clock_rejection(&tenant, Signal::Metrics);
+        controller.record_clock_rejection(&tenant, Signal::Metrics);
+        controller.record_clock_rejection(&tenant, Signal::Logs);
+
+        let snapshot = controller.usage_snapshot();
+        let metrics_row = snapshot
+            .iter()
+            .find(|row| row.tenant_hash == tenant.hash() && row.signal == Signal::Metrics)
+            .expect("a metrics usage row exists after a clock rejection");
+        assert_eq!(metrics_row.requests_rejected_clock_total, 2);
+        let logs_row = snapshot
+            .iter()
+            .find(|row| row.tenant_hash == tenant.hash() && row.signal == Signal::Logs)
+            .expect("a logs usage row exists after a clock rejection");
+        assert_eq!(logs_row.requests_rejected_clock_total, 1);
     }
 }
