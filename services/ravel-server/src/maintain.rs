@@ -2504,6 +2504,216 @@ mod tests {
             .expect("publish");
     }
 
+    /// Publish one L0 commit holding only the erasure subject at
+    /// `(Metrics, shard 0, hour 0)`, with the given `writer_seq`, and return its
+    /// [`CompactionInputIdentity`]. Two of these seed a bucket with two distinct
+    /// L0 inputs that both hold the subject -- the setup the divergence test
+    /// needs, so a forged rewrite can supersede one and leave the other live.
+    async fn publish_subject_l0(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        writer_seq: u64,
+    ) -> ravel_proto::commit::v1::CompactionInputIdentity {
+        let tenant_hash = tenant.hash();
+        let labels = subject_labels(TEST_ERASED_SUBJECT);
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, "http_requests", &labels).expect("series id"),
+            labels,
+            samples: vec![Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(9_200 + u128::from(writer_seq));
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10 + writer_seq as i64,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        ravel_proto::commit::v1::CompactionInputIdentity {
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        }
+    }
+
+    /// Forge a `RewriteRecord` at `(Metrics, shard 0, hour 0)` that supersedes
+    /// ONLY `superseded` (a single L0 identity) and names `request_id` in its
+    /// drops, with one non-empty output part overlapping the subject's event
+    /// time. This is a deliberately inconsistent bucket state -- a real rewrite
+    /// pass always supersedes the whole live input set -- constructed to expose
+    /// the F1 divergence: ravel-maintain's one-hop `resolve_live_record` picks
+    /// this record as the single live generation and reports the request
+    /// `AlreadyApplied`, while the catalog resolver excludes only the one named
+    /// L0 and keeps serving the subject out of any other live L0.
+    async fn forge_partial_rewrite(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        superseded: &ravel_proto::commit::v1::CompactionInputIdentity,
+        request_id: Uuid,
+    ) {
+        let part = ravel_proto::commit::v1::CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: vec![0u8; 32],
+            object_size: 64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: 1_000,
+            max_event_ts_ns: 1_000,
+            segment_format_version: 3,
+        };
+        let inputs = vec![superseded.clone()];
+        let applied = vec![request_id.to_string()];
+        let input_set_hash =
+            ravel_commit::erasure::compute_rewrite_input_set_hash(&inputs, None, &applied);
+        let record = ravel_proto::commit::v1::RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 0,
+            inputs,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            drops: vec![ravel_proto::commit::v1::RewriteDrop {
+                request_id: request_id.to_string(),
+                dropped_count: 1,
+            }],
+            created_unix_ns: 20,
+            superseded_record_key: String::new(),
+        };
+        ravel_commit::erasure::validate_rewrite(&record).expect("forged rewrite is valid");
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite record key");
+        store
+            .put(
+                &key,
+                ravel_commit::erasure::encode_rewrite(&record),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put forged rewrite");
+    }
+
+    /// ADR-0064 §4 (2026-08-08 F1 correction): a `.done` is written ONLY when
+    /// the CATALOG resolver -- the same `resolve_rewrite_supersession` a snapshot
+    /// resolve runs -- agrees every in-scope bucket is erased, never when only
+    /// the rewrite pass's one-hop `resolve_live_record` does.
+    ///
+    /// Construct exactly the state where the two disagree: a sealed bucket with
+    /// two L0 inputs that both hold the subject, plus a forged rewrite that
+    /// supersedes only the first and names the request. The one-hop resolver
+    /// picks that rewrite as the single live record and reports the request
+    /// `AlreadyApplied` (so the rewrite pass is not deferred and would, on the
+    /// pre-fix code, write `.done`). The catalog resolver excludes only the
+    /// named L0, sees the second L0 still live and still holding the subject,
+    /// and must block completion. Drive the real `run_erasure_pass` and assert
+    /// the `.done` follows the catalog resolver: it is NOT written, and the
+    /// `.dreq` survives.
+    ///
+    /// The flip that proves this test bites: in `run_erasure_pass`, remove the
+    /// `if pass.catalog_blocked.contains(&entry.request.request_id) { continue; }`
+    /// guard (revert completion to the rewrite pass's one-hop classification)
+    /// and the `.done` is written here, resurrecting the subject that l0_two
+    /// still serves.
+    #[tokio::test]
+    async fn done_follows_the_catalog_resolver_not_the_one_hop_live_record() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // Two live L0 inputs, both holding the subject, in one sealed bucket.
+        let l0_one = publish_subject_l0(&store, &tenant_id, 1).await;
+        let _l0_two = publish_subject_l0(&store, &tenant_id, 2).await;
+
+        let request_id = Uuid::from_u128(0xF10);
+        // A rewrite that supersedes only l0_one and names the request. l0_two
+        // stays live and keeps serving the subject.
+        forge_partial_rewrite(&store, &tenant, &l0_one, request_id).await;
+
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Drive the real production completion path.
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "the catalog resolver still serves the subject out of l0_two, so no .done may be \
+             written -- even though the one-hop resolver reports the request AlreadyApplied. \
+             Flip: drop the `pass.catalog_blocked.contains(...)` guard in run_erasure_pass and a \
+             .done lands here while l0_two still holds the subject."
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the .dreq (which carries the subject) must survive: the erasure is not complete"
+        );
+    }
+
     /// Submit one erasure request exactly as `ravel-cli erase submit` does: a
     /// validated `ErasureRequest` written `CreateIfAbsent` to its `.dreq` key.
     /// Returns the key.
