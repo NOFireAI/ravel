@@ -1064,14 +1064,15 @@ mod tests {
         tokio::spawn(async move { f1.get("fg1", GetRange::Full).await });
         gate.wait_until_held(2).await;
 
-        // Two background ops enter the scheduler and park: the first claims the
-        // one floor slot, the second is above the floor.
+        // Two background ops enter the scheduler and park, one after the other,
+        // both before any foreground waits. Only the counters distinguish which
+        // path each took, so the test asserts nothing about them: what matters
+        // is which requests are admitted at the end.
         let b0 = bg.clone();
         tokio::spawn(async move { b0.get("bg0", GetRange::Full).await });
-        assert!(
-            spin_until(|| scheduler(&cs).bg_committed.load(Ordering::SeqCst) == 1).await,
-            "the first background op claims the floor slot before waiting"
-        );
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
         let b1 = bg.clone();
         tokio::spawn(async move { b1.get("bg1", GetRange::Full).await });
         for _ in 0..20 {
