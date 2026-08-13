@@ -575,6 +575,9 @@ metrics, `l` logs, `s` spans). Control objects live at the bucket root under
 | audit prefix (`u/…`), read/write | `t/<hash>/u/…` | `t/*/u/*` |
 | legal-hold shard (deny-delete) | `t/<hash>/u/*/0000/…` | `t/*/u/*/0000/*` |
 | query-audit shard (Maintain delete) | `t/<hash>/u/*/0001/…` | `t/*/u/*/0001/*` |
+| erasure request + completion (`del/…`) | `t/<hash>/<sig>/del/…` | `t/*/*/del/*` |
+| erasure request only (`.dreq`, Maintain delete) | `t/<hash>/<sig>/del/*.dreq` | `t/*/*/del/*.dreq` |
+| erasure completion (`.done`, deny-delete) | `t/<hash>/<sig>/del/*.done` | `t/*/*/del/*.done` |
 | tenant discovery (delimited list) | `t/` | `t/` |
 | `sys/tenancy`, `sys/qualification`, `sys/gc` | bucket root | as written |
 
@@ -757,6 +760,84 @@ overwriting an existing record), and it grants no delete: `c/` is not one of
 the deny-delete prefixes (Maintain legitimately sweeps superseded records
 there), so Admin's continued absence from any delete grant is unchanged. See
 ADR-0055's 2026-08-07 amendment for the rationale.
+
+### Selective erasure grants (ADR-0064)
+
+Selective subject erasure (GDPR/DSAR deletion, ADR-0064) adds one new object
+prefix, `t/<hash>/<sig>/del/`, holding two key suffixes: the erasure request
+`<request_id>.dreq` (which contains the subject identifier) and its completion
+marker `<request_id>.done` (which does not). The rewrite pass and physical
+sweep that erasure drives write and delete only under `l0/`, `l1/`, and `c/` —
+prefixes Maintain already has — so no policy change is needed for those. Only
+the `del/` prefix needs new grants, scoped exactly to the ADR-0055 amendment
+(EJ, 2026-08-13):
+
+- **Admin** creates the `.dreq` (`ravel-cli erase submit`) and deletes
+  nothing.
+- **Query** and **Maintain** read `del/` to attach pending predicates at
+  resolve time and to scope the rewrite pass.
+- **Maintain** deletes the `.dreq` **only** (after its `.done` exists and the
+  protection horizon passes), and no role — Maintain included — may delete a
+  `.done`.
+
+Add each statement to the same policy file as the rest of that role's grants
+(`deploy/iam/*.json`); the JSON below shows the statements to add, with
+`my-ravel-bucket` standing in for your bucket. The `.dreq` and `.done`
+suffixes are disjoint key paths, so the Maintain `.dreq` delete allow and the
+`.done` deny never overlap.
+
+`AdminErasureSubmit` — add to `deploy/iam/admin.json` (create-only, no
+delete):
+
+```json
+{
+  "Sid": "AdminErasureSubmit",
+  "Effect": "Allow",
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*"
+}
+```
+
+`QueryErasureRead` / `MaintainErasureRead` — add to `deploy/iam/query.json`
+and `deploy/iam/maintain.json`; add `t/*/*/del/*` to each role's existing
+`ListBucket` `s3:prefix` condition as well:
+
+```json
+{
+  "Sid": "ErasureRead",
+  "Effect": "Allow",
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*"
+}
+```
+
+`MaintainErasureDeleteRequest` — add to `deploy/iam/maintain.json`. Delete is
+granted on the `.dreq` suffix only, never on `del/*` as a whole, so it can
+never reach a `.done`:
+
+```json
+{
+  "Sid": "MaintainErasureDeleteRequest",
+  "Effect": "Allow",
+  "Action": "s3:DeleteObject",
+  "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.dreq"
+}
+```
+
+`DenyDeleteErasureCompletion` — add to **every** role's policy
+(`gateway.json`, `query.json`, `maintain.json`, `admin.json`), alongside the
+existing `DenyDeleteProtected` block. An explicit `Deny` overrides any
+`Allow`, so a `.done` marker is undeletable even by Maintain, whose
+`.dreq`-suffixed allow above does not match it:
+
+```json
+{
+  "Sid": "DenyDeleteErasureCompletion",
+  "Effect": "Deny",
+  "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+  "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.done"
+}
+```
 
 ### Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072 decision 2)
 
