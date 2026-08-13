@@ -62,10 +62,13 @@ const FLEET_CAP: u64 = 100;
 /// same injected instant, so nothing is ever stale.
 const R: Duration = Duration::from_secs(10);
 const ACK: Duration = Duration::from_secs(5);
-/// A fixed ingest instant. The metric data points carry this exact time, so the
-/// ADR-0051 event-time skew check (which runs inside `handle_export` before
-/// admission) never rejects a point for skew; only the active-series cap gates.
-const TS_NS: i64 = 1_000 * 3_600_000_000_000;
+/// A fixed ingest instant, 2026-01-01T00:00:00Z in nanoseconds. The metric data
+/// points carry this exact time, so the ADR-0051 event-time skew check (which
+/// runs inside `handle_export` before admission) never rejects a point for
+/// skew; only the active-series cap gates. Above the receiver-clock
+/// plausibility floor (ADR-0051 amendment, S1-12) so `handle_export`'s clock
+/// check admits it; an exact hour multiple, like the old value.
+const TS_NS: i64 = 1_767_225_600_000_000_000;
 
 /// Limits with only the active-series cap bounded (creation rate and byte rate
 /// unlimited), so the reachability property is exercised through the count cap
