@@ -43,13 +43,30 @@
 //! else.
 //!
 //! ADR-0065 makes the Maintain role N-replica, so the persisted per-shard
-//! cursor no longer has a true single writer: two processes can both own a
-//! shard briefly during a membership transition, or both fall back to
-//! `{self}` during a live-set read outage (worker_set.rs), and both
-//! `Overwrite` the same cursor. This is not a correctness hazard -- a missing
-//! or corrupt cursor is treated as "start over," and a racing overwrite costs
-//! at most a re-scrubbed slice, never wrong or missing coverage -- but it is
-//! no longer a true single-writer invariant, just a benign racing overwrite.
+//! cursor ([`persist_cursor`], written `PutOptions::default()` = Overwrite, no
+//! CAS) no longer has a true single writer: two processes can both own a shard
+//! briefly during a membership transition, or both fall back to `{self}` during
+//! a live-set read outage (worker_set.rs), and both `Overwrite` the same
+//! cursor. The worst case of that clobber is bounded precisely, not merely
+//! "benign":
+//!
+//! - A BACKWARD clobber (a replica writes a cursor position behind another
+//!   replica's) only makes the next tick re-scrub a slice already verified this
+//!   rotation: wasted read bandwidth, no coverage lost.
+//! - A FORWARD clobber (a replica writes a position ahead of another's) makes
+//!   the trailing replica resume past a slice that neither verified this
+//!   rotation, so that slice goes unscrubbed until the rotation wraps. It is not
+//!   lost: [`advance_cursor`]'s past-tail wrap re-covers every slice next
+//!   rotation. The effect is purely a promptness cost -- it DELAYS detection of
+//!   a corruption in that one slice by at most one full rotation period (the
+//!   scrub period `P`, [`DEFAULT_SCRUB_PERIOD`] = 7 days at defaults).
+//!
+//! Nothing is lost because scrub is detection-only (it never repairs, see
+//! below): delaying detection by up to one rotation changes only when an alarm
+//! fires, never what is or is not recoverable. So this is a bounded-promptness
+//! property on a racing overwrite, not a single-writer invariant. Adding CAS to
+//! [`persist_cursor`] would remove even that one-rotation forward-clobber delay,
+//! but it is not required for safety and is deliberately not done here.
 //!
 //! # Detection only, never repair
 //!
