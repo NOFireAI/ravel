@@ -140,43 +140,49 @@ where
     tokio::pin!(sleep);
 
     loop {
-        tokio::select! {
-            // Check the deadline first each iteration so an inner stream that is
-            // always immediately ready can never starve it. Before the deadline
-            // this arm is `Pending` and control falls through to forwarding.
+        // Phase 1: pull the next item, racing the deadline. `biased` polls the
+        // deadline first each iteration so a stream that is always immediately
+        // ready can never starve it.
+        let item = tokio::select! {
             biased;
+            () = &mut sleep => return deadline_reached(&tx),
+            item = inner.next() => item,
+        };
+        let Some(item) = item else {
+            // The inner stream ended on its own (completed, or failed its own
+            // per-batch deadline check). Dropping `tx` closes the channel, which
+            // ends the client's response.
+            return;
+        };
 
-            () = &mut sleep => {
-                // The server ceiling elapsed while this stream was still open.
-                // Hand the client the typed error if the channel has room right
-                // now; never block waiting for room, since a full channel is the
-                // very stall this deadline exists to break. Then return, dropping
-                // `inner` and releasing the permit.
-                let _ = tx.try_send(Err(deadline_status()));
-                return;
-            }
-
-            item = inner.next() => {
-                match item {
-                    // Back-pressure: when the non-reading client has filled the
-                    // channel, this `send` is `Pending`, the whole `select!` is
-                    // `Pending`, and the deadline arm above is what eventually
-                    // fires. A `send` error means the receiver was dropped (the
-                    // client disconnected); stop and release the permit rather
-                    // than spin.
-                    Some(item) => {
-                        if tx.send(item).await.is_err() {
-                            return;
-                        }
-                    }
-                    // The inner stream ended on its own (completed, or failed its
-                    // own per-batch deadline check). Return; dropping `tx` closes
-                    // the channel, which ends the client's response.
-                    None => return,
+        // Phase 2: forward the item, racing the deadline. The `send` -- not the
+        // `next` above -- is where a non-reading client stalls: it fills the
+        // channel and `tx.send` stays `Pending`. Racing it against `sleep` here
+        // (rather than awaiting it outside the `select!`) is the whole point,
+        // and is exactly what a plain `tx.send(item).await` would get wrong:
+        // that await would park with no timer in the race, so the deadline could
+        // never fire during the stall.
+        tokio::select! {
+            biased;
+            () = &mut sleep => return deadline_reached(&tx),
+            result = tx.send(item) => {
+                // A `send` error means the receiver was dropped (the client
+                // disconnected); stop and release the permit rather than spin.
+                if result.is_err() {
+                    return;
                 }
             }
         }
     }
+}
+
+/// The deadline arm shared by both `select!`s in [`drive`]: hand the client the
+/// typed error if the channel has room right now -- never block waiting for
+/// room, since a full channel is the very stall this deadline exists to break --
+/// then let the caller `return`, dropping the inner stream and releasing the
+/// permit.
+fn deadline_reached(tx: &mpsc::Sender<Result<FlightData, Status>>) {
+    let _ = tx.try_send(Err(deadline_status()));
 }
 
 #[tonic::async_trait]
@@ -213,9 +219,10 @@ where
         // (the `tx.send` error arm), or the deadline, so it never leaks.
         tokio::spawn(drive(body, tx, self.max_deadline));
 
-        let stream: Self::DoGetStream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }));
+        let stream: Self::DoGetStream =
+            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            }));
         Ok(Response::from_parts(metadata, stream, extensions))
     }
 
@@ -280,5 +287,128 @@ where
         request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
         self.inner.list_actions(request).await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// An inner result stream that sets a flag when it is dropped, standing in
+    /// for the `QueryPermit` release that dropping `ravel-sql`'s permit-holding
+    /// stream performs. `remaining == None` means it never ends on its own, so
+    /// only the deadline or a disconnect can end the driver.
+    struct DropFlagStream {
+        dropped: Arc<AtomicBool>,
+        remaining: Option<usize>,
+    }
+
+    impl Stream for DropFlagStream {
+        type Item = Result<FlightData, Status>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            match &mut self.remaining {
+                Some(0) => std::task::Poll::Ready(None),
+                Some(n) => {
+                    *n -= 1;
+                    std::task::Poll::Ready(Some(Ok(FlightData::default())))
+                }
+                None => std::task::Poll::Ready(Some(Ok(FlightData::default()))),
+            }
+        }
+    }
+
+    impl Drop for DropFlagStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The deadline releases the inner stream (its permit) even when the
+    /// receiver never reads: the driver is parked on a full-channel `send`, and
+    /// the runtime-scheduled sleep is what ends it. This is the driver-layer
+    /// analogue of the end-to-end stalled-client test; it cannot see hyper's
+    /// send pump, so the transport-level proof lives in
+    /// `tests/flight_deadline_e2e.rs`.
+    #[tokio::test(start_paused = true)]
+    async fn deadline_releases_inner_when_receiver_never_reads() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let inner = DropFlagStream {
+            dropped: Arc::clone(&dropped),
+            remaining: None,
+        };
+        let (tx, _rx) = mpsc::channel::<Result<FlightData, Status>>(DOGET_CHANNEL_CAPACITY);
+        let deadline = Duration::from_secs(30);
+        // `_rx` is held but never polled: the stall this bound targets.
+        let handle = tokio::spawn(drive(inner, tx, deadline));
+
+        // Let the driver run once so it parks on the full-channel `send` with
+        // its `sleep` already armed (biased `select!` polls the sleep first, so
+        // one poll registers it). Only then advance virtual time past the
+        // deadline: advancing before the sleep exists would leave it armed for a
+        // now-later deadline and never fire.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(deadline + Duration::from_secs(1)).await;
+        handle.await.expect("driver task joins");
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the inner stream (and its permit) is dropped by the deadline"
+        );
+    }
+
+    /// A client disconnect (receiver dropped) makes the forwarding `send` fail,
+    /// which stops the driver and drops the inner stream rather than spinning or
+    /// leaking the permit until the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn client_disconnect_stops_driver_and_releases_inner() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let inner = DropFlagStream {
+            dropped: Arc::clone(&dropped),
+            remaining: None,
+        };
+        let (tx, rx) = mpsc::channel::<Result<FlightData, Status>>(DOGET_CHANNEL_CAPACITY);
+        drop(rx); // the client is gone before any item is forwarded
+        let handle = tokio::spawn(drive(inner, tx, Duration::from_secs(30)));
+
+        // No time is advanced: the driver must exit on the `send` error, not by
+        // waiting out the deadline.
+        handle.await.expect("driver task joins");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "a disconnected client releases the permit immediately, not at the deadline"
+        );
+    }
+
+    /// A finite stream drained by a reading receiver delivers every item and no
+    /// deadline error, then ends and drops the inner stream.
+    #[tokio::test(start_paused = true)]
+    async fn progressing_stream_delivers_all_items_without_deadline_error() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let inner = DropFlagStream {
+            dropped: Arc::clone(&dropped),
+            remaining: Some(3),
+        };
+        let (tx, mut rx) = mpsc::channel::<Result<FlightData, Status>>(DOGET_CHANNEL_CAPACITY);
+        let handle = tokio::spawn(drive(inner, tx, Duration::from_secs(30)));
+
+        let mut count = 0;
+        while let Some(item) = rx.recv().await {
+            item.expect("no deadline error on a drained stream");
+            count += 1;
+        }
+        handle.await.expect("driver task joins");
+
+        assert_eq!(count, 3, "every item is delivered");
+        assert!(dropped.load(Ordering::SeqCst), "stream end drops the inner");
     }
 }
