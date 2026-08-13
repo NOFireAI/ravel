@@ -2306,6 +2306,648 @@ mod tests {
         }
     }
 
+    // --- ADR-0064 selective erasure, driven through `run_tick` (issue #997) ---
+
+    /// The injected "now" every erasure test ticks at: hour 10_000 (1971), far
+    /// past the seal margin for the ingest-hour-0 bucket those tests publish,
+    /// so the rewrite pass sees a sealed bucket without any wall-clock
+    /// dependence.
+    const TEST_ERASURE_NOW_NS: i64 = 10_000 * TEST_NS_PER_HOUR;
+
+    /// The label whose value the erasure predicate names (the "subject").
+    const TEST_SUBJECT_LABEL: &str = "user_id";
+    /// The subject to erase, and the one that must survive untouched.
+    const TEST_ERASED_SUBJECT: &str = "u123";
+    const TEST_SURVIVING_SUBJECT: &str = "u999";
+
+    fn subject_labels(subject: &str) -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "http_requests".to_string(),
+            },
+            Label {
+                name: TEST_SUBJECT_LABEL.to_string(),
+                value: subject.to_string(),
+            },
+        ])
+        .expect("valid labels")
+    }
+
+    /// Publish one sealed metrics bucket at ingest hour 0 holding two series:
+    /// the erasure subject and one bystander, one sample each. A single L0
+    /// input keeps the bucket below `min_compaction_inputs`, so the tick's
+    /// compaction pass leaves the live record set as raw L0 and the erasure
+    /// rewrite is what acts on it.
+    async fn publish_erasable_bucket(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+        let tenant_hash = tenant.hash();
+        let mut series: Vec<SeriesInput> = [TEST_ERASED_SUBJECT, TEST_SURVIVING_SUBJECT]
+            .into_iter()
+            .map(|subject| {
+                let labels = subject_labels(subject);
+                SeriesInput {
+                    series_id: SeriesId::compute(tenant, "http_requests", &labels)
+                        .expect("series id"),
+                    labels,
+                    samples: vec![Sample {
+                        ts_ns: 1_000,
+                        value: 1.0,
+                    }],
+                }
+            })
+            .collect();
+        series.sort_by(|a, b| a.series_id.cmp(&b.series_id));
+
+        let writer_id = Uuid::from_u128(9_100);
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// Submit one erasure request exactly as `ravel-cli erase submit` does: a
+    /// validated `ErasureRequest` written `CreateIfAbsent` to its `.dreq` key.
+    /// Returns the key.
+    async fn submit_erasure_request(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        request_id: Uuid,
+        subject: &str,
+        now_ns: i64,
+    ) -> String {
+        let request = ErasureRequest {
+            format_version: ravel_commit::erasure::FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: now_ns,
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: TEST_SUBJECT_LABEL.to_string(),
+                value: subject.to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: "dsar".to_string(),
+        };
+        ravel_commit::erasure::validate_request(&request).expect("valid request");
+        let key = keys::erasure_request_key(tenant, signal, request_id).expect("dreq key");
+        store
+            .put(
+                &key,
+                ravel_commit::erasure::encode_request(&request),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("submit .dreq");
+        key
+    }
+
+    /// Every `RewriteRecord` present in `(tenant, Metrics, shard 0, hour 0)`,
+    /// decoded, in key order.
+    async fn rewrite_records(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+    ) -> Vec<ravel_proto::commit::v1::RewriteRecord> {
+        let prefix =
+            keys::commit_shard_hour_prefix(tenant, Signal::Metrics, 0, 0).expect("bucket prefix");
+        let mut keys_found: Vec<String> = list_all(store, &prefix)
+            .await
+            .expect("list bucket")
+            .into_iter()
+            .map(|meta| meta.key)
+            .filter(|key| key.contains("/rw."))
+            .collect();
+        keys_found.sort();
+        let mut out = Vec::with_capacity(keys_found.len());
+        for key in keys_found {
+            let got = store.get(&key, GetRange::Full).await.expect("get rewrite");
+            out.push(ravel_commit::erasure::decode_rewrite(&got.data).expect("decode rewrite"));
+        }
+        out
+    }
+
+    /// The label sets a rewrite record's output parts actually hold, read back
+    /// out of the published segment objects. This is the "survivors are intact"
+    /// oracle: it reads what a query would read, not what the record claims.
+    async fn rewritten_label_sets(
+        store: &dyn ObjectStoreBackend,
+        record: &ravel_proto::commit::v1::RewriteRecord,
+    ) -> Vec<LabelSet> {
+        use ravel_segment::{ReaderLimits, decode_catalog_v5, open_from_full};
+
+        let limits = ReaderLimits::default();
+        let mut out = Vec::new();
+        for part in &record.parts {
+            let key = keys::reconstruct_rewrite_part_key(record, part).expect("part key");
+            let got = store.get(&key, GetRange::Full).await.expect("get part");
+            let object = got.data;
+            let loc = open_from_full(&object, limits).expect("open part");
+            for entry in decode_catalog_v5(&loc.footer, &object, limits).expect("decode catalog") {
+                out.push(entry.entry.labels);
+            }
+        }
+        out
+    }
+
+    /// THE reachability acceptance test for issue #997 (ADR-0064 decisions 3,
+    /// 4, and 5): everything is driven through `run_tick` itself, never by
+    /// calling `erasure_rewrite_bucket` or `sweep_erasure_requests` directly.
+    ///
+    /// Ingest one sealed bucket holding the erasure subject and one bystander,
+    /// submit a `.dreq` naming the subject, and run a tick. The tick must
+    /// publish a `RewriteRecord` that names the request, drops exactly the
+    /// subject's one sample, and leaves the bystander's series intact in the
+    /// output part -- and must write the request's `.done` in the same tick,
+    /// because every bucket in the request's scope now carries a rewrite
+    /// naming it. The `.dreq` must still be there: the protection horizon has
+    /// not elapsed. Advance the injected clock past that horizon, tick again,
+    /// and the `.dreq` must be gone while the (permanent, PII-free) `.done`
+    /// survives.
+    ///
+    /// The flip that proves this test bites: comment out the
+    /// `run_erasure_pass(...)` call in `run_tick_with_clock`'s per-signal loop
+    /// and it fails at the first assertion (no rewrite record is ever
+    /// published). Flipping only the `.dreq` sweep (dropping the
+    /// `sweep_erasure_requests` call inside `run_erasure_pass`) fails at the
+    /// final assertion instead.
+    #[tokio::test]
+    async fn run_tick_rewrites_for_an_erasure_request_then_sweeps_its_dreq() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7A5);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Tick 1: the rewrite runs and the request completes.
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        let records = rewrite_records(&store, &tenant).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "the tick must publish exactly one RewriteRecord for the bucket"
+        );
+        let record = &records[0];
+        assert_eq!(
+            record.drops.len(),
+            1,
+            "the rewrite applies exactly the one pending request"
+        );
+        assert_eq!(record.drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            record.drops[0].dropped_count, 1,
+            "exactly the subject's one sample is dropped"
+        );
+
+        let survivors = rewritten_label_sets(&store, record).await;
+        assert_eq!(
+            survivors,
+            vec![subject_labels(TEST_SURVIVING_SUBJECT)],
+            "the bystander series survives the rewrite intact and the subject is gone"
+        );
+
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "every bucket in scope carries the request, so the tick writes .done"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            ".dreq must survive until protection_horizon has elapsed past .done"
+        );
+
+        // Tick 2, past the horizon: the `.dreq` (which carries the subject
+        // identifier) is swept; the PII-free `.done` is permanent.
+        clock.set(TEST_ERASURE_NOW_NS + compactor.protection_horizon_ns + 1);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_err(),
+            ".dreq must be swept once its .done is older than protection_horizon"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            ".done is permanent erasure evidence and must never be swept"
+        );
+    }
+
+    /// The EJ-T5 idempotence guard, observed through the loop: a second tick
+    /// over a bucket whose live `RewriteRecord` already names every pending
+    /// request must publish nothing new. Without the `AlreadyApplied` skip the
+    /// second tick would land a no-op rewrite superseding the first, every
+    /// tick, forever.
+    ///
+    /// Driven by keeping the request pending across two ticks: the first tick
+    /// writes `.done`, so the request would drop out of the pending set --
+    /// deleting the `.done` between the ticks puts it back and re-runs the
+    /// rewrite against an already-rewritten bucket, which is exactly the state
+    /// the guard exists for.
+    #[tokio::test]
+    async fn second_tick_over_an_already_erased_bucket_publishes_no_new_rewrite() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7A6);
+        submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        for _ in 0..2 {
+            run_tick_with_clock(
+                &clock,
+                &store,
+                &tenant,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &worker.solo_live_set(),
+            )
+            .await;
+            // Put the request back in the pending set for the next tick.
+            store.delete(&done_key).await.expect("delete .done");
+        }
+
+        let records = rewrite_records(&store, &tenant).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "a bucket already rewritten for every pending request must not be \
+             republished: {records:?}"
+        );
+    }
+
+    /// Failure path: the `.done` write faults. The ordering guarantee must
+    /// hold anyway -- no `.done`, so the `.dreq` stays even once the
+    /// protection horizon has passed, and the request stays pending. A later
+    /// fault-free tick completes it, without redoing the rewrite (the bucket
+    /// is `AlreadyApplied` by then).
+    #[tokio::test]
+    async fn a_failed_done_write_keeps_the_dreq_and_completes_on_a_later_tick() {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&inner, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7A7);
+        let dreq_key = submit_erasure_request(
+            &inner,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        // Fault the FIRST PUT of a `.done` object and nothing else, so the
+        // same store serves the recovery ticks untouched.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Transient("completion write unavailable".into()),
+            )
+            .with_key_contains(".done")
+            .with_occurrence(ravel_object_store::fault::Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Tick 1 under the fault, already past the horizon: the rewrite lands,
+        // the `.done` write fails, and the `.dreq` must survive regardless.
+        clock.set(TEST_ERASURE_NOW_NS + compactor.protection_horizon_ns + 1);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert_eq!(
+            store.fault_count(Op::Put, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the injected .done write fault must actually have fired"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "no .done was written"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "a .dreq must never be swept while its .done is absent, horizon or not"
+        );
+        assert_eq!(
+            rewrite_records(&store, &tenant).await.len(),
+            1,
+            "the rewrite itself landed before the completion write failed"
+        );
+
+        // Tick 2, past the one-shot fault: the request completes, and its
+        // `.dreq` is swept on the tick after the horizon passes.
+        clock.set(TEST_ERASURE_NOW_NS + 2 * compactor.protection_horizon_ns + 2);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "the fault-free tick completes the request"
+        );
+        assert_eq!(
+            rewrite_records(&store, &tenant).await.len(),
+            1,
+            "the completing tick must not republish a rewrite for a bucket that \
+             already names the request"
+        );
+
+        clock.set(TEST_ERASURE_NOW_NS + 3 * compactor.protection_horizon_ns + 3);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_err(),
+            "once the .done exists and its horizon passes, the .dreq is swept"
+        );
+    }
+
+    /// A legal hold over the bucket pauses erasure (ADR-0064 §6): the rewrite
+    /// is skipped, so no `.done` may be written and the `.dreq` must survive
+    /// even past the protection horizon. Legal hold wins over erasure until an
+    /// authorized human clears it.
+    #[tokio::test]
+    async fn a_held_bucket_defers_erasure_completion_and_keeps_the_dreq() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7A8);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        // Hold every scope covering (Metrics, shard 0).
+        for scope in shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("valid hold scopes") {
+            write_hold_set(
+                &store,
+                &tenant,
+                Uuid::new_v4(),
+                TEST_ERASURE_NOW_NS,
+                &scope,
+                "litigation hold over the erasure subject's bucket",
+            )
+            .await
+            .expect("set hold");
+        }
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        clock.set(TEST_ERASURE_NOW_NS + compactor.protection_horizon_ns + 1);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(
+            rewrite_records(&store, &tenant).await.is_empty(),
+            "a held bucket must not be rewritten"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "a deferred request must not be marked complete"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the request stays pending while the hold is in force"
+        );
+    }
+
+    /// The `.done` predicate hash is what makes a permanent completion record
+    /// PII-free, so it must be stable across matcher orderings (two
+    /// submissions of the same erasure hash the same) and must never contain
+    /// the plaintext subject.
+    #[test]
+    fn erasure_predicate_hash_is_order_stable_and_carries_no_plaintext() {
+        let matcher = |key: &str, value: &str| ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        let base = ErasureRequest {
+            format_version: ravel_commit::erasure::FORMAT_VERSION,
+            tenant_hash: TenantId::new("acme").hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            request_id: Uuid::from_u128(1).to_string(),
+            created_unix_ns: 10,
+            predicate: vec![matcher("user_id", "u123"), matcher("region", "eu")],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: "dsar".to_string(),
+        };
+        let mut reordered = base.clone();
+        reordered.predicate.reverse();
+        // A different reason and submit time is the same erasure.
+        reordered.reason = "second submit".to_string();
+        reordered.created_unix_ns = 99;
+        assert_eq!(
+            erasure_predicate_hash(&base),
+            erasure_predicate_hash(&reordered),
+            "matcher order and non-predicate fields must not change the hash"
+        );
+
+        let mut different_value = base.clone();
+        different_value.predicate[0] = matcher("user_id", "u124");
+        assert_ne!(
+            erasure_predicate_hash(&base),
+            erasure_predicate_hash(&different_value),
+            "a different subject must hash differently"
+        );
+
+        let mut windowed = base.clone();
+        windowed.window_start_ns = 1;
+        windowed.window_end_ns = 2;
+        assert_ne!(
+            erasure_predicate_hash(&base),
+            erasure_predicate_hash(&windowed),
+            "the event-time window is part of what is erased, so it is hashed"
+        );
+
+        let hash = erasure_predicate_hash(&base);
+        assert!(
+            !hash.windows(4).any(|w| w == b"u123"),
+            "the digest must not contain the subject identifier"
+        );
+    }
+
     /// Publish one real sealed segment plus its commit record into a past ingest
     /// hour of `(tenant, Metrics, shard 0)`. One input is below the default
     /// `min_compaction_inputs`, and with no retention policy the bucket stays
