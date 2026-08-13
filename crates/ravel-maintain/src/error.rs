@@ -90,6 +90,23 @@ pub enum MaintainError {
         dropped_sample_count: u64,
     },
     #[error(
+        "erasure rewrite input record-count cross-check failed for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: the decode scanned {scanned_record_count} input records but the input objects' footers declare {footer_record_count} (a silent decode-side record loss, fatal invariant breach, ADR-0064 decision 3, issue #981); publish aborted, nothing written, originals preserved"
+    )]
+    ErasureInputConservationViolation {
+        /// Hex tenant hash of the bucket (the key-prefix form operators see).
+        tenant_hash: String,
+        /// Signal key prefix (`m`, `l`, `s`).
+        signal: String,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        /// Records the decode actually scanned out of the live input objects
+        /// (the tally the conservation gate treats as the input total).
+        scanned_record_count: u64,
+        /// Sum of `record_count` declared by every live input object's footer
+        /// (RLOG/RSPAN), the independent authority the scan is checked against.
+        footer_record_count: u64,
+    },
+    #[error(
         "erasure rewrite found no live record in a bucket that is not empty (fatal invariant breach at {bucket_prefix:?}): {live_count} compaction/rewrite records present but every one is named by another's superseded_record_key"
     )]
     NoLiveRecord {

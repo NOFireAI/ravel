@@ -1179,6 +1179,7 @@ pub async fn build_rewrite_logs(
 
     let mut input_sample_count: u64 = 0;
     let mut output_sample_count: u64 = 0;
+    let mut footer_record_count: u64 = 0;
     let mut dropped_counts = vec![0u64; requests.len()];
 
     let identity = rlog::compactor_identity(bucket, config);
@@ -1189,6 +1190,22 @@ pub async fn build_rewrite_logs(
 
     for object_key in object_keys {
         let got = store.get(object_key, GetRange::Full).await?;
+        // Input-side record-count authority (issue #981): each input object's
+        // RLOG footer declares its own `record_count`, written at flush/compact
+        // time independently of the decode path this pass runs. Summing it and
+        // cross-checking against the scan tally below closes the silent
+        // data-loss gap the conservation gate cannot: that gate proves
+        // survivors + drops == the scan's own count, so a decode that silently
+        // dropped input records would satisfy it against a deflated input total
+        // and permanently supersede the originals. Metrics catches the same
+        // class via the catalog `run.sample_count` cross-check; logs/spans had
+        // no equivalent until here.
+        let footer = ravel_logseg::footer::open(got.data.as_ref())?;
+        footer_record_count = footer_record_count
+            .checked_add(footer.record_count)
+            .ok_or_else(|| {
+                MaintainError::Invariant("footer record_count sum overflowed u64".to_string())
+            })?;
         let reader = RlogReader::new(got.data.as_ref(), &read_cfg)?;
         let (records, _stats) = reader.scan(&full_range)?;
         for record in records {
@@ -1212,6 +1229,8 @@ pub async fn build_rewrite_logs(
             }
         }
     }
+
+    input_footer_cross_check(bucket, input_sample_count, footer_record_count)?;
 
     let parts = if any_survivor {
         // dry_run: true -- `publish_rewrite_record` PUTs `build.parts` itself,
@@ -1285,6 +1304,7 @@ pub async fn build_rewrite_spans(
 
     let mut input_sample_count: u64 = 0;
     let mut output_sample_count: u64 = 0;
+    let mut footer_record_count: u64 = 0;
     let mut dropped_counts = vec![0u64; requests.len()];
 
     let identity = rspan_codec::compactor_identity(bucket, config);
@@ -1294,6 +1314,18 @@ pub async fn build_rewrite_spans(
 
     for object_key in object_keys {
         let got = store.get(object_key, GetRange::Full).await?;
+        // Input-side record-count authority (issue #981): the RSPAN footer's
+        // own `record_count`, summed and cross-checked against the scan tally
+        // below. Same rationale as the logs path in `build_rewrite_logs`: the
+        // output-side conservation gate cannot see an input record the decode
+        // silently lost, and the originals get superseded, so the loss would be
+        // permanent and invisible.
+        let footer = ravel_rspan::open(got.data.as_ref())?;
+        footer_record_count = footer_record_count
+            .checked_add(footer.record_count)
+            .ok_or_else(|| {
+                MaintainError::Invariant("footer record_count sum overflowed u64".to_string())
+            })?;
         let reader = RspanReader::new(got.data.as_ref(), &read_cfg)?;
         let (records, _stats) = reader.scan(&full_range)?;
         for record in records {
@@ -1315,6 +1347,8 @@ pub async fn build_rewrite_spans(
             }
         }
     }
+
+    input_footer_cross_check(bucket, input_sample_count, footer_record_count)?;
 
     let parts = if any_survivor {
         // dry_run: true, same reason as build_rewrite_logs.
@@ -1363,6 +1397,37 @@ pub async fn build_rewrite_spans(
 pub enum RewriteSupersession {
     RawL0(Vec<CompactionInputIdentity>),
     Existing(String),
+}
+
+/// Input-side record-count conservation gate for logs/spans (issue #981):
+/// the scan tally `scanned_record_count` (what [`build_rewrite_logs`] /
+/// [`build_rewrite_spans`] counted while decoding every live input object)
+/// MUST equal `footer_record_count`, the sum of every input object's own
+/// footer `record_count`. A mismatch means the decode silently lost (or
+/// duplicated) input records: the output-side
+/// [`MaintainError::ErasureConservationViolation`] gate cannot catch this
+/// because it checks survivors + drops against that same deflated scan tally,
+/// so a lossy decode balances against itself. Aborting here -- before
+/// [`publish_rewrite_record`] writes any part or record -- keeps the originals
+/// live and the `.dreq` pending, exactly as the output-side gate does. Metrics
+/// needs no equivalent: [`build_rewrite`] cross-checks decoded runs against the
+/// catalog `run.sample_count` already.
+fn input_footer_cross_check(
+    bucket: &Bucket,
+    scanned_record_count: u64,
+    footer_record_count: u64,
+) -> Result<()> {
+    if scanned_record_count != footer_record_count {
+        return Err(MaintainError::ErasureInputConservationViolation {
+            tenant_hash: hex::encode(bucket.tenant_hash.0),
+            signal: bucket.signal.key_prefix().to_string(),
+            shard: bucket.shard,
+            ingest_hour_bucket: bucket.ingest_hour_bucket,
+            scanned_record_count,
+            footer_record_count,
+        });
+    }
+    Ok(())
 }
 
 /// Sum `dropped_count`/`sample_count`s in u64 with checked addition,
@@ -3792,6 +3857,364 @@ mod tests {
         assert!(
             !leaked_links,
             "the dropped span's links blob must not survive in any partial form"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Input-side record-count cross-check (issue #981)
+    // -----------------------------------------------------------------
+
+    /// Re-encode an RLOG object's footer with `record_count` bumped by
+    /// `delta`, recomputing the trailer crc so the object still opens cleanly.
+    /// This stands in for a decode that silently loses `delta` input records:
+    /// the footer (the honest authority, written at flush time) over-declares
+    /// relative to what a scan can decode. Body bytes before the footer are
+    /// left untouched, so the block data a scan reads is unchanged.
+    fn bump_rlog_footer_record_count(bytes: &[u8], delta: u64) -> Bytes {
+        use ravel_logseg::footer::{TRAILER_LEN, open, write_footer_and_trailer};
+        let total = bytes.len();
+        let footer_len = u32::from_le_bytes(
+            bytes[total - TRAILER_LEN..total - TRAILER_LEN + 4]
+                .try_into()
+                .expect("footer_len bytes"),
+        ) as usize;
+        let footer_start = total - TRAILER_LEN - footer_len;
+        let mut footer = open(bytes).expect("open rlog footer");
+        footer.record_count += delta;
+        let mut out = bytes[..footer_start].to_vec();
+        write_footer_and_trailer(&mut out, &footer);
+        Bytes::from(out)
+    }
+
+    /// The RSPAN sibling of [`bump_rlog_footer_record_count`].
+    fn bump_rspan_footer_record_count(bytes: &[u8], delta: u64) -> Bytes {
+        use ravel_rspan::footer::{TRAILER_LEN, open, write_footer_and_trailer};
+        let total = bytes.len();
+        let footer_len = u32::from_le_bytes(
+            bytes[total - TRAILER_LEN..total - TRAILER_LEN + 4]
+                .try_into()
+                .expect("footer_len bytes"),
+        ) as usize;
+        let footer_start = total - TRAILER_LEN - footer_len;
+        let mut footer = open(bytes).expect("open rspan footer");
+        footer.record_count += delta;
+        let mut out = bytes[..footer_start].to_vec();
+        write_footer_and_trailer(&mut out, &footer);
+        Bytes::from(out)
+    }
+
+    /// Seed one L0 `.rlog` input exactly like [`seed_logs`], except the stored
+    /// data object's footer over-declares its `record_count` by one. The
+    /// commit record and the data key still describe the honest object (same
+    /// content hash, honest `sample_count`), so the bucket resolves and scans
+    /// normally; only [`build_rewrite_logs`]'s footer-vs-scan cross-check sees
+    /// the discrepancy.
+    async fn seed_logs_footer_overcount(
+        store: &dyn ObjectStoreBackend,
+        seq: u64,
+        records: &[LogRecord],
+    ) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(u128::from(seq));
+        let identity = LogObjectIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+        };
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        for r in records {
+            w.push(r.clone()).expect("push log record");
+        }
+        let bytes = Bytes::from(w.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(
+            &th,
+            Signal::Logs,
+            SHARD,
+            writer_id,
+            EPOCH,
+            seq,
+            &content_hash,
+        )
+        .expect("data key");
+        let bumped = bump_rlog_footer_record_count(&bytes, 1);
+        store
+            .put(&data_key, bumped, PutOptions::default())
+            .await
+            .expect("put data object");
+
+        let mut ids: HashSet<LogStreamId> = HashSet::new();
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for r in records {
+            ids.insert(r.stream_id);
+            min_ts = min_ts.min(r.ts_ns);
+            max_ts = max_ts.max(r.ts_ns);
+        }
+        let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Logs,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: ids.len() as u64,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    /// The RSPAN sibling of [`seed_logs_footer_overcount`].
+    async fn seed_spans_footer_overcount(
+        store: &dyn ObjectStoreBackend,
+        seq: u64,
+        records: &[SpanRecord],
+    ) {
+        let th = tenant_hash();
+        let writer_id = Uuid::from_u128(u128::from(seq));
+        let identity = SpanObjectIdentity {
+            tenant_hash: th.0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+        };
+        let mut w = RspanWriter::new(RspanConfig::default(), identity);
+        for r in records {
+            w.push(r.clone());
+        }
+        let bytes = Bytes::from(w.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(
+            &th,
+            Signal::Spans,
+            SHARD,
+            writer_id,
+            EPOCH,
+            seq,
+            &content_hash,
+        )
+        .expect("data key");
+        let bumped = bump_rspan_footer_record_count(&bytes, 1);
+        store
+            .put(&data_key, bumped, PutOptions::default())
+            .await
+            .expect("put data object");
+
+        let mut traces: HashSet<[u8; 16]> = HashSet::new();
+        let mut min_start = i64::MAX;
+        let mut max_end = i64::MIN;
+        for r in records {
+            traces.insert(r.trace_id);
+            min_start = min_start.min(r.start_ts_ns);
+            max_end = max_end.max(r.end_ts_ns);
+        }
+        let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Spans,
+            shard: SHARD,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: traces.len() as u64,
+            min_event_ts_ns: min_start,
+            max_event_ts_ns: max_end,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: OUTPUT_FORMAT_VERSION,
+            created_unix_ns: created,
+            ingest_hour_bucket: HOUR,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    /// #981: a LOGS input whose footer over-declares its `record_count` (a
+    /// stand-in for a decode that silently loses an input record) must abort
+    /// the rewrite before any publish. The output-side conservation gate
+    /// cannot catch this: it checks survivors + drops against the same
+    /// deflated scan tally, so a lossy decode balances against itself. Because
+    /// the rewrite supersedes the originals, an unguarded loss would be
+    /// permanent and invisible.
+    ///
+    /// Flip-line proof: deleting the `input_footer_cross_check(bucket,
+    /// input_sample_count, footer_record_count)?` call in `build_rewrite_logs`
+    /// (or flipping `scanned_record_count != footer_record_count` to `==` in
+    /// `input_footer_cross_check`) lets this reach `Ok(Rewritten { .. })`,
+    /// failing the `expect_err`.
+    #[tokio::test]
+    async fn logs_input_footer_overcount_aborts_rewrite_publish() {
+        let store = MemoryStore::new();
+        seed_logs_footer_overcount(
+            &store,
+            1,
+            &[
+                log_record(
+                    1,
+                    10,
+                    "checkout failed",
+                    vec![(
+                        "service".to_string(),
+                        LogAttrValue::Str("checkout".to_string()),
+                    )],
+                ),
+                log_record(
+                    2,
+                    20,
+                    "shipping ok",
+                    vec![(
+                        "service".to_string(),
+                        LogAttrValue::Str("shipping".to_string()),
+                    )],
+                ),
+            ],
+        )
+        .await;
+
+        let request = logs_erasure_request(1, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let before = list_all(&store, "").await.expect("list before");
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let mut memo = MaintainMemo::with_default_interval();
+        let err = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &NoLeases,
+            &logs_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect_err("footer/scan record-count mismatch must abort the rewrite");
+
+        assert!(
+            matches!(err, MaintainError::ErasureInputConservationViolation { .. }),
+            "expected ErasureInputConservationViolation, got {err:?}"
+        );
+
+        let after = list_all(&store, "").await.expect("list after");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "an aborted rewrite must write nothing new: originals stay, no part, no record"
+        );
+        let listing = crate::read::list_bucket(&store, &logs_bucket())
+            .await
+            .expect("list bucket");
+        assert!(
+            listing.rewrite_record_keys.is_empty(),
+            "no rewrite record may be published on an input-side conservation abort"
+        );
+        assert_eq!(
+            listing.commit_keys.len(),
+            1,
+            "the original L0 commit (and its data object) must be preserved"
+        );
+    }
+
+    /// The SPANS sibling of [`logs_input_footer_overcount_aborts_rewrite_publish`].
+    /// Flip-line proof: the same, over the `input_footer_cross_check(...)?` call
+    /// in `build_rewrite_spans`.
+    #[tokio::test]
+    async fn spans_input_footer_overcount_aborts_rewrite_publish() {
+        let store = MemoryStore::new();
+        seed_spans_footer_overcount(
+            &store,
+            1,
+            &[
+                span_record(
+                    1,
+                    1,
+                    10,
+                    15,
+                    vec![("service".to_string(), "checkout".to_string())],
+                ),
+                span_record(
+                    2,
+                    2,
+                    20,
+                    25,
+                    vec![("service".to_string(), "shipping".to_string())],
+                ),
+            ],
+        )
+        .await;
+
+        let request = spans_erasure_request(1, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let before = list_all(&store, "").await.expect("list before");
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let mut memo = MaintainMemo::with_default_interval();
+        let err = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &NoLeases,
+            &spans_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect_err("footer/scan record-count mismatch must abort the rewrite");
+
+        assert!(
+            matches!(err, MaintainError::ErasureInputConservationViolation { .. }),
+            "expected ErasureInputConservationViolation, got {err:?}"
+        );
+
+        let after = list_all(&store, "").await.expect("list after");
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "an aborted rewrite must write nothing new: originals stay, no part, no record"
+        );
+        let listing = crate::read::list_bucket(&store, &spans_bucket())
+            .await
+            .expect("list bucket");
+        assert!(
+            listing.rewrite_record_keys.is_empty(),
+            "no rewrite record may be published on an input-side conservation abort"
+        );
+        assert_eq!(
+            listing.commit_keys.len(),
+            1,
+            "the original L0 commit (and its data object) must be preserved"
         );
     }
 }
