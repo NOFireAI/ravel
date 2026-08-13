@@ -85,6 +85,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use tokio::runtime::Handle;
 
 use crate::clock::{Clock, SystemClock};
 use crate::key::CacheKey;
@@ -242,10 +243,11 @@ struct Inner {
 /// `limits.sweep_interval_ns` past `max_entry_age_ns`.
 pub struct DiskCache {
     inner: Arc<Inner>,
-    /// Handle to the background age-sweep task, present only when the cache was
-    /// constructed inside a Tokio runtime (production always is). Aborted on
-    /// drop so no sweeper task outlives its cache.
-    sweeper: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the background age-sweep task. Always present: construction
+    /// requires a Tokio runtime (see [`DiskCache::new_with_clock`]), so the
+    /// sweep can never be silently skipped. Aborted on drop so no sweeper task
+    /// outlives its cache.
+    sweeper: tokio::task::JoinHandle<()>,
 }
 
 impl DiskCache {
@@ -265,10 +267,10 @@ impl DiskCache {
     /// deleted on sight rather than counted: discard and rebuild, never
     /// repair, applies at startup exactly as it does on a live read.
     ///
-    /// Constructed inside a Tokio runtime, this also spawns the background
-    /// age-sweep task (ADR-0064, issue #753, finding F1). Constructed outside
-    /// one (a synchronous test, a non-async CLI path), no task is spawned and
-    /// ageing then relies on the per-`get` and startup checks alone.
+    /// This also spawns the background age-sweep task (ADR-0064, issue #753,
+    /// finding F1), which requires a Tokio runtime. Must be constructed inside
+    /// one; constructing off a runtime panics rather than silently skipping the
+    /// sweep. See [`DiskCache::new_with_clock`].
     pub fn new(dir: PathBuf, limits: CacheLimits) -> Self {
         Self::new_with_clock(dir, limits, Arc::new(SystemClock))
     }
@@ -277,7 +279,20 @@ impl DiskCache {
     /// per-entry max-age and the background sweep (ADR-0064, issue #753).
     /// Production uses [`DiskCache::new`], which injects a [`SystemClock`];
     /// tests inject a clock they advance across the max-age boundary by hand.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime. The background age-sweep is a
+    /// hard requirement of the tier's erasure-residue bound (ADR-0064), not an
+    /// optional extra: a construction that could not spawn it must fail loudly,
+    /// exactly as [`tokio::spawn`] itself would, rather than leave the sweep
+    /// un-spawned and the bound silently unenforced for idle entries. Off-runtime
+    /// construction was previously tolerated (the sweeper was skipped), which
+    /// this deliberately closes (issue #1006, F-D).
     pub fn new_with_clock(dir: PathBuf, limits: CacheLimits, clock: Arc<dyn Clock>) -> Self {
+        // Acquire the runtime handle first, so an off-runtime construction fails
+        // before doing any filesystem work rather than after.
+        let handle = Handle::current();
         let state = Inner::scan_existing(&dir, limits, clock.now_ns());
         let inner = Arc::new(Inner {
             dir,
@@ -288,7 +303,7 @@ impl DiskCache {
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             clock,
         });
-        let sweeper = spawn_sweeper(&inner);
+        let sweeper = spawn_sweeper(&inner, &handle);
         DiskCache { inner, sweeper }
     }
 
@@ -353,25 +368,23 @@ impl Drop for DiskCache {
     /// next tick once this drop frees the last strong reference; the abort just
     /// makes shutdown prompt rather than up to one interval late.
     fn drop(&mut self) {
-        if let Some(handle) = self.sweeper.take() {
-            handle.abort();
-        }
+        self.sweeper.abort();
     }
 }
 
-/// Spawns the periodic age-sweep task for `inner`, returning its join handle,
-/// or `None` when no Tokio runtime is available (a synchronous construction).
-/// The task holds only a [`Weak`], so it never keeps the tier alive: once the
-/// owning [`DiskCache`] drops, the next `upgrade` fails and the task exits. It
-/// also holds no strong reference across its `await`, so a drop that lands
-/// while the task is parked between ticks frees the state immediately.
-fn spawn_sweeper(inner: &Arc<Inner>) -> Option<tokio::task::JoinHandle<()>> {
-    let handle = tokio::runtime::Handle::try_current().ok()?;
+/// Spawns the periodic age-sweep task for `inner` on `handle`, returning its
+/// join handle. Non-optional: the caller supplies a runtime [`Handle`], so
+/// there is no off-runtime path that silently returns nothing. The task holds
+/// only a [`Weak`], so it never keeps the tier alive: once the owning
+/// [`DiskCache`] drops, the next `upgrade` fails and the task exits. It also
+/// holds no strong reference across its `await`, so a drop that lands while the
+/// task is parked between ticks frees the state immediately.
+fn spawn_sweeper(inner: &Arc<Inner>, handle: &Handle) -> tokio::task::JoinHandle<()> {
     let weak: Weak<Inner> = Arc::downgrade(inner);
     // Zero would panic `interval`; a sane floor keeps a misconfigured or
     // test-shrunk value from doing so while staying deterministic.
     let period = Duration::from_nanos(inner.limits.sweep_interval_ns.max(1));
-    Some(handle.spawn(async move {
+    handle.spawn(async move {
         let mut ticker = tokio::time::interval(period);
         // The first tick fires immediately; consume it so the first real sweep
         // is one interval out, not at construction time.
@@ -385,7 +398,7 @@ fn spawn_sweeper(inner: &Arc<Inner>) -> Option<tokio::task::JoinHandle<()>> {
                 None => break,
             }
         }
-    }))
+    })
 }
 
 impl Inner {
@@ -749,8 +762,8 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    #[test]
-    fn round_trip_identical_bytes_all_zero_and_zero_length() {
+    #[tokio::test]
+    async fn round_trip_identical_bytes_all_zero_and_zero_length() {
         let tmp = TempDir::new().unwrap();
         let cache = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
 
@@ -771,8 +784,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_disk_failure_degrades_to_a_miss() {
+    #[tokio::test]
+    async fn every_disk_failure_degrades_to_a_miss() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
 
@@ -901,8 +914,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn partial_write_never_observed_as_complete() {
+    #[tokio::test]
+    async fn partial_write_never_observed_as_complete() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let cache = DiskCache::new(dir.clone(), generous_limits());
@@ -935,8 +948,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deleting_cache_dir_while_live_keeps_reads_correct() {
+    #[tokio::test]
+    async fn deleting_cache_dir_while_live_keeps_reads_correct() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("cache");
         let cache = DiskCache::new(dir.clone(), generous_limits());
@@ -967,8 +980,8 @@ mod tests {
         assert_eq!(cache.get(&other_key).as_deref(), Some(b"world".as_slice()));
     }
 
-    #[test]
-    fn bounds_hold_under_insertion_pressure() {
+    #[tokio::test]
+    async fn bounds_hold_under_insertion_pressure() {
         let tmp = TempDir::new().unwrap();
         let limits = CacheLimits::new(20 * 1024, 8, 4096);
         let cache = DiskCache::new(tmp.path().to_path_buf(), limits);
@@ -1003,8 +1016,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scan_at_startup_seeds_accounting_and_discards_junk() {
+    #[tokio::test]
+    async fn scan_at_startup_seeds_accounting_and_discards_junk() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
 
@@ -1047,8 +1060,8 @@ mod tests {
     /// restarts forever, silently exceeding the directory's configured
     /// byte bound. The fix inspects every file, not just `.rvc`-suffixed
     /// ones, and deletes anything it cannot parse as a live entry.
-    #[test]
-    fn startup_scan_sweeps_orphaned_scratch_files() {
+    #[tokio::test]
+    async fn startup_scan_sweeps_orphaned_scratch_files() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let shard = dir.join("ab");
@@ -1069,8 +1082,8 @@ mod tests {
     /// with `key.len`, rather than writing an entry the header itself
     /// contradicts (which then misses on every future read while still
     /// counting as an admission).
-    #[test]
-    fn insert_rejects_length_mismatch_between_key_and_payload() {
+    #[tokio::test]
+    async fn insert_rejects_length_mismatch_between_key_and_payload() {
         let tmp = TempDir::new().unwrap();
         let cache = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
 
@@ -1087,8 +1100,8 @@ mod tests {
     /// A key that was simply never cached is a clean miss: no entry ever
     /// existed at its canonical path, so nothing is unhealthy about the
     /// disk tier and `record_disk_error` must not fire.
-    #[test]
-    fn get_on_never_cached_key_is_a_clean_miss_not_a_disk_error() {
+    #[tokio::test]
+    async fn get_on_never_cached_key_is_a_clean_miss_not_a_disk_error() {
         let tmp = TempDir::new().unwrap();
         let cache = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
 
@@ -1106,8 +1119,8 @@ mod tests {
     /// miss, per this module's doc, but that degraded miss is distinct from
     /// the plain "nothing at this path" case above: it is what
     /// `disk_errors_degraded_to_misses` exists to surface to an operator.
-    #[test]
-    fn get_on_corrupted_payload_is_a_disk_error_not_a_clean_miss() {
+    #[tokio::test]
+    async fn get_on_corrupted_payload_is_a_disk_error_not_a_clean_miss() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let cache = DiskCache::new(dir.clone(), generous_limits());
@@ -1140,8 +1153,8 @@ mod tests {
     /// that happened to be complete) must be deleted at startup, not
     /// counted: counting it would leak the real file at the canonical
     /// path uncounted and double-book its size into `total_bytes`.
-    #[test]
-    fn startup_scan_deletes_misplaced_entry_rather_than_counting_it() {
+    #[tokio::test]
+    async fn startup_scan_deletes_misplaced_entry_rather_than_counting_it() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
 
@@ -1170,8 +1183,8 @@ mod tests {
     /// and implementation the RAM tier uses, so a scan of distinct
     /// once-touched keys must not evict a working set that was re-accessed
     /// after admission (a plain-FIFO disk tier fails this).
-    #[test]
-    fn disk_tier_survives_repeated_scans_via_s3_fifo_eviction() {
+    #[tokio::test]
+    async fn disk_tier_survives_repeated_scans_via_s3_fifo_eviction() {
         let tmp = TempDir::new().unwrap();
         let entry_size = 1024u64;
         let working_set_len = 20u64;
@@ -1217,8 +1230,8 @@ mod tests {
     /// that is never true (e.g. `> u64::MAX`) or delete the whole
     /// `record_expired_max_age` block: the post-boundary `assert!(... is_none)`
     /// then fails because the aged-out bytes are served.
-    #[test]
-    fn disk_entry_older_than_max_age_is_not_served() {
+    #[tokio::test]
+    async fn disk_entry_older_than_max_age_is_not_served() {
         let tmp = TempDir::new().unwrap();
         let max_age = 24 * 60 * 60 * 1_000_000_000u64; // 24h in ns
         let limits = generous_limits().with_max_entry_age_ns(max_age);
@@ -1273,8 +1286,8 @@ mod tests {
     /// already older than the max-age when a fresh `DiskCache` opens the
     /// directory is deleted and not counted, so a restart never resurrects
     /// bytes that were due to be dropped.
-    #[test]
-    fn startup_scan_drops_entries_already_past_max_age() {
+    #[tokio::test]
+    async fn startup_scan_drops_entries_already_past_max_age() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let max_age = 1_000_000_000u64; // 1s in ns
@@ -1312,8 +1325,8 @@ mod tests {
     /// provably not what fires: the assertions below require the expiry counter
     /// to stay zero (an age-driven miss would bump it) and the disk-error
     /// counter to be exactly the one version-gate rejection.
-    #[test]
-    fn old_format_entry_without_timestamp_is_a_miss_not_served_forever() {
+    #[tokio::test]
+    async fn old_format_entry_without_timestamp_is_a_miss_not_served_forever() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         // A fixed clock, so the age comparison is deterministic and provably
@@ -1366,8 +1379,8 @@ mod tests {
     /// The age check reads `written_at_ns` from the header, so a file too
     /// short to contain one must be rejected before that read is ever
     /// attempted.
-    #[test]
-    fn short_and_garbage_entries_never_panic_under_age_check() {
+    #[tokio::test]
+    async fn short_and_garbage_entries_never_panic_under_age_check() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let clock = TestClock::new(5_000_000_000);
@@ -1407,8 +1420,8 @@ mod tests {
     /// `now_ns.saturating_sub(written_at_ns) > self.limits.max_entry_age_ns`
     /// to `... > u64::MAX` (never true). The sweep then deletes nothing, the
     /// idle file survives, and the `!path.exists()` assertion below fails.
-    #[test]
-    fn idle_entry_past_max_age_is_swept_from_disk() {
+    #[tokio::test]
+    async fn idle_entry_past_max_age_is_swept_from_disk() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let max_age = 24 * 60 * 60 * 1_000_000_000u64; // 24h in ns
@@ -1502,10 +1515,8 @@ mod tests {
         let clock = TestClock::new(1);
         let cache = DiskCache::new_with_clock(tmp.path().to_path_buf(), limits, clock);
 
-        assert!(
-            cache.sweeper.is_some(),
-            "constructed inside a runtime, the sweeper task must exist"
-        );
+        // The sweeper is non-optional now: construction requires a runtime, so
+        // a spawned task always exists (its absence is unrepresentable).
         let weak = cache.inner_weak();
         assert!(weak.upgrade().is_some(), "precondition: state is live");
 
@@ -1524,8 +1535,8 @@ mod tests {
     /// underflow or panic in either age-comparison site (the per-`get` check
     /// and the sweep). Traced safe in #753 via `saturating_sub` but previously
     /// unguarded by a test.
-    #[test]
-    fn max_entry_age_zero_expires_promptly_without_underflow() {
+    #[tokio::test]
+    async fn max_entry_age_zero_expires_promptly_without_underflow() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let limits = generous_limits().with_max_entry_age_ns(0);
@@ -1572,5 +1583,68 @@ mod tests {
         }
         let reader = DiskCache::new_with_clock(dir, limits, TestClock::new(7_000_001));
         assert_eq!(reader.len(), 0, "age-0 startup scan drops the entry");
+    }
+
+    /// Issue #1006: the sweeper's own graceful-exit path -- a tick that finds
+    /// the `Weak` dead and `break`s out of the loop -- was previously
+    /// unexercised (every existing test relied on `Drop::abort`, which stops
+    /// the task before that branch can run). Here the task is spawned against an
+    /// `Inner` we hold the only strong reference to, then that reference is
+    /// dropped without going through `DiskCache::drop`, so the task is never
+    /// aborted. Its next tick must upgrade to `None` and return on its own;
+    /// awaiting the join handle must therefore complete rather than hang.
+    ///
+    /// FLIP (non-vacuity): change the sweep loop's `None => break` to
+    /// `None => continue`. The task then never exits on a dead `Weak`, the
+    /// `timeout` below elapses, and the `expect` fires.
+    #[tokio::test]
+    async fn sweeper_breaks_on_dead_weak_without_abort() {
+        let tmp = TempDir::new().unwrap();
+        // A short interval so the post-drop tick lands well inside the timeout.
+        let limits = generous_limits().with_sweep_interval_ns(1_000_000); // 1 ms
+        let inner = Arc::new(Inner {
+            dir: tmp.path().to_path_buf(),
+            limits,
+            state: Mutex::new(S3Fifo::new(limits)),
+            metrics: Arc::new(CacheMetrics::default()),
+            tmp_counter: AtomicU64::new(0),
+            instance_id: 0,
+            clock: TestClock::new(1),
+        });
+        let handle = spawn_sweeper(&inner, &Handle::current());
+
+        // Drop the sole strong reference. The task holds only a `Weak`, and we
+        // deliberately do NOT abort it (there is no `DiskCache` to drop), so the
+        // only way it can stop is the `None => break` path under test.
+        drop(inner);
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("sweeper must exit on its own once its Weak is dead, not hang")
+            .expect("the sweeper task must return cleanly, not panic");
+    }
+
+    /// Issue #1006 (F-D): constructing a `DiskCache` off a Tokio runtime must
+    /// fail loudly rather than silently skip the background sweep. Before this
+    /// change the spawn was best-effort (`Handle::try_current().ok()?`), so an
+    /// off-runtime construction returned a cache with no sweeper and, once the
+    /// tier is wired, would leave the max-age residue bound unenforced for idle
+    /// entries with no visible signal. This test is deliberately a plain
+    /// `#[test]` (no `#[tokio::test]`) so the construction runs off every
+    /// runtime; it must panic, as `tokio::spawn` itself does off-runtime.
+    #[test]
+    fn off_runtime_construction_fails_loudly() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let limits = generous_limits();
+        let result = std::panic::catch_unwind(|| {
+            // Panics inside `new_with_clock`'s `Handle::current()`; the returned
+            // cache is never bound, so no sweeper is silently skipped.
+            let _ = DiskCache::new(dir, limits);
+        });
+        assert!(
+            result.is_err(),
+            "off-runtime construction must panic loudly, not return a sweeperless cache"
+        );
     }
 }

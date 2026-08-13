@@ -182,9 +182,10 @@ above applies to those bytes exactly as to fetched bytes, so no cache tier
 can ever surface excluded records to a caller. This satisfies the
 acceptance criterion at the semantic level immediately. Physical residue in
 caches is bounded separately: the disk tier gains a per-entry max-age
-(default 24 h, checked on hit and by the existing eviction walk), so raw
-bytes of an erased subject persist on any node's disposable local disk at
-most that long past the sweep; RAM-tier decoded structures for a superseded
+(default 24 h, checked on hit, by the existing eviction walk, and by the
+periodic background sweep added in #998 for entries that are never re-read),
+so raw bytes of an erased subject persist on any node's disposable local disk
+at most that long past the sweep; RAM-tier decoded structures for a superseded
 object are dropped by the same invalidation trigger tombstone observation
 already uses (ADR-0010 §10, ADR-0019 consequences). ADR-0046's own posture
 ("a node with its cache directory deleted mid-flight answers every query

@@ -27,7 +27,8 @@
 //! an entry older than the max-age is treated as a miss on `get`, and a
 //! background sweep drops over-age idle entries on [`DEFAULT_SWEEP_INTERVAL_NS`]
 //! regardless of access, so raw bytes of a subject erased by ADR-0064's sweep
-//! persist in a query node's RAM at most that long past the sweep (issue #988).
+//! persist in a query node's RAM at most the max-age plus one sweep interval
+//! past the sweep, a sum the defaults keep within 24 h (issue #988).
 //! The maintain node's erasure sweep cannot reach a query node's memory, so the
 //! bound is enforced locally, exactly as issue #998 did for the disk tier.
 //!
@@ -43,12 +44,13 @@
 //! [`disk`] module docs for the crash-safety mechanism and what crc32c and
 //! the header actually prove on a hit, per decision 4 as amended
 //! 2026-08-02). A disk entry also carries a stamped write time and a
-//! configured per-entry max-age (default 24 h,
+//! configured per-entry max-age (default 23 h,
 //! [`DEFAULT_MAX_ENTRY_AGE_NS`]): an entry older than the max-age is treated
 //! as a miss and dropped, so raw bytes of a subject erased by ADR-0064's
-//! sweep persist on a node's disposable local disk at most that long past the
-//! sweep (issue #753). Time is injected through [`Clock`] so this ageing is
-//! deterministic under test.
+//! sweep persist on a node's disposable local disk at most the max-age plus
+//! one sweep interval past the sweep -- the defaults are tuned to keep that
+//! sum within ADR-0064's 24 h bound (issue #753). Time is injected through
+//! [`Clock`] so this ageing is deterministic under test.
 
 mod cache;
 mod clock;

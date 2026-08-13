@@ -54,6 +54,25 @@ attach a RAM cache. See "Known gaps" below.
 | `--cache-dir <path>` | none | Reserved for the disk tier. Setting it fails startup today (see "Known gaps"). |
 | `--disable-cache` | off | Turns **every** ADR-0046 cache off: the fetcher cache and the catalog's byte cache both. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
 
+### Disk-tier max-age sweep
+
+The disk tier bounds how long an entry's raw bytes may sit on local disk,
+so bytes of a subject erased by ADR-0064's rewrite pass cannot outlive the
+erasure sweep on a query node by more than a fixed window. Two knobs
+(`CacheLimits`) govern it:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `max_entry_age_ns` | `82800000000000` (23 h) | Maximum wall-clock age an entry is served at. A hit on an older entry is treated as a miss and its bytes dropped. |
+| `sweep_interval_ns` | `3600000000000` (1 h) | Period of the background sweep that drops over-age idle entries nothing re-reads, so an entry that is never touched still ages out on its own. |
+
+The worst-case residue of an idle entry is `max_entry_age_ns +
+sweep_interval_ns`; the defaults (23 h + 1 h) are tuned so that sum meets
+ADR-0064's 24 h bound exactly. These are configuration on the disk tier,
+not CLI flags yet: like `--cache-dir`, the disk tier is not wired into a
+running process (see "Known gaps"), so there is no flag to set them from
+today.
+
 ## Startup warmup
 
 When the cache is on, `ravel-server` warms it before it reports ready
@@ -91,6 +110,15 @@ across both:
   This counter is always 0 today. No disk tier is attached, because
   `--cache-dir` fails startup (see the known gaps below). Do not alert on
   it until a disk tier exists.
+- `ravel_cache_disk_entries_expired_max_age_total`: disk-tier entries
+  dropped because they aged past the per-entry max-age (ADR-0064). Counts
+  every drop point: a hit that found an over-age entry, the startup scan, and
+  the periodic background sweep that reaches idle entries nothing re-reads.
+  Distinct from an eviction (which makes room under the byte or entry bound):
+  this is a time bound, not a capacity bound.
+
+  This counter is always 0 today, for the same reason as the one above: no
+  disk tier is attached. Do not alert on it until a disk tier exists.
 
 With every cache off (`--disable-cache`), none of these samples appear on
 `/metrics` at all: neither `cache="fetch"` nor `cache="catalog"`.
