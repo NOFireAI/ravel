@@ -1,21 +1,29 @@
-/// Default per-entry max-age: 24 hours, in nanoseconds. Chosen by ADR-0064
+/// Default per-entry max-age: 23 hours, in nanoseconds. Chosen by ADR-0064
 /// (issue #753): raw bytes of an erased subject must not outlive the erasure
-/// sweep on any query node by more than this. Both cache tiers share it: the
-/// disk tier bounds bytes on a node's disposable local disk (issue #753), the
-/// RAM tier bounds the same bytes in a query node's memory (issue #988). The
-/// erased data is identical PII either way, and the erasure sweep -- running on
-/// the maintain node -- can reach neither a query node's disk nor its RAM, so
-/// both tiers enforce the same bound locally.
-pub const DEFAULT_MAX_ENTRY_AGE_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+/// sweep on any query node by more than the ADR's 24 h bound. The worst-case
+/// residue of an idle entry is `max_entry_age_ns + sweep_interval_ns` (see
+/// [`DEFAULT_SWEEP_INTERVAL_NS`]), so the default max-age is set one sweep
+/// interval below 24 h (23 h + a 1 h sweep = 24 h exactly) rather than at 24 h,
+/// so the default actually meets the ADR bound instead of overshooting it by
+/// the sweep period. Both cache tiers share it: the disk tier bounds bytes on a
+/// node's disposable local disk (issue #753), the RAM tier bounds the same
+/// bytes in a query node's memory (issue #988). The erased data is identical
+/// PII either way, and the erasure sweep -- running on the maintain node --
+/// can reach neither a query node's disk nor its RAM, so both tiers enforce the
+/// same bound locally.
+pub const DEFAULT_MAX_ENTRY_AGE_NS: u64 = 23 * 60 * 60 * 1_000_000_000;
 
 /// Default period of a tier's background age sweep: 1 hour, in nanoseconds. A
 /// per-`get` (and, on disk, startup-scan) age check only reaches an entry that
 /// is read or that a fresh process scans; an entry that is never re-read and
 /// sees no eviction pressure needs a periodic pass to physically drop its bytes
 /// (ADR-0064, issue #753 finding F1 for disk, issue #988 for RAM). An idle
-/// entry therefore ages out within at most this interval past
-/// [`DEFAULT_MAX_ENTRY_AGE_NS`], well inside the 24 h bound with room to spare.
-/// Shared by both tiers for the same reason the max-age is.
+/// entry therefore ages out within at most one sweep interval past its
+/// max-age, so the true worst-case residue is
+/// `max_entry_age_ns + sweep_interval_ns`, not `max_entry_age_ns` alone. The
+/// defaults are tuned so that sum meets ADR-0064's 24 h bound exactly:
+/// [`DEFAULT_MAX_ENTRY_AGE_NS`] (23 h) + this (1 h) = 24 h. Shared by both
+/// tiers for the same reason the max-age is.
 pub const DEFAULT_SWEEP_INTERVAL_NS: u64 = 60 * 60 * 1_000_000_000;
 
 /// Bounds on a cache tier. The first three are enforced independently by both
@@ -45,7 +53,7 @@ pub struct CacheLimits {
     /// epoch, an entry is served at. A hit whose stamped `written_at_ns` is
     /// older than this is treated as a miss and the stale bytes are dropped
     /// (from disk for [`crate::DiskCache`], from memory for [`crate::Cache`]).
-    /// Defaults to [`DEFAULT_MAX_ENTRY_AGE_NS`] (24 h).
+    /// Defaults to [`DEFAULT_MAX_ENTRY_AGE_NS`] (23 h).
     pub max_entry_age_ns: u64,
     /// Both tiers: the period, in nanoseconds, of the background sweep that
     /// drops entries past `max_entry_age_ns` even when they are never re-read
@@ -57,7 +65,7 @@ pub struct CacheLimits {
 
 impl CacheLimits {
     /// Constructs limits with the default disk-tier max-age
-    /// ([`DEFAULT_MAX_ENTRY_AGE_NS`], 24 h). Use
+    /// ([`DEFAULT_MAX_ENTRY_AGE_NS`], 23 h). Use
     /// [`CacheLimits::with_max_entry_age_ns`] to override it.
     pub fn new(max_bytes: u64, max_entries: usize, max_entry_bytes: u64) -> Self {
         CacheLimits {
