@@ -479,4 +479,64 @@ mod tests {
             .expect("manifest decrypts under the deployment key");
         assert_eq!(recovered, tenant, "manifest recovers the tenant id");
     }
+
+    /// #991: a metrics/OTLP request whose receiver (ingest) clock is below the
+    /// 2020 floor must be rejected as the whole-request `ClockImplausible`
+    /// error (which the transport maps to gRPC `UNAVAILABLE` / HTTP 503, via
+    /// `is_retryable() == true`), and the `reason="clock"` admission counter
+    /// for the tenant's Metrics signal must increment. The clock is injected as
+    /// a fixed sub-floor timestamp, never `SystemTime::now()`, so the test is
+    /// deterministic.
+    ///
+    /// Non-vacuity: delete the `plausible_ingest_clock` guard at the top of
+    /// `handle_export` (ingest.rs, the `if let Err(msg) = ...` block) and this
+    /// test fails, because the empty request then writes cleanly and returns
+    /// `Ok` instead of the expected error, and the counter stays at 0.
+    #[tokio::test]
+    async fn receiver_clock_below_floor_rejects_unavailable_with_reason_clock() {
+        use ravel_ingest::MIN_PLAUSIBLE_INGEST_CLOCK_NS;
+
+        let state = state();
+        let tenant = TenantId::new("acme");
+        // One nanosecond below the 2020 floor: an implausible receiver clock.
+        let sub_floor = MIN_PLAUSIBLE_INGEST_CLOCK_NS - 1;
+
+        // `IngestOutcome` is not `Debug`, so match rather than `expect_err`.
+        let err = match handle_export(
+            &state,
+            tenant.clone(),
+            WriteMode::Strict,
+            empty_request(),
+            sub_floor,
+        )
+        .await
+        {
+            Ok(_) => panic!("a sub-floor receiver clock must reject the whole request"),
+            Err(err) => err,
+        };
+
+        // (a) The typed rejection is ClockImplausible, and it is retryable, so
+        // the transport maps it to gRPC UNAVAILABLE / HTTP 503.
+        assert!(
+            matches!(err, IngestRequestError::ClockImplausible(_)),
+            "expected ClockImplausible, got: {err:?}"
+        );
+        assert!(
+            err.is_retryable(),
+            "ClockImplausible is retryable, which the transport maps to UNAVAILABLE/503"
+        );
+
+        // (b) The admission rejected counter increments under reason=\"clock\"
+        // for this tenant's Metrics signal.
+        let row = state
+            .admission
+            .usage_snapshot()
+            .into_iter()
+            .find(|r| r.tenant_hash == tenant.hash() && r.signal == Signal::Metrics)
+            .expect("a metrics usage row exists after the clock rejection");
+        assert_eq!(
+            row.requests_rejected_clock_total, 1,
+            "the reason=\"clock\" rejected counter incremented exactly once"
+        );
+    }
 }
