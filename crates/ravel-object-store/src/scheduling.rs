@@ -36,6 +36,17 @@
 //!   *fairly* (a FIFO queue slot), so they make progress even against a
 //!   saturating foreground stream. Only requests beyond the floor yield.
 //!
+//! The fair queue slot is not preemptible: once a background request is queued
+//! on the global semaphore, a later foreground acquire cannot displace it,
+//! because tokio hands a released permit straight to the queue head. Entry into
+//! that wait is therefore *reserved* before the wait begins (`bg_committed`),
+//! not counted after the permit is taken; counting after would let N background
+//! requests all read a below-floor count, all commit to the un-preemptible
+//! wait, and turn a floor of one into a floor of N. Every counter the admission
+//! decision reads (`fg_waiters`, `bg_committed`) is held by an RAII guard, so a
+//! cancelled acquire -- a `select!` timeout, a client disconnect, shutdown --
+//! releases it on the way out instead of pinning the decision forever.
+//!
 //! # Off by default (ADR-0070 decision 2)
 //!
 //! [`ClassedStore::passthrough`] is the default construction: both handles are
@@ -129,9 +140,10 @@ pub struct Permit {
     global: Option<OwnedSemaphorePermit>,
     /// The background sub-cap permit; `None` for foreground.
     bg: Option<OwnedSemaphorePermit>,
-    /// For a background permit that took a global permit: the in-flight counter
-    /// to decrement on release. `None` for foreground and for the degraded case.
-    bg_inflight: Option<Arc<AtomicUsize>>,
+    /// For a background request that took a global permit: its slot in the
+    /// `bg_committed` count, released when the request ends. `None` for
+    /// foreground and for the degraded case.
+    bg_committed: Option<CountGuard>,
     /// Woken on release so a yielding or queued acquirer re-evaluates.
     wake: Arc<Notify>,
 }
@@ -139,15 +151,69 @@ pub struct Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         // Release the global permit first so a woken acquirer observes it free,
-        // then the background sub-cap permit, then update the in-flight count,
+        // then the background sub-cap permit, then the committed-count slot,
         // then wake. Doing the wake last means the woken task sees the permit
         // already available rather than racing the release.
         drop(self.global.take());
         drop(self.bg.take());
-        if let Some(inflight) = self.bg_inflight.take() {
-            inflight.fetch_sub(1, Ordering::SeqCst);
-        }
+        drop(self.bg_committed.take());
         self.wake.notify_waiters();
+    }
+}
+
+/// Holds one unit of a `usize` counter for as long as it lives, and releases it
+/// in `Drop`.
+///
+/// Both counters the admission decision reads are held through one of these,
+/// because both are read by *other* tasks to decide whether to yield or to
+/// commit to an un-preemptible wait. A plain increment/decrement pair around an
+/// `.await` releases only on the path where the await completes: drop the
+/// future instead (a `select!` timeout, a client disconnect, a shutdown, a
+/// panic unwinding through the acquire) and the counter stays elevated for the
+/// life of the process, permanently skewing every later decision. `Drop` runs
+/// on all of those paths.
+struct CountGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl CountGuard {
+    /// Take one unit unconditionally.
+    fn acquire(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        CountGuard {
+            count: Arc::clone(count),
+        }
+    }
+
+    /// Take one unit only while the counter is below `limit`, atomically, so
+    /// two concurrent claimants cannot both read the same below-limit value and
+    /// both succeed. `None` means the limit is already reached.
+    fn try_claim(count: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut current = count.load(Ordering::SeqCst);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(CountGuard {
+                        count: Arc::clone(count),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for CountGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -162,9 +228,11 @@ pub struct RequestScheduler {
     /// Count of foreground acquires currently blocked, so background can yield
     /// while any foreground waits.
     fg_waiters: Arc<AtomicUsize>,
-    /// Count of background requests currently holding a global permit, so the
-    /// floor decision knows how many background requests are already admitted.
-    bg_inflight: Arc<AtomicUsize>,
+    /// Count of background requests that hold a global permit *or* have
+    /// committed to the un-preemptible below-floor wait for one. The floor
+    /// decision reads this, so a request must be counted before it enters that
+    /// wait, not after it wins the permit.
+    bg_committed: Arc<AtomicUsize>,
     /// Background requests below this count compete fairly for the global
     /// permit (floor progress); at or above it they yield to foreground.
     bg_floor: usize,
@@ -180,7 +248,7 @@ impl RequestScheduler {
             global: Arc::new(Semaphore::new(config.fg_permits)),
             bg_sem: Arc::new(Semaphore::new(config.bg_permits)),
             fg_waiters: Arc::new(AtomicUsize::new(0)),
-            bg_inflight: Arc::new(AtomicUsize::new(0)),
+            bg_committed: Arc::new(AtomicUsize::new(0)),
             bg_floor: config.bg_floor,
             wake: Arc::new(Notify::new()),
         }
@@ -200,8 +268,14 @@ impl RequestScheduler {
     /// foreground comes from background stepping aside, and the floor comes from
     /// background's fair queue slot, so foreground itself must not sit in that
     /// queue ahead of a floor-guaranteed background request.
+    ///
+    /// The waiter registration is an RAII guard, so dropping this future while
+    /// it is parked (timeout, disconnect, shutdown) releases it. A leaked
+    /// registration would hold `fg_waiters` above zero forever, and background
+    /// yields whenever `fg_waiters > 0`, so one cancelled foreground request
+    /// would pin background at its floor for the life of the process.
     async fn acquire_foreground(&self) -> Permit {
-        self.fg_waiters.fetch_add(1, Ordering::SeqCst);
+        let waiter = CountGuard::acquire(&self.fg_waiters);
         let global = loop {
             let notified = self.wake.notified();
             tokio::pin!(notified);
@@ -214,13 +288,15 @@ impl RequestScheduler {
                 Err(TryAcquireError::Closed) => break None,
             }
         };
-        self.fg_waiters.fetch_sub(1, Ordering::SeqCst);
+        // Release the registration before waking, so a woken background task
+        // reads the cleared count rather than racing the decrement.
+        drop(waiter);
         // A foreground waiter cleared: let background re-evaluate its gate.
         self.wake.notify_waiters();
         Permit {
             global,
             bg: None,
-            bg_inflight: None,
+            bg_committed: None,
             wake: Arc::clone(&self.wake),
         }
     }
@@ -235,17 +311,32 @@ impl RequestScheduler {
     ///   the release reaches foreground.
     /// - At or above the floor, with no foreground waiter: takes a global
     ///   permit if one is free, else waits for a release.
+    ///
+    /// "Below the floor" is decided by *claiming* a slot in `bg_committed`
+    /// before entering the fair wait, not by reading a count of already-admitted
+    /// requests. The fair wait is un-preemptible (tokio hands a released permit
+    /// to the queue head, so a later foreground acquire cannot take it), so a
+    /// request that has entered it counts against the floor from that moment.
+    /// Deciding from the admitted count instead lets every concurrent
+    /// background request read zero, all enter the fair wait, and delay
+    /// foreground behind up to `bg_permits` of them.
     async fn acquire_background(&self) -> Permit {
         // Closed: degrade to unscheduled rather than fail the op (the semaphore
         // is never closed in normal operation).
         let bg_permit = Arc::clone(&self.bg_sem).acquire_owned().await.ok();
+        // This request's slot in `bg_committed`, once it has one. Held from
+        // before the wait it authorizes until the request ends, and released by
+        // the guard on every exit path including cancellation.
+        let mut committed: Option<CountGuard> = None;
         let global = loop {
             let notified = self.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let below_floor = self.bg_inflight.load(Ordering::SeqCst) < self.bg_floor;
-            if below_floor {
+            if committed.is_none() {
+                committed = CountGuard::try_claim(&self.bg_committed, self.bg_floor);
+            }
+            if committed.is_some() {
                 // Floor progress: take a free permit immediately, otherwise
                 // join the fair queue so a release eventually reaches us even
                 // while foreground is saturating the store.
@@ -270,22 +361,34 @@ impl RequestScheduler {
             }
 
             // No foreground waiting: take a free permit or wait for a release.
+            // The slot is claimed before the probe and dropped again if no
+            // permit was free, so a concurrent background request never reads a
+            // count that omits a request already on its way in.
+            let slot = CountGuard::acquire(&self.bg_committed);
             match Arc::clone(&self.global).try_acquire_owned() {
-                Ok(permit) => break Some(permit),
-                Err(TryAcquireError::NoPermits) => notified.await,
+                Ok(permit) => {
+                    committed = Some(slot);
+                    break Some(permit);
+                }
+                Err(TryAcquireError::NoPermits) => {
+                    drop(slot);
+                    notified.await;
+                }
                 Err(TryAcquireError::Closed) => break None,
             }
         };
-        let bg_inflight = if global.is_some() {
-            self.bg_inflight.fetch_add(1, Ordering::SeqCst);
-            Some(Arc::clone(&self.bg_inflight))
+        let committed = if global.is_some() {
+            committed
         } else {
+            // Degraded (semaphore closed): nothing was admitted, so release the
+            // slot rather than counting an unscheduled op against the floor.
+            drop(committed);
             None
         };
         Permit {
             global,
             bg: bg_permit,
-            bg_inflight,
+            bg_committed: committed,
             wake: Arc::clone(&self.wake),
         }
     }
@@ -793,7 +896,7 @@ mod tests {
         let b2 = bg.clone();
         tokio::spawn(async move { b2.get("bg2", GetRange::Full).await });
         assert!(
-            spin_until(|| scheduler(&cs).bg_inflight.load(Ordering::SeqCst) == 2).await,
+            spin_until(|| scheduler(&cs).bg_committed.load(Ordering::SeqCst) == 2).await,
             "exactly two background ops hold global permits"
         );
         // Let bg2 reach its parked wait before the foreground arrives.
@@ -872,6 +975,138 @@ mod tests {
         assert!(
             spin_until(|| held_keys(&gate).contains(&"bg0".to_string())).await,
             "background floor makes progress even against a waiting foreground"
+        );
+    }
+
+    /// Regression: a foreground acquire cancelled while parked must release its
+    /// waiter registration.
+    ///
+    /// Dropping the acquire future is routine (a `select!` timeout, a client
+    /// disconnect, shutdown). With the decrement on the completing path only,
+    /// `fg_waiters` stayed elevated for the life of the process, and since
+    /// background yields whenever `fg_waiters > 0`, one cancelled foreground
+    /// request pinned background at its floor forever. Both halves are asserted:
+    /// the count returns to zero, and background above the floor is admitted
+    /// again afterwards (the count alone could be zeroed by a decrement that
+    /// still left the scheduler wedged).
+    #[tokio::test]
+    async fn review_fg_waiters_leaks_on_cancellation() {
+        let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 2, 1));
+        let fg = cs.foreground();
+        let bg = cs.background();
+
+        // Saturate the global cap so the next foreground op must park.
+        let f0 = fg.clone();
+        let f1 = fg.clone();
+        tokio::spawn(async move { f0.get("fg0", GetRange::Full).await });
+        tokio::spawn(async move { f1.get("fg1", GetRange::Full).await });
+        gate.wait_until_held(2).await;
+
+        let f2 = fg.clone();
+        let parked = tokio::spawn(async move { f2.get("fg2", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).fg_waiters.load(Ordering::SeqCst) == 1).await,
+            "the third foreground op parks as a waiter"
+        );
+
+        // Cancel it while parked, as a timeout or a disconnect would.
+        parked.abort();
+        let _ = parked.await;
+        assert!(
+            spin_until(|| scheduler(&cs).fg_waiters.load(Ordering::SeqCst) == 0).await,
+            "a cancelled foreground acquire must release its waiter registration"
+        );
+
+        // Consequence: with no foreground waiting, background above the floor
+        // is admitted again. A leaked registration wedges it out forever.
+        assert!(release_key(&gate, "fg0"));
+        assert!(release_key(&gate, "fg1"));
+        let b0 = bg.clone();
+        let b1 = bg.clone();
+        tokio::spawn(async move { b0.get("bg0", GetRange::Full).await });
+        tokio::spawn(async move { b1.get("bg1", GetRange::Full).await });
+        assert!(
+            spin_until(|| {
+                let held = held_keys(&gate);
+                held.contains(&"bg0".to_string()) && held.contains(&"bg1".to_string())
+            })
+            .await,
+            "background above the floor must run again once the cancelled \
+             foreground waiter is gone: {:?}",
+            held_keys(&gate)
+        );
+    }
+
+    /// Regression: a foreground acquire must not be delayed by more than one
+    /// in-flight background request, however many background requests entered
+    /// the scheduler first.
+    ///
+    /// The below-floor wait on the global semaphore is un-preemptible: tokio
+    /// hands a released permit straight to the FIFO head, before
+    /// `Permit::drop` reaches `notify_waiters`. Deciding "below the floor" from
+    /// the count of *already admitted* background requests let every concurrent
+    /// background request read zero and all enter that wait, so a floor of one
+    /// became a floor of up to `bg_permits`. Here two background requests park
+    /// while both global permits are held; releasing both must admit the
+    /// waiting foreground, not a second background request.
+    #[tokio::test]
+    async fn review_floor_overshoot_delays_foreground_past_one_request() {
+        // Global cap 2, background sub-cap 4 (so the sub-cap is not what holds
+        // the second background request back), floor 1.
+        let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 4, 1));
+        let fg = cs.foreground();
+        let bg = cs.background();
+
+        // Two foreground ops hold both global permits.
+        let f0 = fg.clone();
+        let f1 = fg.clone();
+        tokio::spawn(async move { f0.get("fg0", GetRange::Full).await });
+        tokio::spawn(async move { f1.get("fg1", GetRange::Full).await });
+        gate.wait_until_held(2).await;
+
+        // Two background ops enter the scheduler and park: the first claims the
+        // one floor slot, the second is above the floor.
+        let b0 = bg.clone();
+        tokio::spawn(async move { b0.get("bg0", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).bg_committed.load(Ordering::SeqCst) == 1).await,
+            "the first background op claims the floor slot before waiting"
+        );
+        let b1 = bg.clone();
+        tokio::spawn(async move { b1.get("bg1", GetRange::Full).await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "neither background op is admitted while foreground holds both permits"
+        );
+
+        // A foreground op arrives and waits, behind both parked background ops.
+        let f2 = fg.clone();
+        tokio::spawn(async move { f2.get("fg2", GetRange::Full).await });
+        assert!(
+            spin_until(|| scheduler(&cs).fg_waiters.load(Ordering::SeqCst) == 1).await,
+            "the third foreground op parks as a waiter"
+        );
+
+        // Free both permits. One goes to the floor-slot background op; the
+        // other must reach the waiting foreground.
+        assert!(release_key(&gate, "fg0"));
+        assert!(release_key(&gate, "fg1"));
+        assert!(
+            spin_until(|| held_keys(&gate).contains(&"fg2".to_string())).await,
+            "foreground must be admitted, delayed by at most one background \
+             request: {:?}",
+            held_keys(&gate)
+        );
+        let held = held_keys(&gate);
+        let bg_held = held.iter().filter(|k| k.starts_with("bg")).count();
+        assert!(
+            bg_held <= 1,
+            "at most one background request may hold a permit ahead of \
+             foreground: {held:?}"
         );
     }
 }
