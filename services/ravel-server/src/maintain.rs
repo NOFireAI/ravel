@@ -14,8 +14,11 @@
 //! or compaction rule decides: it is only the driver that calls
 //! [`scan_and_maintain_with_memo`] (retention-before-compaction over every
 //! sealed bucket), [`ravel_maintain::sweep_shard`] (the three per-shard GC
-//! rules), and [`ravel_maintain::sweep_idempotency_markers`] (the fourth GC
-//! rule, run once per signal instead of per shard) once per tenant per tick.
+//! rules), [`ravel_maintain::sweep_idempotency_markers`] (the fourth GC
+//! rule, run once per signal instead of per shard), and the ADR-0064
+//! selective-erasure trio -- [`ravel_maintain::erasure_rewrite_bucket`] per
+//! bucket, the request-completion `.done` write, and
+//! [`ravel_maintain::sweep_erasure_requests`] -- once per tenant per tick.
 //! All are idempotent, so a missed or crashed tick is recovered on the next
 //! one. The clock is the real [`SystemClock`], matching everything else in
 //! this crate.
@@ -73,17 +76,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ravel_commit::keys;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
 use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
 use ravel_maintain::{
-    Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, LegalHoldCheck, MaintainError,
-    QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, read_all_memo_snapshots, scan_and_compact,
-    sweep_audit_retention, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned,
-    write_memo_snapshot,
+    Bucket, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureRewriteOutcome,
+    LeaseCheck, LegalHoldCheck, MaintainError, PendingErasureRequest, QUERY_AUDIT_SHARD,
+    RetentionConfig, WorkerSet, erasure_rewrite_bucket, pending_erasure_requests,
+    read_all_memo_snapshots, scan_and_compact, sweep_audit_retention, sweep_erasure_requests,
+    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned, write_memo_snapshot,
 };
-use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
+use ravel_proto::commit::v1::{ErasureCompletion, ErasureDeferralCause, ErasureRequest};
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -841,10 +847,11 @@ pub async fn run_discovery_cycle(
 /// for [`Signal::Logs`] and [`Signal::Spans`] only -- markers don't exist for
 /// [`Signal::Metrics`] (ADR-0051 §5) and the marker sweep already covers every
 /// shard of a signal in one LIST, so it does not belong in the per-shard
-/// loop. Every scan/sweep error is logged and retried next tick;
-/// nothing here affects query correctness. Split out from [`run_discovery_cycle`]
-/// so a test can drive a single deterministic tenant tick without discovery or
-/// the timer.
+/// loop -- and finally the ADR-0064 selective-erasure pass
+/// ([`run_erasure_pass`]) for every signal. Every scan/sweep error is logged
+/// and retried next tick; nothing here affects query correctness. Split out
+/// from [`run_discovery_cycle`] so a test can drive a single deterministic
+/// tenant tick without discovery or the timer.
 ///
 /// The legal hold refresh (ADR-0048 decision 1) runs once, before either
 /// pass, and its snapshot gates every `(signal, shard)` of this tick. If the
@@ -887,8 +894,43 @@ pub async fn run_tick(
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
-    let clock = WallClock;
+    run_tick_with_clock(
+        &WallClock,
+        store,
+        tenant,
+        compactor,
+        retention,
+        shard_count,
+        memo,
+        safety,
+        ownership,
+        worker,
+        live_set,
+    )
+    .await
+}
 
+/// [`run_tick`] with the clock injected instead of hardwired to [`WallClock`].
+/// The running service always passes [`WallClock`]; tests pass a
+/// [`ravel_maintain::FixedClock`] so a tick that must observe time *passing*
+/// -- the ADR-0064 `.dreq` sweep waits out `protection_horizon` after the
+/// `.done` write -- can advance it deterministically instead of sleeping or
+/// shrinking the horizon to zero (CLAUDE.md testing patterns: time is
+/// injected).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tick_with_clock(
+    clock: &dyn Clock,
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    compactor: &CompactorConfig,
+    retention: &RetentionConfig,
+    shard_count: u32,
+    memo: &mut MaintainMemo,
+    safety: &MaintenanceSafetyMetrics,
+    ownership: &MaintenanceOwnershipMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+) -> MaintainReport {
     let hold = match LegalHoldCheck::refresh(store, tenant).await {
         Ok(hold) => hold,
         Err(err) => {
@@ -1001,7 +1043,7 @@ pub async fn run_tick(
         // byte-for-byte the pre-ADR-0065 sequential behavior. Each future runs
         // one unit's retention/compaction pass and then its sweep, over a
         // keyspace disjoint from every other unit's.
-        let clock_ref = &clock;
+        let clock_ref = clock;
         let hold_ref = &hold;
         let ownership_ref = ownership;
         let unit_results = run_bounded(
@@ -1181,7 +1223,7 @@ pub async fn run_tick(
         if matches!(signal, Signal::Logs | Signal::Spans)
             && worker.owns_unit(live_set, tenant, signal, 0)
         {
-            match sweep_idempotency_markers(store, &clock, compactor, &hold, tenant, signal).await {
+            match sweep_idempotency_markers(store, clock, compactor, &hold, tenant, signal).await {
                 Ok(outcome) => {
                     tracing::info!(
                         tenant = %tenant.to_hex(),
@@ -1201,6 +1243,41 @@ pub async fn run_tick(
                     );
                 }
             }
+        }
+
+        // Selective subject erasure (ADR-0064, epic EJ, issue #997): the
+        // rewrite pass over every bucket, the request-completion `.done`
+        // write, and the `.dreq` sweep -- in that order, so a request's
+        // `.dreq` is only ever removed after its erasure is durably complete.
+        // This is the production caller for `erasure_rewrite_bucket` and
+        // `sweep_erasure_requests`; without it a submitted request is
+        // physically erased by nothing and its `.dreq` (which carries the
+        // subject identifier) is removed by nothing.
+        //
+        // Runs after this signal's compaction pass above, which is ADR-0064
+        // decision 3 point 5's per-bucket serialization of compaction and
+        // rewrite inside the single per-tenant loop. Gated on ownership of
+        // shard 0 like the marker sweep, but unlike it the pass then walks
+        // EVERY shard in `scan_shards`, not just the ones this process owns:
+        // an erasure request is scoped to a whole (tenant, signal), so its
+        // completion condition (below) is only sound when one process has
+        // observed every shard's buckets. Correctness does not depend on the
+        // resulting cross-worker interleaving with another replica's
+        // compaction of a non-owned shard: every publish is `CreateIfAbsent`
+        // and races resolve exactly as compaction's do (ADR-0064 decision 3
+        // point 5 -- the serialization is an efficiency measure).
+        if worker.owns_unit(live_set, tenant, signal, 0) {
+            run_erasure_pass(
+                store,
+                clock,
+                compactor,
+                &hold,
+                tenant,
+                signal,
+                scan_shards,
+                memo,
+            )
+            .await;
         }
     }
 
@@ -1225,7 +1302,7 @@ pub async fn run_tick(
     // `MaintenanceSafetyMetrics`, whose per-signal arrays cover only
     // MAINTAINED_SIGNALS.
     if worker.owns_unit(live_set, tenant, Signal::Audit, QUERY_AUDIT_SHARD) {
-        match sweep_audit_retention(store, &clock, compactor, &hold, tenant).await {
+        match sweep_audit_retention(store, clock, compactor, &hold, tenant).await {
             Ok(outcome) => tracing::info!(
                 tenant = %tenant.to_hex(),
                 records = outcome.records_deleted,
@@ -1243,7 +1320,7 @@ pub async fn run_tick(
 
         match scan_and_compact(
             store,
-            &clock,
+            clock,
             compactor,
             *tenant,
             Signal::Audit,
@@ -1266,7 +1343,7 @@ pub async fn run_tick(
 
         match sweep_shard(
             store,
-            &clock,
+            clock,
             compactor,
             &hold,
             tenant,
@@ -1291,6 +1368,421 @@ pub async fn run_tick(
     }
 
     total
+}
+
+/// Domain-separation prefix for [`erasure_predicate_hash`], following the same
+/// convention as ravel-commit's rewrite `input_set_hash` domain: a digest from
+/// this preimage can never collide with a digest over any other structure.
+const ERASURE_PREDICATE_HASH_DOMAIN: &[u8] = b"ravel-erasure-predicate-v1\0";
+
+/// blake3 over one erasure request's canonical predicate encoding, which is
+/// what an `ErasureCompletion` carries in place of the plaintext predicate
+/// (ADR-0064 decision 1: the `.done` is permanent, so it must hold no subject
+/// identifier).
+///
+/// The preimage is the domain prefix, the matcher count, then every
+/// `(key, value)` pair length-prefixed and **sorted**, then both window bounds.
+/// Sorting is what makes this canonical: matcher order is not significant to a
+/// conjunction, so two submissions of the same erasure with the matchers typed
+/// in a different order must hash identically. That is exactly the identity
+/// `ravel-cli erase submit`'s `same_erasure` uses to decide whether a
+/// colliding `request_id` is an idempotent retry or a genuinely different
+/// erasure (matchers as an unordered multiset, plus the window bounds), so the
+/// two agree on what "the same predicate" means.
+///
+/// This encoding lives here only because no shared helper exists yet:
+/// ADR-0064 names "a blake3 hash of the canonical predicate encoding" but
+/// neither `ravel_commit::erasure` nor any normative doc defines the bytes,
+/// and this task's scope is this file. Flagged for a follow-up that moves it
+/// next to `compute_rewrite_input_set_hash` in ravel-commit, which is where a
+/// frozen-contract preimage belongs.
+fn erasure_predicate_hash(request: &ErasureRequest) -> [u8; 32] {
+    let mut matchers: Vec<(&str, &str)> = request
+        .predicate
+        .iter()
+        .map(|m| (m.key.as_str(), m.value.as_str()))
+        .collect();
+    matchers.sort_unstable();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ERASURE_PREDICATE_HASH_DOMAIN);
+    hasher.update(&(matchers.len() as u64).to_le_bytes());
+    for (key, value) in matchers {
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&request.window_start_ns.to_le_bytes());
+    hasher.update(&request.window_end_ns.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
+/// ascending -- the erasure pass's bucket discovery. One delimited LIST of the
+/// shard's `c/` prefix, exactly what `ravel_maintain::scan`'s own (private)
+/// hour listing does; a common prefix that is not an ingest hour is layout
+/// drift and errors rather than being skipped.
+async fn list_erasure_scan_hours(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<Vec<u32>, MaintainError> {
+    let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+    let listed = store.list_delimited(&prefix).await?;
+    let mut hours: Vec<u32> = Vec::with_capacity(listed.common_prefixes.len());
+    for common in &listed.common_prefixes {
+        // common == "<prefix><hour>/"; extract the hour segment.
+        let rest = common
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix('/'))
+            .unwrap_or("");
+        hours.push(keys::parse_ingest_hour_string(rest)?);
+    }
+    hours.sort_unstable();
+    Ok(hours)
+}
+
+/// What one `(tenant, signal)` rewrite sweep observed, for the completion
+/// decision and the log line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ErasureRewritePass {
+    /// Buckets this tick actually rewrote (a `RewriteRecord` was published,
+    /// converged, or abandoned -- see `deferred` for the abandoned case).
+    rewritten: usize,
+    /// Buckets whose live `RewriteRecord` already named every overlapping
+    /// request, so nothing was republished (the EJ-T5 idempotence guard).
+    already_applied: usize,
+    /// Buckets that contribute nothing to any pending request: no pending
+    /// request's event-time range overlaps them, or they are tombstoned.
+    out_of_scope: usize,
+    /// Buckets not yet sealed. ADR-0064 decision 3 point 1 defers these to a
+    /// later pass and excludes them from a request's scope; their data is
+    /// already unreturnable through the query-time filter meanwhile.
+    not_sealed: usize,
+    /// A bucket in scope was NOT brought up to date this tick: a legal hold,
+    /// an abandoned publish, a listing failure, or a rewrite error. Any of
+    /// these makes the completion verification unsound, so no `.done` is
+    /// written this tick and every request stays pending.
+    deferred: bool,
+}
+
+/// Rewrite every bucket of one `(tenant, signal)` against `pending`
+/// (ADR-0064 decision 3), and classify what happened for the completion
+/// decision the caller then makes.
+///
+/// `pending` is passed whole to every bucket: `erasure_rewrite_bucket` does
+/// its own per-bucket overlap prefilter and batches every overlapping request
+/// into ONE `RewriteRecord`, so N pending requests cost one rewrite per
+/// bucket, not N (ADR-0064 consequences, "N concurrent DSARs cost one rewrite,
+/// not N").
+///
+/// The [`ErasureRewriteOutcome::AlreadyApplied`] arm is the EJ-T5 idempotence
+/// guard and is deliberately counted, not re-driven: a bucket whose live
+/// record already names every overlapping request must not republish, or every
+/// tick would land a fresh no-op rewrite superseding the last one and churn
+/// generations forever.
+#[allow(clippy::too_many_arguments)]
+async fn erasure_rewrite_pass(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    pending: &[PendingErasureRequest],
+    memo: &mut MaintainMemo,
+) -> ErasureRewritePass {
+    let mut pass = ErasureRewritePass::default();
+    for shard in 0..scan_shards {
+        let hours = match list_erasure_scan_hours(store, tenant, signal, shard).await {
+            Ok(hours) => hours,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    shard,
+                    error = %err,
+                    "maintenance: erasure rewrite could not list a shard's buckets; \
+                     no completion written this tick, retried next tick"
+                );
+                pass.deferred = true;
+                continue;
+            }
+        };
+        for hour in hours {
+            let bucket = Bucket::new(*tenant, signal, shard, hour);
+            match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
+                .await
+            {
+                Ok(ErasureRewriteOutcome::Rewritten { parts, publish }) => {
+                    pass.rewritten += 1;
+                    // An abandoned publish wrote no record, so this bucket
+                    // does not yet name the pending requests.
+                    if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
+                        pass.deferred = true;
+                    }
+                    tracing::info!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        hour,
+                        parts,
+                        publish = ?publish,
+                        "maintenance: erasure rewrite published for a bucket"
+                    );
+                }
+                Ok(ErasureRewriteOutcome::AlreadyApplied) => pass.already_applied += 1,
+                Ok(
+                    ErasureRewriteOutcome::NoApplicableRequests | ErasureRewriteOutcome::Tombstoned,
+                ) => pass.out_of_scope += 1,
+                Ok(ErasureRewriteOutcome::NotSealed) => pass.not_sealed += 1,
+                Ok(ErasureRewriteOutcome::Held) => {
+                    // ADR-0064 §6: a legal hold wins over erasure. The request
+                    // stays pending, query-time exclusion keeps hiding the
+                    // data, and the erasure clock is explicitly paused.
+                    pass.deferred = true;
+                    tracing::info!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        hour,
+                        "maintenance: erasure rewrite skipped a bucket under legal hold; \
+                         the request stays pending until the hold clears"
+                    );
+                }
+                Err(err) => {
+                    pass.deferred = true;
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        hour,
+                        error = %err,
+                        "maintenance: erasure rewrite of a bucket failed; no completion \
+                         written this tick, retried next tick"
+                    );
+                }
+            }
+        }
+    }
+    pass
+}
+
+/// Write one request's `.done` completion record (ADR-0064 decision 1 and 4).
+/// `CreateIfAbsent`, like every other durable record here: an already-present
+/// `.done` is a completed earlier tick, reported as `Ok(false)`, never an
+/// error and never an overwrite (the `.done` is immutable permanent evidence).
+///
+/// The record carries no plaintext predicate -- only its blake3 hash
+/// ([`erasure_predicate_hash`]), the request id, the two timestamps, and the
+/// deferral cause -- so a permanent completion record holds no subject
+/// identifier, which is the entire reason `.dreq` and `.done` are separate
+/// objects.
+///
+/// `bucket_drops` is left empty: the authoritative per-bucket dropped counts
+/// are durable in each bucket's own `RewriteRecord.drops`, and
+/// `ErasureRewriteOutcome` does not surface them to a driver (the live-record
+/// resolution that would read them back is private to ravel-maintain).
+/// Fabricating zeroes here would put wrong counts in a permanent audit record,
+/// so the field stays empty until ravel-maintain returns real ones; flagged as
+/// a follow-up.
+async fn write_erasure_completion(
+    store: &dyn ObjectStoreBackend,
+    now_ns: i64,
+    tenant: &TenantHash,
+    signal: Signal,
+    request: &ErasureRequest,
+) -> Result<bool, MaintainError> {
+    let completion = ErasureCompletion {
+        format_version: ravel_commit::erasure::FORMAT_VERSION,
+        tenant_hash: tenant.0.to_vec(),
+        signal: ravel_commit::signal::to_proto(signal) as i32,
+        request_id: request.request_id.clone(),
+        predicate_hash: erasure_predicate_hash(request).to_vec(),
+        bucket_drops: Vec::new(),
+        requested_unix_ns: request.created_unix_ns,
+        // A completion can never precede its own request in the durable
+        // record (the codec rejects that pair outright), so a backwards or
+        // skewed clock clamps to the request time rather than writing a
+        // record no decoder will accept and stalling the erasure forever.
+        completed_unix_ns: now_ns.max(request.created_unix_ns),
+        deferral_cause: ErasureDeferralCause::Unspecified as i32,
+    };
+    // Validate before writing, matching `erase submit`'s discipline: a record
+    // that would not decode must never reach the store.
+    ravel_commit::erasure::validate_completion(&completion)?;
+    let key = keys::erasure_completion_key_for(&completion)?;
+    let body = ravel_commit::erasure::encode_completion(&completion);
+    match store.put(&key, body, PutOptions::create_if_absent()).await {
+        Ok(_) => Ok(true),
+        Err(StoreError::AlreadyExists) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// One `(tenant, signal)` selective-erasure pass (ADR-0064 decisions 3, 4,
+/// and 5), in the order those decisions require:
+///
+/// 1. **Rewrite** every bucket against every pending `.dreq`
+///    ([`erasure_rewrite_pass`]).
+/// 2. **Complete**: write each pending request's `.done` when the pass proved
+///    every bucket in its scope now carries a live `RewriteRecord` naming it.
+/// 3. **Sweep** the `.dreq`s whose `.done` is older than
+///    `protection_horizon` ([`sweep_erasure_requests`]).
+///
+/// The order is the safety property: a `.dreq` (and with it the query-time
+/// exclusion filter) can only be removed after the `.done` exists and the
+/// horizon has passed, so the filter never retires while a pre-rewrite input
+/// could still be resolvable. Step 3 runs even when nothing is pending,
+/// because a request completed by an earlier tick is by definition no longer
+/// pending and its `.dreq` still has to be swept.
+///
+/// **How completion is computed.** Every bucket of the (tenant, signal) is
+/// classified by the rewrite pass itself, not by a second independent listing:
+/// `Rewritten` and `AlreadyApplied` both mean the bucket's live record now
+/// names every pending request that overlaps it (`erasure_rewrite_bucket`
+/// batches all overlapping requests into one record, and its `AlreadyApplied`
+/// guard fires only when the live record already names all of them);
+/// `NoApplicableRequests` and `Tombstoned` mean the bucket is in no request's
+/// scope. If every bucket lands in those four arms, then for every pending
+/// request, every bucket in that request's scope carries a live
+/// `RewriteRecord` naming it -- ADR-0064 §4's sibling-safe condition ("every
+/// live rewrite record in this bucket names R", not the weaker
+/// "rewrite-output-only") -- and each request's `.done` is written. If any
+/// bucket was held, errored, abandoned its publish, or could not be listed,
+/// `deferred` is set and NO `.done` is written this tick: completion is
+/// verified, never assumed.
+///
+/// Deriving the check from the pass's own outcomes is deliberate: ADR-0064 §4
+/// (2026-08-08 correction) forbids deciding completion from a fresh bucket
+/// LIST taken independently of the exclusion logic, and
+/// `erasure_rewrite_bucket` resolves each bucket's live record through the
+/// same supersession resolution the rewrite itself uses.
+///
+/// **Known gap, matching ADR-0064 decision 3 point 1:** an unsealed bucket is
+/// deferred and excluded from scope, so a windowless request can complete
+/// while the current (still-open) ingest hour holds matching records that will
+/// only seal later -- by which time the request is no longer pending and no
+/// rewrite will revisit it. The ADR defines scope as sealed buckets and defers
+/// unsealed ones; blocking completion on them instead would mean a
+/// continuously-ingesting tenant never completes any request, so its `.dreq`
+/// (which holds the subject identifier) would be retained forever, which is
+/// the failure ADR-0064 decision 5 exists to prevent. Reported rather than
+/// silently resolved either way.
+#[allow(clippy::too_many_arguments)]
+async fn run_erasure_pass(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    memo: &mut MaintainMemo,
+) {
+    match pending_erasure_requests(store, tenant, signal).await {
+        Ok(pending) if !pending.is_empty() => {
+            let pass = erasure_rewrite_pass(
+                store,
+                clock,
+                compactor,
+                hold,
+                tenant,
+                signal,
+                scan_shards,
+                &pending,
+                memo,
+            )
+            .await;
+            tracing::info!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                pending = pending.len(),
+                rewritten = pass.rewritten,
+                already_applied = pass.already_applied,
+                out_of_scope = pass.out_of_scope,
+                not_sealed = pass.not_sealed,
+                deferred = pass.deferred,
+                "maintenance: erasure rewrite pass complete"
+            );
+
+            if pass.deferred {
+                tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    pending = pending.len(),
+                    "maintenance: erasure completion deferred; at least one in-scope bucket \
+                     was not brought up to date this tick, so no .done is written and every \
+                     request stays pending"
+                );
+            } else {
+                for entry in &pending {
+                    match write_erasure_completion(
+                        store,
+                        clock.now_ns(),
+                        tenant,
+                        signal,
+                        &entry.request,
+                    )
+                    .await
+                    {
+                        Ok(true) => tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            request_id = %entry.request.request_id,
+                            "maintenance: erasure request complete; .done written"
+                        ),
+                        Ok(false) => tracing::debug!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            request_id = %entry.request.request_id,
+                            "maintenance: erasure .done already present; left untouched"
+                        ),
+                        Err(err) => tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            request_id = %entry.request.request_id,
+                            error = %err,
+                            "maintenance: erasure .done write failed; the request stays \
+                             pending and its .dreq is kept, retried next tick"
+                        ),
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            error = %err,
+            "maintenance: pending erasure request listing failed; no rewrite or completion \
+             this tick, retried next tick"
+        ),
+    }
+
+    // Rule 6 (ADR-0064 decision 5), last: a `.dreq` is deleted only once its
+    // `.done` exists, the protection horizon has passed, and the legal-hold
+    // check allows it. Runs unconditionally, including when nothing is
+    // pending: a request completed by an earlier tick no longer appears in
+    // `pending_erasure_requests`, and its `.dreq` still needs sweeping.
+    match sweep_erasure_requests(store, clock, compactor, hold, tenant, signal).await {
+        Ok(outcome) => tracing::info!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            deleted = outcome.deleted,
+            kept = outcome.kept,
+            "maintenance: erasure request sweep pass complete"
+        ),
+        Err(err) => tracing::warn!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            error = %err,
+            "maintenance: erasure request sweep pass failed; retried next tick"
+        ),
+    }
 }
 
 /// Whether a recomputed live set differs from the one last held, which is the
