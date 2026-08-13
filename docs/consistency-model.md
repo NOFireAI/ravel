@@ -230,8 +230,19 @@ ingestion.
   `event_ts < ingest_ts - max_ingest_lag` (default 2 h) are rejected with a
   partial-success reason. These bounds are what make the catalog listing
   window sound. Logs and spans enforce the same bounds at admission
-  (ADR-0051 §4); spans bound `end_ts` by `max_future_skew` and `start_ts` by
-  `max_ingest_lag`.
+  (ADR-0051 §4); spans bound `end_ts` by both edges (`max_future_skew` on the
+  future side, `max_ingest_lag` on the late side), and reject `end_ts <
+  start_ts` outright. The lag bound anchors on the span's end, not its start
+  (ADR-0051 amendment 2026-08-13): a long-running span that started more than
+  `max_ingest_lag` ago but ended within the window is admitted; only a span
+  reported more than `max_ingest_lag` after it ended is rejected.
+- The receiver's own admission clock is checked too (ADR-0051 amendment,
+  S1-12): a reading below a compiled floor (2020-01-01T00:00:00Z) or one that
+  yields no representable ingest-hour bucket rejects the whole request with
+  HTTP 503 / gRPC `UNAVAILABLE`, rather than bucketing acked data into a
+  far-past or far-future hour. The same floor extends the fail-loud flush-open
+  check, so a clock that goes bad between a buffered ack and flush open fails
+  the flush instead of writing a nonsense bucket.
 - Config discipline: `max_ingest_lag` is one shared bound, not a per-signal
   one, in the sense that matters operationally, though it is not shared by
   reference: the admission checks (one `max_ingest_lag_ns` constant per
