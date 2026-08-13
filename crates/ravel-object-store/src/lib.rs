@@ -11,6 +11,7 @@ pub mod instrument;
 pub mod kms_routing;
 pub mod memory;
 pub mod s3;
+pub mod scheduling;
 
 use bytes::Bytes;
 
@@ -24,6 +25,12 @@ pub use instrument::{InstrumentedStore, StoreMetrics};
 /// tenant writes to lazily-built, cached per-tenant [`s3::S3Store`]s while every
 /// read and non-tenant key delegates to the default store.
 pub use kms_routing::KmsRoutingStore;
+
+/// Two-class request scheduling (ADR-0070 decision 1): [`ClassedStore`] hands
+/// out foreground/background handles sharing one [`RequestScheduler`], with
+/// strict-priority-with-floor admission. Off by default via
+/// [`ClassedStore::passthrough`] (decision 2).
+pub use scheduling::{ClassedStore, RequestClass, RequestScheduler, SchedulerConfig};
 
 /// Content identity: used only for equality assertions between reads of the
 /// same immutable object. Never used as a CAS precondition (that is
