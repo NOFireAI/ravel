@@ -35,9 +35,16 @@
 //! every failure degrades to a miss rather than an error (see the
 //! [`disk`] module docs for the crash-safety mechanism and what crc32c and
 //! the header actually prove on a hit, per decision 4 as amended
-//! 2026-08-02).
+//! 2026-08-02). A disk entry also carries a stamped write time and a
+//! configured per-entry max-age (default 24 h,
+//! [`DEFAULT_MAX_ENTRY_AGE_NS`]): an entry older than the max-age is treated
+//! as a miss and dropped, so raw bytes of a subject erased by ADR-0064's
+//! sweep persist on a node's disposable local disk at most that long past the
+//! sweep (issue #753). Time is injected through [`Clock`] so this ageing is
+//! deterministic under test.
 
 mod cache;
+mod clock;
 pub mod disk;
 mod key;
 mod limits;
@@ -46,9 +53,10 @@ mod s3fifo;
 mod single_flight;
 
 pub use cache::Cache;
+pub use clock::{Clock, SystemClock};
 pub use disk::DiskCache;
 pub use key::CacheKey;
-pub use limits::CacheLimits;
+pub use limits::{CacheLimits, DEFAULT_MAX_ENTRY_AGE_NS};
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use single_flight::{Role, SingleFlight, SingleFlightError};
 

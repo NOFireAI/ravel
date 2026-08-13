@@ -85,14 +85,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use crate::clock::{Clock, SystemClock};
 use crate::key::CacheKey;
 use crate::limits::CacheLimits;
 use crate::metrics::CacheMetrics;
 use crate::s3fifo::S3Fifo;
 
 const MAGIC: [u8; 4] = *b"RVCD";
-const FORMAT_VERSION: u32 = 2;
-const HEADER_LEN: usize = 4 + 4 + 16 + 32 + 8 + 8 + 4;
+// Version 3 adds the 8-byte `written_at_ns` stamp (ADR-0064, issue #753).
+// Bumping the version is what makes a version-2 entry (no stamp) written by an
+// older binary decode-fail here rather than be misread at shifted offsets or,
+// worse, served fresh forever with no age to check: an old entry is rejected
+// by `decode_header`'s version gate, discarded, and re-fetched. That is the
+// deterministic, fail-safe handling deliverable 2 requires.
+const FORMAT_VERSION: u32 = 3;
+const HEADER_LEN: usize = 4 + 4 + 16 + 32 + 8 + 8 + 8 + 4;
 const ENTRY_EXTENSION: &str = "rvc";
 
 /// Process-wide counter so two `DiskCache` instances constructed in the
@@ -106,10 +113,18 @@ struct Header {
     content_hash: [u8; 32],
     offset: u64,
     len: u64,
+    /// Wall-clock time the entry was written, nanoseconds since the Unix
+    /// epoch, from the injected [`Clock`]. Read on every hit and by the
+    /// startup scan to age the entry out (ADR-0064, issue #753). Not covered
+    /// by `crc32c` (which is payload-only, unchanged): a corrupted stamp only
+    /// ever makes an entry look older (an immediate, safe miss) or younger,
+    /// and a younger-looking entry is still bounded by S3-FIFO eviction, so no
+    /// corruption of these 8 bytes can extend an entry's life without bound.
+    written_at_ns: u64,
     crc32c: u32,
 }
 
-fn encode_header(key: &CacheKey, payload: &[u8]) -> [u8; HEADER_LEN] {
+fn encode_header(key: &CacheKey, payload: &[u8], written_at_ns: u64) -> [u8; HEADER_LEN] {
     let mut buf = [0u8; HEADER_LEN];
     let mut pos = 0usize;
     buf[pos..pos + 4].copy_from_slice(&MAGIC);
@@ -123,6 +138,8 @@ fn encode_header(key: &CacheKey, payload: &[u8]) -> [u8; HEADER_LEN] {
     buf[pos..pos + 8].copy_from_slice(&key.offset.to_le_bytes());
     pos += 8;
     buf[pos..pos + 8].copy_from_slice(&key.len.to_le_bytes());
+    pos += 8;
+    buf[pos..pos + 8].copy_from_slice(&written_at_ns.to_le_bytes());
     pos += 8;
     buf[pos..pos + 4].copy_from_slice(&crc32c::crc32c(payload).to_le_bytes());
     buf
@@ -155,12 +172,15 @@ fn decode_header(buf: &[u8; HEADER_LEN]) -> Option<Header> {
     pos += 8;
     let len = u64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
     pos += 8;
+    let written_at_ns = u64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
+    pos += 8;
     let crc32c = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?);
     Some(Header {
         tenant_hash,
         content_hash,
         offset,
         len,
+        written_at_ns,
         crc32c,
     })
 }
@@ -199,6 +219,11 @@ pub struct DiskCache {
     metrics: Arc<CacheMetrics>,
     tmp_counter: AtomicU64,
     instance_id: u64,
+    /// Injected wall clock. Stamped into each entry's header at `insert` and
+    /// read on every `get` to age entries out past `limits.max_entry_age_ns`
+    /// (ADR-0064, issue #753). Injected so tests drive ageing deterministically
+    /// instead of sleeping.
+    clock: Arc<dyn Clock>,
 }
 
 impl DiskCache {
@@ -218,7 +243,15 @@ impl DiskCache {
     /// deleted on sight rather than counted: discard and rebuild, never
     /// repair, applies at startup exactly as it does on a live read.
     pub fn new(dir: PathBuf, limits: CacheLimits) -> Self {
-        let state = Self::scan_existing(&dir, limits);
+        Self::new_with_clock(dir, limits, Arc::new(SystemClock))
+    }
+
+    /// Like [`DiskCache::new`], but with an explicit [`Clock`] for the
+    /// per-entry max-age (ADR-0064, issue #753). Production uses
+    /// [`DiskCache::new`], which injects a [`SystemClock`]; tests inject a
+    /// clock they advance across the max-age boundary by hand.
+    pub fn new_with_clock(dir: PathBuf, limits: CacheLimits, clock: Arc<dyn Clock>) -> Self {
+        let state = Self::scan_existing(&dir, limits, clock.now_ns());
         DiskCache {
             dir,
             limits,
@@ -226,10 +259,11 @@ impl DiskCache {
             metrics: Arc::new(CacheMetrics::default()),
             tmp_counter: AtomicU64::new(0),
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            clock,
         }
     }
 
-    fn scan_existing(dir: &Path, limits: CacheLimits) -> S3Fifo<()> {
+    fn scan_existing(dir: &Path, limits: CacheLimits, now_ns: u64) -> S3Fifo<()> {
         let mut fifo = S3Fifo::new(limits);
         let Ok(shards) = fs::read_dir(dir) else {
             return fifo;
@@ -247,18 +281,25 @@ impl DiskCache {
             for entry in entries.flatten() {
                 let path = entry.path();
                 match Self::scan_one(&path) {
-                    Some((key, size)) if path_for(dir, &key) == path => {
+                    Some((key, size, written_at_ns))
+                        if path_for(dir, &key) == path
+                            && now_ns.saturating_sub(written_at_ns) <= limits.max_entry_age_ns =>
+                    {
                         fifo.seed(key, (), size);
                     }
                     _ => {
-                        // Not recognisable as a live entry at its own
-                        // canonical path: a foreign file, a previous
-                        // format, an orphaned scratch file (a `.tmp-*`
-                        // name has no parseable header at all), or a
-                        // well-formed entry that simply lives at the
-                        // wrong path (which would otherwise leak its real
-                        // file uncounted and double-count a duplicate key
-                        // into `total_bytes`). Delete rather than count.
+                        // Not recognisable as a *live, unexpired* entry at its
+                        // own canonical path: a foreign file, a previous
+                        // format, an orphaned scratch file (a `.tmp-*` name
+                        // has no parseable header at all), a well-formed entry
+                        // that simply lives at the wrong path (which would
+                        // otherwise leak its real file uncounted and
+                        // double-count a duplicate key into `total_bytes`), or
+                        // an entry already older than the max-age. This
+                        // startup scan is the "existing eviction walk" ADR-0064
+                        // names: an aged-out entry is deleted here rather than
+                        // seeded, so restarting a node never resurrects bytes
+                        // that were due to be dropped. Delete rather than count.
                         let _ = fs::remove_file(&path);
                     }
                 }
@@ -271,7 +312,7 @@ impl DiskCache {
     /// declared payload length against the file's actual physical size, so
     /// a file truncated between a crash and the next startup is discarded
     /// here rather than accounted for and trusted until the next read.
-    fn scan_one(path: &Path) -> Option<(CacheKey, u64)> {
+    fn scan_one(path: &Path) -> Option<(CacheKey, u64, u64)> {
         let metadata = fs::metadata(path).ok()?;
         let mut file = fs::File::open(path).ok()?;
         let mut header_buf = [0u8; HEADER_LEN];
@@ -287,7 +328,7 @@ impl DiskCache {
             header.offset,
             header.len,
         );
-        Some((key, header.len))
+        Some((key, header.len, header.written_at_ns))
     }
 
     /// A cloneable handle to this tier's counters, independent of the
@@ -389,6 +430,20 @@ impl DiskCache {
             self.discard(key, path);
             return None;
         }
+        if self.clock.now_ns().saturating_sub(header.written_at_ns) > self.limits.max_entry_age_ns {
+            // Older than the configured max-age: an erased subject's bytes
+            // must not outlive the sweep on local disk by more than this
+            // (ADR-0064, issue #753). Dropped and re-fetched, not served. This
+            // is not corruption -- the entry is well-formed and its crc32c
+            // would pass -- so it is an expiry, not a `record_disk_error`, and
+            // the payload is not even read. `saturating_sub` keeps a clock
+            // that jumped backward (a stamp newer than "now") from wrapping
+            // into a huge age: such an entry is simply treated as not yet
+            // expired.
+            self.metrics.record_expired_max_age();
+            self.discard(key, path);
+            return None;
+        }
         let mut payload = vec![0u8; header.len as usize];
         if file.read_exact(&mut payload).is_err() {
             // Header is intact but the payload is short: truncated, either
@@ -451,8 +506,9 @@ impl DiskCache {
             return;
         }
         let tmp_path = self.tmp_path_for(parent);
+        let written_at_ns = self.clock.now_ns();
         let mut buf = Vec::with_capacity(HEADER_LEN + value.len());
-        buf.extend_from_slice(&encode_header(&key, value));
+        buf.extend_from_slice(&encode_header(&key, value, written_at_ns));
         buf.extend_from_slice(value);
         if fs::write(&tmp_path, &buf).is_err() {
             let _ = fs::remove_file(&tmp_path);
@@ -506,6 +562,26 @@ mod tests {
 
     fn generous_limits() -> CacheLimits {
         CacheLimits::new(64 * 1024 * 1024, 10_000, 16 * 1024 * 1024)
+    }
+
+    /// A hand-advanced clock so the max-age boundary is crossed
+    /// deterministically, without sleeping. `now_ns` reads whatever the test
+    /// last set; `set` moves wall time forward (or back).
+    struct TestClock(AtomicU64);
+
+    impl TestClock {
+        fn new(start_ns: u64) -> Arc<Self> {
+            Arc::new(TestClock(AtomicU64::new(start_ns)))
+        }
+        fn set(&self, now_ns: u64) {
+            self.0.store(now_ns, Ordering::Relaxed);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_ns(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
     }
 
     #[cfg(unix)]
@@ -680,7 +756,7 @@ mod tests {
 
         let key = test_key_with_len(1, 200);
         let payload = vec![0x42u8; 200];
-        let full_header = encode_header(&key, &payload);
+        let full_header = encode_header(&key, &payload, 0);
         let path = path_for(&dir, &key);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
 
@@ -918,7 +994,7 @@ mod tests {
 
         let real_key = test_key_with_len(1, 64);
         let payload = vec![7u8; 64];
-        let header = encode_header(&real_key, &payload);
+        let header = encode_header(&real_key, &payload, 0);
         let wrong_shard = dir.join("zz");
         fs::create_dir_all(&wrong_shard).unwrap();
         let wrong_path = wrong_shard.join("misplaced.rvc");
@@ -975,6 +1051,166 @@ mod tests {
             assert!(
                 resident as f64 >= working_set_len as f64 * 0.9,
                 "working set collapsed on disk-tier scan pass {pass}: only {resident}/{working_set_len} resident"
+            );
+        }
+    }
+
+    /// ADR-0064 / issue #753: a disk entry younger than the max-age is served;
+    /// once wall time crosses `written_at + max_age`, the same key is a miss
+    /// and the stale bytes are dropped rather than served.
+    ///
+    /// This is the soundness proof for the max-age. To watch it bite, disable
+    /// the age check in `read_and_verify` -- change its `>` to a comparison
+    /// that is never true (e.g. `> u64::MAX`) or delete the whole
+    /// `record_expired_max_age` block: the post-boundary `assert!(... is_none)`
+    /// then fails because the aged-out bytes are served.
+    #[test]
+    fn disk_entry_older_than_max_age_is_not_served() {
+        let tmp = TempDir::new().unwrap();
+        let max_age = 24 * 60 * 60 * 1_000_000_000u64; // 24h in ns
+        let limits = generous_limits().with_max_entry_age_ns(max_age);
+        let clock = TestClock::new(1_000_000);
+        let cache = DiskCache::new_with_clock(tmp.path().to_path_buf(), limits, clock.clone());
+
+        let key = test_key_with_len(1, 5);
+        cache.insert(key, b"hello");
+
+        // Younger than max-age (well within the window): served.
+        clock.set(1_000_000 + max_age / 2);
+        assert_eq!(
+            cache.get(&key).as_deref(),
+            Some(b"hello".as_slice()),
+            "an entry younger than the max-age must be served"
+        );
+
+        // Exactly at the boundary (age == max_age): still served, the check is
+        // strictly-greater-than.
+        clock.set(1_000_000 + max_age);
+        assert_eq!(
+            cache.get(&key).as_deref(),
+            Some(b"hello".as_slice()),
+            "an entry exactly at the max-age is not yet expired"
+        );
+
+        // One nanosecond past the boundary: a miss, the file is dropped, and
+        // it is counted as an expiry rather than a corruption/disk error.
+        clock.set(1_000_000 + max_age + 1);
+        assert!(
+            cache.get(&key).is_none(),
+            "an entry older than the max-age must not be served"
+        );
+        let snapshot = cache.metrics().snapshot();
+        assert_eq!(snapshot.disk_entries_expired_max_age, 1);
+        assert_eq!(
+            snapshot.disk_errors_degraded_to_misses, 0,
+            "an expiry is not a disk error: the entry was well-formed"
+        );
+        assert!(
+            !path_for(tmp.path(), &key).exists(),
+            "the stale entry's bytes must be dropped from disk, not left to persist"
+        );
+
+        // A re-insert after expiry (the fetch that a real caller would do on
+        // the miss) is admitted again and served, with a fresh stamp.
+        cache.insert(key, b"hello");
+        assert_eq!(cache.get(&key).as_deref(), Some(b"hello".as_slice()));
+    }
+
+    /// The startup scan is ADR-0064's "existing eviction walk": an entry
+    /// already older than the max-age when a fresh `DiskCache` opens the
+    /// directory is deleted and not counted, so a restart never resurrects
+    /// bytes that were due to be dropped.
+    #[test]
+    fn startup_scan_drops_entries_already_past_max_age() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let max_age = 1_000_000_000u64; // 1s in ns
+        let limits = generous_limits().with_max_entry_age_ns(max_age);
+
+        let writer_clock = TestClock::new(10_000_000_000);
+        {
+            let writer = DiskCache::new_with_clock(dir.clone(), limits, writer_clock.clone());
+            writer.insert(test_key_with_len(1, 10), &[1u8; 10]);
+        }
+
+        // Reopen with a clock far past the entry's write time + max-age.
+        let reader_clock = TestClock::new(10_000_000_000 + max_age + 1);
+        let reopened = DiskCache::new_with_clock(dir.clone(), limits, reader_clock);
+        assert_eq!(reopened.len(), 0, "an aged-out entry must not be seeded");
+        assert_eq!(reopened.total_bytes(), 0);
+        assert!(
+            !path_for(&dir, &test_key_with_len(1, 10)).exists(),
+            "the startup scan must delete an entry already past the max-age"
+        );
+    }
+
+    /// Deliverable 2: an entry written by an older binary in the previous
+    /// (version-2, no timestamp) header layout must not be served fresh
+    /// forever. The version bump makes `decode_header` reject it, so it
+    /// degrades to a miss and is discarded, never read as a headerless entry
+    /// with an implicit zero age. Crafted by hand at the canonical path in the
+    /// exact 76-byte v2 layout this code used before the stamp was added.
+    #[test]
+    fn old_format_entry_without_timestamp_is_a_miss_not_served_forever() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let cache = DiskCache::new(dir.clone(), generous_limits());
+
+        let key = test_key_with_len(1, 8);
+        let payload = [0x11u8; 8];
+
+        // The old 76-byte header: magic, version 2, the four key fields, then
+        // a payload crc32c -- no written_at field.
+        let mut old_header = Vec::new();
+        old_header.extend_from_slice(&MAGIC);
+        old_header.extend_from_slice(&2u32.to_le_bytes());
+        old_header.extend_from_slice(&key.tenant_hash);
+        old_header.extend_from_slice(&key.content_hash);
+        old_header.extend_from_slice(&key.offset.to_le_bytes());
+        old_header.extend_from_slice(&key.len.to_le_bytes());
+        old_header.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
+        assert_eq!(old_header.len(), 4 + 4 + 16 + 32 + 8 + 8 + 4);
+
+        let path = path_for(&dir, &key);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut buf = old_header;
+        buf.extend_from_slice(&payload);
+        fs::write(&path, &buf).unwrap();
+
+        assert!(
+            cache.get(&key).is_none(),
+            "a previous-format entry must degrade to a miss, never be served"
+        );
+    }
+
+    /// Negative/robustness: a short file, a garbage file, and an
+    /// almost-header-length file at an entry's canonical path each produce a
+    /// clean miss under the max-age code path, never a panic or wrong bytes.
+    /// The age check reads `written_at_ns` from the header, so a file too
+    /// short to contain one must be rejected before that read is ever
+    /// attempted.
+    #[test]
+    fn short_and_garbage_entries_never_panic_under_age_check() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let clock = TestClock::new(5_000_000_000);
+        let cache = DiskCache::new_with_clock(dir.clone(), generous_limits(), clock);
+
+        let key = test_key_with_len(7, 32);
+        let path = path_for(&dir, &key);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for bytes in [
+            Vec::new(),
+            vec![0u8; 3],
+            vec![0xFFu8; HEADER_LEN - 1],
+            b"RVCD not really a header at all........".to_vec(),
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            assert!(
+                cache.get(&key).is_none(),
+                "a {}-byte malformed entry must be a miss",
+                bytes.len()
             );
         }
     }
