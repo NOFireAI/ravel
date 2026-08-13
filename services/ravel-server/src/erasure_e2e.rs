@@ -594,3 +594,301 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
         );
     }
 }
+
+// === Logs: full HTTP e2e chain (SQL surface) ==============================
+
+#[cfg(feature = "sql")]
+mod logs {
+    use super::*;
+    use axum::http::header;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+    use ravel_types::logstream::log_stream_id;
+
+    /// The subject's and bystander's log bodies, the query-visible witnesses.
+    const SUBJECT_BODY: &str = "subject-log-line";
+    const SURVIVOR_BODY: &str = "bystander-log-line";
+    /// Every log event's timestamp: inside ingest-hour bucket 0 and inside the
+    /// query window below.
+    const LOG_TS_NS: i64 = 100;
+    /// The query clock, frozen four hours past the epoch so the `start: 0`
+    /// window resolves to an ordinary span rather than tripping the issue #635
+    /// window-cost ceiling (mirrors `tests/cache_attachment_logs.rs`). Wholly
+    /// independent of the tick clock, which runs at [`TEST_NOW_NS`].
+    const LOG_QUERY_NOW_NS: i64 = 4 * NS_PER_HOUR;
+
+    struct FixedQueryClock;
+    impl ravel_ingest::Clock for FixedQueryClock {
+        fn now_ns(&self) -> i64 {
+            LOG_QUERY_NOW_NS
+        }
+    }
+
+    fn log_record(user_id: &str, body: &str) -> LogRecord {
+        // One shared stream (same resource) so the subject and bystander land in
+        // the same bucket; the subject is named by a PER-RECORD attribute, which
+        // is what the logs erasure filter matches against the merged view.
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("checkout".to_string()),
+        )];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: LOG_TS_NS,
+            observed_ts_ns: LOG_TS_NS,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: body.into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![(SUBJECT_KEY.to_string(), AttrValue::Str(user_id.to_string()))],
+        }
+    }
+
+    /// Publish one sealed RLOG bucket (ingest hour 0, shard 0) holding the
+    /// subject and bystander records. Returns the input data object key.
+    async fn publish_logs_bucket(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> String {
+        let tenant_hash = tenant.hash();
+        let records = [
+            log_record(ERASED_SUBJECT, SUBJECT_BODY),
+            log_record(SURVIVING_SUBJECT, SURVIVOR_BODY),
+        ];
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        let mut streams = std::collections::HashSet::new();
+        for rec in &records {
+            min_ts = min_ts.min(rec.ts_ns);
+            max_ts = max_ts.max(rec.ts_ns);
+            streams.insert(rec.stream_id);
+        }
+
+        let writer_id = Uuid::from_u128(0x1_0000);
+        let mut writer = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for rec in &records {
+            writer.push(rec.clone()).expect("push log record");
+        }
+        let bytes = writer.finish().expect("finish rlog object");
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: streams.len() as u64,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid log commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put log data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish log commit");
+        data_key
+    }
+
+    fn build_logs_app(
+        store: Arc<dyn ObjectStoreBackend>,
+        cache: Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>,
+        tenant: &TenantId,
+    ) -> Router {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("default flags parse");
+        let catalog = build_catalog(
+            Arc::clone(&store),
+            1,
+            cli.disable_cache,
+            cli.cache_max_bytes,
+        )
+        .expect("catalog");
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert("acme-token".to_string(), tenant.clone());
+        let mut sql_state = crate::query::build_sql_state(
+            catalog,
+            store,
+            Arc::new(StaticBearerTokenResolver::new(tokens)),
+            Some(cache),
+            ravel_query::EngineConfig::default(),
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+            ravel_query::QueryAdmissionController::shared(
+                ravel_query::QueryConcurrencyLimit::Unlimited,
+            ),
+        )
+        .expect("sql state");
+        sql_state.clock = Arc::new(FixedQueryClock);
+        crate::sql::router(sql_state)
+    }
+
+    /// `SELECT body FROM logs`, returning the bodies it yields, sorted.
+    async fn query_log_bodies(app: &Router) -> Vec<String> {
+        let payload = serde_json::json!({
+            "query": "SELECT body FROM logs ORDER BY body",
+            "start": 0.0,
+            "end": LOG_QUERY_NOW_NS as f64 / 1_000_000_000.0,
+        })
+        .to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sql")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer acme-token")
+            .body(Body::from(payload))
+            .expect("build request");
+        let response = app.clone().oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK, "sql query must succeed");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: Value = serde_json::from_slice(&bytes).expect("parse json");
+        assert_eq!(json["status"], "success", "sql status: {json}");
+        let mut bodies: Vec<String> = json["data"]["rows"]
+            .as_array()
+            .expect("rows is an array")
+            .iter()
+            .map(|row| row[0].as_str().expect("body string").to_string())
+            .collect();
+        bodies.sort();
+        bodies
+    }
+
+    /// The logs end-to-end acceptance, through the real `/api/v1/sql` surface:
+    /// warm-cache immediate exclusion, a real tick's rewrite, `.dreq` sweep past
+    /// the horizon, and physical absence of the input from durable storage.
+    ///
+    /// Non-vacuous flip: delete the `submit_erasure_request` call. The post-erase
+    /// query then returns `SUBJECT_BODY` again (the exclusion assertion fires) and
+    /// the input is never superseded (the physical-absence assertion fires).
+    #[tokio::test]
+    async fn logs_erasure_reaches_query_cache_rewrite_and_physical_absence() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let data_key = publish_logs_bucket(store.as_ref(), &tenant_id).await;
+
+        let cache = build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli"))
+            .expect("cache enabled by default");
+        let app = build_logs_app(Arc::clone(&store), Arc::clone(&cache), &tenant_id);
+
+        // Pre-erase: both bodies reachable; the query warms the read cache.
+        let before = query_log_bodies(&app).await;
+        assert_eq!(
+            before,
+            vec![SURVIVOR_BODY.to_string(), SUBJECT_BODY.to_string()],
+            "pre-erase, both the subject and the bystander log lines are reachable"
+        );
+        assert!(
+            !cache.is_empty(),
+            "the pre-erase logs query must have warmed the read cache with the RLOG bytes"
+        );
+
+        // Submit the erasure request. THIS is the flip line.
+        let request_id = Uuid::from_u128(0xE7B0);
+        let dreq_key = submit_erasure_request(
+            store.as_ref(),
+            &tenant,
+            Signal::Logs,
+            request_id,
+            ERASED_SUBJECT,
+            TEST_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Logs, request_id).expect("done key");
+
+        // Immediate exclusion from the warm cache while the input still holds
+        // the subject's bytes.
+        let after = query_log_bodies(&app).await;
+        assert_eq!(
+            after,
+            vec![SURVIVOR_BODY.to_string()],
+            "post-erase, the SQL query excludes the subject's log line from the warm cache"
+        );
+        assert!(
+            object_exists(store.as_ref(), &data_key).await,
+            "the durable RLOG input still holds the subject's bytes: exclusion was logical"
+        );
+
+        // A real tick: the logs bucket is rewritten and the request completes.
+        let mut harness = TickHarness::new();
+        harness.tick(store.as_ref(), &tenant, TEST_NOW_NS, 1).await;
+
+        let records = rewrite_records(store.as_ref(), &tenant, Signal::Logs, 0, 0).await;
+        assert_eq!(records.len(), 1, "the tick publishes one RewriteRecord");
+        assert_eq!(
+            records[0].drops.len(),
+            1,
+            "the one pending request is applied"
+        );
+        assert_eq!(records[0].drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            records[0].drops[0].dropped_count, 1,
+            "exactly the subject's one log record is dropped"
+        );
+        assert!(
+            object_exists(store.as_ref(), &done_key).await,
+            "every in-scope bucket carries the request, so the tick writes .done"
+        );
+        assert!(
+            object_exists(store.as_ref(), &dreq_key).await,
+            ".dreq survives until protection_horizon has elapsed"
+        );
+
+        // Past the horizon: `.dreq` swept, input physically gone.
+        let past_horizon = TEST_NOW_NS + harness.protection_horizon_ns() + 1;
+        harness.tick(store.as_ref(), &tenant, past_horizon, 1).await;
+
+        assert!(
+            object_exists(store.as_ref(), &done_key).await,
+            ".done is permanent erasure evidence"
+        );
+        assert!(
+            !object_exists(store.as_ref(), &dreq_key).await,
+            ".dreq must be swept once its .done is older than protection_horizon"
+        );
+        assert!(
+            !object_exists(store.as_ref(), &data_key).await,
+            "physical absence: the pre-rewrite RLOG input is superseded and swept"
+        );
+
+        // Post-sweep, `.dreq` gone: exclusion rests purely on the physical
+        // rewrite, and the bystander's line survives.
+        let cold_cache =
+            build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli")).expect("cache");
+        let fresh_app = build_logs_app(Arc::clone(&store), cold_cache, &tenant_id);
+        let post_sweep = query_log_bodies(&fresh_app).await;
+        assert_eq!(
+            post_sweep,
+            vec![SURVIVOR_BODY.to_string()],
+            "after the .dreq is swept, the subject stays excluded on the physical rewrite alone \
+             and the bystander survives"
+        );
+    }
+}
