@@ -9,7 +9,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ingest_concurrency::IngestConcurrencyController;
 use axum::Router;
@@ -19,8 +18,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
 use ravel_ingest::{
-    AdmissionController, IngestPoint, IngestRouter, IngestValue, RequestRejection, WriteError,
-    WriteMode, plausible_ingest_clock,
+    AdmissionController, Clock, IngestPoint, IngestRouter, IngestValue, RequestRejection,
+    WriteError, WriteMode, plausible_ingest_clock,
 };
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
@@ -140,6 +139,12 @@ pub struct RemoteWriteState {
     /// same shared controller `otlp_http::GatewayState` carries. Checked
     /// first in [`remote_write`], ahead of tenant resolution.
     pub ingest_concurrency: Arc<IngestConcurrencyController>,
+    /// Injected receiver clock read at admission time (CLAUDE.md time
+    /// injection; ADR-0051 amendment, S1-12). In production this is
+    /// `SystemClock`, so behavior is identical to the previous internal
+    /// `SystemTime::now()`; tests supply a fixed sub-floor clock to exercise
+    /// the receiver-clock plausibility floor deterministically.
+    pub clock: Arc<dyn Clock>,
 }
 
 pub fn router(state: Arc<RemoteWriteState>) -> Router {
@@ -161,13 +166,6 @@ fn compute_points_dropped(normalized: &RwNormalizeOutput) -> u64 {
         .map(|r| r.rejected_count() as u64)
         .sum::<u64>()
         + normalized.exemplars_dropped as u64
-}
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 /// Negotiates the Remote Write protocol version: content-type first (the
@@ -281,11 +279,13 @@ async fn remote_write(
         }
     };
 
-    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): checked before
-    // any per-record work and before every other now_ns() reading in this
-    // handler. Whole-request 503, counted reason="clock"; the fault is the
-    // replica's, and a retry against a healthy one succeeds.
-    if let Err(msg) = plausible_ingest_clock(now_ns()) {
+    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): the injected
+    // clock is read once and reused for every admission decision in this
+    // handler, checked before any per-record work. Whole-request 503, counted
+    // reason="clock"; the fault is the replica's, and a retry against a
+    // healthy one succeeds.
+    let now_ns = state.clock.now_ns();
+    if let Err(msg) = plausible_ingest_clock(now_ns) {
         state
             .admission
             .record_clock_rejection(&tenant, Signal::Metrics);
@@ -299,7 +299,7 @@ async fn remote_write(
 
     // Record the tenant's recovery manifest on its first write (ADR-0050
     // section 3), best-effort and off the durability path.
-    crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, now_ns()).await;
+    crate::tenancy::ensure_recovery_manifest(&state.recovery, &tenant, now_ns).await;
 
     // Pin/validate the (tenant, Metrics) shard_count provisioning record on
     // first write (ADR-0050 section 5). A hard mismatch fails this request with
@@ -308,7 +308,7 @@ async fn remote_write(
         &state.provisioning,
         &tenant,
         Signal::Metrics,
-        now_ns(),
+        now_ns,
     )
     .await
     {
@@ -322,7 +322,7 @@ async fn remote_write(
     if let Err(rejection) =
         state
             .admission
-            .check_byte_rate(&tenant, Signal::Metrics, body.len() as u64, now_ns())
+            .check_byte_rate(&tenant, Signal::Metrics, body.len() as u64, now_ns)
     {
         state.metrics.record_request_rejected();
         return admission_rejection_response(rejection);
@@ -357,7 +357,7 @@ async fn remote_write(
 
     // Strict mode only: a Remote Write 2xx must mean durable, so the
     // buffered-mode header override is never consulted on this surface.
-    let normalized = normalize_resolved(&tenant, resolved, &state.limits, now_ns());
+    let normalized = normalize_resolved(&tenant, resolved, &state.limits, now_ns);
     let mut points_dropped = compute_points_dropped(&normalized);
     let metadata_dropped = normalized.metadata_dropped as u64;
     let created_timestamps_dropped = normalized.created_timestamps_dropped as u64;
@@ -376,7 +376,7 @@ async fn remote_write(
     // is the only whole-request rejection (429, no tokens consumed); the
     // active-series cap that follows only ever reduces the written count in
     // the eventual 2xx response, never producing a 4xx of its own.
-    let now = now_ns();
+    let now = now_ns;
     let candidate_series: Vec<SeriesId> = ingest_points.iter().map(|p| p.series_id).collect();
     if let Err(rejection) =
         state
@@ -461,9 +461,18 @@ async fn remote_write(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
+    use std::time::Duration;
+
+    use ravel_ingest::{AdmissionLimits, IngestConfig, MIN_PLAUSIBLE_INGEST_CLOCK_NS, SystemClock};
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::memory::MemoryStore;
     use ravel_otlp::Rejection;
+    use ravel_query::http::AuthError;
     use ravel_remote_write::RwRejection;
+
+    use crate::ingest_concurrency::IngestConcurrencyLimit;
 
     use super::*;
 
@@ -508,5 +517,103 @@ mod tests {
         };
 
         assert_eq!(compute_points_dropped(&normalized), 0);
+    }
+
+    /// Resolves every request to the same fixed tenant, so the handler reaches
+    /// its receiver-clock plausibility check with a known tenant to attribute
+    /// the `reason="clock"` rejection to.
+    struct FixedTenantResolver(TenantId);
+
+    impl TenantResolver for FixedTenantResolver {
+        fn resolve(&self, _headers: &HeaderMap) -> Result<TenantId, AuthError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A deterministic receiver clock (CLAUDE.md time injection): returns a
+    /// fixed timestamp so the plausibility floor is exercised without ever
+    /// reading `SystemTime::now()`.
+    struct FixedClock(i64);
+
+    impl Clock for FixedClock {
+        fn now_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    fn state_with_clock(tenant: &TenantId, clock: Arc<dyn Clock>) -> Arc<RemoteWriteState> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = Arc::new(IngestRouter::new(
+            IngestConfig::default(),
+            store,
+            Signal::Metrics,
+            Arc::new(SystemClock),
+        ));
+        Arc::new(RemoteWriteState {
+            tenant_resolver: Arc::new(FixedTenantResolver(tenant.clone())),
+            router,
+            limits: IngestLimits::default(),
+            ack_deadline: Duration::from_secs(5),
+            metrics: RemoteWriteMetrics::default(),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            recovery: None,
+            provisioning: None,
+            ingest_concurrency: IngestConcurrencyController::shared(
+                IngestConcurrencyLimit::Unlimited,
+            ),
+            clock,
+        })
+    }
+
+    /// #1011 (closing the last gap from #991): a Remote Write request whose
+    /// injected receiver clock is below the 2020 floor must be rejected as a
+    /// whole-request 503 / UNAVAILABLE, and the `reason="clock"` admission
+    /// counter for the tenant's Metrics signal must increment. The clock is a
+    /// fixed sub-floor timestamp, never `SystemTime::now()`, so the test is
+    /// deterministic.
+    ///
+    /// Non-vacuity: delete the `if let Err(msg) = plausible_ingest_clock(now_ns)`
+    /// guard block near the top of [`remote_write`] and this test fails --- the
+    /// sub-floor clock then flows into the rest of the handler, which returns a
+    /// non-503 status (415, no version header) and never touches the
+    /// `reason="clock"` counter.
+    #[tokio::test]
+    async fn receiver_clock_below_floor_rejects_unavailable_with_reason_clock() {
+        let tenant = TenantId::new("acme");
+        // One nanosecond below the 2020 floor: an implausible receiver clock.
+        let sub_floor = MIN_PLAUSIBLE_INGEST_CLOCK_NS - 1;
+        let state = state_with_clock(&tenant, Arc::new(FixedClock(sub_floor)));
+
+        // No content-type / version header and an empty body: the clock check
+        // runs before version negotiation and decode, so those never matter.
+        let response = remote_write(State(state.clone()), HeaderMap::new(), Bytes::new()).await;
+
+        // (a) The transport response is 503 / UNAVAILABLE with a Retry-After,
+        // as this surface returns for an implausible receiver clock.
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a sub-floor receiver clock must reject the whole request as 503"
+        );
+        assert!(
+            response.headers().contains_key(RETRY_AFTER_HEADER),
+            "the 503 carries a Retry-After header"
+        );
+
+        // (b) The admission rejected counter increments under reason="clock"
+        // for this tenant's Metrics signal.
+        let row = state
+            .admission
+            .usage_snapshot()
+            .into_iter()
+            .find(|r| r.tenant_hash == tenant.hash() && r.signal == Signal::Metrics)
+            .expect("a metrics usage row exists after the clock rejection");
+        assert_eq!(
+            row.requests_rejected_clock_total, 1,
+            "the reason=\"clock\" rejected counter incremented exactly once"
+        );
     }
 }

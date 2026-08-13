@@ -504,6 +504,7 @@ fn remote_write_state(
         recovery: recovery.clone(),
         provisioning: provisioning.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
+        clock: Arc::new(SystemClock),
     })
 }
 
