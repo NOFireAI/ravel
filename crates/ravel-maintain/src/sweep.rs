@@ -101,7 +101,7 @@ use prost::Message;
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
-use ravel_proto::commit::v1::{CompactionRecord, RewriteRecord};
+use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionRecord, RewriteRecord};
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
@@ -462,60 +462,65 @@ async fn sweep_superseded_impl(
     let mut records_deleted = 0usize;
     let mut data_deleted = 0usize;
     for (key, entry) in &entries {
-        if !matches!(entry, BucketEntry::CompactionRecord(_)) {
-            continue;
-        }
-        let record = get_compaction_record(store, key).await?;
-        // Horizon gate anchored on the durable created_unix_ns (plan §5).
-        if now
-            < record
-                .created_unix_ns
-                .saturating_add(config.protection_horizon_ns)
-        {
-            continue;
-        }
-
-        // Gather (commit record key, data object key) for every input still
-        // present. The data key needs the record's content hash, so each input
-        // record is read before it is deleted; an input already gone (a
-        // crash-interrupted prior pass) is skipped and its data object, if
-        // any, is collected by orphan GC (row 8).
-        let mut record_keys: Vec<String> = Vec::new();
-        let mut data_keys: Vec<String> = Vec::new();
-        for input in &record.inputs {
-            let writer_id = Uuid::parse_str(&input.writer_id).map_err(|_| {
-                MaintainError::Key(KeyError::InvalidWriterId(input.writer_id.clone()))
-            })?;
-            let commit_key = keys::commit_key(
-                tenant,
-                signal,
-                shard,
-                record.ingest_hour_bucket,
-                writer_id,
-                input.writer_epoch,
-                input.writer_seq,
-            )?;
-            match store.get(&commit_key, GetRange::Full).await {
-                Ok(got) => {
-                    let rec = record::decode(&got.data)?;
-                    // The record's key must reconstruct to the key we fetched
-                    // it at (ADR-0010 §7): a corrupted-but-decodable input
-                    // record's own fields, which reconstruct_data_key trusts,
-                    // must not name a data object outside the bucket this key
-                    // implies (mirrors read::load_inputs).
-                    verify_commit_key(&rec, &commit_key)?;
-                    let data_key = keys::reconstruct_data_key(&rec)?;
-                    record_keys.push(commit_key);
-                    data_keys.push(data_key);
+        // Both a compaction record and a selective-erasure rewrite record
+        // (ADR-0064 decision 3 point 6) render their superseded inputs
+        // collectable by this one rule; a raw commit record or tombstone names
+        // no superseded input. The two record types are fetched NotFound-
+        // tolerantly: a rewrite whose `superseded_record_key` names a
+        // predecessor record deletes that predecessor here, and that same
+        // predecessor may also appear as its own entry in this listing, so its
+        // fetch can legitimately miss once a superseding generation processed
+        // earlier in this pass already removed it.
+        let (record_keys, data_keys) = match entry {
+            BucketEntry::CompactionRecord(_) => {
+                let Some(record) = get_compaction_record_opt(store, key).await? else {
+                    continue;
+                };
+                // Horizon gate anchored on the durable created_unix_ns (plan §5).
+                if now
+                    < record
+                        .created_unix_ns
+                        .saturating_add(config.protection_horizon_ns)
+                {
+                    continue;
                 }
-                Err(StoreError::NotFound) => {}
-                Err(e) => return Err(MaintainError::Store(e)),
+                gather_l0_inputs(store, tenant, signal, shard, &record).await?
             }
-        }
+            BucketEntry::RewriteRecord(_) => {
+                let Some(record) = get_rewrite_record_opt(store, key).await? else {
+                    continue;
+                };
+                // Horizon gate anchored on the rewrite's own durable
+                // created_unix_ns: that is the instant it superseded its
+                // inputs, so a query pinned before it is drained by the
+                // protection horizon exactly as for a compaction record.
+                if now
+                    < record
+                        .created_unix_ns
+                        .saturating_add(config.protection_horizon_ns)
+                {
+                    continue;
+                }
+                if !record.inputs.is_empty() {
+                    // RawL0 rewrite: the same L0 commit records + data objects
+                    // a compaction over the same inputs would supersede.
+                    gather_l0_inputs(store, tenant, signal, shard, &record).await?
+                } else {
+                    // Predecessor rewrite: the whole prior compaction/rewrite
+                    // record this one superseded, plus every L1 part it named
+                    // (the pre-rewrite parts holding the un-erased subject).
+                    // Rule 3 cannot collect those parts while the predecessor
+                    // record still references them, so this rule removes both.
+                    gather_superseded_predecessor(store, &record.superseded_record_key).await?
+                }
+            }
+            BucketEntry::CommitRecord(_) | BucketEntry::Tombstone(_) => continue,
+        };
 
         // Records first, then data objects (plan §5, docs/consistency-model.md):
-        // a crash between the two phases leaves record-less data (orphan GC),
-        // never a record pointing at a deleted object.
+        // a crash between the two phases leaves record-less data (orphan GC) or
+        // an unreferenced part (rule 3), never a record pointing at a deleted
+        // object.
         for k in &record_keys {
             if lease.is_protected(k) {
                 continue;
@@ -536,6 +541,179 @@ async fn sweep_superseded_impl(
         }
     }
     Ok((records_deleted, data_deleted))
+}
+
+/// Gather `(commit record key, data object key)` pairs for every input a
+/// compaction or rewrite record names in its `inputs` list. Shared by rule 2's
+/// compaction and rewrite-RawL0 arms (ADR-0018, ADR-0064 decision 3 point 6):
+/// both name the same raw-L0 input shape. The data key needs each input
+/// record's content hash, so each input record is read before it is deleted; an
+/// input already gone (a crash-interrupted prior pass) is skipped and its data
+/// object, if any, is collected by orphan GC (row 8).
+async fn gather_l0_inputs(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    // Generic rather than `&dyn`: the reference is held across the input GETs'
+    // `.await`, and a `&dyn SupersededInputs` there is not `Send` (the trait
+    // object is not `Sync`), which would make the whole sweep future non-`Send`
+    // and unspawnable from the server's maintain loop. A concrete `&R` over the
+    // two `Sync` proto record types is `Send`.
+    record: &impl SupersededInputs,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut record_keys: Vec<String> = Vec::new();
+    let mut data_keys: Vec<String> = Vec::new();
+    for input in record.inputs() {
+        let writer_id = Uuid::parse_str(&input.writer_id)
+            .map_err(|_| MaintainError::Key(KeyError::InvalidWriterId(input.writer_id.clone())))?;
+        let commit_key = keys::commit_key(
+            tenant,
+            signal,
+            shard,
+            record.ingest_hour_bucket(),
+            writer_id,
+            input.writer_epoch,
+            input.writer_seq,
+        )?;
+        match store.get(&commit_key, GetRange::Full).await {
+            Ok(got) => {
+                let rec = record::decode(&got.data)?;
+                // The record's key must reconstruct to the key we fetched it at
+                // (ADR-0010 §7): a corrupted-but-decodable input record's own
+                // fields, which reconstruct_data_key trusts, must not name a
+                // data object outside the bucket this key implies (mirrors
+                // read::load_inputs).
+                verify_commit_key(&rec, &commit_key)?;
+                let data_key = keys::reconstruct_data_key(&rec)?;
+                record_keys.push(commit_key);
+                data_keys.push(data_key);
+            }
+            Err(StoreError::NotFound) => {}
+            Err(e) => return Err(MaintainError::Store(e)),
+        }
+    }
+    Ok((record_keys, data_keys))
+}
+
+/// A record that names raw-L0 superseded inputs (a compaction record, or a
+/// rewrite record whose live input set was raw L0). Abstracts over the two
+/// proto types so [`gather_l0_inputs`] serves both without duplication.
+trait SupersededInputs {
+    fn inputs(&self) -> &[CompactionInputIdentity];
+    fn ingest_hour_bucket(&self) -> u32;
+}
+
+impl SupersededInputs for CompactionRecord {
+    fn inputs(&self) -> &[CompactionInputIdentity] {
+        &self.inputs
+    }
+    fn ingest_hour_bucket(&self) -> u32 {
+        self.ingest_hour_bucket
+    }
+}
+
+impl SupersededInputs for RewriteRecord {
+    fn inputs(&self) -> &[CompactionInputIdentity] {
+        &self.inputs
+    }
+    fn ingest_hour_bucket(&self) -> u32 {
+        self.ingest_hour_bucket
+    }
+}
+
+/// Gather the deletion targets for a rewrite record that superseded a whole
+/// prior compaction/rewrite record (ADR-0064 amendment: `superseded_record_key`
+/// names either an `l1.<hash>.cmt` compaction record or an `rw.<hash>.cmt`
+/// rewrite record, recursive supersession included). Returns
+/// `([predecessor record key], [predecessor part keys...])`: the record is
+/// deleted first (records-before-data), then every L1 part it named.
+///
+/// A predecessor already gone (swept by an earlier iteration of this same pass
+/// when the predecessor also appeared as its own entry, or by a crash-
+/// interrupted prior pass) yields empty lists: any of its parts that survive
+/// become unreferenced under the live rewrite record and are collected by rule
+/// 3.
+async fn gather_superseded_predecessor(
+    store: &dyn ObjectStoreBackend,
+    predecessor_key: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let got = match store.get(predecessor_key, GetRange::Full).await {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Ok((Vec::new(), Vec::new())),
+        Err(e) => return Err(MaintainError::Store(e)),
+    };
+    let mut data_keys: Vec<String> = Vec::new();
+    match keys::partition_bucket_entry(predecessor_key) {
+        Ok(BucketEntry::CompactionRecord(_)) => {
+            let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
+                MaintainError::Invariant(format!("superseded compaction record decode failed: {e}"))
+            })?;
+            keys::verify_compaction_record_key(&record, predecessor_key)?;
+            for part in &record.parts {
+                data_keys.push(keys::reconstruct_l1_part_key(&record, part)?);
+            }
+        }
+        Ok(BucketEntry::RewriteRecord(_)) => {
+            let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref()).map_err(|e| {
+                MaintainError::Invariant(format!("superseded rewrite record decode failed: {e}"))
+            })?;
+            keys::verify_rewrite_record_key(&record, predecessor_key)?;
+            for part in &record.parts {
+                data_keys.push(keys::reconstruct_rewrite_part_key(&record, part)?);
+            }
+        }
+        Ok(BucketEntry::CommitRecord(_) | BucketEntry::Tombstone(_)) => {
+            return Err(MaintainError::Invariant(format!(
+                "rewrite superseded_record_key {predecessor_key} names a non-compaction, \
+                 non-rewrite entry"
+            )));
+        }
+        Err(KeyError::UnknownBucketEntryShape(k)) => {
+            return Err(MaintainError::UnknownBucketEntry(k));
+        }
+        Err(e) => return Err(MaintainError::Key(e)),
+    }
+    Ok((vec![predecessor_key.to_string()], data_keys))
+}
+
+/// [`get_compaction_record`] tolerant of a NotFound (Ok(None)): the record was
+/// swept between this pass's LIST and now (e.g. a superseding rewrite processed
+/// earlier in the same pass removed it, or a crash-interrupted prior pass).
+async fn get_compaction_record_opt(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<Option<CompactionRecord>> {
+    match store.get(key, GetRange::Full).await {
+        Ok(got) => {
+            let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
+                MaintainError::Invariant(format!("compaction record decode failed: {e}"))
+            })?;
+            keys::verify_compaction_record_key(&record, key)?;
+            Ok(Some(record))
+        }
+        Err(StoreError::NotFound) => Ok(None),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+/// [`get_rewrite_record`] tolerant of a NotFound (Ok(None)); see
+/// [`get_compaction_record_opt`] for when that happens.
+async fn get_rewrite_record_opt(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<Option<RewriteRecord>> {
+    match store.get(key, GetRange::Full).await {
+        Ok(got) => {
+            let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref()).map_err(|e| {
+                MaintainError::Invariant(format!("rewrite record decode failed: {e}"))
+            })?;
+            keys::verify_rewrite_record_key(&record, key)?;
+            Ok(Some(record))
+        }
+        Err(StoreError::NotFound) => Ok(None),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
 }
 
 // --- Rule 3: unreferenced-part cleanup -------------------------------------
@@ -1066,6 +1244,115 @@ fn catalog_snap_prefix(tenant: &TenantHash, signal: Signal) -> String {
 /// name-postings object for one `(tenant, signal)`, across every watermark.
 fn catalog_idx_prefix(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/idx/", tenant.to_hex(), signal.key_prefix())
+}
+
+// --- Rule 6: erasure-request (.dreq) removal (ADR-0064 decision 5) -----------
+
+/// What one erasure-request sweep pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ErasureRequestSweepOutcome {
+    /// `.dreq` objects deleted (or, under `dry_run`, that would have been).
+    pub deleted: usize,
+    /// `.dreq` objects left in place: no `.done` yet (erasure not complete),
+    /// still inside the post-completion protection horizon, or lease/legal-hold
+    /// protected.
+    pub kept: usize,
+}
+
+/// Delete every erasure request `t/<tenant_hash>/<signal>/del/<request_id>.dreq`
+/// whose erasure is complete and past the post-completion horizon (ADR-0064
+/// decision 5, docs/consistency-model.md "Deletion guarantees").
+///
+/// A `.dreq` carries the subject identifier, so it must not outlive its
+/// purpose. Its matching `.done` completion record carries only a predicate
+/// hash and per-bucket counts (no subject identifier) and is permanent,
+/// deny-delete audit evidence: this rule never deletes a `.done`.
+///
+/// A `.dreq` is deleted only when ALL hold:
+/// - its matching `.done` completion exists (erasure is verified complete);
+/// - `now >= done.completed_unix_ns + protection_horizon` -- the same horizon
+///   that gates every superseded-input delete (rule 2), anchored on the
+///   durable completion timestamp, never on wall-clock at sweep time. This
+///   wait is what makes removal safe: retiring the query-time exclusion filter
+///   (which happens the instant the `.dreq` disappears, since the resolver's
+///   `del/` listing no longer finds it) can never resurrect the subject,
+///   because after the horizon no resolvable snapshot can still reference a
+///   pre-rewrite input (ADR-0064 §3.5 race window, closed durably). Deleting
+///   the `.dreq` a nanosecond early would reopen exactly that window.
+/// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
+///   request exactly as it pins any other object.
+///
+/// A completion whose `completed_unix_ns` is zero is treated fail-safe as "not
+/// yet a valid horizon anchor" and its `.dreq` is kept: a zero anchor would
+/// collapse the horizon gate to always-past and could retire the filter early.
+///
+/// Per (tenant, signal), not per shard (the `del/` prefix carries no shard
+/// dimension): the dispatcher calls this once per (tenant, signal) per tick
+/// alongside [`sweep_idempotency_markers`] and
+/// [`sweep_unreferenced_catalog_objects`], not inside the per-shard
+/// [`sweep_shard`] loop. A listing entry under `del/` that is neither a
+/// `.dreq` nor a `.done` is layout drift and fails the pass loud, matching the
+/// resolver's and the rewrite pass's fail-loud discipline for this keyspace.
+pub async fn sweep_erasure_requests(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<ErasureRequestSweepOutcome> {
+    let now = clock.now_ns();
+    let prefix = keys::del_prefix(tenant, signal);
+    let objects = list_all(store, &prefix).await?;
+
+    // One LIST, split into pending requests and their completion timestamps.
+    // Both suffixes share the `del/` prefix, so this needs no second listing.
+    let mut dreq_keys: Vec<(Uuid, String)> = Vec::new();
+    let mut done_completed_ns: HashMap<Uuid, i64> = HashMap::new();
+    for meta in &objects {
+        if let Ok(parsed) = keys::parse_erasure_request_key(&meta.key) {
+            dreq_keys.push((parsed.request_id, meta.key.clone()));
+        } else if let Ok(parsed) = keys::parse_erasure_completion_key(&meta.key) {
+            let got = store.get(&meta.key, GetRange::Full).await?;
+            let completion = ravel_commit::erasure::decode_completion(&got.data).map_err(|e| {
+                MaintainError::Invariant(format!("erasure completion decode failed: {e}"))
+            })?;
+            keys::verify_erasure_completion_key(&completion, &meta.key)?;
+            done_completed_ns.insert(parsed.request_id, completion.completed_unix_ns);
+        } else {
+            return Err(MaintainError::UnknownBucketEntry(meta.key.clone()));
+        }
+    }
+
+    let mut deleted = 0usize;
+    let mut kept = 0usize;
+    for (request_id, dreq_key) in &dreq_keys {
+        let Some(&completed_ns) = done_completed_ns.get(request_id) else {
+            // No `.done`: the erasure is not verified complete, so the request
+            // (and its query-time exclusion filter) must stay live.
+            kept += 1;
+            continue;
+        };
+        // Fail-safe: a zero completion timestamp is not a valid horizon anchor.
+        if completed_ns == 0 {
+            kept += 1;
+            continue;
+        }
+        if now < completed_ns.saturating_add(config.protection_horizon_ns) {
+            kept += 1;
+            continue;
+        }
+        if lease.is_protected(dreq_key) {
+            kept += 1;
+            continue;
+        }
+        if !config.dry_run {
+            store.delete(dreq_key).await?;
+        }
+        deleted += 1;
+    }
+
+    Ok(ErasureRequestSweepOutcome { deleted, kept })
 }
 
 // --- shared helpers --------------------------------------------------------
