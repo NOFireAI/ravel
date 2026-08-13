@@ -24,14 +24,20 @@
 //! removed without its `.done`, and the erasure completes on retry).
 //!
 //! **Signal coverage.** Metrics and logs are exercised through the real
-//! ravel-server HTTP surfaces (`/api/v1/query` and `/api/v1/sql`). Spans have no
-//! ravel-server query endpoint (the SQL executor routes only `logs` and
-//! `samples`; `FROM spans` is unreachable through the server -- a pre-existing,
-//! documented limitation, ADR-0041 phase 5, NOT an erasure gap), so the span
-//! query-exclusion link is driven through the real `ravel_sql::SpansTableProvider`
-//! scan path over a snapshot resolved by the real catalog (which reads the
-//! `.dreq`). The physical rewrite/sweep/absence link runs through the same
-//! production `run_tick` for all three signals.
+//! ravel-server HTTP surfaces (`/api/v1/query` and `/api/v1/sql`), including the
+//! warm-cache clause. Spans have no ravel-server query endpoint (the SQL
+//! executor routes only `logs` and `samples`; `FROM spans` is unreachable
+//! through the server -- a pre-existing, documented limitation, ADR-0041 phase
+//! 5, NOT an erasure gap), so the span query-exclusion link is driven through
+//! the two functions the shipped span scan itself calls --
+//! `ravel_query::snapshot_erasure_predicates` over a snapshot the real
+//! `Catalog::resolve` produced (which reads the `.dreq`), then
+//! `ravel_query::erasure::is_erased_span` per decoded RSPAN row. Because that
+//! path has no in-memory read-cache hook, its immediate-exclusion clause is
+//! proven in the equivalent pre-rewrite state the cache clause guards: the
+//! subject is excluded while its bytes are still physically present in the
+//! durable RSPAN object. The physical rewrite/sweep/absence link runs through
+//! the same production `run_tick` for all three signals.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_arguments)]
 
@@ -887,6 +893,265 @@ mod logs {
         assert_eq!(
             post_sweep,
             vec![SURVIVOR_BODY.to_string()],
+            "after the .dreq is swept, the subject stays excluded on the physical rewrite alone \
+             and the bystander survives"
+        );
+    }
+}
+
+// === Spans: scan-layer query exclusion + full physical rewrite/sweep ======
+//
+// Spans have no ravel-server query endpoint (the SQL executor routes only
+// `logs` and `samples`), so the immediate-exclusion link is driven through the
+// two functions the shipped span scan (`ravel_sql::spans_scan::prepare_partition`)
+// itself calls -- `ravel_query::snapshot_erasure_predicates` over a snapshot the
+// real `Catalog::resolve` produced (which reads the `.dreq`), then
+// `ravel_query::erasure::is_erased_span` per decoded RSPAN row -- rather than
+// through DataFusion, which would require adding datafusion as a dev-dependency
+// only to re-run the same two functions. The physical rewrite/sweep/absence link
+// runs through the real production `run_tick`, exactly as for metrics and logs.
+mod spans {
+    use super::*;
+    use ravel_rspan::{RspanConfig, RspanReader, RspanWriter, SpanQuery, SpanRecord, StatusCode};
+    use ravel_types::TimeRange;
+
+    const SUBJECT_NAME: &str = "subject-span";
+    const SURVIVOR_NAME: &str = "bystander-span";
+    const TRACE_ID: [u8; 16] = [0x11; 16];
+
+    fn span_record(span_id: u8, name: &str, user_id: &str, start: i64) -> SpanRecord {
+        SpanRecord {
+            trace_id: TRACE_ID,
+            span_id: [span_id; 8],
+            parent_span_id: None,
+            name: name.to_string(),
+            start_ts_ns: start,
+            end_ts_ns: start + 10,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![(SUBJECT_KEY.to_string(), user_id.to_string())],
+        }
+    }
+
+    /// Publish one sealed RSPAN bucket (ingest hour 0, shard 0) holding the
+    /// subject and bystander spans. Returns the input data object key.
+    async fn publish_spans_bucket(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> String {
+        let tenant_hash = tenant.hash();
+        let records = [
+            span_record(0, SUBJECT_NAME, ERASED_SUBJECT, 100),
+            span_record(1, SURVIVOR_NAME, SURVIVING_SUBJECT, 200),
+        ];
+        let min_ts = records
+            .iter()
+            .map(|r| r.start_ts_ns)
+            .min()
+            .expect("nonempty");
+        let max_ts = records.iter().map(|r| r.end_ts_ns).max().expect("nonempty");
+
+        let writer_id = Uuid::from_u128(0x2_0000);
+        let mut writer = RspanWriter::new(
+            RspanConfig::default(),
+            ravel_rspan::ObjectIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for rec in &records {
+            writer.push(rec.clone());
+        }
+        let bytes = writer.finish().expect("finish rspan object");
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Spans,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid span commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put span data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish span commit");
+        data_key
+    }
+
+    /// The span names a query would return, computed exactly as the shipped span
+    /// scan does: resolve the `Signal::Spans` snapshot through the real catalog
+    /// (which reads the `.dreq` into `pending_erasure`), derive the scan
+    /// predicates with `snapshot_erasure_predicates`, decode every RSPAN row in
+    /// the snapshot's segments, and drop the rows `is_erased_span` matches.
+    async fn query_span_names(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantHash,
+    ) -> Vec<String> {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("cli");
+        let catalog = build_catalog(Arc::clone(store), 1, cli.disable_cache, cli.cache_max_bytes)
+            .expect("catalog");
+        let snapshot = catalog
+            .resolve(
+                tenant,
+                Signal::Spans,
+                TimeRange {
+                    start_ns: 0,
+                    end_ns: TEST_NOW_NS,
+                },
+                &[],
+                TEST_NOW_NS,
+            )
+            .await
+            .expect("resolve spans snapshot");
+        let erasure = ravel_query::snapshot_erasure_predicates(&snapshot);
+
+        let mut names = Vec::new();
+        for segment in &snapshot.segments {
+            let bytes = store
+                .get(&segment.data_object_key, GetRange::Full)
+                .await
+                .expect("get span object")
+                .data;
+            let reader =
+                RspanReader::new(&bytes, &RspanConfig::default()).expect("open rspan object");
+            let (rows, _stats) = reader
+                .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
+                .expect("scan");
+            for row in rows {
+                if !ravel_query::erasure::is_erased_span(&row.attrs, row.start_ts_ns, &erasure) {
+                    names.push(row.name);
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// The spans end-to-end acceptance: the shipped scan-decision functions
+    /// exclude the subject the instant its `.dreq` is durable (while the durable
+    /// RSPAN input still holds its bytes), and a real tick then rewrites, sweeps
+    /// the `.dreq`, and physically removes the input.
+    ///
+    /// Non-vacuous flip: delete the `submit_erasure_request` call. The post-erase
+    /// resolve then carries no pending erasure, so `is_erased_span` matches
+    /// nothing and the subject span reappears (the exclusion assertion fires),
+    /// and no input is superseded (the physical-absence assertion fires).
+    #[tokio::test]
+    async fn spans_erasure_reaches_scan_exclusion_rewrite_and_physical_absence() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let data_key = publish_spans_bucket(store.as_ref(), &tenant_id).await;
+
+        // Pre-erase: both spans reachable through the real resolve + scan
+        // decision.
+        let before = query_span_names(&store, &tenant).await;
+        assert_eq!(
+            before,
+            vec![SURVIVOR_NAME.to_string(), SUBJECT_NAME.to_string()],
+            "pre-erase, both the subject and the bystander span are reachable"
+        );
+
+        // Submit the erasure request. THIS is the flip line.
+        let request_id = Uuid::from_u128(0xE7C0);
+        let dreq_key = submit_erasure_request(
+            store.as_ref(),
+            &tenant,
+            Signal::Spans,
+            request_id,
+            ERASED_SUBJECT,
+            TEST_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Spans, request_id).expect("done key");
+
+        // Immediate exclusion: the resolve reads the `.dreq`, the scan drops the
+        // subject, yet the durable RSPAN input still holds its bytes.
+        let after = query_span_names(&store, &tenant).await;
+        assert_eq!(
+            after,
+            vec![SURVIVOR_NAME.to_string()],
+            "post-erase, the span scan excludes the subject the instant its .dreq is durable"
+        );
+        assert!(
+            object_exists(store.as_ref(), &data_key).await,
+            "the durable RSPAN input still holds the subject's bytes: exclusion was logical"
+        );
+
+        // A real tick: the spans bucket is rewritten and the request completes.
+        let mut harness = TickHarness::new();
+        harness.tick(store.as_ref(), &tenant, TEST_NOW_NS, 1).await;
+
+        let records = rewrite_records(store.as_ref(), &tenant, Signal::Spans, 0, 0).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "the tick publishes one RewriteRecord for spans"
+        );
+        assert_eq!(
+            records[0].drops.len(),
+            1,
+            "the one pending request is applied"
+        );
+        assert_eq!(records[0].drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            records[0].drops[0].dropped_count, 1,
+            "exactly the subject's one span is dropped"
+        );
+        assert!(
+            object_exists(store.as_ref(), &done_key).await,
+            "every in-scope bucket carries the request, so the tick writes .done"
+        );
+        assert!(
+            object_exists(store.as_ref(), &dreq_key).await,
+            ".dreq survives until protection_horizon has elapsed"
+        );
+
+        // Past the horizon: `.dreq` swept, input physically gone.
+        let past_horizon = TEST_NOW_NS + harness.protection_horizon_ns() + 1;
+        harness.tick(store.as_ref(), &tenant, past_horizon, 1).await;
+
+        assert!(
+            object_exists(store.as_ref(), &done_key).await,
+            ".done is permanent erasure evidence"
+        );
+        assert!(
+            !object_exists(store.as_ref(), &dreq_key).await,
+            ".dreq must be swept once its .done is older than protection_horizon"
+        );
+        assert!(
+            !object_exists(store.as_ref(), &data_key).await,
+            "physical absence: the pre-rewrite RSPAN input is superseded and swept"
+        );
+
+        // Post-sweep, `.dreq` gone: the resolve carries no pending erasure, so
+        // exclusion now rests purely on the physical rewrite, and the bystander
+        // span survives in the rewrite output.
+        let post_sweep = query_span_names(&store, &tenant).await;
+        assert_eq!(
+            post_sweep,
+            vec![SURVIVOR_NAME.to_string()],
             "after the .dreq is swept, the subject stays excluded on the physical rewrite alone \
              and the bystander survives"
         );
