@@ -1081,6 +1081,150 @@ mod tests {
         assert_eq!(store.fault_count(Op::Put, FaultKind::Timeout), 1);
     }
 
+    /// Retryability classification is a normative contract
+    /// (docs/object-store-contract.md: "Retry classification"): `Throttled`,
+    /// `Timeout`, and `Transient` are retryable; `NotFound`, `AlreadyExists`,
+    /// `PreconditionFailed`, and `Permanent` are terminal. This pins both the
+    /// `StoreError` variant AND its `is_retryable()` for a representative set of
+    /// error shapes -- timeout, throttle, a permanent failure, a not-found, and
+    /// a conditional-write (CAS) conflict under each mode -- as observed through
+    /// a backend the conformance harness parameterizes (`FaultStore` over the
+    /// `MemoryStore` oracle). The S3/MinIO adapter's own `Error::Generic`
+    /// classification is pinned complementarily in `s3.rs` (issue #906), where
+    /// `object_store::Error` values can be constructed directly; together they
+    /// cover both the shared taxonomy and the S3-specific mapping.
+    ///
+    /// If a future change flipped a variant's retryability, or an adapter
+    /// misclassified one of these shapes, this fails loudly instead of letting
+    /// a retry loop spin forever on a terminal error (or give up on a
+    /// retryable one).
+    #[tokio::test]
+    async fn retryability_classification_is_pinned_across_a_parameterized_backend() {
+        // (op, scripted fault, put mode, expected variant tag, expected retryable)
+        // Each row induces one error shape and asserts the resulting StoreError
+        // and its is_retryable(). `variant` is a small tag matched below.
+        #[derive(Clone, Copy)]
+        enum Variant {
+            Timeout,
+            Throttled,
+            Transient,
+            Permanent,
+            NotFound,
+            AlreadyExists,
+            PreconditionFailed,
+        }
+
+        async fn induce(fault: ScriptedFault, op: Op, mode: PutMode) -> StoreError {
+            let plan = FaultPlan::empty().with_rule(Rule::new(op, fault));
+            let store = FaultStore::new(MemoryStore::new(), plan);
+            // Seed a key so read/head faults have something to shadow; the
+            // fault fires before the backend is reached regardless.
+            store
+                .put("k", Bytes::from_static(b"seed"), PutOptions::default())
+                .await
+                .ok();
+            match op {
+                Op::Put => store
+                    .put(
+                        "k2",
+                        Bytes::from_static(b"v"),
+                        PutOptions {
+                            mode,
+                            checksum: None,
+                        },
+                    )
+                    .await
+                    .expect_err("put fault must surface"),
+                Op::Get => store
+                    .get("k", GetRange::Full)
+                    .await
+                    .expect_err("get fault must surface"),
+                Op::Head => store.head("k").await.expect_err("head fault must surface"),
+                Op::List => store
+                    .list("", None)
+                    .await
+                    .expect_err("list fault must surface"),
+                Op::Delete => store
+                    .delete("k")
+                    .await
+                    .expect_err("delete fault must surface"),
+            }
+        }
+
+        let cases: Vec<(ScriptedFault, Op, PutMode, Variant, bool)> = vec![
+            (
+                ScriptedFault::Timeout,
+                Op::Get,
+                PutMode::Overwrite,
+                Variant::Timeout,
+                true,
+            ),
+            (
+                ScriptedFault::Throttled {
+                    retry_after_ms: 250,
+                },
+                Op::Get,
+                PutMode::Overwrite,
+                Variant::Throttled,
+                true,
+            ),
+            (
+                ScriptedFault::Transient("blip".into()),
+                Op::List,
+                PutMode::Overwrite,
+                Variant::Transient,
+                true,
+            ),
+            (
+                ScriptedFault::Permanent("nope".into()),
+                Op::Head,
+                PutMode::Overwrite,
+                Variant::Permanent,
+                false,
+            ),
+            (
+                ScriptedFault::NotFoundBlip,
+                Op::Get,
+                PutMode::Overwrite,
+                Variant::NotFound,
+                false,
+            ),
+            (
+                ScriptedFault::FailedConditionalWrite,
+                Op::Put,
+                PutMode::CreateIfAbsent,
+                Variant::AlreadyExists,
+                false,
+            ),
+            (
+                ScriptedFault::FailedConditionalWrite,
+                Op::Put,
+                PutMode::CasVersion(crate::Version("v1".into())),
+                Variant::PreconditionFailed,
+                false,
+            ),
+        ];
+
+        for (fault, op, mode, variant, retryable) in cases {
+            let err = induce(fault.clone(), op, mode).await;
+            let ok = match variant {
+                Variant::Timeout => matches!(err, StoreError::Timeout),
+                Variant::Throttled => matches!(err, StoreError::Throttled { .. }),
+                Variant::Transient => matches!(err, StoreError::Transient(_)),
+                Variant::Permanent => matches!(err, StoreError::Permanent(_)),
+                Variant::NotFound => matches!(err, StoreError::NotFound),
+                Variant::AlreadyExists => matches!(err, StoreError::AlreadyExists),
+                Variant::PreconditionFailed => matches!(err, StoreError::PreconditionFailed),
+            };
+            assert!(ok, "{fault:?} on {op:?} produced unexpected {err:?}");
+            assert_eq!(
+                err.is_retryable(),
+                retryable,
+                "{fault:?} on {op:?} -> {err:?}: retryable mismatch"
+            );
+        }
+    }
+
     /// A fixture standing in for a bucket whose versioning / lifecycle-rule
     /// state a real backend could observe but the `ObjectStoreBackend` contract
     /// cannot. Lets the required-bucket-configuration probe and its alarm
