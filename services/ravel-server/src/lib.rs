@@ -1149,15 +1149,27 @@ pub async fn start(
                 config.maintain.stalled_after_intervals,
             ))
         });
+        // The stored `sys/gc` (`config.gc`) horizon is re-asserted here against
+        // THIS running sweeper's own `clock_skew_allowance_ns` before the sweep
+        // loop is spawned (issue #993, closing the #904 write-fence gap). A
+        // skew-uncovered horizon fails startup fail-closed, before any listener
+        // binds, rather than letting the sweeper delete a pinned reader's
+        // snapshot.
         let maintenance_tasks = maintain::spawn(
             store.clone(),
             config.fold_tenants.clone(),
             config.maintain.clone(),
+            config.gc,
             discovery_metrics,
             safety_metrics,
             ownership_metrics,
             maintain_worker.clone(),
-        );
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "maintain GC-config skew re-assert failed against sys/gc (issue #993): {e}"
+            )
+        })?;
         (fold::FoldTasks::none(), maintenance_tasks)
     } else {
         let fold_tasks = fold::spawn(catalog, store.clone(), &config.fold_tenants, config.fold);

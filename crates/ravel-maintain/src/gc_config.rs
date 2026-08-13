@@ -231,6 +231,24 @@ pub enum GcConfigError {
         stored_grace_ns: i64,
     },
     #[error(
+        "sys/gc records protection_horizon={stored_horizon_ns} ns, but THIS maintain process's \
+         running sweeper is configured with clock_skew_allowance={clock_skew_allowance_ns} ns, and \
+         the skew-covering GC bound requires protection_horizon >= max_query_duration + grace + \
+         clock_skew_allowance = {} ns (stored max_query_duration={stored_max_query_duration_ns} ns, \
+         stored grace={stored_grace_ns} ns): the durable horizon does not cover the skew of the \
+         sweeper that actually deletes, so this sweeper could physically delete an object a live \
+         reader still holds (S1-02). This is a deployment error to fix -- either lower the running \
+         sweeper's --clock-skew-allowance, or raise the durable horizon via `ravel-cli gc-config \
+         set` -- refusing to enter the maintain sweep loop rather than delete a pinned snapshot",
+        .stored_max_query_duration_ns.saturating_add(*.stored_grace_ns).saturating_add(*.clock_skew_allowance_ns)
+    )]
+    MaintainSkewUncovered {
+        stored_horizon_ns: i64,
+        stored_max_query_duration_ns: i64,
+        stored_grace_ns: i64,
+        clock_skew_allowance_ns: i64,
+    },
+    #[error(
         "this query engine's deadline is {deadline_ns} ns, but sys/gc records \
          max_query_duration={max_query_duration_ns} ns: a query may not outlive the GC protection \
          horizon's query-duration term; refusing to start"
@@ -400,6 +418,37 @@ pub fn validate_maintain(
             configured_grace_ns,
             stored_horizon_ns: stored.protection_horizon_ns,
             stored_grace_ns: stored.grace_ns,
+        });
+    }
+    Ok(())
+}
+
+/// Maintain-mode startup RE-ASSERT of the skew-covering horizon bound against
+/// the RUNNING sweeper's own clock-skew allowance (issue #993, closing the #904
+/// gap). The write fence in [`set_gc_config`] validates a proposed `sys/gc`
+/// against the *CLI's* declared `clock_skew_allowance`, but that knob and the
+/// running sweeper's [`crate::CompactorConfig::clock_skew_allowance_ns`] are
+/// independent: a deployment can write `sys/gc` with a 5 min skew while running
+/// sweepers configured with a larger skew, leaving the durable horizon
+/// skew-uncovered for the sweeper that actually deletes. [`validate_maintain`]
+/// does not catch it -- it only checks that the configured horizon and grace
+/// EQUAL the stored ones; the skew term appears in neither. This check re-runs
+/// the bound `protection_horizon >= max_query_duration + grace +
+/// clock_skew_allowance` with `clock_skew_allowance_ns` taken from the running
+/// sweeper's config, so the config fence holds against the process that actually
+/// deletes. Reuses [`GcConfigValues::satisfies_constraint`] (same saturating
+/// arithmetic). Called fail-closed at maintain startup: a violation refuses to
+/// enter the sweep loop rather than delete a pinned reader's snapshot.
+pub fn validate_maintain_skew(
+    stored: &GcConfigValues,
+    clock_skew_allowance_ns: i64,
+) -> Result<(), GcConfigError> {
+    if !stored.satisfies_constraint(clock_skew_allowance_ns) {
+        return Err(GcConfigError::MaintainSkewUncovered {
+            stored_horizon_ns: stored.protection_horizon_ns,
+            stored_max_query_duration_ns: stored.max_query_duration_ns,
+            stored_grace_ns: stored.grace_ns,
+            clock_skew_allowance_ns,
         });
     }
     Ok(())
@@ -862,6 +911,70 @@ mod tests {
         // The exact defaults do pass.
         validate_maintain(&stored, stored.protection_horizon_ns, stored.grace_ns)
             .expect("the exact stored values match");
+    }
+
+    /// Issue #993, the #904-gap closer: a stored `sys/gc` that satisfies its
+    /// OWN declared skew (the CLI's `--clock-skew-allowance` at write time) is
+    /// still rejected at maintain startup when the RUNNING sweeper is configured
+    /// with a LARGER `clock_skew_allowance`, because the durable horizon no
+    /// longer covers the skew of the process that actually deletes.
+    /// `validate_maintain` (horizon/grace must-match) passes it -- the skew term
+    /// is in neither field -- so `validate_maintain_skew` is what bites.
+    ///
+    /// Flip line to watch the fail-closed check pass through (a skew-uncovered
+    /// sweeper would then be allowed to delete): change the call below to pass
+    /// `0` instead of `larger_skew`, i.e. drop the sweeper-skew term. The bound
+    /// then reduces to `horizon >= max_query_duration + grace`, which the stored
+    /// config meets, `validate_maintain_skew` returns `Ok`, and the `expect_err`
+    /// panics.
+    #[test]
+    fn maintain_skew_reassert_refuses_when_running_sweeper_skew_exceeds_stored_horizon() {
+        let write_time_skew = DEFAULT_CLOCK_SKEW_ALLOWANCE_NS; // what the CLI declared
+        // A stored config that meets the bound for the write-time skew exactly:
+        // horizon = max_query_duration + grace + 5m. Written by a #904 write
+        // fence that was told the skew was 5m.
+        let stored = GcConfigValues {
+            protection_horizon_ns: DEFAULT_MAX_QUERY_DURATION_NS
+                + DEFAULT_GRACE_NS
+                + write_time_skew,
+            grace_ns: DEFAULT_GRACE_NS,
+            max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
+            max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+        };
+        assert!(
+            stored.satisfies_constraint(write_time_skew),
+            "the stored config covers the skew it was written against"
+        );
+        // maintain's must-match validation passes: the running sweeper's horizon
+        // and grace equal the stored ones (skew is in neither).
+        validate_maintain(&stored, stored.protection_horizon_ns, stored.grace_ns)
+            .expect("horizon and grace equal the stored values");
+
+        // The running sweeper, however, is configured with a LARGER skew than
+        // the stored horizon budgets for. The re-assert must fail closed.
+        let larger_skew = write_time_skew + 60_000_000_000; // +1 min over the 5m the horizon covers
+        let err = validate_maintain_skew(&stored, larger_skew)
+            .expect_err("a running sweeper skew the stored horizon does not cover must refuse");
+        assert!(
+            matches!(
+                err,
+                GcConfigError::MaintainSkewUncovered {
+                    clock_skew_allowance_ns,
+                    stored_horizon_ns,
+                    ..
+                } if clock_skew_allowance_ns == larger_skew
+                    && stored_horizon_ns == stored.protection_horizon_ns
+            ),
+            "got: {err}"
+        );
+
+        // Mirror: a sweeper whose configured skew the stored horizon DOES cover
+        // (here the same skew the config was written against) starts clean.
+        validate_maintain_skew(&stored, write_time_skew)
+            .expect("a horizon that covers the running sweeper's skew starts normally");
+        // And a smaller running skew is covered a fortiori.
+        validate_maintain_skew(&stored, write_time_skew - 1)
+            .expect("a smaller running skew is covered too");
     }
 
     /// Query deadline validation: a deadline over the stored max_query_duration
