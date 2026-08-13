@@ -503,3 +503,153 @@ distinct, and more common, case of a unit whose operation keeps returning
 - A store NotFound on a segment pinned by a running query surfaces as
   SnapshotInvalidated; the frontend re-resolves and retries once before
   failing the query.
+
+## Deletion guarantees (ADR-0064 selective subject erasure)
+
+Everything under "Deletion and GC" above destroys whole objects at bucket
+granularity (age-based retention, supersession, orphan GC). Selective subject
+erasure (a GDPR/CCPA/DSAR request naming a *subject* -- a label or attribute
+value scattered across many hour buckets, shards, and tiers) is
+predicate-granular deletion built on the same three-step shape every other
+deletion in Ravel has: a durable transaction first, logical exclusion from new
+snapshots second, physical removal third. The mechanism is a durable erasure
+request, immediate query-time exclusion, then an asynchronous
+rewrite-and-supersede pass in Maintain, then the existing horizon-gated
+physical sweep. See the lifecycle diagram:
+[diagrams/erasure-lifecycle.svg](diagrams/erasure-lifecycle.svg).
+
+An erasure request is submitted under the Admin credential
+(`ravel-cli erase submit`) and lands as a durable, immutable predicate record
+at `t/<tenant_hash>/<signal>/del/<request_id>.dreq` (`CreateIfAbsent`). The
+predicate is a conjunction of exact-match label/attribute matchers plus an
+optional event-time range; v1 predicates are equality-only (exact semantics by
+default). The `CreateIfAbsent` ack timestamp is `t = 0` -- the point from which
+every bound below is measured.
+
+### The guarantee, stage by stage
+
+| Stage | Guarantee | Worst-case bound (defaults) |
+|---|---|---|
+| Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within `max_query_duration` (30 s) |
+| Rewrite complete (`.done`) | Every live segment, index entry, and derived dataset is free of matching records | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric |
+| Physical bytes gone from the bucket | Superseded inputs swept | `.done` + `protection_horizon` (default `max_query_duration` + `grace` = 30 s + 24 h) + one sweep interval -- with defaults, under 4 days end to end |
+| Physical bytes gone from query-node disk caches | Non-durable local copies aged out | sweep + disk-tier entry max-age (24 h); or immediately, by deleting cache directories (ADR-0046: a node with its cache directory deleted mid-flight answers every query correctly) |
+
+Each stage in detail:
+
+- **Query exclusion is immediate and cache-tight.** Snapshot resolution lists
+  `t/<th>/<sig>/del/` per resolve and attaches every pending `.dreq`
+  predicate to the resolved snapshot; the scan/materialization layer filters
+  matching series, rows, and spans out of results *after* fetch, *after*
+  cache, before any result reaches the caller. So the filter applies to
+  cached bytes exactly as to freshly-fetched bytes, and no cache tier can
+  surface an excluded record. A query already running keeps its pinned
+  snapshot (snapshot isolation) and is bounded by `max_query_duration`. This
+  is the bounded *bridge* between request and physical rewrite; alone it
+  would be "query exclusion, not erasure," which is why the rewrite pass
+  below is not optional.
+
+- **The rewrite pass physically erases by rewrite-and-supersede.** A Maintain
+  rule reads each in-scope sealed bucket's live segments, decodes, drops the
+  matching records, re-encodes into new segments of the *same frozen format
+  version* (RSEG/RLOG/RSPAN -- producing new valid instances of a frozen
+  format is not a format change), and publishes one `RewriteRecord` that
+  atomically supersedes its named inputs, exactly as a `CompactionRecord`
+  does. A conservation gate asserts `sum(output sample_count) + sum(dropped
+  counts) == sum(input sample_count)` pre-publish; any inequality aborts and
+  publishes nothing, leaving the inputs live (the ADR-0048 gate rearranged
+  for deliberate drops). Unlike compaction, overlap harmlessness does *not*
+  hold for a rewrite -- its outputs deliberately lack records the inputs
+  contain -- so the §2 query-time filter stays active for a request's
+  predicate until its `.dreq` is removed, which by construction happens only
+  after no resolvable snapshot can still reference a pre-rewrite input.
+  Correctness never depends on the per-bucket compaction/rewrite
+  serialization; that serialization is an efficiency measure.
+
+- **The 72 h rewrite bound derives from the maintenance ownership cadence
+  (ADR-0065).** The rewrite pass runs on the Maintain worker that owns each
+  `(tenant_hash, signal, shard)` unit under ADR-0065's rendezvous-hash
+  ownership. A dead or wedged owner's units are taken over by a live sibling
+  within `3 * H` (heartbeat interval `H`, default 60 s, so ~3 min), and even
+  a terminal *interior*-zone bucket -- where a subject's historical data
+  most often sits -- is re-verified at least every `maintain_interior_reverify`
+  (default 6 h), or immediately when EJ's rewrite orders drive it out of
+  terminal state through ADR-0065's `invalidate` hook. So every in-scope
+  bucket is revisited on a cadence far tighter than the 72 h
+  `erasure_rewrite_deadline`; the deadline is the outer alarm, not the
+  expected latency. Completion is *verified, not assumed*: the pass writes
+  the `.done` record only when every bucket in the request's scope has a live
+  record set whose every non-superseded rewrite record names this request in
+  its drops.
+
+- **Physical removal reuses the existing sweep.** A rewrite's superseded
+  inputs become inputs to `sweep_superseded`, deleted after
+  `protection_horizon`, under the same `LegalHoldCheck` gate as every other
+  delete (see "Deletion and GC"). The `.dreq` itself contains the subject
+  identifier and is therefore not kept forever: a sweep rule deletes it once
+  its `.done` exists, `now >= done.created_unix_ns + protection_horizon`, and
+  the legal-hold check passes -- the horizon wait guarantees the query-time
+  filter only disappears after no resolvable snapshot can still include a
+  pre-rewrite input. The `.done` record carries only a hash of the canonical
+  predicate, per-bucket dropped counts, and timestamps -- no subject
+  identifier -- and is permanent, deny-delete audit evidence for every role
+  (ADR-0055 amendment).
+
+### Modifiers to the bound
+
+Each of these extends the bounds above rather than being silently absorbed
+into them. An operator with erasure obligations must budget them deliberately.
+
+- **`+D` -- bucket-default Object Lock retention.** If the operator enabled
+  compliance-mode default retention `D` (the out-of-band step ADR-0042
+  documents; Ravel cannot set or enforce per-object retention through
+  `object_store`), S3 itself refuses the sweep's deletes until each object's
+  retain-until passes, so the physical-removal bound becomes `max(bound, D)`.
+  docs/object-store-contract.md "Required bucket configuration" advises
+  operators with erasure obligations to prefer scoped legal holds over
+  blanket default retention, or to keep `D` inside their erasure SLA.
+
+- **`+E_v` -- bucket versioning.** On a versioned bucket every physical delete
+  becomes a soft delete, and the noncurrent version survives until the
+  operator's required `NoncurrentDays = E_v` expiration rule reaps it. Every
+  physical-erasure and retention bound then gains `+E_v`. Versioning without
+  that expiration rule is an unsupported configuration that silently inverts
+  every deletion guarantee here (S4-12); see the object-store contract.
+
+- **paused -- overlapping legal hold.** The rewrite pass and the
+  superseded-input sweep both consult `LegalHoldCheck`; a bucket under an
+  overlapping hold is skipped, the request stays pending, and its status
+  records `deferred: legal hold <scope>`. The erasure-latency clock is
+  explicitly *paused* for held ranges: a hold preserves evidence against
+  destruction and wins over erasure until an authorized human clears it via
+  the separate Admin-only legal-hold operation (ADR-0042/ADR-0055). Erasure
+  never clears a hold and never re-submission is needed -- the next pass
+  completes once the hold clears. Query-time exclusion (§2) stays active
+  throughout: a hold does not oblige Ravel to keep *serving* the data.
+
+### Scope and interactions
+
+- **Catalog and derived state carry no subject values.** `SnapshotEntry`,
+  `SnapshotPartHeader`, and name postings hold identities, hashes, counts,
+  and metric names -- never label/attribute *values* -- so the deny-deleted
+  `catalog/`, `prov`, and `sys/*` prefixes are disjoint from subject erasure
+  by construction. This holds *only if* subject identifiers appear as
+  label/attribute values and never inside metric names (a documented
+  requirement; see docs/object-store-contract.md "Required bucket
+  configuration" point 5). Superseded catalog entries resolve to NotFound ->
+  SnapshotInvalidated -> re-resolve and the next fold rebuilds over the
+  rewrite outputs.
+
+- **The query-audit keyspace is the one excluded derived store.** It may
+  retain matcher values from audited query text (S4-13); it is deny-deleted
+  under ADR-0055 and owned by epic EL (#462), which will hash/tokenize
+  matcher values. Until EL lands, the erasure guarantee explicitly does not
+  reach the audit keyspace.
+
+- **Erasure applies to the primary bucket only.** Replicas or external
+  backups are outside Ravel's deletion reach by definition (ADR-0058/0059 DR
+  posture); an operator with replicated buckets must apply the same lifecycle
+  discipline (docs/object-store-contract.md) to replicas. Per-tenant KMS
+  crypto-erasure (epic EL) is the complementary, backup-reaching,
+  tenant-granularity layer to this ADR's subject-granularity physical
+  erasure.
