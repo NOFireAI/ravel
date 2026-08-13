@@ -2356,7 +2356,7 @@ mod tests {
                 }
             })
             .collect();
-        series.sort_by(|a, b| a.series_id.cmp(&b.series_id));
+        series.sort_by_key(|s| s.series_id);
 
         let writer_id = Uuid::from_u128(9_100);
         let written = SegmentWriter::write(
