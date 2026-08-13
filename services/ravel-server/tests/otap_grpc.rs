@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
@@ -20,10 +20,13 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use prost::Message;
 use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
+use ravel_object_store::fault::{FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_otap::encode::{DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder};
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_client::ArrowMetricsServiceClient;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
+use ravel_server::ingest_concurrency::IngestConcurrencyLimit;
 use ravel_server::{FoldTaskConfig, LimitsConfig, Mode, ServerConfig};
 use ravel_types::TenantId;
 
@@ -140,6 +143,63 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
+    };
+    ravel_server::start(
+        config,
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
+}
+
+/// Like [`start_test_server`] but backed by `store` (a `FaultStore`, so a test
+/// can hold a data-object PUT open and keep an admitted OTAP batch genuinely
+/// in-flight) with the process-wide in-flight ingest ceiling set to `limit`.
+/// One shard, so every write lands on the same flush.
+async fn start_test_server_fault(
+    store: Arc<dyn ObjectStoreBackend>,
+    limit: IngestConcurrencyLimit,
+) -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let config = ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
+        mode: Mode::All,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: true,
+        metrics_tenant_labels: false,
+        limits: LimitsConfig::default(),
+        deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        scrub_period: std::time::Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
+        distrib: None,
+        remote_clusters: Vec::new(),
+        ingest_concurrency_limit: limit,
     };
     ravel_server::start(
         config,
@@ -575,6 +635,123 @@ async fn active_series_cap_partial_success_reports_drop_count() {
             .contains(&format!("{dropped} data points rejected")),
         "ack must report the dropped-point count ({dropped}): {:?}",
         status.status_message
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// How many durable metrics data objects `store` holds for tenant `acme`.
+async fn durable_metric_object_count(store: &dyn ObjectStoreBackend) -> usize {
+    let prefix = format!("t/{}/m/l0/", TenantId::new("acme").hash().to_hex());
+    list_all(store, &prefix)
+        .await
+        .expect("list metrics data objects")
+        .len()
+}
+
+/// Issue #835: the OTAP gRPC ingest path is gated by the same process-wide
+/// in-flight ingest ceiling (issue #802) OTLP is, so a burst of OTAP exports
+/// cannot bypass the admission-shed backpressure. With the ceiling at 1, one
+/// admitted batch held mid-flush occupies the only slot; a second batch on a
+/// fresh stream is shed with `RESOURCE_EXHAUSTED` (OTLP's shed status),
+/// ingests nothing, and -- like the byte-rate rejection -- tears its stream
+/// down so a batch queued behind it never gets a status. Once the held batch
+/// releases its permit, the next export succeeds.
+///
+/// Drives the real `ArrowMetricsService::arrow_metrics` handler over gRPC, not
+/// a private helper. To watch this test fail (proving the gate bites, not just
+/// a passing wire-up), delete the `try_admit` block at the top of
+/// `otap_grpc::process_batch`: the shed batch would then be admitted, ack OK
+/// instead of `RESOURCE_EXHAUSTED`, and the stream would not tear down.
+#[tokio::test]
+async fn otap_batch_over_inflight_ceiling_is_shed() {
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    let running = start_test_server_fault(store.clone(), IngestConcurrencyLimit::Bounded(1)).await;
+    let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
+
+    // Hold only the first metrics data-object PUT open, so the admitted batch's
+    // strict write blocks awaiting its flush's durable ack and keeps holding
+    // the one permit. `Nth(1)` (not `Always`) leaves the "after" batch's later
+    // PUT free to complete once the permit is released: a hold gate has no
+    // disarm, so an `Always` gate would re-hold every subsequent flush.
+    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new("acme").hash().to_hex());
+    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Nth(1));
+
+    let ts = now_ns();
+
+    // The single admitted batch: its strict write blocks on the held PUT, so it
+    // stays in flight -- holding the only permit -- for the whole window below.
+    let held =
+        tokio::spawn(async move { send_one_batch(grpc_addr, otap_gauge_batch("held", ts)).await });
+
+    // Wait until the held batch actually reaches (and is blocked on) its PUT:
+    // at that point it has passed admission, holds the permit, and is genuinely
+    // in flight. Deterministic, no sleep race.
+    gate.wait_until_held(1).await;
+    assert!(
+        !held.is_finished(),
+        "the admitted batch must still be in flight, blocked on the held flush"
+    );
+
+    // A second stream with two batches: the first is shed over the ceiling and
+    // tears the stream down, so the second never gets a status. Proves both the
+    // shed and the teardown, the way the byte-rate test does.
+    let shed_statuses = open_stream_send(
+        grpc_addr,
+        otap_stream_batches(&[&["shed_a"], &["shed_b"]], ts),
+    )
+    .await;
+    assert_eq!(
+        shed_statuses.len(),
+        1,
+        "an in-flight-ceiling shed must tear the stream down: the second batch must never get a status, got {shed_statuses:?}"
+    );
+    assert_eq!(
+        shed_statuses[0].status_code,
+        StatusCode::ResourceExhausted as i32,
+        "a batch over the in-flight ceiling must be shed as RESOURCE_EXHAUSTED, matching OTLP: {}",
+        shed_statuses[0].status_message
+    );
+    assert!(
+        shed_statuses[0]
+            .status_message
+            .contains("process in-flight ingest-request limit reached"),
+        "shed message must be the in-flight-ceiling reason, not another RESOURCE_EXHAUSTED (byte rate, buffer budget): {:?}",
+        shed_statuses[0].status_message
+    );
+
+    // Release the held PUT and let the admitted batch finish, freeing the slot.
+    for id in gate.held() {
+        gate.release(id);
+    }
+    let held_status = tokio::time::timeout(Duration::from_secs(10), held)
+        .await
+        .expect("held batch completes within 10s")
+        .expect("held task joins");
+    assert_eq!(
+        held_status.status_code,
+        StatusCode::Ok as i32,
+        "the admitted batch must ack OK once its flush is released: {}",
+        held_status.status_message
+    );
+
+    // With the permit freed, the next export succeeds.
+    let after = send_one_batch(grpc_addr, otap_gauge_batch("after", ts)).await;
+    assert_eq!(
+        after.status_code,
+        StatusCode::Ok as i32,
+        "once a permit frees, the next OTAP export must be admitted: {}",
+        after.status_message
+    );
+
+    // The shed batch ingested nothing: only the two admitted batches ("held"
+    // and "after", each its own flush) ever became durable. A third object
+    // would mean the shed batch reached the write path.
+    assert_eq!(
+        durable_metric_object_count(store.as_ref()).await,
+        2,
+        "the shed batch must write nothing durable: only the two admitted batches' flushes persist"
     );
 
     running.shutdown().await.expect("graceful shutdown");
