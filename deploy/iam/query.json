@@ -44,7 +44,7 @@
     {
       "Sid": "QueryTenantKms",
       "Effect": "Allow",
-      "Action": "kms:Decrypt",
+      "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
       "Resource": "arn:aws:kms:us-east-1:111122223333:key/*"
     },
     {

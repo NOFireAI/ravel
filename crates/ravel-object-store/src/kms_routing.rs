@@ -119,6 +119,24 @@ fn parse_tenant_hash(key: &str) -> Option<&str> {
     if hash.is_empty() { None } else { Some(hash) }
 }
 
+/// Whether a write to `key` selects a per-tenant SSE-KMS key --- i.e. routes
+/// through the tenant key rather than delegating to the default store. True
+/// exactly when `key` is tenant-scoped (`t/<non-empty-hash>/<...>`), the same
+/// structural condition [`routed_store`](KmsRoutingStore::routed_store) checks
+/// before consulting the configured-key map; the runtime map only decides
+/// *whether that tenant has a key configured*, never *which keys are eligible
+/// to route*.
+///
+/// Exposed so an out-of-crate policy check (ravel-commit's `iam_templates`
+/// test) can assert that every routed key class a role PUTs is covered by that
+/// role's `kms:Encrypt`/`kms:GenerateDataKey*` grant. Because the check calls
+/// this function rather than re-encoding the `t/<hash>/` rule by hand, widening
+/// the routing here fails that policy test instead of letting a real write fail
+/// closed with `AccessDenied` under `--tenant-kms-config`.
+pub fn routes_through_tenant_key(key: &str) -> bool {
+    parse_tenant_hash(key).is_some()
+}
+
 impl KmsRoutingStore {
     /// Wrap `default` (the deployment-default store) and build per-tenant stores
     /// by cloning `default_config`, overriding only `kms_key_id`, and calling
@@ -753,6 +771,50 @@ mod tests {
             2,
             "a key rotation must rebuild the per-tenant store, not reuse the stale cache entry"
         );
+    }
+
+    /// Pin exactly which key shapes `routes_through_tenant_key` reports as
+    /// routed. This is the predicate ravel-commit's `iam_templates` test
+    /// consults to decide which roles need a `kms:Encrypt`/`GenerateDataKey*`
+    /// grant, so widening it (a new routed keyspace) must be a deliberate edit
+    /// here that also updates the policies those keys are written by. Wildcard
+    /// (`*`)-bearing forms match the resource-ARN patterns those policies use
+    /// verbatim: the policy test passes patterns straight through this function.
+    #[test]
+    fn routes_through_tenant_key_pins_prefixes() {
+        // Tenant-scoped writes route (concrete and policy-pattern forms alike).
+        for routed in [
+            "t/abc/seg/0001",
+            "t/abc/catalog/0/snap/1",
+            "t/abc/catalog/0/HEAD",
+            "t/abc/catalog/0/idx/1",
+            "t/abc/u/1/0000/0",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/HEAD",
+            "t/*/catalog/*/idx/*",
+            "t/*/u/*",
+            "t/*/*/l0/*",
+        ] {
+            assert!(
+                routes_through_tenant_key(routed),
+                "{routed:?} is tenant-scoped and must route through the tenant key"
+            );
+        }
+        // Non-tenant keyspaces and malformed t/ keys never route.
+        for not_routed in [
+            "sys/tenancy",
+            "admission/query/x",
+            "prov/x",
+            "t/",
+            "t//seg",
+            "t/onlyhash",
+            "",
+        ] {
+            assert!(
+                !routes_through_tenant_key(not_routed),
+                "{not_routed:?} is not tenant-scoped and must not route"
+            );
+        }
     }
 
     #[test]
