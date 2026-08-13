@@ -24,7 +24,7 @@ pub use instrument::{InstrumentedStore, StoreMetrics};
 /// Per-tenant SSE-KMS key routing decorator (ADR-0062 decision 1a): routes
 /// tenant writes to lazily-built, cached per-tenant [`s3::S3Store`]s while every
 /// read and non-tenant key delegates to the default store.
-pub use kms_routing::KmsRoutingStore;
+pub use kms_routing::{KmsRoutingStore, routes_through_tenant_key};
 
 /// Two-class request scheduling (ADR-0070 decision 1): [`ClassedStore`] hands
 /// out foreground/background handles sharing one [`RequestScheduler`], with

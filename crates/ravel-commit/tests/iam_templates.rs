@@ -206,15 +206,65 @@ fn resource_key_patterns(policy: &Policy) -> Vec<String> {
     out
 }
 
+/// Resource-ARN key patterns (bucket prefix stripped) from every statement
+/// whose `Action` grants `s3:PutObject` --- the writes that go through
+/// `KmsRoutingStore` and can select a per-tenant key. Delete/Get/Deny
+/// statements are excluded: they never route (reads and deletes delegate to
+/// the default store unconditionally, see `kms_routing.rs`).
+fn put_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy.statements.as_array().unwrap() {
+        let grants_put = match &stmt["Action"] {
+            serde_json::Value::String(s) => s == "s3:PutObject",
+            serde_json::Value::Array(a) => a.iter().any(|v| v == "s3:PutObject"),
+            _ => false,
+        };
+        if !grants_put {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+                out.push(key_pattern.to_string());
+            }
+        }
+    }
+    out
+}
+
 const ROLES_WITH_DISCOVERY: [&str; 3] = ["gateway", "query", "maintain"];
 const ALL_ROLES: [&str; 4] = ["gateway", "query", "maintain", "admin"];
 
+/// Roles that PUT routed `t/<hash>/...` objects yet are deliberately kept
+/// Decrypt-only, exempt from the routed-write KMS grant rule below. Today only
+/// `admin`: ADR-0055 keeps it `GetObject`-only for routine data and forbids it
+/// `kms:GenerateDataKey*` (see `admin_has_no_kms_generate_data_key`) so a
+/// leaked Admin credential cannot mint ciphertext under tenant keys it has no
+/// write role for. Admin's narrow routed PUTs (`t/*/*/c/*` via
+/// `ravel-cli commit reconstruct`, the `t/*/u/*` audit prefix) therefore fail
+/// closed under `--tenant-kms-config` -- a known operational gap documented in
+/// docs/guides/operations.md, not a bug this test should paper over by
+/// demanding the grant. Listing the role here (rather than skipping the whole
+/// admin policy) keeps the exemption explicit and load-bearing: the test still
+/// asserts an exempt role actually writes routed objects, so the exemption
+/// cannot rot into masking a future regression.
+const ROUTED_WRITE_EXEMPT_ROLES: [&str; 1] = ["admin"];
+
 /// Roles whose IAM policy writes tenant data through `KmsRoutingStore`
-/// (issue #929): Gateway's ingest PUTs and Maintain's compaction/rewrite
-/// PUTs land under `t/<hash>/...` and, once `--tenant-kms-config` routes
-/// that tenant to its own key, require `kms:GenerateDataKey*`/`kms:Encrypt`
-/// on that key or the PUT fails closed.
-const WRITE_ROLES: [&str; 2] = ["gateway", "maintain"];
+/// (issues #929, #972): Gateway's ingest PUTs, Maintain's compaction/rewrite
+/// PUTs, and Query's catalog-fold (`t/<hash>/catalog/.../snap|HEAD|idx`) and
+/// query-audit (`t/<hash>/u/...`) PUTs all land under `t/<hash>/...` and, once
+/// `--tenant-kms-config` routes that tenant to its own key, require
+/// `kms:GenerateDataKey*`/`kms:Encrypt` on that key or the PUT fails closed.
+/// This is a hand-maintained list; `roles_writing_routed_objects_have_kms_grant`
+/// is the anti-drift guard that derives the same requirement from each policy's
+/// own PUT patterns and `KmsRoutingStore`'s real routing predicate.
+const WRITE_ROLES: [&str; 3] = ["gateway", "maintain", "query"];
 
 /// `kms:*` action strings appearing anywhere in `policy`'s statements
 /// (`Action` as a bare string or an array), regardless of statement Sid.
@@ -234,14 +284,14 @@ fn kms_actions(policy: &Policy) -> Vec<String> {
     out
 }
 
-/// Gateway/Maintain write tenant data objects through `KmsRoutingStore`
+/// Gateway/Maintain/Query write tenant data objects through `KmsRoutingStore`
 /// (ADR-0062 decision 1a): a configured tenant's PUT is delegated to a
 /// per-tenant `S3Store` built with that tenant's SSE-KMS key, which needs
 /// `kms:GenerateDataKey*` (and `kms:Encrypt`) on the caller's IAM policy or
-/// the PUT fails closed with `AccessDenied` -- issue #929. Flip either
-/// role's added `*TenantKms` statement (or narrow its Action list to drop
-/// `kms:GenerateDataKey*`) in `deploy/iam/{gateway,maintain}.json` and this
-/// test fails.
+/// the PUT fails closed with `AccessDenied` -- issues #929, #972. Flip any
+/// role's `*TenantKms` statement (or narrow its Action list to drop
+/// `kms:GenerateDataKey*`) in `deploy/iam/{gateway,maintain,query}.json` and
+/// this test fails.
 #[test]
 fn write_roles_have_kms_generate_data_key() {
     for role in WRITE_ROLES {
@@ -249,9 +299,66 @@ fn write_roles_have_kms_generate_data_key() {
         let actions = kms_actions(&policy);
         assert!(
             actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
-            "{role}: policy is missing kms:GenerateDataKey* -- its ingest/compaction \
-             PUTs under t/<hash>/... will fail closed against a --tenant-kms-config \
-             tenant (issue #929). Found kms actions: {actions:?}"
+            "{role}: policy is missing kms:GenerateDataKey* -- its ingest/compaction/\
+             catalog-fold PUTs under t/<hash>/... will fail closed against a \
+             --tenant-kms-config tenant (issues #929, #972). Found kms actions: {actions:?}"
+        );
+    }
+}
+
+/// Anti-drift guard (issue #972): for EVERY role, derive whether it PUTs any
+/// object that routes through `KmsRoutingStore`'s per-tenant key straight from
+/// the policy's own `s3:PutObject` resource patterns and the crate's real
+/// routing predicate (`ravel_object_store::routes_through_tenant_key`), then
+/// require that role to carry both `kms:Encrypt` and `kms:GenerateDataKey*`.
+///
+/// Unlike `write_roles_have_kms_generate_data_key`, this test hardcodes no role
+/// list and no key strings: it reads whatever the policy grants PutObject on
+/// and asks the routing code itself whether that shape routes. So it fails in
+/// two independent drift directions --- a policy gaining a new routed PUT class
+/// without the KMS grant, or `routes_through_tenant_key` widening to cover a
+/// keyspace some role already PUTs --- either of which would otherwise ship a
+/// write that fails closed under `--tenant-kms-config`.
+///
+/// Demonstrated non-vacuous: before #972, `deploy/iam/query.json` PUT
+/// `t/*/catalog/*/{snap/*,HEAD,idx/*}` and `t/*/u/*` (all routed) while its
+/// `QueryTenantKms` statement granted only `kms:Decrypt`; this assertion failed
+/// naming `query` until `kms:Encrypt`/`kms:GenerateDataKey*` were added.
+#[test]
+fn roles_writing_routed_objects_have_kms_grant() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let routed: Vec<String> = put_resource_key_patterns(&policy)
+            .into_iter()
+            .filter(|p| ravel_object_store::routes_through_tenant_key(p))
+            .collect();
+        if ROUTED_WRITE_EXEMPT_ROLES.contains(&role) {
+            // Keep the exemption honest: an exempt role that no longer writes
+            // any routed object should be dropped from the list, not left to
+            // silently mask a later regression. `admin_has_no_kms_generate_data_key`
+            // separately pins that this exempt role stays Decrypt-only.
+            assert!(
+                !routed.is_empty(),
+                "{role}: listed in ROUTED_WRITE_EXEMPT_ROLES but PUTs no routed \
+                 object -- remove it from the exemption list"
+            );
+            continue;
+        }
+        if routed.is_empty() {
+            continue;
+        }
+        let actions = kms_actions(&policy);
+        assert!(
+            actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
+            "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
+             kms:GenerateDataKey* -- those writes fail closed under \
+             --tenant-kms-config (issue #972). Found kms actions: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| a == "kms:Encrypt"),
+            "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
+             kms:Encrypt -- those writes fail closed under --tenant-kms-config \
+             (issue #972). Found kms actions: {actions:?}"
         );
     }
 }
