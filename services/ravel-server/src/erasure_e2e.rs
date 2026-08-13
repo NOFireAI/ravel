@@ -1,0 +1,596 @@
+//! ADR-0064 EJ-T8 end-to-end selective-subject erasure reachability acceptance
+//! (issue #756, epic EJ #460).
+//!
+//! Where the per-crate unit tests each prove one link of the erasure pipeline in
+//! isolation, this module drives the WHOLE shipped chain together, for every
+//! signal, through the real surfaces a deployment exposes:
+//!
+//! 1. Ingest a subject's records plus a bystander's into a sealed bucket.
+//! 2. Submit a `.dreq` erasure request exactly as `ravel-cli erase submit` does.
+//! 3. Immediate query exclusion, including from a WARM read cache: the subject's
+//!    bytes are pulled into the ADR-0046 read cache by a pre-erase query, and the
+//!    post-erase query -- reusing that same warm cache -- still excludes them,
+//!    because the ADR-0064 scan-time filter runs post-cache.
+//! 4. Real maintenance ticks ([`crate::maintain::run_tick_with_clock`] with an
+//!    injected clock) publish a `RewriteRecord` for the subject's bucket while
+//!    the bystander survives bit-exact.
+//! 5. Past `protection_horizon`, the request's `.done` marker exists and its
+//!    `.dreq` is swept.
+//! 6. Physical absence: the pre-rewrite input object (which held the subject's
+//!    bytes) is superseded and swept from durable storage; survivors remain.
+//!
+//! Plus a `FaultStore` failure-path variant proving a fault during the rewrite
+//! publish leaves the system in a safe state (no partial deletion, no `.dreq`
+//! removed without its `.done`, and the erasure completes on retry).
+//!
+//! **Signal coverage.** Metrics and logs are exercised through the real
+//! ravel-server HTTP surfaces (`/api/v1/query` and `/api/v1/sql`). Spans have no
+//! ravel-server query endpoint (the SQL executor routes only `logs` and
+//! `samples`; `FROM spans` is unreachable through the server -- a pre-existing,
+//! documented limitation, ADR-0041 phase 5, NOT an erasure gap), so the span
+//! query-exclusion link is driven through the real `ravel_sql::SpansTableProvider`
+//! scan path over a snapshot resolved by the real catalog (which reads the
+//! `.dreq`). The physical rewrite/sweep/absence link runs through the same
+//! production `run_tick` for all three signals.
+
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_arguments)]
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use clap::Parser;
+use ravel_commit::publish::RetryPolicy;
+use ravel_commit::record::NewCommitRecord;
+use ravel_commit::{keys, publish, record};
+use ravel_object_store::list_all;
+use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
+use ravel_query::http::StaticBearerTokenResolver;
+use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
+use serde_json::Value;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use crate::Cli;
+use crate::maintain::{MaintenanceOwnershipMetrics, MaintenanceSafetyMetrics, run_tick_with_clock};
+use crate::query::{build_app_state, build_catalog};
+use crate::store::build_cache;
+
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+/// The injected "now" every tick runs at: hour 10_000 (1971), far past the seal
+/// margin for the ingest-hour-0 buckets these tests publish, so the rewrite pass
+/// sees a sealed bucket with no wall-clock dependence.
+const TEST_NOW_NS: i64 = 10_000 * NS_PER_HOUR;
+
+/// The label/attribute key whose value names the erasure subject.
+const SUBJECT_KEY: &str = "user_id";
+/// The subject to erase, and the bystander that must survive untouched.
+const ERASED_SUBJECT: &str = "u123";
+const SURVIVING_SUBJECT: &str = "u999";
+
+const METRIC_NAME: &str = "http_requests";
+/// The bystander's sample value. A non-integer f64 so a bit-exact survival check
+/// (`to_bits`) after the rewrite is meaningful, not satisfiable by a zeroed or
+/// truncated payload.
+const SURVIVOR_VALUE: f64 = 1234.5;
+/// The subject's sample value, distinct so a stray survival is unambiguous.
+const SUBJECT_VALUE: f64 = 42.25;
+/// The event time of every metric sample: one second past the epoch, inside
+/// ingest-hour bucket 0.
+const SAMPLE_TS_NS: i64 = 1_000_000_000;
+
+/// [`crate::maintain::DEFAULT_STALLED_AFTER_INTERVALS`] is private to that
+/// module; the value is not load-bearing for these tests (no unit ever stalls),
+/// so a local copy of the same default keeps the ownership metric constructible.
+const STALLED_AFTER_INTERVALS: u32 = 3;
+
+// --- shared maintenance-tick driver ---------------------------------------
+
+/// The full per-tenant fixture a real tick needs, built once and reused across
+/// ticks so the memo persists exactly as the running service's does.
+struct TickHarness {
+    compactor: ravel_maintain::CompactorConfig,
+    retention: ravel_maintain::RetentionConfig,
+    memo: ravel_maintain::scan::MaintainMemo,
+    safety: MaintenanceSafetyMetrics,
+    ownership: MaintenanceOwnershipMetrics,
+    worker: ravel_maintain::WorkerSet,
+}
+
+impl TickHarness {
+    fn new() -> Self {
+        Self {
+            compactor: ravel_maintain::CompactorConfig::default(),
+            retention: ravel_maintain::RetentionConfig::default(),
+            memo: ravel_maintain::scan::MaintainMemo::with_default_interval(),
+            safety: MaintenanceSafetyMetrics::default(),
+            ownership: MaintenanceOwnershipMetrics::new(STALLED_AFTER_INTERVALS),
+            worker: ravel_maintain::WorkerSet::with_defaults(0),
+        }
+    }
+
+    fn protection_horizon_ns(&self) -> i64 {
+        self.compactor.protection_horizon_ns
+    }
+
+    /// Drive one real maintenance tick at `now_ns` over `shard_count` shards --
+    /// the same `run_tick_with_clock` the running service calls, only with the
+    /// clock injected so the `.dreq` sweep's `protection_horizon` wait is
+    /// deterministic (CLAUDE.md: time is injected).
+    async fn tick(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        now_ns: i64,
+        shard_count: u32,
+    ) {
+        let clock = ravel_maintain::FixedClock::new(now_ns);
+        let live_set = self.worker.solo_live_set();
+        run_tick_with_clock(
+            &clock,
+            store,
+            tenant,
+            &self.compactor,
+            &self.retention,
+            shard_count,
+            &mut self.memo,
+            &self.safety,
+            &self.ownership,
+            &self.worker,
+            &live_set,
+        )
+        .await;
+    }
+}
+
+// --- durable-store erasure oracles ----------------------------------------
+
+/// Every `RewriteRecord` present in `(tenant, signal, shard, hour)`, decoded, in
+/// key order. A published rewrite is the durable evidence the erasure pass acted
+/// on the bucket.
+async fn rewrite_records(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hour: u32,
+) -> Vec<ravel_proto::commit::v1::RewriteRecord> {
+    let prefix =
+        keys::commit_shard_hour_prefix(tenant, signal, shard, hour).expect("bucket prefix");
+    let mut found: Vec<String> = list_all(store, &prefix)
+        .await
+        .expect("list bucket")
+        .into_iter()
+        .map(|meta| meta.key)
+        .filter(|key| key.contains("/rw."))
+        .collect();
+    found.sort();
+    let mut out = Vec::with_capacity(found.len());
+    for key in found {
+        let got = store.get(&key, GetRange::Full).await.expect("get rewrite");
+        out.push(ravel_commit::erasure::decode_rewrite(&got.data).expect("decode rewrite"));
+    }
+    out
+}
+
+/// The label sets a metrics rewrite record's output parts actually hold, read
+/// back out of the published segment objects: the "survivors are intact" oracle
+/// that reads what a query would read, not what the record claims.
+async fn rewritten_metric_labels(
+    store: &dyn ObjectStoreBackend,
+    record: &ravel_proto::commit::v1::RewriteRecord,
+) -> Vec<LabelSet> {
+    use ravel_segment::{ReaderLimits, decode_catalog_v5, open_from_full};
+
+    let limits = ReaderLimits::default();
+    let mut out = Vec::new();
+    for part in &record.parts {
+        let key = keys::reconstruct_rewrite_part_key(record, part).expect("part key");
+        let got = store.get(&key, GetRange::Full).await.expect("get part");
+        let object = got.data;
+        let loc = open_from_full(&object, limits).expect("open part");
+        for entry in decode_catalog_v5(&loc.footer, &object, limits).expect("decode catalog") {
+            out.push(entry.entry.labels);
+        }
+    }
+    out
+}
+
+/// Whether `data_key` is still a durable object in the store.
+async fn object_exists(store: &dyn ObjectStoreBackend, data_key: &str) -> bool {
+    store.get(data_key, GetRange::Full).await.is_ok()
+}
+
+// --- erasure request submission (the EJ-T6 `erase submit` write) -----------
+
+/// Submit one erasure request exactly as `ravel-cli erase submit` does: a
+/// validated [`ravel_proto::commit::v1::ErasureRequest`] written `CreateIfAbsent`
+/// to its `.dreq` key. Returns the key.
+async fn submit_erasure_request(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    request_id: Uuid,
+    subject: &str,
+    now_ns: i64,
+) -> String {
+    let request = ravel_proto::commit::v1::ErasureRequest {
+        format_version: ravel_commit::erasure::FORMAT_VERSION,
+        tenant_hash: tenant.0.to_vec(),
+        signal: ravel_commit::signal::to_proto(signal) as i32,
+        request_id: request_id.to_string(),
+        created_unix_ns: now_ns,
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: SUBJECT_KEY.to_string(),
+            value: subject.to_string(),
+        }],
+        window_start_ns: 0,
+        window_end_ns: 0,
+        reason: "dsar".to_string(),
+    };
+    ravel_commit::erasure::validate_request(&request).expect("valid request");
+    let key = keys::erasure_request_key(tenant, signal, request_id).expect("dreq key");
+    store
+        .put(
+            &key,
+            ravel_commit::erasure::encode_request(&request),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("submit .dreq");
+    key
+}
+
+// === Metrics: full HTTP e2e chain =========================================
+
+fn metric_labels(subject: &str, disc: &str) -> LabelSet {
+    LabelSet::new(vec![
+        Label {
+            name: "__name__".to_string(),
+            value: METRIC_NAME.to_string(),
+        },
+        Label {
+            name: SUBJECT_KEY.to_string(),
+            value: subject.to_string(),
+        },
+        // A per-bucket discriminator so the subject can appear as a distinct
+        // series in more than one shard (multi-shard coverage) without two
+        // segments claiming the same series id.
+        Label {
+            name: "host".to_string(),
+            value: disc.to_string(),
+        },
+    ])
+    .expect("valid labels")
+}
+
+/// Publish one sealed metrics bucket at ingest hour 0 in `shard`, holding the
+/// erasure subject and one bystander (one sample each), tagged with `disc`. A
+/// single L0 input keeps the bucket below `min_compaction_inputs`, so the tick's
+/// compaction pass leaves the record set as raw L0 and the erasure rewrite is
+/// what acts on it. Returns the input data object's key (the physical-absence
+/// oracle target).
+async fn publish_metrics_bucket(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    shard: u32,
+    disc: &str,
+) -> String {
+    let tenant_hash = tenant.hash();
+    let mut series: Vec<SeriesInput> = [
+        (ERASED_SUBJECT, SUBJECT_VALUE),
+        (SURVIVING_SUBJECT, SURVIVOR_VALUE),
+    ]
+    .into_iter()
+    .map(|(subject, value)| {
+        let labels = metric_labels(subject, disc);
+        SeriesInput {
+            series_id: SeriesId::compute(tenant, METRIC_NAME, &labels).expect("series id"),
+            labels,
+            samples: vec![Sample {
+                ts_ns: SAMPLE_TS_NS,
+                value,
+            }],
+        }
+    })
+    .collect();
+    series.sort_by_key(|s| s.series_id);
+
+    let writer_id = Uuid::from_u128(0x9100 + u128::from(shard));
+    let written = SegmentWriter::write(
+        series,
+        SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write segment");
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 10,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+    data_key
+}
+
+/// Build a PromQL query app whose read cache is `cache`, so two queries against
+/// it share one warm cache.
+fn build_metrics_app(
+    store: Arc<dyn ObjectStoreBackend>,
+    cache: Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>,
+    tenant: &TenantId,
+    shard_count: u32,
+) -> Router {
+    let cli = Cli::try_parse_from(["ravel-server"]).expect("default flags parse");
+    let catalog = build_catalog(
+        Arc::clone(&store),
+        shard_count,
+        cli.disable_cache,
+        cli.cache_max_bytes,
+    )
+    .expect("catalog");
+    let mut tokens = std::collections::HashMap::new();
+    tokens.insert("acme-token".to_string(), tenant.clone());
+    let state = build_app_state(
+        catalog,
+        store,
+        Arc::new(StaticBearerTokenResolver::new(tokens)),
+        Some(cache),
+        ravel_query::EngineConfig::default(),
+        Arc::new(crate::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
+        ravel_query::QueryAdmissionController::shared(
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+        ),
+        None,
+        None,
+    );
+    ravel_query::http::router(state)
+}
+
+/// Run an instant PromQL query for [`METRIC_NAME`] at [`SAMPLE_TS_NS`] and return
+/// the `(user_id, value)` pairs it yields.
+async fn query_metric_subjects(app: &Router) -> Vec<(String, f64)> {
+    let uri = format!(
+        "/api/v1/query?query={METRIC_NAME}&time={}",
+        SAMPLE_TS_NS / 1_000_000_000
+    );
+    let request = Request::builder()
+        .method("GET")
+        .uri(&uri)
+        .header("authorization", "Bearer acme-token")
+        .body(Body::empty())
+        .expect("build request");
+    let response = app.clone().oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK, "query must succeed");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&bytes).expect("parse json");
+    assert_eq!(json["status"], "success", "query status: {json}");
+    let mut out = Vec::new();
+    for entry in json["data"]["result"]
+        .as_array()
+        .expect("result is an array")
+    {
+        let user_id = entry["metric"][SUBJECT_KEY]
+            .as_str()
+            .expect("user_id label")
+            .to_string();
+        let value: f64 = entry["value"][1]
+            .as_str()
+            .expect("value string")
+            .parse()
+            .expect("value parses as f64");
+        out.push((user_id, value));
+    }
+    out
+}
+
+fn user_ids(pairs: &[(String, f64)]) -> Vec<String> {
+    let mut ids: Vec<String> = pairs.iter().map(|(id, _)| id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// The metrics end-to-end acceptance: warm-cache immediate exclusion, a real
+/// tick's rewrite with a bit-exact bystander, `.dreq` sweep past the horizon,
+/// and physical absence of the input from durable storage -- across TWO shards,
+/// proving one `(tenant, signal)`-scoped request reaches every shard.
+///
+/// Non-vacuous flip: delete the `submit_erasure_request` call. Then the
+/// post-erase query returns `u123` again (the exclusion assertion fires), and no
+/// input is ever superseded so the physical-absence assertion fires too. Both
+/// assertions therefore depend on the pipeline, not on a query that returns
+/// nothing.
+#[tokio::test]
+async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant_id = TenantId::new("acme");
+    let tenant = tenant_id.hash();
+    const SHARD_COUNT: u32 = 2;
+
+    // Two sealed buckets: the subject appears as a distinct series in shard 0
+    // and shard 1. One (tenant, Metrics) erasure request must reach both.
+    let data_key_s0 = publish_metrics_bucket(store.as_ref(), &tenant_id, 0, "a").await;
+    let data_key_s1 = publish_metrics_bucket(store.as_ref(), &tenant_id, 1, "b").await;
+
+    let cache = build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli"))
+        .expect("cache enabled by default");
+    let app = build_metrics_app(
+        Arc::clone(&store),
+        Arc::clone(&cache),
+        &tenant_id,
+        SHARD_COUNT,
+    );
+
+    // Pre-erase: both subjects reachable in both shards, and the query warms the
+    // read cache with the segment bytes (which include the subject's).
+    let before = query_metric_subjects(&app).await;
+    assert_eq!(
+        user_ids(&before),
+        vec![ERASED_SUBJECT.to_string(), SURVIVING_SUBJECT.to_string()],
+        "pre-erase, both the subject and the bystander are reachable"
+    );
+    assert_eq!(
+        before.iter().filter(|(id, _)| id == ERASED_SUBJECT).count(),
+        2,
+        "the subject is present as a distinct series in both shards pre-erase"
+    );
+    assert!(
+        !cache.is_empty(),
+        "the pre-erase query must have warmed the read cache with the segment bytes"
+    );
+
+    // Submit the erasure request (the EJ-T6 write). THIS is the flip line: remove
+    // it and the two post-erase exclusion assertions below both fail.
+    let request_id = Uuid::from_u128(0xE7A5);
+    let dreq_key = submit_erasure_request(
+        store.as_ref(),
+        &tenant,
+        Signal::Metrics,
+        request_id,
+        ERASED_SUBJECT,
+        TEST_NOW_NS,
+    )
+    .await;
+    let done_key =
+        keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+    // Immediate exclusion from the WARM cache: the scan-time filter runs
+    // post-cache, so the subject is gone even though its bytes are still cached
+    // AND still physically present in the durable input objects.
+    let after = query_metric_subjects(&app).await;
+    assert_eq!(
+        user_ids(&after),
+        vec![SURVIVING_SUBJECT.to_string()],
+        "post-erase, a query resolving after the request ack excludes the subject from the warm cache"
+    );
+    assert!(
+        object_exists(store.as_ref(), &data_key_s0).await
+            && object_exists(store.as_ref(), &data_key_s1).await,
+        "exclusion is immediate and logical: the durable input objects still hold the subject's \
+         bytes at this point, so the query filtered them, it did not read an emptied store"
+    );
+
+    // A real tick: the rewrite runs in both shards and the request completes
+    // (every in-scope bucket now carries a rewrite naming it).
+    let mut harness = TickHarness::new();
+    harness
+        .tick(store.as_ref(), &tenant, TEST_NOW_NS, SHARD_COUNT)
+        .await;
+
+    for shard in 0..SHARD_COUNT {
+        let records = rewrite_records(store.as_ref(), &tenant, Signal::Metrics, shard, 0).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "shard {shard} must carry exactly one RewriteRecord after the tick"
+        );
+        let record = &records[0];
+        assert_eq!(record.drops.len(), 1, "the one pending request is applied");
+        assert_eq!(record.drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            record.drops[0].dropped_count, 1,
+            "exactly the subject's one sample is dropped in shard {shard}"
+        );
+        let survivors = rewritten_metric_labels(store.as_ref(), record).await;
+        assert_eq!(
+            survivors,
+            vec![metric_labels(
+                SURVIVING_SUBJECT,
+                if shard == 0 { "a" } else { "b" }
+            )],
+            "only the bystander series survives the rewrite in shard {shard}"
+        );
+    }
+
+    assert!(
+        object_exists(store.as_ref(), &done_key).await,
+        "every in-scope bucket carries the request, so the tick writes .done"
+    );
+    assert!(
+        object_exists(store.as_ref(), &dreq_key).await,
+        ".dreq survives until protection_horizon has elapsed past .done"
+    );
+
+    // Past the horizon: the `.dreq` (which carries the subject identifier) is
+    // swept, and the superseded input objects are physically deleted.
+    let past_horizon = TEST_NOW_NS + harness.protection_horizon_ns() + 1;
+    harness
+        .tick(store.as_ref(), &tenant, past_horizon, SHARD_COUNT)
+        .await;
+
+    assert!(
+        object_exists(store.as_ref(), &done_key).await,
+        ".done is permanent erasure evidence"
+    );
+    assert!(
+        !object_exists(store.as_ref(), &dreq_key).await,
+        ".dreq must be swept once its .done is older than protection_horizon"
+    );
+    assert!(
+        !object_exists(store.as_ref(), &data_key_s0).await
+            && !object_exists(store.as_ref(), &data_key_s1).await,
+        "physical absence: the pre-rewrite input objects holding the subject's bytes are \
+         superseded and swept from durable storage"
+    );
+
+    // Post-sweep, the `.dreq` is gone, so exclusion now rests PURELY on the
+    // physical rewrite: a fresh query still excludes the subject and returns the
+    // bystander's sample value bit-exact.
+    let cold_cache =
+        build_cache(&Cli::try_parse_from(["ravel-server"]).expect("cli")).expect("cache");
+    let fresh_app = build_metrics_app(Arc::clone(&store), cold_cache, &tenant_id, SHARD_COUNT);
+    let post_sweep = query_metric_subjects(&fresh_app).await;
+    assert_eq!(
+        user_ids(&post_sweep),
+        vec![SURVIVING_SUBJECT.to_string()],
+        "after the .dreq is swept, the subject stays excluded on the strength of the physical \
+         rewrite alone"
+    );
+    for (_, value) in post_sweep.iter().filter(|(id, _)| id == SURVIVING_SUBJECT) {
+        assert_eq!(
+            value.to_bits(),
+            SURVIVOR_VALUE.to_bits(),
+            "the bystander's sample payload survives the rewrite bit-exact"
+        );
+    }
+}

@@ -9,6 +9,8 @@ pub mod bucket_protection;
 pub mod cache_warm;
 pub mod config;
 pub mod distrib;
+#[cfg(test)]
+mod erasure_e2e;
 pub mod exemplars;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
