@@ -10,6 +10,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 };
 use ravel_ingest::{
     AdmissionController, IngestPoint, IngestRouter, RequestRejection, WriteError, WriteMode,
+    plausible_ingest_clock,
 };
 use ravel_otlp::{IngestLimits, Rejection, normalize_metrics};
 use ravel_types::{CommitToken, SeriesId, TenantId};
@@ -46,6 +47,12 @@ pub enum IngestRequestError {
     /// A whole-request, retryable-later rejection: series-creation-rate
     /// exceeded. No tokens are consumed on rejection.
     Admission(RequestRejection),
+    /// The receiver's admission-time clock was implausible (below the 2020
+    /// floor or non-representable, ADR-0051 amendment, S1-12). No per-record
+    /// decision is meaningful when the reference clock is nonsense, so the
+    /// whole request is rejected with HTTP 503 / gRPC `UNAVAILABLE`; the fault
+    /// is the replica's, and a retry against a healthy replica succeeds.
+    ClockImplausible(String),
     /// The configured `shard_count` disagrees with this (tenant, signal)'s
     /// durable provisioning record (ADR-0050 section 5). The request fails
     /// rather than writing into a shard topology that hides the tenant's
@@ -58,6 +65,7 @@ impl std::fmt::Display for IngestRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IngestRequestError::Admission(rejection) => write!(f, "{}", rejection.reason),
+            IngestRequestError::ClockImplausible(msg) => write!(f, "{msg}"),
             IngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
             IngestRequestError::Write(err) => write!(f, "{err}"),
         }
@@ -75,6 +83,8 @@ impl IngestRequestError {
     pub fn is_retryable(&self) -> bool {
         match self {
             IngestRequestError::Admission(_) => true,
+            // The bad clock is the replica's; a retry against a healthy one works.
+            IngestRequestError::ClockImplausible(_) => true,
             IngestRequestError::Provisioning(_) => false,
             IngestRequestError::Write(err) => err.is_retryable(),
         }
@@ -97,6 +107,17 @@ pub async fn handle_export(
     request: ExportMetricsServiceRequest,
     ingest_ts_ns: i64,
 ) -> Result<IngestOutcome, IngestRequestError> {
+    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): the admission
+    // clock must sit above the 2020 floor and yield a representable hour bucket
+    // before it is used to build the normalize context. Checked first, before
+    // any work: a nonsense reference clock makes no per-record decision
+    // meaningful. Whole-request 503 / UNAVAILABLE, counted reason="clock".
+    if let Err(msg) = plausible_ingest_clock(ingest_ts_ns) {
+        state
+            .admission
+            .record_clock_rejection(&tenant, ravel_types::Signal::Metrics);
+        return Err(IngestRequestError::ClockImplausible(msg));
+    }
     // Record the tenant's recovery manifest on its first write in this process
     // (ADR-0050 section 3). Best-effort and off the durability path: see
     // `crate::tenancy::ensure_recovery_manifest`.
@@ -249,6 +270,12 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::Signal;
 
+    /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
+    /// (ADR-0051 amendment, S1-12): the fixture ingest clock anchors to it so
+    /// the receiver-clock plausibility floor admits the request. Never
+    /// `SystemTime::now()`, so tests stay deterministic.
+    const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
+
     fn state() -> IngestState {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router = Arc::new(IngestRouter::new(
@@ -322,7 +349,7 @@ mod tests {
         const POINT_COUNT: usize = 50_000;
         let points: Vec<NumberDataPoint> = (0..POINT_COUNT)
             .map(|i| NumberDataPoint {
-                time_unix_nano: 1_000,
+                time_unix_nano: BASE_TS_NS as u64,
                 value: Some(NumberValue::AsDouble(i as f64)),
                 ..Default::default()
             })
@@ -362,7 +389,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Buffered,
             request,
-            1_000,
+            BASE_TS_NS,
         )
         .await
         .expect("buffered write with zero admitted points never fails");
@@ -387,7 +414,7 @@ mod tests {
             TenantId::new("acme"),
             WriteMode::Buffered,
             empty_request(),
-            1_000,
+            BASE_TS_NS,
         )
         .await
         .expect("empty request never fails");
@@ -435,7 +462,7 @@ mod tests {
             tenant.clone(),
             WriteMode::Buffered,
             empty_request(),
-            1_000,
+            BASE_TS_NS,
         )
         .await
         .expect("ingest succeeds");

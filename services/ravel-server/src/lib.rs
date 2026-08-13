@@ -474,6 +474,7 @@ fn gateway_state(
             router: span_ingest_router.clone(),
             limits: SpanIngestLimits::default(),
             ack_deadline: DEFAULT_ACK_DEADLINE,
+            admission: admission.clone(),
             store: store.clone(),
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
