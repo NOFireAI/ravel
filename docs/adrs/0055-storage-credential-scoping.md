@@ -583,3 +583,63 @@ per-role credentials, without the follow-up above, will see the epoch
 bootstrap fail closed with an access-denied error on every affected role's
 first `--tenant-kms-config` startup — this is flagged as a required
 follow-up, not fixed here.
+
+## Amendment (EJ, 2026-08-13): the selective-erasure `del/` paths
+
+Epic EJ (issue #460, ADR-0064) ships selective subject erasure: a durable
+erasure request under `t/<hash>/<sig>/del/<request_id>.dreq`, an asynchronous
+rewrite-and-supersede pass in Maintain, and a completion record under
+`t/<hash>/<sig>/del/<request_id>.done`. ADR-0064 decision 6 is the
+"landed-second obligation" issue #460's note made binding on whichever of EE
+and EJ landed last; EJ landed second, so it states the interaction and this
+amendment records the resulting grants against §1's role table. The rewrite
+itself needs no new grant — it writes `l1/**` parts and `c/**` records and
+its inputs are swept from `l0/`, `l1/`, `c/`, all inside Maintain's existing
+`MaintainDelete`/write grants, exactly as ADR-0055's original Consequences
+("Interacts with EJ") predicted. **No fifth role.** Only the `del/` prefix
+itself is new, and it is scoped by these four narrow grants:
+
+- **Admin** gains `s3:PutObject` (create-only, `CreateIfAbsent`) on
+  `t/*/*/del/*` — `ravel-cli erase submit` writes the `.dreq`. Admin still
+  has **no delete grant anywhere**: submitting an erasure request does not
+  delete anything, it creates a durable predicate the Maintain pass acts on.
+  This is the same shape as Admin's other create-only tenant-prefix write
+  (`c/**cmt` for `commit reconstruct`, 2026-08-07 amendment): a `PutObject`
+  allow, no delete.
+- **Query and Maintain** gain read (`s3:GetObject` plus `t/*/*/del/*` in the
+  `ListBucket` `s3:prefix` condition) on `del/**`. Query lists and reads
+  pending `.dreq` predicates at snapshot-resolve time to attach them to the
+  resolved snapshot (ADR-0064 decision 2); Maintain lists and reads them to
+  scope the rewrite pass (decision 3) and to check whether a `.done` already
+  exists (decisions 4-5).
+- **Maintain** gains `s3:DeleteObject` on `t/*/*/del/*.dreq` **only** — and
+  no other role gains any delete on `del/`. The `.dreq` contains the subject
+  identifier and must not outlive its purpose, so ADR-0064 decision 5 has
+  Maintain's sweep delete it once its `.done` exists and
+  `now >= done.created_unix_ns + protection_horizon` (legal-hold-gated like
+  every other delete). This grant is scoped to the `.dreq` suffix so it can
+  never reach a `.done`.
+- **`del/*.done` joins `DenyDeleteProtected` for every role, Maintain
+  included.** A completion record is permanent erasure evidence, and it can
+  be permanent precisely because it carries no subject identifier (only a
+  hash of the canonical predicate, per-bucket dropped counts, and
+  timestamps). This is the same "append-only durability anchor, undeletable
+  by anyone" class as the legal-hold shard `u/0000/**`. The `.dreq` and
+  `.done` are separate key suffixes under the same `del/` prefix, so
+  Maintain's `.dreq` delete grant and the blanket `.done` deny do not
+  overlap — exactly the disjoint-path scoping the EL-6 amendment already
+  uses to split the audit shards `u/0000/*` and `u/0001/*`.
+
+Net effect on §1's role table: Admin's write column gains `t/*/*/del/*`
+(create-only); Query's and Maintain's read columns gain `t/*/*/del/*`;
+Maintain's delete column (`MaintainDelete`) gains `t/*/*/del/*.dreq`; and §3's
+`DenyDeleteProtected` deny list gains `t/*/*/del/*.done` for every role. This
+does not weaken NF-10 or any prior delete-deny ask: `sys/*`, `prov`,
+`catalog/*`, the legal-hold shard, and now `.done` completion markers remain
+undeletable by any role, and the one new deletable object (`.dreq`) is deleted
+only by the one role that already owns every delete, only after its own
+completion record and the protection horizon guarantee it is safe. The
+matching IAM policy JSON is added to `docs/guides/operations.md` in the same
+change. Amended here in ADR-0055 (rather than as a standalone note) so the
+per-role model stays legible end to end, following this ADR's own in-place
+amendment precedent.
