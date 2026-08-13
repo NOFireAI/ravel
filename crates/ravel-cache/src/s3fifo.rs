@@ -226,6 +226,28 @@ impl<V: Clone> S3Fifo<V> {
         true
     }
 
+    /// Removes every resident entry whose stored value satisfies `expired`,
+    /// returning their keys so the caller can count them or free whatever the
+    /// values referenced. Queue membership, byte totals, and entry count are
+    /// all kept consistent via [`S3Fifo::remove`]; ghost entries are left
+    /// untouched (they hold no resident bytes). Used by the RAM tier's periodic
+    /// age sweep, which stamps each value with its write time; the disk tier
+    /// ages entries by their on-disk header instead and does not use this.
+    pub(crate) fn drain_where<F>(&mut self, mut expired: F) -> Vec<CacheKey>
+    where
+        F: FnMut(&V) -> bool,
+    {
+        let keys: Vec<CacheKey> = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| expired(&entry.value).then_some(*key))
+            .collect();
+        for key in &keys {
+            self.remove(key);
+        }
+        keys
+    }
+
     fn evict_to_bounds(&mut self, metrics: &CacheMetrics) -> Vec<CacheKey> {
         let mut evicted_keys = Vec::new();
         while self.total_bytes() > self.limits.max_bytes
