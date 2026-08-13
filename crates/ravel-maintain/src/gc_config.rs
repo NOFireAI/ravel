@@ -1,8 +1,13 @@
 //! The durable, deployment-wide GC configuration object `sys/gc` (ADR-0050
 //! section 4, EC4).
 //!
-//! `protection_horizon >= max_query_duration + grace` protects every pinned
-//! reader from the GC sweeper. Before this object it lived in three unlinked
+//! `protection_horizon >= max_query_duration + grace + clock_skew_allowance`
+//! protects every pinned reader from the GC sweeper, including one whose clock
+//! leads the reader's by up to `clock_skew_allowance` (adversarial finding
+//! S1-02: without the skew term a sweeper skewed ahead reaches its deletion
+//! threshold `now >= anchor + protection_horizon` in true time before a
+//! reader's still-active snapshot, held up to `max_query_duration`, is
+//! released). Before this object the bound lived in three unlinked
 //! per-process configs (the maintain sweep config, the query deadline, the
 //! Flight ticket ceiling) that could be deployed independently, with nothing
 //! validating the constraint anywhere (adversarial findings S1-03 / S5-22). This
@@ -59,7 +64,12 @@ pub const GC_FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcConfigValues {
     /// Horizon between a deletion anchor and physical deletion. Must satisfy
-    /// `>= max_query_duration_ns + grace_ns`.
+    /// `>= max_query_duration_ns + grace_ns + clock_skew_allowance_ns` (the
+    /// skew term is not stored here; it is supplied by the writer's config at
+    /// the single mutation choke point, see [`satisfies_constraint`] and
+    /// [`set_gc_config`]).
+    ///
+    /// [`satisfies_constraint`]: GcConfigValues::satisfies_constraint
     pub protection_horizon_ns: i64,
     /// Shared grace period for the orphan and unreferenced-part age gates.
     pub grace_ns: i64,
@@ -72,7 +82,8 @@ pub struct GcConfigValues {
 
 impl GcConfigValues {
     /// The maintain defaults, which satisfy the constraint by construction
-    /// (`protection_horizon = max_query_duration + grace`, plan §5). This is
+    /// (`protection_horizon = max_query_duration + grace + clock_skew_allowance`,
+    /// plan §5, S1-02). This is
     /// what the first process to touch a fresh bucket bootstraps `sys/gc` from
     /// (ADR-0050 section 4), and it matches [`crate::CompactorConfig::default`]'s
     /// horizon, grace, and flush lifetime.
@@ -86,10 +97,19 @@ impl GcConfigValues {
     }
 
     /// Whether these values satisfy the GC safety constraint
-    /// `protection_horizon >= max_query_duration + grace`. Saturating so an
-    /// absurd (near-`i64::MAX`) input cannot wrap the comparison.
-    pub fn satisfies_constraint(&self) -> bool {
-        self.protection_horizon_ns >= self.max_query_duration_ns.saturating_add(self.grace_ns)
+    /// `protection_horizon >= max_query_duration + grace + clock_skew_allowance`
+    /// (S1-02). The `clock_skew_allowance_ns` term is supplied by the caller
+    /// (the sweeper/writer config, not stored in `sys/gc`) and closes the gap a
+    /// sweeper whose clock leads a reader's would otherwise open: it reaches
+    /// `now >= anchor + protection_horizon` in true time up to
+    /// `clock_skew_allowance` early, so the horizon must budget for it. Saturating
+    /// so an absurd (near-`i64::MAX`) input cannot wrap the comparison.
+    pub fn satisfies_constraint(&self, clock_skew_allowance_ns: i64) -> bool {
+        self.protection_horizon_ns
+            >= self
+                .max_query_duration_ns
+                .saturating_add(self.grace_ns)
+                .saturating_add(clock_skew_allowance_ns)
     }
 
     /// Reject any non-positive field before a write. Every `sys/gc` value is a
@@ -180,15 +200,18 @@ pub enum GcConfigError {
     )]
     NonPositiveValue { field: &'static str, got: i64 },
     #[error(
-        "proposed GC config violates protection_horizon >= max_query_duration + grace: \
-         protection_horizon={protection_horizon_ns} ns, max_query_duration={max_query_duration_ns} ns, \
-         grace={grace_ns} ns (need protection_horizon >= {}); refusing to write sys/gc",
-        .max_query_duration_ns.saturating_add(*.grace_ns)
+        "proposed GC config violates protection_horizon >= max_query_duration + grace + \
+         clock_skew_allowance: protection_horizon={protection_horizon_ns} ns, \
+         max_query_duration={max_query_duration_ns} ns, grace={grace_ns} ns, \
+         clock_skew_allowance={clock_skew_allowance_ns} ns (need protection_horizon >= {}); \
+         refusing to write sys/gc",
+        .max_query_duration_ns.saturating_add(*.grace_ns).saturating_add(*.clock_skew_allowance_ns)
     )]
     ConstraintViolation {
         protection_horizon_ns: i64,
         max_query_duration_ns: i64,
         grace_ns: i64,
+        clock_skew_allowance_ns: i64,
     },
     #[error(
         "a concurrent gc-config set changed sys/gc since this one read it (CasVersion \
@@ -304,17 +327,29 @@ pub enum SetOutcome {
 /// never a silent overwrite. On a bucket with no object yet, creates it with
 /// `CreateIfAbsent` (a concurrent bootstrap winning that race is also a
 /// `CasConflict`, since the caller's read observed no object).
+///
+/// This is the single mutation choke point (`ravel-cli gc-config set`) where the
+/// skew-covering bound `protection_horizon >= max_query_duration + grace +
+/// clock_skew_allowance` is enforced fail-closed: a proposal that fails it is
+/// refused with [`GcConfigError::ConstraintViolation`] and writes nothing, so no
+/// reachable `sys/gc` can leave a skewed sweeper free to delete a pinned reader's
+/// snapshot (S1-02). `clock_skew_allowance_ns` is the writer's configured skew
+/// allowance (the sweeper's [`crate::CompactorConfig::clock_skew_allowance_ns`]),
+/// supplied here rather than stored in `sys/gc` because the persistent format is
+/// frozen; the fence is the validated config, not a stored field.
 pub async fn set_gc_config(
     store: &dyn ObjectStoreBackend,
     proposed: GcConfigValues,
+    clock_skew_allowance_ns: i64,
     now_ns: i64,
 ) -> Result<SetOutcome, GcConfigError> {
     proposed.validate()?;
-    if !proposed.satisfies_constraint() {
+    if !proposed.satisfies_constraint(clock_skew_allowance_ns) {
         return Err(GcConfigError::ConstraintViolation {
             protection_horizon_ns: proposed.protection_horizon_ns,
             max_query_duration_ns: proposed.max_query_duration_ns,
             grace_ns: proposed.grace_ns,
+            clock_skew_allowance_ns,
         });
     }
 
@@ -412,7 +447,7 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use std::sync::Arc;
 
-    use crate::config::CompactorConfig;
+    use crate::config::{CompactorConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS};
 
     fn store() -> Arc<dyn ObjectStoreBackend> {
         Arc::new(MemoryStore::new())
@@ -425,15 +460,17 @@ mod tests {
     #[test]
     fn maintain_defaults_satisfy_the_constraint_and_match_compactor_default() {
         let d = GcConfigValues::maintain_defaults();
-        assert!(d.satisfies_constraint());
         let c = CompactorConfig::default();
+        assert!(d.satisfies_constraint(c.clock_skew_allowance_ns));
         assert_eq!(d.protection_horizon_ns, c.protection_horizon_ns);
         assert_eq!(d.grace_ns, c.grace_ns);
         assert_eq!(d.max_flush_lifetime_ns, c.max_flush_lifetime_ns);
-        // The constraint holds with exactly zero slack at the defaults.
+        // The constraint holds with exactly zero slack at the defaults: the
+        // default horizon is max_query_duration + grace + clock_skew_allowance,
+        // so the skew-covering bound is met at the bound (S1-02).
         assert_eq!(
             d.protection_horizon_ns,
-            d.max_query_duration_ns + d.grace_ns
+            d.max_query_duration_ns + d.grace_ns + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
         );
     }
 
@@ -505,7 +542,7 @@ mod tests {
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
-        assert!(winner.satisfies_constraint());
+        assert!(winner.satisfies_constraint(DEFAULT_CLOCK_SKEW_ALLOWANCE_NS));
         bootstrap_gc_config(store.as_ref(), winner, 1)
             .await
             .expect("winner bootstraps");
@@ -535,7 +572,7 @@ mod tests {
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
-        let err = set_gc_config(store.as_ref(), bad, 1_000)
+        let err = set_gc_config(store.as_ref(), bad, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, 1_000)
             .await
             .expect_err("a constraint-violating proposal must be refused");
         assert!(
@@ -552,6 +589,83 @@ mod tests {
         );
     }
 
+    /// FAILURE SUITE (S1-02, the ticket's required "disagreeing-config" row): a
+    /// config whose `protection_horizon` meets the OLD bound
+    /// (`= max_query_duration + grace`) but NOT the skew-covering bound
+    /// (`+ clock_skew_allowance`) is REJECTED by `set_gc_config` validation with
+    /// `ConstraintViolation`, proving a skew-uncovered sweeper config can never
+    /// be written. The mirror: raising the horizon by exactly the skew allowance
+    /// makes the same proposal acceptable and written.
+    ///
+    /// This test bites the exact fix. To watch it fail, revert
+    /// `satisfies_constraint` to the old bound by dropping its
+    /// `.saturating_add(clock_skew_allowance_ns)` term (leaving
+    /// `>= max_query_duration + grace`): `just_meets_old_bound` then satisfies
+    /// the constraint, `set_gc_config` accepts it, and the `expect_err` below
+    /// panics with "a config that omits the clock-skew allowance must be refused".
+    #[tokio::test]
+    async fn set_refuses_a_config_that_omits_the_clock_skew_allowance() {
+        let store = store();
+        let skew = DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+        // Meets the OLD bound exactly: horizon = max_query_duration + grace, with
+        // zero budget for a skewed-ahead sweeper's clock.
+        let just_meets_old_bound = GcConfigValues {
+            protection_horizon_ns: DEFAULT_MAX_QUERY_DURATION_NS + DEFAULT_GRACE_NS,
+            grace_ns: DEFAULT_GRACE_NS,
+            max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
+            max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
+        };
+        // It DID satisfy the pre-S1-02 bound (skew term zero), but does NOT
+        // satisfy the skew-covering bound.
+        assert!(
+            just_meets_old_bound.satisfies_constraint(0),
+            "the old bound (max_query_duration + grace) is met exactly"
+        );
+        assert!(
+            !just_meets_old_bound.satisfies_constraint(skew),
+            "the skew-covering bound is NOT met: this is the S1-02 gap"
+        );
+
+        let err = set_gc_config(store.as_ref(), just_meets_old_bound, skew, 1_000)
+            .await
+            .expect_err("a config that omits the clock-skew allowance must be refused");
+        assert!(
+            matches!(
+                err,
+                GcConfigError::ConstraintViolation {
+                    clock_skew_allowance_ns,
+                    ..
+                } if clock_skew_allowance_ns == skew
+            ),
+            "got: {err}"
+        );
+        // A skew-uncovered set writes no object: the fence is fail-closed.
+        assert!(
+            read_gc_config(store.as_ref())
+                .await
+                .expect("read")
+                .is_none(),
+            "a skew-uncovered set writes no object"
+        );
+
+        // Mirror: raising the horizon by exactly the skew allowance meets the new
+        // bound, so the same proposal is now accepted and durably written.
+        let covers_skew = GcConfigValues {
+            protection_horizon_ns: DEFAULT_MAX_QUERY_DURATION_NS + DEFAULT_GRACE_NS + skew,
+            ..just_meets_old_bound
+        };
+        assert!(covers_skew.satisfies_constraint(skew));
+        let outcome = set_gc_config(store.as_ref(), covers_skew, skew, 2_000)
+            .await
+            .expect("a skew-covering config is accepted");
+        assert_eq!(outcome, SetOutcome::Created);
+        let (stored, _v) = read_gc_config(store.as_ref())
+            .await
+            .expect("read")
+            .expect("the accepted config was written");
+        assert_eq!(stored, covers_skew);
+    }
+
     /// Bug regression: an all-zero proposal `0,0,0,0` trivially satisfies the
     /// horizon constraint (`0 >= 0 + 0`), so before the positive-value floor it
     /// was accepted and written, after which no valid `sys/gc` could ever match
@@ -566,14 +680,20 @@ mod tests {
             max_query_duration_ns: 0,
             max_flush_lifetime_ns: 0,
         };
-        // The exact shape of the bug: the constraint check alone accepts this.
+        // The exact shape of the bug: the constraint check alone accepts this
+        // (even with a zero skew allowance the horizon inequality holds).
         assert!(
-            all_zero.satisfies_constraint(),
-            "0 >= 0 + 0: the constraint alone does not catch an all-zero config"
+            all_zero.satisfies_constraint(0),
+            "0 >= 0 + 0 + 0: the constraint alone does not catch an all-zero config"
         );
-        let err = set_gc_config(store.as_ref(), all_zero, 1_000)
-            .await
-            .expect_err("an all-zero proposal must now be refused by the positive-value floor");
+        let err = set_gc_config(
+            store.as_ref(),
+            all_zero,
+            DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            1_000,
+        )
+        .await
+        .expect_err("an all-zero proposal must now be refused by the positive-value floor");
         assert!(
             matches!(
                 err,
@@ -603,7 +723,7 @@ mod tests {
             grace_ns: -1,
             ..GcConfigValues::maintain_defaults()
         };
-        let err = set_gc_config(store.as_ref(), bad, 1_000)
+        let err = set_gc_config(store.as_ref(), bad, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, 1_000)
             .await
             .expect_err("a negative grace must be refused");
         assert!(
@@ -765,7 +885,7 @@ mod tests {
     /// refuses; one at or under it passes.
     #[test]
     fn flight_ceiling_over_horizon_refuses() {
-        let stored = GcConfigValues::maintain_defaults(); // ceiling = 25h - 24h = 1h
+        let stored = GcConfigValues::maintain_defaults(); // ceiling = 25h5m - 24h = 1h5m
         let two_hours = 2 * 3_600_000_000_000;
         let err = validate_flight_ceiling(&stored, two_hours)
             .expect_err("a 2h ceiling over a 1h protection_horizon-grace must refuse");

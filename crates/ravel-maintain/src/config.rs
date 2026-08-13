@@ -147,15 +147,23 @@ pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
 /// plan §5). A shared floor for the orphan and unreferenced-part age gates.
 pub const DEFAULT_GRACE_NS: i64 = 24 * NS_PER_HOUR;
 /// Default `max_query_duration`: 1 hour. The horizon must outlast any pinned
-/// in-flight query (`protection_horizon >= max_query_duration + grace`, plan
-/// §5 / docs/consistency-model.md), so this is the query-duration term of the
-/// default `protection_horizon`.
+/// in-flight query (`protection_horizon >= max_query_duration + grace +
+/// clock_skew_allowance`, plan §5 / docs/consistency-model.md), so this is the
+/// query-duration term of the default `protection_horizon`.
 pub const DEFAULT_MAX_QUERY_DURATION_NS: i64 = NS_PER_HOUR;
-/// Default `protection_horizon`: `max_query_duration + grace` (plan §5). The
+/// Default `protection_horizon`: `max_query_duration + grace +
+/// clock_skew_allowance` (plan §5, closing adversarial finding S1-02). The
 /// supersession and retention sweeps gate physical deletion on
 /// `now >= anchor + protection_horizon`, so a query resolved just before the
-/// anchor still has this long to finish reading the inputs it pinned.
-pub const DEFAULT_PROTECTION_HORIZON_NS: i64 = DEFAULT_MAX_QUERY_DURATION_NS + DEFAULT_GRACE_NS;
+/// anchor still has this long to finish reading the inputs it pinned. The
+/// `clock_skew_allowance` term covers a sweeper whose clock leads a reader's by
+/// up to that allowance: without it, a skewed sweeper reaches
+/// `now >= anchor + protection_horizon` in true time before the reader's pinned
+/// snapshot (held up to `max_query_duration`) is released. Bootstrapping from
+/// this default therefore writes a `sys/gc` that satisfies the skew-covering
+/// bound by construction, so no reachable default deployment is skew-uncovered.
+pub const DEFAULT_PROTECTION_HORIZON_NS: i64 =
+    DEFAULT_MAX_QUERY_DURATION_NS + DEFAULT_GRACE_NS + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
 /// Default `max_ingest_lag`: 2 hours. Used only in the ADR-0019 §5 retention
 /// validation floor. This MUST be kept in sync with ravel-catalog's
 /// `DEFAULT_MAX_INGEST_LAG_NS` (crates/ravel-catalog/src/config.rs): a
@@ -305,9 +313,11 @@ pub struct CompactorConfig {
     pub grace_ns: i64,
     /// Horizon between a deletion anchor (a compaction record's
     /// `created_unix_ns`, a tombstone's `retired_at_ns`) and physical
-    /// deletion (plan §5). Must satisfy `>= max_query_duration + grace` so a
-    /// query resolved just before the anchor still has time to read the
-    /// inputs it pinned. Default [`DEFAULT_PROTECTION_HORIZON_NS`] (25 h).
+    /// deletion (plan §5). Must satisfy `>= max_query_duration + grace +
+    /// clock_skew_allowance` so a query resolved just before the anchor still
+    /// has time to read the inputs it pinned even when the sweeper's clock
+    /// leads the reader's (S1-02). Default [`DEFAULT_PROTECTION_HORIZON_NS`]
+    /// (25 h 5 min).
     pub protection_horizon_ns: i64,
     /// Mass-orphan circuit breaker minimum candidate count (ADR-0048
     /// decision 4). The breaker trips a pass only when it would delete at

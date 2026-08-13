@@ -248,10 +248,12 @@ enum GcConfigCommand {
     /// bootstrapped.
     Show {},
     /// Write a full new `sys/gc`, enforcing `protection_horizon >=
-    /// max_query_duration + grace` at write time and swapping the durable object
-    /// with `CasVersion`. All four durations are humantime strings (e.g. `25h`).
+    /// max_query_duration + grace + clock_skew_allowance` at write time and
+    /// swapping the durable object with `CasVersion`. All durations are
+    /// humantime strings (e.g. `25h5m`).
     Set {
-        /// Horizon between a deletion anchor and physical deletion (e.g. `25h`).
+        /// Horizon between a deletion anchor and physical deletion (e.g.
+        /// `25h5m`).
         #[arg(long, value_name = "DURATION")]
         protection_horizon: String,
         /// Shared grace period for the GC age gates (e.g. `24h`).
@@ -263,6 +265,12 @@ enum GcConfigCommand {
         /// Longest a flush may stay open (e.g. `1h`).
         #[arg(long, value_name = "DURATION")]
         max_flush_lifetime: String,
+        /// Cross-host clock-skew allowance the horizon must cover (e.g. `5m`).
+        /// The constraint input that closes S1-02; must match the sweepers'
+        /// `clock_skew_allowance`. Not stored in `sys/gc`. Defaults to 5m when
+        /// omitted.
+        #[arg(long, value_name = "DURATION")]
+        clock_skew_allowance: Option<String>,
     },
 }
 
@@ -972,6 +980,7 @@ async fn main() -> anyhow::Result<()> {
                     grace,
                     max_query_duration,
                     max_flush_lifetime,
+                    clock_skew_allowance,
                 },
         } => {
             ravel_cli::gc_config::set(
@@ -980,6 +989,7 @@ async fn main() -> anyhow::Result<()> {
                 &grace,
                 &max_query_duration,
                 &max_flush_lifetime,
+                clock_skew_allowance.as_deref(),
                 now_ns()?,
             )
             .await
