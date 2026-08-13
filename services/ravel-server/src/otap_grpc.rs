@@ -417,3 +417,96 @@ fn nack(batch_id: i64, code: StatusCode, message: String) -> BatchStatus {
         status_message: message,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ravel_ingest::{
+        AdmissionController, AdmissionLimits, IngestConfig, IngestRouter,
+        MIN_PLAUSIBLE_INGEST_CLOCK_NS, SystemClock,
+    };
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_otap::stream::DecodedBatch;
+    use std::time::Duration;
+
+    fn ingest_state() -> IngestState {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = Arc::new(IngestRouter::new(
+            IngestConfig::default(),
+            store,
+            Signal::Metrics,
+            Arc::new(SystemClock),
+        ));
+        IngestState {
+            router,
+            limits: ravel_otlp::IngestLimits::default(),
+            ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            recovery: None,
+            provisioning: None,
+        }
+    }
+
+    /// #991: an OTAP batch whose receiver (ingest) clock is below the 2020 floor
+    /// must be rejected by `write_batch` as the whole-batch `ClockImplausible`
+    /// error (which the OTAP driver maps to a nacked `BatchStatus`;
+    /// `is_retryable() == true` is the UNAVAILABLE class), and the
+    /// `reason="clock"` admission counter for the tenant's Metrics signal must
+    /// increment. The clock is a fixed sub-floor timestamp, never
+    /// `SystemTime::now()`.
+    ///
+    /// The clock guard is the first thing `write_batch` does, before
+    /// `normalize_decoded` ever touches the payloads, so an empty `DecodedBatch`
+    /// exercises the rejection path exactly.
+    ///
+    /// Non-vacuity: delete the `plausible_ingest_clock` guard at the top of
+    /// `write_batch` (otap_grpc.rs, the `if let Err(msg) = ...` block) and this
+    /// test fails, because the empty batch then writes cleanly and returns `Ok`,
+    /// and the counter stays at 0.
+    #[tokio::test]
+    async fn receiver_clock_below_floor_rejects_unavailable_with_reason_clock() {
+        let ingest = ingest_state();
+        let tenant = TenantId::new("acme");
+        // One nanosecond below the 2020 floor: an implausible receiver clock.
+        let sub_floor = MIN_PLAUSIBLE_INGEST_CLOCK_NS - 1;
+        let batch = DecodedBatch {
+            batch_id: 1,
+            payloads: Vec::new(),
+        };
+
+        // `WriteOutcome` is not `Debug`, so match rather than `expect_err`.
+        let err = match write_batch(&ingest, &tenant, WriteMode::Strict, &batch, sub_floor).await {
+            Ok(_) => panic!("a sub-floor receiver clock must reject the whole batch"),
+            Err(err) => err,
+        };
+
+        // (a) The typed rejection is ClockImplausible, and it is retryable, so
+        // the OTAP nack is the UNAVAILABLE class.
+        assert!(
+            matches!(err, IngestRequestError::ClockImplausible(_)),
+            "expected ClockImplausible, got: {err:?}"
+        );
+        assert!(
+            err.is_retryable(),
+            "ClockImplausible is retryable, the UNAVAILABLE class on this surface"
+        );
+
+        // (b) The admission rejected counter increments under reason=\"clock\"
+        // for this tenant's Metrics signal.
+        let row = ingest
+            .admission
+            .usage_snapshot()
+            .into_iter()
+            .find(|r| r.tenant_hash == tenant.hash() && r.signal == Signal::Metrics)
+            .expect("a metrics usage row exists after the clock rejection");
+        assert_eq!(
+            row.requests_rejected_clock_total, 1,
+            "the reason=\"clock\" rejected counter incremented exactly once"
+        );
+    }
+}
