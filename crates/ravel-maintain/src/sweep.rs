@@ -1076,9 +1076,16 @@ pub struct CatalogSweepOutcome {
 ///   make the live snapshot look unreferenced.
 ///
 /// Per (tenant, signal), not per shard: catalog objects carry no shard
-/// dimension. Like [`sweep_idempotency_markers`], the dispatcher calls this
-/// once per (tenant, signal) per tick, not inside the per-shard
-/// [`sweep_shard`] loop.
+/// dimension, so a driver calls this once per (tenant, signal) per tick, like
+/// [`sweep_idempotency_markers`], not inside the per-shard [`sweep_shard`]
+/// loop.
+///
+/// No production driver calls it yet. `ravel-server`'s maintenance tick runs
+/// [`sweep_idempotency_markers`] and [`sweep_erasure_requests`] at that
+/// granularity but not this rule, so unreferenced catalog objects are
+/// currently collected by nothing outside tests. Stated here rather than left
+/// as the present-tense "the dispatcher calls this", which this doc claimed
+/// before it was true of any rule.
 pub async fn sweep_unreferenced_catalog_objects(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -1287,12 +1294,17 @@ pub struct ErasureRequestSweepOutcome {
 /// collapse the horizon gate to always-past and could retire the filter early.
 ///
 /// Per (tenant, signal), not per shard (the `del/` prefix carries no shard
-/// dimension): the dispatcher calls this once per (tenant, signal) per tick
-/// alongside [`sweep_idempotency_markers`] and
-/// [`sweep_unreferenced_catalog_objects`], not inside the per-shard
-/// [`sweep_shard`] loop. A listing entry under `del/` that is neither a
-/// `.dreq` nor a `.done` is layout drift and fails the pass loud, matching the
-/// resolver's and the rewrite pass's fail-loud discipline for this keyspace.
+/// dimension): `ravel-server`'s maintenance tick calls this once per (tenant,
+/// signal), alongside [`sweep_idempotency_markers`] and after that signal's
+/// erasure rewrite pass and completion (`.done`) write, not inside the
+/// per-shard [`sweep_shard`] loop. That order is what makes the rule safe:
+/// the `.done` this rule waits on is written by the same tick that verified
+/// the rewrite, so a `.dreq` is only ever removed after its erasure is
+/// durably complete. ([`sweep_unreferenced_catalog_objects`] is at the same
+/// granularity but has no driver yet; see its own doc.) A listing entry under
+/// `del/` that is neither a `.dreq` nor a `.done` is layout drift and fails
+/// the pass loud, matching the resolver's and the rewrite pass's fail-loud
+/// discipline for this keyspace.
 pub async fn sweep_erasure_requests(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
