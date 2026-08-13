@@ -1747,6 +1747,14 @@ fn render_cache_family(
          Nonzero here means the disk tier is unhealthy, not merely cold.",
         |s| s.disk_errors_degraded_to_misses,
     );
+    emit(
+        "ravel_cache_disk_entries_expired_max_age_total",
+        "Disk-tier entries dropped because their stamped write time aged past the configured \
+         max-age (ADR-0064), by a read, the startup scan, or the periodic sweep. This is an \
+         expiry, not corruption: the bytes of an erased subject are physically removed from \
+         local disk within the max-age bound.",
+        |s| s.disk_entries_expired_max_age,
+    );
 }
 
 /// The per-(tenant, signal) admission counters (ADR-0051 section 6), read
@@ -3805,7 +3813,7 @@ mod tests {
             evictions: 2,
             single_flight_collapses: 99,
             disk_errors_degraded_to_misses: 3,
-            disk_entries_expired_max_age: 0,
+            disk_entries_expired_max_age: 7,
         };
         let catalog = CacheMetricsSnapshot {
             hits: 70,
@@ -3865,6 +3873,12 @@ mod tests {
                 "ravel_cache_disk_errors_degraded_to_misses_total{mode=\"gateway\",cache=\"fetch\"} 3"
             ),
             "missing fetch cache disk_errors_degraded_to_misses sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"fetch\"} 7"
+            ),
+            "missing fetch cache disk_entries_expired_max_age sample:\n{body}"
         );
 
         // Catalog byte cache, labeled cache="catalog", same metric names.

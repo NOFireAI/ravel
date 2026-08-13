@@ -56,7 +56,7 @@ pub use cache::Cache;
 pub use clock::{Clock, SystemClock};
 pub use disk::DiskCache;
 pub use key::CacheKey;
-pub use limits::{CacheLimits, DEFAULT_MAX_ENTRY_AGE_NS};
+pub use limits::{CacheLimits, DEFAULT_MAX_ENTRY_AGE_NS, DEFAULT_SWEEP_INTERVAL_NS};
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use single_flight::{Role, SingleFlight, SingleFlightError};
 
