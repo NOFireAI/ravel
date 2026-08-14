@@ -488,6 +488,21 @@ creates the bucket, sets that variable, and asserts the gated test executed
 rather than skipping. This job is required: S3 is the only durable backend,
 so an adapter regression must fail CI.
 
+`crates/ravel-object-store/tests/s3_http_faults.rs` covers what neither the
+contract suite nor `s3.rs`'s classification unit tests can: the retry, backoff,
+and multipart behavior `S3Store` exhibits *on the wire*. It stands up a fake S3
+endpoint (axum, loopback, ephemeral port), points `S3Store` at it through the
+ordinary `S3Config::endpoint` override, and scripts per-request faults --- 503,
+429, a `SlowDown` error body as both a 503 and the 200-with-error body S3
+documents for `CompleteMultipartUpload`, 403 `AccessDenied`, a connection
+dropped mid-response, and a multipart sequence failing after some parts
+succeeded. Because the endpoint records every request with a timestamp, the
+assertions are on what the server saw: a throttled GET/PUT is really re-sent, a
+403 is really sent once, the pause between attempts really grows, and a failed
+multipart upload really leaves no object at the key. No live endpoint and no
+Docker, so it runs in the default `cargo test`, unlike the MinIO-gated
+assertions above.
+
 ### Per-tenant KMS routing decorator
 
 `KmsRoutingStore` wraps a default backend and routes writes (`put`,

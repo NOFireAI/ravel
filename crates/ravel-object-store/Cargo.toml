@@ -29,6 +29,12 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Test-only fake S3 HTTP endpoint (tests/s3_http_faults.rs): drives S3Store
+# through its endpoint override against a server that returns 503/429/SlowDown,
+# drops a connection mid-response, and fails one part of a multipart upload, so
+# the retry/backoff/multipart paths are exercised over real HTTP rather than
+# only through synthetic StoreError values.
+axum = { workspace = true }
 
 [lints]
 workspace = true
