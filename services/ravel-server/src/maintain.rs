@@ -286,6 +286,15 @@ impl UnitStallTracker {
     /// without this its entry is stranded and keeps counting toward the
     /// gauge forever. If the unit returns to this process's ownership later
     /// and fails again, it re-accumulates from zero.
+    ///
+    /// `owned` must be the *ownership* set, not the set of units this cycle
+    /// managed to evaluate (issue #920). A unit this process still owns but
+    /// did not reach this cycle -- because its tenant's legal-hold refresh
+    /// failed, or its `(tenant, signal)` pair failed the provisioning or
+    /// shard-generation read -- keeps its streak: it is exactly the stuck
+    /// unit `units_stalled` exists to surface, and pruning it on the error
+    /// tick would restart the observation from zero and let a recurring
+    /// per-tenant fault hold the alarm off indefinitely.
     fn retain_owned(&self, owned: &std::collections::HashSet<(TenantHash, Signal, u32)>) -> u64 {
         let mut failures = self.failures.lock();
         failures.retain(|unit, _| owned.contains(unit));
@@ -312,6 +321,8 @@ pub struct MaintenanceOwnershipMetrics {
     /// This cycle's owned-unit accumulator, paired with `set_units_owned(0)`:
     /// cleared in `begin_cycle`, filled by `note_owned_unit` as `run_tick`
     /// walks each tenant, then consumed by `end_cycle` to prune `stalls`.
+    /// Membership here means "this process owns the unit under the rendezvous
+    /// gate", not "this cycle evaluated it" (issue #920).
     owned_this_cycle: parking_lot::Mutex<std::collections::HashSet<(TenantHash, Signal, u32)>>,
 }
 
@@ -335,8 +346,11 @@ impl MaintenanceOwnershipMetrics {
     }
 
     /// Records that `(tenant, signal, shard)` is owned by this process this
-    /// cycle. Call alongside `add_units_owned` for every unit in an owned
-    /// set, whether inside a discovery cycle or a standalone `run_tick`.
+    /// cycle. Call it for every unit the rendezvous ownership gate assigns to
+    /// this process, whether inside a discovery cycle or a standalone
+    /// `run_tick`, and before any per-tenant or per-signal error path can
+    /// skip the unit's evaluation (issue #920): what is recorded here decides
+    /// which stall streaks `end_cycle` keeps.
     fn note_owned_unit(&self, tenant: TenantHash, signal: Signal, shard: u32) {
         self.owned_this_cycle.lock().insert((tenant, signal, shard));
     }
@@ -860,7 +874,10 @@ pub async fn run_discovery_cycle(
     // `outcome.maintained` (tenant deprovisioned) or reassigned to a peer
     // (rendezvous re-partition) never calls `observe_unit_tick` again, so
     // without this its failure entry -- and its contribution to
-    // `units_stalled` -- would be stranded forever.
+    // `units_stalled` -- would be stranded forever. Each tick above records
+    // its tenant's owned set from the ownership gate before any store read,
+    // so this prunes only genuinely-unowned units, never a still-owned one
+    // whose tick a transient fault skipped (issue #920).
     ownership.end_cycle();
     total
 }
@@ -907,6 +924,12 @@ pub async fn run_discovery_cycle(
 /// (`{self}`) every unit is owned and the behavior is byte-for-byte the
 /// pre-ADR-0065 unconditional walk. Tenant discovery and the legal-hold refresh
 /// below stay per-process, never gated on ownership (ADR-0065 decision 2).
+///
+/// That same ownership gate, evaluated over the configured shard range before
+/// the legal-hold refresh, is what feeds the per-cycle owned set behind the
+/// `units_stalled` stall-streak prune ([`note_owned_units`], issue #920). The
+/// tick reports ownership even when it then skips the tenant or a `(tenant,
+/// signal)` pair on error, so a still-owned stuck unit keeps its streak.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tick(
     store: &dyn ObjectStoreBackend,
@@ -936,6 +959,39 @@ pub async fn run_tick(
     .await
 }
 
+/// Records every `(signal, shard)` unit of `tenant` that the rendezvous
+/// ownership gate assigns to this process under `live_set`, over the
+/// configured `0..shard_count` range of each [`MAINTAINED_SIGNALS`] signal.
+///
+/// This is the pure ownership question (ADR-0065 decision 2): it reads
+/// nothing from the store and cannot fail, so it answers "does this process
+/// own the unit" independently of whether this tick got far enough to
+/// evaluate it. That separation is the fix for issue #920 -- the stall-streak
+/// prune in [`MaintenanceOwnershipMetrics::end_cycle`] keys on ownership, and
+/// a still-owned unit whose tick was skipped by a transient per-tenant or
+/// per-`(tenant, signal)` fault must keep its streak.
+///
+/// Units outside `0..shard_count` (a wider generation in the shard-generation
+/// history) are not visible without a store read, so [`run_tick_with_clock`]
+/// notes those additionally once it has read that history. That read is
+/// exactly one of the paths that can fail; when it does, the units this
+/// process owns within the configured range are still recorded here.
+fn note_owned_units(
+    ownership: &MaintenanceOwnershipMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    tenant: &TenantHash,
+    shard_count: u32,
+) {
+    for signal in MAINTAINED_SIGNALS {
+        for shard in 0..shard_count {
+            if worker.owns_unit(live_set, tenant, signal, shard) {
+                ownership.note_owned_unit(*tenant, signal, shard);
+            }
+        }
+    }
+}
+
 /// [`run_tick`] with the clock injected instead of hardwired to [`WallClock`].
 /// The running service always passes [`WallClock`]; tests pass a
 /// [`ravel_maintain::FixedClock`] so a tick that must observe time *passing*
@@ -957,6 +1013,18 @@ pub(crate) async fn run_tick_with_clock(
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> MaintainReport {
+    // Record this tenant's owned units from the ownership gate alone, before
+    // anything that can fail (issue #920). Ownership is a pure function of
+    // (live set, tenant, signal, shard) under the rendezvous hash, so it is
+    // knowable here, ahead of the legal-hold refresh and the per-(tenant,
+    // signal) provisioning and shard-generation reads below, each of which
+    // returns or continues without evaluating units this process still owns.
+    // Sourcing `owned_this_cycle` from the evaluation path instead let a
+    // transient per-tenant fault prune a still-owned unit's stall streak, so
+    // its `units_stalled` observation restarted from zero and recurring
+    // faults could hold the alarm off indefinitely.
+    note_owned_units(ownership, worker, live_set, tenant, shard_count);
+
     let hold = match LegalHoldCheck::refresh(store, tenant).await {
         Ok(hold) => hold,
         Err(err) => {
@@ -1047,6 +1115,11 @@ pub(crate) async fn run_tick_with_clock(
             .filter(|shard| worker.owns_unit(live_set, tenant, signal, *shard))
             .collect();
         ownership.add_units_owned(owned_shards.len() as u64);
+        // Owned units the pre-refresh `note_owned_units` call could not see:
+        // a shard beyond the configured `shard_count` exists only in the
+        // shard-generation history read just above. Re-noting the shards
+        // below `shard_count` is a no-op on the set, so the loop stays a
+        // plain union rather than a range-split special case.
         for &shard in &owned_shards {
             ownership.note_owned_unit(*tenant, signal, shard);
         }
