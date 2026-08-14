@@ -289,11 +289,10 @@ pub(crate) const DEPLOYMENT_KEY_SECRET_KEY: &str = "key";
 /// `--tenant-hash-key-file` pointed at the mounted Secret (see
 /// [`deployment_key_volume`]/[`deployment_key_volume_mount`]) so the cluster
 /// runs the keyed derivation and the operator's own `sys/auth`
-/// reconciliation (issue #897) has the same key available. Otherwise it
+/// reconciliation has the same key available. Otherwise it
 /// renders `--tenant-hash-unkeyed`, keeping every existing and new
-/// keyless `RavelCluster` on today's v1-unkeyed derivation. This is an
-/// additive opt-in, not a migration of existing unkeyed clusters (EM-T10
-/// #773 owns that story).
+/// keyless `RavelCluster` on the v1-unkeyed derivation. This is an
+/// additive opt-in, not a migration of existing unkeyed clusters.
 ///
 /// Also unconditionally carries `--require-bucket-protection` (ADR-0072
 /// decision 3): "the operator sets it for production profiles", and every
@@ -379,7 +378,7 @@ fn resources(spec: Option<&ResourceRequirementsSpec>) -> Option<ResourceRequirem
 }
 
 /// Liveness and readiness probes pointed at `/healthz` and `/readyz` on the
-/// HTTP port (issue #246's routes; ADR-0034 decision 4). Returned as
+/// HTTP port (ADR-0034 decision 4). Returned as
 /// `(liveness, readiness)`.
 fn probes() -> (Probe, Probe) {
     let http_get = |path: &str| HTTPGetAction {

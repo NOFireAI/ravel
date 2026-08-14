@@ -74,8 +74,8 @@ pub struct RavelClusterSpec {
     /// decision 4): when set, the operator mounts it and renders
     /// `--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and
     /// reconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive
-    /// opt-in, not a migration of existing unkeyed clusters (EM-T10 #773 owns
-    /// that story); omit to keep today's unkeyed behavior unchanged.
+    /// opt-in, not a migration of existing unkeyed clusters; omit to keep
+    /// unkeyed behavior unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_key_secret_ref: Option<LocalSecretRef>,
 
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(spec.gateway.replicas, 1);
         assert_eq!(spec.query.replicas, 1);
         // Maintain replicas is optional and defaults to 1: an existing spec
-        // that omits it keeps today's single-replica behavior (issue #918).
+        // that omits it keeps single-replica behavior.
         assert_eq!(spec.maintain.replicas, 1);
         assert!(spec.maintain.enabled);
         assert_eq!(spec.image_pull_policy, None);

@@ -45,7 +45,7 @@ impl Cli {
     /// `ravel_tracing_export::init` (ADR-0060), or `None` when
     /// `--otlp-trace-endpoint` is absent. Unlike `ravel-server`, the operator
     /// has no `Mode` enum and renders no `/metrics` `mode` label, so `mode` is
-    /// the fixed literal `"operator"` (documented by issue #707); `main` and
+    /// the fixed literal `"operator"`; `main` and
     /// this crate's own test derive the config through this one method so the
     /// two cannot drift.
     fn otlp_export_config(&self) -> Option<OtlpExportConfig> {
