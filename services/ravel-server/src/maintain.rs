@@ -4739,6 +4739,220 @@ mod tests {
         );
     }
 
+    /// A `MemoryStore` holding one tenant's terminal bucket, so tenant
+    /// discovery finds the tenant and its units are real maintenance work.
+    /// A test that needs several stores with different fault plans over the
+    /// same tenant builds one per phase with this.
+    async fn store_with_tenant_data(tenant_id: &TenantId) -> MemoryStore {
+        let store = MemoryStore::new();
+        publish_terminal_bucket(&store, tenant_id).await;
+        store
+    }
+
+    /// A stuck unit's stall streak survives a tick that a transient
+    /// per-tenant or per-`(tenant, signal)` error kept from evaluating it,
+    /// because this process still OWNS the unit (issue #920). A unit that is
+    /// genuinely no longer owned is still pruned, so the fix does not
+    /// reintroduce the stranded-entry bug
+    /// `units_stalled_drops_a_unit_that_leaves_the_owned_set` covers.
+    ///
+    /// Four discovery-cycle phases over `(tenant, Metrics, shard 0)`:
+    ///
+    /// 1. Its own listing faults on `THRESHOLD` consecutive cycles, so it
+    ///    reaches the stall threshold and `units_stalled` is 1.
+    /// 2. A cycle whose legal-hold refresh faults (`Signal::Audit` shard
+    ///    `AUDIT_HOLD_SHARD`'s listing). `run_tick_with_clock` returns before
+    ///    any signal loop runs, so no unit of this tenant is evaluated at
+    ///    all. Asserted through `safety.legal_hold_refresh_failures()`, not
+    ///    inferred: the tick really took the error return.
+    /// 3. A cycle whose `(tenant, Metrics)` provisioning read faults (a GET
+    ///    of `t/<hash>/<signal>/prov`), the per-`(tenant, signal)` `continue`
+    ///    path, so Logs and Spans run normally but shard 0 of Metrics is
+    ///    again never evaluated. Asserted through the `FaultStore` GET
+    ///    counter.
+    /// 4. A peer joins the live set and takes shard 0's rendezvous ownership.
+    ///    Now the unit is genuinely not owned, and its entry must go.
+    ///
+    /// Phases 2 and 3 are exactly the ticks the pre-fix code reported an
+    /// empty owned set for, because `note_owned_unit` was only reached after
+    /// both error paths. Non-vacuity, flipped one line at a time in
+    /// `run_tick_with_clock`: deleting the `note_owned_units(ownership,
+    /// worker, live_set, tenant, shard_count)` call before the legal-hold
+    /// refresh (leaving only the in-loop `note_owned_unit` calls, i.e. the
+    /// pre-fix source) fails phase 2's assertion with `units_stalled` at 0
+    /// instead of 1, and, with phase 2 also cut so phase 3 is reached with
+    /// the streak intact, fails phase 3's assertion the same way -- each
+    /// error path is proven on its own, not just through the earlier one.
+    /// Phase 4 is what fails if that call is instead made unconditional over
+    /// `0..shard_count` without the `owns_unit` gate.
+    #[tokio::test]
+    async fn units_stalled_survives_a_transient_error_that_skips_a_still_owned_tick() {
+        const THRESHOLD: u32 = 3;
+
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let discovery_metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(THRESHOLD);
+        let worker = solo_worker();
+        let live_solo = worker.solo_live_set();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Phase 1: fault only (tenant, Metrics, shard 0)'s own listing, so
+        // that one unit fails every cycle while everything else -- tenant
+        // discovery, the legal-hold refresh, the other units -- stays clean.
+        let shard_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid metrics shard prefix");
+        let stuck = FaultStore::new(
+            store_with_tenant_data(&tenant_id).await,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("scan unavailable".into()),
+                )
+                .with_key_contains(shard_prefix),
+            ),
+        );
+        for _ in 0..THRESHOLD {
+            let _report = run_discovery_cycle(
+                &stuck,
+                None,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &discovery_metrics,
+                &safety,
+                &ownership,
+                &worker,
+                &live_solo,
+            )
+            .await;
+        }
+        assert_eq!(
+            ownership.units_stalled(),
+            1,
+            "shard 0 must cross the stall threshold while still owned"
+        );
+
+        // Phase 2: the tenant's legal-hold refresh faults, so its whole tick
+        // is skipped. The unit is still owned and still stuck.
+        let hold_prefix = keys::commit_shard_prefix(&tenant, Signal::Audit, AUDIT_HOLD_SHARD)
+            .expect("valid audit hold shard prefix");
+        let hold_faulted = FaultStore::new(
+            store_with_tenant_data(&tenant_id).await,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("legal hold unavailable".into()),
+                )
+                .with_key_contains(hold_prefix),
+            ),
+        );
+        let _report = run_discovery_cycle(
+            &hold_faulted,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &discovery_metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &live_solo,
+        )
+        .await;
+        assert_eq!(
+            safety.legal_hold_refresh_failures(),
+            1,
+            "this phase is only meaningful if the tick really took the \
+             legal-hold error return"
+        );
+        assert_eq!(
+            ownership.units_stalled(),
+            1,
+            "a transient legal-hold failure must not reset a still-owned \
+             stuck unit's stall streak: the unit is unevaluated this tick, \
+             not unowned"
+        );
+
+        // Phase 3: the (tenant, Metrics) provisioning read faults, the
+        // per-(tenant, signal) `continue` path. Logs and Spans still run.
+        let prov_key = ravel_catalog::provisioning_key(&tenant, Signal::Metrics);
+        let prov_faulted = FaultStore::new(
+            store_with_tenant_data(&tenant_id).await,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Transient("provisioning record unavailable".into()),
+                )
+                .with_key_contains(prov_key),
+            ),
+        );
+        let _report = run_discovery_cycle(
+            &prov_faulted,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &discovery_metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &live_solo,
+        )
+        .await;
+        assert!(
+            prov_faulted.fault_count(Op::Get, ravel_object_store::fault::FaultKind::Transient) > 0,
+            "this phase is only meaningful if the provisioning read really faulted"
+        );
+        assert_eq!(
+            ownership.units_stalled(),
+            1,
+            "a transient provisioning-read failure must not reset a \
+             still-owned stuck unit's stall streak"
+        );
+
+        // Phase 4: a peer joins and takes shard 0 under the rendezvous hash.
+        // The unit is now genuinely unowned, so its entry must be pruned --
+        // the behavior the evaluated-keyed prune was written for, which
+        // keying on ownership must preserve.
+        let peer_id = (1u128..10_000)
+            .map(Uuid::from_u128)
+            .find(|candidate| {
+                let live = vec![worker.process_id(), *candidate];
+                !worker.owns_unit(&live, &tenant, Signal::Metrics, 0)
+            })
+            .expect("some peer id flips shard 0's rendezvous owner away from the solo worker");
+        let live_ab = vec![worker.process_id(), peer_id];
+        let clean = store_with_tenant_data(&tenant_id).await;
+        let _report = run_discovery_cycle(
+            &clean,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &discovery_metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &live_ab,
+        )
+        .await;
+        assert_eq!(
+            ownership.units_stalled(),
+            0,
+            "a unit this process no longer owns must still be pruned: keying \
+             the prune on ownership rather than evaluation must not strand \
+             its entry"
+        );
+    }
+
     /// A store that (1) counts heartbeat PUTs (writes to `sys/maintain/workers/`)
     /// and (2) blocks tenant discovery: its `list_delimited("t/")` awaits a
     /// `tokio::time::sleep(block)` before delegating, so a discovery cycle stays
