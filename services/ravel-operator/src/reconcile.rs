@@ -80,7 +80,7 @@ pub struct RenderCtx {
 
     /// `resourceVersion` of the `deploymentKeySecretRef` Secret, or `None` when
     /// no deployment key is configured. Every pod that mounts the deployment
-    /// key (review finding 8, #897) must roll when it rotates, the same as a
+    /// key must roll when it rotates, the same as a
     /// credential or tenant-token rotation does; folded into
     /// [`secrets_checksum`] alongside the other two.
     pub deployment_key_resource_version: Option<String>,
@@ -105,7 +105,7 @@ fn tier_credentials_secret_name<'a>(
 /// A deterministic change-detection checksum over the Secrets a tier
 /// consumes: the shared token Secret, the tier's resolved credential Secret,
 /// and the deployment-key Secret (every tier mounts the same one, when
-/// configured -- review finding 8, #897).
+/// configured).
 ///
 /// Built from their `resourceVersion`s, which change exactly when a Secret's
 /// content changes and are stable otherwise, so this value is stable across
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn deployment_key_spec_renders_tenant_hash_key_file_and_mounts_the_secret() {
-        // ADR-0072 decision 4 / #897: when deploymentKeySecretRef is set, every
+        // ADR-0072 decision 4: when deploymentKeySecretRef is set, every
         // deployment must render --tenant-hash-key-file pointed at the mounted
         // Secret instead of --tenant-hash-unkeyed, and the pod must carry a
         // read-only Volume/VolumeMount sourcing that Secret's `key` entry.
@@ -1146,14 +1146,11 @@ mod tests {
 
     #[test]
     fn maintain_replicas_two_renders_two_pods_with_rolling_update_and_ownership_wiring() {
-        // Issue #918 reachability test. Epic EI / ADR-0065 makes >1 maintain
-        // replica safe in-process (rendezvous over a heartbeat-derived live
-        // worker set), but that machinery was unreachable through the operator:
-        // the CRD had no maintain replica field and the Deployment used
-        // Recreate, pinning the tier to one pod. This asserts that setting
+        // ADR-0065 makes >1 maintain replica safe in-process (rendezvous over
+        // a heartbeat-derived live worker set). This asserts that setting
         // spec.maintain.replicas = 2 renders a two-pod Deployment with a
         // >1-safe strategy, and that each pod carries the ownership-protocol
-        // wiring the in-process EI tests rely on.
+        // wiring the in-process ownership tests rely on.
         //
         // The ownership protocol coordinates entirely through the shared object
         // store (self-owned keys under `sys/maintain/`, discovered at runtime),
@@ -1378,8 +1375,8 @@ mod tests {
         assert_ne!(
             a,
             secrets_checksum(Some("100"), Some("200"), Some("301")),
-            "the deployment-key resourceVersion must also feed the checksum \
-             (review finding 8, #897), so its rotation rolls pods that mount it"
+            "the deployment-key resourceVersion must also feed the checksum, \
+             so its rotation rolls pods that mount it"
         );
         // Absent versions collapse to a distinct, stable value.
         let none = secrets_checksum(None, Some("200"), None);
@@ -1595,7 +1592,7 @@ mod tests {
 
     #[test]
     fn deployment_key_secret_rotation_rolls_every_tier() {
-        // Review finding 8 (#897): every tier mounts the SAME
+        // Every tier mounts the SAME
         // `deploymentKeySecretRef` Secret (unlike per-tier credential
         // overrides), so its rotation must roll all three, the same as the
         // shared-credential case above.
