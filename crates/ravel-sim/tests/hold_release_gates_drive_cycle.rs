@@ -5,7 +5,7 @@
 //! path (a call parking, then resuming) through a real cycle without
 //! deadlocking, and every invariant must still hold.
 //!
-//! "prove-the-test" (issue #878): a gate that never holds anything must not
+//! "prove-the-test": a gate that never holds anything must not
 //! let the cycle pass silently, and a held call must be provably blocking,
 //! not just configured. Three tests carry that:
 //!
@@ -53,7 +53,7 @@ fn hold_release_gates_drive_cycle() {
             outcome.gates_armed > 0,
             outcome.gates_held > 0,
             "seed {seed}: gates_armed={} gates_held={} (a reached Ok with an armed, \
-             never-held gate would be exactly the bug issue #878 describes)",
+             never-held gate would be exactly the bug this guards against)",
             outcome.gates_armed,
             outcome.gates_held
         );
@@ -180,7 +180,7 @@ fn never_hit_gate_fails_the_cycle() {
     );
 }
 
-/// Issue #931 deliverable 4: with two gates armed but only one reachable, the
+/// With two gates armed but only one reachable, the
 /// unreachable gate must fail the cycle per gate. Before the per-gate fix,
 /// `gates_held` was a single shared total, so the reachable gate's releases
 /// pushed it positive and the whole schedule passed vacuously with the second

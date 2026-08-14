@@ -1,4 +1,4 @@
-//! Determinism guard (issue #818): the same master seed twice produces an
+//! Determinism guard: the same master seed twice produces an
 //! identical fault plan and an identical cycle digest. A seed that failed once
 //! must fail identically on replay, which requires both the injected fault
 //! schedule and the observable cycle output to be pure functions of the seed.

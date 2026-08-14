@@ -1,4 +1,4 @@
-//! Compaction/sweep-phase fault injection (issue #931 deliverables 1-3).
+//! Compaction/sweep-phase fault injection.
 //!
 //! Two properties, one per branch of the recover-or-typed-error invariant:
 //!

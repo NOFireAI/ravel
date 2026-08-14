@@ -1,9 +1,9 @@
-//! Driver (ADR-0068 deliverables 4/5, issue #818 deliverable 2/3): one seeded
+//! Driver (ADR-0068): one seeded
 //! ingest -> fold -> compact -> sweep -> query cycle over `MemoryStore`, wired
 //! through the same `IngestRouter` -> `Catalog` -> `QueryEngine` path
 //! production traffic takes and driving `ravel-maintain`'s real compaction and
 //! sweep entry points, all under injected faults from a seed-derived
-//! [`FaultSchedule`], plus the invariant checks from deliverable 5.
+//! [`FaultSchedule`], plus the invariant checks from the ADR.
 //!
 //! Runs on a single-threaded, paused-clock tokio runtime
 //! (`current_thread`/`start_paused`) that this module owns end to end:
@@ -63,7 +63,7 @@ use crate::workload::{QuerySpec, SeriesSamples, Workload, WorkloadConfig};
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// Number of idempotent re-runs the compaction/sweep recovery loop will make
-/// before giving up and surfacing the typed error (issue #931 deliverable 2).
+/// before giving up and surfacing the typed error.
 /// A single generated compaction-phase fault fires once (`Occurrence::Nth(1)`)
 /// and the compaction path issues at most three distinct faultable steps in
 /// one bucket (list, L0 read, L1 write), so a budget of six comfortably
@@ -74,7 +74,7 @@ const COMPACTION_FAULT_RETRY_BUDGET: usize = 6;
 
 /// A shared handle to an [`ObjectStoreBackend`] that is itself a backend, so a
 /// second [`FaultStore`] can wrap the same underlying store the ingest phase
-/// writes through. The compaction/sweep fault plans (issue #931) live on
+/// writes through. The compaction/sweep fault plans live on
 /// [`FaultStore`]s the driver builds only around `compact_bucket` and the
 /// sweep's action pass; each wraps a `SharedStore` cloned from the one
 /// `Arc<dyn ObjectStoreBackend>` every phase shares, so their rules govern only
@@ -127,7 +127,7 @@ impl ObjectStoreBackend for SharedStore {
 }
 
 /// Whether a [`MaintainError`] is one the driver's idempotent compaction/sweep
-/// re-run can recover from (issue #931 deliverable 2): a retryable store fault
+/// re-run can recover from: a retryable store fault
 /// (`Transient`/`Throttled`/`Timeout`) or a not-found blip. `NotFound` is not
 /// `StoreError::is_retryable` in general -- a genuine absence is a definite
 /// answer -- but the only `NotFound` this harness injects on the compaction
@@ -163,7 +163,7 @@ pub struct CycleConfig {
     /// on the ingest write path, so a clean cycle stays green; disabling this
     /// runs the cycle against a bare `MemoryStore`.
     pub inject_faults: bool,
-    /// Config for the seed-derived fault-schedule generator (deliverable 1).
+    /// Config for the seed-derived fault-schedule generator.
     pub fault_schedule: FaultScheduleConfig,
     /// Whether to arm the schedule's hold/release gates on the store. Off by
     /// default: a held call needs a releaser to make progress -- either the
@@ -181,8 +181,7 @@ pub struct CycleConfig {
     /// normal seed-derived plan and gates. This exists so a test can arm a
     /// gate with a matcher it knows the exact reachability of (a specific
     /// `Nth`, or one that can never match), rather than searching the
-    /// generator's random output for a seed that happens to produce one --
-    /// issue #878 deliverables 2 and 3.
+    /// generator's random output for a seed that happens to produce one.
     pub fault_schedule_override: Option<FaultSchedule>,
     /// Whether the driver's own tokio runtime pauses virtual time (the
     /// default) or runs on real wall-clock time. A paused clock makes every
@@ -196,7 +195,7 @@ pub struct CycleConfig {
     /// straight past `ack_deadline` and the wait fails with a timeout
     /// instead of staying observably blocked. Set this to `false` only for
     /// a test that must prove a held call is still blocking the cycle
-    /// (issue #878 deliverable 2) -- real wall-clock time then makes
+    /// -- real wall-clock time then makes
     /// `ack_deadline` mean what it says, at the cost of the cycle no
     /// longer being instant.
     pub paused_clock: bool,
@@ -250,7 +249,7 @@ impl Default for CycleConfig {
 }
 
 /// A [`GateHandle`] wrapper that counts every call actually released through
-/// it (issue #878 deliverable 1). `GateHandle` itself has no notion of
+/// it. `GateHandle` itself has no notion of
 /// cumulative holds -- `held()`/`held_count()` only report calls currently
 /// parked, which a released call immediately drops out of -- so a cycle has
 /// no way to prove after the fact that a gate ever held anything. Routing
@@ -271,8 +270,7 @@ pub struct CountingGateHandle {
     /// One release counter per armed gate, index-aligned with `gate_matchers`.
     /// [`CycleError::GateNeverHit`] is now per-gate: every armed gate's counter
     /// must be positive, closing the vacuity where two gates shared one total
-    /// and a reachable gate's releases masked an unreachable one (issue #931
-    /// deliverable 4).
+    /// and a reachable gate's releases masked an unreachable one.
     per_gate_held: Arc<Vec<AtomicUsize>>,
 }
 
@@ -353,7 +351,7 @@ pub struct CycleOutcome {
     /// `fault_schedule_override`) carried none.
     pub gates_armed: usize,
     /// Cumulative count of calls actually released through the armed gate's
-    /// [`CountingGateHandle`] this cycle (issue #878 deliverable 1). A test
+    /// [`CountingGateHandle`] this cycle. A test
     /// with `gates_armed > 0` asserts this is also positive to prove a call
     /// was genuinely held, not just that a gate was configured. `run_cycle`
     /// itself already enforces this -- see [`CycleError::GateNeverHit`] --
@@ -369,7 +367,7 @@ pub struct CycleOutcome {
 /// <test>`, for a test whose seed comes from
 /// [`crate::seed::MasterSeed::from_env_or`] (see that method's doc for which
 /// ones do). The invariant-violation variants embed that replay line
-/// literally in their `Display` output (issue #818 deliverable 4).
+/// literally in their `Display` output.
 #[derive(Debug, thiserror::Error)]
 pub enum CycleError {
     #[error("seed {seed}: workload generation failed: {source}")]
@@ -471,8 +469,7 @@ pub enum CycleError {
     },
 }
 
-/// The recover-or-typed-error invariant's silent-loss guard (issue #931
-/// deliverable 2): after a compaction/sweep-phase fault has been recovered by
+/// The recover-or-typed-error invariant's silent-loss guard: after a compaction/sweep-phase fault has been recovered by
 /// the driver's idempotent re-run, the recovered snapshot must be bit-exactly
 /// what the pre-compaction snapshot returned -- same query digest and same
 /// record count. Any divergence is silent data loss and fails the cycle loud
@@ -507,7 +504,7 @@ fn check_compaction_fault_invariant(
 }
 
 /// Compact one bucket, absorbing a recoverable compaction-phase fault with a
-/// bounded idempotent re-run (issue #931 deliverable 2). Returns the outcome on
+/// bounded idempotent re-run. Returns the outcome on
 /// the recover branch, or a typed [`CycleError::Compact`] when the budget is
 /// exhausted or the error is not recoverable -- the typed-error branch of the
 /// recover-or-typed-error invariant. `compact_bucket` returns a `Result`, so a
@@ -535,7 +532,7 @@ async fn compact_bucket_recover(
 }
 
 /// Sweep one shard, absorbing a recoverable sweep-phase fault with a bounded
-/// idempotent re-run (issue #931 deliverable 2). `sweep_shard` is documented
+/// idempotent re-run. `sweep_shard` is documented
 /// idempotent, so re-running after a mid-pass listing fault converges. Returns
 /// the report on the recover branch, or a typed [`CycleError::Sweep`] on the
 /// typed-error branch.
@@ -789,7 +786,7 @@ async fn run_cycle_async(
     workload: Workload,
     config: &CycleConfig,
 ) -> Result<CycleOutcome, CycleError> {
-    // The seed-derived fault schedule (deliverable 1): the same seed yields
+    // The seed-derived fault schedule: the same seed yields
     // the same plan and gates. Wrap the MemoryStore oracle in a FaultStore so
     // ingest, fold, compaction, and sweep all run through the injected faults.
     let schedule = if let Some(override_schedule) = &config.fault_schedule_override {
@@ -818,12 +815,12 @@ async fn run_cycle_async(
     // the hold/release path is exercised without ever deadlocking. Aborted
     // at the end of the cycle. `GateRelease::Manual` hands the handle to the
     // caller's hook instead and spawns nothing: the caller owns release
-    // timing (issue #878 deliverable 2).
+    // timing.
     //
     // Either way, every release is counted (`CountingGateHandle::release`),
     // so `gates_armed > 0` with a total of zero releases at cycle end is
     // fail-loud (`CycleError::GateNeverHit`) rather than the previous
-    // silent pass with the parked waiter aborted (issue #878 deliverable 3).
+    // silent pass with the parked waiter aborted.
     // Zero, not `schedule.gates.len()`, when `enable_gates` is off: the
     // seed-derived generator emits a gate independently of `enable_gates`
     // (`fault_plan::generate_gates`), and a gate never armed on the store
@@ -837,8 +834,7 @@ async fn run_cycle_async(
     };
     let held_total = Arc::new(AtomicUsize::new(0));
     // Per-gate release counters and their matchers, index-aligned with the
-    // armed gates, so `GateNeverHit` is enforced per gate (issue #931
-    // deliverable 4). Sized to the armed gate count.
+    // armed gates, so `GateNeverHit` is enforced per gate. Sized to the armed gate count.
     let gate_matchers: Arc<Vec<(Op, Option<String>)>> = Arc::new(
         schedule
             .gates
@@ -928,8 +924,7 @@ async fn run_cycle_async(
         ..CompactorConfig::default()
     };
 
-    // Phase-local fault layers over the one shared store (issue #931
-    // deliverable 3): the compaction plan governs only `compact_bucket`, the
+    // Phase-local fault layers over the one shared store: the compaction plan governs only `compact_bucket`, the
     // sweep plan only the sweep's action pass, so their rules cannot fire
     // during ingest, fold, or the query probes. Built once for the whole
     // cycle: each rule fires `Occurrence::Nth(1)`, so it lands on the first
@@ -1110,8 +1105,7 @@ async fn run_cycle_async(
         let hour_lo = hour_of(workload.start_ts_ns);
         let hour_hi = hour_of(bucket_hi_ns);
         // Drive compaction through the compaction-phase FaultStore, wrapping
-        // each bucket in the bounded idempotent re-run (issue #931
-        // deliverables 2/3): the partial-write and missing-object faults fire
+        // each bucket in the bounded idempotent re-run: the partial-write and missing-object faults fire
         // once and the re-run recovers to an equivalent result, or an exhausted
         // fault surfaces as a typed `CycleError::Compact`.
         for shard in 0..config.shard_count {
@@ -1178,8 +1172,7 @@ async fn run_cycle_async(
         )
         .await?;
 
-        // Recover-or-typed-error invariant, recover branch (issue #931
-        // deliverable 2): a compaction-phase fault that the re-run absorbed
+        // Recover-or-typed-error invariant, recover branch: a compaction-phase fault that the re-run absorbed
         // must have reproduced a bit-exact snapshot. Silent loss here fails
         // loud with the seed, distinct from the plain (fault-free) equivalence
         // checks below.
@@ -1223,7 +1216,7 @@ async fn run_cycle_async(
             .saturating_add(NS_PER_HOUR);
         let sweep_clock = FixedClock::new(sweep_now_ns);
         // Action pass through the sweep-phase FaultStore with the bounded
-        // idempotent re-run (issue #931 deliverables 2/3): the pagination fault
+        // idempotent re-run: the pagination fault
         // fires on the first paginated listing and the re-run recovers, or an
         // exhausted fault surfaces as a typed `CycleError::Sweep`.
         for shard in 0..config.shard_count {
@@ -1328,7 +1321,7 @@ async fn run_cycle_async(
     }
 
     let gates_held = held_total.load(Ordering::SeqCst);
-    // Per-gate never-hit check (issue #931 deliverable 4): every armed gate
+    // Per-gate never-hit check: every armed gate
     // must have held at least one call. Checking the shared total instead let
     // a partially-vacuous multi-gate schedule (some gates reachable, others
     // not) pass, because a reachable gate's releases pushed the one shared
@@ -1344,7 +1337,7 @@ async fn run_cycle_async(
     }
 
     // Merge the ingest- and compaction/sweep-phase fault counters and expected
-    // sets (issue #931 deliverable 3), so the existing "every expected fault
+    // sets, so the existing "every expected fault
     // fired" acceptance assertion (`compaction_equivalence_under_faults`, and
     // the nightly seed batch) automatically covers the new faults.
     let mut fault_counters = fault_store.counters_snapshot();
@@ -1593,7 +1586,7 @@ mod tests {
     /// feeding it a fabricated post-recovery mismatch (the "injected silent
     /// loss") makes it fire, and it is the exact function the seeded cycle runs
     /// on real probe data. This is the flip that proves the assertion, per
-    /// issue #931 deliverable 2 / the prove-the-test discipline.
+    /// the prove-the-test discipline.
     #[test]
     fn compaction_fault_invariant_fires_on_injected_silent_loss() {
         // Injected silent loss: same query digest changed, or the record count

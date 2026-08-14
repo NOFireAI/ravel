@@ -1,4 +1,4 @@
-//! Seeded foundation (ADR-0068 deliverable 1): every sub-system draws its
+//! Seeded foundation (ADR-0068): every sub-system draws its
 //! randomness from one master seed via domain-separated hashing into
 //! `StdRng::seed_from_u64`, so a whole cycle is reproducible from a single
 //! `u64` and a failure can be replayed with `RAVEL_SIM_SEED=<seed>`, for

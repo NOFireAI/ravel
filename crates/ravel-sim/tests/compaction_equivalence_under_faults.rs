@@ -1,4 +1,4 @@
-//! Acceptance test for issue #818 (ADR-0068 decisions 3-5): a seeded batch
+//! Acceptance test (ADR-0068 decisions 3-5): a seeded batch
 //! runs the full ingest -> fold -> compact -> sweep -> query cycle with
 //! generated fault schedules, and every invariant stays green:
 //!
