@@ -354,7 +354,7 @@ impl tracing::field::Visit for MessageVisitor {
     }
 }
 
-/// Issue #711: a reachable-but-wrong endpoint (built fine, refused at send time)
+/// A reachable-but-wrong endpoint (built fine, refused at send time)
 /// must surface a `tracing::warn!` line, not fail silently. Point the exporter at
 /// a refused port, emit a span, force an export attempt, and assert the crate
 /// logged its distinct runtime-failure warning.

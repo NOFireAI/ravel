@@ -1,6 +1,6 @@
-//! `ravel-cli provision adopt` (ADR-0050 section 5, EC5): write the durable
-//! `shard_count` provisioning record for a (tenant, signal) with pre-ADR data,
-//! ahead of any server touching it.
+//! `ravel-cli provision adopt` (ADR-0050 section 5): write the durable
+//! `shard_count` provisioning record for a (tenant, signal) with pre-existing
+//! data, ahead of any server touching it.
 //!
 //! This runs the exact same adoption code path a server runs at ingest,
 //! catalog, and maintenance touch: [`ravel_catalog::validate_or_adopt`] with

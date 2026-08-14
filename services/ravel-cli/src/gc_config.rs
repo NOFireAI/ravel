@@ -1,4 +1,4 @@
-//! `ravel-cli gc-config` (ADR-0050 section 4, EC4): show and set the durable,
+//! `ravel-cli gc-config` (ADR-0050 section 4): show and set the durable,
 //! deployment-wide GC configuration object `sys/gc`.
 //!
 //! `set` is the single mutation path for `sys/gc` (every mode only ever reads
