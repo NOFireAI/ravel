@@ -67,7 +67,7 @@ pub(crate) enum FunctionKind {
     /// matrix window, so it does not fit either `RangeVector` shape above
     /// (P9, `histogram_quantile`). Takes `&QueryWindow` so it can raise
     /// warning/info annotations (out-of-range `phi`, malformed buckets,
-    /// forced monotonicity; issue #178).
+    /// forced monotonicity).
     HistogramQuantile(HistogramQuantileFn),
     /// `f(lower, upper, v instant-vector) -> instant-vector`, the two-scalar
     /// counterpart of `HistogramQuantile` (P9, `histogram_fraction`). Takes
@@ -203,7 +203,7 @@ pub(crate) fn eval_call(
             // own check only runs once a rate/increase value was actually
             // computed (its early return for fewer than two samples happens
             // first), so a single-sample selector match must not raise this
-            // either (issue #234).
+            // either.
             maybe_info_non_counter_selector_name(call.func.name, arg, !out.is_empty(), ctx);
             // Native-histogram series matching the same selector: reduce each
             // window to a histogram and emit it as a histogram element. A
@@ -211,7 +211,7 @@ pub(crate) fn eval_call(
             // gated to a matrix selector below): when a subquery's inner
             // expression matches histogram data, `eval_subquery_matrix` errors
             // upstream with `Error::Unsupported` rather than silently dropping
-            // the histogram series here (issue #220).
+            // the histogram series here.
             if let MatrixArg::Selector(ms) = arg {
                 let hmatrix =
                     evaluator.eval_histogram_matrix_selector(source, ms, eval_ts_ns, ctx)?;
@@ -646,9 +646,9 @@ fn range_window(arg: MatrixArg, eval_ts_ns: i64, ctx: &QueryWindow) -> Result<Ra
 /// `rate()`/`increase()` (never `delta()`, which targets gauges and has no
 /// counterpart Prometheus check) over a literal-named vector selector whose
 /// name lacks a Prometheus counter-naming suffix: raises
-/// [`possible_non_counter_info`] (issue #234). The check runs against the
-/// argument's own selector name, not each matched series' `__name__` label
-/// -- matching the minimal scope #178's report left open -- so a
+/// [`possible_non_counter_info`]. The check runs against the
+/// argument's own selector name, not each matched series' `__name__` label,
+/// so a
 /// label-matcher-only selector (no literal name) or a subquery's wrapped
 /// expression has nothing to check here. `produced_a_value` gates it to only
 /// fire once a rate/increase value was actually computed for at least one

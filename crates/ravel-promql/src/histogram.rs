@@ -1,6 +1,6 @@
 //! Native (exponential) histogram value model and the Prometheus histogram
-//! math the P11 function forms are built on (docs/promql-evaluator-plan.md
-//! P11, ADR-0017, ADR-0021).
+//! math the native-histogram function forms are built on (ADR-0017,
+//! ADR-0021).
 //!
 //! [`FloatHistogram`] mirrors Prometheus' `histogram.FloatHistogram`: the
 //! working value type every native-histogram PromQL operation reduces to.
@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(buckets[2].upper, 2.0);
     }
 
-    /// Build the `diff_native_hist` value at +0s from issue #252: schema 0,
+    /// Build the `diff_native_hist` value at +0s: schema 0,
     /// zero_threshold 1e-9, zero_count 1, positive buckets [2,3,1] from index
     /// 1. Cumulative buckets: zero 1, (1,2] 2, (2,4] 3, (4,8] 1; total 7.
     fn diff_native_hist() -> FloatHistogram {

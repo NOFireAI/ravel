@@ -1,5 +1,4 @@
-//! AST-level keyed tokenization of PromQL query text (ADR-0062 decision 2e,
-//! epic EL / issue #761).
+//! AST-level keyed tokenization of PromQL query text (ADR-0062 decision 2e).
 //!
 //! The audit trail's default posture stores a *structure-preserving redacted*
 //! form of every query: the parsed query re-rendered with each PII-carrying

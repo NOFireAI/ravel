@@ -1,4 +1,4 @@
-//! Aggregation operator evaluation (docs/promql-evaluator-plan.md P8): `sum`,
+//! Aggregation operator evaluation: `sum`,
 //! `avg`, `min`, `max`, `count`, `group`, `stddev`, `stdvar`, `topk`,
 //! `bottomk`, `quantile`, `count_values`, with `by`/`without`/`__name__`
 //! label handling.
@@ -413,7 +413,7 @@ fn eval_quantile(
 ) -> InstantVector {
     // A `q` outside [0, 1] does not error; `quantile` clamps it to +/-Inf
     // (and a NaN `q` yields NaN). Prometheus flags any of those with a
-    // warning annotation, and now so does Ravel (issue #178). `!contains`
+    // warning annotation, and so does Ravel. `!contains`
     // covers NaN too (NaN is in no range), matching Prometheus, which warns
     // on `math.IsNaN(q) || q < 0 || q > 1`.
     if !(0.0..=1.0).contains(&q) {

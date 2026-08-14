@@ -1,4 +1,4 @@
-//! Binary operator evaluation (docs/promql-evaluator-plan.md P7): scalar and
+//! Binary operator evaluation: scalar and
 //! vector arithmetic, filter- and bool-mode comparisons, one-to-one and
 //! many-to-one/one-to-many vector matching (`on`/`ignoring`,
 //! `group_left`/`group_right`), and the `and`/`or`/`unless` set operators.
