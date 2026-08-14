@@ -167,6 +167,24 @@ Labels: `mode`. Both samples come from the background store-reachability probe
 | `ravel_store_reachable` | Gauge. 1 when the probe reports the store reachable, 0 after K consecutive failed probes. |
 | `ravel_store_probe_failures_total` | Every failed probe cycle, monotonic, incremented even below the readiness threshold. |
 
+### Durable auth refresh (`ravel_durable_auth_*`)
+
+Labels: `mode`. Renders only when the process built a durable `sys/auth`
+resolver, that is `--deployment-key` set in a request-serving mode (`all`,
+`gateway`, `query`); omitted otherwise (ADR-0066 decision 6). All three come
+from the background refresh loop that keeps the cached token map current.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_durable_auth_refresh_failures_total` | Background refreshes that failed to read or decode `sys/auth`. The staleness gate is not advanced on a failure, so a sustained failure eventually fails auth closed. |
+| `ravel_durable_auth_on_miss_rereads_total` | Off-horizon on-miss re-reads of `sys/auth` begun after the rate limiter, when the request path saw an unknown token. |
+| `ravel_durable_auth_stale_fail_closed_total` | Bearer-token resolutions refused because the cached map was hard-stale (fail-closed). |
+
+`ravel_durable_auth_refresh_failures_total` is the credential-break
+early-warning signal: it climbs as soon as the loop cannot read `sys/auth`,
+long before the hard-stale horizon starts refusing tokens. The operations
+guide gives its alert rule.
+
 ### Maintenance discovery (`ravel_maintain_*`)
 
 Labels: `mode`. Renders only in `maintain` mode (ADR-0048 decision 3).

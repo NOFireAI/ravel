@@ -932,6 +932,7 @@ pub async fn start(
         ingest_concurrency: ingest_concurrency.clone(),
         ingest_buffer_budget: ingest_buffer_budget.clone(),
         distrib: distrib_metrics.clone(),
+        durable_auth: durable_auth.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 

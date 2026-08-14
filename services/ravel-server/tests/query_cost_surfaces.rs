@@ -202,6 +202,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
             ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
         ),
         distrib: None,
+        durable_auth: None,
     });
 
     Surfaces {
@@ -597,6 +598,7 @@ mod flight {
                     ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
                 ),
             distrib: None,
+            durable_auth: None,
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![

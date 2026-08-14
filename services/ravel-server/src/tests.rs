@@ -192,6 +192,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
             ravel_ingest::IngestByteBudgetLimit::Unlimited,
         ),
         distrib: None,
+        durable_auth: None,
     });
 
     Harness {

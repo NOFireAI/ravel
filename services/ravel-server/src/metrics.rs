@@ -1202,6 +1202,82 @@ fn render_bucket_protection_family(out: &mut String, mode: Mode, unknown: u64) {
     );
 }
 
+/// The durable auth (`sys/auth`) background-refresh loop's three counters
+/// (ADR-0066 decision 6), decoupled from
+/// [`crate::lifecycle_refresh::DurableAuthState`] so the renderer is testable
+/// with a plain struct literal, matching [`CatalogCountersSnapshot`]. Rendered
+/// only when the process built a `DurableAuthState` (a keyed deployment with
+/// `--deployment-key`, in `Mode::All`/`Gateway`/`Query`); a process without one
+/// (or `Mode::Maintain`) omits the whole `ravel_durable_auth_*` family.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DurableAuthCountersSnapshot {
+    /// Background refreshes that failed to read or decode `sys/auth` (store,
+    /// decode, wrong-key, or corruption error). The staleness gate is not
+    /// advanced on a failure, so a sustained inability to refresh eventually
+    /// drives the cached map hard-stale and fails auth closed. This is the
+    /// credential-break early-warning signal: it climbs long before the
+    /// hard-stale horizon, which is why an operator alerts on its increase.
+    pub refresh_failures: u64,
+    /// Off-horizon on-miss re-reads of `sys/auth` actually begun after the rate
+    /// limiter, when the request path saw an unknown token.
+    pub on_miss_rereads: u64,
+    /// Bearer-token resolutions refused because the cached map was hard-stale
+    /// (fail-closed, ADR-0066 decision 6).
+    pub stale_fail_closed: u64,
+}
+
+/// The durable-auth refresh-loop counter family (ADR-0066 decision 6). Every
+/// sample carries only `{mode}` (the ADR-0044 allowlist): the loop is
+/// process-wide, one cached `sys/auth` map per deployment key, with no
+/// per-tenant or per-signal breakdown to render. The same mode-only shape as
+/// [`render_catalog_family`] and [`render_store_probe_family`] above. Rendered
+/// only when a `DurableAuthState` exists, so a process with no keyed deployment
+/// omits the whole family rather than exporting three permanent zeros.
+fn render_durable_auth_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: &DurableAuthCountersSnapshot,
+) {
+    write_header(
+        out,
+        "ravel_durable_auth_refresh_failures_total",
+        "Durable auth (sys/auth) background refreshes that failed to read or decode the token map; the staleness gate is not advanced on a failure, so a sustained failure eventually fails auth closed (ADR-0066 decision 6).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_durable_auth_refresh_failures_total",
+        &[Label::Mode(mode)],
+        snapshot.refresh_failures,
+    );
+
+    write_header(
+        out,
+        "ravel_durable_auth_on_miss_rereads_total",
+        "Off-horizon on-miss re-reads of sys/auth begun after the rate limiter, when the request path saw an unknown token (ADR-0066 decision 6).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_durable_auth_on_miss_rereads_total",
+        &[Label::Mode(mode)],
+        snapshot.on_miss_rereads,
+    );
+
+    write_header(
+        out,
+        "ravel_durable_auth_stale_fail_closed_total",
+        "Bearer-token resolutions refused because the cached sys/auth map was hard-stale, failing closed (ADR-0066 decision 6).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_durable_auth_stale_fail_closed_total",
+        &[Label::Mode(mode)],
+        snapshot.stale_fail_closed,
+    );
+}
+
 /// Storage-derived tenant discovery counters for the maintenance driver
 /// (ADR-0048 decision 3), decoupled from
 /// [`crate::tenant_discovery::TenantDiscoveryMetrics`] so the renderer is
@@ -2457,6 +2533,7 @@ pub fn render(
     ingest_concurrency_shed_total: u64,
     ingest_buffer_budget: IngestBufferBudgetSnapshot,
     distrib: Option<&DistribSnapshot>,
+    durable_auth: Option<&DurableAuthCountersSnapshot>,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -2482,6 +2559,9 @@ pub fn render(
         mode,
         crate::bucket_protection::bucket_protection_unknown(),
     );
+    if let Some(snapshot) = durable_auth {
+        render_durable_auth_family(&mut out, mode, snapshot);
+    }
     render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
     if let Some(snapshot) = maintain {
         render_maintain_family(&mut out, mode, snapshot);
@@ -2593,6 +2673,12 @@ pub struct MetricsState {
     /// when the process serves queries with `--distributed-query` on; `None`
     /// otherwise leaves the whole `ravel_distrib_*` family off the exposition.
     pub distrib: Option<Arc<crate::distrib::FragmentMetrics>>,
+    /// The durable `sys/auth` background-refresh state (ADR-0066 decision 6),
+    /// read at scrape time for its three refresh-loop counters. `Some` only
+    /// when `--deployment-key` is set in a request-serving mode
+    /// (`Mode::All`/`Gateway`/`Query`); `None` otherwise leaves the whole
+    /// `ravel_durable_auth_*` family off the exposition.
+    pub durable_auth: Option<Arc<crate::lifecycle_refresh::DurableAuthState>>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -2720,6 +2806,19 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         slice_fetch_nanos_total: metrics.slice_fetch_nanos_total(),
     });
 
+    // Read the durable-auth refresh-loop counters at scrape time (atomic loads),
+    // like every other family. `None` when this process built no
+    // `DurableAuthState`, which omits the whole family.
+    let durable_auth_snapshot =
+        state
+            .durable_auth
+            .as_ref()
+            .map(|auth| DurableAuthCountersSnapshot {
+                refresh_failures: auth.refresh_failures(),
+                on_miss_rereads: auth.on_miss_rereads(),
+                stale_fail_closed: auth.stale_fail_closed(),
+            });
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -2737,6 +2836,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ingest_concurrency_shed_total,
         ingest_buffer_budget,
         distrib_snapshot.as_ref(),
+        durable_auth_snapshot.as_ref(),
     );
     (
         StatusCode::OK,
@@ -2806,6 +2906,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         );
 
@@ -2943,6 +3044,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
 
         let postings_lines: Vec<&str> = body
@@ -3071,6 +3173,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         );
 
@@ -3227,6 +3330,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
 
         assert!(
@@ -3253,6 +3357,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         );
 
@@ -3313,6 +3418,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
 
         assert!(
@@ -3358,6 +3464,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
 
         assert!(
@@ -3395,6 +3502,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -3408,6 +3516,139 @@ mod tests {
         // Both carry the standard TYPE headers.
         assert!(body.contains("# TYPE ravel_store_reachable gauge"));
         assert!(body.contains("# TYPE ravel_store_probe_failures_total counter"));
+    }
+
+    /// THE deliverable-4 test (issue #1079): all three durable-auth
+    /// refresh-loop counters reach `/metrics` and carry the real values their
+    /// underlying conditions produced, not zero placeholders. Each of the three
+    /// is driven by its genuine trigger on a real [`DurableAuthState`] -- a
+    /// failed refresh (a faulting sys/auth GET), an on-miss re-read, and a
+    /// hard-stale fail-closed resolution -- then that state's counters are
+    /// snapshotted and rendered exactly as the `/metrics` handler does, so the
+    /// full condition->counter->exposition chain is asserted end to end.
+    #[tokio::test]
+    async fn render_includes_durable_auth_counters_that_incremented() {
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::fault::{FaultPlan, Op, Rule, ScriptedFault};
+        use ravel_object_store::memory::MemoryStore;
+
+        use crate::lifecycle_refresh::{AuthResolution, DurableAuthState};
+
+        const KEY: [u8; 32] = [0x42u8; 32];
+        let horizon_ns: i64 = 60_000_000_000;
+        let hard_multiple: i64 = 3;
+        let on_miss_ns: i64 = 1_000_000_000;
+        let t0 = 1_000 * horizon_ns;
+
+        // A store that fails every sys/auth GET, so the background refresh can
+        // never succeed and never advances the staleness gate off its t0 seed.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Transient("auth store down".into()))
+                .with_key_contains("sys/auth"),
+        );
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(
+            ravel_object_store::fault::FaultStore::new(MemoryStore::new(), plan),
+        );
+        let state = DurableAuthState::new(store, KEY, horizon_ns, hard_multiple, on_miss_ns, t0);
+
+        // Condition 1: a refresh that genuinely cannot read sys/auth.
+        assert!(
+            state.refresh(t0).await.is_err(),
+            "a faulting sys/auth GET must fail the refresh"
+        );
+        // Condition 2: an on-miss re-read begun after the rate-limit window.
+        assert!(
+            state.try_begin_on_miss_reread(t0),
+            "the first on-miss re-read is allowed"
+        );
+        // Condition 3: a resolution one ns past the hard staleness bound fails
+        // closed (the gate was never advanced past its t0 seed).
+        assert_eq!(
+            state.resolve_token(b"tok", t0 + horizon_ns * hard_multiple + 1),
+            AuthResolution::StaleFailClosed,
+            "past the hard bound the resolver must fail closed"
+        );
+
+        // Each counter observed its condition exactly once; the family is not a
+        // zero placeholder.
+        assert_eq!(state.refresh_failures(), 1);
+        assert_eq!(state.on_miss_rereads(), 1);
+        assert_eq!(state.stale_fail_closed(), 1);
+
+        // Snapshot exactly as the /metrics handler does, then render.
+        let snapshot = DurableAuthCountersSnapshot {
+            refresh_failures: state.refresh_failures(),
+            on_miss_rereads: state.on_miss_rereads(),
+            stale_fail_closed: state.stale_fail_closed(),
+        };
+        let body = render(
+            Mode::Query,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            Some(&snapshot),
+        );
+
+        // All three counters appear, mode-labeled, carrying the driven value.
+        assert!(
+            body.contains("ravel_durable_auth_refresh_failures_total{mode=\"query\"} 1"),
+            "missing refresh-failures counter:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_durable_auth_on_miss_rereads_total{mode=\"query\"} 1"),
+            "missing on-miss-rereads counter:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_durable_auth_stale_fail_closed_total{mode=\"query\"} 1"),
+            "missing stale-fail-closed counter:\n{body}"
+        );
+        // Each carries a counter TYPE header.
+        assert!(body.contains("# TYPE ravel_durable_auth_refresh_failures_total counter"));
+        assert!(body.contains("# TYPE ravel_durable_auth_on_miss_rereads_total counter"));
+        assert!(body.contains("# TYPE ravel_durable_auth_stale_fail_closed_total counter"));
+    }
+
+    /// The `ravel_durable_auth_*` family is omitted entirely when the process
+    /// built no `DurableAuthState` (no `--deployment-key`, or `Mode::Maintain`),
+    /// the same omission discipline every optional family here keeps rather than
+    /// exporting three permanent zeros.
+    #[test]
+    fn render_omits_durable_auth_family_when_absent() {
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+        );
+        assert!(
+            !body.contains("ravel_durable_auth_"),
+            "durable-auth family must be absent when no DurableAuthState exists:\n{body}"
+        );
     }
 
     /// the three maintenance safety controls (ADR-0048 decisions
@@ -3450,6 +3691,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         );
 
@@ -3531,6 +3773,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             Some(&snapshot),
+            None,
         );
 
         for expected in [
@@ -3597,6 +3840,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
         assert!(
             !off.contains("ravel_distrib_"),
@@ -3642,6 +3886,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         );
 
@@ -3721,6 +3966,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -3766,6 +4012,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         );
 
@@ -3839,6 +4086,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         );
 
@@ -3945,6 +4193,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -3976,6 +4225,7 @@ mod tests {
             &[],
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         );
 
@@ -4060,6 +4310,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
 
         assert_eq!(
@@ -4131,6 +4382,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -4201,6 +4453,7 @@ mod tests {
             0,
             IngestBufferBudgetSnapshot::default(),
             None,
+            None,
         );
         assert!(
             body.contains(&format!(
@@ -4247,6 +4500,7 @@ mod tests {
             &metrics.snapshot(),
             0,
             IngestBufferBudgetSnapshot::default(),
+            None,
             None,
         )
     }

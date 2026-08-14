@@ -1151,6 +1151,38 @@ Default alert rule:
 |---|---|---|
 | Store unreachable | `ravel_store_reachable == 0` | The background probe has failed four consecutive GETs of `sys/tenancy`; every data path through this process is almost certainly failing and it has already stopped advertising readiness. Alert on the sustained gauge state, not an `increase()`: this is a live "store is down right now" condition, and it clears itself the moment a single probe succeeds. |
 
+## Durable auth refresh (ADR-0066 decision 6)
+
+When `--deployment-key` is set in a request-serving mode (`all`, `gateway`,
+`query`), the process resolves bearer tokens against a cached copy of the
+durable `sys/auth` map and keeps that copy current with a background refresh
+loop. The loop re-reads `sys/auth` from object storage; on success it advances
+the staleness gate, on any read or decode failure it keeps the last-known map
+and leaves the gate un-advanced. If it cannot refresh for a hard multiple of
+the refresh horizon, the cached map is treated as untrustworthy and token
+resolution fails closed. Three counters, all labeled by `mode`, surface the
+loop's health:
+
+- `ravel_durable_auth_refresh_failures_total`: background refreshes that could
+  not read or decode `sys/auth`.
+- `ravel_durable_auth_on_miss_rereads_total`: off-horizon on-miss re-reads begun
+  after the rate limiter, when the request path saw an unknown token.
+- `ravel_durable_auth_stale_fail_closed_total`: token resolutions refused
+  because the cached map was hard-stale.
+
+The point of `ravel_durable_auth_refresh_failures_total` is to page on a broken
+storage credential (or a corrupt/wrong-key `sys/auth` object) **before** the
+hard-stale horizon starts refusing every durable token. It begins incrementing
+the moment refresh fails, one refresh interval apart, while the last-known map
+still serves; `ravel_durable_auth_stale_fail_closed_total` only starts once the
+horizon has already been crossed and auth is failing closed. Alert on the first,
+so the fix lands inside the grace window rather than after the cliff:
+
+| Condition | Query | Why |
+|---|---|---|
+| Durable auth refresh failing | `increase(ravel_durable_auth_refresh_failures_total[15m]) > 0` | The refresh loop cannot read or decode `sys/auth`: most often the storage credential broke or lost read on the key, or the object is corrupt or written under a different deployment key. The cached map still serves for now, but the staleness gate is not advancing, so this is the early warning that auth will fail closed at the hard-stale horizon if it is not fixed. A nonzero increase is a credential or object problem to reconcile now, not a rate to threshold. |
+| Durable auth failing closed | `increase(ravel_durable_auth_stale_fail_closed_total[5m]) > 0` | The cached map is already past the hard-stale bound and durable tokens are being refused. This is the cliff the refresh-failure alert above exists to keep you off; if it fires, the refresh has been broken for a full hard-stale window and every `sys/auth` token is now rejected until a refresh succeeds. |
+
 ## Tenancy setup
 
 Repeated `--tenant-token TOKEN=TENANT` flags on `ravel-server` configure
