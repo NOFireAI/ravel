@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn deployment_key_secret_ref_is_in_the_schema_and_optional() {
-        // ADR-0072 decision 4 / #897: the CRD gains an optional
+        // ADR-0072 decision 4: the CRD carries an optional
         // deploymentKeySecretRef at the top level (sibling of
         // tenantTokensSecretRef, not per-tier: one deployment key covers the
         // whole cluster). Must be visible in the schema and default to None so

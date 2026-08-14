@@ -302,9 +302,8 @@ fn parse_deployment_key(raw: &[u8]) -> Result<[u8; 32], String> {
 /// What the controller resolves from the deployment key Secret: the parsed
 /// 32-byte key and the Secret's `resourceVersion`. Every tier's pod template
 /// mounts this same Secret, so its `resourceVersion` feeds the shared
-/// secrets checksum alongside the token and credential Secrets (review
-/// finding 8, #897): a key rotation must roll pods the same way a token or
-/// credential rotation does.
+/// secrets checksum alongside the token and credential Secrets: a key
+/// rotation must roll pods the same way a token or credential rotation does.
 struct DeploymentKeySecret {
     /// The parsed key, or `None` when no deployment key Secret is configured
     /// -- the CRD's additive-opt-in state (ADR-0072 decision 4): `sys/auth`
@@ -422,8 +421,7 @@ async fn build_auth_store(
 /// Bounded retry budget for a `sys/auth` primitive call that can fail with
 /// [`ravel_catalog::AuthTokenMapError::CasConflict`] under a concurrent
 /// writer (another operator replica's own reconcile, or a `ravel-cli` call
-/// racing it): re-read, re-apply, up to this many attempts, before giving up
-/// (review blocker 4, #897).
+/// racing it): re-read, re-apply, up to this many attempts, before giving up.
 const SYS_AUTH_CAS_ATTEMPTS: u32 = 3;
 
 /// Run a `sys/auth` primitive call up to [`SYS_AUTH_CAS_ATTEMPTS`] times,
@@ -451,13 +449,13 @@ where
 }
 
 /// Converge `sys/auth` to the token Secret's current contents (ADR-0072
-/// decision 4, #897): upsert every tenant present in the Secret to exactly its
+/// decision 4): upsert every tenant present in the Secret to exactly its
 /// current token, then remove every *operator-managed* tenant present in
 /// `sys/auth` but absent from the Secret.
 ///
 /// Every write and removal here carries or is filtered by
-/// [`ravel_catalog::MANAGED_BY_OPERATOR`] (ADR-0072 decision 4 amendment,
-/// review blocker 1): a tenant `ravel-cli tenant token upsert` provisioned
+/// [`ravel_catalog::MANAGED_BY_OPERATOR`] (ADR-0072 decision 4 amendment):
+/// a tenant `ravel-cli tenant token upsert` provisioned
 /// (or an operator-adjacent tool tagged with its own `--managed-by`), and any
 /// pre-amendment entry with no ownership marker at all, is never touched by
 /// this pass even when absent from the Secret -- only a tenant this same
@@ -465,7 +463,7 @@ where
 ///
 /// A Secret that resolves to zero tenants -- no `tenantTokensSecretRef`
 /// configured, or one configured but empty -- skips both the upsert and
-/// remove passes entirely (review blocker 2) and logs one warning. Treating
+/// remove passes entirely and logs one warning. Treating
 /// "no tokens observed this cycle" as "revoke every operator-managed tenant"
 /// would turn a missing or misconfigured Secret into a mass revocation;
 /// `reconcile_inner` still reconciles workloads in this case, only `sys/auth`
@@ -474,17 +472,17 @@ where
 /// The remove pass reads the tenant set to remove from `sys/auth` itself
 /// (durable, in object storage), never from anything this process remembered
 /// from a previous cycle -- what makes revocation correct after an operator
-/// restart with zero in-memory history (the #875 regression this closes).
+/// restart with zero in-memory history.
 ///
 /// Each primitive call is wrapped in [`retry_cas`]. A tenant whose resulting
 /// entry set is already identical to its stored one resolves to
-/// [`ravel_catalog::AuthSetOutcome::Unchanged`] without a write (review
-/// blocker 3), so a steady-state reconcile of an unchanged Secret issues zero
+/// [`ravel_catalog::AuthSetOutcome::Unchanged`] without a write, so a
+/// steady-state reconcile of an unchanged Secret issues zero
 /// `sys/auth` PUTs.
 ///
 /// A tenant whose token collides with a DIFFERENT tenant's is a per-tenant
-/// error, not a whole-pass one (ADR-0072 decision 4, second amendment, #897
-/// flap follow-up): [`ravel_catalog::AuthTokenMapError::CrossTenantTokenCollision`]
+/// error, not a whole-pass one (ADR-0072 decision 4, second amendment):
+/// [`ravel_catalog::AuthTokenMapError::CrossTenantTokenCollision`]
 /// is logged (tenant ids and a token fingerprint, never the token value) and
 /// that one tenant is skipped this cycle, while every other tenant's upsert
 /// and the remove pass below still run. This is what makes the loop
@@ -501,7 +499,7 @@ async fn reconcile_sys_auth(
         warn!(
             "sys/auth reconcile skipped: the tenant tokens Secret is absent or resolved to \
              zero tenants this cycle; an empty read is never treated as \"revoke every \
-             operator-managed tenant\" (ADR-0072 decision 4 amendment, #897)"
+             operator-managed tenant\" (ADR-0072 decision 4 amendment)"
         );
         return Ok(());
     }
@@ -531,7 +529,7 @@ async fn reconcile_sys_auth(
                     %attempted_tenant,
                     "sys/auth reconcile: this tenant's token collides with a different \
                      tenant's; skipping it this cycle rather than taking the token over \
-                     (ADR-0072 decision 4, second amendment, #897)"
+                     (ADR-0072 decision 4, second amendment)"
                 );
             }
             Err(err) => return Err(err),
@@ -567,7 +565,7 @@ async fn reconcile_sys_auth(
 
 /// Best-effort wrapper around [`reconcile_sys_auth`]: a `sys/auth` failure
 /// that survives [`retry_cas`]'s budget is logged and swallowed here, never
-/// propagated (review blocker 4, #897). `reconcile_inner` calls this without
+/// propagated. `reconcile_inner` calls this without
 /// `?` -- the `()` return type is itself the enforcement that a sys/auth
 /// failure cannot abort Deployment/Service reconciliation, not just a
 /// convention a future edit could accidentally break.
@@ -581,7 +579,7 @@ async fn reconcile_sys_auth_best_effort(
         warn!(
             %err,
             "sys/auth reconcile failed after exhausting its retry budget; continuing to \
-             Deployment/Service reconciliation without it (review blocker 4, #897)"
+             Deployment/Service reconciliation without it"
         );
     }
 }
@@ -677,12 +675,12 @@ async fn reconcile_inner(
     .await?;
 
     // Converge sys/auth to the token Secret whenever a deployment key is
-    // configured (ADR-0072 decision 4, #897): this is the first in-process
-    // writer of the durable bearer-token map, and it must run every cycle --
-    // not just on a token Secret change -- so an operator-managed tenant
-    // removed from the Secret is revoked even after an operator restart wiped
-    // any in-memory history of what used to be there (the #875 regression).
-    // Best-effort (review blocker 4): a sys/auth failure that survives its
+    // configured (ADR-0072 decision 4): this is the in-process writer of the
+    // durable bearer-token map, and it must run every cycle -- not just on a
+    // token Secret change -- so an operator-managed tenant removed from the
+    // Secret is revoked even after an operator restart wiped any in-memory
+    // history of what used to be there.
+    // Best-effort: a sys/auth failure that survives its
     // retry budget is logged, never propagated, so it cannot block the
     // Deployment/Service reconciliation below.
     let deployment_key_secret = resolve_deployment_key(
@@ -1061,7 +1059,7 @@ mod tests {
         assert_eq!(tenants, vec!["tenant-a", "tenant-b"]);
     }
 
-    /// #875 regression pin: a tenant present in `sys/auth` (written here to
+    /// A tenant present in `sys/auth` (written here to
     /// simulate a token the operator itself upserted in a *previous* reconcile
     /// cycle, by a process that has since restarted) but absent from the
     /// current token Secret must be revoked. This runs against a freshly
@@ -1069,9 +1067,8 @@ mod tests {
     /// process state -- `reconcile_sys_auth` learns "tenant-gone used to have
     /// a token" only by reading `sys/auth` itself, never from anything an
     /// earlier call left in memory, which is what makes this correct after an
-    /// operator restart. Seeded with `MANAGED_BY_OPERATOR` (review blocker 1,
-    /// #897): only an entry the operator itself owns is ever revoked by this
-    /// pass.
+    /// operator restart. Seeded with `MANAGED_BY_OPERATOR`: only an entry the
+    /// operator itself owns is ever revoked by this pass.
     #[tokio::test]
     async fn reconcile_sys_auth_revokes_a_tenant_missing_from_a_fresh_secret_read() {
         let store = memory_store();
@@ -1147,8 +1144,8 @@ mod tests {
         assert!(map.entries.iter().any(|e| e.token_hash == new_hash));
     }
 
-    /// Review blocker 1 (#897): the remove pass must touch only entries the
-    /// operator itself manages. A CLI-provisioned tenant and a pre-amendment
+    /// The remove pass must touch only entries the operator itself manages.
+    /// A CLI-provisioned tenant and a pre-amendment
     /// unmanaged entry both survive a reconcile whose Secret does not name
     /// them; an operator-managed tenant absent from the Secret is still
     /// revoked.
@@ -1218,7 +1215,7 @@ mod tests {
         );
     }
 
-    /// Review blocker 2 (#897): a deployment key configured with no token
+    /// A deployment key configured with no token
     /// Secret (or one that resolves to zero tenants) must leave `sys/auth`
     /// untouched, not wipe every operator-managed tenant.
     #[tokio::test]
@@ -1247,7 +1244,7 @@ mod tests {
         );
     }
 
-    /// Review blocker 3 (#897): two consecutive reconciles against an
+    /// Two consecutive reconciles against an
     /// unchanged Secret must perform zero additional `sys/auth` PUTs on the
     /// second run. A `Sequence` of passthrough steps on `Op::Put` against the
     /// `sys/auth` key counts every PUT that actually reaches the backend,
@@ -1287,9 +1284,9 @@ mod tests {
         );
     }
 
-    /// The flap acceptance test (#897, ADR-0072 decision 4 second amendment):
+    /// The flap acceptance test (ADR-0072 decision 4 second amendment):
     /// two tenants, "acme" and "globex", both present in the Secret with the
-    /// SAME token value. Against the prior round's last-writer-wins takeover,
+    /// SAME token value. Under a last-writer-wins takeover,
     /// each identical reconcile cycle would take the hash back for whichever
     /// tenant runs last (alphabetical `BTreeMap` order: "acme" then
     /// "globex"), so cycle two would look identical to cycle one on the
@@ -1360,7 +1357,7 @@ mod tests {
     }
 
     /// A cross-tenant collision must not brick the rest of the reconcile
-    /// pass (ADR-0072 decision 4, second amendment, #897): a third,
+    /// pass (ADR-0072 decision 4, second amendment): a third,
     /// unrelated tenant in the same Secret still gets its token upserted
     /// even though "acme" and "globex" collide with each other.
     /// `reconcile_sys_auth_best_effort_swallows_a_persistent_cas_conflict`
@@ -1398,7 +1395,7 @@ mod tests {
         );
     }
 
-    /// Review blocker 4 (#897): a transient CAS conflict on the first write
+    /// A transient CAS conflict on the first write
     /// must be absorbed by `retry_cas` and still converge within the retry
     /// budget.
     #[tokio::test]
@@ -1434,7 +1431,7 @@ mod tests {
         assert!(map.entries.iter().any(|e| e.tenant_id == "tenant-a"));
     }
 
-    /// Review blocker 4 (#897): a persistent CAS conflict (every write fails)
+    /// A persistent CAS conflict (every write fails)
     /// exhausts the retry budget but `reconcile_sys_auth_best_effort` still
     /// returns cleanly rather than propagating -- the property that lets
     /// `reconcile_inner` call it without `?` and keep reconciling

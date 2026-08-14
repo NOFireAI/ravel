@@ -114,11 +114,10 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    /// #706: `--otlp-trace-endpoint` threads through to
+    /// `--otlp-trace-endpoint` threads through to
     /// `ravel_tracing_export::init` as a `Some(OtlpExportConfig)` stamping the
-    /// operator's fixed `service_name` and `mode` (the literal `"operator"`,
-    /// documented by #707). This proves the operator's own wiring; #705 already
-    /// proved the shared exporter end-to-end.
+    /// operator's fixed `service_name` and `mode` (the literal `"operator"`).
+    /// This proves the operator's own wiring.
     #[test]
     fn otlp_endpoint_flag_derives_export_config() {
         let cli = Cli::parse_from([
