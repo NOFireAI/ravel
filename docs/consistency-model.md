@@ -733,6 +733,33 @@ into them. An operator with erasure obligations must budget them deliberately.
   completes once the hold clears. Query-time exclusion (above) stays active
   throughout: a hold does not oblige Ravel to keep *serving* the data.
 
+- **+ replica residue -- a Tier 1/2 DR replica exists.** When the operator
+  runs a cross-region cross-account replica (the DR posture of ADR-0077
+  decision 1; see [guides/disaster-recovery.md](guides/disaster-recovery.md)),
+  a subject erased on the primary survives on the replica until the replica's
+  own noncurrent-version expiration reaps it. With `DeleteMarkerReplication`
+  enabled, the primary's simple DELETE replicates as a delete marker and the
+  replica's copy is physically gone within **replication lag + `E_v_r`** after
+  the primary sweep (`E_v_r` is the replica's `NoncurrentDays` rule). This is
+  additive to the primary's own `+E_v`: the primary carries erased-subject
+  residue for up to `E_v`, the replica for up to replication lag + `E_v_r`. A
+  Tier 2 replica under bucket-default Object Lock retention `D_r` further
+  extends the replica bound to `max(replication lag + E_v_r, D_r)`, exactly as
+  `+D` does on the primary. Erasure applies only to the primary bucket; the
+  replica is written by the platform's replication channel, and the operator
+  must apply the same lifecycle discipline to it (ADR-0077 decision 1,
+  Consequences).
+
+  > **Unsupported configuration: a replica without `DeleteMarkerReplication`.**
+  > Every Ravel delete is a simple DELETE, which becomes a delete marker on a
+  > versioned bucket and replicates **only** when `DeleteMarkerReplication` is
+  > enabled. A replica configured without it never receives the delete markers
+  > that reap erased (or retention-, orphan-, supersession-deleted) bytes, so
+  > **erased bytes persist on the replica indefinitely.** For any deployment
+  > with erasure obligations this is an **unsupported configuration**:
+  > `DeleteMarkerReplication` is mandatory (ADR-0077 decision 1;
+  > [guides/disaster-recovery.md](guides/disaster-recovery.md)).
+
 ### Scope and interactions
 
 - **Why the `.done` guarantee needs only the commit-record pass.** The
@@ -771,9 +798,12 @@ into them. An operator with erasure obligations must budget them deliberately.
   keyspace.
 
 - **Erasure applies to the primary bucket only.** Replicas or external
-  backups are outside Ravel's deletion reach by definition (ADR-0058/0059 DR
-  posture); an operator with replicated buckets must apply the same lifecycle
-  discipline (docs/object-store-contract.md) to replicas. Per-tenant KMS
+  backups are outside Ravel's deletion reach by definition (ADR-0058/0059/0077
+  DR posture); an operator with replicated buckets must apply the same
+  lifecycle discipline (docs/object-store-contract.md) to replicas, and the
+  sanctioned replica configuration and its residue bound are the "+ replica
+  residue" modifier above and the Tier 1/2 tiers in
+  [guides/disaster-recovery.md](guides/disaster-recovery.md). Per-tenant KMS
   crypto-erasure is the complementary, backup-reaching,
   tenant-granularity layer to this ADR's subject-granularity physical
   erasure.

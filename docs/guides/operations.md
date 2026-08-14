@@ -1278,12 +1278,16 @@ no special shutdown sequence:
   tenant, as long as it has the right `--tenant-token`/S3 credentials.
 - **Nothing to back up** besides the object store bucket itself: no local
   volumes, no WAL, no on-disk state directory. The bucket, however, is a
-  single point of loss, and Ravel ships no backup mechanism, no cross-region
-  failover, and no RTO/RPO guarantee of its own. What exists today, what does
-  not, and the one failure mode (commit-record loss) the reconstruction tool
-  recovers from are documented honestly in
-  [disaster-recovery.md](disaster-recovery.md); read it before relying on
-  "just back up the bucket."
+  single point of loss. Ravel builds no in-product backup, export, or failover
+  mechanism; disaster recovery is operator-owned bucket-level controls
+  (versioning, noncurrent-version expiration, cross-region cross-account
+  replication) proven by a rehearsed restore. The normative runbook —
+  the three configuration tiers and their erasure-bound trade-offs, the
+  mandatory `DeleteMarkerReplication`, the deliberate verified restore
+  procedure (replica as restore source, never a live failover target), and
+  the rehearsal record from which the only published RPO/RTO numbers come — is
+  [disaster-recovery.md](disaster-recovery.md) (ADR-0077). Read it before
+  relying on "just back up the bucket."
 
 ## Garbage collection and retention
 
