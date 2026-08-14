@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use rand::RngExt;
 use rand::rngs::StdRng;
 use ravel_catalog::{
@@ -42,7 +43,6 @@ use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, MaintainError, NoLeases,
     compact_bucket, sweep_shard,
 };
-use bytes::Bytes;
 use ravel_object_store::fault::{FaultKind, FaultStore, GateHandle, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -297,9 +297,9 @@ impl CountingGateHandle {
     /// whose op equals and whose key substring (if any) is contained, matching
     /// the store's own precedence.
     fn attribute(&self, op: Op, key: &str) -> Option<usize> {
-        self.gate_matchers.iter().position(|(gop, gkey)| {
-            *gop == op && gkey.as_deref().is_none_or(|k| key.contains(k))
-        })
+        self.gate_matchers
+            .iter()
+            .position(|(gop, gkey)| *gop == op && gkey.as_deref().is_none_or(|k| key.contains(k)))
     }
 
     /// Releases the held call `id`, exactly as [`GateHandle::release`], and
@@ -525,8 +525,7 @@ async fn compact_bucket_recover(
         match compact_bucket(store, clock, config, bucket).await {
             Ok(outcome) => return Ok(outcome),
             Err(e)
-                if attempt < COMPACTION_FAULT_RETRY_BUDGET
-                    && is_recoverable_maintain_error(&e) =>
+                if attempt < COMPACTION_FAULT_RETRY_BUDGET && is_recoverable_maintain_error(&e) =>
             {
                 continue;
             }
@@ -565,8 +564,7 @@ async fn sweep_shard_recover(
         {
             Ok(_) => return Ok(()),
             Err(e)
-                if attempt < COMPACTION_FAULT_RETRY_BUDGET
-                    && is_recoverable_maintain_error(&e) =>
+                if attempt < COMPACTION_FAULT_RETRY_BUDGET && is_recoverable_maintain_error(&e) =>
             {
                 continue;
             }
@@ -1605,8 +1603,14 @@ mod tests {
 
         // A dropped-record variant (fewer records after "recovery").
         let after_fewer = probe(0xABCD, 96);
-        let err = check_compaction_fault_invariant("tenant-a".len() as u64, "tenant-a", "after compaction", &before, &after_fewer)
-            .expect_err("a post-recovery record drop must trip the invariant");
+        let err = check_compaction_fault_invariant(
+            "tenant-a".len() as u64,
+            "tenant-a",
+            "after compaction",
+            &before,
+            &after_fewer,
+        )
+        .expect_err("a post-recovery record drop must trip the invariant");
         assert!(
             matches!(
                 err,
@@ -1621,8 +1625,9 @@ mod tests {
 
         // A changed-digest variant (same count, different values).
         let after_changed = probe(0x1234, 100);
-        let err = check_compaction_fault_invariant(7, "tenant-a", "after sweep", &before, &after_changed)
-            .expect_err("a post-recovery digest change must trip the invariant");
+        let err =
+            check_compaction_fault_invariant(7, "tenant-a", "after sweep", &before, &after_changed)
+                .expect_err("a post-recovery digest change must trip the invariant");
         assert!(matches!(err, CycleError::CompactionFaultInvariant { .. }));
     }
 

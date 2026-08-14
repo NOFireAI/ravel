@@ -168,7 +168,14 @@ fn never_hit_gate_fails_the_cycle() {
     let err = run_cycle(MasterSeed::new(1), &config)
         .expect_err("a gate that never matches must fail the cycle, not pass it");
     assert!(
-        matches!(err, CycleError::GateNeverHit { armed: 1, gate_index: 0, .. }),
+        matches!(
+            err,
+            CycleError::GateNeverHit {
+                armed: 1,
+                gate_index: 0,
+                ..
+            }
+        ),
         "expected GateNeverHit, got: {err}"
     );
 }
