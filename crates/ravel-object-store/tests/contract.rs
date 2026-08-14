@@ -47,7 +47,7 @@ async fn run_contract_suite(store: &dyn ObjectStoreBackend, root: &str) {
 /// ravel-server's startup gate requires (`Capabilities::mandatory`, checked by
 /// `ravel_server::store::check_capabilities` for every non-maintain mode). A
 /// backend may report more than the mandatory set: `MemoryStore` supports
-/// `upload_checksum` on the wire, `S3Store` cannot (issue #251), and both are
+/// `upload_checksum` on the wire, `S3Store` cannot, and both are
 /// startable. Asserting `satisfies` rather than equality keeps that difference
 /// legal while still failing the moment a backend loses a flag production
 /// needs.
@@ -428,9 +428,9 @@ async fn assert_mandatory_capabilities(store: &dyn ObjectStoreBackend, prefix: &
     assert_delimited_listing(store, &format!("{prefix}prefix-list-delimited/")).await;
 
     // Declared capabilities must be exactly the mandatory set plus
-    // `multipart`, which `S3Store` implements (issue #243) and which
+    // `multipart`, which `S3Store` implements and which
     // `required_capabilities(Mode::Maintain)` demands. `upload_checksum` is not
-    // part of `Capabilities::mandatory()` (issue #251: it is a permanent
+    // part of `Capabilities::mandatory()` (a permanent
     // `object_store` 0.14 client-library limitation, not an endpoint-specific
     // gap, so requiring it made the only durable backend unstartable
     // everywhere). `S3Store::capabilities()` is a constant of the adapter, not
@@ -462,7 +462,7 @@ fn multipart_payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-/// Multipart probe, run against every backend (issue #243).
+/// Multipart probe, run against every backend.
 /// `Mode::Maintain` requires the `multipart` capability on top of
 /// [`Capabilities::mandatory()`] (services/ravel-server `store.rs`
 /// `required_capabilities`), so a backend that cannot serve the
@@ -626,8 +626,8 @@ async fn assert_multipart_upload(store: &dyn ObjectStoreBackend, prefix: &str) {
 /// `complete` with a backend-specific `EntityTooSmall` (or, on the oracle, not
 /// at all). None of these may leave an object behind.
 /// What `S3Store` declares: [`Capabilities::mandatory()`] plus `multipart`
-/// (implemented in issue #243, required by `required_capabilities(Mode::
-/// Maintain)`) and minus `upload_checksum` (unsatisfiable, issue #251).
+/// (required by `required_capabilities(Mode::
+/// Maintain)`) and minus `upload_checksum` (unsatisfiable).
 /// `mandatory()` itself keeps `multipart: false`, because multipart is
 /// mode-conditional rather than universally required.
 fn s3_expected_capabilities() -> Capabilities {
@@ -693,7 +693,7 @@ async fn assert_multipart_sequence_rules(store: &dyn ObjectStoreBackend, prefix:
         "multipart: a rejected sequence must not create the object"
     );
 
-    // A rejected part poisons the handle (issue #297): a `complete` afterward
+    // A rejected part poisons the handle: a `complete` afterward
     // must error rather than publish the truncated single short part. The
     // sequence check runs before any backend call, so this covers the memory
     // oracle and the S3-shaped path alike. `abort` stays callable throughout.
@@ -913,7 +913,7 @@ async fn assert_put_above_threshold_uses_multipart(store: &dyn ObjectStoreBacken
 
 /// Wraps the memory oracle but truthfully reports `multipart: false`, so it
 /// inherits the trait's refusing default `put_multipart`. It exists to keep the
-/// `multipart: false` branch of [`assert_multipart_upload`] live (issue #298):
+/// `multipart: false` branch of [`assert_multipart_upload`] live:
 /// every other suite backend reports `multipart: true`, so without a registered
 /// refusing backend that branch --- the one asserting the flag and the method
 /// agree in the negative direction --- never executes. Every other method
@@ -975,7 +975,7 @@ async fn memory_store_contract() {
 /// The whole suite against a backend that declares `multipart: false`, so the
 /// refusal branch of [`assert_multipart_upload`] actually runs: `put_multipart`
 /// must be refused with `Permanent`, proving the flag and the method agree in
-/// the negative direction (issue #298). Every non-multipart assertion still
+/// the negative direction. Every non-multipart assertion still
 /// holds because the backend delegates to the memory oracle.
 #[tokio::test]
 async fn refusing_multipart_store_contract() {
@@ -1034,7 +1034,7 @@ fn test_s3_config() -> S3Config {
     }
 }
 
-/// The instrumentation decorator must be transparent (issue #272): every
+/// The instrumentation decorator must be transparent: every
 /// contract assertion, capability check included, holds identically with it in
 /// the path, because it forwards each result verbatim and passes
 /// `capabilities()` through. The counter assertions afterward prove the suite
@@ -1078,8 +1078,8 @@ async fn instrumented_memory_store_contract() {
     );
 }
 
-/// Proves the path taken for issue #181: `object_store` 0.14's `AmazonS3`
-/// client has no per-request checksum hook and no way to attach a
+/// Proves why `upload_checksum` is unsupported: `object_store` 0.14's
+/// `AmazonS3` client has no per-request checksum hook and no way to attach a
 /// caller-supplied CRC32C to an outgoing `put` (its only integrity knob,
 /// `AmazonS3Builder::with_checksum_algorithm`, is a whole-client setting
 /// limited to SHA-256/CRC64NVME, and always has the crate compute the
@@ -1089,7 +1089,7 @@ async fn instrumented_memory_store_contract() {
 /// Because that gap is permanent and applies to every S3-compatible endpoint,
 /// `upload_checksum` is not startup-gating: it is not in
 /// `Capabilities::mandatory()` and no mode may require it
-/// (docs/object-store-contract.md, "Upload checksums"; issue #251). This test
+/// (docs/object-store-contract.md, "Upload checksums"). This test
 /// therefore also pins `S3Store`'s reported set to the mandatory set plus
 /// `multipart`, so the server's startup gate cannot start rejecting
 /// `--store s3` again.
@@ -1123,7 +1123,7 @@ fn s3_store_reports_upload_checksum_unsupported() {
 }
 
 /// The startup gate `--mode maintain` applies, asserted against the real
-/// `S3Store` without an endpoint (issue #243): `required_capabilities(Mode::
+/// `S3Store` without an endpoint: `required_capabilities(Mode::
 /// Maintain)` is `mandatory()` with `multipart: true`, and this is the
 /// predicate `ravel_server::store::check_capabilities` evaluates. Restated here
 /// rather than imported, because ravel-object-store must not depend on
@@ -1216,7 +1216,7 @@ async fn minio_contract() {
     run_contract_suite(&store, &root).await;
     // The two S3-shaped multipart proofs the memory oracle cannot give: that
     // the parts went out as parts (composite ETag) and that `put` itself takes
-    // the multipart path above its threshold (issue #243).
+    // the multipart path above its threshold.
     assert_multipart_composite_etag(&store, &format!("{root}/multipart-etag/")).await;
     assert_put_above_threshold_uses_multipart(&store, &format!("{root}/multipart-threshold/"))
         .await;

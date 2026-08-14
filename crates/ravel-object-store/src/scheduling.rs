@@ -990,7 +990,7 @@ mod tests {
     /// again afterwards (the count alone could be zeroed by a decrement that
     /// still left the scheduler wedged).
     #[tokio::test]
-    async fn review_fg_waiters_leaks_on_cancellation() {
+    async fn cancelled_foreground_waiter_releases_and_unblocks_background() {
         let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 2, 1));
         let fg = cs.foreground();
         let bg = cs.background();
@@ -1052,7 +1052,7 @@ mod tests {
     /// floor slot and beats a waiting foreground afterwards (the count alone
     /// could be zeroed while the floor stayed wedged).
     #[tokio::test]
-    async fn review_bg_committed_leaks_on_cancellation() {
+    async fn cancelled_background_acquire_releases_floor_reservation() {
         // Global cap 2, background sub-cap 4 (so the sub-cap never holds a
         // background op back), floor 1.
         let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 4, 1));
@@ -1129,7 +1129,7 @@ mod tests {
     /// while both global permits are held; releasing both must admit the
     /// waiting foreground, not a second background request.
     #[tokio::test]
-    async fn review_floor_overshoot_delays_foreground_past_one_request() {
+    async fn foreground_delayed_by_at_most_one_background_request() {
         // Global cap 2, background sub-cap 4 (so the sub-cap is not what holds
         // the second background request back), floor 1.
         let (cs, gate) = scheduled_rig(SchedulerConfig::new(2, 4, 1));
