@@ -114,7 +114,7 @@ struct TokenSecret {
     /// cheap change-detection signal for the pod-template checksum.
     resource_version: Option<String>,
     /// Tenant name to raw token bytes, the Secret's live values. Only read
-    /// into operator memory for `sys/auth` reconciliation (issue #897); the
+    /// into operator memory for `sys/auth` reconciliation; the
     /// Deployment/Service render path never sees these, it only gets
     /// `tenant_names` (the token values reach pods via `$(VAR)` expansion
     /// from the Secret directly, see `reconcile::tenant_token_env`).
