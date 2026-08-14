@@ -25,6 +25,20 @@
               "spec": {
                 "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.",
                 "properties": {
+                  "deploymentKeySecretRef": {
+                    "description": "Secret with a single key `key` holding the deployment's 32-byte\ndeployment key (64 hex characters or 32 raw bytes, the same format\n`--tenant-hash-key-file` reads). This one key doubles as the v2-keyed\ntenant-hash key and the `sys/auth` token-hashing key (ADR-0072\ndecision 4): when set, the operator mounts it and renders\n`--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and\nreconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive\nopt-in, not a migration of existing unkeyed clusters (EM-T10 #773 owns\nthat story); omit to keep today's unkeyed behavior unchanged.",
+                    "nullable": true,
+                    "properties": {
+                      "name": {
+                        "description": "Name of the Secret.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
                   "gateway": {
                     "default": {
                       "replicas": 1
@@ -108,9 +122,10 @@
                   },
                   "maintain": {
                     "default": {
-                      "enabled": true
+                      "enabled": true,
+                      "replicas": 1
                     },
-                    "description": "Background maintenance tier (compaction, retention, GC). Single replica,\n`Recreate` strategy, no replica field (ADR-0034 decision 3).",
+                    "description": "Background maintenance tier (compaction, retention, GC). Defaults to a\nsingle replica; the bounded multi-worker ownership protocol (ADR-0065)\nmakes `replicas > 1` safe, superseding ADR-0034's single-replica\nguidance.",
                     "properties": {
                       "credentialsSecretRef": {
                         "description": "Per-role S3 credential override for the maintain tier (ADR-0055 section 5).\nWhen set, the maintain Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`.\nMaintain is the only role ADR-0055 grants delete, so this is where an\noperator points the delete-capable credential. Falls back to the shared\ncredential when unset, so existing single-credential clusters are\nunaffected.",
@@ -136,6 +151,13 @@
                         "format": "uint64",
                         "minimum": 0.0,
                         "nullable": true,
+                        "type": "integer"
+                      },
+                      "replicas": {
+                        "default": 1,
+                        "description": "Replica count for the maintain Deployment. Defaults to 1. Values above 1\nare made safe by the ADR-0065 ownership protocol (rendezvous over a\nheartbeat-derived live worker set); the workers coordinate entirely\nthrough the shared object store, so no additional per-pod wiring is\nneeded beyond `--mode maintain` and the shared store flags. Omit to keep\ntoday's single-replica behavior.",
+                        "format": "int32",
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "resources": {
@@ -370,7 +392,7 @@
                     "type": "integer"
                   },
                   "maintainReadyReplicas": {
-                    "description": "Ready replicas reported by the maintain Deployment (0 or 1).",
+                    "description": "Ready replicas reported by the maintain Deployment.",
                     "format": "int32",
                     "nullable": true,
                     "type": "integer"
