@@ -3,7 +3,7 @@
 //!
 //! Partitions the snapshot's segments round-robin into
 //! `N = min(target_partitions, segment_count)` partitions. Each partition
-//! fetches its segments through [`SpanSegmentFetcher::fetch`] with one shared
+//! fetches its segments through [`SpanSegmentFetcher::fetch_accounted`] with one shared
 //! [`ravel_rspan::SpanQuery`] (the extracted ts window, plus the trace_id
 //! fast-path key when a `trace_id =` equality was pushed), decodes the returned
 //! [`ravel_rspan::SpanRecord`]s into Arrow arrays matching
@@ -66,6 +66,8 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_query::erasure::{ErasurePredicate, is_erased_span};
 use ravel_rspan::{BloomPredicate, COL_NAME, COL_SERVICE_NAME, SpanQuery};
+use ravel_types::TenantHash;
+use ravel_types::accounting::QueryAccounting;
 
 use crate::error::SqlError;
 use crate::spans_fetcher::{SpanRow, SpanSegmentFetcher};
@@ -77,6 +79,7 @@ const BATCH_ROWS: usize = 8192;
 /// Span segment scan producing per-partition `(trace_id, start_ts)`-ordered
 /// batches over the public `spans` schema.
 pub struct SpansScanExec {
+    tenant_hash: TenantHash,
     fetcher: SpanSegmentFetcher,
     /// Round-robin segment assignment; `partitions[k]` runs as DataFusion
     /// partition `k`.
@@ -100,11 +103,15 @@ pub struct SpansScanExec {
     status_mask: Option<u8>,
     /// Pending selective-erasure predicates from the resolved snapshot
     /// (ADR-0064 decision 2). Applied per decoded [`SpanRow`] via
-    /// [`is_erased_span`] immediately after `fetcher.fetch` returns, before
+    /// [`is_erased_span`] immediately after `fetcher.fetch_accounted` returns, before
     /// rows are sorted or built into batches. A no-op when empty.
     erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// This query's accounting handle (ADR-0044), threaded into every
+    /// per-partition fetch so span fetches are recorded like every other
+    /// funnel, mirroring `LogsScanExec`.
+    accounting: QueryAccounting,
 }
 
 impl SpansScanExec {
@@ -114,6 +121,7 @@ impl SpansScanExec {
     /// optional `duration_ns`/`status_mask` skip-index prune shapes.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        tenant_hash: TenantHash,
         fetcher: SpanSegmentFetcher,
         segments: &[SegmentRef],
         target_partitions: usize,
@@ -123,6 +131,7 @@ impl SpansScanExec {
         duration_ns: Option<(i64, i64)>,
         status_mask: Option<u8>,
         erasure: Arc<Vec<ErasurePredicate>>,
+        accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -132,6 +141,7 @@ impl SpansScanExec {
         let schema = spans_schema();
         let properties = Arc::new(Self::compute_properties(&schema, n)?);
         Ok(SpansScanExec {
+            tenant_hash,
             fetcher,
             partitions,
             query,
@@ -142,6 +152,7 @@ impl SpansScanExec {
             erasure,
             schema,
             properties,
+            accounting,
         })
     }
 
@@ -222,6 +233,7 @@ impl ExecutionPlan for SpansScanExec {
     ) -> DFResult<SendableRecordBatchStream> {
         let segs = self.partitions.get(partition).cloned().unwrap_or_default();
         let fetcher = self.fetcher.clone();
+        let tenant_hash = self.tenant_hash;
         let schema = Arc::clone(&self.schema);
 
         let reservation = MemoryConsumer::new(format!("SpansScanExec[{partition}]"))
@@ -229,6 +241,7 @@ impl ExecutionPlan for SpansScanExec {
 
         let fut = Box::pin(prepare_partition(
             fetcher,
+            tenant_hash,
             segs,
             self.query,
             self.service_name.clone(),
@@ -236,6 +249,7 @@ impl ExecutionPlan for SpansScanExec {
             self.duration_ns,
             self.status_mask,
             Arc::clone(&self.erasure),
+            self.accounting.clone(),
         ));
         Ok(Box::pin(SpanScanStream {
             schema,
@@ -253,6 +267,7 @@ impl ExecutionPlan for SpansScanExec {
 #[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
     fetcher: SpanSegmentFetcher,
+    tenant_hash: TenantHash,
     segs: Vec<SegmentRef>,
     query: SpanQuery,
     service_name: Option<String>,
@@ -260,6 +275,7 @@ async fn prepare_partition(
     duration_ns: Option<(i64, i64)>,
     status_mask: Option<u8>,
     erasure: Arc<Vec<ErasurePredicate>>,
+    accounting: QueryAccounting,
 ) -> DFResult<Vec<SpanRow>> {
     // The bloom predicates for this scan: one per pushed literal, field-scoped
     // to the column it names (ADR-0054). The same set applies to every segment.
@@ -280,7 +296,15 @@ async fn prepare_partition(
     let mut out: Vec<SpanRow> = Vec::new();
     for seg in &segs {
         let Some(output) = fetcher
-            .fetch(seg, &query, duration_ns, status_mask, &predicates)
+            .fetch_accounted(
+                seg,
+                tenant_hash,
+                &query,
+                duration_ns,
+                status_mask,
+                &predicates,
+                &accounting,
+            )
             .await
             .map_err(SqlError::from)?
         else {
@@ -642,7 +666,12 @@ mod tests {
             segments_pruned: 0,
             pending_erasure: Vec::new(),
         };
-        let provider = SpansTableProvider::new(snapshot, fetcher.clone());
+        let provider = SpansTableProvider::new(
+            snapshot,
+            TenantHash([1u8; 16]),
+            fetcher.clone(),
+            QueryAccounting::new(),
+        );
         let tenant = TenantMemoryAccountant::new(1 << 30);
         let breach = CeilingBreach::new();
         let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = Arc::new(
@@ -860,7 +889,12 @@ mod tests {
             segments_pruned: 0,
             pending_erasure: Vec::new(),
         };
-        let provider = SpansTableProvider::new(snapshot, fetcher.clone());
+        let provider = SpansTableProvider::new(
+            snapshot,
+            TenantHash([1u8; 16]),
+            fetcher.clone(),
+            QueryAccounting::new(),
+        );
 
         // (1) Correctness through the real provider scan entry point.
         let filters = vec![col("service_name").eq(lit("checkout"))];

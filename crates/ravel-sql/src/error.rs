@@ -285,7 +285,12 @@ impl SqlError {
                 LogFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::SpanFetch(fetch) => match fetch {
-                SpanFetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                // A cross-tenant object is an integrity violation of the fetched
+                // segment relative to the request, redacted like corruption
+                // (the mismatching tenant identity never reaches the client).
+                SpanFetchError::Corrupt { .. } | SpanFetchError::TenantMismatch { .. } => {
+                    MSG_CORRUPT.to_string()
+                }
                 SpanFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),

@@ -319,7 +319,12 @@ mod tests {
             segments_pruned: 0,
             pending_erasure: Vec::new(),
         };
-        let provider = crate::spans_provider::SpansTableProvider::new(snapshot, fetcher);
+        let provider = crate::spans_provider::SpansTableProvider::new(
+            snapshot,
+            ravel_types::TenantHash([0u8; 16]),
+            fetcher,
+            QueryAccounting::new(),
+        );
         let ctx = build_session(
             &SqlConfig::default(),
             test_pool(),

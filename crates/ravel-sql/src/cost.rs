@@ -41,6 +41,11 @@ const STORE_BYTES_SAFETY_FACTOR: u64 = 2;
 /// this is exact rather than a bound.
 const LOG_REQUESTS_PER_SEGMENT: u64 = 1;
 
+/// GETs `SpanSegmentFetcher::fetch_accounted` issues per relevant span
+/// segment: always exactly one (`GetRange::Full`, no chase/retry path), so
+/// this is exact rather than a bound. Mirrors [`LOG_REQUESTS_PER_SEGMENT`].
+const SPAN_REQUESTS_PER_SEGMENT: u64 = 1;
+
 /// Upper bound on the decompressed bytes one metrics segment can produce:
 /// every sample scaled to the largest page a reader will decompress, capped
 /// by the largest section a reader will decompress twice over. Mirrors
@@ -100,6 +105,43 @@ pub fn estimate_logs_cost(snapshot: &Snapshot, catalog_requests: u64) -> CostEst
     let series: u64 = snapshot.segments.iter().map(|s| s.series_count).sum();
 
     let estimated_requests = catalog_requests + segments * LOG_REQUESTS_PER_SEGMENT;
+    let estimated_store_bytes: u64 = snapshot
+        .segments
+        .iter()
+        .map(|seg| seg.object_size)
+        .fold(0u64, |acc, size| acc.saturating_add(size));
+
+    CostEstimate::new(
+        estimated_requests,
+        estimated_store_bytes,
+        0,
+        segments,
+        series,
+    )
+}
+
+/// Cost estimate for a spans-target SQL query, given the pinned snapshot and
+/// the catalog term computed before `resolve` ran.
+///
+/// The span fetch funnel (`SpanSegmentFetcher::fetch_accounted`) issues
+/// exactly one GET per relevant segment and never decompresses on a
+/// separately-accounted path (it never calls `add_decompressed_bytes`), so
+/// both the request count and the byte sums here are exact bounds rather than
+/// padded guesses, exactly like [`estimate_logs_cost`]: no chase/retry safety
+/// factor applies because there is no chase/retry path to guard against.
+///
+/// Not yet reached from a production caller: SQL query routing
+/// (`executor::TargetSignal`) has no `Spans` arm until the spans query surface
+/// is wired in (ADR-0045 decision 5, phase 2). It lands here beside its sibling
+/// estimators so that wiring is a one-line `match` arm rather than a new
+/// function; `#[allow(dead_code)]` marks it as intentionally caller-less until
+/// then.
+#[allow(dead_code)]
+pub fn estimate_spans_cost(snapshot: &Snapshot, catalog_requests: u64) -> CostEstimate {
+    let segments = snapshot.segments.len() as u64;
+    let series: u64 = snapshot.segments.iter().map(|s| s.series_count).sum();
+
+    let estimated_requests = catalog_requests + segments * SPAN_REQUESTS_PER_SEGMENT;
     let estimated_store_bytes: u64 = snapshot
         .segments
         .iter()

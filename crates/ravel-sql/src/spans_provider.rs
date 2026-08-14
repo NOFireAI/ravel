@@ -30,6 +30,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
+use ravel_types::TenantHash;
+use ravel_types::accounting::QueryAccounting;
 
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_pushdown::{SpansPushdown, extract_spans};
@@ -40,8 +42,14 @@ use crate::spans_schema::spans_schema;
 /// snapshot.
 pub struct SpansTableProvider {
     snapshot: Arc<Snapshot>,
+    tenant_hash: TenantHash,
     fetcher: SpanSegmentFetcher,
     schema: SchemaRef,
+    /// This query's accounting handle (ADR-0044), cloned into every
+    /// `SpansScanExec` the provider builds so every store fetch the scan
+    /// issues on this query's behalf is recorded against it. Mirrors
+    /// [`crate::logs_provider::LogsTableProvider`].
+    accounting: QueryAccounting,
     /// Pending selective-erasure predicates derived once from
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `SpansScanExec` the provider builds.
@@ -53,12 +61,19 @@ impl SpansTableProvider {
     /// snapshot. Admission and budget config live on the resolve-time seam
     ///, not on the provider, so this no longer takes a
     /// config parameter.
-    pub fn new(snapshot: Snapshot, fetcher: SpanSegmentFetcher) -> Self {
+    pub fn new(
+        snapshot: Snapshot,
+        tenant_hash: TenantHash,
+        fetcher: SpanSegmentFetcher,
+        accounting: QueryAccounting,
+    ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
         SpansTableProvider {
             snapshot: Arc::new(snapshot),
+            tenant_hash,
             fetcher,
             schema: spans_schema(),
+            accounting,
             erasure,
         }
     }
@@ -99,6 +114,7 @@ impl SpansTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
         let scan = SpansScanExec::new(
+            self.tenant_hash,
             self.fetcher.clone(),
             &segments,
             target_partitions,
@@ -108,6 +124,7 @@ impl SpansTableProvider {
             pushdown.duration_window(),
             pushdown.status_mask,
             Arc::clone(&self.erasure),
+            self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))
     }

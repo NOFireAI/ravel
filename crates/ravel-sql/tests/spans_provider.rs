@@ -37,6 +37,8 @@ use ravel_rspan::{
     ObjectIdentity, RspanConfig, RspanWriter, ScanStats, SpanQuery, SpanRecord, StatusCode,
 };
 use ravel_sql::{SpanSegmentFetcher, SpansScanExec, SpansTableProvider};
+use ravel_types::TenantHash;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use uuid::Uuid;
 
 fn identity() -> ObjectIdentity {
@@ -221,7 +223,12 @@ async fn scan_prunes_by_ts_window_returns_exact_rows() {
     };
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
     let fetcher = SpanSegmentFetcher::new(store);
-    let provider = SpansTableProvider::new(snapshot, fetcher);
+    let provider = SpansTableProvider::new(
+        snapshot,
+        TenantHash([1u8; 16]),
+        fetcher,
+        QueryAccounting::new(),
+    );
 
     // WHERE end_ts >= 50 AND start_ts <= 250  (== overlap with the window [50,250])
     let (lo, hi) = (50i64, 250i64);
@@ -287,7 +294,12 @@ async fn trace_id_query_takes_the_cheap_trace_lookup() {
         segments_pruned: 0,
         pending_erasure: Vec::new(),
     };
-    let provider = SpansTableProvider::new(snapshot, fetcher.clone());
+    let provider = SpansTableProvider::new(
+        snapshot,
+        TenantHash([1u8; 16]),
+        fetcher.clone(),
+        QueryAccounting::new(),
+    );
 
     let target = traces[5];
 
@@ -391,7 +403,12 @@ async fn pending_erasure_excludes_matching_spans() {
         segments_pruned: 0,
         pending_erasure: vec![request],
     };
-    let provider = SpansTableProvider::new(snapshot, fetcher);
+    let provider = SpansTableProvider::new(
+        snapshot,
+        TenantHash([1u8; 16]),
+        fetcher,
+        QueryAccounting::new(),
+    );
     let plan = provider.plan(1).expect("build plan");
     let batches = collect_plan(plan).await;
     let got = batches_to_rows(&batches);
@@ -404,4 +421,73 @@ async fn pending_erasure_excludes_matching_spans() {
         keep.name.clone(),
     ));
     assert_eq!(got, want, "the u1 span is erased; the u2 span survives");
+}
+
+/// (ADR-0044) The spans scan path is request/byte accounted, the same way the
+/// logs path is (the sibling of `tests/query_accounting.rs`'s
+/// `a_logs_query_is_accounted`). A `QueryAccounting` handle is threaded through
+/// `SpansTableProvider` -> `SpansScanExec` -> `SpanSegmentFetcher::fetch_accounted`,
+/// so executing the scan records exactly one `Get` request and the object's
+/// transferred bytes against it.
+///
+/// This is proven at the provider/scan level rather than end to end through
+/// `SqlExecutor`, because no production `spans` caller exists yet: routing has
+/// no `Spans` arm until phase 2 (ADR-0045 decision 5). The provider scan path
+/// exercised here is exactly the one that caller will drive.
+///
+/// The counts are exact, not just non-zero: one segment yields one whole-object
+/// GET (`SPAN_REQUESTS_PER_SEGMENT`), and the recorded bytes equal the object's
+/// size. Reverting `fetch` in place of `fetch_accounted` in
+/// `spans_scan.rs::prepare_partition` drops both counts to zero and fails this.
+#[tokio::test]
+async fn a_spans_scan_is_accounted() {
+    let store = MemoryStore::new();
+
+    let t1 = [0x11u8; 16];
+    let records: Vec<SpanRecord> = (0u8..6)
+        .map(|i| {
+            let s = 100 + i64::from(i);
+            span(t1, i, s, s + 1, &format!("op-{i}"))
+        })
+        .collect();
+    let seg = write_object(&store, "spans/accounted.rspan", &records).await;
+    let expected_bytes = seg.object_size;
+    assert!(expected_bytes > 0, "the written object must have a size");
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = SpanSegmentFetcher::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+
+    let accounting = QueryAccounting::new();
+    let provider =
+        SpansTableProvider::new(snapshot, TenantHash([1u8; 16]), fetcher, accounting.clone());
+
+    // A full scan (no pushdown) over the single segment: one whole-object GET.
+    let plan = provider.plan(1).expect("build plan");
+    let batches = collect_plan(plan).await;
+    assert!(
+        !batches.is_empty() && batches.iter().map(|b| b.num_rows()).sum::<usize>() == records.len(),
+        "the scan must return every span so the fetch really ran"
+    );
+
+    let snap = accounting.snapshot();
+    assert_eq!(
+        snap.total_s3_requests(),
+        1,
+        "one segment yields exactly one accounted GET"
+    );
+    assert_eq!(
+        snap.s3_requests(AccountedOp::Get),
+        1,
+        "the accounted request is a Get"
+    );
+    assert_eq!(
+        snap.s3_bytes(AccountedOp::Get),
+        expected_bytes,
+        "the accounted GET records the whole object's transferred bytes"
+    );
 }

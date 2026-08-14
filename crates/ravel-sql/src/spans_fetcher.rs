@@ -49,6 +49,8 @@ use ravel_rspan::skip_index::BlockEntry;
 use ravel_rspan::{
     BloomPredicate, RspanConfig, RspanReader, ScanStats, SpanQuery, SpanRecord, SpanSegError, open,
 };
+use ravel_types::TenantHash;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
 /// One scanned span: the rebuilt record plus its `service_name` read straight
 /// from the v3 dictionary-encoded `COL_SERVICE_NAME` column (ADR-0054), rather
@@ -91,6 +93,8 @@ pub enum SpanFetchError {
         #[source]
         source: SpanSegError,
     },
+    #[error("span segment {key} belongs to a different tenant than the query")]
+    TenantMismatch { key: String },
 }
 
 /// Fetches and scans one RSPAN span segment at a time. Constructed with the
@@ -188,6 +192,72 @@ impl SpanSegmentFetcher {
                 source,
             })?;
         let bytes = got.data;
+
+        let output = self
+            .scan_object(&bytes, query, duration_ns, status_mask, predicates)
+            .map_err(|source| corrupt(key, source))?;
+        Ok(Some(output))
+    }
+
+    /// Accounted, tenant-checked counterpart of [`fetch`](Self::fetch):
+    /// identical prune-and-scan behavior, plus two things (ADR-0044). The
+    /// object GET is recorded against `accounting` at this funnel -- the funnel
+    /// the span scan did not account before -- exactly as
+    /// `LogSegmentFetcher::fetch_accounted` records the log GET; and the fetched
+    /// object's footer `tenant_hash` is verified against `tenant_hash` before it
+    /// is decoded, failing closed with [`SpanFetchError::TenantMismatch`].
+    ///
+    /// `tenant_hash` mirrors the logs scan chain, which threads a
+    /// `TenantHash` from `LogsTableProvider` through `LogsScanExec` into
+    /// `LogSegmentFetcher::fetch_accounted_with_tenant`. There it keys the
+    /// ADR-0046 read cache; RSPAN has no read cache in this crate, so the same
+    /// threaded identity instead guards against decoding an object that belongs
+    /// to another tenant. The GET is recorded before the guard runs: the
+    /// request was really issued regardless of whose object came back.
+    ///
+    /// This is the funnel a production `spans` query takes once a caller is
+    /// wired in (ADR-0045 decision 5, phase 2); the unaccounted, tenant-blind
+    /// [`fetch`](Self::fetch) stays for unit tests and block-stat spies.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_accounted(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        accounting: &QueryAccounting,
+    ) -> Result<Option<SpanFetchOutput>, SpanFetchError> {
+        if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
+            return Ok(None);
+        }
+
+        let key = &seg_ref.data_object_key;
+        let got = self
+            .store
+            .get(key, GetRange::Full)
+            .await
+            .map_err(|source| SpanFetchError::Store {
+                key: key.to_string(),
+                source,
+            })?;
+        // This funnel issues exactly one whole-object GET per call, the same
+        // shape the logs funnel records (one `Get` request, the transferred
+        // byte count). `estimate_spans_cost` bounds this at one GET per segment.
+        accounting.record_s3_request(AccountedOp::Get);
+        accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+        let bytes = got.data;
+
+        // Tenant identity guard: an object whose footer names a different
+        // tenant is never decoded. The footer trailer is parsed here (cheap);
+        // `scan_object` re-opens it for the BLOCKS section descriptor.
+        let footer = open(&bytes).map_err(|source| corrupt(key, source))?;
+        if footer.tenant_hash != tenant_hash.0 {
+            return Err(SpanFetchError::TenantMismatch {
+                key: key.to_string(),
+            });
+        }
 
         let output = self
             .scan_object(&bytes, query, duration_ns, status_mask, predicates)
