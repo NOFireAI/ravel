@@ -1,467 +1,99 @@
 # Ravel
 
+[![CI](https://github.com/NOFireAI/ravel/actions/workflows/ci.yml/badge.svg)](https://github.com/NOFireAI/ravel/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/pmoust/b45c736cf13204279b05507186c24325/raw/coverage.json)](https://github.com/NOFireAI/ravel/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97.1-orange.svg)](rust-toolchain.toml)
 
-Ravel is an OpenTelemetry-native observability database. Object storage is
-its only durable backend: metrics, logs, and traces land as immutable
-segments and commit records on S3 or MinIO, and every Ravel process
-(gateway, ingest shard, query frontend) is disposable. If Ravel
-acknowledges a write in strict mode, that data survives the crash,
-restart, or redeployment of any Ravel process, because it survives on the
-object store, not in any process's memory or local disk.
+An OpenTelemetry-native observability database whose only durable backend is
+object storage.
 
-Ravel is a research prototype. Metrics and logs run end to end today, from
-OTLP or Remote Write ingest through PromQL, SQL, and Flight SQL query,
-against real S3/MinIO. Traces ingest, compact, and retain end to end too
-(the span segment format, RSPAN, ADR-0041); there is no query surface over
-them yet.
+Metrics, logs, and traces land as immutable segments and commit records on S3
+or MinIO. Every Ravel process — gateway, ingest shard, query frontend,
+maintenance worker — is disposable: when Ravel acknowledges a write in strict
+mode, that data survives the crash, restart, or redeployment of any process,
+because it lives on the object store rather than in a process's memory or on
+its local disk.
 
-## See it run
+Metrics and logs run end to end today, from OTLP or Remote Write ingest through
+PromQL, SQL, and Flight SQL query. Traces ingest, compact, and retain end to
+end; a query surface over them is not built yet.
 
-```sh
-make minio   # starts MinIO + bucket creation via docker compose
-make demo    # builds ravel-server/ravel-cli, ingests one OTLP export, queries it back
-```
-
-`make demo` runs [scripts/demo.sh](scripts/demo.sh): it starts `ravel-server`
-against MinIO, sends a generated OTLP metrics export over HTTP, prints the
-commit token it receives, and queries that metric back by
-`min_commit_token`. For the full walkthrough with expected output, see
-[docs/guides/getting-started.md](docs/guides/getting-started.md).
-
-The same round trip against a real local Kubernetes cluster, driven by the
-Ravel operator instead of a bare process:
+## Run it
 
 ```sh
-scripts/kind-up.sh     # kind cluster, both images, fake S3, operator, RavelCluster
-scripts/kind-demo.sh   # OTLP ingest via the gateway, query back via the query tier
-scripts/kind-down.sh   # delete the cluster
+make minio   # MinIO plus bucket creation, via docker compose
+make demo    # ingest one OTLP export and query it back
 ```
 
-This needs `docker`, `kind`, and `kubectl`. For the `RavelCluster` field
-reference and probe semantics, see
-[docs/guides/kubernetes.md](docs/guides/kubernetes.md).
+`make demo` starts `ravel-server` against MinIO, sends a generated OTLP metrics
+export, prints the commit token it receives, and queries the metric back by
+`min_commit_token`. For the walkthrough with expected output, see the
+[getting started guide](docs/guides/getting-started.md).
 
-## How data moves
+The same round trip on a real Kubernetes cluster, driven by the operator, needs
+`docker`, `kind`, and `kubectl`:
+
+```sh
+scripts/kind-up.sh     # cluster, images, fake S3, operator, RavelCluster
+scripts/kind-demo.sh   # ingest via the gateway, query via the query tier
+scripts/kind-down.sh
+```
+
+## How it fits together
 
 ![architecture](docs/diagrams/architecture.svg)
 
-OTLP or Remote Write arrives at the gateway, which authenticates the
-request, resolves a tenant, and checks admission limits before it buffers
-anything. Points route to a shard actor by `hash(tenant, series_id)`. Each
-shard actor is a single task with no locks; it buffers points until a size
-or age trigger fires a flush.
-
-A flush serializes a segment, PUTs it to the object store, mints an
-immutable commit record, and PUTs that too. Only then does Ravel
-acknowledge the waiting request with a commit token:
+A write is durable once its commit record is on the object store, and a reader
+sees it once the catalog resolves that commit into a snapshot. The
+[ingest guide](docs/guides/ingest.md) covers the write path and the
+[query guide](docs/guides/query.md) the read path; the
+[consistency model](docs/consistency-model.md) is normative for what
+acknowledgement, visibility, and crash recovery mean.
 
 ![ingest and commit sequence](docs/diagrams/ingest-commit-sequence.svg)
 
-On the query side, `/api/v1/*` resolves a snapshot of segments from the
-catalog by listing commit records in the relevant shard and hour buckets,
-fetches each segment's footer, prunes series by label matchers, fetches
-only the needed pages, and hands the merged samples to the PromQL
-evaluator:
-
-![query path](docs/diagrams/query-path.svg)
-
-Everything after "PUT succeeded" is derived, replaceable, and disposable.
-Segments themselves are packed for partial reads: a suffix GET for the
-footer, ranged GETs for only the pages a query touches, every section
-checksummed on its own.
-
-![RSEG byte layout](docs/diagrams/rseg-layout.svg)
-
-For the full crate dependency graph, see
-[docs/architecture.md](docs/architecture.md). For the reasoning behind each
-piece, see [docs/adrs/](docs/adrs/).
-
-## What's built
-
-- **OTLP ingest**, HTTP and gRPC, for metrics (gauges and cumulative sums),
-  logs, and traces, with admission limits, event-time skew bounds, and
-  strict or buffered acknowledgement. Trace ingest (`POST /v1/traces`,
-  `trace.v1.TraceService/Export`) routes and sorts spans by `trace_id`
-  ([ADR-0041](docs/adrs/0041-rspan-v1-span-segment-format.md)) into
-  immutable RSPAN objects; there is no query surface over spans yet (see
-  What's next).
-- **Prometheus Remote Write** ingest, `POST /api/v1/write`, both Remote
-  Write 1.0 and 2.0, through the same admission and routing path as OTLP.
-- **PromQL**: vector and matrix selectors, `offset`/`@`, binary operators,
-  the aggregation operators (`sum`, `avg`, `min`, `max`, `count`, `group`,
-  `stddev`, `stdvar`, `topk`, `bottomk`, `quantile`, `count_values`, with
-  `by`/`without`), subqueries, and most of the function library (`rate`,
-  `histogram_quantile`, the `*_over_time` family, label and math
-  functions), over `/api/v1/query` and `/api/v1/query_range`. Native
-  (exponential) histograms are ingested, stored, and queryable with the
-  full set of native-histogram functions.
-- **Exemplars**: `GET`/`POST /api/v1/query_exemplars`, the Prometheus
-  exemplar surface Grafana calls to link a metric point to a trace. Each
-  exemplar's `trace_id` and `span_id` ride in the returned `labels` under
-  those conventional keys, hex-encoded; an all-zero id is treated as absent
-  and its label is omitted. The endpoint reads exemplars from the same
-  segments a sample query over `[start, end]` matches, and ignores `offset`
-  and `@`, matching Prometheus.
-- **SQL**, through Apache DataFusion (`ravel-sql`): `POST /api/v1/sql`
-  against a `samples` table (metrics) or a `logs` table, read-only, with
-  the same duplicate-sample resolution as PromQL so the two agree on
-  results. **Flight SQL** exposes the same query path over Arrow Flight's
-  gRPC surface.
-- **Distributed read fan-out and cross-cluster federation**
-  ([ADR-0071](docs/adrs/0071-distributed-read-fanout.md),
-  [guide](docs/guides/distributed-query.md)), both off by default: two
-  capabilities that change *where* bytes are fetched, never *what* a query
-  computes (results stay byte-identical to local execution, enforced by a
-  differential test):
-  - **Multi-process fan-out** within one cluster, enabled per query node
-    with `--distributed-query` plus a fragment-credential file. The node
-    that receives a request coordinates it: it resolves one pinned snapshot,
-    and when a cost estimate clears the gate (256 MiB of estimated store
-    bytes or 256 segments), it partitions that snapshot shard-major and
-    dispatches each slice to a peer query node over an internal gRPC
-    surface (a `SeriesFetch` service for PromQL, Arrow Flight for SQL).
-    Workers self-register by heartbeat; the coordinator k-way merges the
-    slices and runs the unchanged evaluator. A cheap query runs the local
-    path untouched.
-  - **Cross-cluster federation**, configured per remote with repeatable
-    `--remote-cluster`. The coordinator asks each remote cluster to resolve
-    its own snapshot over matchers and a window and unions the returned
-    series; segment references and S3 credentials never cross a trust
-    boundary, and the coordinator authenticates with a per-remote operator
-    credential (a client's own credential is never forwarded). A remote
-    failure fails the query by default; per-remote `skip_unavailable`
-    instead returns partial results, marked with `partial: true` and one
-    `warnings` entry naming each skipped cluster. The discovery endpoints
-    (`/api/v1/series`, `/api/v1/labels`, `/api/v1/label/<name>/values`)
-    federate on the same terms.
-- **Analytics**: `POST /api/v1/analytics` runs a range query, then applies
-  change point detection (PELT) or exact summary statistics (median, MAD,
-  percentiles, standard deviation, variance) to each series.
-- **Alerting and detection rules** (`ravel-alerting`, [ADR-0043](docs/adrs/0043-unified-alerting-engine.md)):
-  one generic rule shape covers both a PromQL query with a threshold and a
-  SQL query with a nonempty-result condition, so observability alerts and
-  security detections share one engine. `ravel-server --mode all` (or
-  `query`) evaluates every tenant's rules on `--alert-eval-interval-secs`
-  and writes each state transition -- pending, firing, resolved -- as an
-  immutable `Signal::Alerts` record, so alert history is queryable data
-  rather than process memory. Rules are loaded at startup from
-  `--alert-rules-file`; transitions notify `--alert-webhook-url` and
-  `--alertmanager-url` sinks after the record is durable. See
-  [Alerting](#alerting) below.
-- **Compaction, retention, and garbage collection** (`ravel-maintain`):
-  L0-to-L1 compaction, age-based retention, and a sweeper that removes
-  orphaned objects, superseded inputs, and unreferenced parts. Signal-
-  generic across metrics, logs, and traces, runs continuously under
-  `ravel-server --mode maintain` or one-shot via `ravel-cli maintain`.
-- **Grafana and Prometheus compatibility routes**: `/api/v1/labels`,
-  `/api/v1/label/{name}/values`, `/api/v1/series`,
-  `/api/v1/status/buildinfo`, `/api/v1/metadata`, `/-/healthy`, `/-/ready`.
-- **A Prometheus scrape endpoint**, `GET /metrics`, unauthenticated like the
-  health routes, in every mode. It exports Ravel's own object-store, ingest,
-  catalog, cache, admission, and per-query cost counters under a closed label
-  allowlist. See [docs/guides/observability.md](docs/guides/observability.md).
-- **Query-path tracing spans** ([ADR-0044](docs/adrs/0044-query-cost-accounting.md)
-  decision 5): a request-level `sql_query`/`analytics_query`/
-  `flight_sql_statement` span, always visible, wrapping six `debug`-level
-  phase spans -- `catalog_resolve`, `segment_open`, `catalog_decode`,
-  `page_fetch`, `decode`, `evaluate` -- each carrying its own byte/request
-  counts, off under the default log filter until `RUST_LOG` is widened, so a
-  slow query's time attributes to a phase. Optional OTLP/gRPC export
-  ([ADR-0060](docs/adrs/0060-query-path-otlp-trace-export.md)) ships the same
-  spans to a collector, off by default via `--otlp-trace-endpoint` on
-  `ravel-server` and `ravel-operator`, best-effort and never blocking a
-  query. See [docs/guides/tracing.md](docs/guides/tracing.md).
-- **A Kubernetes operator** (`ravel-operator`): a `RavelCluster` CRD that
-  reconciles the gateway, ingest, query, and maintain roles as separate
-  deployments. See [docs/guides/kubernetes.md](docs/guides/kubernetes.md).
-- **Published container images**: `ravel-server` and `ravel-operator`,
-  built in CI and pushed to GHCR on tag.
-- **Prometheus metrics about Ravel itself**, on `GET /metrics` in every
-  mode, including maintain. Object-store calls, bytes, errors by kind and
-  latency; ingest flushes, acks, and buffered volume per signal; catalog
-  anomaly counters. In maintain mode: tenant-discovery gauges, legal-hold
-  refresh failures, compaction conservation-gate aborts, and mass-orphan
-  circuit-breaker trips and withheld-object counts, with default alert
-  rules and a breaker runbook in
-  [docs/guides/operations.md](docs/guides/operations.md#maintenance-safety-metrics-and-alerts).
-  Labels come from a closed allowlist, so Ravel's own telemetry cannot
-  grow unbounded. The route is unauthenticated, like the health routes:
-  do not expose the listener to untrusted networks.
-- **A read cache** ([ADR-0046](docs/adrs/0046-read-cache-tier.md)), in front of
-  both the PromQL/metric-SQL fetcher and the log fetcher: recently read
-  segment and log byte ranges are kept in a RAM tier so a repeat read of
-  the same data does not go back to object storage. Optimization only,
-  never changes a query result. Sized with `--cache-max-bytes`, turned off
-  with `--disable-cache`; warmed with each tenant's most recent parts at
-  startup, before `/readyz` latches, on a best-effort budget. Its hit/miss,
-  byte, and eviction counters render on `/metrics` under the same
-  allowlist as above. See
-  [docs/guides/caching.md](docs/guides/caching.md), including its known
-  gaps (no disk tier yet, no span or `alerts`/`audit` query surface to
-  cache).
-
-Two gaps worth knowing about: PromQL subqueries over native histograms
-return a typed error rather than a wrong answer, and native
-`histogram_quantile`/`histogram_fraction` interpolate linearly within a
-bucket where Prometheus 3.x interpolates exponentially, so interior
-quantiles can differ.
-
-## What's next
-
-- A query surface for traces: a `spans` SQL table (built, not yet wired
-  into `POST /api/v1/sql`) and trace-by-id lookup. Ingest, compaction, and
-  retention for spans already run end to end (see What's built); nothing
-  reads them back yet.
-- Profiles.
-- Catalog snapshots: an index object in place of per-query listing, needed
-  before listing-based discovery runs out of headroom.
-- OTAP (OpenTelemetry Arrow) ingest: the codec is written but not wired
-  into the gateway.
-
-## Try a query
-
-After ingest (see above), query the same data as PromQL or SQL. Both read
-the same catalog and segments and apply the same duplicate-sample
-resolution, so they agree.
+## Query it
 
 ```sh
 # PromQL, instant
-curl -G http://127.0.0.1:4318/api/v1/query \
-  -H "Authorization: Bearer devtoken" \
-  --data-urlencode "query=rate(http_requests_total[5m]) > 0" \
-  --data-urlencode "time=<unix seconds>"
+curl -s 'localhost:8080/api/v1/query?query=http_requests_total'
 
-# PromQL, range
-curl -G http://127.0.0.1:4318/api/v1/query_range \
-  -H "Authorization: Bearer devtoken" \
-  --data-urlencode "query=rate(http_requests_total[5m])" \
-  --data-urlencode "start=<unix seconds>" \
-  --data-urlencode "end=<unix seconds>" \
-  --data-urlencode "step=15s"
-
-# Exemplars: trace/span ids for a metric selector, over [start, end]
-curl -G http://127.0.0.1:4318/api/v1/query_exemplars \
-  -H "Authorization: Bearer devtoken" \
-  --data-urlencode "query=http_request_duration_seconds{method=\"get\"}" \
-  --data-urlencode "start=<unix seconds>" \
-  --data-urlencode "end=<unix seconds>"
-
-# SQL over metrics (needs ravel-server built/run with --features sql)
-curl -X POST http://127.0.0.1:4318/api/v1/sql \
-  -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" \
-  -d '{"query": "SELECT ts, value FROM samples ORDER BY ts", "start": 0, "end": 1893456000}'
-
-# SQL over logs
-curl -X POST http://127.0.0.1:4318/api/v1/sql \
-  -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" \
-  -d '{"query": "SELECT ts, body FROM logs WHERE has_word(body, '\''timeout'\'') ORDER BY ts", "start": 0, "end": 1893456000}'
-
-# Analytics: change point detection over a range query
-curl -X POST http://127.0.0.1:4318/api/v1/analytics \
-  -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" \
-  -d '{"query": "http_requests_total", "start": 0, "end": 1893456000, "step": "30s",
-       "op": {"type": "change_point", "downsample": false}}'
+# SQL over metrics, with ravel-server built and run with --features sql
+curl -s localhost:8080/api/v1/sql -d '{"query":"SELECT * FROM metrics LIMIT 10"}'
 ```
 
-`/api/v1/query_exemplars` returns Prometheus' exemplar shape: an array of
-`{seriesLabels, exemplars}`, each exemplar carrying `labels`, `value`, and
-`timestamp`. The exemplar's trace and span ids ride in `labels` under the
-conventional `trace_id` and `span_id` keys, hex-encoded, which is what
-Grafana follows to open a trace; an all-zero id means absent and its label
-is omitted. Two behaviours an operator should know:
+PromQL, SQL, Flight SQL, exemplars, alerting, and analytics surfaces are each
+covered in the [query guide](docs/guides/query.md) and the
+[distributed query guide](docs/guides/distributed-query.md).
 
-- **Fetch window.** Exemplars are read from exactly the `[start, end]`
-  window's segments. `offset` and `@` in the query are ignored, matching
-  Prometheus; a returned exemplar is kept only when its own timestamp falls
-  inside `[start, end]`.
-- **Deduplication.** During compaction the same exemplar can be readable
-  from two segments at once. Results are deduplicated on the exemplar's
-  full stored identity (series, timestamp, trace id, span id, value, and
-  attributes), so an exact duplicate collapses to one dot while two
-  exemplars that differ in any of those fields are both returned.
+## Where things live
 
-The SQL endpoint is off by default; build or run `ravel-server` with the
-`sql` cargo feature (`flight-sql` implies `sql`). It accepts only `SELECT`
-statements, and rejected statements or execution errors return a redacted
-error body, never raw backend or DataFusion plan text. For the full `logs`
-table reference and every analytics op's request/response schema, see
-[docs/guides/query.md](docs/guides/query.md) and
-[docs/analytics.md](docs/analytics.md).
-
-## Alerting
-
-Rules are a JSON file, loaded at startup. Each rule names a tenant, one query
-(`promql` or `sql`), and the condition that makes it fire:
-
-```json
-{
-  "rules": [
-    {
-      "tenant": "acme",
-      "rule_id": "high-error-rate",
-      "promql": "sum by (job) (rate(http_errors_total[5m]))",
-      "condition": {"type": "threshold", "op": "gt", "value": 10},
-      "labels": {"severity": "page"},
-      "annotations": {"summary": "error rate is high"},
-      "for": "5m"
-    },
-    {
-      "tenant": "acme",
-      "rule_id": "root-login",
-      "sql": "select * from logs where has_word(body, 'root') and severity_num >= 17",
-      "condition": {"type": "non_empty_result"}
-    }
-  ]
-}
-```
-
-A PromQL rule takes a `threshold` condition (`op` is one of `gt`, `ge`, `lt`,
-`le`, `eq`, `ne`) and fires when any series in the instant vector satisfies it.
-A SQL rule takes `non_empty_result` and fires when the query returns any row;
-SQL rules need the `sql` cargo feature. `for` is optional and delays firing
-until the condition has held that long, exactly as in Prometheus alerting.
-
-```sh
-ravel-server --mode all \
-  --tenant-token devtoken=acme \
-  --alert-rules-file rules.json \
-  --alert-eval-interval-secs 60 \
-  --alert-webhook-url https://example.invalid/ravel-alerts \
-  --alertmanager-url http://alertmanager:9093
-```
-
-Every transition is written as an immutable record before any sink is
-contacted, so a sink that is down loses notifications, never alert history;
-delivery is at-least-once and retried on later ticks, including across a
-process restart (the evaluator re-queues every still-open alert for one
-delivery attempt the first tick after it starts). Sinks are optional: with
-none configured, transitions are still recorded durably.
-
-## Tenant tokens
-
-Bearer tokens can live in a durable, deployment-wide map (`sys/auth`) instead
-of only on the command line: `ravel-server`'s `--tenant-token` stays the
-static, process-local source, and `sys/auth` is an additional, hot-reloaded
-source keyed by the bucket's ADR-0072 deployment key. `ravel-cli tenant
-token` manages it directly:
-
-```sh
-ravel-cli tenant token upsert \
-  --deployment-key-file deployment.key \
-  --token "$(cat token.txt)" \
-  --tenant acme
-ravel-cli tenant token list --deployment-key-file deployment.key
-ravel-cli tenant token revoke --deployment-key-file deployment.key --tenant acme
-```
-
-`upsert` hashes the token under the deployment key and drops the plaintext;
-`list` prints each entry's tenant id and a short token-hash fingerprint,
-never the plaintext or the full hash. Every entry is tagged `--managed-by`
-(default `cli`) to record which writer owns its lifecycle: the Kubernetes
-operator's own reconcile loop (see
-[docs/guides/kubernetes.md](docs/guides/kubernetes.md)) tags the entries it
-writes `operator` and only ever removes entries carrying that same tag, so a
-tenant provisioned by this command survives an operator reconcile even when
-its Secret does not name that tenant.
-
-## Per-tenant encryption (SSE-KMS)
-
-Every data-object PUT can be encrypted with a KMS key, either one key for
-the whole deployment (`--s3-kms-key`) or one key per tenant
-(`--tenant-kms-config <path>`, a TOML file mapping tenant name to KMS key
-ARN, ADR-0062 decision 1 / ADR-0072 decision 2). Per-tenant routing is a
-storage-layer decorator (`KmsRoutingStore`) that sends a tenant's writes to
-a `S3Store` built with that tenant's own key; every other tenant, and every
-non-PUT operation, is unaffected. Both flags are off by default: without
-them `ravel-server` builds exactly the store it always has. The first time
-a tenant's key is configured, `ravel-server` records the key's activation
-as an immutable, append-only epoch history (`t/<hash>/enc`) that
-`ravel-cli verify-custody` reads back to confirm every object under that
-tenant predates or postdates the right key. See
-[docs/guides/operations.md](docs/guides/operations.md)'s "Per-tenant
-SSE-KMS routing" section for the config shape and the KMS key policy
-template, and ADR-0055 for a known gap: the
-`deploy/iam/*.json` role policies do not yet grant access to the new
-`t/*/enc` key, a required follow-up before this ships against an
-already-provisioned bucket.
-
-## Bucket protection
-
-`--require-bucket-protection` (ADR-0072 decision 3, default off) gates
-startup on the bucket's own Object Lock and versioning configuration
-instead of only warning about it: a backend that affirmatively reports
-Object Lock disabled, or a versioning-without-expiration alarm (ADR-0064
-section 7), refuses to start. Every backend reachable only through
-`ObjectStoreBackend` today reports the status as unknown rather than
-disabled or enabled -- no adapter queries this yet -- so on today's real
-backends the flag is observability, not an accidental universal refusal:
-it logs one warning and sets the `ravel_bucket_protection_unknown` gauge
-instead of blocking startup. `ravel-operator` sets this flag
-unconditionally for every `RavelCluster` it reconciles. See
-[docs/guides/operations.md](docs/guides/operations.md)'s "Bucket
-protection contract" section for the full state table.
-
-Together with tenant tokens and per-tenant encryption above, this is the
-ADR-0072 tenant trust boundary: per-tenant SSE-KMS routing keeps a leaked
-role credential from decrypting another tenant's data, the durable
-`sys/auth` revoke-by-tenant path lets an operator cut off a tenant's
-access without a restart, and this startup gate keeps a bucket without
-Object Lock/versioning from serving traffic at all. The IAM role policies
-both mechanisms depend on are in [`deploy/iam/`](deploy/iam/), documented
-in operations.md's "Storage credential roles" section.
-
-## Container images
-
-```sh
-docker pull ghcr.io/nofireai/ravel-server:latest
-docker pull ghcr.io/nofireai/ravel-operator:latest
-```
-
-Tags: `X.Y.Z`, `X.Y`, `X`, and `latest` on a `vX.Y.Z` git tag push;
-`manual-<short-sha>` from a manual `workflow_dispatch` run of
-[publish-images.yml](.github/workflows/publish-images.yml). GHCR creates a
-package private on its first push; until it's flipped to public in the
-package settings, pulling needs `docker login ghcr.io` with a PAT that has
-`read:packages`. Building an
-amd64 image on Apple Silicon via `docker build --platform linux/amd64` is
-not supported; `rustc` segfaults under Docker Desktop's QEMU emulation.
-Pull the published image, or build natively on an amd64 host, instead.
-
-## Repository layout
-
-- `crates/`: libraries: types, object store, segment formats (RSEG for
-  metrics, RLOG for logs, RSPAN for spans), commit protocol, catalog,
-  OTLP/OTAP/Remote Write decode, ingest actors, PromQL, query engine, and
-  `ravel-sql` (DataFusion-backed SQL and Flight SQL)
-- `services/`: `ravel-server` (gateway, ingest, query, and maintain modes
-  in one binary) and `ravel-cli` (segment, commit, and catalog inspector;
-  also manages the durable `sys/auth` tenant-token map, see "Tenant
-  tokens" above)
-- `docs/`: specs, ADRs, diagrams, and the user guides in `docs/guides/`
-- `proto/`: protobuf schemas, vendored OTAP protos
-- `deploy/docker-compose/`: local MinIO stack
-- `deploy/k8s/`: operator manifests (CRD, RBAC, Deployment), an example
-  `RavelCluster`, and the fake-S3 backends used by the kind environment
-- `scripts/`: `demo.sh` and the `kind-*.sh` scripts above
+- `crates/` — types, object store, the segment formats (RSEG for metrics, RLOG
+  for logs, RSPAN for spans), commit protocol, catalog, OTLP/OTAP/Remote Write
+  decode, ingest actors, PromQL, the query engine, and DataFusion-backed SQL
+- `services/` — `ravel-server` (gateway, ingest, query, and maintain modes in
+  one binary), `ravel-cli` (segment, commit, and catalog inspector), and the
+  Kubernetes operator
+- `docs/` — specs, decision records, diagrams, and guides
+- `deploy/` — local MinIO stack and Kubernetes manifests
 
 ## Documentation
 
-- [docs/README.md](docs/README.md): index of every guide and spec
-- [docs/segment-format.md](docs/segment-format.md): the RSEG v6
-  specification (columnar catalog, native histograms, multi-run
-  compaction layout, sparse catalog, exemplars), the only version Ravel
-  reads or writes pre-release (ADR-0027, ADR-0047)
-- [docs/log-segment-format.md](docs/log-segment-format.md): the RLOG v1
-  specification (ADR-0029)
-- [docs/span-segment-format.md](docs/span-segment-format.md): the RSPAN
-  v1 specification (ADR-0041)
-- [docs/guides/](docs/guides/): getting started, ingest, admission limits,
-  query, distributed query, operations, observability, tracing, inspecting
-  data, Kubernetes
-- [docs/adrs/](docs/adrs/): one decision record per architectural choice
-- [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
-  conformance table, classifying every construct as supported,
-  intentionally rejected, or unclassified (ADR-0035)
-- [CHANGELOG.md](CHANGELOG.md): released versions and what each contains
+- [Guides](docs/guides/) — getting started, ingest, query, distributed query,
+  operations, observability, tracing, admission limits, caching, correlation,
+  disaster recovery, inspecting data, Kubernetes, development
+- [Documentation index](docs/README.md) — every guide and spec
+- [Architecture](docs/architecture.md) and the
+  [consistency model](docs/consistency-model.md)
+- Formats: [RSEG](docs/segment-format.md) (metrics),
+  [RLOG](docs/log-segment-format.md) (logs),
+  [RSPAN](docs/span-segment-format.md) (spans)
+- [Decision records](docs/adrs/) — one per architectural choice
+- [SQL conformance](docs/sql-conformance.md) — every construct classified as
+  supported, intentionally rejected, or unclassified
+- [Contributing](CONTRIBUTING.md) and the [changelog](CHANGELOG.md)
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
