@@ -28,7 +28,7 @@ fn identity() -> SegmentIdentity {
     SegmentIdentity {
         tenant_hash: [3u8; 16],
         shard: 1,
-        writer_id: "audit-a1".to_string(),
+        writer_id: "test-writer".to_string(),
         writer_epoch: 1,
         writer_seq: 1,
     }
@@ -61,7 +61,7 @@ fn slice(bytes: &[u8], range: (u64, u64)) -> &[u8] {
     &bytes[range.0 as usize..(range.0 + range.1) as usize]
 }
 
-// --- a1-F01 -----------------------------------------------------------------
+// --- uncompressed page size cap ---------------------------------------------
 //
 // `decompress_page_payload_into`'s `comp = NONE` branch copied the payload
 // with no size check, while the LZ4 branch rejects `prefix >

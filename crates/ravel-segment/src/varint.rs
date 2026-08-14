@@ -178,7 +178,7 @@ mod tests {
     }
 }
 
-/// Corrupt-input mutation harness (issue #82, audit finding a11-F05): the
+/// Corrupt-input mutation harness: the
 /// fixed hand-vectors above pin a handful of chosen corruptions; these
 /// proptest targets explore the arbitrary/mutated byte space. The LEB128
 /// reader decodes untrusted stored bytes, so the contract is "typed error

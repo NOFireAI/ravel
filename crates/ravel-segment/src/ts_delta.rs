@@ -35,7 +35,7 @@ pub fn encode_ts_deltas_into(out: &mut Vec<u8>, timestamps: &[i64]) -> Option<()
 /// Rejects trailing bytes past the declared count. Appending (rather than
 /// clearing first) lets a caller concatenate several runs' pages into one
 /// buffer, which the query fetcher's L0 branch relies on to emit one unit per
-/// series with every run's samples in on-disk order (#283); a caller that
+/// series with every run's samples in on-disk order; a caller that
 /// wants a fresh decode clears the buffer itself.
 pub fn decode_ts_deltas_into(
     bytes: &[u8],
@@ -163,7 +163,7 @@ mod tests {
     }
 }
 
-/// Corrupt-input mutation harness (issue #82, audit finding a11-F05). The
+/// Corrupt-input mutation harness. The
 /// TS_DELTA_VARINT decoder reads untrusted stored bytes; the contract is a
 /// typed error or a valid decode, never a panic and never wrong data
 /// (docs/segment-format.md, CLAUDE.md testing patterns). The hand-vectors

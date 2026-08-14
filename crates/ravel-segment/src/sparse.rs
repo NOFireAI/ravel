@@ -709,7 +709,7 @@ pub fn decode_catalog_v5(
     // LABEL_DICT and SERIES_IDS are decompressed here (and their crcs
     // verified) so the decoded bytes go straight in rather than handing raw
     // section slices to `decode_catalog_v4`, which would decode both a second
-    // time (#282). SERIES_META is the one further section decompressed here.
+    // time. SERIES_META is the one further section decompressed here.
     if let Some(meta_section) = find_section(footer, section_kind::SERIES_META) {
         let dict_bytes = decode_section_bytes(
             label_dict_section,
@@ -738,7 +738,7 @@ pub fn decode_catalog_v5(
     // Chunked path: SERIES_IDX + SERIES_META_CHUNKS. Slice the four catalog
     // sections out of the whole object and hand them to the section-based
     // entry, so the whole-object decode and a catalog-only range-fetch
-    // (`decode_catalog_v5_chunked`, #276) share one implementation.
+    // (`decode_catalog_v5_chunked`) share one implementation.
     let idx_section = find_section(footer, section_kind::SERIES_IDX)
         .ok_or(SegmentError::SparseSectionsIncomplete)?;
     let chunks_section = find_section(footer, section_kind::SERIES_META_CHUNKS)
@@ -756,8 +756,8 @@ pub fn decode_catalog_v5(
 /// Decodes the v5 chunked catalog (at or above [`crate::V5_SPARSE_THRESHOLD`]
 /// series) from the already-fetched raw stored bytes of its four catalog
 /// sections -- LABEL_DICT, SERIES_IDS, SERIES_IDX, SERIES_META_CHUNKS --
-/// instead of the whole object. This is the production selective-read entry
-/// (issue #276): a reader that has range-GET only the catalog sections
+/// instead of the whole object. This is the production selective-read entry:
+/// a reader that has range-GET only the catalog sections
 /// (skipping the TS/VAL/HIST page sections a whole-object GET would pull in)
 /// decodes exactly the `SeriesEntryV4` values [`decode_catalog_v5`] returns.
 ///

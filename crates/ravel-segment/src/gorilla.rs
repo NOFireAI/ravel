@@ -163,7 +163,7 @@ pub fn encode_gorilla_into(values: &[f64], out: &mut Vec<u8>) {
 /// [`SegmentError::CorruptGorilla`] or [`SegmentError::Truncated`]; never
 /// panics. Appending (rather than clearing first) lets a caller concatenate
 /// several runs' pages into one buffer, which the query fetcher's L0 branch
-/// relies on (#283); a caller that wants a fresh decode clears the buffer
+/// relies on; a caller that wants a fresh decode clears the buffer
 /// itself.
 pub fn decode_gorilla_into(
     bytes: &[u8],
@@ -263,10 +263,9 @@ mod tests {
     #[test]
     fn window_reuse_hand_vector() {
         // Independent known-answer vector for the "10" window-reuse control
-        // path (gorilla.rs:133-141 encode, :184-194 decode). Oracle source:
-        // docs/reviews/2026-07-27-storage-engine-quality-audit/
-        // a2-segment-codecs.md finding a2-F01. Bytes hand-computed from enc 16
-        // and re-derived here, independent of the encoder.
+        // path (gorilla.rs:133-141 encode, :184-194 decode). Bytes
+        // hand-computed from enc 16 and re-derived here, independent of the
+        // encoder.
         //
         //   values: [0.0, from_bits(0x0F00_0000_0000_0000),
         //                 from_bits(0x0800_0000_0000_0000)]
@@ -299,9 +298,9 @@ mod tests {
     #[test]
     fn clamped_leading_hand_vector() {
         // Independent known-answer vector for the clamped leading-zero path
-        // (real_lead > 31, clamped to 31 by gorilla.rs:143). Oracle source:
-        // a2-F01 in the A2 audit report; bytes hand-computed from enc 16 and
-        // re-derived here, independent of the encoder.
+        // (real_lead > 31, clamped to 31 by gorilla.rs:143). Bytes
+        // hand-computed from enc 16 and re-derived here, independent of the
+        // encoder.
         //
         //   values: [0.0, from_bits(0x0000_0000_0010_0000)]
         //
@@ -435,7 +434,7 @@ mod tests {
     }
 }
 
-/// Corrupt-input mutation harness (issue #82, audit finding a11-F05). The
+/// Corrupt-input mutation harness. The
 /// Gorilla decoder reads an untrusted XOR bit stream; the contract is a
 /// typed error or a valid decode, never a panic and never wrong data
 /// (docs/segment-format.md, CLAUDE.md testing patterns). The hand-vectors

@@ -483,7 +483,7 @@ fn unknown_version_still_fails_closed() {
 }
 
 // ===========================================================================
-// Issue #195 / #196 / #199 regression tests: each hand-tampers one on-disk
+// Structural-tamper regression tests: each hand-tampers one on-disk
 // invariant that a corrupt-but-crc-consistent object could otherwise violate
 // silently, then proves the reader fails closed with the specific typed
 // error rather than the field-level crc32c catching it (crc32c is
@@ -556,7 +556,7 @@ fn series_idx_chunk_entry_offset(series_count: u32, chunk_index: u32) -> usize {
 
 #[test]
 fn tampered_run_total_fails_with_run_count_sum_mismatch() {
-    // Issue #195: decode_catalog_v5 parsed the v5 chunked SERIES_META
+    // decode_catalog_v5 parsed the v5 chunked SERIES_META
     // header's run_total but never cross-checked it against the sum of
     // per-chunk run counts, unlike the dense v4 path and the per-chunk-frame
     // check. Overwrite run_total (the last 4 bytes of the section header,
@@ -593,7 +593,7 @@ fn tampered_run_total_fails_with_run_count_sum_mismatch() {
 
 #[test]
 fn corrupt_series_idx_chunk_chain_fails_to_parse() {
-    // Issue #196: parse_series_idx validated per-field truncation and id
+    // parse_series_idx validated per-field truncation and id
     // sortedness but never the chunk directory's dense first_index chain
     // (0, K, 2K, ...), which only decode_catalog_v5's now-removed ad hoc
     // check enforced -- and locate/chunk_for never called that. A
@@ -647,7 +647,7 @@ fn corrupt_series_idx_chunk_chain_fails_to_parse() {
 
 #[test]
 fn chunk_frame_trailing_value_ord_bytes_fail_closed() {
-    // Issue #199: the v5 frame's value_ord block decode never asserted the
+    // The v5 frame's value_ord block decode never asserted the
     // per-series materialization consumed the whole block, unlike
     // parse_value_ord_block_all_v2 (v2/v3/v4), which returns BadBlockLen on
     // a mismatch. Every fixture series here carries a 3-label schema, so the

@@ -1,7 +1,6 @@
 #![no_main]
 
-//! Coverage-guided fuzz target for the RSEG v5 (sparse) whole-catalog decoder
-//! (issue #48).
+//! Coverage-guided fuzz target for the RSEG v5 (sparse) whole-catalog decoder.
 //!
 //! Unlike the v4 decoders, `decode_catalog_v5` takes the whole object bytes,
 //! because a v5 chunked catalog spans several sections it locates itself

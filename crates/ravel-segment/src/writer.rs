@@ -68,7 +68,7 @@ pub struct WrittenSegment {
 }
 
 /// One histogram sample: an event timestamp paired with a native-histogram
-/// value (docs/rseg-v3-plan.md section 2).
+/// value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistogramSample {
     pub ts_ns: i64,
@@ -77,7 +77,7 @@ pub struct HistogramSample {
 
 /// A series' sample payload for RSEG v3: exactly one of scalar or
 /// histogram samples, fixed for the series' whole life in one segment
-/// (`value_kind`, docs/rseg-v3-plan.md section 3.4).
+/// (`value_kind`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeriesValues {
     Scalar(Vec<ravel_types::Sample>),
@@ -120,7 +120,7 @@ impl SeriesValues {
 
     /// Appends this series' timestamps to `out` without allocating: `out` is
     /// caller-owned scratch, cleared and reused across series within one
-    /// flush (issue #813).
+    /// flush.
     fn extend_ts_values_into(&self, out: &mut Vec<i64>) {
         out.clear();
         match self {
@@ -142,7 +142,7 @@ pub struct SeriesInputV3 {
 }
 
 /// One run's provenance, event-time bounds, and pre-encoded page bytes for
-/// RSEG v4 (docs/compaction-retention-plan.md section 4). `ts_page` and
+/// RSEG v4. `ts_page` and
 /// `value_page` are fully framed (6-byte page header -- enc, comp,
 /// crc32c -- then payload) exactly as read from an input object;
 /// `write_v4` never decodes or re-encodes them, only copies them
@@ -160,8 +160,8 @@ pub struct RunInputV4 {
 }
 
 /// A run's VAL or HIST page, fully framed. The variant fixes the owning
-/// series' `value_kind` for its whole life (docs/rseg-v3-plan.md section
-/// 3.4, generalized to run granularity in v4); mixing variants within one
+/// series' `value_kind` for its whole life (generalized to run granularity
+/// in v4); mixing variants within one
 /// series is rejected (`WriteError::MixedValueKindInSeries`).
 #[derive(Debug, Clone)]
 pub enum RunValuePageV4 {
@@ -246,7 +246,7 @@ impl SegmentWriter {
     /// Same as [`SegmentWriter::write_histograms`], additionally emitting the
     /// EXEMPLARS section (kind 10, ADR-0047) when `exemplars` is non-empty.
     /// This is the flush-path entry point for an ingest shard that buffered
-    /// exemplars alongside its samples (issue #474): exemplars are independent
+    /// exemplars alongside its samples: exemplars are independent
     /// of run/sample framing, so the adapter passes them straight through to
     /// [`SegmentWriter::write_v5_with_exemplars`].
     ///
@@ -279,8 +279,7 @@ impl SegmentWriter {
 
         let mut v4_series = Vec::with_capacity(series.len());
         // One scratch, reused across every series in this flush: the framing
-        // buffers are allocated once here, not once per series (issue #813,
-        // restored after the #976 regression).
+        // buffers are allocated once here, not once per series.
         let mut scratch = WriteScratch::default();
         for s in series {
             let run = encode_run_v4_with_scratch(
@@ -319,7 +318,7 @@ impl SegmentWriter {
     /// runs afterward is dropped in turn (mirrors the empty-series rule of
     /// the raw-sample adapters, generalized to run granularity).
     ///
-    /// Test-only (issue #813): production now reaches the v4 grammar through
+    /// Test-only: production now reaches the v4 grammar through
     /// `assemble_v4_body` directly (see
     /// [`SegmentWriter::write_v5_with_exemplars`]), which finalizes as v4 for
     /// the sparse path's `base` input and as v6 directly otherwise. This
@@ -344,7 +343,7 @@ impl SegmentWriter {
 /// finalization lets [`SegmentWriter::write_v5_with_exemplars`] pick the
 /// output trailer version (6 below the sparse threshold, 4 as the sparse
 /// path's rebuild input) without assembling the body twice or computing
-/// blake3 more than once for the version it actually emits (issue #813).
+/// blake3 more than once for the version it actually emits.
 struct AssembledV4Body {
     object: Vec<u8>,
     footer_bytes: Vec<u8>,
@@ -692,9 +691,7 @@ impl SegmentWriter {
     /// bespoke encode path, so the v4 grammar stays a single source of truth.
     /// Below the threshold, the core is finalized with the version-6 trailer
     /// directly -- no intermediate v4 object, no retrailer copy, exactly one
-    /// whole-object blake3 pass (issue #813; previously a `write_v4` call
-    /// finalized as version 4 and a second pass, `retrailer_v4_to_v6`, copied
-    /// the whole object again to rewrite the trailer as version 6). At or
+    /// whole-object blake3 pass. At or
     /// above the threshold, the core is finalized as version 4 (the shape
     /// [`crate::sparse::build_sparse_object`] expects as input) and the
     /// sparse sections are layered on from there, unchanged from before.
@@ -757,7 +754,7 @@ pub fn encode_run_v4(
 ) -> Result<RunInputV4, WriteError> {
     // The erasure-rewrite path encodes one bucket at a time and is far cooler
     // than the L0 flush loop, so it pays a fresh scratch per call rather than
-    // threading one through (issue #976): output is byte-identical either way.
+    // threading one through; output is byte-identical either way.
     let mut scratch = WriteScratch::default();
     encode_run_v4_with_scratch(
         series_id,
@@ -770,14 +767,11 @@ pub fn encode_run_v4(
 }
 
 /// Framing buffers reused across the series of one L0 flush, so a flush of N
-/// series pays O(1) scratch allocations instead of O(N) (issue #813).
+/// series pays O(1) scratch allocations instead of O(N).
 ///
-/// [`encode_run_v4`] framed each series into three fresh `Vec`s (the run
-/// timestamps, the scalar values, and the page-body scratch). The
-/// selective-erasure rewrite (issue #754) extracted that framing into
-/// `encode_run_v4` but kept the per-call allocation, silently dropping #813's
-/// cross-series reuse on the main ingest write hot path (issue #976). The L0
-/// flush adapter now owns exactly one of these and hands it to every series;
+/// [`encode_run_v4`] frames each series into three `Vec`s (the run
+/// timestamps, the scalar values, and the page-body scratch). The L0
+/// flush adapter owns exactly one of these and hands it to every series;
 /// each buffer is cleared before use, so reuse never changes the framed bytes:
 /// encode output stays byte-identical to a fresh-scratch encode (proven by the
 /// `direct_v6_emit_bit_parity` module).
@@ -792,7 +786,7 @@ pub(crate) struct WriteScratch {
 /// ([`SegmentWriter::write_histograms_with_exemplars`]) allocates one scratch
 /// and reuses it across every series in the flush, amortizing the
 /// ts_values/scalar_values/payload allocations; the buffers only change where
-/// the framing bytes come from, never their contents (issue #813, #976).
+/// the framing bytes come from, never their contents.
 pub(crate) fn encode_run_v4_with_scratch(
     series_id: &SeriesId,
     created_unix_ns: i64,
@@ -883,7 +877,7 @@ fn frame_val_page(series_id: &SeriesId, values: &[f64], payload: &mut Vec<u8>) -
 
 /// Frames one histogram series' HIST page into a fresh buffer: back-to-back
 /// HIST_SPANS records, never per-page compressed (writer policy). Borrows
-/// each sample's [`HistogramValue`] rather than cloning it (issue #813).
+/// each sample's [`HistogramValue`] rather than cloning it.
 /// `payload` is caller-owned scratch (cleared here, reused across series).
 fn frame_hist_page(
     series_id: &SeriesId,
@@ -1022,8 +1016,8 @@ fn intern_dict<'a>(
     }
 }
 
-// --- RSEG v4 only (ADR-0018, docs/compaction-retention-plan.md section 4):
-// multi-run verbatim-copy writer. Deliberately duplicates rather than
+// --- RSEG v4 only (ADR-0018): multi-run verbatim-copy writer. Deliberately
+// duplicates rather than
 // shares helpers with v1/v2/v3 (same discipline as the `_v3` functions
 // above), so each version's byte-for-byte behavior stays provable by
 // inspection alone. This writer never encodes a sample: TS/VAL/HIST page
@@ -1034,9 +1028,9 @@ fn intern_dict<'a>(
 /// v1/v2/v3. A pre-encoded run page shorter than this cannot be valid.
 const RUN_PAGE_HEADER_LEN_V4: usize = 6;
 
-/// Identical grammar and sorted-order rule as v3's `DictionaryV3` (section
-/// 4: "SERIES_IDS / LABEL_DICT ... as v2/v3"; issue #146 restored the sort in
-/// v2/v3, issue #155 carries it here). `__name__` at ordinal 0, every other
+/// Identical grammar and sorted-order rule as v3's `DictionaryV3`
+/// ("SERIES_IDS / LABEL_DICT ... as v2/v3"). `__name__` at ordinal 0, every
+/// other
 /// distinct string in sorted (byte) order.
 struct DictionaryV4<'a> {
     /// Distinct non-`__name__` strings in sorted order (ordinals 1..).
@@ -1055,8 +1049,8 @@ struct DictionaryV4<'a> {
 /// series-then-label, then exemplar-then-attr iteration order, then assigns
 /// sorted ordinals via the shared `sort_and_rank_dict` pass (`__name__`
 /// pinned to 0), the same scheme as `build_dictionary_v2` / `build_dictionary_v3`.
-/// LABEL_DICT is "as v2/v3" (section 4), so this inherits the issue #146 sort
-/// (issue #155): v4 is the L1 compaction output, whose objects are larger and
+/// LABEL_DICT is "as v2/v3", so this inherits the byte-sorted dictionary
+/// order: v4 is the L1 compaction output, whose objects are larger and
 /// longer-lived than L0 segments, so the compression win the sort buys is
 /// worth more here. The order rule stays relaxed (readers locate strings by
 /// ordinal), so this is a writer-side change: no version bump, no ADR.
@@ -1190,8 +1184,7 @@ fn append_hist_run_page_v4(page: &[u8], hist_pages: &mut Vec<u8>) -> Result<(), 
     Ok(())
 }
 
-/// SERIES_META (kind 6, uncompressed form) for RSEG v4
-/// (docs/compaction-retention-plan.md section 4): v3's series-major
+/// SERIES_META (kind 6, uncompressed form) for RSEG v4: v3's series-major
 /// `schema_ref`/`value_ord`/`value_kind` blocks unchanged, plus a new
 /// series-major `run_count` block and a `run_total` header field, then
 /// eight run-major blocks (provenance, sample_count, bounds, and the four
@@ -1703,8 +1696,8 @@ mod v4_tests {
         }
     }
 
-    /// Issue #155: v4's LABEL_DICT is "as v2/v3" (section 4), so it inherits
-    /// the restored sort (issue #146) -- `__name__` at ordinal 0, every other
+    /// v4's LABEL_DICT is "as v2/v3", so it inherits the byte-sorted
+    /// dictionary order -- `__name__` at ordinal 0, every other
     /// distinct string in sorted (byte) order. Inputs are chosen so
     /// first-occurrence order differs from sorted order.
     #[test]
@@ -1751,7 +1744,7 @@ mod v4_tests {
         assert_eq!(
             rest,
             expected.as_slice(),
-            "v4 LABEL_DICT past ordinal 0 must be byte-sorted (as v2/v3, issue #155)"
+            "v4 LABEL_DICT past ordinal 0 must be byte-sorted (as v2/v3)"
         );
         assert_ne!(
             rest[0].as_str(),
@@ -1760,7 +1753,7 @@ mod v4_tests {
         );
     }
 
-    // --- drop rules (docs/compaction-retention-plan.md section 4: a run
+    // --- drop rules: a run
     // with zero samples is dropped; a series left with zero runs is
     // dropped entirely, same silent-drop principle v1 established for
     // zero-sample series). ---
@@ -1784,7 +1777,7 @@ mod v4_tests {
     }
 
     /// The L0 flush adapter (`write_histograms_with_exemplars`, the ingest
-    /// shard's entry point, issue #474) carries exemplars into the EXEMPLARS
+    /// shard's entry point) carries exemplars into the EXEMPLARS
     /// section with `series_index` resolved against the output's sorted
     /// SERIES_IDS, and leaves the records ascending by `(series_index, ts_ns)`
     /// with duplicates intact (ADR-0047 amendment 2026-08-03).
@@ -2536,7 +2529,7 @@ mod v4_tests {
             .unwrap_or(0)
     }
 
-    /// #282: a below-threshold (dense) v5 object carries the whole-section
+    /// A below-threshold (dense) v5 object carries the whole-section
     /// SERIES_META, so `decode_catalog_v5` decodes LABEL_DICT + SERIES_IDS
     /// itself and then builds the catalog via `decode_catalog_v4_from_decoded`.
     /// Pin that LABEL_DICT is decompressed exactly once per catalog decode:
@@ -2594,7 +2587,7 @@ mod v4_tests {
         );
     }
 
-    /// #283: the page decoders append, so decoding a second run into the same
+    /// The page decoders append, so decoding a second run into the same
     /// timestamp/value buffers (what the fetcher's L0 one-unit-per-series path
     /// does) concatenates both runs instead of the second clobbering the
     /// first. Hand-build two runs' pages and decode them into shared buffers;
@@ -2679,10 +2672,10 @@ mod v4_tests {
         )
     }
 
-    /// Issue #976 amortization guard. `encode_run_v4_with_scratch` must reuse
+    /// Amortization guard. `encode_run_v4_with_scratch` must reuse
     /// the caller's `WriteScratch` buffers across series, not allocate fresh
     /// ones per call, so an L0 flush of N series pays O(1) scratch allocations
-    /// (issue #813). Encode a large series first to grow all three buffers,
+    /// Encode a large series first to grow all three buffers,
     /// then a tiny one through the same scratch: if the buffers are reused, the
     /// grown capacities survive; if `encode_run_v4_with_scratch` allocated
     /// fresh `Vec`s internally, the second call would leave capacities at the
@@ -2691,7 +2684,7 @@ mod v4_tests {
     /// Flip line to watch this fail: in `encode_run_v4_with_scratch`, replace
     /// `&mut scratch.payload` (and the `scratch.ts_values`/`scratch.scalar_values`
     /// borrows) with fresh `&mut Vec::new()` / `let mut ts_values = Vec::new()`
-    /// -- the per-series re-allocation the #976 regression reintroduced -- and
+    /// -- reintroducing per-series re-allocation -- and
     /// the capacity assertions below drop to zero.
     #[test]
     fn encode_run_v4_reuses_scratch_across_series() {
@@ -2772,20 +2765,20 @@ mod v4_tests {
     }
 }
 
-/// Bit-parity acceptance test for issue #813. The direct-emit writer
+/// Bit-parity acceptance test for the direct-emit writer. The direct-emit
+/// writer
 /// (`assemble_v4_body` finalized as version 6 for the non-sparse path, no
 /// retrailer, one blake3 pass; scratch-reused `frame_ts_page`/
 /// `frame_val_page`/`frame_hist_page`; a borrowed rather than cloned
 /// `HistogramValue` per sample) must produce byte-for-byte identical output,
-/// and an identical `SegmentSummary`, to the writer it replaced.
+/// and an identical `SegmentSummary`, to an independent reference writer.
 ///
-/// The reference implementation below (`old_*`) is not a re-derivation: every
-/// function is copied verbatim from the pre-#813 commit (`git show
-/// HEAD:crates/ravel-segment/src/writer.rs`, taken before this issue's
-/// changes were made), including the deleted `retrailer_v4_to_v6` and the
-/// original per-series-fresh-`Vec` `frame_*_page`/`ts_values`. A divergence
-/// here means the new assembly actually changed a byte, not that the
-/// reference drifted alongside it.
+/// The reference implementation below (`old_*`) is self-contained and shares
+/// no code with the production writer: it assembles and finalizes as v4 with
+/// a full `retrailer_v4_to_v6` copy and per-series-fresh-`Vec`
+/// `frame_*_page`/`ts_values`. A divergence here means the production
+/// assembly actually changed a byte, not that the reference drifted
+/// alongside it.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod direct_v6_emit_bit_parity {
@@ -2833,16 +2826,16 @@ mod direct_v6_emit_bit_parity {
         }
     }
 
-    // ---- pre-#813 reference algorithm, copied verbatim ----
+    // ---- reference algorithm ----
 
-    fn old_ts_values(values: &SeriesValues) -> Vec<i64> {
+    fn reference_ts_values(values: &SeriesValues) -> Vec<i64> {
         match values {
             SeriesValues::Scalar(v) => v.iter().map(|s| s.ts_ns).collect(),
             SeriesValues::Histogram(v) => v.iter().map(|s| s.ts_ns).collect(),
         }
     }
 
-    fn old_frame_ts_page(series_id: &SeriesId, ts_values: &[i64]) -> Result<Vec<u8>, WriteError> {
+    fn reference_frame_ts_page(series_id: &SeriesId, ts_values: &[i64]) -> Result<Vec<u8>, WriteError> {
         let mut payload = Vec::new();
         encode_ts_deltas_into(&mut payload, ts_values).ok_or(WriteError::TimestampDeltaOverflow)?;
         let enc = page_enc::TS_DELTA_VARINT;
@@ -2859,7 +2852,7 @@ mod direct_v6_emit_bit_parity {
         Ok(frame_page(&series_id.0, enc, comp, body))
     }
 
-    fn old_frame_val_page(series_id: &SeriesId, values: &[f64]) -> Vec<u8> {
+    fn reference_frame_val_page(series_id: &SeriesId, values: &[f64]) -> Vec<u8> {
         let mut payload = Vec::new();
         encode_gorilla_into(values, &mut payload);
         let count = values.len() as u64;
@@ -2875,7 +2868,7 @@ mod direct_v6_emit_bit_parity {
         frame_page(&series_id.0, enc, page_comp::NONE, &payload)
     }
 
-    fn old_frame_hist_page(
+    fn reference_frame_hist_page(
         series_id: &SeriesId,
         values: &[HistogramValue],
     ) -> Result<Vec<u8>, WriteError> {
@@ -2891,11 +2884,11 @@ mod direct_v6_emit_bit_parity {
         ))
     }
 
-    /// Verbatim pre-#813 `write_v4`: the full assemble-and-finalize-as-v4
-    /// body, not a call into today's split `assemble_v4_body` +
-    /// `finalize_v4_trailer`. This is what makes the sparse-path parity case
-    /// below a real check rather than a tautology.
-    fn old_write_v4(
+    /// A standalone assemble-and-finalize-as-v4 body, independent of the
+    /// split `assemble_v4_body` + `finalize_v4_trailer` production path. Kept
+    /// as an independent oracle: this is what makes the sparse-path parity
+    /// case below a real check rather than a tautology.
+    fn reference_write_v4(
         mut series: Vec<SeriesInputV4>,
         identity: SegmentIdentity,
         ingest_bounds: IngestBounds,
@@ -3170,10 +3163,9 @@ mod direct_v6_emit_bit_parity {
         })
     }
 
-    /// Verbatim pre-#813 `retrailer_v4_to_v6`, the function this issue
-    /// deleted: a full-object copy plus a second `footer_crc` and a second
-    /// whole-object blake3.
-    fn old_retrailer_v4_to_v6(base: WrittenSegment) -> WrittenSegment {
+    /// A standalone `retrailer_v4_to_v6`: a full-object copy plus a second
+    /// `footer_crc` and a second whole-object blake3.
+    fn reference_retrailer_v4_to_v6(base: WrittenSegment) -> WrittenSegment {
         let obj = base.bytes.as_ref();
         let total = obj.len();
         let trailer_start = total - crate::format::TRAILER_LEN as usize;
@@ -3212,21 +3204,21 @@ mod direct_v6_emit_bit_parity {
         }
     }
 
-    fn old_write_v5_with_exemplars(
+    fn reference_write_v5_with_exemplars(
         series: Vec<SeriesInputV4>,
         identity: SegmentIdentity,
         ingest_bounds: IngestBounds,
         meta: CompactionMetaV4,
         exemplars: Vec<ExemplarInput>,
     ) -> Result<WrittenSegment, WriteError> {
-        let base = old_write_v4(series, identity, ingest_bounds, meta, exemplars)?;
+        let base = reference_write_v4(series, identity, ingest_bounds, meta, exemplars)?;
         if base.summary.series_count < V5_SPARSE_THRESHOLD {
-            return Ok(old_retrailer_v4_to_v6(base));
+            return Ok(reference_retrailer_v4_to_v6(base));
         }
         crate::sparse::build_sparse_object(&base)
     }
 
-    fn old_write_histograms_with_exemplars(
+    fn reference_write_histograms_with_exemplars(
         mut series: Vec<SeriesInputV3>,
         identity: SegmentIdentity,
         ingest_bounds: IngestBounds,
@@ -3247,15 +3239,15 @@ mod direct_v6_emit_bit_parity {
                 u32::try_from(s.values.len()).map_err(|_| WriteError::TooManySamples)?;
             let min_ts_ns = s.values.first_ts().unwrap_or(0);
             let max_ts_ns = s.values.last_ts().unwrap_or(0);
-            let ts_page = old_frame_ts_page(&s.series_id, &old_ts_values(&s.values))?;
+            let ts_page = reference_frame_ts_page(&s.series_id, &reference_ts_values(&s.values))?;
             let value_page = match &s.values {
                 SeriesValues::Scalar(samples) => {
                     let vals: Vec<f64> = samples.iter().map(|sm| sm.value).collect();
-                    RunValuePageV4::Scalar(old_frame_val_page(&s.series_id, &vals))
+                    RunValuePageV4::Scalar(reference_frame_val_page(&s.series_id, &vals))
                 }
                 SeriesValues::Histogram(hist) => {
                     let vals: Vec<HistogramValue> = hist.iter().map(|h| h.value.clone()).collect();
-                    RunValuePageV4::Histogram(old_frame_hist_page(&s.series_id, &vals)?)
+                    RunValuePageV4::Histogram(reference_frame_hist_page(&s.series_id, &vals)?)
                 }
             };
             v4_series.push(SeriesInputV4 {
@@ -3280,7 +3272,7 @@ mod direct_v6_emit_bit_parity {
             part_index: 0,
             level: 0,
         };
-        old_write_v5_with_exemplars(v4_series, identity, ingest_bounds, meta, exemplars)
+        reference_write_v5_with_exemplars(v4_series, identity, ingest_bounds, meta, exemplars)
     }
 
     // ---- input generation: plain-data specs, instantiated twice (once for
@@ -3386,7 +3378,7 @@ mod direct_v6_emit_bit_parity {
             fixed_bounds(),
             instantiate_exemplars(&exemplar_specs),
         );
-        let old_result = old_write_histograms_with_exemplars(
+        let reference_result = reference_write_histograms_with_exemplars(
             instantiate(&specs),
             fixed_identity(),
             fixed_bounds(),
@@ -3394,8 +3386,8 @@ mod direct_v6_emit_bit_parity {
         );
         assert_eq!(
             normalize(new_result),
-            normalize(old_result),
-            "direct-emit writer diverged from the pre-#813 reference"
+            normalize(reference_result),
+            "direct-emit writer diverged from the reference implementation"
         );
     }
 
@@ -3500,11 +3492,11 @@ mod direct_v6_emit_bit_parity {
     }
 
     /// At/above `V5_SPARSE_THRESHOLD` (4096), `write_v5_with_exemplars`
-    /// finalizes the assembled body as version 4 (unchanged by issue #813)
-    /// and feeds it to `crate::sparse::build_sparse_object`. Comparing
-    /// against `old_write_v4` (the verbatim pre-#813 body, not today's
-    /// `assemble_v4_body`) proves that intermediate v4 object is still
-    /// byte-identical, not just that the sparse builder is unchanged.
+    /// finalizes the assembled body as version 4 and feeds it to
+    /// `crate::sparse::build_sparse_object`. Comparing against `reference_write_v4`
+    /// (a standalone v4 body, independent of `assemble_v4_body`) proves that
+    /// intermediate v4 object is still byte-identical, not just that the
+    /// sparse builder is unchanged.
     #[test]
     fn sparse_shape_at_threshold() {
         let n = V5_SPARSE_THRESHOLD as usize;
@@ -3583,13 +3575,13 @@ mod direct_v6_emit_bit_parity {
                 fixed_bounds(),
                 instantiate_exemplars(&exemplar_specs),
             );
-            let old_result = old_write_histograms_with_exemplars(
+            let reference_result = reference_write_histograms_with_exemplars(
                 instantiate(&specs),
                 fixed_identity(),
                 fixed_bounds(),
                 instantiate_exemplars(&exemplar_specs),
             );
-            prop_assert_eq!(normalize(new_result), normalize(old_result));
+            prop_assert_eq!(normalize(new_result), normalize(reference_result));
         }
     }
 }

@@ -1,7 +1,6 @@
 #![no_main]
 
-//! Coverage-guided fuzz target for the RSEG v5 sparse point-lookup grammar
-//! (issue #48).
+//! Coverage-guided fuzz target for the RSEG v5 sparse point-lookup grammar.
 //!
 //! The v5 analog of a filtered/point catalog read is the sparse probe: parse
 //! the SERIES_IDX directory, then binary-search a SERIES_IDS window for a

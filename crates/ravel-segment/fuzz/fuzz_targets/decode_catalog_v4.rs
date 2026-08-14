@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Coverage-guided fuzz target for the RSEG v4 (run-major) whole-catalog
-//! decoder (issue #48).
+//! decoder.
 //!
 //! `decode_catalog_v4` is handed an untrusted `Footer` plus the three raw
 //! section bodies (LABEL_DICT, SERIES_IDS, SERIES_META) that its section
