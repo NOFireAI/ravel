@@ -1,4 +1,4 @@
-//! PromQL conformance scoring (ADR-0035, issue #133).
+//! PromQL conformance scoring (ADR-0035).
 //!
 //! Unlike `difftest_selectors.rs`, none of this needs the pinned Prometheus
 //! binary or `RAVEL_DIFFTEST=1`: every assertion here is about Ravel's own
@@ -221,7 +221,7 @@ async fn intentionally_rejected_constructs_return_typed_errors() {
     );
 }
 
-/// Issue #262 gap 1: the rejection check compares the registry's *declared*
+/// The rejection check compares the registry's *declared*
 /// status and `errorType` against the observed response, so a construct that
 /// regresses from one typed-error variant to another is caught.
 ///
@@ -312,7 +312,7 @@ fn every_rejection_case_has_a_declared_typed_error_to_compare_against() {
     }
 }
 
-/// Issue #262 gap 2: a `ravel-promql:<fn>` citation is only evidence while
+/// A `ravel-promql:<fn>` citation is only evidence while
 /// that test exists, so the scan must find every cited name in the real crate.
 #[test]
 fn every_cited_ravel_promql_unit_test_exists() {
@@ -506,7 +506,7 @@ async fn run_rejection_cases() -> Vec<RejectionResult> {
 ///
 /// `expected` is the `(status, errorType)` pair parsed out of the construct's
 /// own `typed_error` string, which is what makes this an identity check rather
-/// than a shape check (issue #262 gap 1): a construct whose rejection moves
+/// than a shape check: a construct whose rejection moves
 /// from 422 `execution` to 500 `internal` still rejects cleanly by shape, but
 /// no longer matches the error the published table names.
 fn check_rejection(

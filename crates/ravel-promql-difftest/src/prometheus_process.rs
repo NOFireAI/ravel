@@ -1,11 +1,10 @@
 //! Spawns and tears down the pinned Prometheus binary with a fresh tsdb
-//! directory and `--web.enable-remote-write-receiver` (ADR-0021 decision 4,
-//! docs/promql-evaluator-plan.md section 5.1).
+//! directory and `--web.enable-remote-write-receiver` (ADR-0021 decision 4).
 //!
 //! Uses `std::process::Command` (blocking spawn/kill), not tokio's async
 //! process API: the workspace's shared `tokio` dependency does not enable
 //! the `process` feature, and adding it would touch the root `Cargo.toml`,
-//! out of this ticket's scope (crate-local changes only). Readiness polling
+//! out of scope here (crate-local changes only). Readiness polling
 //! is async (`PrometheusClient::wait_ready`); only the spawn and kill calls
 //! are blocking, and both are quick, non-blocking-runtime-hazard syscalls.
 

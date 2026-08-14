@@ -1,5 +1,5 @@
-//! Runs a parsed corpus against both stacks and diffs each entry
-//! (docs/promql-evaluator-plan.md section 5.4/5.5). A failing entry keeps
+//! Runs a parsed corpus against both stacks and diffs each entry.
+//! A failing entry keeps
 //! both raw JSON bodies attached so a CI failure can archive them as
 //! artifacts without re-running anything.
 

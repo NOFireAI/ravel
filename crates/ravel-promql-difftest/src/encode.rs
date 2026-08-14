@@ -1,12 +1,12 @@
 //! Encodes a generated [`Dataset`](crate::generator::Dataset) as a
 //! Remote Write 1.0 payload: `prometheus.WriteRequest` protobuf, snappy
-//! block-compressed (docs/promql-evaluator-plan.md section 5.1).
+//! block-compressed.
 //!
 //! This is the inverse of `ravel-remote-write`'s decode path
-//! (`crates/ravel-remote-write/src/rw1.rs`), kept crate-local per the plan
-//! ("the remote-write proto is vendored crate-locally... not a Ravel
-//! persistent format") since it only ever produces fixtures for the pinned
-//! Prometheus instance, never decodes production traffic.
+//! (`crates/ravel-remote-write/src/rw1.rs`), kept crate-local (the
+//! remote-write proto is vendored crate-locally and is not a Ravel persistent
+//! format) since it only ever produces fixtures for the pinned Prometheus
+//! instance, never decodes production traffic.
 
 use crate::generator::{Dataset, GeneratedHistogramSeries};
 use crate::proto::prometheus::{
@@ -42,7 +42,7 @@ fn to_write_request(dataset: &Dataset) -> WriteRequest {
 
 /// Encode a native-histogram series as a `TimeSeries` carrying `Histogram`
 /// messages (RW1 native-histogram support), the counterpart of
-/// [`to_timeseries`] for the P11 corpus. Integer histograms are delta-encoded
+/// [`to_timeseries`] for the native-histogram corpus. Integer histograms are delta-encoded
 /// per the remote-write contract (`positive_deltas`, not absolute counts).
 fn to_histogram_timeseries(series: &GeneratedHistogramSeries) -> TimeSeries {
     TimeSeries {

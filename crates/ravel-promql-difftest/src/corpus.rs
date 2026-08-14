@@ -1,5 +1,5 @@
-//! Corpus file format (docs/promql-evaluator-plan.md section 5.3):
-//! blank-line-separated entries, each a small set of `key: value` lines.
+//! Corpus file format: blank-line-separated entries, each a small set of
+//! `key: value` lines.
 //! Lines starting with `#` are comments. Every offset is relative to the
 //! dataset's `base_ts_ms`, so a corpus file never encodes an absolute
 //! timestamp (CLAUDE.md "time is injected").
@@ -45,7 +45,7 @@
 //! present series, a selector that matches nothing, a comparison filter that
 //! keeps nothing). Scoring reads the payload, not just the envelope status, so
 //! an entry that answers empty without declaring it counts as a failure and
-//! demotes every construct it exercises (issue #262): "success" with no data
+//! demotes every construct it exercises: "success" with no data
 //! proves nothing. The declaration is checked in both directions, so an entry
 //! marked `expect: empty` that starts returning data fails too.
 //!
@@ -103,7 +103,7 @@ pub struct CorpusEntry {
     pub tolerance_ulps: Option<u32>,
     /// From an optional `expect: empty` field: a successful answer carrying no
     /// result at all is what this entry pins. Absent by default, which means
-    /// the entry must answer with values (issue #262 gap 3).
+    /// the entry must answer with values.
     pub expects_empty: bool,
 }
 
@@ -463,8 +463,8 @@ mode: error
         let entries =
             parse_corpus(include_str!("../corpus/aggregate.txt")).expect("parse aggregate corpus");
         assert!(entries.len() >= 15);
-        // No entry here uses `mode: ordered` (issue #177 moved the two
-        // topk/bottomk tie-boundary entries to `unordered`: this dataset's
+        // No entry here uses `mode: ordered`: the two topk/bottomk
+        // tie-boundary entries are `unordered` because this dataset's
         // only values produce a tie at both the top and bottom, so there is
         // no tie-free query left to assert a specific rank order against;
         // rank-order correctness itself stays covered by aggregate.rs's own
@@ -481,7 +481,7 @@ mode: error
         // The two point-cap entries are the accepted ADR-0030 one-sided
         // divergence (Ravel errors by design, Prometheus succeeds); they
         // used to be `mode: error` before the comparator gained a mode for
-        // that shape (issue #228).
+        // that shape.
         assert!(
             entries
                 .iter()

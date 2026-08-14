@@ -1,6 +1,5 @@
 //! Compares a Prometheus JSON response against a Ravel JSON response for
-//! bit-exact equivalence (docs/promql-evaluator-plan.md section 5.4,
-//! ADR-0021 decision 3).
+//! bit-exact equivalence (ADR-0021 decision 3).
 //!
 //! Rules: sample values compare by `f64::to_bits`, except any two NaN bit
 //! patterns compare equal as a class (the stale marker and an ordinary NaN
@@ -10,7 +9,7 @@
 //! corpus entry is marked order-sensitive. Errors compare by `errorType`
 //! class string equality. The two annotation channels `warnings` and
 //! `infos` each compare by presence only, but independently: they are
-//! distinct Prometheus fields (issue #178), so a query where one engine
+//! distinct Prometheus fields, so a query where one engine
 //! emits an info and the other a warning (or nothing) is a mismatch.
 //!
 //! A corpus entry may opt into a bounded ULP tolerance (ADR-0025's
@@ -273,7 +272,7 @@ fn compare_success(
         ));
     }
 
-    // `infos` is a distinct Prometheus field from `warnings` (issue #178):
+    // `infos` is a distinct Prometheus field from `warnings`:
     // an out-of-range `quantile` clamp warns, a forced-monotonicity fixup
     // informs. Before Ravel had any annotation channel the comparator could
     // only skip `infos`; now it checks its presence too, so a query where
@@ -677,8 +676,9 @@ mod tests {
     #[test]
     fn info_presence_mismatch_is_caught_independently_of_warnings() {
         // Both sides agree on the (empty) warnings channel and on the result,
-        // but only Prometheus carries an `infos` entry. Before issue #178 the
-        // comparator skipped `infos` entirely and this pair compared equal;
+        // but only Prometheus carries an `infos` entry. Before the comparator
+        // checked `infos` it skipped the field entirely and this pair compared
+        // equal;
         // now the info-presence check must catch it, proving `infos` is
         // compared and is a channel distinct from `warnings`.
         let prom = json!({
