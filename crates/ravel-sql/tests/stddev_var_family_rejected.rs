@@ -1,25 +1,23 @@
-//! Audit SQL-4, finding sql4-F02: does the stddev/variance aggregate family
-//! belong in the v1 SQL subset, or must it be excluded like `avg`?
+//! Does the stddev/variance aggregate family belong in the v1 SQL subset, or
+//! must it be excluded like `avg`?
 //!
-//! docs/reviews/2026-07-28-ravel-sql-audit/sql4-validate-error-tenant.md
-//! confirmed the *validation* half of sql4-F02: at the audit baseline
-//! `crate::validate` rejected only `avg`/`mean` and grouped `min`/`max`, and
-//! `crate::session::build_session` deregistered only the `avg`/`mean` UDAFs.
-//! `stddev`, `var`, `stddev_pop`, `var_pop` (and `covar_*`/`corr`) were
-//! registered by DataFusion's `with_default_features()` and left in place, so
-//! they planned and executed.
+//! `crate::validate` originally rejected only `avg`/`mean` and grouped
+//! `min`/`max`, and `crate::session::build_session` deregistered only the
+//! `avg`/`mean` UDAFs. `stddev`, `var`, `stddev_pop`, `var_pop` (and
+//! `covar_*`/`corr`) were registered by DataFusion's `with_default_features()`
+//! and left in place, so they planned and executed.
 //!
 //! Each of them computes a floating mean internally -- exactly the property
-//! that disqualified `avg`. `avg` was excluded (docs/arrow-datafusion-plan.md
-//! section 2 "Exactness", review F7) because "DataFusion's avg accumulator has
-//! its own intermediate typing and no naive reference is bit-identical to it".
-//! The differential gate (tests/differential.rs) only admits an operator to
-//! the v1 subset when an *independent* reference reproduces DataFusion's output
-//! f64-bit-for-bit; anything that cannot be reproduced that way is rejected at
-//! validation instead, because "exact semantics by default" leaves no room for
-//! a silently-different-but-plausible answer.
+//! that disqualified `avg`. `avg` was excluded on exactness grounds because
+//! DataFusion's avg accumulator has its own intermediate typing and no naive
+//! reference is bit-identical to it. The differential gate
+//! (tests/differential.rs) only admits an operator to the v1 subset when an
+//! *independent* reference reproduces DataFusion's output f64-bit-for-bit;
+//! anything that cannot be reproduced that way is rejected at validation
+//! instead, because "exact semantics by default" leaves no room for a
+//! silently-different-but-plausible answer.
 //!
-//! # Why a naive reference cannot match (the historical finding)
+//! # Why a naive reference cannot match
 //!
 //! DataFusion's `VarianceAccumulator` computes variance with Welford's online
 //! algorithm: it folds one value at a time, maintaining a running `mean` and a
@@ -39,19 +37,16 @@
 //! output is not reproducible by an independent naive computation, so a
 //! differential gate over it would either be a second copy of Welford (not
 //! independent) or would have to weaken to a tolerance (the exact failure mode
-//! review F7 forbids).
+//! exactness forbids).
 //!
-//! # Resolution (issue #160)
+//! # Resolution
 //!
-//! The probe answered the deciding question the audit left open, and the
-//! decision was REJECT, mirroring `avg`. `crate::validate` now rejects the
+//! The decision was REJECT, mirroring `avg`. `crate::validate` now rejects the
 //! whole family with `ValidationError::StddevVarUnsupported`, and
 //! `crate::session::build_session` deregisters the family's UDAFs as a
-//! backstop. The `#[ignore]`d bit-identity probe that used to run the
-//! aggregates through the live path and show the differing bit patterns has
-//! been removed: the family no longer plans or executes, so there is no live
-//! DataFusion value left to compare against, and the argument above is the
-//! historical record. The tests below now assert the family is rejected.
+//! backstop. The family no longer plans or executes, so there is no live
+//! DataFusion value left to compare against. The tests below assert the family
+//! is rejected.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -64,8 +59,8 @@ use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 // ---------------------------------------------------------------------------
 
 /// Cancellation-prone, large-magnitude, finite values in one series with
-/// unique timestamps. This was the regime where a running-mean fold and a
-/// batch-mean fold visibly disagreed (see the module docs); it is kept so the
+/// unique timestamps. This is the regime where a running-mean fold and a
+/// batch-mean fold visibly disagree (see the module docs); it is kept so the
 /// rejection is exercised against real fixture data rather than an empty scan.
 fn cancellation_dataset() -> Vec<SegSpec> {
     let base = 1.0e9f64;
@@ -106,9 +101,8 @@ fn cancellation_dataset() -> Vec<SegSpec> {
 
 /// Every member of the stddev/variance/covariance/correlation family is now
 /// rejected before execution: `crate::validate` refuses the query text and,
-/// as a backstop, `crate::session::build_session` deregisters the UDAFs. This
-/// replaces the audit-baseline probe that pinned the family planning and
-/// executing unguarded; it runs in the normal suite.
+/// as a backstop, `crate::session::build_session` deregisters the UDAFs. It
+/// runs in the normal suite.
 #[tokio::test]
 async fn stddev_var_family_is_rejected() {
     let tenant = tenant_id("probe");
@@ -144,8 +138,8 @@ async fn stddev_var_family_is_rejected() {
 
 /// The rejection is purely syntactic (it inspects the query text before any
 /// planning or scan), so it fires regardless of the data -- including a
-/// dataset carrying a NaN. This documents that the non-finite corner the
-/// audit called out is closed by rejection, not by any NaN-specific handling.
+/// dataset carrying a NaN. The non-finite corner is closed by rejection, not
+/// by any NaN-specific handling.
 #[tokio::test]
 async fn stddev_var_family_is_rejected_even_over_nan_input() {
     const NAN_POS: u64 = 0x7ff8_0000_0000_0001;

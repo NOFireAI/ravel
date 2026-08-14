@@ -1,10 +1,9 @@
-//! Regression tests for finding a9-F01 (issue #73, QF-a9-F01) from
-//! docs/reviews/2026-07-27-storage-engine-quality-audit/a9-otap-arrow.md.
+//! OTAP-vs-OTLP rejection-class parity.
 //!
 //! ADR-0011 and docs/otap-ingest.md require that the OTLP protobuf path and
 //! the OTAP columnar path reject logically identical input with identical
-//! rejection classes. Two documented mechanisms made the OTAP normalizer
-//! diverge from the OTLP oracle:
+//! rejection classes. Two mechanisms can make the OTAP normalizer diverge
+//! from the OTLP oracle:
 //!
 //!   * mechanism a: `build_metric_decisions` checked Sum temporality before
 //!     the metric name, so a delta Sum with an empty name was classed as
@@ -15,10 +14,8 @@
 //!     sorted order) was classed as `LabelNameTooLong` instead of the
 //!     oracle's `LabelValueTooLong`.
 //!
-//! These tests were `#[ignore]`d reproducers on branch audit/repro-a9; the
-//! fix in src/normalize.rs aligns the check order, so they are now enabled
-//! regression tests. (The a9-F02 dictionary-budget test is tracked separately
-//! as issue #74 and is not included here.)
+//! src/normalize.rs aligns the check order on both paths; these tests pin that
+//! the two paths agree on the rejection class.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -61,7 +58,7 @@ fn otlp_reject(req: ExportMetricsServiceRequest) -> NormalizeOutput {
 /// temporality first (UnsupportedTemporality). Both paths must now class it
 /// as EmptyMetricName.
 #[test]
-fn a9_f01_delta_sum_empty_name_rejection_classes_agree() {
+fn delta_sum_empty_name_rejection_classes_agree() {
     let otlp = otlp_reject(ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
             resource: None,
@@ -113,7 +110,7 @@ fn a9_f01_delta_sum_empty_name_rejection_classes_agree() {
 /// the attribute set by key first, so a different attribute was checked first
 /// (LabelNameTooLong). Both paths must now class it as LabelValueTooLong.
 #[test]
-fn a9_f01_attr_order_rejection_classes_agree() {
+fn attr_order_rejection_classes_agree() {
     let long_val = "v".repeat(4097); // > max_label_value_len (4096)
     let long_name = "a".repeat(257); // > max_label_name_len (256)
     let otlp = otlp_reject(ExportMetricsServiceRequest {

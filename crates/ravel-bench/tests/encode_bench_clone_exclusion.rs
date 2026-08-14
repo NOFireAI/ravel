@@ -1,14 +1,13 @@
-//! Deterministic `#[ignore]`d reproducers for the area A12 benchmark-truth
-//! audit (issue #46). Each test is commented with its finding ID. These are
-//! not part of the gate run; execute with `--ignored`:
-//!   cargo test -p ravel-bench --test audit_a12_repro -- --ignored --nocapture
+//! Deterministic `#[ignore]`d measurement probes for the encode benchmark's
+//! timed region. Not part of the gate run; execute with `--ignored`:
+//!   cargo test -p ravel-bench --test encode_bench_clone_exclusion -- --ignored --nocapture
 //!
-//! a12-F01 is fixed: benches/segment_encode.rs now clones the fixture in an
-//! iter_batched setup closure, so the reported time is encode-only. These
-//! tests remain as documentation of that decision. They quantify the clone the
-//! fix removed from the timed region (`f01_clone_is_in_encode_timed_region`)
-//! and confirm that excluding it lowers the measured time
-//! (`f01_iter_batched_excludes_clone`), i.e. why the setup closure exists.
+//! benches/segment_encode.rs clones the fixture in an iter_batched setup
+//! closure so the reported time is encode-only. These probes quantify the
+//! clone that the setup closure keeps out of the timed region
+//! (`clone_is_in_encode_timed_region`) and confirm that excluding it lowers
+//! the measured time (`iter_batched_excludes_clone`), i.e. why the setup
+//! closure exists.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::time::Instant;
@@ -59,8 +58,8 @@ fn clone_inputs(inputs: &[SeriesInput]) -> Vec<SeriesInput> {
 /// clone in the setup closure (as src/bin/segment_alloc_profile.rs does).
 /// Magnitude is host-sensitive; the structural point is not.
 #[test]
-#[ignore = "audit reproducer for a12-F01; run with --ignored"]
-fn f01_clone_is_in_encode_timed_region() {
+#[ignore = "measurement probe; run with --ignored"]
+fn clone_is_in_encode_timed_region() {
     // 100k series / 200k samples: the same high-cardinality case as the
     // `segment_encode/100000_series` bench point.
     let inputs = series_inputs(100_000);
@@ -85,7 +84,7 @@ fn f01_clone_is_in_encode_timed_region() {
 
     let clone_fraction = clone_ns as f64 / (clone_ns + write_ns) as f64;
     println!(
-        "a12-F01: clone {:.2} ms, write {:.2} ms, clone is {:.1}% of the criterion timed region",
+        "clone {:.2} ms, write {:.2} ms, clone is {:.1}% of the criterion timed region",
         clone_ns as f64 / 1e6,
         write_ns as f64 / 1e6,
         clone_fraction * 100.0
@@ -95,8 +94,8 @@ fn f01_clone_is_in_encode_timed_region() {
     // measurable fraction rather than rounding noise. The threshold is kept
     // conservative (>= 0.5%) so it holds under a debug `cargo test` build,
     // where the writer is far slower and the clone's relative share shrinks;
-    // in a `--release` run on the audit host (aarch64) it was ~12-13%, which
-    // the printed line above shows directly.
+    // in a `--release` run on aarch64 it was ~12-13%, which the printed line
+    // above shows directly.
     assert!(
         clone_fraction >= 0.005,
         "clone should be a measurable fraction of the timed region, got {:.2}%",
@@ -104,12 +103,11 @@ fn f01_clone_is_in_encode_timed_region() {
     );
 }
 
-/// a12-F01 (companion): the fix removes the clone from the measured region.
-/// This shows the writer's own time is what should be reported, and that it is
-/// meaningfully lower than clone+write (the quantity the pre-fix bench timed).
+/// Companion: excluding the clone from the measured region reports the
+/// writer's own time, which is meaningfully lower than clone+write.
 #[test]
-#[ignore = "audit reproducer for a12-F01; run with --ignored"]
-fn f01_iter_batched_excludes_clone() {
+#[ignore = "measurement probe; run with --ignored"]
+fn iter_batched_excludes_clone() {
     let inputs = series_inputs(100_000);
 
     // What the pre-fix bench timed: clone + write, per iteration.

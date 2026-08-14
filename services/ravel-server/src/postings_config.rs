@@ -1,8 +1,8 @@
-//! Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3,
-//! issue #511).
+//! Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3).
 //!
-//! POSTINGS indexing is opt-in per field, never automatic: "indexing every
-//! attribute is how ***REMOVED*** acquires its cost disease" (ADR-0049
+//! POSTINGS indexing is opt-in per field, never automatic: every indexed field
+//! makes each write maintain a postings list, so indexing a field no query
+//! filters on spends ingest and storage cost for no query benefit (ADR-0049
 //! decision 3). This module holds the operator-editable list of attribute names
 //! the log writer indexes, defaulting to a small sensible set and overridable
 //! per tenant.
@@ -32,8 +32,8 @@ use ravel_types::{TenantHash, TenantId};
 /// The shipped default indexed-field list, applied to every tenant with no
 /// override when the operator configured no default of their own.
 ///
-/// `service.name` and `k8s.namespace.name` are the two the task and ADR-0049
-/// decision 3 name directly: the service and the Kubernetes namespace are the
+/// `service.name` and `k8s.namespace.name` are the two ADR-0049 decision 3
+/// names directly: the service and the Kubernetes namespace are the
 /// two coordinates almost every log query filters on first. The third,
 /// `http.status_code`, is the highest-value non-identity equality predicate in
 /// log triage ("show me the 5xx"), it is named in ADR-0049 decision 3's own
