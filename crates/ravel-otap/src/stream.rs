@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io::{self, Read, Write};
+use std::panic::{self, AssertUnwindSafe};
 
 use arrow::array::ArrayData;
 use arrow::buffer::{Buffer as ArrowBuffer, MutableBuffer};
@@ -81,6 +82,8 @@ pub enum BatchError {
     SchemaBudgetExceeded { limit: usize },
     #[error("arrow IPC decode failed: {0}")]
     IpcDecode(String),
+    #[error("arrow IPC decode panicked on malformed input: {0}")]
+    InternalPanic(String),
 }
 
 /// The IPC stream state for one (payload_type, schema_id) pair is corrupt.
@@ -286,6 +289,20 @@ pub struct DecodeStats {
     pub copy_fallback_frames: u64,
 }
 
+/// Extract a human-readable message from a caught panic payload, so a decoder
+/// panic converted to a typed error still carries the arrow message that
+/// triggered it (e.g. "the offset of the new Buffer cannot exceed the existing
+/// length"). Falls back to a fixed string for a non-string payload.
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "arrow decoder panicked on malformed input".to_string()
+    }
+}
+
 type DecoderKey = (ArrowPayloadType, String);
 
 /// Per-gRPC-stream decode state: one `StreamDecoder` per (payload_type,
@@ -410,7 +427,32 @@ impl StreamState {
         let frame_range = frame_range_of(&buffer);
         let mut batches = Vec::new();
         while !buffer.is_empty() {
-            match decoder.decode(&mut buffer) {
+            // A hostile `BatchArrowRecords` can drive arrow's `StreamDecoder`
+            // to panic inside `arrow-buffer` (e.g. "the offset of the new
+            // Buffer cannot exceed the existing length") on some malformed
+            // inputs, rather than returning `Err` (a known footgun class in
+            // the arrow decoders; see tests/fuzz_mutation.rs). Catch the
+            // unwind at this boundary so a single tenant's malformed batch is
+            // converted to a typed error instead of unwinding through the
+            // ingest task. A panicked decoder's internal buffering state is
+            // untrustworthy, so it is dropped exactly as on a returned `Err`.
+            let step = match panic::catch_unwind(AssertUnwindSafe(|| decoder.decode(&mut buffer))) {
+                Ok(step) => step,
+                Err(panic_payload) => {
+                    self.decoders.remove(&key);
+                    let detail = panic_detail(panic_payload.as_ref());
+                    if had_schema_before {
+                        return Err(StreamError::Corrupted {
+                            payload_type,
+                            schema_id: payload.schema_id,
+                            detail,
+                        }
+                        .into());
+                    }
+                    return Err(BatchError::InternalPanic(detail).into());
+                }
+            };
+            match step {
                 Ok(Some(record_batch)) => {
                     if batch_is_zero_copy(frame_range, &record_batch) {
                         self.stats.zero_copy_frames += 1;

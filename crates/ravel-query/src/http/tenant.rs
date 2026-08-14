@@ -34,21 +34,62 @@ pub trait TenantResolver: Send + Sync {
     fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError>;
 }
 
+/// Keyed hash of a bearer token under a per-resolver secret key:
+/// `blake3::keyed_hash(hash_key, token)`. Mirrors
+/// `ravel_catalog::auth_token_map::token_hash`: the plaintext token is hashed
+/// before it is ever used as a lookup key, so a configured secret is never
+/// stored in the clear and never compared byte-by-byte against attacker-supplied
+/// input. Because `hash_key` is a process-local secret, the hash an attacker's
+/// candidate token lands on is unpredictable to them, so the map lookup's
+/// comparison order reveals nothing about any configured token.
+fn token_hash(hash_key: &[u8; 32], token: &[u8]) -> [u8; 32] {
+    *blake3::keyed_hash(hash_key, token).as_bytes()
+}
+
+/// A process-local random key, generated once per resolver at construction.
+/// [`StaticBearerTokenResolver`] has no natural deployment-key input the way
+/// `ravel_catalog::auth_token_map` does (that map is a durable object whose
+/// hashes must stay stable across processes and be readable under a configured
+/// key; this resolver is in-memory and rebuilt from plaintext every startup), so
+/// the key need only be unpredictable within this process's lifetime. Sourced
+/// from two v4 UUIDs (244 bits of `getrandom` entropy) to avoid pulling in a
+/// separate RNG crate; `uuid` is already a dependency of this crate.
+fn random_hash_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key
+}
+
 /// Resolves a tenant from a static `Authorization: Bearer <token>` map.
+///
+/// Configured tokens are never held in the clear: each is stored only as its
+/// keyed hash under a process-local secret [`random_hash_key`], and an incoming
+/// token is hashed the same way before lookup. This closes the timing
+/// side-channel a direct `HashMap<String, _>::get(plaintext)` opens, where the
+/// per-byte string comparison against a stored secret leaks how far a candidate
+/// matched (mirroring `ravel_catalog::auth_token_map`).
 pub struct StaticBearerTokenResolver {
-    tokens: HashMap<String, TenantId>,
+    hash_key: [u8; 32],
+    tokens: HashMap<[u8; 32], TenantId>,
 }
 
 impl StaticBearerTokenResolver {
     pub fn new(tokens: HashMap<String, TenantId>) -> Self {
-        StaticBearerTokenResolver { tokens }
+        let hash_key = random_hash_key();
+        let tokens = tokens
+            .into_iter()
+            .map(|(token, tenant)| (token_hash(&hash_key, token.as_bytes()), tenant))
+            .collect();
+        StaticBearerTokenResolver { hash_key, tokens }
     }
 }
 
 impl TenantResolver for StaticBearerTokenResolver {
     fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError> {
         let token = bearer_token(headers)?;
-        self.tokens.get(token).cloned().ok_or(AuthError)
+        let hash = token_hash(&self.hash_key, token.as_bytes());
+        self.tokens.get(&hash).cloned().ok_or(AuthError)
     }
 }
 
@@ -673,6 +714,96 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
             cache.install_jwks(&jwks),
             Err(OidcError::NoUsableKeys)
         ));
+    }
+
+    fn static_bearer(token: &str) -> HeaderMap {
+        bearer(token)
+    }
+
+    #[test]
+    fn static_bearer_stores_only_keyed_hashes_never_plaintext() {
+        // The load-bearing security property: no configured token string is
+        // ever held as a map key. The map is keyed by the keyed hash under the
+        // resolver's process-local secret, so the entry for a token is found
+        // only via `token_hash`, and the plaintext appears nowhere in the map.
+        let mut tokens = HashMap::new();
+        tokens.insert("super-secret-token".to_string(), TenantId::new("acme"));
+        let resolver = StaticBearerTokenResolver::new(tokens);
+
+        let expected = token_hash(&resolver.hash_key, b"super-secret-token");
+        assert!(
+            resolver.tokens.contains_key(&expected),
+            "the entry must be keyed by the keyed hash of the token"
+        );
+        assert_eq!(resolver.tokens.get(&expected), Some(&TenantId::new("acme")));
+
+        // The hash is not the plaintext, and every stored key is a 32-byte
+        // hash, so no plaintext secret can be recovered from the map's keys.
+        assert_ne!(
+            expected.as_slice(),
+            b"super-secret-token".as_slice(),
+            "sanity: the hash is not the plaintext"
+        );
+        assert!(
+            resolver
+                .tokens
+                .keys()
+                .all(|k| k.len() == 32 && k.as_slice() != b"super-secret-token"),
+            "no map key is the raw token; all are keyed hashes"
+        );
+    }
+
+    #[test]
+    fn static_bearer_resolves_valid_and_rejects_invalid() {
+        let mut tokens = HashMap::new();
+        tokens.insert("tok-a".to_string(), TenantId::new("tenant-a"));
+        tokens.insert("tok-b".to_string(), TenantId::new("tenant-b"));
+        let resolver = StaticBearerTokenResolver::new(tokens);
+
+        assert_eq!(
+            resolver
+                .resolve(&static_bearer("tok-a"))
+                .expect("valid token resolves"),
+            TenantId::new("tenant-a")
+        );
+        assert_eq!(
+            resolver
+                .resolve(&static_bearer("tok-b"))
+                .expect("valid token resolves"),
+            TenantId::new("tenant-b")
+        );
+        assert!(
+            resolver.resolve(&static_bearer("tok-unknown")).is_err(),
+            "an unconfigured token is rejected"
+        );
+        assert!(
+            resolver.resolve(&HeaderMap::new()).is_err(),
+            "a missing Authorization header is rejected"
+        );
+    }
+
+    #[test]
+    fn static_bearer_hash_key_is_per_resolver() {
+        // Two resolvers over the same token map hash it under independent
+        // process-local keys, so a stored hash is meaningless outside the
+        // resolver that produced it (the key is load-bearing).
+        let mut tokens = HashMap::new();
+        tokens.insert("tok".to_string(), TenantId::new("t"));
+        let a = StaticBearerTokenResolver::new(tokens.clone());
+        let b = StaticBearerTokenResolver::new(tokens);
+        assert_ne!(
+            a.hash_key, b.hash_key,
+            "each resolver generates its own random key"
+        );
+        // Both still resolve their own configured token correctly.
+        assert_eq!(
+            a.resolve(&static_bearer("tok")).expect("resolves"),
+            TenantId::new("t")
+        );
+        assert_eq!(
+            b.resolve(&static_bearer("tok")).expect("resolves"),
+            TenantId::new("t")
+        );
     }
 
     #[test]

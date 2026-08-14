@@ -55,6 +55,12 @@ async-trait = { workspace = true }
 # generates its process id. Already a workspace dependency (previously a
 # dev-dependency here); promoted to a normal dependency, not a new external one.
 uuid = { workspace = true }
+# Constant-secrecy bearer-token lookup (crates/ravel-query/src/http/tenant.rs):
+# configured tokens are stored only as a keyed BLAKE3 hash under a process-local
+# key, mirroring ravel-catalog's auth_token_map, so a raw token is never held or
+# compared in the clear. Already a workspace dependency (used by ravel-catalog);
+# promoted to a normal dependency of this crate.
+blake3 = { workspace = true }
 
 [build-dependencies]
 # ADR-0071: compile proto/queryfrag_service.proto into the SeriesFetch
