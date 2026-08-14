@@ -46,16 +46,16 @@ const MIN_TOKEN_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// (ADR-0044 decision 3): one HEAD GET, always attempted whenever the window
 /// is non-empty (`resolve_impl` calls it unconditionally); plus one GET per
 /// part a usable HEAD names, capped here at 1 part because every writer
-/// today emits exactly one (metric-index-plan.md 3.1, "v1 writes exactly
-/// one part; readers accept N parts" as an unused sharding escape hatch);
+/// today emits exactly one ("v1 writes exactly
+/// one part; readers accept N parts" is an unused sharding escape hatch);
 /// plus one postings GET, worst case, when the query has an equality
-/// `__name__` filter (metric-index-plan.md 5.4).
+/// `__name__` filter.
 ///
 /// This is not a structural bound: `SnapshotHead.parts` is `repeated` in the
 /// wire format, and `resolve_snapshot_window` issues one GET per named part
 /// regardless of how many there are. Part count is only knowable after the
 /// HEAD GET this constant is trying to avoid, so a future multi-part writer
-/// (the escape hatch metric-index-plan.md 3.2 reserves) would silently make
+/// (the escape hatch the wire format reserves) would silently make
 /// `estimated_catalog_requests` an under-estimate again. Flagged as an open
 /// gap in ADR-0044 decision 3, not resolved here.
 const SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND: u64 = 3;
