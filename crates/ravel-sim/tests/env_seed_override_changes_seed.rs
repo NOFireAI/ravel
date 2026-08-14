@@ -22,6 +22,8 @@
 //! `999999`); the two must differ from each other and the second must
 //! match the override exactly.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::process::Command;
 
 fn run_example(seed_env: Option<&str>) -> u64 {

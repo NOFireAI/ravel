@@ -1572,6 +1572,7 @@ async fn run_query(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

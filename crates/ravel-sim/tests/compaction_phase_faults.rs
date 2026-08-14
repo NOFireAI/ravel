@@ -19,6 +19,8 @@
 //! each_compaction_fault_kind_recovers` (the seed is also in the panic
 //! message, since the batch names each seed directly).
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use ravel_object_store::fault::{FaultKind, FaultPlan, Occurrence, Op, Rule, ScriptedFault};
 use ravel_sim::fault_plan::{FaultSchedule, L1_SUBSTR};
 use ravel_sim::workload::{CardinalityShape, WorkloadConfig};

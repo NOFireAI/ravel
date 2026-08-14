@@ -158,6 +158,7 @@ pub fn mix_value(builder: &mut DigestBuilder, value: &Value) {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use ravel_promql::InstantSample;

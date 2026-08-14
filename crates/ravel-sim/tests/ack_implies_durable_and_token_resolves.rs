@@ -37,6 +37,8 @@
 //! and every acked sample is readable before and after it; it just does not,
 //! by itself, demonstrate that the fold was necessary for either.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use ravel_sim::workload::{CardinalityShape, WorkloadConfig};
 use ravel_sim::{CycleConfig, MasterSeed};
 

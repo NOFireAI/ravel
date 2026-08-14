@@ -24,6 +24,8 @@
 //!   `run_cycle` fails loud (`CycleError::GateNeverHit`) instead of quietly
 //!   aborting the parked waiter and returning `Ok`.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::time::Duration;
 

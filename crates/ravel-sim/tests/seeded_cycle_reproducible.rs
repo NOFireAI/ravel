@@ -12,6 +12,8 @@
 //! real (correct) scope. See `src/digest.rs`'s module doc for the full
 //! narrative of this check.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use ravel_sim::{CycleConfig, MasterSeed, run_cycle};
 
 #[test]

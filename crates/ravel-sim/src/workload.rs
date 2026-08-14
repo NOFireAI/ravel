@@ -295,6 +295,7 @@ fn generate_queries(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

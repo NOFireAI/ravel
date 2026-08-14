@@ -9,6 +9,8 @@
 //! failed as expected, since the generated series ids were then equal.
 //! Restored to the real seeds 1 and 2 afterward.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use ravel_sim::MasterSeed;
 use ravel_sim::workload::{WorkloadConfig, generate};
 

@@ -44,6 +44,8 @@
 //!   listing the commit-record prefix, so the fold is genuinely load-bearing
 //!   here, not just "also present".
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
