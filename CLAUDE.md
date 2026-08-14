@@ -208,6 +208,33 @@ connection, a pushed-but-broken main).
   blast radius of their change. Doctests included (nextest skips them,
   the script runs them separately).
 
+### Guard scripts (mechanical preconditions)
+
+Fast, dependency-free checks that fail closed BEFORE a known-expensive
+mistake. Each encodes a failure class that has recurred across sessions;
+run the relevant one as a precondition, not after the damage.
+
+- `scripts/guards/assert-worktree.sh` — exits non-zero if the cwd is the
+  PRIMARY checkout rather than a linked worktree. Run it before the first
+  edit/commit of any isolated unit of work. A concurrent session can hold
+  in-flight state on the primary checkout at any moment, and an edit or a
+  stray `git checkout -- .` / `git reset --hard` there clobbers it
+  silently; the workspace-isolation rule has no doc-only/one-file
+  exception.
+- `scripts/guards/check-disk-headroom.sh [dir] [min_gb]` — exits non-zero
+  when the volume backing `dir` has less than `min_gb` free (default 20).
+  Run it before any cold `--all-targets`/`--workspace`/feature-lane build
+  or verify-dispatch gate: ENOSPC surfaces mid-link as a FAKE
+  `linking with cc failed` (errno 28) that reads as a code bug, and a full
+  disk can break the harness's own output capture so nothing runs at all.
+  `FLEET_DISK_REAP=1` auto-runs `disk-reap.sh -y` when below the floor.
+- `scripts/guards/assert-fresh-dispatch-ref.sh <ref-sha>` — exits non-zero
+  unless `<ref-sha>` is the tip of `origin/main` fetched in THIS
+  invocation. Run it against the ref you are about to `fleet_dispatch`: a
+  SHA read earlier in the session goes stale the moment another PR merges,
+  and dispatching it silently rebuilds on a superseded tree.
+  `ALLOW_STALE_REF=1` to dispatch an intentionally older ref.
+
 ### Writing gate and poll shell
 
 Three shell bugs have each silently turned a failing gate or watch loop
@@ -242,9 +269,44 @@ and error, one wasted turn (or one lost result) at a time:
   diff another task's result branch, fetch with a destination:
   `git fetch origin '<ref>:refs/remotes/origin/<ref>'`.
 - If the final result push (or a git-start call) fails with a 5xx from
-  the control plane, wait 30 s and retry, up to 5 times, and report the
-  retries. Completed, gate-green work has been lost to a single
-  unretried 502 at exactly this step.
+  the control plane, wait 30 s and retry, and report the retries. Do NOT
+  treat 5 retries as a bound: the fleet-cp git proxy returns intermittent
+  502s on both an executor's final result push and on `fleet_dispatch`
+  start pushes, and an outage can run far longer than 5 attempts (9+
+  consecutive 502s have been observed in one window, losing two
+  already-completed, gate-green results). Keep the 30 s backoff-and-retry
+  loop running until the proxy recovers or you escalate to the user. A 502
+  on the FINAL push discards finished work outright — no result ref exists
+  to fetch — which is exactly why an executor MUST have committed its HEAD
+  before the push step (see the commit-before-gates rule): a lost push then
+  costs a redispatch of push time, not of the work. When you detect a lost
+  final push, redispatch from current `origin/main`, not the stale
+  dispatch-time ref.
+
+## Fleet ledger reconciliation (orchestrator sessions)
+
+The in-flight task ledger is NOT authoritative on its own: your
+conversational context is compactable, and a task that died silently
+simply stops appearing in the tracked list with no error and no retry.
+Before you dispatch ANY new fleet task on a poll tick, you MUST reconcile
+the ledger against ground truth. If you skip this, a dead task's ticket
+sits unfixed for the rest of the session while stacked tickets are
+processed as if it were done.
+
+- For every ticket the ledger marks dispatched-but-not-done, call
+  `fleet_status` on its task id AND `gh pr view` / `gh issue view` on its
+  ticket. If a task is terminal with no result ref, or the ticket is
+  already merged, STOP and fix the mismatch before any new dispatch this
+  tick: redispatch a silently-dead task from freshly-fetched
+  `origin/main`, and mark a merged ticket done.
+- A task that died at provisioning (ENOSPC on the executor's home dir, or
+  a fleet-cp 5xx on the final push) pushes ZERO commits and leaves no
+  result ref. Treat "the task dropped off my list" as a lost task to
+  re-verify, never as a completed one.
+- Persist the ledger outside the compactable context (a checked-in file or
+  the epic issue body), and regenerate any "Wave N landed" claim from a
+  live `gh pr list --json number,state,mergedAt` query over that wave's PR
+  numbers, never from memory of which MERGED notifications fired.
 
 ## Commits
 
