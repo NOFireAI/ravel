@@ -111,8 +111,12 @@ use ravel_ingest::Clock;
 use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, MatchOp, matches_series, plan_selectors};
+use ravel_query::erasure::ErasurePredicate;
 use ravel_query::http::{QueryErrorResponse, TenantResolver};
-use ravel_query::{EngineConfig, QueryEngine, QueryError, admit, request_budget_exceeded};
+use ravel_query::{
+    EngineConfig, QueryEngine, QueryError, admit, request_budget_exceeded,
+    snapshot_erasure_predicates,
+};
 use ravel_segment::{
     ExemplarRecord, ExpectedIdentity, Footer, ReaderLimits, SeriesEntryV4, check_identity,
     decode_catalog_v5, decode_exemplars_section, open_from_full,
@@ -446,6 +450,18 @@ async fn collect_once(
     admit(&snapshot, &origins, &state.engine_config)
         .map_err(|e| CollectError::Api(ApiError::from_query(e)))?;
 
+    // Pending selective-erasure predicates carried on the resolved snapshot
+    // (ADR-0064 decision 1, issue #915). The resolver attaches every pending
+    // request to `Snapshot::pending_erasure`; this converts them into the
+    // scan-time predicate shape once, here, and the record loop excludes any
+    // exemplar an erased subject owns. Without this pass an erased subject's
+    // exemplars (trace ids included) would still be served, while the sample,
+    // series, and log surfaces exclude them: the same data-deletion leak #928
+    // closed for the log-family scan. A snapshot with no pending erasure yields
+    // an empty set and the loop below is a no-op, so the common path is
+    // unchanged.
+    let preds = snapshot_erasure_predicates(&snapshot);
+
     // Segments are read sequentially. The sample path fans this out under a
     // concurrency bound; here correctness and staying inside `ravel-server`'s
     // (non-`futures`) default dependency set win, and the wall deadline above
@@ -462,6 +478,7 @@ async fn collect_once(
             tenant_hash,
             seg,
             matcher_sets,
+            &preds,
             start_ns,
             end_ns,
             &accounting,
@@ -487,6 +504,19 @@ async fn collect_once(
         accounting: QueryAccountingJson::from_snapshot(&accounting.snapshot()),
     };
     Ok((group_by_series(collected), stats))
+}
+
+/// Whether an exemplar owned by `labels` at `ts_ns` is erased by any pending
+/// predicate (ADR-0064 decision 1, issue #915). Erased when a predicate's
+/// conjunction matches the series labels and, if the predicate is windowed,
+/// `ts_ns` falls in its half-open window; a windowless predicate erases every
+/// matching record regardless of timestamp. This is the metric-shape analogue
+/// of `ravel_query::erasure::is_erased_span`, which `ravel_query` keeps for the
+/// span surface but does not expose for a bare `(LabelSet, ts_ns)` pair.
+fn is_erased_exemplar(labels: &LabelSet, ts_ns: i64, preds: &[ErasurePredicate]) -> bool {
+    preds
+        .iter()
+        .any(|p| p.matches_labels(labels) && (!p.has_window() || p.ts_in_window(ts_ns)))
 }
 
 /// The cross-segment exemplar dedup key. Two records collapse only when they
@@ -531,6 +561,7 @@ async fn read_segment_exemplars(
     tenant_hash: TenantHash,
     seg: &SegmentRef,
     matcher_sets: &[Vec<LabelMatcher>],
+    preds: &[ErasurePredicate],
     start_ns: i64,
     end_ns: i64,
     accounting: &QueryAccounting,
@@ -635,6 +666,17 @@ async fn read_segment_exemplars(
             .into());
         };
         if !matched[idx] {
+            continue;
+        }
+        // Exclude a record owned by an erased subject (ADR-0064 decision 1,
+        // issue #915). This filters against `entry.entry.labels`, the exact
+        // series-label view this endpoint materializes into `seriesLabels`
+        // below, so a green result means the shipping surface never emits the
+        // erased subject's exemplars: a windowless predicate erases every
+        // matching record regardless of timestamp, a windowed one only records
+        // whose `ts_ns` fall in its half-open window. Mirrors `is_erased_span`
+        // and the metric `retain_*` rule in `ravel_query::erasure`.
+        if is_erased_exemplar(&entry.entry.labels, rec.ts_ns, preds) {
             continue;
         }
         // Clamp to the query's time range by the exemplar's own timestamp
@@ -1548,6 +1590,52 @@ mod tests {
             .expect("publish");
     }
 
+    /// Writes a real metrics `.dreq` erasure request into `tenant`'s `del/`
+    /// prefix, exactly as the erasure submit path does, so the next
+    /// `Catalog::resolve` attaches it to `Snapshot::pending_erasure` and the
+    /// exemplar surface excludes the matching subject (ADR-0064 decision 1,
+    /// issue #915). The predicate is the conjunction of every `(key, value)` in
+    /// `matchers`; `window_start_ns`/`window_end_ns` are `0` for a windowless
+    /// (whole-subject) request, the same zero-as-unset convention
+    /// `ErasurePredicate` uses.
+    async fn put_dreq(
+        store: &MemoryStore,
+        tenant_id: &TenantId,
+        matchers: &[(&str, &str)],
+        window_start_ns: i64,
+        window_end_ns: i64,
+    ) {
+        let tenant_hash = tenant_id.hash();
+        let request_id = Uuid::new_v4();
+        let request = ravel_proto::commit::v1::ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: 1,
+            predicate: matchers
+                .iter()
+                .map(|(k, v)| ravel_proto::commit::v1::ErasurePredicateMatcher {
+                    key: (*k).to_string(),
+                    value: (*v).to_string(),
+                })
+                .collect(),
+            window_start_ns,
+            window_end_ns,
+            reason: String::new(),
+        };
+        let key =
+            keys::erasure_request_key(&tenant_hash, Signal::Metrics, request_id).expect("dreq key");
+        store
+            .put(
+                &key,
+                ravel_commit::erasure::encode_request(&request),
+                ravel_object_store::PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put dreq");
+    }
+
     /// Writes a segment whose footer `SegmentIdentity` carries `footer_tenant`'s
     /// hash, but publishes it under `record_tenant`'s commit record and
     /// reconstructed data key. This is the shape of a writer or
@@ -1890,6 +1978,125 @@ mod tests {
         assert_eq!(ex0["value"], "0.25");
         // Timestamp is float seconds, whole-second values as bare integers.
         assert_eq!(ex0["timestamp"], (NOW - 30 * NS_PER_SEC) / NS_PER_SEC);
+    }
+
+    /// Data-deletion regression (issue #915): a pending selective-erasure
+    /// request must exclude the erased subject's exemplars from
+    /// `query_exemplars`, while a non-erased subject matched by the same
+    /// selector keeps its exemplars. Drives the real handler end to end (a real
+    /// `.dreq` in the store, the real resolve that attaches it to
+    /// `Snapshot::pending_erasure`, and the shipping `run`/`collect_once` path),
+    /// so a filter dropped from the record loop serves the erased trace ids and
+    /// fails here. Two subjects, not one, so a filter-everything bug (which
+    /// would also make the erased subject "absent") fails on the retained one.
+    #[tokio::test]
+    async fn erased_subject_exemplars_are_excluded() {
+        let store = Arc::new(MemoryStore::new());
+        let (erased_sid, erased_series) = scalar_series(
+            &tenant(),
+            "m",
+            &[("user_id", "erased")],
+            &[(NOW - 60 * NS_PER_SEC, 1.0)],
+        );
+        let (kept_sid, kept_series) = scalar_series(
+            &tenant(),
+            "m",
+            &[("user_id", "kept")],
+            &[(NOW - 60 * NS_PER_SEC, 2.0)],
+        );
+        let erased_ex = exemplar(
+            erased_sid,
+            NOW - 30 * NS_PER_SEC,
+            1.0,
+            TRACE_ID,
+            SPAN_ID,
+            &[("region", "us-east-1")],
+        );
+        let kept_ex = exemplar(
+            kept_sid,
+            NOW - 30 * NS_PER_SEC,
+            2.0,
+            TRACE_ID,
+            SPAN_ID,
+            &[("region", "us-west-2")],
+        );
+        publish_segment(
+            &store,
+            1,
+            vec![erased_series, kept_series],
+            vec![erased_ex, kept_ex],
+        )
+        .await;
+        // Windowless request: erase every record of `user_id="erased"`.
+        put_dreq(&store, &tenant(), &[("user_id", "erased")], 0, 0).await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "success");
+
+        let data = body["data"].as_array().expect("data array");
+        let user_ids: Vec<&str> = data
+            .iter()
+            .map(|s| s["seriesLabels"]["user_id"].as_str().expect("user_id"))
+            .collect();
+        assert!(
+            !user_ids.contains(&"erased"),
+            "erased subject's exemplars must be excluded, got {user_ids:?}"
+        );
+        assert!(
+            user_ids.contains(&"kept"),
+            "non-erased subject's exemplars must still appear, got {user_ids:?}"
+        );
+    }
+
+    /// A *windowed* erasure request excludes only the erased subject's exemplars
+    /// whose `ts_ns` fall in its half-open window, leaving that same subject's
+    /// out-of-window exemplars in place. Proves the windowed branch of the
+    /// record-loop filter is exercised, not just the windowless whole-subject
+    /// drop, and that the window bound is the exemplar's own timestamp.
+    #[tokio::test]
+    async fn windowed_erasure_excludes_only_in_window_exemplars() {
+        let store = Arc::new(MemoryStore::new());
+        let in_window_ts = NOW - 40 * NS_PER_SEC;
+        let out_window_ts = NOW - 10 * NS_PER_SEC;
+        let (sid, series) = scalar_series(
+            &tenant(),
+            "m",
+            &[("user_id", "erased")],
+            &[(NOW - 60 * NS_PER_SEC, 1.0)],
+        );
+        let in_window = exemplar(sid, in_window_ts, 1.0, TRACE_ID, SPAN_ID, &[("k", "in")]);
+        let out_window = exemplar(sid, out_window_ts, 1.0, TRACE_ID, SPAN_ID, &[("k", "out")]);
+        publish_segment(&store, 1, vec![series], vec![in_window, out_window]).await;
+        // Half-open window covering `in_window_ts` but not `out_window_ts`.
+        put_dreq(
+            &store,
+            &tenant(),
+            &[("user_id", "erased")],
+            in_window_ts,
+            out_window_ts,
+        )
+        .await;
+
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "m").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let data = body["data"].as_array().expect("data array");
+        assert_eq!(
+            data.len(),
+            1,
+            "the subject still exists for its kept exemplar"
+        );
+        let exemplars = data[0]["exemplars"].as_array().expect("exemplars array");
+        assert_eq!(
+            exemplars.len(),
+            1,
+            "only the out-of-window exemplar survives"
+        );
+        assert_eq!(exemplars[0]["labels"]["k"], "out");
+        assert_eq!(exemplars[0]["timestamp"], out_window_ts / NS_PER_SEC);
     }
 
     /// An all-zero trace id means absent: the label is omitted rather than
