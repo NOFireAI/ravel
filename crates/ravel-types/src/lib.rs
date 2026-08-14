@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn commit_token_unrecognized_version_is_distinct_from_garbage() {
         // A future "v3" token reaching this older build: well-formed version
-        // prefix, unsupported version. Diagnosable on its own (issue #765).
+        // prefix, unsupported version. Diagnosable on its own.
         let v3 = URL_SAFE_NO_PAD.encode(b"v3:0:some-writer:1:2:3");
         assert_eq!(
             CommitToken::decode(&v3),

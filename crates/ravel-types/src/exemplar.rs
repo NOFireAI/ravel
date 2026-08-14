@@ -1,6 +1,6 @@
 //! Exemplar type and per-series admission cap shared by every OTLP-family
 //! ingest path (ADR-0047). The type and the cap live here, once, so OTLP
-//! normalization and its OTAP and Remote Write siblings (issue #473) call
+//! normalization and its OTAP and Remote Write siblings call
 //! the same code instead of drifting into three implementations of "at
 //! most one exemplar per series per window."
 
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 /// produced it (ADR-0047 decision 1). Field-for-field, this is the RSEG v6
 /// `EXEMPLARS` section record (docs/segment-format.md) minus the
 /// series/dictionary indices the writer resolves at flush time, so the
-/// writer that eventually consumes this value (issue #474) needs no
+/// writer that eventually consumes this value needs no
 /// reshaping.
 ///
 /// `value_bits` is the sample value's `f64` bit pattern: values are
@@ -67,8 +67,8 @@ struct KeptWindow {
 /// Enforced per shard actor, with no cross-shard coordination, the same
 /// shape the cardinality limiter takes: a real per-series-per-window cap
 /// only means something across many requests over wall-clock time, so
-/// whatever holds the long-lived per-series map (the ingest shard,
-/// issue #474) owns one `ExemplarCap` and passes it by `&mut` reference
+/// whatever holds the long-lived per-series map (the ingest shard)
+/// owns one `ExemplarCap` and passes it by `&mut` reference
 /// into every normalize call that shard makes. Normalization itself stays
 /// a stateless, one-request-at-a-time function otherwise (mirroring why
 /// delta-to-cumulative conversion is rejected: it would need the same

@@ -1,13 +1,11 @@
 //! LEB128 varints and zigzag encoding.
 //!
 //! This is a private, crate-internal copy of the same primitives defined
-//! (and fully tested) in `ravel-logseg::varint`. `varint.rs` itself was not
-//! named in issue #429's move list — only `encoding.rs`, `bloom.rs`,
-//! `bloom_section.rs`, and `tokenizer.rs` were — but those modules call it,
-//! and this crate must not depend on `ravel-logseg` (that would be
-//! circular: `ravel-logseg` depends on `ravel-codec` for the re-export).
-//! Not part of this crate's public API; see the final task report for the
-//! duplication this creates and the follow-up it implies.
+//! (and fully tested) in `ravel-logseg::varint`. The codec modules that use
+//! it must not depend on `ravel-logseg` (that would be circular:
+//! `ravel-logseg` depends on `ravel-codec` for the re-export), so the
+//! primitives are duplicated here rather than imported. Not part of this
+//! crate's public API.
 
 use crate::error::CodecError;
 
