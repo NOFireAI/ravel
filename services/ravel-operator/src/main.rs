@@ -61,6 +61,18 @@ impl Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // rustls 0.23 links against a process-level default crypto provider that
+    // must be installed before the first TLS client is built (kube's client
+    // below, or ravel-object-store's S3 client during sys/auth
+    // reconciliation). This binary transitively links both the `ring` and
+    // `aws-lc-rs` provider crates (kube's rustls-tls feature pins `ring`;
+    // ravel-object-store pulls `aws-lc-rs` via the workspace's jsonwebtoken
+    // pin), which rustls refuses to disambiguate on its own -- it panics on
+    // first use instead. `install_default` only errors if a provider was
+    // already installed, which cannot happen this early and is harmless
+    // either way, so the result is discarded rather than unwrapped.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     if cli.print_crd {

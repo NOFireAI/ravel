@@ -4560,6 +4560,7 @@ dependencies = [
  "ravel-catalog",
  "ravel-object-store",
  "ravel-tracing-export",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
