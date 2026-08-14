@@ -192,3 +192,105 @@ script pair is deleted.
   coverage summary. Accepted: it gated nothing and cost 25m.
 - ci.yml becomes the most-edited file of this work; all ci.yml tasks are
   same-file and therefore serialize into distinct waves by design.
+
+## Amendment: main-push coverage ratchet
+
+External review finding J-7 (epic #1061) observes that coverage is
+measured and badged but never gated, so the number can only fall
+silently. Read quickly, that asks this ADR to reverse one of its own
+rejected alternatives:
+
+> Keep `coverage` required with a threshold gate: a hard threshold on a
+> codebase growing 2,000+ lines/day generates noise merges can trip
+> over, while the job still duplicates `check`'s test run. Visibility,
+> not gating, is what coverage provides here.
+
+That rejection stands. It priced a specific mechanism, a PR-required
+threshold check, and both of its named costs are real: threshold noise
+that blocks merges, and a duplicated workspace test run sitting on the
+merge critical path D2 just cut from 22-26m to 13-17m. Nothing observed
+since changes that price, and this amendment does not pay it. No
+coverage measurement returns to pull requests, the merge queue, or the
+required-check set. The PR-blocking critical path is untouched.
+
+What the rejection did not price is the failure mode J-7 names: on
+main, the number can decay for weeks and nothing raises its hand. The
+badge is visibility only for someone who happens to look. This
+amendment makes the existing main-push visibility self-alarming.
+
+### Decision
+
+The main-push `coverage` job (D2) gains a ratchet step after it renders
+`coverage.json`. No new job, no new test execution, no PR trigger.
+
+- The job stores a full-precision baseline (workspace line-coverage
+  percent plus the main SHA that produced it) as a second file in the
+  badge gist it already writes. The badge file itself stays unchanged
+  as a rendered one-decimal display value.
+- After measuring, the job compares the fresh percent against the
+  stored baseline. At or above baseline minus a deadband: pass; the
+  badge updates to the fresh number, and the baseline updates only if
+  the fresh number exceeds it (a high-water mark; a first run with no
+  stored baseline seeds it). Below baseline minus deadband: the step
+  fails the job, and neither badge nor baseline is updated, so the
+  baseline holds its pre-drop value and every subsequent main push
+  stays red until coverage recovers or the drop is deliberately
+  accepted. The baseline never moves down on a green run: without the
+  high-water rule, repeated drops each just inside the deadband would
+  re-base downward every push and decay silently forever. With it,
+  total unalarmed decay is bounded by one deadband below the best
+  number main has ever held.
+- The deadband and an optional explicit re-baseline value live in a
+  small checked-in config the job reads (start at 0.25 percentage
+  points; retune from observed jitter without a new ADR). Accepting a
+  legitimate drop is therefore a one-line PR whose commit message
+  carries the justification. It is never a bot commit to protected
+  main, and never silent.
+- A failed gist read skips the comparison with a loud workflow warning
+  instead of failing the job. The threat model is silent decay, not
+  adversarial bypass, and infra flake must not fabricate red runs on
+  main. A successfully read baseline that the fresh number undershoots
+  fails hard.
+
+### Why this satisfies J-7 without unwinding D2
+
+J-7's harm clause is "the number cannot decay unobserved". Under this
+ratchet a real drop turns main's own push run red, and because main
+merges land one rebase (or one queue batch) per push, the red run
+attributes the drop to a one-PR-wide window. The failure is sticky: it
+repeats on every push until someone restores coverage or re-bases the
+floor with a written reason. Decay is now loud, attributed, and
+persistent, which is what "cannot decay unobserved" requires.
+
+What this deliberately does not provide is prevention at merge time. A
+PR that lowers coverage still merges; main tells us immediately
+afterward. Prevention is exactly the mechanism the rejected alternative
+priced at 22-26 minutes per PR plus a duplicated suite, and J-7's own
+wording targets unobserved decay, not the existence of a PR gate. If a
+recurring pattern emerges of drops that a PR-time signal would have
+cheaply prevented, that is new evidence, and a future amendment can
+weigh a diff-coverage advisory comment (never a required check) against
+it. Epic #1061's exit criterion "a floor that fails the build" is met
+by the main-push build failing; the epic ledger should read it so.
+
+### Consequences
+
+- PR-blocking CI: unchanged, `check`'s 13-17m. Nothing in this
+  amendment runs on a PR ref.
+- A slow legitimate decline (new code consistently a little under the
+  workspace average) will eventually trip the ratchet even though no
+  single merge was at fault. Accepted, and intended: the ratchet
+  converts slow decline from a silent trend into a periodic deliberate
+  decision, recorded in a re-baseline commit.
+- The gate reads the workspace line percent, so one crate's collapse
+  can hide inside another's growth. The job's per-crate table in the
+  step summary is the diagnostic for a tripped ratchet. Per-crate
+  ratchets are rejected for now: 26 independent floors multiply flap
+  for marginal signal. Revisit only if a real decay is shown to have
+  hidden this way.
+- Baseline state lives in the badge gist, outside the repo. Accepted:
+  it is already the trust anchor for the published number, writes
+  require the same `GIST_PAT` secret only main-push runs hold, and the
+  authority to accept a lower floor stays in-repo behind PR review.
+- Added cost per main push: one gist read, one compare, one gist write.
+  Zero added test execution anywhere.
