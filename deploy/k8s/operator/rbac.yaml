@@ -3,6 +3,9 @@
 #   - Deployments and Services: full lifecycle for the objects it manages
 #     (create/update/patch for apply, get/list/watch for the informer cache,
 #     delete to remove the maintain Deployment when maintain.enabled is false).
+#   - Ingresses: the same lifecycle, for the ingest-affinity Ingress objects
+#     (ADR-0076 decision 1). Delete is what lets gateway.ingestAffinity.enabled
+#     go back to false without leaving an orphan routing live ingest traffic.
 #   - RavelCluster (and its status subresource): watch the spec, write status.
 #   - Secrets: get only. The operator reads the credentials and tenant-token
 #     Secrets to resolve tenant names; it never lists, writes, or watches them.
@@ -29,6 +32,9 @@ rules:
     verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
   - apiGroups: [""]
     resources: ["services"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
     verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
   - apiGroups: ["ravel.nofire.ai"]
     resources: ["ravelclusters"]

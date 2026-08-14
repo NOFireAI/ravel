@@ -22,6 +22,19 @@ spec:
     name: ravel-tenant-tokens
   gateway:
     replicas: 1
+    # Ingest affinity (ADR-0076 decision 1) is off here and in every existing
+    # RavelCluster: omitting the block renders no Ingress and behaves exactly
+    # as before. It also needs an ingress controller, which the kind dev
+    # environment does not run. On a real cluster with ingress-nginx, adding
+    # the block below pins each tenant to a stable two-replica subset and
+    # divides its flush PUTs by replicas/subsetSize. Sizing, key choice, and
+    # rebalance behaviour: docs/guides/ingest-affinity.md.
+    #
+    # ingestAffinity:
+    #   ingressClassName: nginx
+    #   hosts: [ingest.example.com]
+    #   tlsSecretName: ingest-tls
+    #   subsetSize: 2
   query:
     replicas: 1
   maintain:

@@ -53,6 +53,11 @@ Start here to run Ravel, ingest into it, or query it.
   `RavelCluster` custom resource, the kind development environment
   (`scripts/kind-up.sh`), and what the `/healthz` and `/readyz` probes mean.
   Read this to deploy Ravel on Kubernetes.
+- [guides/ingest-affinity.md](guides/ingest-affinity.md): pinning each tenant to
+  a stable subset of gateway replicas (ADR-0076 decision 1) -- what it saves,
+  the throughput ceiling it costs, how to size the subset, and what a rolling
+  restart or replica loss does. Read this to cut object-storage request cost
+  without touching latency or any format.
 - [guides/disaster-recovery.md](guides/disaster-recovery.md): recovering a
   deployment from object storage alone -- what state is reconstructable, the
   commit-record and catalog rebuild path, and the operator steps. Read this

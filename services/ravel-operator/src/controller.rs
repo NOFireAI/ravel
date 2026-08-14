@@ -14,6 +14,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
@@ -27,8 +28,7 @@ use tracing::{info, warn};
 use crate::crd::{Condition, LocalSecretRef, RavelCluster, RavelClusterSpec, RavelClusterStatus};
 use crate::reconcile::{
     DEPLOYMENT_KEY_SECRET_KEY, RenderCtx, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
-    desired_gateway_deployment, desired_gateway_service, desired_maintain_deployment,
-    desired_query_deployment, desired_query_service,
+    desired_objects, possible_ingest_ingress_names,
 };
 
 /// Server-side-apply field manager name.
@@ -721,32 +721,62 @@ async fn reconcile_inner(
 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+    let ingresses: Api<Ingress> = Api::namespaced(client.clone(), namespace);
+
+    // One render call produces everything this reconcile applies, so a test
+    // asserting on `desired_objects` is asserting on what actually ships.
+    let desired = desired_objects(&obj.spec, instance, &render_ctx);
 
     // Gateway.
-    let mut gateway = desired_gateway_deployment(&obj.spec, instance, &render_ctx);
+    let mut gateway = desired.gateway_deployment;
     gateway.metadata.namespace = Some(namespace.to_string());
     gateway.metadata.owner_references = owner.clone();
     let gateway_applied = apply(&deployments, &child(instance, "gateway"), &gateway).await?;
 
-    let mut gateway_svc = desired_gateway_service(&obj.spec, instance);
+    let mut gateway_svc = desired.gateway_service;
     gateway_svc.metadata.namespace = Some(namespace.to_string());
     gateway_svc.metadata.owner_references = owner.clone();
     apply(&services, &child(instance, "gateway"), &gateway_svc).await?;
 
+    // Ingest affinity (ADR-0076 decision 1): apply the Ingress objects the spec
+    // asks for, then delete every ingest Ingress name it does not, so turning
+    // affinity off converges back to the affinity-absent state instead of
+    // leaving an orphan routing live traffic under withdrawn rules.
+    let mut desired_ingress_names: BTreeSet<String> = BTreeSet::new();
+    for mut ingress in desired.gateway_ingresses {
+        let name = ingress.name_any();
+        ingress.metadata.namespace = Some(namespace.to_string());
+        ingress.metadata.owner_references = owner.clone();
+        apply(&ingresses, &name, &ingress).await?;
+        desired_ingress_names.insert(name);
+    }
+    for name in possible_ingest_ingress_names(instance) {
+        if desired_ingress_names.contains(&name) {
+            continue;
+        }
+        // Ignore not-found: the Ingress may never have existed, which is the
+        // steady state for every cluster that never enables affinity.
+        if let Err(err) = ingresses.delete(&name, &DeleteParams::default()).await
+            && !is_not_found(&err)
+        {
+            return Err(err.into());
+        }
+    }
+
     // Query.
-    let mut query = desired_query_deployment(&obj.spec, instance, &render_ctx);
+    let mut query = desired.query_deployment;
     query.metadata.namespace = Some(namespace.to_string());
     query.metadata.owner_references = owner.clone();
     let query_applied = apply(&deployments, &child(instance, "query"), &query).await?;
 
-    let mut query_svc = desired_query_service(&obj.spec, instance);
+    let mut query_svc = desired.query_service;
     query_svc.metadata.namespace = Some(namespace.to_string());
     query_svc.metadata.owner_references = owner.clone();
     apply(&services, &child(instance, "query"), &query_svc).await?;
 
     // Maintain: apply when enabled, delete when not.
     let maintain_name = child(instance, "maintain");
-    let maintain_ready = match desired_maintain_deployment(&obj.spec, instance, &render_ctx) {
+    let maintain_ready = match desired.maintain_deployment {
         Some(mut maintain) => {
             maintain.metadata.namespace = Some(namespace.to_string());
             maintain.metadata.owner_references = owner.clone();
@@ -974,6 +1004,7 @@ pub async fn run() -> Result<(), Error> {
     let clusters: Api<RavelCluster> = Api::all(client.clone());
     let deployments: Api<Deployment> = Api::all(client.clone());
     let services: Api<Service> = Api::all(client.clone());
+    let ingresses: Api<Ingress> = Api::all(client.clone());
     let context = Arc::new(Context { client });
 
     // Scope the owned-object watches to this operator's objects only. Without a
@@ -985,7 +1016,8 @@ pub async fn run() -> Result<(), Error> {
     info!("starting ravel-operator controller");
     Controller::new(clusters, watcher::Config::default())
         .owns(deployments, managed.clone())
-        .owns(services, managed)
+        .owns(services, managed.clone())
+        .owns(ingresses, managed)
         .run(reconcile, error_policy, context)
         .for_each(|result| async move {
             match result {

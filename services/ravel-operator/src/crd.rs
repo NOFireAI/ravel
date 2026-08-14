@@ -165,6 +165,19 @@ pub struct GatewaySpec {
     /// runs in the gateway tier, so it is a gateway-only field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fold: Option<FoldSpec>,
+
+    /// Layer-7 ingest affinity (ADR-0076 decision 1). Omit to keep today's
+    /// behavior exactly: no Ingress is rendered and ingest traffic reaches the
+    /// gateway Service however the platform owner already routes it.
+    ///
+    /// Ingest buffers are per `(tenant, signal, shard)` PER REPLICA, so a
+    /// tenant whose writes spray across every gateway replica pays one
+    /// age-triggered flush stream per replica for the same data. Pinning a
+    /// tenant to a stable subset divides that term. Affinity is best-effort:
+    /// `writer_id` and `epoch` already disambiguate concurrent writers in the
+    /// object key, so a reroute is always correct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_affinity: Option<IngestAffinitySpec>,
 }
 
 impl Default for GatewaySpec {
@@ -174,8 +187,148 @@ impl Default for GatewaySpec {
             resources: None,
             credentials_secret_ref: None,
             fold: None,
+            ingest_affinity: None,
         }
     }
+}
+
+/// Layer-7 ingest affinity for the gateway tier (ADR-0076 decision 1).
+///
+/// The operator renders an Ingress (two, when `grpc` is on) carrying
+/// ingress-nginx's consistent-hash annotations
+/// (`nginx.ingress.kubernetes.io/upstream-hash-by` plus its subset pair). The
+/// hash key is tenant identity taken from authentication material, never from
+/// the URL path: OTLP connections are long-lived and Ravel resolves tenancy
+/// server-side from the credential, so a path-based rule cannot see the tenant.
+///
+/// This deliberately does NOT use the core Service `sessionAffinity: ClientIP`
+/// field. That keys on the client's source address, which is the collector's or
+/// the gateway proxy's address rather than the tenant's, and would look like
+/// affinity while pinning the wrong thing.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestAffinitySpec {
+    /// Whether affinity is active. Defaults to true, so declaring the block is
+    /// enough. Set it to false to turn affinity off during an incident without
+    /// deleting the rest of the configuration; the Ingress objects are then
+    /// removed and rendering returns to the affinity-absent baseline.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// How many replicas a tenant's traffic is pinned to. Defaults to
+    /// [`DEFAULT_AFFINITY_SUBSET_SIZE`] (two), not one, so a single replica
+    /// loss does not concentrate a tenant on one process.
+    ///
+    /// A subset is a throughput ceiling by construction: a tenant can use at
+    /// most `subsetSize` gateway replicas no matter how many the Deployment
+    /// runs. Raise it for a high-volume tenant (see
+    /// `docs/guides/ingest-affinity.md`); the request-cost divisor is
+    /// `replicas / subsetSize`.
+    ///
+    /// This is a per-cluster setting, not per-tenant: ingress-nginx's subset
+    /// size is one number per Ingress. A tenant needing a materially larger
+    /// subset than its siblings belongs in its own `RavelCluster`.
+    #[serde(default = "default_subset_size")]
+    pub subset_size: u32,
+
+    /// Where the load balancer reads tenant identity from. Defaults to the
+    /// `Authorization` header, which is what Ravel itself resolves tenancy
+    /// from.
+    #[serde(default)]
+    pub key: AffinityKeySpec,
+
+    /// `spec.ingressClassName` on the rendered Ingress objects. Omit to let the
+    /// cluster's default IngressClass apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_class_name: Option<String>,
+
+    /// Hostnames the ingest Ingress answers on. Empty renders a single
+    /// host-less rule, which matches any host reaching the controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+
+    /// TLS Secret for `spec.tls` on the rendered Ingress objects. Strongly
+    /// recommended and effectively required for the gRPC Ingress: ingress-nginx
+    /// serves HTTP/2 to clients over TLS, and OTLP/gRPC needs HTTP/2. Tenant
+    /// tokens are bearer tokens, so plaintext ingest exposes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_secret_name: Option<String>,
+
+    /// Also render a second Ingress for OTLP/gRPC (port 4317) carrying
+    /// `nginx.ingress.kubernetes.io/backend-protocol: GRPC`. Defaults to true:
+    /// gRPC is the main OTLP ingest path, and affinity that covers only
+    /// OTLP/HTTP would miss most of the traffic generating the request bill.
+    /// A separate object is required because `backend-protocol` is per-Ingress.
+    #[serde(default = "default_true")]
+    pub grpc: bool,
+
+    /// Extra annotations merged onto both rendered Ingress objects, for an
+    /// ingress controller other than ingress-nginx or for tuning
+    /// (`nginx.ingress.kubernetes.io/proxy-body-size` is the common one: the
+    /// ingress-nginx default of 1m rejects larger OTLP/HTTP payloads).
+    ///
+    /// The affinity annotations the operator computes are applied AFTER this
+    /// map, so an entry here can never silently disable the affinity it is
+    /// meant to configure.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl Default for IngestAffinitySpec {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            subset_size: default_subset_size(),
+            key: AffinityKeySpec::default(),
+            ingress_class_name: None,
+            hosts: Vec::new(),
+            tls_secret_name: None,
+            grpc: default_true(),
+            annotations: BTreeMap::new(),
+        }
+    }
+}
+
+/// Which piece of authentication material the load balancer hashes to identify
+/// a tenant.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AffinityKeySpec {
+    /// The identity source. Defaults to
+    /// [`AffinityKeySource::AuthorizationHeader`].
+    #[serde(default)]
+    pub source: AffinityKeySource,
+
+    /// Header name when `source` is `header`. Required in that case, enforced
+    /// by a CEL rule on this object (see [`ravel_cluster_crd`]), and
+    /// constrained to HTTP token characters by an OpenAPI `pattern` so nothing
+    /// user-supplied can reach the rendered nginx directive as syntax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_name: Option<String>,
+}
+
+/// The identity source behind [`AffinityKeySpec`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AffinityKeySource {
+    /// Hash the `Authorization` header (nginx `$http_authorization`). This is
+    /// the credential Ravel itself resolves tenancy from, so it is stable per
+    /// tenant with no extra client configuration. Two consequences worth
+    /// knowing: a tenant using several distinct tokens hashes to several
+    /// subsets, and rotating a token moves that tenant to a new subset.
+    #[default]
+    AuthorizationHeader,
+
+    /// Hash a named header (`headerName`), e.g. a tenant header a trusted
+    /// upstream proxy stamps. Only use this when that header cannot be set by
+    /// the client, or a tenant can choose its own subset.
+    Header,
+
+    /// Hash the mTLS client certificate subject (nginx `$ssl_client_s_dn`).
+    /// Requires the ingress controller to terminate TLS with client-certificate
+    /// authentication configured; the variable is empty otherwise, which
+    /// collapses every tenant onto one subset.
+    MtlsSubject,
 }
 
 /// Catalog fold tuning (`--disable-fold`, `--fold-interval-secs`).
@@ -379,6 +532,15 @@ fn default_true() -> bool {
     true
 }
 
+/// Default ingest-affinity subset size (ADR-0076 decision 1): **two** replicas,
+/// not one, so a single replica loss does not concentrate a tenant on one
+/// process.
+pub const DEFAULT_AFFINITY_SUBSET_SIZE: u32 = 2;
+
+fn default_subset_size() -> u32 {
+    DEFAULT_AFFINITY_SUBSET_SIZE
+}
+
 /// Build the `CustomResourceDefinition` for [`RavelCluster`], with the CEL
 /// immutability rule injected onto the `shards` field.
 ///
@@ -393,6 +555,7 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     let mut crd = RavelCluster::crd();
     inject_shards_immutability(&mut crd);
     inject_minimum_bounds(&mut crd);
+    inject_ingest_affinity_constraints(&mut crd);
     crd
 }
 
@@ -471,6 +634,82 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
             {
                 replicas.minimum = Some(1.0);
             }
+        }
+    }
+}
+
+/// Message surfaced to a user who selects the `header` key source without
+/// naming a header.
+const AFFINITY_HEADER_NAME_MESSAGE: &str =
+    "gateway.ingestAffinity.key.headerName is required when key.source is \"header\"";
+
+/// Allowed characters for `gateway.ingestAffinity.key.headerName`.
+///
+/// The header name is turned into an nginx variable (`X-Scope-OrgID` becomes
+/// `$http_x_scope_orgid`) inside the rendered
+/// `nginx.ingress.kubernetes.io/upstream-hash-by` annotation. The renderer
+/// already maps every character outside `[a-z0-9]` to `_`, so nothing
+/// user-supplied can reach the nginx configuration as syntax; this pattern is
+/// the second belt, rejecting the mistake at admission with a clear message
+/// instead of silently hashing a mangled variable name.
+const AFFINITY_HEADER_NAME_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9-]{0,62}$";
+
+/// Attach the ingest-affinity constraints (ADR-0076 decision 1):
+/// `minimum: 1` on `subsetSize`, a character `pattern` on `key.headerName`, and
+/// a CEL rule requiring `headerName` whenever `key.source` is `header`.
+///
+/// Injected post-hoc for the same reason the other two injectors are: it keeps
+/// each rule directly unit-testable without a live API server, and does not
+/// depend on which validation attributes this `schemars` major happens to emit.
+/// Every step bails out rather than panicking if the schema shape is not what
+/// it expects, matching the existing injectors.
+fn inject_ingest_affinity_constraints(crd: &mut CustomResourceDefinition) {
+    // `has(self.key)` and `has(self.key.source)` guard the field accesses: both
+    // have serde defaults, so a submitted manifest may omit either, and a CEL
+    // rule that reads a missing field errors instead of passing.
+    let rule = ValidationRule {
+        rule: "!has(self.key) || !has(self.key.source) || self.key.source != 'header' || \
+               (has(self.key.headerName) && self.key.headerName != '')"
+            .to_string(),
+        message: Some(AFFINITY_HEADER_NAME_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(affinity) = spec_props
+            .get_mut("gateway")
+            .and_then(|g| g.properties.as_mut())
+            .and_then(|p| p.get_mut("ingestAffinity"))
+        else {
+            continue;
+        };
+        affinity.x_kubernetes_validations = Some(vec![rule.clone()]);
+        let Some(affinity_props) = affinity.properties.as_mut() else {
+            continue;
+        };
+        if let Some(subset_size) = affinity_props.get_mut("subsetSize") {
+            subset_size.minimum = Some(1.0);
+        }
+        if let Some(header_name) = affinity_props
+            .get_mut("key")
+            .and_then(|k| k.properties.as_mut())
+            .and_then(|p| p.get_mut("headerName"))
+        {
+            header_name.pattern = Some(AFFINITY_HEADER_NAME_PATTERN.to_string());
         }
     }
 }
@@ -661,6 +900,156 @@ mod tests {
         });
         let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
         assert_eq!(spec.deployment_key_secret_ref, None);
+    }
+
+    #[test]
+    fn ingest_affinity_is_optional_and_defaults_to_a_two_replica_subset() {
+        // ADR-0076 decision 1. The block is optional: an existing RavelCluster
+        // that never heard of affinity deserializes with None and therefore
+        // renders no Ingress at all. Declaring it empty enables it with the
+        // documented defaults, of which the load-bearing one is subsetSize = 2.
+        let crd = ravel_cluster_crd();
+        let gateway_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .clone();
+        assert!(
+            gateway_props.contains_key("ingestAffinity"),
+            "gateway must expose ingestAffinity in its schema"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.gateway.ingest_affinity, None);
+
+        let mut with_affinity = base;
+        with_affinity["gateway"] = serde_json::json!({ "ingestAffinity": {} });
+        let spec: RavelClusterSpec = serde_json::from_value(with_affinity).expect("deserialize");
+        let affinity = spec
+            .gateway
+            .ingest_affinity
+            .expect("ingestAffinity present");
+        assert!(affinity.enabled, "declaring the block enables affinity");
+        assert_eq!(
+            affinity.subset_size, DEFAULT_AFFINITY_SUBSET_SIZE,
+            "the default subset is two replicas, not one"
+        );
+        assert_eq!(affinity.subset_size, 2);
+        assert_eq!(affinity.key.source, AffinityKeySource::AuthorizationHeader);
+        assert_eq!(affinity.key.header_name, None);
+        assert!(affinity.grpc, "OTLP/gRPC is pinned by default");
+        assert_eq!(affinity.hosts, Vec::<String>::new());
+    }
+
+    #[test]
+    fn ingest_affinity_schema_carries_its_bounds_and_header_rule() {
+        let crd = ravel_cluster_crd();
+        let affinity = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .clone();
+
+        // subsetSize must reject 0: a zero subset routes nowhere.
+        let affinity_props = affinity.properties.as_ref().expect("affinity props");
+        assert_eq!(
+            affinity_props
+                .get("subsetSize")
+                .expect("subsetSize prop")
+                .minimum,
+            Some(1.0)
+        );
+
+        // headerName is constrained to HTTP token characters, so nothing
+        // user-supplied can reach the rendered nginx directive as syntax.
+        assert_eq!(
+            affinity_props
+                .get("key")
+                .expect("key prop")
+                .properties
+                .as_ref()
+                .expect("key props")
+                .get("headerName")
+                .expect("headerName prop")
+                .pattern
+                .as_deref(),
+            Some(AFFINITY_HEADER_NAME_PATTERN)
+        );
+
+        // And source: header without headerName is refused at admission rather
+        // than silently falling back to a different key.
+        let rules = affinity
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("ingestAffinity must carry a validation rule");
+        assert_eq!(rules.len(), 1);
+        assert!(
+            rules[0].rule.contains("headerName"),
+            "rule must be about headerName: {}",
+            rules[0].rule
+        );
+        assert_eq!(
+            rules[0].message.as_deref(),
+            Some(AFFINITY_HEADER_NAME_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn affinity_key_sources_serialize_as_documented_camel_case() {
+        // These strings are the CRD's public enum values and appear in the
+        // operations guide; renaming a variant silently would break manifests.
+        for (source, text) in [
+            (
+                AffinityKeySource::AuthorizationHeader,
+                "authorizationHeader",
+            ),
+            (AffinityKeySource::Header, "header"),
+            (AffinityKeySource::MtlsSubject, "mtlsSubject"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(source).expect("serialize"),
+                serde_json::Value::String(text.to_string())
+            );
+        }
     }
 
     #[test]

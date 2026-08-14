@@ -18,11 +18,18 @@ use k8s_openapi::api::core::v1::{
     PodTemplateSpec, Probe, ResourceRequirements, SecretKeySelector, SecretVolumeSource, Service,
     ServicePort, ServiceSpec, Volume, VolumeMount,
 };
+use k8s_openapi::api::networking::v1::{
+    HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
+    IngressServiceBackend, IngressSpec, IngressTLS, ServiceBackendPort,
+};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
-use crate::crd::{LocalSecretRef, RavelClusterSpec, ResourceRequirementsSpec};
+use crate::crd::{
+    AffinityKeySource, IngestAffinitySpec, LocalSecretRef, RavelClusterSpec,
+    ResourceRequirementsSpec,
+};
 
 /// HTTP listener port (OTLP/HTTP, query API, and the `/healthz` `/readyz`
 /// probes). Fixed to match the Dockerfile's `EXPOSE` and the server's default.
@@ -713,13 +720,317 @@ pub fn desired_query_service(_spec: &RavelClusterSpec, instance: &str) -> Servic
     )
 }
 
+/// ingress-nginx annotation selecting the consistent-hash key. Its value is an
+/// nginx variable; the controller hashes it with ketama, so only a few keys
+/// remap when the endpoint set changes.
+pub const UPSTREAM_HASH_BY_ANNOTATION: &str = "nginx.ingress.kubernetes.io/upstream-hash-by";
+
+/// ingress-nginx annotation turning on subset mode: the key selects a GROUP of
+/// endpoints rather than one endpoint, and a member of that group is then
+/// chosen uniformly at random per request. This is what makes the subset a
+/// subset rather than a pin to a single replica.
+pub const UPSTREAM_HASH_BY_SUBSET_ANNOTATION: &str =
+    "nginx.ingress.kubernetes.io/upstream-hash-by-subset";
+
+/// ingress-nginx annotation setting how many endpoints are in each subset. The
+/// controller's own default is 3; the operator always renders this explicitly
+/// from `subsetSize` so the effective value is what the `RavelCluster` says and
+/// never what the controller version happens to default to.
+pub const UPSTREAM_HASH_BY_SUBSET_SIZE_ANNOTATION: &str =
+    "nginx.ingress.kubernetes.io/upstream-hash-by-subset-size";
+
+/// ingress-nginx annotation choosing between per-Pod endpoints and the
+/// Service's single ClusterIP as the upstream. Always rendered as `"false"`.
+///
+/// This is not decoration. With `service-upstream: true` the upstream has ONE
+/// server (the ClusterIP) and kube-proxy picks the pod, so the hash has nothing
+/// to distribute over and affinity silently does nothing. The controller's
+/// default is false, but it is settable cluster-wide in the ingress-nginx
+/// ConfigMap; rendering it explicitly makes the affinity independent of that.
+pub const SERVICE_UPSTREAM_ANNOTATION: &str = "nginx.ingress.kubernetes.io/service-upstream";
+
+/// ingress-nginx annotation selecting the protocol spoken to the backend.
+/// Rendered as `GRPC` on the gRPC Ingress only. It is per-Ingress, which is why
+/// OTLP/HTTP and OTLP/gRPC need two objects rather than two paths on one.
+pub const BACKEND_PROTOCOL_ANNOTATION: &str = "nginx.ingress.kubernetes.io/backend-protocol";
+
+/// Suffix of the OTLP/HTTP ingest Ingress: `<cluster>-gateway-ingest`.
+const INGEST_INGRESS_COMPONENT: &str = "gateway-ingest";
+
+/// Suffix of the OTLP/gRPC ingest Ingress: `<cluster>-gateway-ingest-grpc`.
+const INGEST_GRPC_INGRESS_COMPONENT: &str = "gateway-ingest-grpc";
+
+/// The OTLP/HTTP ingest paths the HTTP Ingress serves: exactly the routes
+/// `services/ravel-server/src/otlp_http.rs` mounts. Disjoint from
+/// [`INGEST_GRPC_PATHS`], so the two Ingress objects never claim the same
+/// `(host, path)` and ingress-nginx never drops one location as a duplicate.
+const INGEST_HTTP_PATHS: &[&str] = &["/v1/metrics", "/v1/logs", "/v1/traces"];
+
+/// The OTLP/gRPC ingest paths the gRPC Ingress serves: one full service name
+/// per gRPC service registered on the ingest surface in
+/// `services/ravel-server/src/lib.rs`. This list must track that registration
+/// site; the next gRPC service added there must be added here too, or its RPCs
+/// have no Ingress route.
+///
+/// Each entry is a complete gRPC service name, which is a complete path element
+/// under Kubernetes `PathType: Prefix` element-wise matching (split on `/`), so
+/// `/<service>` correctly prefixes `/<service>/<method>` under both the strict
+/// spec semantics and nginx's string-prefix rendering. A truncated common
+/// prefix like `/opentelemetry.proto.collector.` would be a single element that
+/// equals none of these, matching nothing under the spec.
+const INGEST_GRPC_PATHS: &[&str] = &[
+    "/opentelemetry.proto.collector.metrics.v1.MetricsService",
+    "/opentelemetry.proto.collector.logs.v1.LogsService",
+    "/opentelemetry.proto.collector.trace.v1.TraceService",
+    "/opentelemetry.proto.experimental.arrow.v1.ArrowMetricsService",
+];
+
+/// Every Ingress name the ingest-affinity render can produce for `instance`, in
+/// a fixed order, whether or not the current spec asks for them.
+///
+/// The controller applies the ones [`desired_gateway_ingresses`] returns and
+/// deletes every other name in this list, so turning `enabled` off (or dropping
+/// `grpc`) converges back to the affinity-absent state instead of leaving an
+/// orphaned Ingress routing traffic under rules the spec no longer describes.
+pub fn possible_ingest_ingress_names(instance: &str) -> Vec<String> {
+    vec![
+        child_name(instance, INGEST_INGRESS_COMPONENT),
+        child_name(instance, INGEST_GRPC_INGRESS_COMPONENT),
+    ]
+}
+
+/// The nginx variable holding tenant identity for a given key source.
+///
+/// A header name is lowercased with every character outside `[a-z0-9]` mapped
+/// to `_`, which is exactly nginx's own `$http_<name>` mangling (`X-Scope-OrgID`
+/// becomes `$http_x_scope_orgid`). That mapping is also the security property:
+/// no user-supplied character can survive into the rendered annotation as nginx
+/// syntax, so a header name cannot inject a directive. An absent or
+/// all-punctuation header name falls back to `authorization`, which is the
+/// same key the default source uses and therefore still a real tenant key
+/// rather than a constant; the CRD's CEL rule rejects that manifest at
+/// admission anyway.
+fn affinity_hash_variable(key: &crate::crd::AffinityKeySpec) -> String {
+    match key.source {
+        AffinityKeySource::AuthorizationHeader => "$http_authorization".to_string(),
+        AffinityKeySource::MtlsSubject => "$ssl_client_s_dn".to_string(),
+        AffinityKeySource::Header => {
+            let name = key.header_name.as_deref().unwrap_or("authorization");
+            let mangled: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let mangled = if mangled.chars().all(|c| c == '_') {
+                "authorization".to_string()
+            } else {
+                mangled
+            };
+            format!("$http_{mangled}")
+        }
+    }
+}
+
+/// The annotation map for an ingest Ingress: the operator's affinity
+/// annotations layered over the spec's passthrough map.
+///
+/// Order matters and is deliberate. The passthrough entries go in first and the
+/// computed affinity entries overwrite them, so an operator can add
+/// `proxy-body-size` or a different controller's annotations without being able
+/// to accidentally turn off the affinity this object exists to express.
+fn ingest_ingress_annotations(
+    affinity: &IngestAffinitySpec,
+    grpc: bool,
+) -> BTreeMap<String, String> {
+    let mut annotations = affinity.annotations.clone();
+    annotations.insert(
+        UPSTREAM_HASH_BY_ANNOTATION.to_string(),
+        affinity_hash_variable(&affinity.key),
+    );
+    annotations.insert(
+        UPSTREAM_HASH_BY_SUBSET_ANNOTATION.to_string(),
+        "true".to_string(),
+    );
+    annotations.insert(
+        UPSTREAM_HASH_BY_SUBSET_SIZE_ANNOTATION.to_string(),
+        affinity.subset_size.to_string(),
+    );
+    annotations.insert(SERVICE_UPSTREAM_ANNOTATION.to_string(), "false".to_string());
+    if grpc {
+        annotations.insert(BACKEND_PROTOCOL_ANNOTATION.to_string(), "GRPC".to_string());
+    }
+    annotations
+}
+
+/// One ingest Ingress: `paths` to the gateway Service's `port_name` port, under
+/// the affinity annotations from [`ingest_ingress_annotations`].
+///
+/// The path set is passed in rather than hardcoded because OTLP/HTTP and
+/// OTLP/gRPC MUST route on disjoint paths. `backend-protocol` is per-Ingress,
+/// so gRPC needs its own object, and two Ingresses sharing a `(host, path)` is
+/// a duplicate-path conflict in ingress-nginx: it keeps one location and drops
+/// the other's, which would silently disable the gRPC object's `grpc_pass` and
+/// its affinity annotations.
+fn ingest_ingress(
+    instance: &str,
+    component: &str,
+    affinity: &IngestAffinitySpec,
+    port_name: &str,
+    grpc: bool,
+    paths: &[&str],
+) -> Ingress {
+    let backend = IngressBackend {
+        service: Some(IngressServiceBackend {
+            // The gateway Service, whose EndpointSlices are what ingress-nginx
+            // hashes over. Named ports, so this cannot drift from the
+            // ServicePort names in `desired_gateway_service`.
+            name: child_name(instance, "gateway"),
+            port: Some(ServiceBackendPort {
+                name: Some(port_name.to_string()),
+                number: None,
+            }),
+        }),
+        resource: None,
+    };
+    let http = HTTPIngressRuleValue {
+        paths: paths
+            .iter()
+            .map(|path| HTTPIngressPath {
+                path: Some((*path).to_string()),
+                path_type: "Prefix".to_string(),
+                backend: backend.clone(),
+            })
+            .collect(),
+    };
+    // No hosts configured renders one host-less rule, which matches whatever
+    // host reaches the controller. That is the right default for a cluster
+    // fronting Ravel with a single ingest endpoint.
+    let rules: Vec<IngressRule> = if affinity.hosts.is_empty() {
+        vec![IngressRule {
+            host: None,
+            http: Some(http),
+        }]
+    } else {
+        affinity
+            .hosts
+            .iter()
+            .map(|host| IngressRule {
+                host: Some(host.clone()),
+                http: Some(http.clone()),
+            })
+            .collect()
+    };
+    let tls = affinity.tls_secret_name.as_ref().map(|secret| {
+        vec![IngressTLS {
+            // An empty host list means the certificate applies to every host
+            // this Ingress serves, matching the host-less rule above.
+            hosts: if affinity.hosts.is_empty() {
+                None
+            } else {
+                Some(affinity.hosts.clone())
+            },
+            secret_name: Some(secret.clone()),
+        }]
+    });
+    Ingress {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, component)),
+            // The gateway component labels, so the controller's
+            // managed-by-scoped `.owns()` watch sees these objects.
+            labels: Some(labels(instance, "gateway")),
+            annotations: Some(ingest_ingress_annotations(affinity, grpc)),
+            ..Default::default()
+        },
+        spec: Some(IngressSpec {
+            ingress_class_name: affinity.ingress_class_name.clone(),
+            rules: Some(rules),
+            tls,
+            default_backend: None,
+        }),
+        status: None,
+    }
+}
+
+/// The ingest-affinity Ingress objects (ADR-0076 decision 1), or an empty vec
+/// when `gateway.ingestAffinity` is absent or disabled.
+///
+/// Empty is the backward-compatible state: the operator renders no Ingress at
+/// all today, so an existing `RavelCluster` keeps routing ingest exactly the
+/// way its platform owner already routes it.
+pub fn desired_gateway_ingresses(spec: &RavelClusterSpec, instance: &str) -> Vec<Ingress> {
+    let Some(affinity) = spec.gateway.ingest_affinity.as_ref() else {
+        return Vec::new();
+    };
+    if !affinity.enabled {
+        return Vec::new();
+    }
+    let mut ingresses = vec![ingest_ingress(
+        instance,
+        INGEST_INGRESS_COMPONENT,
+        affinity,
+        "http",
+        false,
+        INGEST_HTTP_PATHS,
+    )];
+    if affinity.grpc {
+        ingresses.push(ingest_ingress(
+            instance,
+            INGEST_GRPC_INGRESS_COMPONENT,
+            affinity,
+            "grpc",
+            true,
+            INGEST_GRPC_PATHS,
+        ));
+    }
+    ingresses
+}
+
+/// Everything one `RavelCluster` reconcile applies, rendered in one place.
+///
+/// [`crate::controller`] builds this and applies exactly its contents, so a
+/// test that asserts on a `DesiredObjects` is asserting on the operator's real
+/// render path rather than on a helper that nothing calls.
+#[derive(Debug, Clone)]
+pub struct DesiredObjects {
+    /// The gateway Deployment.
+    pub gateway_deployment: Deployment,
+    /// The gateway Service.
+    pub gateway_service: Service,
+    /// The ingest-affinity Ingress objects; empty when affinity is off.
+    pub gateway_ingresses: Vec<Ingress>,
+    /// The query Deployment.
+    pub query_deployment: Deployment,
+    /// The query Service.
+    pub query_service: Service,
+    /// The maintain Deployment, or `None` when `maintain.enabled` is false (the
+    /// controller deletes it in that case).
+    pub maintain_deployment: Option<Deployment>,
+}
+
+/// Render every Kubernetes object a `RavelCluster` reconcile applies.
+pub fn desired_objects(spec: &RavelClusterSpec, instance: &str, ctx: &RenderCtx) -> DesiredObjects {
+    DesiredObjects {
+        gateway_deployment: desired_gateway_deployment(spec, instance, ctx),
+        gateway_service: desired_gateway_service(spec, instance),
+        gateway_ingresses: desired_gateway_ingresses(spec, instance),
+        query_deployment: desired_query_deployment(spec, instance, ctx),
+        query_service: desired_query_service(spec, instance),
+        maintain_deployment: desired_maintain_deployment(spec, instance, ctx),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::crd::{
-        FoldSpec, GatewaySpec, LocalSecretRef, MaintainSpec, QuerySpec, RetentionSpec, S3Spec,
-        StorageSpec,
+        AffinityKeySpec, DEFAULT_AFFINITY_SUBSET_SIZE, FoldSpec, GatewaySpec, IngestAffinitySpec,
+        LocalSecretRef, MaintainSpec, QuerySpec, RetentionSpec, S3Spec, StorageSpec,
     };
     use std::collections::BTreeMap;
 
@@ -752,6 +1063,7 @@ mod tests {
                     disabled: false,
                     interval_secs: Some(120),
                 }),
+                ingest_affinity: None,
             },
             query: QuerySpec {
                 replicas: 2,
@@ -1588,6 +1900,574 @@ mod tests {
         assert_ne!(checksum_of(&gb), checksum_of(&ga), "gateway must roll");
         assert_ne!(checksum_of(&qb), checksum_of(&qa), "query must roll");
         assert_ne!(checksum_of(&mb), checksum_of(&ma), "maintain must roll");
+    }
+
+    /// An affinity block with everything at its default: what an operator gets
+    /// from writing `ingestAffinity: {}`.
+    fn default_affinity() -> IngestAffinitySpec {
+        IngestAffinitySpec::default()
+    }
+
+    /// The annotations on a rendered Ingress.
+    fn annotations_of(ingress: &Ingress) -> BTreeMap<String, String> {
+        ingress
+            .metadata
+            .annotations
+            .clone()
+            .expect("ingest Ingress must carry annotations")
+    }
+
+    /// The single backend path of a rendered Ingress' first rule.
+    fn first_path_of(ingress: &Ingress) -> HTTPIngressPath {
+        ingress
+            .spec
+            .as_ref()
+            .expect("ingress spec")
+            .rules
+            .as_ref()
+            .expect("rules")[0]
+            .http
+            .as_ref()
+            .expect("http rule")
+            .paths[0]
+            .clone()
+    }
+
+    /// Every `(host, path)` pair a rendered Ingress claims, across all of its
+    /// rules and paths. `host` is `None` for a host-less rule.
+    fn host_paths_of(ingress: &Ingress) -> Vec<(Option<String>, String)> {
+        ingress
+            .spec
+            .as_ref()
+            .expect("ingress spec")
+            .rules
+            .as_ref()
+            .expect("rules")
+            .iter()
+            .flat_map(|rule| {
+                let host = rule.host.clone();
+                rule.http
+                    .as_ref()
+                    .expect("http rule")
+                    .paths
+                    .iter()
+                    .map(move |p| (host.clone(), p.path.clone().expect("path")))
+            })
+            .collect()
+    }
+
+    /// The distinct paths a rendered Ingress serves (order preserved, first
+    /// rule), for asserting the OTLP/HTTP vs OTLP/gRPC path split.
+    fn paths_of(ingress: &Ingress) -> Vec<String> {
+        ingress
+            .spec
+            .as_ref()
+            .expect("ingress spec")
+            .rules
+            .as_ref()
+            .expect("rules")[0]
+            .http
+            .as_ref()
+            .expect("http rule")
+            .paths
+            .iter()
+            .map(|p| p.path.clone().expect("path"))
+            .collect()
+    }
+
+    #[test]
+    fn affinity_enabled_renders_ingest_ingress_keyed_on_tenant_identity_with_subset_two() {
+        // ADR-0076 decision 1, the acceptance test. Asserted through
+        // `desired_objects`, which is the exact call `controller::
+        // reconcile_inner` makes and applies the contents of -- not a builder
+        // in isolation that no reconcile path constructs.
+        let mut spec = base_spec();
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            ingress_class_name: Some("nginx".to_string()),
+            hosts: vec!["ingest.example.com".to_string()],
+            tls_secret_name: Some("ingest-tls".to_string()),
+            ..default_affinity()
+        });
+        let objects = desired_objects(&spec, "prod", &ctx());
+
+        let names: Vec<String> = objects
+            .gateway_ingresses
+            .iter()
+            .map(|i| i.metadata.name.clone().expect("ingress name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "prod-gateway-ingest".to_string(),
+                "prod-gateway-ingest-grpc".to_string()
+            ],
+            "affinity must render an ingest Ingress for OTLP/HTTP and one for OTLP/gRPC"
+        );
+
+        let http_ingress = &objects.gateway_ingresses[0];
+        let annotations = annotations_of(http_ingress);
+
+        // The session-affinity key is tenant identity, read from the
+        // authentication material. NOT the URL path (OTLP connections are
+        // long-lived and Ravel resolves tenancy server-side from the
+        // credential, so a path rule cannot see the tenant).
+        assert_eq!(
+            annotations
+                .get("nginx.ingress.kubernetes.io/upstream-hash-by")
+                .map(String::as_str),
+            Some("$http_authorization"),
+            "the hash key must be the tenant's credential, not the request URI"
+        );
+        assert!(
+            !annotations
+                .values()
+                .any(|v| v.contains("$request_uri") || v.contains("$uri")),
+            "no annotation may key routing on the URL path: {annotations:?}"
+        );
+
+        // Subset mode on, and the default subset size is TWO replicas -- not
+        // one, so a single replica loss does not concentrate a tenant on one
+        // process.
+        assert_eq!(
+            annotations
+                .get("nginx.ingress.kubernetes.io/upstream-hash-by-subset")
+                .map(String::as_str),
+            Some("true"),
+            "without subset mode the key pins a tenant to exactly one replica"
+        );
+        assert_eq!(
+            annotations
+                .get("nginx.ingress.kubernetes.io/upstream-hash-by-subset-size")
+                .map(String::as_str),
+            Some("2"),
+            "ADR-0076 decision 1: the default subset is two replicas"
+        );
+        assert_eq!(DEFAULT_AFFINITY_SUBSET_SIZE, 2);
+
+        // Rendered explicitly false: with service-upstream true the upstream is
+        // the single ClusterIP, the hash has nothing to distribute over, and
+        // the affinity silently does nothing.
+        assert_eq!(
+            annotations
+                .get("nginx.ingress.kubernetes.io/service-upstream")
+                .map(String::as_str),
+            Some("false")
+        );
+
+        // The backend is the gateway Service on its named http port, and that
+        // Service really exposes a port of that name in the same render.
+        let path = first_path_of(http_ingress);
+        assert_eq!(path.path_type, "Prefix");
+        // The HTTP Ingress serves exactly the OTLP/HTTP routes, never `/`.
+        // Sharing `/` with the gRPC Ingress is a duplicate-path conflict:
+        // ingress-nginx keeps one location and drops the other's, silently
+        // disabling the gRPC object's grpc_pass and affinity annotations.
+        assert_eq!(
+            paths_of(http_ingress),
+            vec!["/v1/metrics", "/v1/logs", "/v1/traces"],
+            "the HTTP Ingress serves the OTLP/HTTP routes, not `/`"
+        );
+        let backend = path.backend.service.expect("service backend");
+        assert_eq!(backend.name, "prod-gateway");
+        assert_eq!(
+            backend.port.expect("backend port").name.as_deref(),
+            Some("http")
+        );
+        let service_port_names: Vec<String> = objects
+            .gateway_service
+            .spec
+            .as_ref()
+            .expect("service spec")
+            .ports
+            .as_ref()
+            .expect("ports")
+            .iter()
+            .filter_map(|p| p.name.clone())
+            .collect();
+        assert!(
+            service_port_names.contains(&"http".to_string())
+                && service_port_names.contains(&"grpc".to_string()),
+            "the Ingress backend names ports the gateway Service must expose: {service_port_names:?}"
+        );
+
+        // Ingress plumbing: class, host rule, TLS.
+        let ispec = http_ingress.spec.as_ref().expect("ingress spec");
+        assert_eq!(ispec.ingress_class_name.as_deref(), Some("nginx"));
+        assert_eq!(
+            ispec.rules.as_ref().expect("rules")[0].host.as_deref(),
+            Some("ingest.example.com")
+        );
+        let tls = ispec.tls.as_ref().expect("tls");
+        assert_eq!(tls[0].secret_name.as_deref(), Some("ingest-tls"));
+
+        // The gRPC Ingress is the same rule under backend-protocol GRPC on the
+        // gRPC port; it exists because that annotation is per-Ingress.
+        let grpc_ingress = &objects.gateway_ingresses[1];
+        let grpc_annotations = annotations_of(grpc_ingress);
+        assert_eq!(
+            grpc_annotations
+                .get("nginx.ingress.kubernetes.io/backend-protocol")
+                .map(String::as_str),
+            Some("GRPC")
+        );
+        assert_eq!(
+            grpc_annotations
+                .get("nginx.ingress.kubernetes.io/upstream-hash-by")
+                .map(String::as_str),
+            Some("$http_authorization"),
+            "OTLP/gRPC carries the bulk of ingest; it must be pinned too"
+        );
+        assert_eq!(
+            grpc_annotations
+                .get("nginx.ingress.kubernetes.io/upstream-hash-by-subset-size")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            first_path_of(grpc_ingress)
+                .backend
+                .service
+                .expect("service backend")
+                .port
+                .expect("port")
+                .name
+                .as_deref(),
+            Some("grpc")
+        );
+        assert!(
+            !annotations.contains_key("nginx.ingress.kubernetes.io/backend-protocol"),
+            "the HTTP Ingress must not claim a gRPC backend"
+        );
+
+        // Both objects carry the managed-by label the controller's owned-object
+        // watch selects on, or the operator would never see them change.
+        for ingress in &objects.gateway_ingresses {
+            assert_eq!(
+                ingress
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .expect("labels")
+                    .get("app.kubernetes.io/managed-by")
+                    .map(String::as_str),
+                Some("ravel-operator")
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_ingresses_never_share_a_host_and_path() {
+        // The regression this whole fix exists for. ingress-nginx builds one
+        // `location <path>` per server block; two Ingress objects claiming the
+        // same (host, path) is a duplicate-path conflict that keeps one and
+        // silently drops the other's location. The OTLP/HTTP and OTLP/gRPC
+        // objects previously both rendered path `/`, so the gRPC object's
+        // grpc_pass and affinity annotations never took effect.
+        //
+        // Asserted over the WHOLE rendered set, across every permutation of grpc
+        // on/off and the host cardinalities (none, one, several) -- not
+        // per-object, which is exactly the blind spot that let the defect ship.
+        for grpc in [true, false] {
+            for hosts in [
+                vec![],
+                vec!["ingest.example.com".to_string()],
+                vec![
+                    "a.example.com".to_string(),
+                    "b.example.com".to_string(),
+                    "c.example.com".to_string(),
+                ],
+            ] {
+                let mut spec = base_spec();
+                spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+                    grpc,
+                    hosts: hosts.clone(),
+                    ..default_affinity()
+                });
+                let ingresses = desired_gateway_ingresses(&spec, "prod");
+
+                let mut seen: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
+                for ingress in &ingresses {
+                    let name = ingress.metadata.name.clone().expect("name");
+                    for pair in host_paths_of(ingress) {
+                        if let Some(other) = seen.insert(pair.clone(), name.clone()) {
+                            panic!(
+                                "Ingress objects {other} and {name} both claim \
+                                 (host, path) {pair:?}; ingress-nginx drops one \
+                                 location as a duplicate-path conflict \
+                                 (grpc={grpc}, hosts={hosts:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grpc_ingress_paths_cover_every_registered_ingest_grpc_service() {
+        // The gRPC Ingress must route every gRPC service registered on the
+        // ingest surface in `services/ravel-server/src/lib.rs`. There are FOUR:
+        // the three OTLP collectors plus the OTAP ArrowMetricsService
+        // (lib.rs, registered behind its config but routed unconditionally --
+        // an unrouted path costs nothing, an unroutable service breaks ingest).
+        // The next gRPC service added at that registration site must be added
+        // to INGEST_GRPC_PATHS, or its RPCs have no Ingress route.
+        let mut spec = base_spec();
+        spec.gateway.ingest_affinity = Some(default_affinity());
+        let ingresses = desired_gateway_ingresses(&spec, "prod");
+        let grpc_ingress = ingresses
+            .iter()
+            .find(|i| i.metadata.name.as_deref() == Some("prod-gateway-ingest-grpc"))
+            .expect("gRPC Ingress");
+        let paths = paths_of(grpc_ingress);
+        for service in [
+            "/opentelemetry.proto.collector.metrics.v1.MetricsService",
+            "/opentelemetry.proto.collector.logs.v1.LogsService",
+            "/opentelemetry.proto.collector.trace.v1.TraceService",
+            "/opentelemetry.proto.experimental.arrow.v1.ArrowMetricsService",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == service),
+                "the gRPC Ingress must route {service}; got {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn affinity_absent_renders_no_ingress_and_nothing_else_changes() {
+        // Deliverable 4: affinity off is today's behavior exactly. Two claims.
+        //
+        // First: no Ingress at all, which is what the operator rendered before
+        // this change (it managed only Deployments and Services).
+        let spec = base_spec();
+        assert!(spec.gateway.ingest_affinity.is_none());
+        let objects = desired_objects(&spec, "prod", &ctx());
+        assert!(
+            objects.gateway_ingresses.is_empty(),
+            "a RavelCluster with no affinity field must render no Ingress"
+        );
+
+        // Second: the affinity field cannot reach any other object. Rendering
+        // the same spec WITH affinity enabled must produce byte-identical
+        // Deployments and Services -- which is only possible if the affinity
+        // code path touches nothing but the Ingress list, so the affinity-absent
+        // render of every other object is necessarily unchanged from today.
+        let mut affinity_spec = base_spec();
+        affinity_spec.gateway.ingest_affinity = Some(default_affinity());
+        let with_affinity = desired_objects(&affinity_spec, "prod", &ctx());
+        for (off, on, what) in [
+            (
+                serde_json::to_value(&objects.gateway_deployment),
+                serde_json::to_value(&with_affinity.gateway_deployment),
+                "gateway Deployment",
+            ),
+            (
+                serde_json::to_value(&objects.gateway_service),
+                serde_json::to_value(&with_affinity.gateway_service),
+                "gateway Service",
+            ),
+            (
+                serde_json::to_value(&objects.query_deployment),
+                serde_json::to_value(&with_affinity.query_deployment),
+                "query Deployment",
+            ),
+            (
+                serde_json::to_value(&objects.query_service),
+                serde_json::to_value(&with_affinity.query_service),
+                "query Service",
+            ),
+            (
+                serde_json::to_value(&objects.maintain_deployment),
+                serde_json::to_value(&with_affinity.maintain_deployment),
+                "maintain Deployment",
+            ),
+        ] {
+            assert_eq!(
+                off.expect("serialize affinity-off"),
+                on.expect("serialize affinity-on"),
+                "{what} must not change when affinity is enabled, so the \
+                 affinity-off render is necessarily unchanged from before"
+            );
+        }
+
+        // And the gateway Service in particular is still the plain ClusterIP
+        // Service it always was: no sessionAffinity was bolted on. Client-IP
+        // affinity keys on the collector's or gateway proxy's address, not the
+        // tenant, so it would look like affinity while pinning the wrong thing.
+        let gspec = objects.gateway_service.spec.as_ref().expect("service spec");
+        assert_eq!(gspec.session_affinity, None);
+        assert_eq!(gspec.session_affinity_config, None);
+        assert_eq!(
+            gspec.type_, None,
+            "the gateway Service stays a default ClusterIP"
+        );
+    }
+
+    #[test]
+    fn affinity_disabled_or_grpc_off_removes_the_matching_ingress() {
+        // `enabled: false` is the incident switch: it must converge all the way
+        // back to the affinity-absent render, not leave a stale Ingress.
+        let mut spec = base_spec();
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            enabled: false,
+            ..default_affinity()
+        });
+        assert!(desired_gateway_ingresses(&spec, "prod").is_empty());
+
+        // gRPC off renders the HTTP Ingress only.
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            grpc: false,
+            ..default_affinity()
+        });
+        let ingresses = desired_gateway_ingresses(&spec, "prod");
+        assert_eq!(ingresses.len(), 1);
+        assert_eq!(
+            ingresses[0].metadata.name.as_deref(),
+            Some("prod-gateway-ingest")
+        );
+    }
+
+    #[test]
+    fn every_renderable_ingress_name_is_in_the_delete_sweep_list() {
+        // The controller applies what `desired_gateway_ingresses` returns and
+        // deletes every OTHER name in `possible_ingest_ingress_names`. A name
+        // the render can produce but that list omits would be an Ingress that
+        // routes live traffic forever after affinity is turned off.
+        let mut spec = base_spec();
+        spec.gateway.ingest_affinity = Some(default_affinity());
+        let renderable: Vec<String> = desired_gateway_ingresses(&spec, "prod")
+            .iter()
+            .map(|i| i.metadata.name.clone().expect("name"))
+            .collect();
+        let sweepable = possible_ingest_ingress_names("prod");
+        for name in &renderable {
+            assert!(
+                sweepable.contains(name),
+                "{name} can be rendered but is never swept: {sweepable:?}"
+            );
+        }
+        assert_eq!(sweepable.len(), renderable.len());
+    }
+
+    #[test]
+    fn subset_size_is_configurable_for_a_high_volume_tenant() {
+        // A fixed subset is a throughput ceiling by construction (ADR-0076
+        // decision 1), so the size must scale up.
+        let mut spec = base_spec();
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            subset_size: 6,
+            ..default_affinity()
+        });
+        for ingress in desired_gateway_ingresses(&spec, "prod") {
+            assert_eq!(
+                annotations_of(&ingress)
+                    .get("nginx.ingress.kubernetes.io/upstream-hash-by-subset-size")
+                    .map(String::as_str),
+                Some("6")
+            );
+        }
+    }
+
+    #[test]
+    fn key_sources_render_the_matching_nginx_variable() {
+        let mut spec = base_spec();
+        let hash_by = |spec: &RavelClusterSpec| -> String {
+            annotations_of(&desired_gateway_ingresses(spec, "prod")[0])
+                .get("nginx.ingress.kubernetes.io/upstream-hash-by")
+                .cloned()
+                .expect("upstream-hash-by")
+        };
+
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            key: AffinityKeySpec {
+                source: AffinityKeySource::MtlsSubject,
+                header_name: None,
+            },
+            ..default_affinity()
+        });
+        assert_eq!(hash_by(&spec), "$ssl_client_s_dn");
+
+        // A header name is mangled exactly the way nginx names the variable.
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            key: AffinityKeySpec {
+                source: AffinityKeySource::Header,
+                header_name: Some("X-Scope-OrgID".to_string()),
+            },
+            ..default_affinity()
+        });
+        assert_eq!(hash_by(&spec), "$http_x_scope_orgid");
+
+        // Every character outside [a-z0-9] becomes '_', so no header name can
+        // reach the annotation as nginx syntax. (The CRD's `pattern` rejects
+        // this at admission; the renderer is the second belt.)
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            key: AffinityKeySpec {
+                source: AffinityKeySource::Header,
+                header_name: Some("x; evil $var".to_string()),
+            },
+            ..default_affinity()
+        });
+        let mangled = hash_by(&spec);
+        assert_eq!(mangled, "$http_x__evil__var");
+        assert!(!mangled[1..].contains(['$', ';', ' ']));
+    }
+
+    #[test]
+    fn passthrough_annotations_cannot_disable_the_affinity() {
+        // The extra-annotations map exists for proxy-body-size and other
+        // controllers. It is merged FIRST, so an entry colliding with an
+        // affinity annotation loses rather than silently unpinning every tenant.
+        let mut spec = base_spec();
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            annotations: BTreeMap::from([
+                (
+                    "nginx.ingress.kubernetes.io/proxy-body-size".to_string(),
+                    "16m".to_string(),
+                ),
+                (
+                    "nginx.ingress.kubernetes.io/upstream-hash-by-subset".to_string(),
+                    "false".to_string(),
+                ),
+                (
+                    "nginx.ingress.kubernetes.io/service-upstream".to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+            ..default_affinity()
+        });
+        let annotations = annotations_of(&desired_gateway_ingresses(&spec, "prod")[0]);
+        assert_eq!(
+            annotations
+                .get("nginx.ingress.kubernetes.io/proxy-body-size")
+                .map(String::as_str),
+            Some("16m"),
+            "an unrelated passthrough annotation must survive"
+        );
+        assert_eq!(
+            annotations
+                .get("nginx.ingress.kubernetes.io/upstream-hash-by-subset")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            annotations
+                .get("nginx.ingress.kubernetes.io/service-upstream")
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn no_hosts_renders_one_host_less_rule() {
+        let mut spec = base_spec();
+        spec.gateway.ingest_affinity = Some(default_affinity());
+        let ingress = desired_gateway_ingresses(&spec, "prod").remove(0);
+        let ispec = ingress.spec.as_ref().expect("spec");
+        let rules = ispec.rules.as_ref().expect("rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].host, None);
+        assert_eq!(ispec.tls, None, "no TLS Secret configured renders no tls");
+        assert_eq!(ispec.ingress_class_name, None);
     }
 
     #[test]

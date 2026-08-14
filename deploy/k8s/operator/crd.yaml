@@ -26,7 +26,7 @@
                 "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.",
                 "properties": {
                   "deploymentKeySecretRef": {
-                    "description": "Secret with a single key `key` holding the deployment's 32-byte\ndeployment key (64 hex characters or 32 raw bytes, the same format\n`--tenant-hash-key-file` reads). This one key doubles as the v2-keyed\ntenant-hash key and the `sys/auth` token-hashing key (ADR-0072\ndecision 4): when set, the operator mounts it and renders\n`--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and\nreconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive\nopt-in, not a migration of existing unkeyed clusters (EM-T10 #773 owns\nthat story); omit to keep today's unkeyed behavior unchanged.",
+                    "description": "Secret with a single key `key` holding the deployment's 32-byte\ndeployment key (64 hex characters or 32 raw bytes, the same format\n`--tenant-hash-key-file` reads). This one key doubles as the v2-keyed\ntenant-hash key and the `sys/auth` token-hashing key (ADR-0072\ndecision 4): when set, the operator mounts it and renders\n`--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and\nreconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive\nopt-in, not a migration of existing unkeyed clusters; omit to keep\nunkeyed behavior unchanged.",
                     "nullable": true,
                     "properties": {
                       "name": {
@@ -77,6 +77,85 @@
                           }
                         },
                         "type": "object"
+                      },
+                      "ingestAffinity": {
+                        "description": "Layer-7 ingest affinity (ADR-0076 decision 1). Omit to keep today's\nbehavior exactly: no Ingress is rendered and ingest traffic reaches the\ngateway Service however the platform owner already routes it.\n\nIngest buffers are per `(tenant, signal, shard)` PER REPLICA, so a\ntenant whose writes spray across every gateway replica pays one\nage-triggered flush stream per replica for the same data. Pinning a\ntenant to a stable subset divides that term. Affinity is best-effort:\n`writer_id` and `epoch` already disambiguate concurrent writers in the\nobject key, so a reroute is always correct.",
+                        "nullable": true,
+                        "properties": {
+                          "annotations": {
+                            "additionalProperties": {
+                              "type": "string"
+                            },
+                            "description": "Extra annotations merged onto both rendered Ingress objects, for an\ningress controller other than ingress-nginx or for tuning\n(`nginx.ingress.kubernetes.io/proxy-body-size` is the common one: the\ningress-nginx default of 1m rejects larger OTLP/HTTP payloads).\n\nThe affinity annotations the operator computes are applied AFTER this\nmap, so an entry here can never silently disable the affinity it is\nmeant to configure.",
+                            "type": "object"
+                          },
+                          "enabled": {
+                            "default": true,
+                            "description": "Whether affinity is active. Defaults to true, so declaring the block is\nenough. Set it to false to turn affinity off during an incident without\ndeleting the rest of the configuration; the Ingress objects are then\nremoved and rendering returns to the affinity-absent baseline.",
+                            "type": "boolean"
+                          },
+                          "grpc": {
+                            "default": true,
+                            "description": "Also render a second Ingress for OTLP/gRPC (port 4317) carrying\n`nginx.ingress.kubernetes.io/backend-protocol: GRPC`. Defaults to true:\ngRPC is the main OTLP ingest path, and affinity that covers only\nOTLP/HTTP would miss most of the traffic generating the request bill.\nA separate object is required because `backend-protocol` is per-Ingress.",
+                            "type": "boolean"
+                          },
+                          "hosts": {
+                            "description": "Hostnames the ingest Ingress answers on. Empty renders a single\nhost-less rule, which matches any host reaching the controller.",
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "ingressClassName": {
+                            "description": "`spec.ingressClassName` on the rendered Ingress objects. Omit to let the\ncluster's default IngressClass apply.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "key": {
+                            "default": {
+                              "source": "authorizationHeader"
+                            },
+                            "description": "Where the load balancer reads tenant identity from. Defaults to the\n`Authorization` header, which is what Ravel itself resolves tenancy\nfrom.",
+                            "properties": {
+                              "headerName": {
+                                "description": "Header name when `source` is `header`. Required in that case, enforced\nby a CEL rule on this object (see [`ravel_cluster_crd`]), and\nconstrained to HTTP token characters by an OpenAPI `pattern` so nothing\nuser-supplied can reach the rendered nginx directive as syntax.",
+                                "nullable": true,
+                                "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,62}$",
+                                "type": "string"
+                              },
+                              "source": {
+                                "default": "authorizationHeader",
+                                "description": "The identity source. Defaults to\n[`AffinityKeySource::AuthorizationHeader`].",
+                                "enum": [
+                                  "authorizationHeader",
+                                  "header",
+                                  "mtlsSubject"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "subsetSize": {
+                            "default": 2,
+                            "description": "How many replicas a tenant's traffic is pinned to. Defaults to\n[`DEFAULT_AFFINITY_SUBSET_SIZE`] (two), not one, so a single replica\nloss does not concentrate a tenant on one process.\n\nA subset is a throughput ceiling by construction: a tenant can use at\nmost `subsetSize` gateway replicas no matter how many the Deployment\nruns. Raise it for a high-volume tenant (see\n`docs/guides/ingest-affinity.md`); the request-cost divisor is\n`replicas / subsetSize`.\n\nThis is a per-cluster setting, not per-tenant: ingress-nginx's subset\nsize is one number per Ingress. A tenant needing a materially larger\nsubset than its siblings belongs in its own `RavelCluster`.",
+                            "format": "uint32",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          },
+                          "tlsSecretName": {
+                            "description": "TLS Secret for `spec.tls` on the rendered Ingress objects. Strongly\nrecommended and effectively required for the gRPC Ingress: ingress-nginx\nserves HTTP/2 to clients over TLS, and OTLP/gRPC needs HTTP/2. Tenant\ntokens are bearer tokens, so plaintext ingest exposes them.",
+                            "nullable": true,
+                            "type": "string"
+                          }
+                        },
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "gateway.ingestAffinity.key.headerName is required when key.source is \"header\"",
+                            "rule": "!has(self.key) || !has(self.key.source) || self.key.source != 'header' || (has(self.key.headerName) && self.key.headerName != '')"
+                          }
+                        ]
                       },
                       "replicas": {
                         "default": 1,
