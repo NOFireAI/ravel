@@ -126,7 +126,8 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
     };
     ravel_server::start(
         config,
-        store,
+        store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

@@ -175,7 +175,8 @@ async fn injected_corruption_surfaces_on_metrics_through_the_real_scrub_task() {
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
     let running = ravel_server::start(
         maintain_config(Mode::Maintain, &tenant),
-        store_dyn,
+        store_dyn.clone(),
+        store_dyn.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )
@@ -340,7 +341,8 @@ async fn seal_divergence_surfaces_on_metrics_through_the_real_scrub_task() {
 
     let running = ravel_server::start(
         maintain_config(Mode::Maintain, &tenant),
-        store_dyn,
+        store_dyn.clone(),
+        store_dyn.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )
@@ -475,7 +477,8 @@ async fn postings_disagreement_surfaces_on_metrics_through_the_real_scrub_task()
 
     let running = ravel_server::start(
         maintain_config(Mode::Maintain, &tenant),
-        store_dyn,
+        store_dyn.clone(),
+        store_dyn.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )
@@ -529,7 +532,8 @@ async fn scrub_family_present_only_in_maintain_mode() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let running = ravel_server::start(
             maintain_config(mode, &tenant),
-            store,
+            store.clone(),
+            store.clone(),
             Arc::new(ravel_object_store::StoreMetrics::default()),
             None,
         )

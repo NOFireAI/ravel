@@ -231,7 +231,8 @@ async fn start_server_with_query_cap(
     };
     ravel_server::start(
         config,
-        store,
+        store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

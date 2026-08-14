@@ -62,8 +62,21 @@ async fn main() -> anyhow::Result<()> {
     // here, before any tenant is hashed, because the tenancy scheme is resolved
     // from `sys/tenancy` on this store and must be installed before the first
     // `TenantId::hash()` (which `merge_fold_tenants` below performs).
-    let (store, store_metrics, cache, tenant_kms) =
-        ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
+    // `store` is the foreground handle; the startup gates below (qualification,
+    // bucket protection, tenancy pinning, provisioning validation, GC bootstrap,
+    // tenant-KMS configuration) all run once before any listener binds and use
+    // it. `store_background` is the maintenance-class handle threaded into
+    // `start` alongside it. In the default passthrough construction the two are
+    // the same `Arc`, so this is a no-op split until `--store-scheduling` is set
+    // (ADR-0070).
+    let ravel_server::store::BuiltStore {
+        foreground: store,
+        background: store_background,
+        metrics: store_metrics,
+        cache,
+        kms: tenant_kms,
+        classed: _classed,
+    } = ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
 
     // Store-backend qualification gate (ADR-0050 section 6, EC7). On any
     // production store kind, refuse to start unless a `sys/qualification` record
@@ -435,7 +448,8 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to resolve --remote-cluster settings")?,
     };
 
-    let running = ravel_server::start(config, store, store_metrics, cache).await?;
+    let running =
+        ravel_server::start(config, store, store_background, store_metrics, cache).await?;
     tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
     if cfg!(feature = "flight-sql") {
         tracing::info!(

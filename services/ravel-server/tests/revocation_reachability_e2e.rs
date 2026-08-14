@@ -90,7 +90,8 @@ async fn start_keyed_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server:
     };
     ravel_server::start(
         config,
-        store,
+        store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

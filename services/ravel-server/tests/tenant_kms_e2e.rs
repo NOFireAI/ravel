@@ -385,8 +385,11 @@ async fn tenant_kms_config_routes_each_tenants_puts_to_its_own_key() {
     );
     assert_eq!(cli.store, StoreKind::S3);
 
-    let (store, _metrics, _cache, kms) =
-        build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    let ravel_server::store::BuiltStore {
+        foreground: store,
+        kms,
+        ..
+    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
     let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
 
     let tenant_kms_config = cli
@@ -488,8 +491,11 @@ async fn s3_kms_key_applies_to_every_put_with_no_tenant_kms_config() {
     let cli = s3_cli_with_single_kms_key(&mock.base_url, key);
     assert_eq!(cli.store, StoreKind::S3);
 
-    let (store, _metrics, _cache, kms) =
-        build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    let ravel_server::store::BuiltStore {
+        foreground: store,
+        kms,
+        ..
+    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
     assert!(
         kms.is_none(),
         "--s3-kms-key alone must not construct a KmsRoutingStore; it is a plain S3Config field"
@@ -518,8 +524,11 @@ async fn no_tenant_kms_config_routes_no_puts_through_any_kms_key() {
     let mock = MockS3Server::start().await;
     let cli = s3_cli(&mock.base_url, None);
 
-    let (store, _metrics, _cache, kms) =
-        build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    let ravel_server::store::BuiltStore {
+        foreground: store,
+        kms,
+        ..
+    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
     assert!(
         kms.is_none(),
         "without --tenant-kms-config, build_store must not construct a KmsRoutingStore"

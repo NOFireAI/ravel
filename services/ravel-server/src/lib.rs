@@ -510,9 +510,23 @@ fn remote_write_state(
 
 /// Binds both listeners (as configured by `mode`) and starts serving in the
 /// background. Returns immediately; call [`Running::shutdown`] to stop.
+///
+/// `store` is the foreground, ack-bearing object-store handle (ADR-0070
+/// decision 1): the ingest routers, the catalog, and every query surface use
+/// it. `store_background` is the maintenance-class handle: the maintain, fold,
+/// and scrub loops use it. The two come from a `ClassedStore`; in the default
+/// passthrough construction they are the same `Arc`, so this split changes
+/// nothing at runtime and only becomes load-bearing once `--store-scheduling`
+/// installs the real scheduler. Every other object-store consumer here (the
+/// off-request-path control loops -- store probe, admission reconcilers,
+/// lifecycle refresh, the query-worker heartbeat -- and the alert evaluator)
+/// stays on the foreground handle: ADR-0070 classes only the ingest/query/
+/// catalog foreground and the maintain/fold/sweep/scrub/audit background, and
+/// in passthrough the choice is immaterial regardless.
 pub async fn start(
     mut config: ServerConfig,
     store: Arc<dyn ObjectStoreBackend>,
+    store_background: Arc<dyn ObjectStoreBackend>,
     store_metrics: Arc<StoreMetrics>,
     cache: Option<Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>>,
 ) -> anyhow::Result<Running> {
@@ -1157,7 +1171,9 @@ pub async fn start(
         // binds, rather than letting the sweeper delete a pinned reader's
         // snapshot.
         let maintenance_tasks = maintain::spawn(
-            store.clone(),
+            // Background class (ADR-0070): compaction, retention sweep, and
+            // audit retention all run under the maintenance handle.
+            store_background.clone(),
             config.fold_tenants.clone(),
             config.maintain.clone(),
             config.gc,
@@ -1173,7 +1189,13 @@ pub async fn start(
         })?;
         (fold::FoldTasks::none(), maintenance_tasks)
     } else {
-        let fold_tasks = fold::spawn(catalog, store.clone(), &config.fold_tenants, config.fold);
+        // Background class (ADR-0070): fold is deferred maintenance traffic.
+        let fold_tasks = fold::spawn(
+            catalog,
+            store_background.clone(),
+            &config.fold_tenants,
+            config.fold,
+        );
         (fold_tasks, maintain::MaintenanceTasks::none())
     };
 
@@ -1479,7 +1501,9 @@ pub async fn start(
     // N-replica Maintain role (a benign racing overwrite, not a hazard).
     let scrub_task = match (matches!(config.mode, Mode::Maintain), &scrub_metrics) {
         (true, Some(metrics)) => scrub::spawn(
-            store.clone(),
+            // Background class (ADR-0070): at-rest scrubbing is the same
+            // deferred class as compaction/retention/sweep.
+            store_background.clone(),
             config.fold_tenants.clone(),
             config.scrub_period,
             config.shard_count,

@@ -145,7 +145,8 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
     };
     ravel_server::start(
         config,
-        store,
+        store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

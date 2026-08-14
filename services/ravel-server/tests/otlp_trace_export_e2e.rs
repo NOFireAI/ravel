@@ -303,6 +303,7 @@ async fn sql_query_span_is_exported_to_the_configured_collector() {
     let running = ravel_server::start(
         server_config(tokens),
         store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

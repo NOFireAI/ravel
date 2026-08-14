@@ -89,7 +89,8 @@ async fn start_test_server() -> ravel_server::Running {
     };
     ravel_server::start(
         config,
-        store,
+        store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

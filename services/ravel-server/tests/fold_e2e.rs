@@ -380,7 +380,8 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
     };
     let running = ravel_server::start(
         config,
-        store_dyn,
+        store_dyn.clone(),
+        store_dyn.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )
@@ -516,7 +517,8 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
     };
     let running = ravel_server::start(
         config,
-        store_dyn,
+        store_dyn.clone(),
+        store_dyn.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )
