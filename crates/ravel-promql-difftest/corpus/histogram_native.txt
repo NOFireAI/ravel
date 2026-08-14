@@ -122,6 +122,23 @@ mode: unordered
 # of the 30s dataset step, so every grid point lands on a real sample, and
 # 0.99 exercises the interior-bucket exponential interpolation the #252 median
 # entry above already pins.
+#
+# ADR-0025 allowlist (backend libm residue, not a Ravel bug): the interior
+# of a native-histogram bucket is interpolated exponentially,
+# `lower * (upper/lower).powf(within)` (histogram.rs interpolate_value).
+# Rust's libm `powf` and Go's `math.Pow` round this last-place differently,
+# so two of the six grid points drift from the pinned Prometheus v3.13.1
+# binary while the other four stay bit-exact. This is purely a range-mode
+# artifact of which p99 values 0.99 lands on, NOT a range-vs-instant
+# divergence: the range path (functions/mod.rs HistogramQuantile arm) runs
+# the identical scalar_arg/vector_arg/interpolate_value computation the
+# instant path runs at the same timestamp, verified bit-exact by the
+# range_and_instant_histogram_quantile_agree_bit_exact unit test in
+# ravel-promql. Measured worst case 2 ULP (ts 1700000360:
+# 7.670022283899527 vs 7.670022283899526; ts 1700000420 is 1 ULP), computed
+# with f64::to_bits from this branch's promql-difftest CI run
+# (actions/runs/31840882889). tolerance: 4 is the next power of two above
+# the 2-ULP worst case, matching the exponential-interpolation drift bound.
 name: native_histogram_quantile_p99_range_grafana
 query: histogram_quantile(0.99, diff_native_hist)
 kind: range
@@ -129,6 +146,7 @@ start: +300s
 end: +600s
 step: 60s
 mode: unordered
+tolerance: 4
 
 name: native_histogram_fraction_range
 query: histogram_fraction(0, 4, diff_native_hist)

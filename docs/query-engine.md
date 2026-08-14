@@ -909,7 +909,7 @@ Surface: 131 constructs over 218 corpus entries in 10 corpus files.
 | `timestamp` | function | supported | `corpus/transform.txt`, 2 entries |
 | `vector` | function | supported | `corpus/transform.txt`, 6 entries |
 | `year` | function | supported | `corpus/transform.txt`, 1 entry |
-| float-precision residue (ULP tolerance) | accepted divergence | accepted divergence | ADR-0025, 10 corpus entries; arithmetic and transcendental residue between two independent implementations of the same formula; each entry carries a written justification for its tolerance in the corpus file |
+| float-precision residue (ULP tolerance) | accepted divergence | accepted divergence | ADR-0025, 11 corpus entries; arithmetic and transcendental residue between two independent implementations of the same formula; each entry carries a written justification for its tolerance in the corpus file |
 | subquery per-node point cap | accepted divergence | accepted divergence | ADR-0030, 2 corpus entries; Ravel's per-subquery-node 11,000-point budget has no Prometheus counterpart, so Ravel rejects by design where Prometheus accepts; the comparator asserts exactly that shape |
 <!-- END GENERATED PROMQL CONFORMANCE TABLE -->
 

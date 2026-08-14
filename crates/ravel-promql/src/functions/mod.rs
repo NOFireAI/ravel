@@ -820,10 +820,90 @@ fn apply_reduce(
 #[allow(clippy::expect_used)]
 mod tests {
     use crate::eval::Evaluator;
+    use crate::histogram::{FloatHistogram, ResetHint, Span};
     use crate::testsource::TestSource;
 
     fn ms_ns(ms: i64) -> i64 {
         ms * 1_000_000
+    }
+
+    /// The `diff_native_hist` counter sample at difftest sample index `i`
+    /// (generator.rs `native_histogram_families`): schema 0, three positive
+    /// buckets from index 1 (`[2*step, 3*step, step]`, `step = i + 1`), zero
+    /// bucket populated. Reproduced here so this crate can pin the range path
+    /// against the instant path without depending on ravel-promql-difftest.
+    fn diff_native_hist(i: usize) -> FloatHistogram {
+        let step = (i + 1) as f64;
+        let positive_buckets = vec![2.0 * step, 3.0 * step, step];
+        let bucket_total: f64 = positive_buckets.iter().sum();
+        FloatHistogram {
+            counter_reset_hint: if i > 0 {
+                ResetHint::No
+            } else {
+                ResetHint::Unknown
+            },
+            scale: 0,
+            zero_threshold: 1e-9,
+            zero_count: 1.0,
+            count: bucket_total + 1.0,
+            sum: positive_buckets
+                .iter()
+                .enumerate()
+                .map(|(b, &c)| c * 2f64.powi(b as i32))
+                .sum(),
+            positive_spans: vec![Span {
+                offset: 1,
+                length: 3,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets,
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn range_and_instant_histogram_quantile_agree_bit_exact() {
+        // The range-query top-level `histogram_quantile` arm routes through
+        // `eval_instant_over_grid`, running the identical
+        // scalar_arg/vector_arg/interpolate_value computation the instant arm
+        // runs at the same timestamp. This pins that they produce bit-exact
+        // f64s, so the promql-difftest p99 corpus entry's residual drift from
+        // Prometheus is purely backend libm (`powf` vs Go `math.Pow`) and not
+        // a range-vs-instant divergence introduced by the shared helper. The
+        // +360s and +420s grid points are the two the CI difftest flagged as
+        // 1-2 ULP off Prometheus; every point here must be Ravel-self-exact.
+        let samples: Vec<(i64, FloatHistogram)> = (0..=20)
+            .map(|i| (ms_ns(i as i64 * 30_000), diff_native_hist(i as usize)))
+            .collect();
+        let source = TestSource::new()
+            .with_histogram_series(&[("__name__", "diff_native_hist")], &samples)
+            .expect("valid histogram series");
+
+        let range = Evaluator::new()
+            .range(
+                &source,
+                "histogram_quantile(0.99, diff_native_hist)",
+                300_000,
+                600_000,
+                60_000,
+            )
+            .expect("range evaluates");
+        assert_eq!(range.len(), 1, "one series");
+        let range_samples = &range[0].1;
+
+        for s in range_samples {
+            let ts_ms = s.ts_ns / 1_000_000;
+            let instant = Evaluator::new()
+                .instant(&source, "histogram_quantile(0.99, diff_native_hist)", ts_ms)
+                .expect("instant evaluates");
+            assert_eq!(instant.len(), 1, "one instant sample at {ts_ms}ms");
+            assert_eq!(
+                instant[0].value.to_bits(),
+                s.value.to_bits(),
+                "range and instant histogram_quantile must be bit-exact at {ts_ms}ms",
+            );
+        }
     }
 
     #[test]
