@@ -138,3 +138,179 @@ evaluator scheduler mirrors, not a new scheduling mechanism.
 - Alerts-on-alerts is real but bounded by `max_alert_generation`; an
   operator who needs deeper chains adjusts the config knob, but the
   default protects against an accidental infinite loop from day one.
+
+## Amendment: repeat notifications while firing
+
+Decisions 4 and 6, combined, notify exactly once per transition: a rule
+that starts firing and stays firing sends one notification and then
+nothing for as long as the condition holds. Alertmanager auto-resolves
+any alert it has not heard about within `resolve_timeout` (default 5
+minutes), so at default configuration every persistently firing alert
+produces a false all-clear to on-call while the problem continues. That
+is worse than no alerting. (Epic #1052 finding G-2, risk R3: P1, high
+likelihood.)
+
+The gap is in delivery cadence, not in the data model. Decision 4 is
+correct and unchanged: the durable record is state, and "still firing"
+is a fold, not a heartbeat. What was missing is that a notification is
+not a record, so re-sending one needs no new durable write. The re-send
+mechanism itself already exists: `bootstrap_undelivered` re-notifies
+from the folded latest record on a non-transition tick after a restart.
+This amendment gives that mechanism a cadence.
+
+### Decision
+
+1. **A repeat pass runs on every evaluation tick**, after rule
+   evaluation, on the lease-holding replica only (the same gate as rule
+   evaluation; `flush_sinks` still runs everywhere). For each configured
+   rule whose folded latest record is `Firing`, it computes elapsed time
+   since that record's own durable timestamp and the repeat window index
+
+       k = (now_ns - record.ts_ns) / repeat_interval
+
+   (integer division, clamped to zero if the clock stepped backward,
+   matching the existing pending-duration clamp). When `k >= 1` and no
+   notification has been handed to the sinks for window `k` yet, the
+   alert is queued into the existing `undelivered` map and delivered by
+   the existing `flush_sinks` path. **No durable record is written for a
+   repeat.** Decision 4 stands verbatim.
+
+2. **The schedule is derived from durable state plus the clock, never
+   stored.** The anchor is `record.ts_ns` of the firing transition
+   record, which survives any restart by construction (decision 3). The
+   only in-memory addition is a per-alert mark of
+   `(anchor_ts_ns, window)` for the last window a notification was
+   queued in; a mark whose anchor differs from the current firing
+   record's `ts_ns` is stale and ignored, so a resolve-then-refire
+   cycle re-anchors cleanly instead of inheriting the old episode's
+   window count and staying silent. The mark is a duplicate
+   suppressor, not the schedule: losing it (restart, lease failover)
+   costs at most one extra send, which the at-least-once contract of
+   decision 6 already permits, and can never cause silence, because a
+   fresh process re-derives `k` from the record and
+   `bootstrap_undelivered` queues one delivery immediately anyway. A
+   delivery failure needs no window bookkeeping either: the entry stays
+   in `undelivered` and retries next tick, exactly as transitions do
+   today.
+
+3. **`repeat_interval` is a per-rule field on the rule definition**
+   (`Rule` in `crates/ravel-alerting/src/rule.rs`, and a humantime
+   string in the rules-file `RuleSpec`, like `for`). Absent means the
+   default, `DEFAULT_REPEAT_INTERVAL = 1m` - the same default as
+   Prometheus's `--rules.alert.resend-delay`, giving several sends
+   inside Alertmanager's default 5-minute `resolve_timeout` so a few
+   missed ticks cannot false-clear. An explicit `0s` disables repeats
+   for that rule (for a webhook consumer that opens a ticket per POST).
+   Validation stays at the parse layer: an unparseable duration rejects
+   the rules file at startup, as `for` already does; zero is legal, so
+   `Rule::validate` gains no new constraint. The effective cadence is
+   `repeat_interval` rounded up to the next tick; the evaluator logs a
+   warning at spawn for a rule whose `repeat_interval` is shorter than
+   `--alert-eval-interval-secs`, since the tick then bounds the cadence.
+   There is deliberately no server-wide flag (see rejected
+   alternatives).
+
+4. **Only `Firing` repeats.** `Pending` does not (the Alertmanager
+   payload is already `None` for pending, and `for` exists precisely to
+   keep pending quiet); `Resolved` and `Suppressed` are terminal or
+   intentional silence. An alert whose rule has been removed from the
+   config never repeats, so Alertmanager auto-resolves it after
+   `resolve_timeout` - the correct end for an orphaned alert, and the
+   same outcome Prometheus produces for a deleted rule.
+
+5. **Repeat-send and bootstrap-redelivery share the delivery path and
+   stay two triggers.** Both build an `AlertNotification` from the
+   folded latest record and feed the same `undelivered` map and
+   `flush_sinks` drain; that shared queue is the generalization that
+   matters. The triggers differ on every axis and are not merged:
+   bootstrap runs once per process, unguarded by the lease (it recovers
+   this process's own possibly-lost in-flight notifications), and covers
+   `Pending` too; the repeat pass runs every tick, lease-gated, `Firing`
+   only. On a restart mid-episode they compose instead of doubling: the
+   `undelivered` map is keyed by `alert_id`, and the bootstrap send
+   counts as the current window's send.
+
+6. **No payload change.** Verified against
+   `services/ravel-server/src/alert_sink.rs`: `alertmanager_payload`
+   already emits `startsAt` and omits `endsAt` for a `Firing` record,
+   which is exactly the shape of a Prometheus re-send, and Alertmanager
+   identity is the label set, so a re-POST simply refreshes its timer.
+   The webhook body shape is also unchanged; a repeat sets
+   `previous_state` equal to `state` (firing to firing is the truthful
+   description of a non-transition send), so an idempotent consumer can
+   discard repeats on one comparison. One documented approximation: a
+   repeat built from the folded latest record alone reports
+   `started_at_ns` as the firing record's `ts_ns`, which for an episode
+   with a pending phase is slightly later than the original
+   notification's - the same single-step-fold approximation
+   `bootstrap_undelivered` already carries, and cosmetic only, since
+   Alertmanager keys on labels, not `startsAt`.
+
+### Tick flow
+
+```mermaid
+flowchart TB
+    T[Tick] --> F["Fold: load_latest_records\n(latest durable record per alert_id)"]
+    F --> B["bootstrap_undelivered\n(first tick only: queue live episodes)"]
+    B --> L{Lease held?}
+    L -- no --> D
+    L -- yes --> E["evaluate_rule per rule"]
+    E -- "state transition" --> W["Write durable record\n(decision 4, unchanged)"]
+    W --> Q["queue AlertNotification\nin undelivered"]
+    E -- "no transition:\nno write, fall through" --> RP
+    Q --> RP["repeat pass, per configured rule:\nfolded state Firing?\nk = (now - record.ts_ns) / repeat_interval\nk >= 1 and window k unsent?"]
+    RP -- "due" --> R["queue repeat in undelivered\nNO durable write"]
+    RP -- "not due" --> D
+    R --> D["flush_sinks: drain undelivered\nto every sink, at-least-once"]
+    D --> S["webhook / Alertmanager\nPOST /api/v2/alerts"]
+```
+
+### Rejected alternatives
+
+- **A durable record per repeat (or per tick).** The per-tick variant is
+  the heartbeat model this ADR already rejected. The lighter
+  one-record-per-repeat variant still writes an object per firing alert
+  per minute at the default cadence, multiplying storage, compaction,
+  and audit-log noise in proportion to how long an incident runs -
+  precisely when the system is under stress - and what it buys is
+  duplicate suppression that idempotent sinks (decision 6's stated
+  contract) do not need. The record is state, not a delivery log;
+  decision 6 already established that the sink is a notification, not a
+  second commit path.
+- **A server-wide `--alert-repeat-interval-secs` flag.** Cadence is a
+  property of the rule and its consumers: a page-out rule wants a
+  1-minute keepalive, a ticket-per-POST webhook wants none, and one
+  global knob forces the noisiest rule's needs onto every rule. It also
+  parts company with the rules-file layout decision 2 chose, where
+  everything rule-shaped lives on the rule. Tactically, it would also
+  land in `services/ravel-server/src/config.rs`, which has concurrent
+  in-flight work this session - a guaranteed conflict for no semantic
+  gain.
+- **An in-memory-only timer** ("remember when we last notified, re-send
+  when older than the interval"). Rejected for the same reason as the
+  original in-memory pending-state alternative: it violates decision 3,
+  and here the failure mode is the exact defect this amendment closes.
+  A restart mid-episode resets the timer, so the first repeat arrives a
+  full interval after the restart at best; a process restarting more
+  often than `repeat_interval` - a crash loop, rolling deploys, spot
+  reclaim, all normal for compute Ravel declares disposable - never
+  crosses its timer at all, Alertmanager hits `resolve_timeout`, and
+  on-call gets the false all-clear back. Anchoring the schedule to
+  `record.ts_ns` makes the worst restart cost one duplicate
+  notification, never one silence.
+
+### Consequences
+
+- Closes #1052 G-2 / risk R3. The interim mitigation (raising
+  `resolve_timeout` per deployment) is no longer required.
+- The acceptance proof is the epic's exit criterion verbatim: a test
+  that holds a rule firing across injected-clock advances spanning more
+  than one default `resolve_timeout` and asserts the notification count
+  grows, plus a restart-mid-episode test asserting repeats resume on
+  the schedule derived from the durable record.
+- `docs/architecture.md`'s alerting section gains one sentence on
+  repeat cadence in the same commit that implements it.
+- The rules file grows an optional field; existing files parse
+  unchanged and silently gain the 1-minute default, which is the point:
+  the safe behavior must be the default, because R3's likelihood was
+  rated high specifically at default configuration.
