@@ -442,8 +442,7 @@ async fn assert_mandatory_capabilities(store: &dyn ObjectStoreBackend, prefix: &
     assert_eq!(
         store.capabilities(),
         s3_expected_capabilities(),
-        "declared capabilities must be exactly the mandatory set plus multipart \
-         (issues #251, #243)"
+        "declared capabilities must be exactly the mandatory set plus multipart"
     );
     // The behavior behind the flag still has to hold: the local CRC32C
     // pre-flight rejects a mismatch without creating the object.
@@ -1118,7 +1117,7 @@ fn s3_store_reports_upload_checksum_unsupported() {
         store.capabilities(),
         s3_expected_capabilities(),
         "S3Store must report exactly the mandatory set plus multipart, so the \
-         server's startup gate accepts --store s3 in every mode (#251, #243)"
+         server's startup gate accepts --store s3 in every mode"
     );
 }
 
