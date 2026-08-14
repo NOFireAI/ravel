@@ -1,8 +1,4 @@
-//! OTAP decode CPU and allocation bench (issue #18, A2). No otap bench
-//! workload existed in this repo before this ticket (see the final report
-//! for that gap against the task's "existing bench workloads" premise); this
-//! is the first one, so before/after is reported here rather than as a diff
-//! against a prior run.
+//! OTAP decode CPU and allocation bench.
 //!
 //! Reports two things per batch:
 //! - wall-clock decode throughput, via the criterion group below.
@@ -11,9 +7,8 @@
 //!   everywhere including benches, so allocation counting must go through a
 //!   dependency that owns the `unsafe impl GlobalAlloc` itself), plus the
 //!   observed zero-copy vs copy-fallback frame split from
-//!   `StreamState::decode_stats` (docs/arrow-datafusion-plan.md ticket A2:
-//!   the win is producer-alignment-dependent and must be measured, never
-//!   assumed).
+//!   `StreamState::decode_stats` (the win is producer-alignment-dependent and
+//!   must be measured, never assumed).
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::alloc::System;

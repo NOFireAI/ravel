@@ -6,9 +6,6 @@
 //! results depend on the machine they run on. Run with:
 //!
 //!   cargo test -p ravel-otap --test measurement -- --ignored --nocapture
-//!
-//! Results are reported in the task's final report only, per instructions
-//! (no BENCHMARKS.md edits).
 
 use std::time::Instant;
 

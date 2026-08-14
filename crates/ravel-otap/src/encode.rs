@@ -51,7 +51,7 @@
 //! All `id`/`parent_id` columns are emitted as plain absolute values (no
 //! delta or quasi-delta transport encoding, see otap-spec.md section 6.4):
 //! `StreamState` does not decode those transforms, so encoding otherwise
-//! would produce data Part 1 cannot round-trip. Every such column carries
+//! would produce data the decoder cannot round-trip. Every such column carries
 //! field metadata `("encoding", "plain")` to say so explicitly on the wire,
 //! matching the spec's own vocabulary for the encodings it allows.
 //!
@@ -113,7 +113,7 @@ pub struct AttrRow {
 /// One data point on a metric. Each entry in `exemplars` becomes one
 /// `NUMBER_DP_EXEMPLARS` row joined to this point by `parent_id`, and its
 /// `attrs` become `NUMBER_DP_EXEMPLAR_ATTRS` rows joined to that exemplar's
-/// own `id`, the same two-table shape the histogram side uses (issue #539).
+/// own `id`, the same two-table shape the histogram side uses.
 pub struct DataPointRow {
     pub time_unix_nano: i64,
     pub value: f64,

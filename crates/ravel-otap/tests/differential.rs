@@ -91,8 +91,9 @@ fn attr_key_strategy() -> impl Strategy<Value = String> {
     // The over-long key (> max_label_name_len = 256) drives the per-label
     // LabelNameTooLong rejection. Combined with the over-long value below and
     // the arbitrary attribute order proptest already produces, this reaches
-    // a9-F01 mechanism b: a point with a name violator and a value violator
-    // whose input order differs from key-sorted order. Its sort key ("k"...)
+    // the ordering-sensitive rejection case: a point with a name violator and
+    // a value violator whose input order differs from key-sorted order. Its
+    // sort key ("k"...)
     // orders it against the short keys so input vs sorted order can diverge.
     prop_oneof![
         8 => prop_oneof![
@@ -107,7 +108,7 @@ fn attr_key_strategy() -> impl Strategy<Value = String> {
 
 fn attr_value_strategy() -> impl Strategy<Value = WorkloadValue> {
     // The over-long string value (> max_label_value_len = 4096) drives the
-    // per-label LabelValueTooLong rejection (a9-F01 mechanism b).
+    // per-label LabelValueTooLong rejection.
     prop_oneof![
         8 => "[a-z]{1,8}".prop_map(WorkloadValue::Str),
         1 => any::<bool>().prop_map(WorkloadValue::Bool),
@@ -122,7 +123,8 @@ fn metric_name_strategy() -> impl Strategy<Value = String> {
     // empty name (EmptyMetricName) and the over-long name (> the 512-byte
     // max_metric_name_len, MetricNameTooLong). Paired with the Sum temporality
     // strategy below, an empty or over-long name on a delta Sum is exactly
-    // a9-F01 mechanism a: the name must be classed before temporality.
+    // the name-before-temporality rule: the name must be classed before
+    // temporality.
     prop_oneof![
         6 => "[a-z]{3,10}".prop_map(String::from),
         1 => Just(String::new()),
@@ -515,7 +517,7 @@ fn complex_attribute_value_rejected_on_both_paths() {
     assert_eq!(otap_out.rejected, vec![Rejection::ComplexAttributeValue]);
 }
 
-/// Issue #232: all three non-scalar AnyValue `type` slots -- map (5), slice
+/// All three non-scalar AnyValue `type` slots -- map (5), slice
 /// (6), and bytes (7) per otap-spec.md section 5.5.1 -- must survive
 /// encode-then-decode and land on the normalizer's `ComplexAttributeValue`
 /// rejection path. This pins the spec-aligned discriminant values: an
@@ -1331,18 +1333,16 @@ fn summary_stale_marker_agrees() {
     }]);
 }
 
-/// docs/ingest-breadth-plan.md section 4.1's CH-1 cross-protocol identity
-/// vector, adapted to a shape both paths can actually produce: the plan's
-/// vector maps `job`/`instance` through resource attributes, but the OTAP
-/// encoder never emits `RESOURCE_ATTRS` (documented scope gap, see
-/// src/normalize.rs's module docs) and its `MetricRow` shape has no
-/// resource field to carry them. Passing `job`/`instance` as plain
-/// data-point attributes instead is a valid input on both paths and still
-/// exercises everything CH-1 is actually checking here: bucket
-/// accumulation, `le`/`quantile` float formatting, and SeriesId agreement
-/// for the exact bounds/counts/sum/count the plan specifies.
+/// Cross-protocol identity vector for histogram bucket shape, in a form both
+/// paths can actually produce: `job`/`instance` pass as plain data-point
+/// attributes rather than resource attributes, because the OTAP encoder never
+/// emits `RESOURCE_ATTRS` (documented scope gap, see src/normalize.rs's module
+/// docs) and its `MetricRow` shape has no resource field to carry them. This
+/// still exercises everything the vector checks: bucket accumulation,
+/// `le`/`quantile` float formatting, and SeriesId agreement for the exact
+/// bounds/counts/sum/count.
 #[test]
-fn ch1_histogram_bucket_shape_identity_vector_agrees() {
+fn histogram_bucket_shape_identity_vector_agrees() {
     let point = WorkloadHistogramPoint {
         ts_offset_ns: 0,
         count: 10,
@@ -1415,7 +1415,7 @@ fn ch1_histogram_bucket_shape_identity_vector_agrees() {
     assert_eq!(otlp_out.points.len(), 6, "expected 4 buckets + sum + count");
 }
 
-// --- NUMBER_DATA_POINTS int_value fallback (issue #206) -------------------
+// --- NUMBER_DATA_POINTS int_value fallback ---------------------------------
 //
 // `MetricsStreamEncoder` never emits `int_value` (see encode.rs's module
 // docs), so exercising it takes a hand-built `RecordBatch` fed straight into
@@ -1597,7 +1597,7 @@ fn number_data_point_null_double_value_falls_back_to_int_value() {
     );
 }
 
-// --- Issue #205: DELTA-decode id/parent_id columns (otap-spec.md section
+// --- DELTA-decode id/parent_id columns (otap-spec.md section
 // 6.4.2). These hand-build every payload `RecordBatch` (rather than going
 // through `MetricsStreamEncoder`, which always tags its own `id`/
 // `parent_id` columns `encoding=plain`) so the encoded column and the
@@ -1693,7 +1693,7 @@ fn number_dp_batch(
 /// A `NUMBER_DP_ATTRS` batch with one string attribute per row. `parent_ids`
 /// must be the *decoded* `NUMBER_DATA_POINTS.id` values. This batch declares
 /// no `encoding` on its `parent_id` column, so it takes the QUASI-DELTA
-/// default (otap-spec.md section 6.4.3, decoded since #226); because the two
+/// default (otap-spec.md section 6.4.3); because the two
 /// rows carry different `str` values they never match as equality columns and
 /// each decodes to its own absolute value, so the literal `parent_ids` here
 /// are exactly what QUASI-DELTA yields. See the dedicated QUASI-DELTA tests
@@ -1891,11 +1891,12 @@ fn number_data_points_unrecognized_id_encoding_declaration_is_rejected() {
     );
 }
 
-// --- Issue #226: QUASI-DELTA-decode the `parent_id` column of the `*Attrs`
-// and `*DpExemplars` tables (otap-spec.md section 6.4.3), the gap #205 left
-// open. These, like the #205 tests above, hand-build every payload
-// `RecordBatch` so the encoded column and the decoded value can differ, the
-// only way to observe that decoding actually happened. ---
+// --- QUASI-DELTA-decode the `parent_id` column of the `*Attrs`
+// and `*DpExemplars` tables (otap-spec.md section 6.4.3), which the core
+// id/parent_id DELTA decoding does not cover. These, like the DELTA tests
+// above, hand-build every payload `RecordBatch` so the encoded column and the
+// decoded value can differ, the only way to observe that decoding actually
+// happened. ---
 
 /// A single-metric `UNIVARIATE_METRICS` batch (`id` plain) for one gauge.
 fn single_gauge_root(name: &str) -> RecordBatch {
@@ -2139,7 +2140,7 @@ fn attrs_quasi_delta_parent_id_decodes_to_literal_values() {
     assert_eq!(by_value[&40.0f64.to_bits()].as_deref(), Some("eu"));
 }
 
-/// Issue #233: a null `type` discriminant in a `*Attrs` batch (validity bit
+/// A null `type` discriminant in a `*Attrs` batch (validity bit
 /// unset) must be treated as out of contract, never read from whatever byte the
 /// buffer still holds. An adversarial producer can mark a row's `type` null
 /// while leaving a scalar-type byte (here `ANY_VALUE_TYPE_STRING`) in the
@@ -2169,7 +2170,7 @@ fn attrs_null_type_discriminant_reads_absolute_not_run_continuation() {
     let dp = plain_number_dp_batch(&[0, 2], 0, &[10.0, 20.0], &[INGEST_TS_NS, INGEST_TS_NS + 1]);
 
     // The `type` column: buffer holds a scalar `STRING` byte on every row, but
-    // row 1's validity bit is unset (null), the adversarial shape #233 guards.
+    // row 1's validity bit is unset (null), the adversarial shape this guards.
     let type_values = ScalarBuffer::<u8>::from(vec![
         ANY_VALUE_TYPE_STRING,
         ANY_VALUE_TYPE_STRING,
@@ -2265,7 +2266,7 @@ fn exemplars_quasi_delta_parent_id_decodes_to_literal_values() {
 }
 
 /// A single batch mixing all three encodings proves QUASI-DELTA attrs
-/// decoding does not regress the DELTA id/parent decoding #205 added: the
+/// decoding does not regress the DELTA id/parent decoding: the
 /// root ids and the data-point id/parent_id ride DELTA while the attrs
 /// `parent_id` rides QUASI-DELTA (a matching `region` run that accumulates
 /// `[5, 1]` -> `[5, 6]`), and the whole thing must still agree with the OTLP

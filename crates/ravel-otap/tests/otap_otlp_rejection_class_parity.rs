@@ -53,10 +53,10 @@ fn otlp_reject(req: ExportMetricsServiceRequest) -> NormalizeOutput {
     normalize_metrics(&tenant, req, &limits, TS)
 }
 
-/// a9-F01 mechanism a: a delta Sum with an empty metric name. OTLP checks the
-/// name before temporality (EmptyMetricName); before the fix OTAP checked
-/// temporality first (UnsupportedTemporality). Both paths must now class it
-/// as EmptyMetricName.
+/// A delta Sum with an empty metric name. OTLP checks the name before
+/// temporality (EmptyMetricName); OTAP must class it the same way rather than
+/// checking temporality first (UnsupportedTemporality). Both paths class it as
+/// EmptyMetricName.
 #[test]
 fn delta_sum_empty_name_rejection_classes_agree() {
     let otlp = otlp_reject(ExportMetricsServiceRequest {
@@ -104,11 +104,11 @@ fn delta_sum_empty_name_rejection_classes_agree() {
     );
 }
 
-/// a9-F01 mechanism b: a point with two length-violating attributes whose
-/// input order differs from key-sorted order. OTLP checks attributes in input
-/// order (first violation wins: LabelValueTooLong); before the fix OTAP sorted
-/// the attribute set by key first, so a different attribute was checked first
-/// (LabelNameTooLong). Both paths must now class it as LabelValueTooLong.
+/// A point with two length-violating attributes whose input order differs from
+/// key-sorted order. OTLP checks attributes in input order (first violation
+/// wins: LabelValueTooLong); OTAP must not sort the attribute set by key first,
+/// which would check a different attribute first (LabelNameTooLong). Both paths
+/// class it as LabelValueTooLong.
 #[test]
 fn attr_order_rejection_classes_agree() {
     let long_val = "v".repeat(4097); // > max_label_value_len (4096)

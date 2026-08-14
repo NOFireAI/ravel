@@ -1,19 +1,16 @@
-//! Corrupt-input mutation harness for the OTAP Arrow IPC decode path
-//! (issue #82, audit finding a11-F05). `StreamState::decode` decompresses
-//! and parses untrusted `BatchArrowRecords` bytes off the wire; the contract
-//! is a typed error or a valid decode, never a panic, and a `BatchError`
-//! must leave the stream usable (docs/otap-ingest.md, CLAUDE.md testing
-//! patterns).
+//! Corrupt-input mutation harness for the OTAP Arrow IPC decode path.
+//! `StreamState::decode` decompresses and parses untrusted
+//! `BatchArrowRecords` bytes off the wire; the contract is a typed error or a
+//! valid decode, never a panic, and a `BatchError` must leave the stream
+//! usable (docs/otap-ingest.md, CLAUDE.md testing patterns).
 //!
-//! DISCOVERED DEFECT (cross-reference, do not fix under this ticket): a
-//! single-bit flip of a *valid* Arrow IPC stream can make the underlying
-//! `arrow_ipc::reader::StreamDecoder` panic inside `arrow-buffer`
-//! (`the offset of the new Buffer cannot exceed the existing length`)
-//! instead of returning `Err`. `StreamState::decode` forwards that panic; it
-//! does not convert an arrow-boundary panic into a typed `BatchError`, so the
-//! CLAUDE.md invariant "corrupt-input tests must produce typed errors, never
-//! panics" is violated at the arrow boundary. Per issue #82 this is reported
-//! as a finding for a separate correctness ticket, not fixed here. The
+//! KNOWN LIMITATION: a single-bit flip of a *valid* Arrow IPC stream can make
+//! the underlying `arrow_ipc::reader::StreamDecoder` panic inside
+//! `arrow-buffer` (`the offset of the new Buffer cannot exceed the existing
+//! length`) instead of returning `Err`. `StreamState::decode` forwards that
+//! panic; it does not convert an arrow-boundary panic into a typed
+//! `BatchError`, so the CLAUDE.md invariant "corrupt-input tests must produce
+//! typed errors, never panics" is not yet met at the arrow boundary. The
 //! reproducer `single_bit_flip_of_valid_ipc_can_panic_decoder` (ignored by
 //! default) demonstrates it; the proptest targets below catch the unwind so
 //! the fuzz job stays green while still exercising the path, and a caught
@@ -260,16 +257,14 @@ proptest! {
     }
 }
 
-/// Cross-reference reproducer for the discovered defect (issue #82,
-/// a11-F05): some single-bit flip of a valid Arrow IPC stream panics
-/// `StreamState::decode` (via arrow's `StreamDecoder`) instead of returning
-/// a typed `BatchError`. Ignored by default (it asserts a panic that a
-/// future correctness ticket should turn into a typed error); run with
-/// `cargo test -p ravel-otap --test fuzz_mutation -- --ignored` to observe
-/// it. Mirrors the repo's `audit_*_repro` convention of demonstrating a
-/// finding without fixing it.
+/// Demonstrates the known decoder-robustness limitation: some single-bit flip
+/// of a valid Arrow IPC stream panics `StreamState::decode` (via arrow's
+/// `StreamDecoder`) instead of returning a typed `BatchError`. Ignored by
+/// default (it asserts a panic that turning the arrow-boundary panic into a
+/// typed error would resolve); run with
+/// `cargo test -p ravel-otap --test fuzz_mutation -- --ignored` to observe it.
 #[test]
-#[ignore = "documents a decoder-robustness defect (a11-F05 cross-ref); do not fix under #82"]
+#[ignore = "documents a known decoder-robustness limitation at the arrow boundary"]
 fn single_bit_flip_of_valid_ipc_can_panic_decoder() {
     let seeds = seed_payloads();
     let seed = seeds
@@ -296,7 +291,7 @@ fn single_bit_flip_of_valid_ipc_can_panic_decoder() {
     assert!(
         panics > 0,
         "expected at least one single-bit flip to panic the OTAP IPC decoder \
-         (arrow StreamDecoder), demonstrating the a11-F05 typed-error-not-panic \
+         (arrow StreamDecoder), demonstrating the typed-error-not-panic \
          gap; found none"
     );
     // Keep the discovered count visible when run with --nocapture.
