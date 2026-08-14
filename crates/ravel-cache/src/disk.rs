@@ -94,7 +94,7 @@ use crate::metrics::CacheMetrics;
 use crate::s3fifo::S3Fifo;
 
 const MAGIC: [u8; 4] = *b"RVCD";
-// Version 3 adds the 8-byte `written_at_ns` stamp (ADR-0064, issue #753).
+// Version 3 adds the 8-byte `written_at_ns` stamp (ADR-0064).
 // Bumping the version is what makes a version-2 entry (no stamp) written by an
 // older binary decode-fail here rather than be misread at shifted offsets or,
 // worse, served fresh forever with no age to check: an old entry is rejected
@@ -117,7 +117,7 @@ struct Header {
     len: u64,
     /// Wall-clock time the entry was written, nanoseconds since the Unix
     /// epoch, from the injected [`Clock`]. Read on every hit and by the
-    /// startup scan to age the entry out (ADR-0064, issue #753). Not covered
+    /// startup scan to age the entry out (ADR-0064). Not covered
     /// by `crc32c` (which is payload-only, unchanged): a corrupted stamp only
     /// ever makes an entry look older (an immediate, safe miss) or younger,
     /// and a younger-looking entry is still bounded by S3-FIFO eviction, so no
@@ -226,7 +226,7 @@ struct Inner {
     instance_id: u64,
     /// Injected wall clock. Stamped into each entry's header at `insert`, read
     /// on every `get`, and read by the periodic sweep to age entries out past
-    /// `limits.max_entry_age_ns` (ADR-0064, issue #753). Injected so tests
+    /// `limits.max_entry_age_ns` (ADR-0064). Injected so tests
     /// drive ageing deterministically instead of sleeping.
     clock: Arc<dyn Clock>,
 }
@@ -267,8 +267,8 @@ impl DiskCache {
     /// deleted on sight rather than counted: discard and rebuild, never
     /// repair, applies at startup exactly as it does on a live read.
     ///
-    /// This also spawns the background age-sweep task (ADR-0064, issue #753,
-    /// finding F1), which requires a Tokio runtime. Must be constructed inside
+    /// This also spawns the background age-sweep task (ADR-0064), which
+    /// requires a Tokio runtime. Must be constructed inside
     /// one; constructing off a runtime panics rather than silently skipping the
     /// sweep. See [`DiskCache::new_with_clock`].
     pub fn new(dir: PathBuf, limits: CacheLimits) -> Self {
@@ -276,7 +276,7 @@ impl DiskCache {
     }
 
     /// Like [`DiskCache::new`], but with an explicit [`Clock`] for the
-    /// per-entry max-age and the background sweep (ADR-0064, issue #753).
+    /// per-entry max-age and the background sweep (ADR-0064).
     /// Production uses [`DiskCache::new`], which injects a [`SystemClock`];
     /// tests inject a clock they advance across the max-age boundary by hand.
     ///
@@ -286,9 +286,7 @@ impl DiskCache {
     /// hard requirement of the tier's erasure-residue bound (ADR-0064), not an
     /// optional extra: a construction that could not spawn it must fail loudly,
     /// exactly as [`tokio::spawn`] itself would, rather than leave the sweep
-    /// un-spawned and the bound silently unenforced for idle entries. Off-runtime
-    /// construction was previously tolerated (the sweeper was skipped), which
-    /// this deliberately closes (issue #1006, F-D).
+    /// un-spawned and the bound silently unenforced for idle entries.
     pub fn new_with_clock(dir: PathBuf, limits: CacheLimits, clock: Arc<dyn Clock>) -> Self {
         // Acquire the runtime handle first, so an off-runtime construction fails
         // before doing any filesystem work rather than after.
@@ -548,7 +546,7 @@ impl Inner {
         if self.clock.now_ns().saturating_sub(header.written_at_ns) > self.limits.max_entry_age_ns {
             // Older than the configured max-age: an erased subject's bytes
             // must not outlive the sweep on local disk by more than this
-            // (ADR-0064, issue #753). Dropped and re-fetched, not served. This
+            // (ADR-0064). Dropped and re-fetched, not served. This
             // is not corruption -- the entry is well-formed and its crc32c
             // would pass -- so it is an expiry, not a `record_disk_error`, and
             // the payload is not even read. `saturating_sub` keeps a clock
@@ -655,8 +653,8 @@ impl Inner {
 
     /// Drops every entry whose stamped write time is older than
     /// `max_entry_age_ns`, regardless of whether it was ever re-read. This is
-    /// the periodic driver the background task calls on each tick (ADR-0064,
-    /// issue #753, finding F1): the per-`get` age check only reaches entries
+    /// the periodic driver the background task calls on each tick
+    /// (ADR-0064): the per-`get` age check only reaches entries
     /// that are read, and the startup scan only runs at construction, so an
     /// idle entry under no eviction pressure needs this walk to have its bytes
     /// physically removed within one sweep interval past the max-age.
@@ -1221,7 +1219,7 @@ mod tests {
         }
     }
 
-    /// ADR-0064 / issue #753: a disk entry younger than the max-age is served;
+    /// ADR-0064: a disk entry younger than the max-age is served;
     /// once wall time crosses `written_at + max_age`, the same key is a miss
     /// and the stale bytes are dropped rather than served.
     ///

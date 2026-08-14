@@ -1,4 +1,4 @@
-//! Injected wall clock for disk-tier entry ageing (ADR-0064, issue #753).
+//! Injected wall clock for disk-tier entry ageing (ADR-0064).
 //!
 //! The disk tier stamps each entry's write time into its on-disk header and
 //! refuses to serve an entry older than the configured max-age. That decision

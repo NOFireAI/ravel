@@ -22,7 +22,7 @@ const CORRUPTION_XOR: u8 = 0xA5;
 /// admitted, in nanoseconds since the Unix epoch, read from the injected
 /// [`Clock`]. The stamp is what the per-`get` age check and the background
 /// sweep compare against `max_entry_age_ns` so an erased subject's bytes do
-/// not linger in a query node's RAM past the bound (ADR-0064, issue #988).
+/// not linger in a query node's RAM past the bound (ADR-0064).
 /// Cloned on every hit, but a [`Bytes`] clone is a refcount bump, not a copy.
 #[derive(Clone)]
 struct CacheEntry {
@@ -43,7 +43,7 @@ struct Inner {
     limits: CacheLimits,
     /// Injected wall clock. Stamped into each entry at `insert`, read on every
     /// `get`, and read by the periodic sweep to age entries out past
-    /// `limits.max_entry_age_ns` (ADR-0064, issue #988). Injected so tests
+    /// `limits.max_entry_age_ns` (ADR-0064). Injected so tests
     /// drive ageing deterministically instead of sleeping.
     clock: Arc<dyn Clock>,
 }
@@ -56,10 +56,10 @@ struct Inner {
 /// Like the disk tier, each entry carries a stamped write time and a
 /// configured per-entry max-age (`limits.max_entry_age_ns`). An entry older
 /// than the max-age is treated as a miss on `get` and dropped; a background
-/// sweep (ADR-0064, issue #988) drops every over-age entry on a fixed
+/// sweep (ADR-0064) drops every over-age entry on a fixed
 /// interval regardless of access, so an entry that is never re-read and sees
 /// no eviction pressure still ages out within one `limits.sweep_interval_ns`
-/// past the max-age. This mirrors the disk tier (issue #998) on a query
+/// past the max-age. This mirrors the disk tier on a query
 /// node's separate, in-RAM copy: the erasure sweep runs on the maintain node
 /// and cannot reach a query node's RAM, so the bound is enforced locally.
 pub struct Cache<E> {
@@ -81,7 +81,7 @@ where
     }
 
     /// Like [`Cache::new`], but with an explicit [`Clock`] for the per-entry
-    /// max-age and the background sweep (ADR-0064, issue #988). Production uses
+    /// max-age and the background sweep (ADR-0064). Production uses
     /// [`Cache::new`], which injects a [`SystemClock`]; tests inject a clock
     /// they advance across the max-age boundary by hand. `new` keeps its
     /// original signature so `ravel-query`/`ravel-server` callers compile
@@ -142,7 +142,7 @@ where
 
     /// Look up `key` without fetching. Records a hit or a miss either
     /// way. An entry older than `max_entry_age_ns` is dropped and reported
-    /// as a miss rather than served (ADR-0064, issue #988). In corruption
+    /// as a miss rather than served (ADR-0064). In corruption
     /// mode, a hit returns deliberately corrupted bytes rather than what was
     /// inserted.
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
@@ -242,7 +242,7 @@ impl Inner {
         if self.clock.now_ns().saturating_sub(entry.written_at_ns) > self.limits.max_entry_age_ns {
             // Older than the configured max-age: an erased subject's bytes must
             // not outlive the sweep in a query node's RAM by more than this
-            // (ADR-0064, issue #988). Dropped and re-fetched, not served.
+            // (ADR-0064). Dropped and re-fetched, not served.
             // `saturating_sub` keeps a clock that jumped backward (a stamp
             // newer than "now") from wrapping into a huge age: such an entry is
             // simply treated as not yet expired, mirroring the disk tier.
@@ -267,8 +267,8 @@ impl Inner {
 
     /// Drops every entry whose stamped write time is older than
     /// `max_entry_age_ns`, regardless of whether it was ever re-read. This is
-    /// the periodic driver the background task calls on each tick (ADR-0064,
-    /// issue #988): the per-`get` age check only reaches entries that are read,
+    /// the periodic driver the background task calls on each tick
+    /// (ADR-0064): the per-`get` age check only reaches entries that are read,
     /// so an idle entry under no eviction pressure needs this walk to have its
     /// bytes physically dropped from RAM within one sweep interval past the
     /// max-age. The sweep body is fully synchronous and holds the fifo lock
@@ -350,7 +350,7 @@ mod tests {
         }
     }
 
-    /// ADR-0064 / issue #988: a RAM entry younger than the max-age is served;
+    /// ADR-0064: a RAM entry younger than the max-age is served;
     /// once wall time crosses `written_at + max_age`, the same key is a miss on
     /// `get` and the stale bytes are dropped rather than served.
     ///

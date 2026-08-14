@@ -1,13 +1,13 @@
-/// Default per-entry max-age: 23 hours, in nanoseconds. Chosen by ADR-0064
-/// (issue #753): raw bytes of an erased subject must not outlive the erasure
+/// Default per-entry max-age: 23 hours, in nanoseconds. Chosen by ADR-0064:
+/// raw bytes of an erased subject must not outlive the erasure
 /// sweep on any query node by more than the ADR's 24 h bound. The worst-case
 /// residue of an idle entry is `max_entry_age_ns + sweep_interval_ns` (see
 /// [`DEFAULT_SWEEP_INTERVAL_NS`]), so the default max-age is set one sweep
 /// interval below 24 h (23 h + a 1 h sweep = 24 h exactly) rather than at 24 h,
 /// so the default actually meets the ADR bound instead of overshooting it by
 /// the sweep period. Both cache tiers share it: the disk tier bounds bytes on a
-/// node's disposable local disk (issue #753), the RAM tier bounds the same
-/// bytes in a query node's memory (issue #988). The erased data is identical
+/// node's disposable local disk, the RAM tier bounds the same
+/// bytes in a query node's memory. The erased data is identical
 /// PII either way, and the erasure sweep -- running on the maintain node --
 /// can reach neither a query node's disk nor its RAM, so both tiers enforce the
 /// same bound locally.
@@ -17,7 +17,7 @@ pub const DEFAULT_MAX_ENTRY_AGE_NS: u64 = 23 * 60 * 60 * 1_000_000_000;
 /// per-`get` (and, on disk, startup-scan) age check only reaches an entry that
 /// is read or that a fresh process scans; an entry that is never re-read and
 /// sees no eviction pressure needs a periodic pass to physically drop its bytes
-/// (ADR-0064, issue #753 finding F1 for disk, issue #988 for RAM). An idle
+/// (ADR-0064). An idle
 /// entry therefore ages out within at most one sweep interval past its
 /// max-age, so the true worst-case residue is
 /// `max_entry_age_ns + sweep_interval_ns`, not `max_entry_age_ns` alone. The
@@ -37,8 +37,8 @@ pub const DEFAULT_SWEEP_INTERVAL_NS: u64 = 60 * 60 * 1_000_000_000;
 /// maximum wall-clock age an entry is served at before it is treated as a miss
 /// and dropped, and `sweep_interval_ns` is the period of the background pass
 /// that drops over-age idle entries. Together they bound how long raw bytes of
-/// an erased subject persist on a query node -- on local disk (ADR-0064, issue
-/// #753) and in RAM (issue #988) alike.
+/// an erased subject persist on a query node -- on local disk (ADR-0064)
+/// and in RAM alike.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheLimits {
     /// Total bytes across every resident entry.
@@ -57,7 +57,7 @@ pub struct CacheLimits {
     pub max_entry_age_ns: u64,
     /// Both tiers: the period, in nanoseconds, of the background sweep that
     /// drops entries past `max_entry_age_ns` even when they are never re-read
-    /// (ADR-0064, issue #753 finding F1 for disk, issue #988 for RAM). An idle
+    /// (ADR-0064). An idle
     /// entry ages out within at most this interval past `max_entry_age_ns`.
     /// Defaults to [`DEFAULT_SWEEP_INTERVAL_NS`] (1 h).
     pub sweep_interval_ns: u64,
