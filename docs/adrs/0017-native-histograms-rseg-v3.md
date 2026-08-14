@@ -1,14 +1,11 @@
 # ADR-0017: Native exponential histograms: span-based value model, RSEG v3 after RSEG v2 phase 6 closes
 
-Status: Accepted (2026-07-27); amended by ADR-0027 (2026-07-28): v3 as
-a readable version is retired, while the histogram value model and
-HIST_PAGES sections decided here continue in v5. Implementation plan
-and tickets:
-docs/ingest-breadth-plan.md (track C). The byte-exact v3 grammar is a
-deliverable of that track's first ticket, produced under the
-format-change procedure; this ADR records the decision, the internal
-value model, the sequencing relative to RSEG v2, and the exemplar
-deferral.
+Status: Accepted
+
+Amended by ADR-0027: v3 as a readable version is retired, while the
+histogram value model and HIST_PAGES sections decided here continue in
+v5. This ADR records the decision, the internal value model, the
+sequencing relative to RSEG v2, and the exemplar deferral.
 
 ## Context
 
@@ -40,9 +37,9 @@ native histograms) are defined over the structured value, not over
 per-bucket series. Storing native histograms means a new value type in
 the segment format, which triggers the format-change procedure.
 
-The timing problem: RSEG v2 (ADR-0014) is mid-rollout. Phases 1-3
+The timing problem: RSEG v2 (ADR-0027) is mid-rollout. Phases 1-3
 (spec, writer, reader) are merged; phases 4-6 (fuzz hardening,
-inspector, rollout/default flip = issue #34) are in flight or queued,
+inspector, rollout/default flip) are in flight or queued,
 and the writer default is still v1.
 
 ## Alternatives
@@ -77,9 +74,9 @@ and the writer default is still v1.
 ### For the storage sequencing (the mandatory decision)
 
 1. Bundle a new histogram page/section kind into RSEG v2 before the
-   phase-6 default flip (#34), on the "version bump already paid"
-   argument that justified bundling VAL_RAW_F64 alignment (ADR-0014
-   section 4 precedent). Rejected: the amortization argument does not
+   phase-6 default flip, on the "version bump already paid"
+   argument that justified bundling VAL_RAW_F64 alignment (ADR-0027
+   precedent). Rejected: the amortization argument does not
    transfer. Alignment was a <= 7-byte writer pad with zero new reader
    logic, bundled into a then-unimplemented spec. Histogram storage is
    a new page grammar, new codecs, a catalog change (SERIES_META must
@@ -94,16 +91,16 @@ and the writer default is still v1.
    bump: a new page enc value or section kind that old v2 readers
    would meet changes the persistent contract, and the format-change
    skill requires explicit versioning for exactly this reason.
-2. RSEG v3 on top of v2, after #34 closes (chosen). Costs a third
-   permanent reader-dispatch branch under the no-compactor dual-reader
-   rule (ADR-0014 Consequences: every version is readable forever, a
+2. RSEG v3 on top of v2, after RSEG v2 phase 6 closes (chosen). Costs a
+   third permanent reader-dispatch branch under the no-compactor
+   dual-reader rule (ADR-0027: every version is readable forever, a
    permanent test-matrix row). Mitigations: v3 is specified as a
    strict superset of v2 (v2's catalog and page grammar unchanged;
    v3 adds a histogram page container, the catalog columns to address
    it, and the new page encoding), so the v3 reader is the v2 reader
    plus extensions rather than a parallel implementation, and the
    fuzz/golden matrix grows by the delta, not by a third full grammar.
-   The v2 rollout machinery being built for #34 (version-valued config,
+   The v2 rollout machinery (version-valued config,
    readers-before-writers ordering, mixed-population tests) is reused
    verbatim.
 3. Defer entirely; keep rejecting native histograms at admission.
@@ -119,21 +116,20 @@ and the writer default is still v1.
 ## Decision
 
 Span-based value model (representation alternative 3); RSEG v3
-sequenced strictly after RSEG v2 phase 6 (issue #34) closes (sequencing
+sequenced strictly after RSEG v2 phase 6 closes (sequencing
 alternative 2), with admission-time rejection as the interim behavior.
-Track C of docs/ingest-breadth-plan.md starts with the v3 spec-and-plan
-document (the rseg-v2-plan.md equivalent: byte-exact grammar, checksum
-coverage table, tri-version reader story, phased tickets); no v3
-implementation ticket is dispatched before #34 is closed. Series
+The v3 spec-and-plan document (byte-exact grammar, checksum coverage
+table, tri-version reader story) precedes any v3 implementation, which
+does not begin before RSEG v2 phase 6 closes. Series
 identity is untouched: a native histogram series is one series under
 the existing ADR-0005 hash; only the sample value type is new.
 
-Issue #34 needs one note added now (this is the only interaction with
-the v2 rollout): the segment-version ingest config it threads through
-must be version-valued (an integer/enum, not a write_v2 boolean), and
-its rollout notes should state that a v3 following the same
-readers-before-writers ordering is planned. Phase 6's scope and gates
-are otherwise unchanged.
+The v2 phase-6 rollout needs one note added now (this is the only
+interaction with it): the segment-version ingest config it threads
+through must be version-valued (an integer/enum, not a write_v2
+boolean), and its rollout notes should state that a v3 following the
+same readers-before-writers ordering is planned. Phase 6's scope and
+gates are otherwise unchanged.
 
 Exemplars (OTLP `Exemplar`; RW1/RW2 exemplars): accept-and-drop with
 per-protocol counters, on both the OTLP and RW paths, as an explicit
@@ -145,16 +141,16 @@ an exemplar section enters the format only through a future ADR that
 (a) specifies the exemplar query surface first (there is none today --
 no /api/v1/query_exemplars, no trace store to join against), and (b)
 decides whether to ride the v3 version bump. That ADR is a named
-decision point in the v3 spec ticket, so the bundle-one-bump-beats-two
-economics (ADR-0014 section 4) are weighed exactly when the version is
+decision point in the v3 spec, so the bundle-one-bump-beats-two
+economics (ADR-0027) are weighed exactly when the version is
 being paid, with a consumer spec in hand instead of speculative format
-surface (the rseg-v2-plan section 3.8 rule).
+surface.
 
-> **Update (2026-08-04, #475):** both prerequisites have since been met.
-> ADR-0047 added exemplar storage, and the read surface
-> `/api/v1/query_exemplars` shipped in `services/ravel-server`. The
-> "there is none today -- no /api/v1/query_exemplars" note above records
-> the state when this ADR was written, not the state today.
+> **Update:** both prerequisites have since been met. ADR-0047 added
+> exemplar storage, and the read surface `/api/v1/query_exemplars`
+> shipped in `services/ravel-server`. The "there is none today -- no
+> /api/v1/query_exemplars" note above records the state when this ADR
+> was written, not the state today.
 
 ## Consequences
 

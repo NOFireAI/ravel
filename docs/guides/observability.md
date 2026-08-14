@@ -231,7 +231,7 @@ with `signal="logs"`, not under a separate metric name.
 ### Per-query cost (`ravel_query_*`)
 
 Labels: `mode`, `tenant_hash`, `workload_class`. Every read surface folds its
-per-query cost into this family (ADR-0044, issue #425). Coverage spans
+per-query cost into this family (ADR-0044). Coverage spans
 `POST /api/v1/sql`, `POST /api/v1/analytics`, the Prometheus-shaped
 `GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`, and
 `GET /api/v1/series`, and every Flight SQL request. The `workload_class` label
@@ -255,7 +255,7 @@ Labels: `mode` only, plus `le` on the histogram buckets. This family carries no
 per-shard, per-worker, or per-tenant label (ADR-0044 section 4): a fan-out
 spanning many workers and tenants must not turn one query into a cardinality
 explosion. It renders only when the process runs with `--distributed-query`
-(ADR-0071, issue #865); a local-only process omits the family entirely.
+(ADR-0071); a local-only process omits the family entirely.
 
 | Metric | Meaning |
 |---|---|

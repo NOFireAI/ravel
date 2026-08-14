@@ -1,12 +1,13 @@
 # ADR-0025: PromQL differential float-precision residue (rate/deriv/predict_linear vs. atanh)
 
-Status: Accepted (2026-07-28). Written after fixing three of the four
-failure classes issue #170 found once `promql-difftest` first ran against
-a real, correctly-checksummed pinned Prometheus binary (error
-misclassification, JSON timestamp rendering, and several stale corpus
-assertions; see #170 for the full history). This ADR took up the one
-class left deliberately unfixed: five corpus cases where both engines
-agree on everything except the last few bits of an f64 result.
+Status: Accepted
+
+Written after fixing three of the four failure classes surfaced once
+`promql-difftest` first ran against a real, correctly-checksummed pinned
+Prometheus binary (error misclassification, JSON timestamp rendering, and
+several stale corpus assertions). This ADR took up the one class left
+deliberately unfixed: five corpus cases where both engines agree on
+everything except the last few bits of an f64 result.
 
 **Decision recorded:** alternative 1 (allowlist a scoped tolerance) for
 both classes below, including the four arithmetic cases the "What is not
@@ -29,7 +30,7 @@ as principled relaxations), with the allowlist "expected to stay empty."
 claim for its own family: "a direct, bit-exact-oriented port of
 Prometheus' own `promql/functions.go` ... down to its operation order."
 
-With a real Prometheus binary now in the loop (issue #170), five corpus
+With a real Prometheus binary now in the loop, five corpus
 cases fail on value, not shape or class:
 
 | Case | Function(s) | Prometheus | Ravel | Relative gap |
@@ -60,7 +61,7 @@ values or timestamps) already differ by the time they arrive, not that
 exact arithmetic is unattainable. **This is very likely a findable bug in
 the port or the harness, not a policy question**, and no one has yet done
 the dedicated, per-case investigation to find it. It was set aside during
-the #170 cleanup only because that work was scoped to
+that cleanup only because that work was scoped to
 wiring/classification/corpus fixes, not evaluator numerics.
 
 **`atanh` (the fifth case) is a single call to Rust's `f64::atanh`.**
@@ -120,7 +121,7 @@ two classes below it belongs to and why:
 
 **For the four arithmetic cases:**
 
-1. File a dedicated investigation ticket to find the actual divergence:
+1. Open a dedicated investigation to find the actual divergence:
    instrument `linear_regression`/`extrapolated_rate` to log every
    intermediate sum/product for one failing case on both engines and diff
    them term-by-term, and check whether the seeded dataset generator
@@ -168,9 +169,8 @@ two classes below it belongs to and why:
   against the pinned v3.13.1 binary; every other pre-existing entry stays
   bit-exact. `promql-difftest` is not fully green as of this ADR, though:
   running the full corpus surfaced 7 unrelated mismatches in the
-  aggregation corpus (`aggregate.txt`, added the same day by the P8
-  aggregation-operators work), none of which this ADR's decision covers.
-  Tracked separately in issue #177.
+  aggregation corpus (`aggregate.txt`, added by the aggregation-operators
+  work), none of which this ADR's decision covers. Tracked separately.
 - The differential harness's allowlist is no longer empty. ADR-0021's
   "expected to stay empty" is superseded by this decision for these five
   named entries; any future entry needs the same measured-gap-plus-comment

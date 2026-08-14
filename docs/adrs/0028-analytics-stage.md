@@ -1,19 +1,20 @@
 # ADR-0028: Post-evaluation analytics stage for change point detection and robust statistics
 
-Status: Accepted (2026-07-28). Decides issue #216. Sibling constraints:
-ADR-0007 (PromQL differential gate) and ADR-0022 (SQL floating aggregate
-exactness) are why neither existing query surface hosts this capability.
+Status: Accepted
+
+Sibling constraints: ADR-0007 (PromQL differential gate) and ADR-0022
+(SQL floating aggregate exactness) are why neither existing query surface
+hosts this capability.
 
 ## Context
 
-Elastic ships `CHANGE_POINT` as an ES|QL processing command: PELT (Pruned
-Exact Linear Time) segmentation with a BIC penalty, classifying spikes,
-dips, step changes, trend changes, and distribution changes per series,
-with automatic downsampling of long series. Notably, Elastic placed it
-outside the aggregation layer as a processing stage over query results.
-Ravel wants the same capability, plus the exact statistical summaries in
-the ES|QL aggregate surface (`MEDIAN`, `MEDIAN_ABSOLUTE_DEVIATION`,
-`PERCENTILE`, `STD_DEV`, `VARIANCE`) that Ravel's SQL subset excludes.
+Change point detection classifies spikes, dips, step changes, trend
+changes, and distribution changes per series. A standard implementation
+is PELT (Pruned Exact Linear Time) segmentation with a BIC penalty, run
+as a processing stage over query results rather than inside the
+aggregation layer. Ravel wants this capability, plus exact statistical
+summaries (`median`, `median_absolute_deviation`, `percentile`,
+`stddev`, `variance`) that its SQL subset excludes.
 
 Neither existing surface can host this:
 
@@ -31,15 +32,16 @@ Neither existing surface can host this:
   returns a structured per-series result (type, location, score), which
   does not fit a flat SQL aggregate.
 
-Ravel stores metrics only. ES|QL's text-oriented analytics
-(`CATEGORIZE`, `GROK`, `DISSECT`) have no input here and are out of
-scope by data model, not by choice.
+Ravel stores metrics only. Text-oriented analytics (log categorization,
+pattern extraction) have no input here and are out of scope by data
+model, not by choice.
 
 ## Alternatives
 
 1. Post-evaluation analytics stage in a new pure crate, exposed by a
-   dedicated endpoint (chosen). Mirrors Elastic's own placement of
-   `CHANGE_POINT` outside aggregation. Touches no frozen contract: no
+   dedicated endpoint (chosen). Places change point detection outside
+   aggregation, as a processing stage over query results. Touches no
+   frozen contract: no
    parser fork, no proto or format change, no entry into the ADR-0022
    admission regime, and the evaluator pipeline with its budgets and
    staleness handling is consumed as is.
@@ -68,15 +70,14 @@ scope by data model, not by choice.
    response is a JSON envelope in the Prometheus response style with
    `resultType: "analytics"`, one entry per series carrying `metric`
    labels and the op's result object.
-3. **Op surface, v1.** Two ops, both mapped from the ES|QL analytic
-   surface:
+3. **Op surface, v1.** Two ops:
    - `change_point`: PELT segmentation with a BIC penalty over a
      Gaussian cost (mean and variance). Per series it reports
      `type` (one of `spike`, `dip`, `step_change`, `trend_change`,
      `distribution_change`, `stationary`, `indeterminable`),
      `timestamp` of the most significant change, and a significance
      `score`. Fewer than 22 evaluated points returns `indeterminable`
-     with a typed reason, matching Elastic's floor.
+     with a typed reason.
    - `summary`: exact `median`, `mad`, `percentile` (caller-supplied
      list of quantiles, Prometheus interpolation), `stddev`, and
      `variance` per series. Selection-based statistics sort by
@@ -89,7 +90,7 @@ scope by data model, not by choice.
    fixed-stride bucket averaging to at most 2000 points, and the
    response then carries `downsampled: true` with the original point
    count. This keeps the "approximation is opt-in and visible"
-   invariant that Elastic's silent auto-downsampling would break. An
+   invariant that silent auto-downsampling would break. An
    analytics call processes at most 1000 series; more is a typed
    error, consistent with the query engine's budget-breach-is-an-error
    rule. `summary` runs on the full evaluated series (bounded by the
@@ -120,7 +121,7 @@ scope by data model, not by choice.
      panics or silent wrong data.
 7. **Documentation.** docs/analytics.md is the normative doc for the
    crate and the endpoint: op semantics, parameters, response schema,
-   error taxonomy, and the evidence list above. The CLAUDE.md doc map
+   error taxonomy, and the evidence list above. The doc map
    gains a ravel-analytics row, docs/README.md indexes the new doc, and
    README.md documents the endpoint, all in the same commits as the
    behavior.
@@ -137,8 +138,8 @@ scope by data model, not by choice.
   the capped 2000 points).
 - No new external dependency: PELT, BIC, and the summary statistics are
   implemented in the crate.
-- SQL and PromQL stay untouched. If ES|QL parity later demands more ops
-  (sampling, forecasting), each lands as a new op behind the same
-  endpoint and evidence regime, one ADR amendment per op family.
-- The ES|QL mapping is partial by design: `CATEGORIZE` and the text
-  commands stay out of scope while Ravel stores no log text.
+- SQL and PromQL stay untouched. If more ops are later wanted (sampling,
+  forecasting), each lands as a new op behind the same endpoint and
+  evidence regime, one ADR amendment per op family.
+- The analytic surface is partial by design: text-oriented commands stay
+  out of scope while Ravel stores no log text.

@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Context
 
-ADR-0044 (epic #418, closed) gave every query a `QueryAccounting` handle
+ADR-0044 gave every query a `QueryAccounting` handle
 that measures S3 requests and bytes fetched per phase
 (`crates/ravel-types/src/accounting.rs`), and a pre-execution
 `CostEstimate`, but shipped enforcement out of scope on purpose. A
@@ -23,14 +23,14 @@ independently, inside SQL's own scan loop
 None of these three fields is byte-shaped. A selector that matches a
 handful of series but whose covering segments happen to be large L1 parts
 passes every count cap while reading and paying for an unbounded number
-of bytes — this is finding S4-06/S3-04: count caps do not bound bytes
+of bytes — the gap: count caps do not bound bytes
 scanned, and nothing cancels a query on cost.
 
 Query concurrency has the same shape of gap one layer up. `fetch_concurrency`
 (`EngineConfig`, default 8) bounds concurrent segment fetches *within one
 query* via a `tokio::sync::Semaphore` (`fetcher.rs:310,328`). Nothing bounds
 concurrent queries within one process, and nothing bounds them across the
-fleet. ADR-0057 (epic #656, closed) solved exactly this shape of problem —
+fleet. ADR-0057 solved exactly this shape of problem —
 unbounded aggregate demand across independent processes — for ingest
 admission, via a periodic self-owned-key reconciliation: each process
 writes its own current usage to a key only it writes, reads its siblings'
@@ -44,14 +44,14 @@ not.
 Name-postings pruning (`crates/ravel-catalog/src/snapshot_format/postings.rs`,
 consulted via `Catalog::resolve_pruned_with_accounting`) already prunes
 whole segments before any GET, and already covers both query languages —
-issue #278 (landed 2026-08-01, before this epic was scoped) wired SQL's
+an earlier change (landed before this ADR was scoped) wired SQL's
 `pushed_down_name_filter`/`equality_name_filter`
 (`crates/ravel-sql/src/executor.rs:475-511,900`) onto the same catalog
 call PromQL's `equality_name_filter` (`engine.rs:1023-1059`) already used.
 Both paths, identically, bypass pruning on anything but a lone equality
 `__name__` matcher — a regex `__name__` selector in either language falls
-back to an unpruned resolve, silently. This ADR's finding S3-10 is
-narrower than issue #456's original framing: the gap is regex support in
+back to an unpruned resolve, silently. The gap this ADR addresses is
+narrower than an earlier framing: regex support in
 the postings layer, on both languages equally, not "SQL has no postings
 pruning" (SQL's equality path already landed). The name dictionary
 (`postings.rs`) is a sorted structure, so a literal-prefix-anchored regex
@@ -97,14 +97,14 @@ Cancellation must release everything a normal completion releases
 memory-pool half of this for SQL; this ADR's acceptance test proves the
 new byte-budget half.
 
-## Amendment (2026-08-07): PromQL's enforcement site cannot deliver mid-scan cancellation
+## Amendment: PromQL's enforcement site cannot deliver mid-scan cancellation
 
 Decision 1's PromQL location clause — "alongside the existing
 `max_series`/`max_samples` checks in `engine.rs`'s three merge functions"
 — is incompatible with the same paragraph's own requirement ("checked
-incrementally... once per completed segment fetch"). EF-1 (#721)
-implemented the location clause exactly as written and its Stage 4
-checkpoint caught the contradiction: `engine.rs`'s merge functions
+incrementally... once per completed segment fetch"). An implementation
+of the location clause exactly as written caught the contradiction at a
+checkpoint: `engine.rs`'s merge functions
 (`build_series_by_id`, `merge_soa_runs`, `merge_histogram_soa_runs`) run
 only after `fetch_all_series` / `fetch_all_samples_and_histograms` have
 already drained every segment's fetch via
@@ -143,7 +143,7 @@ segment finishes and cancel the rest, instead of waiting for all of them:
   functions are unaffected and stay where they are; this amendment only
   relocates the new byte check.
 - A single-selector query (`plans.len() == 1`, the common case and the
-  one S4-06 describes) has no sibling plans still fetching once its own
+  one the finding describes) has no sibling plans still fetching once its own
   segments are exhausted, so threading a live `&QueryAccounting` into the
   merge functions instead of a frozen `u64` snapshot would not recover
   mid-scan cancellation for it — the fix must sit in the fetch stage
@@ -156,14 +156,14 @@ segment finishes and cancel the rest, instead of waiting for all of them:
   run's does not distinguish real cancellation from a check that fires
   after the fact.
 
-## Amendment (2026-08-07): the config surface is `--limits-file`, not a new flag
+## Amendment: the config surface is `--limits-file`, not a new flag
 
-EF-3 (#723) implemented the config surface described above and found the
+Implementing the config surface described above found the
 name wrong: there is no `--query-limits-file` flag, and this ADR should
 never have implied a new one. `services/ravel-server`'s existing
 `--limits-file` TOML (ADR-0051 section 3, `[defaults]`/`[tenants.<id>]`
 tables) already carries the ingest admission limits in exactly the shape
-this decision asked for; EF-3 added `max_bytes_scanned` to the same
+this decision asked for; the implementation added `max_bytes_scanned` to the same
 tables rather than inventing a second file and flag. This is a naming
 correction only — the `[defaults]`/`[tenants.<id>]` structure and
 lifecycle (loaded once at startup, changing a limit is a restart) is
@@ -176,8 +176,8 @@ is parsed and validated but has no effect beyond a startup warning
 naming the ineffective tenant (`docs/guides/admission-limits.md` carries
 the operator-facing version of this note). True per-tenant enforcement
 needs a tenant-aware `EngineConfig` lookup inside `ravel-query`, tracked
-as a follow-up rather than blocking this decision's wave-2 landing —
-the epic's stated acceptance (a query under a configured threshold is
+as a follow-up rather than blocking this decision's landing —
+the stated acceptance (a query under a configured threshold is
 cancelled) does not require per-tenant differentiation to be satisfied.
 
 ### 2. Fleet-global query concurrency ceiling via ADR-0057's count-cap reconciliation pattern
@@ -193,7 +193,7 @@ formula, ADR-0057 section 2). Concurrent query count is a stock (how many
 queries are open right now), the same shape as `active_series`, not a
 rate — so this reuses the additive-headroom formula ADR-0057 shipped
 correct the first time, not the rate-cap formula a checkpoint review had
-to fix mid-epic (ADR-0057's own Correction section).
+to fix later (ADR-0057's own Correction section).
 
 This is a single fleet-global ceiling, not per-tenant: the finding is
 aggregate fan-out across tenants overwhelming the fleet, not any one
@@ -241,14 +241,14 @@ postings pruning. Both `engine.rs`'s `equality_name_filter` and
 `executor.rs`'s `equality_name_filter`/`pushed_down_name_filter` gain the
 same prefix-detection and range-scan call against the same
 `Catalog::resolve_pruned_with_accounting`, following the existing
-duplication precedent from decision 1 and from #278's own SQL wiring.
+duplication precedent from decision 1 and from the earlier SQL wiring.
 
-### 4. Corrected epic framing carried into the sub-issue
+### 4. Corrected framing
 
-Issue #456's original text ("name-postings pruning does not extend to...
+An earlier framing ("name-postings pruning does not extend to...
 the SQL path") is stale relative to main: SQL's equality postings pruning
-landed under #278 on 2026-08-01, before this epic was scoped against an
-older snapshot of the codebase. The epic's sub-issue for finding S3-10 is
+landed earlier, before this ADR was scoped against an
+older snapshot of the codebase. The work is
 scoped to decision 3 above (regex only, both languages) rather than
 re-wiring SQL from scratch.
 
@@ -262,8 +262,8 @@ independent subsystems for no benefit — the reconciliation *pattern* is
 what's worth reusing, not the struct.
 
 **A single global (not per-tenant) bytes-scanned budget instead of a
-per-tenant one.** Rejected: issue #456's own framing and finding S4-06
-are about one tenant's selector reading unbounded bytes on the fleet's
+per-tenant one.** Rejected: the finding is about one tenant's selector
+reading unbounded bytes on the fleet's
 behalf; a global-only budget would let one tenant's runaway query consume
 the entire fleet's allowance before a second tenant's much cheaper query
 ever gets a fair chance at it. Per-tenant, following `AdmissionLimits`'
@@ -278,14 +278,13 @@ would cost as much as not pruning it. Prefix-anchored regex is the
 genuinely cheap case the sorted structure already supports; scoping to
 it is honest about what's actually free.
 
-**Re-wire SQL's postings pruning from scratch, as issue #456 originally
-scoped it.** Rejected: it already exists (#278, landed before this epic
-was scoped). Redoing it would be pure duplication against already-tested,
-already-shipped code.
+**Re-wire SQL's postings pruning from scratch.** Rejected: it already
+exists (landed before this ADR was scoped). Redoing it would be pure
+duplication against already-tested, already-shipped code.
 
 ## Consequences
 
-- Closes S4-06/S3-04's cost-cancellation gap and S3-04's concurrency gap
+- Closes the cost-cancellation gap and the concurrency gap
   with two independently landable mechanisms; a query can now be rejected
   before it starts (fleet concurrency) or cancelled mid-flight (bytes
   budget), and an operator configures both per-tenant the same way they

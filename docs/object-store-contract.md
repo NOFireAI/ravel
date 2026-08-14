@@ -110,13 +110,13 @@ expiration, SSE/KMS headers.
 `required_capabilities(Mode::Maintain)` adds it, and no other mode requires it.
 That gate is **forward-looking**, not a description of current behavior: today
 `ravel-maintain` writes its compaction outputs as single-PUT content-addressed
-objects (its `build.rs` records this, citing issue #243), and no production
+objects (its `build.rs` records this), and no production
 caller invokes `put_multipart` yet. The maintain-mode requirement stands so
 that once compaction does stream large L1/L2 segments as multipart uploads, the
 backend is already known to serve the create/upload-part/complete/abort
 sequence rather than discovering the gap at runtime. `MemoryStore` and
-`S3Store` both report `multipart: true` and implement the sequence (issue
-#243), so `--mode maintain` starts against the memory oracle and against any
+`S3Store` both report `multipart: true` and implement the sequence, so
+`--mode maintain` starts against the memory oracle and against any
 S3-compatible endpoint whether or not any caller exercises the path yet.
 (`S3Store::put` does take an internal multipart path above its threshold, but
 that is a size-driven implementation detail of `put`, not a caller reaching for
@@ -167,9 +167,9 @@ retry the part. This is not a Ravel policy choice but what `object_store`'s S3
 upload permits: `S3MultiPartUpload::put_part` fixes the part's index
 synchronously at call time and `complete` errors unless it holds exactly that
 many parts, so a retried part lands at a *new* index and the hole the failed
-part left can never be filled (retrying it is the live-lock issue #296 fixes). A
+part left can never be filled (retrying it would live-lock). A
 part-sequence violation (an empty part, or a non-final part below the minimum)
-poisons the handle the same way (issue #297): a later `complete` errors rather
+poisons the handle the same way: a later `complete` errors rather
 than publishing a truncated object. A checksum mismatch is the one *recoverable*
 rejection: it does not poison, so the caller may re-send the same bytes with the
 correct checksum. `complete` and `abort` consume the handle logically; a second
@@ -239,7 +239,7 @@ CRC64NVME only, and always computes the digest itself). So `S3Store` reports
 `upload_checksum: false` against every S3-compatible endpoint, MinIO and AWS
 S3 included, regardless of what those servers support. Requiring the flag at
 startup therefore made the only durable backend permanently unusable in
-every mode rather than catching a real regression (issue #251).
+every mode rather than catching a real regression.
 
 What still holds with the flag false:
 
@@ -287,7 +287,7 @@ rate-limited warning is logged, never a panic.
 
 `Capabilities` is self-reported: a backend declares `consistent_list: true`
 because its adapter believes the vendor provides it, not because anything
-checked. Adversarial review finding S5-20 is that nothing did — a backend
+checked. The problem is that nothing did — a backend
 that advertises S3 compatibility but actually delivers eventually consistent
 listing was trusted silently, and the resulting failures at the commit layer
 looked like data loss rather than a misconfigured store.
@@ -358,7 +358,7 @@ already holds production data.
 ## Required bucket configuration (ADR-0064 §7, ADR-0072 decision 3)
 
 Everything above is a property of the `ObjectStoreBackend` *adapter*.
-ADR-0064 §7 (S2-16, S4-12) additionally names bucket-level *configuration*
+ADR-0064 §7 additionally names bucket-level *configuration*
 Ravel's deletion and retention guarantees depend on, orthogonal to the
 adapter contract:
 

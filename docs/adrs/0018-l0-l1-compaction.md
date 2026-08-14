@@ -1,12 +1,13 @@
 # ADR-0018: L0 to L1 compaction: verbatim rewrite of sealed ingest-hour buckets
 
-Status: Accepted (2026-07-27); amended by ADR-0026 (v5 replaces v4 as
-the compaction output) and ADR-0027 (v4 support removed pre-release).
-The compaction design itself stands. Implementation plan and tickets:
-docs/compaction-retention-plan.md. This ADR records the decision;
-docs/consistency-model.md, docs/catalog-and-mvcc.md, and
-docs/segment-format.md remain authoritative as written until plan phase 1
-lands their amendments. Nothing in this ADR changes any stored byte today.
+Status: Accepted
+
+Amended by ADR-0026 (v5 replaces v4 as the compaction output) and
+ADR-0027 (v4 support removed pre-release). The compaction design itself
+stands. This ADR records the decision; docs/consistency-model.md,
+docs/catalog-and-mvcc.md, and docs/segment-format.md remain authoritative
+as written until their amendments land. Nothing in this ADR changes any
+stored byte today.
 
 ## Context
 
@@ -16,7 +17,7 @@ that is 3,600 objects per (tenant, shard, hour) and 86,400 per day;
 PROGRESS.md already names listing-based discovery unscalable past ~10^4
 commits per bucket, and the query budget (max_segments = 1024,
 docs/query-engine.md) makes an hour of such data unqueryable outright.
-ADR-0014 (RSEG v2) additionally accepted a permanent dual-reader burden
+ADR-0027 (RSEG v2) additionally accepted a permanent dual-reader burden
 "until a compactor exists". This ADR is that compactor.
 
 This is the first rewrite path and the first deletion trigger beyond the
@@ -95,10 +96,6 @@ record must be durable before any input record is removed.
    corruption in flight fails closed on the same checks readers already
    run.
 
-Alternatives for the trigger, the swap protocol, deletion timing, and
-failure handling are recorded per design question in
-docs/compaction-retention-plan.md §7.
-
 ## Decision
 
 1. **Unit of work.** One sealed bucket: (tenant, signal, shard,
@@ -120,11 +117,11 @@ docs/compaction-retention-plan.md §7.
    bounds. Inputs may be RSEG v1, v2, or v3; their page bytes are copied
    verbatim regardless of input version (the page grammar is identical
    across versions, and v3's HIST_PAGES bytes are copied as an opaque
-   per-run blob, never re-encoded), and raw-f64 alignment (ADR-0014 §3.5)
+   per-run blob, never re-encoded), and raw-f64 alignment (ADR-0027)
    is applied to the output via the existing gap columns. Trailer
    version 3 was already claimed by ADR-0017's native-histogram writer
-   before this ADR's format work landed; version 4 is the resolution
-   (see docs/compaction-retention-plan.md §8). The format-change
+   before this ADR's format work landed; version 4 is the resolution.
+   The format-change
    procedure applies in full: spec amendment, checksum coverage review,
    fuzz and property coverage over all four versions, inspector support.
 3. **Output partitioning.** 1..N part objects per bucket, split by
@@ -133,11 +130,11 @@ docs/compaction-retention-plan.md §7.
    written with a single `CreateIfAbsent` PUT (crates/ravel-maintain/
    src/build.rs `put_part`); no multipart method exists on the
    object-store trait, so streaming/multipart assembly of large parts is
-   deferred to issue #243. The maintain-mode capability gate does add
+   deferred. The maintain-mode capability gate does add
    `multipart` to its required set (crates/ravel-object-store/src/lib.rs),
    but no shipped backend reports that capability (MemoryStore and S3 both
    report `multipart: false`), so the gate as written is a future
-   requirement, not a satisfied one; tracked in issue #243.
+   requirement, not a satisfied one.
 4. **Publication.** New protobuf message `CompactionRecord` (additive,
    proto/ravel/commit.proto): identity fields, ingest_hour_bucket,
    level = 1, the full input identity list [(writer_id, epoch, seq)],
@@ -215,12 +212,12 @@ docs/compaction-retention-plan.md §7.
    every compacted bucket removes v1 (and v2, and v3) objects from the
    population once the sweep completes, and retention (ADR-0019) bounds
    the tail of never-compacted buckets. This is the concrete path
-   ADR-0014 left open: once an audit shows the stored population no
+   ADR-0027 left open: once an audit shows the stored population no
    longer contains v1 objects, a follow-up ADR can retire the v1 decode
    path. That removal is not this ADR's deliverable; the audit procedure
-   is (plan §10).
+   is.
 
-## Crash analysis (summary; full walk in the plan §3.6)
+## Crash analysis (summary)
 
 | Crash point | State left | Convergence |
 |---|---|---|
@@ -237,8 +234,8 @@ compaction record.
 
 ## Consequences
 
-- docs/consistency-model.md and docs/catalog-and-mvcc.md are amended in
-  plan phase 1: the compaction paragraph is replaced by the
+- docs/consistency-model.md and docs/catalog-and-mvcc.md are amended:
+  the compaction paragraph is replaced by the
   overlap-harmless publish-then-supersede protocol, deletion/GC gains the
   supersession trigger, and token resolution gains the coverage fallback.
 - docs/segment-format.md gains the v4 amendment; the property/fuzz
@@ -252,14 +249,13 @@ compaction record.
   untouched, and a differential test proves query-over-inputs equals
   query-over-L1 bit-for-bit.
 - Catalog metadata per L1 series scales with run count (~20 bytes per
-  run) rather than being amortized to one entry; the plan carries a
-  measured stored-byte gate, and a run-merging L2 is the named follow-up
-  if run counts dominate.
+  run) rather than being amortized to one entry; a measured stored-byte
+  gate applies, and a run-merging L2 is the named follow-up if run counts
+  dominate.
 - Segment-level event-time pruning coarsens from per-flush bounds to
   per-part bounds; series-level and page-level pruning are unchanged
   because per-run bounds are preserved.
 - Compaction removes the max_segments and listing-cost ceilings on
   historical buckets but does not reduce LIST-call counts across many
   buckets; that remains the ADR-0003 catalog-snapshot work, which must
-  fold compaction records and tombstones when it lands (coordination
-  note, plan §8).
+  fold compaction records and tombstones when it lands.

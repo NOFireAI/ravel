@@ -1,11 +1,10 @@
 # ADR-0032: RLOG compaction, and a signal-generic ravel-maintain
 
-Status: Accepted (2026-07-29). Epic: #229. Builds on ADR-0018 (L0/L1 compaction),
-ADR-0019 (age-based retention), ADR-0027 (single-version pre-release),
-ADR-0029 (RLOG v1 log segment), and the approved log-storage design
-(docs/superpowers/specs/2026-07-28-log-storage-design.md, "Compaction
-and retention" section, phase 4). This ADR turns that spec section into
-an implementation decision and adds the piece it left unresolved: RLOG's
+Status: Accepted
+
+Builds on ADR-0018 (L0/L1 compaction), ADR-0019 (age-based retention),
+ADR-0027 (single-version pre-release), and ADR-0029 (RLOG v1 log segment).
+This ADR adds the piece the log-storage design left unresolved: RLOG's
 footer carries no compaction identity today, so it cannot be compacted
 as specified without a format amendment.
 
@@ -13,9 +12,8 @@ as specified without a format amendment.
 
 Metrics (RSEG) compaction is largely built: ADR-0018's phases P1-P5 are
 shipped (protos, v4/v5 writer and reader, the `ravel-maintain` compactor,
-and catalog resolver integration landed today, issue #112). What remains
-open against RSEG alone is P6 sweeper (#113), P7 retention physical
-delete (#114), and P8 maintain-mode/CLI (#115).
+and catalog resolver integration). What remains open against RSEG alone is
+the P6 sweeper, P7 retention physical delete, and P8 maintain-mode/CLI.
 
 Logs (RLOG) have none of this. RLOG v1 (ADR-0029) shipped format-only,
 and ingest (`ravel-ingest` log shard actors) merged today, writing one L0
@@ -127,7 +125,7 @@ already specifies - linear merge of sorted `STREAM_DIR`s with a global
 rebuilt `SKIP_IDX` and `BLOOM` over the merged blocks, same 8192-record
 block target.
 
-**Build the sweeper (#113) and retention physical delete (#114)
+**Build the sweeper and retention physical delete
 signal-generically, now, instead of RSEG-only.** Both operate one layer
 below the codec: given a durable record (`CompactionRecord`'s superseded
 input list, or a `RetentionTombstone`'s retired set) and a horizon past
@@ -138,7 +136,7 @@ the key/record layer serves both signals immediately; writing it
 RSEG-only now and generalizing later would mean re-touching the same
 crash-matrix-sensitive deletion path twice.
 
-**#115 (maintain-mode/CLI) covers both signals from the start** -
+**Maintain-mode/CLI covers both signals from the start** -
 compaction and retention run per (tenant, signal, shard), so the ops
 surface (cadence config, metrics, logging) is signal-generic by
 construction once the codec seam exists.
@@ -158,8 +156,8 @@ construction once the codec seam exists.
   gets a crash-path fix.
 - **Reuse RLOG v1's existing field numbers for compaction identity
   instead of adding new ones.** Rejected: violates the additive-only
-  proto rule (CLAUDE.md frozen contracts, format-change procedure step
-  2) and would make a v1 footer byte-ambiguous with a v2 footer that
+  proto rule (frozen contracts, format-change procedure) and would make a
+  v1 footer byte-ambiguous with a v2 footer that
   happens to zero those fields.
 - **Keep a v1 RLOG reader path alongside v2 "to be safe."** Rejected on
   the facts: RLOG has been in `main` for one day, nothing outside
@@ -170,8 +168,8 @@ construction once the codec seam exists.
 - **RSEG-only sweeper/retention now, generalize when RLOG needs it.**
   Rejected: the deletion path is the most crash-sensitive part of this
   whole area (ADR-0018's crash matrix rows 5-9, 12 are explicitly
-  sweeper/retention races, still only partially covered per the P4
-  report). Writing it against the generic key/record layer costs nothing
+  sweeper/retention races, still only partially covered). Writing it
+  against the generic key/record layer costs nothing
   extra today and avoids a second pass through that crash matrix later.
 - **Ship RLOG compaction only after the `logs` query table (design spec
   phase 3) lands.** Rejected: query and compaction are independent
@@ -194,18 +192,13 @@ construction once the codec seam exists.
   1; `ravel-ingest`'s log writer path picks up the same one-line bump
   RSEG's L0 writer would need, populating the new fields at their L0
   defaults.
-- `ravel-maintain` gains a codec seam that P6/P7/P8 (#113/#114/#115) are
-  re-scoped to build against generically rather than RSEG-only; those
-  three issues get their bodies updated to reflect the generic scope
-  under this ADR rather than superseded by new ones.
+- `ravel-maintain` gains a codec seam that P6/P7/P8 are re-scoped to build
+  against generically rather than RSEG-only.
 - The RLOG differential/crash-matrix test suites gain the RSEG side's
   shape: a compacted-vs-uncompacted keystone differential test, and
   crash-matrix coverage for the merge/publish/sweep paths specific to
   RLOG's merge (STREAM_DIR remap correctness under partial-input
   crashes).
-- `docs/log-segment-format.md`, `proto/ravel/logseg.proto`,
-  `docs/compaction-retention-plan.md` (the ~870-line implementer
-  contract that P6/P7/P8 already live in - it gets a logs-signal
-  section, not a fork), and `docs/PROGRESS.md` are amended in the same
-  commits as the code that implements each change, per the doc-currency
-  rule.
+- `docs/log-segment-format.md`, `proto/ravel/logseg.proto`, and
+  `docs/PROGRESS.md` are amended in the same commits as the code that
+  implements each change, per the doc-currency rule.

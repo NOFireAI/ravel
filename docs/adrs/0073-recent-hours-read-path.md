@@ -1,9 +1,6 @@
 # ADR-0073: Recent-hours read path
 
-Status: accepted
-Date: 2026-08-12
-Refs: #658, adversarial review finding S1-13 (v1 section 6, v2 section L
-experiment 10)
+Status: Accepted
 
 ## Context
 
@@ -140,14 +137,14 @@ through the existing accounting merge.
   coordinator resolves and cap-checks before slicing; fan-out moves
   fetch cost, not admission. Not a relief mechanism.
 - **Approximate or partial recent-hour results.** Banned by the
-  exactness invariant; the reviews credit the current design precisely
+  exactness invariant; the current design is credited precisely
   for failing closed.
 
 ## Consequences
 
 - Recent hours of a hot tenant stay queryable through the compaction
   lag window at a bounded, observable request cost; the outage class
-  S1-13 (v2 experiment 10) closes.
+  closes.
 - A hot open hour is expensive until compaction catches up (thousands
   of GETs); operators see it in the existing per-query accounting and
   can tighten per-tenant `max_s3_requests`. The L0.5 read-side
@@ -161,7 +158,7 @@ through the existing accounting merge.
   the unified admission seam; tests in tests/failure/ pin the
   read-your-write-token case and the sustained-flush-past-cap case.
 
-## Amendment, 2026-08-12 (issue #936)
+## Amendment
 
 The request budget from decision 3 is now also re-enforced on the
 cross-cluster/distributed coordinator path (ADR-0071), alongside the

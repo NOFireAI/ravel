@@ -1,6 +1,6 @@
 # ADR-0045: RSPAN v2 and v4: pruning columns, a shared codec crate, and a reachable spans table
 
-Status: Accepted (2026-08-02)
+Status: Accepted
 
 ## Context
 
@@ -92,11 +92,10 @@ duplicate it in the blob.
 
 ### 3. RSPAN v4: attribute columns and span events
 
-Amended, 2026-08-05 (ADR-0054): this decision was originally numbered
-trailer version 3. ADR-0054 claims v3 for a bloom filter and a
-service_name column instead, since that work is ready to ship and this
-one has no code yet. Renumbered to v4 here; issue #434 carries the same
-renumbering.
+Amended (ADR-0054): this decision was originally numbered trailer
+version 3. ADR-0054 claims v3 for a bloom filter and a service_name
+column instead, since that work is ready to ship and this one has no
+code yet. Renumbered to v4 here.
 
 Trailer version 4, landing after v3 (ADR-0054) is green. Ports RLOG's proven
 design rather than inventing a span-specific one: per-key typed columns
@@ -144,7 +143,7 @@ it onto the block-level duration bounds.
 `ravel-maintain`'s span compaction fetches and decodes every input object
 whole (crates/ravel-maintain/src/rspan_codec.rs:156), holding the
 bucket's decoded records in memory across the merge. RLOG had the same
-problem and solved it with `RlogRangeReader` (issue #275). RSPAN gets the
+problem and solved it with `RlogRangeReader`. RSPAN gets the
 equivalent, and the compactor uses it. This is a latent operational
 failure, not a design question: span volume decides when the compactor
 runs out of memory, not whether.

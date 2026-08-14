@@ -1,10 +1,10 @@
 # ADR-0035: Conformance scoring for the PromQL and SQL query surfaces
 
-Status: Proposed. Builds on ADR-0007/ADR-0021 (the PromQL differential
-approach and full-evaluator scope), ADR-0013/ADR-0033 (the DataFusion SQL
-surface), and the accepted-divergence records ADR-0025 and ADR-0030. The
-PromQL half fulfills issue #133; the SQL half is a sub-epic of epic #28
-and delivers part of issue #145's workstream 2 (see Context).
+Status: Accepted
+
+Builds on ADR-0007/ADR-0021 (the PromQL differential approach and
+full-evaluator scope), ADR-0013/ADR-0033 (the DataFusion SQL surface), and
+the accepted-divergence records ADR-0025 and ADR-0030.
 
 ## Context
 
@@ -26,12 +26,11 @@ already investigated and closed: ADR-0025's five ULP-tolerance entries
 (arithmetic residue in `rate`/`deriv`/`predict_linear`, 1-904 ULP, plus
 `atanh` at 169 ULP) and ADR-0030's two `ravel_error_prom_success`
 entries (Ravel's per-subquery-node 11,000-point cap has no Prometheus
-counterpart). Issue #133 (open, unstarted) already specs a
+counterpart). A prior plan already specs a
 "not-supported" table for `docs/query-engine.md` enumerating every
 promql-parser AST node and stable Prometheus function as
 implemented-and-covered or typed-rejected. This ADR's PromQL half is
-that work: the epic closes #133 as fulfilled, it does not add a second
-unrelated table beside it.
+that work; it does not add a second unrelated table beside it.
 
 **SQL.** `crates/ravel-sql` uses DataFusion directly (`datafusion = {
 version = "54", features = ["sql"] }`, no ExprPlanner, so ADR-0033's
@@ -46,16 +45,14 @@ scan oracle (`tests/pipeline.rs`) against an independent merge, and
 layer 2's proptest-driven operator gate (`tests/differential.rs`,
 `tests/util/gate.rs`) checking project/filter/count/sum/group-by/
 order-by/limit/min/max against a hand-written reference executor. That
-is a test fixture, not a published, scored table. Issue #145 (Q1
-ravel-sql audit) workstream 2 already calls for a DataFusion-differential
-audit, tracked under epic #28 (ADR-0013); this ADR's SQL half is scoped
-as a sub-epic of #28 fulfilling that part of #145, not an unlinked
-duplicate.
+is a test fixture, not a published, scored table. A ravel-sql audit
+already called for a DataFusion-differential audit under ADR-0013; this
+ADR's SQL half fulfills that part of it, not an unlinked duplicate.
 
-The gap this ADR closes: misses currently live in ADR prose and closed
-issues. There is no artifact a reader can consult to answer "does Ravel
-support X" for either language, and no scored baseline against which a
-new miss is visible as a ticket rather than a surprise.
+The gap this ADR closes: misses currently live only in ADR prose. There
+is no artifact a reader can consult to answer "does Ravel support X" for
+either language, and no scored baseline against which a new miss is
+visible rather than a surprise.
 
 ## Decision
 
@@ -96,8 +93,8 @@ state, "accepted divergence, see ADR-00XX", cross-linking the existing
 decision rather than re-litigating it as a new miss. The table reuses
 the ADR vocabulary; it does not reopen closed investigations.
 
-**Where the tables live.** The PromQL table extends `docs/query-engine.md`
-per #133's existing plan. The SQL table gets a new doc,
+**Where the tables live.** The PromQL table extends `docs/query-engine.md`.
+The SQL table gets a new doc,
 `docs/sql-conformance.md`, cross-referenced from
 `docs/adrs/0033-sql-query-over-logs.md` and README's doc index, because
 ravel-sql has no equivalent existing doc section to extend.
@@ -108,10 +105,9 @@ test binary emits, or a small script over it), so the published numbers
 cannot silently drift from what actually passes. Hand-written prose is
 limited to the per-row rationale for state-2 entries.
 
-**Triage of current misses is a one-time orchestrator step.** Once the
-suites land, current state-3 rows are triaged into GitHub issues by the
-orchestrating session, not by the test suites themselves (Rejected
-Alternatives, D).
+**Triage of current misses is a one-time step.** Once the suites land,
+current state-3 rows are triaged into tracked issues manually, not by the
+test suites themselves (Rejected Alternatives, D).
 
 This ADR changes no frozen format: no RSEG, proto, series-identity,
 commit-token, or object-key changes, so no version bump. It adds tests,
@@ -132,14 +128,12 @@ the Decision is the resolution: enumerate the full surface, score over
 the claimed part, keep the unclaimed part visible.
 
 **B. A shared `conformance-core` crate or scoring type used by both
-suites.** Rejected: this epic will be decomposed into fleet-dispatched
-waves, and the wave-cutting rule requires zero file overlap and no two
-tasks in the same crate. A shared abstraction forces the PromQL and SQL
-scoring work into one crate or one shared dependency, serializing what
-is otherwise fully parallel work, for a shared scoring struct with no
-real value: the two languages' construct taxonomies (promql-parser AST
-nodes vs. SQL constructs) do not overlap, so there is nothing to share
-beyond three enum variants each side can write locally.
+suites.** Rejected: the PromQL and SQL scoring work is otherwise fully
+parallel, and a shared abstraction would serialize it into one crate for
+a shared scoring struct with no real value: the two languages' construct
+taxonomies (promql-parser AST nodes vs. SQL constructs) do not overlap, so
+there is nothing to share beyond three enum variants each side can write
+locally.
 
 **C. Vendor or adopt DataFusion's own sqllogictest suite wholesale.**
 Rejected: it exercises full ANSI SQL and DataFusion's complete function
@@ -154,13 +148,11 @@ publication, not a third-party corpus.
 
 **D. Continuous CI-automated ticket filing for every scoring run.**
 Rejected for now, flagged as a follow-up rather than rejected forever.
-Filing GitHub issues is an orchestration-time action with side effects
-visible to others, and a fleet task that calls `gh issue create`
-produces duplicate issues on any retry from the failure playbook (fleet
-tasks are re-dispatched once on transient failure). This epic does
-one-time triage of current misses into tickets as a human/orchestrator
-step after the suites land. A follow-up could add a diff-against-baseline
-CI check that flags (not auto-files) new misses.
+Automatically filing issues on every run has side effects visible to
+others and produces duplicates on any retry. Current misses are triaged
+into tracked issues once, manually, after the suites land. A follow-up
+could add a diff-against-baseline CI check that flags (not auto-files) new
+misses.
 
 ## Consequences
 
@@ -170,10 +162,6 @@ CI check that flags (not auto-files) new misses.
   catch, not a false negative to ignore. The state-2 verification tests
   are the enforcement of the typed-rejection invariant on the query
   surface, not paperwork.
-- Issue #133 closes as fulfilled by the PromQL half. The SQL half lands
-  under epic #28 and discharges the DataFusion-differential part of
-  #145's workstream 2; both linkages are stated so neither issue is
-  duplicated by parallel work.
 - ADR-0025's and ADR-0030's accepted divergences appear in the PromQL
   table as "accepted divergence" rows citing those ADRs. They are
   excluded from the state-3 miss bucket permanently; a future reader

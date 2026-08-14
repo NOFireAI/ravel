@@ -212,7 +212,7 @@ query is refused up front, before it can run up an object-store bill or
 saturate the listing path; the error reports both the estimate and the limit,
 so narrow the time range by the reported factor and retry. The ceiling
 permits roughly an 11-year window at one shard and about 8.5 months at
-sixteen; it scales down as shard count rises (issue #635, ADR-0044). Note the
+sixteen; it scales down as shard count rises (ADR-0044). Note the
 limit is on the query's *start*: a narrow `start`/`end` pair costs little
 however recent it is, so the fix is always to move `start` forward, never to
 change `end`.

@@ -11,7 +11,7 @@ pub const MAGIC: [u8; 4] = *b"RSG1";
 #[allow(dead_code)]
 pub const VERSION: u16 = 1;
 
-/// Retired RSEG v2 trailer version (ADR-0014, retired by ADR-0027). Rejected
+/// Retired RSEG v2 trailer version (retired by ADR-0027). Rejected
 /// by the reader; reserved, never reused.
 #[allow(dead_code)]
 pub const VERSION_V2: u16 = 2;
@@ -161,7 +161,7 @@ mod tests {
     use super::*;
 
     /// Pins every persistent-format constant's wire value. A change here is
-    /// a format change (docs/segment-format.md, ADR-0014), never a refactor.
+    /// a format change (docs/segment-format.md, ADR-0027), never a refactor.
     #[test]
     fn format_constants_are_pinned() {
         assert_eq!(VERSION, 1);

@@ -1,10 +1,11 @@
 # ADR-0042: Compliance-grade custody - legal hold, per-tenant KMS, pluggable auth, verify-custody
 
+Status: Accepted
+
 ## Context
 
-Epic 4 (compliance-grade custody, program #333). Codebase survey found
-Ravel already has more of this than expected, and one real gap the
-pinned `object_store` version cannot close:
+A codebase survey found Ravel already has more of this than expected,
+and one real gap the pinned `object_store` version cannot close:
 
 - **Auth**: `crates/ravel-query/src/http/tenant.rs:17`'s `TenantResolver`
   trait is already the pluggable seam (`StaticBearerTokenResolver` is
@@ -47,8 +48,8 @@ pinned `object_store` version cannot close:
    means "the tenant supplies their own `kms_key_id`", not "Ravel
    manages keys."
 2. **Legal hold via the existing `LeaseCheck` seam, not S3 Object
-   Lock.** The sweeper's crash-matrix design (docs/compaction-
-   retention-plan.md) already provisioned a `LeaseCheck` hook
+   Lock.** The sweeper's crash-matrix design already provisioned a
+   `LeaseCheck` hook
    ("consulted before every delete", currently the no-op `NoLeases`)
    as a seam for exactly this kind of future gate. A new
    `LegalHoldCheck` implementation consults a per-tenant (or
@@ -98,7 +99,7 @@ pinned `object_store` version cannot close:
 
 - **Claim full S3 Object Lock WORM support by hand-rolling raw S3 API
   calls that bypass `object_store` for the retain-until-date header.**
-  Rejected for this epic: a second, parallel write path outside the
+  Rejected: a second, parallel write path outside the
   `ObjectStoreBackend` trait's contract-tested abstraction would
   violate "no durability may depend on" an unaudited side channel, and
   duplicates the entire PUT retry/error-mapping story `object_store`
@@ -138,16 +139,16 @@ pinned `object_store` version cannot close:
   with none configured gets today's behavior (whatever bucket-default
   SSE the deployment has) unchanged.
 
-## Amendment (2026-08-12): decision 1's mechanism is key-prefix routing, not a per-tenant `S3Config` field
+## Amendment: decision 1's mechanism is key-prefix routing, not a per-tenant `S3Config` field
 
 Decision 1 as originally written says "`S3Config` gains an optional
 `kms_key_id: Option<String>` (per-tenant, sourced the same way tenant
-tokens are configured today...)". EL-7 (issue #764, epic #462, ADR-0062
-decision 1, ADR-0072 decision 2) is the change that actually wires this
-into a running `ravel-server`, and the mechanism it ships is not that:
-`S3Config.kms_key_id` stays a single, process-wide field (ADR-0062
-decision 1c's single-key posture, `--s3-kms-key`) applied to the one
-default `S3Store` every deployment already builds.
+tokens are configured today...)". The change that actually wires this
+into a running `ravel-server` (ADR-0062 decision 1, ADR-0072 decision 2)
+ships a different mechanism: `S3Config.kms_key_id` stays a single,
+process-wide field (ADR-0062 decision 1c's single-key posture,
+`--s3-kms-key`) applied to the one default `S3Store` every deployment
+already builds.
 
 Per-tenant routing is a separate decorator, `KmsRoutingStore`
 (`crates/ravel-object-store/src/kms_routing.rs`, already implemented and
@@ -165,7 +166,7 @@ store. There is no per-tenant field on `S3Config` itself — there is one
 This is additive, not a reversal: decision 1's actual intent (BYOK, "the
 tenant supplies their own `kms_key_id`") is unchanged, and the object-key
 layout gains nothing beyond the already-authorized `t/<hash>/enc`
-key-epoch record (ADR-0062 decision 1b, EL-2). Only the "how" — a
+key-epoch record (ADR-0062 decision 1b). Only the "how" — a
 per-tenant `S3Config` field versus a routing decorator over per-tenant
 `S3Store` instances keyed by prefix — was wrong in the original text, and
 is corrected here rather than left to mislead a future reader of decision

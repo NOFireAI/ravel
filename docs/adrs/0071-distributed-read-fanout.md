@@ -1,7 +1,6 @@
 # ADR-0071: Distributed read fan-out and cross-cluster federation
 
-Status: Proposed
-Refs: #861
+Status: Accepted
 
 ## Context
 
@@ -161,7 +160,7 @@ credentials lacks. Remote endpoints come only from operator config, never
 from query text. Remote responses are size- and shape-validated data; a
 remote cannot escalate through the coordinator.
 
-**Implementation note (issue #868): the two credential models are one wire
+**Implementation note: the two credential models are one wire
 type with two trust boundaries.** The `FetchRequest` carries a `Scope`. A
 `Pinned` fetch is an intra-cluster slice: the worker trusts the coordinator
 and uses the already-resolved `tenant_hash` on the wire directly. A

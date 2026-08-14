@@ -1,9 +1,10 @@
 # ADR-0034: Kubernetes operator, kind development environment, and k8s CI lane
 
-Status: Proposed (2026-07-30). Deployment and operations tooling only: no
-change to any frozen contract (RSEG layout, proto schemas, series
-identity, commit tokens, object key layout) and no change to ingest or
-query semantics.
+Status: Accepted
+
+Deployment and operations tooling only: no change to any frozen contract
+(RSEG layout, proto schemas, series identity, commit tokens, object key
+layout) and no change to ingest or query semantics.
 
 ## Context
 
@@ -111,7 +112,7 @@ exists for disk-hungry jobs.
    require one). One-shot `ravel-cli maintain` subcommands stay outside
    the operator's scope.
 
-   **Superseded note (ADR-0065, issue #749).** The "sustained N>1
+   **Superseded note (ADR-0065).** The "sustained N>1
    multiplies object-store traffic for zero throughput" reasoning above
    no longer holds. ADR-0065 decisions 1 and 2 give every maintain
    process a self-owned heartbeat identity and partition
@@ -124,7 +125,7 @@ exists for disk-hungry jobs.
    block still has no `replicas` field (decision 3 above) and the
    Deployment strategy in this ADR is unchanged: widening the schema and
    switching the strategy is a follow-up for whoever next touches the
-   operator, not done by EI-T5.
+   operator, not done here.
 
 4. **Health endpoints are in scope**, as the epic's prerequisite server
    task. `/healthz` returns 200 whenever the HTTP listener is serving

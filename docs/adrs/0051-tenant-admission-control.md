@@ -1,26 +1,24 @@
 # ADR-0051: Tenant admission control and ingest-time correctness
 
-Status: Accepted (2026-08-02)
+Status: Accepted
 
 ## Context
 
 ADR-0009 decided that per-tenant quotas (series, bytes per second) are
 "enforced at gateway/frontend from config; hard limits precede
-allocation". Nothing implements that sentence. The adversarial
-architecture review (docs/reviews/adversarial/RAVEL-ADVERSARIAL-REVIEW.md,
-findings S3-01/S4-05, risk B5, experiment L10) verified against the code
-that the only ingest-side limits are per-request structural caps in
-`ravel-otlp` (`IngestLimits`, `LogIngestLimits`, `TraceIngestLimits`) and
-the decompression caps in OTAP (16 MiB) and Remote Write (64 MiB). There
-is no active-series cap, no series-creation-rate limit, and no ingest
-byte-rate quota anywhere; one tenant emitting a fresh label set per point
-drives fleet-wide object count, PUT spend, catalog size, and query
-fan-out, with no per-tenant counter to attribute it (S3-08).
+allocation". Nothing implements that sentence. The only ingest-side
+limits are per-request structural caps in `ravel-otlp` (`IngestLimits`,
+`LogIngestLimits`, `TraceIngestLimits`) and the decompression caps in
+OTAP (16 MiB) and Remote Write (64 MiB). There is no active-series cap,
+no series-creation-rate limit, and no ingest byte-rate quota anywhere;
+one tenant emitting a fresh label set per point drives fleet-wide object
+count, PUT spend, catalog size, and query fan-out, with no per-tenant
+counter to attribute it.
 
-The same epic covers a cluster of ingest-time correctness gaps the review
-rated alongside the quota gap:
+This work covers a cluster of ingest-time correctness gaps alongside the
+quota gap:
 
-- **S2-01 (CRITICAL).** Metrics enforce event-time skew bounds at
+- **Event-time skew for logs and spans (critical).** Metrics enforce event-time skew bounds at
   admission (`checked_event_ts`, crates/ravel-otlp/src/normalize.rs:729;
   ADR-0010 §8): event time outside
   `[ingest_ts - max_ingest_lag, ingest_ts + max_future_skew]` is rejected
@@ -34,34 +32,33 @@ rated alongside the quota gap:
   acked but invisible to every non-token query, and because retention
   anchors expiry on `max_event_ts`, one `now + 100y` record makes its
   bucket unexpirable forever.
-- **S2-02 / S1-07 (CRITICAL).** Query-time dedup exists for metrics only
+- **Log/span duplicate identity (critical).** Query-time dedup exists for metrics only
   (`(series_id, ts)`). Logs and spans have no duplicate identity on any
   read path, so a client retry after a lost ack (crash-matrix row 3, a
   normal event) doubles visible log rows and spans with no signal.
   docs/consistency-model.md documents at-least-once delivery honestly,
   but its "identical duplicates are harmless" framing is true for
   metrics only and is widely over-read.
-- **S1-12.** All three shard actors map a non-representable flush-open
+- **Flush-open clock bucket 0.** All three shard actors map a non-representable flush-open
   clock reading to ingest hour bucket 0 (`u32::try_from(...).unwrap_or(0)`
   at crates/ravel-ingest/src/shard.rs:423, log_shard.rs:349,
-  span_shard.rs:317 — the review cited only the metrics shard; the same
-  line exists in all three). A clock that goes bad between admission and
+  span_shard.rs:317 — the same line exists in all three). A clock that goes bad between admission and
   flush open produces a strict-acked commit in the 1970 bucket that no
   realistic query window ever lists.
-- **S4-11.** The OTLP-HTTP handlers decode from an axum `Bytes` body with
+- **No explicit body limit.** The OTLP-HTTP handlers decode from an axum `Bytes` body with
   no explicit `DefaultBodyLimit` on the routes; the bound is the
   framework default, undocumented, and can regress silently.
-- **S2-06 / S3-05.** The unconditional 500 ms flush age trigger gives
+- **Cadence-driven PUT floor.** The unconditional 500 ms flush age trigger gives
   every tenant a PUT floor set by cadence, not volume: up to ~16 PUTs/s
   across 4 shards per signal regardless of data (~$200/month/tenant in
   PUT requests alone).
-- **S4-07.** `max_series` on the query path is enforced after the full
+- **Late `max_series` enforcement.** `max_series` on the query path is enforced after the full
   `by_id` map is materialized (crates/ravel-query/src/engine.rs:352-364),
   so the memory the cap exists to bound is allocated before the cap
   rejects.
 
-Where the review is stale, this ADR designs for what is on `main` now,
-not for what the review saw:
+Where earlier assessments are stale, this ADR designs for what is on
+`main` now:
 
 - A `/metrics` endpoint exists (services/ravel-server/src/metrics.rs,
   ADR-0044 §4): a hand-written Prometheus exposition renderer with a
@@ -69,7 +66,7 @@ not for what the review saw:
   `op`, `error_kind`, `workload_class`, `level`) and a `TenantHashLabel`
   that folds every unconfigured tenant into `other` so per-tenant
   cardinality is bounded by configured-tenant count, not traffic. The
-  review's "Ravel exports no runtime telemetry at all" is no longer true;
+  earlier "Ravel exports no runtime telemetry at all" is no longer true;
   this ADR reuses that renderer and adds no second registry.
 - Per-query cost accounting types exist (`QueryAccounting` in
   crates/ravel-types/src/accounting.rs, ADR-0044). Measurement is in;
@@ -115,7 +112,7 @@ without passing all of them.
      consuming tokens and without admitting any of the batch. Whole-
      request, because a partially admitted batch that the client retries
      re-ingests the admitted remainder, and for logs that duplication is
-     user-visible (S2-02). Retryable rejections are therefore always
+     user-visible. Retryable rejections are therefore always
      all-or-nothing.
    - **Active-series cap** (`max_active_series`): points that would
      create a series beyond the cap are rejected per-series through
@@ -266,13 +263,13 @@ Two-part decision:
    rule applies to the `c/` prefix only). Markers older than the dedup
    window (default 24 h, from the `ingest_hour` in the file name) are
    deleted by a stateless sweep rule in `ravel-maintain`
-   (`ravel_maintain::sweep_idempotency_markers`, epic #452, EB-9), wired
+   (`ravel_maintain::sweep_idempotency_markers`), wired
    into the maintenance driver's tick in
    `services/ravel-server/src/maintain.rs::run_tick`, once per signal for
    logs and spans (metrics has no markers); `ravel-cli` will get an
-   inspector for the new object class (EB-12; not yet implemented).
+   inspector for the new object class (not yet implemented).
 
-   **Amendment (2026-08-03):** the checksum coverage above was
+   **Amendment:** the checksum coverage above was
    implemented as `crc32c(magic || version || payload)`, not
    `crc32c(payload)` as an earlier draft of this section stated — the
    header fields a reader branches on (magic, version) must be under the
@@ -314,11 +311,11 @@ deliberate flag, not a new auth subsystem.
 
 ### 7. Ingest-time correctness fixes carried with the epic
 
-- **Hour-bucket fail-loud (S1-12):** in all three shard actors a
+- **Hour-bucket fail-loud:** in all three shard actors a
   non-positive or non-representable `flush_open_ns` fails the flush with
   `WriteError::SegmentBuild` (typed, waiters errored, client retries)
   instead of `unwrap_or(0)`.
-- **Idle-aware age trigger (S2-06/S3-05):** the 500 ms age trigger fires
+- **Idle-aware age trigger:** the 500 ms age trigger fires
   only when the flush window contains a strict-mode waiter or the buffer
   holds at least `min_flush_bytes`; otherwise `max_flush_delay_idle`
   (default 10 s) applies. Strict-mode ack latency is unchanged;
@@ -326,7 +323,7 @@ deliberate flag, not a new auth subsystem.
   trickle tenant still pays the floor — that is the price of its ack
   latency, and the per-tenant `max_flush_delay` override is the operator
   lever for tenants that prefer cost over latency.
-- **Incremental `max_series` (S4-07):** the query engine enforces
+- **Incremental `max_series`:** the query engine enforces
   `max_series` during `by_id` construction, aborting the loop at the
   bound, so peak memory is bounded by the cap rather than by the match.
 
@@ -359,8 +356,8 @@ ADR, not this one.
    enforces.
 3. **Anchoring log/span timestamps on ingest time (clamping event time
    into bounds) instead of rejecting.** Rejected: silently rewriting a
-   sender's event time is data corruption of the plausible-wrong-result
-   class the review rates most dangerous; a typed rejection is visible to
+   sender's event time is data corruption of the most dangerous,
+   plausible-wrong-result class; a typed rejection is visible to
    the sender and countable by the operator.
 4. **Content-hash query-time dedup for logs/spans (dedup by
    (stream_id, ts, body-hash) as metrics dedup by (series_id, ts)).**
@@ -391,7 +388,7 @@ ADR, not this one.
    registry-style label allocation as the mechanism by which
    observability systems acquire unbounded self-telemetry, and the
    existing renderer's closed `Label` enum is the cardinality bound this
-   epic itself requires (S3-08). One registry, extended at its documented
+   ADR itself requires. One registry, extended at its documented
    seam.
 8. **Enforcing quotas inside the shard actors instead of at the
    gateway.** Rejected: by the time a point is in a `ShardMsg` the
@@ -410,13 +407,12 @@ ADR, not this one.
   procedure (versioned checksummed body, docs/catalog-and-mvcc.md amended
   with the key-builder change, property tests over corrupt/truncated
   markers, CLI inspector).
-- Experiment L10 (one tenant drives fleet cost with no cap) passes:
-  series count is capped by `max_active_series`, PUT-driving volume by
-  the byte-rate bucket, and the idle age trigger removes the
-  volume-independent PUT floor for buffered-mode tenants. Experiment L6
-  (retry doubles log rows with no signal) passes for keyed requests
-  (count stays flat) and is a documented, counted contract for unkeyed
-  ones.
+- One tenant driving fleet cost with no cap is now bounded: series count
+  is capped by `max_active_series`, PUT-driving volume by the byte-rate
+  bucket, and the idle age trigger removes the volume-independent PUT
+  floor for buffered-mode tenants. A retry doubling log rows with no
+  signal is handled for keyed requests (count stays flat) and is a
+  documented, counted contract for unkeyed ones.
 - Fleet-wide limits are per-process × replicas; operators sizing a hard
   business cap divide by ingest replica count. Documented, not silent.
 - Long-running spans (duration > `max_ingest_lag`) are rejected at
@@ -429,22 +425,22 @@ ADR, not this one.
   fleets that leave it off keep today's `other`-folded exposition and
   still get fleet-total admission counters.
 - The dual-compaction-record overlap for signals without dedup (the
-  read-side half of S2-02) is not addressed here: it is Ravel-caused
-  duplication, not client-caused, and belongs to the compaction/read
-  path, tracked in the review ledger, not to admission control.
+  read-side half of the duplication problem) is not addressed here: it is
+  Ravel-caused duplication, not client-caused, and belongs to the
+  compaction/read path, not to admission control.
 - Read-side cost enforcement (bytes-scanned budgets) remains staged
   behind ADR-0044's measurement, unchanged by this ADR.
 
-## Amendment (2026-08-13): fail-closed ingest-timestamp plausibility
+## Amendment: fail-closed ingest-timestamp plausibility
 
-Issue #905, adversarial finding S1-12. This amendment appends to the
-original decision; where it supersedes a sentence of §4 or a Consequences
-bullet, it says so explicitly. Everything else above stands unchanged.
+This amendment appends to the original decision; where it supersedes a
+sentence of §4 or a Consequences bullet, it says so explicitly.
+Everything else above stands unchanged.
 
 ### Context
 
-S1-12's headline was "ingest-hour derivation fails open on nonsense
-clocks". §7 closed half of it: a non-positive or non-representable
+The remaining gap was ingest-hour derivation failing open on nonsense
+clocks. §7 closed half of it: a non-positive or non-representable
 flush-open clock reading now fails the flush loudly instead of writing
 bucket 0. Two fail-open holes remain, and one earlier fix attempt made
 things worse in a different way:
@@ -462,7 +458,7 @@ things worse in a different way:
    §4 bounds `start_ts` by `max_ingest_lag`, which rejects every
    legitimate span longer than the lag window; the original Consequences
    section admitted this ("Long-running spans ... are rejected at
-   admission"). A review of the first #905 implementation blocked on
+   admission"). A review of the first implementation blocked on
    exactly this class of regression.
 3. **The blocked fix invented a second window.** That implementation
    added a fresh ~2h past-reject bound distinct from `max_ingest_lag`.
@@ -481,9 +477,9 @@ crates/ravel-remote-write/src/normalize.rs, samples, histograms, and
 exemplars), logs (`checked_record_ts`,
 crates/ravel-otlp/src/logs_normalize.rs), and spans
 (`checked_span_interval`, crates/ravel-otlp/src/traces_normalize.rs).
-Issue #905's "extending to the metric path if it lacks the bound" turns
-out to be moot: no metric surface lacks it. The real gaps are the span
-anchor and the receiver clock, below.
+An earlier idea of "extending to the metric path if it lacks the bound"
+turns out to be moot: no metric surface lacks it. The real gaps are the
+span anchor and the receiver clock, below.
 
 ### Decision
 
@@ -563,8 +559,8 @@ under the existing per-signal counter
 `ravel_admission_rejected_total{tenant_hash, signal, reason="skew"}`
 (§6).
 
-**4. The receiver's own clock is checked at both points it is read
-(this is the actual S1-12 close-out).** There is no second clock to
+**4. The receiver's own clock is checked at both points it is read.**
+There is no second clock to
 compare against, but a floor is derivable: no host legitimately runs
 Ravel with a clock reading before the system existed. A compiled
 constant
@@ -669,7 +665,7 @@ safe.
   it is the same behavior change the original ADR already shipped for
   log/span skew.
 
-### Implementation note (issue #905 executor)
+### Implementation note
 
 - **Span anchor:** crates/ravel-otlp/src/traces_normalize.rs
   `checked_span_interval` — move the `max_ingest_lag_ns` check from

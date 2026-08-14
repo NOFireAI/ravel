@@ -1,7 +1,6 @@
 # ADR-0037: CI-built container images published to GHCR
 
-Status: Proposed (2026-07-31). Build and release tooling only: no change
-to any frozen contract, ingest/query semantics, or durability invariant.
+Status: Accepted
 
 ## Context
 
@@ -38,7 +37,7 @@ from instead of building locally at all.
 The repo has no existing cloud registry account, secret, or credential
 of any kind (no AWS, no ECR references outside the failing local
 command's `$ECR` env var, which is a developer-local convention, not
-repo config). The GitHub org is `NOFireAI`, repo `store`.
+repo config).
 
 ## Decision
 
@@ -102,7 +101,7 @@ repo config). The GitHub org is `NOFireAI`, repo `store`.
    explicitly rather than relying on the org default (which may be
    read-only), and the image path is the hardcoded, already-lowercase
    `ghcr.io/nofireai/...` rather than an interpolated
-   `${{ github.repository_owner }}` (`NOFireAI`, mixed case — Docker
+   `${{ github.repository_owner }}` (which is mixed case — Docker
    rejects non-lowercase repository names).
 
 5. **Visibility: public packages, flipped after first publish.** A

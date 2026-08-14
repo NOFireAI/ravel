@@ -1,6 +1,6 @@
 # ADR-0009: Tenant-hashed prefixes, gateway auth, dev-mode header tenancy behind flag
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 
@@ -29,5 +29,5 @@ from request bodies.
   unkeyed, so anyone with bucket-list access can confirm a guessed tenant
   id offline; deployments needing enumeration resistance configure the
   keyed tenant hash (ADR-0010 §13).
-- Static token maps are a stopgap; ADR to follow for OIDC when the gateway
-  hardens (tracked in issues).
+- Static token maps are a stopgap; OIDC support follows when the gateway
+  hardens.

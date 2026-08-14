@@ -47,7 +47,7 @@ Channel: `tokio::sync::mpsc` bounded (default 256 messages per shard).
 holds the request open while it awaits.
 
 What actually bounds gateway memory is a process-wide in-flight
-ingest-request ceiling (issue #802), `--max-inflight-ingest-requests`
+ingest-request ceiling, `--max-inflight-ingest-requests`
 (default 1024, 0 disables it). One `tokio::sync::Semaphore`, shared across
 every OTLP metrics/logs/traces and Remote Write handler, on both the public
 and mTLS listeners and both the HTTP and gRPC transports. A request that does
@@ -87,7 +87,7 @@ complete, so it never routes on a stale view. Operators append a generation with
 `ravel-cli provision reshard`; the record enforces the append-only,
 future-activation mutation model. See ADR-0052 for the full design.
 
-#### Bounded grace window on a stuck re-read (NF-2)
+#### Bounded grace window on a stuck re-read
 
 Fail-closed staleness has an availability failure mode: if the store is slow
 or unreachable for longer than `C`, every re-read attempt fails and the router
@@ -127,7 +127,7 @@ clock skew)` hours past the successor's activation
 (`ravel_catalog::DEFAULT_SCAN_SLACK_HOURS`, `S = 3` with today's defaults:
 `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` = 2 from flush timing plus
 `ravel_catalog::TOLERATED_CLOCK_SKEW_HOURS` = 1 of tolerated inter-writer clock
-skew, NF-3), so a straggler that lands within `S` hours of the activation is
+skew), so a straggler that lands within `S` hours of the activation is
 still scanned and returned, for any writer whose clock skew stays within
 `TOLERATED_CLOCK_SKEW_HOURS`. A writer skewed beyond that bound has no
 read-side fix -- no finite slack covers unbounded skew -- and is a distinct,
@@ -174,7 +174,7 @@ Loop over `select!`:
   canonical label set that id already claims in the buffer; a mismatch
   (hash collision) rejects the point with a typed error and increments
   the series_id_collisions counter instead of silently merging
-  (ADR-0005 fail-loud rule; issue #63).
+  (ADR-0005 fail-loud rule).
 - flush tick (interval default 200 ms): flush if `oldest_ns` older than an
   age threshold, and buffer non-empty. The threshold is `max_flush_delay`
   (default 500 ms) when the buffer has a strict-mode waiter or already holds
@@ -185,12 +185,12 @@ Loop over `select!`:
   window; only a low-volume buffered-mode tenant's PUT cadence changes.
 - channel closed (router dropped): flush the remaining buffer before
   exiting rather than discarding it; points that still fail to flush are
-  counted, never silently lost (issue #64).
+  counted, never silently lost.
 
 Shard-actor death is observable: the router marks a shard dead when its
 channel closes or an ack receiver fails, routes subsequent points for
 that shard to a typed shard-unavailable error, and increments a
-shard_deaths counter. Surviving shards keep working (issue #65).
+shard_deaths counter. Surviving shards keep working.
 
 Flush (still inside the actor; ingest-ordering per shard is the point):
 1. Build RSEG via `ravel-segment::SegmentWriter` (one segment per tenant in
@@ -219,11 +219,11 @@ The commit record's `ingest_hour_bucket` is derived from the flush-open
 clock reading at step 1, before the segment is built. A non-positive or
 non-representable reading fails the flush the same way a segment-build
 error does (typed `SegmentBuild` error, every waiter acked with it, no
-object written) rather than defaulting to bucket 0 (ADR-0051 section 7,
-issue #494): a fallback bucket would make the data undiscoverable by hour
+object written) rather than defaulting to bucket 0 (ADR-0051 section 7):
+a fallback bucket would make the data undiscoverable by hour
 with no trace of the failure.
 
-### Pipelined flushes (ADR-0067, issue #814)
+### Pipelined flushes (ADR-0067)
 
 The PUTs no longer run inline in the actor. At flush-open the actor pins
 the flush's identity synchronously (seq, waiters, ingest-hour bucket) in
@@ -249,7 +249,7 @@ block on. Default 1 reproduces today's one-flush-at-a-time behavior bit
 for bit; raising it trades bounded extra per-shard memory (buffers held
 open by the extra in-flight flushes, up to `max_inflight_flushes - 1`
 flush windows' worth) for overlapped PUT latency, and should be raised
-only as a measured decision recorded in BENCHMARKS.md. `0` is rejected at
+only as a measured decision. `0` is rejected at
 the CLI edge (`Cli::validate`): it would deadlock every flush, since a
 shard could never acquire a permit to run one.
 
@@ -266,9 +266,9 @@ exact object directly.
 
 This applies to the metrics ingest pipeline only. The log and span
 shard actors (below) keep their existing inline flush; extending
-pipelining to them is follow-up work, not part of #814.
+pipelining to them is follow-up work.
 
-### Adaptive flush delay (ADR-0067 decision 3, issue #814)
+### Adaptive flush delay (ADR-0067 decision 3)
 
 `adaptive_flush_delay` (`IngestConfig::adaptive_flush_delay`, CLI
 `--adaptive-flush-delay`, default **false**) replaces the fixed
@@ -307,8 +307,7 @@ ingest pipeline only, same as `max_inflight_flushes` above.
 
 ## Log pipeline
 
-Logs run a parallel pipeline, not a mode of the metrics one
-(ADR-0029, docs/superpowers/specs/2026-07-28-log-storage-design.md):
+Logs run a parallel pipeline, not a mode of the metrics one (ADR-0029):
 
 ```
 POST /v1/logs (axum) | logs.v1.LogsService/Export (tonic)
@@ -341,7 +340,7 @@ places:
   label set that id already claims (ADR-0005), `LogTenantBuf::merge` checks
   nothing: `RlogWriter::finish()` already compares every buffered record's
   `stream_attrs` for a shared `stream_id` and rejects the whole object with
-  `LogSegError::InconsistentStreamAttrs` (issue #225). The flush step maps
+  `LogSegError::InconsistentStreamAttrs`. The flush step maps
   that one variant to `LogWriteError::StreamIdCollision` and counts it in
   `stream_id_collisions`; every other `LogSegError` becomes
   `LogWriteError::SegmentBuild`. Duplicating the check in the buffer would
@@ -509,7 +508,7 @@ the charge would push the gauge past the ceiling
 is shed *before* buffering: no shard is touched, no commit token is minted,
 the shed counter increments, and the caller gets HTTP 429 with `Retry-After`
 (gRPC `RESOURCE_EXHAUSTED`), exactly like the layer-2 byte-rate rejection and
-the #802 in-flight shed. The charge is an RAII guard cloned into every shard
+the in-flight shed. The charge is an RAII guard cloned into every shard
 message the request fans out to; each shard buffer holds its clones and moves
 them into the flush, and the guard refunds the exact charged amount when the
 last buffer holding any of the request's bytes flushes (or its flush fails or
@@ -653,7 +652,7 @@ Counters recorded today:
   `max_inflight_flushes` at its default of 1, this never exceeds
   `shard_count`.
 
-Tracked future work (not yet implemented; own ticket, see a8-F05): a per-shard
+Tracked future work (not yet implemented): a per-shard
 and per-tenant dimensioned model — per-shard buffered bytes/points, flush
 build/put/commit latency histograms, ack latency, and queue depth; per-tenant
 accepted/rejected points and bytes. It requires a metrics backend that these

@@ -1,7 +1,6 @@
 # ADR-0056: Prefix-list traversal for catalog snapshot resolution
 
 Status: Accepted
-Date: 2026-08-05
 
 ## Context
 
@@ -21,14 +20,14 @@ client-supplied `range.start_ns` near the epoch therefore makes step 1 list
 one prefix per bucket from the epoch to the current hour regardless of how
 narrow `range.end_ns` is.
 
-The measured cost (issue #634's closing comment): an epoch-width query issues
+The measured cost: an epoch-width query issues
 **496,089 LISTs for a single shard**, of which 496,088 return nothing, and
 that count grows by one every wall-clock hour, forever, and multiplies by
 `shard_count`. Per-bucket work is already minimal -- `list_hour_bucket` does
 one `guarded_list_all` plus cheap partitioning, and nothing inside the loop
 is reducible. The cost is the request *count*, not the per-request work.
 
-Issue #635 (ADR-0044 decision 3, amended 2026-08-05) capped this by refusing
+ADR-0044 decision 3 (amended) capped this by refusing
 any window whose pre-execution estimate `shard_count * hour_buckets +
 SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` exceeds
 `CatalogConfig::max_catalog_list_requests` (default 100,000). That stops the
@@ -56,7 +55,7 @@ Two facts fall straight out and drive the decision:
 
 - **Per-bucket LISTs = window hours exactly** (one LIST per bucket, and empty
   buckets dominate). Extrapolated to the epoch-width window this is the
-  496,089 of issue #634.
+  496,089 above.
 - **Prefix pages = `floor(total_objects / page_size) + 1`**, independent of
   window width. The 5,000 extra empty trailing hours between the last two
   rows cost the prefix scan nothing and cost the per-bucket loop 5,000 more
@@ -82,16 +81,16 @@ scope-preserving: it reuses the existing public `commit_shard_prefix` key
 builder rather than adding a new one to ravel-commit (out of this task's
 scope), and its shard domain is `max_scan_count_over_range` -- the widest
 shard count any generation active over the queried range holds, per the
-generation-aware read-side scan rule (EK2, `scan_count`) -- not a static
-`0..shard_count` (issue #659: the static bound silently missed stragglers in
+generation-aware read-side scan rule (`scan_count`) -- not a static
+`0..shard_count` (the static bound silently missed stragglers in
 a retiring generation's higher shard indices during a shard-count decrease).
 This makes the listed key set a strict superset of what the per-bucket loop
 lists per hour: the prefix path can list a shard index no in-range hour
 actually needs, but it never lists fewer than the per-bucket loop would for
 that hour, so the two paths' resolved snapshots always converge on the same
 segment set. For the common case of one stable `shard_count` this is one or a
-handful of recursive LISTs, versus `O(hours)` per shard before -- the "single
-recursive prefix LIST" of the ticket, generalized to the provisioned shard
+handful of recursive LISTs, versus `O(hours)` per shard before -- a single
+recursive prefix LIST generalized to the provisioned shard
 set's full generation history.
 
 ### The traversal
@@ -155,7 +154,7 @@ it errs toward keeping the familiar, watermark-pruning per-bucket path.
 
 ### The request ceiling (INTERACTION 1)
 
-Issue #635 made `estimated_catalog_requests` load-bearing: it gates admission,
+ADR-0044 decision 3 made `estimated_catalog_requests` load-bearing: it gates admission,
 refusing any window whose estimate exceeds `max_catalog_list_requests`. That
 estimate is `shard_count * hours + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`,
 which describes the *per-bucket* traversal. Once the prefix path exists, that
@@ -177,14 +176,14 @@ letting the now-cheap wide windows run:
 - The prefix path carries a **runtime LIST cap**: it counts the pages it
   drains and aborts with `CatalogError::WindowTooWide { estimate: <pages
   issued>, limit }` if the count would exceed `max_catalog_list_requests`.
-  This preserves #635's hard bound -- now enforced exactly, at runtime, on the
+  This preserves that hard bound -- now enforced exactly, at runtime, on the
   one path whose cost is not knowable before listing -- and refuses only a
   scan whose *actual data volume* (not its window width) is unsustainable.
 - The per-bucket path is chosen only when `listing_suffix_buckets <=
   max_catalog_list_requests`, so it can never exceed the ceiling and needs no
   separate refusal.
 
-Net effect on admission: a wide-but-sparse window that #635 refused (e.g. an
+Net effect on admission: a wide-but-sparse window that the earlier ceiling refused (e.g. an
 epoch-width window over a tenant with a few thousand objects) is now **served
 cheaply** via the prefix path; a wide window over a genuinely enormous corpus
 is still refused, but at runtime by object volume rather than pre-execution by
@@ -193,7 +192,7 @@ hour count. The typed error, its fields, and its HTTP-422 mapping
 
 **Why the envelope still holds.** `estimated_catalog_requests` must stay
 `>= actual` for the ceiling's guarantee to mean anything. Under the
-sparse-bucket assumption #635's estimate already rests on (at most
+sparse-bucket assumption the estimate already rests on (at most
 `page_size` objects per `(shard, ingest-hour)` bucket -- the estimate already
 counts one LIST per bucket and ignores intra-bucket pagination):
 
@@ -210,7 +209,7 @@ counts one LIST per bucket and ignores intra-bucket pagination):
 
 The one regime where the raw formula could under-count either path is dense
 buckets (more than `page_size` objects in a single `(shard, ingest-hour)`),
-which paginate. That is a **pre-existing** property of #635's estimate, not
+which paginate. That is a **pre-existing** property of the estimate, not
 introduced here, and the prefix path's runtime cap is a strictly stronger
 backstop against it than the per-bucket path ever had. Verified by tests
 (deliverable 3d) asserting `estimated_catalog_requests >= actual requests
@@ -230,11 +229,11 @@ performance problem for a correctness one and is explicitly not done.
 
 ## Rejected alternatives
 
-1. **Keep #635's pre-execution refusal; only optimize inside the admitted
-   region.** Simplest, and preserves #635 untouched. Rejected: it leaves the
+1. **Keep the pre-execution refusal; only optimize inside the admitted
+   region.** Simplest, and preserves it untouched. Rejected: it leaves the
    dangerous direction of INTERACTION 1 unfixed -- an epoch-width window whose
    real cost is a handful of pages stays refused because the hour-counting
-   ceiling still rejects it. The ticket calls this out specifically.
+   ceiling still rejects it. That is the specific hazard being fixed.
 
 2. **Pure replacement: always use the prefix scan, delete the per-bucket
    loop.** Rejected: it regresses the folded, warm window. A tenant with a
@@ -249,7 +248,7 @@ performance problem for a correctness one and is explicitly not done.
    new key-prefix builder in ravel-commit (out of scope) or duplicating the
    key layout in ravel-catalog, and it would list keys under any shard beyond
    `max_scan_count_over_range` -- the generation-aware bound the prefix path
-   actually scopes to (issue #659) -- changing the listed key set versus the
+   actually scopes to -- changing the listed key set versus the
    per-bucket loop. Per-shard listing reuses `commit_shard_prefix` and scopes
    to the provisioned shards for free.
 
@@ -285,7 +284,7 @@ performance problem for a correctness one and is explicitly not done.
   envelope property but is no longer the admission *gate* for wide windows;
   admission for the prefix path moves to a runtime LIST cap against the same
   `max_catalog_list_requests`. ADR-0044 decision 3 is amended to record this.
-  Wide-but-sparse windows #635 refused are now served; only genuinely
+  Wide-but-sparse windows the earlier ceiling refused are now served; only genuinely
   oversized scans are refused, at runtime.
 
 - **INTERACTION 2**: the scanned range is unchanged; only the scan method

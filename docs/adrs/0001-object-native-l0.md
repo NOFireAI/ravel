@@ -1,6 +1,6 @@
 # ADR-0001: Object-native L0, no local WAL
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 

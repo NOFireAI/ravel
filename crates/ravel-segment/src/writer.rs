@@ -1151,7 +1151,7 @@ fn append_ts_run_page_v4(page: &[u8], ts_pages: &mut Vec<u8>) -> Result<u64, Wri
 }
 
 /// Copies one run's pre-framed VAL page verbatim into `val_pages`,
-/// applying the v2/v3 raw-f64 alignment rule (ADR-0014 section 3.5) by
+/// applying the v2/v3 raw-f64 alignment rule (ADR-0027) by
 /// inspecting the page's own `enc` byte (its first byte) rather than
 /// re-deciding the encoding: this writer never decodes the payload.
 /// Returns the pad length inserted before this page's header (the

@@ -1,16 +1,16 @@
 # ADR-0064: selective subject erasure and required bucket lifecycle configuration
 
-Epic EJ (issue #460), program #450. Covers findings S4-10 (no selective or
-per-subject deletion; the review's section 11 analysis concludes the current
-guarantee is "query exclusion plus whole-object deletion, not erasure"),
-S2-16 (bucket lifecycle and versioning interactions unaddressed), and S4-12
-(delete on a versioned bucket leaves recoverable prior versions invisible to
-`verify-custody`). Both review passes rate S4-10 OPEN, severity high,
-certainty certain, and name it (with S4-04) "the most expensive architectural
-mistake ... the two capabilities a compliance-bound customer will demand on
-day one," getting "strictly more expensive with every TB stored."
+Status: Accepted
 
 ## Context
+
+This ADR covers three gaps: no selective or per-subject deletion (the
+current guarantee is "query exclusion plus whole-object deletion, not
+erasure"), bucket lifecycle and versioning interactions unaddressed, and
+delete on a versioned bucket leaving recoverable prior versions invisible
+to `verify-custody`. Selective per-subject erasure (with per-tenant KMS)
+is one of the two capabilities a compliance-bound customer demands on day
+one, getting strictly more expensive with every TB stored.
 
 ### What deletion means in Ravel today
 
@@ -28,8 +28,8 @@ Every deletion primitive Ravel has destroys whole objects, never rows:
 A GDPR/CCPA erasure request names a *subject* — a label or attribute value
 (`user_id="u123"`, `client.address=...`) scattered across every hour bucket,
 every shard, both L0 and L1, for as long as the tenant has retained data.
-Nothing can act on that. The failure-matrix row for S4-10 is blunt: detection
-"N/A (no mechanism)", recovery "Destroy whole bucket, or wait for age-out."
+Nothing can act on that. Nothing detects it, and recovery today is
+"destroy whole bucket, or wait for age-out."
 ADR-0019's consequences anticipated this exactly: "the same tombstone-then-
 sweep machinery is the natural substrate for future explicit deletion
 (tenant offboarding, GDPR-style deletes); those need their own ADR for
@@ -53,36 +53,33 @@ compatible with the invariant are:
 3. **Crypto-shredding**: physical bytes survive; the key dies. Examined and
    rejected below.
 
-### What the review requires of bucket configuration (S2-16, S4-12)
+### What bucket configuration must guarantee
 
-The review's hidden-assumption list includes "the bucket has no lifecycle
-expiration or versioning rules (S2-A5, S4-A6, S5-A7)" — an assumption the
-whole deletion and GC story rests on and that no document states. Two
+The whole deletion and GC story silently assumes the bucket has no
+lifecycle expiration or versioning rules, and no document states it. Two
 concrete failure rows:
 
-- Lifecycle expiration on data prefixes (S2-16): "Mass permanent loss under
-  live commit records ... data unrecoverable." ADR-0019 already *rejected*
+- Lifecycle expiration on data prefixes: mass permanent loss under
+  live commit records, data unrecoverable. ADR-0019 already *rejected*
   S3 lifecycle rules as a retention mechanism for this reason, but rejecting
   them as our mechanism is not the same as telling operators they must not
-  configure them. Meanwhile S5-19 notes incomplete-multipart reaping
+  configure them. Meanwhile incomplete-multipart reaping
   currently *depends* on an undocumented lifecycle rule.
-- Delete on a versioned bucket (S4-12): "'Deleted' data recoverable as a
-  prior version ... incomplete erasure", invisible to `verify-custody`. A
+- Delete on a versioned bucket: 'deleted' data recoverable as a
+  prior version, incomplete erasure, invisible to `verify-custody`. A
   versioned bucket silently converts every Ravel delete — retention,
   sweep, and this ADR's erasure — into a soft delete.
 
 ### Constraints already landed that this ADR must compose with
 
-- **ADR-0055 (EE, landed)**: per-role credentials. Only the Maintain role
+- **ADR-0055 (landed)**: per-role credentials. Only the Maintain role
   holds any `s3:DeleteObject` grant, and only over `l0/`, `l1/`, `c/`,
   `idem/`. Every role is denied delete on `sys/*`, `prov`, `catalog/*`, and
   the audit prefix `t/<th>/u/**`. ADR-0055's consequences call this out by
-  name: "EJ's own ADR should state explicitly which role performs selective
-  deletion (most naturally an extension of Maintain's existing
-  delete-capable role) rather than inventing a fifth role for it." Issue
-  #460's note makes the reverse obligation binding: whichever ADR lands
-  second must address the interaction. This ADR is second; §6 of the
-  Decision does.
+  name: this ADR's role placement is most naturally an extension of
+  Maintain's existing delete-capable role rather than a fifth role. The
+  obligation is binding on whichever ADR lands second; this ADR is second,
+  and §6 of the Decision addresses it.
 - **ADR-0042 (legal hold)**: a `LegalHoldCheck` consulted before every
   physical delete in sweep and retention; a hold present means the delete
   is skipped. Hold records are immutable set/clear audit records folded to
@@ -98,7 +95,7 @@ concrete failure rows:
   *deliberately* drops records needs its own conservation arithmetic, not
   an exemption.
 - **ADR-0046 (read cache)**: query nodes hold raw byte ranges of immutable
-  content-addressed objects on local disk, and S4-09 notes there is no
+  content-addressed objects on local disk, and there is no
   delete-driven invalidation. The acceptance criterion "a subsequent query
   cannot return them from a cache" must hold against both tiers.
 - **Catalog contents**: `SnapshotEntry` and `SnapshotPartHeader`
@@ -183,7 +180,7 @@ can ever surface excluded records to a caller. This satisfies the
 acceptance criterion at the semantic level immediately. Physical residue in
 caches is bounded separately: the disk tier gains a per-entry max-age
 (default 24 h, checked on hit, by the existing eviction walk, and by the
-periodic background sweep added in #998 for entries that are never re-read),
+periodic background sweep for entries that are never re-read),
 so raw bytes of an erased subject persist on any node's disposable local disk
 at most that long past the sweep; RAM-tier decoded structures for a superseded
 object are dropped by the same invalidation trigger tombstone observation
@@ -231,8 +228,8 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    resurrect erased records through query-time dedup. Two things close
    that hole: (a) the maintenance driver serializes compaction and rewrite
    per bucket — both already run inside the single per-tenant Maintain
-   loop (single-replica Recreate deployment, ADR-0034), and epic EI's
-   leased maintenance must preserve per-bucket exclusivity as a stated
+   loop (single-replica Recreate deployment, ADR-0034), and leased
+   maintenance (ADR-0065) must preserve per-bucket exclusivity as a stated
    requirement; (b) the §2 query-time filter remains active for a
    request's predicate until the `.dreq` is removed in §5, which by
    construction happens only after no resolvable snapshot can still
@@ -243,10 +240,10 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    `protection_horizon`, under the same `LegalHoldCheck` gate as every
    other delete.
 
-## Amendment (2026-08-08): the rewrite key must bind to the applied request set, and a rewrite must be able to name a non-L0 predecessor
+## Amendment: the rewrite key must bind to the applied request set, and a rewrite must be able to name a non-L0 predecessor
 
-EJ-T1 (#750) implemented decision 1 and this decision's `RewriteRecord`
-shape and found two problems the Stage 4 checkpoint proved rather than
+Implementing decision 1 and this decision's `RewriteRecord`
+shape found two problems a checkpoint proved rather than
 merely argued.
 
 **The collision.** `input_set_hash` was specified as "blake3 over the
@@ -301,9 +298,9 @@ identities; it cannot name a `CompactionRecord` or `RewriteRecord` key.
   designed.
 
 This is a key-derivation and schema-additivity correction to decision 3,
-not a new decision; it must land before any task that encodes
-supersession matching on top of `RewriteRecord` (EJ-T2) or that
-publishes rewrite records (EJ-T4).
+not a new decision; it must land before any code that encodes
+supersession matching on top of `RewriteRecord` or that
+publishes rewrite records.
 
 ### 4. Completion, verification, and the stated worst-case bound
 
@@ -337,17 +334,16 @@ outputs; entries and postings themselves contain no subject values
 (Context). Exemplar sections ride inside segments and are rewritten with
 them. Idempotency markers store only key hashes and commit-token receipts.
 The query-audit keyspace is the one derived store that may hold subject
-values (S4-13, matcher values in audited query text); it is deny-deleted
-under ADR-0055 and owned by epic EL — see Consequences.
+values (matcher values in audited query text); it is deny-deleted
+under ADR-0055 and owned by the audit work (ADR-0062) — see Consequences.
 
-**Correction (2026-08-08), folded into this section by EJ-T2's Stage 4
-checkpoint:** "the next fold rebuilds snapshots over the rewrite outputs"
+**Correction:** "the next fold rebuilds snapshots over the rewrite outputs"
 above is true only within `fold_reconcile_window_hours` (default 26h) of
 the fold that observes the rewrite -- ADR-0063's incremental fold does not
 re-list an already-folded hour outside that window, and a rewrite's inputs
 stay physically GET-able (no `NotFound` to force a re-resolve) until the
 horizon-gated sweep runs, so there was no other mechanism to fall back on.
-EJ-T2 closed the in-window case by adding `RewriteRecord` to the fold
+A later change closed the in-window case by adding `RewriteRecord` to the fold
 reconcile pass's trigger set (docs/catalog-and-mvcc.md "Fold reconcile
 pass"), so a rewrite into a bucket within the window is picked up by the
 very next fold, same as a late compaction record. The out-of-window case
@@ -357,14 +353,14 @@ against data outside the reconcile window is not automatically re-folded,
 and the folded snapshot can keep serving the pre-erasure input until
 something else forces a re-fold of that hour.
 
-This is now a **binding requirement on EJ-T4** (the rewrite pass), not a
-follow-up nicety: T4's completion verification (§4 above, "re-verified by
+This is now a **binding requirement on the rewrite pass**, not a
+follow-up nicety: the pass's completion verification (§4 above, "re-verified by
 a fresh LIST per bucket") must not write `.done` for a bucket based on a
 fresh LIST alone, because a fresh LIST is blind to what the FOLDED
 snapshot currently serves -- it can correctly observe "this bucket's live
 record set is now rewrite-output-only" and still write `.done` while a
 stale folded snapshot, outside the reconcile window, keeps resolving the
-pre-rewrite input. T4 must derive its "is this bucket's contribution
+pre-rewrite input. The pass must derive its "is this bucket's contribution
 current" check the same way the resolver and the fold do (through
 `resolve_rewrite_supersession` and `classify_bucket`, not a bucket LIST in
 isolation), or must force a reconcile of every bucket in a request's scope
@@ -377,13 +373,13 @@ rewrites over one bucket, neither superseding the other, therefore defeat
 each other: request A's subject is dropped from rewrite A's output but
 still present in rewrite B's, and vice versa. A completion check phrased
 as "this bucket's live record set is rewrite-output-only" reads TRUE in
-exactly that state, so T4 would write `.done` for request A, §5 would
+exactly that state, so the pass would write `.done` for request A, §5 would
 then delete A's `.dreq` after the horizon, the §2 query-time filter would
 stop applying, and A's subject would be served permanently out of rewrite
-B's output. T4's per-bucket completion condition for request R is
+B's output. The pass's per-bucket completion condition for request R is
 therefore not "rewrite-output-only" but "**every live (non-superseded)
 rewrite record in this bucket names R in its `drops`**"; anything weaker
-turns the sibling state into permanent, silent erasure failure. EJ-T2
+turns the sibling state into permanent, silent erasure failure. A later change
 makes the state observable: `Catalog::rewrite_sibling_conflicts` is
 raised by every site that resolves rewrite supersession (snapshot
 resolution, the index fold, and the read-your-write token fallback), so a
@@ -397,15 +393,15 @@ excludes only what it has already discovered up to that point. This is
 sound when the predecessor was genuinely swept (its own inputs are gone
 too), but is a silent under-exclusion if a sweep-ordering anomaly ever
 left the predecessor's inputs live while the predecessor record itself was
-removed. T4's completion verification is the intended safety net for this
+removed. The pass's completion verification is the intended safety net for this
 case too (a live but un-superseded-per-the-chain input fails the "live
-record set is rewrite-output-only" check), so T4 must not derive that
+record set is rewrite-output-only" check), so the pass must not derive that
 check independently of the same exclusion logic the resolver uses, or this
 net has a hole matching the shape above.
 
-## Amendment (2026-08-13): completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies
+## Amendment: completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies
 
-Issue #1000 closes the #997 checkpoint's F1 and F3 findings against the
+A later change closes two checkpoint findings (F1 and F3) against the
 landed rewrite pass (`services/ravel-server/src/maintain.rs`).
 
 **F1 (completion diverged from the query path).** The pass decided
@@ -444,7 +440,7 @@ result can never surface an erased subject and there is no derived object to
 clear. docs/consistency-model.md's `.done` row and "Scope and interactions"
 section are narrowed to state this proof explicitly. The two honest
 residuals are unchanged and already tracked: the out-of-window folded
-snapshot (§4 open item, above) and the query-audit keyspace (epic EL).
+snapshot (§4 open item, above) and the query-audit keyspace (ADR-0062).
 
 ### 5. Erasing the erasure request itself
 
@@ -458,7 +454,7 @@ only, no PII) is permanent.
 
 ### 6. Interaction with ADR-0055 (WORM / credential scoping / legal hold) — the landed-second obligation
 
-Stated explicitly, per issue #460's note and ADR-0055's own consequence:
+Stated explicitly, per ADR-0055's own consequence:
 
 - **Erasure runs under the Maintain role. No fifth role.** The rewrite
   writes `l1/**` parts and `c/**` records and the sweep deletes `l0/`,
@@ -475,8 +471,8 @@ Stated explicitly, per issue #460's note and ADR-0055's own consequence:
 - **Erasure never touches ADR-0055's deny-delete prefixes.** `sys/*`,
   `prov`, `catalog/*`, and `u/**` hold no subject attribute values
   (Context; §7 requirement), so the WORM boundary and subject erasure are
-  disjoint by construction — except the audit keyspace, which is EL's to
-  fix (Consequences).
+  disjoint by construction — except the audit keyspace, which ADR-0062
+  fixes (Consequences).
 - **Legal hold wins over erasure, and the precedence is visible.** The
   rewrite pass and the superseded-input sweep both consult
   `LegalHoldCheck`; a bucket under an overlapping hold is skipped, the
@@ -502,11 +498,11 @@ Stated explicitly, per issue #460's note and ADR-0055's own consequence:
   already treat per-object failures as retryable residue and the
   tombstone/record-last ordering already tolerates partial passes.
 
-### 7. Required bucket configuration (S2-16, S4-12)
+### 7. Required bucket configuration
 
 A new normative "Required bucket configuration" section in
 docs/object-store-contract.md (summarized in docs/guides/operations.md and
-kubernetes.md), replacing the review's unstated assumption with a stated
+kubernetes.md), replacing an unstated assumption with a stated
 contract:
 
 1. **Object versioning: OFF unless deliberately paired.** On an
@@ -516,16 +512,16 @@ contract:
    `NoncurrentDays = E_v` plus expired-delete-marker cleanup on all `t/`
    prefixes, and every physical-erasure and retention bound gains +E_v.
    Versioning without that rule silently inverts every deletion guarantee
-   in the system (S4-12) and is an unsupported configuration.
+   in the system and is an unsupported configuration.
 2. **No lifecycle expiration or transition-to-archival rules on any Ravel
    prefix** (`t/**`, `sys/**`). A lifecycle expiration deletes data out
-   from under live commit records (S2-16: "mass permanent loss");
+   from under live commit records (mass permanent loss);
    transitions to non-instant-retrieval classes break reads. Ravel's own
    retention (ADR-0019) is the only sanctioned age-out mechanism.
    Instant-access storage-class transitions (e.g. to IA) are permitted.
 3. **Exactly two sanctioned lifecycle rules**:
    `AbortIncompleteMultipartUpload` (recommended, 7 days — this also
-   converts S5-19's undocumented dependency into a documented one), and
+   converts an undocumented dependency into a documented one), and
    the noncurrent-version expiration of point 1 when versioning is on.
 4. **Object Lock**: bucket-default retention is supported but extends the
    erasure bound per §6; scoped legal holds (ADR-0042) are the recommended
@@ -542,8 +538,8 @@ sanctioned lifecycle rules where the backend exposes them, recorded
 alongside `sys/qualification`; `ravel-cli verify-custody` gains a
 versioning-aware mode that, on a versioned bucket, also lists noncurrent
 versions under swept keys and reports "deleted but recoverable as prior
-version" as a distinct anomaly class — closing S4-12's "invisible to
-verify-custody" clause. Both remain informational-plus-alarming rather
+version" as a distinct anomaly class — closing the "invisible to
+verify-custody" gap. Both remain informational-plus-alarming rather
 than startup-blocking, consistent with ADR-0042/0055's honest-gap framing:
 `object_store` cannot enforce bucket policy, so Ravel reports what it can
 observe and documents what it requires.
@@ -551,8 +547,8 @@ observe and documents what it requires.
 ## Rejected alternatives
 
 **Query-time exclusion only (durable predicate tombstones, no rewrite).**
-Rejected as the end state — it is, verbatim, the posture the review's
-section 11 analysis already condemned: "query exclusion plus whole-object
+Rejected as the end state — it is, verbatim, the posture already
+condemned: "query exclusion plus whole-object
 deletion, not erasure." Bytes remain in the bucket, in backups, and in
 caches indefinitely; a credential holder or a versioned-bucket restore
 recovers them. It survives in this design only as the bounded bridge (§2)
@@ -570,13 +566,13 @@ object count and destroys the 8 MiB-object economics the whole store is
 built on. (b) Per-record keys put a key lookup on every read path and make
 query latency a KMS function. (c) Key destruction moves the erasure
 guarantee's root of trust outside the bucket into a KMS, while "object
-storage is the source of truth" is the repo's first invariant, and the
-review already flags out-of-bucket durability dependencies as their own
-risk class (S1-08). (d) Ravel does not even have per-*tenant* KMS yet
-(S4-04, OPEN, epic EL #462). Tenant-granularity crypto-erasure via
-per-tenant KMS revocation is EL's natural complement to this ADR — it
+storage is the source of truth" is the repo's first invariant, and
+out-of-bucket durability dependencies are their own
+risk class. (d) Ravel does not even have per-*tenant* KMS yet
+(ADR-0062). Tenant-granularity crypto-erasure via
+per-tenant KMS revocation is that work's natural complement to this ADR — it
 covers offboarding and backup-copy erasure, which rewrite cannot reach —
-and this ADR deliberately leaves that layer to EL rather than half-building
+and this ADR deliberately leaves that layer to it rather than half-building
 it here. Flagged in Consequences.
 
 **Synchronous rewrite-on-request (erase inline in the request path).**
@@ -587,7 +583,7 @@ inputs still must outlive `protection_horizon` for pinned queries, so the
 physical bound barely moves. (c) It would put segment writes and deletes
 in whatever process serves the request — under ADR-0055 that process's
 credential would need write+delete grants that deliberately exist only in
-Maintain; a synchronous path would reopen the credential boundary EE just
+Maintain; a synchronous path would reopen the credential boundary ADR-0055 just
 closed. (d) Visibility, the thing that genuinely must be immediate, is
 already immediate via §2 without any of this cost.
 
@@ -609,15 +605,15 @@ additive later.
 
 **A tenant-facing HTTP erasure endpoint in v1.** Rejected for now: a
 tenant bearer token that can irreversibly destroy data is a new
-threat-model surface (the review already documents forged-request and
-audit-gap concerns on the existing surfaces), and DSAR fulfilment is an
+threat-model surface (forged-request and audit-gap concerns already
+exist on the existing surfaces), and DSAR fulfilment is an
 operator workflow in practice. The CLI/Admin path establishes the
-mechanism; an authenticated API can be layered on once EL's audit
-hardening lands. Additive later.
+mechanism; an authenticated API can be layered on once the audit
+hardening (ADR-0062) lands. Additive later.
 
 **Deny-delete `del/` entirely and keep requests forever.** Rejected: the
 request record contains the subject identifier — retaining it forever is
-itself a GDPR violation (the same trap as S4-13's audit PII). Split
+itself a GDPR violation (the same trap as the audit PII gap). Split
 records (`.dreq` deletable after completion + horizon, `.done` permanent
 and PII-free) get permanent audit evidence without permanent PII.
 
@@ -643,7 +639,7 @@ and PII-free) get permanent audit evidence without permanent PII.
 - **Maintain gains a third destructive responsibility** after retention
   and sweep. It stays inside the existing single per-tenant loop;
   per-bucket exclusivity between compaction and rewrite becomes a stated
-  requirement on epic EI's (#459) leased-maintenance design.
+  requirement on the leased-maintenance design (ADR-0065).
 - **Rewrite is the first machinery that decodes and re-encodes segments
   with intentional record drops.** The adapted conservation gate (outputs
   + dropped = inputs) is the guard rail; property tests must cover all
@@ -655,13 +651,13 @@ and PII-free) get permanent audit evidence without permanent PII.
   apply many request_ids), so N concurrent DSARs cost one rewrite, not N.
   Storage temporarily doubles for covered buckets until the horizon-gated
   sweep clears inputs — same transient shape as compaction.
-- **Interaction with EL (#462), flagged as required by this epic**: (a)
-  the query-audit keyspace persists matcher values (S4-13) under a
+- **Interaction with the audit work (ADR-0062), flagged as required**: (a)
+  the query-audit keyspace persists matcher values under a
   deny-deleted prefix, so audited erasure-adjacent queries can retain
-  subject identifiers outside this ADR's reach — EL's PII
+  subject identifiers outside this ADR's reach — ADR-0062's PII
   policy (hash/tokenize matcher values) is what closes that, and this
   ADR's guarantee statement must name the audit keyspace as excluded
-  until EL lands; (b) per-tenant KMS revocation (EL) is the
+  until it lands; (b) per-tenant KMS revocation (ADR-0062) is the
   tenant-granularity, backup-reaching crypto-erasure complement to this
   ADR's subject-granularity physical erasure — the deletion-guarantees
   doc will present them as the two layers they are.
@@ -674,27 +670,9 @@ and PII-free) get permanent audit evidence without permanent PII.
 - **What this ADR does not do**: no tenant-facing API (v1), no regex
   predicates, no crypto-shredding, no per-tenant KMS, no change to
   retention semantics, no fifth credential role.
-- **Sequencing with EI (#459)**: EI's own ADR-0065 recommends EJ land
-  after EI, because EJ's rewrite pass breaks EI's "interior zone is inert"
-  scheduling assumption and needs its `invalidate` hook. This ADR's
-  rewrite pass should call that hook once EI lands; if EJ's implementation
-  starts first, it must not assume the hook exists and should coordinate
-  with whoever is landing EI at the time.
+- **Sequencing with leased maintenance (ADR-0065)**: ADR-0065 recommends
+  this work land after it, because the rewrite pass breaks its "interior
+  zone is inert" scheduling assumption and needs its `invalidate` hook.
+  This ADR's rewrite pass should call that hook once leased maintenance
+  lands; if this work starts first, it must not assume the hook exists.
 
-## Stage-2-ready task decomposition (sketch, for the approval gate)
-
-| ID | Title | Crates | Deps | Risk |
-|---|---|---|---|---|
-| T1 | `ErasureRequest`/`RewriteRecord` protos, codecs, key-layout doc, property tests | ravel-commit, proto/ | — | high (frozen-contract additive; format-change skill) |
-| T2 | Resolver: `del/` listing, `RewriteRecord` supersession in snapshot resolution, predicate attach | ravel-catalog | T1 | high (visibility correctness) |
-| T3 | Scan-time predicate filters, all three signals, post-cache | ravel-query, ravel-server fetchers | T1 | medium |
-| T4 | Rewrite pass: decode-filter-reencode (RSEG/RLOG/RSPAN), conservation gate, publish, completion verify, legal-hold gate | ravel-maintain, ravel-segment/logseg codec use | T1, T2 | high (rides solo in its wave) |
-| T5 | Sweep additions: rewrite-superseded inputs rule, `.dreq` removal rule; disk-cache entry max-age; RAM invalidation trigger | ravel-maintain, ravel-cache | T4 | high |
-| T6 | `ravel-cli erase submit/status`; qualify probe + verify-custody versioning mode | ravel-cli, ravel-object-store (conformance) | T1 | medium |
-| T7 | Normative docs: deletion guarantees, required bucket configuration, ADR-0055 table amendment + IAM JSON, guides | docs only | T1–T6 shapes | low |
-| T8 | End-to-end reachability test: ingest all three signals → `erase submit` → immediate query exclusion (incl. warm cache node) → maintain pass → `.done` → physical absence via MemoryStore listing + FaultStore failure paths | ravel-server e2e | T2–T6 | high |
-
-Wave shape: T1 solo (high-risk frozen-contract wave) → {T2, T3, T6} (zero
-file overlap, distinct crates) → T4 solo → T5 solo → {T7, T8}. T8 is the
-epic's end-to-end reachability acceptance, driven through the real server
-entry points per the deliver-epic Stage 2 rule.

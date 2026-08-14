@@ -60,21 +60,21 @@ all|gateway|query`). Crate boundaries keep the split honest so later phases
 can deploy them separately. A fourth mode, `--mode maintain`, runs no
 ingest or query surface: it is a disposable background worker that drives
 `ravel-maintain`'s compaction, age-based retention, and GC sweeper per
-tenant over every shard (docs/compaction-retention-plan.md P8). It requires
+tenant over every shard. It requires
 a `multipart`-capable object store (compaction is the only writer of
 multipart objects) and still binds `--listen-http`, serving the `/healthz`,
 `/readyz`, and `/metrics` routes only (no ingest or query surface).
 
 The maintenance driver and the catalog fold task (below) both derive their
-tenant set from storage, not from CLI flags (ADR-0048 decision 3, issue
-#504): each cycle, one supervisor re-enumerates every tenant prefix storage
+tenant set from storage, not from CLI flags (ADR-0048 decision 3): each
+cycle, one supervisor re-enumerates every tenant prefix storage
 reports under `t/` (`ravel_maintain::discover_tenants`, one `list_delimited`
 call) and runs the existing per-tenant maintenance tick for each. This is
 what makes a server authenticating tenants through OIDC or mTLS -- which
 populates neither `--tenant-token` nor `--maintain-tenant` -- still compact,
 retain, and GC every tenant it holds data for; previously the tenant set came
-only from those flags, so such a deployment silently maintained nothing
-(findings S2-17, S5-09). `--tenant-token`/`--maintain-tenant` are now an
+only from those flags, so such a deployment silently maintained nothing.
+`--tenant-token`/`--maintain-tenant` are now an
 optional *restriction* on the discovered set, not its source, and it governs
 only tenants with no durable config record: for such a tenant, unset means it
 is maintained, and set narrows the no-config discovered set to exactly the
@@ -126,8 +126,8 @@ suite version is below the binary's floor. A fresh production deployment must ru
 `ravel-cli store qualify` first; this is deliberate, not a bootstrap-and-continue
 path (docs/guides/operations.md).
 
-Every mode also serves `GET /metrics` on `--listen-http` (ADR-0044 section 4,
-issue #423): a hand-written Prometheus text exposition of counters Ravel
+Every mode also serves `GET /metrics` on `--listen-http` (ADR-0044 section 4):
+a hand-written Prometheus text exposition of counters Ravel
 already computes (object-store calls/errors/bytes/latency, ingest flush and
 ack counters by signal, catalog anomaly counters), rendered by
 `services/ravel-server/src/metrics.rs` rather than pulled from the
@@ -139,7 +139,7 @@ excluded because Ravel's own telemetry must not be able to explode. Like
 from an in-memory counter already held by a running process.
 
 `--mode maintain` additionally renders three tenant-discovery samples
-(ADR-0048 decision 3, issue #504) through this same renderer, no second
+(ADR-0048 decision 3) through this same renderer, no second
 registry: the gauges `ravel_maintain_tenants_discovered` and
 `ravel_maintain_tenants_maintained` (updated once per discovery cycle,
 holding their last known-good value across a failed one), and the counter
@@ -150,7 +150,7 @@ flag restriction configured, or `tenants_maintained` at zero while
 `tenants_discovered` is not, in a mode that should be maintaining.
 
 `--mode maintain` also renders four maintenance-safety samples through
-the same renderer (ADR-0048 decisions 4 and 6, issue #517):
+the same renderer (ADR-0048 decisions 4 and 6):
 `ravel_maintain_legal_hold_refresh_failures_total`,
 `ravel_maintain_conservation_aborts_total` and
 `ravel_maintain_orphan_breaker_tripped_total` (both labeled by
@@ -186,7 +186,7 @@ Sigma/OCSF: later phases. See the spec docs as they land.
   here and nowhere else: never on `--listen-http`, never on the mTLS
   listener. It is also where a worker advertises itself, so a query node with
   no gRPC listener never joins the worker set and runs every slice itself.
-- `--mtls-listener` (ADR-0050 section 1, issue #477): a third listener,
+- `--mtls-listener` (ADR-0050 section 1): a third listener,
   required by and only meaningful together with `--mtls-enabled`. It serves
   the same ingest and query surface as `--listen-http`, but its router chain
   is built with the `MtlsResolver` in place of whatever resolver backs the
@@ -206,7 +206,7 @@ against header forgery by construction, independent of that proxy hygiene.
 
 ## SQL query path (in progress)
 
-`ravel-sql` (ADR-0013, docs/arrow-datafusion-plan.md) adds a second query
+`ravel-sql` (ADR-0013) adds a second query
 path alongside PromQL: `RsegScanExec -> SortPreservingMergeExec ->
 RsegDedupExec`, a DataFusion physical pipeline over the same segments
 PromQL reads, deduplicating cross-segment duplicate samples with the exact
@@ -218,9 +218,9 @@ Status: the scan/merge/dedup pipeline and predicate/projection pushdown
 under a pruning-soundness invariant (pruning may only ever widen the read
 set, never narrow it) are implemented and tested against an independent
 oracle. Not yet built: the HTTP endpoint (`POST /api/v1/sql`, feature
-`sql`) and Flight SQL (feature `flight-sql`) -- both later tickets in the
-same epic, gated behind cargo features so the default build stays free of
-Arrow and DataFusion outside `ravel-otap`.
+`sql`) and Flight SQL (feature `flight-sql`) -- both follow-up work, gated
+behind cargo features so the default build stays free of Arrow and DataFusion
+outside `ravel-otap`.
 
 ## Distributed reads and cross-cluster federation (ADR-0071)
 
@@ -344,8 +344,8 @@ separate key-distribution channel.
 pure per-series functions over `(timestamp_ns, f64)` slices: change point
 detection (PELT with a BIC penalty) and robust summary statistics. It touches
 no frozen contract -- no parser fork, no proto or format change -- and depends
-on `ravel-types` only, mirroring Elastic's placement of `CHANGE_POINT` outside
-the aggregation layer. `ravel-server` exposes it at `POST /api/v1/analytics`:
+on `ravel-types` only, keeping change-point detection out of the aggregation
+layer. `ravel-server` exposes it at `POST /api/v1/analytics`:
 the endpoint runs the same range evaluation `/api/v1/query_range` runs, then
 applies the requested op to each series of the matrix, capping a call at 1000
 series and each `change_point` series at 2000 points (approximation via

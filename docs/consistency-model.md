@@ -46,7 +46,7 @@ rejected point counts and reasons.
 - Without a token, queries see some recent consistent snapshot; freshness is
   bounded by listing behavior, not guaranteed.
 
-## Catalog snapshot staleness (docs/metric-index-plan.md 5.4)
+## Catalog snapshot staleness
 
 - The catalog fold (background task, one-shot via `ravel-cli catalog fold`)
   precomputes an immutable snapshot part per sealed ingest hour behind a
@@ -56,12 +56,12 @@ rejected point counts and reasons.
 - Without a `min_commit_token`, freshness is bounded by listing behavior for
   the open window above the watermark (unchanged from Phase 1: freshness of
   recent commits is listing-immediate) and by the snapshot for sealed
-  history, which is complete by the seal lemma (docs/metric-index-plan.md
-  section 2), so staleness there is zero in healthy operation.
+  history, which is complete by the seal lemma, so staleness there is zero in
+  healthy operation.
 - Every index failure mode (HEAD missing/corrupt, snapshot part
   missing/corrupt, a stale cached HEAD, a folder down for hours, folders
   racing the HEAD CAS) degrades to wider Phase 1 listing, never to missing
-  or wrong data (docs/metric-index-plan.md 5.3). The index never introduces
+  or wrong data. The index never introduces
   false positives beyond what MVCC already handles: a snapshot entry whose
   object was since retired resolves to NotFound -> SnapshotInvalidated ->
   re-resolve, the existing path above.
@@ -90,18 +90,16 @@ rejected point counts and reasons.
   Visibility, ordering, erasure, and the listing-immediate freshness of the
   open hour above are unchanged.
 - Both query surfaces enforce this through one admission seam
-  (`ravel-query`'s `segment_admission` module): the PromQL engine as of
-  RH-T1 (#901), and the SQL executor, the five SQL table providers, and the
-  exemplars state as of RH-T2 (#902) — no per-surface check remains outside
-  it.
-- RH-T3 (#903) is the end-to-end reachability proof: a real `IngestRouter`
+  (`ravel-query`'s `segment_admission` module): the PromQL engine, the SQL
+  executor, the five SQL table providers, and the exemplars state all route
+  through it — no per-surface check remains outside it.
+- An end-to-end reachability test proves the seam: a real `IngestRouter`
   sustains flushes past `max_segments`-worth of L0 objects in the open
   hour, and both real HTTP query surfaces (PromQL and SQL) keep serving
   results bit-identical to a post-compaction read of the same data, while a
   deliberately low request budget still trips the typed
   `RequestBudgetExceeded` rather than hanging or truncating
-  (`services/ravel-server/tests/recent_hours_reachability_e2e.rs`). This
-  closes the S1-13 finding from the adversarial review.
+  (`services/ravel-server/tests/recent_hours_reachability_e2e.rs`).
 
 ## Snapshot isolation
 
@@ -236,8 +234,8 @@ ingestion.
   (ADR-0051 amendment 2026-08-13): a long-running span that started more than
   `max_ingest_lag` ago but ended within the window is admitted; only a span
   reported more than `max_ingest_lag` after it ended is rejected.
-- The receiver's own admission clock is checked too (ADR-0051 amendment,
-  S1-12): a reading below a compiled floor (2020-01-01T00:00:00Z) or one that
+- The receiver's own admission clock is checked too (ADR-0051 amendment):
+  a reading below a compiled floor (2020-01-01T00:00:00Z) or one that
   yields no representable ingest-hour bucket rejects the whole request with
   HTTP 503 / gRPC `UNAVAILABLE`, rather than bucketing acked data into a
   far-past or far-future hour. The same floor extends the fail-loud flush-open
@@ -340,7 +338,7 @@ table).
 `protection_horizon`, `grace`, `max_query_duration`, and `max_flush_lifetime`
 are not per-process knobs each component sets independently. They are recorded
 once, deployment-wide, in the durable object `sys/gc` at the bucket root
-(ADR-0050 section 4, EC4). The first process to touch a fresh bucket bootstraps
+(ADR-0050 section 4). The first process to touch a fresh bucket bootstraps
 `sys/gc` from the maintain defaults via `CreateIfAbsent` (the defaults satisfy
 `protection_horizon >= max_query_duration + grace + clock_skew_allowance` by
 construction; a racing loser re-reads the winner's object, so a fresh bucket
@@ -354,8 +352,8 @@ read a bootstrapped `sys/gc` and finds a real violation does not start; there is
 no "assume defaults" path, because assumed defaults are precisely the
 cross-process drift this object exists to prevent.
 
-**The GC/reader interlock is this validated config, and it is a real fence
-(adversarial finding S1-02).** The four horizon-gated rules above enforce a
+**The GC/reader interlock is this validated config, and it is a real fence.**
+The four horizon-gated rules above enforce a
 reader's pinned snapshot purely by `protection_horizon` arithmetic against a
 durable anchor; there is no store-side lock on the objects a live reader holds.
 What makes that arithmetic sound against a sweeper whose clock disagrees is the
@@ -387,8 +385,8 @@ that actually deletes:
    `CompactorConfig::clock_skew_allowance_ns` are independent knobs: a
    deployment could write `sys/gc` with a 5 min skew while running sweepers
    configured with a *larger* one, leaving the durable horizon skew-uncovered
-   for the process that actually deletes (the #904 write fence alone did not
-   close this; adversarial finding S1-02 residual). So at maintain startup the
+   for the process that actually deletes (the write fence alone does not
+   close this). So at maintain startup the
    server RE-ASSERTS the same bound with the skew taken from THIS running
    sweeper's config (`ravel_maintain::validate_maintain_skew`, called from
    `maintain::spawn` on the shipping `start` -> `spawn` -> `run_loop` path,
@@ -413,9 +411,9 @@ own parameters, not gaps a correctly declared config leaves open.
 |---|---|---|---|
 | orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden) | object last_modified |
 | superseded input (ADR-0018) | L0 commit records + data objects named in a compaction record's input list | now >= record.created_unix_ns + protection_horizon | compaction record created_unix_ns |
-| unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced; issue #273); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
+| unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
-| idempotency marker (ADR-0051 §5, EB-9; logs and spans only, run once per signal rather than per shard) | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` marker object | marker's `<ingest_hour>` older than `now_hour - idem_dedup_window_hours - IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`; a key that fails to parse as `<keyhash32>.<ingest_hour>.idm` is skipped, never deleted | marker key's own `<ingest_hour>` |
+| idempotency marker (ADR-0051 §5; logs and spans only, run once per signal rather than per shard) | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` marker object | marker's `<ingest_hour>` older than `now_hour - idem_dedup_window_hours - IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`; a key that fails to parse as `<keyhash32>.<ingest_hour>.idm` is skipped, never deleted | marker key's own `<ingest_hour>` |
 
 The idempotency-marker rule's age gate subtracts
 `IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` (1 h) from its lower bound, the
@@ -532,8 +530,8 @@ distinct, and more common, case of a unit whose operation keeps returning
   way to stop deletion is to restore records (or use
   `CompactorConfig::force_orphan_gc` deliberately in the other direction,
   see below) before the next pass runs, not to assume the trip persists.
-  The breaker also has three scope limits, tracked as open gaps in issue
-  #500 rather than fixed by design: it evaluates one (tenant, signal,
+  The breaker also has three scope limits, known and deliberate rather than
+  fixed by design: it evaluates one (tenant, signal,
   shard) in isolation, with no cross-shard or cross-tenant aggregation, so
   loss spread thin across many shards can stay under every shard's
   threshold; it never trips below `orphan_breaker_min_count` regardless of
@@ -641,7 +639,7 @@ Each stage in detail:
   within `3 * H` (heartbeat interval `H`, default 60 s, so ~3 min), and even
   a terminal *interior*-zone bucket -- where a subject's historical data
   most often sits -- is re-verified at least every `maintain_interior_reverify`
-  (default 6 h), or immediately when EJ's rewrite orders drive it out of
+  (default 6 h), or immediately when erasure's rewrite orders drive it out of
   terminal state through ADR-0065's `invalidate` hook. So every in-scope
   bucket is revisited on a cadence far tighter than the 72 h
   `erasure_rewrite_deadline`; the deadline is the outer alarm, not the
@@ -654,7 +652,7 @@ Each stage in detail:
   sibling rewrite whose drops omit this request. Deriving completion from the
   rewrite pass's own one-hop live-record view instead would let a `.done` land
   while a snapshot still resolves an L0 input the one hop never excluded
-  (ADR-0064 §4, 2026-08-08 F1 correction); the completion gate blocks exactly
+  (ADR-0064 §4); the completion gate blocks exactly
   that.
 
 - **Physical removal reuses the existing sweep.** A rewrite's superseded
@@ -689,7 +687,7 @@ into them. An operator with erasure obligations must budget them deliberately.
   operator's required `NoncurrentDays = E_v` expiration rule reaps it. Every
   physical-erasure and retention bound then gains `+E_v`. Versioning without
   that expiration rule is an unsupported configuration that silently inverts
-  every deletion guarantee here (S4-12); see the object-store contract.
+  every deletion guarantee here; see the object-store contract.
 
 - **paused -- overlapping legal hold.** The rewrite pass and the
   superseded-input sweep both consult `LegalHoldCheck`; a bucket under an
@@ -704,7 +702,7 @@ into them. An operator with erasure obligations must budget them deliberately.
 
 ### Scope and interactions
 
-- **Why the `.done` guarantee needs only the commit-record pass (F3).** The
+- **Why the `.done` guarantee needs only the commit-record pass.** The
   completion pass walks `c/<shard>/<hour>/` commit records and verifies the
   segment data a snapshot resolves is subject-free. It does NOT separately
   walk index objects or analytics, and it does not need to, because neither
@@ -734,15 +732,15 @@ into them. An operator with erasure obligations must budget them deliberately.
   it verifies the only place a subject physically lives.
 
 - **The query-audit keyspace is the one excluded derived store.** It may
-  retain matcher values from audited query text (S4-13); it is deny-deleted
-  under ADR-0055 and owned by epic EL (#462), which will hash/tokenize
-  matcher values. Until EL lands, the erasure guarantee explicitly does not
-  reach the audit keyspace.
+  retain matcher values from audited query text; it is deny-deleted
+  under ADR-0055 and a future change will hash/tokenize matcher values.
+  Until then, the erasure guarantee explicitly does not reach the audit
+  keyspace.
 
 - **Erasure applies to the primary bucket only.** Replicas or external
   backups are outside Ravel's deletion reach by definition (ADR-0058/0059 DR
   posture); an operator with replicated buckets must apply the same lifecycle
   discipline (docs/object-store-contract.md) to replicas. Per-tenant KMS
-  crypto-erasure (epic EL) is the complementary, backup-reaching,
+  crypto-erasure is the complementary, backup-reaching,
   tenant-granularity layer to this ADR's subject-granularity physical
   erasure.

@@ -1,13 +1,12 @@
 # ADR-0052: Online resharding via generation-versioned shard_count
 
-Status: Accepted (2026-08-04)
+Status: Accepted
 
-Epic EK (issue #461), program #450. Depends on epic EC task EC5
-(ADR-0050 section 5): the durable per-(tenant, signal) provisioning
-record. EC5 is specified but not yet implemented at the time of writing;
-this ADR extends that record's design rather than inventing a parallel
-mechanism, and the two must land in a coordinated order (section
-"Sequencing with EC5").
+Depends on the durable per-(tenant, signal) provisioning record
+(ADR-0050 section 5). That record was specified but not yet implemented
+at the time of writing; this ADR extends its design rather than
+inventing a parallel mechanism, and the two must land in a coordinated
+order (section "Sequencing").
 
 ## Context
 
@@ -16,9 +15,8 @@ froze it; crates/ravel-catalog/src/config.rs:59 documents changing it as
 a forbidden data-loss operation ("segments already routed to a shard
 index become unreachable if the shard count changes"); ADR-0050 section
 5 makes the current value durable and startup-checked but explicitly
-defers changeability. Four independent reviewers flagged the same
-exposure (findings S3-06/S5-14; the same family as ADR-0050's
-S1-06/S2-10): every tenant is pinned to a day-one guess (default 4,
+defers changeability. The exposure is in the same family as ADR-0050's
+shard_count durability gap: every tenant is pinned to a day-one guess (default 4,
 crates/ravel-ingest/src/config.rs:115, `--shards` in
 services/ravel-server/src/main.rs:188), and a tenant that outgrows it
 has no path forward except a bespoke full-tenant rewrite invented under
@@ -78,10 +76,10 @@ that were ever written for the hours it scans.
 the maintain loops (`for shard in 0..shard_count`,
 services/ravel-server/src/maintain.rs:435,
 services/ravel-cli/src/maintain.rs:283) derive the scan set from a
-single static number, so a decrease silently omits shards (the S1-E6
-hazard ADR-0050 closes by refusing mismatches) and an increase makes
+single static number, so a decrease silently omits shards (the
+missing-shard hazard ADR-0050 closes by refusing mismatches) and an increase makes
 old snapshot HEADs fail the `shard_count` equality check. (b) The
-ingest routers fix their actor set at construction. (c) EC5's
+ingest routers fix their actor set at construction. (c) the
 provisioning record, as specified, stores one immutable scalar.
 Nothing else breaks: commit-token resolution reconstructs the exact
 commit key from the token's own fields
@@ -90,7 +88,7 @@ idempotency markers are per-signal, not per-shard
 (docs/catalog-and-mvcc.md:15); there is no cross-shard ordering
 guarantee to preserve (docs/consistency-model.md:35).
 
-The epic's acceptance test: a tenant's `shard_count` is changed with
+The acceptance test: a tenant's `shard_count` is changed with
 ingest running, and queries spanning the change return complete results
 across both generations.
 
@@ -106,9 +104,9 @@ generations remain readable under their original shard indices forever
 (until retention ages their hours out, which needs no changes: hours
 age out per (shard, hour) bucket regardless of generation).
 
-### 1. The generation record: an extension of EC5's provisioning record
+### 1. The generation record: an extension of the provisioning record
 
-EC5 (ADR-0050 section 5) introduces
+ADR-0050 section 5 introduces
 `t/<tenant_hash>/<sig>/prov`, a protobuf record `{tenant_hash, signal,
 shard_count, format floor, created_unix_ns}` written with
 `CreateIfAbsent`. This ADR extends that message additively:
@@ -122,7 +120,7 @@ message ShardGeneration {
   int64  appended_unix_ns = 4; // audit only
 }
 
-// added to the EC5 provisioning message:
+// added to the provisioning message:
 repeated ShardGeneration generations = <next free field>;
 ```
 
@@ -137,7 +135,7 @@ input path.
 The record's mutability model changes from immutable to **append-only
 under `CasVersion`**: the only legal mutation appends one generation
 whose `activation_hour` is in the future (section 3); every existing
-byte of history is immutable. EC5's `CreateIfAbsent` first-write,
+byte of history is immutable. The provisioning record's `CreateIfAbsent` first-write,
 adoption path, and startup/first-touch validation are unchanged;
 validation now compares the full generation history, not one scalar.
 `ravel-cli provision reshard --tenant <t> --signal <s> --shard-count
@@ -181,7 +179,7 @@ generation other than the one nominally active at `h`, within a bounded
 slack: a flush open pins `h` at wall-clock time `t`, but its records
 were routed up to `max_flush_delay` earlier and the flush itself lives
 at most `max_flush_lifetime` (both bounded and enforced,
-crates/ravel-ingest/src/config.rs, issue #182), plus inter-writer clock
+crates/ravel-ingest/src/config.rs), plus inter-writer clock
 skew. Define slack `S` = ceil of (`max_flush_delay` +
 `max_flush_lifetime` + max tolerated clock skew) in hours; with today's
 defaults (500 ms + 3600 s) `S = 2` is safe.
@@ -214,8 +212,8 @@ services/ravel-cli/src/maintain.rs:283, :439). Listing a shard prefix
 that was never written is one empty LIST, and maintain's
 `list_shard_hours` already tolerates empty shards, so the conservative
 window costs little. `CatalogConfig.shard_count` and the server/CLI
-`--shards` flag stop being the source of truth per EC5's own direction;
-the generation history from the provisioning record is.
+`--shards` flag stop being the source of truth per the provisioning
+record's design; the generation history from the provisioning record is.
 
 Query correctness across the boundary needs nothing beyond the scan
 rule: the query engine already merges a series's samples from any set
@@ -276,18 +274,16 @@ the shard-index domain of hour `h` is `0..scan_count(h)`. Implementing
 tasks update docs/catalog-and-mvcc.md, docs/consistency-model.md, and
 docs/ingest.md in the same commits as the behavior.
 
-## Sequencing with EC5
+## Sequencing
 
-EK consumes the provisioning record EC5 builds. Coordination is one of:
-(a) EC5 lands first with `generations` reserved and EK adds the field
-additively (field numbers are frozen, additions are legal), or (b) if
-EK's implementation is planned before EC5 ships, the `ShardGeneration`
-message ships inside EC5's initial proto with only generation 0 ever
-written until EK activates the append path. Either way the append-only
-CAS mutation model in section 1 supersedes EC5's "immutable" wording
-for this record, and EC5's adoption path writes generation 0. This ADR
-does not change EC5's validation choke points; it changes what they
-compare.
+This ADR consumes the provisioning record ADR-0050 section 5 builds.
+The `generations` field is added additively (field numbers are frozen,
+additions are legal); until the append path activates, only generation 0
+is ever written. The append-only CAS mutation model in section 1
+supersedes the provisioning record's "immutable" wording for this
+record, and its adoption path writes generation 0. This ADR does not
+change the provisioning record's validation choke points; it changes
+what they compare.
 
 ## Rejected alternatives
 
@@ -299,7 +295,7 @@ outstanding commit token dangles (read-your-write breaks, violating
 docs/consistency-model.md), and every rewritten object breaks
 compliance custody continuity (ADR-0042 legal holds and verify-custody
 bind to the original objects). It is exactly the "bespoke rewrite
-invented under duress" the epic exists to eliminate.
+invented under duress" this ADR exists to eliminate.
 
 **True online live migration (copy old objects to new shard indices,
 tombstone the originals, while ingest runs).** Rejected. Data objects,
@@ -352,8 +348,8 @@ future, deliberate, compaction-shaped process.
   under the old generation after a decrease; a stale-record writer
   fail-stopping instead of routing; and a `FaultStore`-injected CAS
   race on the append (one winner, loser re-reads).
-- **The provisioning record is no longer immutable**, weakening EC5's
-  simplest invariant to "append-only under CAS". All the validation
+- **The provisioning record is no longer immutable**, weakening the
+  provisioning record's simplest invariant to "append-only under CAS". All the validation
   choke points stay, but they now compare histories, and a new failure
   mode exists: a reader with a stale record view. Increases are safe
   under staleness (subset scan is impossible — the ceiling only
@@ -398,14 +394,14 @@ future, deliberate, compaction-shaped process.
    ceiling = the count), so no dual-reader ambiguity exists — but this
    deserves a reviewer's eye as a frozen-contract judgment call.
 
-## Amendment 2026-08-12: bounded degraded-grace routing (NF-2) and clock-skew-covering read slack (NF-3)
+## Amendment: bounded degraded-grace routing and clock-skew-covering read slack
 
-Adversarial review (v2) found two of section 3's assumptions load-bearing in a way that turns ordinary operational conditions into an outage (NF-2) or a silent-invisibility correctness gap (NF-3). This amendment revises the normative posture accordingly. Both changes ship together and MUST NOT be reverted independently: NF-2's safety depends on NF-3's widened read slack.
+Two of section 3's assumptions turned out to be load-bearing in a way that turns ordinary operational conditions into an outage (the grace-window case) or a silent-invisibility correctness gap (the read-slack case). This amendment revises the normative posture accordingly. Both changes ship together and MUST NOT be reverted independently: the grace window's safety depends on the widened read slack.
 
-NF-2 -- bounded degraded-grace routing. Section 2's rule that a router whose cached provisioning view has aged past the refresh interval C MUST fail every flush closed is relaxed to a bounded grace window. A router that fails to re-read past C MAY continue routing on its last-known-good view while hour_of(now) < hour_of(refreshed_at) + min_lead_hours(C), where min_lead_hours(C) = ceil(C) + 1; beyond that horizon it MUST fail closed as before. This converts sustained store slowness from a total ingest outage into bounded degraded throughput while a provably-still-current shard_count is in effect, and emits the grace_extended_stale_flushes counter so operators observe degraded mode. It is safe because an activation the router has not yet seen has activation_hour >= hour_of(refreshed_at) + L >= the grace horizon under synced clocks, so grace never routes past an unseen generation change.
+Bounded degraded-grace routing. Section 2's rule that a router whose cached provisioning view has aged past the refresh interval C MUST fail every flush closed is relaxed to a bounded grace window. A router that fails to re-read past C MAY continue routing on its last-known-good view while hour_of(now) < hour_of(refreshed_at) + min_lead_hours(C), where min_lead_hours(C) = ceil(C) + 1; beyond that horizon it MUST fail closed as before. This converts sustained store slowness from a total ingest outage into bounded degraded throughput while a provably-still-current shard_count is in effect, and emits the grace_extended_stale_flushes counter so operators observe degraded mode. It is safe because an activation the router has not yet seen has activation_hour >= hour_of(refreshed_at) + L >= the grace horizon under synced clocks, so grace never routes past an unseen generation change.
 
-New assumption (normative). Under clock skew between the reshard-append process and a router, an unseen generation can activate up to TOLERATED_CLOCK_SKEW_HOURS before the grace horizon, so grace can route the old shard_count into an hour the successor generation nominally owns. This does not split-brain the tenant's data only because NF-3's widened read-side slack S covers that overshoot. Therefore this amendment adds the assumption that the reshard-append process's clock is within TOLERATED_CLOCK_SKEW_HOURS of every router's clock (satisfied by any NTP-disciplined fleet with large margin: real skew is sub-second against a one-hour budget). The base fail-closed design did not depend on the append process's clock for read-side coverage; the grace window introduces this dependency, and it is discharged by NF-3.
+New assumption (normative). Under clock skew between the reshard-append process and a router, an unseen generation can activate up to TOLERATED_CLOCK_SKEW_HOURS before the grace horizon, so grace can route the old shard_count into an hour the successor generation nominally owns. This does not split-brain the tenant's data only because the widened read-side slack S covers that overshoot. Therefore this amendment adds the assumption that the reshard-append process's clock is within TOLERATED_CLOCK_SKEW_HOURS of every router's clock (satisfied by any NTP-disciplined fleet with large margin: real skew is sub-second against a one-hour budget). The base fail-closed design did not depend on the append process's clock for read-side coverage; the grace window introduces this dependency, and it is discharged by the read-slack change below.
 
-NF-3 -- clock-skew-covering read slack. Section 3 always named "max tolerated clock skew" as a term of the read-side slack S, but the shipped value had silently dropped it (S = 2 hours, flush-bound only). S is corrected to S = FLUSH_BOUND_SLACK_HOURS + TOLERATED_CLOCK_SKEW_HOURS = 2 + 1 = 3 hours, recorded here normatively. This widens the read-side scan set so that a straggler routed under either the retiring or the activating generation near a boundary -- worst on a shard-count decrease, where the retiring generation's wider range is exactly what covers the straggler -- is always inside the scan set. The invariant restored: no acknowledged write is ever routed to a shard index the read-side scan set for its hour does not cover.
+Clock-skew-covering read slack. Section 3 always named "max tolerated clock skew" as a term of the read-side slack S, but the shipped value had silently dropped it (S = 2 hours, flush-bound only). S is corrected to S = FLUSH_BOUND_SLACK_HOURS + TOLERATED_CLOCK_SKEW_HOURS = 2 + 1 = 3 hours, recorded here normatively. This widens the read-side scan set so that a straggler routed under either the retiring or the activating generation near a boundary -- worst on a shard-count decrease, where the retiring generation's wider range is exactly what covers the straggler -- is always inside the scan set. The invariant restored: no acknowledged write is ever routed to a shard index the read-side scan set for its hour does not cover.
 
-Coupling. NF-2's grace overshoot past an activation is bounded by the append-vs-router skew; NF-3's S = 3 budgets flush timing (~1 hour real) plus that skew (1 hour) with a full hour of margin. Reverting NF-3 while keeping NF-2 reopens the split-brain; reverting NF-2 while keeping NF-3 only over-scans harmlessly. Section 2's fail-closed MUST and section 3's safety argument are to be read as amended by this section.
+Coupling. The grace overshoot past an activation is bounded by the append-vs-router skew; the read slack S = 3 budgets flush timing (~1 hour real) plus that skew (1 hour) with a full hour of margin. Reverting the read slack while keeping the grace window reopens the split-brain; reverting the grace window while keeping the read slack only over-scans harmlessly. Section 2's fail-closed MUST and section 3's safety argument are to be read as amended by this section.

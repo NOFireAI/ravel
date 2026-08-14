@@ -1,14 +1,13 @@
 # ADR-0029: RLOG v1: columnar log segment format, a sibling to RSEG
 
-Status: Accepted (2026-07-28)
+Status: Accepted
 
-Decides the log storage format from the approved design
-`docs/superpowers/specs/2026-07-28-log-storage-design.md`. This ADR
-records the decision; `docs/log-segment-format.md` is the normative
-byte-level contract and ships in the same change. This is a new
-persistent format, added under the format-change procedure (ADR-0010 §4,
-`.claude/skills/format-change`): a new ADR, an explicit version, a
-checksum-coverage review, and fuzz/property/corrupt-input suites.
+Decides the log storage format. This ADR records the decision;
+`docs/log-segment-format.md` is the normative byte-level contract and
+ships in the same change. This is a new persistent format, added under
+the format-change procedure (ADR-0010 §4): a new ADR, an explicit
+version, a checksum-coverage review, and fuzz/property/corrupt-input
+suites.
 
 ## Context
 
@@ -124,9 +123,8 @@ touches one entry at a time:
   bytes.
 
 The format doc records this as a normative checksum-coverage map. This is
-a deliberate refinement of the design spec's whole-section wording,
-forced by ADR-0010 §4; doc and code carry the refined rule so they never
-diverge.
+a deliberate refinement of the whole-section wording, forced by
+ADR-0010 §4; doc and code carry the refined rule so they never diverge.
 
 ### Dual-reader question
 
@@ -168,9 +166,7 @@ dispatch does.
 
 ## References
 
-- Design: `docs/superpowers/specs/2026-07-28-log-storage-design.md`.
 - Normative format: `docs/log-segment-format.md`.
-- Plan: `docs/superpowers/plans/2026-07-28-rlog-v1-format.md`.
 - Precedent: ADR-0004 (RSEG v1), ADR-0005 (series identity),
   ADR-0010 §4/§7 (checksum coverage, identity binding), ADR-0013
   (pruning soundness). docs/catalog-and-mvcc.md (`l` keyspace).

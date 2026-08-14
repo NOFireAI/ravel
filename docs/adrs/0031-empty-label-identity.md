@@ -1,11 +1,10 @@
 # ADR-0031: Empty-valued and empty-named labels in series identity
 
-Status: Proposed (2026-07-28)
+Status: Proposed
 
-Update (2026-08-01): the empty-*value* half of this proposal, for the OTLP and
-OTAP paths, was accepted and implemented in ADR-0038 (issue #202). The
-empty-*name* rejection and the RW1 decode fix described below remain proposed
-and unimplemented.
+Update: the empty-*value* half of this proposal, for the OTLP and OTAP
+paths, was accepted and implemented in ADR-0038. The empty-*name* rejection
+and the RW1 decode fix described below remain proposed and unimplemented.
 
 ## Context
 

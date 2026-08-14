@@ -1,5 +1,7 @@
 # ADR-0036: Performance investigation methodology and scope
 
+Status: Accepted
+
 ## Context
 
 We want a rigorous, evidence-based performance investigation of Ravel:
@@ -12,13 +14,11 @@ Only after that plan exists should implementation begin.
 Four research passes (architecture and data flow, benchmark and
 profiling inventory, I/O model, Arrow integration) were run against the
 current codebase to ground this ADR. The finding that decides the shape
-of this ADR is this: **every benchmark number in `BENCHMARKS.md` is
+of this ADR is this: **every benchmark number then recorded was
 measured against the in-process `MemoryStore` backend.** There is no
-S3/MinIO measurement anywhere in the repository. This is not a gap we
-are discovering; the repo already says so about itself: issue #27
-states outright that the 347k pts/s ingest figure "isn't a usable
-reference point" for anything comparative, because it excludes real
-object-store latency.
+S3/MinIO measurement anywhere in the repository. The 347k pts/s ingest
+figure is not a usable reference point for anything comparative,
+because it excludes real object-store latency.
 
 The catalog-fold result makes the risk concrete: folding cuts catalog
 resolve requests 723x-7,159x, but wall-clock improvement on MemoryStore
@@ -34,14 +34,14 @@ Two other constraints shape the plan:
 - Local development happens on darwin. Linux `perf`, flamegraphs,
   off-CPU analysis, and hardware performance counters do not exist
   here; profiling runs need the Linux reference host
-  (`ci-16gb-fsn1-1`), which `BENCHMARKS.md` already documents as
-  running "often under co-resident CI load" (it doubles as an Actions
-  runner). Profiling and benchmark methodology must account for that
+  (`ci-16gb-fsn1-1`), which often runs under co-resident CI load (it
+  doubles as an Actions runner). Profiling and benchmark methodology
+  must account for that
   noise rather than discover it after the fact.
 - No profiling tooling exists in the repo today (no flamegraph, dhat,
   pprof, or iai; no `.cargo/config.toml`; the `profile_hotspots` bin
-  referenced in `BENCHMARKS.md` was retired with ADR-0027 and no longer
-  exists). `[profile.release] debug = 1` is already set workspace-wide,
+  was retired with ADR-0027 and no longer exists).
+  `[profile.release] debug = 1` is already set workspace-wide,
   which is the one piece already in place for line-level profiling.
 
 ## Decision
@@ -92,20 +92,18 @@ mean replacing the async runtime underneath hyper - a stack change out
 of all proportion to any bottleneck this investigation has found. This
 question is closed; it does not need a Wave 1 task.
 
-**Arrow zero-copy claim in `docs/arrow-datafusion-plan.md` does not
-match the implementation, and the doc needs correcting.** Section 2 of
-that plan states SQL scan batches are built from the segment SoA
-surface via "buffer adoption, not a copy." The actual code
-(`crates/ravel-sql/src/scan.rs:333-362` and `:505-517`) transposes SoA
-vectors into an intermediate `Vec<ScanRow>` (~48 bytes per sample), then
-gathers a fresh `Vec` per column per batch before calling `Array::from`.
-The `from` call adopts that per-batch scratch Vec, never the segment
-decode output - so no copy is eliminated relative to a naive scan, only
-relocated later in the pipeline. This is a confirmed, file:line-level
-finding, not a hypothesis, and it corrects existing documentation. It
-is recorded here as a finding; whether and how to reduce that
-transpose is a Wave 1/2 measurement-and-proposal question, since its
-actual query-latency impact against real S3 latency is unmeasured.
+**The SQL scan path is not zero-copy.** A plausible reading is that SQL
+scan batches are built from the segment SoA surface via buffer adoption,
+not a copy. The actual code (`crates/ravel-sql/src/scan.rs:333-362` and
+`:505-517`) transposes SoA vectors into an intermediate `Vec<ScanRow>`
+(~48 bytes per sample), then gathers a fresh `Vec` per column per batch
+before calling `Array::from`. The `from` call adopts that per-batch
+scratch Vec, never the segment decode output - so no copy is eliminated
+relative to a naive scan, only relocated later in the pipeline. This is
+a confirmed, file:line-level finding, not a hypothesis. Whether and how
+to reduce that transpose is a Wave 1/2 measurement-and-proposal
+question, since its actual query-latency impact against real S3 latency
+is unmeasured.
 
 ### Explicitly deferred
 
@@ -125,7 +123,7 @@ epic may touch the RSEG layout.
 - Every benchmark run reports environment: CPU, memory, storage/
   filesystem, OS/kernel, Rust toolchain, compiler profile and feature
   flags, dataset size and distribution, concurrency level, cache state,
-  and warm-up procedure, per `docs/benchmarking.md`'s existing
+  and warm-up procedure, following the established benchmarking
   methodology, extended to cover the S3/MinIO panel.
 - Report distributions (median, p95, p99) and a variance or confidence
   measure, not single averages, for every new or re-run benchmark.
@@ -137,8 +135,8 @@ epic may touch the RSEG layout.
 
 **Start ranking bottlenecks and implementing optimizations directly
 from today's numbers.** Rejected: every number available today is
-MemoryStore-only, the repo's own issue #27 already disowns that number
-as non-representative, and the catalog-fold result demonstrates
+MemoryStore-only and non-representative, and the catalog-fold result
+demonstrates
 concretely how a MemoryStore-measured win (2.1-2.2x) can understate a
 real-object-store win (documented as expected to be far larger) by an
 order of magnitude or more. Ranking now would optimize against the
@@ -159,8 +157,8 @@ an immediate fix, so it can be prioritized against the S3-latency
 findings rather than fixed in isolation.
 
 **Profile exclusively on the shared CI host without addressing noise.**
-Rejected: `BENCHMARKS.md` already flags that host as running under
-co-resident CI load. Treating single runs from that host as reliable
+Rejected: that host runs under co-resident CI load. Treating single runs
+from that host as reliable
 would reintroduce exactly the kind of unrepresentative number this ADR
 exists to move away from.
 
@@ -179,11 +177,8 @@ making.
   from.
 - Two questions this investigation was asked to answer are answered
   now: io_uring is rejected structurally, and the Arrow
-  zero-copy-adoption claim in `docs/arrow-datafusion-plan.md` is
-  confirmed inaccurate and needs a documentation correction (tracked as
-  a Wave 1 task, since it is a one-file, low-risk fix with a clear
-  acceptance test: the doc no longer claims buffer adoption where a
-  transpose exists).
+  zero-copy-adoption assumption is confirmed inaccurate: the SQL scan
+  path performs a transpose, not buffer adoption.
 - Any proposal that would require changing the RSEG format is out of
   scope for this epic's implementation waves; it is recorded as a
   deferred, separately-gated follow-up if the measurements support it.

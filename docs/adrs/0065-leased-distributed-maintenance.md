@@ -1,22 +1,23 @@
 # ADR-0065: leased distributed maintenance
 
-Epic EI (issue #459, program #450) covers three review findings: S3-03 and
-S5-15 (maintenance does not distribute: no lease, no durable incremental
-cursor, full-rescan cost linear in the retention window, and two replicas
-double-pay rather than partition), and S3-07 (log compaction memory unbounded
-in input size). The acceptance is experiment S5-E6 — two maintain replicas
-partition the work rather than both paying for it — plus a bounded-memory
-assertion on a synthetic large-input RLOG compaction.
+Status: Accepted
 
 ## Context
 
-Every finding was re-verified against current `main` before this design. The
-issue text (written against review v1) is stale on two points and current on
-the core one; review v2 (RAVEL-ADVERSARIAL-REVIEW-V2.md, rows S3-03/S5-15/
-S3-07, all "PARTIALLY CLOSED") matches what the code shows:
+This ADR covers three gaps: maintenance does not distribute (no lease, no
+durable incremental cursor, full-rescan cost linear in the retention
+window, and two replicas double-pay rather than partition), and log
+compaction memory is unbounded in input size. The acceptance is two
+maintain replicas partitioning the work rather than both paying for it,
+plus a bounded-memory assertion on a synthetic large-input RLOG
+compaction.
 
-**Current: no distribution, no lease.** EA (issue #451, ADR-0048, landed
-2026-08-02) rebuilt the maintain driver as a single supervisor loop
+Every gap was re-verified against current `main` before this design.
+Earlier notes were stale on two points and current on the core one; the
+code shows:
+
+**Current: no distribution, no lease.** ADR-0048 rebuilt the maintain
+driver as a single supervisor loop
 (`services/ravel-server/src/maintain.rs`): every tick (default 5 min) it
 re-discovers tenants from storage (`discover_tenants`, one delimited LIST of
 `t/`), then sequentially, per tenant, refreshes legal holds and walks every
@@ -28,11 +29,11 @@ age out), and the advisory CAS cursor (`t/<hash>/<sig>/maint/<shard>/cursor`,
 ADR-0018, used only by the CLI-facing `scan_and_compact` path, deliberately
 not by `scan_and_maintain`) dedups nothing but cursor writes. Write races are
 resolved; read cost is not: each extra worker pays the full listing and
-evaluation cost again (S3-W7). The single supervisor is also an availability
+evaluation cost again. The single supervisor is also an availability
 floor — the operator deploys maintain as a single-replica Recreate Deployment
 (ADR-0034), and when it is down nothing compacts fleet-wide.
 
-**Partially stale: "no incremental cursor".** Issues #280/#330 added
+**Partially stale: "no incremental cursor".** Earlier changes added
 `MaintainMemo` (`crates/ravel-maintain/src/scan.rs`): an in-memory, per-
 process, never-correctness-bearing memo of terminal buckets (compacted-and-
 not-expired, below-threshold, swept-empty), skipped without per-bucket
@@ -49,17 +50,17 @@ linear on restart:
   computable in advance from its hour and the policy.
 - `sweep_shard` is deliberately cursorless and full-scan
   (`crates/ravel-maintain/src/sweep.rs`): all three rules list the shard's
-  whole keyspace every tick. Post-EA the orphan re-verify is batched to one
+  whole keyspace every tick. After ADR-0048 the orphan re-verify is batched to one
   LIST per pass, but the pass itself still walks every retained hour, every
   five minutes.
 
-**Partially stale: "RLOG compaction is not streamed".** Issue #275 landed
+**Partially stale: "RLOG compaction is not streamed".** An earlier change landed
 `RlogRangeReader` and rebuilt the merge (`crates/ravel-maintain/src/rlog.rs`)
 to retain only per-input directory sections and fetch block bytes by range,
-one stream at a time. Review v2 accordingly marks the S3-07 residual as
-RSPAN, not RLOG (`rspan_codec.rs:161` still does `GetRange::Full` per input).
-But RLOG's bound is not yet a real bound, and the review's own workload
-(S3-W4: one high-volume log stream in one sealed hour) still defeats it:
+one stream at a time. The residual is now RSPAN, not RLOG
+(`rspan_codec.rs:161` still does `GetRange::Full` per input).
+But RLOG's bound is not yet a real bound, and one high-volume log stream
+in one sealed hour still defeats it:
 
 - `gather_stream` materializes one stream's records *from every input at
   once* into a `Vec<LogRecord>` before sorting. One hot stream (a single
@@ -79,8 +80,8 @@ introduced this codebase's cross-process coordination primitive: each process
 periodically writes a snapshot to a key it alone ever writes
 (`PutMode::Overwrite`, no CAS, no contention), reads non-stale siblings
 (staleness = 2x the write interval, judged by the reader's clock), and
-derives a local decision from the merged view. Epic EF (ADR-0061, in flight)
-is reusing it for query concurrency. Its properties fit maintenance even
+derives a local decision from the merged view. ADR-0061 reuses it for
+query concurrency. Its properties fit maintenance even
 better than admission: maintenance work is idempotent and convergent (every
 pass is safe to run twice; `CreateIfAbsent` picks winners; deletes are
 horizon-gated), so a bounded coordination-staleness window costs duplicated
@@ -88,7 +89,7 @@ horizon-gated), so a bounded coordination-staleness window costs duplicated
 
 **Naming hazard.** `ravel-maintain` already has a `LeaseCheck` trait
 (`sweep.rs:88`): it is the GC *reader-lease* protection gate (is this key
-protected from deletion), wired to legal holds by EA. It is unrelated to
+protected from deletion), wired to legal holds by ADR-0048. It is unrelated to
 worker coordination. This ADR deliberately does not name its mechanism
 "lease" in code to avoid colliding with it (see Decision 1).
 
@@ -126,8 +127,8 @@ heartbeat anywhere must not freeze maintenance everywhere).
 
 This is deliberately not called a lease in code (`WorkerSet`,
 `sys/maintain/workers/`): the existing `LeaseCheck` trait is the GC
-reader-protection gate and the two concepts must not blur. What the review's
-"single-writer lease" asks for — one owner per unit of work in steady state,
+reader-protection gate and the two concepts must not blur. What a
+single-writer lease asks for — one owner per unit of work in steady state,
 automatic takeover on death, no double-pay — is delivered by Decision 2 on
 top of this membership view.
 
@@ -165,7 +166,7 @@ design: compaction converges at `CreateIfAbsent` (ADR-0018), sweeps are
 idempotent and horizon-gated, retention tombstones are `CreateIfAbsent`,
 scrub is read-only, and the conservation gate and orphan breaker (ADR-0048)
 are per-pass. The transition window costs bounded duplicate reads — the
-steady state costs none, which is what S5-E6 measures.
+steady state costs none, which is what the partition acceptance measures.
 
 **Stuck-owner hazard and mitigation.** Membership is process-level liveness:
 a live-but-wedged worker starves its own units. Mitigations, in this ADR's
@@ -223,7 +224,7 @@ into three zones with different change dynamics:
 - **Interior** (below the frontier, outside the tail): nothing can change a
   terminal interior bucket except a future retention expiry (computable:
   `hour + retention_window`), an operator action (tombstone, hold), or a
-  future EJ erasure order. Terminal interior buckets are re-verified at
+  future erasure order (ADR-0064). Terminal interior buckets are re-verified at
   their computed expiry time when a retention policy exists, and otherwise
   on a slow full re-verify cadence, default 6 h (config
   `maintain_interior_reverify`, replacing the flat 1 h memo interval for
@@ -243,8 +244,8 @@ both sweep shapes.
 
 **Invalidation hook.** `MaintainMemo` gains a public
 `invalidate(tenant, signal, shard, hours)` seam that forces named buckets out
-of terminal state for immediate re-evaluation. Nothing in this epic calls it
-except tests; it exists because EJ's selective-deletion work orders will
+of terminal state for immediate re-evaluation. Nothing in this ADR calls it
+except tests; it exists because selective-deletion (ADR-0064) work orders will
 rewrite interior buckets and must not wait out the slow cadence (see
 Consequences).
 
@@ -278,7 +279,7 @@ merge:
   decoded residency to one in-progress block.
 
 Peak resident memory becomes: per-input retained directories (STREAM_DIR /
-FIELD_DIR / SKIP_IDX — KBs per input, the already-shipped #275 footprint),
+FIELD_DIR / SKIP_IDX — KBs per input, the already-shipped ranged-reader footprint),
 plus one decoded block per input carrying the current stream, plus the
 writer's one in-progress part (bounded by `max_l1_part_bytes`, needed anyway
 because the L1 key is content-addressed, so the object must be complete
@@ -302,11 +303,10 @@ state — a resume cursor for a half-built part would introduce a new mutable
 state class to save re-reads that occur only on crash.
 
 **RSPAN residual, explicitly out of scope.** `rspan_codec.rs` still fetches
-each input whole (one at a time) and review v2 names it the S3-07 residual.
-It is not covered by this epic's acceptance (which names RLOG, per issue
-#459) and needs RSPAN ranged-reader format work plus trace-boundary-aware
-splitting; filed as a named follow-up issue at landing, not silently absorbed
-here.
+each input whole (one at a time); this is the remaining unbounded-memory
+residual. It is not covered by this ADR's acceptance (which names RLOG)
+and needs RSPAN ranged-reader format work plus trace-boundary-aware
+splitting; filed as a named follow-up, not silently absorbed here.
 
 ## Rejected alternatives
 
@@ -318,9 +318,9 @@ here.
    function is needed anyway — and once you have one, the lease object is
    redundant in steady state. (b) Its request cost is a GET (and periodic
    PUT) per unit per tick, a new per-tick cost linear in the unit count —
-   the exact cost class S3-03 exists to remove. (c) TTL expiry makes a
+   the exact cost class this ADR exists to remove. (c) TTL expiry makes a
    coordination decision out of comparing another process's clock against
-   the reader's on a per-object basis, a G9-class clock assumption
+   the reader's on a per-object basis, a clock assumption
    multiplied across every unit; the membership design confines that
    comparison to one heartbeat object per worker. (d) It adds a new
    contended mutable-key class (every worker CASing the same lease keys),
@@ -332,7 +332,7 @@ here.
 
 2. **Leader-elects-and-assigns** (one leader lease; the leader writes an
    assignment object mapping units to workers). Lost because it reintroduces
-   the exact availability floor S5-15 complains about — no leader, no
+   the exact availability floor this ADR removes — no leader, no
    assignment, no maintenance — behind one more election protocol and one
    more mutable object to fight over. Rendezvous hashing computes the same
    assignment with zero shared state and no privileged process.
@@ -356,21 +356,21 @@ here.
 
 ## Consequences
 
-- **On EA (ADR-0048):** builds directly on its supervisor: discovery,
+- **On ADR-0048:** builds directly on its supervisor: discovery,
   restriction flags, hold refresh, breaker, and conservation gate are
   unchanged in logic; the discovery cycle gains an ownership filter, the
   sweep gains zone-scoped scheduling around the same rules, and the hold
   refresh is duplicated per owning replica (bounded, documented). The
   `LeaseCheck`/worker-coordination naming split is documented in both
   modules.
-- **S5-E6 becomes a test**, not an experiment: two supervisors over one
+- **The partition acceptance becomes a test**, not an experiment: two supervisors over one
   counting `MemoryStore` partition the unit set disjointly, cover it
   completely, and the per-unit request counters show no steady-state
   double-pay; kill one and its units are taken over within the staleness
   window. The bounded-memory RLOG assertion is Decision 4's test.
 - **Deployment model changes:** the maintain role may now run N replicas.
   ADR-0034's single-replica Recreate guidance is superseded; the k8s
-  operator (epic #244) needs a follow-up to expose maintain replicas, and
+  operator needs a follow-up to expose maintain replicas, and
   the operations guide documents the new scaling knob and alert rules.
 - **New control-plane keys** `sys/maintain/workers/<process_id>` and
   `sys/maintain/memo/<process_id>`: mutable, self-owned, versioned-tag,
@@ -385,58 +385,33 @@ here.
   one hour. Head and tail behavior — everything time-critical — keeps tick
   cadence. docs/consistency-model.md "Deletion and GC" and the operations
   guide are updated in the same commit as the scheduling change.
-- **On EH (#458, multi-part fold, ravel-catalog):** no file or premise
+- **On multi-part fold (ADR-0063, ravel-catalog):** no file or premise
   overlap — fold's CAS pointer and snapshot layout are untouched here, and
-  this epic's crates (`ravel-maintain`, `ravel-logseg`, `ravel-server`
-  driver files) are disjoint from EH's. The fold loop remains undistributed;
+  this ADR's crates (`ravel-maintain`, `ravel-logseg`, `ravel-server`
+  driver files) are disjoint from it. The fold loop remains undistributed;
   it can adopt the same `WorkerSet` ownership filter later (follow-up, not
-  this epic). No ordering dependency either way.
-- **On EJ (#460, selective deletion):** a real ordering interaction. EJ's
+  this ADR). No ordering dependency either way.
+- **On selective deletion (ADR-0064):** a real ordering interaction. Its
   erasure work will rewrite interior buckets, breaking Decision 3's
   "interior is inert" scheduling assumption; the `invalidate` hook is the
-  seam EJ must call, and EJ's erasure jobs should run *on* this epic's
+  seam it must call, and its erasure jobs should run *on* this ADR's
   ownership partition rather than growing their own coordination.
-  Recommendation recorded here: EJ lands after EI and its ADR names this
-  hook. Flagged in the epic issue at landing.
-- **On EE (#455, WORM):** the new keys (and the existing advisory cursor)
+  Recommendation recorded here: ADR-0064 lands after this and its ADR names this
+  hook.
+- **On WORM (ADR-0055):** the new keys (and the existing advisory cursor)
   are mutable and must sit outside any WORM-protected prefix; whichever ADR
-  lands second addresses the other (same clause EJ/EE already carry).
-- **On S1-W6** (two workers observing different input sets producing two
+  lands second addresses the other.
+- **On the two-writer race** (two workers observing different input sets producing two
   compaction records): steady-state single ownership makes this
   near-impossible rather than merely convergent — a side benefit, not a
   correctness change; the resolver's widening behavior stays.
-- **Stale-issue-text reconciliation, reported:** issue #459's "RLOG
-  compaction is not streamed" predates #275; the shipped gap is the
+- **Reconciliation, reported:** the "RLOG compaction is not streamed"
+  framing predates the streaming change; the shipped gap is the
   hot-stream materialization (fixed here) and the RSPAN whole-object
-  residual (follow-up issue at landing). The epic issue gets a comment
-  correcting the finding state when the ADR lands.
+  residual (follow-up at landing).
 - **New metrics** on the existing `/metrics` endpoint:
   `ravel_maintain_workers_live`, `ravel_maintain_units_owned`,
   `ravel_maintain_units_stalled`, `ravel_maintain_memo_warm_start_units`,
   `ravel_maintain_full_sweep_passes_total`, plus the RLOG merge peak-bytes
   gauge from the tracker seam. Shipped alert rules: `workers_live == 0` in
   a maintaining mode, `units_stalled > 0` sustained.
-
-## Stage-2-ready task decomposition (sketch, for the approval gate)
-
-All tasks land in `ravel-maintain` and/or the `ravel-server` maintain/scrub
-driver files except T4's reader half (`ravel-logseg`). Same-crate tasks
-cannot share a wave, so waves are effectively serial; T4 is
-premise-independent of T1-T3 and is sequenced first so the epic's two
-findings progress independently.
-
-| ID | title | crates | deps | acceptance test | risk |
-|---|---|---|---|---|---|
-| T4 | k-way block-streaming RLOG merge + memory tracker | ravel-logseg, ravel-maintain | - | ravel_maintain::rlog::merge_peak_memory_bounded_under_10x_input_growth | high (solo wave) |
-| T1 | worker membership + rendezvous ownership filter | ravel-maintain, ravel-server | - | ravel_server::maintain::two_replicas_partition_units_without_double_pay | medium |
-| T2 | durable memo snapshot, warm start, handoff seeding | ravel-maintain, ravel-server | T1 | ravel_maintain::scan::warm_start_skips_terminal_buckets_without_reads | medium |
-| T3 | zone scheduling + sweep cadence split + invalidate | ravel-maintain, ravel-server | T2 | ravel_maintain::scan::interior_zone_scheduled_not_rescanned (+ expiry-fires) | high (deletion promptness; solo wave) |
-| T5 | bounded unit concurrency, metrics, alerts, docs, e2e reachability test (S5-E6 through real wiring) | ravel-server | T1-3 | e2e: two real spawn()-wired maintain roles over one store partition and export the new gauges (pattern: PR #555 commit 2a72dee) | low |
-
-Waves: W1 = T4, W2 = T1, W3 = T2, W4 = T3, W5 = T5. T3 and T4 ride solo as
-high-risk; the checkpoint reviewer is pointed at deletion-promptness safety
-(T3) and byte-identical merge output ordering (T4).
-
-Note: this epic should land before EJ (#460), which depends on the
-`invalidate` hook. Whoever dispatches EJ should confirm this ADR (and its
-hook) has landed first.

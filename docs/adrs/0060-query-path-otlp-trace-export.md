@@ -1,6 +1,6 @@
 # ADR-0060: Query-path OTLP trace export
 
-Status: Accepted (2026-08-07)
+Status: Accepted
 
 ## Context
 
@@ -169,5 +169,5 @@ stdout.
   here: `crates/ravel-query/src/log_fetcher.rs` emits `page_fetch` and
   `decode` spans with a `signal = "logs"` field instead of the metric path's
   `page_kind`/`series_count` fields, and `docs/guides/tracing.md`'s span
-  table does not mention this divergence. Reported to the user; not part of
-  this epic's scope.
+  table does not mention this divergence. Reported separately; not part of
+  this ADR's scope.

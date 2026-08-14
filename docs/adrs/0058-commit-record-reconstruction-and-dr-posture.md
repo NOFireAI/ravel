@@ -13,22 +13,21 @@ fat-fingered prefix delete — the data objects they named become invisible to
 every reader immediately, and the orphan sweeper (`crates/ravel-maintain/src/
 sweep.rs`, rule 1) physically deletes them once they clear
 `grace_ns + max_flush_lifetime_ns` (24h + 1h = 25h by default) with no record
-naming them. This is the review's own "most dangerous flaw": one bad
-lifecycle rule, no attacker, no alarm, permanent loss.
+naming them. This is the most dangerous flaw in the durability posture:
+one bad lifecycle rule, no attacker, no alarm, permanent loss.
 
-ADR-0048 (epic EA, already shipped) closed half of this: a mass-orphan
+ADR-0048 (already shipped) closed half of this: a mass-orphan
 circuit breaker halts the sweeper and trips
 `ravel_maintain_orphan_breaker_tripped_total` when candidates exceed
 `orphan_breaker_min_count` (default 50) *and*
 `orphan_breaker_max_ratio` (default 0.10) of listed L0 objects for a shard.
 ADR-0048's own Consequences section named the other half as future work:
 *"the footer-derived commit-record reconstruction tool... is its own piece
-of work."* This ADR is that work, plus the two related findings the same
-review section raised: no document instructs an operator to stop
-`--mode maintain` before touching a metadata anomaly (S5-12), and Ravel's
-disaster-recovery posture is unstated, with the one existing sentence on
-backup ("back up the bucket, or rely on its durability") explicitly named
-by the review as correct-only-in-the-happy-path (S5-04).
+of work."* This ADR is that work, plus two related gaps: no document
+instructs an operator to stop `--mode maintain` before touching a
+metadata anomaly, and Ravel's disaster-recovery posture is unstated, with
+the one existing sentence on backup ("back up the bucket, or rely on its
+durability") correct only in the happy path.
 
 ### The breaker's blind spot
 
@@ -39,7 +38,7 @@ sweeper's candidate count for that bucket never approaches 50 or 10% of
 that shard's L0 objects, so the breaker never trips. The three orphaned
 data objects are deleted at hour 25 exactly as if they were abandoned
 flushes — no metric, no log line above `debug`, nothing. This means the
-acceptance criterion this ADR and EA jointly serve — *"no data object may
+acceptance criterion this ADR and ADR-0048 jointly serve — *"no data object may
 be deleted without a distinct operator-visible alarm"* — does not hold
 under the shipped breaker alone. A reconstruction tool nobody knows to run
 in time is not a mitigation for this case; the trigger is part of this
@@ -71,8 +70,8 @@ bytes, not over writer intent. The cost is a full-object GET per orphaned
 object, not a footer-only suffix read (the same cost `ravel-cli maintain
 verify-custody` already pays, manually, today). If the underlying bytes
 have themselves rotted, reconstruction faithfully hashes the rotted bytes
-and produces a record that matches them — that is EG's problem (ADR-0059,
-the scrubber), not this one's; ED's reconstruction step does not detect
+and produces a record that matches them — that is the scrubber's problem
+(ADR-0059), not this one's; the reconstruction step does not detect
 rot, it only rebuilds the record that would have described whatever is
 actually stored.
 
@@ -129,9 +128,9 @@ decompose time.
 names and compares against the record's key — but it iterates commit
 records to find data objects, so if a shard's commit records are gone
 entirely, it iterates zero records and reports zero anomalies. It cannot
-detect S5-03's scenario at all. `ravel-cli catalog verify`
+detect the missing-records scenario at all. `ravel-cli catalog verify`
 (`services/ravel-cli/src/catalog.rs:147-266`) is a different tool solving
-a different problem (fold/snapshot staleness, EG's S2-04) and is not
+a different problem (fold/snapshot staleness) and is not
 extended here. `ravel_commit::record::build`
 (`crates/ravel-commit/src/record.rs:70-103`) and
 `keys::commit_key_for_record` (`keys.rs:466-483`) are existing, tested
@@ -151,9 +150,9 @@ up besides the object store bucket itself... rely on its durability" —
 true and incomplete: the bucket itself is a single point of loss, with no
 mandated versioning or cross-region replication, no backup cadence, no
 restore drill, and no RTO/RPO statement anywhere. "Replica-bucket
-failover," which the review calls unsound, does not exist as a Ravel
-feature at all (`S3Config` has exactly one bucket, one region); the
-review's language describes a hypothetical operator mitigation (pointing
+failover" does not exist as a Ravel
+feature at all (`S3Config` has exactly one bucket, one region); it would
+be a hypothetical operator mitigation (pointing
 at an S3-CRR replica bucket on outage), not a half-built Ravel mechanism.
 Vanilla S3 CRR is asynchronous and gives no cross-bucket CAS or listing-
 consistency guarantee, which every seal/GC/compaction correctness argument
@@ -229,9 +228,9 @@ alongside the existing mass-orphan-breaker runbook
 commit record, stop (or restrict via `--maintain-tenant`) every running
 `--mode maintain` process for the affected tenant, run
 `commit reconstruct`, verify via `ravel-cli maintain verify-custody` and
-`ravel-cli catalog verify`, then resume maintenance. This closes S5-12
-and fulfills the promise ADR-0048's Consequences section made but did not
-deliver.
+`ravel-cli catalog verify`, then resume maintenance. This closes the
+stop-maintain-first gap and fulfills the promise ADR-0048's Consequences
+section made but did not deliver.
 
 ### 5. Honest DR-posture document
 
@@ -265,7 +264,7 @@ from a decision that should stay a decision — the breaker's whole point
 (ADR-0048 §4) is to halt and force a human look, not to auto-repair.
 Automatic reconstruction could also mask a genuine attack (an adversary
 deleting records specifically to trigger a mass "repair" that writes
-attacker-controlled data) — out of scope for this review's threat model,
+attacker-controlled data) — out of scope for this ADR's threat model,
 but a reason not to remove the human step regardless.
 
 **Treat `last_modified`-derived `created_unix_ns` as exact and skip
@@ -275,13 +274,13 @@ framing costs one paragraph and avoids a future reader assuming
 reconstructed records are indistinguishable from original ones.
 
 **Skip the orphan-presence gauge; rely on operators reading `sweep`
-logs.** Rejected because this is exactly the gap S5-03 names ("no
-alarm") — a `debug`-level log line nobody is tailing is not an alarm, and
+logs.** Rejected because this is exactly the "no alarm" gap — a
+`debug`-level log line nobody is tailing is not an alarm, and
 the fix is a few lines against data the sweeper already computes.
 
 ## Consequences
 
-- **Closes S5-03 at every scale**, not just mass loss: the orphan-
+- **Closes the record-loss gap at every scale**, not just mass loss: the orphan-
   presence gauge catches small-scale record loss the breaker's
   ratio/count thresholds are too coarse for; the reconstruction tool
   recovers from it once noticed.
@@ -292,8 +291,8 @@ the fix is a few lines against data the sweeper already computes.
   consumer that reads them, but this ADR does not claim byte-for-byte
   fidelity to the original record.
 - **Reconstruction does not detect or repair bit rot.** It rebuilds a
-  record describing whatever bytes are currently stored; EG (ADR-0059) is
-  the mechanism that would have caught rot before this point.
+  record describing whatever bytes are currently stored; the scrubber
+  (ADR-0059) is the mechanism that would have caught rot before this point.
 - **Admin's credential grows one write grant** (ADR-0055 amendment) —
   narrowly scoped to the same `c/*` prefix Gateway already writes, no
   delete, no other prefix.

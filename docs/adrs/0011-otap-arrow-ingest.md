@@ -1,6 +1,6 @@
 # ADR-0011: OTAP (OpenTelemetry Arrow) ingest, not generic Arrow Flight
 
-Status: Accepted (2026-07-27)
+Status: Accepted
 
 ## Context
 

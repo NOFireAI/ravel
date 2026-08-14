@@ -90,8 +90,8 @@ Flight's `RESOURCE_EXHAUSTED` status (Flight SQL), the same shape as any
 other admission rejection.
 
 The active-series/stream default is 200,000, not the 1,000,000 ADR-0051
-section 3 names: issue #491 measured the real per-entry cost of the exact
-two-epoch tracker at 35-56 bytes (not the ~16 the ADR assumed), so
+section 3 names: the real per-entry cost of the exact two-epoch tracker was
+measured at 35-56 bytes (not the ~16 the ADR assumed), so
 `ravel-server` ships the lower figure to keep the worst-case tracker
 footprint near 27-43 MiB per fully active tenant instead of 140-224 MiB.
 The `--limits-file` raises it per tenant where the memory is available.
@@ -180,7 +180,7 @@ the end's window placement alone keeps its ingest hour listed).
 ### Receiver-clock floor
 
 Independently of the sender's timestamps, Ravel checks its own admission
-clock (ADR-0051 amendment, S1-12). A reading below a compiled floor
+clock (ADR-0051 amendment). A reading below a compiled floor
 (2020-01-01T00:00:00Z -- no host legitimately runs Ravel with a clock older
 than the system) or one that yields no representable ingest-hour bucket
 rejects the *whole* request with HTTP 503 / gRPC `UNAVAILABLE`, counted under
@@ -283,6 +283,6 @@ admitted/rejected totals, rejected bytes, rejections by reason) in-process.
 As of this writing they are not exposed at `GET /metrics`: no admission
 snapshot is wired into the metrics renderer. Per-tenant attribution behind
 an opt-in `--metrics-tenant-labels` flag, and folding untracked tenants into
-`tenant_hash="other"`, is designed in ADR-0051 section 6 (task EB-6) but not
+`tenant_hash="other"`, is designed in ADR-0051 section 6 but not
 yet implemented -- there is currently no admission-usage surface at
 `/metrics` at all, fleet-total or per-tenant.

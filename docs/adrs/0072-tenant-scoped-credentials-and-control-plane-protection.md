@@ -1,21 +1,18 @@
 # ADR-0072: Tenant-scoped credentials and control-plane write protection
 
-Status: accepted
-Date: 2026-08-12
-Refs: #455 (epic EE, per-tenant half), #875, adversarial review v2 findings
-S4-03 (residual), NF-1, NF-10
+Status: Accepted
 
 ## Context
 
 ADR-0055 scoped storage credentials per role (Gateway / Query / Maintain /
 Admin), enforced at the S3/MinIO IAM layer. That closed the "one
 credential does everything" finding for processes, but the per-tenant
-half of epic EE (#455) was never designed: a leaked Maintain-role
+half of ADR-0055 was never designed: a leaked Maintain-role
 credential can still read every tenant's objects, and any credential
 with write access to `sys/*` or `t/<hash>/<sig>/prov` can roll back or
-destroy control-plane state (findings NF-1, NF-10). Both adversarial
-reviews name the shared-credential blast radius as the top surviving
-reason Ravel is not approved for hostile multi-tenant deployments.
+destroy control-plane state. The shared-credential blast radius is the
+top surviving reason Ravel is not approved for hostile multi-tenant
+deployments.
 
 Three facts discovered while researching this ADR constrain the design:
 
@@ -30,7 +27,7 @@ Three facts discovered while researching this ADR constrain the design:
    a temporary credential today: it has no session-token field.
 2. **Cryptographic scoping already has a designed, unwired mechanism.**
    ADR-0062's `KmsRoutingStore` routes tenant-prefixed PUTs to
-   per-tenant SSE-KMS keys. Once wired (EL-7, #764), a role credential
+   per-tenant SSE-KMS keys. Once wired (ADR-0062), a role credential
    without `kms:Decrypt` on a tenant's key cannot read that tenant's
    plaintext even though S3 `GetObject` succeeds at the IAM layer. That
    converts the cross-tenant-read blast radius from "every tenant's
@@ -43,7 +40,7 @@ Three facts discovered while researching this ADR constrain the design:
    (`crates/ravel-object-store/src/conformance.rs`) can report
    Enabled / Disabled / Unknown, and today it is informational only:
    a bucket with no Object Lock and no versioning boots cleanly, and
-   `sys/tenancy` deletion bricks the deployment (NF-10).
+   `sys/tenancy` deletion bricks the deployment.
 
 Two defects found in the shipped artifacts fold into this ADR's scope
 because fixing them changes the same templates and docs:
@@ -58,9 +55,9 @@ because fixing them changes the same templates and docs:
   real audit keys are `t/<hash>/u/<l0|c|l1>/<shard:04>/...`. An IAM
   prefix transcribed from the ADR matches nothing.
 
-Separately, #875 reported operator token revocation lost across
+Separately, operator token revocation was reported lost across
 restarts. The code says the premise is narrower and worse: `sys/auth`
-(the durable token map from EM-T7) has **no writer in any shipped
+(the durable token map) has **no writer in any shipped
 binary** -- `upsert_token` / `remove_token` have zero production
 callers, the operator does not depend on `ravel-catalog`, and
 operator-managed deployments hardcode the unkeyed tenant hash, which
@@ -91,11 +88,11 @@ only makes externally minted short-lived credentials expressible.
 
 ### 2. Per-tenant isolation is delivered by key custody, not credentials
 
-EL-7 (#764) wires `KmsRoutingStore` into the single store construction
+ADR-0062 wires `KmsRoutingStore` into the single store construction
 site (`services/ravel-server/src/store.rs`) behind
 `--tenant-kms-config`, with epoch-0 bootstrap per
 `crates/ravel-catalog/src/key_epoch.rs`. This ADR adds the posture
-statement EL-7 amends the guides with: in a hostile multi-tenant
+statement that work amends the guides with: in a hostile multi-tenant
 deployment, each tenant's KMS key policy grants decrypt to the Ravel
 role principals only for that deployment, so a leaked role credential
 alone yields ciphertext; compromise requires the credential *and* KMS
@@ -126,7 +123,7 @@ deployments impossible, not lock semantics in-process.
 - `ravel-catalog` gains `remove_tokens_by_tenant(tenant_id)` (and a
   `replace_tenant_tokens` companion) so revocation needs no plaintext:
   entries carry the tenant ID in the clear, only the token is a keyed
-  hash (#875's requested primitive).
+  hash (the requested primitive).
 - `ravel-cli` gains `tenant token upsert|revoke|list` (Admin role),
   making the CLI the first shipped writer of `sys/auth`.
 - `services/ravel-operator` takes a `ravel-catalog` dependency and
@@ -136,8 +133,8 @@ deployments impossible, not lock semantics in-process.
   restart with no in-memory history. The operator also stops
   hardcoding `--tenant-hash-unkeyed` when the CRD carries a deployment
   key, so `DurableBearerResolver` actually constructs on managed
-  clusters (prerequisite for any of this to matter; EM-T10 #773 covers
-  the migration story).
+  clusters (prerequisite for any of this to matter; the migration story
+  is tracked separately).
 
 ### 5. Fix and test the shipped IAM templates
 
@@ -167,9 +164,9 @@ breaks a real key shape fails CI instead of a production deployment.
   it forks the store abstraction for one call. The probe + fail-closed
   flag reaches the same operational outcome (no silently unprotected
   fleet) without it.
-- **Operator-side plaintext token cache made durable** (a literal
-  reading of #875): persists secrets the design deliberately never
-  persists; revoke-by-tenant needs no plaintext at all.
+- **Operator-side plaintext token cache made durable:** persists secrets
+  the design deliberately never persists; revoke-by-tenant needs no
+  plaintext at all.
 
 ## Consequences
 
@@ -188,10 +185,10 @@ breaks a real key shape fails CI instead of a production deployment.
 - The IAM templates become tested artifacts; future key-layout changes
   that invalidate a policy prefix fail CI.
 - Deliberately out of scope: per-tenant credentials (rejected), rekey
-  migration for legacy unkeyed-hash buckets (tracked separately),
+  migration for unkeyed-hash buckets (tracked separately),
   audit-log export off-bucket.
 
-## Amendment (2026-08-12): `sys/auth` entries get an ownership marker
+## Amendment: `sys/auth` entries get an ownership marker
 
 Decision 4's `remove_tokens_by_tenant` reconcile was unsafe as shipped:
 the operator's remove pass ran over every tenant absent from its Secret,
@@ -230,10 +227,10 @@ tenant's resulting entry set against its current one and returns
 rewrote the whole map every call), and the operator wraps each `sys/auth`
 primitive call in a bounded CAS retry and no longer aborts Deployment/
 Service reconciliation on a sys/auth failure -- both were reconcile-loop
-defects the ownership marker didn't by itself fix, found by the same
-review. See PROGRESS.md for the full defect list.
+defects the ownership marker didn't by itself fix. See PROGRESS.md for
+the full defect list.
 
-## Amendment (2026-08-12): `token_hash` is globally unique; last writer takes ownership
+## Amendment: `token_hash` is globally unique; last writer takes ownership
 
 A follow-up review found the ownership marker above could itself brick
 `sys/auth`: three doors all end with two entries sharing one `token_hash`
@@ -321,7 +318,7 @@ understands `format_version = 2` *before* any amended writer's first
 appears -- a lagging old server otherwise loses `sys/auth` entirely (its
 bounded-staleness refresh fails closed) until it, too, is upgraded.
 
-## Amendment (2026-08-12): cross-tenant token collisions are refused, not taken over
+## Amendment: cross-tenant token collisions are refused, not taken over
 
 The door 3 takeover decision above does not converge. Two tenants (say
 `acme` and `globex`) whose Secret-provisioned token values collide are

@@ -1,6 +1,6 @@
 # ADR-0038: Drop empty-valued labels at OTLP and OTAP admission
 
-Status: Accepted (2026-08-01)
+Status: Accepted
 
 ## Context
 
@@ -47,7 +47,7 @@ without a real `region`", matches both, so one logical series shows up as two.
 This is the same disagreement analyzed in ADR-0031 (Proposed), which proposed
 one canonical rule across all paths plus a separate empty-*name* rejection and
 an RW1 decode fix. This ADR decides and implements only the empty-*value* half
-of that proposal, for the OTLP and OTAP paths (issue #202). The empty-name
+of that proposal, for the OTLP and OTAP paths. The empty-name
 rejection and the RW1 decode change remain future work under ADR-0031; nothing
 here contradicts them.
 

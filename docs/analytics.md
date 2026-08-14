@@ -6,7 +6,7 @@ post-evaluation analytics stage: pure per-series functions over
 dependency. Every result is a deterministic function of the input slice and
 the parameters.
 
-The `POST /api/v1/analytics` endpoint (issue #216 part 2, in `ravel-server`)
+The `POST /api/v1/analytics` endpoint (in `ravel-server`)
 exposes these operations over a range query; its request/response schema and
 error table are the [Endpoint](#endpoint) section at the end of this document.
 What follows first specifies the crate's two operations, which the endpoint
@@ -25,9 +25,8 @@ Neither existing query surface can host these operations (ADR-0028 context):
   family, and a structured per-series detector result does not fit a flat
   aggregate.
 
-So the operations live in their own crate and (in part 2) behind their own
-endpoint, mirroring Elastic's placement of `CHANGE_POINT` outside the
-aggregation layer.
+So the operations live in their own crate and behind their own endpoint,
+keeping change point detection outside the aggregation layer.
 
 ## NaN and staleness
 
@@ -91,7 +90,7 @@ Detects the most significant change in one series and classifies it.
 
    A series with no PELT boundary, or with a boundary that trips no
    hypothesis, is `Stationary`. A series with fewer than 22 evaluated points
-   is `Indeterminable` (matching Elastic's floor).
+   is `Indeterminable`.
 
 The classification thresholds above are heuristics tuned against the fixture
 corpus; they are the crate's contract and change only with the corpus and this
@@ -105,8 +104,8 @@ document.
   averaging: bucket `k` spans `[floor(k*n/2000), floor((k+1)*n/2000))`, its
   value is the mean of that range, and its timestamp is the first timestamp in
   it. The result then carries `downsampled: true` and the original non-NaN
-  point count. Approximation is opt-in and visible (a Ravel invariant), unlike
-  Elastic's silent auto-downsampling.
+  point count. Approximation is opt-in and visible (a Ravel invariant); it is
+  never applied silently.
 
 ### Result
 
@@ -119,7 +118,7 @@ before any downsampling), and `nan_excluded`.
 ### Budget
 
 PELT runs on at most 2000 points; its worst case is quadratic in that cap. The
-per-series point cap and (in part 2) the per-call 1000-series cap bound the
+per-series point cap and the per-call 1000-series cap bound the
 stage's cost, and it can never see more data than a legal range query returns.
 
 ## `summary`
@@ -354,4 +353,4 @@ mappings:
 
 `AnalyticsError` messages carry only the caller's own parameters (a
 percentile, a point count) and are echoed; storage-layer faults are redacted
-to a fixed class message and logged in full server-side (a7-F02).
+to a fixed class message and logged in full server-side.

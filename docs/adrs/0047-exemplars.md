@@ -1,6 +1,6 @@
 # ADR-0047: Exemplars: an RSEG section, a capped admission, and a correlation surface
 
-Status: Accepted (2026-08-02)
+Status: Accepted
 
 ## Context
 
@@ -161,11 +161,12 @@ still holds, so v6 retires v5 in the change that introduces it.
 - Object size grows only for tenants that send exemplars, bounded by the
   cap: roughly 40 bytes plus attributes per kept exemplar.
 - Ravel gains metric-to-trace correlation, which is the whole point, and
-  the spans it links to are already stored and, after epic #427, queryable.
+  the spans it links to are already stored and, once the spans query
+  surface lands, queryable.
 - `min`/`max` for native histograms stay dropped. Named gap, not an
   oversight.
 
-## Amendment (2026-08-03): duplicate sort keys are legal
+## Amendment: duplicate sort keys are legal
 
 Decision 1 gave the EXEMPLARS section a `(series_index, ts_ns)` sort order.
 The implementation read that as strictly ascending and rejected an equal
@@ -204,6 +205,6 @@ Note what this format does NOT promise. Two records sharing
 value, or attributes. The writer preserves them verbatim and checks nothing
 beyond the sort order. An earlier revision of this amendment said in passing
 that such records "differ only in trace id"; that was an observation about the
-duplicate-delivery case, not a guarantee, and issue #475 read it as one and
-built a query-time dedup key on it. Any reader that collapses records must key
+duplicate-delivery case, not a guarantee, and it was mistakenly read as one and
+used to build a query-time dedup key. Any reader that collapses records must key
 on every field it would otherwise lose.

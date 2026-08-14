@@ -14,7 +14,7 @@ protobuf-style LEB128; signed values use zigzag.
 
 > History (v1-v4 were retired as readable/writable versions by ADR-0027,
 > and v5 by ADR-0047): the v1 baseline and its row-major catalog; the v2
-> columnar catalog (ADR-0014); native histograms (ADR-0017); the multi-run
+> columnar catalog (ADR-0027); native histograms (ADR-0017); the multi-run
 > compaction layout (ADR-0018); and the sparse id index and chunked catalog
 > (ADR-0026). v5 was the union of those layouts. v6 is v5 plus the optional
 > EXEMPLARS section (ADR-0047) and changes nothing else: every v5 grammar
@@ -415,7 +415,7 @@ dropped one exemplar in favour of another would make an L1 object something
 other than the exact multiset of its inputs, which is precisely what
 ADR-0018's overlap harmlessness forbids.
 
-L0-to-L1 compaction implements that rule (issue #474): it decodes each
+L0-to-L1 compaction implements that rule: it decodes each
 input's section through `decode_exemplars_section` (the public wrapper over
 `decode_exemplars_from_decoded`, which owns the whole-section decode),
 resolves each record's `series_index` to the series id it named, and hands

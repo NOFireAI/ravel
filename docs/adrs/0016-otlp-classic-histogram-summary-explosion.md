@@ -1,7 +1,6 @@
 # ADR-0016: OTLP explicit-bounds histograms and summaries explode to Prometheus-convention series
 
-Status: Accepted (2026-07-27). Implementation plan and tickets:
-docs/ingest-breadth-plan.md (track B).
+Status: Accepted
 
 ## Context
 
@@ -54,10 +53,10 @@ The trade is stated, not hidden: explosion multiplies series (a
 atomicity (bucket series of one point can even land via different
 shards and become visible at slightly different times). Both costs are
 the ones the entire Prometheus ecosystem already pays and its query
-semantics are defined against; RSEG v2's schema-sharing catalog
-(ADR-0014) specifically amortizes the per-series metadata cost, since
-all bucket series of a histogram share one label schema differing only
-in the `le` value ordinal.
+semantics are defined against; the schema-sharing catalog (ADR-0027)
+specifically amortizes the per-series metadata cost, since all bucket
+series of a histogram share one label schema differing only in the `le`
+value ordinal.
 
 ## Decision
 

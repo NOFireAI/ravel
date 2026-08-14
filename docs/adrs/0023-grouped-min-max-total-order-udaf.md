@@ -1,15 +1,15 @@
 # ADR-0023: Grouped MIN/MAX restored via a total-order min/max UDAF replacing the built-ins
 
-Status: Accepted (2026-07-28). Resolves the design gap recorded in issue
-#143; builds on ADR-0013 and the exactness regime of
-docs/arrow-datafusion-plan.md section 2. Sibling decision: ADR-0022 covers
-the `avg`/`stddev` exactness exclusion (review F7); this ADR decides
-grouped MIN/MAX total-order semantics only.
+Status: Accepted
+
+Builds on ADR-0013 and its exactness regime. Sibling decision: ADR-0022
+covers the `avg`/`stddev` exactness exclusion; this ADR decides grouped
+MIN/MAX total-order semantics only.
 
 ## Context
 
 The v1 SQL subset was specified as `count`, `sum`, `min`, `max` under
-`GROUP BY`. The B3 checkpoint review (issue #143) found that DataFusion
+`GROUP BY`. A review found that DataFusion
 54.1.0 ships two disagreeing MIN/MAX implementations. The ungrouped path
 (`AggregateStream` with `MinAccumulator`/`MaxAccumulator` over arrow's
 min/max kernels) compares with `f64::total_cmp`, a true total order:
@@ -25,14 +25,14 @@ result depends on arrival order; and a group whose only values are
 `f64::MAX`/`f64::MIN` instead of the actual value. These are silently
 wrong answers, not approximations ("Exact semantics by default").
 
-The interim fix (part of B3's merge) rejects MIN/MAX combined with
+The interim fix rejects MIN/MAX combined with
 `GROUP BY` at validation: `reject_grouped_min_max` and its
-`GroupedMinMaxFinder` walk in crates/ravel-sql/src/validate.rs. Issue
-#143 left the long-term direction to this ADR.
+`GroupedMinMaxFinder` walk in crates/ravel-sql/src/validate.rs. That
+interim fix left the long-term direction to this ADR.
 
 Two facts from the interim period weigh on the decision:
 
-- The rejection walk has already been wrong once. Issue #159 (closed): a
+- The rejection walk has already been wrong once: a
   grouped `min`/`max` appearing only in a query-level `ORDER BY` escaped
   the walk, because `ORDER BY` is a field of `Query`, not `Select`, and
   the grouped-scope stack was popped before it was visited. A legal
@@ -46,7 +46,7 @@ Two facts from the interim period weigh on the decision:
 - The differential gate cannot cover the current grouped accumulator.
   With semantics defined only by the accumulator's fold order, an
   independent reference is a second copy of the same seed-and-fold
-  algorithm; both sides agree on the wrong answer (#143). The gap is
+  algorithm; both sides agree on the wrong answer. The gap is
   untestable as long as the semantics are accidental.
 
 ## Alternatives
@@ -57,18 +57,17 @@ Two facts from the interim period weigh on the decision:
    built-ins for grouped and ungrouped execution alike.
 2. Wait for an upstream DataFusion fix; re-enable grouped MIN/MAX when a
    version bump's differential gate proves it correct. This would keep
-   the rejection walk unchanged, add a tracking issue pinned against the
-   DataFusion changelog, note the dependency in the plan's version-
-   pinning section, and land the grouped golden cases `#[ignore]`d with
-   a comment naming the tracking issue so re-enablement is trivial.
+   the rejection walk unchanged, note the dependency on the DataFusion
+   changelog in the version-pinning policy, and land the grouped golden
+   cases `#[ignore]`d with a comment so re-enablement is trivial.
    Rejected: the timeline is open-ended for a live gap in the v1
    surface; upstream's eventual semantics are their choice, and nothing
    guarantees they converge the grouped path onto `total_cmp` rather
    than, say, NaN-skipping semantics, so re-enablement is conditional on
    their pick matching our ungrouped pin; and until then the fragile
-   walk (#159) remains the sole guard, with no backstop possible.
+   walk remains the sole guard, with no backstop possible.
 3. Keep the validation rejection permanently; grouped MIN/MAX is simply
-   not in Ravel's SQL surface. This deserves real weight: the #159 hole
+   not in Ravel's SQL surface. This deserves real weight: the hole
    is fixed and regression-tested, the walk's cost looks one-time, and a
    UDAF is an ongoing maintenance burden. Rejected: the extreme per
    series (`SELECT series_id, max(value) ... GROUP BY series_id`) is the
@@ -77,7 +76,7 @@ Two facts from the interim period weigh on the decision:
    the walk's cost is not in fact one-time, because with no
    deregistration backstop available it must be re-proven against every
    sqlparser AST change on every version bump, which is exactly the
-   fragility class #159 demonstrated.
+   fragility class that hole demonstrated.
 4. Hybrid: ship the UDAF now, delete it once upstream fixes the grouped
    accumulator. Rejected: deletion would hand result semantics back to
    upstream, letting a later version bump silently change query results
@@ -119,8 +118,8 @@ Two facts from the interim period weigh on the decision:
    `update_batch` folds `total_cmp`; `state()` round-trips the extreme
    as one nullable Float64 `ScalarValue` and `merge_batch` folds the
    same order, which is associative and commutative, so partial/final
-   aggregation splits stay exact. Performance is acceptable for v1 by
-   the plan's own constraints: aggregation is pinned single-partition
+   aggregation splits stay exact. Performance is acceptable for v1:
+   aggregation is pinned single-partition
    and group count is bounded by the matched-series budget (10k). A
    vectorized `GroupsAccumulator` is a later, benchmark-gated change
    under ADR-0012 discipline and must pass the same gate; it is not part
@@ -160,26 +159,24 @@ Two facts from the interim period weigh on the decision:
      tests/differential.rs gain min/max columns, evaluated per group by
      the existing `min_total_order`/`max_total_order` reference folds,
      asserted f64-bit-identical over the edge-case pool. This is the
-     gate #143 called impossible; defining the semantics as a total
+     gate previously called impossible; defining the semantics as a total
      order is what makes the scalar reference independent.
-   - The #159 shapes execute correctly: `GROUP BY ... ORDER BY
-     max(value)` and `HAVING min(value)` covered by golden or
+   - The previously-escaping shapes execute correctly: `GROUP BY ... ORDER
+     BY max(value)` and `HAVING min(value)` covered by golden or
      differential cases.
    - A delegation case: grouped MIN/MAX over `ts` (Timestamp) plans and
      matches an integer reference fold.
    - All of the above join the pinned surface re-run on every
-     arrow/datafusion version bump (plan section 2, "Version pinning").
+     arrow/datafusion version bump.
 
 ## Consequences
 
 - Grouped MIN/MAX returns to the v1 SQL subset; the rejection error,
-  its message, and the plan's subset description are updated
-  (docs/arrow-datafusion-plan.md section 2 carries the pointer to this
-  ADR until the implementation lands).
+  its message, and the documented subset description are updated.
 - ravel-sql owns floating-point extreme semantics. Upstream fixes or
   regressions in DataFusion's grouped accumulator no longer affect
   results; a version bump cannot silently change MIN/MAX answers.
-- The validation walk shrinks and with it the #159 fragility class: the
+- The validation walk shrinks and with it that fragility class: the
   guard for min/max moves from a syntactic walk that must be airtight to
   a registry replacement that is structurally total, the same shift the
   `avg` deregistration backstop already made for avg.
@@ -192,7 +189,7 @@ Two facts from the interim period weigh on the decision:
   replacement. Irrelevant today: `RsegScanExec` supplies no statistics,
   and exactness prefers the executed path regardless.
 - `ValidationError` loses a variant; workspace-internal API change only.
-- The DataFusion seed-leak (behavior 3 in #143) should be reported
+- The DataFusion seed-leak (behavior 3 above) should be reported
   upstream as a courtesy; nothing here depends on its resolution.
-- The `stddev`/`var` family gap (audit finding sql4-F02) remains open
-  and belongs to ADR-0022's scope, not this ADR.
+- The `stddev`/`var` family gap remains open and belongs to ADR-0022's
+  scope, not this ADR.

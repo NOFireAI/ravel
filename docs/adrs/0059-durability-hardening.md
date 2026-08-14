@@ -12,7 +12,7 @@ covered bytes (`crates/ravel-segment/src/reader.rs`, `open_segment` in
 a page for a series nobody reads, an unqueried section — are never
 checked by anything, ever. `docs/object-store-contract.md` states this
 design choice explicitly: "Ravel's integrity guarantee... is therefore
-read-time only." This is S2-08: bit rot or a partially written object is
+read-time only." So bit rot or a partially written object is
 discovered by accident of query pattern, or not at all.
 
 The closest thing to a scrubber that exists today, `ravel-cli maintain
@@ -28,21 +28,21 @@ staleness but says nothing about whether the postings' claims are actually
 true of the underlying segment data. A *false positive* claim (postings
 lists a name that isn't really there) is spot-checkable cheaply: resolve
 one ordinal, suffix-GET that segment's catalog, check the name appears.
-A *false negative* (S2-09's actual concern — a query gets "no match" when
+A *false negative* (a query gets "no match" when
 the data has a match) is fundamentally not spot-checkable: catching it
 requires re-deriving every covered segment's true name set from its own
 catalog and diffing against what postings claims for it — proportional to
 segment count, not to names. Today this check exists only inside
-`cargo test` as a property test (`docs/metric-index-plan.md`, "postings
-exactness property"); there is no production path that ever runs it.
+`cargo test` as a property test (the postings exactness property); there
+is no production path that ever runs it.
 
-Late-commit seal-loss detection (S2-04) already has a correct tool,
+Late-commit seal-loss detection already has a correct tool,
 `ravel-cli catalog verify` (`services/ravel-cli/src/catalog.rs:147-266`):
 it re-lists sealed commit records and diffs them against the folded
 snapshot, catching under-counting from clock-skew seal divergence. It is
 metadata-cost (reads commit records, not data objects), correct, and
 completely unscheduled — the same "operator must remember to run a CLI"
-gap epic ED closes for a different failure mode.
+gap ADR-0058 closes for a different failure mode.
 
 `ravel-object-store`'s `FaultStore` injects a wide range of faults
 (timeouts, throttling, partial writes, corrupt ranges, duplicate
@@ -58,7 +58,7 @@ depends on their *completion order*, only on the data PUT being
 already enforces by construction. The one place genuine completion-order
 ambiguity exists today is multipart part uploads, whose contract already
 states parts may complete out of submission order — and that assumption
-has never been exercised against anything. S1-14's harness closes a real
+has never been exercised against anything. The reorder harness closes a real
 testing-capability gap, not a live bug; this ADR says so plainly rather
 than implying otherwise.
 
@@ -97,9 +97,9 @@ graceful shutdown) with two tiers:
   to keep sustained read bandwidth at `total corpus bytes / P`. For each
   object the cursor visits: full-object GET, blake3 rehash compared
   against the commit record's `content_hash` (bit-rot / partial-write
-  detection, S2-08) — **and, on the same read, re-derive the object's
+  detection) — **and, on the same read, re-derive the object's
   true name set from its own catalog/label dictionary and diff against
-  what the covering postings object(s) claim for it** (S2-09's false-
+  what the covering postings object(s) claim for it** (the false-
   negative check). This reuses the one expensive full-object read for
   both checks rather than paying for it twice — the strongest part of
   this design, since neither check alone would justify a dedicated full-
@@ -177,7 +177,7 @@ content tier's cursor is already paying for scanning the same objects for
 blake3 rehashing — piggybacking is strictly cheaper for the same
 coverage.
 
-**Treat S1-14 as closing a live correctness bug.** Rejected on the
+**Treat the reorder harness as closing a live correctness bug.** Rejected on the
 evidence: no code path today has its correctness depend on object-store
 completion order (the write path is sequential-by-issuance; concurrent
 GET fan-out is order-insensitive by construction). Framing this as "fixes
@@ -193,7 +193,7 @@ keeps the code next to what it's checking.
 
 ## Consequences
 
-- **Closes S2-08 and S2-09 together, on one shared expensive read per
+- **Closes at-rest integrity and postings-exactness checks together, on one shared expensive read per
   object**, over an explicit, operator-sized rotation period — not
   instantaneous coverage, a documented eventual-coverage guarantee with a
   stated worst-case staleness (`P`).
@@ -202,9 +202,9 @@ keeps the code next to what it's checking.
   (`ravel_scrub_cursor_position`) like any other capacity-planning input,
   not assumed free the way fold/compaction/retention/sweep's metadata
   costs are.
-- **S2-04's fix is a scheduling wrapper, not new detection logic** — the
+- **The seal-divergence fix is a scheduling wrapper, not new detection logic** — the
   correct comparison already existed; it was only ever manually invoked.
-- **S1-14 adds a genuinely new fault-injection primitive**
+- **The reorder harness adds a genuinely new fault-injection primitive**
   (`ravel-object-store`), which other future work (a parallelized write
   path, a multipart-based large-segment writer) can build tests on top of
   — this ADR delivers the primitive and two concrete tests, not
@@ -214,4 +214,4 @@ keeps the code next to what it's checking.
   repair for segment-level corruption has no clear safe action today
   (there is no redundant copy to repair from; ADR-0058's DR document
   states this explicitly). This scrubber's job is detection and alarming,
-  matching the epic's acceptance criterion, not recovery.
+  matching the acceptance criterion, not recovery.

@@ -5,8 +5,7 @@ attributed to a phase. Each crate opens a span around the work it owns, and
 every span carries the same bounded fields the `/metrics` label allowlist
 permits (a tenant hash and per-span byte and request counts), never a query
 text, a metric name, a label value, or an object key. This is the design of
-[ADR-0044](../adrs/0044-query-cost-accounting.md) section 5, shipped by issues
-#642 and #643.
+[ADR-0044](../adrs/0044-query-cost-accounting.md) section 5.
 
 ![query-path tracing: spans and OTLP export](../diagrams/tracing-export.svg)
 
@@ -139,7 +138,7 @@ implicit `error` default, which would hide the `info`-level request spans in
 
 ## Attributing a slow query to a phase
 
-The concrete question (issue #638) is: a query is slow, which phase owns the
+The concrete question is: a query is slow, which phase owns the
 time? Read the phase spans nested under the request span for that query. Two
 signals combine.
 
@@ -237,7 +236,7 @@ surfaces an error to the caller
 ([ADR-0060](../adrs/0060-query-path-otlp-trace-export.md) decision 6); the ADR
 covers the batch-processor mechanism behind that guarantee.
 
-Two failure modes, two different signals (issue #711). A malformed URL fails
+Two failure modes, two different signals. A malformed URL fails
 the exporter build at startup: a single "OTLP trace export disabled" warning,
 and the process degrades to the log-only subscriber. A well-formed but
 unreachable or wrong-collector endpoint builds fine -- the exporter dials

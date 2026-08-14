@@ -1,14 +1,12 @@
 # ADR-0057: fleet-global admission via periodic self-owned-key reconciliation
 
-Status: Accepted (2026-08-06)
+Status: Accepted
 
-Issue #656, program #450. New finding from adversarial review v2
-(post-remediation delta, 2026-08-05), NF-4: epic EB (#452, ADR-0051, closed)
-shipped `AdmissionController` -- active-series, active-stream, byte-rate, and
-series-creation-rate caps -- enforced entirely per process. A tenant routed
-across N ingest replicas gets N times the configured budget, with no
-coordination required to hit it: normal load-balanced traffic, not an
-attack.
+ADR-0051 shipped `AdmissionController` -- active-series, active-stream,
+byte-rate, and series-creation-rate caps -- enforced entirely per
+process. A tenant routed across N ingest replicas gets N times the
+configured budget, with no coordination required to hit it: normal
+load-balanced traffic, not an attack.
 
 ## Context
 
@@ -58,7 +56,7 @@ What this ADR adds is a mechanism ADR-0051 did not consider: reconciliation
 off the hot path, on a bounded interval, using keys each process owns
 exclusively -- so there is no CAS, no shared mutable object, and no
 contention, at the cost of a bounded (not eliminated) overshoot window
-matching the shape issue #656 itself invited ("a hybrid, e.g. per-process
+matching the shape the finding itself invited ("a hybrid, e.g. per-process
 soft caps with periodic reconciliation against a shared hard cap"). The
 closest existing precedent for this shape, though for a different problem,
 is ADR-0052's router live-switch (`crates/ravel-ingest/src/generation.rs`,
@@ -142,7 +140,7 @@ bucket and `EpochIdSet` logic, same sub-microsecond cost -- only the
 number it compares against now comes from the last reconciliation instead
 of being the static configured limit. `configured_fleet_cap` is the value
 an operator sets once, meaning the fleet-wide total, not per-process --
-closing the exact gap issue #656 names: sizing a cap no longer requires
+closing the exact gap: sizing a cap no longer requires
 dividing by replica count.
 
 Count and rate caps need different formulas, because one is a stock and
@@ -163,8 +161,8 @@ admits nothing further, and the value doesn't move again until a
 tenant's usage actually drops. A stable fixed point.
 
 **Rate caps** (`ingest_byte_rate`, `series_creation_rate`) do not have
-that property, and using the same formula for them was a bug the
-checkpoint reviewing EF-T1 caught before it landed (2026-08-06):
+that property, and using the same formula for them was a bug a
+checkpoint caught before it landed:
 `own_current_usage` for a rate cap is a *measured* flow rate, not a
 stock the threshold controls. Once the fleet crosses the configured cap,
 every process's `own` reading is "whatever I'm already sending," so the
@@ -283,20 +281,20 @@ an eventual bounded cleanup of long-abandoned snapshot keys if their
 accumulation ever matters in practice; this ADR does not add that sweep
 now, since an unbounded number of small, cheap-to-ignore stale objects
 under one more `admission/` prefix is a materially smaller concern than
-the `idem/` keyspace growth ADR-0055 and issue #656's sibling findings
+the `idem/` keyspace growth ADR-0055 and this finding's siblings
 already track, and speculative cleanup work is exactly the kind of
-premature scope this program's own discipline argues against.
+premature scope the project's own discipline argues against.
 
 ## Rejected alternatives
 
 **Re-litigate ADR-0051's rejected S3-CAS shared counter.** Rejected again,
 for the same reason ADR-0051 gave: a request-path round-trip against one
 mutable, CAS-contended object is a real latency and correctness cost this
-ADR's whole design exists to avoid. Nothing in review v2 or issue #656
-presents new information that changes that calculus -- issue #656 itself
+ADR's whole design exists to avoid. Nothing about the finding
+presents new information that changes that calculus -- it itself
 explicitly invites the hybrid this ADR delivers instead.
 
-**A small coordinator service.** Issue #656 named this as a candidate.
+**A small coordinator service.** This was named as a candidate.
 Rejected: it is a new stateful, network-reachable process with its own
 availability and durability story, and CLAUDE.md's invariant that "no
 durability may depend on local disk, and no recovery path may read state
@@ -372,17 +370,17 @@ note in the eventual docs, not a redesign of this ADR.
   than the configured cap), not to zero admission -- a sustained failure
   is observable via the new counter rather than silent, but never becomes
   an outage on its own.
-- **Does not close #491** (the ravel-ingest/ravel-server default
-  discrepancy) -- unrelated, already tracked separately.
+- **Does not close the default-config discrepancy** (the
+  ravel-ingest/ravel-server default) -- unrelated, already tracked separately.
 
-## Correction (2026-08-06)
+## Correction
 
 The rate-cap formula in section 2 and the rate-cap overshoot bound in
-section 4 were corrected before this ADR's first implementation (issue
-#677) landed. The originally accepted text applied the count-cap
-additive-headroom formula to rate caps unmodified; a checkpoint review of
-the implementation caught that this formula does not converge for a flow
+section 4 were corrected before this ADR's first implementation landed.
+The originally accepted text applied the count-cap additive-headroom
+formula to rate caps unmodified; a checkpoint review of the
+implementation caught that this formula does not converge for a flow
 quantity (see section 2's "Rate caps" subsection for the failure mode and
 the corrected equal-fleet-share formula). No deployment ever ran the
-original formula -- issue #677's implementation was blocked on this
-finding before landing.
+original formula -- the implementation was blocked on this finding
+before landing.

@@ -1,6 +1,6 @@
 # ADR-0046: A content-addressed read cache at the read funnels, not a store decorator
 
-Status: Accepted (2026-08-02)
+Status: Accepted
 
 ## Context
 
@@ -114,7 +114,7 @@ in the read-path survey are called on cached bytes exactly as on fetched
 bytes. A corrupt entry is therefore indistinguishable from a corrupt S3
 read and fails closed on the existing path.
 
-**Amended 2026-08-02, after a checkpoint review found the original
+**Amended, after a checkpoint review found the original
 instruction unimplementable.** It said the blake3 is verified once, when
 bytes are admitted to the disk tier. The cache crate cannot do that.
 `CacheKey` is `(tenant_hash, content_hash, offset, len)` where

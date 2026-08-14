@@ -56,7 +56,7 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      data, so "wins" only ever breaks a tie between equal values, never
      drops one. The combined series/histogram-series lists are then sorted
      by label set, so their order is deterministic across runs regardless
-     of `HashMap` iteration order or fetch completion order, issue #801)
+     of `HashMap` iteration order or fetch completion order)
   -> ravel-promql Evaluator -> Value (scalar / string / instant vector /
      range matrix)
   -> Prometheus JSON envelope {status, data:{resultType, result},
@@ -64,7 +64,7 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      (warnings/infos are the evaluator's Annotations: two distinct
      Prometheus fields, both omitted when empty. A quantile argument outside
      [0,1] and a malformed classic histogram are warnings; a forced
-     histogram monotonicity fixup is an info. Issue #178.)
+     histogram monotonicity fixup is an info.)
 ```
 
 `padded_range`: the union, over every selector `plan_selectors` reports, of
@@ -94,7 +94,7 @@ exact NaN bit pattern `0x7ff0_0000_0000_0002`, compared via
 `f64::to_bits()`, never `is_nan()`). A selector whose newest in-window
 sample is the marker treats the series as absent at that instant; range
 windows exclude marker samples. Every other NaN payload is a live value
-and passes through bit-exactly (issue #75).
+and passes through bit-exactly.
 
 ## Time-range and matcher pruning order
 
@@ -106,7 +106,7 @@ and passes through bit-exactly (issue #75).
    regex/negative matchers evaluate on materialized label sets.
 3. Page level: v1 has one page pair per series; nothing further to prune.
 
-## Segment catalog fetch: whole-object vs sparse catalog-probe (#276)
+## Segment catalog fetch: whole-object vs sparse catalog-probe
 
 `SegmentFetcher::decode_selected` decodes one segment's catalog before it
 plans page ranges. How it fetches the catalog depends on the object's v5
@@ -136,9 +136,9 @@ empty matcher wants every series, so one whole-object GET beats a catalog GET
 plus a page GET spanning the object); and the object is at least
 `SPARSE_PROBE_MIN_OBJECT_SIZE`. The size floor is the crossover between one
 whole-object GET and one catalog GET plus the extra selective page-range round
-trips. Epic #264 Wave 1 (BENCHMARKS.md, 2026-07-31 MinIO panel) measured
-per-request latency (~1-5 ms loopback, ~15-80 ms projected real S3) but did
-not meter this specific within-segment crossover, so the floor is set
+trips. Measured per-request latency (~1-5 ms loopback, ~15-80 ms projected
+real S3) did not meter this specific within-segment crossover, so the floor
+is set
 conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
 below any real compacted sparse L1 part) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
@@ -188,9 +188,9 @@ samples (10M) enforced independently per selector (a query with several
 selectors, e.g. a future binary/aggregate expression, grants each its own
 full budget rather than splitting one budget across them), max
 range-evaluation points per query (11,000, matching the Prometheus
-resolution limit; issue #77), wall deadline (server maximum, default
+resolution limit), wall deadline (server maximum, default
 30 s). The `timeout` param can only lower the deadline: values above the
-server maximum are clamped to it (issue #58). Exceeding a budget returns a
+server maximum are clamped to it. Exceeding a budget returns a
 Prometheus-style error, never a partial silent result.
 
 ### Segment admission (ADR-0073)
@@ -209,11 +209,11 @@ the same points `max_bytes_scanned` already is, and reported as
 through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
 `request_budget_exceeded(requests, max_s3_requests)` for the incremental
 budget check. `QueryEngine::resolve_bounded` (`engine.rs`) is the call site
-for PromQL as of RH-T1 (#901); the SQL executor, the five SQL table
-providers, and the exemplars state moved onto the same seam under RH-T2
-(#902) — no site still runs a pre-ADR-0073 per-surface check.
+for PromQL; the SQL executor, the five SQL table providers, and the
+exemplars state moved onto the same seam — no site still runs a
+pre-ADR-0073 per-surface check.
 
-RH-T3 (#903) proves this seam end-to-end through both real HTTP query
+An end-to-end test proves this seam through both real HTTP query
 surfaces rather than at the seam's own unit level: a real `IngestRouter`
 sustains flushes past `max_segments`-worth of L0 objects in a tenant's
 open hour against `MemoryStore`, and PromQL and SQL reads over that hot
@@ -225,7 +225,7 @@ truncating the result
 (`services/ravel-server/tests/recent_hours_reachability_e2e.rs`).
 
 Per-tenant max bytes scanned (`ByteLimit`, default `Unlimited`; ADR-0061
-decision 1, issue #721) bounds the total S3 bytes one query may fetch
+decision 1) bounds the total S3 bytes one query may fetch
 across every segment its shared snapshot resolves to, protecting against a
 selector that passes the count caps but whose covering segments are large.
 It is checked once per completed segment fetch, inside the two fetch
@@ -268,7 +268,7 @@ repeatedly re-evaluated subqueries: an outer range query re-evaluates a
 matrix-function argument's subquery from scratch at every one of its own
 grid steps, and a subquery may itself nest another subquery, so a query
 whose every individual node sits safely under 11,000 points can still
-multiply that cost across nesting levels and re-evaluations (issue #193).
+multiply that cost across nesting levels and re-evaluations.
 `ravel_promql::Evaluator` therefore also charges a shared, cross-level
 evaluation budget (`Evaluator::with_max_total_eval_points`, default
 `DEFAULT_MAX_TOTAL_EVAL_POINTS` = 1,000,000 grid points): every subquery
@@ -306,7 +306,7 @@ is actually present in the fetched window, the evaluator returns
 of a wrong empty answer. The trigger is the presence of matched histogram
 data, not the syntactic shape: a float-only subquery, including
 `rate(x[5m:1m])` over float series, is unaffected. Real histogram subquery
-support is tracked by issue #220.
+support is future work.
 
 The max-samples budget is **count-yielded**: samples are counted as the
 lazy k-way merge emits them (post-dedup), and the budget trips at exactly
@@ -420,7 +420,7 @@ path. The operator guide is docs/guides/distributed-query.md.
 Both the value-bearing endpoints (`/api/v1/query`, `/api/v1/query_range`)
 and the discovery endpoints (`/api/v1/series`, `/api/v1/labels`,
 `/api/v1/label/<name>/values`) federate, through the SAME `Federation`
-coordinator and with identical semantics (issue #891). A discovery request
+coordinator and with identical semantics. A discovery request
 sends its matchers and window to each remote; the remote resolves under its
 own tenant auth, enforces its own admission/limits/erasure, and returns
 series whose identities are unioned into the local discovery pool. The only
@@ -491,13 +491,13 @@ still emits exactly one sample per timestamp and never duplicates or
 crashes. Making a cross-cluster tie-break deterministic on value would need
 a cluster-identity component in the order and is out of scope for this wave.
 Inventing a cross-cluster provenance scheme is a separate ADR, deliberately
-not attempted here (issue #891): the behavior above is *defined* only for
+not attempted here: the behavior above is *defined* only for
 disjoint cross-cluster series identity, and this limitation is recorded both
 here and as a code comment at the merge site (`is_greater` in
 crates/ravel-query/src/engine.rs).
 
 The discovery endpoints (`/api/v1/series`, `/api/v1/labels`,
-`/api/v1/label/<name>/values`) federate too (issue #891), but their
+`/api/v1/label/<name>/values`) federate too, but their
 cross-cluster union carries no such ambiguity. Discovery enumerates series
 *identity*, and a `SeriesId` is a canonical function of a series' labels, so
 the same id from two clusters always carries the same `LabelSet`: the union
@@ -524,8 +524,7 @@ It is recorded at existing funnels only, never at scattered call sites:
   instead of being silently free. `engine.rs` has no references to
   `LogSegmentFetcher` at all: the real production callers (ravel-sql's
   `logs_provider`, `alerts_scan`, `audit_scan`, `audit_provider`) still
-  call the unaccounted `fetch`. Wiring them onto this funnel is issue
-  #424.
+  call the unaccounted `fetch`. Wiring them onto this funnel is future work.
 - `Catalog::guarded_get`/`guarded_list_all` (crates/ravel-catalog), for
   every catalog-side store call `Catalog::resolve` makes on the query's
   behalf: `s3_requests`/`s3_bytes` for the resolve LISTs and GETs, plus
@@ -561,9 +560,9 @@ non-zero actual request count.
 `SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` is not a structural bound and is the
 one open gap in this estimate (see its doc comment in catalog.rs): it
 covers one HEAD GET (always attempted), one part GET (capped at 1 because
-every writer today emits exactly one part — metric-index-plan.md 3.1's
-"v1 writes exactly one part" — even though the wire format's `repeated
-SnapshotPartRef parts` allows more), and one postings GET (worst case, for
+every writer today emits exactly one part (v1 writes exactly one part,
+even though the wire format's `repeated SnapshotPartRef parts` allows
+more)), and one postings GET (worst case, for
 an equality `__name__` filter). Part count is only knowable after the HEAD
 GET this constant exists to avoid, so a future multi-part writer (the
 sharding escape hatch the format already reserves) would silently make
@@ -709,7 +708,7 @@ fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
 
-## PromQL conformance (ADR-0035, issue #133)
+## PromQL conformance (ADR-0035)
 
 What Ravel supports, what it deliberately refuses, and what is simply
 untested, one row per construct. The classification is ADR-0035's:
@@ -752,7 +751,7 @@ experimental aggregation operators `limitk` and `limit_ratio`, so a tenant
 can reach them on the query path even though they are outside the scored
 surface. `ravel-promql`'s aggregation dispatch rejects both with a typed
 `Error::Unsupported` naming the operator, never a panic, honoring the state-2
-"rejected, not panicking" guarantee (#260). They stay out of the scored
+"rejected, not panicking" guarantee. They stay out of the scored
 surface (they are not part of the stable language), and are not implemented;
 the clean rejection is what the guarantee requires.
 
@@ -809,7 +808,7 @@ Surface: 133 constructs over 216 corpus entries in 10 corpus files.
 | negative offset | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | `offset` | modifier | supported | `corpus/selectors.txt`, 4 entries |
 | `on` | modifier | supported | `corpus/binop.txt`, 7 entries |
-| subquery over native histograms | modifier | intentionally rejected | `Unsupported: subquery over native histograms (422 execution)`; rejection verified; the subquery grid reducer keeps only each step's float value, so a histogram element would be silently dropped; the trigger is matched histogram data, not the syntactic shape (issue #220) |
+| subquery over native histograms | modifier | intentionally rejected | `Unsupported: subquery over native histograms (422 execution)`; rejection verified; the subquery grid reducer keeps only each step's float value, so a histogram element would be silently dropped; the trigger is matched histogram data, not the syntactic shape |
 | vector matching fill values | modifier | intentionally rejected | `Unsupported: vector matching fill-in values (422 execution)`; rejection verified; `fill`/`fill_left`/`fill_right` are a promql-parser dialect extension with no Prometheus counterpart; ravel-promql's `binop` refuses the modifier rather than evaluating it as plain matching |
 | `without` | modifier | supported | `corpus/aggregate.txt`, 1 entry |
 | `!=` | binary operator | supported | `corpus/binop.txt`, 2 entries |
@@ -960,8 +959,7 @@ never drop a true result):
   never becomes the reader's per-row filter, so it cannot drop a resource-only
   match. The merged `attrs` residual evaluates the equality exactly.
   `attrs['k'] IN (...)` stays unextracted, because an `IN` list is a
-  disjunction the intersecting prune channel cannot represent soundly
-  (issue #519).
+  disjunction the intersecting prune channel cannot represent soundly.
 
 Both gaps ADR-0033 recorded are now closed. Both were deliberate, not
 oversights.
@@ -1019,11 +1017,10 @@ oversights.
    way prunes nothing for it. Version 2 removes the cost by indexing the merged
    view, so a merged-view prune on such a key is sound and applied directly; the
    exclusion is kept for version 1 objects, which are not rewritten. The move to
-   the merged view is the ADR-0049 amendment (2026-08-03, issue #547), a change
+   the merged view is the ADR-0049 amendment, a change
    to the POSTINGS grammar version only, not the trailer version.
 
-   The reader channel and the SQL extractor landed in issue #538, the fetch
-   plumbing in issue #544: `ravel_query::LogQuery` carries a `prune` field (with
+   `ravel_query::LogQuery` carries a `prune` field (with
    a `with_prune` builder) that the fetch hands to `RlogReader::scan_pruned`,
    and `LogsScanExec` fills it from `LogsPushdown::prune`. A live
    `SELECT ... FROM logs WHERE attrs['k'] = 'v'` now prunes blocks through

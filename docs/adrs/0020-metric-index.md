@@ -1,9 +1,9 @@
 # ADR-0020: Metric index: catalog snapshots as the commit index, async fold, name postings gated
 
-Status: Accepted (2026-07-27). Plan, formats, and phased tickets:
-docs/metric-index-plan.md. This ADR builds the "second" half of ADR-0003
-(immutable catalog snapshots); it does not revisit that accepted
-direction.
+Status: Accepted
+
+This ADR builds the "second" half of ADR-0003 (immutable catalog
+snapshots); it does not revisit that accepted direction.
 
 ## Context
 
@@ -106,8 +106,7 @@ commit discovery first:
 New persistent formats (snapshot part envelope, HEAD record, postings
 envelope; one new protobuf file proto/ravel/catalog.proto) follow the
 format-change procedure: explicit version bytes, checksum coverage
-review, corrupt-input property tests, inspector support. Full grammars
-in the plan.
+review, corrupt-input property tests, inspector support.
 
 ## Consequences
 
@@ -129,8 +128,8 @@ in the plan.
   them so snapshots stop referencing compacted-away or retired
   segments, and GC must treat reachability from HEAD-referenced
   snapshots (within the protection horizon) as a delete blocker. The
-  plan pins this contract; the snapshot entry format carries a `level`
-  field from day one so L1 outputs need no format bump.
+  snapshot entry format carries a `level` field from day one so L1
+  outputs need no format bump.
 - Old snapshot parts and CAS-loser parts become garbage; they are
   GC-eligible once unreferenced by HEAD beyond the protection horizon
   (folded into the GC track's rules).

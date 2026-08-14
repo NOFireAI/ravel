@@ -390,6 +390,6 @@ Memory: `ravel-rspan` has no ranged section reader (no equivalent of RLOG's
 `RlogRangeReader`), so the merge fetches and decodes each input object
 whole. Raw bytes are bounded to one input at a time; decoded records for
 the whole bucket are held in memory across the merge. This is the same
-tradeoff RLOG's merge had before issue #275, not an oversight — a ranged
+tradeoff RLOG's merge once accepted, not an oversight — a ranged
 RSPAN reader is the natural follow-up once span bucket sizes in practice
 justify it.

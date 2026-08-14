@@ -1,16 +1,12 @@
 # ADR-0055: per-role storage credential scoping
 
-Status: Accepted (2026-08-05)
+Status: Accepted
 
-Epic EE (issue #455), program #450. The adversarial review calls this "the
-highest-leverage structural fix in the whole review" and "the one thing to
-force a redesign immediately" (S4-03), and review v2 (the post-remediation
-delta run 2026-08-05) restates it as the single change that most raises the
-program's verdict ceiling, now with a wider blast radius than when it was
-first found: the new control-plane objects epics EC and EK added
-(`sys/tenancy`, `sys/qualification`, the per-(tenant,signal) `prov`
-provisioning/generation record) all live under the same single credential
-this ADR splits (findings NF-1, NF-10, issue #455's rescoping comment).
+This is one of the highest-leverage structural fixes in the isolation
+posture, with a wide blast radius: the control-plane objects ADR-0050
+and ADR-0052 added (`sys/tenancy`, `sys/qualification`, the
+per-(tenant,signal) `prov` provisioning/generation record) all live
+under the same single credential this ADR splits.
 
 ## Context
 
@@ -68,19 +64,19 @@ per-role grants below. Two facts from that inventory drive this ADR's shape:
 
 ### The WORM pairing question this ADR must answer
 
-Review v2 pairs the credential split with putting "`sys/`, `c/` (commit
+One proposal pairs the credential split with putting "`sys/`, `c/` (commit
 records), and `prov` objects under WORM / object-lock." Read literally for
 `c/`, that is wrong: `crates/ravel-maintain/src/sweep.rs` (`sweep_superseded`,
 `sweep_unreferenced_parts`) and `retention.rs` (`physical_sweep`) legitimately
 and routinely delete commit records — after compaction supersedes them, or
 after a tombstone's grace period expires. A blanket "no delete on `c/`" would
-break already-shipped, correct maintenance. The review's own next epic (ED
-#454) is a commit-record *reconstruction tool*, which only makes sense if
-commit records can legitimately go missing and need rebuilding — further
-confirming they are not meant to be permanently undeletable.
+break already-shipped, correct maintenance. A separate commit-record
+*reconstruction tool* (ADR-0058) only makes sense if commit records can
+legitimately go missing and need rebuilding — further confirming they
+are not meant to be permanently undeletable.
 
-The actual threat the finding names — S4-03/S5-03's "a compromised process or
-a mistaken lifecycle rule deletes commit records it should not have" — is a
+The actual threat — "a compromised process or a mistaken lifecycle rule
+deletes commit records it should not have" — is a
 question of *who* can delete `c/`, not *whether* `c/` is ever deleted. That
 is a role-scoping question, which this ADR answers directly (§2, sweep
 grants), not a WORM question. WORM applies to the four prefixes nothing
@@ -124,7 +120,7 @@ flowchart TB
 
 A single leaked or compromised credential — from any of the four boxes on
 the left — reads, overwrites, or deletes anything in the bucket. This is
-S4-03.
+the single-credential exposure this ADR closes.
 
 ## Decision
 
@@ -155,10 +151,10 @@ to reject an in-process authorization side channel.
 |---|---|---|---|---|
 | **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | none |
 | **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `admission/query/**` (fleet-global query concurrency reconciliation, ADR-0061 decision 2: LIST the bucket-root `admission/query/` prefix and GET each sibling process's snapshot), `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `admission/query/<process_id>.snapshot` (Overwrite, this process's own fleet-concurrency snapshot, ADR-0061 decision 2 — a bucket-root key, deliberately **not** under a `t/<hash>/` prefix since the ceiling is fleet-global, not per-tenant); `sys/tenancy` (CreateIfAbsent, first-boot race) | none |
-| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep, EL-6 — see Amendment 2026-08-09) — **the only role with any delete grant at all** |
-| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see Amendment 2026-08-07) | none (Admin never deletes; delete stays exclusively Maintain's) |
+| **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race) | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see Amendment below) — **the only role with any delete grant at all** |
+| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see Amendment below) | none (Admin never deletes; delete stays exclusively Maintain's) |
 
-**Correction (2026-08-06), found during epic EE wave 1's adversarial checkpoint:**
+**Correction:**
 the table above was missing four read/write grants in its first accepted
 version, each a genuine gap that would have made the role split unshippable
 (the affected role's process would hard-fail on its own normal operation
@@ -169,17 +165,16 @@ segment data (`l0/`, `l1/`) directly, not only commit-record metadata under
 logic reads `maint/<shard>/cursor` before mutating it; and Admin's `store
 qualify` writes to the `sys/qualify/<run-id>/**` scratch prefix, not only
 the final `sys/qualification` record. All four are corrected in place above
-rather than left wrong with a note, since this ADR has not yet been acted
-on by any deployment at the time of correction — epic EE's own wave 1
-(issues #662-664) is still in its landing checkpoint, not yet shipped.
+rather than left wrong with a note, since this ADR had not yet been acted
+on by any deployment at the time of correction.
 
-This is not the literal "ingest, compaction, query, and sweep" four-way split
-the epic issue named — sweep is not split into its own process here. Sweep
+This is not a literal "ingest, compaction, query, and sweep" four-way split
+— sweep is not split into its own process here. Sweep
 runs inside the same `Mode::Maintain` process as compaction and retention
 today (`crates/ravel-maintain/src/sweep.rs` is invoked from the same tick
 loop as `build.rs`/`retention.rs`), and splitting it into a fifth process
-would be a larger, separate change to the maintenance architecture (epic EI,
-#459, is already the tracked place for maintenance-process restructuring).
+would be a larger, separate change to the maintenance architecture
+(ADR-0065 tracks maintenance-process restructuring).
 See Rejected Alternatives.
 
 ```mermaid
@@ -203,7 +198,7 @@ flowchart TB
     MT -->|"Get (read inputs)"| L0R["l0/**, c/** (read)"]
     MT -->|"CreateIfAbsent"| L1["l1/**"]
     MT -->|"CreateIfAbsent / Put"| C2["c/**l1.cmt, retire.tmb"]
-    MT ==>|"Delete — only role that can"| DEL["l0/** · l1/** · c/** · idem/**\nu/&lt;query-audit shard&gt;/** (EL-6)"]
+    MT ==>|"Delete — only role that can"| DEL["l0/** · l1/** · c/** · idem/**\nu/&lt;query-audit shard&gt;/**"]
 
     AD -->|"CasVersion"| PROVA["prov (reshard)"]
     AD -->|"CasVersion"| GC["sys/gc (set)"]
@@ -230,25 +225,25 @@ Four distinct credentials, each scoped to one process's actual call sites.
 Only Maintain's policy grants `DeleteObject`, and only over `l0/`, `l1/`,
 `c/`, `idem/` — the same four prefixes Ravel's own sweep and retention code
 already deletes from today — plus the query-audit shard `t/<hash>/u/0001/**`
-added by the 2026-08-09 amendment (EL-6). The green box is denied to every role,
+added by the amendment below. The green box is denied to every role,
 including Maintain: nothing currently deletes there, so nothing legitimate
-loses capability, and NF-10 (deleting `sys/tenancy` to brick every
-process's fail-closed startup) becomes unreachable regardless of which
+loses capability, and deleting `sys/tenancy` to brick every
+process's fail-closed startup becomes unreachable regardless of which
 credential is compromised.
 
 ### 2. Delete stays exclusively with Maintain
 
 No role other than Maintain's IAM policy grants `s3:DeleteObject` on
-anything. This is the concrete answer to S4-03/S5-03: a compromised Gateway,
+anything. This is the concrete answer to the single-credential exposure: a compromised Gateway,
 Query, or Admin credential — including a leaked `ravel-cli` credential run
 from a CI job or an operator's laptop — cannot delete a single object,
 anywhere, ever. It can corrupt or forge new data within its write grant
-(a real residual risk, unchanged by this ADR, and the reason ED's
+(a real residual risk, unchanged by this ADR, and the reason the
 reconstruction tool and legal-hold's fail-closed posture matter
 independently), but it cannot make existing data disappear. Only a
 compromised Maintain credential retains delete capability, and only over
-`l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**` (EL-6,
-2026-08-09 amendment) — never `sys/`, `prov`, `catalog/`, or the legal-hold
+`l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**`
+(amendment below) — never `sys/`, `prov`, `catalog/`, or the legal-hold
 shard `u/0000/**` of the audit prefix, which brings us to §3.
 
 ### 3. Deny-delete, everywhere, on the four prefixes nothing deletes
@@ -260,14 +255,14 @@ where the backend distinguishes it, `s3:DeleteObjectVersion`) on:
 - `t/<hash>/<sig>/prov`
 - `t/<hash>/catalog/<sig>/**` (snap parts, HEAD, name postings)
 - `t/<hash>/u/<AUDIT_HOLD_SHARD>/**` (legal-hold records only — the query-audit
-  shard was removed from this deny by the 2026-08-09 amendment below, so it can
+  shard was removed from this deny by the amendment below, so it can
   be age-swept; legal-hold shard 0 stays deny-delete-forever)
 
-This closes NF-10 directly: nobody, including a fully compromised Maintain
+This closes the brick-the-deployment risk directly: nobody, including a fully compromised Maintain
 process, can delete `sys/tenancy` and brick every process's fail-closed
 startup (ADR-0050 §7's `/readyz` probe target). It closes the "roll back the
 qualification marker" and "delete a competitor's `prov` record to force a
-mismatch refusal" scenarios review v2 raised, by the same mechanism.
+mismatch refusal" scenarios, by the same mechanism.
 
 This is a **delete-deny**, not full Object Lock: `CasVersion`-mutated
 objects on this list (`prov`, `sys/gc`, `HEAD`) can still be *overwritten*
@@ -347,8 +342,8 @@ MinIO policy-language equivalent for dev/CI).
 ## Rejected alternatives
 
 **A new runtime "storage-access broker" issuing short-lived per-request
-tokens.** Rejected. This is the literal phrase the source review used, but
-building it means a new stateful, network-reachable service: a new trust
+tokens.** Rejected. Building it means a new stateful, network-reachable
+service: a new trust
 root (what authenticates *to* the broker?), a new durability dependency
 (CLAUDE.md: "no durability may depend on local disk, and no recovery path
 may read state another process wrote locally" — a broker that must be up
@@ -368,11 +363,11 @@ reason is a bigger and different change than this ADR's scope. More
 concretely: IRSA is AWS-specific and would not carry over to MinIO, which
 `kind-up.sh` and CI use as the dev/test backend — adopting it here would
 either fork the credential-acquisition path by backend or drop MinIO
-support, neither of which this epic's problem (a single bucket-wide
-credential) requires. Nothing in this ADR forecloses IRSA as a later,
+support, neither of which the single bucket-wide credential problem
+requires. Nothing in this ADR forecloses IRSA as a later,
 AWS-specific *addition* layered on top of `S3Config` (a credential-provider
 enum instead of only explicit keys); it is simply not required to close
-S4-03, and is out of scope here.
+the single-credential exposure, and is out of scope here.
 
 **In-process authorization inside `ObjectStoreBackend`.** Rejected, per
 ADR-0042 decision 1's already-established precedent against a side channel
@@ -390,12 +385,12 @@ Rejected for this epic, not forever. Sweep runs inside the same
 `Mode::Maintain` process as compaction and retention today; giving it a
 genuinely separate credential would require first giving it a genuinely
 separate process, which is maintenance-architecture restructuring already
-tracked under epic EI (#459, leased distributed maintenance) rather than a
+tracked under ADR-0065 (leased distributed maintenance) rather than a
 credentials change. This ADR's four-role model (Gateway/Query/Maintain/
 Admin) still moves every process from "one bucket-wide credential" to "a
 credential scoped to what that process actually does," including denying
-delete to every role except Maintain — the review's core ask — without
-requiring EI to land first. If EI later splits sweep into its own process,
+delete to every role except Maintain — the core ask — without
+requiring leased maintenance to land first. If it later splits sweep into its own process,
 narrowing Maintain's delete grant to a fifth, sweep-only role is a natural,
 independent follow-up to this ADR, not a redesign of it.
 
@@ -420,13 +415,13 @@ stays the documented, informationally-probed gap ADR-0042 already named.
 - **A compromised Gateway, Query, or Admin credential can no longer delete
   anything, anywhere.** A compromised Maintain credential can still delete
   within `l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**`
-  (EL-6, 2026-08-09 amendment) — the same set Ravel's own maintenance code
+  (amendment below) — the same set Ravel's own maintenance code
   deletes from today — but nothing else.
 - **`sys/tenancy`, `sys/qualification`, `sys/gc`, `prov`, `catalog/*`, and
   the legal-hold shard of the audit prefix (`u/0000/**`) are undeletable by
-  any role's policy.** This closes NF-10
+  any role's policy.** This closes the brick-the-deployment risk
   outright and removes the "roll back a control object via delete-then-
-  recreate" class of attack the review raised against the new resharding
+  recreate" class of attack against the new resharding
   and readiness machinery, without weakening anything sweep or retention
   already legitimately does.
 - **Existing single-credential deployments are unaffected until an operator
@@ -439,20 +434,20 @@ stays the documented, informationally-probed gap ADR-0042 already named.
   ADR-0042 already stated for `c/` — this ADR extends that same honest
   framing to `prov`, `sys/gc`, and `HEAD` rather than silently implying a
   stronger guarantee than the code delivers.
-- **Interacts with EJ (#460, selective deletion).** Selective/subject-level
+- **Interacts with selective deletion (ADR-0064).** Selective/subject-level
   deletion, when designed, will need to delete or rewrite data under `l0/`,
   `l1/`, `c/` — squarely inside Maintain's existing delete grant, not the
-  newly deny-deleted prefixes — so this ADR does not block EJ. EJ's own ADR
+  newly deny-deleted prefixes — so this ADR does not block it. That ADR
   should state explicitly which role performs selective deletion (most
   naturally an extension of Maintain's existing delete-capable role) rather
   than inventing a fifth role for it.
-- **Does not close S4-04 (per-tenant KMS)** or any other program finding.
+- **Does not close per-tenant KMS** or any other finding.
   This ADR is scoped to who can reach which storage operations, not to
-  encryption-at-rest posture, which stays epic EL's (#462) scope.
+  encryption-at-rest posture, which stays ADR-0062's scope.
 
-## Amendment (2026-08-07): Admin gains `c/**cmt` write for commit reconstruction
+## Amendment: Admin gains `c/**cmt` write for commit reconstruction
 
-Epic ED (issue #693, grouped under ADR-0058) ships
+ADR-0058 ships
 `ravel-cli commit reconstruct`, which rebuilds lost L0 commit records for a
 shard from the record-less data objects' own footers and writes each rebuilt
 record `CreateIfAbsent`. That write lands under the `c/` prefix
@@ -478,15 +473,14 @@ Admin's write column in §1's role table therefore gains `s3:PutObject` on
   is an out-of-band operator action, like every other Admin-only write.
 
 This is amended in place rather than left wrong with a note, following the
-same rationale as the 2026-08-06 Correction above: ADR-0055's role split has
-not yet been deployed against a narrower Admin credential (epic EE's own
-landing is still in flight), so nothing has provisioned an Admin policy
-without this grant yet. The matching IAM policy JSON in
+same rationale as the Correction above: this ADR's role split had
+not yet been deployed against a narrower Admin credential, so nothing had
+provisioned an Admin policy without this grant yet. The matching IAM policy JSON in
 `docs/guides/operations.md` (`AdminWrite`) is updated in the same change.
 
-## Amendment (2026-08-09): the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete
+## Amendment: the audit deny-delete narrows to the legal-hold shard; Maintain gains query-audit delete
 
-Epic EL's EL-6 (issue #763, program #462) brings the query-audit shard
+ADR-0062 brings the query-audit shard
 (`Signal::Audit` / `QUERY_AUDIT_SHARD` = 1) into the maintained set:
 `ravel-maintain` now compacts it and age-sweeps it on a dedicated 90-day
 retention window (`sweep_audit_retention`), horizon-gated and legal-hold-gated
@@ -515,21 +509,21 @@ Before/after, expressed as the operations.md IAM wildcards:
 - Deny-delete (all four roles): `t/*/u/*` → `t/*/u/*/0000/*`.
 - Maintain delete grant (`MaintainDelete` only): add `t/*/u/*/0001/*`.
 
-This does not weaken NF-10 or the review's delete-deny asks: `sys/*`, `prov`,
+This does not weaken the brick-the-deployment protection or the delete-deny asks: `sys/*`, `prov`,
 `catalog/*`, and the legal-hold shard remain undeletable by any role. It only
 lets the one role that already owns every delete (Maintain) reclaim the
 query-audit activity log, which — unlike a legal hold or a control object — is
 append-only telemetry with a bounded lifetime, not a durability anchor. Amended
 in place (§1 table Maintain row, §2, §3 deny list, the diagram, and
-Consequences) for the same reason as the amendments above: the role split has
+Consequences) for the same reason as the amendments above: the role split had
 not yet been provisioned against a narrower credential, so no deployed policy
 predates this change. The matching IAM policy JSON in
 `docs/guides/operations.md` (`MaintainDelete` and all four `DenyDeleteProtected`
 blocks) is updated in the same change.
 
-## Amendment (2026-08-12): the `t/<hash>/enc` key-epoch record needs a read/write grant
+## Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant
 
-EL-7 (issue #764, epic #462, ADR-0062 decision 1, ADR-0072 decision 2) wires
+The per-tenant KMS work (ADR-0062 decision 1, ADR-0072 decision 2) wires
 `KmsRoutingStore` into `ravel-server`'s single store-construction site behind
 `--tenant-kms-config`. On first configuration of a tenant's key (and on every
 later rotation), the same process bootstraps that tenant's key-epoch history
@@ -571,7 +565,7 @@ The needed grant, once provisioned:
   in `DenyDeleteProtected` for every role, including Maintain, not left
   outside it by omission.
 
-**This amendment is documentation only.** EL-7's task scope is
+**This amendment is documentation only.** The task scope was
 `services/ravel-server/` and `docs/`; the actual policy files
 (`deploy/iam/gateway.json`, `query.json`, `maintain.json`, `admin.json`) and
 `crates/ravel-commit`'s `tests/iam_templates.rs` CI check that verifies them
@@ -584,19 +578,19 @@ bootstrap fail closed with an access-denied error on every affected role's
 first `--tenant-kms-config` startup — this is flagged as a required
 follow-up, not fixed here.
 
-## Amendment (EJ, 2026-08-13): the selective-erasure `del/` paths
+## Amendment: the selective-erasure `del/` paths
 
-Epic EJ (issue #460, ADR-0064) ships selective subject erasure: a durable
+ADR-0064 ships selective subject erasure: a durable
 erasure request under `t/<hash>/<sig>/del/<request_id>.dreq`, an asynchronous
 rewrite-and-supersede pass in Maintain, and a completion record under
 `t/<hash>/<sig>/del/<request_id>.done`. ADR-0064 decision 6 is the
-"landed-second obligation" issue #460's note made binding on whichever of EE
-and EJ landed last; EJ landed second, so it states the interaction and this
+"landed-second obligation" binding on whichever of this ADR
+and ADR-0064 landed last; ADR-0064 landed second, so it states the interaction and this
 amendment records the resulting grants against §1's role table. The rewrite
 itself needs no new grant — it writes `l1/**` parts and `c/**` records and
 its inputs are swept from `l0/`, `l1/`, `c/`, all inside Maintain's existing
 `MaintainDelete`/write grants, exactly as ADR-0055's original Consequences
-("Interacts with EJ") predicted. **No fifth role.** Only the `del/` prefix
+("Interacts with selective deletion") predicted. **No fifth role.** Only the `del/` prefix
 itself is new, and it is scoped by these four narrow grants:
 
 - **Admin** gains `s3:PutObject` (create-only, `CreateIfAbsent`) on
@@ -604,7 +598,7 @@ itself is new, and it is scoped by these four narrow grants:
   has **no delete grant anywhere**: submitting an erasure request does not
   delete anything, it creates a durable predicate the Maintain pass acts on.
   This is the same shape as Admin's other create-only tenant-prefix write
-  (`c/**cmt` for `commit reconstruct`, 2026-08-07 amendment): a `PutObject`
+  (`c/**cmt` for `commit reconstruct`, amendment above): a `PutObject`
   allow, no delete.
 - **Query and Maintain** gain read (`s3:GetObject` plus `t/*/*/del/*` in the
   `ListBucket` `s3:prefix` condition) on `del/**`. Query lists and reads
@@ -627,14 +621,14 @@ itself is new, and it is scoped by these four narrow grants:
   by anyone" class as the legal-hold shard `u/0000/**`. The `.dreq` and
   `.done` are separate key suffixes under the same `del/` prefix, so
   Maintain's `.dreq` delete grant and the blanket `.done` deny do not
-  overlap — exactly the disjoint-path scoping the EL-6 amendment already
+  overlap — exactly the disjoint-path scoping the audit-shard amendment already
   uses to split the audit shards `u/0000/*` and `u/0001/*`.
 
 Net effect on §1's role table: Admin's write column gains `t/*/*/del/*`
 (create-only); Query's and Maintain's read columns gain `t/*/*/del/*`;
 Maintain's delete column (`MaintainDelete`) gains `t/*/*/del/*.dreq`; and §3's
 `DenyDeleteProtected` deny list gains `t/*/*/del/*.done` for every role. This
-does not weaken NF-10 or any prior delete-deny ask: `sys/*`, `prov`,
+does not weaken the brick-the-deployment protection or any prior delete-deny ask: `sys/*`, `prov`,
 `catalog/*`, the legal-hold shard, and now `.done` completion markers remain
 undeletable by any role, and the one new deletable object (`.dreq`) is deleted
 only by the one role that already owns every delete, only after its own
