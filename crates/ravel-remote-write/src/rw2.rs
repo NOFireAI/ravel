@@ -1,7 +1,7 @@
 //! RW 2.0 decode: snappy-decompress and protobuf-decode an
 //! `io.prometheus.write.v2.Request`, resolve every symbol-table reference,
 //! then converge on the same [`ResolvedRequest`] shape the RW1 decoder
-//! produces (ADR-0015, docs/ingest-breadth-plan.md section 2.1).
+//! produces (ADR-0015).
 //!
 //! Every `labels_refs` index (on a series or an exemplar) and every
 //! metadata `help_ref`/`unit_ref` is validated in range of `symbols` before

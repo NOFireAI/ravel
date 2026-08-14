@@ -1,6 +1,5 @@
 //! Normalization from the version-blind [`ResolvedRequest`] into Ravel's
-//! canonical metric point representation (ADR-0015, docs/ingest-breadth-plan.md
-//! section 2.1).
+//! canonical metric point representation (ADR-0015).
 //!
 //! Unlike `ravel_otlp::normalize`, this module never sanitizes a label name
 //! or metric name: Remote Write payloads are already in the Prometheus data
@@ -26,7 +25,7 @@
 //! survives as an ordinary attribute.
 //!
 //! Native `Histogram` messages are admitted since RSEG v5 gave them durable
-//! storage (ADR-0017, docs/rseg-v3-plan.md phase C8). Their wire shape is
+//! storage (ADR-0017). Their wire shape is
 //! close to the storage model's but not identical: integer bucket sides
 //! arrive as deltas and are accumulated to the absolute counts storage
 //! holds, and every structural rule the RSEG v5 writer or reader enforces is
@@ -149,10 +148,8 @@ pub struct RwNormalizeOutput {
     pub histogram_points: Vec<NormalizedHistogramPoint>,
     pub rejected: Vec<RwRejection>,
     /// Native histogram samples admitted and written, which is what the RW2
-    /// histograms-written stats header reports
-    /// (docs/ingest-breadth-plan.md section 2.1). Nonzero since RSEG v5 gave
-    /// native histograms durable storage (docs/rseg-v3-plan.md phase C8);
-    /// before that every native histogram landed in `histograms_dropped`.
+    /// histograms-written stats header reports. Nonzero because RSEG v5 gives
+    /// native histograms durable storage.
     pub histograms_written: usize,
     /// Native histogram samples seen and rejected (a subset of `rejected`'s
     /// point count; broken out because the RW stats surface reports it as
@@ -224,7 +221,7 @@ pub struct RwMetricsNormalizeResult {
 /// that is not stored is dropped and counted, never silently discarded). The
 /// counter therefore reports the cap's rejections plus whatever this wrapper
 /// threw away afterwards. Callers with somewhere to put admitted exemplars
-/// (issue #474) should call [`normalize_with_exemplars`] with a cap that
+/// should call [`normalize_with_exemplars`] with a cap that
 /// outlives one request, which is the only way the per-series window means
 /// anything.
 pub fn normalize_resolved(
@@ -549,7 +546,7 @@ fn decode_hex_id<const N: usize>(value: &str) -> Option<[u8; N]> {
 }
 
 /// Resolve one series' `__name__` and remaining labels into a metric name
-/// and validated [`LabelSet`], per docs/ingest-breadth-plan.md section 2.1:
+/// and validated [`LabelSet`]:
 /// `__name__` must be present and non-empty; an empty label *name* is
 /// rejected as malformed regardless of its value (ADR-0031), which is what
 /// RW2 already enforces at decode (`Rw2DecodeError::EmptyLabelName`) and RW1
@@ -668,7 +665,7 @@ fn build_histogram_sample(
 }
 
 /// Build the storage-side [`HistogramValue`] from one wire native histogram
-/// (ADR-0017, docs/rseg-v3-plan.md section 2/3.5).
+/// (ADR-0017).
 ///
 /// Every check here mirrors one the RSEG v5 writer or reader performs, and
 /// exists so that no accepted point can later fail either. That matters in
@@ -791,8 +788,8 @@ fn build_histogram_value(h: &ResolvedHistogram) -> Result<HistogramValue, RwReje
 }
 
 /// Map wire spans to storage spans. A zero-length span is rejected here
-/// because the writer rejects it (docs/rseg-v3-plan.md section 3.5): spans
-/// describe *populated* runs, so an empty run has no meaning.
+/// because the writer rejects it: spans describe *populated* runs, so an
+/// empty run has no meaning.
 fn build_spans(spans: &[ResolvedSpan]) -> Result<Vec<HistogramSpan>, RwRejection> {
     spans
         .iter()
@@ -1244,7 +1241,7 @@ mod tests {
         // RW2 rejects this at decode (Rw2DecodeError::EmptyLabelName); the
         // normalizer must reject it too so RW1, which copies the empty name
         // verbatim, agrees and the empty-named label never reaches
-        // SeriesId::compute (ADR-0031, issue #204).
+        // SeriesId::compute (ADR-0031).
         let req = request(vec![series(
             vec![label("__name__", "up"), label("", "surprise")],
             vec![sample(1_000, 1.0)],
@@ -2237,10 +2234,10 @@ mod tests {
         );
     }
 
-    // --- CH-1 cross-protocol identity vector (plan section 4.1) ---
+    // --- cross-protocol identity vector ---
 
     #[test]
-    fn ch1_classic_histogram_series_match_expected_series_ids_and_values() {
+    fn classic_histogram_series_match_expected_series_ids_and_values() {
         let tenant = TenantId::new("t-fixture");
         let ts_ms = 1_700_000_000_000;
         let base_labels = |extra: &[(&str, &str)]| -> Vec<Label> {

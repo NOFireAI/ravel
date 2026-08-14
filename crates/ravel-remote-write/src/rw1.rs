@@ -1,7 +1,6 @@
 //! RW 1.0 decode: snappy-decompress and protobuf-decode a
 //! `prometheus.WriteRequest`, then resolve it into the version-blind
-//! [`ResolvedRequest`] shape (ADR-0015, docs/ingest-breadth-plan.md section
-//! 2.1).
+//! [`ResolvedRequest`] shape (ADR-0015).
 //!
 //! This module never panics on malformed input: every decode failure is a
 //! typed, non-retryable [`Rw1DecodeError`].
