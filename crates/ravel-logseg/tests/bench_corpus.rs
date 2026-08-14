@@ -1,7 +1,7 @@
 //! Proves the synthetic corpus the logseg benches build (`benches/support.rs`)
 //! actually round-trips through `RlogWriter` -> bytes -> `RlogReader::scan`,
 //! so the benches measure real encode/decode work rather than garbage input
-//! (issue #267). Not timed: a fast correctness check, run under `cargo test`.
+//! Not timed: a fast correctness check, run under `cargo test`.
 #![allow(clippy::expect_used)]
 
 use ravel_logseg::{Predicate, RlogReader, RlogWriter};

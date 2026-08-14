@@ -1,5 +1,5 @@
 //! RLOG encode throughput: `RlogWriter` push+finish over a fixed record
-//! budget, swept across stream cardinality (issue #267). Mirrors
+//! budget, swept across stream cardinality. Mirrors
 //! `ravel-bench/benches/segment_encode.rs`'s series-cardinality sweep, with
 //! log streams standing in for metric series: a `1_stream` shape (one stream
 //! absorbing every record) versus a `many_streams` shape (cardinality spread

@@ -26,9 +26,9 @@ pub mod stream_dir;
 pub mod varint;
 pub mod writer;
 
-// encoding, bloom, bloom_section, and tokenizer moved to `ravel-codec`
-// (issue #429, docs/adrs/0045-rspan-v2-trace-investigation.md decision 1).
-// Re-exported here so no other crate's imports or Cargo.toml need to change.
+// encoding, bloom, bloom_section, and tokenizer live in `ravel-codec`
+// (ADR-0045 decision 1). Re-exported here so no other crate's imports or
+// Cargo.toml need to change.
 pub use ravel_codec::{bloom, bloom_section, encoding, tokenizer};
 
 pub use error::LogSegError;

@@ -1,5 +1,5 @@
 //! RLOG decode+scan throughput: `RlogReader::scan` over a pre-built object
-//! (issue #267). The object is built once via `RlogWriter` in an untimed
+//! The object is built once via `RlogWriter` in an untimed
 //! setup step (mirroring `segment_encode.rs`'s `iter_batched` setup/measure
 //! split); only `scan` itself is timed. Two predicates show the
 //! pruning-vs-full-scan difference: `Predicate::And(vec![])` (matches every

@@ -86,8 +86,8 @@ pub struct RlogWriter {
 /// Counters describing one write beyond what the object bytes themselves
 /// already record.
 ///
-/// The POSTINGS counters here are the write-side half of the ADR-0049 metrics
-/// (issue #511). They are deliberately shaped so a `/metrics` renderer can
+/// The POSTINGS counters here are the write-side half of the ADR-0049
+/// metrics. They are deliberately shaped so a `/metrics` renderer can
 /// aggregate them without a per-field label, which the ADR-0044 label
 /// allowlist forbids: `postings_distinct_total` over `postings_indexed_fields`
 /// yields a mean distinct-per-field, and `postings_distinct_max` the tail,
@@ -167,7 +167,7 @@ impl RlogWriter {
     /// share [`RlogWriter::build_object`], so the STREAM_DIR / FIELD_DIR /
     /// BLOCKS / SKIP_IDX / BLOOM encoding (including the dynamic-column cap and
     /// `attrs_raw` overflow rule) cannot drift between an L0 write and an L1
-    /// merge. The compactor (`ravel-maintain`, issue #231) is the only caller.
+    /// merge. The compactor (`ravel-maintain`) is the only caller.
     ///
     /// `input_set_hash` is the compaction's canonical input-set hash (the same
     /// bytes the [`ravel_proto::logseg::v1::LogFooter`] and the
@@ -242,7 +242,7 @@ impl RlogWriter {
         // The caller's indexed-field list (docs/adrs/0049-rlog-postings.md
         // decision 3: opt-in per field). Resolved before column assignment
         // because an indexed field that appears only at stream (resource/scope)
-        // level still gets a dynamic column below (issue #552), so its
+        // level still gets a dynamic column below, so its
         // merged-view postings have a column_id to key by.
         let indexed_names: std::collections::HashSet<&str> =
             self.indexed_fields.iter().map(String::as_str).collect();
@@ -256,14 +256,13 @@ impl RlogWriter {
                 distinct.insert((k.clone(), ty.to_u8()));
             }
         }
-        // Stream-level-only indexed columns (issue #552, completing the
-        // ADR-0049 2026-08-03 amendment). A key that is resource- or scope-level
-        // across the whole object and per-record on no record gets no column
-        // from the per-record loop above. Before this, such a key had no
-        // POSTINGS column and pruned nothing -- yet `service.name` on the
-        // resource is the ordinary OTLP shape the amendment exists for. Give
-        // each indexed stream-level (name, type) a column so
-        // `merged_indexed_terms` can key its merged-view postings by it.
+        // Stream-level-only indexed columns (ADR-0049 amendment). A key that
+        // is resource- or scope-level across the whole object and per-record
+        // on no record gets no column from the per-record loop above, yet
+        // `service.name` on the resource is the ordinary OTLP shape the
+        // amendment exists for. Give each indexed stream-level (name, type) a
+        // column so `merged_indexed_terms` can key its merged-view postings
+        // by it.
         //
         // The column is a POSTINGS KEY, not a materialized per-record value: no
         // row writes a value to it (`resolve_row` populates `columns` from
@@ -493,7 +492,7 @@ impl RlogWriter {
         // never appeared in this object -- also always-legal).
         let postings_capped_fields = postings_capped.len() as u32;
         let mut postings_fields: BTreeMap<u32, FieldTerms> = BTreeMap::new();
-        // Per-field distinct-value accounting for WriteStats (issue #511): a
+        // Per-field distinct-value accounting for WriteStats: a
         // non-capped field's distinct count is the size of its term
         // dictionary. Summed and maxed here, never labelled by field name (the
         // ADR-0044 allowlist forbids a `field` label), so the `/metrics`
@@ -656,9 +655,9 @@ fn resolve_row(
 /// reproduced here so the writer does not depend on ravel-sql
 /// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
 ///
-/// A field with no matching dynamic column contributes nothing. Since issue
-/// #552 the writer gives an indexed field a column even when it appears only at
-/// stream level, so a resource-only indexed key normally does have a column to
+/// A field with no matching dynamic column contributes nothing. The writer
+/// gives an indexed field a column even when it appears only at stream
+/// level, so a resource-only indexed key normally does have a column to
 /// key a posting by; a key stays column-less only when it overflowed the
 /// dynamic-column budget or is not in the indexed-field list. Absence is legal;
 /// no posting for a field means no pruning on it, never a wrong prune. The
@@ -1178,7 +1177,7 @@ mod tests {
     #[test]
     fn write_stats_report_postings_bytes_and_distinct_counts() {
         // Two indexed fields, "svc" with 5 distinct values and "env" with 2.
-        // The write-side POSTINGS metrics (issue #511) must report both fields,
+        // The write-side POSTINGS metrics must report both fields,
         // the summed distinct count (7), the per-field maximum (5), and a
         // non-zero section byte length.
         let cfg = RlogConfig {
@@ -1237,7 +1236,7 @@ mod tests {
         let (obj, stats) = w.finish_with_stats().expect("finish");
         assert_eq!(stats.postings_capped_fields, 1);
         // A capped field contributes no term dictionary, so it is excluded from
-        // the distinct-value accounting entirely (issue #511).
+        // the distinct-value accounting entirely.
         assert_eq!(stats.postings_indexed_fields, 0);
         assert_eq!(stats.postings_distinct_total, 0);
         assert_eq!(stats.postings_distinct_max, 0);

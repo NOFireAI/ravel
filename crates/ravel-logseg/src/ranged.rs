@@ -1,4 +1,4 @@
-//! Ranged RLOG reader (issue #275): read the footer and section directory from
+//! Ranged RLOG reader: read the footer and section directory from
 //! a suffix probe, then serve one stream's records from only the blocks that
 //! stream occupies, fetched by range.
 //!
@@ -12,7 +12,7 @@
 //! Peak resident raw bytes are then the directories plus one stream's blocks,
 //! not the whole object -- the RLOG analogue of RSEG's `open_from_suffix` +
 //! ranged page fetch, and what lets the compactor bound its raw footprint to
-//! one part plus one stream (docs/compaction-retention-plan.md §3.3, §3.7).
+//! one part plus one stream.
 //!
 //! The format is unchanged: this reader parses exactly the bytes
 //! docs/log-segment-format.md already defines. Record decode reuses the same
@@ -68,7 +68,7 @@ impl StreamBlockSpan {
 }
 
 /// The absolute byte range of exactly one candidate block for a stream, for the
-/// block-at-a-time streaming decode a memory-bounded merge needs (issue #745).
+/// block-at-a-time streaming decode a memory-bounded merge needs.
 ///
 /// [`StreamBlockSpan`] names the whole run of blocks a stream occupies in one
 /// GET; a caller that decodes that whole run at once holds decoded records
@@ -264,7 +264,7 @@ impl RlogRangeReader {
     /// This is the block-granular counterpart to [`Self::stream_block_span`]:
     /// where that returns one fused range for a whole-run fetch, this returns
     /// each block separately so a memory-bounded merge can fetch and decode one
-    /// block at a time (issue #745), holding at most one block per input.
+    /// block at a time, holding at most one block per input.
     /// Because a stream's records are stored in `(stream_ref, ts)` order, the
     /// ascending block order is ts-ascending for the stream, so decoding the
     /// blocks in this order yields the stream's records already sorted.
@@ -311,7 +311,7 @@ impl RlogRangeReader {
     ///
     /// This is the per-block seam [`Self::decode_stream`] is built on, exposed
     /// so a streaming merge holds one decoded block per input rather than a
-    /// whole stream's worth (issue #745). It reuses the same
+    /// whole stream's worth. It reuses the same
     /// [`crate::reader::rebuild_record`] path, so a record decoded one block at
     /// a time is byte-for-byte the record a whole-span or whole-object decode
     /// would produce.

@@ -104,7 +104,7 @@ pub const POSTINGS_VERSION_V1: u8 = 1;
 /// probe's one term-block fetch stays a modest ranged GET, large enough that
 /// the sparse index (one entry per block) stays a tiny fraction of the term
 /// dictionary. Chosen to match the order of magnitude of RSEG's per-chunk
-/// series count; see the issue #508 report for the measured tradeoff.
+/// series count.
 pub const DEFAULT_STRIDE: u32 = 128;
 
 /// Sanity ceiling on the number of indexed fields a section may declare,
@@ -934,10 +934,9 @@ mod tests {
         ));
     }
 
-    /// Targeted reproduction (fix-task on epic #479, issue #508 follow-up):
-    /// a one-byte flip of a sparse-index `first_term`, touching no term
-    /// block, used to silently narrow a probe's result instead of failing
-    /// loud. `tests/corrupt.rs`'s proptest cannot find this: a random byte
+    /// A one-byte flip of a sparse-index `first_term`, touching no term
+    /// block, must fail loud rather than silently narrow a probe's result.
+    /// `tests/corrupt.rs`'s proptest cannot find this: a random byte
     /// flip almost never both lands in the header and preserves ascending
     /// `first_term` order, and `parse` rejects anything that doesn't.
     ///
@@ -948,10 +947,10 @@ mod tests {
     /// ascending order across entries (`"aa" < "ba"`), so `parse` still
     /// accepts, and touches no term-block bytes, so `B1`'s own `crc32c`
     /// still verifies. Probing `"bz"` sorts between the corrupted `"ba"` and
-    /// the next entry, so the binary search still lands on `B1` -- which,
-    /// before this fix, decoded fine, did not contain `"bz"`, and reported
-    /// it exact-absent instead of catching that `B1`'s real first term
-    /// ("ca") disagrees with the header entry that pointed at it.
+    /// the next entry, so the binary search still lands on `B1` -- which
+    /// decodes fine and does not contain `"bz"`. Without validation the probe
+    /// would report it exact-absent instead of catching that `B1`'s real
+    /// first term ("ca") disagrees with the header entry that pointed at it.
     #[test]
     fn corrupted_first_term_header_byte_is_caught_not_silently_narrowed() {
         let mut fields = BTreeMap::new();
