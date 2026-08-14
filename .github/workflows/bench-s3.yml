@@ -1,0 +1,99 @@
+name: bench-s3
+
+# Real-S3 benchmark lane (epic #1053, T2). Runs the `bench_report` bin against
+# the real object-storage backend and uploads the machine-readable JSON so a
+# performance/cost number can be committed alongside the command and
+# environment that produced it. ADR-0075 decision 3: a request-budget defect is
+# free on a store with no request charges and billable on real S3, so published
+# figures must come from real S3.
+#
+# NOT a required check and NOT gated on any PR: this costs real money per run
+# and depends on an external service. It runs only on manual dispatch and on a
+# weekly schedule -- never on `push`/`pull_request`/`merge_group` -- so it can
+# never block a merge.
+#
+# Fork PRs never receive secrets; this workflow does not trigger on
+# pull_request at all, and even on a manual dispatch the job skips its real
+# steps cleanly (green, not red) when the S3 credentials are absent, guarded on
+# the access key being non-empty.
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 04:17 UTC. Off-peak and off the :00 mark; one paid run a
+    # week is enough to keep the numbers current without a per-PR cost.
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench-s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      # Credential guard: the org-level secret is mapped into an env var and
+      # checked for non-emptiness. On a fork or an unconfigured org the secret
+      # is empty, `have_creds` is false, and every real step below is skipped,
+      # so the job ends green rather than failing. A lane that failed without
+      # credentials would make every such run red.
+      - name: Check for S3 credentials
+        id: creds
+        env:
+          RAVEL_S3_ACCESS_KEY_ID: ${{ secrets.RAVEL_S3_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$RAVEL_S3_ACCESS_KEY_ID" ]; then
+            echo "have_creds=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::S3 credentials present, running the real-S3 benchmark"
+          else
+            echo "have_creds=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::S3 credentials absent (fork PR or unconfigured org), skipping the real-S3 benchmark cleanly"
+          fi
+      - name: Free disk space
+        if: steps.creds.outputs.have_creds == 'true'
+        uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        if: steps.creds.outputs.have_creds == 'true'
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        if: steps.creds.outputs.have_creds == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.creds.outputs.have_creds == 'true' && steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        if: steps.creds.outputs.have_creds == 'true'
+      - name: Build the bench_report bin
+        if: steps.creds.outputs.have_creds == 'true'
+        run: cargo build --release --locked -p ravel-bench --bin bench_report
+      - name: Run the benchmark against real S3
+        if: steps.creds.outputs.have_creds == 'true'
+        env:
+          # The harness reads these RAVEL_S3_* vars (crates/ravel-bench/src/
+          # harness.rs). Credentials arrive as org-level secrets, bucket and
+          # region as org-level variables.
+          RAVEL_S3_ACCESS_KEY_ID: ${{ secrets.RAVEL_S3_ACCESS_KEY_ID }}
+          RAVEL_S3_SECRET_ACCESS_KEY: ${{ secrets.RAVEL_S3_SECRET_ACCESS_KEY }}
+          RAVEL_S3_BUCKET: ${{ vars.RAVEL_S3_BUCKET }}
+          RAVEL_S3_REGION: ${{ vars.RAVEL_S3_REGION }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          ./target/release/bench_report \
+            --store s3 \
+            --shards 4 \
+            --target-series 1000 \
+            --points-per-sec 50000 \
+            --duration-secs 10 \
+            --out bench/reports/report-s3.json
+      - name: Upload the JSON report
+        if: steps.creds.outputs.have_creds == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-s3-report
+          path: bench/reports/report-s3.json
+          retention-days: 90

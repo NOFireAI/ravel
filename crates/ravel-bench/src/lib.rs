@@ -11,5 +11,6 @@ pub mod ingest;
 pub mod query_latency;
 #[cfg(feature = "parquet-baseline")]
 pub mod read_accounting;
+pub mod report;
 pub mod section_accounting;
 pub mod segment_support;

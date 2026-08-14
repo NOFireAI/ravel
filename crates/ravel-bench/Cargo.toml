@@ -112,6 +112,11 @@ path = "src/bin/s3_e2e_bench.rs"
 bench = false
 
 [[bin]]
+name = "bench_report"
+path = "src/bin/bench_report.rs"
+bench = false
+
+[[bin]]
 name = "concurrent_bench"
 path = "src/bin/concurrent_bench.rs"
 bench = false
