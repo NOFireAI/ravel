@@ -1,4 +1,4 @@
-//! Reproducibility digest (ADR-0068 deliverable 5c).
+//! Reproducibility digest (ADR-0068).
 //!
 //! Scope, deliberately narrow: the digest covers query **results only** --
 //! series label sets, timestamps, and values (compared by `f64::to_bits`,
@@ -7,8 +7,8 @@
 //! It must never fold in commit tokens, object store keys, or writer ids.
 //! Those are legitimately nondeterministic between two runs of the same
 //! seed today: `IngestRouter` mints a fresh UUIDv4 writer id per instance
-//! (the `RngSource` seam that would let a sim seed pin it is a later task,
-//! #816), and object keys and commit tokens derive from that writer id and
+//! (the `RngSource` seam that would let a sim seed pin it is a later task),
+//! and object keys and commit tokens derive from that writer id and
 //! from allocation order. A digest that hashed those would report
 //! "nondeterministic" on every run even though the workload, the ingested
 //! values, and the query results it actually reads back are all identical.
@@ -16,8 +16,8 @@
 //! temporarily widening it back to a token and watching the test fail.
 //!
 //! Series and samples are sorted before mixing so that any latent
-//! iteration-order nondeterminism upstream (the class of bug issue #801
-//! fixed at the query combine stage) cannot leak through the digest either.
+//! iteration-order nondeterminism upstream (a HashMap-iteration bug at the
+//! query combine stage) cannot leak through the digest either.
 
 use ravel_promql::Value;
 use ravel_types::LabelSet;

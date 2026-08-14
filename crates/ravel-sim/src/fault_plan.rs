@@ -1,4 +1,4 @@
-//! Fault-schedule generator (ADR-0068 decision 4, issue #818 deliverable 1).
+//! Fault-schedule generator (ADR-0068 decision 4).
 //!
 //! From the master seed this derives a per-run [`FaultSchedule`]: a
 //! [`FaultPlan`] of scripted rules (operation kind + key substring + Nth
@@ -55,7 +55,7 @@ pub const COMMIT_SUBSTR: &str = "/c/";
 /// the `l1.`-tagged compaction record filename (`.../c/<shard>/<hour>/l1.<hash>.cmt`)
 /// both contain `/l1`, while L0 data (`/l0/`) and L0 commit records
 /// (`<writer>.<epoch>.<seq>.cmt`) never do. A `Put` rule keyed on this fires
-/// only on the compaction write path (issue #931).
+/// only on the compaction write path.
 pub const L1_SUBSTR: &str = "/l1";
 
 /// One hold/release gate the schedule can arm on a [`FaultStore`], holding
@@ -105,7 +105,7 @@ pub struct FaultSchedule {
     /// [`FaultStore::new`]: ravel_object_store::fault::FaultStore::new
     pub plan: FaultPlan,
     /// The scripted plan the driver wraps only around `compact_bucket`
-    /// (issue #931): a partial write on the L1 write path and a missing-object
+    ///: a partial write on the L1 write path and a missing-object
     /// blip on the L0 read path. Isolated to the compaction phase by the
     /// dedicated [`FaultStore`] the driver builds from it, and recovered by the
     /// driver's idempotent re-run, so a single firing surfaces a typed
@@ -114,7 +114,7 @@ pub struct FaultSchedule {
     /// [`FaultStore`]: ravel_object_store::fault::FaultStore
     pub compact_plan: FaultPlan,
     /// The scripted plan the driver wraps only around the sweep's action pass
-    /// (issue #931): a retryable failure on the sweep's paginated listing.
+    ///: a retryable failure on the sweep's paginated listing.
     pub sweep_plan: FaultPlan,
     /// Hold/release gates the driver may arm on the store.
     pub gates: Vec<GateScript>,
@@ -127,7 +127,7 @@ pub struct FaultSchedule {
     /// inject, in emission order. The driver merges these into
     /// [`crate::driver::CycleOutcome::expected_faults`] so the same
     /// "every expected fault fired" acceptance assertion covers the
-    /// compaction/sweep phase (issue #931 deliverable 3).
+    /// compaction/sweep phase.
     ///
     /// [`compact_plan`]: FaultSchedule::compact_plan
     /// [`sweep_plan`]: FaultSchedule::sweep_plan
@@ -215,7 +215,7 @@ pub fn generate(master_seed: &MasterSeed, config: &FaultScheduleConfig) -> Fault
 
     // Compaction/sweep-phase faults, drawn from the SAME `"faults"` sub-seed
     // after the ingest rules and gates so the ingest schedule stays byte-for-byte
-    // what it was before this addition (issue #931 deliverable 1).
+    // what it was before this addition.
     let (compact_plan, sweep_plan, expected_compaction_faults) =
         generate_compaction_faults(&mut rng);
 
@@ -229,15 +229,14 @@ pub fn generate(master_seed: &MasterSeed, config: &FaultScheduleConfig) -> Fault
     }
 }
 
-/// Derive the compaction- and sweep-phase fault plans (issue #931
-/// deliverable 1). All three kinds are armed on every run so the nightly
+/// Derive the compaction- and sweep-phase fault plans. All three kinds are armed on every run so the nightly
 /// 200-seed sweep always exercises them; only the pagination fault's flavor
 /// (transient vs throttled) varies with the seed, keeping the draw
 /// deterministic. Every rule is retryable-once (`Occurrence::Nth(1)`): the
 /// driver wraps the compaction and sweep entry points in a bounded idempotent
 /// re-run, so each fault surfaces a typed error on the first attempt and the
 /// re-run recovers to an equivalent result (the recover-or-typed-error
-/// invariant, deliverable 2).
+/// invariant).
 ///
 /// Phase isolation is by construction, not by key matching: the driver builds
 /// one [`FaultStore`] from `compact_plan` used only around `compact_bucket`
@@ -374,7 +373,7 @@ mod tests {
 
     #[test]
     fn compaction_faults_are_armed_and_phase_isolatable() {
-        // Every run arms all three compaction/sweep fault kinds (deliverable 1),
+        // Every run arms all three compaction/sweep fault kinds,
         // each `Nth(1)` and on a phase-isolated target, so the nightly sweep
         // exercises them deterministically.
         for seed in 1u64..=64 {

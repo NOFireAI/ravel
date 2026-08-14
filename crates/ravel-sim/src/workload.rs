@@ -1,4 +1,4 @@
-//! Deterministic workload generator (ADR-0068 deliverable 3): tenants,
+//! Deterministic workload generator (ADR-0068): tenants,
 //! per-tenant series cardinality shapes, scalar and native-histogram points
 //! over a simulated time span, and a query mix -- all fully determined by
 //! the `"workload"` sub-seed derived from a [`MasterSeed`].
@@ -122,7 +122,7 @@ pub struct Workload {
 /// Generates a full workload from `master_seed`'s `"workload"` sub-seed.
 /// Fully deterministic: no OS entropy, no wall clock is read, and series
 /// live in `Vec`s in generation order throughout (no HashMap iteration
-/// anywhere order-sensitive, the exact class of bug issue #801 fixed).
+/// anywhere order-sensitive).
 pub fn generate(master_seed: &MasterSeed, config: &WorkloadConfig) -> Result<Workload, TypeError> {
     let mut rng = master_seed.rng("workload");
     let mut tenants = Vec::with_capacity(config.tenant_count);

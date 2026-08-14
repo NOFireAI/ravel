@@ -3,7 +3,7 @@
 //! through `QueryEngine::instant` -- see `src/driver.rs`): before the fold,
 //! resolving the whole ingested window depends entirely on the per-bucket
 //! commit-record LIST fallback (`Catalog::resolve`'s per-(shard, hour) listing
-//! pass, `docs/metric-index-plan.md` 5.1 step 3); after the fold, a snapshot
+//! pass); after the fold, a snapshot
 //! watermark covering the whole window serves it from the folded snapshot's
 //! GET-based part index and never lists the commit-record prefix at all.
 //!

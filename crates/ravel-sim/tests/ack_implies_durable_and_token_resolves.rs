@@ -1,4 +1,4 @@
-//! Proves invariants (a) and (b) from ADR-0068 deliverable 5 hold on a
+//! Proves invariants (a) and (b) from ADR-0068 hold on a
 //! small seeded cycle: every commit token `IngestRouter` returns resolves
 //! via `Catalog::resolve`, and the acked samples come back from a query
 //! both immediately (read-your-write) and after the fold (strict-ack-

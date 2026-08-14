@@ -1,4 +1,4 @@
-//! Proves ADR-0068 deliverable 5c: two runs of the same master seed through
+//! Proves reproducibility (ADR-0068): two runs of the same master seed through
 //! the whole ingest -> fold -> query cycle produce identical digests.
 //!
 //! "prove-the-test": this was confirmed to actually catch a break by
