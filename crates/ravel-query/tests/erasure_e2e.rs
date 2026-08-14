@@ -24,7 +24,10 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::{LabelMatcher, Value};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_query::{EngineConfig, QueryEngine};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_segment::{
+    HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
+    SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues,
+};
 use ravel_types::{
     CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash,
     TenantId, TimeRange,
@@ -93,6 +96,96 @@ async fn publish_segment(
         },
     )
     .expect("write segment");
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 0,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 42,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    publish::put_data_object(store, &data_key, written.bytes)
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish")
+}
+
+/// Publishes one RSEG segment carrying native-histogram series
+/// `m{user_id="u1"}` and `m{user_id="u2"}`, each with one histogram sample at
+/// `TS_A`, and returns its read-your-write token. Mirrors [`publish_segment`]
+/// but through `SegmentWriter::write_histograms`, so the query path decodes it
+/// as native histograms and filters it via `retain_histogram_series` rather
+/// than the scalar `retain_series_soa`.
+async fn publish_histogram_segment(
+    store: &MemoryStore,
+    tenant_id: &TenantId,
+    tenant_hash: TenantHash,
+) -> CommitToken {
+    let writer_id = Uuid::from_u128(9);
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: 0,
+    };
+    let one_bucket_histogram = || HistogramValue {
+        scale: 0,
+        zero_threshold: 0.0,
+        sum: Some(1.0),
+        custom_values: None,
+        positive_spans: vec![HistogramSpan {
+            offset: 0,
+            length: 1,
+        }],
+        negative_spans: Vec::new(),
+        counts: HistogramCounts::Int {
+            zero_count: 0,
+            count: 1,
+            positive: vec![1],
+            negative: Vec::new(),
+        },
+        reset_hint: ResetHint::Unknown,
+    };
+    let inputs: Vec<SeriesInputV3> = ["u1", "u2"]
+        .iter()
+        .map(|uid| {
+            let labels = label_set(uid);
+            SeriesInputV3 {
+                series_id: SeriesId::compute(tenant_id, METRIC, &labels).expect("series id"),
+                labels,
+                values: SeriesValues::Histogram(vec![HistogramSample {
+                    ts_ns: TS_A,
+                    value: one_bucket_histogram(),
+                }]),
+            }
+        })
+        .collect();
+    let written = SegmentWriter::write_histograms(
+        inputs,
+        identity,
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write histogram segment");
 
     let rec = record::build(NewCommitRecord {
         tenant_hash,
@@ -229,6 +322,50 @@ async fn queried_user_ids(
     ids
 }
 
+/// The distinct `user_id` label values a range query over `[TS_A, TS_B]`
+/// returns, sorted. The `range` entry point is a distinct materialization
+/// surface from `instant`: it fetches through the same sample funnel but
+/// renders a `Value::Matrix`. Driving it here means a regression that drops
+/// the erasure pass from the range path (or applies it to a narrower view
+/// than the matrix it returns) fails this helper's callers.
+async fn range_user_ids(
+    engine: &QueryEngine,
+    tenant_hash: TenantHash,
+    token: &CommitToken,
+) -> Vec<String> {
+    let value = engine
+        .range(
+            tenant_hash,
+            METRIC,
+            TS_A / 1_000_000,
+            TS_B / 1_000_000,
+            // One step per sample time: TS_A and TS_B are 1000s apart, so a
+            // step lands on each and sees its own sample regardless of the
+            // evaluator's lookback.
+            1_000_000,
+            std::slice::from_ref(token),
+            TS_B + NS,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("range query");
+    let Value::Matrix(matrix) = value else {
+        panic!("range query over a selector must return a matrix");
+    };
+    let mut ids: Vec<String> = matrix
+        .iter()
+        .map(|(labels, _samples)| {
+            labels
+                .get("user_id")
+                .expect("series carries user_id")
+                .to_string()
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// The `user_id` label values the series/labels metadata path returns, sorted.
 async fn enumerated_user_ids(
     engine: &QueryEngine,
@@ -295,6 +432,60 @@ async fn pending_erasure_excludes_matching_series_from_query_results() {
         queried_user_ids(&engine, tenant_hash, &token, TS_A).await,
         vec!["u2".to_string()],
         "the erased subject's series must not reach the caller",
+    );
+}
+
+/// The same windowless request also excludes the matching series from a
+/// *range* query result. The range path renders a `Value::Matrix` through a
+/// materialization step distinct from the instant vector one, so covering it
+/// separately proves the erasure pass is on the range surface too, not only
+/// the instant surface.
+#[tokio::test]
+async fn pending_erasure_excludes_matching_series_from_range_query() {
+    let (store, engine, token, tenant_hash) = setup(&[TS_A, TS_B]).await;
+    assert_eq!(
+        range_user_ids(&engine, tenant_hash, &token).await,
+        vec!["u1".to_string(), "u2".to_string()],
+        "baseline before the erasure request is durable",
+    );
+
+    put_dreq(&store, tenant_hash, "u1", 0, 0).await;
+
+    assert_eq!(
+        range_user_ids(&engine, tenant_hash, &token).await,
+        vec!["u2".to_string()],
+        "the erased subject's series must not reach the caller on the range path",
+    );
+}
+
+/// A native-histogram series takes a decode-and-materialize path distinct from
+/// scalar samples, filtered by its own `retain_histogram_series` call site. A
+/// durable windowless `.dreq` must exclude a matching histogram series from an
+/// instant query exactly as it does a scalar one; this drives that separate
+/// call site through the real engine entry point.
+#[tokio::test]
+async fn pending_erasure_excludes_matching_histogram_series_from_query() {
+    let tenant_id = TenantId::new("tenant-a".to_string());
+    let tenant_hash = tenant_id.hash();
+    let store = Arc::new(MemoryStore::new());
+    let token = publish_histogram_segment(&store, &tenant_id, tenant_hash).await;
+    let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog =
+        Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+    let engine = QueryEngine::new(catalog, backend, EngineConfig::default());
+
+    assert_eq!(
+        queried_user_ids(&engine, tenant_hash, &token, TS_A).await,
+        vec!["u1".to_string(), "u2".to_string()],
+        "baseline: both native-histogram series are returned before erasure",
+    );
+
+    put_dreq(&store, tenant_hash, "u1", 0, 0).await;
+
+    assert_eq!(
+        queried_user_ids(&engine, tenant_hash, &token, TS_A).await,
+        vec!["u2".to_string()],
+        "the erased histogram subject's series must not reach the caller",
     );
 }
 
