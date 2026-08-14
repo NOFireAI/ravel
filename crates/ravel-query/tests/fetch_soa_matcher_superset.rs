@@ -1,10 +1,6 @@
-//! CHECK 1 (issue #145, ravel-query cross-area, finding rq-01 SOUND).
-//!
-//! Confirming test for the assumption the ravel-sql sql1-F01 tests pin from
-//! the SQL side (docs/reviews/2026-07-28-ravel-sql-audit/
-//! sql1-scan-pushdown-pruning.md section 6, and sql3 section 6): that
 //! `SegmentFetcher::fetch_soa` applies label matchers against SERIES_TABLE as
-//! a faithful PromQL superset. A series wrongly excluded here is a silent
+//! a faithful PromQL superset, the assumption the ravel-sql pushdown-pruning
+//! tests also pin from the SQL side. A series wrongly excluded here is a silent
 //! under-fetch (short results) that the SQL `Inexact` residual cannot recover.
 //!
 //! The prune inside `fetch_soa` runs `ravel_promql::matches_series` (via

@@ -279,12 +279,12 @@ struct CapturedSpan {
     /// Present on the logs read path's `page_fetch`/`decode` spans (`"logs"`),
     /// absent on the metric path's, whose spans carry no `signal` field. Lets a
     /// logs-signal assertion isolate its own spans from the metric path's, which
-    /// reuses the same two span names (issue #720).
+    /// reuses the same two span names.
     signal: Option<String>,
     s3_requests: Option<u64>,
     s3_bytes: Option<u64>,
     decompressed_bytes: Option<u64>,
-    /// The logs `decode` span's block-scan counts (issue #720). The metric
+    /// The logs `decode` span's block-scan counts. The metric
     /// `decode` span records `decompressed_bytes` here instead.
     blocks_scanned: Option<u64>,
     blocks_total: Option<u64>,
@@ -303,7 +303,7 @@ impl tracing::field::Visit for SpanFieldVisitor<'_> {
             "s3_bytes" => self.0.s3_bytes = Some(value),
             "decompressed_bytes" => self.0.decompressed_bytes = Some(value),
             // The logs `decode` span records these as `u32`; `tracing` widens a
-            // `u32` field value to `record_u64` (issue #720).
+            // `u32` field value to `record_u64`.
             "blocks_scanned" => self.0.blocks_scanned = Some(value),
             "blocks_total" => self.0.blocks_total = Some(value),
             _ => {}
@@ -326,7 +326,7 @@ impl tracing::field::Visit for SpanFieldVisitor<'_> {
 /// A `tracing` layer that records the name of every span opened while it is the
 /// default subscriber, plus the per-span count fields each phase records, so a
 /// test can assert both which query-path phase spans fired and that their
-/// recorded counts hold plausible values (ADR-0044 decision 5, issue #642).
+/// recorded counts hold plausible values (ADR-0044 decision 5).
 ///
 /// `names` keeps every span name for exact-name presence assertions (a
 /// substring check would let `catalog_decode` satisfy an assertion for
@@ -414,7 +414,7 @@ fn install_span_collector() -> SpanCollector {
         .clone()
 }
 
-/// ADR-0044 decision 5 (issue #642): a real instant query must open all six
+/// ADR-0044 decision 5: a real instant query must open all six
 /// query-path phase spans. This asserts each of `catalog_resolve`,
 /// `segment_open`, `catalog_decode`, `page_fetch`, `decode`, and `evaluate`
 /// fires at least once. Removing any one of the six span attributes makes this
@@ -484,7 +484,7 @@ async fn instant_query_emits_all_six_phase_spans() {
 /// `MemoryStore` and returns it with a matching L0 `SegmentRef`, mirroring the
 /// recipe `cache_correctness.rs` uses. The `decode`-span test below scans it
 /// through `LogSegmentFetcher::fetch_accounted` and asserts the logs `decode`
-/// span records real block-scan counts (issue #720).
+/// span records real block-scan counts.
 async fn write_log_segment_for_span_test() -> (Arc<MemoryStore>, SegmentRef) {
     let resource = vec![(
         "service.name".to_string(),
@@ -548,9 +548,9 @@ async fn write_log_segment_for_span_test() -> (Arc<MemoryStore>, SegmentRef) {
     (store, seg_ref)
 }
 
-/// Issue #720: the logs read path's `decode` span must record a real, non-empty
-/// count field. Before this fix it carried only `signal = "logs"` and zero count
-/// fields, unlike every other phase span. It now records `blocks_scanned` and
+/// The logs read path's `decode` span must record a real, non-empty count
+/// field, unlike a phase span that carried only `signal = "logs"`. It records
+/// `blocks_scanned` and
 /// `blocks_total` from the reader's `ScanStats` (a decompressed-byte count is not
 /// cheaply available on this path; see `log_fetcher.rs` and
 /// docs/guides/tracing.md). This scans a real RLOG object through
@@ -698,8 +698,8 @@ fn one_tenant_app_with_recorder_and_store(
     router(state)
 }
 
-/// ADR-0044 decision 5 (issue #642), the count-value regression F1 was missing:
-/// each `segment_open` span's recorded `s3_bytes` must reflect only that
+/// ADR-0044 decision 5: each `segment_open` span's recorded `s3_bytes` must
+/// reflect only that
 /// segment's own GET, not a delta off the shared `QueryAccounting` handle that
 /// concurrent sibling segments also write. The invariant asserted is cheap and
 /// one the buggy delta version violates under concurrency: the sum of every
@@ -842,13 +842,13 @@ fn one_tenant_app_with_recorder_and_cache(
     router(state)
 }
 
-/// ADR-0044 decision 5 (issue #642), the cache-attribution regression the F1
-/// fix's per-span counting introduced: `open_segment`/`ensure_ranges` must count
-/// only *store-sourced* bytes on their `segment_open`/`page_fetch` spans, not
-/// bytes served from the ADR-0046 read cache. F1's local counters incremented
-/// unconditionally for every `guarded_get` that returned, but a cache hit
-/// returns bytes with no store round trip at all, so a fully warm query -- which
-/// makes zero real S3 GETs -- still reported the segment's whole object size on
+/// ADR-0044 decision 5, the cache-attribution rule for per-span counting:
+/// `open_segment`/`ensure_ranges` must count only *store-sourced* bytes on
+/// their `segment_open`/`page_fetch` spans, not bytes served from the ADR-0046
+/// read cache. Local counters that increment unconditionally for every
+/// `guarded_get` that returned would over-report, because a cache hit returns
+/// bytes with no store round trip at all, so a fully warm query -- which makes
+/// zero real S3 GETs -- would still report the segment's whole object size on
 /// its `segment_open` span.
 ///
 /// The prior phase-attribution tests configure no cache (the default
@@ -857,7 +857,7 @@ fn one_tenant_app_with_recorder_and_cache(
 /// serve from it. On the warm run the query's own `total_s3_bytes` is zero (all
 /// hits), and every `segment_open`/`page_fetch` span's recorded `s3_bytes` must
 /// sum to that same zero -- not to the segment's real object size. Against the
-/// pre-fix code the warm `segment_open` span reports the whole object size while
+/// this accounting the warm `segment_open` span would report the whole object size while
 /// the query total is zero, so `warm_span_bytes_sum <= warm_total` fails.
 #[tokio::test]
 async fn warm_cache_query_records_zero_store_bytes_on_fetch_spans() {
@@ -970,7 +970,7 @@ async fn warm_cache_query_records_zero_store_bytes_on_fetch_spans() {
     // This warm run's fetch spans: the tenant-filtered fetch spans past the cold
     // run's count. Their recorded store-byte counts must sum to the warm query's
     // own zero total -- not to the segment's real object size, which is what the
-    // pre-fix unconditional per-`guarded_get` increment recorded.
+    // unconditional per-`guarded_get` increment would record.
     let warm_span_bytes: Vec<(String, u64)> = {
         let completed = collector.completed.lock().expect("completed lock");
         completed
@@ -1019,7 +1019,7 @@ async fn warm_cache_query_records_zero_store_bytes_on_fetch_spans() {
 /// test can never silently regress onto the whole-object path.
 const WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 
-/// ADR-0044 decision 5 (issue #642): the `page_fetch` phase's cache attribution,
+/// ADR-0044 decision 5: the `page_fetch` phase's cache attribution,
 /// specifically the `ensure_ranges` `join_all` accumulation that
 /// [`warm_cache_query_records_zero_store_bytes_on_fetch_spans`] does not reach.
 ///
@@ -1030,7 +1030,7 @@ const WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 /// via its `missing.is_empty()` check, without ever running the `join_all`
 /// cost-accumulation loop -- so that test's `page_fetch` numbers are true
 /// whether or not the accumulation counts only store-sourced bytes, and prove
-/// nothing about it (they hold even against the pre-fix accumulation shape).
+/// nothing about it (they hold even against the alternative accumulation shape).
 ///
 /// This fixture is a segment strictly larger than [`WHOLE_OBJECT_THRESHOLD`]
 /// (one series, ~100k high-entropy samples so the value pages do not compress
@@ -1512,8 +1512,8 @@ async fn identity_mismatch_between_commit_record_and_footer_returns_500() {
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
 
     // Identity mismatch is a permanent data-integrity fault, not a transient
-    // outage: it maps to the non-retryable 500 `internal`, not 503 (a7-F05,
-    // #62). A retry re-reads the same mismatched objects and never clears.
+    // outage: it maps to the non-retryable 500 `internal`, not 503. A retry
+    // re-reads the same mismatched objects and never clears.
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["status"], "error");
     assert_eq!(body["errorType"], "internal");
@@ -1572,7 +1572,7 @@ async fn corrupt_segment_bytes_return_500_not_wrong_data() {
 
     // Corrupt stored bytes are a permanent server-side data fault: the query
     // fails closed (never wrong data) with the non-retryable 500 `internal`,
-    // not the retryable 503 (a7-F05, #62).
+    // not the retryable 503.
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["status"], "error");
     assert_eq!(body["errorType"], "internal");
@@ -1719,7 +1719,7 @@ async fn series_endpoint_requires_match_param() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-query cost recording (ADR-0044 section 4, issue #425)
+// Per-query cost recording (ADR-0044 section 4)
 //
 // These prove the Prometheus-shaped handlers fold each completed query's cost
 // into the `QueryCostRecorder` seam, and that the numbers recorded are exactly

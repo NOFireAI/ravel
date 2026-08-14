@@ -1,4 +1,4 @@
-//! Phase P5b tests (docs/metric-index-plan.md 5.4): postings-based segment
+//! Postings-based segment
 //! pruning at query time, applied only to snapshot-sourced segments behind
 //! an equality `__name__` matcher, and the `QueryStats` counters it feeds.
 //!

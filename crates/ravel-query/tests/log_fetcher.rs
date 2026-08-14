@@ -1,5 +1,4 @@
-//! Integration tests for [`ravel_query::LogSegmentFetcher`] (ADR-0033, issue
-//! #238). Two small RLOG objects with disjoint ts ranges and distinct stream
+//! Integration tests for [`ravel_query::LogSegmentFetcher`] (ADR-0033). Two small RLOG objects with disjoint ts ranges and distinct stream
 //! identities exercise: ts-range pruning before any GET, stream-attribute
 //! resolution against STREAM_DIR, and an end-to-end word + ts-range scan whose
 //! records are checked against a hand-computed expected set. Objects are
@@ -90,7 +89,7 @@ impl ObjectStoreBackend for CountingStore {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -339,7 +338,7 @@ async fn stream_attr_equality_returns_only_matching_object_records() {
     );
 }
 
-/// The acceptance test named in the epic decomposition: one fetch call prunes
+/// Acceptance test: one fetch call prunes
 /// by ts range (object B skipped, no GET) and by stream attrs (object A's
 /// non-matching stream yields nothing), combined with a word predicate, and
 /// the surviving records match a hand-computed expected set exactly.
@@ -442,7 +441,7 @@ async fn ts_range_prunes_blocks_within_the_object() {
 /// top-level `service.name`, both match the `service.name = "api"` filter.
 ///
 /// This test asserts the current, now-documented behavior rather than the ideal
-/// behavior. Issue #239 owns the decision to make this exact; if it does, this
+/// behavior. Making this exact is future work; if it happens, this
 /// test should be changed to assert the exact result (only `plain_id`), never
 /// deleted, so the change is deliberate and visible.
 #[tokio::test]
@@ -637,7 +636,7 @@ fn prune_records() -> Vec<LogRecord> {
         .collect()
 }
 
-/// Issue #544: the prune channel a `LogQuery` now carries reaches POSTINGS, so a
+/// The prune channel a `LogQuery` carries reaches POSTINGS, so a
 /// fetch decodes strictly fewer blocks, and it does that without dropping a
 /// record the equality matches.
 ///
@@ -774,7 +773,7 @@ async fn prune_arm_on_unindexed_field_prunes_nothing() {
     assert_eq!(got.len(), 12);
 }
 
-// ---- selective-erasure scan-time exclusion (ADR-0064 decision 2, EJ-T3) ----
+// ---- selective-erasure scan-time exclusion (ADR-0064 decision 2) ----
 
 /// A windowless erasure predicate on one exact `key = value` matcher.
 fn erase(key: &str, value: &str) -> ErasurePredicate {
@@ -887,7 +886,7 @@ async fn erasure_window_excludes_only_in_window_rows() {
     assert_eq!(kept, vec![100, 250], "only in-window rows are erased");
 }
 
-/// The ordering guarantee this task exists to close (ADR-0064 decision 2):
+/// The ordering guarantee (ADR-0064 decision 2):
 /// exclusion runs *after* the cache, so stale cached bytes of a since-erased
 /// subject can never leak. A first fetch with no predicate populates the read
 /// cache with the object's bytes; a second fetch that is served entirely from

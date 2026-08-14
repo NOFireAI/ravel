@@ -5,7 +5,7 @@
 //! hash embedded in that key, and raw backend error text in their `Display`
 //! form. Those strings must never reach a client body: the tenant-hashed key
 //! layout exists precisely to keep the physical layout opaque (ADR-0009,
-//! "no tenant names leaked via object listings"; finding a7-F02). This module
+//! "no tenant names leaked via object listings"). This module
 //! is the typed-error to HTTP boundary where that redaction happens: the
 //! caller sees a stable, class-specific message with no internal identifiers,
 //! while the full error is logged server-side for diagnosis.
@@ -49,7 +49,7 @@ pub enum ApiError {
     /// failed validation (corrupt segment, unreconstructable or mismatched
     /// commit record, non-monotonic run). Maps to HTTP 500 `internal`, a
     /// non-retryable 5xx: the corruption is in already-stored objects, so a
-    /// retry re-reads the same bytes and never clears (a7-F05, #62). Kept
+    /// retry re-reads the same bytes and never clears. Kept
     /// distinct from `Unavailable` so a client does not retry forever against
     /// permanently corrupt data.
     Corrupt(String),
@@ -74,7 +74,7 @@ impl From<QueryError> for ApiError {
     fn from(e: QueryError) -> Self {
         // Storage-layer faults are redacted to a fixed, class-specific
         // message; the full `Display` (which embeds the object key and tenant
-        // hash) is logged here and never placed in the body (a7-F02).
+        // hash) is logged here and never placed in the body.
         if let Some(redacted) = redacted_storage_message(&e) {
             tracing::warn!(
                 error = %e,
@@ -83,8 +83,8 @@ impl From<QueryError> for ApiError {
             );
             // A corruption fault is a permanent server-side data problem, not a
             // transient outage: map it to the non-retryable 500 `internal` so a
-            // client stops retrying against permanently corrupt data (a7-F05,
-            // #62). Transient storage faults keep the retryable 503.
+            // client stops retrying against permanently corrupt data.
+            // Transient storage faults keep the retryable 503.
             return if redacted == MSG_CORRUPT {
                 ApiError::Corrupt(redacted.to_string())
             } else {
@@ -102,7 +102,7 @@ impl From<QueryError> for ApiError {
             | QueryError::TooManySamples { .. }
             | QueryError::TooManyBytesScanned { .. }
             | QueryError::RequestBudgetExceeded { .. } => ApiError::Unsupported(e.to_string()),
-            // An over-wide window refused before any LIST (issue #635) is a
+            // An over-wide window refused before any LIST is a
             // resource-budget rejection, grouped with the budget classes above
             // under the same 422 "execution" mapping. Its text carries only the
             // estimate and the limit (counts, no object key or tenant
@@ -140,9 +140,9 @@ impl From<QueryError> for ApiError {
 /// caller (parse errors carry only the client's own query, budget errors
 /// carry only counts and limits, deadlines carry only a duration).
 ///
-/// The four client-visible classes required by a7-F02 are kept distinct:
+/// The four client-visible classes required for redaction are kept distinct:
 /// `corrupt` maps to HTTP 500 `internal` (a permanent, non-retryable
-/// server-side data fault; a7-F05, #62), while `unavailable` and
+/// server-side data fault), while `unavailable` and
 /// unsatisfiable-token map to the retryable HTTP 503; each carries its own
 /// stable message so diagnosability survives redaction; the budget class
 /// keeps its own 422 mapping and unredacted counts.
@@ -152,7 +152,7 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
             FetchError::Corrupt { .. } => MSG_CORRUPT,
             FetchError::Store { .. } | FetchError::EtagChanged { .. } => MSG_UNAVAILABLE,
         }),
-        // An over-wide-window refusal (issue #635) carries only counts and is
+        // An over-wide-window refusal carries only counts and is
         // safe to show; like the budget errors it is not a storage fault, so
         // it is not redacted (the `From` impl maps it to a 422).
         QueryError::Catalog(CatalogError::WindowTooWide { .. }) => None,
@@ -185,7 +185,7 @@ fn from_eval_error(inner: &ravel_promql::Error, outer: &QueryError) -> ApiError 
         | ravel_promql::Error::InvalidRegex { .. }
         | ravel_promql::Error::InvalidLabelName { .. } => ApiError::Unsupported(outer.to_string()),
         // The series-source error can wrap raw backend text; redact it and
-        // log the full detail rather than echo it to the client (a7-F02).
+        // log the full detail rather than echo it to the client.
         ravel_promql::Error::Source(_) => {
             tracing::warn!(
                 error = %outer,
@@ -207,7 +207,7 @@ fn from_eval_error(inner: &ravel_promql::Error, outer: &QueryError) -> ApiError 
 
 /// The HTTP rendering of a query error: the status code, the stable
 /// Prometheus-shaped `errorType` tag, and a client-safe message that has
-/// already passed the a7-F02 redaction boundary (storage-layer faults carry
+/// already passed the redaction boundary (storage-layer faults carry
 /// only a fixed class message here; the full detail is logged, never echoed).
 ///
 /// This is the reusable, public form of the mapping the [`IntoResponse`] impl
@@ -291,7 +291,7 @@ mod tests {
 
     /// The redacted client message must not carry the object key, the tenant
     /// hash embedded in it, the `.rseg` suffix, the `t/` prefix, or raw
-    /// backend error text (a7-F02).
+    /// backend error text.
     fn assert_redacted(message: &str) {
         assert!(!message.contains(LEAKY_KEY), "leaked full key: {message}");
         assert!(
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn non_monotonic_samples_is_not_a_retryable_503() {
-        // a7-F05 (#62): NonMonotonicSamples is a permanent decode-corruption
+        // NonMonotonicSamples is a permanent decode-corruption
         // condition. It must not map to 503 `unavailable` (which a Prometheus
         // client retries forever against the same corrupt stored data); it maps
         // to the non-retryable 500 `internal`.
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn window_too_wide_is_a_422_that_keeps_its_counts() {
-        // Issue #635: an over-wide window refused before any LIST is a
+        // An over-wide window refused before any LIST is a
         // resource-budget rejection grouped with the budget classes at 422
         // "execution", not a storage fault at 503. It is not redacted (counts
         // only), and its text reaches the client verbatim.

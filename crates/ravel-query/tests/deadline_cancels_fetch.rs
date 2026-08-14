@@ -1,10 +1,6 @@
-//! CHECK 2 (issue #145, ravel-query cross-area, finding rq-02 SOUND).
-//!
-//! Confirming test for the cross-area note in
-//! docs/reviews/2026-07-28-ravel-sql-audit/sql3-exec-memory-deadline.md
-//! section 6 ("In-flight fetch cancellation ... Whether the concurrent
-//! segment fetches run inside the stream's poll (cancel on drop) or via
-//! detached `tokio::spawn` (leak after a deadline)").
+//! In-flight fetch cancellation: whether the concurrent segment fetches run
+//! inside the stream's poll (cancel on drop) or via detached `tokio::spawn`
+//! (leak after a deadline).
 //!
 //! In ravel-query, `QueryEngine::{instant,range,resolve_series}` wrap their
 //! inner future in `tokio::time::timeout(deadline, ..)` (engine.rs:76-82).
@@ -114,7 +110,7 @@ impl ObjectStoreBackend for StallingSegmentStore {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()

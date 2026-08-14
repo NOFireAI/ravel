@@ -66,7 +66,7 @@ fn now_ns() -> i64 {
 
 /// Carries a successful response's data into the Prometheus JSON envelope, with
 /// the query's evaluation and federation annotations in the separate `warnings`
-/// and `infos` arrays (issue #178, ADR-0071). Both are omitted from the wire
+/// and `infos` arrays (ADR-0071). Both are omitted from the wire
 /// when empty (Prometheus' `omitempty`), so an unannotated response is
 /// byte-identical to a bare `{"status":"success","data":...}`.
 fn success_annotated<T: serde::Serialize>(
@@ -90,7 +90,7 @@ async fn authenticate(
 
 /// Submit one evidential audit event for a query that reached execution for a
 /// resolved tenant, await its durability, and only then release `result` to
-/// the caller (ADR-0062 §2a, epic EL / issue #762).
+/// the caller (ADR-0062 §2a).
 ///
 /// `result` is the outcome of the surface's actual read: `Ok` audits
 /// `QueryStatus::Ok`, any `Err` audits `QueryStatus::Error`, so the audit trail
@@ -195,8 +195,7 @@ async fn handle_query(
     )
     .await?;
     let (mut warnings, infos) = annotations.into_parts();
-    // Merge the federation fan-out's partial-coverage warnings (ADR-0071, issue
-    // #868) into the top-level `warnings` array alongside the evaluator's own
+    // Merge the federation fan-out's partial-coverage warnings (ADR-0071) into the top-level `warnings` array alongside the evaluator's own
     // annotations, so a `skip_unavailable=true` federated query returns a
     // response a client can tell is partial (the `partial` stats marker) and
     // that names the skipped cluster. These are already redacted at the
@@ -210,8 +209,7 @@ async fn handle_query(
     // Copy the counters out before `stats` is moved into the response body, so
     // the numbers folded into /metrics are exactly the numbers the response
     // reports; recording after the JSON render succeeds means a completed,
-    // fully-rendered query is what gets counted (ADR-0044 section 4, issue
-    // #425). Both are `Copy`.
+    // fully-rendered query is what gets counted (ADR-0044 section 4). Both are `Copy`.
     let accounting = stats.accounting;
     let estimate = stats.estimate;
     let data = with_stats(instant_value_to_json(value, time_ms)?, stats);
@@ -280,8 +278,7 @@ async fn handle_query_range(
     )
     .await?;
     let (mut warnings, infos) = annotations.into_parts();
-    // Merge the federation fan-out's partial-coverage warnings (ADR-0071, issue
-    // #868) into the top-level `warnings` array, same as handle_query. Already
+    // Merge the federation fan-out's partial-coverage warnings (ADR-0071) into the top-level `warnings` array, same as handle_query. Already
     // redacted at the federation seam (cluster name only, no endpoint/errno).
     for w in &stats.warnings {
         if !warnings.contains(w) {
@@ -466,19 +463,19 @@ async fn resolve_matched_series(
     // each resolve_series call only the time still remaining. Without this,
     // each match[] selector would be granted the full `deadline` afresh, so
     // N selectors would get N times the documented budget with no aggregate
-    // cap (finding a7-F03). The engine still enforces the timeout per call;
+    // cap. The engine still enforces the timeout per call;
     // sharing the remaining budget makes the whole request share one wall
     // bound.
     let request_deadline = tokio::time::Instant::now() + deadline;
 
     // Accumulates every sub-query's cost so the whole metadata request folds
-    // once into the /metrics aggregator (ADR-0044 section 4, issue #425). Each
+    // once into the /metrics aggregator (ADR-0044 section 4). Each
     // match[] selector resolves under its own accounting handle, so the
     // request total is the field-wise sum of the per-selector snapshots.
     // Recording once per request, not once per selector, keeps
     // ravel_query_queries_total counting requests.
     let mut combined: Option<(QueryAccountingSnapshot, CostEstimate)> = None;
-    // Cross-cluster federation partial-coverage warnings (ADR-0071, issue #891),
+    // Cross-cluster federation partial-coverage warnings (ADR-0071),
     // accumulated across selectors and surfaced in the Prometheus envelope's
     // top-level `warnings` array -- the same surface the query path uses. Each
     // per-selector resolve federates independently, so a skipped remote can be
@@ -509,10 +506,10 @@ async fn resolve_matched_series(
     // shared wall budget above is orthogonal to that: snapshots stay
     // per-selector, but all selectors draw down one deadline.
     //
-    // Per-selector segment stats (docs/metric-index-plan.md P5b) are not
+    // Per-selector segment stats are not
     // surfaced on this path: the labels/label_values/series endpoints have
     // no established response envelope for it (only the value-bearing
-    // query/query_range endpoints do; see this ticket's final report), and
+    // query/query_range endpoints do), and
     // aggregating per-selector counts here would double count segments any
     // two selectors both matched.
     let mut by_id: HashMap<SeriesId, LabelSet> = HashMap::new();

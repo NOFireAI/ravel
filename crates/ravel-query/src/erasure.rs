@@ -1,10 +1,10 @@
 //! Scan-time selective-erasure filtering (ADR-0064 decision 2, "Immediate
-//! logical exclusion"; EJ-T3, issue #753).
+//! logical exclusion").
 //!
 //! ADR-0064's visibility guarantee is that a query whose snapshot resolves
 //! after an erasure request is durable can never return matching records, from
 //! the store or from any cache tier. The resolver attaches every pending
-//! erasure predicate to the resolved snapshot (EJ-T2); this module is the
+//! erasure predicate to the resolved snapshot; this module is the
 //! downstream consumer: it filters matching series, samples, rows, and spans
 //! out of already-materialized results, run **after fetch, after any cache
 //! layer, before any result reaches the caller**. Because it operates on
@@ -60,7 +60,7 @@ use crate::fetcher::{FetchedHistogramSeries, FetchedSeries, FetchedSeriesSoa};
 /// half-open event-time window.
 ///
 /// This is the scan-layer view of a resolved snapshot's pending erasure
-/// requests. The resolver (EJ-T2) attaches the predicate set to every resolved
+/// requests. The resolver attaches the predicate set to every resolved
 /// snapshot; the query engine and log fetcher convert those into this shape
 /// and hand them to the `retain_*` functions below.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,14 +313,14 @@ pub fn retain_log_records(records: &mut Vec<LogRecord>, predicates: &[ErasurePre
 }
 
 /// The pending selective-erasure predicates attached to a resolved snapshot
-/// (ADR-0064 decision 2, EJ-T3, issue #753). Every SQL and PromQL query
+/// (ADR-0064 decision 2). Every SQL and PromQL query
 /// surface excludes series/samples/rows/spans matching any of these after
 /// fetch and after cache; this is the single connection point between a
 /// resolved [`Snapshot`] and that filter machinery, so `ravel-query`'s engine
 /// and `ravel-sql`'s scan surfaces derive the same predicates from the same
 /// snapshot field rather than each duplicating the mapping.
 ///
-/// EJ-T2 (#752) is the resolver task that lists `t/<th>/<sig>/del/` per resolve
+/// The resolver task lists `t/<th>/<sig>/del/` per resolve
 /// and attaches the decoded pending requests to [`Snapshot::pending_erasure`],
 /// already scoped to this resolve's (tenant, signal). Each `ErasureRequest`
 /// becomes one [`ErasurePredicate`], mapping its repeated `predicate` matchers

@@ -1,4 +1,4 @@
-//! Epic #949 acceptance (T2): generate a subject, mark it erased with a durable
+//! Acceptance: generate a subject, mark it erased with a durable
 //! `.dreq`, and assert it is absent from EVERY query surface `ravel-query`
 //! exposes -- and, crucially, present through none of them -- while a
 //! non-erased subject still appears, so a filter-everything bug fails the test
@@ -30,11 +30,11 @@
 //!
 //! Surfaces NOT covered here live outside `ravel-query` and are reported, not
 //! reached into (task scope): `query_exemplars`
-//! (`services/ravel-server/src/exemplars.rs`, issue #915 -- still leaks; the fix
+//! (`services/ravel-server/src/exemplars.rs` -- still leaks; the fix
 //! is a `ravel-server` change), the analytics endpoint
 //! (`services/ravel-server/src/analytics.rs`, a MATCH: it fetches through
 //! `QueryEngine::range` above), and the spans/alerts/audit SQL surfaces
-//! (`ravel-sql`, filtered per #928/#829).
+//! (`ravel-sql`, selective-erasure filtered).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -77,7 +77,7 @@ const TS_A: i64 = 1_000 * NS;
 const TS_B: i64 = 2_000 * NS;
 const METRIC: &str = "m";
 /// The erased subject and the surviving subject, used identically on every
-/// surface so the epic's "one subject, every surface" property is literal.
+/// surface so the "one subject, every surface" property is literal.
 const ERASED: &str = "u1";
 const KEPT: &str = "u2";
 
@@ -649,7 +649,7 @@ fn ok_response(scalar: Vec<FetchedSeriesSoa>) -> SliceResponse {
 /// An intra-cluster slice worker (ADR-0071): it applies the coordinator's
 /// erasure predicates post-decode, exactly as `distrib::service` does, before
 /// streaming its runs back. `apply_request_erasure = false` models the
-/// regression the epic guards against (a worker that drops that pass).
+/// regression this suite guards against (a worker that drops that pass).
 struct SliceWorker {
     runs: Vec<FetchedSeriesSoa>,
     apply_request_erasure: bool,
@@ -670,7 +670,7 @@ impl SliceFetcher for SliceWorker {
 /// A remote cluster (ADR-0071 federation): the coordinator sends it no erasure
 /// predicates (they are cluster-local), so a compliant remote enforces its OWN,
 /// resolved from its own snapshot. `enforce = false` models a remote that fails
-/// to, the leak the epic guards against.
+/// to, the leak this suite guards against.
 struct RemoteWorker {
     runs: Vec<FetchedSeriesSoa>,
     own_erasure: Vec<ErasurePredicate>,

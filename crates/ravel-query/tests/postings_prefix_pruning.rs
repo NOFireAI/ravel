@@ -1,4 +1,4 @@
-//! EF-4/#724 (ADR-0061 decision 3): postings pruning extended to
+//! Prefix postings pruning (ADR-0061 decision 3): postings pruning extended to
 //! literal-prefix-anchored `__name__` regex (`^foo.*$`) at query time, via the
 //! catalog's sorted-name range scan.
 //!

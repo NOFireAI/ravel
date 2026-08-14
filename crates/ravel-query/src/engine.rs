@@ -48,13 +48,13 @@ enum EvalWindow {
     },
 }
 
-/// Segment-level counters for one query's snapshot resolution
-/// (docs/metric-index-plan.md P5b). `segments_pruned` counts only
+/// Segment-level counters for one query's snapshot resolution.
+/// `segments_pruned` counts only
 /// snapshot-sourced segments postings-based pruning excluded; it is always
 /// 0 when pruning did not apply -- no shared equality `__name__` filter
 /// across the query's selectors, no usable postings, or a window served
 /// entirely by listing/`min_token` lookup, both structurally unprunable
-/// (docs/metric-index-plan.md P5b, `SnapshotWindow::extract_into`). This is
+/// (`SnapshotWindow::extract_into`). This is
 /// an exact count, never an estimate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryStats {
@@ -63,7 +63,7 @@ pub struct QueryStats {
     /// Snapshot-sourced segments postings pruning excluded.
     pub segments_pruned: u64,
     /// Page-fetch counters summed across every segment this query opened
-    /// (issue #25, X1's `FetchStats`), no longer discarded at the
+    /// (`FetchStats`), no longer discarded at the
     /// `fetch_all_samples_and_histograms` call site (ADR-0044). Distinct
     /// from `accounting.decompressed_bytes`: this counts only
     /// `ValPageKind::RawF64` pages, `accounting` counts every decoded
@@ -77,12 +77,12 @@ pub struct QueryStats {
     pub estimate: CostEstimate,
     /// True when the query's coverage is partial: at least one federated
     /// remote cluster was skipped because it was unavailable and its
-    /// `skip_unavailable` was set (ADR-0071, issue #868). Always false for a
+    /// `skip_unavailable` was set (ADR-0071). Always false for a
     /// fully cluster-local query. Set after construction, in `prefetch`, once
     /// the federation fan-out has run.
     pub partial: bool,
     /// Prometheus-compatible `warnings` accumulated by the federation fan-out:
-    /// one message per skipped remote cluster (ADR-0071, issue #868). Empty for
+    /// one message per skipped remote cluster (ADR-0071). Empty for
     /// a fully cluster-local query, or a federated query with every remote
     /// healthy. Surfaced into the query response's `warnings` array alongside
     /// the evaluator's own [`Annotations`] warnings.
@@ -183,8 +183,8 @@ const STORE_BYTES_SAFETY_FACTOR: u64 = 2;
 /// per-sample scaling alone would be absurd, without ever under-shooting.
 /// This never under-shoots, which is the one hard requirement; it is
 /// deliberately loose for scalar-only segments, which is the still-open gap
-/// recorded on issue #418 (closing it needs a persisted per-kind sample
-/// count, a frozen-format change out of this fix's scope).
+/// (closing it needs a persisted per-kind sample
+/// count, a frozen-format change out of scope here).
 fn segment_decompressed_bytes_upper_bound(seg: &SegmentRef, limits: &ReaderLimits) -> u64 {
     let per_sample_scaled = seg
         .sample_count
@@ -241,12 +241,12 @@ pub struct QueryEngine {
     catalog: Arc<Catalog>,
     fetcher: SegmentFetcher,
     config: EngineConfig,
-    /// ADR-0071 distributed read fan-out (issue #864). `None` is the default:
+    /// ADR-0071 distributed read fan-out. `None` is the default:
     /// the engine runs the local fetch path untouched. `Some` opts this engine
     /// into cost-gated fan-out to slice workers; see
     /// [`QueryEngine::with_distributed`].
     distributed: Option<Arc<crate::distrib::Distributed>>,
-    /// ADR-0071 cross-cluster federation (issue #868). `None` is the default:
+    /// ADR-0071 cross-cluster federation. `None` is the default:
     /// no remote clusters, a fully cluster-local query. `Some` opts this engine
     /// into fanning each query's matchers/window out to the configured remote
     /// clusters and unioning their series into the merge pool; see
@@ -269,7 +269,7 @@ impl QueryEngine {
         }
     }
 
-    /// Opts this engine into ADR-0071 distributed read fan-out (issue #864).
+    /// Opts this engine into ADR-0071 distributed read fan-out.
     /// Mirrors [`Self::with_cache`]: `QueryEngine::new` builds a local-only
     /// engine, and this is the single seam a caller uses to attach a
     /// distributed context after construction. Off by default; with no
@@ -280,7 +280,7 @@ impl QueryEngine {
         self
     }
 
-    /// Opts this engine into ADR-0071 cross-cluster federation (issue #868).
+    /// Opts this engine into ADR-0071 cross-cluster federation.
     /// Mirrors [`Self::with_distributed`]: off by default, and with no
     /// federation context every query runs the cluster-local path untouched.
     /// When set, a query fans its matchers/window out to each configured remote
@@ -322,7 +322,7 @@ impl QueryEngine {
     }
 
     /// Same as [`Self::instant`], additionally returning this query's
-    /// segment counters (docs/metric-index-plan.md P5b). Additive: `instant`
+    /// segment counters. Additive: `instant`
     /// keeps its original signature and behavior unchanged, mirroring the
     /// `Catalog::resolve`/`resolve_pruned` split.
     pub async fn instant_with_stats(
@@ -414,7 +414,7 @@ impl QueryEngine {
     }
 
     /// Same as [`Self::range`], additionally returning this query's segment
-    /// counters (docs/metric-index-plan.md P5b). Additive: `range` keeps its
+    /// counters. Additive: `range` keeps its
     /// original signature and behavior unchanged, mirroring the
     /// `Catalog::resolve`/`resolve_pruned` split.
     #[allow(clippy::too_many_arguments)]
@@ -535,7 +535,7 @@ impl QueryEngine {
     }
 
     /// Same as [`Self::resolve_series`], additionally returning this query's
-    /// segment counters (docs/metric-index-plan.md P5b). Additive:
+    /// segment counters. Additive:
     /// `resolve_series` keeps its original signature and behavior unchanged,
     /// mirroring the `Catalog::resolve`/`resolve_pruned` split.
     pub async fn resolve_series_with_stats(
@@ -580,8 +580,7 @@ impl QueryEngine {
                     self.config.max_s3_requests,
                 )
                 .await?;
-            // Cross-cluster federation for the discovery path (ADR-0071, issue
-            // #891): fan the same matchers and window out to every configured
+            // Cross-cluster federation for the discovery path (ADR-0071): fan the same matchers and window out to every configured
             // remote through the SAME `Federation` coordinator the query path
             // uses, and union the returned series identities into the local
             // pool. Without a federation context this is a cheap empty result,
@@ -637,8 +636,7 @@ impl QueryEngine {
         Ok((series, stats))
     }
 
-    /// Cross-cluster federation fan-out for the discovery path (ADR-0071, issue
-    /// #891): the `/api/v1/series`, `/api/v1/labels`, and
+    /// Cross-cluster federation fan-out for the discovery path (ADR-0071): the `/api/v1/series`, `/api/v1/labels`, and
     /// `/api/v1/label/<name>/values` endpoints. Mirrors [`Self::federate_scalar`]
     /// but returns `(SeriesId, LabelSet)` identity pairs rather than sample runs,
     /// because discovery enumerates series, not samples.
@@ -815,7 +813,7 @@ impl QueryEngine {
                         // native-histogram series; fetch both kinds (a series is
                         // one kind for its whole life, so the two sets never
                         // overlap). The two kinds come off each segment in one
-                        // open+decode pass (#278 item 1), not two independent
+                        // open+decode pass, not two independent
                         // segment opens.
                         // The bytes-scanned budget (ADR-0061 decision 1) is
                         // enforced inside `fetch_all_samples_and_histograms`
@@ -883,7 +881,7 @@ impl QueryEngine {
                 page_stats.raw_f64_bytes += per_plan_stats.raw_f64_bytes;
             }
 
-            // Cross-cluster federation (ADR-0071, issue #868): fan each
+            // Cross-cluster federation (ADR-0071): fan each
             // selector's matchers and window out to every configured remote
             // cluster and append the returned runs to the same pool the local
             // fetch produced, so the k-way merge below unions across cluster
@@ -1059,7 +1057,7 @@ impl QueryEngine {
     // (crates/ravel-catalog/src/catalog.rs), so every caller of
     // `Catalog::resolve*` gets it, including ravel-sql's executor which calls
     // `resolve_pruned_with_accounting` directly and never reaches this wrapper
-    // (ADR-0044 decision 5, issue #642). Instrumenting here too would span a
+    // (ADR-0044 decision 5). Instrumenting here too would span a
     // resolve reached through ravel-query twice.
     async fn resolve_bounded(
         &self,
@@ -1091,10 +1089,10 @@ impl QueryEngine {
     }
 
     /// Fetches every matched series from each snapshot segment in a single
-    /// open+decode pass per segment (#278 item 1), returning the scalar SoA
+    /// open+decode pass per segment, returning the scalar SoA
     /// runs and the native-histogram runs as parallel per-segment vectors
     /// (one entry per segment, same order), plus the per-segment
-    /// `FetchStats` summed across the snapshot (issue #25, X1; no longer
+    /// `FetchStats` summed across the snapshot (no longer
     /// discarded, ADR-0044). Replaces the former separate
     /// `fetch_all_samples_soa` + `fetch_all_histograms` passes, which opened
     /// and catalog-decoded every segment twice.
@@ -1161,7 +1159,7 @@ impl QueryEngine {
                 return Err(err);
             }
         }
-        // Selective-erasure exclusion (ADR-0064 decision 2, EJ-T3): drop
+        // Selective-erasure exclusion (ADR-0064 decision 2): drop
         // erased series/samples from every segment's decoded results, after the
         // fetch and after any cache tier `fetch_soa_and_histograms_accounted`
         // consulted, before these results reach the PromQL evaluator. A no-op
@@ -1178,7 +1176,7 @@ impl QueryEngine {
         Ok((scalar_out, page_stats, histogram_out))
     }
 
-    /// The distribution seam (ADR-0071, issue #864). When this engine has a
+    /// The distribution seam (ADR-0071). When this engine has a
     /// distributed context AND the pre-fetch cost estimate trips the gate, fan
     /// the snapshot out to slice workers; otherwise (the default, or a
     /// below-threshold query, or a worker that signalled a fall-back) run the
@@ -1405,7 +1403,7 @@ impl QueryEngine {
             }
         }
         // Selective-erasure exclusion for the labels/label-values/series
-        // metadata path (ADR-0064 decision 2, EJ-T3): a series erased by a
+        // metadata path (ADR-0064 decision 2): a series erased by a
         // windowless predicate must not appear in label enumeration either. A
         // windowed predicate erases only some samples and leaves the series
         // enumerable (see `erasure::retain_series_entries`). No-op when empty.
@@ -1420,10 +1418,10 @@ impl QueryEngine {
 }
 
 /// The pending selective-erasure predicates attached to a resolved snapshot
-/// (ADR-0064 decision 2, EJ-T3, issue #753). The scan layer excludes every
+/// (ADR-0064 decision 2). The scan layer excludes every
 /// series/sample matching any of these after fetch and after cache.
 ///
-/// EJ-T2 (#752) is the resolver task that lists `t/<th>/<sig>/del/` per resolve
+/// The resolver task lists `t/<th>/<sig>/del/` per resolve
 /// and attaches the decoded pending requests to [`Snapshot::pending_erasure`],
 /// already scoped to this resolve's (tenant, signal). This is the single
 /// connection point between that attachment and the filter machinery: each
@@ -1438,7 +1436,7 @@ impl QueryEngine {
 /// the common case and makes every call site below a no-op.
 ///
 /// Delegates to [`crate::erasure::snapshot_pending_erasure_predicates`], the
-/// shared conversion `ravel-sql`'s SQL scan surfaces also call (issue #829),
+/// shared conversion `ravel-sql`'s SQL scan surfaces also call,
 /// so the engine and every SQL table derive predicates from one mapping. Stays
 /// `pub` because the cross-cluster federation resolve path
 /// (`services/ravel-server/src/distrib.rs`) re-exports and calls it.
@@ -1447,7 +1445,7 @@ pub fn snapshot_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePredicate>
 }
 
 /// Builds a `series_id -> labels` map incrementally, rejecting the moment a
-/// new id would push it past `max_series` (issue #470, ADR-0051 S7 / S4-07)
+/// new id would push it past `max_series` (ADR-0051 S7 / S4-07)
 /// instead of finishing the build and checking the total afterward. Peak map
 /// size is therefore bounded by `max_series`, so the cap protects the memory
 /// the construction itself consumes, not just the size of the result it
@@ -1528,7 +1526,7 @@ pub(crate) fn bytes_scanned_exceeded(
 }
 
 /// Collapses the two ways a deadline can surface into the one
-/// `QueryError::DeadlineExceeded` callers already match on (issue #193).
+/// `QueryError::DeadlineExceeded` callers already match on.
 ///
 /// Before the evaluator itself checked a deadline, the only source of
 /// `DeadlineExceeded` was `tokio::time::timeout` elapsing (`Err(_)` here,
@@ -1615,13 +1613,13 @@ fn selector_fetch_window(
 }
 
 /// Leading sentinel marking a `name_filter` as a literal-prefix range key
-/// rather than an exact `__name__` value (ADR-0061 decision 3, EF-4/#724).
+/// rather than an exact `__name__` value (ADR-0061 decision 3).
 ///
 /// This MUST equal `ravel_catalog`'s
 /// `snapshot_resolve::PREFIX_FILTER_SENTINEL`, the byte the catalog strips to
 /// decide the prefix-vs-exact postings lookup. The value is duplicated inline
 /// here (matching this codebase's language-specific-enforcement precedent for
-/// name filters, #278) rather than shared across the crate boundary; the
+/// name filters) rather than shared across the crate boundary; the
 /// catalog pins the value with a test and the postings-pruning oracles in this
 /// file round-trip it end to end, so a silent drift cannot pass.
 const PREFIX_FILTER_SENTINEL: char = '\u{1}';
@@ -1689,8 +1687,7 @@ fn name_pruning_key(m: &LabelMatcher) -> Option<Cow<'_, str>> {
 }
 
 /// The postings pruning key a single `__name__` matcher pins, or `None` if
-/// postings pruning must bypass entirely (docs/metric-index-plan.md P5b,
-/// ADR-0061 decision 3): no `__name__` matcher at all, more than one
+/// postings pruning must bypass entirely (ADR-0061 decision 3): no `__name__` matcher at all, more than one
 /// `__name__` matcher on the same selector, or a lone `__name__` matcher whose
 /// shape is neither an exact `=` nor a literal-prefix-anchored regex (`^foo.*$`)
 /// all take the conservative bypass path. The returned key is an exact value
@@ -1712,7 +1709,7 @@ fn equality_name_filter(matchers: &[LabelMatcher]) -> Option<Cow<'_, str>> {
 }
 
 /// The `__name__` pruning key shared by every selector in a multi-selector
-/// query (docs/metric-index-plan.md P5b, ADR-0061 decision 3). `prefetch`
+/// query (ADR-0061 decision 3). `prefetch`
 /// resolves one snapshot shared across all of a query's selectors (e.g.
 /// `foo + bar`), so pruning only applies when every selector agrees on the
 /// same key; otherwise a filter narrower than some other selector's own
@@ -1986,7 +1983,7 @@ struct Candidate {
 /// in-page index)`, greatest wins; ties broken by raw value bit pattern for
 /// full determinism.
 ///
-/// Cross-cluster limitation (ADR-0071, issue #891): when this merge pool is fed
+/// Cross-cluster limitation (ADR-0071): when this merge pool is fed
 /// by cross-cluster federation (`federate_scalar`), the provenance tuple is
 /// cluster-LOCAL state with no cross-cluster meaning -- two clusters mint
 /// `writer_epoch`/`writer_seq` independently. This order is therefore defined
@@ -2045,8 +2042,8 @@ impl YieldBudget {
 /// max-samples budget is enforced by counting yielded samples
 /// ([`YieldBudget`]); duplicate timestamps resolve under the full total
 /// order in [`is_greater`]. `max_series` is enforced incrementally, the
-/// moment a new series id would push the map past the cap (issue #470,
-/// ADR-0051 S7 / S4-07), so peak map size is bounded by the cap rather than
+/// moment a new series id would push the map past the cap
+/// (ADR-0051 S7 / S4-07), so peak map size is bounded by the cap rather than
 /// by however many distinct series the fetch actually returned.
 // `pub(crate)` (not private) so the ADR-0071 distributed acceptance test
 // (`distrib::tests`) merges a distributed fetch with the exact same total-order
@@ -2163,10 +2160,10 @@ fn merge_series_runs(
     Ok(())
 }
 
-// --- Native-histogram dedup total order (docs/rseg-v3-plan.md section 7) ---
+// --- Native-histogram dedup total order ---
 //
 // Generalizes `is_greater`/`merge_series_runs` to histogram structural
-// comparison by bit pattern. Wired into the live query path (#218):
+// comparison by bit pattern. Wired into the live query path:
 // `merge_histogram_soa_runs` groups the per-segment histogram runs
 // `SegmentFetcher::fetch_histograms` decodes and drains them through
 // `merge_histogram_series_runs` below, and `MergedSource::query_histograms`
@@ -2355,7 +2352,7 @@ fn merge_histogram_series_runs(
 }
 
 /// Converts one storage-model [`ravel_segment::HistogramValue`] to the
-/// evaluator's float working model [`FloatHistogram`] (#218). Integer counts
+/// evaluator's float working model [`FloatHistogram`]. Integer counts
 /// are widened to `f64` exactly as Prometheus converts an integer histogram to
 /// its `FloatHistogram` before evaluation (`ravel_promql::source::HistogramSample`
 /// doc); span layouts and float fields carry over verbatim. A sample with no
@@ -2423,7 +2420,7 @@ fn reset_hint_to_float(hint: ravel_segment::ResetHint) -> ravel_promql::ResetHin
     }
 }
 
-/// Histogram counterpart to [`merge_soa_runs`] (#218): groups the per-segment
+/// Histogram counterpart to [`merge_soa_runs`]: groups the per-segment
 /// histogram runs by series id, lazily k-way merges each series' runs through
 /// [`merge_histogram_series_runs`] (same ascending-ts, per-timestamp-dedup,
 /// full-total-order winner selection as the scalar merge), then converts each
@@ -2507,7 +2504,7 @@ impl SeriesSource for MergedSource {
             .collect())
     }
 
-    /// Native-histogram counterpart to [`query`](Self::query) (#218): the same
+    /// Native-histogram counterpart to [`query`](Self::query): the same
     /// matcher-filter-then-window-clip over the already-merged histogram
     /// series. A series is scalar or histogram in storage, never both, so this
     /// and `query` partition the merged source with no overlap.
@@ -2752,7 +2749,7 @@ mod merge_tests {
         }
     }
 
-    // The bytes-scanned budget (ADR-0061 decision 1, issue #721) is no longer
+    // The bytes-scanned budget (ADR-0061 decision 1) is no longer
     // enforced inside `merge_soa_runs`; it moved into the two fetch fan-outs so
     // it can cancel a query mid-scan rather than after every byte is already
     // fetched. The end-to-end proof (real cancellation, GET-count short-circuit,
@@ -2788,7 +2785,7 @@ mod merge_tests {
         assert!(out[0].samples.is_empty());
     }
 
-    // --- Randomized independent-oracle coverage (issue #56, a6-F01) ---
+    // --- Randomized independent-oracle coverage ---
     //
     // The dedup total order (ADR-0010 §5; docs/catalog-and-mvcc.md
     // "Cross-segment duplicate samples") is the crown-jewel invariant: a
@@ -3040,7 +3037,7 @@ mod merge_tests {
     }
 }
 
-/// Covers `build_series_by_id` directly (issue #470, ADR-0051 S7 / S4-07):
+/// Covers `build_series_by_id` directly (ADR-0051 S7 / S4-07):
 /// the `/series`, `/labels`, and `/label/{name}/values` endpoints' map
 /// construction, distinct from the PromQL evaluation path's own series maps
 /// exercised in `merge_tests`/`histogram_merge_tests`.
@@ -3098,7 +3095,7 @@ mod tests {
     }
 
     /// A snapshot with no `pending_erasure` yields no predicates, so the scan
-    /// filter stays a no-op (the pre-EJ-T2 baseline behavior).
+    /// filter stays a no-op (the baseline behavior).
     #[test]
     fn snapshot_erasure_predicates_empty_when_no_pending() {
         let snapshot = Snapshot::default();
@@ -3111,7 +3108,7 @@ mod tests {
     /// matchers and window bounds are carried through, and the resulting
     /// predicate excludes a matching series from a decoded SoA result via the
     /// same `retain_series_soa` pass the fetch call sites run. This proves the
-    /// EJ-T2 to EJ-T3 wire-up is live end to end, not merely compiling.
+    /// resolver-to-scan wire-up is live end to end, not merely compiling.
     #[test]
     fn snapshot_erasure_predicates_excludes_matching_series() {
         use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
@@ -3218,7 +3215,7 @@ mod tests {
     }
 
     // The bytes-scanned budget no longer lives in `build_series_by_id`
-    // (ADR-0061 amendment, issue #721): it moved into `fetch_all_series`, so a
+    // (ADR-0061 amendment): it moved into `fetch_all_series`, so a
     // labels/series query that matches zero series still evaluates the budget
     // against every segment fetched. That end-to-end behavior, which a
     // `build_series_by_id` unit test could not reach, is proven in
@@ -3226,7 +3223,7 @@ mod tests {
 }
 
 /// Histogram counterpart to `merge_tests`: exercises `merge_histogram_series_runs`
-/// / `histogram_is_greater` (docs/rseg-v3-plan.md section 7) with the same
+/// / `histogram_is_greater` with the same
 /// hand-picked-cases-plus-independent-oracle-proptest structure, substituting
 /// directly-constructed `HistogramValue`s for plain `f64`s.
 #[cfg(test)]
@@ -3467,7 +3464,7 @@ mod histogram_merge_tests {
 }
 
 /// Exercises `merge_histogram_soa_runs` + `MergedSource::query_histograms`
-/// (#218): the fetch-side merge-and-convert path that feeds the evaluator's
+///: the fetch-side merge-and-convert path that feeds the evaluator's
 /// native-histogram source, the histogram counterpart of the scalar
 /// `prefetch`/`MergedSource::query` path. Builds `FetchedHistogramSeries` by
 /// hand (as `merge_tests` builds `FetchedSeriesSoa`), so it is independent of
@@ -3650,7 +3647,7 @@ mod prefetch_tests {
     const BASE_NS: i64 = 1_700_000_000_000_000_000;
     // Single source of truth for the lookback delta lives in ravel-promql
     // (the evaluator owns the semantic). A hand-built plan reuses it so the
-    // test window can never drift from what the evaluator selects (a6-F02).
+    // test window can never drift from what the evaluator selects.
     const DEFAULT_LOOKBACK_NS: i64 = ravel_promql::DEFAULT_LOOKBACK_NS;
 
     fn labels(metric: &str) -> LabelSet {
@@ -4002,7 +3999,7 @@ mod prefetch_tests {
         assert_eq!(only_a[0].labels, labels("metric_a"));
     }
 
-    /// Issue #801: the combine stage's output order must not depend on
+    /// The combine stage's output order must not depend on
     /// `HashMap` `RandomState` iteration order or on which selector's fetch
     /// future happened to finish first (`buffer_unordered`). 40 distinct
     /// series makes an accidental match between two independently-seeded
@@ -4092,7 +4089,7 @@ mod prefetch_tests {
         );
     }
 
-    /// a6-F02: the pre-fetch padding (`padded_range`) and the evaluator's
+    /// The pre-fetch padding (`padded_range`) and the evaluator's
     /// lookback window must be one and the same value. Both now derive from
     /// the single `ravel_promql::DEFAULT_LOOKBACK_NS` constant; this pins the
     /// link so a future change to that constant moves the engine's fetch
@@ -4306,7 +4303,7 @@ mod prefetch_tests {
         assert_estimate_covers_actual("wide window multi-shard query", &stats);
     }
 
-    /// Issue #825: two plans that share the same matcher set (`up + up
+    /// Two plans that share the same matcher set (`up + up
     /// offset 5m` is exactly this shape -- one selector, two `SelectorPlan`s
     /// that differ only in `offset_ns`) fetch byte-identical results off the
     /// shared snapshot: `fetch_all_samples_and_histograms`'s own doc comment
@@ -4369,7 +4366,7 @@ mod prefetch_tests {
         );
     }
 
-    /// Issue #825 part 2: the ADR-0061 bytes-scanned budget
+    /// The ADR-0061 bytes-scanned budget
     /// (`bytes_scanned_exceeded`) is checked against the same shared
     /// `QueryAccounting` handle every plan's fetch charges into
     /// (`fetch_all_samples_and_histograms`). Before the fix, a second plan

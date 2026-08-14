@@ -73,7 +73,7 @@ pub const DEFAULT_SUFFIX_LEN: u64 = 64 * 1024;
 /// coalesced into a single GET.
 pub const DEFAULT_COALESCE_GAP: u64 = 64 * 1024;
 /// Default size at or below which the first GET fetches the whole object in
-/// one request instead of a footer suffix (#278 item 5). The commit record
+/// one request instead of a footer suffix. The commit record
 /// carries the exact object size, so a small object is read whole up front:
 /// its footer, catalog sections, and page bytes then all resolve from that
 /// one buffer with no second probe. Above the threshold the footer-suffix
@@ -83,14 +83,14 @@ pub const DEFAULT_COALESCE_GAP: u64 = 64 * 1024;
 /// a large compacted part just to reach its footer.
 pub const DEFAULT_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 /// Default bound on the number of byte-range GETs a single segment fetch
-/// keeps in flight at once (#278 item 2). The fetcher clones share one
+/// keeps in flight at once. The fetcher clones share one
 /// semaphore, so this also bounds the total in-flight GETs across every
 /// concurrent segment fetch in a query, not just within one segment.
 pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
 
 /// Object-size floor for taking the sparse catalog-probe path in
-/// [`SegmentFetcher::decode_selected`] instead of the whole-object fallback
-/// (issue #276). A sparse (>=4096-series) v5 object lays its catalog sections
+/// [`SegmentFetcher::decode_selected`] instead of the whole-object fallback.
+/// A sparse (>=4096-series) v5 object lays its catalog sections
 /// (LABEL_DICT, SERIES_IDS, SERIES_META_CHUNKS, SERIES_IDX) contiguously at the
 /// front, ahead of the TS/VAL/HIST page sections. Fetching only that catalog
 /// prefix -- one contiguous range GET -- skips the page bytes a whole-object
@@ -100,11 +100,11 @@ pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
 /// The crossover this constant guards is a round-trip-vs-bytes tradeoff, not a
 /// pure win: below the floor the whole object is small enough that a single GET
 /// beats one catalog GET plus the extra selective page-range GETs (each a fresh
-/// round trip: ~15-80 ms on S3, ~1-5 ms on loopback MinIO per the epic #264
-/// Wave 1 panel, BENCHMARKS.md 2026-07-31). Wave 1 measured per-request latency
-/// but did NOT meter this specific within-segment crossover, so this floor is
-/// set conservatively rather than fit to a measured point (see the #276 report
-/// and docs/query-engine.md). 256 KiB is above the four fixed 64 KiB suffix/gap
+/// round trip: ~15-80 ms on S3, ~1-5 ms on loopback MinIO). Those
+/// measurements are per-request latency and do NOT meter this specific
+/// within-segment crossover, so this floor is
+/// set conservatively rather than fit to a measured point (see
+/// docs/query-engine.md). 256 KiB is above the four fixed 64 KiB suffix/gap
 /// probes yet far below any real compacted sparse L1 part, so production sparse
 /// objects take the probe path while a degenerate tiny sparse object keeps the
 /// cheaper single GET.
@@ -170,9 +170,9 @@ pub struct FetchedSeries {
     pub writer_seq: u64,
 }
 
-/// SoA counterpart to `FetchedSeries` (docs/arrow-datafusion-plan.md ticket
-/// A1a): timestamps and values as separate vecs, ready for zero-copy Arrow
-/// buffer adoption in `ravel-sql` (Phase B). Same provenance fields, same
+/// SoA counterpart to `FetchedSeries`: timestamps and values as separate
+/// vecs, ready for zero-copy Arrow
+/// buffer adoption in `ravel-sql`. Same provenance fields, same
 /// per-segment on-disk order and in-page-index tiebreak (index into
 /// `timestamps`/`values`) as `FetchedSeries`.
 #[derive(Debug, Clone)]
@@ -186,7 +186,7 @@ pub struct FetchedSeriesSoa {
     pub writer_seq: u64,
 }
 
-/// Histogram counterpart to `FetchedSeriesSoa` (#218): the decoded
+/// Histogram counterpart to `FetchedSeriesSoa`: the decoded
 /// native-histogram samples of one matched histogram-kind series, as parallel
 /// timestamp/value vecs, with the same provenance fields and per-segment
 /// on-disk order (index into `timestamps`/`values` is the in-page-index
@@ -204,8 +204,8 @@ pub struct FetchedHistogramSeries {
     pub writer_seq: u64,
 }
 
-/// Page-kind counters accumulated over one `fetch_soa` call, for issue #25
-/// (X1) to consume later. Currently tracks VAL_RAW_F64 pages only.
+/// Page-kind counters accumulated over one `fetch_soa` call, for downstream
+/// consumers to read. Currently tracks VAL_RAW_F64 pages only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FetchStats {
     pub raw_f64_pages: u64,
@@ -248,7 +248,7 @@ impl FetchedRegions {
                 let start_rel = usize::try_from(offset - s).ok()?;
                 let end_rel = usize::try_from(end - s).ok()?;
                 // Refcounted slice of the already-fetched buffer, not a
-                // copy (docs/arrow-datafusion-plan.md hop 6, review F1):
+                // copy:
                 // `b` is `Bytes`, so `slice` shares the backing allocation.
                 // `end_rel <= b.len()` holds by the range check above.
                 Some(b.slice(start_rel..end_rel))
@@ -298,13 +298,13 @@ pub struct SegmentFetcher {
     suffix_len: u64,
     coalesce_gap: u64,
     /// Object size at or below which the first GET reads the whole object
-    /// instead of a footer suffix (#278 item 5).
+    /// instead of a footer suffix.
     whole_object_threshold: u64,
     limits: ReaderLimits,
     /// Bounds the byte-range GETs kept in flight. Shared across `clone`s (it
     /// is an `Arc`), so every concurrent segment fetch in one query draws
     /// from the same permit pool rather than each opening its own unbounded
-    /// fan-out (#278 item 2). It is only ever held around a single leaf
+    /// fan-out. It is only ever held around a single leaf
     /// `store.get`, never across a scope that acquires another permit, so no
     /// fetch can deadlock waiting on permits it already holds.
     get_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
@@ -353,7 +353,7 @@ impl SegmentFetcher {
         self
     }
 
-    /// Sets the whole-object fetch threshold (#278 item 5). An object whose
+    /// Sets the whole-object fetch threshold. An object whose
     /// commit-record size is at or below `n` is read whole on its first GET;
     /// a larger one keeps the footer-suffix path. `0` disables the
     /// whole-object path entirely (every object takes the suffix path),
@@ -365,7 +365,7 @@ impl SegmentFetcher {
         self
     }
 
-    /// Sets the in-flight byte-range GET bound (#278 item 2). Shared across
+    /// Sets the in-flight byte-range GET bound. Shared across
     /// this fetcher's clones.
     #[must_use]
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
@@ -373,8 +373,8 @@ impl SegmentFetcher {
         self
     }
 
-    /// One store GET, bounded by the shared in-flight semaphore (#278 item
-    /// 2). The permit is released the moment the GET resolves; callers must
+    /// One store GET, bounded by the shared in-flight semaphore. The permit
+    /// is released the moment the GET resolves; callers must
     /// never hold the returned future's permit across another
     /// `guarded_get`/`ensure_ranges` call, or a query whose in-flight GETs
     /// already fill the pool could wait on itself.
@@ -621,7 +621,7 @@ impl SegmentFetcher {
             return Ok(GetCost::default());
         }
         // Fetch the coalesced ranges concurrently rather than one await at a
-        // time (#278 item 2): a multi-page selection over a large segment
+        // time: a multi-page selection over a large segment
         // used to pay one round trip per coalesced range in series. The
         // shared semaphore inside `guarded_get` bounds the actual in-flight
         // GETs; `join_all` preserves input order, so the resulting
@@ -661,8 +661,8 @@ impl SegmentFetcher {
     /// `open_from_suffix` has already rejected anything else and there is no
     /// per-version dispatch left for callers to do.
     ///
-    /// Identity verification is level-aware
-    /// (docs/compaction-retention-plan.md §3.5). An L0 ref verifies the
+    /// Identity verification is level-aware.
+    /// An L0 ref verifies the
     /// footer's writer identity against the commit record (ADR-0010 §7). An
     /// L1 part ref has no writer identity of its own, so the footer's
     /// tenant/shard/ingest_hour/input_set_hash/part_index (and `level == 1`)
@@ -697,7 +697,7 @@ impl SegmentFetcher {
             let mut span_requests: u64 = 0;
             let mut span_bytes: u64 = 0;
             let key = &seg_ref.data_object_key;
-            // Size-aware first GET (#278 item 5): the commit record already
+            // Size-aware first GET: the commit record already
             // carries the exact object size, so a small object is read whole in
             // one request (its footer, catalog, and pages then all come from that
             // buffer, never a second probe), while a large one keeps the
@@ -785,7 +785,7 @@ impl SegmentFetcher {
     ///   bytes it will not return.
     /// - **At or above the threshold** (SERIES_META absent) the catalog is the
     ///   chunked SERIES_META_CHUNKS plus the SERIES_IDX directory. When the
-    ///   object qualifies for the sparse catalog-probe path (issue #276), fetch
+    ///   object qualifies for the sparse catalog-probe path, fetch
     ///   just its four catalog sections (LABEL_DICT, SERIES_IDS, SERIES_IDX, and
     ///   SERIES_META_CHUNKS, contiguous at the object front) and decode via
     ///   [`decode_catalog_v5_chunked`], skipping the TS/VAL/HIST page bytes the
@@ -1052,7 +1052,7 @@ impl SegmentFetcher {
     }
 
     /// Histogram counterpart to [`fetch_scalar_pages`](Self::fetch_scalar_pages)
-    /// (#218): coalesced TS/HIST page ranges for the histogram runs of
+    ///: coalesced TS/HIST page ranges for the histogram runs of
     /// `histogram`, fetched into `regions`. `plan_ranges_v4` fills each
     /// histogram run's `hist_range` (and leaves `val_range` a `(0, 0)`
     /// sentinel), so this fetches the TS and HIST byte ranges the histogram
@@ -1158,7 +1158,7 @@ impl SegmentFetcher {
         Ok((kind, decompressed))
     }
 
-    /// Histogram counterpart to [`decode_run`](Self::decode_run) (#218):
+    /// Histogram counterpart to [`decode_run`](Self::decode_run):
     /// decodes one histogram run's TS/HIST pages into `timestamps`/`values`
     /// (appending). `decode_run_histogram_pages` yields combined
     /// [`ravel_segment::HistogramSample`]s (ts + value), which this splits into
@@ -1196,7 +1196,7 @@ impl SegmentFetcher {
 
     /// Core of `fetch`/`fetch_soa`: decodes every matched scalar series into
     /// one [`RunDecode`] per emitted unit, with resolved provenance keyed on
-    /// the segment level (docs/compaction-retention-plan.md §3.5):
+    /// the segment level:
     ///
     /// - **L0**: one unit per series, all runs concatenated in on-disk order,
     ///   stamped with the segment's commit-record provenance
@@ -1211,7 +1211,7 @@ impl SegmentFetcher {
     ///
     /// Histogram-valued series are skipped here: a scalar SoA cannot hold
     /// them. They are fetched by the mirror-image
-    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) instead (#218).
+    /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) instead.
     async fn fetch_runs(
         &self,
         tenant_hash: TenantHash,
@@ -1269,7 +1269,7 @@ impl SegmentFetcher {
     /// for the per-level emission contract). Split out so the scalar-only
     /// [`fetch_runs`](Self::fetch_runs) and the combined
     /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) share
-    /// one decode body rather than drifting apart (#278 item 1).
+    /// one decode body rather than drifting apart.
     #[allow(clippy::too_many_arguments)]
     fn build_scalar_decodes(
         &self,
@@ -1306,7 +1306,7 @@ impl SegmentFetcher {
                 SegmentLevel::L0 => {
                     // One unit per series: concatenate every run's samples in
                     // on-disk order, segment-level provenance. `decode_run`
-                    // appends (its page decoders append, #283), so the shared
+                    // appends (its page decoders append), so the shared
                     // `timestamps`/`values` accumulate across runs rather than
                     // each run clobbering the last. An L0 flush frames exactly
                     // one run per series today, so this is normally a single
@@ -1390,7 +1390,7 @@ impl SegmentFetcher {
         Ok((out, stats))
     }
 
-    /// Histogram counterpart to [`fetch_runs`](Self::fetch_runs) (#218):
+    /// Histogram counterpart to [`fetch_runs`](Self::fetch_runs):
     /// decodes every matched histogram-kind series into one
     /// [`RunHistogramDecode`] per emitted unit, with the same per-level
     /// provenance resolution as the scalar path (L0: one unit per series, runs
@@ -1445,8 +1445,7 @@ impl SegmentFetcher {
     /// already-fetched histogram page bytes of `histogram` into one
     /// [`RunHistogramDecode`] per emitted unit. Shared by the histogram-only
     /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) and the combined
-    /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms) (#278
-    /// item 1).
+    /// [`fetch_runs_and_histograms`](Self::fetch_runs_and_histograms).
     fn build_histogram_decodes(
         &self,
         key: &str,
@@ -1547,7 +1546,7 @@ impl SegmentFetcher {
     }
 
     /// Opens the segment once and decodes both its matched scalar and matched
-    /// histogram series in a single pass (#278 item 1). The scalar-only
+    /// histogram series in a single pass. The scalar-only
     /// [`fetch_runs`](Self::fetch_runs) and histogram-only
     /// [`fetch_histogram_runs`](Self::fetch_histogram_runs) each re-run
     /// `open_segment` (a footer GET) and `decode_selected` (catalog decode)
@@ -1721,8 +1720,7 @@ impl SegmentFetcher {
         Ok(runs.into_iter().map(RunDecode::into_aos).collect())
     }
 
-    /// SoA counterpart to `fetch` (docs/arrow-datafusion-plan.md ticket
-    /// A1a): decodes the same selected scalar series but returns timestamps
+    /// SoA counterpart to `fetch`: decodes the same selected scalar series but returns timestamps
     /// and values as separate vecs per emitted unit, plus page-kind stats.
     /// Same per-level emission shape and provenance as `fetch`
     /// (see [`fetch_runs`](Self::fetch_runs)). Reuses one decompression
@@ -1753,7 +1751,7 @@ impl SegmentFetcher {
         Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
     }
 
-    /// Histogram counterpart to [`fetch_soa`](Self::fetch_soa) (#218): fetches
+    /// Histogram counterpart to [`fetch_soa`](Self::fetch_soa): fetches
     /// and decodes the native-histogram samples of every histogram-kind series
     /// in this segment matching `matchers`, as SoA
     /// [`FetchedHistogramSeries`]. Scalar-kind series carry no histogram
@@ -1791,7 +1789,7 @@ impl SegmentFetcher {
 
     /// Single-open counterpart to calling [`fetch_soa`](Self::fetch_soa) and
     /// [`fetch_histograms`](Self::fetch_histograms) back to back on the same
-    /// segment (#278 item 1): opens the segment once, decodes its catalog
+    /// segment: opens the segment once, decodes its catalog
     /// once, and returns both the scalar SoA series (with page-kind stats) and
     /// the native-histogram series. The scalar and histogram results are
     /// identical to the two separate calls; only the segment open and catalog
@@ -1894,7 +1892,7 @@ impl RunDecode {
     }
 }
 
-/// Histogram counterpart to [`RunDecode`] (#218): one decoded,
+/// Histogram counterpart to [`RunDecode`]: one decoded,
 /// provenance-resolved histogram emission unit. For L0 this is one series
 /// (runs concatenated); for L1 this is one (series, run).
 struct RunHistogramDecode {
@@ -1922,9 +1920,9 @@ impl RunHistogramDecode {
 }
 
 /// Verify an L1 part's v5 footer against the compaction record's identity
-/// fields the [`SegmentRef`] carries (docs/compaction-retention-plan.md
-/// §3.5: readers verify tenant/shard/ingest_hour/input_set_hash/part_index
-/// against the record, the L1 analog of ADR-0010 §7). A part has no writer
+/// fields the [`SegmentRef`] carries (readers verify
+/// tenant/shard/ingest_hour/input_set_hash/part_index against the record,
+/// the L1 analog of ADR-0010 §7). A part has no writer
 /// identity, so these five fields plus `level == 1` are the identity.
 /// ADR-0027 leaves v5 the only version, so there is no format-version field
 /// to check here beyond what `open_from_suffix` already enforced.
@@ -2513,7 +2511,7 @@ mod tests {
         (SegmentFetcher::new(backend), metrics)
     }
 
-    /// #276: a matcher-pruned read of a sparse (>= 4096-series) v5 segment now
+    /// A matcher-pruned read of a sparse (>= 4096-series) v5 segment
     /// fetches only the catalog sections (LABEL_DICT + SERIES_IDS + SERIES_IDX +
     /// SERIES_META_CHUNKS) plus the matched series' pages, instead of a
     /// whole-object GET. The probe read moves far fewer bytes than the object
@@ -2530,14 +2528,14 @@ mod tests {
         // Matcher pins one metric, so only its series' pages should be fetched.
         let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
         let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
-        // #278 item 5 reads an object whole on its first GET when its size is at
+        // The whole-object path reads an object whole on its first GET when its size is at
         // or below `whole_object_threshold` (default 512 KiB); this test's
         // sparse object is smaller than that, so without disabling it here the
         // first GET alone would already cover the whole object and the
         // catalog-probe path below would correctly find nothing left to fetch
-        // -- exercising #278's optimization instead of the one this test is
+        // -- exercising the whole-object optimization instead of the one this test is
         // for. Disable it so the first GET stays a footer suffix and this test
-        // isolates the #276 catalog-probe path on its own.
+        // isolates the catalog-probe path on its own.
         let fetcher = fetcher.with_whole_object_threshold(0);
         let (soa, _stats) = fetcher
             .fetch_soa(tenant_hash, &seg_ref, &matchers)
@@ -2566,7 +2564,7 @@ mod tests {
         );
     }
 
-    /// #276: an object that does not qualify for the probe path keeps the
+    /// An object that does not qualify for the probe path keeps the
     /// unchanged whole-object fallback. An empty matcher matches every series,
     /// so the fetcher takes the whole-object GET (one GET covering the object)
     /// rather than the catalog-probe path. Proven by the metered GET bytes
@@ -2595,7 +2593,7 @@ mod tests {
         );
     }
 
-    // --- coalesce_ranges / FetchedRegions unit coverage (a5-F01).
+    // --- coalesce_ranges / FetchedRegions unit coverage.
     // docs/query-engine.md "coalesce adjacent byte ranges": merge within the
     // gap, split beyond it, never join unrelated regions, never overflow. The
     // fetcher's whole multi-GET plan reduces to these two helpers, so they are
@@ -2689,7 +2687,7 @@ mod tests {
         ))
     }
 
-    /// #278 item 1: opening a segment once with `fetch_soa_and_histograms`
+    /// Opening a segment once with `fetch_soa_and_histograms`
     /// returns byte-for-byte the same scalar and histogram series the two
     /// separate `fetch_soa` + `fetch_histograms` passes did, while issuing
     /// strictly fewer GETs (one segment open instead of two).
@@ -2757,7 +2755,7 @@ mod tests {
         );
     }
 
-    /// #278 item 5: below the whole-object threshold the first GET reads the
+    /// Below the whole-object threshold the first GET reads the
     /// entire object (one request, no footer probe) regardless of `suffix_len`;
     /// above it the footer-suffix path runs and a tiny suffix forces the
     /// `NeedRange` chase into more than one GET. Both decode identical data.
@@ -2820,8 +2818,7 @@ mod tests {
     #[test]
     fn fetched_regions_does_not_cover_a_range_straddling_two_buffers() {
         // A sub-range that spans a buffer boundary is reported uncovered, so
-        // the fetcher refetches it rather than stitching bytes from two GETs
-        // (docs/reviews .../a5-fetch-object-store.md §5 "duplicate fetches").
+        // the fetcher refetches it rather than stitching bytes from two GETs.
         let mut regions = FetchedRegions::default();
         regions.insert(0, Bytes::from(vec![0u8; 10]));
         regions.insert(10, Bytes::from(vec![1u8; 10]));

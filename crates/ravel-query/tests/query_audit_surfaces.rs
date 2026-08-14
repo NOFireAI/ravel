@@ -1,6 +1,6 @@
 //! Every Prometheus-shaped query surface submits exactly one evidential audit
 //! event through the [`QueryAuditSink`] seam and awaits its durability before
-//! releasing the response (ADR-0062 §2a, epic EL / issue #762).
+//! releasing the response (ADR-0062 §2a).
 //!
 //! These drive real requests through `ravel_query::http::router` with an
 //! injected recording sink over an empty store: a query over no data still

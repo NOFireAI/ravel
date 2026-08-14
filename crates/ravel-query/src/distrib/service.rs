@@ -1,5 +1,5 @@
 //! The ADR-0071 slice worker service and the remote client that drives it
-//! (issue #864).
+//!.
 //!
 //! A coordinator dispatches one [`pb::FetchRequest`] per slice; the worker
 //! ([`SeriesFetchService`]) executes the existing local fetch path over only
@@ -11,7 +11,7 @@
 //! # Scalar-only, for now
 //!
 //! Distribution carries scalar series only. The histogram span payload grammar
-//! is a later ticket (`proto/ravel/queryfrag.proto`'s `HistogramRun`), so a
+//! is future work (`proto/ravel/queryfrag.proto`'s `HistogramRun`), so a
 //! slice whose segments decode any native-histogram series returns
 //! [`pb::status::Code::Unsupported`]; the coordinator then silently falls back
 //! to fully local execution for the whole query (ADR-0071 failure semantics),
@@ -22,7 +22,7 @@
 //! A worker receives durable [`pb::SegmentIdentity`] values, not object keys or
 //! trusted bytes (ADR-0071 reconstruct-don't-trust). Turning an identity back
 //! into the [`SegmentRef`] to fetch needs the `ravel-commit` key
-//! reconstruction that ticket #865 owns. Until that lands, a [`SegmentResolver`]
+//! reconstruction that is not yet implemented. Until that lands, a [`SegmentResolver`]
 //! maps an identity to a ref by its content hash; [`SnapshotSegmentResolver`]
 //! is the interim implementation, resolving against the same pinned snapshot
 //! the coordinator dispatched from.
@@ -44,7 +44,7 @@ use crate::engine::bytes_scanned_exceeded;
 use crate::fetcher::{FetchError, FetchStats, SegmentFetcher};
 
 /// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
-/// worker fetches. The production resolver (ticket #865) reconstructs the
+/// worker fetches. The production resolver reconstructs the
 /// object key from the identity and verifies the footer; see the module docs
 /// for why an interim content-hash resolver stands in for now.
 pub trait SegmentResolver: Send + Sync {
@@ -56,7 +56,7 @@ pub trait SegmentResolver: Send + Sync {
 
 /// Interim [`SegmentResolver`] that resolves identities by content hash against
 /// a fixed set of known segments (the pinned snapshot the coordinator
-/// dispatched from). Stands in for the #865 reconstruct-from-identity path.
+/// dispatched from). Stands in for the reconstruct-from-identity path.
 pub struct SnapshotSegmentResolver {
     by_content_hash: HashMap<[u8; 32], SegmentRef>,
 }
@@ -156,7 +156,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
 
         let identities = match request.scope {
             Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments,
-            // Cross-cluster resolve scope is a later ticket; fall back to local.
+            // Cross-cluster resolve scope is future work; fall back to local.
             Some(pb::fetch_request::Scope::Resolve(_)) | None => {
                 return Err((
                     pb::status::Code::Unsupported,
@@ -280,7 +280,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
 }
 
 /// The stream type the generated trait requires: a boxed stream of already-
-/// built frames. The slice is fetched eagerly (this ticket does not stream
+/// built frames. The slice is fetched eagerly (it does not stream
 /// mid-fetch), then replayed as a stream to satisfy the server-streaming RPC.
 type FrameStream =
     Pin<Box<dyn Stream<Item = Result<pb::FetchResponse, tonic::Status>> + Send + 'static>>;

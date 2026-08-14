@@ -1,5 +1,5 @@
 //! LogSegmentFetcher: a thin fetch abstraction over one RLOG log segment
-//! (crate `ravel-logseg`, docs/log-segment-format.md; ADR-0033, epic #236).
+//! (crate `ravel-logseg`, docs/log-segment-format.md; ADR-0033).
 //!
 //! This is the log-signal sibling of [`crate::SegmentFetcher`], which serves
 //! the RSEG metric path. The two never share code and never touch each other:
@@ -28,8 +28,8 @@
 //!
 //! v1 fetches the whole object with a single [`GetRange::Full`]. RLOG objects
 //! are not yet large enough to justify the suffix-then-range-chase read
-//! `SegmentFetcher` uses for RSEG; see the module note in the issue #238
-//! report for when that may deserve revisiting.
+//! `SegmentFetcher` uses for RSEG; this may deserve revisiting once they
+//! grow.
 
 use std::sync::Arc;
 
@@ -121,7 +121,7 @@ pub struct LogQuery {
     /// match lives only in its resource or scope attributes.
     pub prune: Vec<Predicate>,
     /// Pending selective-erasure predicates for this query's resolved snapshot
-    /// (ADR-0064 decision 2, EJ-T3). Every decoded row whose per-record
+    /// (ADR-0064 decision 2). Every decoded row whose per-record
     /// attributes match any predicate (intersected with the predicate's
     /// event-time window) is dropped in [`scan_bytes`](LogSegmentFetcher::
     /// scan_bytes), after the fetch and after any cache layer, before the
@@ -129,7 +129,7 @@ pub struct LogQuery {
     /// which reads and returns exactly what it did before this field existed.
     ///
     /// The caller populates this from the resolved snapshot's attached
-    /// predicates. The resolver already surfaces them: EJ-T2 (#752) attaches
+    /// predicates. The resolver already surfaces them: it attaches
     /// every pending request to `Snapshot::pending_erasure` on each resolve.
     /// What is still missing is the last hop -- the `ravel-sql` scans that
     /// build this query (`logs_scan`, `alerts_scan`, `audit_scan`) do not yet
@@ -307,9 +307,9 @@ impl LogSegmentFetcher {
     ///
     /// Making this exact requires walking the blob entry by entry so that
     /// nesting depth is known, which requires either a public STREAM_DIR blob
-    /// decoder in `ravel-logseg` or an entry-walking decoder here. Issue #238
-    /// deliberately adds neither. Issue #239, which builds the real logs query
-    /// path, owns that decision and must do one of two things: make the match
+    /// decoder in `ravel-logseg` or an entry-walking decoder here. This path
+    /// deliberately adds neither. The real logs query path owns that decision
+    /// and must do one of two things: make the match
     /// exact, or re-apply the equality on returned records and state the
     /// limitation in its user-facing query semantics. Silently inheriting this
     /// over-approximation into a user-facing query would violate the "exact
@@ -355,7 +355,7 @@ impl LogSegmentFetcher {
     /// negatives: every record that does match is returned.
     ///
     /// A caller that needs exact stream-attribute semantics must re-apply the
-    /// equality on the returned records itself. Issue #239 must either do that
+    /// equality on the returned records itself. That path must either do that
     /// or document the limitation in its user-facing query semantics; it cannot
     /// assume this method filtered exactly.
     ///
@@ -376,8 +376,8 @@ impl LogSegmentFetcher {
     /// references to `LogSegmentFetcher` at all; the real production callers
     /// (ravel-sql's `logs_provider`, `alerts_scan`, `audit_scan`, and
     /// `audit_provider`) still call the unaccounted [`fetch`](Self::fetch).
-    /// Wiring them onto this funnel is issue #424; `fetch` stays the
-    /// unaccounted entry point until that lands, so those callers need no
+    /// Wiring them onto this funnel is future work; `fetch` stays the
+    /// unaccounted entry point until then, so those callers need no
     /// signature change yet.
     pub async fn fetch_accounted(
         &self,
@@ -389,7 +389,7 @@ impl LogSegmentFetcher {
             return Ok(None);
         }
         let key = &seg_ref.data_object_key;
-        // Two separable phases here (ADR-0044 decision 5, issue #642): the
+        // Two separable phases here (ADR-0044 decision 5): the
         // whole-object GET, then the STREAM_DIR resolve + `RlogReader` scan in
         // `scan_bytes`. They are named `page_fetch` and `decode` to match the
         // metric path's phase names. This entry point is reached by the
@@ -397,7 +397,7 @@ impl LogSegmentFetcher {
         // audit callers in `ravel-sql` go through
         // `fetch_accounted_with_tenant`, which carries its own copy of these
         // spans over its own (cache-aware) GET path. Wiring those callers onto
-        // an accounted funnel at all is issue #424, still open.
+        // an accounted funnel at all is separate, still-open future work.
         let fetch_span = tracing::debug_span!(
             "page_fetch",
             signal = "logs",
@@ -439,8 +439,8 @@ impl LogSegmentFetcher {
     /// tenant. Wiring production callers (`ravel-sql`'s `logs_provider`,
     /// `alerts_scan`, `audit_scan`, `audit_provider`) onto this method
     /// instead of [`fetch_accounted`](Self::fetch_accounted) is out of
-    /// scope here: it is a `ravel-sql` change, and issue #424 already tracks
-    /// moving those callers onto the accounted funnel in the first place.
+    /// scope here: it is a `ravel-sql` change, and moving those callers onto
+    /// the accounted funnel is separately tracked future work.
     ///
     /// With no cache configured (`with_cache` never called), this fetches
     /// exactly like [`fetch_accounted`](Self::fetch_accounted): every GET
@@ -458,8 +458,7 @@ impl LogSegmentFetcher {
         let key = &seg_ref.data_object_key;
 
         // Same two phases as `fetch_accounted`, spanned on the path production
-        // log/alerts/audit traffic actually takes (ADR-0044 decision 5, issue
-        // #642): the whole-object GET (`page_fetch`), then the STREAM_DIR
+        // log/alerts/audit traffic actually takes (ADR-0044 decision 5): the whole-object GET (`page_fetch`), then the STREAM_DIR
         // resolve + `RlogReader` scan in `scan_bytes` (`decode`). Duplicated
         // rather than shared with `fetch_accounted` because the byte-fetch
         // differs -- this one is cache-aware and may serve a hit with no store
@@ -558,7 +557,7 @@ impl LogSegmentFetcher {
     /// The metric path's `decode` span (`crate::fetcher`) carries `page_kind`,
     /// `series_count`, and `decompressed_bytes`. This one carries `signal =
     /// "logs"` plus `blocks_scanned`/`blocks_total`, and no `decompressed_bytes`
-    /// (issue #720, documented in docs/guides/tracing.md). No decompressed-byte
+    /// (documented in docs/guides/tracing.md). No decompressed-byte
     /// count is cheaply available here: [`ScanStats`] carries block counts, not
     /// bytes, and decompression happens per block inside
     /// [`RlogReader::scan_pruned`] (`read_block`) where the total is never
@@ -638,7 +637,7 @@ impl LogSegmentFetcher {
         let (mut records, stats) = reader
             .scan_pruned(&pred, &query.prune)
             .map_err(|source| corrupt(key, source))?;
-        // Selective-erasure exclusion (ADR-0064 decision 2, EJ-T3): drop every
+        // Selective-erasure exclusion (ADR-0064 decision 2): drop every
         // row a pending erasure predicate matches. Applied here, on the decoded
         // records, so it excludes rows identically whether `bytes` came from
         // the store or from a cache hit -- the whole point of filtering after
@@ -648,7 +647,7 @@ impl LogSegmentFetcher {
     }
 
     /// Decodes the STREAM_DIR section of an object from its own public section
-    /// descriptor, using the crate's public whole-section reader (issue #221).
+    /// descriptor, using the crate's public whole-section reader.
     /// This does not go through [`RlogReader`], which decodes STREAM_DIR
     /// internally but exposes no accessor for it.
     fn decode_stream_dir(&self, bytes: &[u8]) -> Result<StreamDir, LogSegError> {

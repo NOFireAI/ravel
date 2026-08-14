@@ -1,13 +1,12 @@
-//! Regression coverage for the `SegmentFetcher` multi-GET path (audit A5,
-//! finding a5-F01; docs/reviews/2026-07-27-storage-engine-quality-audit/
-//! a5-fetch-object-store.md). Every segment in the pre-existing test corpus
+//! Regression coverage for the `SegmentFetcher` multi-GET path. Every segment
+//! in the pre-existing test corpus
 //! fits inside the default 64 KiB suffix read, so the footer `NeedRange`
 //! chase (`fetcher.rs` `open_segment`), `ensure_ranges` issuing additional
 //! GETs, byte-range coalescing, and both `EtagChanged` snapshot guards were
 //! unreachable. These tests shrink the suffix window below the object so the
 //! multi-GET plan runs for real.
 //!
-//! GET counting uses the `FaultStore` sequencing API (issue #92): a `Sequence`
+//! GET counting uses the `FaultStore` sequencing API: a `Sequence`
 //! of pass-throughs on the segment key advances one step per matching `get`,
 //! so `sequence_progress` reports exactly how many GETs a fetch issued (the
 //! step budget is set well above any fetch's GET count, so the cursor never
@@ -152,7 +151,7 @@ fn assert_same_series(a: &[FetchedSeries], b: &[FetchedSeries]) {
     }
 }
 
-/// a5-F01, deliverable 1: a suffix smaller than the trailer+footer forces
+/// A suffix smaller than the trailer+footer forces
 /// `open_segment` down the `NeedRange` branch and `ensure_ranges` into extra
 /// GETs. The default-suffix fetch reads the whole object in one GET; the tiny
 /// suffix issues several. Both decode to identical series, proving the footer
@@ -197,7 +196,7 @@ async fn needrange_chase_issues_a_second_get_and_matches_full_suffix() {
     assert_same_series(&reference, &multi_get);
 }
 
-/// a5-F01, deliverable 2: the coalesce gap changes only how planned ranges are
+/// The coalesce gap changes only how planned ranges are
 /// grouped into GETs, never the decoded result. A zero gap fetches each
 /// non-touching range separately (the maximal GET set); a huge gap merges
 /// adjacent ranges (the minimal GET set). Data is identical, and widening the
@@ -243,7 +242,7 @@ async fn coalesce_gap_changes_get_count_but_not_data() {
     );
 }
 
-/// a5-F01, deliverable 3: the footer `NeedRange` etag guard
+/// The footer `NeedRange` etag guard
 /// (`open_segment`). The suffix read pins etag A; the scripted footer read
 /// returns fresh bytes under etag B, so the fetch must surface `EtagChanged`
 /// rather than decode a footer from a different object version. A control run
@@ -296,7 +295,7 @@ async fn etag_change_on_footer_chase_surfaces_etag_changed() {
     assert_eq!(store.fault_count(Op::Get, FaultKind::EtagChange), 1);
 }
 
-/// a5-F01, deliverable 3: the `ensure_ranges` etag guard. The suffix and the
+/// The `ensure_ranges` etag guard. The suffix and the
 /// footer NeedRange read pass through consistently; the first catalog range
 /// GET returns fresh bytes under a changed etag, so the fetch surfaces
 /// `EtagChanged` before decoding any catalog bytes from the wrong version.

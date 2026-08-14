@@ -1,6 +1,5 @@
-//! Differential proof for P5 of docs/compaction-retention-plan.md (issue
-//! #112): query-over-inputs must equal query-over-L1 bit-for-bit, and also
-//! equal query-over-(L1 + any input subset). Drives P4's real compactor
+//! Differential proof that query-over-inputs equals query-over-L1
+//! bit-for-bit, and also equals query-over-(L1 + any input subset). Drives P4's real compactor
 //! (`ravel_maintain::compact_bucket`) to produce RSEG v6 L1 parts from
 //! adversarial L0 populations, then compares the deduped sample streams the
 //! fetcher + engine order would produce.

@@ -1,15 +1,14 @@
-//! Acceptance proof for issue #936 (request-budget parity item): the
-//! cross-cluster federation coordinator path (`QueryEngine::federate_discovery`,
-//! ADR-0071/ADR-0073) re-enforces the bytes-scanned budget over the folded
-//! local+remote spend but, before this fix, never re-checked the
-//! `max_s3_requests` request budget the same way `federate_scalar` and the
-//! distributed sample-fetch path already do.
+//! Acceptance proof for request-budget parity: the cross-cluster federation
+//! coordinator path (`QueryEngine::federate_discovery`, ADR-0071/ADR-0073)
+//! re-enforces the `max_s3_requests` request budget over the folded
+//! local+remote spend, the same way `federate_scalar` and the distributed
+//! sample-fetch path do.
 //!
 //! Flip-line proof: `crates/ravel-query/src/engine.rs`'s `federate_discovery`
 //! calls `bytes_scanned_exceeded(...)` right after folding the federation
-//! outcome into `accounting`, and (as of this fix) immediately follows it with
+//! outcome into `accounting`, and immediately follows it with
 //! `segment_admission::request_budget_exceeded(...)`. Deleting that second
-//! block (reverting to the pre-fix code) makes
+//! block makes
 //! `federated_series_over_request_budget_trips_typed_error` below fail: the
 //! query that must return `QueryError::RequestBudgetExceeded` instead returns
 //! `Ok` with an empty series list, because only the bytes budget was checked.
