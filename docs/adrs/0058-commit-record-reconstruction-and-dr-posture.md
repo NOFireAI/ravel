@@ -2,6 +2,12 @@
 
 Status: Accepted
 
+Amended by ADR-0075: decision 5's disaster-recovery document graduates
+from an honest statement of absence to a normative DR runbook (tiers,
+restore procedure, rehearsal-derived RPO/RTO). Decisions 1-4 stand
+unchanged and become load-bearing steps of that runbook's restore
+reconciliation.
+
 ## Context
 
 Commit records are the sole metadata root in Ravel. A reader trusts nothing

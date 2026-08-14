@@ -60,7 +60,7 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0055](0055-storage-credential-scoping.md) | Per-role storage credential scoping | Accepted |
 | [0056](0056-catalog-resolve-prefix-list-traversal.md) | Prefix-list traversal for catalog snapshot resolution: a per-shard recursive LIST replacing the per-(shard, hour) loop for wide windows, with a runtime request cap | Accepted |
 | [0057](0057-fleet-global-admission-reconciliation.md) | Fleet-global admission via periodic self-owned-key reconciliation | Accepted |
-| [0058](0058-commit-record-reconstruction-and-dr-posture.md) | Commit-record reconstruction and DR posture | Accepted |
+| [0058](0058-commit-record-reconstruction-and-dr-posture.md) | Commit-record reconstruction and DR posture | Amended by 0075 |
 | [0059](0059-durability-hardening.md) | Durability hardening: scrub, postings verification, reorder harness | Accepted |
 | [0060](0060-query-path-otlp-trace-export.md) | Query-path OTLP trace export | Accepted |
 | [0061](0061-query-cost-governance.md) | Query cost governance: per-tenant bytes-scanned budget, fleet-global concurrency ceiling, regex postings pruning | Accepted |
@@ -77,3 +77,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0072](0072-tenant-scoped-credentials-and-control-plane-protection.md) | Tenant-scoped credentials and control-plane write protection: cryptographic tenant isolation via wired per-tenant KMS, fail-closed bucket-protection startup check, a durable sys/auth owner with revoke-by-tenant, tested IAM templates | Accepted |
 | [0073](0073-recent-hours-read-path.md) | Recent-hours read path: open/sealing-hour segments exempt from max_segments, governed by a per-query S3 request budget through one admission seam | Accepted |
 | [0074](0074-benchmark-driven-distribution-thresholds.md) | Benchmark-driven distributed-query thresholds | Accepted |
+| [0075](0075-dr-posture-and-chaos-evidence.md) | Operator-owned DR via replicated-bucket controls, a rehearsed restore, and a process-kill evidence lane | Accepted |
