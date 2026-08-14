@@ -247,9 +247,8 @@ pub fn normalize_resolved(
 ///
 /// `exemplar_cap` is `&mut` and caller-owned rather than built here: a
 /// per-series-per-window cap only means something across many requests over
-/// wall-clock time, so whoever holds the long-lived per-shard state (issue
-/// #474) owns one `ExemplarCap` and passes it into every call that shard
-/// makes.
+/// wall-clock time, so whoever holds the long-lived per-shard state owns one
+/// `ExemplarCap` and passes it into every call that shard makes.
 ///
 /// See [`normalize_resolved`] for the panic and error-handling contract, which
 /// is identical here.

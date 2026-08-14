@@ -605,7 +605,7 @@ async fn check_object(store: &dyn ObjectStoreBackend, key: &str) -> anyhow::Resu
 /// reported like a content-hash mismatch.
 ///
 /// REQUIRES that whatever writes the first key-epoch record for a tenant
-/// (server startup wiring, EL-7) bootstraps epoch 0 as `key_arn: ""`
+/// (server startup wiring) bootstraps epoch 0 as `key_arn: ""`
 /// (deployment default) with an `activated_ns` at or before the tenant's
 /// earliest live object, not just at "whenever the operator first configures
 /// a per-tenant key." Otherwise every object written before that

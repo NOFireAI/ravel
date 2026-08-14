@@ -255,8 +255,8 @@ const ALL_ROLES: [&str; 4] = ["gateway", "query", "maintain", "admin"];
 /// cannot rot into masking a future regression.
 const ROUTED_WRITE_EXEMPT_ROLES: [&str; 1] = ["admin"];
 
-/// Roles whose IAM policy writes tenant data through `KmsRoutingStore`
-/// (issues #929, #972): Gateway's ingest PUTs, Maintain's compaction/rewrite
+/// Roles whose IAM policy writes tenant data through `KmsRoutingStore`:
+/// Gateway's ingest PUTs, Maintain's compaction/rewrite
 /// PUTs, and Query's catalog-fold (`t/<hash>/catalog/.../snap|HEAD|idx`) and
 /// query-audit (`t/<hash>/u/...`) PUTs all land under `t/<hash>/...` and, once
 /// `--tenant-kms-config` routes that tenant to its own key, require
@@ -288,7 +288,7 @@ fn kms_actions(policy: &Policy) -> Vec<String> {
 /// (ADR-0062 decision 1a): a configured tenant's PUT is delegated to a
 /// per-tenant `S3Store` built with that tenant's SSE-KMS key, which needs
 /// `kms:GenerateDataKey*` (and `kms:Encrypt`) on the caller's IAM policy or
-/// the PUT fails closed with `AccessDenied` -- issues #929, #972. Flip any
+/// the PUT fails closed with `AccessDenied`. Flip any
 /// role's `*TenantKms` statement (or narrow its Action list to drop
 /// `kms:GenerateDataKey*`) in `deploy/iam/{gateway,maintain,query}.json` and
 /// this test fails.

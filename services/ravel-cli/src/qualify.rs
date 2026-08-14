@@ -13,7 +13,7 @@ use ravel_object_store::conformance::{
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
 
 // The record and its key now live in `ravel-object-store` so `ravel-server`
-// startup (ADR-0050 section 6, EC7) and this writer share one definition.
+// startup (ADR-0050 section 6) and this writer share one definition.
 // Re-exported here so existing `ravel_cli::qualify::{QUALIFICATION_KEY,
 // QualificationRecord}` call sites (and the in-process CLI test) keep resolving
 // against the CLI's own module path.
