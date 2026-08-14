@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::error::AlertError;
 
 /// The query a rule evaluates. This crate never executes the query itself
-/// (that is Wave 2's `QueryEngine`/`SqlExecutor` wiring); the variant only
+/// (that is the caller's `QueryEngine`/`SqlExecutor` wiring); the variant only
 /// records the language and text so the evaluator can route it and so the
 /// resulting record can name its source.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub enum RuleQuery {
 impl RuleQuery {
     /// True when this rule reads the `alerts` table as input, the only case
     /// where [`crate::compute_generation`] applies (ADR-0043 decision 5).
-    /// Heuristic on the query text; Wave 2's planner resolves the real table
+    /// Heuristic on the query text; the caller's planner resolves the real table
     /// set. Ordinary metric/log rules always compute `generation = 0`.
     pub fn targets_alerts_table(&self) -> bool {
         match self {
@@ -50,7 +50,7 @@ impl RuleQuery {
 ///
 /// This is deliberately a small heuristic, not a SQL parser. This crate is pure
 /// logic with no SQL parser dependency and must not gain one (ADR-0043 keeps
-/// the real table-set resolution in Wave 2's planner); the reachable
+/// the real table-set resolution in the caller's planner); the reachable
 /// `ravel-sql` crate offers no lightweight lexer to reuse (its parsing is
 /// DataFusion's, behind a heavy dependency this crate does not take). Removing
 /// single- and double-quoted literals (honoring both a backslash escape and the
@@ -181,7 +181,7 @@ pub struct Rule {
 
 impl Rule {
     /// Checks the structural invariants a `Rule` must hold to be evaluated
-    /// safely, so this crate's own callers (a Wave 2 evaluator constructing or
+    /// safely, so this crate's own callers (an evaluator constructing or
     /// loading rules) can reject a bad rule up front rather than have it fail
     /// every tick. Checks:
     ///

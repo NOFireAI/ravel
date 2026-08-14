@@ -1,5 +1,5 @@
 //! Generation computation and the recursion guard for alerts-on-alerts
-//! (deliverable 4, ADR-0040 decision 4 / ADR-0043 decision 5).
+//! (ADR-0040 decision 4 / ADR-0043 decision 5).
 //!
 //! Generation is a property of the alert *entity* (one `alert_id`'s whole
 //! lifecycle), not of any single tick's evaluation: it is computed once, when

@@ -1,4 +1,4 @@
-//! Alert states and the pure state-transition function (deliverable 3).
+//! Alert states and the pure state-transition function.
 //!
 //! State is derived by fold, never mutated (ADR-0040 decision 3): the caller
 //! folds the records sharing an `alert_id` to the greatest-`ts` one, hands it

@@ -1,6 +1,6 @@
-//! Condition evaluation over already-evaluated query results (deliverable 2).
+//! Condition evaluation over already-evaluated query results.
 //!
-//! This crate never runs PromQL or SQL. The caller (Wave 2's evaluator loop)
+//! This crate never runs PromQL or SQL. The caller (the evaluator loop)
 //! executes the query against a real `QueryEngine`/`SqlExecutor`, summarizes
 //! the result into a [`QueryResultSummary`], and hands it here. That keeps the
 //! firing decision pure and fully unit-testable with no query engine present.

@@ -35,8 +35,8 @@ const SCOPE_NAME: &str = "ravel-alerting";
 const SCOPE_VERSION: &str = "1";
 const RESOURCE_RULE_ID_KEY: &str = "rule.id";
 
-/// 128-bit stable alert identity: the hash of `rule_id` plus a label *set*
-/// (deliverable 3). All records for one distinct alerting condition share it,
+/// 128-bit stable alert identity: the hash of `rule_id` plus a label *set*.
+/// All records for one distinct alerting condition share it,
 /// which is what makes the fold-to-current-state model (ADR-0040 decision 3)
 /// work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -296,7 +296,7 @@ pub fn encode_record_object(
     Ok(writer.finish()?)
 }
 
-/// The full write path (deliverable 5): given a rule, the transition decision
+/// The full write path: given a rule, the transition decision
 /// for this tick, the most recent prior record for this alert (if any), the
 /// generations of any alert records this tick's query consumed as input (only
 /// meaningful when `rule.query.targets_alerts_table()`; pass `&[]` otherwise),
