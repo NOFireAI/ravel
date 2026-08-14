@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Measure process-program metrics (docs/superpowers/specs/2026-07-28-process-program-design.md
-section 2) against current repo and GitHub state. Writes a Markdown report
-plus a sibling JSON snapshot so the program's end can diff before/after.
+"""Measure process metrics against current repo and GitHub state. Writes a
+Markdown report plus a sibling JSON snapshot so a program's end can diff
+before/after.
 
 Usage: python3 scripts/process_metrics.py [--repo OWNER/NAME] [--output PATH]
 """
@@ -82,14 +82,13 @@ _FINDING_ID_RE = re.compile(r"^[A-Za-z0-9]+-F\d+$")
 def count_finding_table_rows(report_text: str, section_heading: str) -> int:
     """Count Markdown finding rows under '## <n>. <section_heading>'.
 
-    A finding row is one whose first table cell is a finding ID
-    (e.g. ``a4-F01`` or ``sql3-F02``). Counting on that positive signal,
-    rather than "every pipe-line except the header and separator", is what
-    lets this ignore the table's header row, its ``|---|`` separator, and
-    non-finding scaffolding rows such as the ``infra-faultstore-seq`` entry
-    in the Q0 audit's child-ticket index (confidence ``n/a``, tracked but
-    not itself a confirmed finding). It is the one signal consistent across
-    audit tables that otherwise share no column schema."""
+    A finding row is one whose first table cell is a finding ID matching
+    ``<prefix>-F<number>``. Counting on that positive signal, rather than
+    "every pipe-line except the header and separator", is what lets this
+    ignore the table's header row, its ``|---|`` separator, and non-finding
+    scaffolding rows that share the table but carry no finding ID. It is the
+    one signal consistent across finding tables that otherwise share no
+    column schema."""
     heading_re = re.compile(
         r"^## \d+\. " + re.escape(section_heading) + r"\s*$", re.MULTILINE
     )
@@ -124,31 +123,28 @@ def cross_check_escape_count(report_text: str, section_heading: str) -> dict:
 MANUAL_METRICS = {
     "lost_work_incidents": {
         "value": 2,
-        "source": "docs/reviews/2026-07-27-storage-engine-quality-audit.md section 1 "
-                   "('A3 and A4 required one redispatch each ... first runs committed "
-                   "to side worktrees the fleet harness does not collect')",
-        "note": "Both were Q0 audit tasks; fixed by the CLAUDE.md commit-on-dispatched-HEAD "
-                "override documented in the fleet-worktree-rule-conflict memory. No durable "
-                "counter exists for this class of incident before SP1/SP2 land telemetry for "
-                "it, so this is a point-in-time historical count, not a live query.",
+        "source": "historical count of results lost when a first run committed "
+                  "to a side worktree the fleet harness does not collect",
+        "note": "Fixed by the commit-on-dispatched-HEAD rule. No durable "
+                "counter exists for this class of incident yet, so this is a "
+                "point-in-time historical count, not a live query.",
     },
     "merge_touch_cost_steps": {
         "value": 7,
-        "source": "merge-fleet-result skill procedure (ls-remote verify, EnterWorktree, "
-                   "fetch result branch, review diff scope, run three local gates, "
-                   "merge --no-ff, push+delete refs+close issue)",
-        "note": "Counts distinct manual actions the skill's documented procedure requires "
-                "per merge on the current, un-automated path. SP3's merge queue is designed "
-                "to bring this to 0 for the green-path case.",
+        "source": "distinct manual actions the documented merge procedure "
+                  "requires per merge (remote verify, worktree, fetch result "
+                  "branch, review diff scope, run local gates, merge --no-ff, "
+                  "push and clean up refs)",
+        "note": "Counts distinct manual actions the current, un-automated "
+                "merge path requires. A merge queue is designed to bring this "
+                "to 0 for the green-path case.",
     },
     "redispatch_rate": {
         "value": "unmeasurable",
         "source": "no durable dispatch log exists outside session transcripts",
-        "note": "Two known incidents are documented anecdotally: a B3 dispatch that "
-                "resolved a stale local main pointer and reimplemented already-merged "
-                "files (ravel-workflow-directives memory, directive 6), and the two Q0 "
-                "worktree-rule redispatches counted under lost_work_incidents above. "
-                "SP2's stall telemetry is the intended fix for this gap.",
+        "note": "Known incidents are documented only anecdotally; there is no "
+                "durable dispatch log to compute a rate from. Stall telemetry "
+                "is the intended fix for this gap.",
     },
 }
 
@@ -187,10 +183,8 @@ def render_markdown(report: dict) -> str:
         "",
         f"Generated {report['generated_date']} against `{report['repo']}` "
         f"main. Source data and re-run instructions: "
-        f"`python3 scripts/process_metrics.py`. Re-run at the end of the "
-        f"Q1 process program (docs/superpowers/specs/"
-        f"2026-07-28-process-program-design.md section 6) for the "
-        f"before/after comparison.",
+        f"`python3 scripts/process_metrics.py`. Re-run at the end of a "
+        f"process program for the before/after comparison.",
         "",
         "## Metrics",
         "",
@@ -203,12 +197,12 @@ def render_markdown(report: dict) -> str:
         f"({ci['failures']} failures / {ci['successes']} successes, "
         f"{ci['in_progress']} in progress, {ci['total']} total) | "
         f"`gh api repos/{report['repo']}/actions/runs` |",
-        f"| Escape rate, Q0 audit | {q0['table_count']} confirmed findings "
+        f"| Escape rate, storage audit | {q0['table_count']} confirmed findings "
         f"(prose/table agree: {q0['agrees']}) | "
-        f"docs/reviews/2026-07-27-storage-engine-quality-audit.md |",
+        f"storage-engine quality audit |",
         f"| Escape rate, ravel-sql audit | {sql['table_count']} table rows, "
         f"{sql['prose_count']} findings claimed (prose/table agree: "
-        f"{sql['agrees']}) | docs/reviews/2026-07-28-ravel-sql-audit.md |",
+        f"{sql['agrees']}) | ravel-sql audit |",
     ]
     for name, entry in manual.items():
         lines.append(f"| {name.replace('_', ' ')} | {entry['value']} | {entry['source']} |")
@@ -217,8 +211,8 @@ def render_markdown(report: dict) -> str:
         lines.append(
             f"- ravel-sql escape count: prose says {sql['prose_count']}, the "
             f"finding table has {sql['table_count']} rows. This is a documented, "
-            f"understood exception (one finding, sql3-F03, folds into ticket "
-            f"#156 instead of getting its own row) -- not parser error."
+            f"understood exception (one finding folds into another ticket "
+            f"instead of getting its own row) -- not parser error."
         )
     for name, entry in manual.items():
         if entry["value"] == "unmeasurable":
@@ -236,7 +230,7 @@ def main():
     parser.add_argument("--repo-path", default=".")
     parser.add_argument(
         "--output",
-        default="docs/reviews/2026-07-28-process-metrics-baseline.md",
+        default="process-metrics-baseline.md",
     )
     args = parser.parse_args()
 
@@ -245,11 +239,9 @@ def main():
     )
     ci_stats = compute_ci_failure_rate(fetch_main_push_runs(args.repo))
 
-    with open(
-        f"{args.repo_path}/docs/reviews/2026-07-27-storage-engine-quality-audit.md"
-    ) as f:
+    with open(f"{args.repo_path}/storage-engine-quality-audit.md") as f:
         q0_escape = cross_check_escape_count(f.read(), "Child-ticket index")
-    with open(f"{args.repo_path}/docs/reviews/2026-07-28-ravel-sql-audit.md") as f:
+    with open(f"{args.repo_path}/ravel-sql-audit.md") as f:
         sql_escape = cross_check_escape_count(f.read(), "Finding index")
 
     report = build_report(

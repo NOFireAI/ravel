@@ -46,7 +46,7 @@ message CompactionInputIdentity {
   uint64 writer_seq = 3;
 }
 
-// One RSEG v3 output object of a compaction run (docs/compaction-retention-plan.md §3.1).
+// One RSEG v3 output object of a compaction run.
 message CompactionPart {
   uint32 part_index = 1;
   bytes first_series_id = 2;   // 16 bytes, inclusive

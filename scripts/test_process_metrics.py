@@ -24,9 +24,9 @@ Q0_FIXTURE = """## 1. Executive summary
 
 | Finding | Issue | Severity | Confidence | Crate | Category | Dependencies | Size | Wave |
 |---|---|---|---|---|---|---|---|---|
-| a4-F01 | #52 | S1 | Confirmed | ravel-catalog | MVCC | -> #56, #76 | M | 0 |
-| a1-F01 | #49 | S2 | Confirmed | ravel-segment | DEC | none | S | 1 |
-| a4-F02 | #53 | S2 | High | ravel-catalog | MVCC | blocked by #92 | M | 1 |
+| c1-F01 | #101 | S1 | Confirmed | ravel-catalog | MVCC | -> #105, #120 | M | 0 |
+| c2-F01 | #102 | S2 | Confirmed | ravel-segment | DEC | none | S | 1 |
+| c1-F02 | #103 | S2 | High | ravel-catalog | MVCC | blocked by #130 | M | 1 |
 
 ## 8. Dependency graph and dispatch order
 
@@ -41,8 +41,8 @@ SQL_FIXTURE = """## 3. Summary
 
 | ID | Area | Sev | Cat | Ticket | Reproducer |
 |---|---|---|---|---|---|
-| sql3-F01 | SQL-3 | S1 | MEM | #156 | audit_sql3_exec::sql3_f01 |
-| sql3-F02 | SQL-3 | S2 | MEM | #157 | audit_sql3_exec::sql3_f02 |
+| q1-F01 | SQL | S1 | MEM | #201 | audit_sql_exec::q1_f01 |
+| q1-F02 | SQL | S2 | MEM | #202 | audit_sql_exec::q1_f02 |
 """
 
 Q0_FIXTURE_ESCAPE = {"prose_count": 43, "table_count": 43, "agrees": True}
@@ -55,7 +55,7 @@ class TestCountTaskMergeCommits(unittest.TestCase):
             "Merge remote-tracking branch 'origin/task/bc08408e-441a-478d-95d9-a89e52fcb59a/result'",
             "feat(promql): implement P6 elementwise, clamp, sort, label, time functions",
             "Merge remote-tracking branch 'origin/task/4cbd60db-7cc0-4c90-a679-9b69a25dbe71/result'",
-            "docs: add Q1 process program design spec",
+            "docs: add process program design spec",
         ]
         self.assertEqual(count_task_merge_commits(subjects), 2)
 

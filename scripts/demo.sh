@@ -81,7 +81,7 @@ docker run --rm --network host \
 log "building ravel-server and ravel-cli"
 cargo build --quiet -p ravel-server -p ravel-cli
 
-# ADR-0050 section 6 (EC7, issue #623): server startup on a non-Memory store
+# ADR-0050 section 6 (EC7): server startup on a non-Memory store
 # refuses unless `sys/qualification` is already present, and there is
 # deliberately no bootstrap-and-continue path for it (unlike the tenancy
 # marker and gc-config objects). A bucket `mc mb`'d fresh above has no such
