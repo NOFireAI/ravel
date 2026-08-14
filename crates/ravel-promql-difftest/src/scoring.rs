@@ -580,7 +580,7 @@ pub static REGISTRY: &[Construct] = &[
         "Unsupported: subquery over native histograms (422 execution)",
         "the subquery grid reducer keeps only each step's float value, so a \
          histogram element would be silently dropped; the trigger is \
-         matched histogram data, not the syntactic shape (issue #220)",
+         matched histogram data, not the syntactic shape",
     ),
     // ---- Binary operators ----
     binop("+", corpus("corpus/binop.txt")),
