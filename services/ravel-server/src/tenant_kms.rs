@@ -1,4 +1,4 @@
-//! Per-tenant SSE-KMS wiring (EL-7, issue #764, ADR-0062 decision 1,
+//! Per-tenant SSE-KMS wiring (ADR-0062 decision 1,
 //! ADR-0072 decision 2): `--tenant-kms-config` maps tenant name to KMS key
 //! ARN. Parsing (this module's [`parse_tenant_kms_config`]) happens at
 //! startup, before the tenant-hash scheme is installed; applying the parsed

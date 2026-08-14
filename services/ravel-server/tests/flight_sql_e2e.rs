@@ -1,8 +1,5 @@
 //! End-to-end Flight SQL against a MinIO-backed `ravel-server` with a pinned
-//! arrow-flight SQL client (issue #153 deliverable 5,
-//! docs/arrow-datafusion-plan.md Phase C: "e2e test with a pinned ADBC or
-//! arrow-flight-sql client driving real queries against ravel-server with
-//! MinIO").
+//! arrow-flight SQL client.
 //!
 //! Every other Flight test in this workspace runs over `MemoryStore`. This one
 //! closes the last gap: object storage is the only durable backend (CLAUDE.md

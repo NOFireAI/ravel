@@ -264,7 +264,7 @@ async fn grpc_byte_rate_exceeded_yields_resource_exhausted() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// Issue #803: gRPC byte-rate admission must charge the request's wire
+/// gRPC byte-rate admission must charge the request's wire
 /// bytes (what `WireByteCountLayer` counts off the transport), not
 /// `Message::encoded_len()` (the decoded protobuf tree's size). A gRPC
 /// message on the wire is `encoded_len()` payload bytes plus a 5-byte

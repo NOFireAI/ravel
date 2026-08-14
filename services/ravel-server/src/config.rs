@@ -18,7 +18,7 @@ pub enum Mode {
     Gateway,
     Query,
     /// Background maintenance only: compaction, age-based retention, and the
-    /// GC sweeper (docs/compaction-retention-plan.md P8). Serves no ingest or
+    /// GC sweeper. Serves no ingest or
     /// query routes; requires a backend that supports multipart uploads.
     Maintain,
 }
@@ -128,21 +128,20 @@ pub struct Cli {
     )]
     pub tenant_kms_config: Option<PathBuf>,
 
-    /// Disables the per-(tenant, signal) background catalog fold task
-    /// (docs/metric-index-plan.md section 4). Folding is a pure optimization
+    /// Disables the per-(tenant, signal) background catalog fold task.
+    /// Folding is a pure optimization
     /// for query resolve cost; disabling it never changes query results, only
     /// their cost (ADR-0020).
     #[arg(long)]
     pub disable_fold: bool,
 
     /// How often each tenant's fold task wakes up to check for newly sealed
-    /// hours, in seconds (docs/metric-index-plan.md section 4).
+    /// hours, in seconds.
     #[arg(long, default_value_t = 300)]
     pub fold_interval_secs: u64,
 
     /// How often each tenant's maintenance task (`--mode maintain`) wakes up to
-    /// run retention, compaction, and the sweeper over every shard, in seconds
-    /// (docs/compaction-retention-plan.md P8).
+    /// run retention, compaction, and the sweeper over every shard, in seconds.
     #[arg(long, default_value_t = 300)]
     pub maintain_interval_secs: u64,
 
@@ -192,7 +191,7 @@ pub struct Cli {
     #[arg(long = "retention-tenant", value_name = "TENANT=DURATION")]
     pub retention_tenants: Vec<String>,
 
-    /// Default POSTINGS indexed-field list (ADR-0049 decision 3, issue #511),
+    /// Default POSTINGS indexed-field list (ADR-0049 decision 3),
     /// as a repeatable `--indexed-field FIELD`. These are the attribute names
     /// the log writer builds an exact block-level index over, so an equality or
     /// `IN` query on one prunes to the blocks that hold it. Unset falls back to
@@ -351,7 +350,7 @@ pub struct Cli {
     #[arg(long = "max-concurrent-queries", value_name = "COUNT")]
     pub max_concurrent_queries: Option<u64>,
 
-    /// The process-wide in-flight ingest-request ceiling (issue #802): the
+    /// The process-wide in-flight ingest-request ceiling: the
     /// maximum number of OTLP metrics/logs/traces and Remote Write requests
     /// this process admits at once, across every listener (public and mTLS)
     /// and every transport (HTTP and gRPC). Over the limit, a request is
@@ -364,8 +363,8 @@ pub struct Cli {
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
 
-    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1, issue
-    /// #819): a ceiling on the sum of estimated buffered ingest bytes held
+    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1): a
+    /// ceiling on the sum of estimated buffered ingest bytes held
     /// across every tenant and signal (metrics, logs, traces) at once. A
     /// request whose estimated buffered bytes would push the gauge past this
     /// ceiling is shed before any buffering -- HTTP 429 with `Retry-After`,
@@ -378,7 +377,7 @@ pub struct Cli {
     pub max_ingest_buffer_bytes: u64,
 
     /// Per-shard bound on concurrently in-flight flushes for the metrics
-    /// ingest pipeline (ADR-0067 decision 2, issue #814). Each shard's flush
+    /// ingest pipeline (ADR-0067 decision 2). Each shard's flush
     /// runs in a spawned task the shard actor no longer waits on; this caps
     /// how many such tasks a single shard may have outstanding at once, so
     /// pipelining trades bounded extra memory (buffers held by in-flight
@@ -393,7 +392,7 @@ pub struct Cli {
     pub max_inflight_flushes: u32,
 
     /// Enables the adaptive flush-delay corridor for the metrics ingest
-    /// pipeline (ADR-0067 decision 3, issue #814): instead of always
+    /// pipeline (ADR-0067 decision 3): instead of always
     /// flushing a tenant's buffer on the fixed `--max-flush-delay` age, the
     /// age threshold adapts within `[500ms floor, ceiling]`, where the
     /// ceiling derives from the shard's observed PUT p99 RTT and the
@@ -419,7 +418,7 @@ pub struct Cli {
     pub scrub_period: Option<String>,
 
     /// How long re-derivable per-tenant state may sit idle before a background
-    /// sweep evicts it (ADR-0069 decision 2, issue #820), as a humantime
+    /// sweep evicts it (ADR-0069 decision 2), as a humantime
     /// duration (e.g. `1h`). The sweep evicts idle generation-switch views,
     /// catalog per-tenant caches, and SQL memory accountants with zero
     /// outstanding reservations; every evicted entry is re-derived on the
@@ -447,7 +446,7 @@ pub struct Cli {
     /// Maximum resident bytes for the ADR-0046 read caches' RAM tier. Bounds
     /// every ADR-0046 cache in the process from this one number: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
-    /// (`query::build_catalog`) both, not just the fetcher cache (issue #553).
+    /// (`query::build_catalog`) both, not just the fetcher cache.
     /// Read at startup only; there is no live resize. Ignored when
     /// `--disable-cache` is set.
     #[arg(long, default_value_t = DEFAULT_CACHE_MAX_BYTES)]
@@ -467,7 +466,7 @@ pub struct Cli {
 
     /// Disables every ADR-0046 read cache in the process entirely: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
-    /// (`query::build_catalog`) both, not just the fetcher cache (issue #553).
+    /// (`query::build_catalog`) both, not just the fetcher cache.
     /// With this set, no cache of either kind is constructed, so query results
     /// are byte-for-byte identical to a build with no read-cache wiring at all
     /// and the process holds no read-cache memory. This is the flag for a
@@ -557,7 +556,7 @@ pub struct Cli {
     #[arg(long = "otlp-trace-endpoint", value_name = "URL")]
     pub otlp_trace_endpoint: Option<String>,
 
-    /// Opt this process into ADR-0071 distributed read fan-out (issue #865).
+    /// Opt this process into ADR-0071 distributed read fan-out.
     /// Off by default: a process with this unset resolves and fetches every
     /// query on the byte-identical local path, exactly as before this flag
     /// existed, and never registers the cluster-internal fragment gRPC surface.
@@ -572,7 +571,7 @@ pub struct Cli {
     pub distributed_query: bool,
 
     /// Path to the shared cluster-internal bearer token that guards the ADR-0071
-    /// fragment `SeriesFetch` surface (issue #865). A file, never an inline
+    /// fragment `SeriesFetch` surface. A file, never an inline
     /// value or env var, so the secret never appears in a process listing
     /// (mirrors `--tenant-hash-key-file`). Every worker and coordinator in one
     /// cluster reads the same file: a coordinator presents this exact token on
@@ -584,7 +583,7 @@ pub struct Cli {
     pub fragment_auth_token_file: Option<PathBuf>,
 
     /// The distinct internal-workload admission cap for inbound fragment
-    /// (`SeriesFetch`) requests (ADR-0071, issue #865): the maximum number of
+    /// (`SeriesFetch`) requests (ADR-0071): the maximum number of
     /// slice fetches this process serves concurrently for remote coordinators.
     /// This is a separate class from `--max-concurrent-queries`, which gates
     /// client queries: a coordinator holding a client-query permit while it
@@ -595,7 +594,7 @@ pub struct Cli {
     #[arg(long = "max-inflight-fragments", default_value_t = 32)]
     pub max_inflight_fragments: u64,
 
-    /// The estimated-store-bytes axis of the ADR-0071 cost gate (issue #865): a
+    /// The estimated-store-bytes axis of the ADR-0071 cost gate: a
     /// query whose pre-fetch cost estimate reaches this many bytes is worth
     /// distributing; a cheaper query on both axes runs fully locally. Feeds
     /// `DistribThresholds::min_store_bytes`. Meaningful only with
@@ -604,7 +603,7 @@ pub struct Cli {
     #[arg(long = "distribute-bytes-threshold", default_value_t = ravel_query::distrib::DISTRIBUTE_MIN_STORE_BYTES)]
     pub distribute_bytes_threshold: u64,
 
-    /// The segment-count axis of the ADR-0071 cost gate (issue #865): either
+    /// The segment-count axis of the ADR-0071 cost gate: either
     /// axis alone trips the gate. Feeds `DistribThresholds::min_segments`.
     /// Meaningful only with `--distributed-query`. Default 256 (ADR-0074's
     /// measured crossover, `ravel_query::distrib::DISTRIBUTE_MIN_SEGMENTS`).
@@ -612,7 +611,7 @@ pub struct Cli {
     pub distribute_segments_threshold: u64,
 
     /// The ceiling on concurrently dispatched slices per distributed query
-    /// (ADR-0071, issue #865): bounds fan-out width so a wide snapshot does not
+    /// (ADR-0071): bounds fan-out width so a wide snapshot does not
     /// spawn an unbounded number of remote fetches. Feeds
     /// `DistribThresholds::max_parallel_slices`; clamped to at least 1. Default
     /// 8 (`ravel_query::distrib::partition::DEFAULT_MAX_PARALLEL_SLICES`).
@@ -620,7 +619,7 @@ pub struct Cli {
     pub max_parallel_slices: usize,
 
     /// A remote cluster this coordinator federates a query out to (ADR-0071
-    /// cross-cluster federation, issue #868). Repeatable: one flag per remote.
+    /// cross-cluster federation). Repeatable: one flag per remote.
     ///
     /// The value is a comma-separated `key=value` spec. Required keys: `name`
     /// (the cluster's stable label, surfaced in the `warnings` field when it is
@@ -644,8 +643,7 @@ pub struct Cli {
     #[arg(long = "remote-cluster", value_name = "SPEC")]
     pub remote_clusters: Vec<String>,
 
-    /// The default per-remote soft timeout for a federated fetch (ADR-0071,
-    /// issue #868): a remote cluster that does not answer within this bound is
+    /// The default per-remote soft timeout for a federated fetch (ADR-0071): a remote cluster that does not answer within this bound is
     /// treated as unavailable (failing the query, or skipped, per that remote's
     /// `skip-unavailable`). A `soft-timeout` key on an individual
     /// `--remote-cluster` overrides it for that remote. Accepts a humantime
@@ -715,7 +713,7 @@ pub struct AuthResolverSettings {
     pub mtls_header: Option<String>,
 }
 
-/// The resolved ADR-0071 distributed read fan-out settings (issue #865),
+/// The resolved ADR-0071 distributed read fan-out settings,
 /// `Some` only when `--distributed-query` is set. Carries the shared
 /// cluster-internal bearer token (read from `--fragment-auth-token-file`), the
 /// fragment admission cap, and the cost gate/fan-out thresholds.
@@ -731,8 +729,8 @@ pub struct DistribSettings {
     pub thresholds: ravel_query::distrib::partition::DistribThresholds,
 }
 
-/// One resolved `--remote-cluster` (ADR-0071 cross-cluster federation, issue
-/// #868). The credential has already been read from its file and trimmed, so
+/// One resolved `--remote-cluster` (ADR-0071 cross-cluster federation).
+/// The credential has already been read from its file and trimmed, so
 /// this struct carries the operator principal directly; the secret never
 /// appears in a process listing because the flag names a file, not a value.
 #[derive(Clone)]
@@ -863,7 +861,7 @@ impl Cli {
     }
 
     /// Build the raw [`IndexedFieldPolicy`] from `--indexed-field` and the
-    /// repeatable `--indexed-field-tenant TENANT=FIELDS` (issue #511). An unset
+    /// repeatable `--indexed-field-tenant TENANT=FIELDS`. An unset
     /// default (`--indexed-field` never passed) is `None`, so
     /// [`IndexedFieldConfig::from_policy`](crate::postings_config::IndexedFieldConfig::from_policy)
     /// falls back to the shipped list; a
@@ -1081,7 +1079,7 @@ impl Cli {
     }
 
     /// Parse `--max-inflight-ingest-requests` into an
-    /// [`crate::ingest_concurrency::IngestConcurrencyLimit`] (issue #802),
+    /// [`crate::ingest_concurrency::IngestConcurrencyLimit`],
     /// mapping `0` to `Unlimited` like every other admission ceiling in this
     /// crate that spells "no limit" as `0` rather than a sentinel
     /// `u64::MAX`. Always `Ok`: unlike `--max-concurrent-queries`, `0` here
@@ -1095,7 +1093,7 @@ impl Cli {
         })
     }
 
-    /// Resolve the ADR-0071 distributed read fan-out settings (issue #865).
+    /// Resolve the ADR-0071 distributed read fan-out settings.
     /// `Ok(None)` when `--distributed-query` is off (the local-only default).
     /// When on, reads and trims the `--fragment-auth-token-file` bearer token
     /// (failing on an unreadable or empty file), and packages the admission cap
@@ -1134,7 +1132,7 @@ impl Cli {
     }
 
     /// The default per-remote soft timeout for federated fetches
-    /// (`--remote-cluster-soft-timeout`, ADR-0071 issue #868), or
+    /// (`--remote-cluster-soft-timeout`, ADR-0071), or
     /// [`ravel_query::distrib::DEFAULT_REMOTE_SOFT_TIMEOUT`] when unset. Rejects
     /// a zero or unparseable duration: a zero timeout would treat every remote
     /// as instantly unavailable.
@@ -1157,7 +1155,7 @@ impl Cli {
     }
 
     /// Parse every `--remote-cluster` spec into a resolved
-    /// [`RemoteClusterConfig`] (ADR-0071 cross-cluster federation, issue #868).
+    /// [`RemoteClusterConfig`] (ADR-0071 cross-cluster federation).
     ///
     /// Each spec is a comma-separated `key=value` list. `name`, `endpoint`, and
     /// `credential-file` are required; `tls`, `tls-ca-file`, `skip-unavailable`,
@@ -1275,8 +1273,8 @@ impl Cli {
     }
 
     /// Parse `--max-ingest-buffer-bytes` into a
-    /// [`ravel_ingest::IngestByteBudgetLimit`] (ADR-0069 decision 1, issue
-    /// #819), mapping `0` to `Unlimited` like `--max-inflight-ingest-requests`
+    /// [`ravel_ingest::IngestByteBudgetLimit`] (ADR-0069 decision 1),
+    /// mapping `0` to `Unlimited` like `--max-inflight-ingest-requests`
     /// above. Always `Ok`: `0` is a deliberate, documented "no ceiling", not a
     /// footgun worth rejecting.
     pub fn parse_ingest_buffer_budget(
@@ -1405,7 +1403,7 @@ impl Cli {
             );
         }
 
-        // ADR-0071 fragment surface pairing (issue #865): the cluster-internal
+        // ADR-0071 fragment surface pairing: the cluster-internal
         // SeriesFetch surface is only ever exposed behind a shared bearer
         // token, and the token file is only read when the surface is enabled.
         // Reject either half of the pair on its own so a misconfiguration fails
@@ -1435,7 +1433,7 @@ impl Cli {
             anyhow::bail!("--max-parallel-slices must be at least 1");
         }
 
-        // ADR-0071 cross-cluster federation (issue #868): parse every
+        // ADR-0071 cross-cluster federation: parse every
         // `--remote-cluster` spec (and the shared soft-timeout default) here so
         // a malformed spec, a duplicate name, or an unreadable/empty credential
         // file fails startup, at the same point every other credential file is
@@ -1616,7 +1614,7 @@ impl Cli {
 /// Kept separate from the two parse methods because it is what a deployment
 /// authenticating only through OIDC or mTLS depends on: those tenants have no
 /// `--tenant-token` entry, and before this merge existed the fold and
-/// maintenance tenant list was silently empty for them (issue #398).
+/// maintenance tenant list was silently empty for them.
 pub fn merge_fold_tenants<'a>(
     token_tenants: impl IntoIterator<Item = &'a TenantId>,
     maintain_tenants: impl IntoIterator<Item = &'a TenantId>,
@@ -1738,8 +1736,8 @@ pub mod limits {
     /// `max_active_series` and `max_active_streams` are lower than ADR-0051
     /// section 2's proposed `1,000,000`. That figure assumed roughly 16
     /// bytes per tracked identity in `AdmissionController`'s two-epoch
-    /// `HashSet<SeriesId>` / `HashSet<LogStreamId>` tracker; issue #491
-    /// measured the actual cost at 35-56 bytes per live entry once
+    /// `HashSet<SeriesId>` / `HashSet<LogStreamId>` tracker; measurement
+    /// puts the actual cost at 35-56 bytes per live entry once
     /// hashbrown's power-of-two table sizing at 7/8 load and allocator
     /// headroom are counted, 2-4x the ADR's assumption. At `1,000,000` that
     /// is roughly 140-224 MiB per fully active tenant (cap x bytes-per-entry
@@ -1750,7 +1748,7 @@ pub mod limits {
     /// docs/guides/admission-limits.md for the arithmetic and per-tenant-count
     /// examples. This is a deliberate change from the ADR's proposed number,
     /// not the ADR's own 16-byte figure being corrected in place: that
-    /// correction is issue #491 and belongs in ADR-0051 section 2 itself.
+    /// correction belongs in ADR-0051 section 2 itself.
     ///
     /// `ingest_bytes_per_sec` / `ingest_byte_burst` and
     /// `series_creation_rate_per_sec` / `series_creation_burst` are
@@ -2428,7 +2426,7 @@ mod tests {
         Cli::try_parse_from(argv).expect("flags parse")
     }
 
-    /// Reachability (ADR-0074, issue #956): the shipped
+    /// Reachability (ADR-0074): the shipped
     /// `--distribute-*-threshold` flag defaults flow through
     /// `parse_distrib_settings` into the `DistribThresholds` the live query
     /// path consults, and the measured defaults gate `should_distribute`
@@ -2636,7 +2634,7 @@ mod tests {
 
     #[test]
     fn oidc_without_audience_fails_startup() {
-        // #397: OIDC enabled (issuer + jwks) but no --oidc-audience must fail
+        // OIDC enabled (issuer + jwks) but no --oidc-audience must fail
         // fast. Otherwise `OidcResolver` disables audience validation and any
         // correctly-signed token from the issuer, for any relying party,
         // authenticates.
@@ -2895,7 +2893,7 @@ mod tests {
 
     #[test]
     fn merge_with_no_tenant_tokens_still_folds_maintain_tenants() {
-        // The issue #398 shape: an OIDC/mTLS-only deployment has no
+        // An OIDC/mTLS-only deployment has no
         // --tenant-token entries at all.
         let none: [TenantId; 0] = [];
         let from_maintain = [TenantId::new("acme")];

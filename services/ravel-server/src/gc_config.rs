@@ -8,8 +8,8 @@
 //! converts the `Duration`-typed process knobs (the query engine deadline, the
 //! Flight ticket ceiling) into the nanoseconds the validators compare.
 //!
-//! The fresh-bucket property every startup path here depends on (the EC3/#566
-//! lesson): [`bootstrap`] writes `sys/gc` from the maintain defaults on a fresh
+//! The fresh-bucket property every startup path here depends on:
+//! [`bootstrap`] writes `sys/gc` from the maintain defaults on a fresh
 //! bucket rather than refusing because the object is absent, and a racing loser
 //! re-reads the winner's object. So a fresh, never-bootstrapped bucket never
 //! fails startup for any process; only a *present* object that a mode really

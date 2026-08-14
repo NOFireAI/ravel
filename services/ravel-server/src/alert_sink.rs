@@ -1,4 +1,4 @@
-//! Notification sinks for alert transitions (ADR-0043 decision 6, issue #382).
+//! Notification sinks for alert transitions (ADR-0043 decision 6).
 //!
 //! Two sinks ship in v1: a generic webhook (the transition record as JSON) and
 //! an Alertmanager-compatible sink (Alertmanager's own `/api/v2/alerts` payload

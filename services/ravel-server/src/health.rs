@@ -23,7 +23,7 @@
 //!   per probe.
 //!
 //! `/-/healthy` and `/-/ready` are Prometheus' own spellings of the same two
-//! probes, routed to the same handler functions (issue #336) so a
+//! probes, routed to the same handler functions so a
 //! Prometheus-shaped client can probe the paths it already knows.
 
 use std::sync::Arc;

@@ -1,14 +1,10 @@
-//! Regression test for issue #60 / finding a7-F03: the metadata endpoints
+//! The metadata endpoints
 //! (`/series`, `/labels`, `/label/{name}/values`) must apply one wall
 //! deadline to the whole request, not grant the full deadline afresh to each
 //! `match[]` selector.
 //!
-//! Adapted from the `#[ignore]`d a7-F03 reproducer on branch `audit/repro-a7`
-//! (`many_selectors_are_all_processed`). That reproducer only asserted that
-//! all selectors are accepted (HTTP 200) against an instant in-memory store,
-//! which cannot distinguish a shared budget from a per-selector one. This
-//! version wraps the store so every listing costs a fixed delay, sets a short
-//! client `timeout`, and asserts the request as a whole is bounded by that
+//! The store is wrapped so every listing costs a fixed delay, and with a short
+//! client `timeout` the request as a whole is bounded by that
 //! single budget: it fails with a `504 timeout` well before N per-selector
 //! budgets would elapse.
 
@@ -74,7 +70,7 @@ impl ObjectStoreBackend for SlowListStore {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -135,7 +131,7 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> Running {
     .expect("server starts")
 }
 
-/// issue #60 / a7-F03: a `/series` request carrying many `match[]` selectors
+/// A `/series` request carrying many `match[]` selectors
 /// shares one wall deadline. Each selector drives one snapshot resolution,
 /// which lists a handful of catalog buckets; slowing each list by
 /// `LIST_DELAY` makes one selector cost roughly `PER_SELECTOR`. The client

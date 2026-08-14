@@ -1,5 +1,5 @@
-//! End-to-end coverage for the process-wide in-flight ingest-request ceiling
-//! (issue #802): a real HTTP or gRPC export blocked mid-flush, over
+//! End-to-end coverage for the process-wide in-flight ingest-request ceiling:
+//! a real HTTP or gRPC export blocked mid-flush, over
 //! `--max-inflight-ingest-requests`, is shed immediately rather than queued.
 //!
 //! Every test here holds the shard's data-object PUT open with a

@@ -1,6 +1,5 @@
 //! End-to-end proof that a stalled `DoGet` releases its query-concurrency
-//! permit by the server deadline, over the *real* tonic + hyper transport
-//! (issue #785).
+//! permit by the server deadline, over the *real* tonic + hyper transport.
 //!
 //! # Why this must be an end-to-end test
 //!

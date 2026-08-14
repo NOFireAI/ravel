@@ -1,4 +1,4 @@
-//! EE-T6 1c (issue #900, epic #894): reachability proof that an operator-
+//! Reachability proof that an operator-
 //! driven revoke of a tenant's durable `sys/auth` token actually reaches a
 //! RUNNING server's [`ravel_server::lifecycle_refresh::DurableBearerResolver`]
 //! within the ADR-0066 decision 6 staleness horizon.
@@ -161,7 +161,7 @@ async fn operator_revoke_reaches_running_server_within_the_horizon() {
 
     // The operator's reconcile remove-pass: revoke exactly this tenant's
     // operator-owned tokens, leaving any CLI-provisioned or unmanaged entry
-    // for another tenant untouched (ADR-0072 decision 4 amendment, #897) --
+    // for another tenant untouched (ADR-0072 decision 4 amendment) --
     // irrelevant here since this bucket has only the one entry, but this is
     // the real scoped primitive, not a blunt whole-map wipe.
     ravel_catalog::remove_tokens_by_tenant_owned_by(

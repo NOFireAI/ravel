@@ -134,7 +134,7 @@ impl IndexedFieldConfig {
     }
 }
 
-/// Bridge to the ingest layer's resolver trait (issue #511). `ravel-ingest`
+/// Bridge to the ingest layer's resolver trait. `ravel-ingest`
 /// owns the trait so it need not depend on this crate's config types; the log
 /// ingest router calls `fields_for` per flush. The inherent `fields_for` above
 /// wins method resolution here, so this is not a self-recursive call; it only
@@ -316,7 +316,7 @@ mod tests {
 
     // ---- the resolved list drives the writer -------------------------------
 
-    /// The acceptance test (issue #511, this exact name): a tenant whose
+    /// The acceptance test (this exact name): a tenant whose
     /// resolved list is absent (empty) indexes nothing, so the object carries no
     /// POSTINGS section and every write-side POSTINGS counter round-trips as
     /// zero. Absence is always legal (ADR-0049 decision 5).

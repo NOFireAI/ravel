@@ -1,5 +1,4 @@
-//! ADR-0064 EJ-T8 end-to-end selective-subject erasure reachability acceptance
-//! (issue #756, epic EJ #460).
+//! ADR-0064 end-to-end selective-subject erasure reachability acceptance.
 //!
 //! Where the per-crate unit tests each prove one link of the erasure pipeline in
 //! isolation, this module drives the WHOLE shipped chain together, for every
@@ -210,7 +209,7 @@ async fn object_exists(store: &dyn ObjectStoreBackend, data_key: &str) -> bool {
     store.get(data_key, GetRange::Full).await.is_ok()
 }
 
-// --- erasure request submission (the EJ-T6 `erase submit` write) -----------
+// --- erasure request submission (the `erase submit` write) -----------------
 
 /// Submit one erasure request exactly as `ravel-cli erase submit` does: a
 /// validated [`ravel_proto::commit::v1::ErasureRequest`] written `CreateIfAbsent`
@@ -485,7 +484,7 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
         "the pre-erase query must have warmed the read cache with the segment bytes"
     );
 
-    // Submit the erasure request (the EJ-T6 write). THIS is the flip line: remove
+    // Submit the erasure request. THIS is the flip line: remove
     // it and the two post-erase exclusion assertions below both fail.
     let request_id = Uuid::from_u128(0xE7A5);
     let dreq_key = submit_erasure_request(
@@ -631,7 +630,7 @@ mod logs {
     /// query window below.
     const LOG_TS_NS: i64 = 100;
     /// The query clock, frozen four hours past the epoch so the `start: 0`
-    /// window resolves to an ordinary span rather than tripping the issue #635
+    /// window resolves to an ordinary span rather than tripping the
     /// window-cost ceiling (mirrors `tests/cache_attachment_logs.rs`). Wholly
     /// independent of the tick clock, which runs at [`TEST_NOW_NS`].
     const LOG_QUERY_NOW_NS: i64 = 4 * NS_PER_HOUR;

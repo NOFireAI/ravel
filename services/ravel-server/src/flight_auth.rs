@@ -1,5 +1,4 @@
-//! gRPC metadata adapter for the future Flight SQL service (ticket C1c,
-//! issue #151).
+//! gRPC metadata adapter for the future Flight SQL service.
 //!
 //! Flight SQL rides on gRPC, so authentication and read-your-write pinning
 //! arrive as request metadata rather than as the HTTP headers the REST paths
@@ -10,8 +9,8 @@
 //!
 //! It deliberately stops there. No [`FlightSqlService`](https://docs.rs/arrow-flight)
 //! method lives here, and it does not cross-check the resolved tenant against a
-//! ticket's embedded tenant; a later ticket consumes this together with the
-//! ticket codec from issue #150.
+//! ticket's embedded tenant; a later change consumes this together with the
+//! ticket codec.
 //!
 //! # Tenant resolution
 //!

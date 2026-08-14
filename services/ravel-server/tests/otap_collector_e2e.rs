@@ -1,5 +1,5 @@
 //! Real-OTel-Collector-in-Docker e2e for the `otap` `ArrowMetricsService`
-//! (ADR-0011, issue #12 phase 3).
+//! (ADR-0011).
 //!
 //! This is the "against a real sender" half of phase 3: a pinned OTel
 //! Collector Contrib binary whose `otelarrow` exporter encodes OTAP with the

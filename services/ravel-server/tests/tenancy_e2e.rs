@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 //! End-to-end startup pinning for the deployment-keyed tenant hash
-//! (ADR-0050 section 3, EC3/issue #566). These drive
+//! (ADR-0050 section 3, EC3). These drive
 //! [`ravel_server::tenancy::resolve_and_pin`] directly against a
 //! `MemoryStore`, which is where the startup refusals live: the real `main`
 //! calls the same function and installs its resolved scheme. The scheme is
@@ -115,7 +115,7 @@ async fn fresh_bucket_unkeyed_starts_and_writes_marker() {
 
 /// A pre-ADR bucket (holds `t/` data, no marker) is adopted as `V1_UNKEYED`
 /// with no flags, writes the marker, and every existing prefix still resolves
-/// to exactly the same hash it did before this change: no re-key, no breakage.
+/// to exactly the same unkeyed hash: no re-key, no breakage.
 #[tokio::test]
 async fn pre_adr_bucket_adopts_unkeyed_and_preserves_hashes() {
     let store = store();

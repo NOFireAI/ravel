@@ -1,4 +1,4 @@
-//! ADR-0071 SQL-lane server wiring (issue #868): the deployment's
+//! ADR-0071 SQL-lane server wiring: the deployment's
 //! implementation of ravel-sql's [`WorkerEndpoints`] trait over the ravel-fleet
 //! query-worker registry, and the [`DistributedFlightConfig`] a coordinator
 //! would install on the Flight SQL service under `--distributed-query`.
@@ -24,7 +24,7 @@
 //!
 //! The [`DistributedFlightConfig`] this module builds is installed on the
 //! Flight SQL service through `RavelFlightSqlService::with_distributed_scan`
-//! (ADR-0071, issue #868): the server registration site
+//! (ADR-0071): the server registration site
 //! ([`crate::flight::service`]) passes the config built here when
 //! `--distributed-query` is on in a query-serving mode. On a positive cost
 //! gate, `do_get_statement` mints slice tickets and fans the samples scan out
@@ -43,7 +43,7 @@ use ravel_sql::{DistributedFlightConfig, WorkerEndpoints};
 type LiveWorkers = Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>>;
 
 /// A [`WorkerEndpoints`] over the ravel-fleet query-worker registry (ADR-0071
-/// SQL lane, issue #868). Returns the Flight location of every live,
+/// SQL lane). Returns the Flight location of every live,
 /// protocol-matched worker, in the registry's order. An empty result means no
 /// workers are available, and ravel-sql runs the query fully local (a single
 /// self-endpoint over the whole pinned set), which is always correct.
@@ -89,7 +89,7 @@ impl WorkerEndpoints for FleetWorkerEndpoints {
 ///
 /// `auth_token` is the cluster-internal fragment secret every process in the
 /// deployment already shares (`DistribSettings::auth_token`). The Flight ticket
-/// MAC key is derived from it (ADR-0071, issue #868) so a coordinator's slice
+/// MAC key is derived from it (ADR-0071) so a coordinator's slice
 /// ticket verifies on the worker process that redeems it; without a shared key,
 /// cross-process slice fan-out would fail every ticket MAC.
 pub fn distributed_flight_config(

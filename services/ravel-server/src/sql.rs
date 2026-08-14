@@ -1,5 +1,4 @@
-//! `POST /api/v1/sql`: the read-only SQL endpoint (ticket B3, issue #22,
-//! docs/arrow-datafusion-plan.md section 2).
+//! `POST /api/v1/sql`: the read-only SQL endpoint.
 //!
 //! This module is the transport and the error-to-HTTP boundary; every
 //! semantic decision lives in ravel-sql. That split is what keeps ADR-0013's
@@ -7,7 +6,7 @@
 //! ravel-sql links axum. Results cross the boundary as an opaque
 //! `QueryOutput` that encodes itself to Arrow IPC or JSON.
 //!
-//! # Error redaction (a7-F02, applied to a second boundary)
+//! # Error redaction (applied to a second boundary)
 //!
 //! crates/ravel-query/src/http/error.rs establishes the discipline for the
 //! PromQL path: storage-layer faults get a fixed, class-specific client
@@ -43,7 +42,7 @@
 //! `start`/`end` are Unix float seconds (the Prometheus convention used by
 //! the other endpoints) and bound the commit listing only; every predicate is
 //! still re-applied above the scan. `timeout` can only *lower* the server
-//! deadline, never raise it (finding a7-F01).
+//! deadline, never raise it.
 //!
 //! The response encoding follows `Accept`:
 //! `application/vnd.apache.arrow.stream` yields an Arrow IPC stream, which is
@@ -92,10 +91,9 @@ pub struct SqlState {
     pub store: Arc<dyn ObjectStoreBackend>,
     /// The evidential audit sink this endpoint submits one
     /// [`AuditEvent`](ravel_maintain::AuditEvent) through per executed query,
-    /// awaiting its durability before releasing the response (ADR-0062 §2a,
-    /// epic EL / issue #762). Migrated from the direct `write_query_audit`
-    /// call this endpoint previously made, so every query surface now audits
-    /// through one seam. Defaults to
+    /// awaiting its durability before releasing the response (ADR-0062 §2a).
+    /// Every query surface audits through this one seam rather than a direct
+    /// `write_query_audit` call. Defaults to
     /// [`NoopQueryAuditSink`](ravel_maintain::NoopQueryAuditSink); a deployment
     /// attaches the one shared pipeline.
     pub audit_sink: Arc<dyn QueryAuditSink>,
@@ -105,15 +103,15 @@ pub struct SqlState {
     pub clock: Arc<dyn Clock>,
     /// Server wall-deadline ceiling. A request `timeout` is clamped to it.
     pub max_deadline: Duration,
-    /// The process-global per-query cost aggregator (ADR-0044 section 4, issue
-    /// #425). Each completed statement folds its accounting snapshot and cost
+    /// The process-global per-query cost aggregator (ADR-0044 section 4).
+    /// Each completed statement folds its accounting snapshot and cost
     /// estimate into it, tagged with the tenant hash and workload class, for
     /// `/metrics`. One instance per process, shared with `/api/v1/analytics`.
     ///
     /// The Flight SQL and PromQL paths do not record into it yet: both build
     /// their own `QueryAccounting` per request and report it in the response
     /// only, so `/metrics` covers SQL and analytics traffic, not all query
-    /// traffic. Wiring them is the rest of #425.
+    /// traffic. Wiring them is future work.
     pub query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     /// The fleet-global query concurrency ceiling (ADR-0061 decision 2), the one
     /// shared controller every query surface in the process gates against.
@@ -240,7 +238,7 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     );
 
     // Fold this query's LogsScanExec block counters into the process-global
-    // prune-selectivity totals (issue #511). These are the scan's own
+    // prune-selectivity totals. These are the scan's own
     // DataFusion counters, read off the plan in ravel-sql and surfaced on
     // `stats`; a metrics query passes zeros and moves nothing. Separate from
     // the cost aggregator above: that one answers "what did this query
@@ -256,9 +254,9 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
 }
 
 /// Submit the query-audit event for one request through the shared sink and
-/// await its durability (ADR-0062 §2a). Unlike the pre-EL direct-write path
-/// this replaced -- which logged and swallowed a write failure so a successful
-/// query stayed a success -- the audit trail is now a release gate: in
+/// await its durability (ADR-0062 §2a). Unlike a direct-write path
+/// that logs and swallows a write failure so a successful
+/// query stays a success, the audit trail is a release gate: in
 /// `audit_mode=required` a flush failure (or a stopped pipeline) returns an
 /// error here and the request fails closed with a retryable 503, the
 /// deliberate inversion of "queries outlive the trail". In
@@ -333,7 +331,7 @@ fn build_request(
     }
 
     // A client may shorten its own deadline but never extend it past the
-    // server budget (finding a7-F01).
+    // server budget.
     let deadline = match body.timeout {
         Some(secs) if secs > 0.0 && secs.is_finite() => {
             Duration::from_secs_f64(secs).min(max_deadline)
@@ -384,8 +382,8 @@ fn seconds_to_ns(name: &str, secs: f64) -> Result<i64, ApiError> {
 
 /// Encode the result per the `Accept` header.
 ///
-/// `stats` is this query's cost accounting and estimate (ADR-0044, issue
-/// #425). It attaches only to the JSON encoding, as a sibling of `data`
+/// `stats` is this query's cost accounting and estimate (ADR-0044).
+/// It attaches only to the JSON encoding, as a sibling of `data`
 /// mirroring `/api/v1/query_exemplars`' "stats beside data" shape: an Arrow IPC
 /// stream is a bare columnar payload with no envelope to carry a JSON object,
 /// so an arrow-negotiated response reports no in-body stats. The `/metrics`
@@ -526,7 +524,7 @@ mod tests {
         assert_eq!(request.window.start_ns, 5_000_000_000 - ONE_HOUR_NS);
     }
 
-    /// a7-F01: a client `timeout` above the server maximum is clamped, never
+    /// A client `timeout` above the server maximum is clamped, never
     /// honored verbatim.
     #[test]
     fn a_timeout_above_the_server_maximum_is_clamped() {

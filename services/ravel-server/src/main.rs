@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let otap = false;
 
     // Every object-store call this process makes is counted by the decorator
-    // `build_store` wraps the backend in (issue #272), and the same handle is
+    // `build_store` wraps the backend in, and the same handle is
     // served at `GET /metrics` and attached to the query fetchers below. Built
     // here, before any tenant is hashed, because the tenancy scheme is resolved
     // from `sys/tenancy` on this store and must be installed before the first
@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     // into every ingest path.
     let deployment_key = resolved_tenancy.deployment_key;
 
-    // Per-tenant SSE-KMS routing (EL-7, issue #764, ADR-0062 decision 1,
+    // Per-tenant SSE-KMS routing (ADR-0062 decision 1,
     // ADR-0072 decision 2). Deferred to here, not folded into `build_store`
     // above: registering a tenant's key needs `TenantId::hash()`, which is
     // not valid to call until the tenant-hash scheme installed just above is
@@ -145,13 +145,13 @@ async fn main() -> anyhow::Result<()> {
 
     let tenant_tokens = cli.parse_tenant_tokens()?;
     // Fold and maintenance derive their tenant set from storage each cycle
-    // (ADR-0048 decision 3, issue #504), not from these flags. This is now
+    // (ADR-0048 decision 3), not from these flags. This is now
     // only an optional restriction: the union of the statically mapped bearer
     // tenants and whatever `--maintain-tenant` names. Empty (the default, and
     // the common case for a deployment authenticating tenants through OIDC or
     // mTLS, which has no `--tenant-token` entries) means no restriction is
     // configured, so every tenant storage discovers data for is maintained --
-    // not, as before issue #504, that nothing is.
+    // not, as an empty discovered set could be misread, that nothing is.
     let maintain_tenants = cli.parse_maintain_tenants()?;
     let fold_tenants =
         ravel_server::config::merge_fold_tenants(tenant_tokens.values(), &maintain_tenants);
@@ -331,8 +331,7 @@ async fn main() -> anyhow::Result<()> {
              tenant-aware query budgets land."
         );
     }
-    // Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3,
-    // issue #511). An empty or duplicate field name fails startup here rather
+    // Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3). An empty or duplicate field name fails startup here rather
     // than silently indexing the wrong set. `ravel_server::start` hands this to
     // the log ingest router, the one production call site that reads it.
     let indexed_fields = ravel_server::postings_config::IndexedFieldConfig::from_policy(
@@ -349,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
              Signal::Alerts records and nothing will be notified"
         );
     }
-    // #388: the alert evaluator only spawns in the modes that build a query
+    // the alert evaluator only spawns in the modes that build a query
     // engine (Mode::All and Mode::Query; see `ravel_server::start`), because a
     // rule is a query. In any other mode a rules file is still parsed and
     // validated above, but no evaluator ever runs it, so the whole alerting
@@ -454,7 +453,7 @@ async fn main() -> anyhow::Result<()> {
     if cfg!(feature = "flight-sql") {
         tracing::info!(
             "Flight SQL is registered on the gRPC listener, but every method answers \
-             UNIMPLEMENTED until issue #152 lands the service"
+             UNIMPLEMENTED because the service is not yet implemented"
         );
     }
 
@@ -482,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Whether a loaded rules file will never be evaluated because the process mode
-/// does not run the alert evaluator (#388). The evaluator spawns only in the
+/// does not run the alert evaluator. The evaluator spawns only in the
 /// modes that build a query engine ([`Mode::All`] and [`Mode::Query`]; see
 /// `ravel_server::start`). Factored out of `main` so the gate that drives the
 /// startup warning is unit-testable without standing up a whole process.
@@ -518,7 +517,7 @@ async fn wait_for_shutdown_signal() {
 mod tests {
     use super::*;
 
-    /// #388: the modes that build a query engine (and therefore spawn the alert
+    /// the modes that build a query engine (and therefore spawn the alert
     /// evaluator) must not warn; the modes that do not, must warn when rules are
     /// present. With no rules there is nothing to warn about in any mode.
     #[test]

@@ -1,5 +1,5 @@
 //! `POST /api/v1/analytics`: the post-evaluation analytics endpoint decided by
-//! ADR-0028 (issue #216 part 2).
+//! ADR-0028.
 //!
 //! The endpoint runs the exact same range evaluation `/api/v1/query_range`
 //! uses (same planner, budgets, staleness filtering, and wall deadline), then
@@ -68,7 +68,7 @@
 //! # Errors
 //!
 //! Evaluator errors keep the exact status mapping `/api/v1/query_range` uses,
-//! including the a7-F02 redaction of storage-layer faults that would otherwise
+//! including the redaction of storage-layer faults that would otherwise
 //! leak an object key or tenant hash. `ravel-analytics` errors and the
 //! per-call series cap map to 422. The full table is in docs/analytics.md.
 
@@ -117,14 +117,14 @@ pub struct AnalyticsState {
     pub engine: Arc<QueryEngine>,
     pub tenant_resolver: Arc<dyn TenantResolver>,
     pub clock: Arc<dyn Clock>,
-    /// The process-global per-query cost aggregator (ADR-0044 section 4, issue
-    /// #425). The analytics endpoint runs the same range evaluation
+    /// The process-global per-query cost aggregator (ADR-0044 section 4).
+    /// The analytics endpoint runs the same range evaluation
     /// `/api/v1/query_range` does, so its accounting folds into `/metrics`
     /// exactly like a range query's would.
     pub query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     /// The evidential audit sink one event per executed analytics query is
     /// submitted through, its durability awaited before the response is
-    /// released (ADR-0062 §2a, epic EL / issue #762). Defaults to the no-op in
+    /// released (ADR-0062 §2a). Defaults to the no-op in
     /// deployments with no pipeline; a deployment attaches the one shared
     /// pipeline.
     pub audit_sink: Arc<dyn QueryAuditSink>,
@@ -156,7 +156,7 @@ struct AnalyticsBody {
     step: Scalar,
     op: OpSpec,
     /// Per-request wall deadline in seconds. Clamped to the server maximum;
-    /// can only lower it, never raise it (finding a7-F01).
+    /// can only lower it, never raise it.
     #[serde(default)]
     timeout: Option<f64>,
     /// Read-your-write commit tokens, exactly as the range endpoint treats
@@ -249,8 +249,7 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
     // its durability before releasing the response. A request rejected earlier
     // (auth, body parse, invalid parameters) never reached here and is not
     // audited. The recorded window is the request's resolved `[start, end]`.
-    // Collect per-slice fragment observability (ADR-0071 stats.fragments[],
-    // issue #865) for the duration of the range evaluation. The sink is
+    // Collect per-slice fragment observability (ADR-0071 stats.fragments[]) for the duration of the range evaluation. The sink is
     // installed in task-local storage so every distributed slice the engine
     // dispatches records into it; a non-distributed engine (or a query the cost
     // gate declined to fan out) records nothing, and the field stays absent.
@@ -301,7 +300,7 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
         &stats.estimate,
     );
     let mut stats_json = crate::query::accounting_stats_json(&stats.accounting, &stats.estimate);
-    // ADR-0071 (issue #865): a distributed run attaches a per-slice
+    // ADR-0071: a distributed run attaches a per-slice
     // `fragments[]` beside `accounting`/`estimate`; a non-distributed run
     // collected no entries, so the field is omitted rather than an empty array.
     let fragments = fragment_sink.take();
@@ -344,7 +343,7 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
                 "result": result,
             },
             // Beside `data`, the "stats object beside data" shape
-            // `/api/v1/query_exemplars` uses (ADR-0044, issue #425).
+            // `/api/v1/query_exemplars` uses (ADR-0044).
             "stats": stats_json,
         })),
     )
@@ -501,7 +500,7 @@ fn seconds_to_ms(name: &'static str, secs: f64) -> Result<i64, ApiError> {
 
 /// Resolve the wall deadline: the client `timeout` seconds clamped to the
 /// server maximum, or the server maximum when absent. A non-positive or
-/// non-finite `timeout` is a 400 (finding a7-F01, matching sql.rs).
+/// non-finite `timeout` is a 400 (matching sql.rs).
 fn parse_deadline(timeout: Option<f64>, max: Duration) -> Result<Duration, ApiError> {
     match timeout {
         Some(secs) if secs > 0.0 && secs.is_finite() => Ok(Duration::from_secs_f64(secs).min(max)),
@@ -564,8 +563,8 @@ impl ApiError {
 
     /// Map a `QueryError` through `ravel-query`'s public HTTP mapping, so this
     /// endpoint keeps the exact status contract of `/api/v1/query_range`,
-    /// including the a7-F02 redaction of storage-layer faults, from one shared
-    /// source rather than a copy that could drift (issue #219).
+    /// including the redaction of storage-layer faults, from one shared
+    /// source rather than a copy that could drift.
     fn from_query(err: QueryError) -> Self {
         let QueryErrorResponse {
             status,
@@ -839,7 +838,7 @@ mod tests {
         );
 
         // Storage faults are redacted, never echoed. The redacted messages are
-        // single-sourced from ravel-query (issue #219), so assert against those
+        // single-sourced from ravel-query, so assert against those
         // public constants rather than a local copy.
         let corrupt = ApiError::from_query(QueryError::NonMonotonicSamples { prev: 2, next: 1 });
         assert_eq!(corrupt.status, StatusCode::INTERNAL_SERVER_ERROR);

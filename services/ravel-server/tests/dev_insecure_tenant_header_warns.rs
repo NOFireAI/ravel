@@ -1,4 +1,4 @@
-//! Regression test for issue #61 / finding a7-F04: when
+//! When
 //! `--dev-insecure-tenant-header` is enabled, the server must log a loud
 //! startup warning that tenant isolation is bypassed (ADR-0009 mitigation).
 //!

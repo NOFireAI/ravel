@@ -1,4 +1,4 @@
-//! Process-wide in-flight ingest-request limit (issue #802).
+//! Process-wide in-flight ingest-request limit.
 //!
 //! One [`IngestConcurrencyController`] is built in [`crate::start`] and shared
 //! (via `Arc`) into every `GatewayState`/`RemoteWriteState` built for the

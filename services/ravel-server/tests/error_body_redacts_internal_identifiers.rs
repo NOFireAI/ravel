@@ -1,14 +1,10 @@
-//! Regression test for issue #59 / finding a7-F02: a storage-layer failure
-//! must surface to the client as a stable, typed, redacted message that
-//! carries no object key, tenant hash, or raw object-store text, while the
-//! full detail still reaches the server log.
+//! A storage-layer failure must surface to the client as a stable, typed,
+//! redacted message that carries no object key, tenant hash, or raw
+//! object-store text, while the full detail still reaches the server log.
 //!
-//! Adapted from the `#[ignore]`d a7-F02 reproducer on branch `audit/repro-a7`
-//! (`store_error_body_leaks_object_key`). That reproducer asserted the defect:
-//! the 503 body contained the `t/<tenant_hash>/.../*.rseg` key verbatim. This
-//! version inverts the assertion (the body must contain none of those tokens)
-//! and additionally captures the server's `tracing` output to prove the full
-//! detail, including the object key, is preserved for the operator.
+//! The response body must contain none of those tokens, and the server's
+//! captured `tracing` output must still preserve the full detail, including
+//! the object key, for the operator.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -188,7 +184,7 @@ async fn ingest_one(base: &str, client: &reqwest::Client, metric: &str) -> Strin
         .to_string()
 }
 
-/// issue #59 / a7-F02: forcing a segment decode failure must yield a 503 whose
+/// Forcing a segment decode failure must yield a 503 whose
 /// body is a stable, redacted message with no internal identifiers, while the
 /// server log still carries the full detail (the object key) for diagnosis.
 #[tokio::test]
@@ -244,8 +240,8 @@ async fn storage_failure_body_is_redacted_but_log_keeps_detail() {
         .expect("query request completes");
 
     // A corrupt segment is a permanent server-side data fault, so it maps to
-    // the non-retryable 500 `internal`, not the retryable 503 (issue #62,
-    // a7-F05). The redaction of the body content (below) is unchanged (#59).
+    // the non-retryable 500 `internal`, not the retryable 503. The redaction
+    // of the body content (below) is unchanged.
     assert_eq!(
         response.status(),
         500,

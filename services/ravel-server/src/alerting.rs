@@ -1,4 +1,4 @@
-//! Per-tenant alert-rule evaluator (ADR-0043, issue #382).
+//! Per-tenant alert-rule evaluator (ADR-0043).
 //!
 //! One background tokio task per tenant that has rules, mirroring
 //! [`crate::maintain`]'s shape exactly: a config struct, `spawn`/`run_loop`, a
@@ -111,7 +111,7 @@ const ALERT_WRITER_EPOCH: u64 = 1;
 const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
 const NS_PER_MS: i64 = 1_000_000;
 
-/// Lease lifetime as a multiple of the evaluation interval (#387). A holder
+/// Lease lifetime as a multiple of the evaluation interval. A holder
 /// renews the lease at the start of every tick, so the lease must outlive a
 /// couple of missed ticks (a slow query, jitter, a brief GC pause) or a healthy
 /// holder would keep losing it to a standby. Three intervals lets a holder miss
@@ -119,7 +119,7 @@ const NS_PER_MS: i64 = 1_000_000;
 /// how long a genuinely dead holder blocks failover to roughly three intervals.
 const LEASE_TTL_TICKS: u32 = 3;
 
-/// The per-tenant alert lease object body (#387): who holds it and until when.
+/// The per-tenant alert lease object body: who holds it and until when.
 /// Small JSON, mirroring how the rules file is already JSON; the value is
 /// advisory coordination state, not a frozen persistent format.
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,7 +132,7 @@ struct AlertLease {
     expiry_ns: i64,
 }
 
-/// The lease object key for a tenant's alert evaluation (#387).
+/// The lease object key for a tenant's alert evaluation.
 ///
 /// Lives under the tenant's alert keyspace (`Signal::Alerts` prefix `a`) but
 /// deliberately outside the `c/<shard>/` commit prefix that
@@ -324,11 +324,11 @@ pub struct AlertEvalReport {
     /// re-fire an alert that is already firing.
     pub history_unavailable: bool,
     /// `true` when another replica held the tenant's alert lease this tick, so
-    /// this replica skipped rule evaluation (#387). Expected steady state in a
+    /// this replica skipped rule evaluation. Expected steady state in a
     /// multi-replica deployment, not an error.
     pub lease_not_held: bool,
     /// `true` when the lease could not be acquired or renewed because the
-    /// object store failed (#387). Distinct from `lease_not_held`: this is a
+    /// object store failed. Distinct from `lease_not_held`: this is a
     /// store error, not a peer holding the lease. Rule evaluation is skipped and
     /// retried next tick.
     pub lease_unavailable: bool,
@@ -345,7 +345,7 @@ pub struct AlertEvaluator {
     http: reqwest::Client,
     query_deadline: Duration,
     /// How long a lease this evaluator writes stays valid before any replica may
-    /// take it over (#387). Derived from the evaluation interval at construction
+    /// take it over. Derived from the evaluation interval at construction
     /// ([`LEASE_TTL_TICKS`] times it).
     lease_ttl: Duration,
     /// Only read by the `sql` feature's [`AlertEvaluator::run_sql`]; a build
@@ -439,7 +439,7 @@ impl AlertEvaluator {
             self.bootstrapped = true;
         }
 
-        // #387: only the lease holder for this tenant evaluates rules and writes
+        // only the lease holder for this tenant evaluates rules and writes
         // transition records this tick, so two `--mode all`/`--mode query`
         // replicas configured with the same rules do not both fire and notify
         // every transition. History reading and bootstrap above are unguarded on
@@ -499,7 +499,7 @@ impl AlertEvaluator {
         report
     }
 
-    /// Try to own this tenant's alert lease for this tick (#387).
+    /// Try to own this tenant's alert lease for this tick.
     ///
     /// Two replicas can be configured with the same rules for the same tenant.
     /// Their folds are independent, so without coordination both evaluate every
@@ -618,7 +618,7 @@ impl AlertEvaluator {
             return Ok(false);
         }
 
-        // #385: guard against a backward wall-clock step (an NTP correction can
+        // guard against a backward wall-clock step (an NTP correction can
         // move `now_ns` behind the prior record's `ts_ns`).
         // `load_latest_records` orders records by `(ts_ns, epoch, seq)` with
         // `ts_ns` first, so a record stamped at or before its predecessor sorts
@@ -668,7 +668,7 @@ impl AlertEvaluator {
         // generation included, with no second computation to drift.
         let written = decode_single_record(&bytes)?;
         // Publish with the same corrected stamp so the commit record's event
-        // time matches the record's `ts_ns` (#385).
+        // time matches the record's `ts_ns`.
         self.publish(bytes, seq, stamp_ns).await?;
 
         tracing::info!(
@@ -799,7 +799,7 @@ impl AlertEvaluator {
         for meta in entries {
             let parsed = match keys::partition_bucket_entry(&meta.key)? {
                 keys::BucketEntry::CommitRecord(parsed) => parsed,
-                // #386: tolerate (skip) a compaction record rather than
+                // tolerate (skip) a compaction record rather than
                 // hard-erroring. Alerts are not a maintained signal today
                 // (`Signal::Alerts` is absent from `maintain::MAINTAINED_SIGNALS`),
                 // so nothing writes a `CompactionRecord` under this prefix yet.
@@ -813,8 +813,7 @@ impl AlertEvaluator {
                 // the L1 part this `CompactionRecord` names must be read from
                 // that part for full correctness. Reading L1 alert parts is out
                 // of scope here (no producer exists yet) and is deliberately left
-                // to the change that turns compaction on for this signal. See
-                // issue #386.
+                // to the change that turns compaction on for this signal.
                 keys::BucketEntry::CompactionRecord(_) => continue,
                 // A retention tombstone (or any other shape) under the alerts
                 // commit prefix is still unexpected and a real signal of layout
@@ -1373,8 +1372,8 @@ mod tests {
 }
 
 /// Tick-level tests that need a real store, catalog, and `QueryEngine`: the
-/// backward-clock monotonic stamp (#385), the compaction-record tolerance in
-/// the fold (#386), and the cross-replica lease (#387). Kept apart from the
+/// backward-clock monotonic stamp, the compaction-record tolerance in
+/// the fold, and the cross-replica lease. Kept apart from the
 /// pure parsing tests above because they pull in the ingest/segment/query
 /// stack; the seeding here mirrors `tests/alerting_e2e.rs`'s harness.
 #[cfg(test)]
@@ -1555,7 +1554,7 @@ mod tick_tests {
         let cfg = RlogConfig::default();
         let mut out = Vec::new();
         for meta in list_all(store, &prefix).await.expect("list") {
-            // Skip anything that is not an L0 commit record (e.g. the #386
+            // Skip anything that is not an L0 commit record (e.g. the
             // compaction-record test injects one under this prefix).
             if !matches!(
                 keys::partition_bucket_entry(&meta.key).expect("classify"),
@@ -1586,7 +1585,7 @@ mod tick_tests {
         out
     }
 
-    /// #385: a backward wall-clock step between ticks must still produce a
+    /// a backward wall-clock step between ticks must still produce a
     /// strictly-increasing `ts_ns`, and the evaluator must converge rather than
     /// re-transition from stale state every tick. The instant query sees the
     /// seed at `NOW`, then a clock stepped behind the seed empties the vector so
@@ -1655,7 +1654,7 @@ mod tick_tests {
         );
     }
 
-    /// #386: `load_latest_records` must skip a `CompactionRecord` under the
+    /// `load_latest_records` must skip a `CompactionRecord` under the
     /// alerts commit prefix instead of erroring. Constructed directly in the
     /// store: today nothing produces one, so this is forward-compatible
     /// groundwork for when compaction is enabled for `Signal::Alerts`.
@@ -1690,7 +1689,7 @@ mod tick_tests {
         );
     }
 
-    /// #387: two evaluator instances (two "replicas") over the same store,
+    /// two evaluator instances (two "replicas") over the same store,
     /// evaluating the same tick, must not both fire and write. The lease holder
     /// writes the transition; the other finds a live lease held by a different
     /// identity and skips evaluation entirely.
@@ -1728,7 +1727,7 @@ mod tick_tests {
         );
     }
 
-    /// #387: once the holder's lease expires, a second replica takes it over and
+    /// once the holder's lease expires, a second replica takes it over and
     /// then evaluates. Proves the lease is a lease, not a permanent lock: a dead
     /// holder does not block a tenant forever.
     #[tokio::test]

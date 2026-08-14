@@ -1,6 +1,6 @@
 //! End-to-end reachability test for ADR-0065's ownership and merge-memory
-//! metrics (EI-T5, issue #749). This is the epic's designated proof that the
-//! new gauges are actually wired and reachable through the real `/metrics`
+//! metrics. This is the designated proof that the
+//! gauges are actually wired and reachable through the real `/metrics`
 //! surface, not merely unit-tested against `MaintenanceOwnershipMetrics`
 //! directly: it spins up TWO real `Mode::Maintain` `ravel_server::start`
 //! roles (each with its own real spawned maintenance supervisor and
@@ -172,7 +172,7 @@ fn sample_value(body: &str, line_prefix: &str) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
-/// ADR-0065's whole-epic acceptance criterion (EI-T5, issue #749): two real
+/// ADR-0065's overall acceptance criterion: two real
 /// `Mode::Maintain` roles, wired exactly as production spawns them, sharing
 /// one store partition, converge their `ravel_maintain_workers_live` gauge to
 /// 2 and jointly own every `(signal, shard)` unit with no double-pay, all

@@ -1,4 +1,4 @@
-//! End-to-end tests for `POST /api/v1/sql` (ticket B3, issue #22).
+//! End-to-end tests for `POST /api/v1/sql`.
 //!
 //! Real RSEG segments, real commit records, a real catalog, and the route
 //! driven through `tower::ServiceExt::oneshot`, so everything asserted here
@@ -468,7 +468,7 @@ async fn rejected_statement_kinds_return_400_over_http() {
     }
 }
 
-/// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): the
+/// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): the
 /// sequential-fold UDAF now answers over HTTP like any other aggregate.
 /// Bit-exactness against the reference fold is gated in
 /// crates/ravel-sql/tests/differential.rs; this only checks the endpoint
@@ -521,7 +521,7 @@ async fn tenants_cannot_read_each_others_rows_over_http() {
 }
 
 // ---------------------------------------------------------------------------
-// Error redaction (a7-F02, second boundary)
+// Error redaction (second boundary)
 // ---------------------------------------------------------------------------
 
 /// The assertion set the PromQL boundary's tests use, applied to the raw
@@ -720,7 +720,7 @@ async fn min_commit_token_is_accepted_and_read_your_write_resolves() {
 }
 
 // ---------------------------------------------------------------------------
-// The `logs` table over HTTP (ADR-0033, issue #240)
+// The `logs` table over HTTP (ADR-0033)
 // ---------------------------------------------------------------------------
 
 /// The epic's acceptance test for the endpoint wiring: a real `POST
@@ -1030,7 +1030,7 @@ impl ObjectStoreBackend for LogsCommitListSpy {
 
     fn capabilities(&self) -> ravel_object_store::Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         ravel_object_store::Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -1039,7 +1039,7 @@ impl ObjectStoreBackend for LogsCommitListSpy {
 }
 
 // ---------------------------------------------------------------------------
-// Query-audit records (ADR-0042 decision 4, issue #391)
+// Query-audit records (ADR-0042 decision 4)
 // ---------------------------------------------------------------------------
 
 /// Read back every query-audit record (`kind=query`) the server has written to
@@ -1195,9 +1195,9 @@ async fn a_request_rejected_before_execution_is_not_audited() {
 /// (c) An audit-write failure fails the query CLOSED in `audit_mode=required`
 /// (ADR-0062 §2b): every PUT to the `Signal::Audit` keyspace is faulted, so the
 /// pipeline's flush fails and `submit` returns an error; the endpoint must then
-/// return 503 rather than release an unaudited 200. This is the deliberate
-/// inversion of the pre-EL "log and swallow" behavior -- "queries outlive the
-/// trail" is exactly the gap the epic closes.
+/// return 503 rather than release an unaudited 200. This deliberately inverts
+/// a "log and swallow" behavior in which "queries outlive the
+/// trail"; the required mode closes that gap.
 #[tokio::test]
 async fn an_audit_write_failure_fails_the_query_closed_in_required_mode() {
     let plan = FaultPlan::empty().with_rule(

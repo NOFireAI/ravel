@@ -1,7 +1,7 @@
-//! Online-resharding acceptance test (ADR-0052, epic EK task EK3, issue #592).
+//! Online-resharding acceptance test (ADR-0052).
 //!
 //! This proves the shipped generation-versioned `shard_count` mechanism end to
-//! end: EK1's write-side router live switch, EK2's read-side per-hour scan rule,
+//! end: the write-side router live switch, the read-side per-hour scan rule,
 //! and the reshard append operation together return complete query results
 //! across a reshard boundary, for both an increase and a decrease.
 //!
@@ -538,7 +538,7 @@ async fn increase_with_concurrent_ingest_returns_complete_results() {
 /// range query spanning hours `BASE` and `BASE + 2` returns both, because
 /// `scan_count` keeps the retiring, wider count in the scan set through the
 /// activation hour's slack window (ADR-0052 section 4). Decreases are not gated
-/// behind a follow-up: EK1/EK2 shipped them, so the acceptance test covers one.
+/// behind a follow-up: the write- and read-side rules cover them, so the acceptance test covers one.
 #[tokio::test]
 async fn decrease_with_concurrent_ingest_returns_complete_results() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -802,7 +802,7 @@ async fn decrease_straggler_write_inside_slack_window_is_found() {
 /// comes back only because Phase 1 listing scans the post-reshard, widened range
 /// for those hours. One range query spans both regions and returns both.
 ///
-/// Note on which acceptance arm fires (the Finding 2 caveat): through a real
+/// Note on which acceptance arm fires: through a real
 /// fold the head's `shard_count` equals the ceiling the reader recomputes at the
 /// head's watermark (the fold sealed only hours strictly below the reshard's
 /// activation, so the widened generation does not yet raise the ceiling there),
@@ -965,9 +965,9 @@ async fn read_your_write_token_resolves_after_decrease() {
     router.flush_all().await;
 
     // Decrease 8 -> 4 activating at BASE-5 (now_hour BASE-7, lead 2). With
-    // S = 3 (NF-3), activation + S = BASE-2, comfortably before the write's
+    // S = 3, activation + S = BASE-2, comfortably before the write's
     // ingest hour (BASE): scan_count(BASE) = 4 and shard >= 4 is not scanned.
-    // (Activating at BASE-2, the pre-NF-3 timing, would put the write inside
+    // (Activating at BASE-2 would put the write inside
     // the widened S = 3 slack and destroy the test's purpose -- see the
     // ADR-0052 2026-08-12 amendment.)
     let outcome = reshard(
@@ -1011,8 +1011,8 @@ async fn read_your_write_token_resolves_after_decrease() {
 // Acceptance property 5: stale writer fails closed.
 // --------------------------------------------------------------------------
 
-/// Staleness fail-closed, with the NF-2 bounded grace window (ADR-0052
-/// amendment 2026-08-12, issue #655): once the router's cached view for a
+/// Staleness fail-closed, with the bounded grace window (ADR-0052
+/// amendment 2026-08-12): once the router's cached view for a
 /// tenant ages past `C`, the router re-reads the provisioning record before
 /// routing; if that re-read cannot complete (here a store fault on the record
 /// GET), the router falls back to
@@ -1022,11 +1022,11 @@ async fn read_your_write_token_resolves_after_decrease() {
 /// write still routes, on the last-known-good view, and the grace-extended
 /// counter increments; only once the horizon is crossed does the write fail
 /// closed with the typed [`WriteError::StaleProvisioningView`] and the
-/// ordinary stale-flush counter (ADR-0052 section 3). Before the grace window
-/// existed, this test's first write asserted `expect_err` at exactly the
-/// still-within-horizon point -- that is the total outage NF-2 replaces with
-/// bounded degraded routing. Tested at the router level, per the ticket's
-/// explicit allowance: forcing the record re-read to fail deterministically
+/// ordinary stale-flush counter (ADR-0052 section 3). Without the grace
+/// window, a write at the still-within-horizon point would be a total outage
+/// (an immediate `expect_err`); the grace window replaces that with
+/// bounded degraded routing. Tested at the router level: forcing the record
+/// re-read to fail deterministically
 /// needs a `FaultStore` on the record GET, which live HTTP ingest offers no
 /// clean seam for, and the `IngestRouter` is the exact component that
 /// enforces this posture.
@@ -1128,16 +1128,16 @@ async fn stale_view_routes_via_grace_window_then_fails_closed_past_horizon() {
 }
 
 // --------------------------------------------------------------------------
-// Acceptance property 6: NF-2/NF-3 coupling (ADR-0052 amendment 2026-08-12).
+// Acceptance property 6: grace-window / read-slack coupling (ADR-0052 amendment 2026-08-12).
 // --------------------------------------------------------------------------
 
 /// Pins the exact coupling the amendment's safety argument depends on: a
-/// write that NF-2's grace window routes under a stale, retiring-generation
+/// write that the grace window routes under a stale, retiring-generation
 /// view (count 8) into an hour the successor decrease generation (count 4)
 /// already nominally owns on the real record -- possible under the
 /// amendment's new assumption that the reshard-append process's clock may
 /// lead the router's by up to `TOLERATED_CLOCK_SKEW_HOURS` -- must still be
-/// found on read, because NF-3 widens the read-side slack `S` to cover
+/// found on read, because the widened read-side slack `S` covers
 /// exactly that overshoot.
 ///
 /// The reshard (8 -> 4, activating at `BASE_HOUR`) is appended for real
@@ -1149,8 +1149,8 @@ async fn stale_view_routes_via_grace_window_then_fails_closed_past_horizon() {
 /// horizon relative to the cache's own refresh time) rather than a fresh
 /// read, landing in a shard only the retiring count-8 generation ever wrote.
 ///
-/// Flipped-line proof: with `DEFAULT_SCAN_SLACK_HOURS` reverted to its
-/// pre-NF-3 value of 2 (`crates/ravel-catalog/src/provisioning.rs:398`,
+/// Flipped-line proof: with `DEFAULT_SCAN_SLACK_HOURS` set to the narrower
+/// value of 2 (`crates/ravel-catalog/src/provisioning.rs:398`,
 /// `pub const DEFAULT_SCAN_SLACK_HOURS: u32 = FLUSH_BOUND_SLACK_HOURS +
 /// TOLERATED_CLOCK_SKEW_HOURS;`, which evaluates to 2 instead of 3),
 /// `scan_count` at `activation + 2` would exclude the retiring generation
@@ -1224,7 +1224,7 @@ async fn grace_routed_decrease_straggler_is_covered_by_widened_slack() {
     assert_eq!(
         router.metrics().snapshot().grace_extended_stale_flushes,
         1,
-        "the write must have gone through NF-2's grace path, not a fresh read"
+        "the write must have gone through the grace path, not a fresh read"
     );
     router.flush_all().await;
 
@@ -1240,7 +1240,7 @@ async fn grace_routed_decrease_straggler_is_covered_by_widened_slack() {
     assert_eq!(
         value_of(&value, &straggler_metric),
         Some(99.0),
-        "NF-3's widened slack (S = 3) still scans the retiring generation's \
+        "the widened slack (S = 3) still scans the retiring generation's \
          shards at activation + 2, so the grace-routed straggler is found"
     );
 }
