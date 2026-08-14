@@ -1,11 +1,11 @@
-//! Ravel's unified alerting engine, Wave 1 (issue #372, ADR-0043).
+//! Ravel's unified alerting engine (ADR-0043).
 //!
 //! This crate is pure logic: the rule shape, condition evaluation, the alert
 //! state machine, the alerts-on-alerts generation guard, and the record write
 //! path. It has no service wiring, no HTTP, no scheduler loop, and it never
-//! executes PromQL or SQL or performs an object-store PUT. Wave 2 supplies the
-//! per-tenant evaluator task, the real query engines, and the sinks; it calls
-//! into the functions here.
+//! executes PromQL or SQL or performs an object-store PUT. The caller supplies
+//! the per-tenant evaluator task, the real query engines, and the sinks; it
+//! calls into the functions here.
 //!
 //! One generic [`Rule`] covers both rule families (ADR-0043 decision 1):
 //! observability alert rules ([`RuleQuery::Promql`] + [`RuleCondition::Threshold`])
