@@ -191,7 +191,7 @@ async fn permanent_fault_before_data_put_leaves_no_visible_commit() {
 
     let snapshot = router.metrics().snapshot();
     // A permanent data-object PUT fault exhausts the retry budget, so this is
-    // a durability abandonment, not an input rejection (a8-F05 split).
+    // a durability abandonment, not an input rejection.
     assert_eq!(snapshot.abandoned_retry_exhausted, 1);
     assert_eq!(snapshot.abandoned_input_rejected, 0);
 

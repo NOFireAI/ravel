@@ -35,7 +35,7 @@ pub const SPAN_SEGMENT_FORMAT_VERSION: u16 = ravel_rspan::footer::VERSION;
 pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// Receiver-clock plausibility floor: 2020-01-01T00:00:00Z in nanoseconds
-/// (ADR-0051 amendment 2026-08-13, S1-12 close-out). No host legitimately
+/// (ADR-0051 amendment). No host legitimately
 /// runs Ravel with a clock reading before the system existed, so a reading
 /// below this floor is the replica's own fault, not the request's data. It is
 /// the one floor derivable without a second reference clock: a wrong-but-post-
@@ -49,7 +49,7 @@ pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
 pub const MIN_PLAUSIBLE_INGEST_CLOCK_NS: i64 = 1_577_836_800_000_000_000;
 
 /// Checks a receiver admission-clock reading for plausibility before it is
-/// used to build a normalize context (ADR-0051 amendment, S1-12 close-out).
+/// used to build a normalize context (ADR-0051 amendment).
 ///
 /// The reading must sit at or above [`MIN_PLAUSIBLE_INGEST_CLOCK_NS`] and yield
 /// a representable `u32` ingest-hour bucket. A failure is the replica's fault,
@@ -74,8 +74,7 @@ pub fn plausible_ingest_clock(now_ns: i64) -> Result<(), String> {
 }
 
 /// Derives the commit record's `ingest_hour_bucket` from a flush-open clock
-/// reading, fail-loud (ADR-0051 section 7 and the 2026-08-13 amendment,
-/// S1-12). A non-positive reading (a clock that reports zero or has gone
+/// reading, fail-loud (ADR-0051 section 7 and its amendment). A non-positive reading (a clock that reports zero or has gone
 /// backwards past the epoch), or a positive-but-implausible one below
 /// [`MIN_PLAUSIBLE_INGEST_CLOCK_NS`] (a host whose RTC reset to shortly after
 /// the epoch), can never be a valid hour bucket. Silently mapping it to bucket
@@ -120,7 +119,7 @@ pub struct IngestConfig {
     pub flush_tick: Duration,
     /// Age threshold applied instead of `max_flush_delay` when a buffer has
     /// no strict-mode waiter and holds fewer than `min_flush_bytes`
-    /// (ADR-0051 section 7, S2-06/S3-05). Keeps the fast age trigger for
+    /// (ADR-0051 section 7). Keeps the fast age trigger for
     /// buffers a caller is blocked on or that are already worth a PUT, while
     /// an idle, low-volume buffered-mode tenant waits this long instead of
     /// paying a PUT every `max_flush_delay` regardless of how little data it
@@ -159,8 +158,8 @@ pub struct IngestConfig {
     /// moves its buffer into a spawned task while continuing to drain its
     /// channel; this semaphore is the only thing that can make a flush
     /// trigger block. Default 1 reproduces today's one-flush-at-a-time
-    /// behavior bit for bit; raising it is a measured decision recorded in
-    /// BENCHMARKS.md, not a routine tuning change. Must be at least 1: a
+    /// behavior bit for bit; raising it is a measured decision, not a routine tuning
+    /// change. Must be at least 1: a
     /// value of 0 deadlocks every flush (`services/ravel-server`'s
     /// `Cli::validate` rejects it at the edge).
     pub max_inflight_flushes: u32,

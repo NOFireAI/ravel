@@ -14,7 +14,7 @@ pub enum WriteError {
     /// leaves the router serving the surviving shards while every series
     /// hashing to the dead shard fails here. The router counts each distinct
     /// shard death (`IngestMetricsSnapshot::shard_deaths`) so the degraded
-    /// state is observable rather than silent (a8-F03). Retryable at the
+    /// state is observable rather than silent. Retryable at the
     /// client, but points routed to a dead shard keep failing until the
     /// process is restarted.
     #[error("shard actor unavailable")]
@@ -41,8 +41,7 @@ pub enum WriteError {
     SeriesIdCollision(String),
     /// Two points in one shard buffer carried the same `series_id` but one
     /// was scalar and the other was a histogram: a series is one value kind
-    /// for its whole life in a segment (`value_kind`, docs/rseg-v3-plan.md
-    /// section 3.4). The batch is rejected fail-loud rather than silently
+    /// for its whole life in a segment (`value_kind`). The batch is rejected fail-loud rather than silently
     /// picking one kind and dropping the other's points. Not retryable:
     /// identical input reproduces the same mismatch.
     #[error("series value-kind mismatch: {0}")]

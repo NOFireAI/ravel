@@ -10,8 +10,7 @@
 //! worth restating: this buffer performs no stream-identity collision check
 //! of its own. Unlike [`crate::shard::TenantBuf::merge`]'s ADR-0005 series-id
 //! check, the equivalent fail-loud check for logs already lives in
-//! [`RlogWriter::finish`] (`LogSegError::InconsistentStreamAttrs`, issue
-//! #225), which compares every buffered record's `stream_attrs` for a shared
+//! [`RlogWriter::finish`] (`LogSegError::InconsistentStreamAttrs`), which compares every buffered record's `stream_attrs` for a shared
 //! `stream_id`. Duplicating it here would only be dead code with a second
 //! chance to drift, so the flush step maps that one `finish()` error variant
 //! to [`LogWriteError::StreamIdCollision`] instead.
@@ -173,7 +172,7 @@ pub(crate) struct LogShardActor {
     rx: mpsc::Receiver<LogShardMsg>,
     tenants: HashMap<TenantId, LogTenantBuf>,
     /// Resolves each tenant's POSTINGS indexed-field list at flush time
-    /// (ADR-0049 decision 3, issue #511). Shared across shards.
+    /// (ADR-0049 decision 3). Shared across shards.
     indexed_fields: Arc<dyn LogIndexedFields>,
 }
 
@@ -305,7 +304,7 @@ impl LogShardActor {
     /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7, S2-06). Strict-mode ack latency is unaffected:
+    /// (ADR-0051 section 7). Strict-mode ack latency is unaffected:
     /// a strict write always leaves `waiters` non-empty for its whole flush
     /// window.
     fn age_threshold_ns(&self, buf: &LogTenantBuf) -> i64 {
@@ -368,7 +367,7 @@ impl LogShardActor {
     /// and increments `stream_id_collisions`; every other `LogSegError`
     /// becomes [`LogWriteError::SegmentBuild`]. This is the only site that
     /// constructs `StreamIdCollision`, because the collision check itself now
-    /// lives in `finish()` (issue #225), not in this module.
+    /// lives in `finish()`, not in this module.
     async fn flush_tenant(&mut self, tenant: TenantId, buf: LogTenantBuf, trigger: FlushTrigger) {
         let LogTenantBuf {
             records,
@@ -428,7 +427,7 @@ impl LogShardActor {
             writer_seq: seq,
         };
         // Resolve this tenant's POSTINGS indexed-field list (ADR-0049 decision
-        // 3, issue #511) once per object and hand it to the writer. An empty
+        // 3) once per object and hand it to the writer. An empty
         // list leaves the object without a POSTINGS section, which is always
         // legal (decision 5).
         let indexed_fields = self.indexed_fields.fields_for(&tenant_hash);
@@ -443,7 +442,7 @@ impl LogShardActor {
         }
         let bytes = match writer.finish_with_stats() {
             Ok((bytes, stats)) => {
-                // Write-side POSTINGS metrics (issue #511): section bytes,
+                // Write-side POSTINGS metrics: section bytes,
                 // per-field distinct counts, and the cap-exceeded counter, all
                 // aggregated label-free by the /metrics renderer.
                 self.metrics.record_postings(stats);
@@ -1087,7 +1086,7 @@ mod tests {
     }
 
     /// A permanently-retryable fault on every RLOG data-object PUT drives
-    /// exactly `put_retry_max_attempts + 1` inner PUT calls (issue #281): one
+    /// exactly `put_retry_max_attempts + 1` inner PUT calls: one
     /// first attempt plus `max_attempts` retries, counted off the FaultStore.
     #[tokio::test]
     async fn log_data_put_makes_exactly_max_attempts_plus_one_calls() {

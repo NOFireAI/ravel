@@ -68,7 +68,7 @@ pub struct SpanIngestMetrics {
     /// the span-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
     stale_provisioning_flushes: AtomicU64,
     /// Flushes routed on a last-known-good provisioning view inside the
-    /// bounded NF-2 grace window (ADR-0052 degraded-safe fallback), the
+    /// bounded grace window (ADR-0052 degraded-safe fallback), the
     /// span-pipeline counterpart of `IngestMetrics::grace_extended_stale_flushes`.
     grace_extended_stale_flushes: AtomicU64,
 }
@@ -147,7 +147,7 @@ impl SpanIngestMetrics {
     }
 
     /// One flush routed on a last-known-good provisioning view inside the
-    /// bounded NF-2 grace window (ADR-0052 degraded-safe fallback).
+    /// bounded grace window (ADR-0052 degraded-safe fallback).
     pub(crate) fn record_grace_extended_stale_flush(&self) {
         self.grace_extended_stale_flushes
             .fetch_add(1, Ordering::Relaxed);

@@ -102,7 +102,7 @@ impl Clock for TestClock {
 /// delegating to the inner store. Models a backend call that is merely slow
 /// -- it always eventually succeeds, never errors -- so a test can drive
 /// the shard actor's `max_flush_lifetime` deadline past `delay` and assert
-/// the flush is abandoned rather than published (issue #182), without any
+/// the flush is abandoned rather than published, without any
 /// real wall-clock wait: the delay only ever elapses if the test itself
 /// advances `clock` that far.
 pub struct SlowStore {
@@ -174,7 +174,7 @@ impl ObjectStoreBackend for SlowStore {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -442,7 +442,7 @@ impl ObjectStoreBackend for StallingStore {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()

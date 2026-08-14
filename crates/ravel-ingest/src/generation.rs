@@ -1,5 +1,4 @@
-//! Router live switch for online resharding (ADR-0052 sections 2-3, epic EK
-//! task EK1).
+//! Router live switch for online resharding (ADR-0052 sections 2-3).
 //!
 //! Each ingest router owns a fixed shard-actor set built once at construction.
 //! Resharding replaces that with a *generation-versioned* view: a tenant's
@@ -77,7 +76,7 @@ fn ceil_hours(ns: i64) -> u32 {
 }
 
 /// The ADR-0052 section 3 minimum reshard lead time `L >= ceil(C) + 1` for a
-/// refresh interval `C`, in hours. The NF-2 grace window (issue #655) reuses
+/// refresh interval `C`, in hours. The grace window reuses
 /// this exact bound in reverse: a generation appended after a router's last
 /// successful refresh cannot activate within `min_lead_hours(C)` hours of that
 /// refresh, so a cached view stays provably authoritative for any wall-clock
@@ -230,7 +229,7 @@ impl<H> GenerationSwitch<H> {
         Routed::Fresh(self.ensure_set(&mut inner, count))
     }
 
-    /// NF-2 bounded degraded-safe fallback (ADR-0052 sections 2-3, issue #655):
+    /// Bounded degraded-safe fallback (ADR-0052 sections 2-3):
     /// called by a router whose provisioning re-read could not complete after
     /// [`GenerationSwitch::route_cached`] returned [`Routed::Stale`], so it can
     /// continue routing on the last-known-good view instead of failing every
@@ -495,7 +494,7 @@ mod tests {
         assert!(matches!(sw.route_cached(t, t0 + c + 1), Routed::Fresh(_)));
     }
 
-    /// ADR-0069 decision 2 (issue #820): an idle tenant's generation view is
+    /// ADR-0069 decision 2: an idle tenant's generation view is
     /// evicted once it has gone untouched past the TTL, its next access
     /// re-derives it by re-reading the provisioning record and succeeds, and a
     /// tenant still being written survives the same sweep.
@@ -589,7 +588,7 @@ mod tests {
         );
     }
 
-    /// NF-2 (issue #655): a router whose cached view has gone stale by `C` but
+    /// A router whose cached view has gone stale by `C` but
     /// whose `shard_count` provably has not (and cannot have) changed continues
     /// routing inside the bounded grace window, rather than failing every flush
     /// closed. `min_lead_hours(C) = 2` for the default `C`, so the grace window
@@ -615,7 +614,7 @@ mod tests {
         );
     }
 
-    /// NF-2: once the grace horizon is crossed, an unseen generation append
+    /// Once the grace horizon is crossed, an unseen generation append
     /// becomes possible, so the switch refuses to extend and the caller must
     /// fail the flush closed exactly as it did before this fallback existed.
     #[test]
@@ -637,7 +636,7 @@ mod tests {
         );
     }
 
-    /// NF-2: a tenant never resolved from a real read has no cached view to
+    /// A tenant never resolved from a real read has no cached view to
     /// extend, so grace-extension cannot help it either -- it must go through
     /// the normal re-read (and fail closed if that fails), identically to a
     /// tenant whose view has gone stale.
@@ -651,7 +650,7 @@ mod tests {
         );
     }
 
-    /// NF-2: grace-extension is exactly as safe when a future generation change
+    /// Grace-extension is exactly as safe when a future generation change
     /// is already visible in the cached view -- `active_shard_count` accounts
     /// for it regardless of staleness, so routing through the grace window on a
     /// tenant with a known upcoming reshard still returns the count that will

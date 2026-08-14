@@ -103,7 +103,7 @@ impl AdmissionLimits {
 ///
 /// `DEFAULT_MAX_ACTIVE_SERIES` / `DEFAULT_MAX_ACTIVE_STREAMS` here are
 /// 1,000,000, the ADR's original figure, assuming ~16 bytes per tracked
-/// identity in the two-epoch `HashSet` tracker. Issue #491 measured the
+/// identity in the two-epoch `HashSet` tracker. Measurements put the
 /// real cost at 35-56 bytes per live entry (hashbrown's power-of-two
 /// table sizing plus allocator headroom), so at 1,000,000 the worst case
 /// (cap x bytes-per-entry x 2 rotating epochs x 2 tracked signals) is
@@ -112,8 +112,7 @@ impl AdmissionLimits {
 /// (`services/ravel-server/src/config.rs`, `limits::shipped_defaults`),
 /// cutting that worst case to roughly 27-43 MiB, and does not construct
 /// this `Default` impl in its startup path. The two crates carrying
-/// different defaults is a known discrepancy, not yet reconciled; see
-/// issue #491.
+/// different defaults is a known discrepancy, not yet reconciled.
 impl Default for AdmissionLimits {
     fn default() -> Self {
         AdmissionLimits {
@@ -321,7 +320,7 @@ struct SignalUsage {
     requests_rejected_series_rate_total: u64,
     /// Whole requests rejected because the receiver's admission clock was
     /// implausible (below `MIN_PLAUSIBLE_INGEST_CLOCK_NS` or non-representable,
-    /// ADR-0051 amendment 2026-08-13, S1-12). The fault is the replica's, not
+    /// ADR-0051 amendment). The fault is the replica's, not
     /// the request's, but the counter is per (tenant, signal) so it renders in
     /// the `ravel_admission_rejected_total{reason="clock"}` family (§6). See
     /// [`AdmissionController::record_clock_rejection`].
@@ -368,7 +367,7 @@ pub struct TenantUsage {
     pub requests_rejected_byte_rate_total: u64,
     pub requests_rejected_series_rate_total: u64,
     /// Whole requests rejected for an implausible receiver admission clock
-    /// (ADR-0051 amendment, S1-12). Rendered under
+    /// (ADR-0051 amendment). Rendered under
     /// `ravel_admission_rejected_total{reason="clock"}`. See
     /// [`SignalUsage::requests_rejected_clock_total`].
     pub requests_rejected_clock_total: u64,
@@ -595,7 +594,7 @@ impl AdmissionController {
     }
 
     /// Records a whole-request rejection for an implausible receiver admission
-    /// clock (ADR-0051 amendment 2026-08-13, S1-12), so it surfaces under
+    /// clock (ADR-0051 amendment), so it surfaces under
     /// `ravel_admission_rejected_total{reason="clock"}` (§6). The gateway calls
     /// this at admission when [`crate::plausible_ingest_clock`] fails, then
     /// rejects the whole request with HTTP 503 / gRPC `UNAVAILABLE`.

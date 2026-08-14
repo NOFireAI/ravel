@@ -1,16 +1,12 @@
-//! Regression test for issue #66 (audit finding a8-F04): the shard actor's
+//! Regression test: the shard actor's
 //! flush tick must run on the injected `Clock`, so advancing that clock past
 //! `max_flush_delay` drives an age-based flush deterministically, with no
 //! wall-clock sleep and no flakiness.
 //!
-//! Adapted from the `#[ignore]`d reproducer
-//! `crates/ravel-ingest/tests/audit_a8_repro.rs::a8_f04_clock_advance_before_enqueue_starves_the_age_flush`
-//! on branch `audit/repro-a8`. That reproducer forced the losing interleaving
-//! of two independent clocks (the injected `Clock` for the age check, the
-//! tokio timer for the tick) and asserted the write starved to `AckTimeout`.
-//! With the tick moved onto the one injected clock the interleaving no longer
-//! exists: buffer the point first, then advance the clock, and the age flush
-//! lands every time. The ordering is established with a cooperative poll on
+//! With the tick on the one injected clock, the two-clock interleaving
+//! (the injected `Clock` for the age check, the tokio timer for the tick)
+//! cannot occur: buffer the point first, then advance the clock, and the age
+//! flush lands every time. The ordering is established with a cooperative poll on
 //! the buffered-points counter rather than a real `tokio::time::sleep`, so
 //! the test cannot race.
 #![allow(clippy::expect_used)]
@@ -158,7 +154,7 @@ async fn a_tick_below_max_flush_delay_does_not_flush() {
     router.shutdown().await;
 }
 
-/// ADR-0051 section 7 (S2-06): a buffered-mode buffer with no strict-mode
+/// ADR-0051 section 7: a buffered-mode buffer with no strict-mode
 /// waiter and fewer than `min_flush_bytes` is idle, so the fast
 /// `max_flush_delay` age trigger must not fire for it -- only the slower
 /// `max_flush_delay_idle` does. This pins the idle side of the predicate;

@@ -89,7 +89,7 @@ pub struct IngestMetrics {
     /// build failed (`WriteError::SegmentBuild`). A client signal: identical
     /// input will fail again, so the write is not retryable. Split out from
     /// `abandoned_retry_exhausted` because `error.rs` already treats the two
-    /// causes differently (a8-F05).
+    /// causes differently.
     abandoned_input_rejected: AtomicU64,
     /// Cumulative bytes admitted into shard buffers at enqueue time.
     buffered_bytes_total: AtomicU64,
@@ -120,7 +120,7 @@ pub struct IngestMetrics {
     /// ended (e.g. panicked) without the router shutting it down. Counted
     /// once per shard on the first observation, so it never exceeds
     /// `shard_count` and makes a permanently degraded process observable
-    /// (docs/ingest.md "Metrics (self-observability)", a8-F03).
+    /// (docs/ingest.md "Metrics (self-observability)").
     shard_deaths: AtomicU64,
     /// Flushes failed closed because the router's cached provisioning view for
     /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
@@ -129,7 +129,7 @@ pub struct IngestMetrics {
     /// refused rather than routed on a possibly-missed activation.
     stale_provisioning_flushes: AtomicU64,
     /// Flushes routed on a last-known-good provisioning view past the refresh
-    /// interval `C`, inside the bounded NF-2 grace window, because the
+    /// interval `C`, inside the bounded grace window, because the
     /// provisioning re-read could not complete but the cached view's validity
     /// horizon had not been crossed (`GenerationSwitch::try_grace_extend`).
     /// Degraded, not failed: distinct from `stale_provisioning_flushes`, which
@@ -274,7 +274,7 @@ impl IngestMetrics {
     }
 
     /// One flush routed on a last-known-good provisioning view inside the
-    /// bounded NF-2 grace window (ADR-0052 degraded-safe fallback).
+    /// bounded grace window (ADR-0052 degraded-safe fallback).
     pub(crate) fn record_grace_extended_stale_flush(&self) {
         self.grace_extended_stale_flushes
             .fetch_add(1, Ordering::Relaxed);
@@ -376,8 +376,8 @@ mod tests {
         let metrics = IngestMetrics::default();
         // Two durability abandonments (retry/lifetime exhaustion) and one
         // input rejection (segment build failed). The split lets an operator
-        // tell a store problem from a bad-input problem by counter alone
-        // (a8-F05), which the old single `abandoned_flushes` could not.
+        // tell a store problem from a bad-input problem by counter alone, which a single
+        // `abandoned_flushes` counter could not.
         metrics.record_abandoned_retry_exhausted();
         metrics.record_abandoned_retry_exhausted();
         metrics.record_abandoned_input_rejected();

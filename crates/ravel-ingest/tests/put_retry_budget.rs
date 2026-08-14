@@ -1,5 +1,5 @@
 //! The put-retry budget is exactly `put_retry_max_attempts + 1` total inner
-//! PUT calls (issue #281), pinned by counting scripted `FaultStore` faults,
+//! PUT calls, pinned by counting scripted `FaultStore` faults,
 //! and the retry backoff waits on the injected `Clock` rather than the real
 //! timer, so its timing is observable and controllable with no wall-clock
 //! sleep.

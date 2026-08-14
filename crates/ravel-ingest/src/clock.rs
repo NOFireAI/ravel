@@ -22,7 +22,7 @@ pub trait Clock: Send + Sync + 'static {
     /// through this method (crate `shard.rs`) puts the age-based flush cadence
     /// on the same injected clock as the age check itself, so a test can drive
     /// a flush tick deterministically by advancing the clock, with no
-    /// wall-clock sleep (finding a8-F04).
+    /// wall-clock sleep.
     fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(tokio::time::sleep(dur))
     }

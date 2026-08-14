@@ -31,7 +31,7 @@ pub enum LogWriteError {
     /// disagreed on `stream_attrs` (a stream-id hash collision, or an
     /// upstream bug computing `log_stream_id`/`stream_attrs_bytes`
     /// inconsistently). Detected by `RlogWriter::finish()`
-    /// (`LogSegError::InconsistentStreamAttrs`, issue #225) and mapped to
+    /// (`LogSegError::InconsistentStreamAttrs`) and mapped to
     /// this variant by the log shard actor's flush step, the same ADR-0005
     /// precedent as [`crate::WriteError::SeriesIdCollision`]: rejected
     /// fail-loud rather than silently attributing one stream's records to

@@ -1,4 +1,4 @@
-//! Bounded-staleness lifecycle refresh (ADR-0066 decision 6, epic EM, EM-T8):
+//! Bounded-staleness lifecycle refresh (ADR-0066 decision 6):
 //! the admission-limits and auth analogue of [`crate::GenerationSwitch`]'s
 //! routing-generation refresh.
 //!

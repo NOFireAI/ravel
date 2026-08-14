@@ -1,6 +1,5 @@
 //! Exemplars from the wire through the shard buffer into the flushed RSEG v6
-//! object's EXEMPLARS section (kind 10, ADR-0047 decisions 1 and 2, issue
-//! #474). Reads the section back with `ravel-segment`'s own decoder, so these
+//! object's EXEMPLARS section (kind 10, ADR-0047 decisions 1 and 2). Reads the section back with `ravel-segment`'s own decoder, so these
 //! tests assert on stored bytes rather than on the ingest crate's own view of
 //! what it buffered.
 #![allow(clippy::expect_used, clippy::unwrap_used)]

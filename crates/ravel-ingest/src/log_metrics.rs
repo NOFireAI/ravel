@@ -76,7 +76,7 @@ pub struct LogIngestMetrics {
     acks_err: AtomicU64,
     /// Batches rejected because two records shared a `stream_id` under
     /// different `stream_attrs` (the fail-loud collision check
-    /// `RlogWriter::finish()` performs, issue #225).
+    /// `RlogWriter::finish()` performs).
     stream_id_collisions: AtomicU64,
     /// Distinct log shard actors observed dead by the router: its send half
     /// or a strict-mode ack found the shard channel closed, meaning the actor
@@ -88,7 +88,7 @@ pub struct LogIngestMetrics {
     /// the log-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
     stale_provisioning_flushes: AtomicU64,
     /// Flushes routed on a last-known-good provisioning view past the refresh
-    /// interval `C`, inside the bounded NF-2 grace window, because the
+    /// interval `C`, inside the bounded grace window, because the
     /// provisioning re-read could not complete but the cached view's validity
     /// horizon had not been crossed (`GenerationSwitch::try_grace_extend`).
     /// Degraded, not failed: distinct from `stale_provisioning_flushes`, which
@@ -97,8 +97,7 @@ pub struct LogIngestMetrics {
     /// rather than fleet-wide-outed; the log-pipeline counterpart of
     /// `IngestMetrics::grace_extended_stale_flushes`.
     grace_extended_stale_flushes: AtomicU64,
-    /// Objects flushed carrying a non-empty POSTINGS section (ADR-0049, issue
-    /// #511). The denominator for average section bytes per indexed object; an
+    /// Objects flushed carrying a non-empty POSTINGS section (ADR-0049). The denominator for average section bytes per indexed object; an
     /// object whose resolved indexed-field list produced no section is not
     /// counted here.
     postings_objects: AtomicU64,
@@ -207,7 +206,7 @@ impl LogIngestMetrics {
 
     /// Fold one flushed object's write-side POSTINGS counters
     /// ([`ravel_logseg::writer::WriteStats`]) into the cumulative totals
-    /// (ADR-0049, issue #511). An object with no POSTINGS section
+    /// (ADR-0049). An object with no POSTINGS section
     /// (`postings_bytes == 0`) still records here: it moves no counter, so an
     /// unindexed tenant leaves every total untouched. Unlike the single-counter
     /// `record_*` methods this moves several counters at once, one per field of
