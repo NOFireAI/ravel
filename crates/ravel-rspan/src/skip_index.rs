@@ -28,7 +28,7 @@ use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
 /// `field_id` is the bloom field the literal is scoped to: `COL_NAME` (3) for a
 /// `name = <literal>` predicate, `COL_SERVICE_NAME` (9) for a
 /// `service_name = <literal>` predicate (docs/span-segment-format.md "BLOOM",
-/// ADR-0054). A caller in another crate (for example ravel-sql, issue #650)
+/// ADR-0054). A caller in another crate (for example ravel-sql)
 /// builds this from a plain `u32` and `&str` and needs no RSPAN-internal type.
 #[derive(Clone, Copy, Debug)]
 pub struct BloomPredicate<'a> {
@@ -121,7 +121,7 @@ impl SkipIndex {
     /// bloom, or a bloom whose entry count does not match the block count, is a
     /// typed `Corrupted` error, never a panic.
     ///
-    /// This is the surface ravel-sql's span pushdown (issue #650) calls: it
+    /// This is the surface ravel-sql's span pushdown calls: it
     /// passes a parsed [`BloomSection`] (obtained through this crate's public
     /// `open`/`read_section` on the BLOOM descriptor) and a slice of
     /// [`BloomPredicate`]s built from plain `u32`/`&str`, constructing no

@@ -1,6 +1,6 @@
 #![no_main]
 
-//! Coverage-guided fuzz target for the RSPAN decode path (issue #352).
+//! Coverage-guided fuzz target for the RSPAN decode path.
 //!
 //! ADR-0041 and docs/span-segment-format.md mandate that every RSPAN decode
 //! path treat stored lengths, offsets, and section descriptors as untrusted and

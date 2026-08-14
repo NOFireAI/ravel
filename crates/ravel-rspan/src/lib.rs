@@ -45,7 +45,7 @@ pub use record::{COL_NAME, COL_SERVICE_NAME, SpanRecord, StatusCode, merge_attrs
 pub use skip_index::{BloomPredicate, SkipIndex};
 pub use writer::{ObjectIdentity, RspanConfig, RspanWriter};
 
-/// Re-exported so a bloom-pruning caller (for example ravel-sql, issue #650)
+/// Re-exported so a bloom-pruning caller (for example ravel-sql)
 /// can parse the BLOOM section this crate hands it and call
 /// [`SkipIndex::candidate_blocks_with_bloom`] without depending on
 /// `ravel-codec` directly or constructing any RSPAN-internal type.

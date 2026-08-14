@@ -116,7 +116,7 @@ pub struct SpanRecord {
 /// This is a small helper rather than an import from `ravel-logseg`: logs keep
 /// resource+scope in a separate identity blob and never merge them into one
 /// record-level map, so there is no generic merge to reuse across the crate
-/// boundary (ADR-0041 deliverable 5); the rule itself is what is reused.
+/// boundary (ADR-0041); the rule itself is what is reused.
 pub fn merge_attrs(
     resource: &[(String, String)],
     scope: &[(String, String)],

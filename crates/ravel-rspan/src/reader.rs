@@ -160,7 +160,7 @@ impl<'a> RspanReader<'a> {
         // the whole object. A corrupt (block_offset, block_len) decoded from
         // SKIP_IDX could otherwise land `end` past the BLOCKS section's own
         // boundary while still inside the file (into SKIP_IDX or the footer),
-        // and return foreign bytes (issue #349). Checked against the section
+        // and return foreign bytes. Checked against the section
         // length captured at open time: `block_offset + block_len <=
         // blocks_len`.
         let rel_end = block_offset
@@ -342,7 +342,7 @@ mod tests {
         // One skip entry whose (offset, len) stays inside the whole file but
         // runs past the BLOCKS section's own end (8): rel_end = 0 + 12 > 8. Its
         // trace_id range and time interval are wide open so pruning keeps it and
-        // the scan actually reaches block_bytes (issue #349).
+        // the scan actually reaches block_bytes.
         let entry = BlockEntry {
             block_offset: 0,
             block_len: 12,
@@ -457,9 +457,9 @@ mod tests {
     /// A structurally valid, whole-section-crc-correct BLOOM container whose
     /// entry count disagrees with the block count must still fail at open,
     /// not open clean and silently under-prune or panic the first time
-    /// something indexes past its entries (issue #649 checkpoint review:
-    /// this was checked only lazily at the first bloom probe, never at open,
-    /// so a short BLOOM body opened and scanned clean). Built manually
+    /// something indexes past its entries (an entry-count mismatch checked
+    /// only lazily at the first bloom probe, never at open, would let a short
+    /// BLOOM body open and scan clean). Built manually
     /// (like `block_range_past_blocks_section_is_error` above) rather than
     /// patching a real writer object, so the section crc is computed over
     /// the actually-short content and only the entry-count check can catch

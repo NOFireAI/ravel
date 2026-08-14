@@ -633,10 +633,10 @@ mod tests {
         assert!(matches!(open(&obj), Err(SpanSegError::Corrupted(_))));
     }
 
-    /// Epic checkpoint acceptance test (issue #649, ADR-0054). Writes a v3
+    /// Round-trip of a v3 segment (ADR-0054). Writes a v3
     /// segment with known service names and span names across multiple blocks,
     /// reads it back, and confirms: the trailer is at the live `footer::VERSION`
-    /// (never a mirrored literal, issue #482); the mandatory BLOOM section
+    /// (never a mirrored literal); the mandatory BLOOM section
     /// exists and answers membership with no false negatives (a false positive
     /// is allowed); the `service_name` column decodes correctly per row; and a
     /// corrupted or truncated BLOOM section is a typed `Corrupted` error, not a
