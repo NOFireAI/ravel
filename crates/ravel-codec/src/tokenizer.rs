@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(toks("STRASSE"), vec![b"strasse".to_vec()]);
     }
 
-    /// Acceptance test (issue #429): pins the four normative rules from
+    /// Acceptance test: pins the four normative rules from
     /// docs/log-segment-format.md "Tokenizer" in one place, independent of
     /// the smaller unit tests above.
     #[test]
