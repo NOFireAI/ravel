@@ -1,5 +1,5 @@
 //! Admission limits and typed rejection reasons for OTLP log normalization
-//! (docs/superpowers/specs/2026-07-28-log-storage-design.md; ADR-0029).
+//! (ADR-0029).
 //!
 //! Ordering and cost. These limits are enforced inside
 //! [`crate::logs_normalize::normalize_logs`], which runs only after the
@@ -20,8 +20,7 @@
 //! record under one `ResourceLogs` or `ScopeLogs` uses
 //! [`LogRejection::Grouped`] to carry the shared reason plus the record count
 //! it covers, instead of materializing one clone per record. This mirrors
-//! [`crate::limits::Rejection::Grouped`] (issue #209) rather than the
-//! per-record clone the metrics path used before it.
+//! [`crate::limits::Rejection::Grouped`] on the metrics path.
 
 /// Admission limits checked at OTLP log ingest, before allocating per-record
 /// attribute structures.
@@ -158,8 +157,7 @@ pub enum LogRejection {
     /// resource or scope (a resource or scope whose attribute set exceeded
     /// its limit, so nothing under it can be given a stream identity).
     /// Represents the same information as `count` clones of `reason` without
-    /// materializing them, mirroring [`crate::limits::Rejection::Grouped`]
-    /// (issue #209).
+    /// materializing them, mirroring [`crate::limits::Rejection::Grouped`].
     #[error("{reason} (rejecting {count} log records under it)")]
     Grouped {
         reason: Box<LogRejection>,

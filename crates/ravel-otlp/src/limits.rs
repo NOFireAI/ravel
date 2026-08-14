@@ -21,15 +21,13 @@
 //! whose resource labels failed to build) uses [`Rejection::Grouped`] for the
 //! same purpose: one `Rejection` value carries the shared reason plus the
 //! point count it covers, instead of `normalize_resource` materializing one
-//! clone per point (issue #209; see also finding a8-F07 in
-//! `docs/reviews/2026-07-27-storage-engine-quality-audit/a8-ingest-otlp.md`,
-//! which flagged the per-point materialization cost). The counting itself
-//! (what `rejected_count` sums to) was already correct before #209 and is
-//! unchanged by it; #209 only changes how that count is represented in
-//! memory.
+//! clone per point. The counting itself (what `rejected_count` sums to) is
+//! independent of this representation: `Grouped` only changes how that count
+//! is carried in memory, not the count.
 //!
-//! Cross-reference (not corrected here): decoding the full body before the
-//! request-size check is a separate behavior gap, also recorded under a8-F07.
+//! Note (not addressed here): the full request body is decoded before the
+//! request-size check runs, so that check does not bound decode-time
+//! allocation; the transport body/message limit does.
 
 /// Admission limits checked at OTLP ingest, before allocating per-point
 /// label structures.

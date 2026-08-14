@@ -42,7 +42,7 @@ use crate::promcompat::format_float;
 pub struct NormalizedLogRecord {
     pub stream_id: LogStreamId,
     /// The exact bytes [`ravel_logseg::stream_attrs_bytes`] produced for this
-    /// record's resource+scope (issue #225): `stream_id ==
+    /// record's resource+scope: `stream_id ==
     /// blake3("ravel-logstream-v1" || stream_attrs)[..16]`. Carried on every
     /// record, not just once per stream, because the shard buffer and
     /// `RlogWriter::finish()` are the only places positioned to detect a
