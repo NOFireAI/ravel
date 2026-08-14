@@ -5,10 +5,18 @@ all-features = false
 version = 2
 yanked = "deny"
 ignore = [
-  # RUSTSEC-2025-0141: bincode 1.3.3 is unmaintained. It enters the
-  # graph only as a build-time transitive dependency of promql-parser's
-  # lrpar/lrlex parser generator; there is no runtime use and no upgrade is
-  # available. Revisit when promql-parser drops the lrpar bincode dependency.
+  # RUSTSEC-2025-0141: bincode 1.3.3 is unmaintained. It is a runtime
+  # dependency of the PromQL parser, not a build-time-only one:
+  # promql-parser's lrpar/lrlex serialize the grammar and state tables
+  # with bincode when the parser is generated at build time, and the
+  # generated parser deserializes them again at runtime, on parser
+  # construction inside the shipped binary (lrpar's
+  # ctbuilder::_reconstitute). The path is reachable in production, but
+  # its only input is the table bytes the build script baked into the
+  # binary; no attacker-controlled data ever reaches bincode. That
+  # compile-time-fixed input, not unreachability, is why the advisory is
+  # acceptable to ignore. No fixed bincode 1.x exists; revisit when
+  # promql-parser drops the lrpar bincode dependency.
   "RUSTSEC-2025-0141",
 ]
 
