@@ -1,4 +1,4 @@
-//! Ranged RSPAN reader (issue #433): read the footer and SKIP_IDX bytes from a
+//! Ranged RSPAN reader: read the footer and SKIP_IDX bytes from a
 //! suffix/ranged probe, then serve one trace's records from only the blocks
 //! that trace occupies, fetched by range.
 //!
@@ -11,7 +11,7 @@
 //! that trace can appear in), fetches that one range, and hands the bytes to
 //! [`RspanRangeReader::decode_trace`]. Peak resident raw bytes are then the
 //! SKIP_IDX plus one trace's blocks, not the whole object -- the RSPAN
-//! analogue of RLOG's post-#275 `RlogRangeReader`
+//! analogue of RLOG's `RlogRangeReader`
 //! (`ravel-logseg/src/ranged.rs`), the model this follows (ADR-0045 decision
 //! 6). RSPAN needs no STREAM_DIR/FIELD_DIR equivalent: every field of a
 //! `SpanRecord` is stored inline per row with no per-object directory to
@@ -25,7 +25,7 @@
 //! whole-object reader uses, so a record decoded through a selective fetch is
 //! byte-for-byte the record a whole-object scan would produce.
 //!
-//! # Sequential block access (issue #908)
+//! # Sequential block access
 //!
 //! [`TraceBlockSpan`]/[`decode_trace`](RspanRangeReader::decode_trace) serve a
 //! *point lookup*: one named trace's contiguous block run. Compaction's k-way
@@ -87,7 +87,7 @@ impl TraceBlockSpan {
 /// The absolute byte range of one block in the BLOCKS section, addressed by
 /// its skip-index position. Unlike [`TraceBlockSpan`] (one trace's whole
 /// contiguous run), this is exactly one block: compaction's k-way merge
-/// (issue #908) fetches and decodes one at a time, bounding peak resident
+/// fetches and decodes one at a time, bounding peak resident
 /// bytes to one block per input rather than one trace's whole span.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockLoc {
@@ -250,7 +250,7 @@ impl RspanRangeReader {
     }
 
     /// The absolute byte range of block `index`, for a caller streaming
-    /// every block of the object in order (issue #908's k-way compaction
+    /// every block of the object in order (the k-way compaction
     /// merge) rather than fetching one trace's whole span. `index` must be
     /// `< self.block_count()`.
     pub fn block_loc(&self, index: usize) -> Result<BlockLoc, SpanSegError> {
@@ -297,7 +297,7 @@ impl RspanRangeReader {
     /// (not merely the whole object): a corrupt `(block_offset, block_len)`
     /// decoded from SKIP_IDX could otherwise land past the BLOCKS section's
     /// own end while still inside the object, and return foreign bytes
-    /// (the same class of bug issue #349 fixed in the whole-object reader).
+    /// (the same class of bug the whole-object reader guards against).
     fn block_abs_range(&self, entry: &BlockEntry) -> Result<(u64, u64), SpanSegError> {
         let rel_end = entry
             .block_offset
@@ -380,9 +380,9 @@ mod tests {
         (footer, reader)
     }
 
-    /// ACCEPTANCE TEST (issue #433): for several traces in a multi-block
-    /// object, the ranged path returns the identical records, in the same
-    /// order, as a whole-object scan for the same trace.
+    /// For several traces in a multi-block object, the ranged path returns
+    /// the identical records, in the same order, as a whole-object scan for
+    /// the same trace.
     #[test]
     fn ranged_trace_read_matches_whole_object_scan() {
         let cfg = RspanConfig {
