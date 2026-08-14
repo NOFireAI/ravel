@@ -1,5 +1,4 @@
-//! Peak-memory measurement on a synthetic 3,600-input bucket (plan §3.3
-//! memory bound; the P4 report records the measured number and method).
+//! Peak-memory measurement on a synthetic 3,600-input bucket.
 //!
 //! Method: seed 3,600 L0 inputs (each a small flush of the same hot series)
 //! into a `MemoryStore`, record the process resident set (VmRSS) and peak
@@ -8,7 +7,7 @@
 //! VmRSS(after seeding)`: the extra resident memory the build/publish pass
 //! needed on top of the already-resident input objects. The design bound is
 //! catalog metadata for all inputs plus one in-flight part buffer, since
-//! page bytes are fetched by range during the merge, not held (plan §3.3).
+//! page bytes are fetched by range during the merge, not held.
 //!
 //! This is a measurement with a deliberately loose upper-bound assertion, not
 //! a tight gate; the printed numbers are what the report cites. Run with
@@ -113,7 +112,7 @@ async fn peak_memory_on_3600_input_bucket() {
     }
 }
 
-/// The RLOG analogue (issue #275): the ranged reader means the merge holds only
+/// The RLOG analogue: the ranged reader means the merge holds only
 /// per-input directories plus one stream's blocks at a time, so the compactor's
 /// incremental peak stays bounded as the input count grows rather than scaling
 /// with the whole bucket's raw bytes (the pre-#275 merge held every input

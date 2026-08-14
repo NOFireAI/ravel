@@ -1,4 +1,4 @@
-//! The RLOG side of the codec seam (ADR-0032, issue #231): L0-to-L1 log
+//! The RLOG side of the codec seam (ADR-0032): L0-to-L1 log
 //! segment compaction.
 //!
 //! # What the merge does (docs/log-segment-format.md, ADR-0032)
@@ -21,7 +21,7 @@
 //!   per-block `BLOOM`s, and `POSTINGS` over the merged, re-blocked contents at
 //!   the same 8192 record block target.
 //!
-//! # POSTINGS is rebuilt, never merged (ADR-0049 decision 6, issue #509)
+//! # POSTINGS is rebuilt, never merged (ADR-0049 decision 6)
 //!
 //! A POSTINGS posting list holds *block indices*, and the merge re-blocks every
 //! record, so an input's block indices describe nothing in the output. Nothing
@@ -40,7 +40,7 @@
 //!   `BLOOM` plus the exact scan.
 //! - The output's *indexed-field list* is recovered from the inputs
 //!   ([`RlogCodec::load_input_catalog`]), because per-tenant configuration of
-//!   that list is issue #511 and does not exist yet. See
+//!   that list is future per-tenant configuration and does not exist yet. See
 //!   [`input_indexed_fields`] for what is recovered and how.
 //!
 //! # Reuse, not reimplementation
@@ -56,7 +56,7 @@
 //! one writer implementation, so an L0 write and an L1 merge cannot drift. The
 //! only ravel-logseg addition this required is `finish_compacted` itself.
 //!
-//! # Memory (issue #745, ADR-0065 decision 4)
+//! # Memory (ADR-0065 decision 4)
 //!
 //! The read side ([`RlogCodec::load_input_catalog`]) retains only per-input
 //! catalog metadata: a [`RlogRangeReader`] holding the decoded STREAM_DIR,
@@ -64,7 +64,7 @@
 //!
 //! The merge itself is a **k-way block-streaming merge**, so its peak resident
 //! memory is bounded independently of any one stream's size -- the defect
-//! issue #745 fixed. Issue #275 already fetched one stream's blocks by range
+//! the k-way merge fixed. The ranged reader already fetched one stream's blocks by range
 //! rather than whole objects, but it then fully materialized *all* of that
 //! stream's decoded records from every input into one `Vec` before returning,
 //! and the part builder held a second fully decoded copy in its accumulator.
@@ -152,7 +152,7 @@ const INDEXED_PROBE_TERM: &[u8] = &[];
 /// [`RlogRangeReader`] over its directories (STREAM_DIR, FIELD_DIR, SKIP_IDX),
 /// and the input's indexed-field names. This is all the read side retains; the
 /// block/bloom bytes are fetched by range one stream at a time during the merge
-/// (issue #275, docs/log-segment-format.md, this module's memory note). The
+/// (docs/log-segment-format.md, this module's memory note). The
 /// untrusted-input caps on the directory sections live inside the ranged reader.
 #[derive(Debug, Clone)]
 pub struct RlogInputCatalog {
@@ -180,7 +180,7 @@ impl SegmentCodec for RlogCodec {
 
         // Locate the footer and section directory from a suffix probe: one
         // ranged GET, growing to a second only if the probe missed the footer
-        // (the RLOG analogue of the RSEG read path, issue #275).
+        // (the RLOG analogue of the RSEG read path).
         let probe = store
             .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
             .await?;
@@ -269,11 +269,9 @@ impl SegmentCodec for RlogCodec {
         // No whole-object fetch: the per-input ranged readers are already in the
         // catalogs. Each stream's blocks are fetched by range one block at a
         // time in the k-way merge below, so raw resident bytes stay bounded to
-        // one block per input, never a whole stream or the whole bucket
-        // (issue #745, building on issue #275).
+        // one block per input, never a whole stream or the whole bucket.
         let identity = compactor_identity(bucket, config);
-        // The output's indexed-field list: the union of the inputs' (issue #509,
-        // and see `input_indexed_fields`). Every part of this compaction gets
+        // The output's indexed-field list: the union of the inputs' (see `input_indexed_fields`). Every part of this compaction gets
         // the same list, so a field is indexed uniformly across the output.
         let indexed_fields = merged_indexed_fields(&catalogs);
         let tracker = config.merge_memory_tracker.as_ref();
@@ -329,7 +327,7 @@ impl SegmentCodec for RlogCodec {
 /// and feeds the [`MergeMemoryTracker`]'s writer term. Holding a whole part's
 /// records before [`PartBuilder::finish`] stamps its content-addressed key is
 /// unavoidable (the key is a hash of the whole object); the k-way merge is what
-/// keeps everything *else* bounded (issue #745).
+/// keeps everything *else* bounded.
 struct PartBuilder {
     writer: RlogWriter,
     /// Sum of [`estimate_record`] over every pushed record: the split trigger
@@ -400,7 +398,7 @@ impl PartBuilder {
 /// (ts-ascending) order one block at a time. At most one decoded block is
 /// resident: `head` is the next record to merge, `block` holds the rest of the
 /// current block, and the next block's bytes are fetched by range only once the
-/// current block is drained (issue #745). `input_index` is the cursor's
+/// current block is drained. `input_index` is the cursor's
 /// canonical position in `catalogs`, the k-way merge's tie-break on equal
 /// `ts_ns`.
 struct StreamCursor<'a> {
@@ -682,10 +680,10 @@ fn attr_value_estimate(v: &AttrValue) -> u64 {
 
 /// The dynamic attribute names one input object carries POSTINGS for.
 ///
-/// # Why the inputs are the source (issue #509 deliverable 3)
+/// # Why the inputs are the source
 ///
 /// ADR-0049 decision 3 makes the indexed-field list explicit per-tenant
-/// configuration, and that configuration is issue #511: it is not on main, so
+/// configuration, and that configuration is not yet built: it is not on main, so
 /// the compactor has no tenant-scoped list to read and must not invent one.
 /// What it does have is the inputs, each of which already records the decision
 /// its writer was configured with. So the output indexes what its inputs
@@ -1049,7 +1047,7 @@ mod tests {
         FieldDir::decode(&raw, MAX_FIELDS).expect("decode").len()
     }
 
-    // --- POSTINGS rebuild helpers (ADR-0049 decision 6, issue #509) ----------
+    // --- POSTINGS rebuild helpers (ADR-0049 decision 6) ----------
 
     /// The block index of every record of an RLOG object, in stored order,
     /// taken from the object's own SKIP_IDX record counts. This is the ground
@@ -1211,13 +1209,13 @@ mod tests {
         }
     }
 
-    /// The acceptance test for issue #509. POSTINGS in an L1 part is rebuilt
+    /// The POSTINGS-rebuild acceptance test. POSTINGS in an L1 part is rebuilt
     /// from the merged, re-blocked records: every term's posting list names the
     /// output's own block indices (checked against an oracle derived from the
     /// output's decoded rows and its own SKIP_IDX, never from POSTINGS), and a
     /// query over the L1 part returns exactly the records the same query returns
     /// The rebuild inherits POSTINGS v2's merged-view indexing with no code of
-    /// its own (ADR-0049's 2026-08-03 amendment, issue #547).
+    /// its own (ADR-0049's amendment).
     ///
     /// `gather_stream` materializes records through the reader, which populates
     /// `stream_attrs` from STREAM_DIR, and `flush_part` hands whole
@@ -1234,7 +1232,7 @@ mod tests {
     ///
     /// A key that is resource-level across the WHOLE object still has no
     /// postings, because postings are keyed by a FIELD_DIR column and those come
-    /// from the per-record layer. That gap is issue #552, not this ticket.
+    /// from the per-record layer. That is a separate gap in the per-record layer.
     #[tokio::test]
     async fn compaction_indexes_the_merged_view_in_the_output() {
         let store = MemoryStore::new();
@@ -1541,8 +1539,7 @@ mod tests {
         assert_eq!(decode_all(l1).len(), 2 * per_input);
     }
 
-    /// The output's indexed-field list is the union of its inputs' (issue #509
-    /// deliverable 3, until issue #511 makes it per-tenant configuration): a
+    /// The output's indexed-field list is the union of its inputs' (until it becomes per-tenant configuration): a
     /// field one input indexed is indexed in the output even when another input
     /// indexed nothing, and an object whose inputs indexed nothing gets no
     /// POSTINGS section at all.
@@ -1654,7 +1651,7 @@ mod tests {
         assert!(!ftr.input_set_hash.is_empty());
         // Assert the recorded version against the format's own constant, not
         // against the compactor's `OUTPUT_FORMAT_VERSION`, which would only
-        // assert that constant against itself (issue #482). The `open` above
+        // assert that constant against itself. The `open` above
         // rejects any trailer whose version is not `footer::VERSION`, so the
         // part having opened at all is what ties this number to the bytes on
         // the object rather than to another constant in this crate.
@@ -1883,9 +1880,9 @@ mod tests {
         assert_eq!(canon_multiset(&l1), canon_multiset(&expected));
     }
 
-    // --- issue #745: bounded-memory k-way merge ------------------------------
+    // --- bounded-memory k-way merge ------------------------------
 
-    /// Acceptance test for issue #745 (ADR-0065 decision 4): the RLOG
+    /// Acceptance test (ADR-0065 decision 4): the RLOG
     /// compaction merge's peak resident decode memory is bounded by block size
     /// times input count, independent of how large one hot stream grows.
     ///
@@ -2004,7 +2001,7 @@ mod tests {
         );
     }
 
-    /// Byte-identical-output test for issue #745: the new k-way streaming merge
+    /// Byte-identical-output test: the new k-way streaming merge
     /// produces the exact same part bytes as the old "concatenate every input's
     /// decoded records for the stream in canonical input order, then stable
     /// sort by `ts_ns`" path. Parts are content-addressed, so a reordering bug
@@ -2216,7 +2213,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
 
-        /// The correctness core (ADR-0032, issue #231): for a random corpus of
+        /// The correctness core (ADR-0032): for a random corpus of
         /// log records split across N L0 objects, the full decoded record set is
         /// identical whether the N L0 inputs are decoded and concatenated or the
         /// single compacted L1 output is decoded. Default part cap: a single L1

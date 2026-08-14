@@ -1,4 +1,4 @@
-//! Query-audit records (ADR-0042 decision 4, issue #391).
+//! Query-audit records (ADR-0042 decision 4).
 //!
 //! `ravel-server` writes one immutable [`Signal::Audit`] record every time it
 //! executes a tenant's SQL request, so query activity is durably logged and
@@ -10,7 +10,7 @@
 //! (`services/ravel-server/src/sql.rs`) writes one after every request, and the
 //! Flight SQL transport (`crates/ravel-sql/src/flight`) writes one after every
 //! executed statement, from `DoGet` where the statement runs through the same
-//! `SqlExecutor` (issue #395). The "cannot be forged or suppressed" property
+//! `SqlExecutor`. The "cannot be forged or suppressed" property
 //! now holds for every way a tenant runs SQL, not just one transport.
 //!
 //! The two paths share this writer and differ only in what a time window means
@@ -129,7 +129,7 @@ impl QueryStatus {
 ///
 /// This is the record content every query surface submits through the
 /// [`QueryAuditSink`](crate::audit_pipeline::QueryAuditSink) seam (ADR-0062
-/// §2a, epic EL / issue #762). It is the single source of the query-audit
+/// §2a). It is the single source of the query-audit
 /// record shape: the attrs, the shared log stream, and the status-derived
 /// severity live here so every surface -- PromQL, SQL HTTP, Flight SQL,
 /// analytics, exemplars -- emits one identical schema differing only in the

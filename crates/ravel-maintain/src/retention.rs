@@ -1,4 +1,4 @@
-//! Age-based retention (ADR-0019, docs/compaction-retention-plan.md §6): the
+//! Age-based retention (ADR-0019): the
 //! second deletion trigger, and the first that destroys data rather than a
 //! redundant copy of it.
 //!
@@ -70,7 +70,7 @@ pub enum RetentionOutcome {
     Swept,
 }
 
-/// Run one retention pass over a single sealed bucket (ADR-0019, plan §6):
+/// Run one retention pass over a single sealed bucket (ADR-0019):
 /// evaluate expiry, write the tombstone if newly expired, and run the
 /// horizon-gated physical sweep if a tombstone is already present and its
 /// horizon has elapsed. Stateless and idempotent: a crashed pass re-run from
@@ -118,7 +118,7 @@ pub async fn retention_sweep_bucket(
     }
 
     // Not tombstoned: evaluate expiry from the bucket's records (no footer
-    // reads; plan §6).
+    // reads).
     let mut commit_records = Vec::with_capacity(listing.commit_keys.len());
     for key in &listing.commit_keys {
         commit_records.push(load_commit_record(store, key).await?);
@@ -167,7 +167,7 @@ pub async fn maintain_bucket(
 }
 
 /// The maximum `max_event_ts_ns` across a bucket's L0 commit records and
-/// compaction-record parts (plan §6). `None` when the bucket holds no records.
+/// compaction-record parts. `None` when the bucket holds no records.
 pub fn max_event_ts(
     commit_records: &[CommitRecord],
     compaction_records: &[CompactionRecord],
@@ -226,7 +226,7 @@ async fn write_tombstone(
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&payload));
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
     // Dry-run: the tombstone and its key are assembled identically, but the
-    // durable PUT that would tombstone the bucket is skipped (plan §8).
+    // durable PUT that would tombstone the bucket is skipped.
     if dry_run {
         return Ok(());
     }
@@ -236,7 +236,7 @@ async fn write_tombstone(
     }
 }
 
-/// Horizon-gated physical sweep (ADR-0019 decision 4, plan §6). Deletes in the
+/// Horizon-gated physical sweep (ADR-0019 decision 4). Deletes in the
 /// fixed order L0 commit records, compaction records, L0 data objects, L1
 /// parts, then the tombstone last, and only after a verifying LIST shows the
 /// bucket's commit prefix holds only the tombstone and its `l1/` prefix is

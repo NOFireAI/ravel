@@ -1,5 +1,5 @@
 //! The sweeper: one component, five eligibility rules
-//! (docs/compaction-retention-plan.md §5, docs/consistency-model.md "Deletion
+//! (docs/consistency-model.md "Deletion
 //! and GC"). This is the first implementation of any deletion in Ravel.
 //!
 //! 1. **Orphan GC** (ADR-0010 §11): an `l0/` data object with no commit
@@ -28,7 +28,7 @@
 //!    bucket and no compaction record does, which makes any future compaction
 //!    impossible (`compact_bucket`'s tombstone gate returns before building or
 //!    publishing, ADR-0019), so every record-less `l1/` object in the bucket
-//!    can never be re-referenced by a legal future publish (issue #273). A
+//!    can never be re-referenced by a legal future publish. A
 //!    bucket with neither a record nor a tombstone keeps its record-less
 //!    parts: a future compaction over the same sealed, content-addressed input
 //!    set will republish the identical keys and name them. The exact branch
@@ -46,8 +46,7 @@
 //!    `<keyhash32>.<ingest_hour>.idm` is logged and skipped, never deleted and
 //!    never fatal: the prefix is additive, so the `c/`-prefix fail-loud
 //!    unknown-shape rule (rules 1-3) does not apply to it.
-//! 5. **Unreferenced catalog-object sweep** (EH-T4, issue #741,
-//!    docs/metric-index-plan.md 3-4): a snapshot part under
+//! 5. **Unreferenced catalog-object sweep**: a snapshot part under
 //!    `t/<tenant_hash>/catalog/<signal>/snap/` or a name-postings object under
 //!    the sibling `.../idx/` prefix that the current
 //!    `.../catalog/<signal>/HEAD` does not name (neither a `parts[].key` nor
@@ -84,8 +83,8 @@
 //! The [`LeaseCheck`] hook is consulted before every delete in all five
 //! rules. It ships as the no-op [`NoLeases`] ("nothing is ever protected"):
 //! the consistency-model's "not lease-protected" precondition is then
-//! vacuously satisfied everywhere. It is a seam for future slow-consumer work
-//! (plan §5, Q3), not live logic; no lease machinery is built behind it.
+//! vacuously satisfied everywhere. It is a seam for future slow-consumer work,
+//! not live logic; no lease machinery is built behind it.
 //!
 //! [`sweep_shard_zoned`] scopes rules 2 and 3 to a given hour set, mirroring
 //! the unit scan's zone split (ADR-0065 decision 3): the caller's per-tick
@@ -114,7 +113,7 @@ use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
 
 /// A hook the sweeper consults before every delete, in all five rules. The
 /// only implementation today is [`NoLeases`] (nothing is ever protected); this
-/// is a seam for future reader-lease / slow-consumer work (plan §5, Q3), never
+/// is a seam for future reader-lease / slow-consumer work, never
 /// a correctness dependency of the current design (the protection horizon and
 /// the age gates are what protect in-flight readers).
 pub trait LeaseCheck: Send + Sync {
@@ -125,7 +124,7 @@ pub trait LeaseCheck: Send + Sync {
 
 /// The shipped [`LeaseCheck`]: nothing is ever protected, so the
 /// consistency-model's "not lease-protected" GC precondition is vacuously
-/// satisfied everywhere (plan §5).
+/// satisfied everywhere.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoLeases;
 
@@ -164,7 +163,7 @@ pub struct SweepReport {
     /// 2 and 3 did here too, either because the caller used [`sweep_shard`]
     /// or because [`sweep_shard_zoned`] was asked to widen to every hour).
     /// `false` for a [`sweep_shard_zoned`] pass scoped to a hour subset.
-    /// Counter seam for EI-T5's `ravel_maintain_full_sweep_passes_total`: a
+    /// Counter seam for `ravel_maintain_full_sweep_passes_total`: a
     /// caller running the slow safety-net cadence increments its own counter
     /// when this is `true`.
     pub full_pass: bool,
@@ -476,7 +475,7 @@ async fn sweep_superseded_impl(
                 let Some(record) = get_compaction_record_opt(store, key).await? else {
                     continue;
                 };
-                // Horizon gate anchored on the durable created_unix_ns (plan §5).
+                // Horizon gate anchored on the durable created_unix_ns.
                 if now
                     < record
                         .created_unix_ns
@@ -517,7 +516,7 @@ async fn sweep_superseded_impl(
             BucketEntry::CommitRecord(_) | BucketEntry::Tombstone(_) => continue,
         };
 
-        // Records first, then data objects (plan §5, docs/consistency-model.md):
+        // Records first, then data objects (docs/consistency-model.md):
         // a crash between the two phases leaves record-less data (orphan GC) or
         // an unreferenced part (rule 3), never a record pointing at a deleted
         // object.
@@ -602,7 +601,7 @@ async fn gather_l0_inputs(
 /// bucket-membership answer is the wrong one.
 ///
 /// Shared by rule 2's own [`gather_l0_inputs`] and by the migrate floor-raise
-/// re-audit ([`crate::migrate::count_below_target`], issue #923), so the
+/// re-audit ([`crate::migrate::count_below_target`]), so the
 /// definition of supersession has exactly one implementation and the re-audit
 /// stays an independent check of input-set coverage rather than a restatement
 /// of the walk's assumptions.
@@ -757,7 +756,7 @@ async fn get_rewrite_record_opt(
 /// condition with a fresh strongly consistent LIST immediately before each
 /// delete. Two branches make an object collectable (see [`PartBranch`]): its
 /// bucket holds a compaction record and no record references it, or its bucket
-/// holds a retention tombstone and no compaction record (issue #273). A bucket
+/// holds a retention tombstone and no compaction record. A bucket
 /// with neither is left alone: its record-less parts belong to a future
 /// compaction that will republish the identical content-addressed keys.
 /// Returns the number deleted.
@@ -841,7 +840,7 @@ enum PartBranch {
     /// The bucket holds a retention tombstone and no compaction record. The
     /// tombstone makes any future compaction impossible (`compact_bucket`
     /// returns `Tombstoned` before it builds or publishes, ADR-0019), so no
-    /// legal future publish can name this object (issue #273).
+    /// legal future publish can name this object.
     TombstonedRecordless,
 }
 
@@ -870,7 +869,7 @@ fn classify_part(
 /// keys those records reference; and the set of buckets that hold a retention
 /// tombstone. A bucket in neither collection has no compaction record and no
 /// tombstone, so its `l1/` objects are never swept by rule 3 (a future
-/// compaction may still publish a record naming them; issue #273).
+/// compaction may still publish a record naming them).
 async fn bucket_reference_map_scoped(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -1036,7 +1035,7 @@ fn is_keyhash32(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-// --- Rule 5: unreferenced catalog-object sweep (EH-T4, issue #741) ----------
+// --- Rule 5: unreferenced catalog-object sweep ----------
 
 /// What one unreferenced-catalog-object sweep pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1054,8 +1053,7 @@ pub struct CatalogSweepOutcome {
 /// Delete every snapshot part (`t/<tenant_hash>/catalog/<signal>/snap/`) and
 /// name-postings object (sibling `.../idx/`) that the current
 /// `.../catalog/<signal>/HEAD` does not name, once the object's `last_modified`
-/// age exceeds `config.protection_horizon_ns` (EH-T4, issue #741,
-/// docs/metric-index-plan.md 3-4).
+/// age exceeds `config.protection_horizon_ns`.
 ///
 /// A fold supersedes a part or postings object by writing a fresh
 /// content-addressed key and swapping HEAD; the old object is deliberately left
@@ -1086,7 +1084,7 @@ pub struct CatalogSweepOutcome {
 ///   catalog object is indistinguishable from a part such a fold is mid-flight
 ///   on, so it must be left alone.
 /// - **Age gate is a reader-pinning buffer, NOT a writer interlock.** The
-///   `protection_horizon_ns` term is `max_query_duration + grace` (plan §5): it
+///   `protection_horizon_ns` term is `max_query_duration + grace`: it
 ///   spares an object a query resolved just before the fold still has pinned.
 ///   Unlike [`CompactorConfig::orphan_age_gate_ns`] (`grace +
 ///   max_flush_lifetime`) and [`CompactorConfig::unreferenced_part_age_gate_ns`]
@@ -1101,7 +1099,7 @@ pub struct CatalogSweepOutcome {
 ///   adopts old keys, so we never sweep without a HEAD) and the pre-delete HEAD
 ///   re-verify (a fold that has completed its CAS is seen). The remaining
 ///   window between the re-verify GET and the delete is the seam the
-///   [`LeaseCheck`] hook / future reader-lease work closes (plan §5, Q3); it is
+///   [`LeaseCheck`] hook / future reader-lease work closes; it is
 ///   not closed by an age gate, and this comment does not claim otherwise.
 /// - **Lease/legal-hold gate.** Every delete consults the [`LeaseCheck`] hook,
 ///   like every other physical delete here.
@@ -1404,7 +1402,7 @@ pub async fn sweep_erasure_requests(
 // --- shared helpers --------------------------------------------------------
 
 /// List a shard's commit prefix and classify every key by shape, failing loud
-/// on any unknown shape (plan §3.1). Returns `(key, entry)` pairs.
+/// on any unknown shape. Returns `(key, entry)` pairs.
 ///
 /// `hours: None` lists the whole shard, across every hour, in one LIST (the
 /// pre-zone-split behavior). `hours: Some(hs)` issues one LIST per hour in
@@ -1789,7 +1787,7 @@ mod tests {
         let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
 
         // The sweep's min_hour also subtracts the shared forward-skew
-        // tolerance (fix for issue #531's adversarial checkpoint): a marker
+        // tolerance (forward-skew tolerance): a marker
         // is only strictly past the window once
         // now_hour - hour > window + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS,
         // the same margin read_marker grants on its own upper bound, so the
@@ -2133,7 +2131,7 @@ mod tests {
         assert!(still_there.is_ok(), "dry_run must not actually delete");
     }
 
-    // --- Rule 5: unreferenced catalog-object sweep (EH-T4, #741) -----------
+    // --- Rule 5: unreferenced catalog-object sweep -----------
 
     /// A [`LeaseCheck`] that protects any key under one prefix. Stands in for a
     /// real [`crate::legal_hold::LegalHoldCheck`] snapshot holding that prefix,
@@ -2211,7 +2209,7 @@ mod tests {
         store.get(key, GetRange::Full).await.is_ok()
     }
 
-    /// The acceptance test (EH-T4): a snapshot part named by the current HEAD is
+    /// The acceptance test: a snapshot part named by the current HEAD is
     /// spared even when it is far older than the protection horizon, and an
     /// unreferenced part younger than the horizon is spared by the age gate.
     /// Neither delete fires; both objects survive.
@@ -2469,7 +2467,7 @@ mod tests {
         );
     }
 
-    /// Finding 2: with no HEAD present, rule 5 sweeps NOTHING, even for an
+    /// With no HEAD present, rule 5 sweeps NOTHING, even for an
     /// object far older than the horizon. An absent HEAD is the no-anchor case
     /// (mirroring rule 3's neither-record-nor-tombstone bucket): a recovery
     /// fold rebuilding from no HEAD recomputes and re-PUTs every part, adopting
@@ -2601,7 +2599,7 @@ mod tests {
         }
     }
 
-    /// Finding 1 + 3: an old, unreferenced object that a concurrent fold adopts
+    /// An old, unreferenced object that a concurrent fold adopts
     /// via `AlreadyExists` (so its `last_modified` stays old) and names in a
     /// HEAD it CASes *after* the sweep's first HEAD read must NOT be deleted.
     /// The pre-delete re-verify GET of HEAD sees the fold's just-published HEAD
@@ -2689,7 +2687,7 @@ mod tests {
         assert!(present(&store, &referenced).await);
     }
 
-    /// Finding 3: the pre-delete re-verify GET of HEAD actually happens. Fault
+    /// The pre-delete re-verify GET of HEAD actually happens. Fault
     /// the second HEAD GET (the re-verify) and the pass aborts before any
     /// delete, exactly as rule 1's and rule 3's re-verify-fault tests prove for
     /// their re-verify LIST. Mirrors

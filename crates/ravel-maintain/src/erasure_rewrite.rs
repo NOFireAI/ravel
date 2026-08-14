@@ -1,14 +1,14 @@
 //! Selective-erasure rewrite pass for the metrics (RSEG), logs (RLOG), and
-//! spans (RSPAN) signals (ADR-0064 decision 3, epic EJ, issues #754/#460).
+//! spans (RSPAN) signals (ADR-0064 decision 3).
 //! [`build_rewrite`] is the metrics (RSEG) driver; [`build_rewrite_logs`] and
-//! [`build_rewrite_spans`] are its EJ-T4b logs/spans siblings, decoding whole
+//! [`build_rewrite_spans`] are its logs/spans siblings, decoding whole
 //! `.rlog`/`.rspan` objects rather than RSEG's per-run catalogs (see
 //! [`build_rewrite_logs`]'s doc for why). [`erasure_rewrite_bucket`] dispatches
 //! to whichever of the three applies by `bucket.signal` and, on a successful
 //! publish, calls [`crate::scan::MaintainMemo::invalidate`] for the rewritten
 //! bucket's hour so the interior zone re-verifies immediately instead of
 //! waiting for the next re-verify cadence -- for all three signals, closing
-//! the gap EJ-T4a left open for metrics too.
+//! the gap for metrics too.
 //!
 //! ## Why this is not [`crate::rewrite::rewrite_and_publish`]
 //!
@@ -232,8 +232,7 @@ impl ErasureMatcher {
 /// A minimal, semantically-faithful duplicate of
 /// `ravel_query::erasure::ErasurePredicate::matches_log_attrs`, reimplemented
 /// here for the same dependency-direction reason as [`ErasureMatcher`]. A log
-/// record's own `attrs` field is matched (never `stream_attrs`/resource, EJ-T3
-/// parity), and only [`LogAttrValue::Str`] values can satisfy a matcher --
+/// record's own `attrs` field is matched (never `stream_attrs`/resource, matching the query path), and only [`LogAttrValue::Str`] values can satisfy a matcher --
 /// any other attribute-value variant never matches, mirroring
 /// `ravel-query`'s `logs_non_string_attr_never_matches` test.
 #[derive(Debug, Clone)]
@@ -290,8 +289,8 @@ impl LogErasureMatcher {
 /// reason as [`ErasureMatcher`]. Spans carry no separate resource/scope
 /// attribute set to exclude: [`ravel_rspan::merge_attrs`] already folds
 /// resource+scope+span attributes into [`ravel_rspan::SpanRecord::attrs`] at
-/// ingest time, so matching that one field is matching the full merged set
-/// EJ-T3 matches too.
+/// ingest time, so matching that one field is matching the same full merged set
+/// the span query path matches.
 #[derive(Debug, Clone)]
 pub struct SpanErasureMatcher {
     matchers: Vec<(String, String)>,
@@ -332,7 +331,7 @@ impl SpanErasureMatcher {
     }
 
     /// Whether this predicate drops a span whose merged attributes are
-    /// `attrs`, using its `start_ts_ns` as the event time (EJ-T3 parity: the
+    /// `attrs`, using its `start_ts_ns` as the event time (query-path parity: the
     /// span query surface passes `start_ts_ns` to `is_erased_span` as
     /// `event_ts_ns`).
     pub fn drops_record(&self, attrs: &[(String, String)], ts_ns: i64) -> bool {
@@ -356,7 +355,7 @@ impl SpanErasureMatcher {
 /// clock-skewed writes, so a windowed request's event-time window can miss
 /// a bucket's ingest hour while still matching samples the bucket
 /// physically stores. Using ingest bounds here previously produced
-/// physical under-erasure that diverged from EJ-T3's scan-time exclusion
+/// physical under-erasure that diverged from the query path's scan-time exclusion
 /// (which always filters on the real sample `ts_ns`): the query path would
 /// correctly hide the matching samples while this prefilter skipped the
 /// bucket that should have erased them (a GDPR gap, ADR-0064).
@@ -617,8 +616,8 @@ fn live_input_event_bounds(live: &LiveInputs) -> (i64, i64) {
 /// `drops`, when that live record is a [`RewriteRecord`]; `None` when the live
 /// record is raw L0 or a compaction record (nothing has been rewritten yet, so
 /// no request has been applied here). [`erasure_rewrite_bucket`] uses this to
-/// skip a bucket already rewritten for every overlapping request (EJ-T4b
-/// finding-2), so a completed generation never churns a fresh no-op record.
+/// skip a bucket already rewritten for every overlapping request,
+/// so a completed generation never churns a fresh no-op record.
 fn live_rewrite_applied_request_ids(live: &LiveInputs) -> Option<HashSet<String>> {
     match live {
         LiveInputs::Existing {
@@ -723,7 +722,7 @@ fn live_input_object_keys_and_target(
 /// not just the one that triggered the rewrite -- to end up with a `drops[]`
 /// entry in the resulting `RewriteRecord`, even `dropped_count: 0` if nothing
 /// in this bucket happened to match that particular request. Callers (the
-/// driver, EJ-T7) are responsible for building this batch once per bucket,
+/// driver) are responsible for building this batch once per bucket,
 /// covering every pending request whose [`bucket_may_overlap`] prefilter
 /// passed, never one request at a time.
 #[derive(Debug, Clone)]
@@ -1190,7 +1189,7 @@ pub async fn build_rewrite_logs(
 
     for object_key in object_keys {
         let got = store.get(object_key, GetRange::Full).await?;
-        // Input-side record-count authority (issue #981): each input object's
+        // Input-side record-count authority: each input object's
         // RLOG footer declares its own `record_count`, written at flush/compact
         // time independently of the decode path this pass runs. Summing it and
         // cross-checking against the scan tally below closes the silent
@@ -1314,7 +1313,7 @@ pub async fn build_rewrite_spans(
 
     for object_key in object_keys {
         let got = store.get(object_key, GetRange::Full).await?;
-        // Input-side record-count authority (issue #981): the RSPAN footer's
+        // Input-side record-count authority: the RSPAN footer's
         // own `record_count`, summed and cross-checked against the scan tally
         // below. Same rationale as the logs path in `build_rewrite_logs`: the
         // output-side conservation gate cannot see an input record the decode
@@ -1391,7 +1390,7 @@ pub async fn build_rewrite_spans(
 /// rewritten). Exactly one of `RewriteRecord.inputs` /
 /// `.superseded_record_key` is ever set (`ravel_commit::erasure::validate_rewrite`),
 /// and which one is a property of [`resolve_live_record`]'s result at the
-/// point [`build_rewrite`] ran -- the driver (EJ-T7) threads it through
+/// point [`build_rewrite`] ran -- the driver threads it through
 /// unchanged since [`build_rewrite`] itself does not need to know.
 #[derive(Debug, Clone)]
 pub enum RewriteSupersession {
@@ -1399,7 +1398,7 @@ pub enum RewriteSupersession {
     Existing(String),
 }
 
-/// Input-side record-count conservation gate for logs/spans (issue #981):
+/// Input-side record-count conservation gate for logs/spans:
 /// the scan tally `scanned_record_count` (what [`build_rewrite_logs`] /
 /// [`build_rewrite_spans`] counted while decoding every live input object)
 /// MUST equal `footer_record_count`, the sum of every input object's own
@@ -1460,7 +1459,7 @@ fn checked_sample_sum(counts: impl Iterator<Item = u64>) -> Result<u64> {
 /// aborts before the first byte is written: no part, no record, nothing
 /// converges on a lossy or inflated rewrite. The live L0/L1 inputs stay live
 /// and queryable and the `.dreq` stays pending, exactly like an aborted
-/// compaction (plan §3.4 point 3).
+/// compaction.
 pub async fn publish_rewrite_record(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -1659,11 +1658,11 @@ pub enum ErasureRewriteOutcome {
     NoApplicableRequests,
     /// The bucket (or some object still listed in it) is under legal hold
     /// ([`bucket_is_held`]); skipped, every applicable `.dreq` stays pending,
-    /// and EJ-T3's scan-time exclusion keeps hiding the held data from
+    /// and the query path's scan-time exclusion keeps hiding the held data from
     /// queries in the meantime.
     Held,
     /// Every pending request that overlaps this bucket is already named in the
-    /// bucket's live [`RewriteRecord`]'s `drops` (EJ-T4b finding-2): the bucket
+    /// bucket's live [`RewriteRecord`]'s `drops`: the bucket
     /// has already been rewritten for all of them, so there is nothing new to
     /// erase. Skipped without any build or publish. Without this skip, a second
     /// pass over an already-rewritten bucket recomputes a *different*
@@ -1681,7 +1680,7 @@ pub enum ErasureRewriteOutcome {
 }
 
 /// Rewrite one sealed bucket against every pending erasure request that
-/// applies to it (ADR-0064 decision 3, EJ-T4). `pending` MUST already be
+/// applies to it (ADR-0064 decision 3). `pending` MUST already be
 /// every request pending on this bucket's `(tenant_hash, signal)`
 /// ([`pending_erasure_requests`]); this function does the per-bucket
 /// [`bucket_may_overlap`] prefiltering itself, so the same `pending` slice is
@@ -1699,8 +1698,8 @@ pub enum ErasureRewriteOutcome {
 /// state for the rewritten bucket's hour ([`MaintainMemo::invalidate`],
 /// ADR-0065's "public invalidate seam"), so the interior zone re-evaluates on
 /// the next tick instead of waiting for the re-verify cadence. This is the
-/// EJ-T4b wiring this function's doc used to defer -- applied uniformly after
-/// every signal's publish, including metrics, which EJ-T4a left un-invalidated.
+/// The invalidation is applied uniformly after
+/// every signal's publish, including metrics.
 /// Scoped to [`PublishOutcome::Published`] only (not `Converged`/`Abandoned`):
 /// a converged run observed a record that already existed, so whichever run
 /// actually published it already invalidated the memo; an abandoned run wrote
@@ -1717,7 +1716,7 @@ fn invalidate_after_publish(memo: &mut MaintainMemo, bucket: &Bucket, publish: &
 }
 
 /// Rewrite one sealed bucket against every pending erasure request that
-/// applies to it (ADR-0064 decision 3, EJ-T4/EJ-T4b). `pending` MUST already be
+/// applies to it (ADR-0064 decision 3). `pending` MUST already be
 /// every request pending on this bucket's `(tenant_hash, signal)`
 /// ([`pending_erasure_requests`]); this function does the per-bucket
 /// [`bucket_may_overlap`] prefiltering itself, so the same `pending` slice is
@@ -1734,7 +1733,7 @@ fn invalidate_after_publish(memo: &mut MaintainMemo, bucket: &Bucket, publish: &
 /// matcher/build step below dispatches on `bucket.signal` to the metrics
 /// ([`build_rewrite`]), logs ([`build_rewrite_logs`]), or spans
 /// ([`build_rewrite_spans`]) driver. [`MaintainError::Invariant`] surfaces
-/// for any other signal: this task's dispatch (EJ-T4/EJ-T4b) scopes erasure
+/// for any other signal: this dispatch scopes erasure
 /// rewrite to metrics/logs/spans only, and profiles/alerts/audit have no
 /// driver here to dispatch to.
 pub async fn erasure_rewrite_bucket(
@@ -1776,7 +1775,7 @@ pub async fn erasure_rewrite_bucket(
         return Ok(ErasureRewriteOutcome::NoApplicableRequests);
     }
 
-    // EJ-T4b finding-2 (idempotence/termination): if the bucket's live record
+    // Idempotence/termination guard: if the bucket's live record
     // is already a RewriteRecord whose `drops` name every overlapping request,
     // this bucket has already been rewritten for all of them and there is
     // nothing new to erase. Re-publishing here would recompute a different
@@ -1920,7 +1919,7 @@ pub async fn erasure_rewrite_bucket(
         }
         other => {
             return Err(MaintainError::Invariant(format!(
-                "erasure rewrite has no driver for signal {other:?} (EJ-T4/EJ-T4b scope metrics/logs/spans only)"
+                "erasure rewrite has no driver for signal {other:?} (erasure rewrite scopes metrics/logs/spans only)"
             )));
         }
     };
@@ -2167,7 +2166,7 @@ fn bucket_serves_subject(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    //! Eight required tests (EJ-T4, issue #754): drop-exact-preserve-others,
+    //! Eight required tests: drop-exact-preserve-others,
     //! conservation-abort, legal-hold-skip, idempotence (no double-count on
     //! resolve), corrupt/truncated input, cross-input same-series merge
     //! (review blocker 1), backfilled/clock-skewed windowed selection
@@ -2670,7 +2669,7 @@ mod tests {
         );
     }
 
-    /// EJ-T4b finding-2 regression (idempotence/termination): a completed
+    /// Idempotence/termination regression: a completed
     /// generation must not churn. After one full `erasure_rewrite_bucket` pass
     /// publishes a `RewriteRecord` naming the request, a SECOND pass with the
     /// same still-pending request must return [`ErasureRewriteOutcome::AlreadyApplied`]
@@ -3045,7 +3044,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // LOGS (RLOG) -- EJ-T4b, issue #754
+    // LOGS (RLOG)
     // -----------------------------------------------------------------
 
     use ravel_logseg::LogRecord;
@@ -3566,7 +3565,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // SPANS (RSPAN) -- EJ-T4b, issue #754
+    // SPANS (RSPAN)
     // -----------------------------------------------------------------
 
     fn span_record(t: u8, s: u8, start: i64, end: i64, attrs: Vec<(String, String)>) -> SpanRecord {
@@ -4112,7 +4111,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Input-side record-count cross-check (issue #981)
+    // Input-side record-count cross-check
     // -----------------------------------------------------------------
 
     /// Re-encode an RLOG object's footer with `record_count` bumped by
@@ -4470,7 +4469,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `.done` completion soundness regressions (issue #1015)
+    // `.done` completion soundness regressions
     // -----------------------------------------------------------------
 
     /// Event-time base for the fidelity fixture below: the start of the

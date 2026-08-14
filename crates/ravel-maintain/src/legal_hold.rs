@@ -1,5 +1,5 @@
 //! Legal hold: a real [`LeaseCheck`] over immutable hold records (ADR-0042
-//! decision 2, issue #368).
+//! decision 2).
 //!
 //! The sweeper consults a [`LeaseCheck`] before every physical delete. Legal
 //! hold is the first non-trivial implementation of that seam: a held object is

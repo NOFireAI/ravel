@@ -1,16 +1,16 @@
 //! The durable, deployment-wide GC configuration object `sys/gc` (ADR-0050
-//! section 4, EC4).
+//! section 4).
 //!
 //! `protection_horizon >= max_query_duration + grace + clock_skew_allowance`
 //! protects every pinned reader from the GC sweeper, including one whose clock
-//! leads the reader's by up to `clock_skew_allowance` (adversarial finding
-//! S1-02: without the skew term a sweeper skewed ahead reaches its deletion
+//! leads the reader's by up to `clock_skew_allowance` (without
+//! the skew term a sweeper skewed ahead reaches its deletion
 //! threshold `now >= anchor + protection_horizon` in true time before a
 //! reader's still-active snapshot, held up to `max_query_duration`, is
 //! released). Before this object the bound lived in three unlinked
 //! per-process configs (the maintain sweep config, the query deadline, the
 //! Flight ticket ceiling) that could be deployed independently, with nothing
-//! validating the constraint anywhere (adversarial findings S1-03 / S5-22). This
+//! validating the constraint anywhere. This
 //! module makes the four deployment-wide values a single durable truth:
 //!
 //! - **Bootstrap.** On the first touch of a fresh bucket, [`bootstrap_gc_config`]
@@ -18,9 +18,8 @@
 //!   ([`GcConfigValues::maintain_defaults`], which satisfy the constraint by
 //!   construction). It never refuses to start because the object is merely
 //!   absent: an absent object on a fresh bucket is bootstrapped, not a fault
-//!   (the EC3/#566 lesson). A racing loser (`AlreadyExists`) re-reads and
-//!   returns the winner's object, exactly the race-loser pattern EB-7 / EC3 /
-//!   EC5 established (`write_marker` / `resolve_and_pin` / the provisioning
+//!   (the fail-open-avoidance lesson). A racing loser (`AlreadyExists`) re-reads and
+//!   returns the winner's object, exactly the race-loser pattern established (`write_marker` / `resolve_and_pin` / the provisioning
 //!   record), so two processes bootstrapping one fresh bucket both start.
 //! - **Mutation.** Only [`set_gc_config`] (behind `ravel-cli gc-config set`)
 //!   changes it. It enforces the constraint at write time and swaps with
@@ -82,8 +81,7 @@ pub struct GcConfigValues {
 
 impl GcConfigValues {
     /// The maintain defaults, which satisfy the constraint by construction
-    /// (`protection_horizon = max_query_duration + grace + clock_skew_allowance`,
-    /// plan §5, S1-02). This is
+    /// (`protection_horizon = max_query_duration + grace + clock_skew_allowance`). This is
     /// what the first process to touch a fresh bucket bootstraps `sys/gc` from
     /// (ADR-0050 section 4), and it matches [`crate::CompactorConfig::default`]'s
     /// horizon, grace, and flush lifetime.
@@ -97,8 +95,8 @@ impl GcConfigValues {
     }
 
     /// Whether these values satisfy the GC safety constraint
-    /// `protection_horizon >= max_query_duration + grace + clock_skew_allowance`
-    /// (S1-02). The `clock_skew_allowance_ns` term is supplied by the caller
+    /// `protection_horizon >= max_query_duration + grace + clock_skew_allowance`.
+    /// The `clock_skew_allowance_ns` term is supplied by the caller
     /// (the sweeper/writer config, not stored in `sys/gc`) and closes the gap a
     /// sweeper whose clock leads a reader's would otherwise open: it reaches
     /// `now >= anchor + protection_horizon` in true time up to
@@ -237,7 +235,7 @@ pub enum GcConfigError {
          clock_skew_allowance = {} ns (stored max_query_duration={stored_max_query_duration_ns} ns, \
          stored grace={stored_grace_ns} ns): the durable horizon does not cover the skew of the \
          sweeper that actually deletes, so this sweeper could physically delete an object a live \
-         reader still holds (S1-02). This is a deployment error to fix -- either lower the running \
+         reader still holds. This is a deployment error to fix -- either lower the running \
          sweeper's --clock-skew-allowance, or raise the durable horizon via `ravel-cli gc-config \
          set` -- refusing to enter the maintain sweep loop rather than delete a pinned snapshot",
         .stored_max_query_duration_ns.saturating_add(*.stored_grace_ns).saturating_add(*.clock_skew_allowance_ns)
@@ -293,7 +291,7 @@ pub async fn read_gc_config(
 /// bootstrapped one, returning the values every mode then validates against
 /// (ADR-0050 section 4).
 ///
-/// The critical fail-open-avoidance property (the EC3/#566 lesson): a
+/// The critical fail-open-avoidance property: a
 /// never-bootstrapped bucket does not refuse startup. The object is written from
 /// `defaults` (the caller's maintain-config-derived values, which satisfy the
 /// constraint), and validation then runs against the object this process just
@@ -351,7 +349,7 @@ pub enum SetOutcome {
 /// clock_skew_allowance` is enforced fail-closed: a proposal that fails it is
 /// refused with [`GcConfigError::ConstraintViolation`] and writes nothing, so no
 /// reachable `sys/gc` can leave a skewed sweeper free to delete a pinned reader's
-/// snapshot (S1-02). `clock_skew_allowance_ns` is the writer's configured skew
+/// snapshot. `clock_skew_allowance_ns` is the writer's configured skew
 /// allowance (the sweeper's [`crate::CompactorConfig::clock_skew_allowance_ns`]),
 /// supplied here rather than stored in `sys/gc` because the persistent format is
 /// frozen; the fence is the validated config, not a stored field.
@@ -424,8 +422,7 @@ pub fn validate_maintain(
 }
 
 /// Maintain-mode startup RE-ASSERT of the skew-covering horizon bound against
-/// the RUNNING sweeper's own clock-skew allowance (issue #993, closing the #904
-/// gap). The write fence in [`set_gc_config`] validates a proposed `sys/gc`
+/// the RUNNING sweeper's own clock-skew allowance. The write fence in [`set_gc_config`] validates a proposed `sys/gc`
 /// against the *CLI's* declared `clock_skew_allowance`, but that knob and the
 /// running sweeper's [`crate::CompactorConfig::clock_skew_allowance_ns`] are
 /// independent: a deployment can write `sys/gc` with a 5 min skew while running
@@ -516,7 +513,7 @@ mod tests {
         assert_eq!(d.max_flush_lifetime_ns, c.max_flush_lifetime_ns);
         // The constraint holds with exactly zero slack at the defaults: the
         // default horizon is max_query_duration + grace + clock_skew_allowance,
-        // so the skew-covering bound is met at the bound (S1-02).
+        // so the skew-covering bound is met at the bound.
         assert_eq!(
             d.protection_horizon_ns,
             d.max_query_duration_ns + d.grace_ns + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
@@ -638,7 +635,7 @@ mod tests {
         );
     }
 
-    /// FAILURE SUITE (S1-02, the ticket's required "disagreeing-config" row): a
+    /// FAILURE SUITE (the "disagreeing-config" row): a
     /// config whose `protection_horizon` meets the OLD bound
     /// (`= max_query_duration + grace`) but NOT the skew-covering bound
     /// (`+ clock_skew_allowance`) is REJECTED by `set_gc_config` validation with
@@ -664,7 +661,7 @@ mod tests {
             max_query_duration_ns: DEFAULT_MAX_QUERY_DURATION_NS,
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
-        // It DID satisfy the pre-S1-02 bound (skew term zero), but does NOT
+        // It DID satisfy the old bound (skew term zero), but does NOT
         // satisfy the skew-covering bound.
         assert!(
             just_meets_old_bound.satisfies_constraint(0),
@@ -672,7 +669,7 @@ mod tests {
         );
         assert!(
             !just_meets_old_bound.satisfies_constraint(skew),
-            "the skew-covering bound is NOT met: this is the S1-02 gap"
+            "the skew-covering bound is NOT met: this is the skew gap"
         );
 
         let err = set_gc_config(store.as_ref(), just_meets_old_bound, skew, 1_000)

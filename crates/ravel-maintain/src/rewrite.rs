@@ -135,12 +135,12 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
 /// [`MigrateOutcome::Rewritten`] left the bucket untouched, with the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateOutcome {
-    /// Not yet sealed: the input set is not guaranteed complete (plan §3.2).
+    /// Not yet sealed: the input set is not guaranteed complete.
     NotSealed,
     /// A retention tombstone is present; the bucket is never rewritten.
     Tombstoned,
     /// A compaction (or rewrite) record already exists. The live record set is
-    /// L1 parts, not raw L0 objects; migrating those is EM-T6's rewrite-on-
+    /// L1 parts, not raw L0 objects; migrating those is the rewrite-on-
     /// touch, which reads L1 parts as inputs. This caller handles the pre-
     /// compaction L0 case only.
     AlreadyCompacted,
@@ -161,7 +161,7 @@ pub enum MigrateOutcome {
 /// below `target_version`.
 ///
 /// This is the "N-1 decode, re-encode, publish, conservation" shape named in
-/// EM-T4's issue, wired end to end: it gates the bucket exactly as
+/// The rewrite primitive, wired end to end: it gates the bucket exactly as
 /// [`crate::compact::compact_bucket`] does (seal, tombstone, already-compacted),
 /// reads the L0 commit records, and -- if any records the current writer would
 /// supersede was written below the target format version -- rewrites the whole
@@ -175,8 +175,8 @@ pub enum MigrateOutcome {
 /// which is how the tests exercise the migration path before an actual N-1
 /// version exists to read.
 ///
-/// EM-T5's `maintain migrate` driver (resumable cursor, budget, verify-and-
-/// raise-floor) and EM-T6's rewrite-on-touch build on this entry point; the
+/// The `maintain migrate` driver (resumable cursor, budget, verify-and-
+/// raise-floor) and rewrite-on-touch build on this entry point; the
 /// server/CLI wiring is their scope, not this task's.
 pub async fn migrate_bucket_format(
     store: &dyn ObjectStoreBackend,

@@ -1,5 +1,4 @@
-//! Input discovery and decode (docs/compaction-retention-plan.md §3.3 steps
-//! 1-2). Lists a sealed bucket, partitions its objects by key shape, decodes
+//! Input discovery and decode. Lists a sealed bucket, partitions its objects by key shape, decodes
 //! every L0 commit record, sorts the inputs canonically, computes the
 //! `input_set_hash`, and decodes each input segment's catalog down to
 //! per-run absolute page ranges.
@@ -11,8 +10,7 @@
 //! small and bounded by the ingest admission cap, so they stay inside this
 //! metadata bound. The verbatim TS/VAL/HIST page bytes are
 //! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so
-//! peak memory is bounded by catalog metadata plus one in-flight part buffer
-//! (plan §3.3 memory bound), not by the whole bucket's page data.
+//! peak memory is bounded by catalog metadata plus one in-flight part buffer, not by the whole bucket's page data.
 
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::record;
@@ -37,11 +35,11 @@ const EXEMPLARS: u32 = 10;
 
 /// Domain-separated prefix for the `input_set_hash` preimage. Fixes the
 /// canonical byte stream so any two compactors over the same sealed bucket
-/// derive the same hash and therefore the same record key (plan §3.1/§3.4).
+/// derive the same hash and therefore the same record key.
 const INPUT_SET_HASH_DOMAIN: &[u8] = b"ravel-compaction-input-set-v1\0";
 
 /// The partitioned result of listing a bucket's `c/<shard>/<hour>/` prefix
-/// (plan §3.5: "partitions listed keys by shape"). Unknown shapes are a hard
+/// (partitions listed keys by shape). Unknown shapes are a hard
 /// error surfaced by [`list_bucket`], never silently dropped.
 #[derive(Debug, Default)]
 pub struct BucketListing {
@@ -51,7 +49,7 @@ pub struct BucketListing {
     pub compaction_record_keys: Vec<String>,
     /// Selective-erasure rewrite record keys (`rw.<hash16>.cmt`, ADR-0064
     /// decision 3) present in the bucket. Recognized and surfaced here rather
-    /// than treated as layout drift; the rewrite pass (EJ-T4) is what acts on
+    /// than treated as layout drift; the rewrite pass is what acts on
     /// them. Classifying them keeps `list_bucket` from hard-erroring on a
     /// bucket that has already been erased once.
     pub rewrite_record_keys: Vec<String>,
@@ -59,7 +57,7 @@ pub struct BucketListing {
     pub tombstone_key: Option<String>,
 }
 
-/// List one bucket and classify every object by key shape (plan §3.1/§3.5).
+/// List one bucket and classify every object by key shape.
 /// A key matching no known shape is [`MaintainError::UnknownBucketEntry`]
 /// (fail loud on layout drift), never skipped.
 pub async fn list_bucket(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> Result<BucketListing> {
@@ -100,7 +98,7 @@ pub struct InputRecord {
 /// GET and decode every L0 commit record, verifying each record's key against
 /// its own identity fields (ADR-0010 §7 discipline) and its signal against
 /// the bucket, then sort the inputs canonically by
-/// `(writer_id, writer_epoch, writer_seq)` (plan §3.3 step 1).
+/// `(writer_id, writer_epoch, writer_seq)`.
 pub async fn load_inputs(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -185,7 +183,7 @@ fn signal_name(s: Signal) -> String {
 }
 
 /// Canonical `input_set_hash`: blake3 over a domain-separated, length-framed
-/// encoding of the sorted input identities (plan §3.1). Inputs MUST already
+/// encoding of the sorted input identities. Inputs MUST already
 /// be in canonical order (as [`load_inputs`] leaves them).
 pub fn input_set_hash(inputs: &[InputRecord]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
@@ -203,7 +201,7 @@ pub fn input_set_hash(inputs: &[InputRecord]) -> [u8; 32] {
 }
 
 /// One run's copy plan: dedup-priority provenance (from the input's COMMIT
-/// RECORD, plan §3.3 step 3), event-time bounds, sample count, and the
+/// RECORD), event-time bounds, sample count, and the
 /// absolute byte ranges of its verbatim TS and VAL-or-HIST pages within the
 /// input object. `page_abs` is the VAL page for a scalar series and the HIST
 /// page for a histogram series (`kind` says which).
@@ -247,13 +245,13 @@ pub struct InputCatalog {
     /// and always legal. Unlike page bytes, these are retained (not fetched
     /// lazily during the merge): a record is ~40 bytes plus attributes and the
     /// admission cap bounds how many an object can hold, so this stays inside
-    /// the plan's "catalog metadata" memory bound rather than scaling with the
+    /// the "catalog metadata" memory bound rather than scaling with the
     /// bucket's data.
     pub exemplars: Vec<ExemplarInput>,
 }
 
 /// Decode one input's catalog into per-run absolute page ranges, stamping
-/// every run's provenance from the input's commit record (plan §3.3 step 3).
+/// every run's provenance from the input's commit record.
 ///
 /// Footer is located by a suffix probe (one GET, growing to a second GET only
 /// if the probe missed the footer). The catalog sections are then read: a

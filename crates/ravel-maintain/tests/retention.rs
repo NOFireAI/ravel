@@ -1,4 +1,4 @@
-//! Retention tests (ADR-0019, docs/compaction-retention-plan.md §6): the
+//! Retention tests (ADR-0019): the
 //! under-retention impossibility floor, tombstone irreversibility, the
 //! compactor-racing-tombstone ordering interlock, partial-sweep crash
 //! convergence, and the config validation floor. The convergence/interlock

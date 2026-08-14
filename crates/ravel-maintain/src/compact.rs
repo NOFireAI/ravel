@@ -1,8 +1,8 @@
 //! The per-bucket compaction driver: seal + trigger checks, then the
-//! plan-build-publish pipeline (docs/compaction-retention-plan.md §3.2-§3.4).
+//! plan-build-publish pipeline.
 //! Stateless and idempotent: a crashed run re-run from scratch reuses
 //! content-addressed part keys and converges at the record's
-//! `CreateIfAbsent` (plan §3.6).
+//! `CreateIfAbsent`.
 
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::Signal;
@@ -26,10 +26,10 @@ use crate::rspan_codec::SpanCodec;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionOutcome {
     /// Not yet sealed: the writer interlock does not yet guarantee a complete
-    /// input set (plan §3.2). Later hours are also unsealed.
+    /// input set. Later hours are also unsealed.
     NotSealed,
     /// A retention tombstone is present: the bucket contributes nothing and is
-    /// never compacted (ADR-0019, plan §3.2).
+    /// never compacted (ADR-0019).
     Tombstoned,
     /// A compaction record already exists; nothing to do.
     AlreadyCompacted,
@@ -43,7 +43,7 @@ pub enum CompactionOutcome {
     },
 }
 
-/// Compact one sealed bucket end to end (plan §3.2-§3.4). Safe to call
+/// Compact one sealed bucket end to end. Safe to call
 /// concurrently with other compactors over the same bucket: the record's
 /// `CreateIfAbsent` picks a single winner and losers converge.
 pub async fn compact_bucket(
@@ -90,7 +90,7 @@ pub async fn compact_bucket(
         }
         // Query-audit records ride RLOG (see `query_audit`), so they compact
         // through the same RLOG codec as logs -- the machinery is reused, only
-        // the signal and shard are new (issue #763, EL-6). The legal-hold shard
+        // the signal and shard are new. The legal-hold shard
         // (`legal_hold::AUDIT_HOLD_SHARD` = 0) is deliberately excluded: the
         // legal-hold fold (`legal_hold::load_hold_records`) reads L0 commit
         // records only and ignores compaction records, so compacting its records
@@ -154,7 +154,7 @@ pub use read::BucketListing;
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     //! Exemplar carry-through for L0-to-L1 metric compaction (ADR-0047
-    //! decision 3, issue #474). Seeds real L0 RSEG v6 objects through the
+    //! decision 3). Seeds real L0 RSEG v6 objects through the
     //! ingest flush writer, runs the whole `compact_bucket` pipeline over a
     //! `MemoryStore`, and reads the L1 parts' EXEMPLARS sections back with
     //! `ravel-segment`'s own decoder.
@@ -427,7 +427,7 @@ mod tests {
         all
     }
 
-    /// The acceptance test for issue #474: the exemplars in the L1 output are
+    /// The acceptance test: the exemplars in the L1 output are
     /// exactly the union (as a multiset) of the inputs', with series indices
     /// remapped into each part's own SERIES_IDS ordering. Series ids are
     /// chosen so the two inputs' orderings differ from the output's, so a

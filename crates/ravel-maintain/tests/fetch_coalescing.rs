@@ -1,4 +1,4 @@
-//! Page-fetch mechanics of the RSEG compactor (#279, perf epic #264 Wave 2):
+//! Page-fetch mechanics of the RSEG compactor:
 //! coalescing adjacent page ranges from the same input into one GET, and
 //! keeping the buffered page bytes bounded to one part under the concurrent
 //! fetch. These assert the *mechanics* only; the differential-equivalence of

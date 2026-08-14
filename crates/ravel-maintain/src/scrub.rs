@@ -1,5 +1,5 @@
 //! At-rest integrity scrubber: the library half of the durability-hardening
-//! epic (ADR-0059 decisions 1 and 3, issue #694). Ravel's checksum hierarchy
+//! epic (ADR-0059 decisions 1 and 3). Ravel's checksum hierarchy
 //! (whole-object blake3 at write time, footer/section crc32c on read) is
 //! otherwise verified only when a query happens to touch the covered bytes, so
 //! bytes nobody queries are never checked by anything. This module re-verifies
@@ -20,8 +20,8 @@
 //!    re-fetched here, so the two tiers together cover the whole hierarchy
 //!    without the structural tier ever reading more than the footer.
 //! 2. **Content tier** (expensive): a full-object GET, blake3 rehash compared
-//!    against `record.content_hash` (bit-rot / partial-write detection,
-//!    S2-08). This is the one check that actually proves the object still
+//!    against `record.content_hash` (bit-rot / partial-write detection).
+//!    This is the one check that actually proves the object still
 //!    matches what was written.
 //! 3. **Postings tier** (only when covering postings are supplied): re-derive
 //!    this object's true `__name__` set from its own catalog via
@@ -29,7 +29,7 @@
 //!    that wrote the postings used -- and diff it against what the covering
 //!    name-postings object claims for this object's ordinal. A name present in
 //!    the true set but absent from the postings' claims for this object is the
-//!    false-negative disagreement S2-09 exists to catch (a query would get "no
+//!    false-negative disagreement this tier exists to catch (a query would get "no
 //!    match" for data that has a match).
 //!
 //! ADR-0059 decision 1 folds the content and postings checks onto the one
@@ -104,14 +104,14 @@ pub enum ScrubResult {
         detail: String,
     },
     /// The whole-object blake3 rehash did not match `record.content_hash`
-    /// (S2-08: bit rot or a partially written object). A real anomaly.
+    /// (bit rot or a partially written object). A real anomaly.
     ChecksumMismatch {
         /// The hash the commit record recorded at write time.
         expected: [u8; 32],
         /// The hash of the bytes actually stored now.
         actual: [u8; 32],
     },
-    /// The postings tier found a false negative (S2-09): `name` really is
+    /// The postings tier found a false negative: `name` really is
     /// present on this object, but the covering postings object omits this
     /// object's `ordinal` from that name's postings list, so a query filtering
     /// on `name` would wrongly skip this object.

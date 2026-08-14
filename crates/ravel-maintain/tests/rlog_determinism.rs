@@ -11,7 +11,7 @@
 //! inputs' canonical order. If that order were not deterministic, the two
 //! runs' blocks would differ and the part bytes would diverge; asserting
 //! byte-identical output across two independent runs pins the behaviour that
-//! crash-recovery convergence depends on (plan §3.4).
+//! crash-recovery convergence depends on.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeSet;

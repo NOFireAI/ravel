@@ -1,10 +1,10 @@
-//! Storage-derived tenant discovery (ADR-0048 decision 3, issue #504).
+//! Storage-derived tenant discovery (ADR-0048 decision 3).
 //!
 //! The maintenance and fold background tasks used to learn their tenant set
 //! only from CLI flags (`--tenant-token`, `--maintain-tenant`), so a
 //! deployment authenticating tenants through OIDC or mTLS -- which never
-//! populates either flag -- silently ran neither task for any of them
-//! (findings S2-17, S5-09). Storage already knows every tenant with data: one
+//! populates either flag -- silently ran neither task for any of them.
+//! Storage already knows every tenant with data: one
 //! delimited LIST of the `t/` prefix enumerates it directly, with no second
 //! source of truth to drift from what is actually durable (ADR-0048 rejected
 //! alternative 2).

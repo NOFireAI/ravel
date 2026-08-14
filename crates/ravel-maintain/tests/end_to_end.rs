@@ -1,6 +1,5 @@
 //! End-to-end compaction against the `MemoryStore` oracle, including listing
-//! pagination via `with_page_size(2)` (docs/compaction-retention-plan.md P4
-//! test list).
+//! pagination via `with_page_size(2)`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -100,7 +99,7 @@ async fn compacts_bucket_and_preserves_all_samples() {
     }
 
     // Every input sample survives, byte-for-byte (union view; dedup is a
-    // query-time concern, plan §7).
+    // query-time concern).
     let got = read_record_samples(&store, &record).await;
     let expected = expected_samples(&specs);
     assert_eq!(got, expected);
@@ -108,7 +107,7 @@ async fn compacts_bucket_and_preserves_all_samples() {
 
 #[tokio::test]
 async fn dry_run_reports_the_plan_but_writes_nothing() {
-    // P8: config.dry_run computes the identical eligible set and part plan a
+    // Dry-run: config.dry_run computes the identical eligible set and part plan a
     // real run would, but skips every store.put. The reported outcome reflects
     // what a real run *would* have written; the store is left untouched.
     let store = MemoryStore::new();
