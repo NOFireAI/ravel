@@ -1,4 +1,4 @@
-# ADR-0075: operator-owned DR via replicated-bucket controls, a rehearsed restore, and a process-kill evidence lane
+# ADR-0077: operator-owned DR via replicated-bucket controls, a rehearsed restore, and a process-kill evidence lane
 
 Status: Accepted
 
