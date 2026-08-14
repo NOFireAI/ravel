@@ -1,5 +1,5 @@
 //! `GET /metrics` is served on the HTTP listener in every mode, including
-//! `Mode::Maintain` (issue #423), the same regression shape as
+//! `Mode::Maintain`, the same regression shape as
 //! `health_endpoints.rs`'s maintain-mode guard.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -70,9 +70,8 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
     .expect("server starts")
 }
 
-/// Regression guard for issue #423: `/metrics` must be served in every mode,
-/// maintain included, where before this change only `/healthz` and `/readyz`
-/// existed.
+/// `/metrics` must be served in every mode, maintain included, alongside
+/// `/healthz` and `/readyz`.
 #[tokio::test]
 async fn metrics_served_in_every_mode() {
     for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
@@ -150,7 +149,7 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
     }
 }
 
-// --- ADR-0051 section 6: the /metrics admission family (issue #573) ---
+// --- ADR-0051 section 6: the /metrics admission family ---
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -378,7 +377,7 @@ fn admission_tenant_hashes(body: &str) -> std::collections::HashSet<String> {
     out
 }
 
-/// THE ACCEPTANCE TEST for issue #573 (ADR-0051 section 6). N tenants each
+/// The acceptance test for per-tenant admission labels (ADR-0051 section 6). N tenants each
 /// generate admission activity (one admitted, three rejected by distinct
 /// reasons). Scraped with `--metrics-tenant-labels` off, every
 /// `ravel_admission_*` series collapses to `tenant_hash="other"`, so the

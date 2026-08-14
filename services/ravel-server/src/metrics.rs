@@ -15,7 +15,7 @@
 //! `error_kind`, `workload_class`, `level`, `reason`, and `cache` (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
 //! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
-//! `cache` by issue #553 to split the read-cache family into the
+//! `cache` to split the read-cache family into the
 //! fetcher and catalog byte caches). Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
@@ -31,8 +31,8 @@
 //!
 //! # Extending with a new source
 //!
-//! Issue #425 adds per-query cost accounting on top of this renderer. Doing
-//! so means building a new snapshot-to-[`Label`] mapping and a new family
+//! Adding a new source such as per-query cost accounting on top of this
+//! renderer means building a new snapshot-to-[`Label`] mapping and a new family
 //! function beside [`render_store_family`]/[`render_ingest_family`], called
 //! from [`render`]; it does not mean reshaping [`Label`] or the escaping and
 //! line-writing helpers below.
@@ -65,7 +65,7 @@ use ravel_types::{Signal, TenantHash};
 use crate::config::Mode;
 
 /// How a query reached the engine, the `workload_class` label on the
-/// per-query cost family (issue #425, ADR-0044 section 4). A closed set:
+/// per-query cost family (ADR-0044 section 4). A closed set:
 /// `interactive` is a client-driven HTTP or Flight query, `background` is an
 /// internally scheduled query (alert-rule evaluation). Bounded like every
 /// other label here, so it can dimension the query-cost series without
@@ -115,7 +115,7 @@ impl Level {
 /// 6, extended by the 2026-08-13 amendment). ADR-0051 named a closed set of
 /// six reasons `{body_size, byte_rate, series_rate, series_cap, skew,
 /// structural}`; the amendment adds a seventh, `clock`, for the receiver-clock
-/// floor (S1-12). The four here are exactly the ones
+/// floor. The four here are exactly the ones
 /// `AdmissionController::usage_snapshot` counts today
 /// (`ravel_ingest::TenantUsage`). The remaining three (body_size, skew,
 /// structural) are enforced at layers that keep no per-tenant counter in that
@@ -131,7 +131,7 @@ pub enum RejectReason {
     SeriesCap,
     /// The receiver's admission clock was implausible (below the 2020 floor or
     /// non-representable), so the whole request was rejected 503 / `UNAVAILABLE`
-    /// (ADR-0051 amendment, S1-12). The fault is the replica's, not the data's.
+    /// (ADR-0051 amendment). The fault is the replica's, not the data's.
     Clock,
 }
 
@@ -157,8 +157,8 @@ impl RejectReason {
 }
 
 /// The `reason` label on `ravel_scrub_seal_divergence_total` (ADR-0059 decision
-/// 2, issue #695). A closed set of two values: `missing` (a sealed commit record
-/// absent from the folded snapshot, S2-04 under-count) and `mismatched` (a
+/// 2). A closed set of two values: `missing` (a sealed commit record
+/// absent from the folded snapshot, an under-count) and `mismatched` (a
 /// snapshot entry whose `content_hash` disagrees with the sealed record).
 /// `orphaned` divergences (a snapshot entry with no surviving commit record) are
 /// the expected retention-after-fold shape and deliberately have no label value:
@@ -243,7 +243,7 @@ impl MergeMemoryKind {
     }
 }
 
-/// Which ADR-0046 read cache a `ravel_cache_*` sample belongs to (issue #553).
+/// Which ADR-0046 read cache a `ravel_cache_*` sample belongs to.
 /// Both caches share one metric family and are told apart only by this
 /// `cache=` label, the same discipline every other family here uses to split
 /// one metric name across a closed dimension. `fetch` is the query fetchers'
@@ -562,14 +562,14 @@ pub struct IngestPipelineSnapshot {
     /// Flushes failed closed because the router's cached provisioning view for
     /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
     pub stale_provisioning_flushes: u64,
-    /// Write-side POSTINGS counters (ADR-0049, issue #511). `Some` only for the
+    /// Write-side POSTINGS counters (ADR-0049). `Some` only for the
     /// log pipeline; `None` for metrics and spans, which build no POSTINGS
     /// section, so the postings family renders no sample for them.
     pub postings: Option<PostingsCounters>,
 }
 
 /// The log pipeline's write-side POSTINGS counters, cumulative over flushed
-/// objects (ADR-0049 decision 4, issue #511). Rendered without any per-field
+/// objects (ADR-0049 decision 4). Rendered without any per-field
 /// label, which the ADR-0044 allowlist forbids: `distinct_values_total` over
 /// `indexed_fields_total` is the mean distinct-per-field, and `bytes_total`
 /// over `objects` the mean section bytes per indexed object.
@@ -858,7 +858,7 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     }
 }
 
-/// The write-side POSTINGS counters (ADR-0049 decision 4, issue #511): section
+/// The write-side POSTINGS counters (ADR-0049 decision 4): section
 /// bytes and per-field distinct-value counts per indexed object, and the
 /// cap-exceeded counter.
 ///
@@ -870,7 +870,7 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
 /// `ravel_logs_postings_indexed_fields_total`, so a scraper derives the mean
 /// distinct-per-field without any field-name label, which the ADR-0044 label
 /// allowlist forbids. The prune-selectivity metric is rendered separately, off
-/// the query path's DataFusion counters (issue #511 deliverable 2).
+/// the query path's DataFusion counters.
 fn render_logs_postings_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelineSnapshot]) {
     fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
         [Label::Mode(mode), Label::Signal(signal)]
@@ -995,7 +995,7 @@ fn render_tenancy_family(out: &mut String, mode: Mode, v1_unkeyed_adoptions: u64
     );
 }
 
-/// Process-wide in-flight ingest-request shed counter (issue #802). Mode-only
+/// Process-wide in-flight ingest-request shed counter. Mode-only
 /// labeled like `render_tenancy_family` above: the controller is a single
 /// semaphore shared across OTLP metrics/logs/traces and Remote Write, on
 /// every listener and transport, with no per-signal breakdown to render.
@@ -1014,8 +1014,7 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
     );
 }
 
-/// The process-wide ingest buffer byte budget family (ADR-0069 decision 1,
-/// issue #819): the current gauge of estimated buffered bytes, the configured
+/// The process-wide ingest buffer byte budget family (ADR-0069 decision 1): the current gauge of estimated buffered bytes, the configured
 /// ceiling, and the cumulative shed counter. Mode-only labeled like
 /// `render_ingest_concurrency_family` above: the budget is a single gauge
 /// shared across metrics/logs/traces with no per-signal breakdown.
@@ -1069,9 +1068,9 @@ fn render_ingest_buffer_budget_family(
     );
 }
 
-/// The logs prune-selectivity family (ADR-0049, issue #511 deliverable 2):
+/// The logs prune-selectivity family (ADR-0049):
 /// blocks the logs scans saw, survived, and pruned by postings, cumulative
-/// across queries. Reads the `LogsScanExec` DataFusion counters (#544) that
+/// across queries. Reads the `LogsScanExec` DataFusion counters that
 /// `ravel-sql` surfaces on `SqlOutcome::stats`, folded into a process-global by
 /// the SQL endpoint. Selectivity is `blocks_survived / blocks_total` (blocks
 /// surviving over blocks total); the raw counters are exposed so a scraper
@@ -1204,7 +1203,7 @@ fn render_bucket_protection_family(out: &mut String, mode: Mode, unknown: u64) {
 }
 
 /// Storage-derived tenant discovery counters for the maintenance driver
-/// (ADR-0048 decision 3, issue #504), decoupled from
+/// (ADR-0048 decision 3), decoupled from
 /// [`crate::tenant_discovery::TenantDiscoveryMetrics`] so the renderer is
 /// testable with a plain struct literal, matching [`CatalogCountersSnapshot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1272,7 +1271,7 @@ fn render_maintain_family(out: &mut String, mode: Mode, snapshot: &MaintenanceDi
 }
 
 /// One signal's maintenance-safety counters for one scrape (ADR-0048
-/// decisions 4 and 6; issue #517).
+/// decisions 4 and 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceSafetySignalSnapshot {
     pub signal: Signal,
@@ -1282,7 +1281,7 @@ pub struct MaintenanceSafetySignalSnapshot {
     pub conservation_aborts: u64,
     /// Orphan-GC mass-orphan circuit breaker trips (ADR-0048 decision 4).
     /// Monotonic: a later pass that no longer trips (dilution or partial
-    /// restoration, issue #500) does not decrement this. An operator's alert
+    /// restoration) does not decrement this. An operator's alert
     /// rule must fire on the first trip (`increase(...) > 0`), never on a
     /// sustained "currently tripped" condition, because the condition can
     /// clear itself while the withheld data loss persists.
@@ -1304,8 +1303,7 @@ pub struct MaintenanceSafetySignalSnapshot {
     pub orphans_present: u64,
 }
 
-/// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6;
-/// issue #517): the three safety controls that, before this issue, reached
+/// One scrape's maintenance-safety counters (ADR-0048 decisions 1, 4, 6): the three safety controls that, before this issue, reached
 /// an operator only through a `tracing` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceSafetySnapshot {
@@ -1323,8 +1321,7 @@ pub struct MaintenanceSafetySnapshot {
 /// exists, but it only applies to the admission usage family (ADR-0051
 /// section 6); this maintenance-safety family is untouched by it. Adding a
 /// raw tenant hash here would violate ADR-0044's safety precondition; see
-/// [`crate::maintain::MaintenanceSafetyMetrics`] and the issue #517 report
-/// for the full contradiction.
+/// [`crate::maintain::MaintenanceSafetyMetrics`] for the full contradiction.
 fn render_maintain_safety_family(
     out: &mut String,
     mode: Mode,
@@ -1367,7 +1364,7 @@ fn render_maintain_safety_family(
         "ravel_maintain_orphan_breaker_tripped_total",
         "Orphan-GC mass-orphan circuit breaker trips, by signal. Alert on increase() > 0, not \
          on sustained state: the condition can clear itself while the withheld data loss \
-         persists (issue #500).",
+         persists.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -1414,7 +1411,7 @@ fn render_maintain_safety_family(
     }
 }
 
-/// One scrape's ADR-0065 stuck-owner mitigation counters (issue #749): how
+/// One scrape's ADR-0065 stuck-owner mitigation counters: how
 /// many in-process workers are live, how many units this process currently
 /// owns, how many warm-started from a durable memo snapshot, how many full
 /// (unscoped) sweep passes have run, and how many owned units are stalled.
@@ -1545,22 +1542,22 @@ fn render_merge_memory_family(
 }
 
 /// One signal's at-rest scrubber counters for one scrape (ADR-0059 decisions
-/// 1, 3; issue #694).
+/// 1, 3).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScrubSignalSnapshot {
     pub signal: Signal,
     /// Objects that failed at-rest integrity re-verification for this signal:
     /// a whole-object blake3 mismatch against the recorded content hash (bit
-    /// rot / partial write, S2-08) or a footer/section crc failure. Both are
+    /// rot / partial write) or a footer/section crc failure. Both are
     /// data-object corruption, so both increment this one counter.
     pub checksum_mismatch: u64,
     /// Objects where the covering name-postings object omitted a `__name__`
-    /// the object really carries (S2-09's false negative). Wired but only
+    /// the object really carries (a false negative). Wired but only
     /// nonzero once covering-postings resolution lands in the scrub task.
     pub postings_disagreement: u64,
     /// Sealed commit records absent from the folded snapshot for this signal
-    /// (S2-04 under-count): `ravel_scrub_seal_divergence_total{reason="missing"}`
-    /// (ADR-0059 decision 2, issue #695).
+    /// (an under-count): `ravel_scrub_seal_divergence_total{reason="missing"}`
+    /// (ADR-0059 decision 2).
     pub seal_divergence_missing: u64,
     /// Snapshot entries whose `content_hash` disagreed with the sealed commit
     /// record for this signal:
@@ -1571,15 +1568,15 @@ pub struct ScrubSignalSnapshot {
     pub cursor_position: f64,
 }
 
-/// One scrape's at-rest scrubber counters (ADR-0059 decisions 1, 3; issue
-/// #694), per signal. `Some` only in [`Mode::Maintain`], the one mode that runs
+/// One scrape's at-rest scrubber counters (ADR-0059 decisions 1, 3), per
+/// signal. `Some` only in [`Mode::Maintain`], the one mode that runs
 /// the scrubber.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScrubSnapshot {
     pub signals: Vec<ScrubSignalSnapshot>,
 }
 
-/// The at-rest scrubber family (ADR-0059 decision 3, issue #694). Follows
+/// The at-rest scrubber family (ADR-0059 decision 3). Follows
 /// [`render_maintain_safety_family`]'s conventions exactly: per-signal series
 /// under `{mode, signal}` and deliberately no `tenant_hash` label (ADR-0044
 /// section 4 blocks any per-tenant series on this unauthenticated route). The
@@ -1613,7 +1610,7 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
         out,
         "ravel_scrub_postings_disagreement_total",
         "Objects whose covering name-postings object omitted a __name__ the object really carries \
-         (S2-09 false negative), by signal (ADR-0059).",
+         (a false negative), by signal (ADR-0059).",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -1630,7 +1627,7 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
         "ravel_scrub_seal_divergence_total",
         "Divergences between the folded snapshot and the re-listed sealed commit history, by \
          signal and reason (ADR-0059 decision 2): reason=\"missing\" is a sealed commit record \
-         absent from the snapshot (S2-04 under-count), reason=\"mismatched\" a snapshot entry \
+         absent from the snapshot (an under-count), reason=\"mismatched\" a snapshot entry \
          whose content_hash disagrees with the sealed record. Orphaned entries (a snapshot entry \
          with no surviving commit record) are the expected retention-after-fold shape and are \
          never counted. Alert on increase() > 0.",
@@ -1673,7 +1670,7 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
     }
 }
 
-/// The ADR-0046 read caches' counters (issues #445, #502, #553). Two caches
+/// The ADR-0046 read caches' counters. Two caches
 /// share this one family: the query fetchers' RAM cache (`fetch`) and the
 /// catalog's content-addressed byte cache (`catalog`), told apart by the
 /// `cache=` label, the same one-name-split-by-a-closed-dimension discipline
@@ -1681,7 +1678,7 @@ fn render_scrub_family(out: &mut String, mode: Mode, snapshot: &ScrubSnapshot) {
 /// is `hits / (hits + misses)` and byte hit rate is `bytes_served /
 /// (bytes_served plus bytes_admitted)`; both are left for PromQL to compute per
 /// `cache` from the raw counters, not baked in here. The family deliberately
-/// omits `single_flight_collapses` because issue #503 is its own fleet-wide
+/// omits `single_flight_collapses` because that is a separate fleet-wide
 /// collapse-rate metric, not this one, and this family must not preempt that
 /// decision by shipping a shape it did not choose.
 ///
@@ -1957,7 +1954,7 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
 }
 
 /// One (tenant bucket, workload class) row's accumulated per-query cost
-/// counters (issue #425, ADR-0044 section 1 and 3). Both the actuals summed
+/// counters (ADR-0044 section 1 and 3). Both the actuals summed
 /// from each query's [`QueryAccountingSnapshot`] and the estimates summed from
 /// each query's [`CostEstimate`] live here side by side, but they render as
 /// separate metric families ([`render_query_family`]): the estimate never
@@ -2091,7 +2088,7 @@ impl QueryAccountingMetrics {
     }
 }
 
-/// The recorder seam (ADR-0044 section 4, issue #425): this is what lets the
+/// The recorder seam (ADR-0044 section 4): this is what lets the
 /// Prometheus-shaped query handlers in `ravel-query` and the Flight SQL path in
 /// `ravel-sql` fold their per-query cost into this process-global aggregator
 /// without depending on `services/ravel-server`. Both hold an
@@ -2121,7 +2118,7 @@ impl QueryCostRecorder for QueryAccountingMetrics {
     }
 }
 
-/// The per-query cost family (issue #425, ADR-0044 section 4). Every sample
+/// The per-query cost family (ADR-0044 section 4). Every sample
 /// carries `mode`, `tenant_hash`, and `workload_class`, all closed or
 /// allowlist-bounded (see [`QueryAccountingMetrics`] for the tenant fold). The
 /// estimate series (`*_estimated_*`) render beside the actuals under distinct
@@ -2282,7 +2279,7 @@ fn render_query_family(out: &mut String, mode: Mode, rows: &[QueryAccountingRow]
     }
 }
 
-/// One scrape's ADR-0071 distributed read fan-out counters (issue #865). Read
+/// One scrape's ADR-0071 distributed read fan-out counters. Read
 /// at scrape time from [`crate::distrib::FragmentMetrics`]; `Some` only when the
 /// process serves queries with `--distributed-query` on. Carries no per-shard,
 /// per-worker, or per-tenant field: the `ravel_distrib_*` family renders under
@@ -2300,7 +2297,7 @@ pub struct DistribSnapshot {
     pub slice_fetch_nanos_total: u64,
 }
 
-/// The ADR-0071 distributed read fan-out family (issue #865). Follows the store
+/// The ADR-0071 distributed read fan-out family. Follows the store
 /// and maintenance families exactly: every series carries only `{mode}`, and the
 /// three slice-routing outcomes are distinct metric names rather than one metric
 /// with a `route` label, so no label outside the closed [`Label`] allowlist is
@@ -2543,26 +2540,26 @@ pub struct MetricsState {
     pub catalog: Arc<Catalog>,
     /// `Some` only in [`Mode::Maintain`], the one mode that spawns
     /// [`crate::maintain::spawn`] and therefore has tenant discovery counters
-    /// to render (ADR-0048 decision 3, issue #504).
+    /// to render (ADR-0048 decision 3).
     pub tenant_discovery: Option<Arc<crate::tenant_discovery::TenantDiscoveryMetrics>>,
     /// `Some` only in [`Mode::Maintain`], alongside `tenant_discovery` above
-    /// (ADR-0048 decisions 1, 4, 6; issue #517).
+    /// (ADR-0048 decisions 1, 4, 6).
     pub maintenance_safety: Option<Arc<crate::maintain::MaintenanceSafetyMetrics>>,
     /// `Some` only in [`Mode::Maintain`], alongside `maintenance_safety` above:
-    /// ADR-0065's stuck-owner mitigation counters (issue #749).
+    /// ADR-0065's stuck-owner mitigation counters.
     pub maintenance_ownership: Option<Arc<crate::maintain::MaintenanceOwnershipMetrics>>,
     /// `Some` only in [`Mode::Maintain`]: the ADR-0065 decision 4 RLOG k-way
     /// merge peak-bytes tracker, the same handle `ravel_maintain::rlog`'s real
     /// merge call sites record into.
     pub merge_memory: Option<ravel_maintain::MergeMemoryTracker>,
     /// `Some` only in [`Mode::Maintain`], alongside `maintenance_safety` above,
-    /// the one mode that spawns the at-rest scrubber (ADR-0059, issue #694).
+    /// the one mode that spawns the at-rest scrubber (ADR-0059).
     pub scrub: Option<Arc<crate::scrub::ScrubMetrics>>,
-    /// The ADR-0046 fetcher cache's counters handle (issues #445, #502), or
+    /// The ADR-0046 fetcher cache's counters handle, or
     /// `None` when `--disable-cache` leaves no fetcher cache constructed at all.
     /// Rendered under `cache="fetch"`.
     pub cache_metrics: Option<Arc<ravel_cache::CacheMetrics>>,
-    /// The ADR-0046 catalog byte cache's counters handle (issue #553), or
+    /// The ADR-0046 catalog byte cache's counters handle, or
     /// `None` when `--disable-cache` leaves no catalog byte cache constructed
     /// at all. Rendered under `cache="catalog"`, the same family as the fetcher
     /// cache above, so the documented hit-rate formula covers every ADR-0046
@@ -2579,11 +2576,11 @@ pub struct MetricsState {
     /// each observed tenant's real hash. Off keeps the exposition's cardinality
     /// bounded regardless of tenant count, which is why it is opt-in.
     pub metrics_tenant_labels: bool,
-    /// The process-global per-query cost aggregator (issue #425, ADR-0044
+    /// The process-global per-query cost aggregator (ADR-0044
     /// section 4), written by every query handler and read here at scrape time.
     /// Always present; renders no samples until a query records into it.
     pub query_accounting: Arc<QueryAccountingMetrics>,
-    /// The process-wide in-flight ingest-request ceiling (issue #802), shared
+    /// The process-wide in-flight ingest-request ceiling, shared
     /// with every OTLP HTTP/gRPC service and Remote Write on both the public
     /// and mTLS listeners. Always present; its `shed_total` is simply `0`
     /// until the ceiling first rejects a request.
@@ -2592,7 +2589,7 @@ pub struct MetricsState {
     /// at scrape time for the `ravel_ingest_buffer_bytes` gauge, its limit, and
     /// the `ravel_ingest_buffer_shed_total` counter.
     pub ingest_buffer_budget: Arc<ravel_ingest::IngestByteBudget>,
-    /// The ADR-0071 distributed read fan-out counters (issue #865). `Some` only
+    /// The ADR-0071 distributed read fan-out counters. `Some` only
     /// when the process serves queries with `--distributed-query` on; `None`
     /// otherwise leaves the whole `ravel_distrib_*` family off the exposition.
     pub distrib: Option<Arc<crate::distrib::FragmentMetrics>>,
@@ -2786,7 +2783,7 @@ mod tests {
         }
     }
 
-    /// THE ACCEPTANCE TEST for issue #423. Proves both halves: a populated
+    /// The acceptance test for the exposition renderer. Proves both halves: a populated
     /// `StoreMetrics` snapshot renders to well-formed exposition text with the
     /// expected sample names and values, and the renderer's label API cannot
     /// express a label outside ADR-0044 section 4's allowlist.
@@ -2847,9 +2844,9 @@ mod tests {
         // fails the length assertion until it is extended too -- two
         // independent breaks for one added variant, by design. `reason` is the
         // eighth, added by ADR-0051 section 6 for the admission family; `cache`
-        // is the ninth, added by issue #553 to split the read-cache family into
+        // is the ninth, added to split the read-cache family into
         // the fetcher and catalog byte caches; `kind` is the tenth, added by
-        // ADR-0065 decision 4 (issue #749) for the RLOG merge-memory gauge.
+        // ADR-0065 decision 4 for the RLOG merge-memory gauge.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -2898,8 +2895,8 @@ mod tests {
                 "kind",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
-             ADR-0059 section 2's scrub seal-divergence family), issue #553's `cache`, and \
-             ADR-0065 decision 4's `kind` (issue #749); `shard` must never appear here"
+             ADR-0059 section 2's scrub seal-divergence family), the `cache` label, and \
+             ADR-0065 decision 4's `kind`; `shard` must never appear here"
         );
         assert_eq!(
             one_of_each.len(),
@@ -2908,7 +2905,7 @@ mod tests {
         );
     }
 
-    /// The POSTINGS family (issue #511) renders one sample per metric for the
+    /// The POSTINGS family renders one sample per metric for the
     /// log pipeline, each carrying exactly the labels the ADR-0044 allowlist
     /// permits for it: `{mode, signal}` and nothing else. The label *set* is
     /// asserted, not just the values, so a future stray label (a field name,
@@ -2982,7 +2979,7 @@ mod tests {
         }
     }
 
-    /// The prune-selectivity family (issue #511) renders its three counters,
+    /// The prune-selectivity family renders its three counters,
     /// each labelled with exactly `{mode, signal="logs"}` and nothing more.
     /// Rendered directly rather than through the process-global so the values
     /// are deterministic and do not race another test's queries.
@@ -3289,7 +3286,7 @@ mod tests {
         );
     }
 
-    /// ADR-0048 decision 3 / issue #504: the tenant discovery gauges and
+    /// ADR-0048 decision 3: the tenant discovery gauges and
     /// failure counter render through this same closed-label renderer, no
     /// second registry, exactly like every other family here.
     #[test]
@@ -3413,7 +3410,7 @@ mod tests {
         assert!(body.contains("# TYPE ravel_store_probe_failures_total counter"));
     }
 
-    /// Issue #517: the three maintenance safety controls (ADR-0048 decisions
+    /// the three maintenance safety controls (ADR-0048 decisions
     /// 1, 4, 6) render on this same closed-label endpoint, no second
     /// registry, exactly like every other family here.
     #[test]
@@ -3496,7 +3493,7 @@ mod tests {
         );
     }
 
-    /// The ADR-0071 distributed read fan-out family (issue #865) renders under
+    /// The ADR-0071 distributed read fan-out family renders under
     /// the new `ravel_distrib_*` names, and every one of its series carries only
     /// the closed `{mode}` label: no per-shard, per-worker, or per-tenant label
     /// (ADR-0044 section 4). Also asserts the family is absent entirely when the
@@ -3800,7 +3797,7 @@ mod tests {
 
     #[test]
     fn cache_family_renders_both_caches_labeled_distinctly_and_omits_single_flight_collapses() {
-        // Issue #553: the fetcher cache (cache="fetch") and the catalog byte
+        // the fetcher cache (cache="fetch") and the catalog byte
         // cache (cache="catalog") share this family, told apart by the `cache`
         // label, so the documented hit-rate formula covers every ADR-0046
         // cache. Distinct values per cache so a mislabeled sample is caught.
@@ -3918,7 +3915,7 @@ mod tests {
 
         assert!(
             !body.contains("single_flight_collapse"),
-            "issue #503: fleet-wide single-flight collapse rate must never be \
+            "fleet-wide single-flight collapse rate must never be \
              emitted on /metrics, found in:\n{body}"
         );
     }
@@ -3962,7 +3959,7 @@ mod tests {
     #[test]
     fn cache_family_omitted_entirely_when_no_cache_is_attached() {
         // A `--disable-cache` process attaches neither the fetcher cache nor
-        // the catalog byte cache (issue #553), so the whole family is absent.
+        // the catalog byte cache, so the whole family is absent.
         let body = render(
             Mode::Gateway,
             &StoreMetricsSnapshot::default(),
@@ -4214,7 +4211,7 @@ mod tests {
         );
     }
 
-    // --- Issue #425: the per-query cost family ---
+    // --- the per-query cost family ---
 
     use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot};
 
@@ -4272,7 +4269,7 @@ mod tests {
         out
     }
 
-    /// THE FOLD TEST (issue #425 deliverable 2). With no tenant configured
+    /// THE FOLD TEST. With no tenant configured
     /// (the safe default), every tenant's per-query cost folds into
     /// `tenant_hash="other"` *at record time*, so an unconfigured tenant can
     /// never allocate a new series no matter how many distinct tenants query.
@@ -4364,7 +4361,7 @@ mod tests {
     }
 
     /// The estimate and the actual render as SEPARATE, differently-named
-    /// series (issue #425 deliverable 3, ADR-0044 section 3), so their
+    /// series (ADR-0044 section 3), so their
     /// divergence is directly measurable. A single query with a deliberately
     /// higher estimate than actual proves neither replaced the other.
     #[test]

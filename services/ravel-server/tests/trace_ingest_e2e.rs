@@ -253,7 +253,7 @@ async fn http_export_round_trips_to_a_durable_rspan_object() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// Reachability + soundness for the 2026-08-13 amendment (ADR-0051, S1-12): a
+/// Reachability + soundness for the 2026-08-13 amendment (ADR-0051): a
 /// long-running span whose start precedes `now - max_ingest_lag` (here 3 h
 /// before ingest, well past the default 2 h lag) but whose end is at `now` is
 /// ADMITTED, becomes durable, and is discoverable by a range query that

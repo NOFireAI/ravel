@@ -1,4 +1,4 @@
-//! Prometheus HTTP API compatibility routes (issue #336): the four routes
+//! Prometheus HTTP API compatibility routes: the four routes
 //! Grafana's built-in Prometheus datasource probes but that carry no query
 //! semantics.
 //!

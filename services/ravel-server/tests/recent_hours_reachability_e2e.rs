@@ -1,9 +1,9 @@
-//! RH-T3 (issue #903, epic #895, ADR-0073): end-to-end reachability proof for
-//! the recent-hours read path, driven through the real production handlers
+//! End-to-end reachability proof for the recent-hours read path (ADR-0073),
+//! driven through the real production handlers
 //! (`services/ravel-server/src/query.rs`'s `build_app_state`/`build_sql_state`,
 //! the same factory functions `ravel_server::start` calls) rather than any
-//! unit-level stub. RH-T1 (issue #901) proved the admission seam in
-//! isolation; RH-T2 (issue #902) proved SQL/PromQL parity at the same level;
+//! unit-level stub. Where narrower tests prove the admission seam and
+//! SQL/PromQL parity in isolation,
 //! this proves both real HTTP query surfaces actually observe the exemption
 //! while a real `IngestRouter` drives the open hour past `max_segments`.
 //!
@@ -529,7 +529,7 @@ async fn recent_hour_reads_survive_the_open_hour_and_match_post_compaction_exact
     );
     assert_eq!(
         hot_promql_bits, hot_sql_bits,
-        "PromQL and SQL must agree on the same hot data (RH-T2 parity, over real HTTP)"
+        "PromQL and SQL must agree on the same hot data (parity, over real HTTP)"
     );
 }
 

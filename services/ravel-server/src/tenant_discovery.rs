@@ -1,11 +1,11 @@
 //! Shared storage-derived tenant discovery for the maintenance and fold
-//! background tasks (ADR-0048 decision 3, issue #504).
+//! background tasks (ADR-0048 decision 3).
 //!
 //! Both tasks used to learn their tenant set only from `--tenant-token` and
 //! `--maintain-tenant`, so a deployment authenticating tenants through OIDC
 //! or mTLS -- which populates neither flag -- silently ran neither task for
-//! any of them (findings S2-17, S5-09; issue #398's `--maintain-tenant` plus
-//! startup warning only fires when the merged list is entirely empty, so a
+//! any of them (the `--maintain-tenant` startup warning only fires when the
+//! merged list is entirely empty, so a
 //! stale non-empty list is still silent for a newly onboarded tenant). This
 //! module replaces the flag-derived set with [`ravel_maintain::discover_tenants`]
 //! and narrows it to an optional flag *restriction* instead.
@@ -76,7 +76,7 @@ pub async fn discover_and_restrict(
     })
 }
 
-/// Lifecycle-aware discovery (ADR-0066 decision 6, EM-T8): the maintained set
+/// Lifecycle-aware discovery (ADR-0066 decision 6): the maintained set
 /// is re-derived each cycle from the durable per-tenant config records, not
 /// frozen at startup from the `--tenant-token`/`--maintain-tenant` union.
 ///
@@ -92,7 +92,8 @@ pub async fn discover_and_restrict(
 /// (empty means `None`). It is a fallback source that governs ONLY tenants with
 /// no config record yet: such a tenant is maintained when `fallback_allow` is
 /// `None` or names it, and excluded (and counted) otherwise. This preserves the
-/// pre-EM behaviour for data that predates per-tenant config records (legacy or
+/// flag-restriction behaviour for data that predates per-tenant config records
+/// (legacy or
 /// OIDC-only tenants). It is explicitly NOT a filter that can override a config
 /// record: any flag-derived set that could exclude a config-recorded tenant
 /// would reintroduce the removed-token-disables-retention hazard this whole
@@ -106,7 +107,8 @@ pub async fn discover_and_restrict(
 /// deprovisioned-by-token tenant keeps its `active` record and stays maintained
 /// (retention enforcement continues) until its data is actually gone. A tenant
 /// otherwise only drops out by having its data (and therefore its `t/` prefix)
-/// removed -- fully-completed offboarding, EJ's (#460) mechanism, not EM's.
+/// removed -- fully-completed offboarding through the erasure mechanism, not
+/// lifecycle refresh.
 ///
 /// A per-tenant config read error is NOT allowed to drop a tenant on its own:
 /// that would reintroduce the very hazard (a transient fault silently disabling
@@ -447,7 +449,7 @@ mod tests {
     /// A discovered tenant with NO config record still honours the static flag
     /// restriction (backward compatibility for legacy/OIDC data that predates
     /// per-tenant config records): named by the restriction it is maintained,
-    /// not named it is excluded, exactly as before EM-T8.
+    /// not named it is excluded.
     #[tokio::test]
     async fn lifecycle_discovery_falls_back_to_flag_restriction_without_a_config_record() {
         let store = MemoryStore::new();

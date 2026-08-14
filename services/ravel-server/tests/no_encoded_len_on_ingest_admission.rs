@@ -1,4 +1,4 @@
-//! Guard for issue #803: no gRPC ingest admission call site may charge
+//! Guard: no gRPC ingest admission call site may charge
 //! byte-rate on `Message::encoded_len()` (an `O(message)` walk of the
 //! decoded protobuf tree) again. Charging must come from `WireByteCountLayer`
 //! (`src/wire_byte_count.rs`) reading transport-derived wire bytes instead.

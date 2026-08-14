@@ -1,5 +1,4 @@
-//! Background idle-tenant state eviction sweep (ADR-0069 decision 2, issue
-//! #820).
+//! Background idle-tenant state eviction sweep (ADR-0069 decision 2).
 //!
 //! Ravel's per-tenant maps never shrank for idle tenants: generation-switch
 //! views, the catalog's per-tenant decoded caches, and the SQL per-tenant
@@ -218,7 +217,7 @@ mod tests {
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
-    /// ADR-0069 decision 2 (issue #820): a sweep that evicts idle re-derivable
+    /// ADR-0069 decision 2: a sweep that evicts idle re-derivable
     /// per-tenant state leaves the admission controller's cap state for the same
     /// idle tenant untouched. Admission state is explicitly excluded from
     /// eviction (its active-series counts are correctness-bearing caps), which

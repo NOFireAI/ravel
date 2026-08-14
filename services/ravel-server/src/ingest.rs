@@ -48,7 +48,7 @@ pub enum IngestRequestError {
     /// exceeded. No tokens are consumed on rejection.
     Admission(RequestRejection),
     /// The receiver's admission-time clock was implausible (below the 2020
-    /// floor or non-representable, ADR-0051 amendment, S1-12). No per-record
+    /// floor or non-representable, ADR-0051 amendment). No per-record
     /// decision is meaningful when the reference clock is nonsense, so the
     /// whole request is rejected with HTTP 503 / gRPC `UNAVAILABLE`; the fault
     /// is the replica's, and a retry against a healthy replica succeeds.
@@ -94,8 +94,8 @@ impl IngestRequestError {
 /// Upper bound on the assembled `error_message` byte length. Without a cap,
 /// a request rejected across many distinct reasons (e.g. one per data point,
 /// each with a different oversized label) would still produce an unbounded
-/// response string even after aggregation collapses identical reasons
-/// (#209). Chosen to comfortably fit a handful of readable rejection
+/// response string even after aggregation collapses identical reasons.
+/// Chosen to comfortably fit a handful of readable rejection
 /// messages (each well under 200 bytes) while staying far under typical
 /// HTTP header/body sanity limits.
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
@@ -107,7 +107,7 @@ pub async fn handle_export(
     request: ExportMetricsServiceRequest,
     ingest_ts_ns: i64,
 ) -> Result<IngestOutcome, IngestRequestError> {
-    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): the admission
+    // Receiver-clock plausibility (ADR-0051 amendment): the admission
     // clock must sit above the 2020 floor and yield a representable hour bucket
     // before it is used to build the normalize context. Checked first, before
     // any work: a nonsense reference clock makes no per-record decision
@@ -271,7 +271,7 @@ mod tests {
     use ravel_types::Signal;
 
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
-    /// (ADR-0051 amendment, S1-12): the fixture ingest clock anchors to it so
+    /// (ADR-0051 amendment): the fixture ingest clock anchors to it so
     /// the receiver-clock plausibility floor admits the request. Never
     /// `SystemTime::now()`, so tests stay deterministic.
     const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
@@ -356,7 +356,7 @@ mod tests {
             .collect();
         let rm = ResourceMetrics {
             // A bytes-valued service.name fails whole-resource label
-            // building, rejecting every point under it (#209's scenario).
+            // building, rejecting every point under it.
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
@@ -421,7 +421,7 @@ mod tests {
         assert!(outcome.response.partial_success.is_none());
     }
 
-    /// EC3/#566 finding 2: on a keyed bucket, a tenant's first ingest write must
+    /// On a keyed bucket, a tenant's first ingest write must
     /// record its recovery manifest. This drives the real `handle_export`
     /// through an `IngestState` carrying a `RecoveryManifestWriter`, then
     /// asserts `sys/t/<tenant_hash>` exists and decrypts to the tenant id. It is
@@ -480,7 +480,7 @@ mod tests {
         assert_eq!(recovered, tenant, "manifest recovers the tenant id");
     }
 
-    /// #991: a metrics/OTLP request whose receiver (ingest) clock is below the
+    /// a metrics/OTLP request whose receiver (ingest) clock is below the
     /// 2020 floor must be rejected as the whole-request `ClockImplausible`
     /// error (which the transport maps to gRPC `UNAVAILABLE` / HTTP 503, via
     /// `is_retryable() == true`), and the `reason="clock"` admission counter

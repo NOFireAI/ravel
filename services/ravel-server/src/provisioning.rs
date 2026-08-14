@@ -15,7 +15,7 @@
 //! wired in [`crate::maintain`]. All three go through
 //! [`ravel_catalog::validate_or_adopt`].
 //!
-//! Fresh-deployment safety (the EC3/#566 lesson): a brand-new tenant with no
+//! Fresh-deployment safety: a brand-new tenant with no
 //! prior writes and no provisioning record must never fail startup. The startup
 //! check uses [`AbsentPolicy::AdoptIfData`], which returns
 //! [`ProvisioningCheck::FreshNoData`] for a (tenant, signal) with no record and
@@ -189,7 +189,7 @@ pub async fn ensure_provisioning_record(
 /// data passes through without refusing (the fresh-deployment case), a
 /// (tenant, signal) with pre-ADR data is adopted once, and only a present
 /// record that disagrees or pre-ADR data a lower value would hide refuses. This
-/// is the property the EC3/#566 lesson demands: a brand-new tenant with no
+/// is the fresh-deployment property: a brand-new tenant with no
 /// prior writes and no provisioning record does not fail startup.
 pub async fn validate_static_provisioning(
     store: &dyn ObjectStoreBackend,
@@ -265,7 +265,7 @@ mod tests {
             .expect("seed record");
     }
 
-    /// The EC3/#566 lesson, made a test: a brand-new tenant with no prior
+    /// The fresh-deployment guarantee, made a test: a brand-new tenant with no prior
     /// writes and no provisioning record does not fail startup. This is the
     /// exact fresh-`ravel-operator`-cluster shape (configured tenant tokens,
     /// zero data).
@@ -290,7 +290,7 @@ mod tests {
     }
 
     /// A statically-known tenant whose record disagrees refuses startup with a
-    /// typed `ShardCountMismatch` (the S1-E6 acceptance shape at the unit
+    /// typed `ShardCountMismatch` (the acceptance shape at the unit
     /// level).
     #[tokio::test]
     async fn static_tenant_mismatch_refuses_startup() {
@@ -339,7 +339,7 @@ mod tests {
             .expect("an unrelated tenant provisions cleanly");
     }
 
-    /// Finding 3 regression: a future-version record on a dynamic tenant's
+    /// A future-version record on a dynamic tenant's
     /// first-touch path fails that request with a typed `UnsupportedVersion`
     /// error and increments the mismatch counter, rather than being logged and
     /// letting ingest proceed under an unknown shard_count (ADR-0050 section 5:
@@ -384,7 +384,7 @@ mod tests {
         );
     }
 
-    /// Finding 3 regression: an undecodable (corrupt) record on a dynamic
+    /// An undecodable (corrupt) record on a dynamic
     /// tenant's first-touch path fails that request with a typed `Decode` error
     /// rather than being swallowed and letting ingest proceed under an unknown
     /// shard_count.

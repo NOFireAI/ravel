@@ -1,5 +1,5 @@
 //! End-to-end reachability for the ADR-0072 decision 3 bucket-protection
-//! startup gate (EE-T6, issue #900, epic #894).
+//! startup gate.
 //!
 //! `services/ravel-server/src/bucket_protection.rs`'s own unit tests prove
 //! `enforce`/`enforce_if_required` refuse on `Disabled` and warn-and-continue

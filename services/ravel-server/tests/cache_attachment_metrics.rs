@@ -1,4 +1,4 @@
-//! Deliverable 4 (issues #445, #502): proves a server built from a
+//! Proves a server built from a
 //! cache-enabled `Cli` config actually has the ADR-0046 read cache attached
 //! on the metric (PromQL engine) path, not just that construction succeeds.
 //!
@@ -164,13 +164,13 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
 
     let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
     // Pass the same cache flags build_cache read above, so build_catalog wires
-    // the catalog byte cache from the CLI too (issue #553), not just the
+    // the catalog byte cache from the CLI too, not just the
     // fetcher cache. A cache-enabled Cli means the catalog byte cache exists.
     let catalog =
         build_catalog(backend.clone(), 1, cli.disable_cache, cli.cache_max_bytes).expect("catalog");
     assert!(
         catalog.byte_cache_metrics().is_some(),
-        "a cache-enabled config must attach the catalog byte cache too (issue #553)"
+        "a cache-enabled config must attach the catalog byte cache too"
     );
     let mut tokens = HashMap::new();
     tokens.insert("acme-token".to_string(), tenant.clone());

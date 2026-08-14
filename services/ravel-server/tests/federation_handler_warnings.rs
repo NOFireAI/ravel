@@ -1,4 +1,4 @@
-//! Item 2 (issue #913): the HTTP query handler merges a federated fan-out's
+//! Item 2: the HTTP query handler merges a federated fan-out's
 //! partial-coverage warnings into the Prometheus response envelope's top-level
 //! `warnings` array.
 //!

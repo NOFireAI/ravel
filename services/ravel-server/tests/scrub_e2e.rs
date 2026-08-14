@@ -1,5 +1,5 @@
-//! End-to-end reachability test for the at-rest integrity scrubber (ADR-0059,
-//! issue #694). This is the epic's designated proof that the capability is
+//! End-to-end reachability test for the at-rest integrity scrubber (ADR-0059).
+//! This is the designated proof that the capability is
 //! actually constructed and reachable, not merely unit-tested in isolation: it
 //! spins up a real `Mode::Maintain` `ravel_server::start` server (whose
 //! `start` spawns the real `ScrubTask` on a real timer), injects a corrupted
@@ -306,9 +306,9 @@ async fn publish_sealed_segment(
 }
 
 /// A real seal divergence, injected at rest, surfaces on `/metrics` through the
-/// real scheduled scrub task (ADR-0059 decision 2, issue #695). One sealed
+/// real scheduled scrub task (ADR-0059 decision 2). One sealed
 /// record is folded into the snapshot; a second is sealed *after* the fold, so
-/// the snapshot under-counts against the re-listed sealed commit history (S2-04).
+/// the snapshot under-counts against the re-listed sealed commit history.
 /// The running `Mode::Maintain` server's scrub task detects this on a real tick
 /// and reports it as `ravel_scrub_seal_divergence_total{reason="missing"} 1`.
 #[tokio::test]
@@ -380,9 +380,9 @@ async fn seal_divergence_surfaces_on_metrics_through_the_real_scrub_task() {
     );
 }
 
-/// A real postings disagreement (S2-09 false negative), injected at rest,
+/// A real postings disagreement (a false negative), injected at rest,
 /// surfaces on `/metrics` through the real scheduled scrub task (ADR-0059
-/// decision 1, issue #708). A tenant's real data is folded so a real,
+/// decision 1). A tenant's real data is folded so a real,
 /// correctly-bound name-postings object exists at `head.postings`; then a NEW,
 /// internally valid postings object that omits a name the folded segment really
 /// carries is written over the real postings key and the HEAD's postings ref is

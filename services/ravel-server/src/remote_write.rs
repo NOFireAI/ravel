@@ -1,5 +1,5 @@
 //! `POST /api/v1/write`: Prometheus Remote Write 1.0 and 2.0 ingest
-//! (ADR-0015, docs/ingest-breadth-plan.md Track A).
+//! (ADR-0015).
 //!
 //! This surface is strict-mode only regardless of the OTLP ingest mode
 //! header: a Remote Write sender expects a 2xx to mean the samples are
@@ -135,12 +135,12 @@ pub struct RemoteWriteState {
     /// Durable shard_count provisioning-record writer (ADR-0050 section 5),
     /// pins the (tenant, Metrics) record on the tenant's first write.
     pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
-    /// The process-wide in-flight ingest-request ceiling (issue #802), the
+    /// The process-wide in-flight ingest-request ceiling, the
     /// same shared controller `otlp_http::GatewayState` carries. Checked
     /// first in [`remote_write`], ahead of tenant resolution.
     pub ingest_concurrency: Arc<IngestConcurrencyController>,
     /// Injected receiver clock read at admission time (CLAUDE.md time
-    /// injection; ADR-0051 amendment, S1-12). In production this is
+    /// injection; ADR-0051 amendment). In production this is
     /// `SystemClock`, so behavior is identical to the previous internal
     /// `SystemTime::now()`; tests supply a fixed sub-floor clock to exercise
     /// the receiver-clock plausibility floor deterministically.
@@ -240,7 +240,7 @@ fn retry_after_seconds(retry_after_ns: i64) -> u64 {
     ns.div_ceil(1_000_000_000).max(1)
 }
 
-/// A fixed `Retry-After` for the process-wide in-flight shed (issue #802),
+/// A fixed `Retry-After` for the process-wide in-flight shed,
 /// the same rationale as [`RETRY_AFTER_SECONDS`] above: no per-caller refill
 /// time is tracked, and a slot can free up as soon as any in-flight request
 /// completes, so a short fixed wait is the right shape.
@@ -279,7 +279,7 @@ async fn remote_write(
         }
     };
 
-    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): the injected
+    // Receiver-clock plausibility (ADR-0051 amendment): the injected
     // clock is read once and reused for every admission decision in this
     // handler, checked before any per-record work. Whole-request 503, counted
     // reason="clock"; the fault is the replica's, and a retry against a
@@ -393,12 +393,12 @@ async fn remote_write(
         points_dropped += admission.rejected.len() as u64;
     }
 
-    // The RW2 stats headers count the two admitted point kinds separately
-    // (docs/ingest-breadth-plan.md section 2.1): a native histogram is one
+    // The RW2 stats headers count the two admitted point kinds separately: a
+    // native histogram is one
     // written histogram, not one written sample. Computed from the
     // admission-filtered points, so a series-cap rejection above is reflected
-    // in the written counts. Histograms became writable with RSEG v5
-    // (docs/rseg-v3-plan.md phase C8), so this is where the histograms-written
+    // in the written counts. Histograms became writable with RSEG v5, so this
+    // is where the histograms-written
     // header stops being a constant zero.
     let samples_written = ingest_points
         .iter()
@@ -568,7 +568,7 @@ mod tests {
         })
     }
 
-    /// #1011 (closing the last gap from #991): a Remote Write request whose
+    /// A Remote Write request whose
     /// injected receiver clock is below the 2020 floor must be rejected as a
     /// whole-request 503 / UNAVAILABLE, and the `reason="clock"` admission
     /// counter for the tenant's Metrics signal must increment. The clock is a

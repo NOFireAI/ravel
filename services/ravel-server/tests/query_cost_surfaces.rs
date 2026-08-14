@@ -1,6 +1,6 @@
-//! Per-query cost accounting reaches `/metrics` for the read surfaces #602 did
-//! not wire: the Prometheus-shaped query paths, and (under `flight-sql`) Flight
-//! SQL (issue #425, ADR-0044 section 4).
+//! Per-query cost accounting reaches `/metrics` for the read surfaces beyond
+//! the SQL endpoint: the Prometheus-shaped query paths, and (under `flight-sql`) Flight
+//! SQL (ADR-0044 section 4).
 //!
 //! These drive the real `ravel_query::http` router and the real `GET /metrics`
 //! handler over one shared [`QueryAccountingMetrics`], exactly as
@@ -59,8 +59,8 @@ fn now_ns() -> i64 {
 /// router reads wall-clock `now` (crates/ravel-query/src/http/handlers.rs) and
 /// `Catalog::resolve` lists one prefix per (shard, ingest-hour) from the window
 /// start up to `now`. Data anchored at the epoch with a `start=0` query would
-/// list every hour bucket since 1970 (about half a million) and now trip the
-/// issue #635 window-cost ceiling; the PromQL tests place data a few minutes in
+/// list every hour bucket since 1970 (about half a million) and trip the
+/// window-cost ceiling; the PromQL tests place data a few minutes in
 /// the past and query a recent window instead, exactly as tests/e2e.rs does.
 /// The Flight SQL path injects a fixed clock, so it keeps `base_ns = 0`.
 async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) {
@@ -137,8 +137,8 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
 /// Publish a segment a few minutes in the past and return the `(start, end)`
 /// seconds of a recent PromQL query window that covers it. The PromQL router
 /// reads wall-clock `now`, so the window must be anchored on it; a bounded,
-/// recent window keeps the resolve's listing to a handful of hour buckets
-/// (issue #635), the same shape tests/e2e.rs uses.
+/// recent window keeps the resolve's listing to a handful of hour buckets,
+/// the same shape tests/e2e.rs uses.
 async fn publish_recent(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> (i64, i64) {
     let now = now_ns();
     publish_segment(store, tenant, now - 10 * NS_PER_MIN).await;
@@ -470,7 +470,7 @@ mod flight {
             &ravel_maintain::GcConfigValues::maintain_defaults(),
         );
         // This surface does not exercise the ADR-0071 distributed scan; run
-        // every statement whole-set on the coordinator (issue #868).
+        // every statement whole-set on the coordinator.
         let service = ravel_server::flight::service(state, ceiling, None);
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()

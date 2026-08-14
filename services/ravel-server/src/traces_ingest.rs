@@ -26,8 +26,7 @@ pub struct SpanIngestState {
     pub ack_deadline: Duration,
     /// Tenant admission controller. Spans get no layer-4 series/stream
     /// admission (ADR-0051 excludes them), so this is used only to record the
-    /// receiver-clock rejection counter (`reason="clock"`, ADR-0051 amendment,
-    /// S1-12); the shared `GatewayState.admission` charges span byte rate.
+    /// receiver-clock rejection counter (`reason="clock"`, ADR-0051 amendment); the shared `GatewayState.admission` charges span byte rate.
     pub admission: Arc<AdmissionController>,
     /// Object store, for the idempotency marker read/write (ADR-0051 section
     /// 5), the span-pipeline counterpart of
@@ -66,7 +65,7 @@ impl SpanIngestOutcome {
 #[derive(Debug, Clone)]
 pub enum SpanIngestRequestError {
     /// The receiver's admission-time clock was implausible (ADR-0051
-    /// amendment, S1-12). Whole-request HTTP 503 / gRPC `UNAVAILABLE`; the
+    /// amendment). Whole-request HTTP 503 / gRPC `UNAVAILABLE`; the
     /// replica's fault, retryable against a healthy replica.
     ClockImplausible(String),
     /// The supplied `x-ravel-idempotency-key` exceeds
@@ -115,7 +114,7 @@ impl SpanIngestRequestError {
 }
 
 /// Upper bound on the assembled `error_message` byte length, the same cap and
-/// for the same reason as [`crate::logs_ingest`]'s log equivalent (#209): a
+/// for the same reason as [`crate::logs_ingest`]'s log equivalent: a
 /// request rejected across many distinct reasons would otherwise produce an
 /// unbounded response string even after aggregation collapses identical
 /// reasons.
@@ -129,7 +128,7 @@ pub async fn handle_export_traces(
     ingest_ts_ns: i64,
     idempotency_key: Option<Vec<u8>>,
 ) -> Result<SpanIngestOutcome, SpanIngestRequestError> {
-    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): checked before
+    // Receiver-clock plausibility (ADR-0051 amendment): checked before
     // any other work; the hour bucket the marker path and normalize both
     // derive is nonsense on a bad clock. Whole-request 503 / UNAVAILABLE,
     // counted reason="clock".
@@ -211,7 +210,7 @@ pub async fn handle_export_traces(
     // attribute-level rejection (one oversized/malformed attribute, an
     // over-long events/links blob, a bad parent_span_id) drops a single field
     // of a span that still lands, and `SpanRejection::rejected_count` returns 0
-    // for it, so it does not inflate this total (#364).
+    // for it, so it does not inflate this total.
     let rejected_spans: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
 
     // Spans this request actually writes, captured before `spans` is moved.
@@ -238,7 +237,7 @@ pub async fn handle_export_traces(
         })
     };
 
-    // Ordering (ADR-0051 section 5, experiment L6): write the marker after the
+    // Ordering (ADR-0051 section 5): write the marker after the
     // durable commit and before returning, so a retry of this keyed request
     // finds it. Only a real commit (tokens present) gets a marker.
     if let (Some(key), Some(bucket)) = (idempotency_key.as_deref(), hour_bucket)
@@ -342,7 +341,7 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
 
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
-    /// (ADR-0051 amendment, S1-12): every fixture clock and span timestamp is
+    /// (ADR-0051 amendment): every fixture clock and span timestamp is
     /// anchored to it so the receiver-clock plausibility floor admits the
     /// request. Never `SystemTime::now()`, so tests stay deterministic.
     const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
@@ -437,7 +436,7 @@ mod tests {
             .expect("one attribute rejected");
         assert_eq!(
             partial_success.rejected_spans, 0,
-            "the span landed; only one attribute was dropped, so no span was rejected (#364)"
+            "the span landed; only one attribute was dropped, so no span was rejected"
         );
         assert!(
             partial_success.error_message.contains("attribute value is"),
@@ -455,7 +454,7 @@ mod tests {
     async fn one_bad_attribute_among_several_spans_rejects_zero_spans() {
         // N spans exported, exactly one attribute on one of them oversized: the
         // reported rejected_spans must be 0 because every span still lands, while
-        // the attribute drop is still surfaced through error_message (#364).
+        // the attribute drop is still surfaced through error_message.
         let state = state();
         let oversized = SpanIngestLimits::default().max_attribute_value_len + 1;
         let request = request(vec![
@@ -625,7 +624,7 @@ mod tests {
             .expect("the dropped attribute is reported");
         assert_eq!(
             partial_success.rejected_spans, 0,
-            "the array-valued resource attribute costs one attribute, not the span (#364)"
+            "the array-valued resource attribute costs one attribute, not the span"
         );
         assert!(
             partial_success
@@ -711,7 +710,7 @@ mod tests {
         );
     }
 
-    /// #991: a traces request whose receiver (ingest) clock is below the 2020
+    /// a traces request whose receiver (ingest) clock is below the 2020
     /// floor must be rejected as the whole-request `ClockImplausible` error
     /// (retryable, so the transport maps it to gRPC `UNAVAILABLE` / HTTP 503),
     /// and the `reason="clock"` admission counter for the tenant's Spans signal

@@ -1,4 +1,4 @@
-//! Experiment L6 (ADR-0051 §5, epic #452 EB-8): a client retry after a lost
+//! Idempotency of log ingest (ADR-0051 §5): a client retry after a lost
 //! ack must not double log rows when the request carries an
 //! `x-ravel-idempotency-key`, and must still double (a documented,
 //! counter-attributable outcome) when it does not.

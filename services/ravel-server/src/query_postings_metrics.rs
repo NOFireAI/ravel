@@ -1,8 +1,8 @@
 //! Process-global prune-selectivity counters for the logs query path
-//! (ADR-0049, issue #511 deliverable 2).
+//! (ADR-0049).
 //!
 //! The `LogsScanExec` publishes `blocks_total`, `blocks_scanned`, and
-//! `blocks_pruned_by_postings` as DataFusion metrics (#544). `ravel-sql` reads
+//! `blocks_pruned_by_postings` as DataFusion metrics. `ravel-sql` reads
 //! those counters off the plan after each query drains and returns them on
 //! `SqlOutcome::stats`; the SQL endpoint folds each query's numbers in here,
 //! and `/metrics` renders the cumulative totals. Nothing counts a block twice:

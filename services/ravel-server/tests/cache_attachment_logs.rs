@@ -1,4 +1,4 @@
-//! Deliverable 4 (issues #445, #502): proves a server built from a
+//! Proves a server built from a
 //! cache-enabled `Cli` config actually has the ADR-0046 read cache attached
 //! on the log (SQL `logs` table) path, not just that construction succeeds.
 //!
@@ -40,7 +40,7 @@ const NOW_NS: i64 = 4 * NS_PER_HOUR;
 /// A clock frozen at [`NOW_NS`]. `build_sql_state` defaults to a real
 /// `SystemClock`; left as-is, this test's `start: 0.0` window would list one
 /// prefix per (shard, ingest-hour) from the epoch to the real current hour
-/// (about half a million LISTs) and now trip the issue #635 window-cost
+/// (about half a million LISTs) and trip the window-cost
 /// ceiling with a 422. Freezing the clock keeps the resolved listing window an
 /// ordinary four hours: the epoch-width span was incidental to what this test
 /// asserts (cache attachment on the log path), not part of it, so narrowing it
@@ -214,7 +214,7 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
     )
     .expect("sql state");
     // Freeze the clock so the epoch-start window resolves to an ordinary
-    // four-hour span rather than tripping the issue #635 cost ceiling.
+    // four-hour span rather than tripping the cost ceiling.
     sql_state.clock = Arc::new(FixedClock);
     let app = ravel_server::sql::router(sql_state);
 

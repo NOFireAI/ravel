@@ -1,4 +1,4 @@
-//! EF-3 (issue #723), ADR-0061 decision 1: the per-query bytes-scanned budget
+//! ADR-0061 decision 1: the per-query bytes-scanned budget
 //! is reachable end-to-end from an operator's `--limits-file` through to a real
 //! HTTP query response, not merely present in the engine.
 //!
@@ -14,7 +14,8 @@
 //! test fails if any layer of the CLI -> config -> EngineConfig -> HTTP chain
 //! drops the budget or mismaps the error.
 //!
-//! EF-1 already proved the engine cancels mid-scan in isolation; this proves an
+//! Where a narrower test proves the engine cancels mid-scan in isolation, this
+//! proves an
 //! operator can actually turn that enforcement on and observe it from a client.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -56,7 +57,7 @@ fn now_ns() -> i64 {
 /// segment, and issues a real GET whose bytes are charged against the budget.
 /// Mirrors `query_cost_surfaces.rs`'s helper (the same shape `tests/e2e.rs`
 /// uses): data a few minutes in the past, queried over a recent window, keeps
-/// the catalog listing to a handful of hour buckets (issue #635).
+/// the catalog listing to a handful of hour buckets.
 async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base_ns: i64) {
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {

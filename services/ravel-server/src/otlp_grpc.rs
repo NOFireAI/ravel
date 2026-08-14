@@ -53,7 +53,7 @@ pub(crate) fn admission_rejection_status(rejection: RequestRejection) -> Status 
     Status::resource_exhausted(rejection.reason.to_string())
 }
 
-/// A shed over the process-wide in-flight ceiling (issue #802), as
+/// A shed over the process-wide in-flight ceiling, as
 /// `RESOURCE_EXHAUSTED`: before tenant resolution or any per-signal
 /// admission check, so a shed request touches no shard and carries no commit
 /// token. Shared by every gRPC ingest service, the same discipline
@@ -104,7 +104,7 @@ impl MetricsService for GrpcMetricsService {
         .await
         .map_err(|err| match err {
             IngestRequestError::Admission(rejection) => admission_rejection_status(rejection),
-            // Receiver-clock floor (ADR-0051 amendment, S1-12): UNAVAILABLE,
+            // Receiver-clock floor (ADR-0051 amendment): UNAVAILABLE,
             // the replica's fault; a retry against a healthy one succeeds.
             err @ IngestRequestError::ClockImplausible(_) => Status::unavailable(err.to_string()),
             IngestRequestError::Provisioning(prov_err) => Status::internal(prov_err.to_string()),

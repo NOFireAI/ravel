@@ -1,5 +1,5 @@
 //! Acceptance coverage for the ADR-0071 cross-cluster federation wiring in
-//! `ravel-server` (issue #868).
+//! `ravel-server`.
 //!
 //! Every test drives the real path: a coordinator [`QueryEngine`] with a
 //! [`Federation`] whose remotes are genuine in-process [`FragmentService`] gRPC
@@ -8,7 +8,7 @@
 //! own snapshot, applies its own erasure, and answers a Resolve-scope request
 //! through the same fragment surface an intra-cluster slice hits.
 //!
-//! Three properties (the issue #868 deliverables 2-4):
+//! Three properties:
 //!
 //! - `remote_failure_fails_query_by_default`: two servers over separate stores
 //!   provisioned for different tenants; the remote is unavailable and its
@@ -177,7 +177,7 @@ impl Remote {
 
 /// Stand up a real `FragmentService` gRPC server over `store`, recording every
 /// `authorization` metadata value it is presented. `credential` is the ordinary
-/// tenant credential the remote resolves to `tenant` (ADR-0071 #868: a federated
+/// tenant credential the remote resolves to `tenant` (ADR-0071: a federated
 /// resolve-scope request authenticates through the remote's normal tenant
 /// resolver, not the shared fragment token, and the tenant comes from the
 /// credential, never the wire).
@@ -327,7 +327,7 @@ fn instances(series: &[(SeriesId, LabelSet)]) -> Vec<String> {
     out
 }
 
-/// Deliverable 1 (issue #891), reachability + union: a federated discovery
+/// Deliverable 1, reachability + union: a federated discovery
 /// request (the seam `/api/v1/series` reaches through `resolve_series_with_stats`)
 /// returns series from BOTH clusters. The healthy remote's series merge into the
 /// local pool exactly as the query path unions them, and a dead cluster under
@@ -812,7 +812,7 @@ async fn spawn_histogram_remote() -> Remote {
     }
 }
 
-/// Item 1 (issue #913), skip half: a remote that answers with a real
+/// Item 1, skip half: a remote that answers with a real
 /// native-histogram frame over the wire is a coverage gap, not corruption.
 /// Driven through the REAL fetcher (`FederationSliceFetcher` -> the production
 /// `decode_slice_frames` -> `DistribError::HistogramUnsupported`), with

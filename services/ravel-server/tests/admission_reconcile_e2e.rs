@@ -1,5 +1,5 @@
-//! Fleet-global admission reconciliation acceptance test (ADR-0057, EF-T1,
-//! issue #677). The epic's proof that the capability works end to end: two
+//! Fleet-global admission reconciliation acceptance test (ADR-0057): a proof
+//! that the capability works end to end: two
 //! independent admission controllers, each fronting its own real ingest write
 //! path over one shared object store, hold a single fleet-wide active-series
 //! cap that neither would hold alone.
@@ -66,7 +66,7 @@ const ACK: Duration = Duration::from_secs(5);
 /// points carry this exact time, so the ADR-0051 event-time skew check (which
 /// runs inside `handle_export` before admission) never rejects a point for
 /// skew; only the active-series cap gates. Above the receiver-clock
-/// plausibility floor (ADR-0051 amendment, S1-12) so `handle_export`'s clock
+/// plausibility floor (ADR-0051 amendment) so `handle_export`'s clock
 /// check admits it; an exact hour multiple, like the old value.
 const TS_NS: i64 = 1_767_225_600_000_000_000;
 
@@ -186,7 +186,7 @@ fn active_series(admission: &AdmissionController) -> u64 {
         .unwrap_or(0)
 }
 
-/// THE reachability test (ADR-0057, EF-T1). Two processes share one fleet-wide
+/// THE reachability test (ADR-0057). Two processes share one fleet-wide
 /// active-series cap of 100 over one real `MemoryStore`. Before reconciliation
 /// each enforces the cap independently, so their combined real traffic
 /// overshoots it (120 > 100 — the bounded overshoot ADR-0057 section 4 admits

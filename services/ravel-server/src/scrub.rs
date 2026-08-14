@@ -1,5 +1,4 @@
-//! Background at-rest integrity scrubber task (ADR-0059 decisions 1, 3, 4,
-//! issue #694). The scheduling half of the durability-hardening scrubber: the
+//! Background at-rest integrity scrubber task (ADR-0059 decisions 1, 3, 4). The scheduling half of the durability-hardening scrubber: the
 //! per-object verification logic lives in [`ravel_maintain::scrub`] (part 1 of
 //! this issue) and is unit-tested there; this module is the periodic loop that
 //! drives it over a real object corpus, exactly the mechanism/lifecycle split
@@ -140,7 +139,7 @@ fn signal_index(signal: Signal) -> usize {
 /// `checksum_mismatch`; a [`ScrubResult::ReadError`] is transient and increments
 /// nothing.
 ///
-/// Seal divergence (ADR-0059 decision 2, issue #695) is a distinct, metadata-cost
+/// Seal divergence (ADR-0059 decision 2) is a distinct, metadata-cost
 /// check on the same tick: sealed commit records re-listed and diffed against the
 /// folded snapshot. `missing` and `mismatched` divergences increment
 /// `seal_divergence_*`; `orphaned` is the expected retention-after-fold shape and
@@ -149,7 +148,7 @@ fn signal_index(signal: Signal) -> usize {
 pub struct ScrubMetrics {
     checksum_mismatch: [AtomicU64; MAINTAINED_SIGNALS.len()],
     postings_disagreement: [AtomicU64; MAINTAINED_SIGNALS.len()],
-    /// Sealed commit records absent from the folded snapshot (S2-04 under-count),
+    /// Sealed commit records absent from the folded snapshot (an under-count),
     /// per signal. The `reason="missing"` value of
     /// `ravel_scrub_seal_divergence_total`.
     seal_divergence_missing: [AtomicU64; MAINTAINED_SIGNALS.len()],
@@ -366,7 +365,7 @@ pub async fn run_cycle(
     for tenant in &outcome.maintained {
         for signal in MAINTAINED_SIGNALS {
             // Resolve the covering name-postings object once per (tenant,
-            // signal) per tick (issue #708): postings cover a whole snapshot
+            // signal) per tick: postings cover a whole snapshot
             // HEAD (one `head.postings` bound to every part), not one per shard,
             // so it is loaded here, before the shard loop, and the owned data is
             // threaded by reference into every shard's tick. A load failure or
@@ -425,7 +424,7 @@ pub async fn run_cycle(
                 )
                 .await;
             }
-            // Seal-divergence tier (ADR-0059 decision 2, issue #695): once per
+            // Seal-divergence tier (ADR-0059 decision 2): once per
             // (tenant, signal) per tick, not per shard and not gated behind the
             // content-tier cursor. It is metadata-cost, matching the structural
             // tier's cost class rather than the content tier's corpus-scan
@@ -440,8 +439,7 @@ pub async fn run_cycle(
     }
 }
 
-/// One seal-divergence tick over one `(tenant, signal)` (ADR-0059 decision 2,
-/// issue #695): re-list the sealed commit records and diff them against the
+/// One seal-divergence tick over one `(tenant, signal)` (ADR-0059 decision 2): re-list the sealed commit records and diff them against the
 /// folded snapshot via [`ravel_catalog::verify_seal_divergence`] (the exact
 /// comparison `ravel-cli catalog verify` runs), recording missing and
 /// mismatched counts on the metrics.
@@ -636,7 +634,7 @@ async fn run_shard_tick(
     let slice = advance_cursor(&cursor, &corpus, budget, clock.now_ns());
 
     // Build the borrowing `CoveringPostings` once for this signal's tick from
-    // the owned data loaded per (tenant, signal) in `run_cycle` (issue #708).
+    // the owned data loaded per (tenant, signal) in `run_cycle`.
     // `CoveringPostings` is `Copy`, so it is passed by value into each object's
     // scrub. When no covering postings resolved (no postings ref yet, or a
     // degrade-to-None load), this stays `None` and `scrub_one_object` runs only
@@ -656,7 +654,7 @@ async fn run_shard_tick(
         // whole-object blake3 vs the recorded content hash). The postings tier
         // runs additionally when `covering_postings` is `Some`: the object's
         // true `__name__` set is re-derived and diffed against what the covering
-        // postings object claims for it (S2-09 false-negative check).
+        // postings object claims for it (the false-negative check).
         match scrub_one_object(store, clock, record, covering_postings).await {
             ScrubResult::Clean => {}
             ScrubResult::ChecksumMismatch { .. } => {
@@ -1151,7 +1149,7 @@ mod tests {
     /// a name the segment really carries, and the HEAD's postings ref is pointed
     /// at it (matching blake3) so the load accepts it. `run_shard_tick` must
     /// then pass `Some(covering)` to `scrub_one_object`, which re-derives the
-    /// segment's true name set and records the S2-09 false negative. This is the
+    /// segment's true name set and records the false negative. This is the
     /// direct `MemoryStore`-backed proof that the `Some(covering)` path fires.
     #[tokio::test]
     async fn postings_disagreement_surfaces_through_run_shard_tick() {

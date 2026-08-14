@@ -1,8 +1,8 @@
 //! `GET`/`POST /api/v1/query_exemplars`: Prometheus' exemplar-query surface
-//! (ADR-0047 decision 4, issue #475).
+//! (ADR-0047 decision 4).
 //!
-//! This is the read side of exemplars: #471 through #474 wrote them into the
-//! RSEG `EXEMPLARS` section (kind 10) at flush and copied them verbatim
+//! This is the read side of exemplars: the write path stores them in the
+//! RSEG `EXEMPLARS` section (kind 10) at flush and copies them verbatim
 //! through compaction, but nothing read them back until this endpoint. It is
 //! what Grafana calls when a user clicks an exemplar on a metric panel, and
 //! the trace/span ids it surfaces are the whole point of the feature.
@@ -35,8 +35,6 @@
 //! inside it only because Prometheus fixes this endpoint's `data` as an array.
 //!
 //! # Two data facts and how this endpoint decides them
-//!
-//! Both were found reviewing #474 and are called out in the issue.
 //!
 //! 1. **An exemplar's `ts_ns` can fall outside its object's event bounds.**
 //!    The exemplar timestamp does not go through the sample path's
@@ -89,7 +87,7 @@
 //! like any other fetch, and the whole request runs under the same wall
 //! deadline, `max_segments` sealed-set budget, and `max_s3_requests` budget
 //! as `/api/v1/query`, enforced through the shared `ravel_query::admit`/
-//! `request_budget_exceeded` seam (RH-T2, issue #902, ADR-0073 decision 4).
+//! `request_budget_exceeded` seam (ADR-0073 decision 4).
 //!
 //! Those two bound the *input*. The result itself is bounded by
 //! [`DEFAULT_MAX_EXEMPLARS`], this endpoint's analogue of the engine's
@@ -176,8 +174,8 @@ const DEFAULT_MAX_EXEMPLARS: usize = 100_000;
 /// doc data fact 1), plus the query engine's own [`EngineConfig`] so this
 /// endpoint honors the identical deadline, `max_segments` sealed-set ceiling,
 /// and `max_s3_requests` budget by calling `ravel_query::admit` and
-/// `ravel_query::request_budget_exceeded` directly (RH-T2, issue #902,
-/// ADR-0073 decision 4) rather than keeping its own copy of the check.
+/// `ravel_query::request_budget_exceeded` directly (ADR-0073 decision 4)
+/// rather than keeping its own copy of the check.
 #[derive(Clone)]
 pub struct ExemplarsState {
     pub catalog: Arc<Catalog>,
@@ -189,7 +187,7 @@ pub struct ExemplarsState {
     pub deadline: Duration,
     /// The query engine's resource limits, consumed through the shared
     /// `ravel_query::admit`/`request_budget_exceeded` seam rather than a
-    /// private copy of either check (RH-T2, issue #902).
+    /// private copy of either check.
     pub engine_config: EngineConfig,
     /// Cap on the exemplars one request may materialize, enforced
     /// incrementally so the accumulation never grows past it. Defaults to
@@ -199,7 +197,7 @@ pub struct ExemplarsState {
     pub max_exemplars: usize,
     /// The evidential audit sink one event per executed exemplar query is
     /// submitted through, its durability awaited before the response is
-    /// released (ADR-0062 §2a, epic EL / issue #762). Defaults to the no-op
+    /// released (ADR-0062 §2a). Defaults to the no-op
     /// ([`from_engine`](Self::from_engine)); a deployment attaches the one
     /// shared pipeline with [`with_audit_sink`](Self::with_audit_sink).
     pub audit_sink: Arc<dyn QueryAuditSink>,
@@ -443,7 +441,7 @@ async fn collect_once(
         .map_err(|e| CollectError::Api(ApiError::from_query(QueryError::from(e))))?;
 
     // The same admission seam `/api/v1/query` and SQL enforce after resolve
-    // (RH-T2, issue #902, ADR-0073 decision 4): the sealed-set count against
+    // (ADR-0073 decision 4): the sealed-set count against
     // `max_segments`, recent and token-resolved segments exempt (decision 2).
     // Their cost is bounded below instead, incrementally, by the S3 request
     // budget (decision 3).
@@ -465,7 +463,8 @@ async fn collect_once(
     // Segments are read sequentially. The sample path fans this out under a
     // concurrency bound; here correctness and staying inside `ravel-server`'s
     // (non-`futures`) default dependency set win, and the wall deadline above
-    // still bounds the total. Noted in the issue #475 report as a follow-up.
+    // still bounds the total. Reading them concurrently here is a possible
+    // future improvement.
     //
     // Dedup runs here rather than after the walk so `max_exemplars` counts
     // distinct exemplars (an overlap-window duplicate must not consume budget)
@@ -486,7 +485,7 @@ async fn collect_once(
             &mut collected,
         )
         .await?;
-        // Per-tenant S3 request budget (RH-T2, issue #902, ADR-0073 decision
+        // Per-tenant S3 request budget (ADR-0073 decision
         // 4): checked once per completed segment, the same checkpoint the SQL
         // metrics scan path and PromQL's engine use, so a trip here also
         // means the remaining segments' GETs never happen.
@@ -648,7 +647,7 @@ async fn read_segment_exemplars(
     // Whole-section decode: query_exemplars matches a *set* of series, and one
     // pass over the section filtered by `matched` is strictly fewer passes
     // than one early-exit `probe_exemplars_by_series` per matched series over
-    // the same already-fetched bytes (see the issue #475 report).
+    // the same already-fetched bytes.
     let records = decode_exemplars_section(footer, label_dict_bytes, exemplars_bytes, limits)
         .map_err(|source| corrupt(data_object_key, source))?;
     accounting.add_decompressed_bytes(exemplars_uncompressed);
@@ -682,7 +681,7 @@ async fn read_segment_exemplars(
         // Clamp to the query's time range by the exemplar's own timestamp
         // (Prometheus' [start, end] contract). This is independent of the
         // object-level pruning above: an exemplar's ts_ns can sit outside its
-        // object's event bounds (#474 data fact 1).
+        // object's event bounds.
         if rec.ts_ns < start_ns || rec.ts_ns > end_ns {
             continue;
         }
@@ -809,7 +808,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// The literal metric name a single equality `__name__` matcher pins, or
 /// `None` if postings pruning must bypass (a regex/negation/absent `__name__`,
 /// or more than one `__name__` matcher). Mirrors the engine's private
-/// `equality_name_filter` (docs/metric-index-plan.md P5b) for the equality
+/// `equality_name_filter` for the equality
 /// case; unlike the engine's filter as of ADR-0061 decision 3, this one does
 /// not recognize a literal-prefix-anchored regex, so this endpoint bypasses
 /// pruning on a prefix regex a sample query over the same selector would
@@ -851,8 +850,7 @@ fn shared_equality_name_filter(matcher_sets: &[Vec<LabelMatcher>]) -> Option<Str
 
 /// Verifies the opened footer's identity against the commit/compaction record
 /// the [`SegmentRef`] was reconstructed from, the same level-aware check the
-/// sample path runs in `SegmentFetcher::open_segment`
-/// (docs/compaction-retention-plan.md section 3.5). An L0 ref checks the
+/// sample path runs in `SegmentFetcher::open_segment`. An L0 ref checks the
 /// footer's writer identity via [`check_identity`]; an L1 part has no writer
 /// identity of its own, so tenant/shard/ingest_hour/input_set_hash/part_index
 /// and `level == 1` are checked instead. Returns
@@ -883,8 +881,7 @@ fn verify_segment_identity(
 
 /// L1-part footer identity check, mirroring `ravel_query`'s crate-private
 /// `verify_l1_identity` (which this endpoint cannot import). A part carries no
-/// writer identity, so these five fields plus `level == 1` are its identity
-/// (docs/compaction-retention-plan.md section 3.5).
+/// writer identity, so these five fields plus `level == 1` are its identity.
 fn verify_l1_identity(
     footer: &Footer,
     tenant_hash: TenantHash,
@@ -1527,8 +1524,8 @@ mod tests {
         publish_segment_at_hour(store, tenant_id, writer_seq, series, exemplars, hour_bucket).await
     }
 
-    /// As `publish_segment_for`, but with an explicit `ingest_hour_bucket`
-    /// (RH-T2, issue #902). Admission's sealed/recent split (ADR-0073
+    /// As `publish_segment_for`, but with an explicit `ingest_hour_bucket`.
+    /// Admission's sealed/recent split (ADR-0073
     /// decision 2) is decided from the commit record's hour bucket against
     /// the fixed test clock, never from the sample timestamps inside the
     /// segment, so this lets a test put a segment on either side of the seal
@@ -1780,7 +1777,7 @@ mod tests {
     }
 
     /// As `build_router_full`, but with a caller-supplied `EngineConfig` so a
-    /// test can exercise `max_s3_requests` (RH-T2, issue #902) alongside or
+    /// test can exercise `max_s3_requests` alongside or
     /// instead of `max_segments`.
     fn build_router_with_engine_config(
         backend: Arc<dyn ObjectStoreBackend>,
@@ -1891,7 +1888,7 @@ mod tests {
         query_as_with_start(app, promql, token, NOW - NS_PER_HOUR).await
     }
 
-    /// As `query_as`, but with a caller-supplied `start` (RH-T2, issue #902):
+    /// As `query_as`, but with a caller-supplied `start`:
     /// the default last-hour window every other test uses is narrower than
     /// the ~80-minute seal margin (`fold.rs`'s `MARGIN_NS`), so it can never
     /// reach a genuinely sealed hour. A sealed-segment admission test needs a
@@ -1928,7 +1925,7 @@ mod tests {
     ];
     const SPAN_ID: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
 
-    /// The acceptance test (issue #475, this exact path and name): a query
+    /// The acceptance test (this exact path and name): a query
     /// returns the Prometheus shape, and the exemplar's trace and span ids
     /// ride in its labels under the conventional hex-encoded keys.
     #[tokio::test]
@@ -2273,7 +2270,7 @@ mod tests {
     /// the same `TooManySegments` mapping, before any exemplar is read. Uses
     /// a segment sealed 10 hours before `NOW` (see `publish_segment_at_hour`)
     /// rather than `publish_segment`'s current-hour default: since this
-    /// endpoint moved onto `ravel_query::admit` (RH-T2, issue #902), a
+    /// endpoint moved onto `ravel_query::admit`, a
     /// current-hour segment is exempt from `max_segments` (ADR-0073 decision
     /// 2) and this test would otherwise flip from a 422 to a 200 for the
     /// wrong reason (exemption, not a raised budget).
@@ -2328,7 +2325,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// The per-tenant S3 request budget (RH-T2, issue #902, ADR-0073 decision
+    /// The per-tenant S3 request budget (ADR-0073 decision
     /// 3) still bounds a query over current-hour segments once `max_segments`
     /// no longer does: two recent segments under `max_s3_requests:
     /// Bounded(1)` trip the budget on the second segment's `GET`, the same
@@ -2944,7 +2941,7 @@ mod tests {
 
     /// An executed exemplar query submits exactly one audit event through the
     /// sink, with `query.language=exemplars` and `ok` status, its durability
-    /// awaited before the response is released (ADR-0062 §2a, issue #762).
+    /// awaited before the response is released (ADR-0062 §2a).
     #[tokio::test]
     async fn query_exemplars_submits_one_audit_event() {
         let store = Arc::new(MemoryStore::new());

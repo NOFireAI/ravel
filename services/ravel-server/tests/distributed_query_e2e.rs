@@ -1,5 +1,5 @@
 //! Acceptance coverage for the ADR-0071 distributed read fan-out wiring in
-//! `ravel-server` (issue #865).
+//! `ravel-server`.
 //!
 //! Two properties are proven against real `ravel_server::start`ed servers over
 //! a shared `MemoryStore`, so the whole CLI -> config -> engine -> HTTP chain
@@ -921,7 +921,7 @@ async fn fragment_admits_while_client_cap_saturated_no_deadlock_single_fragment_
 }
 
 // ---------------------------------------------------------------------------
-// Fault-matrix coverage (ADR-0071 failure semantics, issue #867).
+// Fault-matrix coverage (ADR-0071 failure semantics).
 //
 // A configurable in-process mock `SeriesFetch` worker lets a coordinator's
 // re-dispatch and slice-atomicity behavior be driven deterministically: each
@@ -1092,7 +1092,7 @@ fn top_three_owners(unit_key: &[u8]) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
 /// NON-VACUITY: delete the re-dispatch block in `RoutingSliceFetcher::dispatch`
 /// (`services/ravel-server/src/distrib.rs`) -- the `if let Some(Owner::Remote(next))`
 /// arm that calls `try_remote` a second time -- so a lost primary falls straight
-/// to local (the pre-#867 one-attempt-then-local behavior). Mock B then receives
+/// to local (a one-attempt-then-local behavior). Mock B then receives
 /// zero dispatches and `assert_eq!(b_hits, 1)` fails.
 #[tokio::test]
 async fn worker_loss_redispatches_once_then_fails_typed() {
@@ -1263,7 +1263,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
     );
 }
 
-/// ADR-0071 deliverable 4 (subsumes issue #885 item 3): a live worker whose
+/// ADR-0071 deliverable 4: a live worker whose
 /// `protocol_version` is skewed from the coordinator's receives no slices. The
 /// mismatch is caught at routing time, so the skewed worker is never dialed --
 /// the query silently runs fully local and is byte-identical to a non-distributed

@@ -1,5 +1,5 @@
-//! Durable `shard_count` acceptance test (ADR-0050 section 5, EC5; experiment
-//! S1-E6). Ingest across four shards through a real in-process server (which
+//! Durable `shard_count` acceptance test (ADR-0050 section 5, EC5).
+//! Ingest across four shards through a real in-process server (which
 //! writes the provisioning record with shard_count=4), then simulate a restart
 //! configured for two shards and assert the process refuses to start with a
 //! typed error naming the record, and that no query path serves the truncated
@@ -144,7 +144,7 @@ async fn start_server(
     .expect("server starts")
 }
 
-/// S1-E6: ingest 4 shards, restart at 2, assert the restart refuses with a
+/// Ingest 4 shards, restart at 2, assert the restart refuses with a
 /// typed error naming the record, and that no query serves the truncated range.
 #[tokio::test]
 async fn startup_fails_on_shard_count_mismatch() {
@@ -252,7 +252,7 @@ async fn startup_fails_on_shard_count_mismatch() {
     );
 }
 
-/// The fresh-deployment guarantee at the server layer (the EC3/#566 lesson): a
+/// The fresh-deployment guarantee at the server layer: a
 /// brand-new tenant with no prior writes and no provisioning record does not
 /// fail startup. This is the exact shape of a fresh operator-managed cluster
 /// (configured tenant tokens, zero data).

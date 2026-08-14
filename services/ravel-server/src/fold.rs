@@ -1,6 +1,5 @@
-//! Per-signal background catalog fold task (docs/metric-index-plan.md
-//! section 4, ADR-0020; storage-derived tenant set is ADR-0048 decision 3,
-//! issue #504). Periodically calls [`Catalog::fold`] so query resolve can
+//! Per-signal background catalog fold task (ADR-0020; storage-derived tenant
+//! set is ADR-0048 decision 3). Periodically calls [`Catalog::fold`] so query resolve can
 //! serve sealed history from snapshots instead of full listing.
 //!
 //! Never runs on the ingest or query path, and never affects correctness:
@@ -34,7 +33,7 @@ use uuid::Uuid;
 
 use crate::tenant_discovery::discover_and_restrict_by_lifecycle;
 
-/// Default `fold_interval`: 5 minutes (docs/metric-index-plan.md section 4).
+/// Default `fold_interval`: 5 minutes.
 pub const DEFAULT_FOLD_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy)]
@@ -96,8 +95,8 @@ const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans]
 /// Spawns one fold loop per signal in [`FOLD_SIGNALS`], not one per tenant:
 /// each tick re-derives the tenant set from storage. [`run_loop`] is
 /// signal-generic; a new signal is added by extending that array, not by
-/// restructuring this function (ADR-0033 gap 1; docs/metric-index-plan.md is
-/// written per (tenant, signal) throughout).
+/// restructuring this function (ADR-0033 gap 1; folding is per
+/// (tenant, signal) throughout).
 ///
 /// [`Signal::Logs`] folds through the same [`Catalog::fold`] path as metrics
 /// and produces `catalog/l/HEAD` plus snapshot parts, but no name-postings
@@ -289,8 +288,8 @@ pub(crate) fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
     base + Duration::from_millis(extra_ms)
 }
 
-/// Cheap duplicate-work avoidance across replicas (docs/metric-index-plan.md
-/// section 4 scheduling note): peeks at HEAD directly (bypassing the
+/// Cheap duplicate-work avoidance across replicas: peeks at HEAD directly
+/// (bypassing the
 /// catalog's own HEAD cache and fold logic) and skips this tick if another
 /// replica folded within the last `interval`. Correctness never depends on
 /// this: `catalog.fold` performs its own authoritative HEAD read and no-ops

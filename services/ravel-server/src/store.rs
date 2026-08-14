@@ -71,15 +71,14 @@ impl std::error::Error for UnsatisfiedCapabilities {}
 /// [`Capabilities::mandatory`]; [`Mode::Maintain`] additionally requires
 /// `multipart`, because compaction is the only path that writes multipart
 /// objects (large L1/L2 parts) and ingest/query never need it. Multipart is
-/// NOT made globally mandatory: a gateway/query/all deployment keeps today's
-/// `mandatory()` set exactly (docs/compaction-retention-plan.md P8; the
-/// `Capabilities::mandatory` "mandatory from Phase 2" note).
+/// NOT made globally mandatory: a gateway/query/all deployment keeps the base
+/// `mandatory()` set exactly (see `Capabilities::mandatory`).
 ///
 /// `upload_checksum` is not required by any mode, including maintain, and no
 /// mode may add it. Unlike `multipart`, which some backend could supply and
 /// which one mode genuinely needs, `upload_checksum` is permanently
 /// unsatisfiable by S3, the only durable backend: the `object_store` client
-/// cannot put a caller-supplied CRC32C on the wire at all (issue #251, and
+/// cannot put a caller-supplied CRC32C on the wire at all (and
 /// the `Capabilities::mandatory` doc). Gating startup on it rejected every
 /// S3-compatible endpoint in every mode. Read-time integrity still comes
 /// from the segment crc32c hierarchy and `put()`'s local pre-flight check.
@@ -211,8 +210,8 @@ pub struct BuiltStore {
     pub kms: Option<Arc<KmsRoutingStore>>,
     /// The [`ClassedStore`] both handles were drawn from. Held so the per-class
     /// [`ClassedStore::metrics`] blocks (the `{class}` metric dimension) stay
-    /// reachable; wiring them onto the `/metrics` scrape is later work
-    /// (E5-T3/T4). `None`-valued per-class metrics in passthrough mode.
+    /// reachable; wiring them onto the `/metrics` scrape is later work.
+    /// `None`-valued per-class metrics in passthrough mode.
     pub classed: Arc<ClassedStore>,
 }
 
@@ -313,8 +312,8 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
             let store = S3Store::new(config.clone())
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
 
-            // EL-7 (issue #764, ADR-0062 decision 1, ADR-0072 decision 2): off
-            // by default. Without --tenant-kms-config this builds exactly
+            // Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072
+            // decision 2): off by default. Without --tenant-kms-config this builds exactly
             // today's store, byte-for-byte, no KmsRoutingStore in the chain.
             if cli.tenant_kms_config.is_some() {
                 let kms = Arc::new(KmsRoutingStore::new(
@@ -472,9 +471,9 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #251: `ravel-server --store s3` could not
-    /// start in any mode against any S3-compatible endpoint, because
-    /// `Capabilities::mandatory()` required `upload_checksum`, which
+    /// `ravel-server --store s3` must start in every mode against any
+    /// S3-compatible endpoint. `Capabilities::mandatory()` must not require
+    /// `upload_checksum`, which
     /// `S3Store` permanently reports as unsupported (`object_store` 0.14 has
     /// no way to put a caller-supplied CRC32C on the wire). This stub
     /// reports exactly the S3Store/MemoryStore-shaped set: every mandatory
@@ -496,11 +495,10 @@ mod tests {
         let backend = StubBackend { caps };
 
         check_mandatory_capabilities(&backend)
-            .expect("an S3-shaped backend without upload_checksum must start (issue #251)");
+            .expect("an S3-shaped backend without upload_checksum must start");
         for mode in [Mode::All, Mode::Gateway, Mode::Query] {
-            check_capabilities(&backend, mode).unwrap_or_else(|e| {
-                panic!("{mode:?} must not require upload_checksum (issue #251), got: {e}")
-            });
+            check_capabilities(&backend, mode)
+                .unwrap_or_else(|e| panic!("{mode:?} must not require upload_checksum, got: {e}"));
         }
         for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
             assert!(
@@ -532,8 +530,7 @@ mod tests {
             !store.capabilities().upload_checksum,
             "precondition: S3Store reports upload_checksum unsupported"
         );
-        check_mandatory_capabilities(&store)
-            .expect("S3Store must satisfy mandatory capabilities (issue #251)");
+        check_mandatory_capabilities(&store).expect("S3Store must satisfy mandatory capabilities");
     }
 
     #[test]
@@ -613,7 +610,7 @@ mod tests {
     /// The built store is instrumented, and the instrumentation is invisible
     /// to the capability gate: `MemoryStore` supports `upload_checksum` on the
     /// wire, so the decorator must report that flag too rather than flattening
-    /// the set to `mandatory()` (issue #272). The counters are proven to be
+    /// the set to `mandatory()`. The counters are proven to be
     /// the returned handle's by driving one operation through the store.
     #[tokio::test]
     async fn build_store_wraps_the_backend_and_passes_capabilities_through() {
@@ -655,8 +652,8 @@ mod tests {
         assert_eq!(snap.put.bytes, 3);
     }
 
-    /// EL-7's off-by-default guarantee: `--store s3` with no
-    /// `--tenant-kms-config` builds exactly today's chain, no
+    /// The SSE-KMS off-by-default guarantee: `--store s3` with no
+    /// `--tenant-kms-config` builds exactly the base chain, no
     /// `KmsRoutingStore` anywhere in it.
     #[test]
     fn build_store_s3_without_tenant_kms_config_inserts_no_kms_routing() {
@@ -685,7 +682,7 @@ mod tests {
         );
     }
 
-    /// EL-7's reachability: `--tenant-kms-config` on `--store s3` inserts a
+    /// SSE-KMS reachability: `--tenant-kms-config` on `--store s3` inserts a
     /// live `KmsRoutingStore` between the raw `S3Store` and the outermost
     /// `InstrumentedStore`, and the returned handle is that same instance
     /// (proven by `set_tenant_key` on the handle changing routing decisions
@@ -734,7 +731,7 @@ mod tests {
         );
     }
 
-    /// E5-T2 (ADR-0070, epic #810): the reachability acceptance test for the
+    /// The reachability acceptance test (ADR-0070) for the
     /// two-class scheduler wiring, driven end-to-end through `build_store` from
     /// a `Cli`.
     ///

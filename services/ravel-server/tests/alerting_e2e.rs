@@ -1,5 +1,4 @@
-//! End-to-end tests for the alert evaluator and its sinks (ADR-0043, issue
-//! #382).
+//! End-to-end tests for the alert evaluator and its sinks (ADR-0043).
 //!
 //! Real RSEG segments, real commit records, a real catalog and `QueryEngine`,
 //! a real `MemoryStore`, and real HTTP sinks served by an in-process axum

@@ -1,5 +1,5 @@
 //! Durable tenant-lifecycle refresh: auth without restart, plus the
-//! admission-limit refresh loop (ADR-0066 decision 6, epic EM, EM-T8).
+//! admission-limit refresh loop (ADR-0066 decision 6).
 //!
 //! This is the server-side *lifecycle* half of the bounded-staleness pattern
 //! whose *mechanism* lives in `ravel-ingest` ([`ravel_ingest::StalenessGate`],
@@ -9,7 +9,7 @@
 //!
 //! - [`DurableAuthState`] + [`DurableBearerResolver`]: a [`TenantResolver`] that
 //!   resolves an `Authorization: Bearer <token>` against the durable `sys/auth`
-//!   keyed-hash token map (EM-T7), read on the bounded-staleness horizon with a
+//!   keyed-hash token map, read on the bounded-staleness horizon with a
 //!   rate-limited on-miss re-read so a freshly provisioned token authenticates
 //!   within seconds. Revocation is horizon-bounded in the other direction (a
 //!   removed token can still authenticate for up to one horizon), the

@@ -11,7 +11,7 @@ use ravel_query::{CacheFetchError, EngineConfig, QueryAdmissionController, Query
 use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
 
 /// The per-query `stats` object attached beside a query response's data
-/// (issue #425, ADR-0044 sections 1 and 3): this query's actual accounting
+/// (ADR-0044 sections 1 and 3): this query's actual accounting
 /// counters and its pre-execution cost estimate, rendered as camelCase JSON to
 /// match the field names `ravel-query`'s PromQL `stats.accounting`/`stats.estimate`
 /// already use (crates/ravel-query/src/http/json.rs).
@@ -56,7 +56,7 @@ pub fn accounting_stats_json(
 }
 
 /// Render the per-slice `stats.fragments[]` array for a distributed query
-/// (ADR-0071 observability deliverable, issue #865): one object per dispatched
+/// (ADR-0071 observability deliverable): one object per dispatched
 /// slice, in camelCase to match the rest of the stats JSON. A query handler
 /// attaches this beside `accounting`/`estimate` only when a distributed run
 /// collected entries; a non-distributed query collects none, so the field is
@@ -81,13 +81,13 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 }
 
 /// Builds the shared [`Catalog`] used both for query resolve and for the
-/// background fold task (docs/metric-index-plan.md section 4): one instance
+/// background fold task: one instance
 /// per process so its decoded HEAD/part caches serve both paths.
 ///
 /// `disable_cache` and `cache_max_bytes` are the CLI's `--disable-cache` and
 /// `--cache-max-bytes`, the same flags that govern the fetcher cache in
 /// [`crate::store::build_cache`]. They reach the catalog's ADR-0046 byte cache
-/// too (issue #553): `--disable-cache` builds a catalog with no byte cache at
+/// too: `--disable-cache` builds a catalog with no byte cache at
 /// all (the `byte_cache_max_bytes: 0` sentinel), so a memory-constrained
 /// `--disable-cache` deployment no longer silently keeps a 512 MiB catalog
 /// byte cache; otherwise `cache_max_bytes` is the catalog byte cache's total
@@ -141,21 +141,21 @@ pub fn build_app_state(
     if let Some(cache) = cache {
         engine = engine.with_cache(cache);
     }
-    // ADR-0071 distributed read fan-out (issue #865): attach a coordinator
+    // ADR-0071 distributed read fan-out: attach a coordinator
     // context only under `--distributed-query`. Absent it, the engine keeps the
     // byte-identical local path (`with_distributed` is the sole opt-in seam).
     if let Some(distributed) = distributed {
         engine = engine.with_distributed(distributed);
     }
-    // ADR-0071 cross-cluster federation (issue #868): attach the remote-cluster
+    // ADR-0071 cross-cluster federation: attach the remote-cluster
     // fan-out only when `--remote-cluster` was configured. Absent it, the engine
     // resolves only local data (`with_federation` is the sole opt-in seam).
     if let Some(federation) = federation {
         engine = engine.with_federation(federation);
     }
     // Fold every completed Prometheus-shaped query into the same process
-    // aggregator the SQL and analytics paths use (ADR-0044 section 4, issue
-    // #425), so `/metrics` covers PromQL read traffic too. The shared query
+    // aggregator the SQL and analytics paths use (ADR-0044 section 4), so
+    // `/metrics` covers PromQL read traffic too. The shared query
     // concurrency controller (ADR-0061 decision 2) gates every handler before
     // it resolves or fetches.
     AppState::new(Arc::new(engine), tenant_resolver)
@@ -165,9 +165,8 @@ pub fn build_app_state(
 
 /// Default per-tenant SQL memory ceiling: 1 GiB across a tenant's concurrent
 /// queries, four times the per-query default in `ravel_sql::SqlConfig`. A
-/// placeholder pending the Phase B measurements
-/// docs/arrow-datafusion-plan.md says will set both figures in BENCHMARKS.md;
-/// documented as such so it is not mistaken for a tuned value.
+/// placeholder pending measurement rather than a tuned value; documented as
+/// such so it is not mistaken for one.
 #[cfg(feature = "sql")]
 pub const DEFAULT_MAX_TENANT_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -182,8 +181,8 @@ pub const DEFAULT_MAX_TENANT_BYTES: usize = 1024 * 1024 * 1024;
 /// `engine_config` carries the resolved query deadline (ADR-0050 section 4,
 /// EC4), the SAME value passed to [`build_app_state`]: SQL and Flight SQL
 /// must enforce the deadline `main` validated against `sys/gc`, not an
-/// independent `EngineConfig::default()` (the bug the fix-continuation for
-/// issue #588 found: PromQL was wired, SQL/Flight SQL were not).
+/// independent `EngineConfig::default()` (without this, PromQL is wired to
+/// the validated deadline but SQL/Flight SQL would not be).
 #[cfg(feature = "sql")]
 pub fn build_sql_state(
     catalog: Arc<Catalog>,
@@ -228,10 +227,10 @@ pub fn build_sql_state(
         max_deadline,
         query_accounting,
         query_admission,
-        // EL-5 routes the SQL HTTP audit through the QueryAuditSink seam;
-        // installing the process-wide AuditPipeline is EL-7's server-wiring
-        // task, so this defaults to the no-op today. The endpoint already
-        // submits and awaits through the trait, so EL-7 is a one-line swap.
+        // The SQL HTTP audit routes through the QueryAuditSink seam;
+        // installing the process-wide AuditPipeline is a separate server-wiring
+        // step, so this defaults to the no-op today. The endpoint already
+        // submits and awaits through the trait, so enabling it is a one-line swap.
         audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
     })
 }
@@ -284,7 +283,7 @@ mod catalog_cache_tests {
         );
     }
 
-    /// Issue #553: `--disable-cache` (passed as `disable_cache: true`) must
+    /// `--disable-cache` (passed as `disable_cache: true`) must
     /// build a catalog with no byte cache constructed, the byte-cache analogue
     /// of the `None` fetcher cache `build_cache` returns. Asserts on the
     /// absence of the counters handle, not a zero hit count.
@@ -341,7 +340,7 @@ mod catalog_cache_tests {
         );
     }
 
-    /// Issue #553: with caching on, `--cache-max-bytes` must bound the catalog
+    /// with caching on, `--cache-max-bytes` must bound the catalog
     /// byte cache, not just the fetcher cache. The value reaches
     /// `CatalogConfig::byte_cache_max_bytes`, and the byte cache (with its
     /// counters handle) is constructed.

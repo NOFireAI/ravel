@@ -1,9 +1,9 @@
-//! Background maintenance task (docs/compaction-retention-plan.md P8, issue
-//! #115; storage-derived tenant set is ADR-0048 decision 3, issue #504).
+//! Background maintenance task (storage-derived tenant set is ADR-0048
+//! decision 3).
 //! Periodically runs age-based retention, L0->L1 compaction, and the GC
 //! sweeper over every `(signal, shard)` of every tenant storage holds data
 //! for. It also brings the query-audit shard (`Signal::Audit` /
-//! `QUERY_AUDIT_SHARD`) into the maintained set (issue #763, EL-6): after the
+//! `QUERY_AUDIT_SHARD`) into the maintained set: after the
 //! data-signal loop it compacts that shard, cleans up the compacted L0 inputs,
 //! and runs a dedicated age-based retention sweep on its own 90-day window,
 //! separate from the ADR-0019 per-tenant data retention. The legal-hold shard
@@ -38,7 +38,7 @@
 //! failure (the LIST errors) skips the whole cycle -- no tenant's tick runs
 //! -- with a logged warning and a failure counter; it never falls back to an
 //! empty set, because that would be indistinguishable from healthy idleness,
-//! the exact silence findings S2-17/S5-09 describe.
+//! the exact silence this avoids.
 //!
 //! [`LegalHoldCheck::refresh`] is called once per tenant per tick, before
 //! either pass, and its snapshot is the [`LeaseCheck`] threaded through every
@@ -48,7 +48,7 @@
 //! unprotected delete pass.
 //!
 //! One [`MaintainMemo`] is held across every tick and every tenant until
-//! shutdown (issue #280, #330). The memo records buckets already known
+//! shutdown. The memo records buckets already known
 //! terminal so a steady-state tick skips re-listing and re-reading them,
 //! until a periodic full re-verify forces a fresh evaluation. It is ephemeral
 //! and never correctness-bearing: a fresh (cold) memo on the first tick after
@@ -58,7 +58,7 @@
 //! process-wide memo safely spans every tenant this supervisor discovers,
 //! across ticks.
 //!
-//! That memo is also persisted durably (ADR-0065 decision 3, issue #747). On
+//! That memo is also persisted durably (ADR-0065 decision 3). On
 //! its discovery cadence [`run_loop`] writes a compact per-unit summary of the
 //! memo to `sys/maintain/memo/<process_id>`, debounced so an unchanged tick
 //! writes nothing (the debounce compares the timestamp-free snapshot body, so
@@ -118,8 +118,8 @@ impl Clock for WallClock {
 /// signal-generic compaction/retention/sweep code (ADR-0032), carrying ADR-0019
 /// per-tenant retention and per-signal shard counts. `Signal::Audit` is
 /// deliberately absent: the query-audit shard is a fixed control-plane shard
-/// maintained separately at the end of [`run_tick`] on its own window (issue
-/// #763, EL-6), and the legal-hold shard is never a delete target at all.
+/// maintained separately at the end of [`run_tick`] on its own window, and
+/// the legal-hold shard is never a delete target at all.
 pub(crate) const MAINTAINED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
 /// Position of `signal` within [`MAINTAINED_SIGNALS`], and therefore within
@@ -138,8 +138,8 @@ fn signal_index(signal: Signal) -> usize {
     }
 }
 
-/// Process-global counters for the three maintenance safety controls that,
-/// before issue #517, only reached an operator through a `tracing` line: a
+/// Process-global counters for the three maintenance safety controls that
+/// previously only reached an operator through a `tracing` line: a
 /// legal-hold refresh failure (ADR-0048 decision 1), a compaction
 /// conservation-gate abort (decision 6), and an orphan-GC circuit breaker
 /// trip (decision 4). Rendered on the existing `GET /metrics` endpoint by
@@ -153,7 +153,7 @@ fn signal_index(signal: Signal) -> usize {
 /// flag now exists, but it applies only to the admission usage family
 /// (ADR-0051 section 6), not to this maintenance-safety family. Adding a
 /// raw `tenant_hash` label here would violate ADR-0044's safety
-/// precondition; see the issue #517 report for the full contradiction.
+/// precondition, the contradiction described above.
 #[derive(Debug, Default)]
 pub struct MaintenanceSafetyMetrics {
     legal_hold_refresh_failures: AtomicU64,
@@ -288,7 +288,7 @@ impl UnitStallTracker {
     /// and fails again, it re-accumulates from zero.
     ///
     /// `owned` must be the *ownership* set, not the set of units this cycle
-    /// managed to evaluate (issue #920). A unit this process still owns but
+    /// managed to evaluate. A unit this process still owns but
     /// did not reach this cycle -- because its tenant's legal-hold refresh
     /// failed, or its `(tenant, signal)` pair failed the provisioning or
     /// shard-generation read -- keeps its streak: it is exactly the stuck
@@ -322,7 +322,7 @@ pub struct MaintenanceOwnershipMetrics {
     /// cleared in `begin_cycle`, filled by `note_owned_unit` as `run_tick`
     /// walks each tenant, then consumed by `end_cycle` to prune `stalls`.
     /// Membership here means "this process owns the unit under the rendezvous
-    /// gate", not "this cycle evaluated it" (issue #920).
+    /// gate", not "this cycle evaluated it".
     owned_this_cycle: parking_lot::Mutex<std::collections::HashSet<(TenantHash, Signal, u32)>>,
 }
 
@@ -349,7 +349,7 @@ impl MaintenanceOwnershipMetrics {
     /// cycle. Call it for every unit the rendezvous ownership gate assigns to
     /// this process, whether inside a discovery cycle or a standalone
     /// `run_tick`, and before any per-tenant or per-signal error path can
-    /// skip the unit's evaluation (issue #920): what is recorded here decides
+    /// skip the unit's evaluation: what is recorded here decides
     /// which stall streaks `end_cycle` keeps.
     fn note_owned_unit(&self, tenant: TenantHash, signal: Signal, shard: u32) {
         self.owned_this_cycle.lock().insert((tenant, signal, shard));
@@ -486,8 +486,8 @@ impl MaintenanceTasks {
 /// [`MaintenanceTasks::shutdown`].
 ///
 /// `stored_gc` is the durable `sys/gc` object `main` already bootstrapped and
-/// read (ADR-0050 section 4). Before this fail-closed startup RE-ASSERT (issue
-/// #993, closing the #904 gap): the write fence in `ravel-cli gc-config set`
+/// read (ADR-0050 section 4). Before this fail-closed startup RE-ASSERT: the
+/// write fence in `ravel-cli gc-config set`
 /// validates a proposed horizon against the *CLI's* declared
 /// `--clock-skew-allowance`, but that knob and THIS running sweeper's
 /// [`CompactorConfig::clock_skew_allowance_ns`] are independent -- a deployment
@@ -518,7 +518,7 @@ pub fn spawn(
         return Ok(MaintenanceTasks::none());
     }
 
-    // Fail-closed skew re-assert (issue #993) BEFORE any delete path can run:
+    // Fail-closed skew re-assert BEFORE any delete path can run:
     // the stored `sys/gc` horizon must cover THIS running sweeper's own
     // `clock_skew_allowance_ns`, not just the write-time skew the horizon was
     // authored against. A violation refuses to spawn the sweep loop at all.
@@ -583,7 +583,7 @@ async fn run_loop(
     mut shutdown: oneshot::Receiver<()>,
 ) {
     // One memo for the whole process, held across every tick and every
-    // discovered tenant until shutdown (issue #280, #330). Its key includes
+    // discovered tenant until shutdown. Its key includes
     // the tenant and signal, so this single instance safely spans every
     // tenant this supervisor discovers. Cold on the first tick, so that tick
     // is a full rescan identical to the pre-memo behavior -- unless warm start
@@ -596,7 +596,7 @@ async fn run_loop(
     // `compactor.interior_reverify_ns`, not the crate's flat 1 h default.
     let mut memo = MaintainMemo::new(compactor.interior_reverify_ns);
 
-    // Durable memo snapshot state (ADR-0065 decision 3, issue #747).
+    // Durable memo snapshot state (ADR-0065 decision 3).
     //
     // `reseed` requests a warm start: seed `memo` from every non-stale durable
     // snapshot (this process's own previous one and siblings') for the units
@@ -617,8 +617,8 @@ async fn run_loop(
     let clock = WallClock;
 
     // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
-    // `H`, independent of the (coarser) discovery interval, and -- since issue
-    // #796 -- in its OWN spawned task rather than as a `select!` arm sharing the
+    // `H`, independent of the (coarser) discovery interval, and in its OWN
+    // spawned task rather than as a `select!` arm sharing the
     // loop with discovery. A discovery cycle walks every tenant sequentially
     // with no wall-time bound; when the heartbeat was a `select!` arm the macro
     // did not re-enter while the discovery arm's future ran, so the heartbeat
@@ -787,8 +787,8 @@ async fn run_loop(
         }
     }
 
-    // Stop the heartbeat task so no spawned task outlives this loop (issue
-    // #796): signal it and await its handle. On return the heartbeat task is
+    // Stop the heartbeat task so no spawned task outlives this loop: signal it
+    // and await its handle. On return the heartbeat task is
     // guaranteed finished rather than detached, matching
     // `MaintenanceTasks::shutdown`'s join of the supervisor task itself.
     let _ = heartbeat_shutdown_tx.send(());
@@ -797,15 +797,14 @@ async fn run_loop(
 
 /// One discovery cycle: re-enumerate tenants from storage, narrow by lifecycle
 /// state and the flag fallback, then run [`run_tick`] for each tenant in the
-/// result (ADR-0048 decision 3, ADR-0066 decision 6, issue #504).
+/// result (ADR-0048 decision 3, ADR-0066 decision 6).
 /// `fallback_allow` is the token-derived allow-list governing no-config tenants;
 /// a tenant carrying a config record is maintained unconditionally, so no flag
 /// can exclude it. `metrics` records the discovered and maintained gauges on
 /// success; a discovery failure -- the LIST itself erroring -- skips the whole
 /// cycle (no tenant's tick runs) and only bumps the failure counter, never
 /// falling back to an empty set. Falling back would render identically to
-/// "storage has no tenants," the exact silent failure findings S2-17/S5-09
-/// describe.
+/// "storage has no tenants," the exact silent failure this avoids.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_discovery_cycle(
     store: &dyn ObjectStoreBackend,
@@ -877,7 +876,7 @@ pub async fn run_discovery_cycle(
     // `units_stalled` -- would be stranded forever. Each tick above records
     // its tenant's owned set from the ownership gate before any store read,
     // so this prunes only genuinely-unowned units, never a still-owned one
-    // whose tick a transient fault skipped (issue #920).
+    // whose tick a transient fault skipped.
     ownership.end_cycle();
     total
 }
@@ -907,7 +906,7 @@ pub async fn run_discovery_cycle(
 ///
 /// `memo` is the caller's per-worker [`MaintainMemo`], threaded through every
 /// `(signal, shard)` and mutated in place: buckets it already knows terminal
-/// are skipped without a per-bucket LIST or GET (issue #280, #330). The
+/// are skipped without a per-bucket LIST or GET. The
 /// returned [`MaintainReport`] sums the per-`(signal, shard)` reports of the
 /// retention-and-compaction passes (the sweep pass is logged, not summed);
 /// `skipped_terminal` is the count of buckets the memo let this tick skip.
@@ -927,7 +926,7 @@ pub async fn run_discovery_cycle(
 ///
 /// That same ownership gate, evaluated over the configured shard range before
 /// the legal-hold refresh, is what feeds the per-cycle owned set behind the
-/// `units_stalled` stall-streak prune ([`note_owned_units`], issue #920). The
+/// `units_stalled` stall-streak prune ([`note_owned_units`]). The
 /// tick reports ownership even when it then skips the tenant or a `(tenant,
 /// signal)` pair on error, so a still-owned stuck unit keeps its streak.
 #[allow(clippy::too_many_arguments)]
@@ -966,8 +965,9 @@ pub async fn run_tick(
 /// This is the pure ownership question (ADR-0065 decision 2): it reads
 /// nothing from the store and cannot fail, so it answers "does this process
 /// own the unit" independently of whether this tick got far enough to
-/// evaluate it. That separation is the fix for issue #920 -- the stall-streak
-/// prune in [`MaintenanceOwnershipMetrics::end_cycle`] keys on ownership, and
+/// evaluate it. That separation is what keeps the stall-streak accounting
+/// correct: the stall-streak prune in
+/// [`MaintenanceOwnershipMetrics::end_cycle`] keys on ownership, and
 /// a still-owned unit whose tick was skipped by a transient per-tenant or
 /// per-`(tenant, signal)` fault must keep its streak.
 ///
@@ -1014,7 +1014,7 @@ pub(crate) async fn run_tick_with_clock(
     live_set: &[Uuid],
 ) -> MaintainReport {
     // Record this tenant's owned units from the ownership gate alone, before
-    // anything that can fail (issue #920). Ownership is a pure function of
+    // anything that can fail. Ownership is a pure function of
     // (live set, tenant, signal, shard) under the rendezvous hash, so it is
     // knowable here, ahead of the legal-hold refresh and the per-(tenant,
     // signal) provisioning and shard-generation reads below, each of which
@@ -1344,7 +1344,7 @@ pub(crate) async fn run_tick_with_clock(
             }
         }
 
-        // Selective subject erasure (ADR-0064, epic EJ, issue #997): the
+        // Selective subject erasure (ADR-0064): the
         // rewrite pass over every bucket, the request-completion `.done`
         // write, and the `.dreq` sweep -- in that order, so a request's
         // `.dreq` is only ever removed after its erasure is durably complete.
@@ -1380,7 +1380,7 @@ pub(crate) async fn run_tick_with_clock(
         }
     }
 
-    // Query-audit shard maintenance (issue #763, EL-6). The query-audit shard
+    // Query-audit shard maintenance. The query-audit shard
     // (Signal::Audit / QUERY_AUDIT_SHARD) is brought into the maintained set on
     // its own terms: a dedicated age-based retention sweep on
     // `compactor.audit_retention_window_ns` (default 90 days), then RLOG
@@ -1551,7 +1551,7 @@ struct ErasureRewritePass {
     /// converged, or abandoned -- see `deferred` for the abandoned case).
     rewritten: usize,
     /// Buckets whose live `RewriteRecord` already named every overlapping
-    /// request, so nothing was republished (the EJ-T5 idempotence guard).
+    /// request, so nothing was republished (the idempotence guard).
     already_applied: usize,
     /// Buckets that contribute nothing to any pending request: no pending
     /// request's event-time range overlaps them, or they are tombstoned.
@@ -1586,7 +1586,7 @@ struct ErasureRewritePass {
 /// bucket, not N (ADR-0064 consequences, "N concurrent DSARs cost one rewrite,
 /// not N").
 ///
-/// The [`ErasureRewriteOutcome::AlreadyApplied`] arm is the EJ-T5 idempotence
+/// The [`ErasureRewriteOutcome::AlreadyApplied`] arm is the idempotence
 /// guard and is deliberately counted, not re-driven: a bucket whose live
 /// record already names every overlapping request must not republish, or every
 /// tick would land a fresh no-op rewrite superseding the last one and churn
@@ -2098,7 +2098,7 @@ mod tests {
         WorkerSet::with_defaults(0)
     }
 
-    /// The acceptance test named by issue #746 / experiment S5-E6 (ADR-0065
+    /// The acceptance test for shared-store ownership (ADR-0065
     /// decisions 1 and 2): two maintain replicas sharing one store partition the
     /// unit set rather than both paying for it.
     ///
@@ -2385,9 +2385,8 @@ mod tests {
     }
 
     /// `run_tick` must actually call the idempotency-marker sweep for logs
-    /// and spans, once per signal, using the real [`WallClock`] (issue #531's
-    /// adversarial checkpoint: the sweep previously had no production
-    /// caller). Seeds one marker per maintained signal at ingest hour 0
+    /// and spans, once per signal, using the real [`WallClock`] (the sweep
+    /// previously had no production caller). Seeds one marker per maintained signal at ingest hour 0
     /// (1970, far past any real dedup window) and one at the real current
     /// ingest hour (still within window), then asserts the past-window
     /// marker is gone and the in-window one survives after a single tick --
@@ -2487,7 +2486,7 @@ mod tests {
         }
     }
 
-    // --- ADR-0064 selective erasure, driven through `run_tick` (issue #997) ---
+    // --- ADR-0064 selective erasure, driven through `run_tick` ---
 
     /// The injected "now" every erasure test ticks at: hour 10_000 (1971), far
     /// past the seal margin for the ingest-hour-0 bucket those tests publish,
@@ -2882,7 +2881,7 @@ mod tests {
         out
     }
 
-    /// THE reachability acceptance test for issue #997 (ADR-0064 decisions 3,
+    /// The reachability acceptance test for selective erasure (ADR-0064 decisions 3,
     /// 4, and 5): everything is driven through `run_tick` itself, never by
     /// calling `erasure_rewrite_bucket` or `sweep_erasure_requests` directly.
     ///
@@ -3009,7 +3008,7 @@ mod tests {
         );
     }
 
-    /// The EJ-T5 idempotence guard, observed through the loop: a second tick
+    /// The idempotence guard, observed through the loop: a second tick
     /// over a bucket whose live `RewriteRecord` already names every pending
     /// request must publish nothing new. Without the `AlreadyApplied` skip the
     /// second tick would land a no-op rewrite superseding the first, every
@@ -3553,7 +3552,7 @@ mod tests {
     /// A second `run_tick` with the same memo (a second tick) skips the buckets
     /// the first tick proved terminal: `skipped_terminal` rises from 0 to the
     /// bucket count, and the second tick issues strictly fewer GETs because the
-    /// skipped bucket's per-bucket LIST/GET reads are elided (issue #280, #330).
+    /// skipped bucket's per-bucket LIST/GET reads are elided.
     #[tokio::test]
     async fn second_tick_with_shared_memo_skips_terminal_buckets() {
         let store = InstrumentedStore::new(MemoryStore::new());
@@ -3826,12 +3825,12 @@ mod tests {
         );
     }
 
-    /// The test the task spec requires by name: a tenant known only to
+    /// A tenant known only to
     /// storage (no `--tenant-token`, no `--maintain-tenant`, i.e. `restrict =
     /// None`) is discovered and maintained by the real driver wiring
-    /// (ADR-0048 decision 3, issue #504, experiment L2). This is exactly the
-    /// OIDC/mTLS-authenticated-tenant scenario findings S2-17/S5-09
-    /// describe: the flag-derived set used to be empty and nothing ran.
+    /// (ADR-0048 decision 3). This is exactly the
+    /// OIDC/mTLS-authenticated-tenant scenario the discovery path must cover:
+    /// the flag-derived set used to be empty and nothing ran.
     #[tokio::test]
     async fn storage_discovered_tenant_is_maintained_without_flags() {
         let store = MemoryStore::new();
@@ -4055,7 +4054,7 @@ mod tests {
         handle.abort();
     }
 
-    /// ADR-0065 decision 3 (issue #747): the durable memo write is debounced.
+    /// ADR-0065 decision 3: the durable memo write is debounced.
     /// A first persist writes the snapshot object; a second persist over an
     /// unchanged memo writes nothing (no PUT); and a persist after the memo
     /// gained a bucket writes again. Counts PUTs through an `InstrumentedStore`
@@ -4134,7 +4133,7 @@ mod tests {
         );
     }
 
-    /// ADR-0065 decision 3 (issue #747): warm start and ownership handoff
+    /// ADR-0065 decision 3: warm start and ownership handoff
     /// through real store objects. Worker A maintains a unit, memoizes its
     /// terminal bucket, and persists a durable snapshot. Worker B -- a distinct
     /// process that now owns the unit -- reads the snapshots back from the store
@@ -4212,7 +4211,7 @@ mod tests {
         assert_eq!(report.already_done, 0, "no per-bucket work redone by B");
     }
 
-    /// ADR-0065 decision 3 (issue #747): the reseed trigger and the ownership
+    /// ADR-0065 decision 3: the reseed trigger and the ownership
     /// filter under a *genuine* handoff, with two independent live-set views
     /// rather than two `solo_live_set()`s (which make ownership unconditional and
     /// the `computed != live_set` filter vacuous). Two replicas A and B share a
@@ -4339,7 +4338,7 @@ mod tests {
     }
 
     /// The un-trip an operator must not read as "resolved" (ADR-0048 decision
-    /// 4, issue #500): a second, non-tripped sweep pass for the same signal
+    /// 4): a second, non-tripped sweep pass for the same signal
     /// drops `orphans_withheld` back to `0`, but `orphan_breaker_trips` -- the
     /// counter a first-trip alert fires on -- keeps the earlier trip on the
     /// record.
@@ -4751,7 +4750,7 @@ mod tests {
 
     /// A stuck unit's stall streak survives a tick that a transient
     /// per-tenant or per-`(tenant, signal)` error kept from evaluating it,
-    /// because this process still OWNS the unit (issue #920). A unit that is
+    /// because this process still OWNS the unit. A unit that is
     /// genuinely no longer owned is still pruned, so the fix does not
     /// reintroduce the stranded-entry bug
     /// `units_stalled_drops_a_unit_that_leaves_the_owned_set` covers.
@@ -5035,9 +5034,9 @@ mod tests {
         }
     }
 
-    /// Issue #796 (the real fix): the heartbeat must keep firing on cadence `H`
+    /// The heartbeat must keep firing on cadence `H`
     /// even while a single discovery cycle runs far longer than the `3 * H`
-    /// liveness window. Before the fix the heartbeat was a `select!` arm sharing
+    /// liveness window. When the heartbeat was a `select!` arm sharing
     /// `run_loop` with the discovery arm, so once `run_discovery_cycle(...).await`
     /// began the macro never re-entered and the heartbeat `interval` arm was
     /// never polled (`MissedTickBehavior::Delay` merely defers the tick). A cycle
@@ -5132,7 +5131,7 @@ mod tests {
         handle.abort();
     }
 
-    /// Issue #796 clean shutdown: the heartbeat task `run_loop` spawns must stop
+    /// clean shutdown: the heartbeat task `run_loop` spawns must stop
     /// when the loop ends -- no leaked task. `run_loop` signals and awaits the
     /// heartbeat handle before returning, so once the loop's own join handle
     /// resolves the heartbeat task is guaranteed finished, not detached.
@@ -5206,7 +5205,7 @@ mod tests {
         );
     }
 
-    /// Issue #993 fail-closed re-assert (closing the #904 gap): a stored
+    /// The fail-closed re-assert (closing the write-fence gap): a stored
     /// `sys/gc` that satisfies its OWN write-time skew is still refused when the
     /// RUNNING sweeper is configured with a LARGER `clock_skew_allowance`, so the
     /// sweep loop that actually deletes is never spawned with a skew-uncovered
@@ -5230,7 +5229,7 @@ mod tests {
         let default_skew = CompactorConfig::default().clock_skew_allowance_ns;
 
         // A running sweeper configured with a LARGER skew than the stored
-        // horizon budgets for: independent knob, never cross-checked before #993.
+        // horizon budgets for: an independent knob, cross-checked only by this re-assert.
         let over_skew = default_skew + 60_000_000_000; // +1 min
         let fail_config = MaintenanceTaskConfig {
             enabled: true,

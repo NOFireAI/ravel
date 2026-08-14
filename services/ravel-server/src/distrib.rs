@@ -1,6 +1,6 @@
-//! ADR-0071 distributed read fan-out server wiring (issue #865).
+//! ADR-0071 distributed read fan-out server wiring.
 //!
-//! This module turns the `ravel-query` distribution primitives (issue #864)
+//! This module turns the `ravel-query` distribution primitives
 //! into a running cluster surface. It has three parts:
 //!
 //! * [`FragmentService`] -- the worker side. It implements the generated
@@ -8,7 +8,7 @@
 //!   cluster-internal bearer token and admitting it against a distinct
 //!   [`FragmentAdmission`] class (never the client-query cap). Per request it
 //!   resolves a snapshot for the request's tenant over the request's event-time
-//!   window (issue #885 item 1), builds an interim content-hash
+//!   window, builds an interim content-hash
 //!   [`SnapshotSegmentResolver`], and delegates to the in-crate
 //!   [`SeriesFetchService`] so a fragment fetch is byte-identical to what the
 //!   local path would read.
@@ -21,7 +21,7 @@
 //!
 //!   The ADR-0071 failure matrix is enforced here (deliverable 1, 3, 4). A
 //!   version-skewed worker is dropped at routing time, so a protocol mismatch
-//!   costs no round trip (subsumes issue #885 item 3). A first remote attempt
+//!   costs no round trip. A first remote attempt
 //!   lost at transport or answered `Unavailable` is re-dispatched exactly once
 //!   to the next rendezvous worker, then executed coordinator-local; a typed
 //!   failure surfaces only if local execution also fails. A worker-reported
@@ -83,7 +83,7 @@ use uuid::Uuid;
 /// the kernel's TCP SYN timeout (often over two minutes).
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The `ravel_distrib_*` metric family (ADR-0071, issue #865). Process-global
+/// The `ravel_distrib_*` metric family (ADR-0071). Process-global
 /// atomics, read at `/metrics` scrape time. Carries only the closed `mode`
 /// label at render time; never a per-shard, per-worker, or per-tenant label
 /// (ADR-0044 section 4).
@@ -249,7 +249,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// The distinct internal-workload admission class for inbound fragment fetches
-/// (ADR-0071 deliverable 2, issue #865). A plain counting semaphore, separate
+/// (ADR-0071 deliverable 2). A plain counting semaphore, separate
 /// from the client-query admission controller: a coordinator that holds a
 /// client-query permit while it waits on its dispatched fragments can never
 /// deadlock behind client queries queued on the client cap, because the workers
@@ -310,7 +310,7 @@ struct FragmentServiceInner {
     /// The deployment's ordinary tenant resolver chain. Used only for
     /// cross-cluster federation (resolve-scope) requests, where a federating
     /// coordinator's credential is an ordinary tenant credential and the tenant
-    /// is derived from it, never from the wire (ADR-0071 security, #868). The
+    /// is derived from it, never from the wire (ADR-0071 security). The
     /// intra-cluster pinned path never consults it.
     tenant_resolver: Arc<dyn TenantResolver>,
     admission: FragmentAdmission,
@@ -385,7 +385,7 @@ impl FragmentService {
     /// Authenticate a cross-cluster federation (resolve-scope) request and
     /// derive its tenant from the presented credential, never from the wire.
     ///
-    /// ADR-0071 (#868) requires the remote to treat a federating coordinator's
+    /// ADR-0071 requires the remote to treat a federating coordinator's
     /// credential as an ORDINARY TENANT CREDENTIAL: it runs the deployment's
     /// normal [`TenantResolver`] chain over the request metadata and takes the
     /// tenant from whatever that credential maps to. The cluster-internal
@@ -403,7 +403,7 @@ impl FragmentService {
 
     /// Build the interim content-hash resolver for one request by resolving a
     /// snapshot for the request's tenant and metrics signal over the request's
-    /// event-time window (issue #885 item 1).
+    /// event-time window.
     ///
     /// The coordinator carries the event-time envelope of the slice's pinned
     /// segments in `window_start_ns`/`window_end_ns` (see
@@ -451,7 +451,7 @@ impl FragmentService {
     }
 
     /// Rewrite a cross-cluster resolve-scope request into a pinned one over this
-    /// cluster's own snapshot (ADR-0071 federation, issue #868).
+    /// cluster's own snapshot (ADR-0071 federation).
     ///
     /// A federated coordinator ships matchers and a time window with an empty
     /// [`pb::fetch_request::Scope::Resolve`] scope; the remote resolves its OWN
@@ -621,7 +621,7 @@ impl SeriesFetch for FragmentService {
 }
 
 /// One per-slice entry in a distributed query's `stats.fragments[]` (ADR-0071
-/// observability deliverable, issue #865). [`RoutingSliceFetcher`] records one
+/// observability deliverable). [`RoutingSliceFetcher`] records one
 /// for every slice a distributed query dispatches; the query handler renders
 /// the collected entries into the stats JSON via [`crate::query::fragments_json`].
 /// The family carries per-slice cardinality here, in the response body, never as
@@ -791,7 +791,7 @@ impl RoutingSliceFetcher {
     /// Only workers whose `protocol_version` equals the coordinator's are
     /// considered: a version-skewed worker is dropped here, at routing time, so
     /// the mismatch never costs a dispatch round trip (ADR-0071 failure
-    /// semantics; subsumes issue #885 item 3). The ranking is produced by
+    /// semantics). The ranking is produced by
     /// repeatedly asking [`worker_set::owner`] for the top owner of the
     /// remaining candidate set, so it matches the single-owner mapping the rest
     /// of the cluster computes, extended to a deterministic failover order.
@@ -1052,7 +1052,7 @@ pub fn spawn_heartbeat(
 }
 
 /// A [`SliceFetcher`] over one remote cluster's fragment `SeriesFetch` surface
-/// (ADR-0071 cross-cluster federation, issue #868).
+/// (ADR-0071 cross-cluster federation).
 ///
 /// Unlike [`RoutingSliceFetcher`], which rendezvous-maps intra-cluster slices
 /// across the local worker set, this always dials one fixed remote endpoint and
@@ -1125,7 +1125,7 @@ impl SliceFetcher for FederationSliceFetcher {
         let mut tonic_request = tonic::Request::new(request);
         // Present the operator credential, never the calling client's: the
         // client credential never crosses a cluster boundary (ADR-0071 trust
-        // boundary, issue #868).
+        // boundary).
         let value = format!("Bearer {}", self.credential).parse().map_err(|_| {
             DistribError::Transport("invalid federation bearer token metadata".to_string())
         })?;
@@ -1651,7 +1651,7 @@ mod tests {
         assert_eq!(fallback.segment_count, 1);
     }
 
-    // --- Cross-cluster federation auth (ADR-0071 security, #868) ------------
+    // --- Cross-cluster federation auth (ADR-0071 security) ------------
 
     /// A fixed clock so `Catalog::resolve` over a bounded window is
     /// deterministic (the same reasoning as `tests::FixedClock`).
@@ -1892,7 +1892,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
-    // --- Windowed fragment resolve (issue #885 item 1) ----------------------
+    // --- Windowed fragment resolve ------------------------------------------
 
     /// A `FragmentService` over `store` on the intra-cluster pinned path: a
     /// fixed clock and no tenant credentials (the pinned path only checks the
@@ -1933,8 +1933,8 @@ mod tests {
             .expect("one published segment")
     }
 
-    /// The whole timestamp domain, the window the worker used to resolve over
-    /// before issue #885 item 1 narrowed it. Used here only as the test oracle
+    /// The whole timestamp domain, wider than the event-time window a worker
+    /// resolves over. Used here only as the test oracle
     /// (a full-window resolve) and to name a disjoint window.
     const FULL: TimeRange = TimeRange {
         start_ns: i64::MIN,

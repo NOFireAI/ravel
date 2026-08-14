@@ -72,7 +72,7 @@ pub enum LogIngestRequestError {
     /// exceeded. No tokens are consumed on rejection.
     Admission(RequestRejection),
     /// The receiver's admission-time clock was implausible (ADR-0051
-    /// amendment, S1-12). Whole-request HTTP 503 / gRPC `UNAVAILABLE`; the
+    /// amendment). Whole-request HTTP 503 / gRPC `UNAVAILABLE`; the
     /// replica's fault, retryable against a healthy replica.
     ClockImplausible(String),
     /// The supplied `x-ravel-idempotency-key` exceeds
@@ -126,7 +126,7 @@ impl LogIngestRequestError {
 }
 
 /// Upper bound on the assembled `error_message` byte length, the same cap and
-/// for the same reason as [`crate::ingest`]'s metrics equivalent (#209): a
+/// for the same reason as [`crate::ingest`]'s metrics equivalent: a
 /// request rejected across many distinct reasons would otherwise produce an
 /// unbounded response string even after aggregation collapses identical
 /// reasons.
@@ -140,7 +140,7 @@ pub async fn handle_export_logs(
     ingest_ts_ns: i64,
     idempotency_key: Option<Vec<u8>>,
 ) -> Result<LogIngestOutcome, LogIngestRequestError> {
-    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): checked before
+    // Receiver-clock plausibility (ADR-0051 amendment): checked before
     // any other work, since the hour bucket the marker path and normalize both
     // derive is nonsense on a bad clock. Whole-request 503 / UNAVAILABLE,
     // counted reason="clock".
@@ -267,7 +267,7 @@ pub async fn handle_export_logs(
         None
     };
 
-    // Ordering (ADR-0051 section 5, experiment L6): the data is durably
+    // Ordering (ADR-0051 section 5): the data is durably
     // committed once `router.write` returns its tokens. Write the marker here,
     // before this function returns and thus before the client can observe any
     // ack, so a retry of this keyed request finds it. Only a real commit
@@ -390,7 +390,7 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
 
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
-    /// (ADR-0051 amendment, S1-12): the fixture ingest clock and every log
+    /// (ADR-0051 amendment): the fixture ingest clock and every log
     /// record timestamp anchor to it so the receiver-clock plausibility floor
     /// admits the request. Never `SystemTime::now()`, so tests stay
     /// deterministic.
@@ -592,7 +592,7 @@ mod tests {
         .expect("a key exactly at the cap is accepted");
     }
 
-    /// #991: a logs request whose receiver (ingest) clock is below the 2020
+    /// a logs request whose receiver (ingest) clock is below the 2020
     /// floor must be rejected as the whole-request `ClockImplausible` error
     /// (retryable, so the transport maps it to gRPC `UNAVAILABLE` / HTTP 503),
     /// and the `reason="clock"` admission counter for the tenant's Logs signal

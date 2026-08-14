@@ -144,13 +144,13 @@ pub struct ServerConfig {
     pub listen_grpc: SocketAddr,
     pub shard_count: u32,
     /// Per-shard in-flight flush bound for the metrics ingest pipeline
-    /// (ADR-0067 decision 2, issue #814), forwarded to
+    /// (ADR-0067 decision 2), forwarded to
     /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]. Does not apply
     /// to the log or span ingest pipelines, which keep their existing inline
     /// flush. See `--max-inflight-flushes`.
     pub max_inflight_flushes: u32,
     /// Enables the adaptive flush-delay corridor for the metrics ingest
-    /// pipeline (ADR-0067 decision 3, issue #814), forwarded to
+    /// pipeline (ADR-0067 decision 3), forwarded to
     /// [`ravel_ingest::IngestConfig::adaptive_flush_delay`]. Does not apply
     /// to the log or span ingest pipelines. See `--adaptive-flush-delay`.
     pub adaptive_flush_delay: bool,
@@ -163,7 +163,7 @@ pub struct ServerConfig {
     /// resolver onto them by accident.
     pub mtls_listener: Option<MtlsListenerConfig>,
     /// An optional restriction on the tenants the fold and maintenance tasks
-    /// act on (ADR-0048 decision 3, issue #504). Both tasks derive their
+    /// act on (ADR-0048 decision 3). Both tasks derive their
     /// working tenant set from storage each cycle
     /// (`ravel_maintain::discover_tenants`); an empty `fold_tenants` (the
     /// default, from no `--tenant-token`/`--maintain-tenant`) means no
@@ -267,15 +267,14 @@ pub struct ServerConfig {
     /// `P`, so sustained scrub read bandwidth is bounded at `corpus_bytes / P`.
     /// Not spawned in ingest/query modes, whose job is the hot path.
     pub scrub_period: Duration,
-    /// Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3,
-    /// issue #511), resolved from `--indexed-field` / `--indexed-field-tenant`.
+    /// Per-tenant POSTINGS indexed-field configuration (ADR-0049 decision 3), resolved from `--indexed-field` / `--indexed-field-tenant`.
     /// [`start`] wraps it in an `Arc` and hands it to the log ingest router,
     /// which resolves `fields_for(tenant_hash)` at flush time and feeds the
     /// result to `RlogWriter::with_indexed_fields`. This is the one production
     /// call site that reads the configuration.
     pub indexed_fields: crate::postings_config::IndexedFieldConfig,
     /// `--disable-cache`: turn off every ADR-0046 read cache in the process,
-    /// not just the fetcher cache (issue #553). `main` sets it from
+    /// not just the fetcher cache. `main` sets it from
     /// `Cli::disable_cache`, the same flag `store::build_cache` reads to return
     /// a `None` fetcher cache; [`start`] additionally passes it to
     /// [`query::build_catalog`] so the catalog builds no byte cache either, so
@@ -285,10 +284,10 @@ pub struct ServerConfig {
     /// `--cache-max-bytes`: the shared RAM budget for the ADR-0046 read caches.
     /// `main` sets it from `Cli::cache_max_bytes`; it bounds the fetcher cache
     /// (via `store::build_cache`) and the catalog byte cache (via
-    /// [`query::build_catalog`]) from one number (issue #553). Ignored when
+    /// [`query::build_catalog`]) from one number. Ignored when
     /// `disable_cache` is set.
     pub cache_max_bytes: u64,
-    /// The process-wide in-flight ingest-request ceiling (issue #802), from
+    /// The process-wide in-flight ingest-request ceiling, from
     /// `--max-inflight-ingest-requests` (default `Bounded(1024)`, `0` maps to
     /// `Unlimited`). [`start`] builds one shared
     /// [`ingest_concurrency::IngestConcurrencyController`] from this and
@@ -298,8 +297,8 @@ pub struct ServerConfig {
     /// `query_concurrency_limit` above, this is never reconciled fleet-wide:
     /// each process sheds independently against its own local bound.
     pub ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit,
-    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1, issue
-    /// #819), from `--max-ingest-buffer-bytes` (default `Bounded(512 MiB)`, `0`
+    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1),
+    /// from `--max-ingest-buffer-bytes` (default `Bounded(512 MiB)`, `0`
     /// maps to `Unlimited`). [`start`] builds one shared
     /// [`ravel_ingest::IngestByteBudget`] from this and installs it on the
     /// metrics, log, and span routers via `with_budget`, so a single ceiling
@@ -307,7 +306,7 @@ pub struct ServerConfig {
     /// `ingest_concurrency_limit`, a per-process local bound, never reconciled.
     pub ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit,
     /// How long re-derivable per-tenant state may sit idle before the
-    /// background sweep evicts it (ADR-0069 decision 2, issue #820), from
+    /// background sweep evicts it (ADR-0069 decision 2), from
     /// `--idle-tenant-state-ttl` (default 1h; `Duration::ZERO` disables the
     /// sweep). [`start`] spawns one sweep task per process that evicts idle
     /// generation views (ingest-serving modes), catalog per-tenant caches
@@ -317,7 +316,7 @@ pub struct ServerConfig {
     /// (ADR-0069 decision 2). Every evicted entry is re-derived on the tenant's
     /// next access.
     pub idle_tenant_state_ttl: Duration,
-    /// The resolved ADR-0071 distributed read fan-out settings (issue #865),
+    /// The resolved ADR-0071 distributed read fan-out settings,
     /// `Some` only under `--distributed-query` (which requires
     /// `--fragment-auth-token-file`). In a query-serving mode
     /// ([`Mode::All`]/[`Mode::Query`]) [`start`] then registers the
@@ -328,7 +327,7 @@ pub struct ServerConfig {
     /// engine. `None` (the default) leaves every query on the byte-identical
     /// local path and never binds the fragment surface.
     pub distrib: Option<crate::config::DistribSettings>,
-    /// The resolved ADR-0071 cross-cluster federation remotes (issue #868), from
+    /// The resolved ADR-0071 cross-cluster federation remotes, from
     /// the repeatable `--remote-cluster` flag. Empty (the default) leaves the
     /// query engine with no federation seam, so every query resolves only local
     /// data. In a query-serving mode ([`Mode::All`]/[`Mode::Query`]) [`start`]
@@ -562,7 +561,7 @@ pub async fn start(
     // `l` keyspace (docs/ingest.md "Log pipeline"). It exists in exactly the
     // modes that serve ingest, so the two options are always Some together.
     let log_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
-        // The per-tenant POSTINGS indexed-field resolver (issue #511) reaches
+        // The per-tenant POSTINGS indexed-field resolver reaches
         // the writer here: the router hands it to every shard, which resolves
         // `fields_for(tenant_hash)` at flush time.
         let indexed_fields: Arc<dyn ravel_ingest::LogIndexedFields> =
@@ -643,7 +642,7 @@ pub async fn start(
         admission.set_tenant_limits(tenant.clone(), *limits);
     }
 
-    // Restart-free tenant lifecycle (ADR-0066 decision 6, EM-T8). On a keyed
+    // Restart-free tenant lifecycle (ADR-0066 decision 6). On a keyed
     // bucket in a tenant-resolving mode, resolve bearer tokens against the
     // durable `sys/auth` map read on a bounded-staleness horizon: a freshly
     // provisioned token authenticates within seconds (on-miss re-read), a
@@ -694,7 +693,7 @@ pub async fn start(
     let query_admission =
         ravel_query::QueryAdmissionController::shared(config.query_concurrency_limit);
 
-    // Process-wide in-flight ingest-request ceiling (issue #802): one shared
+    // Process-wide in-flight ingest-request ceiling: one shared
     // controller per process, threaded into every `GatewayState`/
     // `RemoteWriteState` below (public and mTLS listeners alike), so HTTP,
     // gRPC, and both listeners draw down the same ceiling. Unlike
@@ -703,7 +702,7 @@ pub async fn start(
     let ingest_concurrency =
         ingest_concurrency::IngestConcurrencyController::shared(config.ingest_concurrency_limit);
 
-    // Per-query cost aggregator (ADR-0044 section 4, issue #425): one per
+    // Per-query cost aggregator (ADR-0044 section 4): one per
     // process, shared with every query handler below and read at scrape time by
     // the `/metrics` route. Its per-tenant allowlist is the tenants an operator
     // explicitly configured limits for, but only when `--metrics-tenant-labels`
@@ -798,7 +797,7 @@ pub async fn start(
     )?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the
-    // fetcher cache (issue #553).
+    // fetcher cache.
 
     // Built in every mode, `Some` only in Mode::Maintain (the one mode that
     // spawns `maintain::spawn` below and therefore has discovery counters to
@@ -808,12 +807,12 @@ pub async fn start(
         .then(|| Arc::new(tenant_discovery::TenantDiscoveryMetrics::default()));
 
     // Same sharing rationale as `tenant_discovery_metrics` above, for the
-    // maintenance safety counters (ADR-0048 decisions 1, 4, 6; issue #517).
+    // maintenance safety counters (ADR-0048 decisions 1, 4, 6).
     let maintenance_safety_metrics = matches!(config.mode, Mode::Maintain)
         .then(|| Arc::new(maintain::MaintenanceSafetyMetrics::default()));
 
     // Same sharing rationale as `maintenance_safety_metrics` above, for the
-    // at-rest scrubber counters (ADR-0059 decisions 1, 3; issue #694). `Some`
+    // at-rest scrubber counters (ADR-0059 decisions 1, 3). `Some`
     // only in Mode::Maintain, the one mode that spawns `scrub::spawn` below and
     // therefore has scrub anomalies and a cursor position to render. Built here
     // so both the `/metrics` state and the scrub task share the same instance.
@@ -821,7 +820,7 @@ pub async fn start(
         matches!(config.mode, Mode::Maintain).then(|| Arc::new(scrub::ScrubMetrics::default()));
 
     // Same sharing rationale as `maintenance_safety_metrics` above, for the
-    // ADR-0065 stuck-owner mitigation counters (issue #749): workers live,
+    // ADR-0065 stuck-owner mitigation counters: workers live,
     // units owned, warm-started units, full-sweep passes, and stalled units.
     let maintenance_ownership_metrics = matches!(config.mode, Mode::Maintain).then(|| {
         Arc::new(maintain::MaintenanceOwnershipMetrics::new(
@@ -842,7 +841,7 @@ pub async fn start(
         tracker
     });
 
-    // --- ADR-0071 distributed read fan-out scaffolding (issue #865) ---
+    // --- ADR-0071 distributed read fan-out scaffolding ---
     // The coordinator (a `RoutingSliceFetcher` wrapped in a `Distributed`), the
     // worker-side `FragmentService`, and their shared `FragmentMetrics` are
     // built here, before the `/metrics` state and the query engine, because the
@@ -969,7 +968,7 @@ pub async fn start(
             max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
             ..ravel_query::EngineConfig::default()
         };
-        // ADR-0071 cross-cluster federation (issue #868): build one gRPC
+        // ADR-0071 cross-cluster federation: build one gRPC
         // federation client per configured remote and install a `Federation` on
         // the engine. `None` when no `--remote-cluster` is set, leaving the
         // engine to resolve only local data. Independent of `--distributed-query`:
@@ -1052,9 +1051,9 @@ pub async fn start(
             tenant_resolver: config.tenant_resolver.clone(),
             clock: Arc::new(SystemClock),
             query_accounting: query_accounting.clone(),
-            // EL-5 routes analytics through the QueryAuditSink seam; the
-            // process-wide AuditPipeline install is EL-7, so this is the no-op
-            // sink today (the handler already submits and awaits through it).
+            // Analytics routes through the QueryAuditSink seam; the
+            // process-wide AuditPipeline install is a separate step, so this is
+            // the no-op sink today (the handler already submits and awaits through it).
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
         };
         http_router = http_router.merge(analytics::router(analytics_state));
@@ -1069,7 +1068,7 @@ pub async fn start(
             mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
         }
 
-        // GET/POST /api/v1/query_exemplars (ADR-0047 decision 4, issue #475):
+        // GET/POST /api/v1/query_exemplars (ADR-0047 decision 4):
         // reads the RSEG EXEMPLARS section back out of the segments a query
         // already matched. Shares the same `Catalog` and object store the
         // PromQL engine uses (so an exemplar query resolves byte-for-byte the
@@ -1166,7 +1165,7 @@ pub async fn start(
         });
         // The stored `sys/gc` (`config.gc`) horizon is re-asserted here against
         // THIS running sweeper's own `clock_skew_allowance_ns` before the sweep
-        // loop is spawned (issue #993, closing the #904 write-fence gap). A
+        // loop is spawned (closing the write-fence gap). A
         // skew-uncovered horizon fails startup fail-closed, before any listener
         // binds, rather than letting the sweeper delete a pinned reader's
         // snapshot.
@@ -1183,9 +1182,7 @@ pub async fn start(
             maintain_worker.clone(),
         )
         .map_err(|e| {
-            anyhow::anyhow!(
-                "maintain GC-config skew re-assert failed against sys/gc (issue #993): {e}"
-            )
+            anyhow::anyhow!("maintain GC-config skew re-assert failed against sys/gc: {e}")
         })?;
         (fold::FoldTasks::none(), maintenance_tasks)
     } else {
@@ -1287,7 +1284,7 @@ pub async fn start(
         let ceiling = gc_config::flight_ceiling(&config.gc);
         gc_config::validate_flight(&config.gc, ceiling)
             .map_err(|e| anyhow::anyhow!("Flight SQL ticket-TTL ceiling violates sys/gc: {e}"))?;
-        // ADR-0071 (issue #868): build the coordinator-side distributed scan
+        // ADR-0071: build the coordinator-side distributed scan
         // config from the same live query-worker roster and cost thresholds the
         // PromQL distributed lane installs above, so both lanes gate
         // distribution on identical estimate semantics. Built only when
@@ -1312,7 +1309,7 @@ pub async fn start(
             .as_ref()
             .map(|state| flight::service(state, ceiling, distributed))
     };
-    // The ADR-0071 fragment `SeriesFetch` service (issue #865) is a
+    // The ADR-0071 fragment `SeriesFetch` service is a
     // cluster-internal query surface: it binds this listener too, so a
     // query-only process with `--distributed-query` on (but no OTLP ingest and
     // no Flight SQL) still stands the listener up to serve fragment fetches. It
@@ -1324,7 +1321,7 @@ pub async fn start(
     let serve_grpc = metrics_service.is_some() || fragment_service.is_some();
 
     let (grpc_addr, grpc_shutdown, grpc_task) = if serve_grpc {
-        // Issue #803: every ingest service on this listener charges layer-2
+        // every ingest service on this listener charges layer-2
         // byte-rate admission on wire bytes, counted by this layer as tonic's
         // decoder reads them, instead of re-walking the decoded protobuf tree
         // (`Message::encoded_len`) per request. Applies uniformly to every
@@ -1341,7 +1338,7 @@ pub async fn start(
         let grpc = grpc.add_optional_service(flight_service);
         #[cfg(feature = "otap")]
         let grpc = grpc.add_optional_service(arrow_metrics_service);
-        // ADR-0071 fragment service (issue #865), token-guarded inside the
+        // ADR-0071 fragment service, token-guarded inside the
         // handler. Present only when `--distributed-query` is on; absent
         // entirely otherwise, so the service cannot be reached without the flag.
         let grpc = grpc.add_optional_service(fragment_service.as_ref().map(|s| s.into_server()));
@@ -1366,7 +1363,7 @@ pub async fn start(
         (None, None, None)
     };
 
-    // ADR-0071 query-worker heartbeat (issue #865). The fragment endpoint other
+    // ADR-0071 query-worker heartbeat. The fragment endpoint other
     // coordinators dial is the address the gRPC listener actually bound, known
     // only now, so the `QueryWorkers` identity is built here rather than with
     // the coordinator scaffolding above. Its generated UUID is published into
@@ -1490,7 +1487,7 @@ pub async fn start(
         query_admission_reconcile::QueryAdmissionReconcileTask::none()
     };
 
-    // At-rest integrity scrubber (ADR-0059, issue #694): one task per process,
+    // At-rest integrity scrubber (ADR-0059): one task per process,
     // only in Mode::Maintain. Scrubbing is background housekeeping over durable
     // objects, the same class as compaction/retention/sweep (which lib gates on
     // Mode::Maintain just above), and independent of ingest/query traffic. It
@@ -1513,7 +1510,7 @@ pub async fn start(
         _ => scrub::ScrubTask::none(),
     };
 
-    // Durable lifecycle refresh loop (ADR-0066 decision 6, EM-T8): refresh the
+    // Durable lifecycle refresh loop (ADR-0066 decision 6): refresh the
     // `sys/auth` map on the horizon (and on-miss) so token grants/revocations
     // take effect without a restart, and re-invoke `set_tenant_limits` from each
     // known tenant's durable config record so per-tenant admission overrides do
@@ -1539,7 +1536,7 @@ pub async fn start(
         lifecycle_refresh::spawn(durable_auth.clone(), store.clone(), limits, interval)
     };
 
-    // Idle-tenant state eviction sweep (ADR-0069 decision 2, issue #820): one
+    // Idle-tenant state eviction sweep (ADR-0069 decision 2): one
     // task per process that evicts re-derivable per-tenant state idle past
     // `--idle-tenant-state-ttl`. The evictor set is built from whatever
     // re-derivable state this mode actually holds: the three generation-view

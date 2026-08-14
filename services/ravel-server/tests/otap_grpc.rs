@@ -1,4 +1,4 @@
-//! Phase 3 gateway wiring (issue #12): drive one encoded OTAP metrics batch
+//! Phase 3 gateway wiring: drive one encoded OTAP metrics batch
 //! through the `otap`-gated `ArrowMetricsService` in-process and assert the
 //! strict ack carries a commit token, then that the stored, queryable data
 //! matches what the equivalent OTLP request produces on the same server.
@@ -511,8 +511,8 @@ async fn otap_and_otlp_produce_identical_stored_series() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// Finding 1 (checkpoint review of #524): a byte-rate rejection mid-stream
-/// tears the gRPC stream down instead of keeping it alive. Keeping it alive
+/// A byte-rate rejection mid-stream must not
+/// tear the gRPC stream down instead of keeping it alive. Keeping it alive
 /// would leave the stateful per-`DecoderKey` Arrow IPC decoder desynced,
 /// because the rejected (pre-decode) batch's Schema/DictionaryBatch messages
 /// never reached it. Proven two ways: the stream ends right after the
@@ -595,7 +595,7 @@ async fn byte_rate_rejection_tears_down_stream_and_reconnect_is_clean() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// Finding 2 (checkpoint review of #524): when the active-series cap drops
+/// When the active-series cap drops
 /// some of a batch's points, the ack stays OK (ADR-0051 layer 4 is "OK +
 /// partial success") but must signal the drop, not read as a clean ack. The
 /// `status_message` leads with a `partial-success:` line carrying the exact
@@ -652,8 +652,8 @@ async fn durable_metric_object_count(store: &dyn ObjectStoreBackend) -> usize {
         .len()
 }
 
-/// Issue #835: the OTAP gRPC ingest path is gated by the same process-wide
-/// in-flight ingest ceiling (issue #802) OTLP is, so a burst of OTAP exports
+/// the OTAP gRPC ingest path is gated by the same process-wide
+/// in-flight ingest ceiling OTLP is, so a burst of OTAP exports
 /// cannot bypass the admission-shed backpressure. With the ceiling at 1, one
 /// admitted batch held mid-flush occupies the only slot; a second batch on a
 /// fresh stream is shed with `RESOURCE_EXHAUSTED` (OTLP's shed status),

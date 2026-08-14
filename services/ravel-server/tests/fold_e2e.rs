@@ -1,5 +1,5 @@
-//! End-to-end coverage for the background catalog fold task
-//! (docs/metric-index-plan.md section 4): ingest a metric into an
+//! End-to-end coverage for the background catalog fold task: ingest a metric
+//! into an
 //! already-sealed hour, let the fold task run against a real timer, then
 //! confirm HEAD was written directly against the store (bypassing the query
 //! path, which is already covered by `integration.rs`).
@@ -32,7 +32,7 @@ use ravel_types::logstream::log_stream_id;
 use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
 
-// EH-T6 (#744) additions. The multi-part fold acceptance test drives the real
+// The multi-part fold acceptance test drives the real
 // durable object layout (commit records, compaction records, retention
 // tombstones) through the same publish/record/key APIs the ingest flush and
 // the maintain compaction/retention tasks use, then exercises the real
@@ -53,7 +53,7 @@ const TOKEN: &str = "testtoken";
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// Sealed well past the default `max_flush_lifetime (1h) + clock_skew_allowance
-/// (5m) + fold_safety_margin (15m)` bound (docs/metric-index-plan.md section 2),
+/// (5m) + fold_safety_margin (15m)` bound,
 /// so the fold task treats this ingest hour as immutable on its first tick.
 const SEALED_AGE: Duration = Duration::from_secs(3 * 60 * 60);
 
@@ -303,7 +303,7 @@ impl ObjectStoreBackend for GetSpyStore {
 
     fn capabilities(&self) -> ravel_object_store::Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         ravel_object_store::Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -570,9 +570,9 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-// ---- EH-T6 (#744): multi-part parallel fold end-to-end reachability ----
+// ---- multi-part parallel fold end-to-end reachability ----
 //
-// ADR-0063 section 8 (acceptance S3-E2/E3). Drives a tenant's sealed segment
+// ADR-0063 section 8. Drives a tenant's sealed segment
 // count past a scaled-down single-part ceiling and asserts, through the real
 // `Catalog` fold and resolve entry points, that: the fold produces multiple
 // parts under one HEAD; a whole-range query returns exactly what the

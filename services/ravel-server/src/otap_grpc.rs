@@ -60,7 +60,7 @@ struct StreamCtx {
     mode: WriteMode,
     finished: bool,
     /// Queue of completed gRPC message-frame byte lengths `WireByteCountLayer`
-    /// has parsed off this stream's request body, in wire order (issue #803).
+    /// has parsed off this stream's request body, in wire order.
     /// `process_batch` pops exactly one entry per batch it decodes: each
     /// `.message()` call that yields a batch corresponds to exactly one
     /// completed frame the layer already queued, since the layer parses the
@@ -133,8 +133,8 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
     // name the batch it rejects.
     let batch_id = batch.batch_id;
 
-    // Process-wide in-flight ingest ceiling (issue #802, extended to OTAP by
-    // #835): admit or shed this batch before it does any ingest work -- the
+    // Process-wide in-flight ingest ceiling (extended to OTAP): admit or shed
+    // this batch before it does any ingest work -- the
     // same gate each unary OTLP gRPC export applies via `try_admit`
     // (otlp_grpc.rs), so a burst of OTAP batches cannot bypass the
     // admission-shed backpressure OTLP already respects. The `_permit` binding
@@ -161,7 +161,7 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
         }
     };
 
-    // Layer 2 (ADR-0051 section 1, layer 2; issue #803): byte rate on this
+    // Layer 2 (ADR-0051 section 1, layer 2): byte rate on this
     // batch's wire bytes, charged before decode so over-rate bytes cost one
     // buffered body and nothing else. `WireByteCountLayer` parses this
     // stream's request body into discrete gRPC message frames as
@@ -230,7 +230,7 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
                     ),
                     false,
                 ),
-                // Receiver-clock floor (ADR-0051 amendment, S1-12): UNAVAILABLE,
+                // Receiver-clock floor (ADR-0051 amendment): UNAVAILABLE,
                 // the replica's fault. The batch already decoded cleanly, so the
                 // decoder is unharmed and the stream stays open (false).
                 Err(IngestRequestError::ClockImplausible(msg)) => {
@@ -306,7 +306,7 @@ async fn write_batch(
     decoded: &DecodedBatch,
     ingest_ts_ns: i64,
 ) -> Result<WriteOutcome, IngestRequestError> {
-    // Receiver-clock plausibility (ADR-0051 amendment, S1-12): checked before
+    // Receiver-clock plausibility (ADR-0051 amendment): checked before
     // the normalize window is computed. A nonsense reference clock rejects the
     // batch UNAVAILABLE (counted reason="clock"); the fault is the replica's.
     if let Err(msg) = plausible_ingest_clock(ingest_ts_ns) {
@@ -452,7 +452,7 @@ mod tests {
         }
     }
 
-    /// #991: an OTAP batch whose receiver (ingest) clock is below the 2020 floor
+    /// an OTAP batch whose receiver (ingest) clock is below the 2020 floor
     /// must be rejected by `write_batch` as the whole-batch `ClockImplausible`
     /// error (which the OTAP driver maps to a nacked `BatchStatus`;
     /// `is_retryable() == true` is the UNAVAILABLE class), and the

@@ -65,7 +65,7 @@ pub struct GatewayState {
     /// Tenant admission (ADR-0051): shared by all three signals for the
     /// layer-2 byte-rate check, done here on wire bytes before decode.
     pub admission: Arc<AdmissionController>,
-    /// The process-wide in-flight ingest-request ceiling (issue #802), shared
+    /// The process-wide in-flight ingest-request ceiling, shared
     /// with every OTLP HTTP/gRPC service and Remote Write on this listener
     /// and the mTLS listener. Checked first in every handler below, ahead of
     /// tenant resolution and the layer-2 byte-rate check, so a shed request
@@ -100,7 +100,7 @@ fn retry_after_seconds(retry_after_ns: i64) -> u64 {
     ns.div_ceil(1_000_000_000).max(1)
 }
 
-/// A fixed `Retry-After` for the process-wide in-flight shed (issue #802): the
+/// A fixed `Retry-After` for the process-wide in-flight shed: the
 /// controller tracks no per-caller refill time the way `RequestRejection`
 /// does, and a slot can free up as soon as any in-flight request completes,
 /// so a short fixed wait is the right shape here (no per-error estimate is
@@ -284,7 +284,7 @@ async fn export_metrics(
             encode_commit_tokens(&outcome.tokens).as_deref(),
         ),
         Err(IngestRequestError::Admission(rejection)) => admission_rejection_response(rejection),
-        // Receiver-clock floor (ADR-0051 amendment, S1-12): 503, the fault is
+        // Receiver-clock floor (ADR-0051 amendment): 503, the fault is
         // the replica's and a retry against a healthy one succeeds.
         Err(err @ IngestRequestError::ClockImplausible(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()

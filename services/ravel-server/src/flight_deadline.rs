@@ -1,5 +1,5 @@
 //! Wall-clock bound on a Flight SQL `DoGet` stream so a stalled consumer cannot
-//! pin a query-concurrency slot indefinitely (issue #785).
+//! pin a query-concurrency slot indefinitely.
 //!
 //! # The problem
 //!

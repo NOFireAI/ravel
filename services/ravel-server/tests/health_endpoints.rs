@@ -128,7 +128,7 @@ async fn healthz_returns_ok_once_serving() {
 /// `Running`, so the pre-ready 503 window is not observable from a started
 /// server without a startup hook that holds the server at a pre-ready point.
 /// No such hook exists in this crate's test utilities, and building one is out
-/// of scope for this task (issue #246). So this test uses approach (b) from
+/// of scope for this task. So this test uses approach (b) from
 /// the task, strengthened: it drives the real `health::router` handlers
 /// through the actual axum router (not merely the atomic in isolation) with
 /// the readiness flag both false and true, then confirms a fully started

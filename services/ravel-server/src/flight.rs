@@ -1,14 +1,14 @@
 //! Flight SQL registration on the gRPC listener, compiled only under the
 //! `flight-sql` feature.
 //!
-//! Ticket C1d (issue #152) replaces C1a's `UnimplementedFlightSqlService` stub
+//! Ticket C1d replaces C1a's `UnimplementedFlightSqlService` stub
 //! with the real service from `ravel_sql::flight`. This module is only the
 //! wiring: it adapts the two deployment-owned things ravel-sql states as
 //! traits -- the authoritative request identity and the injected clock -- and
 //! hands them to [`RavelFlightSqlService`] together with the same
 //! `SqlExecutor`, clock, deadline ceiling, and object store `SqlState` already
 //! carries for `POST /api/v1/sql`. Sharing the store is what lets the Flight
-//! path write the same query-audit record the HTTP endpoint does (issue #395),
+//! path write the same query-audit record the HTTP endpoint does,
 //! so a tenant's query activity is durably logged on both transports.
 //!
 //! Sharing the executor is the point, not an optimization: the per-tenant
@@ -82,8 +82,8 @@ impl FlightClock for IngestClock {
 /// ceiling becomes the single durable authority the flight_ticket.rs docs
 /// anticipate. The default event-time window still takes ravel-sql's default.
 ///
-/// `distributed`, when `Some`, is the ADR-0071 coordinator-side scan config
-/// (issue #868): the fleet worker roster plus the cost gate the process
+/// `distributed`, when `Some`, is the ADR-0071 coordinator-side scan config:
+/// the fleet worker roster plus the cost gate the process
 /// installs under `--distributed-query`. It engages the SQL-lane distributed
 /// scan for a whole-set statement whose pinned snapshot clears the gate; the
 /// external Flight SQL contract (one endpoint, byte-identical result) is
@@ -112,7 +112,7 @@ pub fn service(
         config,
         // The same per-query cost aggregator every other read surface folds
         // into, cloned out of `SqlState`, so Flight SQL cost reaches the one
-        // process `ravel_query_*` family (ADR-0044 section 4, issue #425).
+        // process `ravel_query_*` family (ADR-0044 section 4).
         Arc::clone(&state.query_accounting) as Arc<dyn ravel_types::accounting::QueryCostRecorder>,
         // The one shared fleet-global query concurrency controller (ADR-0061
         // decision 2), cloned out of `SqlState`, so Flight SQL
@@ -121,11 +121,11 @@ pub fn service(
         Arc::clone(&state.query_admission),
     )
     // The same evidential audit sink the HTTP SQL endpoint submits through
-    // (ADR-0062 §2a). Flight SQL audits at stream completion through it
-    // (issue #413), so both transports' query-audit trails land through one
+    // (ADR-0062 §2a). Flight SQL audits at stream completion through it,
+    // so both transports' query-audit trails land through one
     // seam.
     .with_audit_sink(Arc::clone(&state.audit_sink));
-    // ADR-0071 (issue #868): install the coordinator-side distributed scan when
+    // ADR-0071: install the coordinator-side distributed scan when
     // the deployment built one (`--distributed-query` on a query-serving mode).
     // Absent it, the service is byte-identical to the pre-distribution build.
     if let Some(config) = distributed {
@@ -133,7 +133,7 @@ pub fn service(
     }
     // Bound every DoGet stream by the server ceiling so a client that opens the
     // stream and then reads nothing cannot pin its query-concurrency permit
-    // indefinitely (issue #785). `max_deadline` is the same bound the per-ticket
+    // indefinitely. `max_deadline` is the same bound the per-ticket
     // effective deadline is already clamped against, so this never shortens a
     // within-ticket consumer's budget; it only breaks the transport-level stall
     // the per-batch deadline check inside the stream cannot reach.

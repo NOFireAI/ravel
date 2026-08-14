@@ -1,6 +1,4 @@
-//! End-to-end coverage for the real-authn resolvers (ADR-0042 decision 6,
-//! issue #392) and the mTLS dedicated-listener isolation (ADR-0050 section 1,
-//! issue #477): an in-process server backed by `MemoryStore` resolves a
+//! End-to-end coverage for the real-authn resolvers (ADR-0042 decision 6) and the mTLS dedicated-listener isolation (ADR-0050 section 1): an in-process server backed by `MemoryStore` resolves a
 //! tenant through a real HTTP request via the OIDC and mTLS resolvers, and
 //! rejects unauthenticated requests.
 //!
@@ -12,11 +10,11 @@
 //! outright, since a JWKS is a public document and a symmetric key inside one
 //! is a published verification secret, never a usable one.
 //!
-//! The mTLS cases exercise the fix for adversarial review finding S4-08: the
+//! The mTLS cases pin an isolation guarantee: the
 //! `MtlsResolver` trusts an unauthenticated `x-ravel-client-cert-cn` header,
 //! so it must be reachable only from the dedicated `--mtls-listener`, never
 //! from the public HTTP or gRPC/Flight listeners. `forged_mtls_header_rejected_on_public_listeners`
-//! is experiment L8 from that review, run against real server wiring rather
+//! runs that check against real server wiring rather
 //! than a hand-built rig.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -251,7 +249,7 @@ async fn mtls_header_authenticates_only_on_dedicated_listener() {
     running.shutdown().await.expect("clean shutdown");
 }
 
-/// Experiment L8 from the adversarial review (finding S4-08): a forged
+/// A forged
 /// `x-ravel-client-cert-cn` header, naming a victim tenant with no client
 /// certificate at all, sent directly to every public listener. Before
 /// ADR-0050 section 1 this authenticated as the named tenant on any listener

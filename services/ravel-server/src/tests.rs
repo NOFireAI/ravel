@@ -1,4 +1,4 @@
-//! In-crate acceptance test for issue #425: per-query cost accounting must
+//! In-crate acceptance test for per-query cost accounting: it must
 //! reach both a query response's `stats` object and the `/metrics` exposition,
 //! and it must not perturb the query result.
 //!
@@ -242,7 +242,7 @@ async fn scrape_metrics(app: &Router) -> String {
     String::from_utf8(bytes.to_vec()).expect("metrics body is utf8")
 }
 
-/// THE ACCEPTANCE TEST (issue #425): a query's cost accounting reaches both the
+/// THE ACCEPTANCE TEST: a query's cost accounting reaches both the
 /// response `stats` object and the `/metrics` exposition. One real SQL query
 /// over one real segment, then a real `/metrics` scrape, both through the same
 /// aggregator the handler recorded into.

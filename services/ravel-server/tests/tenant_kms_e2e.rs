@@ -1,5 +1,5 @@
-//! EL-7 (issue #764, ADR-0062 decision 1, ADR-0072 decision 2): reachability
-//! proof that `--tenant-kms-config` actually routes each tenant's data-object
+//! Reachability proof (ADR-0062 decision 1, ADR-0072 decision 2)
+//! that `--tenant-kms-config` actually routes each tenant's data-object
 //! PUTs through that tenant's own KMS key, end to end through the real
 //! startup path (`build_store`) and the real ingest handler
 //! (`handle_export_logs`), not just through `KmsRoutingStore`'s own unit
@@ -472,7 +472,7 @@ async fn tenant_kms_config_routes_each_tenants_puts_to_its_own_key() {
     mock.stop().await;
 }
 
-/// EE-T6 1b (issue #933): reachability proof for the OTHER SSE-KMS
+/// Reachability proof for the OTHER SSE-KMS
 /// mechanism `build_store` wires up -- `--s3-kms-key`, a single deployment-
 /// wide key applied to the default `S3Store` unconditionally
 /// (`services/ravel-server/src/store.rs`'s `kms_key_id: cli.s3_kms_key.clone()`),

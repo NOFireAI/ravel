@@ -1,5 +1,4 @@
-//! End-to-end tests for `POST /api/v1/analytics` (ADR-0028, issue #216
-//! part 2).
+//! End-to-end tests for `POST /api/v1/analytics` (ADR-0028).
 //!
 //! Real RSEG segments, real commit records, a real catalog and query engine,
 //! and the route driven through `tower::ServiceExt::oneshot`, so everything
@@ -705,7 +704,7 @@ async fn an_unauthenticated_request_is_a_401() {
 }
 
 // ---------------------------------------------------------------------------
-// Evidential audit coverage (ADR-0062 §2a, epic EL / issue #762)
+// Evidential audit coverage (ADR-0062 §2a)
 // ---------------------------------------------------------------------------
 
 /// Captures every submitted audit event and reports durability success.

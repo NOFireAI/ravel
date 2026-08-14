@@ -1,6 +1,6 @@
-//! End-to-end Flight SQL tests (ticket C1d, issue #152).
+//! End-to-end Flight SQL tests.
 //!
-//! These replace C1a's startup smoke test. Everything here goes over a real
+//! Everything here goes over a real
 //! tonic channel with real gRPC metadata, because the registration site is
 //! precisely where a mistake would not show up in ravel-sql's own tests: the
 //! tenant resolver, the metadata-to-header translation, and the service
@@ -221,8 +221,8 @@ impl FlightServer {
         Self::start_with(state, None).await
     }
 
-    /// Start a Flight server with an ADR-0071 distributed scan config installed
-    /// (issue #868), so a whole-set statement's `DoGet` fans the samples scan
+    /// Start a Flight server with an ADR-0071 distributed scan config installed,
+    /// so a whole-set statement's `DoGet` fans the samples scan
     /// out to the roster the config carries.
     async fn start_distributed(state: &SqlState, distributed: DistributedFlightConfig) -> Self {
         Self::start_with(state, Some(distributed)).await
@@ -603,7 +603,7 @@ async fn a_garbage_ticket_is_refused() {
     server.stop().await;
 }
 
-/// Deliverable 5 (issue #868), the reachable half of the ADR-0071 SQL lane.
+/// Deliverable 5, the reachable half of the ADR-0071 SQL lane.
 ///
 /// This proves what is installable read-only:
 ///
@@ -724,7 +724,7 @@ impl WorkerEndpoints for CountingEndpoints {
     }
 }
 
-/// Deliverable 5 (issue #868): the ADR-0071 SQL-lane distributed scan ENGAGES in
+/// Deliverable 5: the ADR-0071 SQL-lane distributed scan ENGAGES in
 /// the shipping service, and its result is identical to the whole-set local
 /// path.
 ///

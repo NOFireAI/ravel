@@ -1,7 +1,6 @@
-//! Real-Prometheus-in-Docker e2e for `POST /api/v1/write` (ADR-0015,
-//! docs/ingest-breadth-plan.md Ticket A3).
+//! Real-Prometheus-in-Docker e2e for `POST /api/v1/write` (ADR-0015).
 //!
-//! This is the "against a real sender" half of A3's acceptance criteria: a
+//! This is the "against a real sender" half of the acceptance criteria: a
 //! pinned Prometheus binary, remote-writing both protocol versions, into an
 //! in-process `ravel-server` backed by `MemoryStore`, with the samples read
 //! back via `/api/v1/query` using the returned commit token.

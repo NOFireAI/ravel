@@ -1,4 +1,4 @@
-//! Wire-byte counting for gRPC ingest admission (issue #803).
+//! Wire-byte counting for gRPC ingest admission.
 //!
 //! Every OTLP gRPC ingest handler used to charge layer-2 byte-rate admission
 //! (docs/ingest.md admission section) on `request.get_ref().encoded_len()`:
@@ -108,7 +108,7 @@ pub fn wire_byte_counter<T>(request: &Request<T>) -> Result<WireByteCounter, Sta
 
 /// A [`tower::Layer`] that wraps every request reaching the gRPC listener so
 /// admission can charge wire bytes without re-walking the decoded protobuf
-/// tree (issue #803). Apply with `Server::builder().layer(WireByteCountLayer)`;
+/// tree. Apply with `Server::builder().layer(WireByteCountLayer)`;
 /// it wraps whichever services are `add_service`d after, in either order.
 #[derive(Clone, Copy, Default)]
 pub struct WireByteCountLayer;
