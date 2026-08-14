@@ -184,3 +184,195 @@ repo config).
 - The published packages are private until someone completes the
   decision-5 visibility flip; the README's "no login pull" claim is
   only true after that step is done and verified.
+
+## Amendment: verifiable release artifacts
+
+An independent due-diligence review (epic #1056, findings K-1 and K-2)
+rated the release artifact itself as the weak half of an otherwise strong
+build-and-test story: images publish under mutable tags, unsigned, with
+no SBOM, and nothing gates the release tag on CI. This amendment adds
+signing, SBOM and provenance attestation, an explicit CI gate on tag
+publishes, and a tag-mutability and version policy. It amends decisions
+3 and 4 rather than merely extending them: what a tag names and what a
+tag push does both change from what those decisions state.
+
+Facts this amendment is built on, verified against the live registry and
+current `main` rather than assumed:
+
+- The published object is already an OCI image index, not a bare image
+  manifest. `docker/build-push-action@v6` attaches a min-mode provenance
+  attestation by default, so `ghcr.io/nofireai/ravel-server:latest` (the
+  v0.9.0 publish) is an index with two entries: the `linux/amd64` image
+  manifest and an attestation manifest. The index-vs-manifest shape
+  change some of this amendment's mechanisms imply has therefore already
+  shipped; what is missing is content (no SBOM, min rather than max
+  provenance) and any signature over it.
+- Release tags live on the public mirror (`NOFireAI/ravel`), not on this
+  repository: `v0.9.0` exists only there, and its commit
+  (`fb0fecbb`) is not in this repository's history because the mirror's
+  history is rewritten. The publish that produced the `0.9.0` image ran
+  from the mirror's copy of `publish-images.yml`.
+- `ci.yml` has no tag trigger (its `on:` block is `push: branches:
+  [main]`, `pull_request`, `merge_group`), and GitHub Actions has no
+  cross-workflow `needs:`. Nothing machine-checks that the commit a
+  `v*` tag points at ever passed CI. The evidence a gate needs does
+  exist, though: the mirror's own `ci.yml` ran on the v0.9.0 commit
+  (`c3224840`, via its main-push trigger) and passed. What is missing
+  is the requirement, not the data.
+- `v0.9.0` is an annotated tag: the ref points at a tag object, which
+  points at the commit. Any gate that resolves "the tagged commit" must
+  peel the tag object rather than use the ref target directly, or it
+  will look up CI runs for a SHA no workflow ever ran on.
+- Nothing in this repository pulls these images by digest or depends on
+  manifest shape: `deploy/k8s/` has no `@sha256` references, there is no
+  Helm chart, the operator passes `image` strings opaquely into pod
+  specs, and the kind lanes load locally built images rather than pull
+  from GHCR.
+- `[workspace.package] version` is still `0.1.0` on `main` while the
+  mirror has already shipped `v0.9.0`; the Prometheus-compat buildinfo
+  endpoint reports `env!("CARGO_PKG_VERSION")`
+  (crates/ravel-query/src/http/compat.rs:67), so the `0.9.0` release
+  reported itself as `0.1.0`. Contrary to the epic's text, PR #1050
+  fixed only the committed symlink; the version mismatch is still live
+  and is addressed by decision 11.
+
+### Decision 7: signing is cosign keyless (Sigstore), not a managed key
+
+Every published index digest is signed with cosign keyless: the publish
+job requests an OIDC token (`id-token: write`), Fulcio issues a
+short-lived certificate binding the signature to the exact workflow
+identity that ran, and the signature plus certificate land in GHCR next
+to the image with the entry recorded in Rekor's public transparency log.
+
+Keyless is the right fit here and a managed key pair is rejected, for a
+reason stronger than convenience: the claim an adopter needs verified is
+"this image was built by that public repository's release workflow at
+that tag", and a Fulcio certificate states exactly that
+(`https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml`
+at `refs/tags/vX.Y.Z`), while a key signature only proves possession of
+a key whose custody a stranger cannot audit. A managed key would also
+add a secret to protect and rotate in a repo that deliberately has no
+long-lived credentials (decision 1 chose GHCR precisely to avoid one),
+and key compromise would be silent, where keyless leaves every issuance
+in a public log. Nothing in GHCR or the existing workflow pushes the
+other way: GHCR stores cosign signatures as ordinary OCI artifacts under
+the same package, and the only workflow change is the added permission
+and signing step.
+
+Because releases publish from the mirror, the certificate identity
+consumers verify is the mirror's workflow path. That is a feature: the
+mirror is the repository strangers can actually read, so the identity in
+the certificate is auditable by the people the signature is for.
+`workflow_dispatch` `manual-<short-sha>` images are signed too; their
+certificate carries the branch ref instead of a tag ref, which is
+exactly the distinction a verifier should see.
+
+### Decision 8: SBOM and max-mode provenance (amends decision 3)
+
+The publish step sets `sbom: true` and `provenance: mode=max` on
+`docker/build-push-action`. This upgrades the attestation manifest the
+index already carries: max-mode provenance records the full build
+definition (materials, args, invocation), and the SBOM documents what
+the image contains. Both are then covered by the decision-7 signature
+over the index digest.
+
+Decision 3's "only `linux/amd64` is published" survives in substance but
+its object changes: what a tag names is an OCI index whose only runnable
+platform is `linux/amd64`, not a bare amd64 image manifest. As verified
+above this is already the published reality, so no in-repo consumer
+breaks; the honest external consequence is that any consumer who pinned
+a pre-existing digest sees a new digest on the next publish (true of any
+rebuild) and any tooling that assumes `manifest inspect` returns a
+single image manifest must handle an index (true since v0.9.0). The
+multi-arch deferral in Rejected alternatives is unchanged; when arm64
+arrives it slots into the same index.
+
+### Decision 9: CI gates the tag, explicitly (amends decision 4)
+
+A tag push no longer publishes unconditionally. `publish-images.yml`
+gains a first job that resolves the tagged commit and requires a
+successful `ci.yml` run for that exact SHA before the publish jobs
+(`needs:` the gate) may start, polling with a bounded wait and failing
+closed on failure, absence, or timeout.
+
+The implicit gate argument ("tags are only ever cut from commits that
+already passed PR CI on protected `main`") was considered and rejected,
+because for this repository it is factually hollow: the tagged commit
+lives on the mirror's rewritten history, so its SHA never went through
+the private repo's protected-main PR CI at all. The only CI evidence
+that can exist for the exact tagged commit is the mirror's own
+push-to-main `ci.yml` run, and today nothing checks that it ran, let
+alone passed. Discipline on the private repo cannot gate a SHA it has
+never seen; only an explicit check on the publishing side can.
+
+Adding a `v*` tag trigger to `ci.yml` and trusting temporal ordering was
+also rejected: it would re-run roughly an hour of CI on a tree whose
+identical commit already has (or is about to have) a main-push run, and
+ordering between two independently triggered workflows is still not a
+dependency. The bounded wait in the gate job handles the real race where
+the tag arrives while the main-push CI run is still in flight. The gate
+job also enforces decision 11's version match. `workflow_dispatch`
+publishes pass through the same gate; a manual publish of an unverified
+SHA is exactly what the gate should refuse.
+
+### Decision 10: tag mutability and digest pinning
+
+GHCR has no tag-immutability setting, so registry-enforced immutability
+is not available and is out of scope until GHCR ships it. The policy is:
+
+- `X.Y.Z` tags are write-once by policy. A bad release is superseded by
+  a new patch release, never by re-pushing the tag. The decision-9 gate
+  makes silent re-pointing harder (a re-push still has to pass CI and
+  version checks), but policy, not the registry, is what holds the line.
+- `latest`, `X`, and `X.Y` remain moving tags by design, as decision 4
+  defined them.
+- Consumers who need immutability pin by digest; consumers who need
+  trust verify the decision-7 signature. The README "Container images"
+  section decision 6 called for was never actually written (verified:
+  README.md has no pull command, tag scheme, or GHCR reference today),
+  so this amendment's documentation deliverable writes it now, including
+  the `cosign verify` invocation with the exact expected identity, and
+  each release's notes record the published index digests. A mutable
+  tag plus a verifiable signature is strictly stronger than an
+  unverifiable "immutable" tag claim.
+
+### Decision 11: the workspace version is the release version
+
+`[workspace.package] version` tracks release tags 1:1: the PR that
+prepares release `vX.Y.Z` bumps the workspace version to `X.Y.Z` in the
+same change, and every crate (all inherit the workspace version) and the
+buildinfo endpoint then report it. Enforcement is mechanical, in the
+decision-9 gate job: on a tag push, the gate extracts the workspace
+version from the tagged tree and fails the publish when `v<version>`
+differs from the pushed tag. A `workflow_dispatch` publish has no tag
+to match and skips this check; its `manual-<short-sha>` image name
+already states exactly what it is. Nothing enforces the bump at PR
+time, and that is
+acceptable: a forgotten bump surfaces as a refused publish with an exact
+error, not as a shipped artifact that lies about its own version the way
+`v0.9.0` did.
+
+### Out of scope for this amendment, proceeding independently
+
+SHA-pinning the mutable action refs across all workflows (the K-2
+finding) is mechanical policy, not an architecture decision, and the
+repo already demonstrates it (`helm/kind-action` is SHA-pinned in both
+files that use it). It ships as its own change without waiting on this
+amendment, as does the guard that fails CI when a tracked file is a
+symlink pointing outside the repository.
+
+### Consequences (amendment)
+
+- A stranger can verify that a pulled image was built by the public
+  release workflow at the tag it claims, from the signature alone.
+- A tag push can no longer publish an image whose commit never passed
+  CI, and can no longer publish an image that misreports its version.
+- The publish workflow gains `id-token: write` on the publish job and a
+  gate job with no registry credentials at all.
+- `.github/workflows/` changes remain unverifiable locally (no gate
+  compiles them); the gate and signing steps are only proven by a real
+  Actions run, so their rollout must include a `workflow_dispatch`
+  publish exercised on a scratch ref before the next release tag relies
+  on them.
+- The next publish changes every moving tag's digest, as every publish
+  always has.
