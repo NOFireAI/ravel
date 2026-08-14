@@ -253,7 +253,7 @@ pub enum Rejection {
     /// `reason` applied identically to `count` data points that share one
     /// scope (currently: every point under a `ResourceMetrics` whose
     /// resource labels failed to build). Represents the same information as
-    /// `count` clones of `reason` without materializing them (#209).
+    /// `count` clones of `reason` without materializing them.
     #[error("{reason} (rejecting {count} data points under it)")]
     Grouped {
         reason: Box<Rejection>,

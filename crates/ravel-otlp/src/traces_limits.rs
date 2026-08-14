@@ -16,7 +16,7 @@
 //! response reports a rejected-span count, and [`SpanRejection::rejected_count`]
 //! gives the multiplier for a rejection that covers more than one span. A
 //! rejection that drops one attribute of an otherwise-stored span returns 0
-//! from [`SpanRejection::rejected_count`], because no span was lost (#364); it
+//! from [`SpanRejection::rejected_count`], because no span was lost; it
 //! is still reported to the sender through the partial-success `error_message`,
 //! just not counted toward `rejected_spans`. A rejection that applies
 //! identically to every span under one `ResourceSpans` or `ScopeSpans` uses
@@ -248,7 +248,7 @@ impl SpanRejection {
     /// Attribute-level rejections return 0: they drop one attribute (or the
     /// events/links blob, or a malformed `parent_span_id` edge) of a span that
     /// is still stored, so counting them as a rejected *span* over-reports how
-    /// many spans a sender's export lost (#364). They remain visible to the
+    /// many spans a sender's export lost. They remain visible to the
     /// sender through the partial-success `error_message`; only their
     /// contribution to `rejected_spans` is zero. This mirrors the metrics
     /// path's [`crate::limits::Rejection::rejected_count`], where an admitted
@@ -386,8 +386,8 @@ mod tests {
 
     /// Attribute-level rejections drop one attribute (or blob, or the parent
     /// edge) of a span that is still stored, so they contribute zero to
-    /// `rejected_spans` (#364). Pinned so a future edit that reintroduces the
-    /// old catch-all `_ => 1` has to argue with a failing test.
+    /// `rejected_spans`. Pinned so a future edit that introduces a catch-all
+    /// `_ => 1` has to argue with a failing test.
     #[test]
     fn rejected_count_is_zero_for_attribute_level_reasons() {
         for r in [

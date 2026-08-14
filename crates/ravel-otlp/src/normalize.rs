@@ -2248,7 +2248,7 @@ mod tests {
     fn resource_complex_attribute_value_rejects_every_point_under_it() {
         // service.name as a bytes value is invalid; every point under this
         // resource is rejected via one aggregated `Rejection::Grouped` entry
-        // carrying the point count, not one clone per point (#209).
+        // carrying the point count, not one clone per point.
         let rm = resource_metrics(
             vec![bytes_kv("service.name")],
             vec![gauge_metric(
@@ -3452,7 +3452,7 @@ mod tests {
         }
     }
 
-    /// #551: two exemplars on one series with identical `ts_ns` must break the
+    /// Two exemplars on one series with identical `ts_ns` must break the
     /// tie deterministically. Candidates are sorted descending by `ts_ns` with a
     /// stable sort, so the first in wire order wins the tie and is offered to the
     /// cap first. Distinguishable values let the assertion name the survivor; an
@@ -3516,11 +3516,11 @@ mod tests {
         );
     }
 
-    /// #540: one series, one exemplar, through the production entry point
+    /// One series, one exemplar, through the production entry point
     /// (`normalize_metrics`, the throwaway-cap wrapper). The exemplar is admitted
     /// by the cap but discarded by the wrapper, since nothing stores exemplars on
-    /// this path yet; it must still be counted as dropped. Before the fix this
-    /// counter read 0 while the exemplar was silently thrown away.
+    /// this path yet; it must still be counted as dropped, never silently thrown
+    /// away with the counter reading zero.
     #[test]
     fn one_admitted_then_discarded_exemplar_is_counted_as_dropped() {
         let mut dp = number_point(vec![], 1_000, NumberValue::AsDouble(1.0));
@@ -3542,7 +3542,7 @@ mod tests {
         assert_eq!(out.rejected[0].rejected_count(), 0);
     }
 
-    /// #540, second half: a request over the data-point limit is rejected whole,
+    /// A request over the data-point limit is rejected whole,
     /// before any point is inspected. Every exemplar it carried is dropped with
     /// it and must be counted, matching the Remote Write twin's
     /// `TooManyDataPoints` early return, so the dropped-data counter does not
