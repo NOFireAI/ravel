@@ -259,6 +259,17 @@ pub struct ServerConfig {
     /// gateway/maintain modes, which serve no queries; `Unlimited` (the default)
     /// never rejects and skips all reconciliation I/O.
     pub query_concurrency_limit: ravel_query::QueryConcurrencyLimit,
+    /// The per-query S3 request budget (ADR-0073 decision 3, ADR-0075),
+    /// resolved from `--max-s3-requests`. `main` fills it via
+    /// [`crate::config::Cli::resolve_max_s3_requests`]: an explicit flag is
+    /// used verbatim, otherwise the budget is derived from `--shards` and the
+    /// ingest flush cadence so the worst legitimate open hour fits at the
+    /// configured shard count while a runaway query stays bounded. [`start`]
+    /// threads this into the one process-wide `EngineConfig` both query
+    /// surfaces (PromQL/HTTP and SQL/HTTP) share, so the resolved budget is the
+    /// enforced budget. Distinct from the flat default an
+    /// `EngineConfig::default()` would carry, which knows no shard count.
+    pub max_s3_requests: ravel_query::RequestLimit,
     /// The at-rest scrub period `P` (ADR-0059 decision 1), from `--scrub-period`
     /// (default 7 days). [`start`] spawns one scrub task per process at a
     /// cadence derived from this, only in [`Mode::Maintain`] (the one mode that
@@ -966,6 +977,12 @@ pub async fn start(
         let engine_config = ravel_query::EngineConfig {
             deadline: config.query_deadline,
             max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
+            // The shard-aware S3 request budget (ADR-0075), resolved in `main`
+            // from `--max-s3-requests` (verbatim) or derived from `--shards`
+            // and the flush cadence. Threaded here so the running binary uses
+            // the derived value, not `EngineConfig::default()`'s
+            // no-deployment-context fallback.
+            max_s3_requests: config.max_s3_requests,
             ..ravel_query::EngineConfig::default()
         };
         // ADR-0071 cross-cluster federation: build one gRPC

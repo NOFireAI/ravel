@@ -350,6 +350,18 @@ pub struct Cli {
     #[arg(long = "max-concurrent-queries", value_name = "COUNT")]
     pub max_concurrent_queries: Option<u64>,
 
+    /// Per-query cap on total S3 requests a single query may issue (ADR-0073
+    /// decision 3, ADR-0075). Omitted (the default): the cap is DERIVED from
+    /// `--shards` and the ingest flush cadence, so the worst legitimate open
+    /// hour fits at any shard count while a runaway query stays bounded
+    /// (`ravel_query::derive_max_s3_requests`). The old flat 25,000 default
+    /// was a per-query total against a per-shard-hour cost, so it rejected the
+    /// worst legitimate open hour above 3 shards; the derivation scales it with
+    /// the shard count. Set this flag to override the derivation with an exact
+    /// count, used verbatim. `0` is rejected: it would reject every query.
+    #[arg(long = "max-s3-requests", value_name = "COUNT")]
+    pub max_s3_requests: Option<u64>,
+
     /// The process-wide in-flight ingest-request ceiling: the
     /// maximum number of OTLP metrics/logs/traces and Remote Write requests
     /// this process admits at once, across every listener (public and mTLS)
@@ -1078,6 +1090,26 @@ impl Cli {
         }
     }
 
+    /// Resolve the per-query S3 request budget (ADR-0075). An explicit
+    /// `--max-s3-requests` is used verbatim; otherwise the budget is DERIVED
+    /// from `--shards` and the ingest pipeline's flush cadence
+    /// (`ravel_ingest::IngestConfig::default().max_flush_delay`, the value the
+    /// server's own metrics ingest pipeline runs with, since `start` builds
+    /// `IngestConfig` with `..IngestConfig::default()`). This is the one place
+    /// the derivation is wired into the real startup path: `main.rs` calls it
+    /// to fill [`crate::ServerConfig::max_s3_requests`], which `start` threads
+    /// into the process-wide `EngineConfig` both query surfaces share. A `0`
+    /// override is rejected by [`Self::validate`], not here.
+    pub fn resolve_max_s3_requests(&self) -> ravel_query::RequestLimit {
+        match self.max_s3_requests {
+            Some(n) => ravel_query::RequestLimit::Bounded(n),
+            None => ravel_query::RequestLimit::Bounded(ravel_query::derive_max_s3_requests(
+                self.shards,
+                ravel_ingest::IngestConfig::default().max_flush_delay,
+            )),
+        }
+    }
+
     /// Parse `--max-inflight-ingest-requests` into an
     /// [`crate::ingest_concurrency::IngestConcurrencyLimit`],
     /// mapping `0` to `Unlimited` like every other admission ceiling in this
@@ -1372,6 +1404,13 @@ impl Cli {
                 "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
                  acquire a permit to run one. Set a positive count (1 keeps today's \
                  non-pipelined behavior)."
+            );
+        }
+
+        if self.max_s3_requests == Some(0) {
+            anyhow::bail!(
+                "--max-s3-requests '0' would reject every query; omit the flag to derive the \
+                 budget from --shards and the flush cadence, or set a positive count"
             );
         }
 
@@ -2381,6 +2420,61 @@ mod tests {
                 "expected a positive-duration error for {flag}, got: {err}"
             );
         }
+    }
+
+    /// ADR-0075 reachability: the S3 request budget the running binary
+    /// enforces comes from the real CLI -> `resolve_max_s3_requests` path
+    /// `main.rs` calls to fill `ServerConfig::max_s3_requests`, not from a
+    /// crate-level arithmetic test. A previous epic shipped a merged,
+    /// crate-tested capability no production path ever constructed; this drives
+    /// clap parsing so a green result proves a running binary uses the derived
+    /// value. Covers both the derived-default and explicit-override halves.
+    #[test]
+    fn max_s3_requests_budget_is_reachable_from_cli() {
+        use ravel_query::RequestLimit;
+
+        // Derived path: no --max-s3-requests, default --shards (4). The budget
+        // is the shard-aware derivation, and the worst legitimate open hour at
+        // 4 shards (4 x 7,200 = 28,800 GETs) must fit under it. The old flat
+        // 25,000 default rejected exactly this cost.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.shards, 4,
+            "guards the shard default this test is pinned to"
+        );
+        let flush = ravel_ingest::IngestConfig::default().max_flush_delay;
+        let expected = ravel_query::derive_max_s3_requests(cli.shards, flush);
+        assert_eq!(
+            cli.resolve_max_s3_requests(),
+            RequestLimit::Bounded(expected)
+        );
+        let open_hour_cost = 4 * (3_600_000u64 / 500);
+        assert_eq!(open_hour_cost, 28_800);
+        assert!(
+            !RequestLimit::Bounded(expected).is_exceeded_by(open_hour_cost),
+            "the derived budget {expected} must admit the 4-shard open hour ({open_hour_cost})"
+        );
+        assert!(
+            RequestLimit::Bounded(25_000).is_exceeded_by(open_hour_cost),
+            "sanity: the old flat 25,000 default rejected the 4-shard open hour"
+        );
+        // And the derived cap must still bound a runaway query (three GETs per
+        // recent segment across shards).
+        assert!(RequestLimit::Bounded(expected).is_exceeded_by(open_hour_cost * 3));
+
+        // Explicit override: used verbatim, the derivation does not apply.
+        let cli = Cli::try_parse_from(["ravel-server", "--max-s3-requests", "999"])
+            .expect("explicit flag parses");
+        assert_eq!(cli.resolve_max_s3_requests(), RequestLimit::Bounded(999));
+
+        // Zero is rejected at validation, never silently used as a budget that
+        // rejects every query.
+        let cli = Cli::try_parse_from(["ravel-server", "--max-s3-requests", "0"])
+            .expect("0 parses at the CLI layer");
+        assert!(
+            cli.validate().is_err(),
+            "--max-s3-requests 0 must fail startup"
+        );
     }
 
     #[test]

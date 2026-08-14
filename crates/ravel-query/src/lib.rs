@@ -15,8 +15,9 @@ mod query_admission;
 mod segment_admission;
 
 pub use config::{
-    ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_S3_REQUESTS,
-    DEFAULT_MAX_SAMPLES, DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig, RequestLimit,
+    ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SAMPLES,
+    DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig, REQUEST_BUDGET_FIXED_OVERHEAD,
+    RequestLimit, derive_max_s3_requests,
 };
 pub use engine::{QueryEngine, QueryStats, snapshot_erasure_predicates};
 pub use error::QueryError;

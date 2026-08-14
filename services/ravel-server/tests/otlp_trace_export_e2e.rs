@@ -246,6 +246,7 @@ fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
         store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
         admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
         query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
         indexed_fields: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,

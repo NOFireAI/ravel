@@ -424,6 +424,7 @@ async fn main() -> anyhow::Result<()> {
         query_concurrency_limit: cli
             .parse_query_concurrency_limit()
             .context("failed to parse --max-concurrent-queries")?,
+        max_s3_requests: cli.resolve_max_s3_requests(),
         scrub_period: cli
             .parse_scrub_period()
             .context("failed to parse --scrub-period")?,
