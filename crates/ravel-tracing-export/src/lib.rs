@@ -1,6 +1,7 @@
 //! Subscriber construction shared by `ravel-server` and `ravel-operator`
-//! (ADR-0060). One entry point, [`init`], stands in for each binary's former
-//! inline `tracing_subscriber::fmt()...init()` call.
+//! (ADR-0060). One entry point, [`init`], is the single subscriber
+//! construction each binary calls instead of an inline
+//! `tracing_subscriber::fmt()...init()`.
 //!
 //! With `otlp: None` it installs exactly today's bare `fmt` subscriber: same
 //! output, same behavior, no OTLP object constructed and no export attempted
@@ -71,7 +72,7 @@ impl Drop for ExportGuard {
 }
 
 /// Install the process-wide subscriber (ADR-0060 decision 1). Call once at
-/// process start in place of the former inline `tracing_subscriber::fmt()`.
+/// process start in place of an inline `tracing_subscriber::fmt()`.
 ///
 /// `filter` is the single `EnvFilter` both layers share (decision 2): with
 /// `otlp: Some(_)` it gates the `fmt` layer and the OTLP layer alike, so
@@ -136,9 +137,9 @@ fn build(
     )
 }
 
-/// Today's bare `fmt` subscriber as a [`Dispatch`] (ADR-0060 decision 1).
-/// `.finish()` builds the exact subscriber the former inline
-/// `tracing_subscriber::fmt()...init()` installed, so the log path is
+/// The bare `fmt` subscriber as a [`Dispatch`] (ADR-0060 decision 1).
+/// `.finish()` builds the same subscriber a plain
+/// `tracing_subscriber::fmt()...init()` installs, so the log path is
 /// unchanged and no OTLP object is constructed.
 fn fmt_only(filter: EnvFilter) -> Dispatch {
     Dispatch::new(tracing_subscriber::fmt().with_env_filter(filter).finish())
@@ -154,8 +155,8 @@ fn fmt_only(filter: EnvFilter) -> Dispatch {
 /// succeeds and the failure only surfaces when the background export task
 /// first dials. [`WarnOnExportFailure`] wraps the exporter to turn that
 /// otherwise-silent runtime failure into a one-shot `tracing::warn!`, distinct
-/// from the build-time "OTLP trace export disabled" message [`init`] emits
-/// (issue #711). The wrapper only observes the export result on the same
+/// from the build-time "OTLP trace export disabled" message [`init`] emits.
+/// The wrapper only observes the export result on the same
 /// background task the SDK already runs, so it adds no blocking or latency to
 /// the span-emitting path or to shutdown (decision 6).
 fn build_provider(
@@ -178,7 +179,7 @@ fn build_provider(
 }
 
 /// A [`SpanExporter`] decorator that surfaces a runtime export failure as a
-/// `tracing::warn!` line (issue #711).
+/// `tracing::warn!` line.
 ///
 /// `opentelemetry_otlp::SpanExporter` dials the collector lazily, so an
 /// endpoint that is syntactically valid but unreachable (connection refused,

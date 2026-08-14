@@ -321,7 +321,7 @@ type CapturedWarnings = Arc<Mutex<Vec<String>>>;
 /// A `tracing` layer that records each WARN event's target and message. This is
 /// the event-level counterpart to the mock collector above: where the collector
 /// captures exported spans, this captures the `tracing::warn!` line the runtime
-/// export-failure signal (issue #711) emits, so the test can assert on it.
+/// export-failure signal emits, so the test can assert on it.
 struct WarnCaptureLayer {
     warnings: CapturedWarnings,
 }
