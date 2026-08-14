@@ -8,7 +8,7 @@
     </marker>
   </defs>
   <rect width="920" height="540" fill="#fdfcf8"/>
-  <text x="24" y="34" font-size="20" fill="#1b2230">Ingest-timestamp plausibility window (ADR-0051 amendment, #905)</text>
+  <text x="24" y="34" font-size="20" fill="#1b2230">Ingest-timestamp plausibility window (ADR-0051 amendment)</text>
 
   <!-- reject: too old -->
   <path d="M 60 110 Q 58 107 64 107 L 320 105 Q 327 106 326 112 L 327 298 Q 326 304 320 303 L 65 305 Q 59 304 60 298 Z" fill="#f7ecec" stroke="#b3423a" stroke-width="2" stroke-dasharray="7 4" stroke-linecap="round"/>

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1310" height="740" viewBox="0 0 1310 740" font-family="system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1310" height="560" viewBox="0 0 1310 560" font-family="system-ui, sans-serif">
   <rect x="0" y="0" width="1310" height="740" fill="#f4f5f7"/>
 
   <text x="30" y="34" font-size="20" font-weight="bold" fill="#17191c">RSEG v6 object byte layout</text>
@@ -15,7 +15,7 @@
     <text x="856" y="85" font-size="12" fill="#17191c">sparse catalog (at &#8805; 4096 series)</text>
   </g>
 
-  <!-- main section tape: below-threshold v5 layout -->
+  <!-- main section tape: below-threshold v6 layout -->
   <text x="30" y="96" font-size="13" font-weight="bold" fill="#17191c">Sections (physical order; readers locate everything through footer offsets)</text>
 
   <g stroke-width="2">
@@ -62,16 +62,13 @@
   </g>
   <text x="710" y="256" font-size="11" fill="#4a4f57">&#8212; a point lookup range-GETs one id window + one meta chunk, each crc-verified.</text>
 
-  <!-- retired kind -->
-  <text x="30" y="300" font-size="11" fill="#8a2020">Retired: kind 2 SERIES_TABLE (RSEG v1). Never emitted; the number is reserved forever so a stray old object stays detectably foreign.</text>
-
   <!-- footer + trailer -->
   <g stroke-width="2">
     <rect x="30"  y="322" width="470" height="60" rx="6" fill="#f4c869" stroke="#8a5a10"/>
     <rect x="510" y="322" width="580" height="60" rx="6" fill="#f0d9a0" stroke="#8a5a10"/>
   </g>
   <text x="265" y="348" font-size="13" font-weight="bold" fill="#17191c" text-anchor="middle">footer: FooterProto</text>
-  <text x="265" y="368" font-size="11" fill="#4a4f57" text-anchor="middle">identity, event/ingest bounds, sections[], v4 compaction provenance</text>
+  <text x="265" y="368" font-size="11" fill="#4a4f57" text-anchor="middle">identity, event/ingest bounds, sections[], compaction provenance</text>
   <text x="800" y="342" font-size="13" font-weight="bold" fill="#17191c" text-anchor="middle">trailer (16 bytes)</text>
   <text x="800" y="362" font-size="11" fill="#4a4f57" text-anchor="middle">footer_len:u32 &#183; footer_crc32c:u32 &#183; version:u16(=6) &#183; signal:u8 &#183; reserved:u8 &#183; magic:"RSG1"</text>
 
@@ -86,17 +83,4 @@
     <text x="30" y="538">&#8226; whole-object blake3 recorded in the commit record; its first 16 hex chars are embedded in the data key.</text>
   </g>
 
-  <!-- history note -->
-  <g>
-    <rect x="30" y="562" width="1250" height="152" rx="8" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
-    <text x="46" y="584" font-size="13" font-weight="bold" fill="#17191c">History (v1&#8211;v4 retired by ADR-0027, v5 by ADR-0047)</text>
-    <g font-size="12" fill="#4a4f57">
-      <text x="46" y="606">v1 (ADR-0004): the baseline and its row-major SERIES_TABLE catalog.</text>
-      <text x="46" y="624">v2 (ADR-0014): the columnar SERIES_IDS + SERIES_META catalog and VAL_RAW_F64 alignment.</text>
-      <text x="46" y="642">v3 (ADR-0017): native histograms &#8212; HIST_PAGES and the HIST_SPANS value model.</text>
-      <text x="46" y="660">v4 (ADR-0018): the multi-run compaction layout (run-major SERIES_META, compaction-provenance footer fields).</text>
-      <text x="46" y="678">v5 (ADR-0026): the sparse id index and chunked catalog. v5 is the union of these layouts.</text>
-      <text x="46" y="696">v6 (ADR-0047): the optional EXEMPLARS section. v6 is v5 plus that section, drawn above.</text>
-    </g>
-  </g>
 </svg>

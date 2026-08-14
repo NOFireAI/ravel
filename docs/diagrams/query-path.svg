@@ -90,7 +90,7 @@
   <rect x="90" y="726" width="130" height="20" rx="10" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
   <text x="155" y="740" font-size="9" text-anchor="middle" fill="#17191c">page crc32c verified</text>
 
-  <text x="1076" y="770" font-size="10" text-anchor="end" fill="#4a4f57">v1: one page pair per series; nothing further to prune at page level</text>
+  <text x="1076" y="770" font-size="10" text-anchor="end" fill="#4a4f57">one page pair per series; nothing further to prune at page level</text>
 
   <line x1="600" y1="780" x2="600" y2="808" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 
@@ -106,7 +106,7 @@
   <!-- Evaluator -->
   <rect x="60" y="920" width="1080" height="60" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="600" y="944" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">SeriesSource -&gt; ravel-promql Evaluator</text>
-  <text x="600" y="962" font-size="10.5" text-anchor="middle" fill="#17191c">selectors + lookback (5 m default, extended by largest selector offset) -&gt; instant vector / range matrix</text>
+  <text x="600" y="962" font-size="10.5" text-anchor="middle" fill="#17191c">full evaluation (rate, aggregations, binops); lookback 5 m default, extended by largest selector offset -&gt; instant vector / range matrix</text>
 
   <line x1="600" y1="980" x2="600" y2="998" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 
@@ -132,8 +132,8 @@
   <text x="1176" y="660" font-size="9" text-anchor="end" fill="#17191c">ranged GETs</text>
 
   <!-- Bottom notes -->
-  <text x="30" y="1085" font-size="11" fill="#4a4f57">Budgets (Phase 1, static config): max 1024 segments touched, max 8 concurrent GETs, max 10k matched series, max 10M samples materialized, 30 s wall deadline (timeout param can lower it).</text>
-  <text x="30" y="1101" font-size="11" fill="#4a4f57">Exceeding a budget returns a Prometheus-style error, never a partial silent result. Caching: Phase 1 caches only decoded commit records and parsed footers, keyed by (object key, etag), in-memory LRU.</text>
+  <text x="30" y="1085" font-size="11" fill="#4a4f57">Budgets (static config): max 1024 segments touched, max 8 concurrent GETs, max 10k matched series, max 10M samples materialized, 30 s wall deadline (timeout param can lower it).</text>
+  <text x="30" y="1101" font-size="11" fill="#4a4f57">Exceeding a budget returns a Prometheus-style error, never a partial silent result. Caching: only decoded commit records and parsed footers, keyed by (object key, etag), in-memory LRU.</text>
   <text x="30" y="1117" font-size="11" fill="#4a4f57">padded_range = query range extended left by the lookback delta plus the largest selector offset, so lookback never misses samples stored only in an earlier segment.</text>
   <text x="30" y="1133" font-size="11" fill="#4a4f57">A store NotFound on a pinned segment surfaces as SnapshotInvalidated; the frontend re-resolves and retries the query once.</text>
 </svg>

@@ -137,7 +137,7 @@
 
   <!-- annotations column on the right of the export path -->
   <rect x="740" y="662" width="430" height="220" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
-  <text x="756" y="682" font-size="10.5" font-weight="bold" fill="#17191c">Failure handling (ADR-0060, issue #711)</text>
+  <text x="756" y="682" font-size="10.5" font-weight="bold" fill="#17191c">Failure handling (ADR-0060)</text>
   <text x="756" y="700" font-size="9.5" fill="#17191c">Malformed --otlp-trace-endpoint: build fails, one</text>
   <text x="756" y="713" font-size="9.5" fill="#17191c">startup warning, degrades to the fmt-only subscriber.</text>
   <text x="756" y="732" font-size="9.5" fill="#17191c">Reachable-but-wrong collector: the exporter builds</text>
@@ -153,5 +153,4 @@
   <text x="756" y="880" font-size="9.5" fill="#17191c">subscriber — no OTLP object constructed at all.</text>
 
   <text x="30" y="978" font-size="10" fill="#4a4f57">Illustrates: docs/guides/tracing.md, docs/adrs/0044-query-cost-accounting.md (decision 5), docs/adrs/0060-query-path-otlp-trace-export.md.</text>
-  <text x="30" y="994" font-size="10" fill="#4a4f57">Last verified against the code: 2026-08-08 (epic #702 + follow-ups #711, #720, all landed on main).</text>
 </svg>

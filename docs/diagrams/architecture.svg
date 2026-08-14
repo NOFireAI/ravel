@@ -7,12 +7,12 @@
 
   <rect x="0" y="0" width="1440" height="1040" fill="#f4f5f7"/>
 
-  <text x="30" y="34" font-size="22" font-weight="bold" fill="#17191c">Ravel architecture (Phase 1)</text>
+  <text x="30" y="34" font-size="22" font-weight="bold" fill="#17191c">Ravel architecture</text>
   <text x="30" y="54" font-size="13" fill="#4a4f57">docs/architecture.md — the object store is the only durable component; everything else may crash and restart empty</text>
 
   <!-- Legend -->
   <g>
-    <rect x="1195" y="18" width="225" height="120" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+    <rect x="1195" y="18" width="225" height="96" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
     <text x="1207" y="34" font-size="12" font-weight="bold" fill="#17191c">Legend</text>
     <rect x="1207" y="42" width="16" height="16" rx="3" fill="#a9c9e6" stroke="#1f4e79" stroke-width="1.5"/>
     <text x="1230" y="54" font-size="11" fill="#17191c">service / actor (disposable)</text>
@@ -20,8 +20,6 @@
     <text x="1230" y="76" font-size="11" fill="#17191c">immutable object (durable)</text>
     <rect x="1207" y="86" width="16" height="16" rx="3" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
     <text x="1230" y="98" font-size="11" fill="#17191c">checksum-verified region</text>
-    <rect x="1207" y="108" width="16" height="16" rx="3" fill="#a9c9e6" stroke="#1f4e79" stroke-width="1.5" stroke-dasharray="4,3"/>
-    <text x="1230" y="120" font-size="11" fill="#17191c">planned, not yet built</text>
   </g>
 
   <!-- LEFT COLUMN: ingest path -->
@@ -34,8 +32,9 @@
   <text x="290" y="177" font-size="13" text-anchor="middle" fill="#17191c">OTLP HTTP</text>
   <text x="290" y="192" font-size="11" text-anchor="middle" fill="#17191c">protobuf</text>
 
-  <rect x="380" y="150" width="160" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2" stroke-dasharray="5,4"/>
-  <text x="460" y="182" font-size="13" text-anchor="middle" fill="#17191c">OTAP (planned)</text>
+  <rect x="380" y="150" width="160" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="460" y="177" font-size="13" text-anchor="middle" fill="#17191c">OTAP (Arrow)</text>
+  <text x="460" y="192" font-size="11" text-anchor="middle" fill="#17191c">feature "otap"</text>
 
   <line x1="300" y1="205" x2="300" y2="225" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 
@@ -47,7 +46,7 @@
 
   <rect x="40" y="300" width="520" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="300" y="323" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">ingest router</text>
-  <text x="300" y="339" font-size="11" text-anchor="middle" fill="#17191c">hash(tenant, series_id) % shard_count</text>
+  <text x="300" y="339" font-size="11" text-anchor="middle" fill="#17191c">series_id % shard_count (per-tenant buffered)</text>
 
   <line x1="300" y1="355" x2="300" y2="375" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 
@@ -84,7 +83,7 @@
 
   <rect x="880" y="300" width="500" height="55" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="1130" y="323" font-size="13" font-weight="bold" text-anchor="middle" fill="#17191c">PromQL evaluator</text>
-  <text x="1130" y="339" font-size="11" text-anchor="middle" fill="#17191c">selectors + lookback (Phase 1)</text>
+  <text x="1130" y="339" font-size="11" text-anchor="middle" fill="#17191c">rate · aggregations · binops · lookback</text>
 
   <line x1="1130" y1="355" x2="1130" y2="375" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 
@@ -125,12 +124,13 @@
   <text x="710" y="832" font-size="13" text-anchor="middle" fill="#17191c" font-weight="bold">Everything above the object store is disposable and stateless.</text>
   <text x="710" y="850" font-size="12" text-anchor="middle" fill="#17191c">Any process may crash at any instant; restart-from-empty is the only recovery path (ADR-0001). No local WAL, no local durability dependency.</text>
 
-  <!-- SQL query path (Phase 2, in progress) -->
-  <rect x="40" y="878" width="1340" height="90" rx="6" fill="#eceef1" stroke="#1f4e79" stroke-width="2" stroke-dasharray="6,4"/>
-  <text x="710" y="904" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">SQL query path (ravel-sql, in progress — not yet wired to a service endpoint)</text>
+  <!-- SQL query path (ravel-sql) -->
+  <rect x="40" y="878" width="1340" height="90" rx="6" fill="#eceef1" stroke="#1f4e79" stroke-width="2"/>
+  <text x="710" y="904" font-size="14" font-weight="bold" text-anchor="middle" fill="#17191c">SQL query path (ravel-sql, DataFusion) — POST /api/v1/sql, feature "sql" (off by default)</text>
   <text x="710" y="924" font-size="11" text-anchor="middle" fill="#17191c">RsegScanExec -&gt; SortPreservingMergeExec -&gt; RsegDedupExec over DataFusion; matches PromQL's dedup total order bit-for-bit (ADR-0013)</text>
-  <text x="710" y="942" font-size="11" text-anchor="middle" fill="#17191c">Planned: POST /api/v1/sql (HTTP, feature "sql") and Flight SQL (feature "flight-sql"), same catalog/object store below</text>
+  <text x="710" y="942" font-size="11" text-anchor="middle" fill="#17191c">Also: /api/v1/analytics (always on); Flight SQL (feature "flight-sql") registered on gRPC, methods not yet implemented</text>
 
-  <text x="40" y="990" font-size="11" fill="#4a4f57">Crate order: ravel-types -&gt; ravel-object-store -&gt; ravel-segment -&gt; ravel-commit -&gt; ravel-catalog -&gt; ravel-otlp -&gt; ravel-ingest -&gt; ravel-promql -&gt; ravel-query -&gt; ravel-sql (DataFusion, in progress) -&gt; services/*</text>
-  <text x="40" y="1008" font-size="11" fill="#4a4f57">Phase 1 runs every service as a mode of one binary: ravel-server --mode all|gateway|query.</text>
+  <text x="40" y="990" font-size="11" fill="#4a4f57">Crate order: ravel-types -&gt; ravel-object-store -&gt; ravel-segment -&gt; ravel-commit -&gt; ravel-catalog -&gt; ravel-otlp -&gt; ravel-ingest -&gt; ravel-promql -&gt; ravel-query -&gt; ravel-sql (DataFusion) -&gt; services/*</text>
+  <text x="40" y="1008" font-size="11" fill="#4a4f57">Every service is a mode of one binary: ravel-server --mode all|gateway|query|maintain.</text>
+  <text x="40" y="1026" font-size="11" fill="#4a4f57">Metrics (RSEG) illustrated. Logs (RLOG, l/) and spans (RSPAN, s/) are live signals sharing this ingest, commit, query path and object-key layout.</text>
 </svg>

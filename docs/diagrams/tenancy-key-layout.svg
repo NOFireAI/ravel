@@ -5,7 +5,7 @@
   <text x="30" y="48" font-size="12" fill="#4a4f57">docs/catalog-and-mvcc.md key layout + ADR-0009 tenant isolation + ADR-0010 §3/§13</text>
 
   <!-- legend -->
-  <rect x="1200" y="15" width="270" height="112" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
+  <rect x="1200" y="15" width="270" height="92" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
   <rect x="1212" y="24" width="14" height="14" rx="3" fill="#dde1e7" stroke="#454b54" stroke-width="1.5"/>
   <text x="1232" y="35" font-size="10" fill="#17191c">fixed literal path segment</text>
   <rect x="1212" y="44" width="14" height="14" rx="3" fill="#a9c9e6" stroke="#1f4e79" stroke-width="1.5"/>
@@ -14,8 +14,6 @@
   <text x="1232" y="75" font-size="10" fill="#17191c">full key = an immutable object</text>
   <rect x="1212" y="84" width="14" height="14" rx="3" fill="#a9dcae" stroke="#2f6b34" stroke-width="1.5"/>
   <text x="1232" y="95" font-size="10" fill="#17191c">checksum-derived component</text>
-  <rect x="1212" y="104" width="14" height="14" rx="3" fill="#dde1e7" stroke="#454b54" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <text x="1232" y="115" font-size="10" fill="#17191c">reserved / planned (later)</text>
 
   <!-- R0 root -->
   <rect x="40" y="150" width="70" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
@@ -42,8 +40,8 @@
   <line x1="780" y1="170" x2="820" y2="170" stroke="#7a808a" stroke-width="1.5"/>
   <rect x="820" y="150" width="170" height="40" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="905" y="174" font-size="12" text-anchor="middle" fill="#17191c">&lt;shard&gt;/</text>
-  <text x="820" y="204" font-size="9.5" fill="#4a4f57">zero-padded 4-digit decimal. shard_count immutable per</text>
-  <text x="820" y="216" font-size="9.5" fill="#4a4f57">(tenant, signal) in v1 — changing it is a forbidden, data-loss operation</text>
+  <text x="820" y="204" font-size="9.5" fill="#4a4f57">zero-padded 4-digit decimal. shard_count is fixed per generation;</text>
+  <text x="820" y="216" font-size="9.5" fill="#4a4f57">online resharding appends a new generation (ADR-0052)</text>
 
   <!-- R5 data leaf -->
   <line x1="990" y1="170" x2="1030" y2="170" stroke="#7a808a" stroke-width="1.5"/>
@@ -88,36 +86,31 @@
   <text x="674" y="425" font-size="10.5" fill="#17191c">writer_id, epoch, seq: the same identity fields as the data key, pinned once for the whole flush</text>
   <text x="674" y="441" font-size="10.5" fill="#17191c">.cmt fixed suffix — no content-hash component; commit-record existence is the sole visibility truth</text>
 
-  <!-- Reserved signals -->
-  <line x1="280" y1="190" x2="280" y2="520" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <line x1="280" y1="520" x2="450" y2="520" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <rect x="450" y="500" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
-  <text x="535" y="524" font-size="12" text-anchor="middle" fill="#17191c">l/  (logs, reserved)</text>
+  <!-- signal subtrees + catalog -->
+  <line x1="280" y1="190" x2="280" y2="520" stroke="#7a808a" stroke-width="1.5"/>
+  <line x1="280" y1="520" x2="450" y2="520" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="450" y="500" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="535" y="524" font-size="12" text-anchor="middle" fill="#17191c">l/  (logs)</text>
 
-  <line x1="280" y1="520" x2="280" y2="560" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <line x1="280" y1="560" x2="450" y2="560" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <rect x="450" y="540" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
-  <text x="535" y="564" font-size="12" text-anchor="middle" fill="#17191c">s/  (spans, reserved)</text>
+  <line x1="280" y1="520" x2="280" y2="560" stroke="#7a808a" stroke-width="1.5"/>
+  <line x1="280" y1="560" x2="450" y2="560" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="450" y="540" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="535" y="564" font-size="12" text-anchor="middle" fill="#17191c">s/  (spans)</text>
 
-  <line x1="280" y1="560" x2="280" y2="600" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <line x1="280" y1="600" x2="450" y2="600" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <rect x="450" y="580" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
-  <text x="535" y="604" font-size="12" text-anchor="middle" fill="#17191c">p/  (profiles, reserved)</text>
+  <!-- catalog -->
+  <line x1="280" y1="560" x2="280" y2="660" stroke="#7a808a" stroke-width="1.5"/>
+  <line x1="280" y1="660" x2="450" y2="660" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="450" y="640" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="535" y="664" font-size="12" text-anchor="middle" fill="#17191c">catalog/</text>
 
-  <!-- catalog (future) -->
-  <line x1="280" y1="600" x2="280" y2="660" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <line x1="280" y1="660" x2="450" y2="660" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <rect x="450" y="640" width="170" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
-  <text x="535" y="664" font-size="12" text-anchor="middle" fill="#17191c">catalog/  (later)</text>
+  <line x1="620" y1="660" x2="660" y2="660" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="660" y="640" width="330" height="40" rx="6" fill="#f4c869" stroke="#8a5a10" stroke-width="2.5"/>
+  <text x="825" y="664" font-size="11.5" text-anchor="middle" fill="#17191c">&lt;signal&gt;/snap/&lt;watermark&gt;.&lt;hash16&gt;.csnap</text>
 
-  <line x1="620" y1="660" x2="660" y2="660" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <rect x="660" y="640" width="330" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
-  <text x="825" y="664" font-size="11.5" text-anchor="middle" fill="#17191c">snap/&lt;snapshot_id&gt;.snap  (catalog snapshot, later)</text>
-
-  <line x1="535" y1="680" x2="535" y2="710" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <line x1="535" y1="710" x2="660" y2="710" stroke="#7a808a" stroke-width="1.5" stroke-dasharray="4,3"/>
-  <rect x="660" y="690" width="330" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2" stroke-dasharray="5,4"/>
-  <text x="825" y="714" font-size="11.5" text-anchor="middle" fill="#17191c">HEAD  (mutable pointer to current snapshot, later)</text>
+  <line x1="535" y1="680" x2="535" y2="710" stroke="#7a808a" stroke-width="1.5"/>
+  <line x1="535" y1="710" x2="660" y2="710" stroke="#7a808a" stroke-width="1.5"/>
+  <rect x="660" y="690" width="330" height="40" rx="6" fill="#dde1e7" stroke="#454b54" stroke-width="2"/>
+  <text x="825" y="714" font-size="11.5" text-anchor="middle" fill="#17191c">&lt;signal&gt;/HEAD  (mutable, CAS)</text>
 
   <!-- bottom notes -->
   <rect x="30" y="770" width="1440" height="150" rx="6" fill="#eceef1" stroke="#454b54" stroke-width="1.5"/>
@@ -126,6 +119,6 @@
   <text x="46" y="826" font-size="11" fill="#17191c">a mismatch with the stored object_key is a fatal invariant breach (ADR-0010 §7).</text>
   <text x="46" y="846" font-size="11" fill="#17191c">Commit token v2 = base64url of "v2:&lt;shard&gt;:&lt;writer_id&gt;:&lt;epoch&gt;:&lt;seq&gt;:&lt;ingest_hour_bucket&gt;" — it fully determines the commit-record key above,</text>
   <text x="46" y="862" font-size="11" fill="#17191c">so read-your-write resolves by exact GET, never by re-listing.</text>
-  <text x="46" y="882" font-size="11" fill="#17191c">Signal prefixes l/, s/, p/ and the catalog/ subtree are reserved names, not yet written by any code path; they are shown here to fix the namespace early.</text>
+  <text x="46" y="882" font-size="11" fill="#17191c">Logs (l/) and spans (s/) use the same l0/ + c/ skeleton as m/, with RLOG and RSPAN segment payloads; catalog/&lt;signal&gt;/ snapshot parts and HEAD are written by the fold task.</text>
   <text x="46" y="902" font-size="11" fill="#17191c">Data objects use PutMode::CreateIfAbsent; AlreadyExists is success because the key embeds the content hash, so a retry always names the same bytes.</text>
 </svg>
