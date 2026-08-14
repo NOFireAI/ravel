@@ -1,5 +1,4 @@
-//! Prometheus Remote Write ingest (ADR-0015, docs/ingest-breadth-plan.md
-//! section 3, tickets A1 and A2).
+//! Prometheus Remote Write ingest (ADR-0015).
 //!
 //! Two decoders converge on one version-blind [`resolved`] intermediate:
 //! RW 1.0 ([`rw1`], inline string labels) and RW 2.0 ([`rw2`], a per-request

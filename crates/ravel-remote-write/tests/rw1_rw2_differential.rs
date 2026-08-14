@@ -1,5 +1,5 @@
-//! RW1-vs-RW2 differential gate (docs/ingest-breadth-plan.md section 3,
-//! ADR-0015): the same logical payload, encoded once as an RW1
+//! RW1-vs-RW2 differential gate (ADR-0015): the same logical payload,
+//! encoded once as an RW1
 //! `WriteRequest` (inline string labels) and once as an RW2 `Request`
 //! (symbol-table references), must decode and normalize to identical
 //! `RwNormalizeOutput`s: same admitted points, same rejection classes.
@@ -206,8 +206,8 @@ fn empty_value_label_dropped_identically_across_decoders() {
 #[test]
 fn empty_label_name_rejects_identically_across_decoders() {
     // The same logical payload carrying a label with an empty name must be
-    // rejected by both wire formats (ADR-0015 protocol parity, ADR-0031,
-    // issue #204). RW2 rejects it at decode (`Rw2DecodeError::EmptyLabelName`,
+    // rejected by both wire formats (ADR-0015 protocol parity, ADR-0031).
+    // RW2 rejects it at decode (`Rw2DecodeError::EmptyLabelName`,
     // because an empty label name resolves through `symbols[0]`); RW1 copies
     // the empty name verbatim and the shared normalizer rejects it. Different
     // layers, but the series is admitted by neither, so the empty-named label

@@ -1,6 +1,5 @@
-//! The resolved-series intermediate that both the RW1 decoder (this crate,
-//! phase A1) and the future RW2 decoder (phase A2) converge on
-//! (ADR-0015, docs/ingest-breadth-plan.md section 2.1). The normalizer in
+//! The resolved-series intermediate that both the RW1 decoder and the RW2
+//! decoder converge on (ADR-0015). The normalizer in
 //! [`crate::normalize`] consumes only this shape, never a wire message
 //! directly, so it stays version-blind.
 //!
@@ -100,10 +99,9 @@ pub struct ResolvedExemplar {
 /// One series (label set plus its samples, native histograms, and exemplars)
 /// resolved from either RW1 or RW2, before normalization.
 ///
-/// Exemplar bodies survive decode since ADR-0047 gave exemplars storage and
-/// an admission cap: they used to be a bare count here, because everything
-/// beyond the tally was thrown away. Native histograms have survived since
-/// RSEG v5 admitted and wrote them (docs/rseg-v3-plan.md phase C8).
+/// Exemplar bodies survive decode: ADR-0047 gives exemplars durable storage
+/// and an admission cap, so the full body is carried here, not a bare count.
+/// Native histograms survive decode because RSEG v5 admits and writes them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSeries {
     pub labels: Vec<Label>,
