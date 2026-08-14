@@ -16,10 +16,7 @@
 //! fresh LIST, gated by the mass-orphan circuit breaker). Its own crash-matrix
 //! coverage lives in `crates/ravel-maintain/tests/sweep_crash_matrix.rs`
 //! (e.g. row 8's convergence case and `orphan_gc_respects_live_records_and_age_gate`),
-//! which exercises the real `sweep_orphans` fn against a `FaultStore`. See
-//! finding a11-F04
-//! (docs/reviews/2026-07-27-storage-engine-quality-audit/a11-tests-ci-deps.md)
-//! and issue #81.
+//! which exercises the real `sweep_orphans` fn against a `FaultStore`.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -127,8 +124,8 @@ async fn crash_before_data_put_leaves_nothing_stored_or_visible() {
 /// before `grace + max_flush_lifetime`, re-verify commit absence, then
 /// delete) against `spec_model_sweep_orphans`, a SPECIFICATION MODEL — no
 /// production GC exists yet (Phase 2). The test name carries `spec_model_gc`
-/// so a green run is never read as production-GC coverage. See a11-F04 /
-/// issue #81; when the real GC lands, retarget these assertions at it.
+/// so a green run is never read as production-GC coverage. When the real GC
+/// lands, retarget these assertions at it.
 #[tokio::test]
 async fn crash_after_data_put_before_commit_orphans_then_spec_model_gc_sweeps_after_grace() {
     let plan = FaultPlan::empty().with_rule(
@@ -208,7 +205,7 @@ async fn crash_after_data_put_before_commit_orphans_then_spec_model_gc_sweeps_af
     // Everything below drives `spec_model_sweep_orphans`, NOT production
     // code: it checks the GC rule against an executable restatement of that
     // same rule, so it validates the model and cannot catch a real GC that
-    // is built with different timing or a missing re-verify (a11-F04, #81).
+    // is built with different timing or a missing re-verify.
     let window = GcWindow::default();
     let tenant_hash = tid.hash();
 

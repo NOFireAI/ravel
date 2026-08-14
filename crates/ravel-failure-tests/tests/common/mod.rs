@@ -235,10 +235,9 @@ impl Default for GcWindow {
 /// calls it, and no production orphan-sweep symbol exists yet (Phase 2
 /// roadmap; the future crate is referred to as `ravel-gc`). A test driving
 /// this helper proves a property of the model, NOT of Ravel: the assertion
-/// and the code under assertion are the same logic. See finding a11-F04
-/// (docs/reviews/2026-07-27-storage-engine-quality-audit/a11-tests-ci-deps.md)
-/// and issue #81. When the production GC lands, delete this helper and point
-/// the crash-row assertions at the real symbol.
+/// and the code under assertion are the same logic. When the production GC
+/// lands, delete this helper and point the crash-row assertions at the real
+/// symbol.
 ///
 /// Sweeps L0 data objects for one (tenant, signal, shard) that have no commit
 /// record, deleting only those older than `grace + max_flush_lifetime` and

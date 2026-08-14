@@ -1,11 +1,10 @@
-//! Folder crash matrix (docs/metric-index-plan.md 5.3 "Failure modes,
-//! enumerated") and the fallback-not-failure guarantee: every row exercises
-//! a folder/index failure end to end through `QueryEngine`, never `Catalog`
-//! in isolation (that is already covered inside `crates/ravel-catalog`'s own
-//! unit tests). The point of this file is the caller-visible contract: a
-//! degraded or absent index changes cost, never correctness, except for the
-//! one documented row (clock skew past the seal margin) where 5.3 itself
-//! names a narrow, repairable visibility gap.
+//! Folder crash matrix and the fallback-not-failure guarantee: every row
+//! exercises a folder/index failure end to end through `QueryEngine`, never
+//! `Catalog` in isolation (that is already covered inside
+//! `crates/ravel-catalog`'s own unit tests). The point of this file is the
+//! caller-visible contract: a degraded or absent index changes cost, never
+//! correctness, except for the one documented row (clock skew past the seal
+//! margin) that names a narrow, repairable visibility gap.
 
 #![allow(clippy::expect_used)]
 
@@ -30,10 +29,9 @@ fn hour_end_ns(hour: u32) -> i64 {
     (i64::from(hour) + 1) * NS_PER_HOUR
 }
 
-/// A `now_ns` that safely seals `hour` (docs/metric-index-plan.md 2: default
-/// margins sum to 1h20m, not a whole number of hours, so 3h of padding is
-/// used everywhere in this suite to clear the boundary regardless of which
-/// hour the margin arithmetic lands in).
+/// A `now_ns` that safely seals `hour`: default margins sum to 1h20m, not a
+/// whole number of hours, so 3h of padding is used everywhere in this suite to
+/// clear the boundary regardless of which hour the margin arithmetic lands in.
 fn now_sealing(hour: u32) -> i64 {
     hour_end_ns(hour) + 3 * NS_PER_HOUR
 }
@@ -151,8 +149,8 @@ async fn folder_down_for_hours_never_loses_data_only_widens_listing() {
 
 /// Row: "HEAD missing/corrupt" -> full Phase 1 listing cost, never an
 /// error. A HEAD overwritten with garbage bytes must degrade
-/// `resolve_snapshot_window` to `None` (docs/metric-index-plan.md 5.3),
-/// not surface `CatalogError` up through the query engine.
+/// `resolve_snapshot_window` to `None`, not surface `CatalogError` up through
+/// the query engine.
 #[tokio::test]
 async fn corrupt_head_falls_back_to_listing_never_to_an_error() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -211,9 +209,9 @@ async fn corrupt_head_falls_back_to_listing_never_to_an_error() {
 }
 
 /// Row: "part missing/corrupt" -> full Phase 1 listing cost after one HEAD
-/// re-read. Deleting the part HEAD names (a GC race, docs/metric-index-plan.md
-/// 5.1 step 2) must trigger exactly one bypass-cache HEAD re-read before
-/// falling back, never an error and never missing data.
+/// re-read. Deleting the part HEAD names (a GC race) must trigger exactly one
+/// bypass-cache HEAD re-read before falling back, never an error and never
+/// missing data.
 #[tokio::test]
 async fn missing_snapshot_part_falls_back_to_listing_after_one_head_reread() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -447,13 +445,11 @@ async fn stale_head_cache_widens_listing_but_never_misses_new_data() {
 
 /// Row: "folder clock fast beyond fold_safety_margin" -> commits published
 /// into a wrongly-sealed bucket are invisible to non-token queries until
-/// repair; the token path is unaffected (docs/metric-index-plan.md 5.3).
-/// Modeled the way the table itself equates it: "same failure class as
-/// writer skew beyond clock_skew_allowance today" -- a writer's flush lands
-/// in an hour the folder already folded as sealed. Repair follows the
-/// table's own prescription: delete HEAD (forcing the next fold onto its
-/// existing absent-HEAD full-rebuild path, docs/metric-index-plan.md 5.3
-/// "HEAD missing/corrupt" row) and fold again.
+/// repair; the token path is unaffected. This is the same failure class as
+/// writer skew beyond clock_skew_allowance: a writer's flush lands in an hour
+/// the folder already folded as sealed. Repair: delete HEAD (forcing the next
+/// fold onto its existing absent-HEAD full-rebuild path, the "HEAD
+/// missing/corrupt" row) and fold again.
 #[tokio::test]
 async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs_it() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -524,7 +520,7 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
     // lookback, so a masked late sample does not show up as an empty
     // vector: `pick_sample` falls through to the on-time sample instead.
     // The value, not the length, is what proves the late sample stayed
-    // invisible to the non-token query (docs/metric-index-plan.md 5.3).
+    // invisible to the non-token query.
     assert_eq!(
         without_token.len(),
         1,
@@ -534,7 +530,7 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
         without_token[0].value, 1.0,
         "a commit published into an already-sealed bucket must stay invisible \
          to a non-token query: only the on-time sample, never the late one, \
-         may satisfy it (docs/metric-index-plan.md 5.3)"
+         may satisfy it"
     );
 
     let with_token = expect_vector(
