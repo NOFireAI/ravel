@@ -12,8 +12,8 @@ use ravel_types::{Label, LabelSet, SeriesId};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, VERSION_V6, compression, page_comp, page_enc,
-    section_kind,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SUPPORTED_VERSIONS, VERSION_V6, compression,
+    page_comp, page_enc, section_kind,
 };
 use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use crate::varint::{read_uvarint, read_zigzag_varint};
@@ -79,10 +79,12 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     if magic != MAGIC {
         return Err(SegmentError::BadMagic);
     }
-    // ADR-0027: v6 is the only supported version. Versions 1-5 fail closed
-    // with the same typed error as any unknown future version; a stray
-    // pre-v6 object is rejected, never half-parsed.
-    if version != VERSION_V6 {
+    // The reader accepts only versions inside its supported-version window
+    // (ADR-0066 decision 1). Today that window is the single current version
+    // [`VERSION_V6`]; versions 1-5 and any unknown future version fail closed
+    // with the same typed error, so a stray pre-v6 object is rejected, never
+    // half-parsed.
+    if !SUPPORTED_VERSIONS.contains(version) {
         return Err(SegmentError::UnsupportedVersion(version));
     }
     if signal != SIGNAL_METRICS {

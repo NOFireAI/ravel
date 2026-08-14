@@ -20,6 +20,66 @@ pub const MAGIC: [u8; 4] = *b"RLG1";
 /// there is no dual-reader path (ADR-0032: RLOG had no data outside development
 /// when v2 landed).
 pub const VERSION: u16 = 2;
+
+/// The set of RLOG trailer versions this build's reader accepts (ADR-0066
+/// decision 1: "N/N-1 window, readers first"). Writers always emit the current
+/// version [`VERSION`]; readers accept the current version and, once a version
+/// bump lands, the immediately preceding one. The window is at most two
+/// versions wide by construction and never accepts anything below the
+/// immediately preceding version, so a retired version (RLOG v1) stays
+/// rejected. This is the single source the reader gate and the CLI
+/// `audit-versions`/`migrate` paths all read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportedVersions {
+    newest: u16,
+    oldest: u16,
+}
+
+impl SupportedVersions {
+    /// A window accepting exactly one version. This is the shape today: only
+    /// one RLOG version has existed since ADR-0032 deleted the v1 reader, so
+    /// there is no N-1 to accept and the reader behaves identically to the old
+    /// single-version gate.
+    pub const fn single(version: u16) -> Self {
+        Self {
+            newest: version,
+            oldest: version,
+        }
+    }
+
+    /// The N/N-1 window: accept `newest` and the immediately preceding version.
+    /// Used at the first format bump that ships a dual reader; no RLOG version
+    /// uses it today.
+    pub const fn n_and_prev(newest: u16) -> Self {
+        // `newest` is always a real format version (>= 1), so the predecessor
+        // never underflows.
+        Self {
+            newest,
+            oldest: newest - 1,
+        }
+    }
+
+    /// The current (newest, always-written) version.
+    pub const fn newest(&self) -> u16 {
+        self.newest
+    }
+
+    /// The oldest accepted version (the window floor).
+    pub const fn oldest(&self) -> u16 {
+        self.oldest
+    }
+
+    /// Whether `version` is inside the accepted window.
+    pub const fn contains(&self, version: u16) -> bool {
+        version >= self.oldest && version <= self.newest
+    }
+}
+
+/// RLOG's supported-version window. Today it resolves to the single current
+/// version [`VERSION`]; the machinery carries ADR-0066's two-wide shape ready
+/// for the first bump.
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);
+
 /// Signal byte for log segments.
 pub const SIGNAL_LOGS: u8 = 2;
 /// Reserved trailer byte; must be zero.
@@ -247,7 +307,7 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
     if magic != MAGIC {
         return Err(LogSegError::Corrupted("bad magic".into()));
     }
-    if version != VERSION {
+    if !SUPPORTED_VERSIONS.contains(version) {
         return Err(LogSegError::UnsupportedVersion(version));
     }
     if signal != SIGNAL_LOGS {
@@ -513,6 +573,35 @@ mod tests {
             open(&obj),
             Err(LogSegError::UnsupportedVersion(1))
         ));
+    }
+
+    /// Today's RLOG window resolves to exactly the single current version, so
+    /// the reader's accepted set is byte-for-byte the pre-ADR-0066 behaviour:
+    /// v2 accepted, v1 and a hypothetical v3 rejected. Only the window's shape
+    /// is new machinery.
+    #[test]
+    fn todays_window_accepts_only_the_current_version() {
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
+        assert!(SUPPORTED_VERSIONS.contains(VERSION));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION - 1));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION + 1));
+    }
+
+    /// The N/N-1 window shape, proven on a synthetic version number (no RLOG
+    /// version below v2 has a byte fixture). The window is exactly two versions
+    /// wide with a hard floor at N-1: it accepts N and N-1, rejects N-2 and
+    /// older, and must never silently widen past N-1.
+    #[test]
+    fn n_and_prev_window_is_exactly_two_wide_with_a_floor() {
+        const N: u16 = 100;
+        let window = SupportedVersions::n_and_prev(N);
+        assert_eq!(window.newest(), N);
+        assert_eq!(window.oldest(), N - 1);
+        assert!(window.contains(N));
+        assert!(window.contains(N - 1));
+        assert!(!window.contains(N - 2), "N-2 is below the floor, rejected");
+        assert!(!window.contains(N + 1));
     }
 
     /// An L0 object built through the normal writer path stamps the compaction

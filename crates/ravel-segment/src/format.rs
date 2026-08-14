@@ -46,6 +46,68 @@ pub const VERSION_V5: u16 = 5;
 /// writer.
 pub const VERSION_V6: u16 = 6;
 
+/// The set of RSEG trailer versions this build's reader accepts (ADR-0066
+/// decision 1: "N/N-1 window, readers first"). Writers always emit the current
+/// version [`VERSION_V6`]; readers accept the current version and, once a
+/// version bump lands, the immediately preceding one. The window is at most two
+/// versions wide by construction and never accepts anything below the
+/// immediately preceding version, so a retired version (RSEG v1-v5) stays
+/// rejected.
+///
+/// This is the single source the reader gate, `audit-versions`, and `migrate`
+/// all read, so a future bump edits one constant instead of the sixteen
+/// hand-mirrored version sites ADR-0049 measured for the RSEG bump alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportedVersions {
+    newest: u16,
+    oldest: u16,
+}
+
+impl SupportedVersions {
+    /// A window accepting exactly one version. This is the shape today: only
+    /// one RSEG version has existed since ADR-0027 deleted the older readers,
+    /// so there is no N-1 to accept and the reader behaves identically to the
+    /// old single-version gate.
+    pub const fn single(version: u16) -> Self {
+        Self {
+            newest: version,
+            oldest: version,
+        }
+    }
+
+    /// The N/N-1 window: accept `newest` and the immediately preceding version.
+    /// Used at the first format bump that ships a dual reader; no RSEG version
+    /// uses it today.
+    pub const fn n_and_prev(newest: u16) -> Self {
+        // `newest` is always a real format version (>= 1), so the predecessor
+        // never underflows.
+        Self {
+            newest,
+            oldest: newest - 1,
+        }
+    }
+
+    /// The current (newest, always-written) version.
+    pub const fn newest(&self) -> u16 {
+        self.newest
+    }
+
+    /// The oldest accepted version (the window floor).
+    pub const fn oldest(&self) -> u16 {
+        self.oldest
+    }
+
+    /// Whether `version` is inside the accepted window.
+    pub const fn contains(&self, version: u16) -> bool {
+        version >= self.oldest && version <= self.newest
+    }
+}
+
+/// RSEG's supported-version window. Today it resolves to the single current
+/// version [`VERSION_V6`] (ADR-0027's single-version state persists until the
+/// first bump); the machinery carries ADR-0066's two-wide shape ready for it.
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION_V6);
+
 /// Series-count threshold at or above which `SegmentWriter::write_v5` emits
 /// the sparse SERIES_IDX + chunked SERIES_META sections (ADR-0026 decision
 /// point 4). A writer-side constant, not a reader contract: presence is
@@ -184,5 +246,50 @@ mod tests {
         assert_eq!(page_enc::HIST_SPANS, 32);
         assert_eq!(V5_SPARSE_THRESHOLD, 4096);
         assert_eq!(V5_STRIDE, 512);
+    }
+
+    /// Today's RSEG window resolves to exactly the single current version, so
+    /// the reader's accepted set is byte-for-byte the pre-ADR-0066 behaviour:
+    /// v6 accepted, everything else (including v5 and a hypothetical v7)
+    /// rejected. Only the window's shape is new machinery.
+    #[test]
+    fn todays_window_accepts_only_the_current_version() {
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION_V6);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION_V6);
+        assert!(SUPPORTED_VERSIONS.contains(VERSION_V6));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION_V5));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION_V6 + 1));
+        assert!(!SUPPORTED_VERSIONS.contains(0));
+    }
+
+    /// The N/N-1 window shape, proven on a synthetic version number rather than
+    /// a real N-1 byte fixture (no RSEG version below v6 has ever existed
+    /// post-ADR-0027). The window is exactly two versions wide: it accepts N
+    /// and N-1 and has a hard floor at N-1, rejecting N-2 and older. This is
+    /// the machinery a real bump will switch [`SUPPORTED_VERSIONS`] to; it must
+    /// never silently widen past N-1.
+    #[test]
+    fn n_and_prev_window_is_exactly_two_wide_with_a_floor() {
+        const N: u16 = 100;
+        let window = SupportedVersions::n_and_prev(N);
+        assert_eq!(window.newest(), N);
+        assert_eq!(window.oldest(), N - 1);
+        assert!(window.contains(N), "N is accepted");
+        assert!(window.contains(N - 1), "N-1 is accepted");
+        assert!(!window.contains(N - 2), "N-2 is below the floor, rejected");
+        assert!(!window.contains(N + 1), "a newer version is rejected");
+    }
+
+    /// A single-version window has no predecessor: it is a one-wide window with
+    /// its floor equal to its newest, so N-1 is rejected exactly like N-2.
+    #[test]
+    fn single_window_has_no_predecessor() {
+        const N: u16 = 42;
+        let window = SupportedVersions::single(N);
+        assert_eq!(window.newest(), N);
+        assert_eq!(window.oldest(), N);
+        assert!(window.contains(N));
+        assert!(!window.contains(N - 1));
+        assert!(!window.contains(N + 1));
     }
 }

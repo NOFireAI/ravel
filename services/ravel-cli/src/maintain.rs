@@ -288,11 +288,13 @@ async fn generation_scan_shards(
 /// live object at an unsupported version is unreadable, so this is a safety
 /// audit, not a migration tool.
 ///
-/// The supported version is read from each reader crate's own constant
-/// (`ravel_segment::VERSION_V6`, `ravel_logseg::footer::VERSION`,
-/// `ravel_rspan::footer::VERSION`) so a future version bump does not silently
-/// make this audit stale. Version numbers are
-/// read from each surviving commit record's `segment_format_version` (an L0
+/// The supported-version window is read from each reader crate's single source
+/// ([`signal_supported_versions`], wired to `ravel_segment::SUPPORTED_VERSIONS`,
+/// `ravel_logseg::footer::SUPPORTED_VERSIONS`,
+/// `ravel_rspan::footer::SUPPORTED_VERSIONS`) so a future version bump does not
+/// silently make this audit stale, and so an object at the reader's N-1 version
+/// (once a window carries one) is not miscounted as an anomaly. Version numbers
+/// are read from each surviving commit record's `segment_format_version` (an L0
 /// object's liveness == a surviving commit record) and each compaction
 /// record's parts (live L1 objects). Exits nonzero if any anomaly is found.
 pub async fn audit_versions(
@@ -305,16 +307,7 @@ pub async fn audit_versions(
     let tenant_hash = TenantId::new(tenant).hash();
     let mut anomalies = 0usize;
     for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
-        let supported: u32 = match signal {
-            Signal::Metrics => u32::from(ravel_segment::VERSION_V6),
-            Signal::Logs => u32::from(ravel_logseg::footer::VERSION),
-            Signal::Spans => u32::from(ravel_rspan::footer::VERSION),
-            other => {
-                return Err(anyhow::anyhow!(
-                    "audit-versions does not support signal {other:?}"
-                ));
-            }
-        };
+        let window = signal_supported_versions(signal)?;
         // Generation-aware scan range (ADR-0052 section 4), not the static
         // `--shards`: a reshard-increase widens the live shard set, and this
         // audit must visit every shard any generation ever wrote or it would
@@ -375,18 +368,22 @@ pub async fn audit_versions(
             }
         }
 
-        println!("== signal {:?} (supported version: {supported}) ==", signal);
+        println!(
+            "== signal {:?} (supported versions: {}) ==",
+            signal,
+            window.display()
+        );
         if hist.is_empty() {
             println!("  no live objects");
         }
         for (version, (l0, l1)) in &hist {
-            let flag = if *version == supported {
+            let flag = if window.contains(*version) {
                 ""
             } else {
                 "  <-- ANOMALY (unsupported version)"
             };
             println!("  version {version}: l0_records={l0} l1_parts={l1}{flag}");
-            if *version != supported {
+            if !window.contains(*version) {
                 anomalies += l0 + l1;
             }
         }
@@ -415,19 +412,71 @@ fn signal_family(signal: Signal) -> &'static str {
     }
 }
 
-/// The current supported on-object format version for a signal, read from each
-/// reader crate's own constant so a future version bump does not silently make
-/// the default migration target stale. Mirrors `audit_versions`' supported
-/// versions.
-fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
-    Ok(match signal {
-        Signal::Metrics => u32::from(ravel_segment::VERSION_V6),
-        Signal::Logs => u32::from(ravel_logseg::footer::VERSION),
-        Signal::Spans => u32::from(ravel_rspan::footer::VERSION),
-        other => {
-            return Err(anyhow::anyhow!("migrate does not support signal {other:?}"));
+/// A signal's reader-supported version window, projected to `u32` from the
+/// owning format crate's single source (ADR-0066 decision 1). One place in the
+/// CLI reads the crate constants; every consumer derives from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupportedWindow {
+    /// The current (newest, always-written) version: the default migrate target.
+    newest: u32,
+    /// The oldest accepted version (the window floor).
+    oldest: u32,
+}
+
+impl SupportedWindow {
+    /// Whether `version` is inside the accepted window.
+    fn contains(&self, version: u32) -> bool {
+        version >= self.oldest && version <= self.newest
+    }
+
+    /// Human-readable window for the audit header: a single version when the
+    /// window is one wide, else an inclusive range.
+    fn display(&self) -> String {
+        if self.oldest == self.newest {
+            format!("{}", self.newest)
+        } else {
+            format!("{}..={}", self.oldest, self.newest)
         }
+    }
+}
+
+/// The single source in the CLI for a signal's reader-supported version window,
+/// wired to each format crate's own `SUPPORTED_VERSIONS` constant (ADR-0066
+/// decision 1). Both `audit-versions`' anomaly predicate and `migrate`'s
+/// default target version derive from this one function, so the CLI can never
+/// hand-mirror a version the readers do not actually accept: a bump to any
+/// crate's `SUPPORTED_VERSIONS` moves both consumers together.
+fn signal_supported_versions(signal: Signal) -> anyhow::Result<SupportedWindow> {
+    let (newest, oldest) = match signal {
+        Signal::Metrics => {
+            let w = ravel_segment::SUPPORTED_VERSIONS;
+            (w.newest(), w.oldest())
+        }
+        Signal::Logs => {
+            let w = ravel_logseg::footer::SUPPORTED_VERSIONS;
+            (w.newest(), w.oldest())
+        }
+        Signal::Spans => {
+            let w = ravel_rspan::footer::SUPPORTED_VERSIONS;
+            (w.newest(), w.oldest())
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "supported versions unknown for signal {other:?}"
+            ));
+        }
+    };
+    Ok(SupportedWindow {
+        newest: u32::from(newest),
+        oldest: u32::from(oldest),
     })
+}
+
+/// The default `migrate` target for a signal: its current supported version,
+/// derived from the same single source [`signal_supported_versions`] the audit
+/// anomaly predicate uses, so the two never drift.
+fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
+    Ok(signal_supported_versions(signal)?.newest)
 }
 
 /// `maintain migrate`: raise a `(tenant, signal, format family)`'s recorded
@@ -1144,6 +1193,55 @@ mod tests {
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::memory::MemoryStore;
+
+    /// Both CLI consumers of the supported-version window derive from the one
+    /// crate source (ADR-0066 decision 1): `audit-versions`' anomaly predicate
+    /// and `migrate`'s default target both read [`signal_supported_versions`],
+    /// itself wired to each format crate's `SUPPORTED_VERSIONS`. This pins that
+    /// wiring so the two can never drift back into independent hand-mirrored
+    /// literals: the CLI window equals the crate source for every signal, and
+    /// the migrate target equals the window's newest. A bump to any crate's
+    /// `SUPPORTED_VERSIONS` therefore moves both consumers together.
+    #[test]
+    fn cli_supported_versions_derive_from_the_crate_single_source() {
+        // Metrics -> RSEG.
+        let seg = ravel_segment::SUPPORTED_VERSIONS;
+        let w = signal_supported_versions(Signal::Metrics).expect("metrics window");
+        assert_eq!(w.newest, u32::from(seg.newest()));
+        assert_eq!(w.oldest, u32::from(seg.oldest()));
+        assert_eq!(
+            signal_current_version(Signal::Metrics).expect("metrics target"),
+            w.newest
+        );
+
+        // Logs -> RLOG.
+        let log = ravel_logseg::footer::SUPPORTED_VERSIONS;
+        let w = signal_supported_versions(Signal::Logs).expect("logs window");
+        assert_eq!(w.newest, u32::from(log.newest()));
+        assert_eq!(w.oldest, u32::from(log.oldest()));
+        assert_eq!(
+            signal_current_version(Signal::Logs).expect("logs target"),
+            w.newest
+        );
+
+        // Spans -> RSPAN.
+        let span = ravel_rspan::footer::SUPPORTED_VERSIONS;
+        let w = signal_supported_versions(Signal::Spans).expect("spans window");
+        assert_eq!(w.newest, u32::from(span.newest()));
+        assert_eq!(w.oldest, u32::from(span.oldest()));
+        assert_eq!(
+            signal_current_version(Signal::Spans).expect("spans target"),
+            w.newest
+        );
+
+        // The audit anomaly predicate is the window's `contains`: today's
+        // single-wide window flags anything but the current version, exactly
+        // like the reader gate.
+        let w = signal_supported_versions(Signal::Metrics).expect("metrics window");
+        assert!(w.contains(u32::from(seg.newest())));
+        assert!(!w.contains(u32::from(seg.newest()) + 1));
+        assert!(!w.contains(u32::from(seg.oldest()).saturating_sub(1)));
+    }
 
     /// Publish one commit record (and its data object) at `shard` for Metrics
     /// with the given `segment_format_version`, so the version audit has a live
