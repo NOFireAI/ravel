@@ -1,5 +1,5 @@
-//! Function registry and dispatch (plan section 7's parallelization note).
-//! Each function family lives in its own module exposing a `const
+//! Function registry and dispatch. Each function family lives in its own
+//! module exposing a `const
 //! FUNCTIONS: &[FunctionDef]`; [`FAMILIES`] is the single place that
 //! aggregates them. A later phase adding a disjoint family (e.g.
 //! `aggregate_over_time`, label functions, aggregation operators) adds its
@@ -37,13 +37,13 @@ pub(crate) struct FunctionDef {
 
 /// A function's evaluation shape.
 ///
-/// * `RangeVector`/`RangeVectorScalar` (P4): `f(v range-vector) ->
+/// * `RangeVector`/`RangeVectorScalar`: `f(v range-vector) ->
 ///   instant-vector`, reduced from one series' matrix window per step
 ///   (`predict_linear` additionally takes a scalar).
-/// * `VectorMap` (P6): `f(v instant-vector) -> instant-vector`, the whole
+/// * `VectorMap`: `f(v instant-vector) -> instant-vector`, the whole
 ///   evaluated argument vector in, a whole vector out (elementwise math,
 ///   `sort`/`sort_desc`, `timestamp`). No other arguments.
-/// * `Instant` (P6): every other shape (extra scalar/string arguments,
+/// * `Instant`: every other shape (extra scalar/string arguments,
 ///   optional arguments, zero vector arguments, or access to the call's own
 ///   AST for argument introspection like `absent`). Given the evaluator and
 ///   full call context directly so each function evaluates its own
@@ -52,12 +52,12 @@ pub(crate) struct FunctionDef {
 pub(crate) enum FunctionKind {
     RangeVector(fn(&[Sample], RangeWindow) -> Option<f64>),
     RangeVectorScalar(fn(&[Sample], RangeWindow, f64) -> Option<f64>),
-    /// `rate`/`increase`/`delta` (P11): a float window reducer plus a native-
+    /// `rate`/`increase`/`delta`: a float window reducer plus a native-
     /// histogram window reducer, so one registration serves both sample
     /// kinds. In an instant query both the float and histogram matrix
     /// selectors are evaluated and their outputs unioned; in a range query
     /// only the float reducer runs (a histogram-valued range result has no
-    /// JSON rendering and no read path to feed it yet, see the P11 report).
+    /// JSON rendering and no read path to feed it yet).
     RangeVectorFloatOrHist {
         float: fn(&[Sample], RangeWindow) -> Option<f64>,
         hist: fn(&[TimedHistogram], RangeWindow) -> Option<FloatHistogram>,
@@ -65,17 +65,17 @@ pub(crate) enum FunctionKind {
     /// `f(phi, v instant-vector) -> instant-vector`: many-to-fewer,
     /// grouping `v` by its own labels rather than reducing one series'
     /// matrix window, so it does not fit either `RangeVector` shape above
-    /// (P9, `histogram_quantile`). Takes `&QueryWindow` so it can raise
+    /// (`histogram_quantile`). Takes `&QueryWindow` so it can raise
     /// warning/info annotations (out-of-range `phi`, malformed buckets,
     /// forced monotonicity).
     HistogramQuantile(HistogramQuantileFn),
     /// `f(lower, upper, v instant-vector) -> instant-vector`, the two-scalar
-    /// counterpart of `HistogramQuantile` (P9, `histogram_fraction`). Takes
+    /// counterpart of `HistogramQuantile` (`histogram_fraction`). Takes
     /// `&QueryWindow` for the same annotation reason.
     HistogramFraction(HistogramFractionFn),
     /// `f(q, v range-vector) -> instant-vector`: the scalar comes first
     /// (`quantile_over_time(q, v)`), the mirror image of
-    /// `RangeVectorScalar`'s argument order (`predict_linear(v, t)`). P5's
+    /// `RangeVectorScalar`'s argument order (`predict_linear(v, t)`). The
     /// only member of this shape.
     ScalarRangeVector(fn(f64, &[Sample], RangeWindow) -> Option<f64>),
     /// `absent_over_time`: not a per-series reduction of the matrix
@@ -83,21 +83,20 @@ pub(crate) enum FunctionKind {
     /// whether the *whole* range vector matched anything at all,
     /// synthesizing its own single output series from the selector's
     /// equality matchers when it did not (the same label-derivation rule
-    /// `absent()` uses, duplicated in `over_time.rs` rather than shared:
-    /// P6's `functions/transform.rs`, the home for `absent()`, lands in
-    /// parallel and this phase must not touch that file). Carries no
+    /// `absent()` uses, duplicated in `over_time.rs` rather than shared with
+    /// `functions/transform.rs`, the home for `absent()`). Carries no
     /// function pointer; `eval_call`/`eval_range_call` special-case it
     /// directly.
     AbsentOverTime,
     /// `f(v instant-vector) -> instant-vector`: the whole evaluated
     /// argument vector in, a whole vector out (elementwise math,
-    /// `sort`/`sort_desc`, `timestamp`). No other arguments (P6).
+    /// `sort`/`sort_desc`, `timestamp`). No other arguments.
     VectorMap(fn(InstantVector) -> InstantVector),
     /// Every other shape (extra scalar/string arguments, optional
     /// arguments, zero vector arguments, or access to the call's own AST
     /// for argument introspection like `absent`). Given the evaluator and
     /// full call context directly so each function evaluates its own
-    /// arguments however its shape requires (P6).
+    /// arguments however its shape requires.
     Instant(InstantFn),
 }
 
@@ -359,8 +358,8 @@ pub(crate) fn eval_range_call(
         FunctionKind::RangeVectorFloatOrHist { float, hist: _ } => {
             // Range queries reduce only the float series: a histogram-valued
             // range result cannot be rendered by the HTTP JSON layer and no
-            // read path feeds native histograms into a range query yet (P11
-            // report). The float reduction is identical to `RangeVector`.
+            // read path feeds native histograms into a range query yet.
+            // The float reduction is identical to `RangeVector`.
             let arg = matrix_arg(&call.args.args[0])?;
             let result = eval_matrix_arg_range_reduction(
                 evaluator,
@@ -530,7 +529,7 @@ pub(crate) fn eval_instant_over_grid(
 /// stream to cursor over (each grid step's inner expression is its own
 /// recursive evaluation, per [`Evaluator::eval_subquery_matrix`]), so it is
 /// re-evaluated fully at each outer step instead: exactly the "no cross-step
-/// caching" discipline plan section 3.1 requires, generalized to the
+/// caching" discipline, generalized to the
 /// two-grids-deep case a subquery nested in a range query produces.
 #[allow(clippy::too_many_arguments)]
 fn eval_matrix_arg_range_reduction(

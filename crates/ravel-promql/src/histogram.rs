@@ -13,10 +13,10 @@
 //! ## Exactness status (read this before trusting the numbers)
 //!
 //! ADR-0021 requires mirroring Prometheus' float algorithms operation-for-
-//! operation, verified by the differential gate. P11's differential gate
+//! operation, verified by the differential gate. That differential gate
 //! cannot run yet: no native-histogram sample can reach Ravel's evaluator,
 //! because the query read path and the ingest path are still f64-only (see
-//! this crate's P11 report and the `histogram_native` corpus header). Every
+//! the `histogram_native` corpus header). Every
 //! algorithm here is therefore a structural port of Prometheus'
 //! `model/histogram` and `promql/quantile.go`/`functions.go`, checked
 //! against hand-computed fixtures rather than a live Prometheus. Two known
@@ -29,7 +29,7 @@
 //!   exponents. `scale <= 0` bounds are exact powers of two and match.
 //! * Differing zero-thresholds between two operands of `add`/`sub` are not
 //!   reconciled (Prometheus' `reconcileZeroBuckets`); operands are required to
-//!   share a zero-threshold. Every P11 code path that combines histograms
+//!   share a zero-threshold. Every native-histogram code path that combines histograms
 //!   (rate windows, aggregation groups) operates on one producer's series, so
 //!   this holds in practice, but it is not the general Prometheus behavior.
 
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn quantile_interpolates_exponentially_within_native_bucket() {
-        // Issue #252 reproduction. Median rank 3.5 lands in (2,4] at within
+        // Median rank 3.5 lands in (2,4] at within
         // 1/6. Prometheus interpolates exponentially: 2*(4/2)^(1/6) =
         // 2*2^(1/6) = 2.244..., not the old linear 2 + 2/6 = 2.333....
         let h = diff_native_hist();
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn fraction_matches_prometheus_zero_bucket_and_exponential() {
-        // Issue #252 reproduction of histogram_fraction(0, 4, diff_native_hist).
+        // histogram_fraction(0, 4, diff_native_hist).
         // rank_at(4) = 6 (through (2,4]); rank_at(0) = 0 because the one-sided
         // zero bucket is bounded at 0 on the populated side. => 6/7, matching
         // Prometheus, not Ravel's old linear 5.5/7.

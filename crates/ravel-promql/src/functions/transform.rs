@@ -1,5 +1,5 @@
-//! Elementwise math, clamping, and instant-vector reordering function family
-//! (plan section 9/P6): `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`,
+//! Elementwise math, clamping, and instant-vector reordering function family:
+//! `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`,
 //! `log2`, `log10`, `sgn`, the trig family, `deg`, `rad`, `pi`, `clamp`,
 //! `clamp_min`, `clamp_max`, `sort`, `sort_desc`. Formulas and the
 //! metric-name-dropping rule per function are direct ports of Prometheus'

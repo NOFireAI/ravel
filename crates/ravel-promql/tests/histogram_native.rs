@@ -1,4 +1,4 @@
-//! Integration tests for the native-histogram function forms (plan P11)
+//! Integration tests for the native-histogram function forms
 //! driven end to end through the `Evaluator` over a `TestSource` that carries
 //! injected native-histogram series. These exercise the wiring (selector ->
 //! histogram element -> function/aggregation) that the per-module unit tests
@@ -6,8 +6,7 @@
 //!
 //! Every value here is hand-computed from Prometheus' documented algorithms;
 //! the live differential gate cannot run for native histograms yet (no read
-//! path feeds them into Ravel), so these fixtures are the acceptance bar. See
-//! the crate's P11 report.
+//! path feeds them into Ravel), so these fixtures are the acceptance bar.
 
 #![allow(clippy::expect_used)]
 
@@ -147,7 +146,7 @@ fn avg_aggregation_of_native_histograms() {
 fn mixed_float_and_histogram_group_is_dropped_by_sum() {
     // One float series and one histogram series collapse into the same (empty)
     // group under `sum(...)`; the mixed group is omitted (Prometheus warns and
-    // drops it, #178). The result is an empty vector rather than a wrong sum.
+    // drops it). The result is an empty vector rather than a wrong sum.
     let src = TestSource::new()
         .with_series(&[("__name__", "m"), ("i", "1")], &[(0, 5.0)])
         .expect("valid")

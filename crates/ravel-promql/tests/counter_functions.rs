@@ -1,4 +1,4 @@
-//! Integration coverage for the P4 function-call dispatch path itself
+//! Integration coverage for the function-call dispatch path itself
 //! (`crate::functions::eval_call`/`eval_range_call`,
 //! `Evaluator::eval_range_matrix_reduction`'s per-series cursor, and
 //! `negate_matrix`) through the public `Evaluator` API. `rate.rs`'s own
@@ -81,8 +81,8 @@ fn offset_shifts_the_selector_window_the_function_operates_over() {
 }
 
 /// `predict_linear`'s second argument is a scalar, dispatched through
-/// `FunctionKind::RangeVectorScalar`; this is the only P4 shape that takes
-/// one.
+/// `FunctionKind::RangeVectorScalar`; this is the only counter-family shape
+/// that takes one.
 #[test]
 fn predict_linear_scalar_argument_dispatches_correctly() {
     let source = one_per_second_counter();

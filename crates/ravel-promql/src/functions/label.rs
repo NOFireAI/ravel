@@ -1,4 +1,4 @@
-//! Label-manipulation function family (plan section 10/P6): `label_replace`,
+//! Label-manipulation function family: `label_replace`,
 //! `label_join`, `absent`. Ports of Prometheus' `promql/functions.go`
 //! `funcLabelReplace`, `funcLabelJoin`, `funcAbsent` /
 //! `createLabelsForAbsentFunction`.

@@ -60,14 +60,14 @@ pub fn from_ast_matcher(m: &promql_parser::label::Matcher) -> LabelMatcher {
 }
 
 /// Convert every plain (non-`or`-grouped) matcher on a parsed `Matchers`
-/// into our `LabelMatcher` list. Use [`has_or_group`] first: Phase 1 does
-/// not support the `or`-grouped alternative-matcher extension.
+/// into our `LabelMatcher` list. Use [`has_or_group`] first: this evaluator
+/// does not support the `or`-grouped alternative-matcher extension.
 pub fn from_ast_matchers(m: &promql_parser::label::Matchers) -> Vec<LabelMatcher> {
     m.matchers.iter().map(from_ast_matcher).collect()
 }
 
 /// Whether `m` uses the `or`-grouped alternative-matcher extension, which
-/// Phase 1 rejects as unsupported.
+/// this evaluator rejects as unsupported.
 pub fn has_or_group(m: &promql_parser::label::Matchers) -> bool {
     !m.or_matchers.is_empty()
 }

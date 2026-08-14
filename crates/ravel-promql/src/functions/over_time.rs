@@ -1,4 +1,4 @@
-//! `_over_time` aggregation family (plan section 8/P5): `avg`, `min`, `max`,
+//! `_over_time` aggregation family: `avg`, `min`, `max`,
 //! `sum`, `count`, `stddev`, `stdvar`, `quantile`, `present`, `last`, and
 //! `absent` `_over_time`. Every accumulation is a direct, bit-exact-oriented
 //! port of Prometheus' own `promql/functions.go` and `promql/quantile.go`:

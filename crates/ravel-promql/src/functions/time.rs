@@ -1,4 +1,4 @@
-//! Time and UTC calendar function family (plan section 11/P6): `vector`,
+//! Time and UTC calendar function family: `vector`,
 //! `scalar`, `time`, `timestamp`, and the eight calendar functions
 //! (`minute`, `hour`, `day_of_week`, `day_of_month`, `day_of_year`,
 //! `days_in_month`, `month`, `year`). Calendar math is Howard Hinnant's

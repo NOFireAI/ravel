@@ -12,7 +12,7 @@
 //! promql-parser 0.10 also parses `limitk`/`limit_ratio` (Prometheus'
 //! experimental sampling aggregators). Those are not evaluated here; the
 //! dispatch below rejects them with a typed [`Error::Unsupported`] rather
-//! than panicking, so no tenant query can panic the query path (#260).
+//! than panicking, so no tenant query can panic the query path.
 //!
 //! Grouping (Prometheus' `generateGroupingKey`/output-metric construction):
 //! `without (labels)` keeps every label except `__name__` and the named
@@ -23,7 +23,7 @@
 //! own grouping code takes the same "no grouping labels, not `without`"
 //! branch for both.
 //!
-//! Deterministic accumulation order (plan section 8/P8): the input instant
+//! Deterministic accumulation order: the input instant
 //! vector is sorted by label set before grouping, mirroring Prometheus'
 //! sorted postings expansion, so Kahan/Welford accumulation lands on the
 //! same bit pattern regardless of the storage backend's own return order.
@@ -52,14 +52,14 @@
 //! claimed to match Prometheus at any `k`: an earlier version of this
 //! comment claimed bit-for-bit agreement for `k <= 12` on the theory that
 //! Go's `sort.Sort(sort.Reverse(heap))` resolves to a stable insertion sort
-//! at that size. Issue #177 found that claim false even at `k == 2`
+//! at that size. That claim is false even at `k == 2`
 //! (`agg_topk_tie_fully_retained`/`agg_bottomk_tie_fully_retained`): this
 //! crate's heap ends up in the same pre-sort array order Prometheus' own
 //! heap should (same push/pop mechanics, same encounter order), yet the two
 //! engines emit the tied pair in opposite order. `sort.Reverse` wrapping a
 //! stable sort does not trivially reduce to "stable sort then reverse the
 //! whole list" the way it might seem to; the exact mechanism was not chased
-//! down further; see #177. The differential corpus tests tie-boundary
+//! down further. The differential corpus tests tie-boundary
 //! *retention* as `mode: unordered` (right: which members survive is
 //! well-defined and verified) rather than asserting a specific tie-break
 //! order (not: no PromQL consumer can rely on which of several exactly-equal
@@ -149,7 +149,7 @@ pub(crate) fn eval_aggregate(
             // with a typed `Error::Unsupported` naming the operator, the same
             // pattern used for every other deliberately-unsupported construct,
             // rather than panicking (docs/query-engine.md state-2 conformance
-            // guarantee, #260).
+            // guarantee).
             Err(Error::Unsupported {
                 construct: format!("aggregation operator {}", agg.op),
             })
@@ -241,7 +241,7 @@ fn eval_plain_aggregate(
     eval_ts_ns: i64,
 ) -> InstantVector {
     // Group full samples (not just their float values) so `sum`/`avg` can see
-    // native-histogram members (P11).
+    // native-histogram members.
     group_by(modifier, input, |s| s)
         .into_iter()
         .filter_map(|(labels, members)| reduce_group_samples(op, labels, members, eval_ts_ns))
@@ -251,8 +251,8 @@ fn eval_plain_aggregate(
 /// Reduce one group to its output sample, or `None` to omit the group. `sum`
 /// and `avg` aggregate native histograms when the group holds them; a group
 /// mixing float and histogram members is dropped (Prometheus emits an
-/// "incompatible sample types" annotation and produces no output for it,
-/// #178). `min`/`max`/`stddev`/`stdvar` ignore histogram members (float-only
+/// "incompatible sample types" annotation and produces no output for it).
+/// `min`/`max`/`stddev`/`stdvar` ignore histogram members (float-only
 /// in Prometheus, with an annotation), omitting a group with no float member.
 /// `count` counts every member; `group` is always 1.
 fn reduce_group_samples(
@@ -266,7 +266,7 @@ fn reduce_group_samples(
             let (hists, floats): (Vec<InstantSample>, Vec<InstantSample>) =
                 members.into_iter().partition(|s| s.histogram.is_some());
             if !hists.is_empty() && !floats.is_empty() {
-                // Mixed float/histogram group: dropped (#178 annotation).
+                // Mixed float/histogram group: dropped with an annotation.
                 return None;
             }
             if !hists.is_empty() {
@@ -727,7 +727,7 @@ mod tests {
     /// promql-parser 0.10 parses `limitk`/`limit_ratio`, so both reach the
     /// aggregation dispatch. They are not implemented; each must return a
     /// typed `Error::Unsupported` naming the operator rather than panicking on
-    /// the old `unreachable!` arm (#260, docs/query-engine.md state-2).
+    /// the old `unreachable!` arm (docs/query-engine.md state-2).
     #[test]
     fn limitk_and_limit_ratio_reject_without_panicking() {
         use crate::eval::Error;

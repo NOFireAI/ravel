@@ -1,4 +1,4 @@
-//! Counter/regression function family (plan section 8/P4): `rate`, `irate`,
+//! Counter/regression function family: `rate`, `irate`,
 //! `increase`, `delta`, `idelta`, `resets`, `changes`, `deriv`,
 //! `predict_linear`. Every formula is a direct, bit-exact-oriented port of
 //! Prometheus' own `promql/functions.go` (`extrapolatedRate`,
@@ -80,7 +80,7 @@ fn delta(samples: &[Sample], w: RangeWindow) -> Option<f64> {
     extrapolated_rate(samples, w, false, false)
 }
 
-/// `rate` over a native-histogram window (P11): the counter-reset-compensated
+/// `rate` over a native-histogram window: the counter-reset-compensated
 /// window reduction ([`histogram::histogram_rate`]) scaled by the same
 /// boundary-extrapolation-and-per-second factor the float path uses.
 fn rate_hist(samples: &[TimedHistogram], w: RangeWindow) -> Option<FloatHistogram> {
