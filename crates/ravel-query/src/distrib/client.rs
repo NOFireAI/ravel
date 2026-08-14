@@ -1,5 +1,5 @@
 //! The coordinator's view of a slice worker: the [`SliceFetcher`] seam and its
-//! `tonic`-backed [`RemoteSliceFetcher`] (ADR-0071, issue #864).
+//! `tonic`-backed [`RemoteSliceFetcher`] (ADR-0071).
 //!
 //! [`SliceFetcher`] is the one seam the merge layer holds. A [`RemoteSliceFetcher`]
 //! drives a real gRPC worker; a test double can implement the same trait to
@@ -117,8 +117,8 @@ impl SliceFetcher for RemoteSliceFetcher {
 
 /// Decode a slice's full frame sequence into a [`SliceResponse`].
 ///
-/// This is the single decode implementation for a slice's frames (issue #885
-/// item 2). [`RemoteSliceFetcher`] drains its gRPC stream into a `Vec` and
+/// This is the single decode implementation for a slice's frames.
+/// [`RemoteSliceFetcher`] drains its gRPC stream into a `Vec` and
 /// calls this; the server-side coordinator paths in `services/ravel-server`
 /// (the local no-hop fetch, an intra-cluster remote dispatch, and cross-cluster
 /// federation) collect their frames and call the same function, so the two

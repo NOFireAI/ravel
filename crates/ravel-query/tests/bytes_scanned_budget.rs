@@ -1,5 +1,5 @@
 //! Acceptance proof for the relocated per-tenant bytes-scanned budget
-//! (ADR-0061 decision 1, issue #721; ADR-0061 amendment 2026-08-07).
+//! (ADR-0061 decision 1; ADR-0061 amendment 2026-08-07).
 //!
 //! The budget's enforcement point was moved out of the three cross-segment
 //! merge functions and into the two fetch fan-outs that own segment
@@ -98,7 +98,7 @@ impl ObjectStoreBackend for GetCountingStore {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -434,7 +434,7 @@ async fn setup_gated(
 /// a one-byte budget. The query must return promptly -- proving the engine
 /// did not wait on the other `GATED_CONCURRENCY - 1` held calls, which this
 /// test deliberately never releases. An engine that drained the fan-out
-/// before checking the budget (the pre-fix behavior) would hang on those
+/// before checking the budget would hang on those
 /// held calls forever; the `tokio::time::timeout` below turns that hang into
 /// a clean test failure instead of a stuck CI job. A weaker regression --
 /// per-segment fetches spawned onto independent tasks the stream drop cannot

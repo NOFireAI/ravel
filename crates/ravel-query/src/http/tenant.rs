@@ -83,7 +83,7 @@ impl TenantResolver for DevHeaderTenantResolver {
     }
 }
 
-// --- OIDC (JWT) tenant resolution (ADR-0042 decision 6, issue #392) ----------
+// --- OIDC (JWT) tenant resolution (ADR-0042 decision 6) ----------
 
 /// A JWKS refresh or a key parse failed. The request-path resolver
 /// ([`OidcResolver::resolve`]) never surfaces this: it maps every validation
@@ -712,7 +712,7 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
     // (RSA), which exercises a different `DecodingKey::from_jwk` branch and a
     // different key-family check in `jsonwebtoken::decode` than the ES256/EC
     // keypair above. Signed via `EncodingKey::from_rsa_pem` under the
-    // `aws_lc_rs` backend (issue #405); no extra dependency is pulled in for
+    // `aws_lc_rs` backend; no extra dependency is pulled in for
     // RSA key generation.
     const RSA_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCu7ZpSqycgiMDi\n\
@@ -786,7 +786,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
 
     #[test]
     fn valid_rs256_token_resolves_claimed_tenant() {
-        // #399: real-world OIDC issuers overwhelmingly use RS256. A validly
+        // Real-world OIDC issuers overwhelmingly use RS256. A validly
         // RS256-signed token must resolve the claimed tenant just like ES256.
         let cache = cache_with(&jwks_rsa_with(RSA_KID));
         let token = sign_rs256(&claims(Some("acme"), 3600), RSA_KID);

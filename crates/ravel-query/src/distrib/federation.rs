@@ -1,4 +1,4 @@
-//! Cross-cluster federation fan-out (ADR-0071 Resolve scope, issue #868).
+//! Cross-cluster federation fan-out (ADR-0071 Resolve scope).
 //!
 //! Intra-cluster distribution ([`Distributed`](crate::distrib::Distributed))
 //! resolves ONE pinned snapshot and fans its segments out to workers in the
@@ -409,7 +409,7 @@ impl Federation {
 /// `reason` carries the raw transport/timeout detail (remote endpoint IP:port,
 /// errno, remote-supplied status text). That detail is an internal identifier
 /// that must never reach a client body, exactly like the object keys and tenant
-/// hashes redacted at the `QueryError` HTTP boundary (http/error.rs, a7-F02):
+/// hashes redacted at the `QueryError` HTTP boundary (http/error.rs):
 /// it is logged server-side and, on the fatal path, carried in the typed
 /// `QueryError::Federation` (which http/error.rs redacts to `MSG_UNAVAILABLE`),
 /// but the client-facing `skip_unavailable` warning is a stable message naming

@@ -1,10 +1,10 @@
 //! Unified snapshot admission seam (ADR-0073 decision 4): the sealed-set
 //! count check and the request-spend budget check, one call per resolve
 //! replacing the eight divergent per-surface checks the ADR describes. This
-//! crate's PromQL engine is the only site this task wires up
+//! crate's PromQL engine is the only site wired up here
 //! (`crates/ravel-query/src/engine.rs`'s `resolve_bounded`); the SQL
 //! executor, the five SQL providers, and the exemplars state move onto this
-//! seam under RH-T2 (#902).
+//! seam.
 
 use ravel_catalog::{SegmentOrigins, Snapshot};
 

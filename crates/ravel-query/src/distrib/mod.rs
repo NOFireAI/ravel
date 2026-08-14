@@ -1,4 +1,4 @@
-//! Distributed read fan-out core (ADR-0071, issue #864).
+//! Distributed read fan-out core (ADR-0071).
 //!
 //! The coordinator resolves ONE pinned snapshot, then (when the cost gate
 //! trips) [`Distributed::fetch`] partitions it into shard-major slices,
@@ -63,7 +63,7 @@ pub type FetchedTriple = (
 
 /// The closed event-time envelope `[min, max]` of a slice's pinned segments,
 /// carried on the fragment request so the worker resolves its interim
-/// content-hash resolver over just this window (issue #885 item 1) instead of
+/// content-hash resolver over just this window instead of
 /// the whole timestamp domain.
 ///
 /// The envelope contains every pinned segment's own `[min_event_ts_ns,
@@ -154,7 +154,7 @@ impl Distributed {
         let mut stream = stream::iter(slices)
             .map(|slice| {
                 // Carry the event-time envelope of this slice's pinned segments
-                // (issue #885 item 1). The worker resolves its interim
+                // The worker resolves its interim
                 // content-hash resolver over exactly this window instead of the
                 // whole timestamp domain, so a self-mapped or dispatched slice
                 // no longer pays a whole-history catalog resolve on the query

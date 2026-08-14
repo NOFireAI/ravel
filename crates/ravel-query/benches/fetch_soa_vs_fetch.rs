@@ -3,7 +3,7 @@
 //! fix and the SoA decode path together as the actual query-path caller
 //! would (see `bytes_slice_vs_copy` for the `Bytes::slice` fix measured in
 //! isolation). Self-contained: builds its own segment with `SegmentWriter`
-//! rather than depending on `ravel-bench` (out of scope for this ticket).
+//! rather than depending on `ravel-bench` (out of scope here).
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;

@@ -1,5 +1,5 @@
 //! Snapshot partitioning and the cost gate for the ADR-0071 distributed read
-//! fan-out (issue #864).
+//! fan-out.
 //!
 //! The coordinator resolves ONE pinned snapshot, then this module decides
 //! whether the query is expensive enough to distribute at all (the cost gate)
@@ -35,7 +35,7 @@ use ravel_types::accounting::CostEstimate;
 /// keeping this conservative: `should_distribute` cannot see the worker
 /// count, and at 1 worker the same corpus is ~2.5x slower distributed, so no
 /// single byte threshold in the 36-256 MiB band is correct. A
-/// worker-count-aware gate is tracked as #962.
+/// worker-count-aware gate is future work.
 pub const DISTRIBUTE_MIN_STORE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Segment count at or above which a query is worth distributing. Either axis

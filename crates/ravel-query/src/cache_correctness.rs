@@ -1,4 +1,4 @@
-//! Acceptance gate for ADR-0046's read-cache epic (issue #444, epic #437).
+//! Acceptance gate for ADR-0046's read cache.
 //!
 //! Wires `Cache::with_corruption` into the two ADR-0046 funnels this crate
 //! owns -- `SegmentFetcher::guarded_get` (RSEG) and
@@ -9,7 +9,7 @@
 //! (including NaN bit patterns) to the same query run with no cache at all.
 //!
 //! `Catalog::guarded_get` is ADR-0046's third funnel
-//! (crates/ravel-catalog/src/catalog.rs); issue #443 owns it, so this suite
+//! (crates/ravel-catalog/src/catalog.rs), covered elsewhere, so this suite
 //! covers RSEG and RLOG only.
 //!
 //! Known limitation, stated in ADR-0046 decision 4's amendment:
@@ -469,7 +469,7 @@ fn assert_log_matches_or_errors(
 /// ADR-0046 decision 4's acceptance gate: a cache whose every hit returns
 /// deliberately corrupted bytes must never let a query return a wrong
 /// result. Covers both funnels this crate owns; `Catalog::guarded_get`
-/// (issue #443) is out of scope.
+/// is out of scope.
 #[tokio::test]
 async fn corrupted_cache_hits_never_produce_wrong_results() {
     let (rseg_store, rseg_ref) = write_rseg_segment().await;
@@ -566,7 +566,7 @@ async fn cache_hit_returns_bit_identical_result_to_uncached_fetch() {
 }
 
 /// A `SegmentFetcher` with no cache attached at all (the production default
-/// before this epic, and any deployment that never calls `with_cache`) must
+/// with no read cache, and any deployment that never calls `with_cache`) must
 /// still decode the exact chaotic NaN-bit sample.
 #[tokio::test]
 async fn disabled_cache_produces_correct_result() {
@@ -837,7 +837,7 @@ async fn corrupted_page_hit_behind_clean_footer_fails_closed() {
     }
 }
 
-// ---- Cross-tenant cache isolation (issue #554) --------------------------
+// ---- Cross-tenant cache isolation --------------------------
 //
 // ADR-0046 decision 2: `tenant_hash` is in the `CacheKey` as a
 // defence-in-depth boundary so "a hash collision or a programming error

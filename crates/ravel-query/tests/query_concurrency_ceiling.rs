@@ -1,5 +1,5 @@
 //! End-to-end acceptance proof for the fleet-global query concurrency ceiling
-//! (ADR-0061 decision 2, issue #725) — the epic's final, highest-risk wave.
+//! (ADR-0061 decision 2).
 //!
 //! These tests drive real Prometheus-shaped queries through the full HTTP stack
 //! (`ravel_query::http::router` -> `AppState` -> `QueryEngine` -> catalog ->
@@ -7,8 +7,8 @@
 //!
 //! 1. When the process is at its (reconciled) ceiling, the next query is
 //!    rejected with HTTP 503 **before it does any store work at all** — no
-//!    resolve LIST/GET, no data-object GET. This is verified the same way EF-1's
-//!    cancellation proof verified non-work: a counting store shows the rejected
+//!    resolve LIST/GET, no data-object GET. This is verified the same way the
+//!    cancellation proof verifies non-work: a counting store shows the rejected
 //!    query added exactly zero store operations, not merely that it got an error
 //!    response.
 //!
@@ -192,7 +192,7 @@ async fn publish_segment(
 /// `FaultStore(CountingStore(MemoryStore))`. The [`GateHandle`] holds every
 /// data-object GET (`Op::Get` on a key containing `"rseg"`) *before* it reaches
 /// the counting store, so a held query's data fetch is neither completed nor
-/// counted while parked — exactly the shape EF-1's gated cancellation proof
+/// counted while parked — exactly the shape the gated cancellation proof
 /// uses. Catalog/commit reads and the `admission/query/*` reconciliation reads
 /// are not data objects, so they are never gated.
 struct Harness {

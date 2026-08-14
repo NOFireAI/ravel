@@ -1,5 +1,5 @@
 //! Acceptance and coordinator-invariant tests for the ADR-0071 distributed
-//! read fan-out (issue #864).
+//! read fan-out.
 //!
 //! The centerpiece is [`distributed_merge_equals_local_bitwise`]: over a real
 //! in-process `tonic` loopback worker (bound on `127.0.0.1:0`), a distributed

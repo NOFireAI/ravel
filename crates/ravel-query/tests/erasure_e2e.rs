@@ -1,5 +1,5 @@
 //! End-to-end proof that a pending selective-erasure request excludes records
-//! from a real query result (ADR-0064 decision 2; EJ-T2 #752 + EJ-T3 #753).
+//! from a real query result (ADR-0064 decision 2).
 //!
 //! Every test here drives the whole stack: a real `.dreq` object in the store,
 //! the real `Catalog::resolve` that lists `t/<th>/<sig>/del/` and attaches the

@@ -1,7 +1,7 @@
-//! Wire codec for the ADR-0071 distributed read fan-out (issue #864).
+//! Wire codec for the ADR-0071 distributed read fan-out.
 //!
 //! Maps the in-memory query shapes to and from the frozen `ravel.queryfrag.v1`
-//! protobuf messages (`ravel_proto::queryfrag::v1`, ticket #863). Every mapping
+//! protobuf messages (`ravel_proto::queryfrag::v1`). Every mapping
 //! here is total and typed: an unknown protocol version, a malformed series id,
 //! an unknown enum discriminant, or a run whose timestamp and value columns
 //! disagree in length is a [`CodecError`], never a panic and never a silently
@@ -316,7 +316,7 @@ pub fn decode_erasure(predicates: Vec<pb::ErasurePredicate>) -> Vec<ErasurePredi
 /// reconstruct-don't-trust), so the coordinator never ships a trusted key.
 ///
 /// The reverse map (identity back to a full `SegmentRef`, which needs the
-/// `ravel-commit` key reconstruction that ticket #865 owns) is not provided
+/// `ravel-commit` key reconstruction) is not provided
 /// here; a worker resolves an identity to a ref by its content hash. See
 /// [`identity_content_hash`].
 pub fn encode_segment_identity(seg: &SegmentRef) -> pb::SegmentIdentity {
@@ -341,9 +341,8 @@ pub fn encode_segment_identity(seg: &SegmentRef) -> pb::SegmentIdentity {
         // The single readable/writable RSEG version (ADR-0027). `SegmentRef`
         // carries no per-segment format version, so every current segment is a
         // VERSION_V6 object; shipping the real constant rather than a
-        // meaningless hardcoded 0 gives #865's reconstruct-and-verify path the
-        // version to check the fetched footer against. See the final report's
-        // note on the `SegmentRef` limitation.
+        // meaningless hardcoded 0 gives the reconstruct-and-verify path the
+        // version to check the fetched footer against.
         segment_format_version: u32::from(ravel_segment::VERSION_V6),
     }
 }

@@ -1,4 +1,4 @@
-//! Prove-the-test coverage for ADR-0073 (recent-hours read path, issue #901):
+//! Prove-the-test coverage for ADR-0073 (recent-hours read path):
 //! the sealed-set segment cap and the S3 request budget replace the single
 //! whole-snapshot `max_segments` check that made a hot tenant's newest 1-2
 //! hours unqueryable and could make `resolve_min_token` violate
@@ -155,9 +155,8 @@ fn matrix_bits(value: &Value) -> Vec<(String, i64, u64)> {
 /// Sealed (below-watermark) segments still count against `max_segments`;
 /// recent (above-watermark, never folded) segments must not (ADR-0073
 /// decision 2). One sealed segment plus five recent segments, `max_segments:
-/// 1`: pre-fix, `resolve_bounded` compared the whole snapshot's 6 segments
-/// against the cap of 1 and refused with `TooManySegments`. The fix counts
-/// only `origins.sealed_count` (1), so the query is admitted.
+/// 1`: `resolve_bounded` counts only `origins.sealed_count` (1), not the
+/// whole snapshot's 6 segments, so the query is admitted.
 #[tokio::test]
 async fn recent_hours_exempt_from_segment_cap() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

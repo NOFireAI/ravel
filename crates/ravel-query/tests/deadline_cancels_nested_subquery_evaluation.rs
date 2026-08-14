@@ -1,9 +1,9 @@
-//! Confirming test for issue #193: nested subqueries had no cross-level
-//! cost budget and the evaluator was fully synchronous with no yield point,
-//! so `QueryEngine`'s `tokio::time::timeout` wrapper (engine.rs) could only
-//! ever fire *after* a runaway nested evaluation finished, not interrupt it.
+//! Nested subquery evaluation is interruptible at the query deadline: the
+//! evaluator yields at cross-level cost-budget checkpoints, so `QueryEngine`'s
+//! `tokio::time::timeout` wrapper (engine.rs) can interrupt a runaway nested
+//! evaluation rather than only firing after it finishes.
 //!
-//! `ravel_promql::Evaluator` now checks a wall-clock deadline
+//! `ravel_promql::Evaluator` checks a wall-clock deadline
 //! (`with_deadline`/`QueryWindow::check_deadline`) between subquery grid
 //! steps, and `QueryEngine::{instant,range}_with_stats` derive that deadline
 //! from their own `Duration` parameter and pass it into the evaluator before

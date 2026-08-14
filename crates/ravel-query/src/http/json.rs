@@ -58,10 +58,10 @@ impl<T> ApiResponse<T> {
 }
 
 /// Segment counters for the query that produced a response
-/// (docs/metric-index-plan.md P5b), rendered under the Prometheus response
+///, rendered under the Prometheus response
 /// envelope's `data` object alongside `resultType`/`result`. Prometheus'
 /// own API has no standardized shape for this (ravel-query previously
-/// carried no query-level stats at all; see this ticket's final report),
+/// carried no query-level stats at all),
 /// so the field names here are ravel's own.
 #[derive(Debug, Serialize)]
 pub struct QueryStatsJson {
@@ -72,8 +72,8 @@ pub struct QueryStatsJson {
     pub accounting: QueryAccountingJson,
     pub estimate: CostEstimateJson,
     /// True when at least one federated remote cluster was skipped because it
-    /// was unavailable and its `skip_unavailable` opt-in was set (ADR-0071,
-    /// issue #868), so the query's coverage is partial. Always `false` for a
+    /// was unavailable and its `skip_unavailable` opt-in was set
+    /// (ADR-0071), so the query's coverage is partial. Always `false` for a
     /// fully cluster-local query. A client can read this marker to tell a
     /// partial federated result apart from a complete one; the skipped
     /// cluster(s) are named in the top-level `warnings` array.
@@ -103,7 +103,7 @@ impl From<crate::QueryStats> for QueryStatsJson {
 /// Actual per-query counters (ADR-0044 decision 1), rendered under
 /// `stats.accounting`. Field names are ravel's own; Prometheus has no
 /// standard shape for this. `raw_f64_pages`/`raw_f64_bytes` are the
-/// pre-existing per-segment `FetchStats` (issue #25, X1): a narrower count
+/// pre-existing per-segment `FetchStats`: a narrower count
 /// of `ValPageKind::RawF64` pages specifically, kept distinct from
 /// `decompressed_bytes` (the typed-output footprint of every decoded
 /// sample, any encoding). Has no `segmentsPruned` field: `QueryAccounting`
@@ -236,7 +236,7 @@ pub enum QueryData {
 /// `value` field and a native-histogram sample under a `histogram` field;
 /// exactly one is present per element (a series is scalar or histogram in
 /// storage, never both), so both are `Option` with `omitempty`, matching
-/// Prometheus' `web/api/v1` sample shape (#218).
+/// Prometheus' `web/api/v1` sample shape.
 #[derive(Debug, Serialize)]
 pub struct VectorResult {
     pub metric: HashMap<String, String>,
@@ -253,7 +253,7 @@ pub struct MatrixResult {
 }
 
 /// Prometheus' `model.SampleHistogram` JSON shape for a native (exponential)
-/// histogram value (#218): `count` and `sum` as strings (same
+/// histogram value: `count` and `sum` as strings (same
 /// full-precision string encoding as a float sample value), and `buckets` an
 /// array of `[boundaries, lower, upper, count]` tuples in cumulative ascending
 /// order. Field names match Prometheus so the differential comparator (a
@@ -322,7 +322,7 @@ fn ts_ns_to_seconds(ts_ns: i64) -> Timestamp {
     Timestamp((ts_ns as f64) / 1_000_000_000.0)
 }
 
-/// Render one instant-vector element (#218): a native-histogram element
+/// Render one instant-vector element: a native-histogram element
 /// (`histogram: Some`) becomes Prometheus' `histogram` field, a float element
 /// its `value` field. The evaluator leaves `value` at `0.0` on a histogram
 /// element, so the two are never both meaningful.
@@ -344,7 +344,7 @@ fn vector_result(s: ravel_promql::InstantSample) -> VectorResult {
 }
 
 /// Convert a [`FloatHistogram`] to Prometheus' `model.SampleHistogram` JSON
-/// shape (#218): `count`/`sum` as strings, and every populated bucket in
+/// shape: `count`/`sum` as strings, and every populated bucket in
 /// cumulative ascending order (the order `FloatHistogram::all_buckets` yields,
 /// itself matching Prometheus' `AllFloatBucketIterator`). Zero-count buckets
 /// are skipped, exactly as Prometheus' marshaler skips them.
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn success_envelope_carries_warnings_and_infos() {
         // Both annotation channels render as top-level arrays, matching
-        // Prometheus' `warnings`/`infos` fields (issue #178).
+        // Prometheus' `warnings`/`infos` fields.
         let resp = ApiResponse::success_with_annotations(
             "data-goes-here",
             vec!["quantile value should be between 0 and 1, got 1.5".to_string()],
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn stats_json_carries_partial_and_warnings() {
-        // BLOCK 1 (ADR-0071, issue #868): the partial-coverage marker and the
+        // BLOCK 1 (ADR-0071): the partial-coverage marker and the
         // per-skipped-cluster warnings must survive `QueryStats ->
         // QueryStatsJson`, never be silently dropped.
         //
@@ -717,7 +717,7 @@ mod tests {
         // A native-histogram vector element renders under Prometheus'
         // `histogram` field (not `value`), with count/sum as strings and each
         // populated bucket a [boundaries, lower, upper, count] array in
-        // cumulative ascending order (#218). This value has a negative bucket
+        // cumulative ascending order. This value has a negative bucket
         // (-2,-1] (boundaries 1), a zero bucket (-0.5,0.5] (boundaries 3), and
         // a positive bucket (1,2] (boundaries 0).
         use ravel_promql::{FloatHistogram, InstantSample, ResetHint, Span};

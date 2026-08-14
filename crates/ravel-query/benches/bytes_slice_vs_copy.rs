@@ -1,5 +1,5 @@
-//! Isolates the `FetchedRegions::slice` fix (docs/reviews/2026-07-27
-//! -arrow-datafusion-plan-review.md finding F1): `Bytes::slice` (refcounted,
+//! Isolates the `FetchedRegions::slice` optimization: `Bytes::slice`
+//! (refcounted,
 //! O(1)) versus the old `Bytes::copy_from_slice` (memcpy, O(len)) for
 //! carving a page-sized region out of a suffix-fetch-sized buffer. Uses
 //! `bytes::Bytes` directly rather than the private `FetchedRegions` type,

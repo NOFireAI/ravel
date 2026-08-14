@@ -1,5 +1,5 @@
-//! Selective-query timing for BENCHMARKS.md's P5b row (postings pruning,
-//! docs/metric-index-plan.md 5.4): equality `__name__` query (pruned) vs.
+//! Selective-query timing for postings pruning: equality `__name__` query
+//! (pruned) vs.
 //! regex `__name__` query (bypassed, fetches every segment) over the same
 //! fold, at two segment counts. `#[ignore]`d: a wall-clock measurement, not
 //! a correctness assertion, so it stays out of the crate's normal test gate.

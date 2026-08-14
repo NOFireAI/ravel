@@ -40,7 +40,7 @@ pub struct AppState {
     pub tenant_resolver: Arc<dyn TenantResolver>,
     /// Records each completed query's cost (its accounting snapshot and its
     /// pre-execution estimate) into a process aggregate exported at `/metrics`
-    /// (ADR-0044 section 4, issue #425). Defaults to
+    /// (ADR-0044 section 4). Defaults to
     /// [`NoopQueryCostRecorder`]; a deployment sets the real aggregator so the
     /// Prometheus-shaped read paths fold into `/metrics` like the SQL path
     /// does.
@@ -56,7 +56,7 @@ pub struct AppState {
     pub query_admission: Arc<QueryAdmissionController>,
     /// The evidential audit sink every query surface submits one
     /// [`AuditEvent`](ravel_maintain::AuditEvent) through before releasing its
-    /// response (ADR-0062 §2a, epic EL / issue #762). Submission awaits the
+    /// response (ADR-0062 §2a). Submission awaits the
     /// event's durability, so a completed handler's response is released only
     /// after its audit record is durable (or, in best-effort mode, after the
     /// pipeline decided to release it anyway). Defaults to

@@ -169,7 +169,7 @@ pub fn decode_commit_tokens(raw: &[String]) -> Result<Vec<CommitToken>, ParamErr
 /// (docs/query-engine.md "Budgets": the `timeout` param can only *lower* the
 /// deadline). When `timeout` is absent the server maximum applies. When it is
 /// present the parsed value is clamped to `max`, so a client can shorten its
-/// own deadline but never extend it past the server budget (finding a7-F01).
+/// own deadline but never extend it past the server budget.
 pub fn parse_deadline(params: &Params, max: Duration) -> Result<Duration, ParamError> {
     match params.first("timeout") {
         Some(s) => {
@@ -197,10 +197,10 @@ mod tests {
         Params::parse(Some(&format!("timeout={timeout}")), None)
     }
 
-    /// a7-F01 regression: a client `timeout` above the configured server
-    /// wall-deadline is clamped to that maximum, never honored verbatim. The
-    /// effective deadline is the observable: before the fix this returned the
-    /// full 3600 s; after it, the 30 s server budget.
+    /// A client `timeout` above the configured server wall-deadline is
+    /// clamped to that maximum, never honored verbatim. The effective
+    /// deadline is the observable: an over-max timeout yields the 30 s server
+    /// budget, not the full 3600 s.
     #[test]
     fn timeout_above_server_max_is_clamped_to_max() {
         let params = params_with_timeout("3600");
