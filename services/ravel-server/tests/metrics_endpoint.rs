@@ -59,9 +59,15 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
             1024,
         ),
     };
-    ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)
-        .await
-        .expect("server starts")
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
 }
 
 /// Regression guard for issue #423: `/metrics` must be served in every mode,
@@ -323,9 +329,15 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
             ..LimitsConfig::default()
         },
     };
-    ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)
-        .await
-        .expect("server starts")
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
 }
 
 /// Drives every scenario's one export request against `base`, generating the

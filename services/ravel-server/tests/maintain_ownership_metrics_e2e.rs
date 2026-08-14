@@ -187,6 +187,7 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     let a = ravel_server::start(
         maintain_config(&tenant),
         store_dyn.clone(),
+        store_dyn.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )
@@ -194,7 +195,8 @@ async fn two_maintain_workers_reach_and_report_full_ownership_on_real_metrics() 
     .expect("worker a starts");
     let b = ravel_server::start(
         maintain_config(&tenant),
-        store_dyn,
+        store_dyn.clone(),
+        store_dyn.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

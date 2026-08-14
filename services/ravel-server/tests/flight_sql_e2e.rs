@@ -362,7 +362,8 @@ async fn flight_sql_against_minio_returns_rows_and_isolates_tenants() {
     };
     let running = ravel_server::start(
         config,
-        store,
+        store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

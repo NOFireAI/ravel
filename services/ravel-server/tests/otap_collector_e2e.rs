@@ -130,9 +130,15 @@ async fn start_test_server() -> ravel_server::Running {
             1024,
         ),
     };
-    ravel_server::start(config, store, Arc::new(StoreMetrics::default()), None)
-        .await
-        .expect("server starts")
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
 }
 
 /// A collector config with an `otlp` receiver (the test pushes to it) and an

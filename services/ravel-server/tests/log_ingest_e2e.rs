@@ -126,6 +126,7 @@ async fn start_test_server() -> (ravel_server::Running, Arc<MemoryStore>) {
     let running = ravel_server::start(
         config,
         store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )

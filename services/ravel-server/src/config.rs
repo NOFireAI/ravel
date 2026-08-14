@@ -653,6 +653,39 @@ pub struct Cli {
     /// `ravel_query::distrib::DEFAULT_REMOTE_SOFT_TIMEOUT` when unset.
     #[arg(long = "remote-cluster-soft-timeout", value_name = "DURATION")]
     pub remote_cluster_soft_timeout: Option<String>,
+
+    /// Enable the two-class object-store request scheduler (ADR-0070 decision
+    /// 1). Off by default (decision 2): both the foreground and the background
+    /// store handles pass straight through to the same backend, byte-for-byte
+    /// today's behavior with no permit acquire and no added latency. When set,
+    /// `build_store` installs a shared `RequestScheduler` sized by
+    /// `--store-fg-permits`/`--store-bg-permits` with a background floor of 1
+    /// (the value that makes the "foreground never delayed by more than one
+    /// in-flight background" guarantee hold), and hands the ack-bearing ingest,
+    /// query, and catalog paths a foreground handle and the maintain/fold/
+    /// scrub background loops a background handle. The permit defaults are not
+    /// frozen and change only on decision-4 panel evidence.
+    #[arg(long)]
+    pub store_scheduling: bool,
+
+    /// Foreground permit count for the store scheduler (`--store-scheduling`):
+    /// the global in-flight cap on object-store requests, which foreground
+    /// ack-bearing traffic may use in full (ADR-0070 decision 1). Ignored
+    /// unless `--store-scheduling` is set. Clamped to at least 1 by
+    /// `SchedulerConfig::new`. Default 64; not a frozen value (decision 2).
+    #[arg(long, default_value_t = 64)]
+    pub store_fg_permits: usize,
+
+    /// Background permit count for the store scheduler (`--store-scheduling`):
+    /// the concurrent-request cap on background maintenance traffic, itself
+    /// additionally bounded by `--store-fg-permits` and yielding to foreground
+    /// above the floor of 1 (ADR-0070 decision 1). Ignored unless
+    /// `--store-scheduling` is set. Clamped into `1..=bg_permits` by
+    /// `SchedulerConfig::new`. Default 8, the strictly-safer bound the ADR
+    /// applies to the unbounded sweep/scrub/audit paths independent of panel
+    /// calibration; not a frozen value (decision 2).
+    #[arg(long, default_value_t = 8)]
+    pub store_bg_permits: usize,
 }
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of

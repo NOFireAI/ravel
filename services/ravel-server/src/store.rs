@@ -8,9 +8,9 @@ use ravel_cache::{Cache, CacheLimits};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_object_store::{
-    Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, KmsRoutingStore,
-    ListPage, MultipartUpload, ObjectMeta, ObjectStoreBackend, PageToken, PutOptions, PutOutcome,
-    StoreError, StoreMetrics,
+    Capabilities, ClassedStore, DelimitedList, GetOutcome, GetRange, InstrumentedStore,
+    KmsRoutingStore, ListPage, MultipartUpload, ObjectMeta, ObjectStoreBackend, PageToken,
+    PutOptions, PutOutcome, SchedulerConfig, StoreError, StoreMetrics,
 };
 use ravel_query::CacheFetchError;
 
@@ -172,25 +172,49 @@ pub fn check_mandatory_capabilities(
 /// returned so the caller can hold it for that later work. The cache is
 /// exposed: the caller attaches it to the query fetchers via their existing
 /// `with_cache` builders.
-/// Backend, its metrics handle, the optional ADR-0046 read cache, and (only
-/// when `--tenant-kms-config` is set) a handle onto the live
-/// [`KmsRoutingStore`] embedded in the backend chain, as built by
-/// [`build_store`].
 ///
-/// The fourth element exists because `build_store` runs before the
-/// tenant-hash scheme is installed (see `main.rs`'s ordering note on its
-/// `build_store` call): hashing a tenant name to register its key with
-/// `KmsRoutingStore::set_tenant_key` needs `TenantId::hash()`, which is not
-/// valid to call yet at this point in startup. `main.rs` holds this handle
-/// and calls [`crate::tenant_kms::configure_tenant_kms`] on it once the
-/// scheme is installed. `None` when no `KmsRoutingStore` was inserted at all
-/// (either `--store memory`, or `--store s3` with no `--tenant-kms-config`).
-pub type BuiltStore = (
-    Arc<dyn ObjectStoreBackend>,
-    Arc<StoreMetrics>,
-    Option<Arc<Cache<CacheFetchError>>>,
-    Option<Arc<KmsRoutingStore>>,
-);
+/// The two store handles ([`Self::foreground`], [`Self::background`]) come from
+/// a [`ClassedStore`] (ADR-0070 decision 1) wrapping the instrumented backend
+/// chain. In the default passthrough construction (decision 2, when
+/// `--store-scheduling` is off) both are the same `Arc` as the instrumented
+/// store verbatim: `Arc::ptr_eq(&foreground, &background)` holds and there is
+/// no scheduling, no added latency, and no per-class metrics. When
+/// `--store-scheduling` is on they are two distinct scheduled handles sharing
+/// one `RequestScheduler`, and [`Self::classed`] exposes the per-class metrics.
+pub struct BuiltStore {
+    /// The foreground, ack-bearing store handle: ingest, query, and catalog
+    /// paths use this. In passthrough it is the instrumented backend verbatim.
+    pub foreground: Arc<dyn ObjectStoreBackend>,
+    /// The background maintenance store handle: the maintain, fold, and scrub
+    /// loops use this. In passthrough it is the same `Arc` as `foreground`.
+    pub background: Arc<dyn ObjectStoreBackend>,
+    /// The metrics handle the instrumentation decorator counts every op into,
+    /// served at `GET /metrics`. Shared by both class handles (the decorator
+    /// sits under the [`ClassedStore`], so it counts foreground and background
+    /// traffic alike). Distinct from the per-class metrics on [`Self::classed`].
+    pub metrics: Arc<StoreMetrics>,
+    /// The ADR-0046 read cache, `None` when `--disable-cache` is set. The caller
+    /// attaches it to the query fetchers via their existing `with_cache`
+    /// builders.
+    pub cache: Option<Arc<Cache<CacheFetchError>>>,
+    /// A handle onto the live [`KmsRoutingStore`] embedded in the backend chain,
+    /// `Some` only when `--tenant-kms-config` is set on `--store s3`.
+    ///
+    /// It exists because `build_store` runs before the tenant-hash scheme is
+    /// installed (see `main.rs`'s ordering note on its `build_store` call):
+    /// hashing a tenant name to register its key with
+    /// `KmsRoutingStore::set_tenant_key` needs `TenantId::hash()`, which is not
+    /// valid to call yet at this point in startup. `main.rs` holds this handle
+    /// and calls [`crate::tenant_kms::configure_tenant_kms`] on it once the
+    /// scheme is installed. `None` when no `KmsRoutingStore` was inserted at all
+    /// (either `--store memory`, or `--store s3` with no `--tenant-kms-config`).
+    pub kms: Option<Arc<KmsRoutingStore>>,
+    /// The [`ClassedStore`] both handles were drawn from. Held so the per-class
+    /// [`ClassedStore::metrics`] blocks (the `{class}` metric dimension) stay
+    /// reachable; wiring them onto the `/metrics` scrape is later work
+    /// (E5-T3/T4). `None`-valued per-class metrics in passthrough mode.
+    pub classed: Arc<ClassedStore>,
+}
 
 /// Delegates every [`ObjectStoreBackend`] method to a shared handle. Exists
 /// only so the same [`KmsRoutingStore`] instance can be both the backend
@@ -310,9 +334,43 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
 
     // Runs against the decorator, which passes `capabilities()` straight
     // through, so this still gates on the wrapped backend's own declaration.
+    // Checked here, before `store` is moved into the `ClassedStore`; the
+    // `ClassedStore` handles also pass `capabilities()` straight through
+    // (passthrough returns the inner store verbatim, and each scheduled handle
+    // delegates), so the class wrapping does not hide the backend's real caps.
     check_capabilities(store.as_ref(), cli.mode)?;
+
+    // Two-class request scheduling (ADR-0070). The `ClassedStore` wraps the
+    // fully-instrumented backend chain, preserving the KMS-routing and
+    // instrumentation wrapping order above: the decorator still counts every
+    // op, and (when scheduling is on) each class adds its own per-class metrics
+    // on top. Off by default (decision 2): `passthrough` hands both callers the
+    // instrumented store verbatim, byte-for-byte today's behavior. When
+    // `--store-scheduling` is set, `scheduled` installs a shared
+    // `RequestScheduler` with a background floor of 1 -- the value that makes
+    // ADR-0070's "a foreground acquire is never delayed by more than one
+    // in-flight background request" guarantee hold; it is deliberately not a
+    // CLI knob.
+    let classed = Arc::new(if cli.store_scheduling {
+        ClassedStore::scheduled(
+            store,
+            SchedulerConfig::new(cli.store_fg_permits, cli.store_bg_permits, 1),
+        )
+    } else {
+        ClassedStore::passthrough(store)
+    });
+    let foreground = classed.foreground();
+    let background = classed.background();
+
     let cache = build_cache(cli);
-    Ok((store, metrics, cache, kms))
+    Ok(BuiltStore {
+        foreground,
+        background,
+        metrics,
+        cache,
+        kms,
+        classed,
+    })
 }
 
 #[cfg(test)]
@@ -563,7 +621,12 @@ mod tests {
         use ravel_object_store::PutOptions;
 
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
-        let (store, metrics, _cache, kms) = build_store(&cli).expect("memory backend must build");
+        let BuiltStore {
+            foreground: store,
+            metrics,
+            kms,
+            ..
+        } = build_store(&cli).expect("memory backend must build");
         assert!(
             kms.is_none(),
             "no --tenant-kms-config means no KmsRoutingStore handle"
@@ -613,8 +676,9 @@ mod tests {
             "test",
         ])
         .expect("flags parse");
-        let (_store, _metrics, _cache, kms) =
-            build_store(&cli).expect("dummy S3 config must build without network access");
+        let kms = build_store(&cli)
+            .expect("dummy S3 config must build without network access")
+            .kms;
         assert!(
             kms.is_none(),
             "no --tenant-kms-config must yield no KmsRoutingStore handle"
@@ -656,14 +720,106 @@ mod tests {
             file.path().to_str().expect("temp path is valid utf-8"),
         ])
         .expect("flags parse");
-        let (store, _metrics, _cache, kms) =
-            build_store(&cli).expect("dummy S3 config must build without network access");
+        let BuiltStore {
+            foreground: store,
+            kms,
+            ..
+        } = build_store(&cli).expect("dummy S3 config must build without network access");
         let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
 
         assert_eq!(
             store.capabilities(),
             kms.capabilities(),
             "the returned store handle must be (or wrap) the same KmsRoutingStore instance"
+        );
+    }
+
+    /// E5-T2 (ADR-0070, epic #810): the reachability acceptance test for the
+    /// two-class scheduler wiring, driven end-to-end through `build_store` from
+    /// a `Cli`.
+    ///
+    /// (a) `--store-scheduling` OFF (the default) is passthrough: the
+    ///     foreground and background handles are the SAME store (`Arc::ptr_eq`),
+    ///     byte-for-byte today's single-handle behavior, and there are no
+    ///     per-class metrics. This assertion is non-vacuous: it fails if the
+    ///     scheduled variant is ever wired by default, because scheduled hands
+    ///     out two distinct wrapper handles. The line that keeps it passing is
+    ///     the `else { ClassedStore::passthrough(store) }` arm in `build_store`
+    ///     (paired with `store_scheduling` defaulting to `false`); flip either
+    ///     and this case fails.
+    /// (b) `--store-scheduling` ON: the two handles are DISTINCT scheduled
+    ///     handles (`Arc::ptr_eq` is false).
+    /// (c) a foreground op and a background op each record under their own
+    ///     class: the `{class}` dimension is realized as one `StoreMetrics`
+    ///     block per class, so the foreground block sees exactly the foreground
+    ///     op and the background block exactly the background op.
+    #[tokio::test]
+    async fn scheduler_wiring_passthrough_and_scheduled() {
+        use clap::Parser;
+        use ravel_object_store::RequestClass;
+
+        // (a) Off by default: passthrough hands out one shared store.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert!(
+            !cli.store_scheduling,
+            "the store scheduler must default off (ADR-0070 decision 2)"
+        );
+        let built = build_store(&cli).expect("memory backend must build");
+        assert!(
+            Arc::ptr_eq(&built.foreground, &built.background),
+            "passthrough: the foreground and background handles must be the same store"
+        );
+        assert!(
+            built.classed.metrics(RequestClass::Foreground).is_none(),
+            "passthrough adds no per-class metrics"
+        );
+
+        // (b) Scheduling on: two distinct scheduled handles over one scheduler.
+        let cli = Cli::try_parse_from(["ravel-server", "--store-scheduling"])
+            .expect("scheduling flag parses");
+        assert!(cli.store_scheduling);
+        let built = build_store(&cli).expect("scheduled memory backend must build");
+        assert!(
+            !Arc::ptr_eq(&built.foreground, &built.background),
+            "scheduled: the foreground and background handles must be distinct"
+        );
+
+        // (c) Each class records its own op under its own `{class}` label.
+        built
+            .foreground
+            .put("t/fg", Bytes::from_static(b"abc"), PutOptions::default())
+            .await
+            .expect("foreground put");
+        built
+            .background
+            .put("t/bg", Bytes::from_static(b"de"), PutOptions::default())
+            .await
+            .expect("background put");
+        let fg = built
+            .classed
+            .metrics(RequestClass::Foreground)
+            .expect("scheduled mode has foreground metrics");
+        let bg = built
+            .classed
+            .metrics(RequestClass::Background)
+            .expect("scheduled mode has background metrics");
+        let (fg, bg) = (fg.snapshot(), bg.snapshot());
+        assert_eq!(
+            fg.put.calls, 1,
+            "class=\"foreground\" must record exactly the foreground op"
+        );
+        assert_eq!(
+            bg.put.calls, 1,
+            "class=\"background\" must record exactly the background op"
+        );
+        // Non-vacuous label separation: neither class absorbed the other's op.
+        assert_eq!(
+            fg.put.bytes, 3,
+            "foreground op's payload size, not the bg op's"
+        );
+        assert_eq!(
+            bg.put.bytes, 2,
+            "background op's payload size, not the fg op's"
         );
     }
 }

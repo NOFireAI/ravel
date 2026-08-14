@@ -537,7 +537,8 @@ async fn the_server_registers_the_real_flight_sql_service() {
     };
     let running = ravel_server::start(
         config,
-        store,
+        store.clone(),
+        store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
         None,
     )
