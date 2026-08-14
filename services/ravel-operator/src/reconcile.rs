@@ -580,10 +580,19 @@ pub fn desired_query_deployment(
 /// The maintain Deployment, or `None` when `maintain.enabled` is false (the
 /// controller deletes the Deployment in that case).
 ///
-/// Single replica with the `Recreate` strategy (ADR-0034 decision 3): there is
-/// only ever 0 or 1, so there is no replica field on the spec side. Maintain
-/// serves `--listen-http` for the health probes only; retention flags render
-/// here because retention is enforced by this tier.
+/// Replica count comes from `spec.maintain.replicas` (default 1) and the
+/// strategy is `RollingUpdate`, superseding ADR-0034 decision 3's
+/// single-replica `Recreate` guidance. ADR-0065's ownership protocol makes
+/// `replicas > 1` safe: every maintain pod runs `--mode maintain`, which spawns
+/// the heartbeat/rendezvous machinery that partitions the `(tenant, signal,
+/// shard)` unit space across the live worker set discovered from the shared
+/// store. The coordination is entirely store-side (self-owned keys under
+/// `sys/maintain/`), so the pod spec needs no extra ownership flags beyond
+/// `--mode maintain` and the shared store args every tier already carries; a
+/// rolling restart is safe because a briefly-overlapping owner during the
+/// handoff window only duplicates idempotent work, never corrupts it (ADR-0065
+/// decision 2). Maintain serves `--listen-http` for the health probes only;
+/// retention flags render here because retention is enforced by this tier.
 ///
 /// Maintain DOES get the same `--tenant-token` args and env as gateway and
 /// query, but for a different reason: it authenticates no incoming requests, so
@@ -644,9 +653,9 @@ pub fn desired_maintain_deployment(
         args,
         env,
         ports,
-        1,
+        spec.maintain.replicas,
         spec.maintain.resources.as_ref(),
-        "Recreate",
+        "RollingUpdate",
         &tier_secrets_checksum(spec, ctx, tier_override),
     ))
 }
@@ -752,6 +761,7 @@ mod tests {
             },
             maintain: MaintainSpec {
                 enabled: true,
+                replicas: 1,
                 interval_secs: Some(600),
                 resources: None,
                 credentials_secret_ref: None,
@@ -1034,14 +1044,29 @@ mod tests {
     }
 
     #[test]
-    fn maintain_deployment_uses_recreate_strategy_and_no_replica_field() {
+    fn maintain_deployment_defaults_to_one_replica_rolling_update() {
+        // ADR-0065 supersedes ADR-0034's single-replica Recreate guidance: the
+        // maintain tier now renders from spec.maintain.replicas (default 1) with
+        // a RollingUpdate strategy. The default (base_spec sets replicas=1) must
+        // still yield exactly one pod, so an existing cluster is unaffected.
         let spec = base_spec();
         let m = desired_maintain_deployment(&spec, "prod", &ctx()).expect("enabled");
         let dspec = m.spec.as_ref().expect("spec");
         assert_eq!(dspec.replicas, Some(1));
         assert_eq!(
             dspec.strategy.as_ref().expect("strategy").type_.as_deref(),
-            Some("Recreate")
+            Some("RollingUpdate"),
+            "maintain must use a >1-safe strategy (ADR-0065)"
+        );
+        // RollingUpdate must not carry a rollingUpdate block the render path
+        // never sets; a Recreate leftover here would be a silent mismatch.
+        assert!(
+            dspec
+                .strategy
+                .as_ref()
+                .expect("strategy")
+                .rolling_update
+                .is_none()
         );
         let args = args_of(&m);
         assert_eq!(arg_value(&args, "--mode").as_deref(), Some("maintain"));
@@ -1118,6 +1143,80 @@ mod tests {
         let mut spec = base_spec();
         spec.maintain.enabled = false;
         assert!(desired_maintain_deployment(&spec, "prod", &ctx()).is_none());
+    }
+
+    #[test]
+    fn maintain_replicas_two_renders_two_pods_with_rolling_update_and_ownership_wiring() {
+        // Issue #918 reachability test. Epic EI / ADR-0065 makes >1 maintain
+        // replica safe in-process (rendezvous over a heartbeat-derived live
+        // worker set), but that machinery was unreachable through the operator:
+        // the CRD had no maintain replica field and the Deployment used
+        // Recreate, pinning the tier to one pod. This asserts that setting
+        // spec.maintain.replicas = 2 renders a two-pod Deployment with a
+        // >1-safe strategy, and that each pod carries the ownership-protocol
+        // wiring the in-process EI tests rely on.
+        //
+        // The ownership protocol coordinates entirely through the shared object
+        // store (self-owned keys under `sys/maintain/`, discovered at runtime),
+        // so there is no per-pod heartbeat/rendezvous flag to render: the
+        // wiring that reaches it is `--mode maintain` (which spawns the
+        // heartbeat + rendezvous machinery) plus the shared store args
+        // (identical `--shards`/`--s3-bucket`, so both replicas coordinate over
+        // one store) and the tenant list (without which maintain spawns no
+        // tasks at all). True multi-pod convergence onto disjoint ownership is
+        // covered in-process by ravel-server's maintain tests
+        // (two_replicas_partition_units_without_double_pay); this operator test
+        // proves only that a real deployment can now stand up two such pods.
+        let mut spec = base_spec();
+        spec.maintain.replicas = 2;
+        let ctx = ctx();
+        let m = desired_maintain_deployment(&spec, "prod", &ctx).expect("enabled");
+        let dspec = m.spec.as_ref().expect("spec");
+
+        assert_eq!(dspec.replicas, Some(2), "maintain must render two pods");
+        assert_eq!(
+            dspec.strategy.as_ref().expect("strategy").type_.as_deref(),
+            Some("RollingUpdate"),
+            "two replicas require a >1-safe strategy, not Recreate"
+        );
+
+        // Ownership-protocol wiring: --mode maintain spawns the heartbeat +
+        // rendezvous machinery in-process.
+        let margs = args_of(&m);
+        assert_eq!(arg_value(&margs, "--mode").as_deref(), Some("maintain"));
+
+        // Both replicas coordinate over one shared store: the store flags that
+        // scope the `sys/maintain/` keyspace must match what gateway/query
+        // render from the same spec, so every replica sees the same world.
+        let g = desired_gateway_deployment(&spec, "prod", &ctx);
+        let gargs = args_of(&g);
+        assert_eq!(
+            arg_value(&margs, "--s3-bucket"),
+            arg_value(&gargs, "--s3-bucket"),
+            "all replicas must share one store bucket to coordinate ownership"
+        );
+        assert_eq!(
+            arg_value(&margs, "--shards"),
+            arg_value(&gargs, "--shards"),
+            "the shard count defines the unit space the workers partition"
+        );
+
+        // The tenant list must render, or maintain::spawn gets an empty tenant
+        // set and every replica is a silent no-op regardless of replica count.
+        let tenant_pairs: Vec<String> = margs
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--tenant-token")
+            .map(|(i, _)| margs[i + 1].clone())
+            .collect();
+        assert_eq!(
+            tenant_pairs,
+            vec![
+                "$(RAVEL_TENANT_TOKEN_0)=acme".to_string(),
+                "$(RAVEL_TENANT_TOKEN_1)=globex".to_string(),
+            ],
+            "each maintain replica needs the tenant list to own any units"
+        );
     }
 
     #[test]

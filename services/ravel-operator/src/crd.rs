@@ -87,8 +87,10 @@ pub struct RavelClusterSpec {
     #[serde(default)]
     pub query: QuerySpec,
 
-    /// Background maintenance tier (compaction, retention, GC). Single replica,
-    /// `Recreate` strategy, no replica field (ADR-0034 decision 3).
+    /// Background maintenance tier (compaction, retention, GC). Defaults to a
+    /// single replica; the bounded multi-worker ownership protocol (ADR-0065)
+    /// makes `replicas > 1` safe, superseding ADR-0034's single-replica
+    /// guidance.
     #[serde(default)]
     pub maintain: MaintainSpec,
 
@@ -224,15 +226,32 @@ impl Default for QuerySpec {
     }
 }
 
-/// Maintain tier: enabled flag, interval, resources. Deliberately no replica
-/// field: maintain is pinned to a single replica with the `Recreate` strategy
-/// (ADR-0034 decision 3).
+/// Maintain tier: enabled flag, replicas, interval, resources.
+///
+/// `replicas` defaults to 1 (today's behavior). ADR-0065's bounded
+/// multi-worker ownership protocol (self-owned heartbeat keys under
+/// `sys/maintain/workers/` plus rendezvous-hash unit partitioning) makes
+/// `replicas > 1` safe: every maintain pod runs `--mode maintain`, discovers
+/// the live worker set from the shared store, and independently owns a
+/// disjoint slice of the `(tenant, signal, shard)` unit space, so N replicas
+/// partition the work rather than each paying for all of it. This supersedes
+/// ADR-0034 decision 3's single-replica `Recreate` guidance (see ADR-0065's
+/// deployment-model consequence).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MaintainSpec {
     /// Whether the maintain Deployment exists at all. Defaults to true.
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// Replica count for the maintain Deployment. Defaults to 1. Values above 1
+    /// are made safe by the ADR-0065 ownership protocol (rendezvous over a
+    /// heartbeat-derived live worker set); the workers coordinate entirely
+    /// through the shared object store, so no additional per-pod wiring is
+    /// needed beyond `--mode maintain` and the shared store flags. Omit to keep
+    /// today's single-replica behavior.
+    #[serde(default = "default_replicas")]
+    pub replicas: i32,
 
     /// How often the maintenance task wakes, in seconds
     /// (`--maintain-interval-secs`).
@@ -259,6 +278,7 @@ impl Default for MaintainSpec {
     fn default() -> Self {
         Self {
             enabled: default_true(),
+            replicas: default_replicas(),
             interval_secs: None,
             resources: None,
             credentials_secret_ref: None,
@@ -311,7 +331,7 @@ pub struct RavelClusterStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_ready_replicas: Option<i32>,
 
-    /// Ready replicas reported by the maintain Deployment (0 or 1).
+    /// Ready replicas reported by the maintain Deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintain_ready_replicas: Option<i32>,
 
@@ -412,7 +432,8 @@ fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
 }
 
 /// Attach OpenAPI `minimum: 1` bounds to the count fields that must be positive:
-/// `spec.shards`, `spec.gateway.replicas`, and `spec.query.replicas`.
+/// `spec.shards`, `spec.gateway.replicas`, `spec.query.replicas`, and
+/// `spec.maintain.replicas`.
 ///
 /// Without this, `shards: 0` or a negative replica count passes CRD validation
 /// and only fails much later as a confusing Deployment-apply error or a
@@ -442,7 +463,7 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
         if let Some(shards) = spec_props.get_mut("shards") {
             shards.minimum = Some(1.0);
         }
-        for tier in ["gateway", "query"] {
+        for tier in ["gateway", "query", "maintain"] {
             if let Some(replicas) = spec_props
                 .get_mut(tier)
                 .and_then(|t| t.properties.as_mut())
@@ -539,7 +560,7 @@ mod tests {
             Some(1.0),
             "shards must reject 0"
         );
-        for tier in ["gateway", "query"] {
+        for tier in ["gateway", "query", "maintain"] {
             let replicas = spec_props
                 .get(tier)
                 .expect("tier prop")
@@ -655,6 +676,9 @@ mod tests {
         assert_eq!(spec.storage.s3.region, "us-east-1");
         assert_eq!(spec.gateway.replicas, 1);
         assert_eq!(spec.query.replicas, 1);
+        // Maintain replicas is optional and defaults to 1: an existing spec
+        // that omits it keeps today's single-replica behavior (issue #918).
+        assert_eq!(spec.maintain.replicas, 1);
         assert!(spec.maintain.enabled);
         assert_eq!(spec.image_pull_policy, None);
     }
