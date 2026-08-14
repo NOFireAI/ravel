@@ -237,8 +237,8 @@ struct Inner {
 /// A per-`get` age check and the startup scan drop entries past
 /// `max_entry_age_ns`, but only ones that are read or that a fresh process
 /// scans. An entry that is never re-read and sees no eviction pressure would
-/// keep its bytes on disk indefinitely; a background sweep (ADR-0064, issue
-/// #753, finding F1) closes that gap by dropping every over-age entry on a
+/// keep its bytes on disk indefinitely; a background sweep (ADR-0064)
+/// closes that gap by dropping every over-age entry on a
 /// fixed interval, so an idle entry ages out within one
 /// `limits.sweep_interval_ns` past `max_entry_age_ns`.
 pub struct DiskCache {
@@ -1403,7 +1403,7 @@ mod tests {
         }
     }
 
-    /// Finding F1, the soundness proof for the periodic sweep: an entry that is
+    /// Soundness proof for the periodic sweep: an entry that is
     /// never re-read (no `get`, no eviction pressure) and ages past
     /// `max_entry_age_ns` must have its bytes physically removed from disk by
     /// the sweep, not linger until something happens to touch it. This is the
@@ -1462,7 +1462,7 @@ mod tests {
         );
     }
 
-    /// Finding F1, wiring proof: the background task spawned at construction
+    /// Wiring proof: the background task spawned at construction
     /// drives `sweep_expired` on its interval, with no manual trigger. An idle
     /// entry aged past the max-age is gone within one sweep interval.
     #[tokio::test]
@@ -1501,7 +1501,7 @@ mod tests {
         assert!(cache.get(&key).is_none());
     }
 
-    /// Finding F1, clean shutdown: dropping the cache must leave no sweeper
+    /// Clean shutdown: dropping the cache must leave no sweeper
     /// task holding its state alive. The sweeper holds only a `Weak`, so once
     /// the sole strong `Arc` (inside `DiskCache`) drops, the shared state is
     /// freed and a later `upgrade` returns `None`; `Drop` also aborts the task
@@ -1529,10 +1529,10 @@ mod tests {
         );
     }
 
-    /// Finding F4: `max_entry_age_ns == 0` must expire promptly with no u64
+    /// `max_entry_age_ns == 0` must expire promptly with no u64
     /// underflow or panic in either age-comparison site (the per-`get` check
-    /// and the sweep). Traced safe in #753 via `saturating_sub` but previously
-    /// unguarded by a test.
+    /// and the sweep). The `saturating_sub` in both sites makes this safe;
+    /// this test guards it.
     #[tokio::test]
     async fn max_entry_age_zero_expires_promptly_without_underflow() {
         let tmp = TempDir::new().unwrap();
@@ -1583,7 +1583,7 @@ mod tests {
         assert_eq!(reader.len(), 0, "age-0 startup scan drops the entry");
     }
 
-    /// Issue #1006: the sweeper's own graceful-exit path -- a tick that finds
+    /// The sweeper's own graceful-exit path -- a tick that finds
     /// the `Weak` dead and `break`s out of the loop -- was previously
     /// unexercised (every existing test relied on `Drop::abort`, which stops
     /// the task before that branch can run). Here the task is spawned against an
@@ -1622,7 +1622,7 @@ mod tests {
             .expect("the sweeper task must return cleanly, not panic");
     }
 
-    /// Issue #1006 (F-D): constructing a `DiskCache` off a Tokio runtime must
+    /// Constructing a `DiskCache` off a Tokio runtime must
     /// fail loudly rather than silently skip the background sweep. Before this
     /// change the spawn was best-effort (`Handle::try_current().ok()?`), so an
     /// off-runtime construction returned a cache with no sweeper and, once the

@@ -958,7 +958,8 @@ mod tests {
 
         let part = Bytes::from(vec![0u8; crate::MULTIPART_MIN_PART_SIZE]);
         // First failure: the classified backend error (Transient here), which
-        // on its own would invite a retry -- exactly the live-lock #296 fixes.
+        // on its own would invite a retry -- exactly the live-lock the
+        // handle-poisoning rule prevents.
         let first = handle
             .put_part(part.clone(), None)
             .await

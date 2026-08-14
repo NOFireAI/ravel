@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn resolve_keyed_marker_without_key_is_fail_closed() {
         // A v2-keyed marker with no key configured must refuse, never fall back
-        // to the v1 default (the EC3/#566 data-safety bug this guards).
+        // to the v1 default (the data-safety bug this guards).
         let err = resolve_scheme_against_marker(
             MarkerScheme::V2Keyed,
             &[0u8; TENANT_KEY_FINGERPRINT_LEN],

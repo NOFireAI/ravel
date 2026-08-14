@@ -660,8 +660,8 @@ mod tests {
         );
     }
 
-    /// A part that violates the sequence rules poisons the handle (issue
-    /// #297): completing afterward must error rather than publish a truncated
+    /// A part that violates the sequence rules poisons the handle:
+    /// completing afterward must error rather than publish a truncated
     /// object, the poison error is non-retryable, and `abort` stays callable.
     /// The sequence check happens before any backend call, so this in-process
     /// oracle covers the S3-shaped path too.
