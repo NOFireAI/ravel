@@ -1,5 +1,4 @@
-//! Deterministic byte-gate test for the RSEG v5 sparse catalog (issue #166,
-//! #176; re-anchored by ADR-0027).
+//! Deterministic byte-gate test for the RSEG v5 sparse catalog (ADR-0027).
 //!
 //! ADR-0027 retired the v1-v4 writers, so the old v1-relative catalog/total/
 //! LABEL_DICT ratio gates (which needed a v1 baseline object to compare

@@ -1,4 +1,4 @@
-//! Self-contained float-value codecs for the issue #99 bake-off
+//! Self-contained float-value codecs for the codec bake-off
 //! (`src/bin/codec_bakeoff.rs`). Report-only: these live in the bench crate
 //! and never touch a production code path. They exist to be compared against
 //! the production Gorilla codec (RSEG enc 16, docs/segment-format.md), which

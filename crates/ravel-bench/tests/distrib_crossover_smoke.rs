@@ -1,5 +1,5 @@
-//! Smoke test for the local-vs-distributed crossover bench core (ADR-0071,
-//! issue #869): runs `distrib_crossover::run` over a tiny `MemoryStore` corpus
+//! Smoke test for the local-vs-distributed crossover bench core (ADR-0071):
+//! runs `distrib_crossover::run` over a tiny `MemoryStore` corpus
 //! and asserts the two paths agree on what the query computes and on the
 //! host-independent cost counters, exactly the invariants ADR-0071 guarantees.
 //! This is the CI/smoke-runnable target for the bench; it exercises the same

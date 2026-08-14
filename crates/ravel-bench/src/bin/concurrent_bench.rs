@@ -1,6 +1,5 @@
-//! Concurrent readers-and-writers + cold-vs-warm cache benchmark
-//! (docs/benchmarking.md "End-to-end", issue #269). Thin wrapper around
-//! `ravel_bench::concurrent::run`: parses `--store memory|s3` via
+//! Concurrent readers-and-writers + cold-vs-warm cache benchmark. Thin
+//! wrapper around `ravel_bench::concurrent::run`: parses `--store memory|s3` via
 //! `ravel_bench::harness`, same convention as `s3_e2e_bench`, then prints
 //! the report.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -10,9 +9,7 @@ use ravel_bench::concurrent::{ConcurrentConfig, Report, run};
 use ravel_bench::harness::{StoreKind, store_from_env};
 
 #[derive(Parser, Debug)]
-#[command(
-    about = "Concurrent readers-and-writers + cold/warm cache benchmark (docs/benchmarking.md \"End-to-end\")"
-)]
+#[command(about = "Concurrent readers-and-writers + cold/warm cache benchmark")]
 struct Args {
     #[arg(long, value_enum, default_value_t = StoreKind::Memory)]
     store: StoreKind,

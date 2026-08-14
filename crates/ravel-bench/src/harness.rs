@@ -1,6 +1,5 @@
-//! Shared object-store construction for end-to-end bench bins
-//! (docs/benchmarking.md "End-to-end"). Extracted from `ingest_bench`'s
-//! `s3_config_from_env`/`StoreKind` so every bin that needs a
+//! Shared object-store construction for end-to-end bench bins. Extracted from
+//! `ingest_bench`'s `s3_config_from_env`/`StoreKind` so every bin that needs a
 //! `--store memory|s3` flag shares one copy of the `RAVEL_S3_*` env-var
 //! convention instead of re-deriving it (`ingest_bench.rs` and
 //! `catalog_resolve_bench.rs` predate this module and keep their own inline

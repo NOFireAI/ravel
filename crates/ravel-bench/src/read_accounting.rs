@@ -1,4 +1,4 @@
-//! Read-path GET accounting wrappers (GitHub issue #97 phase b).
+//! Read-path GET accounting wrappers.
 //!
 //! Two counting wrappers, both delegating every call to an inner store while
 //! tallying GET requests and the bytes those GETs actually transferred:
@@ -171,7 +171,7 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false so the flag matches the refusing default
-        // `put_multipart` this double inherits (issue #298).
+        // `put_multipart` this double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()

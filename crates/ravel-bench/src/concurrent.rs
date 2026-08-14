@@ -1,5 +1,5 @@
 //! Concurrent readers-and-writers benchmark core, plus a cold-vs-warm query
-//! cache comparison (docs/benchmarking.md "End-to-end", issue #269).
+//! cache comparison.
 //!
 //! `ravel_bench::e2e::run` drives `IngestRouter` and `QueryEngine` through
 //! one randomized-tenant ingest-then-query cycle, sequentially: it is not a
@@ -135,8 +135,8 @@ pub struct ReaderReport {
 /// "Cold" is the first instant query issued against that fresh pair; "warm"
 /// is the same query repeated immediately after, against the same pair.
 ///
-/// `ravel-query` itself has no segment-footer or page cache yet
-/// (docs/benchmarking.md "Profiling"), but the fresh `Catalog` this
+/// `ravel-query` itself has no segment-footer or page cache yet,
+/// but the fresh `Catalog` this
 /// comparison builds owns five caches on the resolve path (commit
 /// records, compaction records, HEAD, snapshot parts, postings --
 /// `ravel_catalog::catalog::Catalog`), all cold at construction. The
@@ -210,8 +210,8 @@ async fn run_writer(
         series_idx_offset,
         ..WorkloadConfig::default()
     };
-    // The generator now stamps every series with a __name__ label (issue
-    // #277), so reader tasks' PromQL selector matches by name directly.
+    // The generator stamps every series with a __name__ label, so reader
+    // tasks' PromQL selector matches by name directly.
     let batches: Vec<Vec<NormalizedPoint>> =
         generate_batches(&workload).expect("generate writer workload");
 

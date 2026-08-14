@@ -1,5 +1,4 @@
-//! Within-segment selective-read GET accounting for RSEG v5 (ADR-0026,
-//! issue #176; supersedes the #167 prototype bin).
+//! Within-segment selective-read GET accounting for RSEG v5 (ADR-0026).
 //!
 //! Measures what a point lookup, a 10-series multi-lookup, and a full scan
 //! each cost -- in GET requests and bytes transferred -- for two RSEG layouts
@@ -18,10 +17,10 @@
 //!           whole-catalog read.
 //!
 //! at 500 / 10k / 100k series (`many_small`, 2 samples/series), the shapes the
-//! #97/#167 read-path accounting used. GET count and bytes are
-//! backend-independent, so -- as the #97 harness argues -- they are the
-//! deliverable regardless of backend; this bin meters an in-memory object
-//! directly, one GET and its returned bytes per metered fetch.
+//! read-path accounting uses. GET count and bytes are backend-independent, so
+//! they are the deliverable regardless of backend; this bin meters an
+//! in-memory object directly, one GET and its returned bytes per metered
+//! fetch.
 //!
 //! Report-only: never changes library behavior. Runs under the default
 //! `cargo test -p ravel-bench` via its correctness test.
@@ -39,8 +38,8 @@ use ravel_segment::{
     verify_id_window,
 };
 
-/// RSEG reader-protocol suffix probe (docs/segment-format.md step 2), same
-/// 64 KiB the #97 harness used.
+/// RSEG reader-protocol suffix probe (docs/segment-format.md step 2), the
+/// same 64 KiB the read-path accounting harness uses.
 const SUFFIX_PROBE: u64 = 64 * 1024;
 /// Series counts (many_small, 2 samples/series).
 const SHAPES: [usize; 3] = [500, 10_000, 100_000];

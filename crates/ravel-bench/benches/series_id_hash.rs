@@ -1,5 +1,4 @@
-//! Series canonicalization + BLAKE3 id throughput (docs/benchmarking.md
-//! Phase 1: "Series canonicalization + BLAKE3 id throughput").
+//! Series canonicalization + BLAKE3 id throughput.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};

@@ -1,5 +1,5 @@
 //! Smoke tests for the `concurrent_bench` readers-and-writers +
-//! cold/warm-cache path (docs/benchmarking.md "End-to-end", issue #269):
+//! cold/warm-cache path:
 //! `readers_writers_memory_smoke` always runs against an in-process
 //! `MemoryStore`; `readers_writers_minio_smoke` runs the same path against a
 //! real MinIO endpoint, gated on `RAVEL_MINIO_URL` exactly like

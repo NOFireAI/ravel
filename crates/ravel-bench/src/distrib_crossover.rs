@@ -1,5 +1,5 @@
 //! Local-vs-distributed read crossover benchmark core (ADR-0071 distributed
-//! read fan-out, issue #869). Every other query bench in this crate measures
+//! read fan-out). Every other query bench in this crate measures
 //! one isolated stage or the single-process query path; this one measures the
 //! same fixed PromQL query over the same fixed corpus twice -- once through the
 //! local `QueryEngine` and once through the ADR-0071 distributed fan-out -- and
@@ -29,8 +29,7 @@
 //! pays off once real object-store latency and extra fetch NICs dominate, which
 //! a `MemoryStore`/loopback shape cannot exhibit. An object-store-backed
 //! crossover panel (real S3/MinIO, workers on separate hosts) is the explicit
-//! follow-up, the same way every other MemoryStore panel in BENCHMARKS.md marks
-//! its object-store row pending. The S3-request counts and bytes-moved, by
+//! follow-up. The S3-request counts and bytes-moved, by
 //! contrast, are host-independent: ADR-0071 makes them identical to local
 //! execution for a scalar query, and this bench reports both so that invariant
 //! is visible rather than asserted.
@@ -66,7 +65,7 @@ use crate::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
 
 /// Inputs for one crossover run. Corpus knobs deliberately default small so the
 /// smoke target stays fast; a recorded run passes larger values on the command
-/// line (see BENCHMARKS.md).
+/// line.
 pub struct CrossoverConfig {
     pub store: Arc<dyn ObjectStoreBackend>,
     pub store_label: String,

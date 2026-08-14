@@ -1,8 +1,8 @@
-//! Allocation + wall-clock profile for `SegmentWriter::write` (issue #19 /
-//! A3). Criterion's `segment_encode` bench reports throughput but not
-//! allocator traffic, and the bench harness must not change; this is a
-//! separate, report-only bin using `stats_alloc`'s instrumented global
-//! allocator to capture the before/after numbers the A3 report asks for.
+//! Allocation + wall-clock profile for `SegmentWriter::write`. Criterion's
+//! `segment_encode` bench reports throughput but not allocator traffic, and
+//! the bench harness must not change; this is a separate, report-only bin
+//! using `stats_alloc`'s instrumented global allocator to capture allocation
+//! counts and bytes alongside wall time.
 //! `stats_alloc`'s `unsafe impl GlobalAlloc` lives entirely inside that
 //! crate; no `unsafe` appears in this file.
 //!

@@ -1,5 +1,5 @@
-//! End-to-end ingest-then-query benchmark CLI (docs/benchmarking.md
-//! "End-to-end"). Thin wrapper around `ravel_bench::e2e::run`: parses
+//! End-to-end ingest-then-query benchmark CLI. Thin wrapper around
+//! `ravel_bench::e2e::run`: parses
 //! `--store memory|s3` via `ravel_bench::harness`, then prints the report.
 //! The `s3` store reads `RAVEL_S3_*` env vars (`ravel_bench::harness::
 //! s3_config_from_env`), same convention as `ingest_bench`.
@@ -10,7 +10,7 @@ use ravel_bench::e2e::{Report, run};
 use ravel_bench::harness::{StoreKind, store_from_env};
 
 #[derive(Parser, Debug)]
-#[command(about = "End-to-end ravel ingest+query benchmark (Phase 1, docs/benchmarking.md)")]
+#[command(about = "End-to-end ravel ingest+query benchmark")]
 struct Args {
     #[arg(long, value_enum, default_value_t = StoreKind::Memory)]
     store: StoreKind,

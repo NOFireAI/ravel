@@ -1,6 +1,6 @@
 //! End-to-end ingest benchmark: drives `IngestRouter` directly (no HTTP)
-//! against a real or in-memory object store (docs/benchmarking.md
-//! "End-to-end"). Thin wrapper around `ravel_bench::ingest::run`, mirroring
+//! against a real or in-memory object store. Thin wrapper around
+//! `ravel_bench::ingest::run`, mirroring
 //! `concurrent_bench`/`s3_e2e_bench`: the flag surface, validation, and
 //! report structure all live in the lib so `tests/ingest_smoke.rs` exercises
 //! the same path this bin runs. Report-only: never changes

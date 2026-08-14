@@ -1,16 +1,15 @@
-//! End-to-end ingest benchmark core (docs/benchmarking.md "End-to-end"):
-//! drives `IngestRouter` directly (no HTTP) against a real or in-memory
+//! End-to-end ingest benchmark core: drives `IngestRouter` directly (no HTTP)
+//! against a real or in-memory
 //! object store. Lives in the lib (not the `ingest_bench` bin) so
 //! `tests/ingest_smoke.rs` can exercise the same flags-to-report path the
 //! bin runs, matching how `ravel_bench::e2e` and `ravel_bench::concurrent`
 //! are tested directly rather than through a bin. Report-only: never changes
 //! ravel-ingest/ravel-catalog behavior, only measures it.
 //!
-//! The epic #807 wave-4 measurement panel sweeps this binary over pipeline
-//! depth {1,2,3,4} x flush-delay policy {fixed, adaptive} (ADR-0067). The
-//! two knobs are `--max-inflight-flushes` and `--flush-delay-policy`; their
-//! defaults (depth 1, fixed) reproduce production defaults so a panel row
-//! taken at the defaults is comparable to older BENCHMARKS.md entries.
+//! The measurement panel sweeps this binary over pipeline depth {1,2,3,4} x
+//! flush-delay policy {fixed, adaptive} (ADR-0067). The two knobs are
+//! `--max-inflight-flushes` and `--flush-delay-policy`; their defaults
+//! (depth 1, fixed) reproduce production defaults.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
@@ -28,9 +27,9 @@ use serde::Serialize;
 use crate::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
 use crate::harness::{StoreKind, store_from_env};
 
-/// Bytes on the wire per logical sample: `ts_ns: i64` + `value: f64`
-/// (docs/benchmarking.md "write amplification (bytes stored / bytes
-/// ingested logical)").
+/// Bytes on the wire per logical sample: `ts_ns: i64` + `value: f64`. Used as
+/// the denominator of write amplification (bytes stored / bytes ingested
+/// logical).
 const LOGICAL_BYTES_PER_SAMPLE: u64 = 16;
 const VISIBILITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const VISIBILITY_POLL_MAX_ROUNDS: u32 = 30;
@@ -71,7 +70,7 @@ impl std::fmt::Display for FlushDelayPolicy {
 /// the bin does, mirroring how `services/ravel-server`'s `Cli` is validated
 /// in its own crate.
 #[derive(Parser, Debug)]
-#[command(about = "End-to-end ravel-ingest benchmark (Phase 1, docs/benchmarking.md)")]
+#[command(about = "End-to-end ravel-ingest benchmark")]
 pub struct IngestBenchArgs {
     #[arg(long, value_enum, default_value_t = StoreKind::Memory)]
     pub store: StoreKind,
@@ -90,7 +89,7 @@ pub struct IngestBenchArgs {
     /// Upper bound on concurrently in-flight flush tasks per shard
     /// (ADR-0067 decision 2). Passed straight through to
     /// `IngestConfig::max_inflight_flushes`. Default 1 reproduces today's
-    /// one-flush-at-a-time behavior; the wave-4 panel sweeps {1,2,3,4}.
+    /// one-flush-at-a-time behavior; the measurement panel sweeps {1,2,3,4}.
     #[arg(long, default_value_t = 1)]
     pub max_inflight_flushes: u32,
     /// Flush-delay policy (ADR-0067 decision 3): `fixed` keeps the fixed

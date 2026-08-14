@@ -1,6 +1,5 @@
-//! RSEG encode throughput by series cardinality (docs/benchmarking.md Phase
-//! 1: "RSEG metric segment encode: samples/s, bytes/sample, by cardinality
-//! (100 / 10k / 1M series)"). 1M series is scaled down to 200k for `--quick`
+//! RSEG encode throughput by series cardinality: samples/s and bytes/sample
+//! at 100 / 10k / 1M series. 1M series is scaled down to 200k for `--quick`
 //! CI runtime; pass a higher `RAVEL_BENCH_MAX_SERIES` to widen the sweep.
 //!
 //! Measures the RSEG v5 writer (`SegmentWriter::write`, the raw-sample
@@ -17,9 +16,9 @@ use ravel_segment::{SegmentWriter, SeriesInput, SeriesInputV3};
 
 const TOTAL_SAMPLES: usize = 200_000;
 
-/// Axis-sweep cells (issue #98): samples-per-series x labels-per-series at a
-/// fixed ~200k total sample budget. Existing `segment_encode` cases above are
-/// frozen (BENCHMARKS.md); these are new ids in their own group.
+/// Axis-sweep cells: samples-per-series x labels-per-series at a fixed ~200k
+/// total sample budget. The `segment_encode` cases above keep their own case
+/// ids; these are a separate group.
 const AXIS_SAMPLES_PER_SERIES: [usize; 3] = [2, 60, 500];
 const AXIS_LABELS_PER_SERIES: [usize; 2] = [5, 15];
 
@@ -66,7 +65,7 @@ fn bench_segment_encode(c: &mut Criterion) {
         // The fixture clone is setup, not part of encode: `SegmentWriter::write`
         // consumes its input, so each iteration needs a fresh copy, but the deep
         // clone of every LabelSet and Vec<Sample> must not be charged to encode
-        // time (a12-F01). iter_batched runs the clone in the untimed setup
+        // time. iter_batched runs the clone in the untimed setup
         // closure and times only the write, matching the pattern in
         // src/bin/segment_alloc_profile.rs.
         group.bench_function(format!("{series_count}_series_v5"), |b| {
@@ -95,9 +94,9 @@ fn axis_inputs(samples_per_series: usize, labels_per_series: usize) -> Vec<Serie
         .collect()
 }
 
-/// samples-per-series x labels-per-series sweep for encode, v1 and v2 each
-/// (issue #98). Case ids are `s{samples}_l{labels}_v1` / `_v2`. Same untimed
-/// clone-in-setup pattern as `bench_segment_encode` (a12-F01): the deep
+/// samples-per-series x labels-per-series sweep for encode, v1 and v2 each.
+/// Case ids are `s{samples}_l{labels}_v1` / `_v2`. Same untimed
+/// clone-in-setup pattern as `bench_segment_encode`: the deep
 /// fixture clone is charged to setup, only the write is timed.
 fn bench_segment_encode_axis_sweep(c: &mut Criterion) {
     let mut group = c.benchmark_group("segment_encode_axis_sweep");
@@ -134,11 +133,11 @@ fn clone_hist_inputs(inputs: &[SeriesInputV3]) -> Vec<SeriesInputV3> {
 }
 
 /// RSEG v3 native-histogram encode throughput for the representative shape
-/// from docs/rseg-v3-plan.md section 8 (30 populated buckets/side, 4 spans,
-/// integer counts, has_sum, one sample per series). New group with ids
-/// `{series_count}_series_histogram`, distinct from the frozen scalar
-/// `segment_encode` ids. Same untimed clone-in-setup pattern as
-/// `bench_segment_encode` (a12-F01): `write_histograms` consumes its input,
+/// (30 populated buckets/side, 4 spans, integer counts, has_sum, one sample
+/// per series). Separate group with ids `{series_count}_series_histogram`,
+/// distinct from the scalar `segment_encode` ids. Same untimed
+/// clone-in-setup pattern as `bench_segment_encode`: `write_histograms`
+/// consumes its input,
 /// so each iteration gets a fresh copy from the untimed setup closure and
 /// only the write is timed. Throughput is one element per histogram sample
 /// (one per series in this shape).

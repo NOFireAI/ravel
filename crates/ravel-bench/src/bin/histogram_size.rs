@@ -1,18 +1,15 @@
 //! Measures the real encoded RSEG v3 size of the representative
-//! native-histogram shape (docs/rseg-v3-plan.md section 8), superseding that
-//! section's analytical ~99 bytes/record estimate with a genuine
-//! encoded-byte number.
+//! native-histogram shape as a genuine encoded-byte number.
 //!
 //! Builds one segment over the histogram workload via
 //! `SegmentWriter::write_histograms` and reports, per record (one histogram
-//! sample per series in the section 8 shape):
+//! sample per series in the representative shape):
 //!   - total object bytes / record (whole segment: catalog, labels, footer,
 //!     all pages), and
-//!   - HIST_PAGES section bytes / record (just the histogram value pages, the
-//!     direct analog of section 8's per-record HIST_SPANS arithmetic).
+//!   - HIST_PAGES section bytes / record (just the histogram value pages).
 //!
 //! Not a criterion bench (it measures size, not time); run it directly to
-//! obtain the numbers recorded in BENCHMARKS.md.
+//! obtain the encoded-size numbers.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_histograms};
@@ -62,7 +59,7 @@ fn measure(series_count: usize) {
 }
 
 fn main() {
-    println!("RSEG v3 native-histogram encoded size (docs/rseg-v3-plan.md section 8 shape)");
+    println!("RSEG v3 native-histogram encoded size (representative shape)");
     println!("30 buckets/side, 4 spans/side, integer counts, has_sum, 1 sample/series");
     println!();
     for &series_count in &[100usize, 10_000] {

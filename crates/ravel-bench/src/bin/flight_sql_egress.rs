@@ -1,8 +1,8 @@
-//! Flight SQL vs JSON result-egress bench (GitHub issue #154, Phase C).
+//! Flight SQL vs JSON result-egress bench.
 //!
-//! Answers one question the arrow-datafusion plan's Phase C bench criteria
-//! asks: for the same query over the same dataset, what does result egress
-//! cost over Flight SQL (Arrow IPC streamed through `DoGet`) versus the
+//! Answers one question: for the same query over the same dataset, what does
+//! result egress cost over Flight SQL (Arrow IPC streamed through `DoGet`)
+//! versus the
 //! existing `POST /api/v1/sql` JSON encoding? The deliverable is
 //! bytes-on-wire and wall time, normalized per million samples returned.
 //!
