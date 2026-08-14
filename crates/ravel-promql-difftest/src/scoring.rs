@@ -564,18 +564,6 @@ pub static REGISTRY: &[Construct] = &[
          refuses the modifier rather than evaluating it as plain matching",
     ),
     rejected_modifier(
-        "histogram_quantile at range-query top level",
-        "Unsupported: histogram_quantile in a range query (422 execution)",
-        "`eval_range`'s per-step matrix reduction has no shape for a \
-         function that groups a whole instant vector; still fully usable \
-         in an instant query and nested inside one",
-    ),
-    rejected_modifier(
-        "histogram_fraction at range-query top level",
-        "Unsupported: histogram_fraction in a range query (422 execution)",
-        "same range-path boundary as `histogram_quantile` above",
-    ),
-    rejected_modifier(
         "subquery over native histograms",
         "Unsupported: subquery over native histograms (422 execution)",
         "the subquery grid reducer keeps only each step's float value, so a \
@@ -775,20 +763,6 @@ pub static REJECTION_CASES: &[RejectionCase] = &[
         eval: RejectionEval::Instant,
         time_offset_ms: 0,
         message_contains: "fill-in values",
-    },
-    RejectionCase {
-        construct: "histogram_quantile at range-query top level",
-        query: "histogram_quantile(0.9, diff_histogram_bucket)",
-        eval: RejectionEval::Range,
-        time_offset_ms: 0,
-        message_contains: "histogram_quantile in a range query",
-    },
-    RejectionCase {
-        construct: "histogram_fraction at range-query top level",
-        query: "histogram_fraction(0.1, 1, diff_histogram_bucket)",
-        eval: RejectionEval::Range,
-        time_offset_ms: 0,
-        message_contains: "histogram_fraction in a range query",
     },
     RejectionCase {
         // +600s so the subquery's epoch-aligned grid lands inside the

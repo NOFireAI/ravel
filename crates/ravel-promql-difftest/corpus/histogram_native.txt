@@ -108,3 +108,32 @@ query: histogram_sum(avg(diff_native_hist_agg))
 kind: instant
 time: +0s
 mode: unordered
+
+# FIXED (#1081): histogram_quantile/histogram_fraction now evaluate at a
+# range-query top level (previously a typed rejection there). This is the
+# literal canonical Grafana p99 latency panel shape --
+# `histogram_quantile(0.99, <native-histogram-selector>)` with no wrapping
+# arithmetic -- which was the first thing that errored against Ravel. The
+# same expression nested in an arithmetic identity (`... * 1`) already
+# evaluated; these entries pin the un-nested range form bit-exact against the
+# pinned Prometheus binary, evaluated over a stepped grid (the whole call is
+# recomputed fresh at each grid point and stitched into a matrix, exactly the
+# generalization VectorMap/Instant already use). The step (60s) is a multiple
+# of the 30s dataset step, so every grid point lands on a real sample, and
+# 0.99 exercises the interior-bucket exponential interpolation the #252 median
+# entry above already pins.
+name: native_histogram_quantile_p99_range_grafana
+query: histogram_quantile(0.99, diff_native_hist)
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered
+
+name: native_histogram_fraction_range
+query: histogram_fraction(0, 4, diff_native_hist)
+kind: range
+start: +300s
+end: +600s
+step: 60s
+mode: unordered

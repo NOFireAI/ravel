@@ -385,18 +385,35 @@ pub(crate) fn eval_range_call(
             maybe_info_non_counter_selector_name(call.func.name, arg, !result.is_empty(), ctx);
             Ok(result)
         }
-        // `eval_range`'s current architecture (`resolve_range_core`) only
-        // supports a top-level call that reduces one series' matrix window
-        // per grid step; `histogram_quantile`/`histogram_fraction` instead
-        // group and reduce a whole instant vector at once, so they have no
-        // per-series matrix to reduce here. Both are still fully usable in
-        // an instant query, including nested inside another expression
-        // (`eval_call` above), a pre-existing architectural boundary of the
-        // range-query path rather than something specific to these two
-        // functions.
-        FunctionKind::HistogramQuantile(_) | FunctionKind::HistogramFraction(_) => {
-            Err(Error::Unsupported {
-                construct: format!("{} in a range query", call.func.name),
+        // `histogram_quantile`/`histogram_fraction` group and reduce a whole
+        // instant vector at once, so they have no per-series matrix to reduce
+        // per grid step the way `resolve_range_core` reduces a matrix window.
+        // Instead they route through `eval_instant_over_grid`, the same
+        // generalization `VectorMap`/`Instant` use below: evaluate the whole
+        // call fresh at every grid point (identical to the `eval_call` arm
+        // above) and stitch the per-step instant vectors into one matrix.
+        // This makes the canonical Grafana p99 pattern
+        // (`histogram_quantile(0.99, <native-histogram-selector>)`) evaluate
+        // at a range-query top level, matching what it already did nested in
+        // an arithmetic identity.
+        FunctionKind::HistogramQuantile(f) => {
+            eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+                ctx.check_deadline()?;
+                let phi = scalar_arg(evaluator, source, &call.args.args[0], t, ctx)?;
+                let vector = vector_arg(evaluator, source, &call.args.args[1], t, ctx)?;
+                Ok(Value::Vector(to_instant_vector(f(phi, vector, ctx), t)))
+            })
+        }
+        FunctionKind::HistogramFraction(f) => {
+            eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
+                ctx.check_deadline()?;
+                let lower = scalar_arg(evaluator, source, &call.args.args[0], t, ctx)?;
+                let upper = scalar_arg(evaluator, source, &call.args.args[1], t, ctx)?;
+                let vector = vector_arg(evaluator, source, &call.args.args[2], t, ctx)?;
+                Ok(Value::Vector(to_instant_vector(
+                    f(lower, upper, vector, ctx),
+                    t,
+                )))
             })
         }
         FunctionKind::ScalarRangeVector(f) => {

@@ -1,14 +1,15 @@
 //! Integration coverage for `histogram_quantile`/`histogram_fraction`
 //! through the public `Evaluator` API: parsing and registry dispatch,
 //! grouping by labels-minus-`le` end to end, nested composition with
-//! another function's output (the plan's "rate-of-buckets" shape), and the
-//! typed error a range-query top-level call gets since neither function
-//! fits `eval_range`'s matrix-reducing shape. `histogram_classic.rs`'s own
-//! unit tests already pin the bucket math itself; these tests exercise the
-//! wiring around it.
+//! another function's output (the plan's "rate-of-buckets" shape), and
+//! range-query top-level evaluation (the canonical Grafana p99 shape), which
+//! routes through `eval_instant_over_grid` since neither function fits
+//! `eval_range`'s matrix-reducing shape. `histogram_classic.rs`'s own unit
+//! tests already pin the bucket math itself; these tests exercise the wiring
+//! around it.
 #![allow(clippy::expect_used)]
 
-use ravel_promql::{Error, Evaluator, testsource::TestSource};
+use ravel_promql::{Evaluator, testsource::TestSource};
 
 fn two_jobs_bucket_source() -> TestSource {
     TestSource::new()
@@ -126,34 +127,62 @@ fn histogram_quantile_composes_with_rate_of_buckets() {
     assert_eq!(result[0].value, raw[0].value);
 }
 
+/// The canonical Grafana p99 shape: `histogram_quantile` at a range-query
+/// top level, no wrapping arithmetic. It now routes through
+/// `eval_instant_over_grid` (the same generalization `VectorMap`/`Instant`
+/// use), evaluating the whole call fresh at each grid step and stitching the
+/// per-step instant vectors into one matrix. The per-step values match the
+/// instant evaluation at that step's timestamp.
 #[test]
-fn histogram_quantile_is_rejected_in_the_range_call_path() {
+fn histogram_quantile_evaluates_in_the_range_call_path() {
     let source = two_jobs_bucket_source();
-    let err = Evaluator::new()
-        .range(
-            &source,
-            "histogram_quantile(0.9, http_request_duration_seconds_bucket)",
-            0,
-            60_000,
-            60_000,
-        )
-        .expect_err("not supported at the range-query top level");
-    assert!(matches!(err, Error::Unsupported { .. }));
-    assert!(err.to_string().contains("histogram_quantile"));
+    let query = "histogram_quantile(0.9, http_request_duration_seconds_bucket)";
+    let mut matrix = Evaluator::new()
+        .range(&source, query, 0, 60_000, 60_000)
+        .expect("evaluates at the range-query top level");
+    matrix.sort_by(|a, b| a.0.get("job").cmp(&b.0.get("job")));
+    // Two grid steps (0s, 60s) over two jobs (a, b).
+    assert_eq!(matrix.len(), 2);
+    assert_eq!(matrix[0].0.get("job"), Some("a"));
+    assert_eq!(matrix[0].0.get("__name__"), None, "metric name dropped");
+    assert_eq!(matrix[1].0.get("job"), Some("b"));
+    for (labels, samples) in &matrix {
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].ts_ns, 0);
+        assert_eq!(samples[1].ts_ns, 60_000_000_000);
+        for step_ms in [0_i64, 60_000] {
+            let instant = Evaluator::new()
+                .instant(&source, query, step_ms)
+                .expect("evaluates");
+            let expected = instant
+                .iter()
+                .find(|s| s.labels.get("job") == labels.get("job"))
+                .expect("job present at this step");
+            let step_ns = step_ms * 1_000_000;
+            let got = samples
+                .iter()
+                .find(|s| s.ts_ns == step_ns)
+                .expect("sample at this step");
+            assert_eq!(got.value.to_bits(), expected.value.to_bits());
+        }
+    }
 }
 
 #[test]
-fn histogram_fraction_is_rejected_in_the_range_call_path() {
+fn histogram_fraction_evaluates_in_the_range_call_path() {
     let source = two_jobs_bucket_source();
-    let err = Evaluator::new()
-        .range(
-            &source,
-            "histogram_fraction(0, 1, http_request_duration_seconds_bucket)",
-            0,
-            60_000,
-            60_000,
-        )
-        .expect_err("not supported at the range-query top level");
-    assert!(matches!(err, Error::Unsupported { .. }));
-    assert!(err.to_string().contains("histogram_fraction"));
+    let query = "histogram_fraction(0, 0.1, http_request_duration_seconds_bucket{job=\"a\"})";
+    let matrix = Evaluator::new()
+        .range(&source, query, 0, 60_000, 60_000)
+        .expect("evaluates at the range-query top level");
+    assert_eq!(matrix.len(), 1);
+    let (labels, samples) = &matrix[0];
+    assert_eq!(labels.get("job"), Some("a"));
+    assert_eq!(samples.len(), 2);
+    // 10 of 40 total observations are at or below 0.1 at t=0s.
+    assert_eq!(samples[0].ts_ns, 0);
+    assert_eq!(samples[0].value.to_bits(), 0.25_f64.to_bits());
+    // At t=60s: 20 of 80 total observations are at or below 0.1.
+    assert_eq!(samples[1].ts_ns, 60_000_000_000);
+    assert_eq!(samples[1].value.to_bits(), 0.25_f64.to_bits());
 }

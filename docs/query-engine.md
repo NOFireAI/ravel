@@ -768,15 +768,15 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 133 constructs over 216 corpus entries in 10 corpus files.
+Surface: 131 constructs over 218 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
 | supported | 124 |
-| intentionally rejected | 7 |
+| intentionally rejected | 5 |
 | accepted divergence | 2 |
 | unclassified | 0 |
-| **score** (supported + intentionally rejected + accepted divergence / total) | **133/133 = 100%** |
+| **score** (supported + intentionally rejected + accepted divergence / total) | **131/131 = 100%** |
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
@@ -797,8 +797,6 @@ Surface: 133 constructs over 216 corpus entries in 10 corpus files.
 | `by` | modifier | supported | `corpus/aggregate.txt`, 11 entries |
 | `group_left` | modifier | supported | `corpus/binop.txt`, 2 entries |
 | `group_right` | modifier | supported | `corpus/binop.txt`, 1 entry |
-| histogram_fraction at range-query top level | modifier | intentionally rejected | `Unsupported: histogram_fraction in a range query (422 execution)`; rejection verified; same range-path boundary as `histogram_quantile` above |
-| histogram_quantile at range-query top level | modifier | intentionally rejected | `Unsupported: histogram_quantile in a range query (422 execution)`; rejection verified; `eval_range`'s per-step matrix reduction has no shape for a function that groups a whole instant vector; still fully usable in an instant query and nested inside one |
 | `ignoring` | modifier | supported | `corpus/binop.txt`, 1 entry |
 | label matcher != | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | label matcher !~ | modifier | supported | `corpus/selectors.txt`, 1 entry |
