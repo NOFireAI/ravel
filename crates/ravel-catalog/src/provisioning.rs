@@ -391,10 +391,9 @@ pub const TOLERATED_CLOCK_SKEW_HOURS: u32 = 1;
 /// for `S` hours past the successor's activation so that straggler is still
 /// found, for any writer whose clock skew stays within
 /// [`TOLERATED_CLOCK_SKEW_HOURS`]. A writer skewed beyond that bound is a
-/// distinct, unclosed hazard (see NF-3 in
-/// docs/reviews/2026-08-adversarial-program/RAVEL-ADVERSARIAL-REVIEW-V2.md):
-/// no finite read-side slack can cover unbounded skew, so the bound must be
-/// tolerated-but-finite and documented, not silently assumed zero.
+/// distinct, unclosed hazard: no finite read-side slack can cover unbounded
+/// skew, so the bound must be tolerated-but-finite and documented, not
+/// silently assumed zero.
 pub const DEFAULT_SCAN_SLACK_HOURS: u32 = FLUSH_BOUND_SLACK_HOURS + TOLERATED_CLOCK_SKEW_HOURS;
 
 /// Nanoseconds per unix hour, the unit `activation_hour` and `ingest_hour_bucket`

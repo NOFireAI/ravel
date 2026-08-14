@@ -1,8 +1,7 @@
-//! Audit SQL-3 reproducers (issue #145, review
-//! docs/reviews/2026-07-28-ravel-sql-audit/sql3-exec-memory-deadline.md).
+//! Memory-ceiling enforcement and budget-error typing for the SQL executor.
 //!
-//! Each test is `#[ignore]`d and fails when un-ignored on the audited HEAD
-//! (a7c95ef). They stay on the result branch; they are not a fix.
+//! The grow-path probe is `#[ignore]`d: it documents the desired ceiling
+//! behavior and is not part of the gate run.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -16,23 +15,21 @@ use ravel_sql::{CeilingBreach, SqlConfig, SqlError, TenantDelegatingPool, Tenant
 use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
-/// sql3-F01 (S1, MEM). `MemoryPool::grow` is infallible and checks no
-/// ceiling, so a reservation can grow past both the per-query and per-tenant
-/// limits with no error, while `try_grow` of the same size refuses. The
-/// configured budget is therefore not a hard cap on the `grow` path, which
-/// (per the implementer's note at memory.rs:196-214) is the path the
+/// `MemoryPool::grow` is infallible and checks no ceiling, so a reservation
+/// can grow past both the per-query and per-tenant limits with no error, while
+/// `try_grow` of the same size refuses. The configured budget is therefore not
+/// a hard cap on the `grow` path (memory.rs:196-214), which is the path the
 /// nested-loop and sort-merge join operators use.
 ///
 /// This drives the pool directly, no query engine needed, so it is
 /// deterministic and isolates the mechanism from operator-selection details.
-/// It FAILS on the audited HEAD: `reserved()` ends at 4096, four times the
-/// 1024-byte ceiling, with no error raised.
+/// The grow path must not push `reserved()` past the 1024-byte ceiling.
 #[test]
-#[ignore = "sql3-F01: grow bypasses the memory ceiling; fails on the audited HEAD"]
-fn sql3_f01_grow_bypasses_the_query_and_tenant_ceiling() {
+#[ignore = "grow-path memory-ceiling probe; not wired as a gate"]
+fn grow_must_not_bypass_the_query_and_tenant_ceiling() {
     let tenant = TenantMemoryAccountant::new(1024);
-    // The breach flag is the #163 addition; sql3-F01 ignores it and still
-    // asserts the raw counters overshoot on the grow path (accepted in #156).
+    // The breach flag is a separate signal; this probe ignores it and asserts
+    // the raw counters do not overshoot the ceiling on the grow path.
     let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
         1024,
         Arc::clone(&tenant),
@@ -40,7 +37,7 @@ fn sql3_f01_grow_bypasses_the_query_and_tenant_ceiling() {
         QueryAccounting::new(),
     ));
 
-    let res = MemoryConsumer::new("audit-sql3-f01").register(&pool);
+    let res = MemoryConsumer::new("grow-ceiling-probe").register(&pool);
 
     // The checked path enforces the ceiling: 4096 > 1024 is refused and
     // reserves nothing. This half already holds today.
@@ -52,8 +49,7 @@ fn sql3_f01_grow_bypasses_the_query_and_tenant_ceiling() {
     assert_eq!(tenant.reserved(), 0);
 
     // The infallible path is what joins reach. It must not exceed the ceiling.
-    // On the audited HEAD it does: grow adds 4096 unconditionally to both
-    // budgets.
+    // A naive `grow` adds 4096 unconditionally to both budgets.
     res.grow(4096);
     assert!(
         pool.reserved() <= 1024,
@@ -67,24 +63,22 @@ fn sql3_f01_grow_bypasses_the_query_and_tenant_ceiling() {
     );
 }
 
-/// sql3-F02 (S2, MEM). A memory-budget exhaustion raised deep in a plan (a
-/// sort or an aggregate) is a native `DataFusionError::ResourcesExhausted`,
-/// but by the time it reaches `execution_error` it is wrapped in
-/// `Context`/`Shared`, which `take_sql_error` (executor.rs:366) re-wraps
-/// rather than unwraps for a *native* error (it only recovers a nested
-/// `SqlError`, and only strips the `ArrowError` layer). The top-level
-/// `ResourcesExhausted` match therefore misses it and it degrades to
-/// `SqlError::Execution`, whose `client_message` is the fixed, redacted
-/// `MSG_EXECUTION` -- so the client is never told they hit the memory budget
-/// and cannot narrow the query.
+/// A memory-budget exhaustion raised deep in a plan (a sort or an aggregate)
+/// is a native `DataFusionError::ResourcesExhausted`, but by the time it
+/// reaches `execution_error` it is wrapped in `Context`/`Shared`, which
+/// `take_sql_error` (executor.rs:366) re-wraps rather than unwraps for a
+/// *native* error (it only recovers a nested `SqlError`, and only strips the
+/// `ArrowError` layer). The top-level `ResourcesExhausted` match therefore
+/// misses it and it degrades to `SqlError::Execution`, whose `client_message`
+/// is the fixed, redacted `MSG_EXECUTION` -- so the client is never told they
+/// hit the memory budget and cannot narrow the query.
 ///
 /// A projection-only scan happens to recover correctly (its error crosses
-/// `SortPreservingMergeExec`, wrapped in `ArrowError`, which
-/// `take_sql_error` *does* strip). The two common non-trivial shapes below
-/// do not. Both assertions FAIL on the audited HEAD: the error is
-/// `SqlError::Execution`, not `ResourcesExhausted`.
+/// `SortPreservingMergeExec`, wrapped in `ArrowError`, which `take_sql_error`
+/// *does* strip). The two common non-trivial shapes below must keep their
+/// `ResourcesExhausted` type.
 #[tokio::test]
-async fn sql3_f02_a_sort_or_aggregate_budget_error_keeps_its_type() {
+async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
     let tenant = tenant_id("acme");
     let specs = vec![SegSpec::new(
         10,

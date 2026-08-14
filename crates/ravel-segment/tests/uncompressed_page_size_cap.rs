@@ -1,12 +1,9 @@
-//! Regression test for finding a1-F01 of the 2026-07-27 storage-engine
-//! quality audit (issue #49, parent #35): the reader's `comp = NONE` page
-//! path must enforce the per-page uncompressed cap before materializing the
-//! payload, matching the LZ4 path.
+//! The reader's `comp = NONE` page path enforces the per-page uncompressed
+//! cap before materializing the payload, matching the LZ4 path.
 //!
-//! Before the fix an oversized uncompressed page decoded successfully; after
-//! it, the page is rejected with the same typed `PageTooLarge` error the LZ4
-//! branch returns. The a1-F02 coverage tests are tracked separately (issue
-//! #50) and are not part of this file.
+//! An oversized uncompressed page is rejected with the same typed
+//! `PageTooLarge` error the LZ4 branch returns, rather than decoding
+//! successfully.
 #![allow(clippy::expect_used)]
 
 use ravel_segment::{
@@ -75,7 +72,7 @@ fn slice(bytes: &[u8], range: (u64, u64)) -> &[u8] {
 // before the fix (the page decoded) and passes now that the NONE branch
 // enforces the cap.
 #[test]
-fn f01_none_page_ignores_max_page_uncompressed_cap() {
+fn none_page_enforces_max_page_uncompressed_cap() {
     let object = one_sample_object();
     let catalog_limits = ReaderLimits::default();
 
