@@ -1,10 +1,10 @@
-//! The group-commit audit pipeline (ADR-0062 decision 2, epic EL, issue #758).
+//! The group-commit audit pipeline (ADR-0062 decision 2).
 //!
 //! Every query surface must durably record one audit event before its response
 //! is released, and the trail must be non-lossy: no acknowledged query may ever
 //! lack a durable audit record. Writing one RLOG object plus one commit record
 //! per query (the [`crate::query_audit`] path) satisfies durability but at two
-//! PUTs per query forever (finding S5-07). [`AuditPipeline`] keeps the exact
+//! PUTs per query forever. [`AuditPipeline`] keeps the exact
 //! durability guarantee while decoupling the PUT rate from the query rate: it
 //! batches submitted [`AuditEvent`]s and flushes on `max_batch` records or
 //! `max_age` (default 25 ms), whichever comes first, as one

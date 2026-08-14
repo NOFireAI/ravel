@@ -1,5 +1,4 @@
-//! The compaction unit: one `(tenant, signal, shard, ingest-hour)` bucket
-//! (docs/compaction-retention-plan.md §3.2).
+//! The compaction unit: one `(tenant, signal, shard, ingest-hour)` bucket.
 
 use ravel_types::{Signal, TenantHash};
 
@@ -45,7 +44,7 @@ impl Bucket {
         i64::from(self.ingest_hour_bucket).saturating_mul(NS_PER_HOUR)
     }
 
-    /// A bucket is sealed once `now_ns >= end_ns + seal_margin` (plan §3.2):
+    /// A bucket is sealed once `now_ns >= end_ns + seal_margin`:
     /// the writer interlock then guarantees no further commit record can ever
     /// appear, making one strongly consistent LIST a complete input set.
     pub fn is_sealed(&self, now_ns: i64, config: &CompactorConfig) -> bool {

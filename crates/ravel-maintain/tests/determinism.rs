@@ -1,5 +1,5 @@
 //! Determinism: the same inputs, compacted twice, produce the same part
-//! bytes, the same object keys, and the same record bytes (plan §3.4: the
+//! bytes, the same object keys, and the same record bytes (the
 //! record CreateIfAbsent is the serialization point, but canonical orders are
 //! still specified so identical builds converge on identical keys and the
 //! race costs nothing).

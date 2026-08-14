@@ -1,6 +1,5 @@
 //! Compactor configuration: the seal margin, the trigger threshold, the part
-//! size cap, and the abandonment deadline (docs/compaction-retention-plan.md
-//! §3.2, §3.3, §3.4), plus the sweep/retention knobs (grace, protection
+//! size cap, and the abandonment deadline, plus the sweep/retention knobs (grace, protection
 //! horizon, ADR-0019 per-tenant retention windows). All durations are
 //! nanoseconds to match the injected [`crate::clock::Clock`].
 
@@ -13,8 +12,7 @@ use ravel_types::{TenantHash, TenantId};
 use uuid::Uuid;
 
 /// A test-injectable accounting hook for the RLOG and RSPAN compaction
-/// merges' peak resident memory (RLOG: issue #745, ADR-0065 decision 4; RSPAN:
-/// issue #908).
+/// merges' peak resident memory (RLOG and RSPAN, ADR-0065 decision 4).
 ///
 /// The RLOG k-way merge ([`crate::rlog`]) and the RSPAN k-way merge
 /// ([`crate::rspan_codec`]) drive this at their real allocation/decode points
@@ -31,7 +29,7 @@ use uuid::Uuid;
 /// Two high-water marks are kept:
 ///
 /// - [`Self::peak_transient_bytes`]: `fetched + decoded`, the merge's *own*
-///   decode-side buffers. This is the quantity issue #745/#908 bound: at most
+///   decode-side buffers. This is the quantity these merges bound: at most
 ///   one raw block plus one decoded block per input, so it is
 ///   `O(input_count * block_size)` and does NOT scale with stream/trace size.
 /// - [`Self::peak_total_bytes`]: `fetched + decoded + writer`, adding the
@@ -132,27 +130,27 @@ pub const NS_PER_HOUR: i64 = 3_600_000_000_000;
 pub const DEFAULT_MAX_FLUSH_LIFETIME_NS: i64 = NS_PER_HOUR;
 /// Default `clock_skew_allowance`: 5 minutes (matches ravel-catalog).
 pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 300_000_000_000;
-/// Default `max_compaction_lifetime`: 1 hour (plan §3.4 point 4). Mirrors the
+/// Default `max_compaction_lifetime`: 1 hour. Mirrors the
 /// writer interlock so the sweeper's unreferenced-part rule is safe.
 pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
-/// Default `max_l1_part_bytes`: 256 MiB (plan §3.3 point 4).
+/// Default `max_l1_part_bytes`: 256 MiB.
 pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
-/// Default minimum L0 records for a bucket to be worth compacting (plan §3.2).
+/// Default minimum L0 records for a bucket to be worth compacting.
 pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
 /// Default footer suffix-probe size. 64 KiB covers the footer + catalog of a
 /// typical L0 flush in one GET (docs/segment-format.md reader protocol).
 pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
 
-/// Default `grace`: 24 hours (docs/consistency-model.md "Deletion and GC",
-/// plan §5). A shared floor for the orphan and unreferenced-part age gates.
+/// Default `grace`: 24 hours (docs/consistency-model.md "Deletion and GC").
+/// A shared floor for the orphan and unreferenced-part age gates.
 pub const DEFAULT_GRACE_NS: i64 = 24 * NS_PER_HOUR;
 /// Default `max_query_duration`: 1 hour. The horizon must outlast any pinned
 /// in-flight query (`protection_horizon >= max_query_duration + grace +
-/// clock_skew_allowance`, plan §5 / docs/consistency-model.md), so this is the
+/// clock_skew_allowance`, docs/consistency-model.md), so this is the
 /// query-duration term of the default `protection_horizon`.
 pub const DEFAULT_MAX_QUERY_DURATION_NS: i64 = NS_PER_HOUR;
 /// Default `protection_horizon`: `max_query_duration + grace +
-/// clock_skew_allowance` (plan §5, closing adversarial finding S1-02). The
+/// clock_skew_allowance`. The
 /// supersession and retention sweeps gate physical deletion on
 /// `now >= anchor + protection_horizon`, so a query resolved just before the
 /// anchor still has this long to finish reading the inputs it pinned. The
@@ -183,7 +181,7 @@ pub const DEFAULT_ORPHAN_BREAKER_MIN_COUNT: usize = 50;
 /// in a large shard is never mistaken for mass record loss.
 pub const DEFAULT_ORPHAN_BREAKER_MAX_RATIO: f64 = 0.10;
 
-/// Default `audit_retention_window_ns`: 90 days (issue #763, EL-6). The
+/// Default `audit_retention_window_ns`: 90 days. The
 /// dedicated retention window for query-audit records on
 /// [`crate::query_audit::QUERY_AUDIT_SHARD`], independent of the ADR-0019
 /// per-tenant data-retention windows ([`RetentionConfig`]): query-audit is a
@@ -286,37 +284,37 @@ impl Default for AuditPipelineConfig {
 #[derive(Debug, Clone)]
 pub struct CompactorConfig {
     /// Longest a flush may stay open; a bucket is sealed only after its end
-    /// plus this plus the skew allowance (plan §3.2).
+    /// plus this plus the skew allowance.
     pub max_flush_lifetime_ns: i64,
-    /// Extra seal margin for cross-host clock skew (plan §3.2).
+    /// Extra seal margin for cross-host clock skew.
     pub clock_skew_allowance_ns: i64,
     /// Deadline after which a compaction run must not publish its record
-    /// (plan §3.4 point 4); measured from the run's start via the clock.
+    /// measured from the run's start via the clock.
     pub max_compaction_lifetime_ns: i64,
     /// Split parts on series boundaries once accumulated verbatim page bytes
-    /// reach this (plan §3.3 point 4).
+    /// reach this.
     pub max_l1_part_bytes: u64,
     /// Buckets with fewer L0 records than this are left uncompacted; set 1 for
-    /// v1-retirement campaigns (plan §3.2).
+    /// v1-retirement campaigns.
     pub min_compaction_inputs: usize,
     /// Suffix-probe size for the first footer GET of each input.
     pub footer_probe_bytes: u64,
     /// This compactor process's uuid. Informational only: it is recorded in
-    /// each part's footer `writer_id` and never enters dedup priority
-    /// (plan §4). Default is the nil uuid; the service sets a real one.
+    /// each part's footer `writer_id` and never enters dedup priority.
+    /// Default is the nil uuid; the service sets a real one.
     pub compactor_writer_id: Uuid,
     /// Shared grace period for the orphan and unreferenced-part age gates
-    /// (plan §5, docs/consistency-model.md "Deletion and GC"). An object is
+    /// (docs/consistency-model.md "Deletion and GC"). An object is
     /// only ever a deletion candidate once its `last_modified` age exceeds
     /// this plus the relevant lifetime bound. Default
     /// [`DEFAULT_GRACE_NS`] (24 h).
     pub grace_ns: i64,
     /// Horizon between a deletion anchor (a compaction record's
     /// `created_unix_ns`, a tombstone's `retired_at_ns`) and physical
-    /// deletion (plan §5). Must satisfy `>= max_query_duration + grace +
+    /// deletion. Must satisfy `>= max_query_duration + grace +
     /// clock_skew_allowance` so a query resolved just before the anchor still
     /// has time to read the inputs it pinned even when the sweeper's clock
-    /// leads the reader's (S1-02). Default [`DEFAULT_PROTECTION_HORIZON_NS`]
+    /// leads the reader's. Default [`DEFAULT_PROTECTION_HORIZON_NS`]
     /// (25 h 5 min).
     pub protection_horizon_ns: i64,
     /// Mass-orphan circuit breaker minimum candidate count (ADR-0048
@@ -354,7 +352,7 @@ pub struct CompactorConfig {
     /// code-level default (`read_marker` has no default of its own).
     pub idem_dedup_window_hours: u32,
     /// Retention window for query-audit records on
-    /// [`crate::query_audit::QUERY_AUDIT_SHARD`] (issue #763, EL-6). A
+    /// [`crate::query_audit::QUERY_AUDIT_SHARD`]. A
     /// query-audit record whose newest event is older than this is swept by
     /// [`crate::audit_retention::sweep_audit_retention`], horizon-gated on the
     /// record's durable `created_unix_ns` and legal-hold-gated exactly as the
@@ -364,7 +362,7 @@ pub struct CompactorConfig {
     /// other sweep knob so `..CompactorConfig::default()` call sites are
     /// unaffected. Default [`DEFAULT_AUDIT_RETENTION_NS`] (90 days).
     pub audit_retention_window_ns: i64,
-    /// Dry-run switch (plan §8, P8). When `true`, every maintenance path
+    /// Dry-run switch. When `true`, every maintenance path
     /// computes exactly the same eligible set and decision it would in a real
     /// run -- all reads (LIST/GET/HEAD, re-verify listings, k-way merges,
     /// part planning) happen identically -- but each `store.put`/`store.delete`
@@ -376,8 +374,8 @@ pub struct CompactorConfig {
     /// config via `..CompactorConfig::default()`, stay byte-for-byte unchanged
     /// with `dry_run == false`. Default `false`.
     pub dry_run: bool,
-    /// Optional test-injectable accounting hook for the RLOG (issue #745) and
-    /// RSPAN (issue #908) compaction merges' peak resident memory. `None` in
+    /// Optional test-injectable accounting hook for the RLOG and
+    /// RSPAN compaction merges' peak resident memory. `None` in
     /// production (the merges' accounting hooks are skipped); a test installs
     /// one and reads its high-water marks after `compact_bucket` to assert the
     /// k-way merge stayed bounded independently of stream/trace size. Carried
@@ -422,7 +420,7 @@ impl Default for CompactorConfig {
 
 impl CompactorConfig {
     /// The seal margin: a bucket ending at `bucket_end_ns` is sealed once
-    /// `now_ns >= bucket_end_ns + this` (plan §3.2). No new commit record can
+    /// `now_ns >= bucket_end_ns + this`. No new commit record can
     /// appear in the bucket after that, so a single strongly consistent LIST
     /// is a complete, repeatable input set.
     pub fn seal_margin_ns(&self) -> i64 {
@@ -432,7 +430,7 @@ impl CompactorConfig {
 
     /// The orphan-GC age gate: an `l0/` data object with no commit record is a
     /// deletion candidate only once its `last_modified` age exceeds this
-    /// (`grace + max_flush_lifetime`, plan §5). The `max_flush_lifetime` term
+    /// (`grace + max_flush_lifetime`). The `max_flush_lifetime` term
     /// is what makes the writer interlock hold: a writer abandons any flush
     /// older than that and never publishes it, so a record-less object older
     /// than this can never gain a commit record later (ADR-0010 §11).
@@ -442,9 +440,8 @@ impl CompactorConfig {
 
     /// The unreferenced-part age gate: an `l1/` object referenced by no
     /// compaction record in its bucket is a deletion candidate only once its
-    /// `last_modified` age exceeds this (`grace + max_compaction_lifetime`,
-    /// plan §5). The `max_compaction_lifetime` term mirrors the abandonment
-    /// deadline (plan §3.4 point 4): a compactor past that deadline never
+    /// `last_modified` age exceeds this (`grace + max_compaction_lifetime`). The `max_compaction_lifetime` term mirrors the abandonment
+    /// deadline: a compactor past that deadline never
     /// publishes, so it can never re-reference a part this old.
     pub fn unreferenced_part_age_gate_ns(&self) -> i64 {
         self.grace_ns
@@ -467,7 +464,7 @@ impl CompactorConfig {
 }
 
 /// A raw per-tenant retention policy as a deployment would express it
-/// (plan §6, ADR-0019 §5): `retention: { default: none, tenants: { <id>: R } }`.
+/// (ADR-0019 §5): `retention: { default: none, tenants: { <id>: R } }`.
 /// Tenant ids are plain strings here; [`RetentionConfig::from_policy`] hashes
 /// them at load so the validated config never stores raw ids.
 #[derive(Debug, Clone, Default)]
@@ -493,7 +490,7 @@ pub enum RetentionConfigError {
     },
 }
 
-/// The validated per-tenant retention configuration (plan §6, ADR-0019).
+/// The validated per-tenant retention configuration (ADR-0019).
 /// Only the sweeper reads it; resolvers never do (ADR-0019 §5 / alternative
 /// 1). Tenant ids are hashed at construction, so this struct never holds a
 /// raw tenant id.
@@ -506,8 +503,7 @@ pub struct RetentionConfig {
 
 impl RetentionConfig {
     /// Validate a [`RetentionPolicy`] against the ADR-0019 §5 floor and hash
-    /// every tenant id (plan §6: "Tenant ids in config, hashed at load;
-    /// config never stores tenant hashes" -- i.e. never the raw id). Rejects
+    /// every tenant id (hashed at load so the config never stores a raw tenant id). Rejects
     /// any window below `config.retention_floor_ns(max_ingest_lag_ns)`.
     pub fn from_policy(
         policy: RetentionPolicy,

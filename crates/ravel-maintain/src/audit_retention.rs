@@ -1,4 +1,4 @@
-//! Query-audit retention (issue #763, EL-6): a dedicated age-based sweep of the
+//! Query-audit retention: a dedicated age-based sweep of the
 //! query-audit shard ([`crate::query_audit::QUERY_AUDIT_SHARD`]).
 //!
 //! Query-audit records are an ever-growing, server-written activity log
@@ -40,7 +40,7 @@
 //!   record's recent `created_unix_ns` keeps its parts for the horizon even
 //!   though the events they hold are already past the window.
 //!
-//! # The hour prefilter (issue #850)
+//! # The hour prefilter
 //!
 //! An L0 commit record's key-derived `ingest_hour_bucket` lower-bounds its
 //! `max_event_ts_ns` exactly (see `hour_certainly_not_expired`), so before
@@ -95,7 +95,7 @@ pub struct AuditRetentionOutcome {
 }
 
 /// Sweep expired query-audit records from a tenant's
-/// [`QUERY_AUDIT_SHARD`] (issue #763, EL-6).
+/// [`QUERY_AUDIT_SHARD`].
 ///
 /// A record is deleted only when it is BOTH expired (its newest event is older
 /// than `config.audit_retention_window_ns`) AND past the protection horizon
@@ -221,7 +221,7 @@ pub async fn sweep_audit_retention(
     Ok(outcome)
 }
 
-/// Conservative, GET-free prefilter (issue #850): true only when the key's
+/// Conservative, GET-free prefilter: true only when the key's
 /// `ingest_hour_bucket` alone *proves* an L0 commit record cannot be expired,
 /// so the caller may skip fetching and decoding it.
 ///

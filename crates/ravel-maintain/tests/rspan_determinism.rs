@@ -11,7 +11,7 @@
 //! canonical order. If that order were not deterministic, the two runs' blocks
 //! would differ and the part bytes would diverge; asserting byte-identical
 //! output across two independent runs pins the behaviour that crash-recovery
-//! convergence depends on (plan §3.4).
+//! convergence depends on.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -111,7 +111,7 @@ async fn compact_once() -> (String, Vec<u8>, Vec<(String, Vec<u8>)>) {
     (record_key, record_bytes, parts)
 }
 
-/// v3 coverage (issue #651, ADR-0054): merge two inputs with disjoint service
+/// v3 coverage (ADR-0054): merge two inputs with disjoint service
 /// names and span names, then prove the compacted output's BLOOM section and
 /// `service_name` column were rebuilt from the merged union. A bloom or column
 /// copied from one input would answer/decode correctly for only that input's

@@ -1,4 +1,4 @@
-//! Publish protocol and idempotency (docs/compaction-retention-plan.md §3.4).
+//! Publish protocol and idempotency.
 //! The compaction record's `CreateIfAbsent` PUT is the single serialization
 //! point: correctness never depends on two compactors producing identical
 //! bytes. On `AlreadyExists` a racing or prior run won; the loser verifies the
@@ -26,7 +26,7 @@ pub enum PublishOutcome {
     /// `input_set_hash`); we HEAD-and-repaired its parts and converged.
     Converged { parts_repaired: usize },
     /// The `max_compaction_lifetime` deadline passed before the record PUT;
-    /// the run abandoned and did NOT publish (plan §3.4 point 4). Its parts
+    /// the run abandoned and did NOT publish. Its parts
     /// are content-addressed and deterministic for the sealed bucket, so any
     /// later successful compaction over the same frozen input set republishes
     /// the identical keys and its record references them: an abandoned run's
@@ -35,10 +35,10 @@ pub enum PublishOutcome {
     /// exists for the bucket (a leftover part no record names ages out as
     /// unreferenced), or once a retention tombstone exists (which makes any
     /// future compaction impossible, so every record-less part in the bucket
-    /// is collectable; issue #273). A bucket with neither a compaction record
+    /// is collectable). A bucket with neither a compaction record
     /// nor a tombstone keeps its record-less parts, because a future
     /// compaction may still publish a record naming them
-    /// (docs/consistency-model.md, plan §5).
+    /// (docs/consistency-model.md).
     Abandoned,
 }
 
@@ -74,7 +74,7 @@ pub fn conserve_exact() -> impl ConservationPredicate {
 /// publish it per §3.4 with the exact-conservation gate. `start_ns` is when
 /// this run began (for the abandonment deadline); `created_unix_ns` on the
 /// record is stamped from the clock at publish time (the supersession-horizon
-/// anchor, plan §5). This is the compaction entry point; the shared rewrite
+/// anchor). This is the compaction entry point; the shared rewrite
 /// primitive ([`crate::rewrite`]) calls [`publish_record_with_conservation`]
 /// with its own predicate.
 #[allow(clippy::too_many_arguments)]
@@ -124,8 +124,7 @@ pub async fn publish_record_with_conservation(
     conservation: impl ConservationPredicate,
 ) -> Result<PublishOutcome> {
     // Abandonment mirror of the writer interlock: past the deadline, a run
-    // must never publish, so the sweeper's unreferenced-part rule stays safe
-    // (plan §3.4 point 4, §3.6 row 13).
+    // must never publish, so the sweeper's unreferenced-part rule stays safe.
     let now = clock.now_ns();
     if now.saturating_sub(start_ns) > config.max_compaction_lifetime_ns {
         tracing::warn!(
@@ -135,10 +134,10 @@ pub async fn publish_record_with_conservation(
         return Ok(PublishOutcome::Abandoned);
     }
 
-    // Record-count conservation gate (ADR-0048 decision 6, review finding
-    // S2-03): compaction is a verbatim page copy for every signal and never
+    // Record-count conservation gate (ADR-0048 decision 6):
+    // compaction is a verbatim page copy for every signal and never
     // dedups, so the built parts must carry exactly the records the inputs
-    // carry. A rewrite that deliberately drops records (EJ) supplies a
+    // carry. A rewrite that deliberately drops records supplies a
     // predicate that accounts for the drop; the exact-match compaction and
     // format-migration paths supply [`conserve_exact`]. Publishing a merge the
     // predicate rejects would be a permanent silent loss or gain (the resolver
@@ -225,7 +224,7 @@ fn checked_sample_sum(counts: impl Iterator<Item = u64>) -> Result<u64> {
 /// references and re-PUT any our-built part that is missing (content-addressed
 /// keys make this safe), then report convergence. Different `input_set_hash`:
 /// a sealed bucket cannot legitimately hold two input sets, so alarm and stop
-/// without deleting anything (plan §3.4 point 3, §3.6 row 11).
+/// without deleting anything.
 async fn resolve_already_exists(
     store: &dyn ObjectStoreBackend,
     record_key: &str,

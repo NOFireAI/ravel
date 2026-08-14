@@ -25,15 +25,14 @@
 //! directory from a suffix probe and then fetches only the bytes a part
 //! actually needs -- RSEG's `ravel_segment::open_from_suffix` fetching the
 //! page bytes of one series' runs, RLOG's `ravel_logseg::open_from_suffix`
-//! plus `RlogRangeReader` fetching the blocks of one stream (issue #275). For
+//! plus `RlogRangeReader` fetching the blocks of one stream. For
 //! those two, peak resident bytes -- decoded and raw -- are bounded by
 //! catalog metadata plus one part plus one series/stream, never the whole
 //! bucket. The earlier RLOG merge held every input object whole (RLOG then
 //! had no ranged `.rlog` section reader); that gap is now closed.
 //!
 //! [`crate::rspan_codec::SpanCodec`] (RSPAN, spans) is the third
-//! implementation and now holds the same bound (issue #908, mirroring RLOG's
-//! issue #275/#745): `ravel-rspan`'s `RspanRangeReader` fetches SKIP_IDX by
+//! implementation and now holds the same bound: `ravel-rspan`'s `RspanRangeReader` fetches SKIP_IDX by
 //! range at catalog load, then the merge streams BLOCKS bytes one block per
 //! input at a time (`rspan_codec.rs`'s own module doc). So "bounded decoded
 //! memory" is now a trait-wide guarantee across all three codecs, not a
@@ -79,11 +78,11 @@ pub trait SegmentCodec {
     /// one `CreateIfAbsent` (build.rs's job). `catalogs` is aligned one-to-one
     /// with `inputs` in canonical input order and is taken by value: this is
     /// the catalogs' last use, so a codec may move records out of them rather
-    /// than clone (RSEG moves exemplars, issue #557). RSEG and RLOG fetch page/block
+    /// than clone (RSEG moves exemplars). RSEG and RLOG fetch page/block
     /// bytes lazily by range, bounding peak *decoded* memory to catalog
     /// metadata plus one in-flight part, and additionally bound raw fetched
     /// bytes via their ranged readers (RSEG's `open_from_suffix`, RLOG's
-    /// `RlogRangeReader`, issue #275; RSPAN's `RspanRangeReader`, issue #908)
+    /// `RlogRangeReader`; RSPAN's `RspanRangeReader`)
     /// to one part plus one series/stream/block-per-input -- see the trait doc
     /// above, [`crate::rlog::RlogCodec`], and [`crate::rspan_codec::SpanCodec`].
     async fn build_parts(

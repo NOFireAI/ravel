@@ -44,7 +44,7 @@
 //! `input_set_hash`, and the `part_index`. An L0 write and an L1 merge share the
 //! one writer implementation and so cannot drift.
 //!
-//! # Memory (issue #908, mirroring RLOG's issue #745)
+//! # Memory (mirroring RLOG's k-way merge)
 //!
 //! The read side ([`SpanCodec::load_input_catalog`]) retains only per-input
 //! catalog metadata: an [`RspanRangeReader`] holding the decoded SKIP_IDX plus
@@ -210,7 +210,7 @@ impl SegmentCodec for SpanCodec {
         // No whole-object fetch: the per-input ranged readers are already in
         // the catalogs. Blocks are fetched by range one at a time in the flat
         // k-way merge below, so raw resident bytes stay bounded to one block
-        // per input, never a whole object or the whole bucket (issue #908).
+        // per input, never a whole object or the whole bucket.
         let identity = compactor_identity(bucket, config);
         let tracker = config.merge_memory_tracker.as_ref();
 
@@ -388,7 +388,7 @@ struct BlockCursor<'a> {
     head: Option<SpanRecord>,
     /// Running count of records this cursor has decoded and handed to the
     /// merge (bumped in [`Self::take_head`]). Cross-checked against
-    /// `declared_record_count` at exhaustion (issue #926).
+    /// `declared_record_count` at exhaustion.
     decoded_count: u64,
     /// This input's own footer `record_count`, the independent authority the
     /// decode tally is checked against when the cursor drains. The whole-read
@@ -480,8 +480,8 @@ impl<'a> BlockCursor<'a> {
         // This input is drained. Cross-check the records the merge actually
         // decoded against the footer's own `record_count` -- the whole-read
         // compaction path asserted `decoded_record_count == footer.record_count`
-        // per input and failed loud on mismatch; the streaming merge dropped it
-        // (issue #926). Only a logically inconsistent but CRC-valid object
+        // per input and failed loud on mismatch; the streaming merge dropped it.
+        // Only a logically inconsistent but CRC-valid object
         // (truncation kills the suffix footer, mid-object damage trips block
         // CRCs) reaches here with a mismatch, but that is exactly the case the
         // per-input check catches. Fires exactly once per cursor: once `head`
@@ -837,7 +837,7 @@ mod tests {
         assert_eq!(ftr.level, 1);
         assert!(!ftr.input_set_hash.is_empty());
         // Against the format's constant, not the compactor's: see the same
-        // assertion in `rlog.rs` and issue #482. `open` above rejects any
+        // assertion in `rlog.rs`. `open` above rejects any
         // other trailer version, so this pins the recorded number to the
         // bytes rather than to a second constant in this crate.
         assert_eq!(
@@ -884,7 +884,7 @@ mod tests {
         }
     }
 
-    /// The v3 keystone (issue #651, ADR-0054): merge inputs with pairwise
+    /// The v3 keystone (ADR-0054): merge inputs with pairwise
     /// disjoint service names and span names, then prove the compacted output's
     /// BLOOM section and `service_name` column were rebuilt from the merged
     /// union, not copied from whichever input's blooms happened to be around.
@@ -1097,7 +1097,7 @@ mod tests {
     /// The result opens cleanly (`footer::open` succeeds) but its declared
     /// `record_count` disagrees with the number of records the body decodes to
     /// -- a logically inconsistent but CRC-valid object, the exact case the
-    /// per-input cross-check in `BlockCursor::refill` must catch (issue #926).
+    /// per-input cross-check in `BlockCursor::refill` must catch.
     fn rewrite_footer_record_count(bytes: &[u8], new_count: u64) -> Bytes {
         let trailer_len = 16usize; // footer::TRAILER_LEN
         let n = bytes.len();
@@ -1187,7 +1187,7 @@ mod tests {
         }
     }
 
-    // --- issue #908: bounded-memory k-way merge -------------------------------
+    // --- bounded-memory k-way merge -------------------------------
 
     /// L0 writer config for the tests below: 1000-record blocks, so an input
     /// is blocked differently from the 8192-record output (the compactor
@@ -1215,7 +1215,7 @@ mod tests {
         }
     }
 
-    /// Acceptance test for issue #908 (mirroring RLOG's issue #745): the RSPAN
+    /// Acceptance test (mirroring RLOG's): the RSPAN
     /// compaction merge's peak resident decode memory is bounded by block size
     /// times input count, independent of how large one hot trace grows.
     ///
@@ -1342,7 +1342,7 @@ mod tests {
         );
     }
 
-    /// Byte-identical-output test for issue #908: the new k-way streaming
+    /// Byte-identical-output test: the new k-way streaming
     /// merge produces the exact same part bytes as the old "concatenate every
     /// input's decoded records by trace_id in canonical input order, then
     /// stable sort by (trace_id, start_ts)" path. Parts are content-addressed,

@@ -1,4 +1,4 @@
-//! Durable per-worker memo snapshots (ADR-0065 decision 3, epic EI): the store
+//! Durable per-worker memo snapshots (ADR-0065 decision 3): the store
 //! I/O half of warm start and ownership handoff.
 //!
 //! Each maintain-role process persists, on its discovery cadence and debounced

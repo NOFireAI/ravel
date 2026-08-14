@@ -1,14 +1,12 @@
-//! FaultStore crash-matrix coverage for the sweeper: rows 7, 8, 9, and 12 of
-//! docs/compaction-retention-plan.md §3.6, plus the convergence,
-//! pinned-query-races-sweep, and horizon-boundary properties from the P6
-//! ticket. Every fault-injecting test asserts the fault actually fired (via
+//! FaultStore crash-matrix coverage for the sweeper's crash-recovery rows, plus the convergence,
+//! pinned-query-races-sweep, and horizon-boundary properties. Every fault-injecting test asserts the fault actually fired (via
 //! `fault_count`) so it proves its own fault point, per the repo testing
 //! conventions.
 //!
 //! The sweeper is signal-generic, so the shared suite runs once over an RSEG
 //! (metrics) fixture, once over an RLOG (logs) fixture, and once over an RSPAN
 //! (spans) fixture via [`Sig`] and one seeding helper called three times,
-//! never three copies of every test (plan §3.7, issue text; ADR-0041 phase 4
+//! never three copies of every test (ADR-0041 phase 4
 //! confirms the sweeper needs no spans-specific code). L1 "still intact" is
 //! asserted signal-generically by HEADing the compaction record's parts, not by
 //! decoding samples, so one assertion serves every format.
@@ -660,8 +658,7 @@ async fn sweep_unreferenced_result(
 // interleaving the first attempt lost data on.
 
 /// Seed two compactable L0 inputs, then run a compaction that builds and PUTs
-/// its L1 parts but abandons past `max_compaction_lifetime` without publishing
-/// (plan §3.4 point 4). The bucket is left with record-less `l1/` parts and no
+/// its L1 parts but abandons past `max_compaction_lifetime` without publishing. The bucket is left with record-less `l1/` parts and no
 /// compaction record. Returns the bucket.
 async fn seed_and_abandon(store: &dyn ObjectStoreBackend, clock: &dyn Clock, sig: Sig) -> Bucket {
     let bucket = seed_two(store, sig).await;
@@ -729,7 +726,7 @@ async fn l1_part_keys(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> Vec<St
     out
 }
 
-/// THE decisive test (issue #273, second attempt). Models exactly the
+/// THE decisive test. Models exactly the
 /// data-loss interleaving the first attempt introduced: an abandoned run
 /// leaves record-less L1 parts older than the age gate, the sweeper fires
 /// while the bucket is still record-less (the worst point: mid recovery
@@ -934,7 +931,7 @@ async fn young_tombstoned_recordless_part_survives_age_gate() {
 
 /// A record-less part in a bucket with NEITHER a compaction record NOR a
 /// tombstone is never swept, no matter how old: a future recovery compaction
-/// may still publish a record naming it (issue #273; the leak stays open until
+/// may still publish a record naming it (the leak stays open until
 /// the bucket is either compacted or retired). This is the safety boundary of
 /// option (b), asserted directly.
 #[tokio::test]
@@ -1037,7 +1034,7 @@ async fn orphan_gc_respects_live_records_and_age_gate() {
     run(Sig::Spans).await;
 }
 
-// --- P8: dry-run reports the eligible set but deletes nothing ---------------
+// --- Dry-run reports the eligible set but deletes nothing ---------------
 
 #[tokio::test]
 async fn dry_run_sweep_reports_eligible_set_but_deletes_nothing() {
@@ -1082,8 +1079,7 @@ async fn dry_run_sweep_reports_eligible_set_but_deletes_nothing() {
     run(Sig::Spans).await;
 }
 
-// --- Zone-scoped sweep and the full-pass safety net (ADR-0065 decision 3,
-//     issue #748) --------------------------------------------------------------
+// --- Zone-scoped sweep and the full-pass safety net (ADR-0065 decision 3) ---
 //
 // `sweep_shard_zoned` scopes the superseded-input and unreferenced-part rules
 // to the caller's per-tick hour set (typically the unit scan's head+tail

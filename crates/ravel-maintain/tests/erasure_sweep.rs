@@ -1,4 +1,4 @@
-//! EJ-T5 (#755): the physical-removal half of selective subject erasure.
+//! The physical-removal half of selective subject erasure.
 //!
 //! Proves, against a `MemoryStore` oracle with an injected clock, that the
 //! sweep additions honor ADR-0064's deletion guarantees:

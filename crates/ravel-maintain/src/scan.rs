@@ -1,5 +1,5 @@
 //! Sealed-bucket scan with the advisory CAS cursor
-//! (docs/compaction-retention-plan.md §3.2, ADR-0018). Walks the hours of one
+//! (ADR-0018). Walks the hours of one
 //! `(tenant, signal, shard)` upward from the cursor, compacting every sealed,
 //! eligible bucket, and advances the cursor past the buckets it finished. The
 //! cursor is advisory mutable state (the ADR-0003 HEAD-pointer precedent):
@@ -41,7 +41,7 @@ pub struct ScanReport {
 /// Scan and compact every eligible sealed bucket for one `(tenant, signal,
 /// shard)`, then advance the advisory cursor. Idempotent: re-running after a
 /// crash reprocesses at most the buckets past the last persisted cursor, and
-/// each bucket's own idempotency (plan §3.4) makes reprocessing harmless.
+/// each bucket's own idempotency makes reprocessing harmless.
 pub async fn scan_and_compact(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -114,7 +114,7 @@ pub struct MaintainReport {
     /// Buckets skipped because not yet sealed.
     pub not_sealed: usize,
     /// Buckets skipped this pass because the [`MaintainMemo`] already knows them
-    /// terminal (issue #280), so no per-bucket LIST/GET was issued for them.
+    /// terminal, so no per-bucket LIST/GET was issued for them.
     /// Always zero on a cold pass and for the non-memoized
     /// [`scan_and_maintain`] entry point.
     pub skipped_terminal: usize,
@@ -231,7 +231,7 @@ pub fn classify_zone(
 /// retention-expired, or an entry corrupted in memory -- before the maintain
 /// loop acts on it. One hour is far below any retention window (days) and any
 /// protection horizon, so the deferred action is never a correctness problem,
-/// only a small bound on promptness (issue #280).
+/// only a small bound on promptness.
 pub const DEFAULT_MEMO_REVERIFY_INTERVAL_NS: i64 = NS_PER_HOUR;
 
 /// Staleness bound past which a durable memo snapshot (ADR-0065 decision 3,
@@ -337,7 +337,7 @@ struct MemoEntry {
     verified_at_ns: i64,
 }
 
-/// Per-worker in-memory memo of terminal bucket states (issue #280).
+/// Per-worker in-memory memo of terminal bucket states.
 ///
 /// The full-scan-every-tick maintain loop is correct but re-lists and re-reads
 /// every retained bucket on every tick, at roughly two LISTs plus a few GETs
@@ -453,7 +453,7 @@ impl MaintainMemo {
     /// the next tick, regardless of interior re-verify cadence.
     ///
     /// This is the public invalidate seam named in ADR-0065: callers outside
-    /// this crate (the erasure rewrite work orders in EJ-T4, issue #754) use
+    /// this crate (the erasure rewrite work orders) use
     /// it to force a specific interior hour back through `maintain_bucket`
     /// without waiting for the slow safety-net sweep or the interior
     /// re-verify interval to elapse. It is a thin wrapper over [`Self::forget`]:
@@ -1061,7 +1061,7 @@ fn classify_terminal(
 /// never retire aging data. So this walks all hours each pass, matching the
 /// cursorless full-scan model [`crate::sweep::sweep_shard`] uses, and pairs
 /// with a `sweep_shard` call for the same shard to run all three deletion
-/// paths per tick (plan §8). Idempotent: `maintain_bucket` and every rule it
+/// paths per tick. Idempotent: `maintain_bucket` and every rule it
 /// drives converge on re-run.
 #[allow(clippy::too_many_arguments)]
 pub async fn scan_and_maintain(
@@ -1094,7 +1094,7 @@ pub async fn scan_and_maintain(
 }
 
 /// [`scan_and_maintain`] with a caller-owned [`MaintainMemo`] persisted across
-/// ticks (issue #280). Buckets the memo already knows terminal
+/// ticks. Buckets the memo already knows terminal
 /// (compacted-and-not-expired, below-threshold, or swept empty) are skipped
 /// without any per-bucket LIST or GET, until the memo's periodic re-verify
 /// interval forces a fresh evaluation. On the first tick after a worker start
@@ -1540,7 +1540,7 @@ mod memo_snapshot_tests {
         assert_eq!(body_from_full_1, body_from_full_2);
     }
 
-    /// Finding 1 (issue #747): a decoded entry whose `verified_ns` is past the
+    /// A decoded entry whose `verified_ns` is past the
     /// snapshot's own `snapshot_unix_ns` -- a corrupted or clock-skewed run --
     /// is clamped to `snapshot_unix_ns` at the seed site, never trusted at its
     /// raw future value. Without the clamp such an entry reads as eternally
@@ -1604,7 +1604,7 @@ mod memo_snapshot_tests {
     }
 
     proptest::proptest! {
-        /// Finding 4 (issue #747): RLE memo codec round-trip. For an arbitrary
+        /// RLE memo codec round-trip. For an arbitrary
         /// per-hour terminal/non-terminal state sequence (independent choices at
         /// each hour, so consecutive hours may alternate state), `decode(encode)`
         /// reproduces the *effective* per-hour state and verified_ns. Effective
@@ -1678,9 +1678,9 @@ mod memo_snapshot_tests {
     }
 }
 
-/// EJ-T4b (issue #754): proves `erasure_rewrite_bucket` actually invalidates
+/// Proves `erasure_rewrite_bucket` actually invalidates
 /// a memoized terminal state, for all three wired signals (metrics, logs,
-/// spans) -- including metrics, which EJ-T4a left un-invalidated. Lives here
+/// spans), including metrics. Lives here
 /// rather than in `erasure_rewrite.rs`'s own test module because
 /// `MaintainMemo::mark_terminal` is private to this module and only visible
 /// to its descendants (the same access pattern `memo_snapshot_tests` above
@@ -1960,7 +1960,7 @@ mod invalidate_tests {
 
     /// A successful METRICS rewrite forgets the bucket's memoized terminal
     /// state, so the next scan tick re-evaluates it instead of trusting a
-    /// stale "already compacted" verdict -- the EJ-T4a gap this task closes.
+    /// stale "already compacted" verdict.
     /// Flip-line proof: in `invalidate_after_publish`
     /// (`erasure_rewrite.rs`), changing the call's `bucket.signal` argument
     /// to a hardcoded `Signal::Logs` (or deleting the call from the

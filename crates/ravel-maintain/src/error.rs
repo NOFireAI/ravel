@@ -1,6 +1,6 @@
 //! Error taxonomy for the compactor. Every stored-byte or protocol
 //! inconsistency is a typed variant; nothing panics on adversarial input
-//! (CLAUDE.md invariants, docs/compaction-retention-plan.md §3.6).
+//! (CLAUDE.md invariants).
 
 use ravel_commit::erasure::ErasureError;
 use ravel_commit::keys::{KeyError, ReconstructionError};
@@ -12,9 +12,8 @@ use ravel_segment::SegmentError;
 
 /// A compaction run's failure. Retryable store faults surface as
 /// [`MaintainError::Store`] carrying the underlying [`StoreError`]; the caller
-/// decides whether to re-run the whole bucket (the idempotent recovery path,
-/// plan §3.4/§3.6). The `*Divergence` and `*Mismatch` variants are invariant
-/// breaches that must never be silently worked around (plan §3.4 point 3).
+/// decides whether to re-run the whole bucket (the idempotent recovery path). The `*Divergence` and `*Mismatch` variants are invariant
+/// breaches that must never be silently worked around.
 #[derive(Debug, thiserror::Error)]
 pub enum MaintainError {
     #[error(transparent)]
@@ -71,7 +70,7 @@ pub enum MaintainError {
         part_sample_count: u64,
     },
     #[error(
-        "rspan compaction input record-count cross-check failed for object {object_key:?}: the streaming k-way merge decoded {decoded_record_count} records from this input but its footer declares {footer_record_count} (a logically inconsistent but CRC-valid input, silent decode-side record loss or gain, fatal invariant breach, issue #926); publish aborted, nothing written"
+        "rspan compaction input record-count cross-check failed for object {object_key:?}: the streaming k-way merge decoded {decoded_record_count} records from this input but its footer declares {footer_record_count} (a logically inconsistent but CRC-valid input, silent decode-side record loss or gain, fatal invariant breach); publish aborted, nothing written"
     )]
     SpanInputRecordCountMismatch {
         /// Data-object key of the input whose decode diverged from its footer.
@@ -102,7 +101,7 @@ pub enum MaintainError {
         dropped_sample_count: u64,
     },
     #[error(
-        "erasure rewrite input record-count cross-check failed for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: the decode scanned {scanned_record_count} input records but the input objects' footers declare {footer_record_count} (a silent decode-side record loss, fatal invariant breach, ADR-0064 decision 3, issue #981); publish aborted, nothing written, originals preserved"
+        "erasure rewrite input record-count cross-check failed for tenant {tenant_hash} signal {signal} shard {shard} hour {ingest_hour_bucket}: the decode scanned {scanned_record_count} input records but the input objects' footers declare {footer_record_count} (a silent decode-side record loss, fatal invariant breach, ADR-0064 decision 3); publish aborted, nothing written, originals preserved"
     )]
     ErasureInputConservationViolation {
         /// Hex tenant hash of the bucket (the key-prefix form operators see).

@@ -1,18 +1,16 @@
-//! Ravel maintenance: the L0-to-L1 compactor (phase 4 of
-//! docs/compaction-retention-plan.md, issue #111).
+//! Ravel maintenance: the L0-to-L1 compactor.
 //!
 //! A compactor is a disposable process that rewrites a sealed ingest-hour
 //! bucket's many small L0 segments into a handful of large RSEG v5 L1 parts,
 //! without ever decoding a sample: it copies each series' TS/VAL/HIST pages
 //! verbatim and lets query-time merge remain the single implementation of the
-//! dedup total order (plan §7 "Dedup axis"). Object storage is the only
-//! durable state; every step is idempotent and re-runnable from a bare LIST
-//! (plan §3.6).
+//! dedup total order. Object storage is the only
+//! durable state; every step is idempotent and re-runnable from a bare LIST.
 //!
 //! # Pipeline (one bucket)
 //!
 //! 1. [`compact::compact_bucket`] gates on the seal rule and trigger
-//!    ([`bucket::Bucket::is_sealed`], plan §3.2), then:
+//!    ([`bucket::Bucket::is_sealed`]), then:
 //! 2. [`read::list_bucket`] partitions the bucket listing by key shape and
 //!    [`read::load_inputs`] decodes and canonically orders the L0 records,
 //!    yielding a stable [`read::input_set_hash`];
@@ -25,7 +23,7 @@
 //!    completed part's bytes are retained until publish for convergence
 //!    repair);
 //! 5. [`publish::publish_record`] publishes the [`CompactionRecord`] with
-//!    `CreateIfAbsent`, converging on any racing winner (plan §3.4).
+//!    `CreateIfAbsent`, converging on any racing winner.
 //!
 //! [`scan::scan_and_compact`] drives step 1 across a `(tenant, signal,
 //! shard)`'s hours with the advisory CAS cursor.

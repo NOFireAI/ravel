@@ -1,6 +1,5 @@
 //! Compaction-specific crash coverage for the RSPAN codec: the "crash after
-//! parts written, before the record" row (rows 2/3 of
-//! docs/compaction-retention-plan.md §3.6) exercised over a spans bucket.
+//! parts written, before the record" case, exercised over a spans bucket.
 //!
 //! The signal-generic sweeper crash matrix (`sweep_crash_matrix.rs`) already
 //! runs every sweeper row over a spans fixture, and the pipeline around the
@@ -155,7 +154,7 @@ async fn row2_3_crash_after_parts_before_record_spans() {
     );
 }
 
-/// v3 coverage over the crash path (issue #651, ADR-0054): the re-published
+/// v3 coverage over the crash path (ADR-0054): the re-published
 /// part after a mid-publish crash is not merely record-complete, its BLOOM
 /// section and `service_name` column are correct too. Seeds two inputs with
 /// disjoint service names, so a bloom or column copied from a single input

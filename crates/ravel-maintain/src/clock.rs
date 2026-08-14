@@ -5,9 +5,7 @@
 //! this crate clock-free.
 
 /// A monotone-enough source of unix-epoch nanoseconds. Only used for the
-/// compaction record's `created_unix_ns` (the supersession-horizon anchor,
-/// plan §5) and the `max_compaction_lifetime` abandonment deadline
-/// (plan §3.4 point 4). Never used to order commits (that is the pinned
+/// compaction record's `created_unix_ns` (the supersession-horizon anchor) and the `max_compaction_lifetime` abandonment deadline. Never used to order commits (that is the pinned
 /// flush identity's job).
 pub trait Clock: Send + Sync {
     fn now_ns(&self) -> i64;

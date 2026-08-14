@@ -1,15 +1,15 @@
-//! Format-floor migration driver (epic EM, EM-T5; issues #770, #463).
+//! Format-floor migration driver.
 //!
 //! This is the resumable driver that walks one `(tenant, signal, format
 //! family)`, rewrites every live record still below a target format version up
-//! to it via the EM-T4 rewrite primitive ([`crate::rewrite::migrate_bucket_format`]),
+//! to it via the rewrite primitive ([`crate::rewrite::migrate_bucket_format`]),
 //! and -- only once a fresh re-audit confirms nothing below the target survives
 //! -- raises the recorded format floor
-//! ([`ravel_catalog::raise_format_floor`], EM-T3).
+//! ([`ravel_catalog::raise_format_floor`]).
 //!
-//! It reimplements neither the codec-level rewrite (that is EM-T4's
+//! It reimplements neither the codec-level rewrite (that is
 //! [`migrate_bucket_format`], called per bucket) nor the floor history (that is
-//! EM-T3's append-only CAS machinery, called once at the end). It contributes
+//! the append-only CAS machinery, called once at the end). It contributes
 //! three things on top of them:
 //!
 //! 1. **A resumable cursor.** Progress is a `(shard, ingest_hour)` position
@@ -29,7 +29,7 @@
 //! 2. **A budget.** One invocation migrates at most [`MigrateBudget::max_records`]
 //!    L0 records before persisting the cursor and returning control, so a very
 //!    large migration never holds a lock or a long-lived process. The unit is
-//!    records rather than wall time because the EM-T4 primitive is
+//!    records rather than wall time because the rewrite primitive is
 //!    bucket-atomic (it rewrites a whole bucket's live L0 set in one publish and
 //!    cannot be interrupted partway); a record count is therefore both the
 //!    natural granularity at which the driver can yield (a bucket boundary) and
@@ -43,7 +43,7 @@
 //!    one straggler is found -- data that landed below the target between the
 //!    walk finishing and the floor being raised -- the floor is left untouched
 //!    and the driver reports the stragglers, so a floor is never CAS-appended
-//!    over a stale audit (EM-T10's named acceptance pattern).
+//!    over a stale audit.
 //!
 //! The floor is a claim about *every* live object of the family, so the
 //! re-audit deliberately counts every live commit and compaction record
@@ -55,10 +55,10 @@
 //! by): those are sweepable leftovers of a rewrite this same walk may just
 //! have performed, not stragglers, so migrating a bucket and then re-auditing
 //! it in the same invocation converges without needing an interleaved `sweep`
-//! in between (issue #826). The exclusion asks the input-set question
+//! in between. The exclusion asks the input-set question
 //! directly rather than "does this record's bucket carry a compaction record",
 //! so the re-audit confirms coverage instead of assuming the seal invariant
-//! that makes the two equivalent (issue #923).
+//! that makes the two equivalent.
 
 use std::collections::HashSet;
 
@@ -324,7 +324,7 @@ async fn list_shard_hours(
 /// An L0 commit record is excluded once some compaction or rewrite record in
 /// the same shard names it as an input: the record's own parts are then the
 /// live successor of that commit record, which is a pre-rewrite leftover,
-/// sweepable but not live (issue #826). Without this exclusion a migrate
+/// sweepable but not live. Without this exclusion a migrate
 /// invocation that just rewrote a bucket would count its own superseded L0
 /// records as stragglers and refuse the floor raise it earned, converging only
 /// after an unrelated sweep physically deletes them.
@@ -332,7 +332,7 @@ async fn list_shard_hours(
 /// The exclusion is keyed on the superseding record's explicit `inputs` list
 /// (via [`crate::sweep::superseded_input_commit_keys`], the same predicate
 /// sweep rule 2 deletes by), not on membership of the record's ingest-hour
-/// bucket (issue #923). Bucket membership gives the same answer today, since
+/// bucket. Bucket membership gives the same answer today, since
 /// compaction and rewrite refuse an unsealed bucket and a sealed bucket's L0
 /// set is frozen, so any record over a bucket covers that bucket's whole L0
 /// set. But this re-audit exists to verify the walk independently, and keying
@@ -452,7 +452,7 @@ pub async fn count_below_target(
 /// 2. walks buckets in `(shard, ingest_hour)` order, skipping everything at or
 ///    below the cursor, and for each sealed, un-tombstoned, not-yet-compacted
 ///    bucket carrying a below-target L0 record, rewrites its whole live L0 set
-///    to the target via [`migrate_bucket_format`] (the EM-T4 primitive),
+///    to the target via [`migrate_bucket_format`] (the rewrite primitive),
 ///    advancing the cursor past every examined bucket;
 /// 3. stops early once `budget` is spent (persisting the cursor and returning
 ///    with `walk_complete == false` so the caller re-invokes), or runs the
@@ -512,7 +512,7 @@ pub async fn migrate_family(
             // commit records' recorded format version, never a data-object GET.
             // Only a sealed, un-tombstoned, not-yet-compacted bucket carrying a
             // below-target L0 record is rewritten here; a compacted bucket's L1
-            // parts are EM-T6's rewrite-on-touch scope, and the re-audit below
+            // parts are the rewrite-on-touch scope, and the re-audit below
             // still refuses the floor raise if any such L1 straggler survives.
             let listing = list_bucket(store, &bucket).await?;
             if bucket.is_sealed(now, config)
@@ -584,7 +584,7 @@ pub async fn migrate_family(
     // this is the race close. A record that landed below the target between the
     // walk finishing and now -- including a still-unsealed one the walk could
     // not migrate -- is counted here and refuses the raise, so a floor is never
-    // asserted over a stale audit (EM-T10).
+    // asserted over a stale audit.
     // Re-resolve the shard range too, for the same reason the audit itself is
     // re-run: `scan_shards` was resolved before a walk that can run for a long
     // time, and resharding is online (ADR-0052 section 3 has no quiescence
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(compaction_record_count(&store, 1, 100).await, 1);
     }
 
-    /// Race safety (EM-T10's named acceptance pattern): the floor raise refuses
+    /// Race safety: the floor raise refuses
     /// when a fresh below-target straggler is present at re-audit time that the
     /// walk did not migrate. Everything sealed is already at the target, so the
     /// walk drains with nothing to rewrite and would raise the floor -- but an
@@ -1130,7 +1130,7 @@ mod tests {
 
         fn capabilities(&self) -> Capabilities {
             // multipart: false to match the refusing default `put_multipart`
-            // this double inherits (issue #298); the corpora here are tiny.
+            // this double inherits; the corpora here are tiny.
             Capabilities {
                 multipart: false,
                 ..self.inner.capabilities()
@@ -1138,7 +1138,7 @@ mod tests {
         }
     }
 
-    /// Race safety, the real interleaving (EM-T10's named acceptance pattern).
+    /// Race safety, the real interleaving.
     /// Unlike the pre-seeded variant above, the straggler here does not exist
     /// while the walk runs: it is written by the store decorator at the instant
     /// the verification re-audit issues its first list, so it lands strictly
@@ -1372,7 +1372,7 @@ mod tests {
         );
     }
 
-    /// Regression for issue #826: a bucket the walk itself just rewrote must
+    /// Regression: a bucket the walk itself just rewrote must
     /// not make its own pre-rewrite L0 commit record look like a straggler.
     /// The one seeded record is below target, so [`migrate_bucket_format`]
     /// rewrites it into a superseding compaction record; the pre-rewrite
@@ -1391,7 +1391,7 @@ mod tests {
     /// that same fictional target then makes the rewrite's own L1 output
     /// (recorded at `VERSION_V6`, genuinely `< FUTURE_VERSION`) count as
     /// below target too, independent of this fix -- a `FloorRaised` result
-    /// is structurally unreachable here, orthogonal to issue #826. Calling
+    /// is structurally unreachable here, orthogonal to the just-rewrote case. Calling
     /// `count_below_target` directly isolates exactly the mechanism the fix
     /// changes (the L0 branch) from that unrelated, expected L1 count.
     ///
@@ -1466,7 +1466,7 @@ mod tests {
         );
     }
 
-    /// Regression for issue #923: the re-audit's supersession exclusion must be
+    /// Regression: the re-audit's supersession exclusion must be
     /// keyed on the superseding record's explicit input set, not on membership
     /// of its ingest-hour bucket. A commit record that no compaction or rewrite
     /// record names is live, however many such records its bucket carries.

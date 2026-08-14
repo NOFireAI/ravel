@@ -1,4 +1,4 @@
-//! Sealed-bucket scan and advisory CAS cursor (plan §3.2). Covers multi-hour
+//! Sealed-bucket scan and advisory CAS cursor. Covers multi-hour
 //! walking, cursor advancement, stopping at the first unsealed hour, and the
 //! cursor's re-scan-avoidance on a second pass.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -125,7 +125,7 @@ async fn scan_stops_at_first_unsealed_hour() {
     );
 }
 
-// --- Terminal-bucket memo (issue #280) -------------------------------------
+// --- Terminal-bucket memo -------------------------------------
 //
 // The maintain loop re-lists and re-reads every retained bucket on every tick.
 // A per-worker `MaintainMemo` records buckets already known terminal so
@@ -520,8 +520,7 @@ async fn periodic_reverify_relists_terminal_bucket_and_catches_expiry() {
     );
 }
 
-// --- Durable memo snapshot: warm start and handoff (ADR-0065 decision 3,
-//     issue #747) --------------------------------------------------------------
+// --- Durable memo snapshot: warm start and handoff (ADR-0065 decision 3) ---
 //
 // A worker persists its terminal-bucket memo to a durable snapshot and, on
 // startup or after ownership handoff, seeds a fresh in-memory memo from it. The
@@ -776,7 +775,7 @@ async fn ownership_handoff_seeds_successor_from_predecessor_snapshot() {
     );
 }
 
-// --- Zone-scheduled maintenance (ADR-0065 decision 3, issue #748) ----------
+// --- Zone-scheduled maintenance (ADR-0065 decision 3) ----------
 //
 // The unit scan splits a unit's ingest hours into head/tail (evaluated every
 // tick, exactly as before this split existed) and interior (memo-gated,
@@ -788,7 +787,7 @@ async fn ownership_handoff_seeds_successor_from_predecessor_snapshot() {
 // without being re-listed, skipping only while the interior zone's own 6h
 // cadence has not yet elapsed.
 
-/// The named acceptance test (ADR-0065 decision 3, issue #748): an interior
+/// The named acceptance test (ADR-0065 decision 3): an interior
 /// hour memoized terminal is NOT re-listed on a tick 3h later, even though
 /// that is past the old flat 1h re-verify interval -- only the interior
 /// zone's own 6h cadence governs it now. Proven by an exact LIST-count
@@ -980,14 +979,14 @@ async fn interior_zone_expiry_transition_forces_reevaluation() {
     assert!(has_tombstone(&store, &bucket_at(HOUR)).await);
 }
 
-/// `MaintainMemo::invalidate` (ADR-0065 decision 3, issue #748) marks an
+/// `MaintainMemo::invalidate` (ADR-0065 decision 3) marks an
 /// interior hour due for re-evaluation on the next tick regardless of the
 /// interior cadence, and the invalidation survives a memo snapshot save/load
 /// round trip: because it works by forgetting the entry (there is nothing to
 /// encode), a snapshot taken after `invalidate()` carries no terminal verdict
 /// for that hour, so a fresh memo seeded from it treats the hour as due, not
 /// as freshly terminal. `invalidate()` has no production caller yet in this
-/// crate: EJ-T4 (issue #754) is what wires the erasure-rewrite work orders to
+/// crate: the erasure rewrite path is what wires the erasure-rewrite work orders to
 /// call it.
 #[tokio::test]
 async fn invalidate_forces_reevaluation_and_survives_snapshot_round_trip() {

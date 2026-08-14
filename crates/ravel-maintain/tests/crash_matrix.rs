@@ -1,7 +1,6 @@
-//! FaultStore crash-matrix coverage for the compactor: rows 1-4, 10, 11, and
-//! 13 of docs/compaction-retention-plan.md §3.6. Every test asserts the fault
+//! FaultStore crash-matrix coverage for the compactor's crash-recovery paths. Every test asserts the fault
 //! actually fired (via `fault_count`) so it proves its own fault point, per
-//! the repo testing conventions, and asserts the convergence the plan claims.
+//! the repo testing conventions, and asserts the expected convergence.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;

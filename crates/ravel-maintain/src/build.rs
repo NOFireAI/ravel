@@ -1,5 +1,5 @@
 //! Whole-bucket catalog group-by and verbatim-page copy into RSEG v5 parts
-//! (docs/compaction-retention-plan.md §3.3 steps 3-4, with the ADR-0026/0027
+//! (with the ADR-0026/0027
 //! v5 writer substitution). Every input catalog's series is grouped into one
 //! `BTreeMap` keyed by series id (all inputs' per-series metadata resident at
 //! once), then iterated in id order; this is a group-by-then-iterate, not a
@@ -9,11 +9,11 @@
 //! are split on series boundaries once accumulated page bytes reach
 //! `max_l1_part_bytes`, so a series' runs never straddle a part and part
 //! id-ranges are disjoint. Each finished part is a whole object written with a
-//! single `CreateIfAbsent` PUT (no multipart; issue #243), and its encoded
+//! single `CreateIfAbsent` PUT (no multipart), and its encoded
 //! bytes are retained in the returned `Vec` until publish so the
 //! convergence-repair path can re-PUT a part a racing winner is missing.
 //!
-//! Page fetch mechanics (#279, perf epic #264): the pages for one part are
+//! Page fetch mechanics: the pages for one part are
 //! fetched as a batch, not one blocking GET per page. First the per-run TS and
 //! VAL-or-HIST byte ranges of every series in the batch are grouped by input
 //! object and coalesced (adjacent/near ranges merged into one GET, mirroring
@@ -28,7 +28,7 @@
 //! so the built part bytes are identical. Fetch buffering is bounded to one
 //! part's worth of page bytes because a batch is exactly the series that fit
 //! under `max_l1_part_bytes`; the encoded parts held until publish still
-//! dominate peak memory (plan §3.3 memory bound).
+//! dominate peak memory.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -52,8 +52,7 @@ use crate::error::{MaintainError, Result};
 use crate::read::{InputCatalog, InputRecord, RunPlan, SeriesPlan};
 
 /// Maximum concurrent page GETs in flight across a whole `build_parts` call.
-/// A single global cap (one shared [`Semaphore`], the "one global semaphore"
-/// docs/reviews/2026-07-30-performance-investigation.md §10 calls for) driving
+/// A single global cap (one shared [`Semaphore`]) driving
 /// a `buffer_unordered` window of the same width: high enough to hide
 /// per-request latency on real object storage, low enough not to trip a
 /// bucket's per-prefix request-rate throttle.
@@ -80,15 +79,15 @@ pub struct BuiltPart {
     pub part: CompactionPart,
 }
 
-/// Merge all inputs into size-capped v5 parts (plan §3.3). `catalogs` MUST be
+/// Merge all inputs into size-capped v5 parts. `catalogs` MUST be
 /// aligned with `inputs` (both in canonical input order): the alignment is
 /// what makes run tie-breaking by canonical input position deterministic.
 ///
 /// `catalogs` is taken by value, and this call is their last use, so the
 /// exemplar records are moved out of them (`std::mem::take` below) rather than
 /// cloned: the retained records exist in exactly one place at a time, which is
-/// what keeps them inside `read.rs`'s stated catalog-metadata memory bound
-/// (issue #557). Only the borrowed page-range metadata (`&SeriesPlan`,
+/// what keeps them inside `read.rs`'s stated catalog-metadata memory bound.
+/// Only the borrowed page-range metadata (`&SeriesPlan`,
 /// `object_key`) is read after the take.
 pub async fn build_parts(
     store: &dyn ObjectStoreBackend,
@@ -111,7 +110,7 @@ pub async fn build_parts(
     // The records are MOVED out of the catalogs (`std::mem::take`), not cloned:
     // `read.rs` argues the retained exemplars fit the catalog-metadata memory
     // bound, and that holds for one copy, not the originals plus a full clone
-    // set live at once (issue #557). Grouping is only how a part collects the
+    // set live at once. Grouping is only how a part collects the
     // exemplars of the series it carries: nothing here merges, deduplicates,
     // re-caps, or re-sorts them, and two inputs each carrying an exemplar for
     // the same (series, ts) both stay. `exemplar_total` is what the per-part
@@ -131,7 +130,7 @@ pub async fn build_parts(
     // Group every series across every input by id, carrying the input index
     // so pages can be fetched from the right object. Inserting in canonical
     // input order means each id's contribution list is already in canonical
-    // input order, which is the run tie-break rule (plan §3.3 step 3).
+    // input order, which is the run tie-break rule.
     let mut by_series: BTreeMap<[u8; 16], Vec<(usize, &SeriesPlan)>> = BTreeMap::new();
     for (idx, catalog) in catalogs.iter().enumerate() {
         for series in &catalog.series {
@@ -427,7 +426,7 @@ async fn fetch_one_range<'a>(
 
 /// Slice each run's TS and VAL-or-HIST page out of the fetched regions in the
 /// batch's series-then-run order and pack them into [`SeriesInputV4`], stamping
-/// each run's provenance from its commit record (plan §3.3 step 3). The page
+/// each run's provenance from its commit record. The page
 /// bytes are sliced zero-copy from the coalesced GET buffers; the single
 /// `to_vec` per page here is the copy `RunInputV4`'s owned `Vec<u8>` fields
 /// require, not a redundant copy off the wire.
@@ -599,7 +598,7 @@ fn flush_part(
 
 /// PUT one part `CreateIfAbsent`; `AlreadyExists` is idempotent success (the
 /// key embeds the content hash, so the stored bytes are identical by
-/// construction, plan §3.4 point 1).
+/// construction).
 pub async fn put_part(store: &dyn ObjectStoreBackend, part: &BuiltPart) -> Result<()> {
     use ravel_object_store::{PutOptions, StoreError, UploadChecksum};
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&part.bytes));

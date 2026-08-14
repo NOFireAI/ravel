@@ -130,7 +130,7 @@ impl InputSpec {
 /// Encode a raw batch into a single-run RSEG v5 L0 object (bootstrap note
 /// above). Every run's provenance is set to `provenance`, matching the commit
 /// record; the compactor overrides run provenance from the commit record
-/// anyway (plan §3.3 step 3).
+/// anyway.
 pub fn build_v5_l0(
     raw: &[RawSeries],
     hour: u32,
@@ -520,7 +520,7 @@ pub fn span_record(t: u8, s: u8, start: i64, end: i64) -> ravel_rspan::SpanRecor
 
 /// A synthetic span carrying an explicit `service.name` attribute and a chosen
 /// span `name`, so the writer's v3 `service_name` column and the block bloom
-/// over name/service tokens are populated (issue #651, ADR-0054). Unlike
+/// over name/service tokens are populated (ADR-0054). Unlike
 /// [`span_record`] (which uses a plain "svc" attr key) this drives the v3
 /// lifted-column path.
 pub fn span_record_with_service(

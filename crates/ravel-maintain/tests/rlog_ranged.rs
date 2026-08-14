@@ -1,4 +1,4 @@
-//! Request-shape coverage for the ranged RLOG reader (issue #275).
+//! Request-shape coverage for the ranged RLOG reader.
 //!
 //! Before the ranged reader, the RLOG merge fetched every input `.rlog` object
 //! whole twice: once in `load_input_catalog` (to read the footer) and once in
