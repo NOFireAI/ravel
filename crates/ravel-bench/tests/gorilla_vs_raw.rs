@@ -1,6 +1,5 @@
 //! Gorilla vs raw f64 page sizes on constant, gauge random-walk, and counter
-//! workloads (docs/benchmarking.md Phase 1: "Gorilla vs raw f64 page sizes
-//! on gauge, counter, and random walks"). Criterion measures time, not size,
+//! workloads. Criterion measures time, not size,
 //! so this ships as a plain `#[test]` that prints a small table; run with
 //! `cargo test -p ravel-bench --test gorilla_vs_raw -- --nocapture` to see
 //! it.

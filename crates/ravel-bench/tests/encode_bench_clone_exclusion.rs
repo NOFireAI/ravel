@@ -48,15 +48,15 @@ fn clone_inputs(inputs: &[SeriesInput]) -> Vec<SeriesInput> {
         .collect()
 }
 
-/// a12-F01: before the fix, the `segment_encode` criterion bench ran
-/// `clone_inputs` inside its timed `b.iter` closure, so the reported encode
-/// throughput included the fixture clone. This quantifies that the clone is a
-/// non-trivial fraction of the writer's own time at high cardinality (where the
-/// clone deep-copies one `LabelSet` per series) — the contamination the fix
-/// removed from the timed region, which was confounding the per-series-overhead
-/// comparison the bench isolates. The bench now uses `b.iter_batched` with the
-/// clone in the setup closure (as src/bin/segment_alloc_profile.rs does).
-/// Magnitude is host-sensitive; the structural point is not.
+/// Running `clone_inputs` inside a timed `b.iter` closure would fold the
+/// fixture clone into the reported encode throughput. This quantifies that the
+/// clone is a non-trivial fraction of the writer's own time at high
+/// cardinality (where the clone deep-copies one `LabelSet` per series), the
+/// contamination the setup closure keeps out of the timed region so it does
+/// not confound the per-series-overhead comparison the bench isolates. The
+/// bench uses `b.iter_batched` with the clone in the setup closure (as
+/// src/bin/segment_alloc_profile.rs does). Magnitude is host-sensitive; the
+/// structural point is not.
 #[test]
 #[ignore = "measurement probe; run with --ignored"]
 fn clone_is_in_encode_timed_region() {
@@ -134,7 +134,7 @@ fn iter_batched_excludes_clone() {
     }
 
     println!(
-        "a12-F01: current(clone+write) {:.2} ms vs fixed(write-only) {:.2} ms",
+        "current(clone+write) {:.2} ms vs fixed(write-only) {:.2} ms",
         current_ns as f64 / 1e6,
         fixed_ns as f64 / 1e6
     );

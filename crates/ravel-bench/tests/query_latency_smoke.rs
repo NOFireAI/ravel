@@ -1,5 +1,5 @@
 //! Smoke tests for the `query_latency_bench` end-to-end PromQL query-latency
-//! path (docs/benchmarking.md "End-to-end", issue #270):
+//! path:
 //! `promql_instant_memory_smoke` and `promql_range_memory_smoke` always run
 //! against an in-process `MemoryStore`; `promql_instant_range_minio_smoke`
 //! runs the same path against a real MinIO endpoint, gated on

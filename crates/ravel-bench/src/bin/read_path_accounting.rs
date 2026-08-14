@@ -1,4 +1,4 @@
-//! Read-path GET accounting harness (GitHub issue #97 phase b).
+//! Read-path GET accounting harness.
 //!
 //! Measures what a single-series lookup, a ~1% label-matcher selection, and a
 //! full scan each cost, in GET requests and bytes transferred, for two
@@ -26,8 +26,8 @@
 //! backend-independent, so they are the primary deliverable whether this runs
 //! against MinIO or the in-process reference stores.
 //!
-//! Backend selection: if the `RAVEL_S3_*` env vars BENCHMARKS.md documents
-//! are set and the endpoint is reachable, both paths run against it (MinIO);
+//! Backend selection: if the `RAVEL_S3_*` env vars are set and the endpoint
+//! is reachable, both paths run against it (MinIO);
 //! otherwise both fall back to the in-process stores (MemoryStore for RSEG,
 //! `object_store::memory::InMemory` for Parquet) and wall times are labeled
 //! in-process. The chosen backend is printed in the header.
@@ -183,7 +183,7 @@ fn backend_label(backend: &Backend) -> &'static str {
 }
 
 fn print_header(backend: &Backend) {
-    println!("== read-path GET accounting (issue #97 phase b) ==");
+    println!("== read-path GET accounting ==");
     println!("  backend            : {}", backend_label(backend));
     println!("  suffix probe       : {SUFFIX_PROBE} bytes");
     println!(

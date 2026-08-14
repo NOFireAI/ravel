@@ -1,5 +1,5 @@
-//! End-to-end ingest-then-query benchmark core (docs/benchmarking.md
-//! "End-to-end"): drives `IngestRouter` and `QueryEngine` directly (no HTTP)
+//! End-to-end ingest-then-query benchmark core: drives `IngestRouter` and
+//! `QueryEngine` directly (no HTTP)
 //! against a real or in-memory object store. Lives in the lib (not the
 //! `s3_e2e_bench` bin) so `tests/s3_e2e_smoke.rs` can exercise the same path
 //! the bin runs, matching how `ravel_bench::codecs` and
@@ -28,9 +28,9 @@ use serde::Serialize;
 
 use crate::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
 
-/// Bytes on the wire per logical sample: `ts_ns: i64` + `value: f64`
-/// (docs/benchmarking.md "write amplification (bytes stored / bytes
-/// ingested logical)"). Same constant `ingest_bench` uses.
+/// Bytes on the wire per logical sample: `ts_ns: i64` + `value: f64`. Used as
+/// the denominator of write amplification (bytes stored / bytes ingested
+/// logical). Same constant `ingest_bench` uses.
 const LOGICAL_BYTES_PER_SAMPLE: u64 = 16;
 const VISIBILITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const VISIBILITY_POLL_MAX_ROUNDS: u32 = 30;
@@ -154,8 +154,8 @@ pub struct VisibilityReport {
     pub max: f64,
 }
 
-/// GET/LIST call counts and GET bytes returned, for the query phase (docs/
-/// benchmarking.md "GET count, bytes read"). Not the same type as
+/// GET/LIST call counts and GET bytes returned, for the query phase. Not the
+/// same type as
 /// `catalog_resolve_bench`'s `Counters`/`CountingStore`: that one has no byte
 /// counter (it only needed request counts) and is private to that bin, so it
 /// is duplicated here rather than shared -- see the final report for why
@@ -225,7 +225,7 @@ impl ObjectStoreBackend for CountingStore {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -282,8 +282,8 @@ pub async fn run(config: &E2eConfig) -> Report {
         batch_size: BatchSizeDistribution::fixed(config.batch_size),
         ..WorkloadConfig::default()
     };
-    // The generator now stamps every series with a __name__ label (issue
-    // #277), so the query phase's PromQL selector matches by name directly.
+    // The generator stamps every series with a __name__ label, so the query
+    // phase's PromQL selector matches by name directly.
     let batches: Vec<Vec<_>> = generate_batches(&workload).expect("generate workload");
 
     let ack_deadline = Duration::from_secs(config.ack_timeout_secs);
@@ -451,8 +451,7 @@ pub async fn run(config: &E2eConfig) -> Report {
     // GET/LIST/byte counter and a fresh Catalog/QueryEngine, then runs the
     // configured instant selector repeatedly for latency percentiles. Always
     // "hot" -- there is no segment-footer cache in `ravel-query` yet
-    // (docs/benchmarking.md's cold-state variant is future work, see the
-    // final report).
+    // (a cold-state variant is future work).
     let (query_store, query_counters) = CountingStore::wrap(Arc::clone(&store));
     let query_catalog = Arc::new(
         Catalog::new(

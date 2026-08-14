@@ -1,12 +1,11 @@
-//! Local-vs-distributed read crossover benchmark (ADR-0071, issue #869). Thin
+//! Local-vs-distributed read crossover benchmark (ADR-0071). Thin
 //! wrapper around `ravel_bench::distrib_crossover::run`: parses `--store
 //! memory|s3` via `ravel_bench::harness` (same convention as `s3_e2e_bench` and
 //! `query_latency_bench`), then prints the report.
 //!
 //! The distributed panels run in-process `tonic` loopback workers over the
 //! chosen store; on `MemoryStore` this measures the fan-out overhead against a
-//! zero-latency store, a lower bound on the crossover (see the module docs and
-//! BENCHMARKS.md).
+//! zero-latency store, a lower bound on the crossover (see the module docs).
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use clap::Parser;

@@ -1,14 +1,12 @@
-//! X1 (issue #25): measures, on production-shaped bench workloads, what
-//! fraction of VAL pages use VAL_RAW_F64 rather than VAL_GORILLA, by page
-//! count and by page byte size. Feeds docs/x1-alignment-measurement.md.
+//! Measures, on production-shaped bench workloads, what fraction of VAL pages
+//! use VAL_RAW_F64 rather than VAL_GORILLA, by page count and by page byte
+//! size.
 //!
-//! This is also the minimal raw-f64/Gorilla page-kind counter called for by
-//! A1a (issue #17): as of this commit no such counter exists in
-//! ravel-segment or ravel-query, so it is added here, scoped to ravel-bench,
-//! using the enc byte ravel-bench already reads in `tests/gorilla_vs_raw.rs`
-//! via `segment_support::val_page_bytes`. Run with `cargo test -p
-//! ravel-bench --test alignment_measurement -- --nocapture` to see the
-//! table.
+//! A raw-f64/Gorilla page-kind counter does not exist in ravel-segment or
+//! ravel-query, so it is computed here, scoped to ravel-bench, using the enc
+//! byte ravel-bench already reads in `tests/gorilla_vs_raw.rs` via
+//! `segment_support::val_page_bytes`. Run with `cargo test -p ravel-bench
+//! --test alignment_measurement -- --nocapture` to see the table.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_raw};

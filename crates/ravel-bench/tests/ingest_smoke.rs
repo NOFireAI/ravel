@@ -1,5 +1,5 @@
-//! Smoke tests for the `ingest_bench` pipeline-depth / flush-delay sweep
-//! (issue #815, epic #807 wave 4). `depth_and_adaptive_policy_memory_smoke`
+//! Smoke tests for the `ingest_bench` pipeline-depth / flush-delay sweep.
+//! `depth_and_adaptive_policy_memory_smoke`
 //! is the acceptance test: it runs the bench harness end to end against an
 //! in-process `MemoryStore` with `--max-inflight-flushes 3` and the adaptive
 //! policy, and asserts the report carries the new fields with sane values.

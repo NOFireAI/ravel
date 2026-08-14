@@ -1,5 +1,5 @@
-//! End-to-end PromQL query-latency benchmark core (docs/benchmarking.md
-//! "End-to-end", issue #270): every other bench in this crate measures one
+//! End-to-end PromQL query-latency benchmark core: every other bench in this
+//! crate measures one
 //! isolated stage (fetch, decode, merge -- `read_accounting`,
 //! `codecs`, `section_accounting`) or the full ingest path
 //! (`ravel_bench::e2e`, `ravel_bench::concurrent`), but none of them time
@@ -183,8 +183,8 @@ pub async fn run(config: &QueryLatencyConfig) -> Report {
         batch_size: BatchSizeDistribution::fixed(config.batch_size),
         ..WorkloadConfig::default()
     };
-    // The generator now stamps every series with a __name__ label (issue
-    // #277), so the instant/range query phases match by name directly.
+    // The generator stamps every series with a __name__ label, so the
+    // instant/range query phases match by name directly.
     let batches: Vec<Vec<_>> = generate_batches(&workload).expect("generate workload");
 
     let ack_deadline = Duration::from_secs(config.ack_timeout_secs);

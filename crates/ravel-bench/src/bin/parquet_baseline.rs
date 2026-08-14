@@ -1,4 +1,4 @@
-//! Write-side Parquet baseline harness (GitHub issue #97 phase a).
+//! Write-side Parquet baseline harness.
 //!
 //! From the identical generated workloads the RSEG benches use, this bin
 //! encodes the same logical content three ways and reports encode wall
@@ -56,7 +56,7 @@ fn main() {
 
     // Shape 1: 100k series, 200k total samples (2/series), many_small. This
     // is the `segment_encode` / `profile_hotspots` encode shape, the
-    // high-cardinality wall docs/rseg-v2-plan.md section 1 measures.
+    // high-cardinality wall.
     let many_small = WorkloadConfig {
         series_count: 100_000,
         samples_per_series: 2,
@@ -84,7 +84,7 @@ fn main() {
 }
 
 fn print_header() {
-    println!("== parquet write-side baseline (issue #97 phase a) ==");
+    println!("== parquet write-side baseline ==");
     println!("  runs per measurement : {RUNS} (median reported)");
     println!("  arrow                : {}", arrow_version());
     println!("  parquet              : {}", parquet_version());
@@ -154,8 +154,8 @@ fn run_shape(label: &str, config: &WorkloadConfig) {
         median_write(|| write_parquet(Arc::clone(&schema), &unsorted_batch));
 
     // RSEG (v5) from the same logical content. build_segment consumes its
-    // input, so pre-clone RUNS copies outside the timed region (the
-    // in-timed-region clone bias fixed by commit d605400, BENCHMARKS.md).
+    // input, so pre-clone RUNS copies outside the timed region: the clone must
+    // not sit inside the timed region or it biases the encode measurement.
     let (rseg_ms, rseg_bytes) = median_rseg(&raw, build_segment);
 
     println!("  encoder            median ms     object bytes");

@@ -1,4 +1,4 @@
-//! Unit tests for the read-path GET accounting wrappers (issue #97 phase b).
+//! Unit tests for the read-path GET accounting wrappers.
 //!
 //! Gated on `parquet-baseline`: without the feature this file compiles to
 //! nothing, so `cargo test -p ravel-bench` (the standard gate) is unaffected.

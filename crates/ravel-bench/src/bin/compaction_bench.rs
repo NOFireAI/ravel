@@ -1,9 +1,9 @@
-//! Compaction benchmark (docs/compaction-retention-plan.md P8, §9 gate, issue
-//! #115). Measures, on a synthetic sealed hour of small L0 segments:
+//! Compaction benchmark. Measures, on a synthetic sealed hour of small L0
+//! segments:
 //!
 //! - object count and stored bytes: L0 objects vs L1 parts, plus the
-//!   commit-record / compaction-record metadata share (the §9 gate: L1 total
-//!   <= 80% of L0 total; a miss files an L2 follow-up, it does not fail here);
+//!   commit-record / compaction-record metadata share (the size gate: L1 total
+//!   <= 80% of L0 total; a miss is reported, it does not fail here);
 //! - resolve + query latency and GET/LIST counts, before vs after compaction;
 //! - compaction wall time and peak RSS (VmHWM delta from /proc/self/status);
 //! - an end-to-end demo: ingest -> compact -> query-equivalence -> retention
@@ -12,12 +12,11 @@
 //! Report-only: it never changes ravel-maintain / ravel-catalog / ravel-query
 //! behavior, only measures it. It never invents a number: the metrics (RSEG)
 //! path runs fully here; the logs (RLOG) signal-generic numbers and the S3
-//! panel are marked pending in BENCHMARKS.md, not fabricated (see the header
-//! notes there).
+//! panel are reported as pending, not fabricated.
 //!
-//! Object count (not raw byte reduction) is the primary compaction win per the
-//! plan; the stored-byte gate is a secondary target whose miss is recorded,
-//! not treated as a failure (plan §9).
+//! Object count (not raw byte reduction) is the primary compaction win; the
+//! stored-byte gate is a secondary target whose miss is recorded, not treated
+//! as a failure.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
@@ -71,7 +70,7 @@ enum Scenario {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Compaction benchmark (docs/compaction-retention-plan.md P8, §9 gate)")]
+#[command(about = "Compaction benchmark (L1-vs-L0 size gate)")]
 struct Args {
     #[arg(long, value_enum, default_value_t = Scenario::All)]
     scenario: Scenario,
@@ -158,7 +157,7 @@ impl ObjectStoreBackend for CountingStore {
     }
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()

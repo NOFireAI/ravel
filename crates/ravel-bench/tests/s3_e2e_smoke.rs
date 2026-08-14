@@ -1,5 +1,5 @@
-//! Smoke tests for the `s3_e2e_bench` end-to-end ingest+query path
-//! (docs/benchmarking.md "End-to-end", issue #266): `memory_smoke` always
+//! Smoke tests for the `s3_e2e_bench` end-to-end ingest+query path:
+//! `memory_smoke` always
 //! runs against an in-process `MemoryStore`; `minio_ingest_read_smoke` runs
 //! the same path against a real MinIO endpoint, gated on `RAVEL_MINIO_URL`
 //! exactly like `minio_contract` in

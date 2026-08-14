@@ -1,4 +1,4 @@
-//! Correctness gates for the issue #99 bake-off codecs (`ravel_bench::codecs`).
+//! Correctness gates for the bake-off codecs (`ravel_bench::codecs`).
 //! Every codec must round-trip bit-exactly (`f64::to_bits`), including NaN
 //! payload bits, -0.0, denormals, and mixed streams, and every decoder must
 //! turn corrupt or truncated input into a typed error, never a panic (the

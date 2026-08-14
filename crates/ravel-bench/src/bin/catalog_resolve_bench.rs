@@ -1,9 +1,8 @@
-//! Catalog resolve benchmark (docs/metric-index-plan.md phase 4,
-//! ADR-0020): measures `Catalog::resolve` cost before and after a fold at
-//! 10^4-10^5 commit scale, and the phase 5 gate measurement (segment-fetch
-//! share of a selective query's total request cost, docs/metric-index-plan.md
-//! "Gate for phase 5"). Report-only: never changes ravel-catalog/ravel-query
-//! behavior, only measures it.
+//! Catalog resolve benchmark (ADR-0020): measures `Catalog::resolve` cost
+//! before and after a fold at 10^4-10^5 commit scale, and the segment-fetch
+//! gate measurement (segment-fetch share of a selective query's total request
+//! cost). Report-only: never changes ravel-catalog/ravel-query behavior, only
+//! measures it.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
@@ -65,9 +64,7 @@ enum Scenario {
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    about = "Catalog resolve before/after fold benchmark (docs/metric-index-plan.md phase 4)"
-)]
+#[command(about = "Catalog resolve before/after fold benchmark")]
 struct Args {
     #[arg(long, value_enum, default_value_t = StoreKind::Memory)]
     store: StoreKind,
@@ -81,7 +78,7 @@ struct Args {
     resolve_shards: u32,
     #[arg(long, default_value_t = 25)]
     resolve_hours: u32,
-    /// Number of distinct single-series segments in the phase 5 gate's one
+    /// Number of distinct single-series segments in the segment-fetch gate's one
     /// (shard, hour) bucket. The query matches exactly one of them, so
     /// selectivity is `1 / gate_segments`.
     #[arg(long, default_value_t = 200)]
@@ -181,7 +178,7 @@ impl ObjectStoreBackend for CountingStore {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -235,7 +232,7 @@ async fn publish_lightweight(
 }
 
 /// Writes a real RSEG segment with one series and publishes its commit
-/// record, for the phase 5 gate scenario: `QueryEngine::instant` must be
+/// record, for the segment-fetch gate scenario: `QueryEngine::instant` must be
 /// able to decode it, unlike the lightweight commits above. Duplicated from
 /// `crates/ravel-failure-tests/tests/common/mod.rs::publish_segment`
 /// (test-only helper, different crate, not importable).
@@ -430,7 +427,7 @@ async fn run_gate_scenario(raw_store: Arc<dyn ObjectStoreBackend>, args: &Args) 
     let hour = BASE_HOUR + 500; // disjoint from the resolve scenario's hour range
     let ts_ns = hour_end_ns(hour) - NS_PER_SEC;
 
-    println!("== phase 5 gate: segment-fetch share of a selective query ==");
+    println!("== segment-fetch gate: segment-fetch share of a selective query ==");
     println!(
         "populating {} single-series segments in one (shard, hour) bucket",
         args.gate_segments
@@ -453,9 +450,9 @@ async fn run_gate_scenario(raw_store: Arc<dyn ObjectStoreBackend>, args: &Args) 
     let query = "gate_metric_0";
     let t_ms = ts_ns / 1_000_000;
 
-    // The gate question ("Gate for phase 5") is scoped to "with snapshots
-    // on": fold this bucket first so both measurements below hit the index
-    // rather than Phase 1 listing. An unfolded resolve would GET every
+    // The gate question is scoped to "with snapshots on": fold this bucket
+    // first so both measurements below hit the index rather than the
+    // full-listing fallback. An unfolded resolve would GET every
     // commit record just to build the candidate list, swamping the signal
     // this scenario exists to isolate (the per-segment suffix-GET cost the
     // fold does NOT eliminate, since it prunes by hour, not by name).
@@ -526,7 +523,7 @@ async fn run_gate_scenario(raw_store: Arc<dyn ObjectStoreBackend>, args: &Args) 
     let fetch_wall = query_wall.saturating_sub(resolve_wall);
     let fetch_wall_share = fetch_wall.as_secs_f64() / query_wall.as_secs_f64().max(1e-9);
 
-    println!("--- phase 5 gate ---");
+    println!("--- segment-fetch gate ---");
     println!(
         "segment-fetch requests: {fetch_requests} / {query_requests} total ({:.1}% by request count)",
         fetch_share * 100.0
@@ -536,7 +533,7 @@ async fn run_gate_scenario(raw_store: Arc<dyn ObjectStoreBackend>, args: &Args) 
         fetch_wall_share * 100.0
     );
     println!(
-        "gate criterion (docs/metric-index-plan.md 'Gate for phase 5'): segment-fetch \
+        "gate criterion: segment-fetch \
          dominant (>50% of requests) = {}",
         fetch_share > 0.5
     );

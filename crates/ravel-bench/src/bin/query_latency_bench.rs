@@ -1,5 +1,4 @@
-//! End-to-end PromQL query-latency benchmark (docs/benchmarking.md
-//! "End-to-end", issue #270). Thin wrapper around
+//! End-to-end PromQL query-latency benchmark. Thin wrapper around
 //! `ravel_bench::query_latency::run`: parses `--store memory|s3` via
 //! `ravel_bench::harness`, same convention as `s3_e2e_bench` and
 //! `concurrent_bench`, then prints the report.
@@ -10,9 +9,7 @@ use ravel_bench::harness::{StoreKind, store_from_env};
 use ravel_bench::query_latency::{QueryLatencyConfig, Report, run};
 
 #[derive(Parser, Debug)]
-#[command(
-    about = "End-to-end PromQL instant/range query latency benchmark (docs/benchmarking.md \"End-to-end\")"
-)]
+#[command(about = "End-to-end PromQL instant/range query latency benchmark")]
 struct Args {
     #[arg(long, value_enum, default_value_t = StoreKind::Memory)]
     store: StoreKind,

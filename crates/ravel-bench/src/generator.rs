@@ -1,6 +1,5 @@
-//! Deterministic-by-seed synthetic workload generator (docs/benchmarking.md
-//! "Workload generator" section). Same seed and config always produce the
-//! same series, labels, and samples.
+//! Deterministic-by-seed synthetic workload generator. Same seed and config
+//! always produce the same series, labels, and samples.
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -11,7 +10,7 @@ use ravel_segment::{
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId, TypeError};
 
-/// Gauge or cumulative counter, matching docs/benchmarking.md's workload list.
+/// Gauge or cumulative counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricKind {
     Gauge,
@@ -46,7 +45,7 @@ impl CardinalityProfile {
     }
 
     /// [`many_small`](Self::many_small) with an explicit base-label count
-    /// instead of the fixed 4, for the label-count axis sweep (issue #98).
+    /// instead of the fixed 4, for the label-count axis sweep.
     /// The generator always appends a `__name__` label and one uniquifying
     /// `series_idx` label, so a series built from this profile carries
     /// `labels_per_set + 2` labels.
@@ -111,8 +110,8 @@ pub struct WorkloadConfig {
     pub counter_fraction: f64,
     pub cardinality: CardinalityProfile,
     pub batch_size: BatchSizeDistribution,
-    /// Added to every generated series' `series_idx` label value (issue
-    /// #269): lets independent `generate_batches` calls that share a
+    /// Added to every generated series' `series_idx` label value: lets
+    /// independent `generate_batches` calls that share a
     /// tenant, metric name pool, and cardinality profile still produce
     /// disjoint `SeriesId`s, by giving each call its own slice of the
     /// index space. Zero (the default) reproduces the original,
@@ -120,7 +119,7 @@ pub struct WorkloadConfig {
     pub series_idx_offset: usize,
 }
 
-/// Total sample budget the axis-sweep cells hold fixed (issue #98): every
+/// Total sample budget the axis-sweep cells hold fixed: every
 /// cell derives its series count as `AXIS_SWEEP_TOTAL_SAMPLES /
 /// samples_per_series`, so encode/decode work is compared at a constant total
 /// sample count while samples-per-series and label-count vary independently.
@@ -128,7 +127,7 @@ pub const AXIS_SWEEP_TOTAL_SAMPLES: usize = 200_000;
 
 impl WorkloadConfig {
     /// One cell of the samples-per-series x labels-per-series axis sweep
-    /// (issue #98). Fixes the total sample count at [`AXIS_SWEEP_TOTAL_SAMPLES`]
+    /// Fixes the total sample count at [`AXIS_SWEEP_TOTAL_SAMPLES`]
     /// by deriving `series_count = AXIS_SWEEP_TOTAL_SAMPLES /
     /// samples_per_series` (so the product is exactly the budget when it
     /// divides evenly, otherwise the largest whole-series total at or below
@@ -215,9 +214,8 @@ pub fn generate_batches(config: &WorkloadConfig) -> Result<Vec<Vec<NormalizedPoi
     Ok(batches)
 }
 
-/// Populated buckets per side in the representative native-histogram shape
-/// (docs/rseg-v3-plan.md section 8): 30 per side, 60 total, a mid-range
-/// latency-style population.
+/// Populated buckets per side in the representative native-histogram shape:
+/// 30 per side, 60 total, a mid-range latency-style population.
 pub const HIST_BUCKETS_PER_SIDE: usize = 30;
 /// Contiguous populated runs (spans) per side in the representative shape:
 /// 4, a typical latency distribution's few clustered runs rather than one
@@ -227,8 +225,8 @@ pub const HIST_SPANS_PER_SIDE: usize = 4;
 /// The representative shape's per-side span lengths, summing to
 /// [`HIST_BUCKETS_PER_SIDE`] across [`HIST_SPANS_PER_SIDE`] runs.
 const HIST_SPAN_LENGTHS: [u32; HIST_SPANS_PER_SIDE] = [8, 8, 7, 7];
-/// Per-side span offsets, each relative to the previous run's end
-/// (docs/rseg-v3-plan.md section 3.5): the first run starts at index 0, each
+/// Per-side span offsets, each relative to the previous run's end:
+/// the first run starts at index 0, each
 /// later run sits a small gap past the previous run, so the buckets cluster
 /// instead of running fully contiguous.
 const HIST_SPAN_GAPS: [i32; HIST_SPANS_PER_SIDE] = [0, 2, 2, 2];
@@ -244,18 +242,17 @@ fn representative_hist_side(rng: &mut StdRng) -> (Vec<HistogramSpan>, Vec<u64>) 
         .map(|(&length, offset)| HistogramSpan { offset, length })
         .collect();
     let bucket_count: usize = HIST_SPAN_LENGTHS.iter().map(|&l| l as usize).sum();
-    // Small per-bucket counts (1..=127, a single varint byte each), matching
-    // section 8's "30 bucket counts * ~1" byte assumption so the measured
-    // HIST_PAGES bytes/record supersedes the same shape rather than a
-    // denser-valued one.
+    // Small per-bucket counts (1..=127, a single varint byte each): roughly
+    // one varint byte per populated bucket, the representative low-density
+    // shape.
     let counts: Vec<u64> = (0..bucket_count)
         .map(|_| rng.random_range(1..128))
         .collect();
     (spans, counts)
 }
 
-/// One native-histogram value matching the representative shape from
-/// docs/rseg-v3-plan.md section 8: integer counts (no custom boundaries),
+/// One native-histogram value matching the representative shape: integer
+/// counts (no custom boundaries),
 /// [`HIST_BUCKETS_PER_SIDE`] populated buckets per side clustered into
 /// [`HIST_SPANS_PER_SIDE`] spans, `has_sum` set, at OTel/Prometheus default
 /// scale.
@@ -286,16 +283,14 @@ fn representative_histogram_value(rng: &mut StdRng) -> HistogramValue {
 
 /// Native-histogram workload at the segment-writer level: one
 /// [`SeriesInputV3`] per series carrying exactly one [`HistogramSample`] of
-/// the representative shape (docs/rseg-v3-plan.md section 8). Reuses
-/// `config`'s tenant, seed, cardinality, and `series_count` so it lines up
-/// with the scalar `many_small` workload for comparability; unlike the scalar
-/// generators it always emits one sample per series (section 8's stated
-/// assumption, matching many_small's convention used throughout
-/// docs/rseg-v2-plan.md's own arithmetic) and ignores `samples_per_series`.
+/// the representative shape. Reuses `config`'s tenant, seed, cardinality, and
+/// `series_count` so it lines up with the scalar `many_small` workload for
+/// comparability; unlike the scalar generators it always emits one sample per
+/// series and ignores `samples_per_series`.
 ///
 /// Operates directly on the RSEG v3 writer input, not through the
 /// OTLP/`NormalizedPoint` ingest pipeline: `NormalizedPoint` has no
-/// native-histogram sample type yet (issue #218), so this shape is only
+/// native-histogram sample type yet, so this shape is only
 /// reachable at the `SegmentWriter::write_histograms` level.
 pub fn generate_histograms(config: &WorkloadConfig) -> Result<Vec<SeriesInputV3>, TypeError> {
     let tenant = TenantId::new(config.tenant.clone());
@@ -374,7 +369,7 @@ fn generate_series(config: &WorkloadConfig) -> Result<Vec<GeneratedSeries>, Type
         // ingest path does (ADR-0005). SeriesId::compute hashes the metric name
         // separately and skips the __name__ label, so the id is unchanged by
         // this label's presence; storing it lets a PromQL selector match the
-        // series by name. Issue #277.
+        // series by name.
         base_labels.push(Label {
             name: METRIC_NAME_LABEL.to_string(),
             value: metric_name.to_string(),
@@ -678,7 +673,7 @@ mod tests {
     fn generated_series_carry_matching_name_label() {
         // Every generated series must carry __name__ = its metric name, and
         // that name must be the same one SeriesId::compute derived the id
-        // from, so the labels and id agree (issue #277). A mismatch would
+        // from, so the labels and id agree. A mismatch would
         // trip the shard buffer's collision check on ingest.
         let config = WorkloadConfig {
             series_count: 32,
