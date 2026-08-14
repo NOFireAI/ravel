@@ -1,4 +1,4 @@
-//! Shared helpers for the Phase 1 correctness and failure-point suite
+//! Shared helpers for the correctness and failure-point suite
 //! (docs/consistency-model.md, docs/catalog-and-mvcc.md). Not part of any
 //! crate's public API; used only by integration tests under `tests/`.
 #![allow(clippy::expect_used, dead_code)]
@@ -232,9 +232,8 @@ impl Default for GcWindow {
 /// "Deletion and GC" (grace + max_flush_lifetime horizon, re-verify
 /// commit-record absence immediately before each delete) and ADR-0010 SS11.
 /// It exists only to document the intended behavior; no shipped GC path
-/// calls it, and no production orphan-sweep symbol exists yet (Phase 2
-/// roadmap; the future crate is referred to as `ravel-gc`). A test driving
-/// this helper proves a property of the model, NOT of Ravel: the assertion
+/// calls it. A test driving this helper proves a property of the model, NOT
+/// of Ravel: the assertion
 /// and the code under assertion are the same logic. When the production GC
 /// lands, delete this helper and point the crash-row assertions at the real
 /// symbol.
