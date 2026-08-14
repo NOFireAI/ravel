@@ -1,5 +1,5 @@
-//! In-process coverage for `ravel-cli store qualify` (ADR-0050 section 6,
-//! issue #478). Same in-process-against-a-shared-`MemoryStore` pattern as
+//! In-process coverage for `ravel-cli store qualify` (ADR-0050 section 6).
+//! Same in-process-against-a-shared-`MemoryStore` pattern as
 //! `tests/catalog.rs`: a subprocess-per-invocation test could not observe
 //! whether a second `qualify` call left an existing `sys/qualification`
 //! record untouched, since each subprocess would start from an empty store.

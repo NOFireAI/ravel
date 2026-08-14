@@ -1,5 +1,5 @@
-//! `ravel-cli maintain` subcommands (docs/compaction-retention-plan.md P8,
-//! issue #115): one-shot drivers for the compaction, sweep, retention, and
+//! `ravel-cli maintain` subcommands: one-shot drivers for the compaction,
+//! sweep, retention, and
 //! version-audit paths, plus decode/print for `CompactionRecord` and
 //! `RetentionTombstone`. Built strictly against `ravel-maintain`'s and
 //! `ravel-commit`'s public APIs; no maintenance decision logic lives here.
@@ -279,8 +279,8 @@ async fn generation_scan_shards(
 }
 
 /// `maintain audit-versions`: a safety audit of the on-object format versions
-/// live for a tenant, across all three signals (issue #115 rescoped text,
-/// extended to spans by #355). For RSEG (metrics) it confirms the ADR-0027
+/// live for a tenant, across all three signals. For RSEG (metrics) it confirms
+/// the ADR-0027
 /// single-version policy holds: any live object at a version other than the
 /// one supported version is an anomaly (there is no migration path, only this
 /// report). For RLOG (logs) and RSPAN (spans) it reports the live population
@@ -432,7 +432,7 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 
 /// `maintain migrate`: raise a `(tenant, signal, format family)`'s recorded
 /// format floor to `target_version`, migrating every live record still below it
-/// first (epic EM, EM-T5; issues #770, #463). The same operation the server
+/// first. The same operation the server
 /// maintain loop can call via [`migrate_family`]; this is its one-shot CLI
 /// driver.
 ///
@@ -444,8 +444,8 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 /// untouched and this exits nonzero, reporting what it found. The re-audit
 /// already excludes a bucket's pre-rewrite commit records once that bucket
 /// carries a compaction/rewrite record (dead, sweepable leftovers of a
-/// rewrite this same invocation may have just performed, not stragglers;
-/// issue #826), so a clean migration converges and raises the floor in one
+/// rewrite this same invocation may have just performed, not stragglers),
+/// so a clean migration converges and raises the floor in one
 /// invocation -- no interleaved `sweep` required. A reported straggler is
 /// therefore genuine below-target live data still to migrate.
 ///
@@ -913,7 +913,7 @@ pub async fn verify_custody(
                         // record does; verify each exists and still matches its
                         // content hash. Input-identity resolution and the
                         // versioning-aware custody surface for erased data are
-                        // EJ-T6's to extend; this only covers the surviving
+                        // future extensions; this only covers the surviving
                         // rewritten parts so verify-custody does not silently
                         // ignore a bucket that has been erased once.
                         let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {

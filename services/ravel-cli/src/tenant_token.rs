@@ -1,5 +1,5 @@
-//! `ravel-cli tenant token upsert|revoke|list` (ADR-0072 decision 4, #875): the
-//! first shipped writer of the durable `sys/auth` bearer-token map
+//! `ravel-cli tenant token upsert|revoke|list` (ADR-0072 decision 4): the
+//! writer of the durable `sys/auth` bearer-token map
 //! (`ravel_catalog::auth_token_map`).
 //!
 //! `upsert` and `revoke` need the bucket's 32-byte deployment key (the same
@@ -35,7 +35,7 @@ fn load_deployment_key(path: &Path) -> anyhow::Result<[u8; 32]> {
 /// `tenant token upsert`: map `token` to `tenant_id` in `sys/auth`, hashing it
 /// under the deployment key. The plaintext is hashed and dropped, never
 /// persisted or printed. `managed_by` is stamped onto the entry (ADR-0072
-/// decision 4 amendment, #897); the CLI defaults it to `"cli"`, distinct
+/// decision 4 amendment); the CLI defaults it to `"cli"`, distinct
 /// from the operator's `"operator"` tag, so the operator's reconcile loop
 /// never revokes a token this command provisioned.
 pub async fn upsert(

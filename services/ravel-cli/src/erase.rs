@@ -1,4 +1,4 @@
-//! `ravel-cli erase` subcommands (ADR-0064 decision 1, issue #751): submit and
+//! `ravel-cli erase` subcommands (ADR-0064 decision 1): submit and
 //! inspect selective (GDPR/CCPA subject) erasure requests.
 //!
 //! Erasure is an operator/compliance workflow, deliberately not a tenant-facing

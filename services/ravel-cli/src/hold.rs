@@ -1,4 +1,4 @@
-//! `ravel-cli hold` subcommands (ADR-0048 decision 2, issue #505): the only
+//! `ravel-cli hold` subcommands (ADR-0048 decision 2): the only
 //! production mechanism to place, clear, and list legal holds. ADR-0048
 //! rejected an HTTP admin API for this: no authenticated admin plane exists,
 //! and letting tenant credentials place their own holds would invert the
