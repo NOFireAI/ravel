@@ -50,6 +50,13 @@ pub const L0_DATA_SUBSTR: &str = "/l0/";
 /// record and retention tombstone, which is why every rule uses
 /// [`Occurrence::Nth`] and is consumed during ingest (see the module docs).
 pub const COMMIT_SUBSTR: &str = "/c/";
+/// Key substring matching every object a compaction publishes and nothing an
+/// ingest flush writes: the `l1/` part directory (`.../l1/<shard>/...`) and
+/// the `l1.`-tagged compaction record filename (`.../c/<shard>/<hour>/l1.<hash>.cmt`)
+/// both contain `/l1`, while L0 data (`/l0/`) and L0 commit records
+/// (`<writer>.<epoch>.<seq>.cmt`) never do. A `Put` rule keyed on this fires
+/// only on the compaction write path (issue #931).
+pub const L1_SUBSTR: &str = "/l1";
 
 /// One hold/release gate the schedule can arm on a [`FaultStore`], holding
 /// each matching call open until released (ADR-0059 decision 5). Matching is
@@ -93,17 +100,38 @@ impl Default for FaultScheduleConfig {
 /// A deterministic, seed-derived fault schedule.
 #[derive(Debug, Clone)]
 pub struct FaultSchedule {
-    /// The scripted plan handed to [`FaultStore::new`].
+    /// The scripted plan handed to [`FaultStore::new`] for the ingest phase.
     ///
     /// [`FaultStore::new`]: ravel_object_store::fault::FaultStore::new
     pub plan: FaultPlan,
+    /// The scripted plan the driver wraps only around `compact_bucket`
+    /// (issue #931): a partial write on the L1 write path and a missing-object
+    /// blip on the L0 read path. Isolated to the compaction phase by the
+    /// dedicated [`FaultStore`] the driver builds from it, and recovered by the
+    /// driver's idempotent re-run, so a single firing surfaces a typed
+    /// retryable error the re-run absorbs.
+    ///
+    /// [`FaultStore`]: ravel_object_store::fault::FaultStore
+    pub compact_plan: FaultPlan,
+    /// The scripted plan the driver wraps only around the sweep's action pass
+    /// (issue #931): a retryable failure on the sweep's paginated listing.
+    pub sweep_plan: FaultPlan,
     /// Hold/release gates the driver may arm on the store.
     pub gates: Vec<GateScript>,
-    /// The `(Op, FaultKind)` pair each emitted rule injects, in emission
-    /// order. A test asserts the store's counter for each pair fired at least
-    /// once, proving the faults were actually injected rather than silently
-    /// skipped.
+    /// The `(Op, FaultKind)` pair each emitted ingest-phase rule injects, in
+    /// emission order. A test asserts the store's counter for each pair fired
+    /// at least once, proving the faults were actually injected rather than
+    /// silently skipped.
     pub expected_faults: Vec<(Op, FaultKind)>,
+    /// The `(Op, FaultKind)` pairs the [`compact_plan`]/[`sweep_plan`] rules
+    /// inject, in emission order. The driver merges these into
+    /// [`crate::driver::CycleOutcome::expected_faults`] so the same
+    /// "every expected fault fired" acceptance assertion covers the
+    /// compaction/sweep phase (issue #931 deliverable 3).
+    ///
+    /// [`compact_plan`]: FaultSchedule::compact_plan
+    /// [`sweep_plan`]: FaultSchedule::sweep_plan
+    pub expected_compaction_faults: Vec<(Op, FaultKind)>,
 }
 
 impl FaultSchedule {
@@ -111,8 +139,11 @@ impl FaultSchedule {
     pub fn none() -> Self {
         FaultSchedule {
             plan: FaultPlan::empty(),
+            compact_plan: FaultPlan::empty(),
+            sweep_plan: FaultPlan::empty(),
             gates: Vec::new(),
             expected_faults: Vec::new(),
+            expected_compaction_faults: Vec::new(),
         }
     }
 
@@ -182,11 +213,85 @@ pub fn generate(master_seed: &MasterSeed, config: &FaultScheduleConfig) -> Fault
 
     let gates = generate_gates(&mut rng, config, &chosen);
 
+    // Compaction/sweep-phase faults, drawn from the SAME `"faults"` sub-seed
+    // after the ingest rules and gates so the ingest schedule stays byte-for-byte
+    // what it was before this addition (issue #931 deliverable 1).
+    let (compact_plan, sweep_plan, expected_compaction_faults) =
+        generate_compaction_faults(&mut rng);
+
     FaultSchedule {
         plan,
+        compact_plan,
+        sweep_plan,
         gates,
         expected_faults,
+        expected_compaction_faults,
     }
+}
+
+/// Derive the compaction- and sweep-phase fault plans (issue #931
+/// deliverable 1). All three kinds are armed on every run so the nightly
+/// 200-seed sweep always exercises them; only the pagination fault's flavor
+/// (transient vs throttled) varies with the seed, keeping the draw
+/// deterministic. Every rule is retryable-once (`Occurrence::Nth(1)`): the
+/// driver wraps the compaction and sweep entry points in a bounded idempotent
+/// re-run, so each fault surfaces a typed error on the first attempt and the
+/// re-run recovers to an equivalent result (the recover-or-typed-error
+/// invariant, deliverable 2).
+///
+/// Phase isolation is by construction, not by key matching: the driver builds
+/// one [`FaultStore`] from `compact_plan` used only around `compact_bucket`
+/// and another from `sweep_plan` used only around the sweep's action pass, so
+/// neither rule can fire during ingest, fold, or the query probes.
+///
+/// [`FaultStore`]: ravel_object_store::fault::FaultStore
+fn generate_compaction_faults(
+    rng: &mut rand::rngs::StdRng,
+) -> (FaultPlan, FaultPlan, Vec<(Op, FaultKind)>) {
+    let mut expected = Vec::new();
+
+    // Compaction phase: partial write on the L1 write path, then a missing
+    // object on the L0 read path.
+    let mut compact_plan = FaultPlan::empty();
+    // Partial write: the connection drops before the L1 part lands, so the
+    // object stays invisible (`put` is not applied). Surfaces as a retryable
+    // `Transient`; the re-run rewrites the content-addressed part.
+    compact_plan = compact_plan.with_rule(
+        Rule::new(Op::Put, ScriptedFault::PartialWriteThenError)
+            .with_key_contains(L1_SUBSTR)
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    expected.push((Op::Put, FaultKind::PartialWriteThenError));
+    // Missing object: an eventual-consistency not-found blip on an L0 input
+    // read. Surfaces as `StoreError::NotFound`; the idempotent re-run reads the
+    // object that is really there (the blip fired once).
+    compact_plan = compact_plan.with_rule(
+        Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+            .with_key_contains(L0_DATA_SUBSTR)
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    expected.push((Op::Get, FaultKind::NotFoundBlip));
+
+    // Sweep phase: a retryable failure on the paginated shard listing. No key
+    // filter -- it governs the first `list` the sweep issues, which is the page
+    // fetch that drives rules 2/3's superseded/unreferenced scan.
+    let mut sweep_plan = FaultPlan::empty();
+    let (list_fault, list_kind) = if rng.random_bool(0.5) {
+        (
+            ScriptedFault::Transient("sim fault schedule: transient on sweep listing".to_string()),
+            FaultKind::Transient,
+        )
+    } else {
+        (
+            ScriptedFault::Throttled { retry_after_ms: 50 },
+            FaultKind::Throttled,
+        )
+    };
+    sweep_plan =
+        sweep_plan.with_rule(Rule::new(Op::List, list_fault).with_occurrence(Occurrence::Nth(1)));
+    expected.push((Op::List, list_kind));
+
+    (compact_plan, sweep_plan, expected)
 }
 
 /// Derive the hold/release gate scripts. Kept on the same safe targets as the
@@ -243,6 +348,7 @@ mod tests {
         let a = generate(&MasterSeed::new(99), &cfg);
         let b = generate(&MasterSeed::new(99), &cfg);
         assert_eq!(a.expected_faults, b.expected_faults);
+        assert_eq!(a.expected_compaction_faults, b.expected_compaction_faults);
         assert_eq!(a.gates, b.gates);
         assert_eq!(a.plan.rules.len(), b.plan.rules.len());
         for (ra, rb) in a.plan.rules.iter().zip(b.plan.rules.iter()) {
@@ -250,6 +356,65 @@ mod tests {
             assert_eq!(ra.key_contains, rb.key_contains);
             assert_eq!(ra.occurrence, rb.occurrence);
             assert_eq!(ra.fault, rb.fault);
+        }
+        // The compaction/sweep plans replay identically too.
+        for (pa, pb) in [
+            (&a.compact_plan, &b.compact_plan),
+            (&a.sweep_plan, &b.sweep_plan),
+        ] {
+            assert_eq!(pa.rules.len(), pb.rules.len());
+            for (ra, rb) in pa.rules.iter().zip(pb.rules.iter()) {
+                assert_eq!(ra.op, rb.op);
+                assert_eq!(ra.key_contains, rb.key_contains);
+                assert_eq!(ra.occurrence, rb.occurrence);
+                assert_eq!(ra.fault, rb.fault);
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_faults_are_armed_and_phase_isolatable() {
+        // Every run arms all three compaction/sweep fault kinds (deliverable 1),
+        // each `Nth(1)` and on a phase-isolated target, so the nightly sweep
+        // exercises them deterministically.
+        for seed in 1u64..=64 {
+            let s = generate(&MasterSeed::new(seed), &FaultScheduleConfig::default());
+            assert_eq!(
+                s.expected_compaction_faults.len(),
+                3,
+                "seed {seed}: expected exactly three compaction/sweep faults"
+            );
+            // Partial write on the L1 write path.
+            assert!(
+                s.compact_plan.rules.iter().any(|r| r.op == Op::Put
+                    && r.key_contains.as_deref() == Some(L1_SUBSTR)
+                    && matches!(r.fault, ScriptedFault::PartialWriteThenError)),
+                "seed {seed}: no partial-write rule on the L1 write path"
+            );
+            // Missing object on the L0 read path.
+            assert!(
+                s.compact_plan.rules.iter().any(|r| r.op == Op::Get
+                    && r.key_contains.as_deref() == Some(L0_DATA_SUBSTR)
+                    && matches!(r.fault, ScriptedFault::NotFoundBlip)),
+                "seed {seed}: no missing-object rule on the L0 read path"
+            );
+            // Retryable pagination fault on the sweep listing.
+            assert!(
+                s.sweep_plan.rules.iter().any(|r| r.op == Op::List
+                    && matches!(
+                        r.fault,
+                        ScriptedFault::Transient(_) | ScriptedFault::Throttled { .. }
+                    )),
+                "seed {seed}: no retryable pagination rule on the sweep listing"
+            );
+            // Every compaction/sweep rule fires exactly once.
+            for rule in s.compact_plan.rules.iter().chain(s.sweep_plan.rules.iter()) {
+                assert_eq!(
+                    rule.occurrence,
+                    Occurrence::Nth(1),
+                    "seed {seed}: compaction/sweep rule must be Nth(1)"
+                );
+            }
         }
     }
 

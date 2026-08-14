@@ -42,9 +42,13 @@ use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, MaintainError, NoLeases,
     compact_bucket, sweep_shard,
 };
-use ravel_object_store::ObjectStoreBackend;
+use bytes::Bytes;
 use ravel_object_store::fault::{FaultKind, FaultStore, GateHandle, Op};
 use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+};
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine, QueryError};
 use ravel_segment::HistogramCounts;
@@ -57,6 +61,87 @@ use crate::seed::MasterSeed;
 use crate::workload::{QuerySpec, SeriesSamples, Workload, WorkloadConfig};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// Number of idempotent re-runs the compaction/sweep recovery loop will make
+/// before giving up and surfacing the typed error (issue #931 deliverable 2).
+/// A single generated compaction-phase fault fires once (`Occurrence::Nth(1)`)
+/// and the compaction path issues at most three distinct faultable steps in
+/// one bucket (list, L0 read, L1 write), so a budget of six comfortably
+/// absorbs every generated schedule while still bounding a genuinely stuck
+/// fault (`Occurrence::Always`, only reachable via a test override) into a
+/// loud typed error rather than an infinite loop.
+const COMPACTION_FAULT_RETRY_BUDGET: usize = 6;
+
+/// A shared handle to an [`ObjectStoreBackend`] that is itself a backend, so a
+/// second [`FaultStore`] can wrap the same underlying store the ingest phase
+/// writes through. The compaction/sweep fault plans (issue #931) live on
+/// [`FaultStore`]s the driver builds only around `compact_bucket` and the
+/// sweep's action pass; each wraps a `SharedStore` cloned from the one
+/// `Arc<dyn ObjectStoreBackend>` every phase shares, so their rules govern only
+/// the calls those two entry points make and every write stays visible to
+/// every phase. `MemoryStore` is not `Clone`, so this delegating newtype is
+/// how a phase-local fault layer reaches the one backing store.
+struct SharedStore(Arc<dyn ObjectStoreBackend>);
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for SharedStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.0.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.0.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        self.0.put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.0.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.0.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.0.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.0.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.0.capabilities()
+    }
+}
+
+/// Whether a [`MaintainError`] is one the driver's idempotent compaction/sweep
+/// re-run can recover from (issue #931 deliverable 2): a retryable store fault
+/// (`Transient`/`Throttled`/`Timeout`) or a not-found blip. `NotFound` is not
+/// `StoreError::is_retryable` in general -- a genuine absence is a definite
+/// answer -- but the only `NotFound` this harness injects on the compaction
+/// read path is a one-shot eventual-consistency blip (`ScriptedFault::NotFoundBlip`,
+/// `Occurrence::Nth(1)`), and re-running the stateless, idempotent
+/// `compact_bucket` reads the object that is really there. Every other
+/// `MaintainError` (an invariant breach, a decode failure, a conservation
+/// violation) is surfaced immediately as a typed error, never retried.
+fn is_recoverable_maintain_error(e: &MaintainError) -> bool {
+    matches!(
+        e,
+        MaintainError::Store(se) if se.is_retryable() || matches!(se, StoreError::NotFound)
+    )
+}
 
 /// Knobs for [`run_cycle`]. `shard_count` applies uniformly to both
 /// `IngestRouter` and `Catalog` (they must agree: the shard a series routes
@@ -177,6 +262,18 @@ impl Default for CycleConfig {
 pub struct CountingGateHandle {
     handle: GateHandle,
     held_total: Arc<AtomicUsize>,
+    /// One matcher per armed gate, in the order the schedule armed them, so a
+    /// released call can be attributed to the gate that held it. Attribution
+    /// mirrors the store's own "first matching gate governs the call"
+    /// precedence (see `GateRegistry::arm`): the first gate whose op and key
+    /// substring match.
+    gate_matchers: Arc<Vec<(Op, Option<String>)>>,
+    /// One release counter per armed gate, index-aligned with `gate_matchers`.
+    /// [`CycleError::GateNeverHit`] is now per-gate: every armed gate's counter
+    /// must be positive, closing the vacuity where two gates shared one total
+    /// and a reachable gate's releases masked an unreachable one (issue #931
+    /// deliverable 4).
+    per_gate_held: Arc<Vec<AtomicUsize>>,
 }
 
 impl CountingGateHandle {
@@ -196,13 +293,35 @@ impl CountingGateHandle {
         self.handle.held_count()
     }
 
+    /// The armed gate that would govern a call matching `(op, key)`: the first
+    /// whose op equals and whose key substring (if any) is contained, matching
+    /// the store's own precedence.
+    fn attribute(&self, op: Op, key: &str) -> Option<usize> {
+        self.gate_matchers.iter().position(|(gop, gkey)| {
+            *gop == op && gkey.as_deref().is_none_or(|k| key.contains(k))
+        })
+    }
+
     /// Releases the held call `id`, exactly as [`GateHandle::release`], and
-    /// -- only on a genuine release -- counts it toward the cumulative total
-    /// this cycle's [`CycleOutcome::gates_held`] reports.
+    /// -- only on a genuine release -- counts it toward both the cumulative
+    /// total this cycle's [`CycleOutcome::gates_held`] reports and the per-gate
+    /// counter of the gate that held it. The matcher is read from
+    /// [`GateHandle::held_details`] before the release removes the held call.
     pub fn release(&self, id: u64) -> bool {
+        let matcher = self
+            .handle
+            .held_details()
+            .into_iter()
+            .find(|(cid, _, _)| *cid == id)
+            .map(|(_, op, key)| (op, key));
         let released = self.handle.release(id);
         if released {
             self.held_total.fetch_add(1, Ordering::SeqCst);
+            if let Some((op, key)) = matcher
+                && let Some(idx) = self.attribute(op, &key)
+            {
+                self.per_gate_held[idx].fetch_add(1, Ordering::SeqCst);
+            }
         }
         released
     }
@@ -323,12 +442,137 @@ pub enum CycleError {
         report: String,
     },
     #[error(
-        "seed {seed}: {armed} hold/release gate(s) were armed but none ever held a call over \
-         the whole cycle -- a matcher that never fires (wrong Nth, too few matching calls) must \
-         fail the cycle, not silently pass with the parked waiter aborted. \
+        "seed {seed}: compaction-phase fault invariant violated for tenant {tenant} ({phase}): a \
+         compaction/sweep-phase fault neither recovered to an equivalent result nor surfaced a \
+         typed error -- {before_records} records / digest {before_digest:#018x} before vs \
+         {after_records} records / digest {after_digest:#018x} after (silent data loss). \
          replay: RAVEL_SIM_SEED={seed} cargo test -p ravel-sim"
     )]
-    GateNeverHit { seed: u64, armed: usize },
+    CompactionFaultInvariant {
+        seed: u64,
+        tenant: String,
+        phase: &'static str,
+        before_records: usize,
+        after_records: usize,
+        before_digest: u64,
+        after_digest: u64,
+    },
+    #[error(
+        "seed {seed}: hold/release gate #{gate_index} of {armed} armed was never held over the \
+         whole cycle -- a matcher that never fires (wrong Nth, too few matching calls, or a gate \
+         shadowed by an earlier one on the same target) must fail the cycle per gate, not pass \
+         because some OTHER armed gate absorbed the shared release count. \
+         replay: RAVEL_SIM_SEED={seed} cargo test -p ravel-sim"
+    )]
+    GateNeverHit {
+        seed: u64,
+        armed: usize,
+        gate_index: usize,
+    },
+}
+
+/// The recover-or-typed-error invariant's silent-loss guard (issue #931
+/// deliverable 2): after a compaction/sweep-phase fault has been recovered by
+/// the driver's idempotent re-run, the recovered snapshot must be bit-exactly
+/// what the pre-compaction snapshot returned -- same query digest and same
+/// record count. Any divergence is silent data loss and fails the cycle loud
+/// with the seed. The typed-error branch of the invariant is enforced
+/// separately: [`compact_bucket_recover`]/[`sweep_shard_recover`] surface an
+/// exhausted or non-recoverable fault as a typed [`CycleError::Compact`] /
+/// [`CycleError::Sweep`], never a panic and never a silent success.
+///
+/// Under a correct `ravel-maintain` the recovered snapshot always matches, so
+/// this never fires on a real run; a dedicated unit test drives it with a
+/// fabricated mismatch to prove it is not vacuous, then with a match to prove
+/// it holds.
+fn check_compaction_fault_invariant(
+    seed: u64,
+    tenant: &str,
+    phase: &'static str,
+    before: &Probe,
+    after: &Probe,
+) -> Result<(), CycleError> {
+    if before.digest != after.digest || before.record_count != after.record_count {
+        return Err(CycleError::CompactionFaultInvariant {
+            seed,
+            tenant: tenant.to_string(),
+            phase,
+            before_records: before.record_count,
+            after_records: after.record_count,
+            before_digest: before.digest.0,
+            after_digest: after.digest.0,
+        });
+    }
+    Ok(())
+}
+
+/// Compact one bucket, absorbing a recoverable compaction-phase fault with a
+/// bounded idempotent re-run (issue #931 deliverable 2). Returns the outcome on
+/// the recover branch, or a typed [`CycleError::Compact`] when the budget is
+/// exhausted or the error is not recoverable -- the typed-error branch of the
+/// recover-or-typed-error invariant. `compact_bucket` returns a `Result`, so a
+/// panic is structurally impossible here.
+async fn compact_bucket_recover(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    seed: u64,
+) -> Result<CompactionOutcome, CycleError> {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match compact_bucket(store, clock, config, bucket).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(e)
+                if attempt < COMPACTION_FAULT_RETRY_BUDGET
+                    && is_recoverable_maintain_error(&e) =>
+            {
+                continue;
+            }
+            Err(source) => return Err(CycleError::Compact { seed, source }),
+        }
+    }
+}
+
+/// Sweep one shard, absorbing a recoverable sweep-phase fault with a bounded
+/// idempotent re-run (issue #931 deliverable 2). `sweep_shard` is documented
+/// idempotent, so re-running after a mid-pass listing fault converges. Returns
+/// the report on the recover branch, or a typed [`CycleError::Sweep`] on the
+/// typed-error branch.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_shard_recover(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    config: &CompactorConfig,
+    tenant_hash: &TenantHash,
+    shard: u32,
+    seed: u64,
+) -> Result<(), CycleError> {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match sweep_shard(
+            store,
+            clock,
+            config,
+            &NoLeases,
+            tenant_hash,
+            Signal::Metrics,
+            shard,
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if attempt < COMPACTION_FAULT_RETRY_BUDGET
+                    && is_recoverable_maintain_error(&e) =>
+            {
+                continue;
+            }
+            Err(source) => return Err(CycleError::Sweep { seed, source }),
+        }
+    }
 }
 
 /// Clock the driver hands to `IngestRouter`: `now_ns` is a plain atomic
@@ -594,6 +838,18 @@ async fn run_cycle_async(
         0
     };
     let held_total = Arc::new(AtomicUsize::new(0));
+    // Per-gate release counters and their matchers, index-aligned with the
+    // armed gates, so `GateNeverHit` is enforced per gate (issue #931
+    // deliverable 4). Sized to the armed gate count.
+    let gate_matchers: Arc<Vec<(Op, Option<String>)>> = Arc::new(
+        schedule
+            .gates
+            .iter()
+            .map(|g| (g.op, g.key_contains.clone()))
+            .collect(),
+    );
+    let per_gate_held: Arc<Vec<AtomicUsize>> =
+        Arc::new((0..gates_armed).map(|_| AtomicUsize::new(0)).collect());
     let gate_releaser: Option<tokio::task::JoinHandle<()>> =
         if config.enable_gates && gates_armed > 0 {
             schedule
@@ -604,6 +860,8 @@ async fn run_cycle_async(
                     let counting = CountingGateHandle {
                         handle,
                         held_total: Arc::clone(&held_total),
+                        gate_matchers: Arc::clone(&gate_matchers),
+                        per_gate_held: Arc::clone(&per_gate_held),
                     };
                     match &config.gate_release {
                         GateRelease::Immediate => {
@@ -671,6 +929,27 @@ async fn run_cycle_async(
         compactor_writer_id: compactor_rng.new_uuid(),
         ..CompactorConfig::default()
     };
+
+    // Phase-local fault layers over the one shared store (issue #931
+    // deliverable 3): the compaction plan governs only `compact_bucket`, the
+    // sweep plan only the sweep's action pass, so their rules cannot fire
+    // during ingest, fold, or the query probes. Built once for the whole
+    // cycle: each rule fires `Occurrence::Nth(1)`, so it lands on the first
+    // tenant's compaction/sweep and later tenants run fault-free -- the same
+    // once-per-cycle firing the ingest schedule uses. Both wrap a `SharedStore`
+    // cloned from `store`, so every write stays visible to every phase.
+    let compact_fault_store = Arc::new(FaultStore::new(
+        SharedStore(Arc::clone(&store)),
+        schedule.compact_plan.clone(),
+    ));
+    let sweep_fault_store = Arc::new(FaultStore::new(
+        SharedStore(Arc::clone(&store)),
+        schedule.sweep_plan.clone(),
+    ));
+    let compact_store: Arc<dyn ObjectStoreBackend> =
+        Arc::clone(&compact_fault_store) as Arc<dyn ObjectStoreBackend>;
+    let sweep_store: Arc<dyn ObjectStoreBackend> =
+        Arc::clone(&sweep_fault_store) as Arc<dyn ObjectStoreBackend>;
 
     let fold_now_ns = seal_now_ns(workload.end_ts_ns);
     let full_range = TimeRange {
@@ -832,13 +1111,22 @@ async fn run_cycle_async(
             .set_clock_ms((compact_now_ns / 1_000_000).max(0) as u64);
         let hour_lo = hour_of(workload.start_ts_ns);
         let hour_hi = hour_of(bucket_hi_ns);
+        // Drive compaction through the compaction-phase FaultStore, wrapping
+        // each bucket in the bounded idempotent re-run (issue #931
+        // deliverables 2/3): the partial-write and missing-object faults fire
+        // once and the re-run recovers to an equivalent result, or an exhausted
+        // fault surfaces as a typed `CycleError::Compact`.
         for shard in 0..config.shard_count {
             for hour in hour_lo..=hour_hi {
                 let bucket = Bucket::new(tenant_hash, Signal::Metrics, shard, hour);
-                let outcome =
-                    compact_bucket(store.as_ref(), &compact_clock, &compactor_config, &bucket)
-                        .await
-                        .map_err(|source| CycleError::Compact { seed, source })?;
+                let outcome = compact_bucket_recover(
+                    compact_store.as_ref(),
+                    &compact_clock,
+                    &compactor_config,
+                    &bucket,
+                    seed,
+                )
+                .await?;
                 if matches!(outcome, CompactionOutcome::Compacted { .. }) {
                     buckets_compacted += 1;
                 }
@@ -892,6 +1180,19 @@ async fn run_cycle_async(
         )
         .await?;
 
+        // Recover-or-typed-error invariant, recover branch (issue #931
+        // deliverable 2): a compaction-phase fault that the re-run absorbed
+        // must have reproduced a bit-exact snapshot. Silent loss here fails
+        // loud with the seed, distinct from the plain (fault-free) equivalence
+        // checks below.
+        check_compaction_fault_invariant(
+            seed,
+            tenant_wl.tenant.as_str(),
+            "after compaction",
+            &probe_before,
+            &probe_after,
+        )?;
+
         // Invariant (a): bit-exact query equivalence before vs after
         // compaction. Compaction copies pages verbatim, so every query must
         // return byte-identical results (float values compared via `to_bits`
@@ -923,25 +1224,28 @@ async fn run_cycle_async(
             .saturating_add(compactor_config.grace_ns)
             .saturating_add(NS_PER_HOUR);
         let sweep_clock = FixedClock::new(sweep_now_ns);
+        // Action pass through the sweep-phase FaultStore with the bounded
+        // idempotent re-run (issue #931 deliverables 2/3): the pagination fault
+        // fires on the first paginated listing and the re-run recovers, or an
+        // exhausted fault surfaces as a typed `CycleError::Sweep`.
         for shard in 0..config.shard_count {
-            sweep_shard(
-                store.as_ref(),
+            sweep_shard_recover(
+                sweep_store.as_ref(),
                 &sweep_clock,
                 &compactor_config,
-                &NoLeases,
                 &tenant_hash,
-                Signal::Metrics,
                 shard,
+                seed,
             )
-            .await
-            .map_err(|source| CycleError::Sweep { seed, source })?;
+            .await?;
         }
 
         // Invariant (c): no orphan objects or unreferenced parts left past the
         // sweep horizon. A verification pass at the same (past-horizon) clock
         // must find nothing left to collect -- had the first pass left an
         // orphan or an unreferenced part behind, this pass would delete it and
-        // report a non-zero count.
+        // report a non-zero count. Runs on the base `store` (no sweep faults),
+        // so it verifies real physical convergence, not a fault-perturbed pass.
         for shard in 0..config.shard_count {
             let report = sweep_shard(
                 store.as_ref(),
@@ -984,6 +1288,16 @@ async fn run_cycle_async(
             config.query_deadline,
         )
         .await?;
+        // Recover-or-typed-error invariant, recover branch, over the sweep:
+        // with the L0 inputs physically gone, a sweep-phase fault the re-run
+        // absorbed must leave the L1-served snapshot bit-exact.
+        check_compaction_fault_invariant(
+            seed,
+            tenant_wl.tenant.as_str(),
+            "after sweep",
+            &probe_before,
+            &probe_after_sweep,
+        )?;
         if probe_after_sweep.digest != probe_before.digest {
             return Err(CycleError::CompactionEquivalence {
                 seed,
@@ -1016,12 +1330,35 @@ async fn run_cycle_async(
     }
 
     let gates_held = held_total.load(Ordering::SeqCst);
-    if gates_armed > 0 && gates_held == 0 {
-        return Err(CycleError::GateNeverHit {
-            seed,
-            armed: gates_armed,
-        });
+    // Per-gate never-hit check (issue #931 deliverable 4): every armed gate
+    // must have held at least one call. Checking the shared total instead let
+    // a partially-vacuous multi-gate schedule (some gates reachable, others
+    // not) pass, because a reachable gate's releases pushed the one shared
+    // counter positive. Attribution mirrors the store's precedence.
+    for idx in 0..gates_armed {
+        if per_gate_held[idx].load(Ordering::SeqCst) == 0 {
+            return Err(CycleError::GateNeverHit {
+                seed,
+                armed: gates_armed,
+                gate_index: idx,
+            });
+        }
     }
+
+    // Merge the ingest- and compaction/sweep-phase fault counters and expected
+    // sets (issue #931 deliverable 3), so the existing "every expected fault
+    // fired" acceptance assertion (`compaction_equivalence_under_faults`, and
+    // the nightly seed batch) automatically covers the new faults.
+    let mut fault_counters = fault_store.counters_snapshot();
+    for (key, count) in compact_fault_store
+        .counters_snapshot()
+        .into_iter()
+        .chain(sweep_fault_store.counters_snapshot())
+    {
+        *fault_counters.entry(key).or_insert(0) += count;
+    }
+    let mut expected_faults = schedule.expected_faults;
+    expected_faults.extend(schedule.expected_compaction_faults);
 
     Ok(CycleOutcome {
         master_seed,
@@ -1031,8 +1368,8 @@ async fn run_cycle_async(
         queries_run,
         buckets_compacted,
         records_conserved,
-        fault_counters: fault_store.counters_snapshot(),
-        expected_faults: schedule.expected_faults,
+        fault_counters,
+        expected_faults,
         gates_armed,
         gates_held,
     })
@@ -1240,5 +1577,89 @@ async fn run_query(
                 )
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(digest: u64, record_count: usize) -> Probe {
+        Probe {
+            digest: Digest(digest),
+            record_count,
+        }
+    }
+
+    /// The recover-or-typed-error invariant's silent-loss guard is not vacuous:
+    /// feeding it a fabricated post-recovery mismatch (the "injected silent
+    /// loss") makes it fire, and it is the exact function the seeded cycle runs
+    /// on real probe data. This is the flip that proves the assertion, per
+    /// issue #931 deliverable 2 / the prove-the-test discipline.
+    #[test]
+    fn compaction_fault_invariant_fires_on_injected_silent_loss() {
+        // Injected silent loss: same query digest changed, or the record count
+        // dropped, after a fault the driver "recovered" -- either divergence is
+        // a violation.
+        let before = probe(0xABCD, 100);
+
+        // A dropped-record variant (fewer records after "recovery").
+        let after_fewer = probe(0xABCD, 96);
+        let err = check_compaction_fault_invariant("tenant-a".len() as u64, "tenant-a", "after compaction", &before, &after_fewer)
+            .expect_err("a post-recovery record drop must trip the invariant");
+        assert!(
+            matches!(
+                err,
+                CycleError::CompactionFaultInvariant {
+                    before_records: 100,
+                    after_records: 96,
+                    ..
+                }
+            ),
+            "expected CompactionFaultInvariant, got: {err}"
+        );
+
+        // A changed-digest variant (same count, different values).
+        let after_changed = probe(0x1234, 100);
+        let err = check_compaction_fault_invariant(7, "tenant-a", "after sweep", &before, &after_changed)
+            .expect_err("a post-recovery digest change must trip the invariant");
+        assert!(matches!(err, CycleError::CompactionFaultInvariant { .. }));
+    }
+
+    /// The removed-injection half of the flip: with the recovered snapshot
+    /// bit-exactly matching the pre-compaction one -- what a correct re-run
+    /// always produces -- the same guard holds (returns `Ok`), so it never
+    /// fires on a real cycle.
+    #[test]
+    fn compaction_fault_invariant_holds_when_equivalent() {
+        let before = probe(0xABCD, 100);
+        let after = probe(0xABCD, 100);
+        check_compaction_fault_invariant(7, "tenant-a", "after compaction", &before, &after)
+            .expect("an equivalent recovered snapshot must satisfy the invariant");
+    }
+
+    /// A recoverable store fault (retryable, or a not-found blip) is retried;
+    /// every other `MaintainError` surfaces immediately as a typed error.
+    #[test]
+    fn recoverable_maintain_error_classification() {
+        assert!(is_recoverable_maintain_error(&MaintainError::Store(
+            StoreError::Transient("blip".into())
+        )));
+        assert!(is_recoverable_maintain_error(&MaintainError::Store(
+            StoreError::Throttled { retry_after_ms: 1 }
+        )));
+        assert!(is_recoverable_maintain_error(&MaintainError::Store(
+            StoreError::Timeout
+        )));
+        assert!(is_recoverable_maintain_error(&MaintainError::Store(
+            StoreError::NotFound
+        )));
+        // Not recoverable: a genuine precondition failure or an invariant breach.
+        assert!(!is_recoverable_maintain_error(&MaintainError::Store(
+            StoreError::PreconditionFailed
+        )));
+        assert!(!is_recoverable_maintain_error(&MaintainError::Invariant(
+            "breach".into()
+        )));
     }
 }
