@@ -564,18 +564,7 @@ async fn gather_l0_inputs(
 ) -> Result<(Vec<String>, Vec<String>)> {
     let mut record_keys: Vec<String> = Vec::new();
     let mut data_keys: Vec<String> = Vec::new();
-    for input in record.inputs() {
-        let writer_id = Uuid::parse_str(&input.writer_id)
-            .map_err(|_| MaintainError::Key(KeyError::InvalidWriterId(input.writer_id.clone())))?;
-        let commit_key = keys::commit_key(
-            tenant,
-            signal,
-            shard,
-            record.ingest_hour_bucket(),
-            writer_id,
-            input.writer_epoch,
-            input.writer_seq,
-        )?;
+    for commit_key in superseded_input_commit_keys(tenant, signal, shard, record)? {
         match store.get(&commit_key, GetRange::Full).await {
             Ok(got) => {
                 let rec = record::decode(&got.data)?;
@@ -596,10 +585,55 @@ async fn gather_l0_inputs(
     Ok((record_keys, data_keys))
 }
 
+/// Reconstruct the commit key of every raw-L0 input a compaction or rewrite
+/// record explicitly names, in `inputs` order. This is rule 2's supersession
+/// predicate on its own, with no store access: a commit record whose key this
+/// returns is superseded by `record` and is a pre-compaction leftover, and one
+/// whose key it does not return is not, whatever bucket either sits in.
+///
+/// It is deliberately keyed on the record's own input list rather than on the
+/// bucket the record lives in. The two coincide today only because a
+/// compaction or rewrite refuses an unsealed bucket and a sealed bucket's L0
+/// set is frozen, so a record over that bucket necessarily covers all of it.
+/// Any caller that needs "is this L0 record superseded" must ask this
+/// question, not the bucket-membership question, or it inherits that seal
+/// invariant as a silent premise: a partial-coverage record (one naming some
+/// but not all of its bucket's L0 set) makes the two answers differ, and the
+/// bucket-membership answer is the wrong one.
+///
+/// Shared by rule 2's own [`gather_l0_inputs`] and by the migrate floor-raise
+/// re-audit ([`crate::migrate::count_below_target`], issue #923), so the
+/// definition of supersession has exactly one implementation and the re-audit
+/// stays an independent check of input-set coverage rather than a restatement
+/// of the walk's assumptions.
+pub(crate) fn superseded_input_commit_keys(
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    record: &impl SupersededInputs,
+) -> Result<Vec<String>> {
+    let mut keys_out = Vec::with_capacity(record.inputs().len());
+    for input in record.inputs() {
+        let writer_id = Uuid::parse_str(&input.writer_id)
+            .map_err(|_| MaintainError::Key(KeyError::InvalidWriterId(input.writer_id.clone())))?;
+        keys_out.push(keys::commit_key(
+            tenant,
+            signal,
+            shard,
+            record.ingest_hour_bucket(),
+            writer_id,
+            input.writer_epoch,
+            input.writer_seq,
+        )?);
+    }
+    Ok(keys_out)
+}
+
 /// A record that names raw-L0 superseded inputs (a compaction record, or a
 /// rewrite record whose live input set was raw L0). Abstracts over the two
-/// proto types so [`gather_l0_inputs`] serves both without duplication.
-trait SupersededInputs {
+/// proto types so [`gather_l0_inputs`] and
+/// [`superseded_input_commit_keys`] serve both without duplication.
+pub(crate) trait SupersededInputs {
     fn inputs(&self) -> &[CompactionInputIdentity];
     fn ingest_hour_bucket(&self) -> u32;
 }

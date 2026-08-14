@@ -49,12 +49,16 @@
 //! re-audit deliberately counts every live commit and compaction record
 //! regardless of seal state: a fresh, still-unsealed below-target record the
 //! walk could not yet migrate still blocks the raise, which is exactly the
-//! guarantee the floor must carry. "Live" excludes a bucket's pre-rewrite L0
-//! commit records once a compaction or rewrite record for that bucket exists
-//! ([`count_below_target`]): those are sweepable leftovers of a rewrite this
-//! same walk may just have performed, not stragglers, so migrating a bucket
-//! and then re-auditing it in the same invocation converges without needing
-//! an interleaved `sweep` in between (issue #826).
+//! guarantee the floor must carry. "Live" excludes an L0 commit record that a
+//! compaction or rewrite record names in its input list
+//! ([`count_below_target`], keyed on the same predicate sweep rule 2 deletes
+//! by): those are sweepable leftovers of a rewrite this same walk may just
+//! have performed, not stragglers, so migrating a bucket and then re-auditing
+//! it in the same invocation converges without needing an interleaved `sweep`
+//! in between (issue #826). The exclusion asks the input-set question
+//! directly rather than "does this record's bucket carry a compaction record",
+//! so the re-audit confirms coverage instead of assuming the seal invariant
+//! that makes the two equivalent (issue #923).
 
 use std::collections::HashSet;
 
@@ -73,6 +77,7 @@ use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::read::{list_bucket, load_inputs};
 use crate::rewrite::{MigrateOutcome, migrate_bucket_format};
+use crate::sweep::superseded_input_commit_keys;
 
 /// One-byte version tag on the advisory migrate-cursor payload. As with
 /// [`crate::scan`]'s compaction cursor, this is not a frozen format: the tag
@@ -316,18 +321,27 @@ async fn list_shard_hours(
 /// the evidence of a live object; data objects are never listed directly). This
 /// is the verification pass; a nonzero total refuses the floor raise.
 ///
-/// A bucket's L0 commit records are excluded once that bucket also carries a
-/// compaction or rewrite record: the same "already rewritten, skip the L0
-/// check" gate [`migrate_bucket_format`]'s `AlreadyCompacted` branch applies
-/// before ever touching a bucket. A rewrite in this crate is bucket-atomic
-/// over the complete sealed L0 set (a sealed bucket's input set is frozen, so
-/// nothing can land there afterward), so the compaction/rewrite record's own
-/// parts are the live successor of every one of that bucket's commit records;
-/// the commit records themselves are pre-rewrite leftovers, sweepable but not
-/// live (issue #826). Without this exclusion a migrate invocation that just
-/// rewrote a bucket would count its own superseded L0 records as stragglers
-/// and refuse the floor raise it earned, converging only after an unrelated
-/// sweep physically deletes them.
+/// An L0 commit record is excluded once some compaction or rewrite record in
+/// the same shard names it as an input: the record's own parts are then the
+/// live successor of that commit record, which is a pre-rewrite leftover,
+/// sweepable but not live (issue #826). Without this exclusion a migrate
+/// invocation that just rewrote a bucket would count its own superseded L0
+/// records as stragglers and refuse the floor raise it earned, converging only
+/// after an unrelated sweep physically deletes them.
+///
+/// The exclusion is keyed on the superseding record's explicit `inputs` list
+/// (via [`crate::sweep::superseded_input_commit_keys`], the same predicate
+/// sweep rule 2 deletes by), not on membership of the record's ingest-hour
+/// bucket (issue #923). Bucket membership gives the same answer today, since
+/// compaction and rewrite refuse an unsealed bucket and a sealed bucket's L0
+/// set is frozen, so any record over a bucket covers that bucket's whole L0
+/// set. But this re-audit exists to verify the walk independently, and keying
+/// it on membership would make it inherit that seal invariant as a premise
+/// instead of confirming coverage. If a partial-coverage record ever exists
+/// (naming some but not all of its bucket's L0 set), membership would exclude
+/// the still-live, un-migrated remainder and raise the floor over data below
+/// the target, a false claim about durable state; the input-set predicate
+/// excludes exactly the records that were actually superseded.
 pub async fn count_below_target(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -343,38 +357,22 @@ pub async fn count_below_target(
         let prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)?;
         let metas = list_all(store, &prefix).await?;
 
-        // First pass, no store reads: classify every key by shape and record
-        // which buckets (ingest hours) already carry a compaction or rewrite
-        // record. Parsing a key's shape is free (it only inspects the
-        // filename), so this costs nothing beyond the listing already done.
-        let mut entries = Vec::with_capacity(metas.len());
-        let mut superseded_hours = HashSet::new();
+        // First pass: classify every key by shape (parsing a key's shape is
+        // free, it only inspects the filename), read each compaction and
+        // rewrite record, count its below-target parts, and collect the commit
+        // keys it explicitly supersedes. A record must be read for its parts
+        // anyway, so deriving the supersession set from its `inputs` list here
+        // adds no store read over the bucket-membership version this replaced;
+        // commit records are deferred to the second pass because the full
+        // supersession set is only known once every record in the shard has
+        // been seen.
+        let mut commit_keys = Vec::with_capacity(metas.len());
+        let mut superseded_commits: HashSet<String> = HashSet::new();
         for meta in metas {
             let entry = keys::partition_bucket_entry(&meta.key).map_err(MaintainError::Key)?;
-            match &entry {
-                keys::BucketEntry::CompactionRecord(k) => {
-                    superseded_hours.insert(k.ingest_hour_bucket);
-                }
-                keys::BucketEntry::RewriteRecord(k) => {
-                    superseded_hours.insert(k.ingest_hour_bucket);
-                }
-                keys::BucketEntry::CommitRecord(_) | keys::BucketEntry::Tombstone(_) => {}
-            }
-            entries.push((meta.key, entry));
-        }
-
-        for (key, entry) in entries {
+            let key = meta.key;
             match entry {
-                keys::BucketEntry::CommitRecord(parsed) => {
-                    if superseded_hours.contains(&parsed.ingest_hour_bucket) {
-                        continue;
-                    }
-                    let got = store.get(&key, GetRange::Full).await?;
-                    let rec = record::decode(&got.data)?;
-                    if rec.segment_format_version < target_version {
-                        l0_below += 1;
-                    }
-                }
+                keys::BucketEntry::CommitRecord(_) => commit_keys.push(key),
                 keys::BucketEntry::CompactionRecord(_) => {
                     let got = store.get(&key, GetRange::Full).await?;
                     let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
@@ -388,13 +386,24 @@ pub async fn count_below_target(
                             l1_below += 1;
                         }
                     }
+                    superseded_commits.extend(superseded_input_commit_keys(
+                        tenant_hash,
+                        signal,
+                        shard,
+                        &rec,
+                    )?);
                 }
                 // A rewrite record (selective erasure, ADR-0064) carries the
                 // same CompactionPart parts as a compaction record; its
                 // surviving parts can sit below the target version and must
                 // count toward the re-audit exactly like L1 parts, or a
                 // "migration complete" claim could pass over unmigrated
-                // rewritten objects.
+                // rewritten objects. Its `inputs` list supersedes raw L0
+                // exactly as a compaction record's does; a predecessor rewrite
+                // (empty `inputs`, superseding a whole prior compaction or
+                // rewrite record instead) supersedes no L0 record directly,
+                // and the predecessor record it names still carries the L0
+                // input list for as long as that record exists.
                 keys::BucketEntry::RewriteRecord(_) => {
                     let got = store.get(&key, GetRange::Full).await?;
                     let rec = RewriteRecord::decode(got.data.as_ref()).map_err(|err| {
@@ -407,8 +416,25 @@ pub async fn count_below_target(
                             l1_below += 1;
                         }
                     }
+                    superseded_commits.extend(superseded_input_commit_keys(
+                        tenant_hash,
+                        signal,
+                        shard,
+                        &rec,
+                    )?);
                 }
                 keys::BucketEntry::Tombstone(_) => {}
+            }
+        }
+
+        for key in commit_keys {
+            if superseded_commits.contains(&key) {
+                continue;
+            }
+            let got = store.get(&key, GetRange::Full).await?;
+            let rec = record::decode(&got.data)?;
+            if rec.segment_format_version < target_version {
+                l0_below += 1;
             }
         }
     }
