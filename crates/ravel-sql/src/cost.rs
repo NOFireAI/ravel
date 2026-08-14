@@ -130,13 +130,9 @@ pub fn estimate_logs_cost(snapshot: &Snapshot, catalog_requests: u64) -> CostEst
 /// padded guesses, exactly like [`estimate_logs_cost`]: no chase/retry safety
 /// factor applies because there is no chase/retry path to guard against.
 ///
-/// Not yet reached from a production caller: SQL query routing
-/// (`executor::TargetSignal`) has no `Spans` arm until the spans query surface
-/// is wired in (ADR-0045 decision 5, phase 2). It lands here beside its sibling
-/// estimators so that wiring is a one-line `match` arm rather than a new
-/// function; `#[allow(dead_code)]` marks it as intentionally caller-less until
-/// then.
-#[allow(dead_code)]
+/// Reached from `executor::SqlExecutor::resolve` for a `TargetSignal::Spans`
+/// query (ADR-0045 decision 5), beside its `estimate_metrics_cost` and
+/// `estimate_logs_cost` siblings.
 pub fn estimate_spans_cost(snapshot: &Snapshot, catalog_requests: u64) -> CostEstimate {
     let segments = snapshot.segments.len() as u64;
     let series: u64 = snapshot.segments.iter().map(|s| s.series_count).sum();

@@ -147,6 +147,7 @@ impl Harness {
             Arc::clone(&fixture.catalog),
             fixture.fetcher.clone(),
             LogSegmentFetcher::new(Arc::clone(&fixture.store)),
+            ravel_sql::SpanSegmentFetcher::new(Arc::clone(&fixture.store)),
             SqlConfig::default(),
             1 << 30,
         ));

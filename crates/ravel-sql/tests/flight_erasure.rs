@@ -168,6 +168,7 @@ async fn build_shard_service(
         Arc::clone(&catalog),
         fetcher,
         LogSegmentFetcher::new(Arc::clone(&store)),
+        ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
         SqlConfig::default(),
         1 << 30,
     ));

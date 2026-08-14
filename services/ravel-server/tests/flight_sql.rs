@@ -168,6 +168,84 @@ async fn publish_segment_on_shard(
         .expect("publish");
 }
 
+/// Publish one real RSPAN object plus its `Signal::Spans` commit record for
+/// `tenant` (ADR-0045 decision 5). The footer carries `tenant`'s hash so the
+/// tenant-checked span fetch admits it, and it lands at the reconstructed data
+/// key so `Catalog::resolve` for `Signal::Spans` finds it. Each `records` entry
+/// is `(service, name, start_ns, duration_ns, status)`.
+async fn publish_span_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    records: &[(&str, &str, i64, i64, ravel_rspan::StatusCode)],
+) {
+    let tenant_hash = tenant.hash();
+    let spans: Vec<ravel_rspan::SpanRecord> = records
+        .iter()
+        .enumerate()
+        .map(
+            |(i, (service, name, start, dur, status))| ravel_rspan::SpanRecord {
+                trace_id: [0xABu8; 16],
+                span_id: [i as u8; 8],
+                parent_span_id: None,
+                name: (*name).to_string(),
+                start_ts_ns: *start,
+                end_ts_ns: *start + *dur,
+                status_code: *status,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), (*service).to_string())],
+            },
+        )
+        .collect();
+
+    let min_event_ts_ns = spans.iter().map(|s| s.start_ts_ns).min().expect("nonempty");
+    let max_event_ts_ns = spans.iter().map(|s| s.end_ts_ns).max().expect("nonempty");
+
+    let writer_id = Uuid::from_u128(5_000);
+    let identity = ravel_rspan::ObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let mut writer = ravel_rspan::RspanWriter::new(ravel_rspan::RspanConfig::default(), identity);
+    for span in &spans {
+        writer.push(span.clone());
+    }
+    let bytes = writer.finish().expect("finish rspan object");
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Spans,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: spans.len() as u64,
+        series_count: 1,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        min_ingest_ts_ns: min_event_ts_ns,
+        max_ingest_ts_ns: max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 10,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid span commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put span data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish span commit");
+}
+
 fn sql_state(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantId>) -> SqlState {
     sql_state_with_shards(store, tokens, 1)
 }
@@ -190,6 +268,7 @@ fn sql_state_with_shards(
         catalog,
         SegmentFetcher::new(store.clone()),
         LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
         SqlConfig::default(),
         1 << 30,
     );
@@ -377,6 +456,92 @@ async fn a_flight_sql_query_returns_the_published_rows() {
 
     assert_eq!(rows, samples.len(), "every published sample comes back");
     assert_eq!(columns, vec!["ts".to_string(), "value".to_string()]);
+
+    server.stop().await;
+}
+
+/// ADR-0045 decision 5 reachability, over Flight SQL: `GetFlightInfo` then
+/// `DoGet` for a `SELECT ... FROM spans WHERE ...` statement over a real tonic
+/// channel returns the published spans. This proves the second production
+/// surface (not just `/api/v1/sql`) reaches the newly-wired spans path through
+/// `plan_pinned`: the ticket resolves the `Signal::Spans` snapshot at
+/// `GetFlightInfo` and executes the accounted, tenant-checked span scan at
+/// `DoGet`. Row values are compared bit-for-bit against `SqlExecutor::execute`
+/// in ravel-sql's own tests; this level proves the shape survives the wire.
+#[tokio::test]
+async fn a_flight_sql_spans_query_returns_the_published_rows() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_span_segment(
+        store.as_ref(),
+        &tenant,
+        &[
+            (
+                "checkout",
+                "POST /checkout",
+                100,
+                600_000_000,
+                ravel_rspan::StatusCode::Error,
+            ),
+            (
+                "cart",
+                "GET /cart",
+                200,
+                100_000_000,
+                ravel_rspan::StatusCode::Ok,
+            ),
+            (
+                "checkout",
+                "POST /checkout/confirm",
+                300,
+                700_000_000,
+                ravel_rspan::StatusCode::Error,
+            ),
+        ],
+    )
+    .await;
+
+    let mut tokens = HashMap::new();
+    tokens.insert("acme-token".to_string(), tenant);
+    let state = sql_state(store, tokens);
+    let server = FlightServer::start(&state).await;
+    let mut client = server.client().await;
+
+    let command = CommandStatementQuery {
+        query: "SELECT name, duration_ns, service_name FROM spans \
+                WHERE service_name = 'checkout' ORDER BY start_ts"
+            .to_string(),
+        transaction_id: None,
+    };
+    let info = client
+        .get_flight_info(authed(descriptor(&command), "acme-token"))
+        .await
+        .expect("flight info")
+        .into_inner();
+    let ticket = info
+        .endpoint
+        .first()
+        .expect("one endpoint")
+        .ticket
+        .clone()
+        .expect("a ticket");
+
+    let stream = client
+        .do_get(authed(ticket, "acme-token"))
+        .await
+        .expect("do get")
+        .into_inner();
+    let (rows, columns) = decode(stream).await.expect("decode");
+
+    assert_eq!(rows, 2, "only the two checkout spans come back");
+    assert_eq!(
+        columns,
+        vec![
+            "name".to_string(),
+            "duration_ns".to_string(),
+            "service_name".to_string()
+        ]
+    );
 
     server.stop().await;
 }

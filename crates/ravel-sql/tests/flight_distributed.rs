@@ -385,6 +385,7 @@ fn wire_service(store: Arc<dyn ObjectStoreBackend>) -> Arc<RavelFlightSqlService
         catalog,
         fetcher,
         LogSegmentFetcher::new(Arc::clone(&store)),
+        ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
         SqlConfig::default(),
         1 << 30,
     ));
@@ -843,6 +844,7 @@ async fn service_over_two_shards() -> (RavelFlightSqlService, Arc<SqlExecutor>, 
         Arc::clone(&catalog),
         fetcher,
         LogSegmentFetcher::new(Arc::clone(&store)),
+        ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
         SqlConfig::default(),
         1 << 30,
     ));

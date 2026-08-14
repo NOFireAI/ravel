@@ -235,6 +235,7 @@ impl Fixture {
             Arc::clone(&catalog),
             fetcher.clone(),
             LogSegmentFetcher::new(Arc::clone(&store)),
+            ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
             config,
             max_tenant_bytes,
         );

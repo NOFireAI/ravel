@@ -10,10 +10,11 @@
 //!    now_ns, name_filter)`, with `now_ns` threaded in from the caller's
 //!    injected clock (no `SystemTime::now()` in library logic).
 //!    `signal` is chosen from the query's own `FROM` clause
-//!    ([`SqlExecutor::target_signal`], ADR-0033): `Signal::Logs` when the
-//!    query references the `logs` table, otherwise `Signal::Metrics`. A query
-//!    referencing both tables is rejected here, before the LIST, because v1
-//!    admits one signal per query (decision C). `name_filter` is the equality
+//!    ([`SqlExecutor::target_signal`], ADR-0033, extended to `spans` by
+//!    ADR-0045 decision 5): `Signal::Logs` for the `logs` table,
+//!    `Signal::Spans` for the `spans` table, otherwise `Signal::Metrics`. A
+//!    query referencing two of the three tables is rejected here, before the
+//!    LIST, because v1 admits one signal per query (decision C). `name_filter` is the equality
 //!    `__name__` value derived from the query's pushed-down predicates
 //!    ([`SqlExecutor::pushed_down_name_filter`]), so a metrics query
 //!    naming one metric prunes by postings exactly as PromQL does; a logs
@@ -88,27 +89,31 @@ use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnap
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
 use crate::config::SqlConfig;
-use crate::cost::{estimate_logs_cost, estimate_metrics_cost};
+use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
 use crate::error::SqlError;
 use crate::logs_provider::LogsTableProvider;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::output::QueryOutput;
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
-use crate::session::{LOGS_TABLE, SAMPLES_TABLE, SessionTable, build_session};
+use crate::session::{LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, build_session};
+use crate::spans_fetcher::SpanSegmentFetcher;
+use crate::spans_provider::SpansTableProvider;
 use crate::udf::{label_match_udf, label_udf};
 use crate::validate::{referenced_base_tables, validate};
 
-/// Which of the two v1 tables (and thus which `Signal`) a query targets.
-/// A closed two-variant enum rather than `Signal` directly: `Signal` carries
-/// variants (`Spans`, `Profiles`) the SQL surface has no table for, and the
-/// executor must never resolve or register those.
+/// Which of the three v1 tables (and thus which `Signal`) a query targets.
+/// A closed enum rather than `Signal` directly: `Signal` carries a `Profiles`
+/// variant the SQL surface has no table for, and the executor must never
+/// resolve or register that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetSignal {
     /// The `samples` table, resolved against `Signal::Metrics`.
     Metrics,
     /// The `logs` table, resolved against `Signal::Logs`.
     Logs,
+    /// The `spans` table, resolved against `Signal::Spans` (ADR-0045 decision 5).
+    Spans,
 }
 
 impl TargetSignal {
@@ -116,6 +121,7 @@ impl TargetSignal {
         match self {
             TargetSignal::Metrics => Signal::Metrics,
             TargetSignal::Logs => Signal::Logs,
+            TargetSignal::Spans => Signal::Spans,
         }
     }
 }
@@ -235,6 +241,12 @@ pub struct SqlExecutor {
     /// The RLOG/logs sibling of `fetcher` (ADR-0033). Used only when a query
     /// targets the `logs` table; a metrics-only query never touches it.
     log_fetcher: LogSegmentFetcher,
+    /// The RSPAN/spans sibling of `fetcher` (ADR-0045 decision 5). Used only
+    /// when a query targets the `spans` table; a metrics- or logs-only query
+    /// never touches it. Its `fetch_accounted` path is tenant-checked (fails
+    /// closed on a footer tenant_hash mismatch) and records every span GET
+    /// against the query's `QueryAccounting`.
+    span_fetcher: SpanSegmentFetcher,
     config: SqlConfig,
     max_tenant_bytes: usize,
     /// Per-tenant byte accountants, created on first use and shared across
@@ -267,6 +279,7 @@ impl SqlExecutor {
         catalog: Arc<Catalog>,
         fetcher: SegmentFetcher,
         log_fetcher: LogSegmentFetcher,
+        span_fetcher: SpanSegmentFetcher,
         config: SqlConfig,
         max_tenant_bytes: usize,
     ) -> Self {
@@ -274,6 +287,7 @@ impl SqlExecutor {
             catalog,
             fetcher,
             log_fetcher,
+            span_fetcher,
             config,
             max_tenant_bytes,
             tenants: Mutex::new(HashMap::new()),
@@ -555,6 +569,16 @@ impl SqlExecutor {
                 self.log_fetcher.clone(),
                 accounting.clone(),
             ))),
+            // The spans provider drives `SpanSegmentFetcher::fetch_accounted`
+            // for every scanned segment: `accounting` is cloned in so each
+            // span GET is recorded against this query, and the fetch is
+            // tenant-checked (fails closed on a footer tenant_hash mismatch).
+            TargetSignal::Spans => SessionTable::Spans(Arc::new(SpansTableProvider::new(
+                snapshot,
+                tenant_hash,
+                self.span_fetcher.clone(),
+                accounting.clone(),
+            ))),
         };
 
         let ctx = build_session(&self.config, pool, table).map_err(plan_error)?;
@@ -688,7 +712,9 @@ impl SqlExecutor {
         // safely when postings are absent or unusable.
         let name_filter = match target {
             TargetSignal::Metrics => self.pushed_down_name_filter(tenant_hash, &req.sql).await,
-            TargetSignal::Logs => None,
+            // Only a metrics query has a `__name__` postings index; neither a
+            // logs nor a spans query prunes by it.
+            TargetSignal::Logs | TargetSignal::Spans => None,
         };
         let catalog_requests = self
             .catalog
@@ -714,6 +740,7 @@ impl SqlExecutor {
         let estimate = match target {
             TargetSignal::Metrics => estimate_metrics_cost(&snapshot, catalog_requests),
             TargetSignal::Logs => estimate_logs_cost(&snapshot, catalog_requests),
+            TargetSignal::Spans => estimate_spans_cost(&snapshot, catalog_requests),
         };
         Ok((snapshot, estimate))
     }
@@ -763,28 +790,41 @@ impl SqlExecutor {
     ///
     /// The referenced table names come from the same `DFParser` front end the
     /// validation gate uses ([`referenced_base_tables`]), never a raw-text
-    /// scan. The mapping:
+    /// scan. The mapping (ADR-0045 decision 5 extends the ADR-0033 two-table
+    /// rule to a third arm):
     ///
-    /// - references `logs` (and not `samples`) -> [`TargetSignal::Logs`].
-    /// - references `samples`, or references neither table ->
+    /// - references `logs` only -> [`TargetSignal::Logs`].
+    /// - references `spans` only -> [`TargetSignal::Spans`].
+    /// - references `samples` only, or references no real table ->
     ///   [`TargetSignal::Metrics`].
-    /// - references both -> [`SqlError::CrossSignalQuery`], rejected before the
-    ///   catalog LIST (decision C: v1 admits one signal per query).
+    /// - references two or more of {`samples`, `logs`, `spans`} ->
+    ///   [`SqlError::CrossSignalQuery`], rejected before the catalog LIST
+    ///   (decision C: v1 admits one signal per query).
     ///
-    /// The "neither" case (a constant query such as `SELECT 1`, or one whose
-    /// only source is a CTE with no base table) defaults to `Metrics`: it
+    /// The "no real table" case (a constant query such as `SELECT 1`, or one
+    /// whose only source is a CTE with no base table) defaults to `Metrics`: it
     /// preserves the pre-ADR-0033 behavior exactly -- such a query resolved a
     /// metrics snapshot and never touched it -- and `crate::validate` already
     /// rules out anything that would need a data source it cannot reach. Only
-    /// the both-tables case is genuinely unsupported, so only it is an error.
+    /// the multiple-table case is genuinely unsupported, so only it is an error.
     fn target_signal(sql: &str) -> Result<TargetSignal, SqlError> {
         let tables = referenced_base_tables(sql)?;
         let has_samples = tables.contains(SAMPLES_TABLE);
         let has_logs = tables.contains(LOGS_TABLE);
-        match (has_samples, has_logs) {
-            (true, true) => Err(SqlError::CrossSignalQuery),
-            (_, true) => Ok(TargetSignal::Logs),
-            (_, false) => Ok(TargetSignal::Metrics),
+        let has_spans = tables.contains(SPANS_TABLE);
+        // Naming two of the three real tables crosses signals: v1 resolves one
+        // snapshot per query, so this is rejected before any catalog listing.
+        let named = u8::from(has_samples) + u8::from(has_logs) + u8::from(has_spans);
+        if named > 1 {
+            return Err(SqlError::CrossSignalQuery);
+        }
+        if has_logs {
+            Ok(TargetSignal::Logs)
+        } else if has_spans {
+            Ok(TargetSignal::Spans)
+        } else {
+            // `samples` only, or no real table at all: metrics by default.
+            Ok(TargetSignal::Metrics)
         }
     }
 
@@ -1457,6 +1497,11 @@ mod tests {
             SqlExecutor::target_signal("SELECT body FROM logs WHERE body = 'samples'").expect("ok"),
             TargetSignal::Logs
         );
+        // spans -> spans (ADR-0045 decision 5, the third arm).
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT trace_id FROM spans").expect("ok"),
+            TargetSignal::Spans
+        );
     }
 
     #[test]
@@ -1465,6 +1510,26 @@ mod tests {
             SqlExecutor::target_signal("SELECT * FROM samples JOIN logs ON samples.ts = logs.ts")
                 .expect_err("both tables rejected");
         assert!(matches!(err, SqlError::CrossSignalQuery));
+    }
+
+    /// ADR-0045 decision 5: the one-signal-per-query rule now spans three
+    /// tables, so a query naming any two of {samples, logs, spans} -- or all
+    /// three -- is rejected as `CrossSignalQuery`, exactly as samples+logs was.
+    #[test]
+    fn target_signal_rejects_two_of_the_three_tables() {
+        for sql in [
+            "SELECT * FROM samples JOIN spans ON samples.ts = spans.start_ts",
+            "SELECT * FROM logs JOIN spans ON logs.ts = spans.start_ts",
+            "SELECT * FROM samples JOIN logs ON samples.ts = logs.ts \
+             JOIN spans ON spans.start_ts = logs.ts",
+        ] {
+            let err = SqlExecutor::target_signal(sql)
+                .expect_err("a query naming two of the three tables is rejected");
+            assert!(
+                matches!(err, SqlError::CrossSignalQuery),
+                "expected CrossSignalQuery for {sql:?}, got {err:?}"
+            );
+        }
     }
 
     /// A CTE named after the other table is query-local, not a base-table
@@ -1491,6 +1556,66 @@ mod tests {
         );
     }
 
+    /// ADR-0045 decision 5 / ADR-0033 decision C: a cross-signal query is
+    /// rejected before any catalog work, so it costs zero store requests. Runs
+    /// a `spans` + `samples` join through `execute` against an
+    /// `InstrumentedStore` and asserts both that the error is `CrossSignalQuery`
+    /// and that the store saw no LIST/GET/HEAD at all -- proving the rejection
+    /// lands in `target_signal` ahead of `resolve`'s catalog LIST, not after it.
+    #[tokio::test]
+    async fn cross_signal_query_rejected_before_any_catalog_listing() {
+        use ravel_catalog::CatalogConfig;
+        use ravel_object_store::instrument::InstrumentedStore;
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store.clone()),
+            SqlConfig::default(),
+            1 << 30,
+        );
+
+        let request = SqlRequest {
+            sql: "SELECT * FROM spans JOIN samples ON spans.start_ts = samples.ts".to_string(),
+            window: TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+            min_tokens: Vec::new(),
+            now_ns: 2_000,
+            deadline: Duration::from_secs(30),
+        };
+
+        let before = store.metrics().snapshot();
+        let err = executor
+            .execute(TenantHash([7u8; 16]), &request)
+            .await
+            .expect_err("a spans+samples cross-signal query is rejected");
+        let after = store.metrics().snapshot();
+
+        assert!(
+            matches!(err, SqlError::CrossSignalQuery),
+            "expected CrossSignalQuery, got {err:?}"
+        );
+        assert_eq!(
+            after.list.calls, before.list.calls,
+            "a cross-signal query must be rejected before any catalog LIST"
+        );
+        assert_eq!(
+            after.get.calls, before.get.calls,
+            "a cross-signal query must issue no GET"
+        );
+        assert_eq!(
+            after.head.calls, before.head.calls,
+            "a cross-signal query must issue no HEAD"
+        );
+    }
+
     #[test]
     fn resources_exhausted_keeps_its_own_counts() {
         let df = DataFusionError::ResourcesExhausted("needs 40 bytes, limit 8".to_string());
@@ -1508,7 +1633,15 @@ mod tests {
         let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("cat"));
         let fetcher = SegmentFetcher::new(store.clone());
         let log_fetcher = LogSegmentFetcher::new(store.clone());
-        SqlExecutor::new(catalog, fetcher, log_fetcher, SqlConfig::default(), 1 << 30)
+        let span_fetcher = SpanSegmentFetcher::new(store.clone());
+        SqlExecutor::new(
+            catalog,
+            fetcher,
+            log_fetcher,
+            span_fetcher,
+            SqlConfig::default(),
+            1 << 30,
+        )
     }
 
     /// ADR-0069 decision 2: a tenant idle past the TTL has its
@@ -1679,8 +1812,15 @@ mod tests {
             Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
         let fetcher = SegmentFetcher::new(store.clone());
         let log_fetcher = LogSegmentFetcher::new(store.clone());
-        let executor =
-            SqlExecutor::new(catalog, fetcher, log_fetcher, SqlConfig::default(), 1 << 30);
+        let span_fetcher = SpanSegmentFetcher::new(store.clone());
+        let executor = SqlExecutor::new(
+            catalog,
+            fetcher,
+            log_fetcher,
+            span_fetcher,
+            SqlConfig::default(),
+            1 << 30,
+        );
 
         let request = SqlRequest {
             sql: "SELECT ts, value FROM samples".to_string(),

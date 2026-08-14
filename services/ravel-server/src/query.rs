@@ -194,7 +194,7 @@ pub fn build_sql_state(
     query_admission: Arc<QueryAdmissionController>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
-    use ravel_sql::{SqlConfig, SqlExecutor};
+    use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
 
     let config = SqlConfig {
         engine: engine_config,
@@ -203,17 +203,25 @@ pub fn build_sql_state(
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone());
     let mut logs_fetcher = LogSegmentFetcher::new(store.clone());
+    // The spans fetcher (RSPAN) reads the same object store, with the default
+    // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache: unlike
+    // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired
+    // here. Its `fetch_accounted` path is tenant-checked and accounted (ADR-0045
+    // via #1080), so a `spans` query is isolated and metered like any other.
+    let span_fetcher = SpanSegmentFetcher::new(store.clone());
     if let Some(cache) = cache {
         metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
         logs_fetcher = logs_fetcher.with_cache(cache);
     }
-    // The metrics fetcher (RSEG) and the logs fetcher (RLOG) both read the
-    // same object store; the executor uses whichever the query's target table
-    // needs (ADR-0033).
+    // The metrics fetcher (RSEG), the logs fetcher (RLOG), and the spans
+    // fetcher (RSPAN) all read the same object store; the executor uses
+    // whichever the query's target table needs (ADR-0033, extended to `spans`
+    // by ADR-0045 decision 5).
     let executor = SqlExecutor::new(
         catalog,
         metrics_fetcher,
         logs_fetcher,
+        span_fetcher,
         config,
         DEFAULT_MAX_TENANT_BYTES,
     );

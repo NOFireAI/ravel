@@ -207,6 +207,7 @@ async fn sql_and_promql_agree_recent_hours_are_exempt() {
         Arc::clone(&cat),
         SegmentFetcher::new(store.clone()),
         LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
         sql_config,
         1 << 30,
     );
@@ -283,6 +284,7 @@ async fn sql_and_promql_agree_sealed_set_still_capped() {
         Arc::clone(&cat),
         SegmentFetcher::new(store.clone()),
         LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
         sql_config,
         1 << 30,
     );
@@ -352,6 +354,7 @@ async fn sql_recent_hour_segments_are_exempt_from_max_segments() {
         cat,
         SegmentFetcher::new(store.clone()),
         LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
         sql_config,
         1 << 30,
     );
@@ -413,6 +416,7 @@ async fn no_recent_hour_data_default_config_is_unaffected() {
         cat,
         SegmentFetcher::new(store.clone()),
         LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
         sql_config,
         1 << 30,
     );

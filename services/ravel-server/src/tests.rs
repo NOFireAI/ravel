@@ -145,6 +145,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         Arc::clone(&catalog),
         SegmentFetcher::new(store.clone()),
         LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
         SqlConfig::default(),
         1 << 30,
     ));

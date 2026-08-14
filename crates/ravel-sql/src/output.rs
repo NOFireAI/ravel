@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, MapArray, StringArray,
-    StringViewArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
+    StringViewArray, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Int32Type, SchemaRef, TimeUnit};
 use datafusion::arrow::ipc::writer::StreamWriter;
@@ -130,6 +130,11 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
         DataType::Boolean => Json::Bool(downcast::<BooleanArray>(array, "Boolean")?.value(row)),
         DataType::Int32 => json!(downcast::<Int32Array>(array, "Int32")?.value(row)),
         DataType::Int64 => json!(downcast::<Int64Array>(array, "Int64")?.value(row)),
+        // `spans.status_code` is a `UInt8` (the OTLP status byte), reachable
+        // through the public spans table (ADR-0045 decision 5); without this
+        // arm a `SELECT status_code FROM spans` fails JSON encoding with a
+        // generic internal error.
+        DataType::UInt8 => json!(downcast::<UInt8Array>(array, "UInt8")?.value(row)),
         DataType::UInt32 => json!(downcast::<UInt32Array>(array, "UInt32")?.value(row)),
         DataType::UInt64 => json!(downcast::<UInt64Array>(array, "UInt64")?.value(row)),
         DataType::Float32 => float_to_json(f64::from(
@@ -314,6 +319,31 @@ mod tests {
         assert_eq!(col.value(0).to_bits(), payload.to_bits());
         assert_eq!(col.value(1).to_bits(), (-0.0f64).to_bits());
         assert_eq!(col.value(2).to_bits(), f64::NEG_INFINITY.to_bits());
+    }
+
+    /// `spans.status_code` is a `UInt8` reachable through the public spans
+    /// table (ADR-0045 decision 5). It must JSON-encode as a plain integer, not
+    /// fall through to the "no JSON encoding for arrow type" internal error the
+    /// generic `other =>` arm produces for an unhandled type.
+    #[test]
+    fn json_encodes_uint8_columns_as_integers() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "status_code",
+            DataType::UInt8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt8Array::from(vec![0u8, 1, 2])) as ArrayRef],
+        )
+        .expect("batch");
+        let json = QueryOutput::new(schema, vec![batch])
+            .to_json()
+            .expect("json");
+        let rows = json["rows"].as_array().expect("rows");
+        assert_eq!(rows[0][0], json!(0));
+        assert_eq!(rows[1][0], json!(1));
+        assert_eq!(rows[2][0], json!(2));
     }
 
     #[test]

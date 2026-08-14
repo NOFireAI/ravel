@@ -233,6 +233,99 @@ async fn publish_log_segment(
         .expect("publish log commit");
 }
 
+/// One span on `service` with an explicit duration and status. `service.name`
+/// is carried in the merged `attrs` map exactly as RSPAN v1 stores it, so the
+/// `service_name` SQL column is populated from the map at scan time.
+fn span_record(
+    trace: [u8; 16],
+    span_id: u8,
+    service: &str,
+    name: &str,
+    start: i64,
+    duration_ns: i64,
+    status: ravel_rspan::StatusCode,
+) -> ravel_rspan::SpanRecord {
+    ravel_rspan::SpanRecord {
+        trace_id: trace,
+        span_id: [span_id; 8],
+        parent_span_id: None,
+        name: name.to_string(),
+        start_ts_ns: start,
+        end_ts_ns: start + duration_ns,
+        status_code: status,
+        status_message: None,
+        attrs: vec![("service.name".to_string(), service.to_string())],
+    }
+}
+
+/// Publish one real RSPAN object plus its `Signal::Spans` commit record for
+/// `tenant`, the span-signal sibling of [`publish_log_segment`]. The object's
+/// footer carries `tenant`'s hash, so the accounted, tenant-checked span fetch
+/// (`SpanSegmentFetcher::fetch_accounted`) admits it; it lands at the
+/// reconstructed data key, so `Catalog::resolve` for `Signal::Spans` finds it.
+async fn publish_span_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    index: usize,
+    records: &[ravel_rspan::SpanRecord],
+) {
+    let tenant_hash = tenant.hash();
+
+    let mut min_event_ts_ns = i64::MAX;
+    let mut max_event_ts_ns = i64::MIN;
+    let mut traces = std::collections::HashSet::new();
+    for rec in records {
+        min_event_ts_ns = min_event_ts_ns.min(rec.start_ts_ns);
+        max_event_ts_ns = max_event_ts_ns.max(rec.end_ts_ns);
+        traces.insert(rec.trace_id);
+    }
+
+    let writer_id = Uuid::from_u128(5_000 + index as u128);
+    let identity = ravel_rspan::ObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+    };
+    let mut writer = ravel_rspan::RspanWriter::new(ravel_rspan::RspanConfig::default(), identity);
+    for rec in records {
+        writer.push(rec.clone());
+    }
+    let bytes = writer.finish().expect("finish rspan object");
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Spans,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: records.len() as u64,
+        series_count: traces.len() as u64,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        min_ingest_ts_ns: min_event_ts_ns,
+        max_ingest_ts_ns: max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 10 + index as i64,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid span commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put span data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish span commit");
+}
+
 fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantId>) -> Router {
     build_router_with_sink(store, tokens, Arc::new(ravel_maintain::NoopQueryAuditSink))
 }
@@ -248,6 +341,7 @@ fn build_router_with_sink(
         catalog,
         SegmentFetcher::new(store.clone()),
         LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
         SqlConfig::default(),
         1 << 30,
     );
@@ -782,6 +876,122 @@ async fn sql_query_against_logs_table_returns_rows() {
         "only the 'connection timeout' record: {value}"
     );
     assert_eq!(rows[0][0], serde_json::json!(150));
+}
+
+/// ADR-0045 decision 5 reachability proof: a `SELECT ... FROM spans WHERE ...`
+/// query, posted to the real `/api/v1/sql` handler over ingested RSPAN span
+/// data, returns real rows. This is the gap #1085 closes -- before the wiring,
+/// `SpansTableProvider`/`SpansScanExec`/`SpanSegmentFetcher` existed and were
+/// tested in isolation, but nothing in production constructed them, so this
+/// query could not reach the span data at all.
+///
+/// It asserts the whole path end to end: the handler routes to the `spans`
+/// table purely from the `FROM` clause (`TargetSignal::Spans`), resolves the
+/// `Signal::Spans` snapshot, drives the accounted+tenant-checked
+/// `fetch_accounted`, and pushes the `duration_ns`/`status_code`/`service_name`
+/// predicates the ADR names. A first query returns every ingested span; the
+/// filtered query returns exactly the two `checkout` error spans over 500ms,
+/// proving the pushdown predicate and the computed `duration_ns` column both
+/// reach the scan.
+#[tokio::test]
+async fn sql_query_against_spans_table_returns_rows() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+
+    let trace = [0xABu8; 16];
+    // Three spans on one trace: two slow `checkout` errors and one fast `cart`
+    // ok. Durations straddle the 500ms pushdown boundary.
+    let records = vec![
+        span_record(
+            trace,
+            0,
+            "checkout",
+            "POST /checkout",
+            100,
+            600_000_000,
+            ravel_rspan::StatusCode::Error,
+        ),
+        span_record(
+            trace,
+            1,
+            "cart",
+            "GET /cart",
+            200,
+            100_000_000,
+            ravel_rspan::StatusCode::Ok,
+        ),
+        span_record(
+            trace,
+            2,
+            "checkout",
+            "POST /checkout/confirm",
+            300,
+            700_000_000,
+            ravel_rspan::StatusCode::Error,
+        ),
+    ];
+    publish_span_segment(store.as_ref(), &tenant, 0, &records).await;
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
+    // Every ingested span comes back: proves the endpoint reaches the span
+    // data at all (the reachability gap).
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT name, service_name FROM spans ORDER BY start_ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 3, "every ingested span is returned: {value}");
+    assert_eq!(rows[0][0], serde_json::json!("POST /checkout"));
+    assert_eq!(rows[0][1], serde_json::json!("checkout"));
+    assert_eq!(rows[1][0], serde_json::json!("GET /cart"));
+
+    // The predicate query pushes `duration_ns > 5e8`, `status_code = 2`
+    // (Error), and `service_name = 'checkout'` down to the scan and returns
+    // exactly the two slow checkout errors, proving the computed `duration_ns`
+    // column and the spans pushdown both run end to end over HTTP.
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT name, duration_ns, status_code, service_name FROM spans \
+         WHERE duration_ns > 500000000 AND status_code = 2 \
+           AND service_name = 'checkout' ORDER BY start_ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "only the two slow checkout error spans: {value}"
+    );
+    assert_eq!(rows[0][0], serde_json::json!("POST /checkout"));
+    assert_eq!(rows[0][1], serde_json::json!(600_000_000));
+    assert_eq!(rows[0][2], serde_json::json!(2));
+    assert_eq!(rows[0][3], serde_json::json!("checkout"));
+    assert_eq!(rows[1][0], serde_json::json!("POST /checkout/confirm"));
+    assert_eq!(rows[1][1], serde_json::json!(700_000_000));
+}
+
+/// A cross-signal query naming `spans` and `samples` is rejected as a 400 with
+/// the shared `CrossSignalQuery` message, over the real HTTP handler and before
+/// any catalog listing (ADR-0033 decision C extended to the third table by
+/// ADR-0045 decision 5).
+#[tokio::test]
+async fn a_spans_plus_samples_query_is_rejected_over_http() {
+    let app = one_tenant_app("m", &[(100, 1.0)]).await;
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT * FROM spans JOIN samples ON spans.start_ts = samples.ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["status"], "error");
 }
 
 /// A planning failure on a `logs` query returns the shared, redacted planning

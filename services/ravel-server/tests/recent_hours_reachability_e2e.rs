@@ -434,6 +434,7 @@ async fn post_compaction_bits(
         sql_cat,
         ravel_query::SegmentFetcher::new(store.clone()),
         ravel_query::LogSegmentFetcher::new(store.clone()),
+        ravel_sql::SpanSegmentFetcher::new(store.clone()),
         sql_config,
         1 << 30,
     );
