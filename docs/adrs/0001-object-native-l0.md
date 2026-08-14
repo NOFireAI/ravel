@@ -12,10 +12,10 @@ another node's disk or accepting loss.
 
 ## Alternatives
 
-1. Local WAL + async upload (VictoriaMetrics-style): fast acks, but violates
+1. Local WAL + async upload: fast acks, but violates
    the no-local-durability invariant.
 2. Distributed log (Kafka/Redpanda) in front: durable, but adds a stateful
-   dependency the mission explicitly forbids.
+   dependency Ravel's design explicitly forbids.
 3. Object-native L0: the first durable artifact *is* an immutable, queryable
    object in the store; acknowledgement follows its successful PUT + commit
    record.

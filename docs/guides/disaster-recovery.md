@@ -49,7 +49,7 @@ disaster-recovery plan.
 ## What a real DR posture would require (future work, not built here)
 
 A genuine DR posture is named here as future work, not delivered by this
-document or this epic. Two shapes are plausible:
+document. Two shapes are plausible:
 
 - **Periodic bucket-to-bucket copy with an explicit staleness bound.** A
   scheduled copy (for example `aws s3 sync`, or a lifecycle-driven

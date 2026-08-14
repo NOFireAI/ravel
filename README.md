@@ -1,7 +1,5 @@
 # Ravel
 
-[![CI](https://github.com/NOFireAI/ravel/actions/workflows/ci.yml/badge.svg)](https://github.com/NOFireAI/ravel/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/pmoust/b45c736cf13204279b05507186c24325/raw/coverage.json)](https://github.com/NOFireAI/ravel/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97.1-orange.svg)](rust-toolchain.toml)
 
@@ -205,7 +203,7 @@ piece, see [docs/adrs/](docs/adrs/).
   cache).
 
 Two gaps worth knowing about: PromQL subqueries over native histograms
-return a typed error rather than a wrong answer (issue #220), and native
+return a typed error rather than a wrong answer, and native
 `histogram_quantile`/`histogram_fraction` interpolate linearly within a
 bucket where Prometheus 3.x interpolates exponentially, so interior
 quantiles can differ.
@@ -384,7 +382,7 @@ as an immutable, append-only epoch history (`t/<hash>/enc`) that
 tenant predates or postdates the right key. See
 [docs/guides/operations.md](docs/guides/operations.md)'s "Per-tenant
 SSE-KMS routing" section for the config shape and the KMS key policy
-template, and the ADR-0055 2026-08-12 amendment for a known gap: the
+template, and ADR-0055 for a known gap: the
 `deploy/iam/*.json` role policies do not yet grant access to the new
 `t/*/enc` key, a required follow-up before this ships against an
 already-provisioned bucket.
@@ -466,7 +464,4 @@ Pull the published image, or build natively on an amd64 host, instead.
 - [docs/sql-conformance.md](docs/sql-conformance.md): the SQL surface
   conformance table, classifying every construct as supported,
   intentionally rejected, or unclassified (ADR-0035)
-- [BENCHMARKS.md](BENCHMARKS.md): measured numbers, with the exact
-  commands and environment that produced them
-- [PROGRESS.md](PROGRESS.md): a living log of what shipped, what broke,
-  and what's next
+- [CHANGELOG.md](CHANGELOG.md): released versions and what each contains

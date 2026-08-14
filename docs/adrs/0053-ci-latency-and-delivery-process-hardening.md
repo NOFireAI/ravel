@@ -70,7 +70,7 @@ structurally instead of procedurally.
 
 ### D2. Correct the required-check set
 
-`coverage` leaves the required set and stops running on pull requests
+`coverage` leaves the required set and stops running on PRs
 entirely; it runs on pushes to main (badge and JSON artifact unchanged)
 and its double test execution collapses to one `--no-report` run followed
 by two `report` invocations. `k8s-integration` joins the required set, but
