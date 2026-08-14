@@ -1291,8 +1291,8 @@ mod tests {
         w.finish().expect("finish")
     }
 
-    /// The exact-postings acceptance test (issue #508): every block containing
-    /// a matching record survives postings pruning (soundness), and blocks
+    /// Every block containing a matching record survives postings pruning
+    /// (soundness), and blocks
     /// proven not to contain the term are pruned before bloom or exact scan
     /// (pruning). 12 blocks of 5 records each, `svc` constant within a block
     /// and cycling through 3 values across blocks, so a probe for one value
@@ -1393,20 +1393,20 @@ mod tests {
         assert!(rows.iter().all(|r| (r.ts_ns / 5) % 3 == 0));
     }
 
-    /// End-to-end reproduction (fix-task on epic #479, issue #508 follow-up):
-    /// a one-byte flip of a POSTINGS sparse-index `first_term`, corrupting no
-    /// term block, used to reach `scan` as `postings_degraded == false` and a
-    /// silently narrowed (wrong) result. Four terms `aa, bz, ca, cz` with
-    /// `postings_stride: 2` (one per its own physical block, so a probe hit
-    /// is exactly one row) split into term blocks `B0 = [aa, bz]` and
-    /// `B1 = [ca, cz]`; flipping `B1`'s declared `first_term` from `"ca"` to
-    /// `"ba"` preserves ascending order and every term-block crc, so before
-    /// this fix `RlogReader::new` and `PostingsSection::parse` both accepted
-    /// it and a probe for `"bz"` landed on `B1`, missed, and reported the
-    /// term absent -- baseline 1 row, mutated 0 rows, no error, no counter.
-    /// The whole-section `crc32c` this fix now verifies before `parse`
-    /// catches the flip regardless of which term is probed, degrading to
-    /// bloom + exact scan instead.
+    /// A one-byte flip of a POSTINGS sparse-index `first_term`, corrupting no
+    /// term block, must degrade to bloom + exact scan rather than reach `scan`
+    /// as `postings_degraded == false` with a silently narrowed (wrong)
+    /// result. Four terms `aa, bz, ca, cz` with `postings_stride: 2` (one per
+    /// its own physical block, so a probe hit is exactly one row) split into
+    /// term blocks `B0 = [aa, bz]` and `B1 = [ca, cz]`; flipping `B1`'s
+    /// declared `first_term` from `"ca"` to `"ba"` preserves ascending order
+    /// and every term-block crc, so without a whole-section check
+    /// `RlogReader::new` and `PostingsSection::parse` would both accept it and
+    /// a probe for `"bz"` would land on `B1`, miss, and report the term absent
+    /// -- baseline 1 row, mutated 0 rows, no error, no counter. The
+    /// whole-section `crc32c` verified before `parse` catches the flip
+    /// regardless of which term is probed, degrading to bloom + exact scan
+    /// instead.
     #[test]
     fn corrupted_first_term_header_byte_degrades_instead_of_narrowing() {
         let cfg = RlogConfig {
@@ -1456,7 +1456,7 @@ mod tests {
         );
     }
 
-    /// Soundness (issue #538): a prune equality whose per-record resolution does
+    /// Soundness: a prune equality whose per-record resolution does
     /// NOT match, on a record whose match lives only in its resource/scope
     /// stream attributes, must still return that record. The prune-only channel
     /// drives block pruning alone, so a `service.name` that is a resource
@@ -1502,7 +1502,7 @@ mod tests {
         assert_eq!(
             wrong.len(),
             0,
-            "content wiring drops the resource-only match (the bug #538 fixes)"
+            "content wiring drops the resource-only match"
         );
     }
 
@@ -1516,8 +1516,8 @@ mod tests {
     /// in that column, so it is in no posting list, so probing the term would
     /// prune its block. The merged SQL view
     /// (`ravel_sql::rlog_attrs::merged_attrs`) is the union of both layers and
-    /// needs that record. This is the same union-over-two-layers problem #510
-    /// refused to ship, relocated into the prune channel.
+    /// needs that record. This is the same union-over-two-layers problem,
+    /// relocated into the prune channel.
     ///
     /// Under version 2 the writer indexes the merged view, so the resource-only
     /// records ARE in the `"svc0"` posting list and the prune keeps their block
@@ -1707,7 +1707,7 @@ mod tests {
         body
     }
 
-    /// The soundness case (issue #547): a key that is a resource attribute on
+    /// The soundness case: a key that is a resource attribute on
     /// one stream and a per-record attribute on another. The version 2 writer
     /// indexes the merged view, so every record the merged view matches is
     /// returned AND a block holding no match is actually pruned. Asserted on
@@ -1765,7 +1765,7 @@ mod tests {
         assert!(!stats.postings_degraded);
     }
 
-    /// Record-wins precedence (issue #547): a key present at resource level and
+    /// Record-wins precedence: a key present at resource level and
     /// per-record on the same record indexes the record's value. A probe for the
     /// record's value matches the block; a probe for the (overridden) resource
     /// value prunes it away.
@@ -1961,11 +1961,11 @@ mod tests {
         assert_eq!(section.probe(cid, b"svc0").expect("probe"), None);
     }
 
-    /// Issue #552: a key that is resource-level on EVERY record and per-record
-    /// on none. Before this change it had no FIELD_DIR column, so no posting
-    /// list, so a merged-view prune for it skipped nothing -- the ordinary
+    /// A key that is resource-level on EVERY record and per-record on none.
+    /// Without a FIELD_DIR column it would have no posting list, so a
+    /// merged-view prune for it would skip nothing -- the ordinary
     /// single/few-service OTLP deployment the ADR-0049 amendment was written
-    /// for. Now the writer gives it a stream-level-only column, so the prune
+    /// for. The writer gives it a stream-level-only column, so the prune
     /// proves non-matching blocks absent AND every matching record survives.
     ///
     /// Three streams, one block each: resource `service.name` = svc0 (block 0),
@@ -2009,7 +2009,7 @@ mod tests {
         assert!(!stats.postings_degraded);
     }
 
-    /// Issue #552 soundness: adding a stream-level-only column must NOT turn
+    /// Soundness: adding a stream-level-only column must NOT turn
     /// `equals` (the exact per-record channel) into a merged-view match. A
     /// record whose `service.name` comes solely from its resource blob must not
     /// match a `content` equals for it, because the column carries no per-record
@@ -2053,7 +2053,7 @@ mod tests {
         );
     }
 
-    /// Issue #552 under version 1: a resource-level-only key now has a column
+    /// Under version 1: a resource-level-only key has a column
     /// and a posting list, but a v1 posting list indexes the per-record layer
     /// only, so the conservative rule must decline to prune it (the key is at
     /// stream level). Every merged-view match still reads back; no block is
@@ -2092,7 +2092,7 @@ mod tests {
     }
 
     /// A truncated POSTINGS section on an object whose only indexed field is
-    /// resource-level (the issue #552 shape) still degrades to a typed error
+    /// resource-level still degrades to a typed error
     /// path, never a panic: the scan falls back to bloom + exact scan and sets
     /// `postings_degraded`.
     #[test]
