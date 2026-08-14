@@ -1,22 +1,21 @@
 # ADR-0022: Floating aggregate exactness: allowlisted v1 subset, avg admitted via a sequential UDAF, second-moment family excluded
 
-Status: Accepted (2026-07-28). Resolves the half of review finding F7
-(docs/reviews/2026-07-27-arrow-datafusion-plan-review.md) that the plan
-deferred to a future ADR, and issue #160. Companion to ADR-0013; amends
-the v1 aggregate subset in docs/arrow-datafusion-plan.md section 2.
-Grouped min/max total-order semantics (issue #143) are a sibling gap
-decided separately in ADR-0023; this ADR does not touch them. Whether
-the built-in `sum` should also move to a sequential-fold UDAF (for
-architecture-independent results and so it agrees bit-for-bit with the
-`avg` UDAF this ADR admits) is intentionally out of scope: `sum` is
-already an admitted, shipping, gated aggregate, and changing its output
-bits is a separate decision from the admission policy this ADR sets.
-That question is tracked, not decided, in ADR-0024 (Proposed).
+Status: Accepted
+
+Companion to ADR-0013; amends the v1 aggregate subset it defines. Grouped
+min/max total-order semantics are a sibling gap decided separately in
+ADR-0023; this ADR does not touch them. Whether the built-in `sum` should
+also move to a sequential-fold UDAF (for architecture-independent results
+and so it agrees bit-for-bit with the `avg` UDAF this ADR admits) is
+intentionally out of scope: `sum` is already an admitted, shipping, gated
+aggregate, and changing its output bits is a separate decision from the
+admission policy this ADR sets. That question is tracked, not decided, in
+ADR-0024 (Proposed).
 
 ## Context
 
-The SQL surface's exactness rule (ADR-0013; docs/arrow-datafusion-plan.md
-section 2) requires every DataFusion-executed operator to match an
+The SQL surface's exactness rule (ADR-0013) requires every
+DataFusion-executed operator to match an
 independent reference bit-for-bit, compared by `f64::to_bits`, NaN
 payloads and -0.0 significant. v1 executes aggregation single-partitioned
 above the sort-preserving merge, so input order is deterministic and the
@@ -26,7 +25,7 @@ remaining variable is the accumulator algorithm itself.
 validation (crates/ravel-sql/src/validate.rs, `reject_avg`) with an error
 naming `SUM`/`COUNT` as the workaround, and deregistered in
 `build_session` (crates/ravel-sql/src/session.rs), pending exactly this
-ADR (review F7). Issue #160 then found the same design question asked a
+ADR. A later review then found the same design question asked a
 second time: `stddev`, `var`, `stddev_pop`, `var_pop`, `covar_samp`,
 `covar_pop`, and `corr` carry the same floating-mean accumulator property
 that disqualified `avg`, yet remain registered and reachable through the
@@ -68,16 +67,17 @@ What the pinned datafusion 54.1.0 accumulators actually do
 
 ## Alternatives
 
-1. Keep the built-in accumulators and build references that mirror them
-   (F7 amendment (b); issue #160's second option). Rejected. For `avg`
+1. Keep the built-in accumulators and build references that mirror them.
+   Rejected. For `avg`
    it is impossible: the lane-parallel batch sum has no portable
    sequential equivalent. For the second-moment family it would mean
    pinning, per function, both the Welford path and the grouped
    sum-of-products path, the planner's mode and accumulator selection,
    the lossy merge formula, and the evaluate-time NaN special cases. The
    reference stops being independent and becomes a mirror that agrees
-   with whatever upstream does, which is the failure mode F7 warned
-   about, relocated from the tolerance knob into the reference itself.
+   with whatever upstream does, which is the failure mode the review
+   warned about, relocated from the tolerance knob into the reference
+   itself.
 2. Custom bit-exact UDAFs for the whole family, `avg` and second-moment
    alike. Owned semantics, stable across upgrades, but the second-moment
    half is seven-plus functions of co-moment recurrences, grouped
@@ -153,8 +153,8 @@ What the pinned datafusion 54.1.0 accumulators actually do
    and the `regr_*` regression aggregates, along with every other
    default aggregate outside the admitted set, all through decision 2.
    Readmission of any of them is a custom UDAF meeting decision 1 with
-   its recurrence named in the plan document; that is an implementation
-   ticket plus a plan amendment, not a new ADR.
+   its recurrence documented; that is an implementation task plus a doc
+   amendment, not a new ADR.
 6. **Gate evidence before an admitted function ships**: (a) golden cases
    with stored expected bits for architecture-independent results:
    exact finite sums, signed infinities, -0.0 preservation, empty and
@@ -166,20 +166,20 @@ What the pinned datafusion 54.1.0 accumulators actually do
    bits are sound because `total_cmp` selects an input value and never
    synthesizes one; (c) proptest over the full adversarial pool, grouped
    and ungrouped, asserting bit-identical results; (d) the suite re-runs
-   on every DataFusion version bump per the plan's upgrade policy.
-7. **Sequencing**: two tickets. First, exclusion: decision 2 lands with
-   `avg`/`mean` still excluded, closing issue #160's live unverified
-   surface immediately. Second, admission: decisions 3, 4 and 6 land
-   together, flipping `avg`/`mean` into the allowlist in the same commit
-   as the UDAF and its gate evidence.
+   on every DataFusion version bump per the upgrade policy.
+7. **Sequencing**: two steps. First, exclusion: decision 2 lands with
+   `avg`/`mean` still excluded, closing the live unverified surface
+   immediately. Second, admission: decisions 3, 4 and 6 land together,
+   flipping `avg`/`mean` into the allowlist in the same commit as the
+   UDAF and its gate evidence.
 
 ## Consequences
 
 - `avg` returns to v1 with pinned, documented,
-  architecture-independent semantics; the F7 interim rejection ends when
-  the admission ticket lands, and the rejection error keeps naming
+  architecture-independent semantics; the interim rejection ends when
+  the admission change lands, and the rejection error keeps naming
   `SUM`/`COUNT` until then.
-- Issue #160 is resolved by exclusion, and the aggregate surface becomes
+- The unverified-aggregate gap is resolved by exclusion, and the aggregate surface becomes
   fail-closed under dependency upgrades: the reachable aggregates are
   the enumerated admitted set, nothing else, enforced at both validation
   and registration. The audit acceptance test

@@ -1,13 +1,13 @@
 # ADR-0010: Spec amendments from the first adversarial design review
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 
 An adversarial review of the commit protocol, catalog resolution, RSEG v1,
 object-store contract, and tenant-isolation specs found correctness flaws
-that are cheap to fix before any writer ships and expensive after. Full
-findings live in the review record; this ADR fixes the decisions.
+that are cheap to fix before any writer ships and expensive after. This ADR
+fixes the decisions.
 
 ## Decisions
 

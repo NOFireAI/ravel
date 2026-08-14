@@ -1,20 +1,20 @@
 # ADR-0026: RSEG v5: sparse id index and chunked SERIES_META for the compacted tier
 
-Status: Accepted (2026-07-28); amended by ADR-0027 (2026-07-28): the
-reader accepts v5 only and all writers, L0 included, emit v5.
-Decides issue #175 from the issue #167
-experiment. This ADR records the decision; docs/segment-format.md gains
-its "RSEG v5 amendment" section when the implementation lands, and until
-then nothing in this ADR changes any stored byte. The flag-gated
-prototype merged from #167 (crates/ravel-segment/src/experiment.rs) is
-measurement-grade and is replaced, not promoted, by the implementation.
+Status: Accepted
+
+Amended by ADR-0027: the reader accepts v5 only and all writers, L0
+included, emit v5. This ADR records the decision; docs/segment-format.md
+gains its "RSEG v5 amendment" section when the implementation lands, and
+until then nothing in this ADR changes any stored byte. The flag-gated
+prototype (crates/ravel-segment/src/experiment.rs) is measurement-grade
+and is replaced, not promoted, by the implementation.
 
 ## Context
 
 A selective read against an RSEG object fetches the whole catalog:
 SERIES_IDS and SERIES_META are whole-section objects, so a point lookup
 against a 100k-series object costs 3.05MB to answer a question about
-one series (issue #97, re-measured in #167). At the L0 flush shape
+one series. At the L0 flush shape
 (hundreds of series) this does not matter; the 64KiB suffix probe
 already covers most of the object. It matters exactly where compaction
 is about to take us: L1 objects (ADR-0018) merge many L0 runs and grow
@@ -23,7 +23,7 @@ dominates selective-query cost. This was also the one measured read
 shape where a Parquet layout still beat RSEG (1.6MB for the same
 lookup).
 
-The #167 experiment prototyped two pieces behind a writer flag and
+The experiment prototyped two pieces behind a writer flag and
 measured GET counts and bytes (backend-independent) at 500 / 10k / 100k
 series:
 
@@ -53,8 +53,8 @@ probe. The experiment's decision rule (point lookup at 100k under
    frozen section-kind registry with the implementation.
 
 2. v5 is the default compaction output format. This amends ADR-0018,
-   whose output was v4: the compactor (compaction-retention-plan phase
-   4, issue #111) writes v5. Within v5 the sparse sections are
+   whose output was v4: the compactor writes v5. Within v5 the sparse
+   sections are
    optional: they are emitted when the output object has
    `series_count >= 4096` and omitted below that, where the object
    simply carries the v4-shaped catalog and readers use the legacy
@@ -63,7 +63,7 @@ probe. The experiment's decision rule (point lookup at 100k under
 
 3. L0 writers never emit v5. The measured small-object regression is a
    property of the L0 shape itself, not a tuning artifact. The L0
-   default path remains ADR-0017/issue #140 (v3, readers before
+   default path remains ADR-0017 (v3, readers before
    writers), and this ADR does not change it.
 
 4. The emission threshold is 4096 series. The measurement brackets the
@@ -84,7 +84,7 @@ probe. The experiment's decision rule (point lookup at 100k under
    Section.crc32c. This preserves the reader rule that every byte used
    is checksum-verified (ADR-0010 §4) on the sparse path.
 
-7. Composition with the metric index (ADR-0020, issues #120/#121):
+7. Composition with the metric index (ADR-0020):
    postings prune which segments a query reads; SERIES_IDX prunes what
    a query reads within one segment. The combined selective path is:
    snapshot resolve, postings segment pruning, per-segment footer
@@ -94,7 +94,7 @@ probe. The experiment's decision rule (point lookup at 100k under
 8. Rollout keeps the readers-before-writers discipline used for v2 and
    v3: readers accept versions 1-5 and the sparse read path lands
    before any writer emits version 5. Since no production compactor
-   exists yet (#111 open), there is no flag-flip moment for existing
+   exists yet, there is no flag-flip moment for existing
    data; v5 becomes the default by being what the compactor writes from
    its first release.
 
@@ -102,7 +102,7 @@ probe. The experiment's decision rule (point lookup at 100k under
 
 - The last read shape where Parquet beat RSEG inverts: 92KB against
   1.6MB for a point lookup at 100k series, at +0.48% stored bytes.
-- The case for capping L1 output size on catalog-fetch grounds (#148)
+- The case for capping L1 output size on catalog-fetch grounds
   weakens: lookup cost is bounded by the index, not by object size.
   The size budget question becomes one of compaction work units and
   blast radius, not read amplification.
@@ -110,18 +110,14 @@ probe. The experiment's decision rule (point lookup at 100k under
   in force: readers dispatch on the trailer version, every version
   remains readable indefinitely, and the golden-bytes, fuzz, and
   differential suites extend to v5.
-- The #167 prototype code is deleted when the implementation lands;
+- The prototype code is deleted when the implementation lands;
   its tests (flag-off byte identity, old-reader section skip) migrate
   to the production paths.
 
 ## References
 
-- Issue #167 (experiment, measurement tables), #175 (this decision),
-  #97 (read-path accounting), #148 (L1 size budget), #140 (v3
-  rollout), #111 (compactor), #120/#121 (postings).
 - docs/segment-format.md (v1-v4; v5 amendment to follow with the
-  implementation), docs/compaction-retention-plan.md, ADR-0014,
-  ADR-0017, ADR-0018, ADR-0020.
+  implementation), ADR-0017, ADR-0018, ADR-0020, ADR-0027.
 - bench: crates/ravel-bench selective_read_accounting,
   section_bytes_report; deterministic byte gates in
-  tests/catalog_byte_gates.rs (#166).
+  tests/catalog_byte_gates.rs.

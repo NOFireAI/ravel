@@ -1,6 +1,6 @@
 # ADR-0004: RSEG v1: hand-specified layout, protobuf footer, per-page compression
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 

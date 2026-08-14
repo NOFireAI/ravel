@@ -1,6 +1,6 @@
 # ADR-0021: Full PromQL evaluator scope and phasing, differential harness against pinned Prometheus
 
-Status: Accepted (2026-07-27)
+Status: Accepted
 
 ## Context
 
@@ -10,17 +10,15 @@ until it passes differential tests against a pinned Prometheus binary").
 What exists today is the Phase 1 slice of that decision: a selector-only
 evaluator (instant and range, lookback, offset, all matcher types) in
 crates/ravel-promql, with no function library, no binary operators, no
-aggregations, no subqueries, and no differential harness at all. The
-quality audit (a10) confirmed the gap and its consequence: the evaluator
+aggregations, no subqueries, and no differential harness at all. A
+quality audit confirmed the gap and its consequence: the evaluator
 is validated only against an oracle that shares its own assumptions, and
-a real semantic defect (stale-marker NaNs surfacing as live values,
-a10-F01) went unnoticed because no external oracle exists.
+a real semantic defect (stale-marker NaNs surfacing as live values)
+went unnoticed because no external oracle exists.
 
 This ADR does not reopen ADR-0007's decisions. It records the decisions
 needed to implement the rest of it: evaluator architecture, semantics
 target, exactness policy, harness design, and CI placement.
-docs/promql-evaluator-plan.md is the companion implementer contract with
-the phased plan and tickets.
 
 ## Decision
 
@@ -91,8 +89,7 @@ the phased plan and tickets.
    surface ADR-0007 declared gate-worthy; a nightly-only gate would let
    a semantics regression merge and surface a day later with the
    offending PR unidentified. Failing runs archive the query, dataset
-   seed, and both raw JSON responses as CI artifacts (mirroring
-   docs/benchmarking.md's raw-output discipline).
+   seed, and both raw JSON responses as CI artifacts.
 
 6. **Scope boundary: native histograms are explicitly out.** The
    function library ships its classic-bucket histogram forms
@@ -141,10 +138,10 @@ the phased plan and tickets.
   types out) is preserved, but ravel-query's prefetch contract changes
   from "the one selector's window" to "every selector window the plan
   reports"; docs/query-engine.md is updated in the same phase.
-- Known audit findings on this surface (a10-F01 staleness, a10-F03
-  unbounded grid) are fixed as part of the evaluator-core phase rather
-  than patched separately, and issue #10 (paren unwrap) becomes an
-  explicit prerequisite landed before the core phase.
+- Known defects on this surface (staleness handling, unbounded grid) are
+  fixed as part of the evaluator-core phase rather than patched
+  separately, and the paren-unwrap fix becomes an explicit prerequisite
+  landed before the core phase.
 - A future Prometheus pin bump can surface upstream behavior changes as
   corpus diffs; that is the designed failure mode (drift becomes
   visible), same consequence ADR-0007 already accepted.

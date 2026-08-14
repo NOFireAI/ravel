@@ -9,9 +9,6 @@ how to turn it on, what a client sees, and what happens when something fails.
 For the engine-internal specification (slice partitioning, the merge order,
 the budget re-enforcement rules, the credential model) read
 [query-engine.md](../query-engine.md#intra-cluster-read-fan-out-adr-0071).
-For the as-built status of the epic that delivered it, including the two
-places the shipped code deviates from the original design, read
-[the status addendum](../reviews/2026-08-adversarial-program/RAVEL-DISTRIBUTED-SEARCH-STATUS.md).
 
 Contents:
 
@@ -74,12 +71,10 @@ byte-identical to a build without the flag. A third flag,
 `--max-parallel-slices` (default 8), caps how many slices one query fans out
 into, and therefore how many concurrent remote fetches it can start.
 
-The defaults are ADR-0071's initial gate, set before the crossover benchmark
-had a store-latency-bearing environment to run in. On a zero-latency store the
-fan-out is pure overhead (see the `distrib_crossover` panel in
-[BENCHMARKS.md](../../BENCHMARKS.md)); it pays off when object-store latency,
-not CPU, is the bound. Tune both thresholds against your own store before
-leaving the defaults in place.
+The defaults are ADR-0071's initial gate. On a zero-latency store the
+fan-out is pure overhead; it pays off when object-store latency, not CPU, is
+the bound. Tune both thresholds against your own store before leaving the
+defaults in place.
 
 ## The lifecycle of a distributed query
 
@@ -561,9 +556,7 @@ Deliberately, in this generation:
   ingest shard makes an oversized slice, because a shard is never split.
 - **Client-visible multi-endpoint Flight SQL.** The Flight SQL surface returns
   exactly one endpoint to a client, whatever the fan-out does behind it. Slice
-  tickets are an internal coordinator-to-worker contract; see
-  [the status addendum](../reviews/2026-08-adversarial-program/RAVEL-DISTRIBUTED-SEARCH-STATUS.md)
-  for why.
+  tickets are an internal coordinator-to-worker contract.
 
 ## See also
 
@@ -574,8 +567,6 @@ Deliberately, in this generation:
   re-enforcement.
 - [architecture.md](../architecture.md#distributed-reads-and-cross-cluster-federation-adr-0071):
   where the distributed role sits among the services.
-- [RAVEL-DISTRIBUTED-SEARCH-STATUS.md](../reviews/2026-08-adversarial-program/RAVEL-DISTRIBUTED-SEARCH-STATUS.md):
-  what shipped, the two as-built deviations, and what remains.
 - [operations.md](operations.md): the full flag and environment reference.
 - [observability.md](observability.md): reading `/metrics` and per-query cost.
 - [consistency-model.md](../consistency-model.md): the snapshot, deadline, and

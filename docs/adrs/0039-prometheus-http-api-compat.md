@@ -1,11 +1,11 @@
 # ADR-0039: Prometheus HTTP API compatibility surface for Grafana
 
+Status: Accepted
+
 ## Context
 
-Epic: Prometheus drop-in (issue TBD, filed alongside this ADR).
-
 Ravel's PromQL query surface is further along than README.md and
-PROGRESS.md currently claim. A codebase survey for this epic found:
+PROGRESS.md currently claim. A codebase survey found:
 
 - Aggregation operators (`sum`, `avg`, `min`, `max`, `count`, `group`,
   `stddev`, `stdvar`, `topk`, `bottomk`, `quantile`, `count_values`) are
@@ -15,16 +15,14 @@ PROGRESS.md currently claim. A codebase survey for this epic found:
   `plan.rs`, `functions/mod.rs`). The one gap is a subquery whose matched
   series carry native histogram data, which is rejected with a typed
   `Error::Unsupported` (422) rather than silently dropping data
-  (`eval.rs:939-960`, tracked separately as issue #220 - a real but
-  narrow gap, not blocking this epic).
+  (`eval.rs:939-960`) - a real but narrow gap.
 - Remote Write 1.0/2.0 ingest is implemented (`crates/ravel-remote-write`)
   and mounted at `POST /api/v1/write` (`services/ravel-server/src/
   remote_write.rs`), with admission limits at parity with the OTLP path.
 
 None of this is a decision this ADR needs to make; it is a documentation
 currency bug (README/PROGRESS say "planned" or "does not work yet" for
-behavior that has shipped), fixed as part of this epic's last wave per
-CLAUDE.md's doc-currency rule.
+behavior that has shipped), fixed per CLAUDE.md's doc-currency rule.
 
 What remains a genuine gap, and what this ADR is actually about: Grafana's
 built-in Prometheus datasource, on "Save & Test" and periodically after,
@@ -56,8 +54,7 @@ additive only, no existing route changed:
    empty `data` object is a valid, honest answer under Prometheus's own
    contract (an empty result is not an error) rather than inventing
    metadata Ravel doesn't have. A future epic can populate it for real if
-   OTLP metric descriptors get captured; that is out of this epic's
-   scope.
+   OTLP metric descriptors get captured; that is out of scope here.
 3. `GET /-/healthy` and `GET /-/ready`: thin aliases over the existing
    `/healthz`/`/readyz` handlers (`services/ravel-server/src/health.rs`).
    No new health logic. These are Prometheus's own path convention,
@@ -83,8 +80,8 @@ additive only, no existing route changed:
   like a real Prometheus release**, so version-gated Grafana features
   assume full parity. Rejected: dishonest, and brittle the moment a
   Grafana feature checks a real Prometheus version constraint Ravel
-  doesn't actually meet (e.g. a PromQL construct still gated behind
-  issue #220 or a future gap). Honest version string, real supported
+  doesn't actually meet (e.g. a PromQL construct still gated behind a
+  current or future gap). Honest version string, real supported
   surface.
 - **Populate `/api/v1/metadata` with inferred placeholder type/help
   strings** (e.g. guessing `counter` vs `gauge` from naming convention).
@@ -101,5 +98,5 @@ additive only, no existing route changed:
 - `/api/v1/metadata` returning empty is a known, visible limitation until
   a later epic captures real OTLP metric descriptors; not silently
   degraded, documented in docs/query-engine.md.
-- Issue #220 (native-histogram subquery) stays open, tracked separately,
-  and does not block this epic's "Grafana works day one" acceptance bar.
+- The native-histogram subquery gap stays open, tracked separately, and
+  does not block the "Grafana works day one" acceptance bar.

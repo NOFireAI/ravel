@@ -1,23 +1,17 @@
 # ADR-0050: Fail-closed isolation and startup invariants
 
-Status: Proposed (2026-08-02)
-
-Refs: epic #453 (program #450). Remediates adversarial-review findings
-S4-08, S4-02, S5-23/S4-15/S1-08, S1-03/S5-22, S1-06/S2-10, S5-20, and
-S5-10 (docs/reviews/adversarial/RAVEL-ADVERSARIAL-REVIEW.md, sections B,
-D and J.1).
+Status: Accepted
 
 ## Context
 
-The adversarial review found one consistent pattern across the isolation
-and startup surface: controls that the design promises are, in the
-running binary, either advisory (a doc comment), degrade-open (a
-`tracing::warn!` plus fallback), or absent. This ADR decides the
-fail-closed shape for seven of those findings. Each finding was
-re-verified against current `main` before designing for it; the review
-is stale or wrong on two points, noted below.
+One consistent pattern runs across the isolation and startup surface:
+controls that the design promises are, in the running binary, either
+advisory (a doc comment), degrade-open (a `tracing::warn!` plus
+fallback), or absent. This ADR decides the fail-closed shape for seven
+of them. Each was re-verified against current `main` before designing
+for it; two points were stale or wrong, noted below.
 
-**S4-08, confirmed.** `MtlsResolver`
+**The mTLS resolver is unverified.** `MtlsResolver`
 (crates/ravel-query/src/http/tenant.rs:389-449) maps the plain
 `x-ravel-client-cert-cn` header to a `TenantId` with no verification.
 `build_auth_resolver` (services/ravel-server/src/tenant.rs:82) installs
@@ -29,7 +23,7 @@ bypass. Nothing enforces the documented trust precondition; enabling
 `--mtls-enabled` hands tenant selection to any client that can reach any
 listener whose header path is not stripped by a proxy.
 
-**S4-02, confirmed.** Commit-record decode fails closed on a foreign
+**The snapshot fast path degrades open on a foreign `tenant_hash`.** Commit-record decode fails closed on a foreign
 `tenant_hash`, but the snapshot fast path degrades open: a `tenant_hash`
 mismatch on the catalog HEAD (snapshot_resolve.rs:332-333) or on a
 postings object (snapshot_resolve.rs:275-276) logs a warning and falls
@@ -40,9 +34,9 @@ on the same HEAD is already a hard `CatalogError::FieldMismatch`
 (snapshot_resolve.rs:340-346), so the loud-error precedent exists in the
 same function.
 
-**S5-23 / S4-15 / S1-08, confirmed and worse than reported.** The review
-describes the deployment-keyed tenant hash as opt-in. It is not
-implemented at all. `TenantId::hash()` (crates/ravel-types/src/lib.rs:55)
+**The deployment-keyed tenant hash is not implemented.** It was
+described as opt-in; it is not implemented at all.
+`TenantId::hash()` (crates/ravel-types/src/lib.rs:55)
 is unkeyed BLAKE3 over `"ravel-tenant-v1" || tenant_id`, and no keyed
 derivation or key-loading config exists anywhere in the workspace. The
 normative docs are wrong on this point: docs/catalog-and-mvcc.md:43-44
@@ -53,7 +47,7 @@ switching the hash later relocates every object of every tenant, so this
 is the one decision here that gets structurally harder with every byte
 ingested.
 
-**S1-03 / S5-22, confirmed.** `protection_horizon >= max_query_duration
+**The GC protection constraint lives in three unlinked configs.** `protection_horizon >= max_query_duration
 + grace` protects every pinned reader from the GC sweeper, and it lives
 in three unlinked per-process configs: the maintain sweep config
 (crates/ravel-maintain/src/config.rs:83-86, a doc comment saying "must
@@ -63,8 +57,8 @@ satisfy"), the query deadline (crates/ravel-query/src/config.rs,
 is no process-wide GC configuration to read). Nothing validates the
 constraint anywhere, and the three values can be deployed independently.
 
-**S1-06 / S2-10, confirmed with a nuance.** `shard_count` lives only in
-process config (crates/ravel-catalog/src/config.rs:47,
+**`shard_count` lives only in process config**
+(crates/ravel-catalog/src/config.rs:47,
 crates/ravel-ingest/src/config.rs:33). Resolution iterates
 `0..config.shard_count` (catalog.rs:289), so a lower configured value
 silently omits every series in the missing shards. The one existing
@@ -72,9 +66,9 @@ check — the fold HEAD carries `shard_count` (proto/ravel/catalog.proto
 field 4) and resolve errors loudly on mismatch — fires only when a
 Phase 2 snapshot HEAD exists and is readable. Phase 1 listing, fresh
 tenants, and every path before the first fold are silent, which is
-exactly experiment S1-E6's failure.
+exactly the missing-shard failure.
 
-**S5-20, confirmed.** `Capabilities`
+**Store capabilities are asserted, never exercised.** `Capabilities`
 (crates/ravel-object-store/src/lib.rs:287) is a struct the backend
 constructor fills in; `check_capabilities`
 (services/ravel-server/src/store.rs) compares flags against
@@ -83,17 +77,17 @@ store that advertises `consistent_list` but delivers eventual listing
 silently violates the seal lemma and can make orphan-GC re-verify see
 false absence.
 
-**S5-10, confirmed, but the review is stale on the surrounding facts.**
+**`/readyz` never reflects store health, though the surrounding facts have moved.**
 `/readyz` is a startup-completion latch that never flips back
 (services/ravel-server/src/health.rs), performing no store I/O by
-documented design. However, the review's claim that Ravel has no metrics
+documented design. However, the earlier claim that Ravel has no metrics
 surface is no longer true: `GET /metrics` exists on every mode's HTTP
-listener (ADR-0044 section 4, issue #423,
+listener (ADR-0044 section 4,
 services/ravel-server/src/metrics.rs), which changes the design space —
 a background store-probe gauge now has somewhere to land. Separately,
 `--maintain-tenant` now exists (services/ravel-server/src/config.rs:60),
-partially addressing the review's B10; that finding is outside this
-epic's scope but the staleness is noted for the record.
+partially addressing the maintenance-coverage gap; that is outside this
+scope but the staleness is noted for the record.
 
 ### Frozen-format impact
 
@@ -152,9 +146,8 @@ The operator contract becomes: point the TLS-terminating,
 header-stripping proxy at the mTLS listener and nothing else at it
 (network policy); the public listeners are safe against header forgery
 by construction, not by proxy hygiene. Misconfiguration is a refusal to
-start, never a warning. Experiment L8 (forged header on the Flight
-listener) passes because the Flight listener's chain cannot resolve the
-header at all.
+start, never a warning. A forged header on the Flight listener is inert
+because the Flight listener's chain cannot resolve the header at all.
 
 ### 2. `tenant_hash` mismatch fails closed everywhere
 
@@ -217,7 +210,7 @@ built; a deployment that requires enumeration resistance starts a new
 keyed bucket and drains into it operationally. This is stated in the
 operations guide.
 
-**Key custody (S1-08).** For keyed buckets the deployment key becomes
+**Key custody.** For keyed buckets the deployment key becomes
 tier-0 durable state outside the bucket, and the docs say so: losing it
 makes every `t/<hash>/` prefix unattributable — bytes intact, data
 gone. Two mitigations ship with the feature: the fingerprint in
@@ -277,7 +270,7 @@ loser re-reads and validates. Consumers:
   serve a subset of shards.
 - The existing fold-HEAD `shard_count` check stays; the record extends
   the same loud `FieldMismatch` semantics to Phase 1 listing and fresh
-  tenants, closing the S1-E6 window.
+  tenants, closing the missing-shard window.
 
 **Adoption for pre-ADR data.** A (tenant, signal) with data but no
 record is adopted exactly once, at first ingest or maintenance touch:
@@ -314,7 +307,7 @@ below the binary's required floor; `MemoryStore` (the semantics oracle)
 is exempt. Qualification is once per bucket, not per boot: a per-boot
 probe would add write cost and fleet-restart herding while adding no
 proof, and a backend that regresses after qualification is exactly what
-the S4-02 hard errors, the fold-divergence checks, and `catalog verify`
+the tenant_hash hard errors, the fold-divergence checks, and `catalog verify`
 exist to catch downstream.
 
 ### 7. `/readyz` reflects store reachability, with hysteresis
@@ -385,7 +378,7 @@ where nothing consumes readiness.
    explicit durable record with explicit adoption.
 10. **Keep relying on the fold-HEAD `shard_count` check alone (status
     quo).** Absent for fresh tenants and for Phase 1 listing — exactly
-    the S1-E6 window. Lost because the record closes the window the
+    the missing-shard window. Lost because the record closes the window the
     existing check structurally cannot.
 11. **Run the conformance probe at every server startup.** Repeated
     write cost, thundering-herd on fleet restarts, and false comfort — a
@@ -398,8 +391,8 @@ where nothing consumes readiness.
 13. **`/readyz` performs a live store call per probe.** Kubelet-frequency
     S3 cost and single-blip fleet ejection — the objections health.rs
     already documents are correct. Lost to the background probe.
-14. **Keep `/readyz` green and export only a metrics gauge (the review's
-    own S5-10 mitigation).** Leaves the one interface Kubernetes acts on
+14. **Keep `/readyz` green and export only a metrics gauge.** Leaves the
+    one interface Kubernetes acts on
     lying during the exact outage it exists to signal, and deployments
     without alerting stay blind. Lost because hysteresis removes the
     mass-ejection objection that motivated it.
@@ -436,10 +429,10 @@ where nothing consumes readiness.
   deployments gated on readiness will (correctly) halt while the store
   is unreachable. The operations guide documents this and the K-failure
   hysteresis knobs.
-- Experiments L8 (forged mTLS header), S1-E6 (lower `shard_count` on
-  restart), and S5-E4 (`/readyz` under store outage) become automated
-  tests; S4-02's isolation fault becomes observable at `/metrics`.
+- Forged mTLS header, lower `shard_count` on restart, and `/readyz`
+  under store outage become automated tests; the isolation fault becomes
+  observable at `/metrics`.
 - Not solved here, explicitly: resharding (needs a shard-epoch ADR),
-  per-tenant credentials (S4-03, program-level), and per-tenant KMS
-  (S4-04). Nothing in this ADR forecloses them; the provisioning record
+  per-tenant credentials, and per-tenant KMS. Nothing in this ADR
+  forecloses them; the provisioning record
   gives a future epoch map a durable home.

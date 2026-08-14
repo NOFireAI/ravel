@@ -213,8 +213,8 @@ key as a per-record attribute. An **indexed** field (POSTINGS, below) is the
 one exception: if the writer was told to index a name (`with_indexed_fields`)
 that appears only at stream level (a resource or scope attribute) across the
 whole object and per-record on no record, that `(name, type)` still gets a
-column, so its merged-view postings have a `column_id` to key by (ADR-0049,
-issue #552). Such a column is a POSTINGS key, not a materialized value: no
+column, so its merged-view postings have a `column_id` to key by (ADR-0049).
+Such a column is a POSTINGS key, not a materialized value: no
 row writes a per-record value to it, so it is all-null in every block, its
 `present_blocks` is 0, and the reader's exact per-record equality on the key
 still reads only the per-record layer (it never resolves against the resource
@@ -473,7 +473,7 @@ and an entry index outside `[0, count)`.
 
 ## POSTINGS
 
-Optional (ADR-0049, issue #508). Exact block-level pruning for equality
+Optional (ADR-0049). Exact block-level pruning for equality
 predicates on dynamic attribute fields the writer was told to index
 (`RlogWriter::with_indexed_fields`), a stronger complement to BLOOM: a
 bloom probe can only prove absence with a false-positive rate, but a
@@ -582,20 +582,17 @@ apart from the bytes, which is why the version byte exists.
   per-record attributes, the record winning on a key collision (the view
   `ravel_sql::rlog_attrs::merged_attrs` computes for the `attrs` column). A
   reader prunes a merged-view query directly. This is the version the writer
-  emits (ADR-0049 amendment 2026-08-03, issue #547).
+  emits (ADR-0049 amendment).
 
-Issue #552 completed the version-2 writer, which until then indexed a
-merged-view key only when it also had a per-record column; a key that was
-resource- or scope-level across the whole object (the ordinary OTLP
-`service.name` shape) got no column and so no posting list, and pruned
-nothing. The writer now gives such a key a stream-level-only FIELD_DIR column
-(above), so its merged-view postings exist. This added no version bump: it
-adds entries under the existing version-2 meaning (a posting list indexes the
-merged view) rather than changing what a posting list means, so the bytes and
-their interpretation are unchanged. An old version-2 object simply carries no
-posting list for a resource-only key, which a reader handles as "no
-information" (probe returns `Ok(None)`, no prune) exactly as for any
-unindexed field.
+The version-2 writer gives a merged-view key that is resource- or scope-level
+across the whole object (the ordinary OTLP `service.name` shape) a
+stream-level-only FIELD_DIR column (above), so its merged-view postings exist
+even without a per-record column. This adds entries under the existing
+version-2 meaning (a posting list indexes the merged view) rather than
+changing what a posting list means, so the bytes and their interpretation are
+unchanged. A version-2 object that carries no posting list for a given key is
+handled as "no information" (probe returns `Ok(None)`, no prune) exactly as
+for any unindexed field.
 
 A reader accepts both versions. Stored version-1 objects are not rewritten,
 so the conservative rule keeps them correct with no migration.
@@ -611,7 +608,7 @@ legality, needs a trailer version bump and an ADR.
 
 ## Compaction (L0 → L1)
 
-Compaction (ADR-0032, issue #231) rewrites many small L0 `.rlog` flush
+Compaction (ADR-0032) rewrites many small L0 `.rlog` flush
 objects for one sealed `(tenant, shard, ingest-hour)` bucket into a
 handful of large L1 parts, the log analogue of RSEG's L0→L1 compaction
 (ADR-0018). It lives in `ravel-maintain` behind a per-signal codec seam;

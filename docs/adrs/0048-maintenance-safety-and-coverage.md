@@ -1,25 +1,20 @@
 # ADR-0048: Maintenance safety and coverage
 
-Status: Accepted (2026-08-02)
+Status: Accepted
 
 ## Context
 
-Epic EA (issue #451, program issue #450) remediates five maintenance
-findings from the adversarial architecture review
-(docs/reviews/adversarial/RAVEL-ADVERSARIAL-REVIEW.md, sections B4, B7,
-B10, G.1, J.1): legal hold is dead code in every production path (S4-01,
-S1-04, S5-05); the maintenance tenant set is derived from CLI flags, so
-an OIDC- or mTLS-only deployment maintains nothing (S2-17, S5-09);
-orphan GC has no mass-orphan circuit breaker, so out-of-band
-commit-record loss converts into physical data loss on a ~25 h fuse
-(S5-03, J.1 item 2; the epic ledger also cites S5-11, whose
-namespace-deletion blast radius the breaker reduces for the commit
-prefix); compaction publishes with no record-count conservation check
-(S2-03); and the orphan-GC re-verify pays a full-shard LIST per deletion
-candidate (S1-15).
+This work remediates five maintenance gaps: legal hold is dead code in
+every production path; the maintenance tenant set is derived from CLI
+flags, so an OIDC- or mTLS-only deployment maintains nothing; orphan GC
+has no mass-orphan circuit breaker, so out-of-band commit-record loss
+converts into physical data loss on a ~25 h fuse (the same breaker also
+reduces the namespace-deletion blast radius for the commit prefix);
+compaction publishes with no record-count conservation check; and the
+orphan-GC re-verify pays a full-shard LIST per deletion candidate.
 
-Each finding was re-verified against current `main` before this design.
-The review is current on most points and stale on two:
+Each gap was re-verified against current `main` before this design.
+Most points hold; two were already partly addressed:
 
 - **Confirmed current.** Both shipped maintenance drivers pass
   `&NoLeases` into retention/compaction and the sweeper
@@ -37,14 +32,14 @@ The review is current on most points and stale on two:
   commit prefix of the shard (`referenced_l0_identities`) once per
   deletion candidate, and no circuit breaker of any kind exists in the
   sweep or retention paths.
-- **Stale: the observability claim.** The review (S5-01, B10) states
+- **The observability claim is stale.** An earlier assessment stated
   Ravel exports no runtime telemetry. Since then ADR-0044 section 4
   landed: `GET /metrics` is mounted unconditionally in every mode
   (services/ravel-server/src/metrics.rs, services/ravel-server/src/lib.rs),
   with a typed label allowlist that already includes `tenant_hash` and
   `signal`. The alarm surfaces in this ADR are therefore new counter and
   gauge families on that existing endpoint, not a new endpoint.
-- **Partially stale: the tenant-set finding.** Issue #398 added a
+- **The tenant-set finding is partly stale.** A prior change added a
   `--maintain-tenant` flag, `merge_fold_tenants`
   (services/ravel-server/src/config.rs:417), and a startup warning when
   OIDC/mTLS is configured but the merged list is empty
@@ -53,15 +48,15 @@ The review is current on most points and stale on two:
   operator hand-maintaining a list that storage already knows, and the
   warning fires only when the list is entirely empty. A stale-but-
   non-empty list (a tenant onboarded via OIDC after deployment) is
-  silent, exactly the failure class S2-17/S5-09 describe.
+  silent, exactly the failure class this addresses.
 
-One design constraint discovered during verification shapes the S1-15
-remediation: an L0 data key
+One design constraint discovered during verification shapes the
+re-verify remediation: an L0 data key
 (`t/<tenant>/<sig>/l0/<shard>/<writer>.<epoch>.<seq>.<hash16>.rseg`)
 does not carry the flush's pinned ingest hour. The hour exists only in
 commit keys and in signal-specific object footers, and the sweeper is
-deliberately signal-generic (key-only, never a segment byte). The
-review's suggested "scope the re-verify LIST to the candidate's hour
+deliberately signal-generic (key-only, never a segment byte). A naive
+fix of "scope the re-verify LIST to the candidate's hour
 bucket" is therefore not directly implementable without breaking that
 design; the decision below achieves the same cost bound differently.
 
@@ -148,7 +143,7 @@ prefixes excluded by the restriction are counted, not silently ignored.
 Discovery failure (the LIST errors) skips the whole cycle with a logged
 warning and a failure counter; the supervisor never treats a failed
 enumeration as "no tenants", because an empty run is indistinguishable
-from healthy idleness, which is the exact silence S5-09 describes.
+from healthy idleness, which is the exact silence this design removes.
 
 **What alarms.** Three families on the existing `/metrics` endpoint,
 with default alert rules shipped in the operations guide:
@@ -158,7 +153,7 @@ with default alert rules shipped in the operations guide:
 and when `maintained == 0` in a mode that runs maintenance),
 `ravel_maintain_tenant_discovery_failures_total` (counter; alert on
 increase). The `maintained < discovered` condition is exactly "a prefix
-has data but no maintaining owner" from J.1 item 3: under this design it
+has data but no maintaining owner": under this design it
 can only arise from the deliberate flag restriction or a discovery
 fault, and both are visible.
 
@@ -206,7 +201,7 @@ suspect, so no automatic resume exists (rejected alternative 3).
 
 ### 5. The orphan re-verify is batched, once per pass
 
-The per-candidate full-shard LIST (S1-15) is replaced by phase (b)
+The per-candidate full-shard LIST is replaced by phase (b)
 above: exactly one fresh strongly consistent LIST of the commit prefix
 per pass, between candidate selection and the delete phase, shared by
 every candidate. Cost drops from O(candidates x commit records) LIST
@@ -220,7 +215,7 @@ between the first listing and the delete. Batching narrows its window
 from "immediately before each delete" to "after candidate selection,
 before the pass's deletes" — a window still bounded by one pass's
 delete loop, protecting against the same class of straggler. The
-hour-scoped per-candidate variant the review suggested is rejected
+hour-scoped per-candidate variant is rejected
 because the candidate's pinned hour is not derivable from the data key
 (Context above; rejected alternative 4).
 docs/consistency-model.md's "Deletion and GC" wording is updated in the
@@ -271,7 +266,7 @@ calling `publish_record` with mismatched parts.
    would need a write path, a repair path, and a new mutable object
    kind (a key-layout change), and buys nothing at current scale where
    one delimited LIST enumerates every tenant. Revisit only if tenant
-   counts make the per-cycle LIST material (J.2 territory).
+   counts make the per-cycle LIST material.
 3. **Automatic breaker resume (server retries or auto-clears after N
    ticks or after a re-verify).** Lost because in the mass-orphan state
    the system's only signal — commit-record absence — is exactly what
@@ -280,12 +275,11 @@ calling `publish_record` with mismatched parts.
    breaker. Only a human can distinguish mass record loss from a
    legitimate mass abandonment, so the halt stays sticky until a
    deliberate, flagged, one-shot CLI override.
-4. **Hour-scoped re-verify per candidate (S1-15's literal
-   mitigation).** Lost because the L0 data key carries no ingest hour;
-   recovering the pinned hour needs either signal-specific footer reads
-   (breaking the sweeper's key-only, signal-generic design) or a
-   guessed hour window from `last_modified` (reintroducing a clock
-   assumption into a delete path, which G9 warns about). The batched
+4. **Hour-scoped re-verify per candidate.** Lost because the L0 data
+   key carries no ingest hour; recovering the pinned hour needs either
+   signal-specific footer reads (breaking the sweeper's key-only,
+   signal-generic design) or a guessed hour window from `last_modified`
+   (reintroducing a clock assumption into a delete path). The batched
    single-LIST re-verify reaches the same O(1)-LISTs-per-pass cost with
    no new assumptions.
 5. **Post-publish conservation audit (verify-custody-style) instead of
@@ -296,8 +290,8 @@ calling `publish_record` with mismatched parts.
    and the loss is permanent. The pre-publish gate costs one addition
    per input over values already in memory and closes the window to
    zero.
-6. **Keeping flag-derived tenant sets and relying on issue #398's
-   `--maintain-tenant` plus the startup warning.** Lost because it
+6. **Keeping flag-derived tenant sets and relying on the existing
+   `--maintain-tenant` flag plus the startup warning.** Lost because it
    makes lifecycle coverage depend on an operator hand-synchronizing a
    flag list with tenant onboarding, and the warning only fires when
    the list is entirely empty: a stale non-empty list (one OIDC tenant
@@ -306,11 +300,10 @@ calling `publish_record` with mismatched parts.
 
 ## Consequences
 
-- Experiments L2, L3, and L5 from the review's section L become passing
-  tests: an OIDC-only server maintains every tenant with data (L2), a
-  held bucket survives a retention tick through real server wiring and
-  a production mechanism exists to set the hold (L3), and a lossy merge
-  aborts before publish (L5).
+- Three acceptance scenarios become passing tests: an OIDC-only server
+  maintains every tenant with data, a held bucket survives a retention
+  tick through real server wiring and a production mechanism exists to
+  set the hold, and a lossy merge aborts before publish.
 - Deletion breadth increases by design: tenants that previously had no
   maintenance (OIDC/mTLS deployments) start being compacted and swept
   on upgrade. Age-based retention remains opt-in via the existing
@@ -336,10 +329,10 @@ calling `publish_record` with mismatched parts.
   on the existing ADR-0044 `/metrics` endpoint within its existing
   label allowlist (`tenant_hash`, `signal`, `mode`); default alert
   rules and the breaker-override runbook (including the
-  stop-maintain-first step from the review's B1 mitigation) land in
+  stop-maintain-first step) land in
   docs/guides/operations.md in the same commits as the behavior.
 - Out of scope, deliberately: the footer-derived commit-record
-  reconstruction tool (the other half of closing S5-03), per-tenant
+  reconstruction tool (the other half of that remediation), per-tenant
   quotas, and the credential split. The breaker bounds the blast radius
   of record loss to "halted and alarmed" but does not repair it; the
   rebuild tool is its own piece of work.

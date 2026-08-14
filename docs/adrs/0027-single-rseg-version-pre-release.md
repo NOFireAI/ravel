@@ -1,14 +1,15 @@
 # ADR-0027: Single supported RSEG version until first release
 
-Status: Accepted (2026-07-28). Implementation: #179, building on the
-RSEG v5 implementation (#176, ADR-0026). This ADR changes the format
-lifecycle policy, not any byte of the v5 layout.
+Status: Accepted
+
+This ADR changes the format lifecycle policy, not any byte of the v5
+layout, building on the RSEG v5 implementation (ADR-0026).
 
 ## Context
 
 RSEG has five versions. v1 is the original layout with the
 SERIES_TABLE catalog, v2 replaced that catalog with the columnar
-SERIES_IDS/SERIES_META pair (ADR-0014), v3 added native histogram
+SERIES_IDS/SERIES_META pair, v3 added native histogram
 pages (ADR-0017), v4 is the multi-run compaction output (ADR-0018),
 and v5 adds the sparse id index and chunked SERIES_META for the
 compacted tier (ADR-0026). Every bump kept the earlier versions
@@ -17,6 +18,17 @@ golden-byte and differential suites pin the old layouts, ravel-bench
 carries per-version builders for cross-version comparisons, and
 docs/segment-format.md is written as a v1 baseline plus four
 amendment layers.
+
+The columnar catalog that v5 uses originates in the v2 redesign, which
+replaced the v1 SERIES_TABLE with two sections: SERIES_IDS (raw sorted
+ids, stored uncompressed because BLAKE3 ids are incompressible and gain
+nothing from zstd) and SERIES_META (a schema dictionary of label-name
+lists followed by per-field varint columns: schema refs, value
+ordinals, sample counts, footer-relative timestamp bounds, and gap/len
+page addressing). That redesign also relaxed the sorted-LABEL_DICT rule
+so the writer skips a distinct-string sort, and bundled the VAL_RAW_F64
+8-byte alignment rule so raw-f64 pages support Arrow zero-copy views.
+Both the columnar split and the alignment rule carry forward into v5.
 
 That compatibility surface protects nobody today. Ravel has not been
 released; no deployment outside development holds RSEG objects, and
@@ -40,9 +52,9 @@ data nobody depends on.
    identical to v4's, differing only in the trailer version bytes, so
    small L0 objects pay nothing for the bump; the emission threshold,
    not the writer tier, is what protects small objects. The one-flip
-   question tracked in #140 (which version L0 should move to)
-   dissolves: there is only one version to write.
-   Addendum (2026-07-28, from the #179 implementation): an L0 flush is
+   question of which version L0 should move to dissolves: there is only
+   one version to write.
+   Addendum: an L0 flush is
    not a compaction output, so the raw-sample write adapters stamp
    sentinel compaction-meta values: level 0, part_index 0, an all-zero
    input_set_hash, and per-run created_unix_ns equal to
@@ -73,8 +85,8 @@ data nobody depends on.
    version becomes a breaking change requiring its own ADR.
 8. Documentation follows the code: docs/segment-format.md becomes a
    self-contained specification of the current version, not a baseline
-   plus an amendment chain. History lives in the ADRs. ADR-0014 is
-   superseded (the v2 layout is gone); ADR-0017 and ADR-0018 are
+   plus an amendment chain. History lives in the ADRs. The v2 columnar
+   catalog layout is gone; ADR-0017 and ADR-0018 are
    amended, not superseded, because the histogram value model and the
    compaction design they decided continue in v5; ADR-0026 is amended
    on its reader-version-range and L0-emission clauses by points 1 and
@@ -89,7 +101,6 @@ data nobody depends on.
   visibly (typed UnsupportedVersion), never silently. Wipe or
   re-ingest.
 - Cross-version byte-comparison benches lose their comparison basis
-  and are removed; their recorded numbers in BENCHMARKS.md stand as
-  the historical record. #94, which gates a v2 decode ratio against
-  the removed v1 path, becomes obsolete; #140 is superseded by
-  decision 2.
+  and are removed. A gate that measured a v2 decode ratio against the
+  removed v1 path becomes obsolete, and the L0 version-flip question is
+  superseded by decision 2.

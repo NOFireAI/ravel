@@ -1,10 +1,11 @@
 # ADR-0033: SQL query over logs (log storage phase 3)
 
-Status: Proposed. Builds on ADR-0013 (Arrow/DataFusion SQL integration),
-ADR-0029 (RLOG v1 log segment), the approved log-storage design
-(docs/superpowers/specs/2026-07-28-log-storage-design.md, "Query"
-section, phase 3), and log storage phases 1-2 (merged: `ravel-logseg`,
-OTLP log ingest over HTTP/gRPC, durable to the `l` keyspace).
+Status: Accepted
+
+Builds on ADR-0013 (Arrow/DataFusion SQL integration), ADR-0029 (RLOG v1
+log segment), the log-storage design's query phase, and log storage
+phases 1-2 (`ravel-logseg`, OTLP log ingest over HTTP/gRPC, durable to the
+`l` keyspace).
 
 ## Context
 
@@ -46,7 +47,7 @@ pipeline (footer-first fetch → label-matcher pruning → k-way merge →
 cross-segment dedup) is likewise built entirely around RSEG's shape.
 Nothing wraps `ravel_logseg::RlogReader` for query use; it is used today
 only by ingest, `ravel-maintain` (RLOG compaction, ADR-0032, a sibling,
-independent epic — #229 — with no file overlap with this one), and
+independent effort with no file overlap with this one), and
 `ravel-cli`'s inspector.
 
 ## Decision
@@ -65,7 +66,7 @@ interval is a config-shape follow-up if that changes).
 `LogSegmentFetcher` in `ravel-query` (or a new small module — task
 decomposition decides), wrapping `ravel_logseg::RlogReader`. It fetches
 each candidate object's footer + STREAM_DIR (both already whole-section,
-single-GET reads per `ravel_logseg::read_section`, issue #221) to decide
+single-GET reads per `ravel_logseg::read_section`) to decide
 per-object relevance — time range from the footer summary, stream
 membership from STREAM_DIR — before any block-level GET, mirroring how
 `SegmentFetcher` already decodes a segment's catalog section before
@@ -146,7 +147,7 @@ catalog-level filter without a stream-identity index (see Rejected
 Alternatives, A) — it resolves per-object: the fetcher decodes each
 candidate object's STREAM_DIR, matches attribute predicates against each
 entry's canonical `stream_attrs` blob (`ravel_logseg::stream_attrs_bytes`'
-own encoding, already self-consistent with `LogStreamId`, issue #225),
+own encoding, already self-consistent with `LogStreamId`),
 and builds a `Predicate::StreamIn` over the matching `stream_ref`s for
 that object before calling `scan`. This costs one STREAM_DIR decode per
 candidate object surviving time-range pruning — acceptable for v1, and
@@ -158,7 +159,7 @@ now comes from the residual re-applying the predicate against the fully
 merged `attrs` column, not from any pre-DataFusion filtering step being
 exact on its own.
 
-**Amendment (issue #241): a stream-attribute predicate is not pushed as a
+**Amendment: a stream-attribute predicate is not pushed as a
 fetch prune at all.** The paragraph above is inconsistent with the merged-
 `attrs` amendment two paragraphs up, and the inconsistency was a live data-
 loss bug. It calls the per-object `StreamIn` match "pruning only," i.e. a
@@ -203,14 +204,14 @@ merged-map cases; this is unrelated to the merge fix above. Fail-loud is
 acceptable for v1 under this repo's own posture (a hard planning error,
 never a silently wrong answer) but the SQL surface is not usable end to
 end until it is resolved. This is an explicit gate for the session/
-endpoint wiring task (design spec phase 3's remaining task, T4): either
+endpoint wiring task: either
 register the `ExprPlanner` (weighing it against the deliberate
 no-nested-expressions dependency-surface stance) or document the
 supported map-access syntax and have the planner reject the subscript
 form with a clear error. `has_word(col, 'literal')` and `LIKE` do not
 depend on this — both plan and push down today without it.
 
-**Amended 2026-08-03: this gap is closed.** The gate above offered two
+**Amended: this gap is closed.** The gate above offered two
 ways out; the first was taken. `crates/ravel-sql/src/map_field_planner.rs`
 registers a hand-written `ExprPlanner` covering only the map-field case, so
 `attrs['k'] = 'v'` plans and answers without enabling DataFusion's
@@ -268,7 +269,7 @@ actually reads), not a false `CrossSignalQuery` rejection.
 
 **Correctness gate: exact equality, not bit-pattern, and scan-oracle
 only for v1.** Mirror the *structure* of the existing two-layer
-differential gate (docs/arrow-datafusion-plan.md), not its float-specific
+differential gate, not its float-specific
 comparator. Layer 1 (scan oracle): an independent reference that
 resolves the same `Signal::Logs` snapshot, fetches every surviving
 object, and evaluates the query's predicate by direct record iteration
@@ -281,8 +282,8 @@ add it when/if log aggregation ships.
 
 ## Rejected alternatives
 
-**A. Build the stream-postings catalog index now**, per the original
-design spec's Query section ("catalog snapshot parts for `l` carry... a
+**A. Build the stream-postings catalog index now**, per the log-storage
+design's Query section ("catalog snapshot parts for `l` carry... a
 stream postings list"). Rejected for this epic: the existing postings
 codec (`NamePostings`/RNP1, `crates/ravel-catalog/src/snapshot_format/postings.rs`)
 is hard-typed to a UTF-8 string key (`decode_postings` explicitly
@@ -335,11 +336,11 @@ gain.
   attribute filtering costs one STREAM_DIR decode per surviving object.
   This is a documented, revisit-able choice (Rejected Alternative A),
   not an oversight.
-- This epic and the compaction epic (#229, ADR-0032) both read the
-  commit-record/catalog layer but touch disjoint files (this epic:
+- This work and the compaction work (ADR-0032) both read the
+  commit-record/catalog layer but touch disjoint files (this work:
   `services/ravel-server/src/fold.rs`, `ravel-query`, `ravel-sql`;
-  #229: `ravel-maintain`, `ravel-logseg`'s footer) — no wave-planning
-  conflict between them.
+  compaction: `ravel-maintain`, `ravel-logseg`'s footer) — no conflict
+  between them.
 - Real new code volume: a fetcher and a `TableProvider`/scan-exec/
   pushdown module roughly proportional to what already exists for RSEG
   (`SegmentFetcher`, `RavelTableProvider`, `RsegScanExec`, `pushdown.rs`

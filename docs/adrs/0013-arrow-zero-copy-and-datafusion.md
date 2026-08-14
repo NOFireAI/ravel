@@ -1,11 +1,6 @@
 # ADR-0013: Targeted Arrow zero-copy, DataFusion for SQL and relational operators only
 
-Status: Accepted (2026-07-27); amended the same day after the adversarial
-review (docs/reviews/2026-07-27-arrow-datafusion-plan-review.md), and
-amended again 2026-07-28 to scope the memory-ceiling guarantee after the
-ravel-sql audit (see the amendment at the end). The decision stands;
-several mechanism claims below are corrected, and the plan document
-carries the full finding-by-finding response.
+Status: Accepted
 
 ## Context
 
@@ -13,8 +8,8 @@ ADR-0006 deferred the Arrow/DataFusion question to Phase 3. That
 evaluation is now due: a SQL analytics surface and Flight SQL interop are
 wanted, RavelQL will need relational operators (where/project/join/stats),
 and reimplementing a relational optimizer and executor by hand is wasted
-effort. Separately, BENCHMARKS.md names allocation churn as a measured
-bottleneck, inviting zero-copy claims that must be checked against the
+effort. Separately, allocation churn is a measured bottleneck, inviting
+zero-copy claims that must be checked against the
 frozen RSEG v1 layout: TS pages are lz4-compressed, Gorilla and varint
 encodings are transforms, page crcs force a full read of every payload
 byte, and VAL_RAW_F64 payloads sit at unaligned offsets inside fetched
@@ -86,9 +81,8 @@ Option 3. Concretely:
   them is an RSEG v2 alignment decision through the format-change
   procedure, opened only after a measurement of raw-f64 page share.
 
-Detail, phasing (A: in-crate zero-copy with measurements, B: TableProvider
-and SQL endpoint, C: Flight SQL, D: RavelQL lowering), tickets, and risks:
-docs/arrow-datafusion-plan.md.
+Phasing: A: in-crate zero-copy with measurements, B: TableProvider and SQL
+endpoint, C: Flight SQL, D: RavelQL lowering.
 
 ## Consequences
 
@@ -109,12 +103,10 @@ docs/arrow-datafusion-plan.md.
   promised has happened, and its core holding (custom evaluator for
   PromQL) stands.
 
-## Amendment (2026-07-28): memory ceilings are best-effort for joins
+## Amendment: memory ceilings are best-effort for joins
 
-The independent ravel-sql audit
-(docs/reviews/2026-07-28-ravel-sql-audit/sql3-exec-memory-deadline.md,
-finding sql3-F01) found that the Decision's "budget exhaustion is an
-error" clause and the pool implementation disagree on the `grow` path.
+An independent ravel-sql audit found that the Decision's "budget exhaustion
+is an error" clause and the pool implementation disagree on the `grow` path.
 The code is correct; this amendment makes the ADR match it.
 
 - The per-query and per-tenant memory ceilings are a hard cap for scan,
@@ -144,7 +136,7 @@ The code is correct; this amendment makes the ADR match it.
   cross-tenant disclosure.
 - Blast-radius mitigation, a per-tenant concurrent-query or query-memory
   limit that bounds how much a single tenant can commit at once, is
-  tracked as a separate follow-up (Refs: #156). It is not a precondition
+  tracked as a separate follow-up. It is not a precondition
   for keeping joins enabled.
 - The behavior is demonstrated by
   `crates/ravel-sql/tests/audit_sql3_exec.rs::sql3_f01_grow_bypasses_the_query_and_tenant_ceiling`,

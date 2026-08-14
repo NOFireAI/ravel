@@ -1,6 +1,6 @@
 # ADR-0002: Two-object commit protocol with create-if-absent commit records
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 

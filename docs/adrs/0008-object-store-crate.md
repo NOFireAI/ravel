@@ -1,6 +1,6 @@
 # ADR-0008: Wrap `object_store` crate behind our ObjectStoreBackend trait
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 

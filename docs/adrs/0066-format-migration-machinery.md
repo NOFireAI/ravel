@@ -1,12 +1,18 @@
 # ADR-0066: format migration machinery and restart-free tenant lifecycle
 
-Findings: S5-17 (no data-format migration machinery) and S5-16 (tenant-lifecycle changes require a fleet restart), both section J.2 "before large scale" items in the adversarial review. The V2 review keeps both OPEN, S5-16 narrowed ("maintenance now discovers tenants live; ingest auth maps and provisioning still config-bound") and S5-17 noting "ADR-0052 gives an additive proto-field precedent but no general migration harness".
+Status: Accepted
 
 ## Context
 
-Every persistent format in Ravel is a frozen contract, and nearly every one is already version-tagged in its encoded bytes with a fail-closed check. The gap the review names is not detection; it is that nothing exists between "the reader fails closed on an old version" and "wipe the bucket". ADR-0027 made that explicit and temporary: "No migration tooling. Development object stores holding pre-v5 objects are wiped or re-ingested. Acceptable only because nothing has shipped" (decision 6), and "this policy expires at the first public release" (decision 7). ADR-0032 (RLOG v2) and ADR-0045/0054 (RSPAN) applied the same single-version, no-dual-reader policy, each noting it is a pre-release state, not a standing rule. EM builds what ADR-0027 decision 7 promises, before the formats are frozen in anger.
+This ADR closes two gaps: no data-format migration machinery, and
+tenant-lifecycle changes requiring a fleet restart (maintenance
+discovers tenants live, but ingest auth maps and provisioning stay
+config-bound; ADR-0052 gives an additive proto-field precedent but no
+general migration harness).
 
-### What is already versioned, per format (surveyed 2026-08-08)
+Every persistent format in Ravel is a frozen contract, and nearly every one is already version-tagged in its encoded bytes with a fail-closed check. The gap is not detection; it is that nothing exists between "the reader fails closed on an old version" and "wipe the bucket". ADR-0027 made that explicit and temporary: "No migration tooling. Development object stores holding pre-v5 objects are wiped or re-ingested. Acceptable only because nothing has shipped" (decision 6), and "this policy expires at the first public release" (decision 7). ADR-0032 (RLOG v2) and ADR-0045/0054 (RSPAN) applied the same single-version, no-dual-reader policy, each noting it is a pre-release state, not a standing rule. This ADR builds what ADR-0027 decision 7 promises, before the formats are frozen in anger.
+
+### What is already versioned, per format
 
 **Bulk data objects.** All three carry a 16-byte trailer with a crc-covered u16 version and a 4-byte format-family magic, and fail closed on any version other than the single supported one:
 
@@ -37,11 +43,11 @@ And one blocking fact: today's readers accept exactly one version, so the compac
 
 The format-change skill already requires every format ADR to answer "the dual-reader question" and keep both read paths "until retention clears the old data" — but nothing today can make old data converge faster than retention, verify that it has converged, or say when the old read path may be deleted. That is the machinery gap. (The skill also still asserts "data written today must be readable by every future version", which the pre-release ADRs contradict; Consequences amends it to state both regimes.)
 
-### Tenant lifecycle today (S5-16)
+### Tenant lifecycle today
 
 Every tenant-shaped input is a clap flag parsed once into an immutable `ServerConfig`: the bearer token map (`--tenant-token`, `services/ravel-server/src/config.rs:58`), per-tenant admission limits (`--limits-file`, `config.rs:237`, installed once at `lib.rs:496-503` — `admission.rs:422-424` says outright "changing limits is a restart", codified by ADR-0051 §3), per-tenant retention, indexed fields, alert rules, and `--shards`. There is no SIGHUP handler, no file watch, no reload endpoint (`main.rs:392-410` handles shutdown signals only). The operations guide documents restart as the mechanism: "To add, remove, or rotate a tenant token, restart ravel-server with a different flag set" (`docs/guides/operations.md:1060-1062`). The k8s operator makes the restart structural: a tenant-token Secret change restamps a checksum annotation and rolls the Deployments (`services/ravel-operator/src/reconcile.rs:44,:378,:1010`).
 
-What the V2 review's "narrowed" means, precisely: maintenance, fold, and scrub discover tenants live by LISTing `t/` (`crates/ravel-maintain/src/discover.rs:23`, `services/ravel-server/src/tenant_discovery.rs:47`) — but only when the restriction set is empty. Any deployment using `--tenant-token` gets a startup-frozen allowlist (`main.rs:109` unions token tenants into `config.fold_tenants` once), so a newly onboarded tenant is discovered-but-excluded until restart, and — worse — removing a token to "deprovision" a tenant leaves its data present but no longer compacted, swept, or retention-enforced, since the maintenance cycle iterates only maintained tenants. Deprovisioning as such does not exist; ADR-0019 deferred offboarding and nothing since picked it up.
+What "narrowed" means, precisely: maintenance, fold, and scrub discover tenants live by LISTing `t/` (`crates/ravel-maintain/src/discover.rs:23`, `services/ravel-server/src/tenant_discovery.rs:47`) — but only when the restriction set is empty. Any deployment using `--tenant-token` gets a startup-frozen allowlist (`main.rs:109` unions token tenants into `config.fold_tenants` once), so a newly onboarded tenant is discovered-but-excluded until restart, and — worse — removing a token to "deprovision" a tenant leaves its data present but no longer compacted, swept, or retention-enforced, since the maintenance cycle iterates only maintained tenants. Deprovisioning as such does not exist; ADR-0019 deferred offboarding and nothing since picked it up.
 
 One mechanism already does restart-free per-tenant config, and it is the model to generalize: `GenerationSwitch` (`crates/ravel-ingest/src/generation.rs:11-59`) caches each tenant's durable `prov` record and re-reads it on a 60s horizon, failing the flush closed if the re-read fails — which is why `ravel-cli provision reshard` changes fleet-wide routing with no restart. ADR-0057 adds the fleet-wide transport shape (self-owned snapshot keys, interval reads off the hot path, staleness rule, last-known-value on read failure). Nothing applies either pattern to auth, limits, or lifecycle today.
 
@@ -59,14 +65,14 @@ ADR-0027's single-version policy is superseded at (and only at) first public rel
 - A version bump still requires an ADR, a version bump, and the format-change skill procedure — the machinery lowers the cost of carrying a transition, not the bar for starting one.
 - Version constants stay single-sourced in each format crate (`VERSION_V6`, `footer::VERSION`), which audit-versions and the migration job read, so a bump does not repeat ADR-0049's sixteen-hand-edited-sites experience.
 
-Until first release, ADR-0027 stands unchanged; EM's machinery lands exercised by tests and dry-runs rather than by carrying real dual versions in anger.
+Until first release, ADR-0027 stands unchanged; this ADR's machinery lands exercised by tests and dry-runs rather than by carrying real dual versions in anger.
 
 ### 2. Fail-closed-on-newer, everywhere, typed
 
 Every decoder of a persistent format must, on a version newer than it knows, return a typed error distinct from corruption, and no caller may treat that error as absence, corruption, or a miss. (Sole deliberate exception: the local disk cache, where old-version-equals-miss is correct semantics, `crates/ravel-cache/src/disk.rs:143-148`.) Concretely:
 
 - RLOG and RSPAN trailer version failures become typed `UnsupportedVersion(u16)` variants instead of `Corrupted(String)`, matching RSEG.
-- The catalog fold distinguishes `UnsupportedHeadVersion` from a corrupt HEAD and fails its cycle instead of CAS-clobbering (`fold.rs:866-869`) — the rolling-upgrade hazard from Context. This is a hard prerequisite for EH (#458).
+- The catalog fold distinguishes `UnsupportedHeadVersion` from a corrupt HEAD and fails its cycle instead of CAS-clobbering (`fold.rs:866-869`) — the rolling-upgrade hazard from Context. This is a hard prerequisite for multi-part fold (ADR-0063).
 - The commit token parser surfaces an unknown version prefix as its own typed error rather than flat `InvalidCommitToken`, so a future v3 token is diagnosable at the client boundary.
 
 ### 3. Durable format floors in the provisioning record
@@ -93,11 +99,11 @@ A recorded floor F for family X asserts that no live object of family X below ve
 2. Rewrite-on-touch: compaction outputs are always current-version, so L0 converges through the normal maintenance loop once the N-1 reader exists. Additionally, maintenance treats "live L1 part with `segment_format_version` < current" as compaction-eligible at low priority under the existing maintenance cost budget, so compacted data converges opportunistically too. Caveat honored from Context: this carries trailer/section-layer bumps through the existing verbatim-copy pipeline; a page-grammar bump routes through the re-encode primitive of Decision 5 instead.
 3. The operator-triggered migration job (Decision 5) for the tail neither force reaches fast enough, and for verify-and-raise-floor.
 
-**Class B — derived catalog objects (.csnap, .npost, HEAD).** Rebuildable from commit records by construction; the fold rewrites them continuously. A version bump needs no migration tool: the upgraded fold emits the new version, supersession GCs the old parts, and dual-read is needed only across the rolling-upgrade window. EH (#458, multi-part fold) is exactly such a bump and is this rule's first consumer.
+**Class B — derived catalog objects (.csnap, .npost, HEAD).** Rebuildable from commit records by construction; the fold rewrites them continuously. A version bump needs no migration tool: the upgraded fold emits the new version, supersession GCs the old parts, and dual-read is needed only across the rolling-upgrade window. Multi-part fold (ADR-0063) is exactly such a bump and is this rule's first consumer.
 
 **Class C — immutable metadata records (commit records, compaction records, tombstones, sys/* objects, idempotency markers).** Never rewritten; commit-record immutability is a repo invariant and migration machinery gets no exemption. Default evolution is additive protobuf change (frozen field numbers, new fields only — the ADR-0052 precedent, now normative). A genuinely incompatible change requires a new record kind under a new key suffix, dual-listed alongside the old kind until retention tombstones the old records' hour buckets; the reader-floor `format_version` these records already carry keeps an incompatible in-place edit detectable and refused.
 
-**Class D — identity and domain-hash encodings (series-identity domain string, tenant-hash scheme, commit-token version).** Not migratable by generic machinery: a bump splits identity rather than failing a decode. The obligation here is containment, not migration: the active version is pinned per bucket in a durable control object — the `sys/tenancy` `TenantHashScheme` pattern, extended to record the series-identity domain and token version — and a process whose build disagrees refuses to start. An actual identity re-key is out of EM's scope; each such event is its own ADR (as the V2 review already treats the unkeyed-tenant-hash re-key, S4-15).
+**Class D — identity and domain-hash encodings (series-identity domain string, tenant-hash scheme, commit-token version).** Not migratable by generic machinery: a bump splits identity rather than failing a decode. The obligation here is containment, not migration: the active version is pinned per bucket in a durable control object — the `sys/tenancy` `TenantHashScheme` pattern, extended to record the series-identity domain and token version — and a process whose build disagrees refuses to start. An actual identity re-key is out of scope here; each such event is its own ADR (as the unkeyed-tenant-hash re-key already is).
 
 ### 5. The migration job: a compaction variant, resumable, verifying
 
@@ -108,7 +114,7 @@ A new maintenance operation, `ravel-cli maintain migrate`, also runnable under s
 - Resumability: a durable per-(tenant, signal, family) cursor in the advisory CAS maint-cursor pattern (`crates/ravel-maintain/src/scan.rs`), so a killed job resumes rather than restarts. Rate and cost ride the existing maintenance budget; the job is idempotent by construction.
 - Verification and floor raise: after a clean walk, re-run the audit enumeration from current records; any straggler exits nonzero and the floor is not raised; otherwise CAS-append the floor (Decision 3).
 - Role: runs under the maintenance credential (ADR-0055). Query and ingest roles never rewrite objects; there is no read-path migration.
-- Once EI (#459) lands, `migrate` becomes a leased work kind like compaction and sweep; until then it follows today's maintain-mode single-runner rules.
+- Once leased maintenance (ADR-0065) lands, `migrate` becomes a leased work kind like compaction and sweep; until then it follows today's maintain-mode single-runner rules.
 
 ### 6. Tenant lifecycle without restart
 
@@ -120,15 +126,15 @@ Move per-tenant lifecycle state from flags to durable control objects, read on a
 - **Operator**: the CRD's tenant Secret continues to hold tokens, but the operator writes the hashed map and per-tenant config objects instead of restamping pod templates; a tenant change becomes a control-object write, not a Deployment roll.
 - Staleness semantics are explicit and asymmetric: grants (new tenant, raised limit) may take up to the horizon to appear everywhere; revocations are also horizon-bounded, and the horizon is a documented, configurable constant of the same order as `GenerationSwitch`'s 60s. A process that cannot refresh past a hard multiple of the horizon treats auth-affecting state as stale and fails closed for lifecycle-gated operations, mirroring ADR-0052's prov-staleness rule.
 
-Deleting an offboarded tenant's data is EJ's (#460) mechanism, not EM's; the `offboarding` lifecycle state is the hook EJ consumes.
+Deleting an offboarded tenant's data is selective deletion's (ADR-0064) mechanism, not this ADR's; the `offboarding` lifecycle state is the hook it consumes.
 
 ## Rejected alternatives
 
 **Unbounded dual-read (every reader understands every historical version forever).** The pre-ADR-0027 reality: five RSEG versions in weeks, each dragging a permanent reader-dispatch branch, goldens, fuzz seeds, bench builders, and an amendment layer (ADR-0017 named the cost; ADR-0049 measured the version-literal sprawl at sixteen sites for one bump). Rejected because the cost is recorded history here, and because "every consumer handles every version" spreads that cost to the fold, the compactor, the CLI inspectors, and every future reader. The N/N-1 window plus evidence-based retirement keeps reader surface proportional to two versions, not the version count.
 
-**Stop-the-world offline migration on upgrade.** Rewrite everything to N before the fleet runs N. Violates the deliverable ("does not require rewriting all data at once"); its cost grows with stored volume forever (the review's five-year test failure); ADR-0050 rejected exactly this shape for the tenant-hash re-key ("a full copy of every object, plus dual-read during the copy, imposed on every existing deployment at upgrade"), and ADR-0052 rejected it again for resharding — doubling storage and PUT spend, an unbounded degraded window, and dangling every issued commit token. Rejected on the same grounds.
+**Stop-the-world offline migration on upgrade.** Rewrite everything to N before the fleet runs N. Violates the deliverable ("does not require rewriting all data at once"); its cost grows with stored volume forever; ADR-0050 rejected exactly this shape for the tenant-hash re-key ("a full copy of every object, plus dual-read during the copy, imposed on every existing deployment at upgrade"), and ADR-0052 rejected it again for resharding — doubling storage and PUT spend, an unbounded degraded window, and dangling every issued commit token. Rejected on the same grounds.
 
-**A dedicated migration service.** Rejected: every compute process is disposable, and maintenance already owns "walk a tenant's records and rewrite objects under a budget" (compaction, sweep, retention, scrub), with leases arriving via EI. A separate service duplicates that machinery, needs its own credential role under ADR-0055, and adds a standing component for a rare-by-design operation.
+**A dedicated migration service.** Rejected: every compute process is disposable, and maintenance already owns "walk a tenant's records and rewrite objects under a budget" (compaction, sweep, retention, scrub), with leases arriving via ADR-0065. A separate service duplicates that machinery, needs its own credential role under ADR-0055, and adds a standing component for a rare-by-design operation.
 
 **Version tags in object keys (`.rseg7` suffixes or a version path segment).** Would let migration find old objects by LIST alone. Rejected: the key layout is itself a frozen contract, the suffix is version-free on purpose (`keys.rs:15-17`), and commit-record metadata already answers "which version is this object" without a GET. A second source of version truth in keys can only ever disagree with the first.
 
@@ -142,47 +148,30 @@ Deleting an offboarded tenant's data is EJ's (#460) mechanism, not EM's; the `of
 
 ## Consequences
 
-- ADR-0027 is superseded at first public release on the terms its own decision 7 set; until then it stands, and EM's Class A machinery is exercised by tests and dry-runs.
+- ADR-0027 is superseded at first public release on the terms its own decision 7 set; until then it stands, and this ADR's Class A machinery is exercised by tests and dry-runs.
 - The format-change skill is amended: state the format's migration class (A-D) and convergence plan in every format ADR; for Class A, land the N-1 reader before any N writer ships; deleting an old version's reader requires citing every bucket's floor. The skill's "readable by every future version" sentence is corrected to state both regimes (pre-release single-version per ADR-0027; post-release N/N-1 window per this ADR) — today the carve-out lives only inside ADR-0027 and the skill contradicts it.
 - `docs/segment-format.md`, `docs/log-segment-format.md`, `docs/catalog-and-mvcc.md` each gain a normative migration paragraph; ADR-0051 §3 and `docs/guides/admission-limits.md` and `operations.md` drop "restart to change"; README/PROGRESS updated in the same commits as the code (doc-currency rule).
-- Interaction with EH (#458): the multi-part fold is a Class B bump — envelope version bump, fold regenerates, dual-read across the rolling window only. Decision 2's HEAD fix must land before EH's format change dispatches, or a lagging fold process will CAS-clobber EH's new-format HEAD during rollout. EM should sequence that task first for EH's benefit.
-- Interaction with EJ (#460): EJ's erasure rewrite (read object, drop a subject's records, write new object, supersede) is structurally Decision 5's rewrite primitive with a different conservation predicate (EM: exact conservation; EJ: exact minus the erased set). The primitive is built once in ravel-maintain and shared; whichever epic lands second consumes it. EJ also consumes the `offboarding` lifecycle state as its whole-tenant entry point. Both ADRs must reference this split.
-- Interaction with EI (#459): `migrate` becomes a leased work kind when leases land; its cursor and budget design must not assume a single runner in a way EI would have to unwind.
+- Interaction with multi-part fold (ADR-0063): it is a Class B bump — envelope version bump, fold regenerates, dual-read across the rolling window only. Decision 2's HEAD fix must land before its format change dispatches, or a lagging fold process will CAS-clobber its new-format HEAD during rollout. This ADR should sequence that task first for its benefit.
+- Interaction with selective deletion (ADR-0064): its erasure rewrite (read object, drop a subject's records, write new object, supersede) is structurally Decision 5's rewrite primitive with a different conservation predicate (this ADR: exact conservation; ADR-0064: exact minus the erased set). The primitive is built once in ravel-maintain and shared; whichever lands second consumes it. ADR-0064 also consumes the `offboarding` lifecycle state as its whole-tenant entry point. Both ADRs must reference this split.
+- Interaction with leased maintenance (ADR-0065): `migrate` becomes a leased work kind when leases land; its cursor and budget design must not assume a single runner in a way it would have to unwind.
 - New failure surface accepted: a floor CAS-appended over a stale audit would be a false assertion; hence the raise re-audits from current records after the walk and the whole raise rides behind the same publish-side guards as compaction. Named as an acceptance test.
 - New failure surface accepted: bounded-staleness auth means a revoked token can authenticate for up to the horizon; this is documented and bounded, versus today's alternative of a fleet restart per revocation. The fail-closed staleness rule converts an unreachable store into refused lifecycle-gated operations, the same availability trade ADR-0052 made for prov staleness.
 - Cost: the migration job's rewrite is a read+PUT per object, bounded by the maintenance budget; floors add one small CAS append per (tenant, signal, family) per migration; tenant-config refresh adds one GET per tenant per horizon per process, the same order as the existing GenerationSwitch reads.
 
-## Stage-2 sketch (task decomposition, for the approval gate)
-
-| ID | Title | Crates | Risk |
-|----|-------|--------|------|
-| T1 | Typed `UnsupportedVersion` for RLOG + RSPAN trailers | ravel-logseg, ravel-rspan | low |
-| T2 | Fold HEAD fail-closed-on-newer (no clobber); commit-token version-distinct error | ravel-catalog, ravel-types | medium |
-| T3 | `FormatFloor` in `ProvisioningRecord` (additive proto + CAS append + validation) | proto/ravel/sys.proto, ravel-catalog | high (persistent contract) |
-| T4 | Shared segment-rewrite primitive: N-1 decode, re-encode, publish + supersede + conservation | ravel-maintain, ravel-segment | high |
-| T5 | `maintain migrate`: resumable cursor, budget, verify-and-raise-floor; audit-versions extension | ravel-cli, ravel-maintain | medium |
-| T6 | Rewrite-on-touch: old-version live L1 parts compaction-eligible under budget | ravel-maintain | medium |
-| T7 | Per-tenant config record + `sys/auth` hashed token map (proto + read/refresh paths) | proto/ravel/sys.proto, ravel-catalog or ravel-types | high (persistent contract) |
-| T8 | Server refresh loops: limits/auth/lifecycle bounded-staleness swap; thaw fold_tenants restriction | ravel-server, ravel-ingest | high |
-| T9 | Operator writes control objects instead of restamping pod templates | ravel-operator | medium |
-| T10 | E2E reachability: mixed-version bucket converges via real server maintain-mode + floor raised; tenant add / limit change / revoke observed live with no restart | server e2e / ravel-failure-tests | medium |
-
-High-risk tasks ride solo waves. T1/T2 first (T2 gates EH); T3 before T5; T4 before T5/T6; T7 before T8/T9. Acceptance tests are named per task at Stage 2 proper, including the two named above (floor-raise race audit; revocation horizon).
-
 ## Out-of-scope findings, reported not fixed
 
-1. **Live rolling-upgrade bug**: the catalog fold treats an `UnsupportedHeadVersion` HEAD as corrupt and CAS-clobbers it (`crates/ravel-catalog/src/fold.rs:866-869`, `:796-798`). A lagging process would overwrite a newer-format HEAD during any future rollout. Folded into this ADR as Decision 2, but it is a live hazard today, independent of whether this epic is approved, and gates EH (#458).
-2. **Spec/code contradiction**: `.claude/skills/format-change/SKILL.md` asserts "data written today must be readable by every future version" and "keep both paths", but ADR-0027/0032/0045/0054 delete old read paths pre-release; the carve-out lives only in ADR-0027 decision 7. The skill was never amended.
-3. **Stale doc pointers**: issue #450 says the review lives at `docs/reviews/adversarial/RAVEL-ADVERSARIAL-REVIEW.md` "with the five slice reports beside it" — the actual files are `RAVEL-ADVERSARIAL-REVIEW.md` and `-V2.md` at the repo root, and no slice reports exist (only `plans/`). Also `docs/adrs/README.md:52` still lists ADR-0045 as "RSPAN v2 and v3" (amended to v2/v4 by ADR-0054), and `crates/ravel-segment/src/reader.rs:3,:135` and `lib.rs:4` doc comments still say "v5 only" while the gate is v6.
+1. **Live rolling-upgrade bug**: the catalog fold treats an `UnsupportedHeadVersion` HEAD as corrupt and CAS-clobbers it (`crates/ravel-catalog/src/fold.rs:866-869`, `:796-798`). A lagging process would overwrite a newer-format HEAD during any future rollout. Folded into this ADR as Decision 2, but it is a live hazard today, independent of whether this ADR is approved, and gates multi-part fold (ADR-0063).
+2. **Spec/code contradiction**: the format-change skill asserts "data written today must be readable by every future version" and "keep both paths", but ADR-0027/0032/0045/0054 delete old read paths pre-release; the carve-out lives only in ADR-0027 decision 7. The skill was never amended.
+3. **Stale doc pointers**: `docs/adrs/README.md` still lists ADR-0045 as "RSPAN v2 and v3" (amended to v2/v4 by ADR-0054), and `crates/ravel-segment/src/reader.rs:3,:135` and `lib.rs:4` doc comments still say "v5 only" while the gate is v6.
 4. Minor: `CommitRecord.segment_format_version` is copied through unvalidated (`record.rs:97`); many tests hardcode `1` and nothing rejects it.
 
-## Amendment (2026-08-08): `family` is a lowercase string, not an enum
+## Amendment: `family` is a lowercase string, not an enum
 
-T3 shipped `FormatFloor.family` as `string family = 1` (lowercase format-family
+The implementation shipped `FormatFloor.family` as `string family = 1` (lowercase format-family
 id: `"rseg"`, `"rlog"`, `"rspan"`, mirroring each format's trailer magic),
-not the `uint32 family` enum sketched in Decision 3. Reason: by the time T3
-landed, T1/T2 had already established no typed family-naming convention —
-their `UnsupportedVersion(u16)` variants carry only a numeric version, no
+not the `uint32 family` enum sketched in Decision 3. Reason: by the time it
+landed, the typed `UnsupportedVersion` work had already established no
+family-naming convention — those variants carry only a numeric version, no
 family tag — so there was no enum to be consistent with, and a free-form
 string keeps a new format family (a future signal, or a sub-format within an
 existing one) addable without a proto change, matching the additive-evolution

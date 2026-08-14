@@ -1,14 +1,12 @@
 # ADR-0053: CI latency and delivery process hardening
 
-Status: proposed
-Date: 2026-08-04
+Status: Accepted
 
 ## Context
 
-Four days of measured evidence (2026-07-31 to 2026-08-04, 321 CI runs, 131
-merged PRs, 17 local sessions, fleet dispatch history):
+Four days of measured evidence across 321 CI runs and 131 merged PRs:
 
-- CI median wall time grew from 10.1m (07-30) to 24-25m (08-03/04). For a
+- CI median wall time grew from 10.1m to 24-25m over the window. For a
   clean code PR with auto-merge, CI is 95-100% of PR lifetime; the
   `coverage` job (22-26m, required) alone sets the merge critical path. It
   has no threshold gate: `--summary-only` exits 0 regardless of the
@@ -18,16 +16,17 @@ merged PRs, 17 local sessions, fleet dispatch history):
   invocations).
 - `required_status_checks.strict` is false and there is no merge queue.
   Two individually green PRs combined by rebase-merge broke main at least
-  three times in the window (issue #565: PR #555's 4th `start()` parameter
-  vs PR #560's three new 3-arg call sites left main red ~40 minutes; same
+  three times in the window (one instance: a 4th `start()` parameter
+  vs three new 3-arg call sites left main red ~40 minutes; same
   shape twice more). The local cold-gate rule cannot catch this class: it
   gates the pre-rebase tree.
 - `k8s-integration` is the only lane that proves the operator reconciles
-  and the shipped images start, and it caught a real regression (PR #577,
-  deployment-keyed tenant hash), but it is not a required check, so #577
-  auto-merged while red and crash-looped fresh RavelCluster deployments
-  (fixed by #581). The job is also flaky (issue #587: readiness timeout
-  with no diagnostics dump, plus a kubectl download failure mode) and has
+  and the shipped images start, and it caught a real regression (the
+  deployment-keyed tenant hash change), but it is not a required check,
+  so that change auto-merged while red and crash-looped fresh
+  RavelCluster deployments (fixed the next day). The job is also flaky
+  (readiness timeout with no diagnostics dump, plus a kubectl download
+  failure mode) and has
   breached its own documented remedy trigger (ci.yml names 25m warm-cache
   as the split-the-binary-build threshold; observed 17m/20m/44m).
 - All 10 compiling jobs fan out in parallel behind the `changes` job. A
@@ -52,10 +51,10 @@ merged PRs, 17 local sessions, fleet dispatch history):
 - Process friction outside ci.yml: executors append pure fmt/style fixup
   commits instead of formatting before committing (9 of 268 main commits),
   and `wip:` headers reach protected main because the merge path never
-  squashes or rewords. Three ADR number collisions in one day (08-02) from
-  parallel epics. Derived doc counts (docs/query-engine.md corpus count)
+  squashes or rewords. Three ADR number collisions in one day from
+  parallel work. Derived doc counts (docs/query-engine.md corpus count)
   broke a textually clean parallel merge once and are checked by nothing.
-  Epic #502 shipped a reviewed, merged read-cache that no production code
+  A reviewed, merged read-cache once shipped that no production code
   path ever constructed; crate-level tests cannot catch dead wiring.
 
 ## Decision
@@ -66,7 +65,7 @@ Seven decisions, ordered by leverage.
 
 Enable the GitHub merge queue for `main`; add a `merge_group` trigger to
 ci.yml so required checks run on the queued merge result. This tests the
-exact tree that will become main, closing the green+green=red class (#565)
+exact tree that will become main, closing the green+green=red class
 structurally instead of procedurally.
 
 ### D2. Correct the required-check set
@@ -117,7 +116,7 @@ green run pays no extra serialization on its critical path. `check` and
 Execute the remedy ci.yml already names: split the release binary build
 into a build job that uploads the two binaries as artifacts;
 k8s-integration downloads them, assembles images, and runs kind. Add the
-diagnostics dump on readiness timeout that #587 asks for (describe pods,
+diagnostics dump on readiness timeout (describe pods,
 events, operator logs), pin or retry the kubectl download, and raise the
 readiness timeout to cover measured startup. When it holds green for a
 probation window on main, flip it required (D2).
@@ -144,8 +143,8 @@ script pair is deleted.
   main via PR at the moment the number is chosen, before the ADR is
   written; the epic acceptance checklist requires an end-to-end
   reachability test proving the feature is constructed and attached in the
-  shipping binary (the #502 lesson; PR #555's "prove the read cache is
-  attached" test is the template).
+  shipping binary (the read-cache dead-wiring lesson; the "prove the read
+  cache is attached" test is the template).
 - gates.sh: use nextest with the `ci` profile where nextest is installed,
   matching CI's configuration so local and CI runs exercise the same
   artifacts.
@@ -172,7 +171,7 @@ script pair is deleted.
 - Remote build cache (sccache to S3, Bazel-class systems): premature
   against a 10 GB GHA budget not yet proven insufficient after D4 reduces
   the configuration count.
-- ADR numbers derived from epic issue numbers: breaks the contiguous
+- ADR numbers derived from issue numbers: breaks the contiguous
   sequence readers navigate; a claim-stub PR is one minute of work.
 
 ## Consequences
@@ -184,12 +183,12 @@ script pair is deleted.
   unreliable "cold-gate the merged tree locally" step for this class.
 - A red fmt/clippy PR dies in ~5m having spent ~3 job-minutes, not ~90.
 - k8s-integration becomes a required, diagnosable gate; operator
-  regressions of the #577 shape cannot auto-merge red again.
+  regressions of that shape cannot auto-merge red again.
 - Stale lockfiles, dead feature code, and derived-doc drift become CI
   failures instead of post-merge archaeology.
 - Merge queue adds per-PR queue latency (one extra CI cycle when the
   queue is contended); accepted in exchange for structural integrity.
 - Coverage numbers update only on main; PR authors lose the per-PR
   coverage summary. Accepted: it gated nothing and cost 25m.
-- ci.yml becomes the most-edited file of the epic; all ci.yml tasks are
+- ci.yml becomes the most-edited file of this work; all ci.yml tasks are
   same-file and therefore serialize into distinct waves by design.

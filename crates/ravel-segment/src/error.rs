@@ -143,7 +143,7 @@ pub enum SegmentError {
     #[error("identity mismatch on field {0}")]
     IdentityMismatch(&'static str),
 
-    // --- RSEG v2 only (ADR-0014, docs/segment-format.md "RSEG v2
+    // --- RSEG v2 only (ADR-0027, docs/segment-format.md "RSEG v2
     // amendment"): SERIES_IDS / SERIES_META decode. v1 objects never
     // produce these. ---
     #[error("SERIES_IDS entries are not strictly ascending by series_id bytes")]

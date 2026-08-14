@@ -1,6 +1,6 @@
 # ADR-0006: Custom signal-aware engine first; Arrow/DataFusion evaluated at Phase 3
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 

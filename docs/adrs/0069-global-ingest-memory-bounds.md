@@ -1,8 +1,6 @@
 # ADR-0069: Global ingest memory bounds and idle-tenant state eviction
 
-Status: proposed (2026-08-09)
-Refs: 2026-08-09 architecture review (RAVEL-TIGERBEETLE-REVIEW.md R5,
-section 8), issue #802 (transport concurrency limit, in flight).
+Status: Accepted
 
 ## Context
 
@@ -15,8 +13,8 @@ with no unbounded channels anywhere. But nothing bounds the *sum*:
   dozen active tenants can theoretically exceed RAM before any per-tenant
   limit trips.
 - Every parked strict request holds its decoded, normalized points for up
-  to the 10 s ack deadline. Issue #802 (in flight) bounds the number of
-  parked requests; it does not bound their bytes.
+  to the 10 s ack deadline. A separate transport concurrency limit bounds
+  the number of parked requests; it does not bound their bytes.
 - Per-tenant map entries are never evicted for idle tenants: admission
   controller state, generation-switch views (old shard sets are never
   removed), the catalog's per-tenant cache outer maps, and SQL memory
@@ -78,7 +76,7 @@ flowchart LR
 - **LRU caps on the admission maps**: silently discards correctness-bearing
   cap state; a tenant's active-series count must never reset as a side
   effect of memory pressure.
-- **Relying on the #802 concurrency limit alone**: bounds request *count*,
+- **Relying on the transport concurrency limit alone**: bounds request *count*,
   not buffered *bytes*; a small number of maximal 16 MiB requests across
   many tenants still needs the byte gauge.
 - **cgroup/OOM-based limits**: an OOM kill loses every in-flight strict
@@ -97,7 +95,7 @@ flowchart LR
 - The admission-state exclusion is an honest gap, documented, with a named
   follow-up rather than an unsafe eviction.
 
-## Implementation notes (idle-tenant eviction, issue #820)
+## Implementation notes (idle-tenant eviction)
 
 Decision 2 is implemented as one background sweep in `services/ravel-server`
 (`idle_tenant_state.rs`), spawned alongside the other worker loops with the

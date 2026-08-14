@@ -27,8 +27,8 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--s3-access-key <key>` | `RAVEL_S3_ACCESS_KEY` | none | Required when `--store s3`. |
 | `--s3-secret-key <secret>` | `RAVEL_S3_SECRET_KEY` | none | Required when `--store s3`. |
 | `--s3-kms-key <arn>` | `RAVEL_S3_KMS_KEY` | none | Single-key SSE-KMS (ADR-0062 decision 1c): every PUT the default store makes is encrypted with this KMS key ARN, applied to `S3Config.kms_key_id`. Off by default: unset, the store's SSE behavior is unchanged from before this flag existed (whatever bucket-default SSE the deployment has). |
-| `--tenant-kms-config <path>` | `RAVEL_TENANT_KMS_CONFIG` | none | TOML file mapping tenant name to KMS key ARN (`[tenants]` table, ADR-0062 decision 1, ADR-0072 decision 2), EL-7 (issue #764). Requires `--store s3` — refuses to start under `--store memory`, since the per-tenant routing decorator always constructs a real `S3Store`. Off by default: unset, `build_store` produces exactly the store it always has, with no per-tenant routing decorator in the chain at all. See "Per-tenant SSE-KMS routing" below. |
-| `--disable-fold` | | off | Disables the per-(tenant, signal) background catalog fold task (docs/metric-index-plan.md section 4). Folding only lowers query resolve cost; disabling it never changes query results. |
+| `--tenant-kms-config <path>` | `RAVEL_TENANT_KMS_CONFIG` | none | TOML file mapping tenant name to KMS key ARN (`[tenants]` table, ADR-0062 decision 1, ADR-0072 decision 2). Requires `--store s3` — refuses to start under `--store memory`, since the per-tenant routing decorator always constructs a real `S3Store`. Off by default: unset, `build_store` produces exactly the store it always has, with no per-tenant routing decorator in the chain at all. See "Per-tenant SSE-KMS routing" below. |
+| `--disable-fold` | | off | Disables the per-(tenant, signal) background catalog fold task. Folding only lowers query resolve cost; disabling it never changes query results. |
 | `--fold-interval-secs <n>` | | `300` | How often each tenant's fold task wakes up to check for newly sealed hours. |
 | `--maintain-interval-secs <n>` | | `300` | Used only in `--mode maintain`. How often each tenant's maintenance task wakes to run retention, compaction, and the sweeper over every shard of both signals. |
 | `--maintain-interior-reverify <duration>` | | `6h` | Used only in `--mode maintain`. The slow safety-net cadence for the ADR-0065 interior zone (the ingest hours that aren't in the head or tail zones this tick): an interior bucket's memoized terminal state is re-verified no less often than this, and the sweeper runs a full-keyspace pass (instead of its per-tick head+tail-only pass) on the same cadence. Head and tail hours are unaffected and are always evaluated every tick. A zero duration disables the safety net (every interior bucket is always due), matching pre-ADR-0065 behavior for that zone; only an unparseable duration fails startup. |
@@ -45,7 +45,7 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--metrics-tenant-labels` | | off | Emits real per-tenant `tenant_hash` labels on the `ravel_admission_*` family at `/metrics` (ADR-0051 section 6) instead of folding every tenant into `tenant_hash="other"`. A deliberate cardinality trade; off by default so `/metrics` cardinality never scales with tenant count unless an operator opts in. See "Admission usage" above. |
 | `--store-probe-interval <duration>` | | `30s` | How often the background store-reachability probe GETs `sys/tenancy` (ADR-0050 section 7), as a humantime duration, jittered. After four consecutive failures `/readyz` returns 503; one success recovers it. See "Store reachability probe and `/readyz`" below. |
 | `--scrub-period <duration>` | | `7d` | Used only in `--mode maintain`. The at-rest scrub period `P` (ADR-0059 decision 1), as a humantime duration. The content-tier scrubber rotates through the whole object corpus once per `P`, so sustained scrub read bandwidth is bounded at `corpus_bytes / P`. A zero or unparseable duration fails startup. See "At-rest integrity scrubber" below. |
-| `--distributed-query` | | off | Turns on ADR-0071 distributed read fan-out (issue #865). A query-serving process (`all`, `query`) both registers the cluster-internal `SeriesFetch` fragment gRPC surface and acts as a coordinator that may fan a large query's pinned snapshot out to live query workers. Requires `--fragment-auth-token-file`; set without it, the process refuses to start rather than exposing an unauthenticated fetch surface. Off means a process serves queries exactly as before and never registers the fragment surface. |
+| `--distributed-query` | | off | Turns on ADR-0071 distributed read fan-out. A query-serving process (`all`, `query`) both registers the cluster-internal `SeriesFetch` fragment gRPC surface and acts as a coordinator that may fan a large query's pinned snapshot out to live query workers. Requires `--fragment-auth-token-file`; set without it, the process refuses to start rather than exposing an unauthenticated fetch surface. Off means a process serves queries exactly as before and never registers the fragment surface. |
 | `--fragment-auth-token-file <path>` | | none | File holding the shared cluster-internal bearer token that guards the fragment surface. A file, never an inline value or env var, so the secret never appears in a process listing. Every worker and coordinator in one cluster reads the same file: a coordinator presents this token on each slice dispatch, and a worker refuses any fragment request whose token is missing or unequal. The fragment surface binds only on the cluster-internal gRPC listener, never the external HTTP or mTLS listeners. Meaningful only with `--distributed-query`. |
 | `--max-inflight-fragments <n>` | | `32` | The admission cap for inbound fragment (`SeriesFetch`) requests: the maximum slice fetches this process serves concurrently for remote coordinators. A distinct workload class from the client-query cap, so a coordinator waiting on its own dispatched fragments cannot deadlock behind client queries. Over the cap a fragment request queues rather than being rejected. Clamped to at least 1. |
 | `--distribute-bytes-threshold <n>` | | `268435456` (256 MiB) | The estimated-store-bytes axis of the fan-out cost gate. A query whose pre-fetch cost estimate reaches this many bytes is distributed; a query below both axes runs fully locally. Meaningful only with `--distributed-query`. |
@@ -56,9 +56,8 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 flag or env) fails at startup with an explicit error that names the missing
 one. It does not start in a broken state.
 
-Note: [BENCHMARKS.md](../../BENCHMARKS.md) documents the S3 env vars as
-`RAVEL_S3_ACCESS_KEY_ID` and `RAVEL_S3_SECRET_ACCESS_KEY`. The real flags
-are `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY`, above; use those.
+Note: the real S3 env var flags are `RAVEL_S3_ACCESS_KEY` and
+`RAVEL_S3_SECRET_KEY`, above; use those.
 `allow_http` and `force_path_style` are not configurable at all. The code
 derives `allow_http` from whether `--s3-endpoint` is set, and it always passes
 `force_path_style: true`.
@@ -109,9 +108,9 @@ series_creation_burst        = 100000
 
 The rate defaults match ADR-0051 section 3. The two active-count caps do
 not: the ADR sets both at 1,000,000, sized against an assumed ~16 bytes per
-tracked entry. Issue #491 measured the actual `HashSet` entry cost (hashbrown
-slot overhead, power-of-two table sizing at 7/8 load, allocator headroom) at
-35-56 bytes, a 2-4x underestimate. `AdmissionController` tracks each of
+tracked entry. Measurement of the actual `HashSet` entry cost (hashbrown
+slot overhead, power-of-two table sizing at 7/8 load, allocator headroom) put
+it at 35-56 bytes, a 2-4x underestimate. `AdmissionController` tracks each of
 active series and active streams in a two-epoch rotating set
 (`ACTIVE_EPOCH_NS`), so both epochs' sets can be live at once. Worst-case
 resident memory for one fully active tenant is:
@@ -147,7 +146,7 @@ above).
 | `ravel-cli maintain sweep --tenant <n> --signal <metrics\|logs\|spans> --shard <n> [--dry-run]` | | Runs one sweep pass (orphan GC, superseded inputs, unreferenced parts) over a shard and prints the four delete counts. `--dry-run` reports the eligible set but deletes nothing. |
 | `ravel-cli maintain status --tenant <n> --signal <metrics\|logs\|spans> --shard <n> --hour <n>` | | Reports a bucket's state (sealed, tombstoned, compacted, L0 record count, superseded-input count, L1 parts present, unreferenced-part count). Read-only, so no `--dry-run`. |
 | `ravel-cli maintain audit-versions --tenant <n> [--shards <n>]` | `--shards` default `4` | Audits live on-object format versions across all three signals. It flags any RSEG object at a version other than the one supported version (ADR-0027), reports the RLOG population by trailer version (1 vs 2, ADR-0032), and the RSPAN population by trailer version. Exits nonzero on any anomaly. |
-| `ravel-cli maintain migrate --tenant <n> --signal <metrics\|logs\|spans> [--shards <n>] [--target-version <n>] [--family <name>] [--budget-records <n>]` | `--shards` default `4`, `--budget-records` default `0` (unlimited) | Migrates every live record below `--target-version` (defaults to the signal's current supported version) and raises the recorded format floor once a fresh re-audit confirms nothing below it survives (epic EM, EM-T5; see "Format migration" below). Resumable: re-run to continue from the durable cursor after a budget stop. A refused raise ("FOUND STRAGGLERS") means genuine live data still below target, not a self-inflicted false positive (issue #826) -- no interleaved `sweep` is needed for this to converge. |
+| `ravel-cli maintain migrate --tenant <n> --signal <metrics\|logs\|spans> [--shards <n>] [--target-version <n>] [--family <name>] [--budget-records <n>]` | `--shards` default `4`, `--budget-records` default `0` (unlimited) | Migrates every live record below `--target-version` (defaults to the signal's current supported version) and raises the recorded format floor once a fresh re-audit confirms nothing below it survives (see "Format migration" below). Resumable: re-run to continue from the durable cursor after a budget stop. A refused raise ("FOUND STRAGGLERS") means genuine live data still below target, not a self-inflicted false positive -- no interleaved `sweep` is needed for this to converge. |
 | `ravel-cli maintain verify-custody --tenant <n> [--shards <n>]` | `--shards` default `4` | Read-only, no `--dry-run` (nothing is written or deleted). Re-verifies the content-addressed chain at rest: every live data object's key-embedded `hash16` against its actual content hash, and every surviving compaction record's referenced inputs (a mismatch is an anomaly; an input the sweeper already legitimately reclaimed past its protection horizon is reported separately, not as an anomaly). Exits nonzero on any anomaly. |
 | `ravel-cli catalog list --tenant <name> [--hours <n>] [--shards <n>]` | `--hours` default `1`, `--shards` default `4` | Lists commit records that the catalog resolves for that tenant over the last `hours` hours. `--shards` must match the shard count the data was written with. |
 | `ravel-cli catalog fold --tenant <name> [--shards <n>]` | `--shards` default `4` | One-shot catalog fold: seals every eligible hour into a new snapshot part and CAS-advances HEAD. Prints the fold report (watermark before/after, buckets folded, entry count, request counts). This is the same operation that the background fold task runs on a timer. |
@@ -161,7 +160,7 @@ fetched from the configured store.
 
 ## Catalog fold and verify
 
-The catalog fold (docs/metric-index-plan.md, ADR-0020) is a query-cost
+The catalog fold (ADR-0020) is a query-cost
 optimization, not a durability mechanism. `resolve` always falls back to
 listing commit records directly. A folder that never runs, crashes, or
 falls behind therefore never loses or hides data; it only makes queries pay
@@ -186,8 +185,7 @@ before every writer's flush for it has landed. A commit published into
 that already-sealed bucket becomes invisible to non-token queries. A
 `min_commit_token` query is unaffected: it always GETs its exact commit
 key directly, never through the snapshot. This is the one failure mode
-in docs/metric-index-plan.md 5.3 that needs an operator repair rather than
-resolves itself:
+that needs an operator repair rather than resolving itself:
 
 1. Run `ravel-cli catalog verify --tenant <name>` (per signal). A nonzero
    exit and a nonempty "missing from snapshot" count confirm sealed
@@ -232,10 +230,10 @@ Coverage is not yet complete: the PromQL/remote-read and SQL query paths
 share one `Catalog` instance and both count here, but a `tenant_hash`
 mismatch on a commit or compaction record (`crates/ravel-catalog/src/
 catalog.rs`'s `validate_expected_fields` / `validate_compaction_expected_fields`)
-hard-fails its query without incrementing this counter (issue #529), and a
+hard-fails its query without incrementing this counter, and a
 foreign postings object that fails its part-binding check first degrades
-silently before the tenant_hash comparison ever runs (issue #528). A silent
-gap for snapshot parts also exists (issue #527): a part's own `tenant_hash`
+silently before the tenant_hash comparison ever runs. A silent
+gap for snapshot parts also exists: a part's own `tenant_hash`
 is never checked against the requesting tenant at all.
 
 Default alert rule:
@@ -459,12 +457,12 @@ maintenance family.
   this one counter.
 - `ravel_scrub_postings_disagreement_total{signal}` (counter): objects whose
   covering name-postings object omitted a `__name__` the object really carries
-  (S2-09's false negative).
+  (a false negative).
 - `ravel_scrub_seal_divergence_total{signal,reason}` (counter, ADR-0059 decision
   2): divergences between the folded snapshot and the re-listed sealed commit
   history, checked once per tick on the fold cadence (metadata-cost, not gated
   behind the content-tier cursor). `reason="missing"` is a sealed commit record
-  absent from the snapshot (a folder under-count, S2-04); `reason="mismatched"`
+  absent from the snapshot (a folder under-count); `reason="mismatched"`
   is a snapshot entry whose `content_hash` disagrees with the sealed record.
   Orphaned entries — a snapshot entry with no surviving commit record — are the
   expected shape once retention deletes a folded commit record and are never
@@ -477,7 +475,7 @@ maintenance family.
 |---|---|---|
 | Checksum mismatch | `increase(ravel_scrub_checksum_mismatch_total[1h]) > 0` | There is no redundant copy to repair from, so any nonzero increase is at-rest corruption an operator must investigate immediately, not a rate to threshold. |
 | Postings disagreement | `increase(ravel_scrub_postings_disagreement_total[1h]) > 0` | A false negative means a query filtering on that name silently skips matching data; any nonzero increase is a correctness bug to page on. |
-| Seal divergence | `increase(ravel_scrub_seal_divergence_total[1h]) > 0` | A `missing` or `mismatched` divergence means the folded snapshot under-counts the sealed commit history (late-commit seal loss, S2-04); a query reading the snapshot silently omits committed data. Page on any nonzero increase. |
+| Seal divergence | `increase(ravel_scrub_seal_divergence_total[1h]) > 0` | A `missing` or `mismatched` divergence means the folded snapshot under-counts the sealed commit history (late-commit seal loss); a query reading the snapshot silently omits committed data. Page on any nonzero increase. |
 | Scrub falling behind | `ravel_scrub_cursor_position` stuck near 0 across a period longer than `P` | A rotation that never advances means scrubbing is not keeping pace with `P`; the effective staleness bound is no longer `P`. |
 
 ### Storage credential impact (ADR-0055)
@@ -596,8 +594,8 @@ The `c/` commit prefix (`t/<hash>/<sig>/c/…`) and the catalog prefix
 the other, so Maintain's delete grant on `c/` never reaches catalog objects.
 
 The audit prefix (`t/<hash>/u/…`) holds two fixed control-plane shards that the
-policies treat differently on delete (ADR-0055 §3, as amended by EL-6, issue
-#763). Every audit object key carries its shard as a four-digit segment
+policies treat differently on delete (ADR-0055 §3). Every audit object key
+carries its shard as a four-digit segment
 (`t/<hash>/u/<l0|c|l1>/<shard>/…`), so `0000` and `0001` name disjoint paths a
 wildcard can separate:
 
@@ -633,11 +631,11 @@ principal (user or role) whose access key you put in that role's Kubernetes
 Secret. Every policy — including Gateway's, Query's, and Admin's, which have
 no delete grant at all — carries the same explicit `Deny` on
 `s3:DeleteObject`/`s3:DeleteObjectVersion` over the six protected prefixes
-(ADR-0055 section 3, as amended by EL-6). An explicit `Deny` overrides any
+(ADR-0055 section 3). An explicit `Deny` overrides any
 `Allow`, so this makes those prefixes undeletable even by a role that otherwise
 has delete rights (Maintain). The sixth of those prefixes is the audit
-**legal-hold shard** only (`t/*/u/*/0000/*`), not the whole audit prefix: EL-6
-(issue #763) narrowed it there so the query-audit shard (`t/*/u/*/0001/*`) can
+**legal-hold shard** only (`t/*/u/*/0000/*`), not the whole audit prefix: it
+was narrowed there so the query-audit shard (`t/*/u/*/0001/*`) can
 be age-swept, and added that query-audit path to Maintain's delete grant alone.
 
 **Gateway:** [`deploy/iam/gateway.json`](../../deploy/iam/gateway.json).
@@ -715,7 +713,7 @@ The `MaintainList` statement's `s3:prefix` condition carries the same bare
 
 Maintain's `MaintainDelete` grants delete on `l0/`, `l1/`, `c/`, `idem/` — the
 four prefixes Ravel's own sweep and retention code deletes from today — plus
-the query-audit shard `t/*/u/*/0001/*` (EL-6, issue #763): the Maintain process
+the query-audit shard `t/*/u/*/0001/*`: the Maintain process
 compacts and age-sweeps the query-audit activity log on its own 90-day window
 (`ravel-maintain`'s `sweep_audit_retention`), so it needs delete there. The
 `DenyDeleteProtected` block still applies to Maintain: its `c/` delete grant
@@ -841,8 +839,8 @@ existing `DenyDeleteProtected` block. An explicit `Deny` overrides any
 
 ### Per-tenant SSE-KMS routing (ADR-0062 decision 1, ADR-0072 decision 2)
 
-EL-7 (issue #764, epic #462) wires the `KmsRoutingStore` decorator
-(`crates/ravel-object-store/src/kms_routing.rs`) into `ravel-server`'s single
+The `KmsRoutingStore` decorator
+(`crates/ravel-object-store/src/kms_routing.rs`) wires into `ravel-server`'s single
 store-construction site. Two independent flags, both off by default:
 
 - `--s3-kms-key <arn>`: single-key SSE-KMS on the one default `S3Store`
@@ -923,7 +921,7 @@ credential roles" above) — a role that never routes writes through this key
 gains nothing from being able to decrypt it, and every principal added here
 widens the compromise blast radius this key policy exists to narrow.
 
-**Role-side grant (required too, issue #929).** The key policy above only
+**Role-side grant (required too).** The key policy above only
 grants usage to the *principal*; AWS also requires the calling principal's
 own IAM policy to allow the `kms:*` action, or the request is denied before
 it reaches the key policy at all. Each `deploy/iam/*.json` role template
@@ -1262,7 +1260,7 @@ maintenance loop (`ravel-server --mode maintain`) drives both, or one-shot
 from `ravel-cli maintain`. Objects are immutable throughout. Deletion
 removes whole objects; nothing is ever modified in place
 ([docs/consistency-model.md](../consistency-model.md#deletion-and-gc),
-docs/compaction-retention-plan.md, ADR-0018/ADR-0019). All of it is
+ADR-0018/ADR-0019). All of it is
 signal-generic: metrics (RSEG) and logs (RLOG) go through the same code.
 
 ### What runs
@@ -1340,7 +1338,7 @@ maintenance loop uses the defaults.
 
 `ravel-cli maintain migrate --tenant T --signal metrics` raises a `(tenant,
 signal, format family)`'s recorded format floor to a target on-object format
-version (epic EM, EM-T5). One invocation:
+version. One invocation:
 
 1. walks buckets in `(shard, ingest_hour)` order from a durable cursor,
    rewriting every sealed, un-tombstoned, not-yet-compacted bucket that still
@@ -1360,7 +1358,7 @@ sealed and migrated yet, or data that arrived after the walk passed. Re-run
 The re-audit's liveness definition already excludes a bucket's pre-rewrite L0
 commit records once that bucket carries a compaction or rewrite record: those
 records are dead, sweepable leftovers of a rewrite this same invocation may
-have just performed, not stragglers (issue #826). Because of this, a clean
+have just performed, not stragglers. Because of this, a clean
 migration converges and raises the floor in one invocation; running `sweep`
 in between is never required for `migrate` to converge. `sweep`'s
 superseded-input rule (above) still physically deletes those pre-rewrite
@@ -1371,7 +1369,7 @@ reclamation concern, not a correctness precondition for the floor raise.
 
 `--mode maintain` renders five additional samples on the existing `GET
 /metrics` endpoint (ADR-0044 section 4), alongside the tenant-discovery
-gauges (issue #504): `ravel_maintain_legal_hold_refresh_failures_total`
+gauges: `ravel_maintain_legal_hold_refresh_failures_total`
 (counter), `ravel_maintain_conservation_aborts_total` (counter, labeled
 by `signal`), `ravel_maintain_orphan_breaker_tripped_total` (counter,
 labeled by `signal`), `ravel_maintain_orphans_withheld` (gauge,
@@ -1385,7 +1383,7 @@ unless the opt-in `--metrics-tenant-labels` flag is set (see below); by
 default all five samples stay process-wide totals, not broken out per
 tenant.
 
-### Maintenance ownership, concurrency, and merge-memory metrics and alerts (ADR-0065, issue #749)
+### Maintenance ownership, concurrency, and merge-memory metrics and alerts (ADR-0065)
 
 `--mode maintain` also renders the ADR-0065 leased-distributed-maintenance
 family, one process-wide series per name (`mode` label only, plus `kind` on
@@ -1436,7 +1434,7 @@ cardinality stays bounded regardless of tenant count. Pass
 instead -- one series per (tenant, signal, reason) -- which is a
 cardinality trade an operator opts into deliberately, not a default.
 
-### Per-query cost accounting (ADR-0044, issue #425)
+### Per-query cost accounting (ADR-0044)
 
 A query reports what it spent on object storage to the client that ran it.
 An operator can then see cost per tenant and per workload, and never reads
@@ -1525,7 +1523,7 @@ Default alert rules:
 | Compaction conservation gate aborting | `increase(ravel_maintain_conservation_aborts_total[15m]) > 0` | Each abort means a compaction publish was refused because input and output record counts disagreed (ADR-0048 decision 6); nothing was written, but a bucket stuck retrying every tick without ever compacting needs an operator, not just a retry. |
 | Mass-orphan circuit breaker trip | `increase(ravel_maintain_orphan_breaker_tripped_total[5m]) > 0` | Fire on the **first trip**, not on a sustained condition. The trip condition can clear itself (dilution or partial restoration, see below) while the underlying record loss and the pass's withheld deletions persist; a sustained-state alert (`orphan_breaker_tripped_total` treated as a level) can clear before anyone looks. The counter only increments, so any `increase() > 0` is a real trip that happened, whether or not the shard is still tripping now. |
 | Orphans present (small-scale loss) | `ravel_maintain_orphans_present > 0` for `12h` | Catches the breaker's blind spot (ADR-0058 decision 1): delete a handful of commit records for one shard and the candidate count never reaches `orphan_breaker_min_count` or `orphan_breaker_max_ratio`, so the breaker never trips and `orphans_withheld` stays `0`, yet the orphaned data objects are deleted at the grace horizon like ordinary abandoned flushes. A sustained nonzero here is either that loss or a genuinely stuck abandoned flush; both warrant a look before the grace window (default 25h) elapses. Twelve hours is roughly half the grace window, long enough that a single normal abandoned-flush cleanup between passes doesn't page, short enough that real loss alarms with hours to spare. |
-| Discovered tenants not maintained | `ravel_maintain_tenants_maintained < ravel_maintain_tenants_discovered` for `10m` | A prefix under `t/` holds data with no maintaining owner, the exact `maintained < discovered` condition ADR-0048 decision 3 names, and the same S2-17/S5-09 finding recurring for a different reason (ADR-0048 Context). Ten minutes is two cycles at the default 300s `--maintain-interval-secs`, long enough that a single tick's transient gap (a restart, a tenant mid-onboarding) doesn't page, short enough that a real gap alarms within the hour. |
+| Discovered tenants not maintained | `ravel_maintain_tenants_maintained < ravel_maintain_tenants_discovered` for `10m` | A prefix under `t/` holds data with no maintaining owner, the exact `maintained < discovered` condition ADR-0048 decision 3 names, and the same class of gap recurring for a different reason (ADR-0048 Context). Ten minutes is two cycles at the default 300s `--maintain-interval-secs`, long enough that a single tick's transient gap (a restart, a tenant mid-onboarding) doesn't page, short enough that a real gap alarms within the hour. |
 | Tenant discovery failing | `increase(ravel_maintain_tenant_discovery_failures_total[5m]) > 0` | A failed `LIST t/` skips the *entire* cycle, every tenant, not just one (ADR-0048 decision 3): the supervisor deliberately never treats a failed enumeration as "no tenants" so it can't be confused with healthy idleness, but that means a sustained failure is a fully silent maintenance outage. Alarm on the first occurrence rather than waiting for a sustained window, faster than the gauge condition above, because a skipped cycle is worse than one tenant falling behind: nothing is being maintained at all. |
 
 `ravel_maintain_orphans_withheld` is a gauge, not an alert target: it
@@ -1609,8 +1607,7 @@ verifying the candidates really are abandoned data) that deletion is
 safe, since the same record-absence signal orphan GC re-verifies
 against is exactly what out-of-band record loss forges.
 
-**Known blind spots (tracked as open gaps in issue #500, not fixed by
-this design)**:
+**Known blind spots (open gaps, not fixed by this design)**:
 
 - **No protection below the floor.** The breaker never trips below
   `orphan_breaker_min_count` (default 50) regardless of ratio, so total
@@ -1647,8 +1644,8 @@ reattach.
    excludes tenants that do not yet carry a durable `t/<hash>/config` record;
    once a tenant carries one, no CLI flag can exclude it from maintenance, so
    restarting restricted to other tenants will not keep the sweeper off a
-   config-recorded tenant (issue #857 tracks a durable per-tenant
-   maintenance-exclusion mechanism). Do not rely on the mass-orphan breaker to
+   config-recorded tenant (a durable per-tenant maintenance-exclusion
+   mechanism is not yet built). Do not rely on the mass-orphan breaker to
    hold the shard open either: it is not self-clearing in the way an operator
    expects (see the runbook above), and small-scale record loss may never trip
    it at all.
@@ -1692,9 +1689,9 @@ content-hash check).
 
 ## Known limitations
 
-From [PROGRESS.md](../../PROGRESS.md), as of the Phase 1 vertical slice:
+As of the Phase 1 vertical slice:
 
-- Catalog snapshot resolution (docs/metric-index-plan.md phase 4) removes
+- Catalog snapshot resolution removes
   most of the per-query listing cost for sealed history, but only where
   the background fold has run. Two cases still list commit records per
   (tenant, shard, hour) bucket on every query: the open window above the
@@ -1706,10 +1703,9 @@ From [PROGRESS.md](../../PROGRESS.md), as of the Phase 1 vertical slice:
   query corpus.
 - RSEG encode throughput drops sharply at high series cardinality in one
   segment: about 14.7M samples/s at 100 series, down to about 235K/s at
-  100,000 series, in the committed microbenchmarks
-  ([BENCHMARKS.md](../../BENCHMARKS.md)).
+  100,000 series, in the committed microbenchmarks.
 - Parenthesized PromQL expressions (`(up)`) are rejected as unsupported.
-  This is a known gap (issue #10), not a silent reinterpretation.
+  This is a known gap, not a silent reinterpretation.
 - No exactly-once ingestion guarantee. Delivery is at-least-once. A
   client-side retry after a lost ack response re-ingests the same points
   as a duplicate (both copies are stored; a query takes the last value at

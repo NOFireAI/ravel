@@ -1,9 +1,10 @@
 # ADR-0019: Age-based retention via bucket tombstones and horizon-gated sweep
 
-Status: Accepted (2026-07-27). Implementation plan and tickets:
-docs/compaction-retention-plan.md. Builds on the sweeper, key-layout, and
-horizon machinery of ADR-0018 but is independently adoptable: retention
-of never-compacted L0 buckets needs no compactor.
+Status: Accepted
+
+Builds on the sweeper, key-layout, and horizon machinery of ADR-0018 but
+is independently adoptable: retention of never-compacted L0 buckets needs
+no compactor.
 
 ## Context
 

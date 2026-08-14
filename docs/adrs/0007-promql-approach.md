@@ -1,6 +1,6 @@
 # ADR-0007: promql-parser crate for parsing, own evaluator, differential testing gate
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 

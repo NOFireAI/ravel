@@ -57,7 +57,7 @@ up the layout.
 Illustrates: docs/segment-format.md (the self-contained v5 spec),
 docs/adrs/0004-rseg-format.md,
 docs/adrs/0010-spec-amendments-review-1.md (§4, checksum coverage),
-docs/adrs/0014, 0017, 0018, 0026, 0027.
+docs/adrs/0017, 0018, 0026, 0027.
 
 Last verified against the code: 2026-07-28 (v5 is the only readable and
 writable version, ADR-0027; frozen and proved byte-identical by the
@@ -115,15 +115,14 @@ each does today.
 Illustrates: docs/guides/tracing.md, docs/adrs/0044-query-cost-accounting.md
 (decision 5), docs/adrs/0060-query-path-otlp-trace-export.md.
 
-Last verified against the code: 2026-08-08 (epic #702 landed the OTLP export
-crate and both binaries' wiring; follow-ups #711 and #720 landed the
-runtime-export-failure warning and the logs-decode-span field parity this
-diagram documents).
+Last verified against the code: 2026-08-08 (the OTLP export crate and both
+binaries' wiring landed, along with the runtime-export-failure warning and
+the logs-decode-span field parity this diagram documents).
 
 ## ingest-plausibility-window.svg
 
 The fail-closed ingest-timestamp plausibility window from the ADR-0051
-amendment (2026-08-13, issue #905): the accept region
+amendment (2026-08-13): the accept region
 `[now - max_ingest_lag, now + max_future_skew]` on the event-time axis,
 with both reject zones and the typed rejections they produce (`TooOld`,
 `FutureSkew`), the per-signal bounded timestamps (metric sample ts, log
@@ -137,4 +136,4 @@ Illustrates: docs/adrs/0051-tenant-admission-control.md (amendment
 docs/consistency-model.md "Late and skewed data".
 
 Drawn 2026-08-13 against the amendment's decision; the span-end rule and
-clock floor describe the decided behavior, which issue #905 implements.
+clock floor describe the decided and implemented behavior.

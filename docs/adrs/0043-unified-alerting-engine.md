@@ -1,16 +1,17 @@
 # ADR-0043: Unified alerting engine - observability alerts and detection rules, stored as data
 
+Status: Accepted
+
 ## Context
 
-Epic 3 (program #333), scoped by the user explicitly to cover both
-observability alerting (recording/alert rules over PromQL, the
-Grafana-adjacent workflow) and security detection (Sigma-style rules
-over the `logs` SQL table), with alert state itself stored as durable
-data so a rule can read alert history - including a rule that fires on
-other alerts. This depends on ADR-0040 (`Signal::Alerts`, RLOG-format
-reuse, fold-derived state, the generation-based recursion guard) and
-benefits from, but does not require, Epic 2's aggregation operators
-(already on main).
+This engine covers both observability alerting (recording/alert rules
+over PromQL, the Grafana-adjacent workflow) and security detection
+(Sigma-style rules over the `logs` SQL table), with alert state itself
+stored as durable data so a rule can read alert history - including a
+rule that fires on other alerts. This depends on ADR-0040
+(`Signal::Alerts`, RLOG-format reuse, fold-derived state, the
+generation-based recursion guard) and benefits from, but does not
+require, the aggregation operators already on main.
 
 No rule-evaluation machinery exists in Ravel today. The closest
 structural precedent is `services/ravel-server/src/maintain.rs`'s
@@ -75,12 +76,12 @@ evaluator scheduler mirrors, not a new scheduling mechanism.
    latest record, never block the record from being written - the
    durable record is the source of truth, the sink is a notification,
    not a second commit path.
-7. **Query surface**: `alerts` and (Epic 4's) `audit` SQL tables follow
+7. **Query surface**: `alerts` and `audit` SQL tables follow
    the exact `logs` table provider/pushdown/scan pattern (ADR-0033),
    reusing `LogSegmentFetcher`'s shape against the shared RLOG-format
    reader (ADR-0040).
 
-## Deferred (explicitly out of this epic's v1)
+## Deferred (explicitly out of v1)
 
 - **Recording rules** (a PromQL query that always writes a derived
   series back as new metric data, rather than conditionally firing an
@@ -112,8 +113,8 @@ evaluator scheduler mirrors, not a new scheduling mechanism.
   either.
 - **Two separate engines for observability alerts and security
   detections**, matching how most vendors ship them as separate
-  products. Rejected per the user's explicit direction and because the
-  generic rule shape (point 1) already covers both without
+  products. Rejected because the generic rule shape (point 1) already
+  covers both without
   duplicating the scheduler, the fold logic, or the sink code.
 - **Exactly-once sink delivery via a second durable outbox table.**
   Rejected: real added complexity (an outbox needs its own retry/dedup

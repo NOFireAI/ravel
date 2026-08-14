@@ -1,8 +1,6 @@
 # ADR-0070: Request-class scheduling for object-store traffic and a CI benchmark regression gate
 
-Status: accepted
-Date: 2026-08-12
-Refs: #810, #805, #870, #872
+Status: Accepted
 
 ## Context
 
@@ -12,7 +10,7 @@ ack-bearing traffic (ingest data and commit PUTs, query segment GETs,
 resolve LISTs) and background traffic (compaction, fold, sweep, scrub,
 audit retention) meet in the same connection pool with no request
 prioritization and no global cap. The starvation is measured, not
-hypothesized: the BENCHMARKS.md `s3_e2e` MinIO panel saturated ingest at
+hypothesized: the `s3_e2e` MinIO panel saturated ingest at
 3,923 accepted points/s with 70 s visibility lag, and the bench's
 min-token resolve probe repeatedly timed out queued behind the ingest
 PUT backlog. Under the same load, reader p99 was 417 ms against 26 ms on
@@ -41,13 +39,13 @@ Two facts constrain the design:
   already encodes the honest answer in
   `crates/ravel-bench/tests/catalog_byte_gates.rs`: bytes and request
   counts are exact and deterministic, "this makes the gate unlosable."
-  Meanwhile nothing gates performance at all: the #94 eager-decode
-  regression merged silently, and every BENCHMARKS.md panel is a
+  Meanwhile nothing gates performance at all: a past eager-decode
+  regression merged silently, and every benchmark panel is a
   manual, one-shot run.
 
-The 2026-08-09 ADR-0067 depth panel left cells pending: depth 3 under
-~300 ms injected RTT (#872, committed as zero-byte placeholders) and a
-multi-tenant bench shape (#870, the single-tenant cadence never wants a
+ADR-0067's depth panel left cells pending: depth 3 under
+~300 ms injected RTT (committed as zero-byte placeholders) and a
+multi-tenant bench shape (the single-tenant cadence never wants a
 second in-flight flush). Both block the `max_inflight_flushes` and
 adaptive-flush default decisions.
 
@@ -100,7 +98,7 @@ mode, which for the first time bounds their in-flight store requests
   baseline under `bench/baselines/`, threshold +/-15%, posting a PR
   comment, never failing the build, and running only on the
   self-hosted reference runner where the baseline was recorded.
-  Promotion to enforcing (closing #805) happens after a probation
+  Promotion to enforcing happens after a probation
   window shows acceptable false-positive rate, and only for regressions
   beyond 15% sustained across two consecutive runs of the same PR head.
 
@@ -108,10 +106,10 @@ mode, which for the first time bounds their in-flight store requests
 
 A single local panel session (MinIO + toxiproxy, the ADR-0067 panel's
 fresh-data-dir/fresh-bucket/drift-canary methodology) produces:
-the real-S3/non-loopback rerun BENCHMARKS.md lists as pending; the
+the real-S3/non-loopback rerun listed as pending; the
 GET-concurrency sweep {8, 16, 32, 64, 128} under concurrent ingest
 (needs the fetch/catalog knobs plumbed to bench flags first);
-the #872 depth-3-at-300ms cells; and the #870 multi-tenant shape
+the depth-3-at-300ms cells; and the multi-tenant shape
 (needs an ingest_bench `--tenants` flag). The bench report JSON gains a
 counted `resolve_starvation_timeouts` field so starvation stops being a
 grep over raw logs. Panel results freeze the scheduler defaults
@@ -135,7 +133,7 @@ decision).
   everyone to ignore red. Exact gates stay hard, timing stays advisory
   until probation proves otherwise.
 - **Skipping the panel and sizing semaphores analytically.** The
-  existing constants came from exactly that method and §11's arithmetic
+  existing constants came from exactly that method and the arithmetic
   shows they can be off by 4x against real RTT; the panel is the
   cheaper mistake.
 
@@ -151,6 +149,6 @@ decision).
   when the runner is offline.
 - The panel is local-only work (MinIO + toxiproxy on a workstation, per
   the depth-panel methodology); code legs are fleet-dispatchable, the
-  workflow leg iterates on live Actions runs per #805.
-- BENCHMARKS.md keeps its discipline: every number states its
+  workflow leg iterates on live Actions runs.
+- The benchmark discipline holds: every number states its
   environment; loopback panels stay labeled as loopback.

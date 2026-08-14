@@ -1,6 +1,6 @@
 # ADR-0044: Per-query cost accounting, a bounded metrics endpoint, and a pre-execution cost estimate
 
-Status: Accepted (2026-08-02)
+Status: Accepted
 
 ## Context
 
@@ -108,7 +108,7 @@ The original form of this decision specified only the second part, which
 was wrong and unbuildable: an estimate computed after resolve structurally
 cannot bound resolve's own spend, so wiring the catalog's accounting in
 would make actual exceed estimate on exactly the queries a limiter most
-needs to catch. Amended 2026-08-02 after a checkpoint review found the
+needs to catch. Amended after a checkpoint review found the
 contradiction.
 
 **Per-sample cost is per value kind, not one constant.** A single
@@ -124,7 +124,7 @@ Each query records the estimate and the actual side by side, so the
 estimate's accuracy is itself a measurable quantity before anything
 depends on it.
 
-**Amendment, 2026-08-05 (issue #635).** Decision 3's catalog term becomes
+**Amendment.** Decision 3's catalog term becomes
 load-bearing: it now gates admission. Rejected alternative 4 ("no query is
 rejected on a cost ceiling") is narrowed, not reversed wholesale. The
 *segment* term and every byte- and sample-per-value weight remain
@@ -133,9 +133,8 @@ acquires an enforced ceiling, and only because it is the one part of the
 estimate that is both computed before any work is done and, left unchecked,
 an availability incident on its own: a client-supplied `start` of `0.0` makes
 `Catalog::resolve` issue one LIST per (shard, ingest-hour) from the epoch to
-now -- 496,089 LISTs for a single shard as of this writing (issue #634's
-measurement), a count that grows by one every wall-clock hour, forever, and
-multiplies by `shard_count`.
+now -- 496,089 LISTs for a single shard as of this writing, a count that
+grows by one every wall-clock hour, forever, and multiplies by `shard_count`.
 
 The catalog term stays an upper envelope and never a prediction. The ceiling
 gates the *worst case* resolve would face with no snapshot watermark to
@@ -182,7 +181,7 @@ construction rather than one endpoint at a time. The estimate and the limit
 ride on the typed error only; per section 4's closed label allowlist they are
 never emitted as a metrics label.
 
-**Amendment, 2026-08-05 (issue #636, ADR-0056).** ADR-0056 replaced the
+**Amendment (ADR-0056).** ADR-0056 replaced the
 per-`(shard, ingest-hour)` LIST loop with a single per-shard recursive prefix
 LIST for wide windows. This changes what the catalog term above must mean, in
 two coordinated ways, and the amended contract is:
@@ -209,7 +208,7 @@ two coordinated ways, and the amended contract is:
   hard guarantee "a single resolve never issues more than
   `max_catalog_list_requests` catalog LISTs" is preserved -- now enforced at
   runtime on the one path whose cost is not knowable before listing. A
-  wide-but-sparse window that this decision (as amended for #635) would have
+  wide-but-sparse window that this decision would have
   refused is now served; only a scan whose actual object volume is
   unsustainable is refused. The typed error, its fields, and its HTTP-422
   mapping are unchanged.
@@ -240,7 +239,7 @@ tenants; anything else folds into `tenant_hash="other"`. `shard` is not a
 label. Query text, metric names, label values, stream ids, trace ids, and
 object keys are never labels.
 
-**Amendment, 2026-08-04 (issue #603).** ADR-0051 section 6 added an
+**Amendment.** ADR-0051 section 6 added an
 eighth permitted label, `reason`, for the admission family's
 `ravel_admission_rejected_total`. That decision belongs to ADR-0051; this
 paragraph records it so that the list above stays exhaustive rather than
@@ -319,7 +318,7 @@ today, so a slow query cannot be attributed to a phase.
   per-tenant series exist, an unauthenticated scrape discloses one
   tenant's volumes and error rates to anyone who can reach the port.
   Per-tenant series are therefore blocked on an authentication decision
-  for this route, recorded on the issue that adds them.
+  for this route.
 - The estimate is recorded but never enforced. Nothing in this change can
   reject a query that runs today.
 - The cost model's weights are not fixed here. Recording requests, bytes,

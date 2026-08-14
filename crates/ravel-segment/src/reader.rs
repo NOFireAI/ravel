@@ -1081,7 +1081,7 @@ pub fn decode_run_histogram_pages(
         .collect())
 }
 
-// --- RSEG v2 decode path (ADR-0014, docs/segment-format.md "RSEG v2
+// --- RSEG v2 decode path (ADR-0027, docs/segment-format.md "RSEG v2
 // amendment", docs/rseg-v2-plan.md phase P3, issue #31). SERIES_IDS +
 // SERIES_META decode producing the same `SeriesEntry` shape v1's
 // `decode_catalog`/`decode_catalog_matching` already produce.

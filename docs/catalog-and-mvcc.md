@@ -32,8 +32,8 @@ sys/maintain/workers/<process_id>                                       maintain
 sys/maintain/memo/<process_id>                                          maintain-worker durable memo snapshot for warm start/handoff (root-level, per-process, Overwrite; ADR-0065 §3)
 ```
 
-The compaction/retention key shapes (ADR-0018, ADR-0019;
-docs/compaction-retention-plan.md §3.1) and the selective-erasure key shapes
+The compaction/retention key shapes (ADR-0018, ADR-0019) and the
+selective-erasure key shapes
 (`rw.` rewrite records and the `del/` request/completion prefix, ADR-0064) are
 additive: existing keys and their meaning are untouched.
 
@@ -116,7 +116,7 @@ listing consistency under a fresh `run-id` each run; these objects are
 transient probe fixtures, not durable state, and carry no lifecycle
 guarantee beyond the run that created them.
 
-`t/<tenant_hash>/<signal>/prov` (ADR-0050 §5, EC5) is the durable
+`t/<tenant_hash>/<signal>/prov` (ADR-0050 §5) is the durable
 `shard_count` provisioning record: a per-(tenant, signal) object holding
 `tenant_hash`, `signal`, `shard_count`, a `format_version` floor,
 `created_unix_ns`, an append-only `generations` history (ADR-0052), and an
@@ -145,7 +145,7 @@ history is immutable, and the scalar `shard_count` field stays equal to
 generation 0's count. Readers derive the per-hour shard fan-out from the
 history via `ravel_catalog::scan_count` rather than a single static count.
 
-`t/<tenant_hash>/enc` (ADR-0062 §1b, epic EL) is the durable per-tenant
+`t/<tenant_hash>/enc` (ADR-0062 §1b) is the durable per-tenant
 KMS key-epoch record: a tenant-scoped object (not per-signal, since a
 tenant's KMS key applies across every signal) holding `tenant_hash`, a
 `format_version` floor, `created_unix_ns`, and an append-only `epochs`
@@ -170,7 +170,7 @@ returns `Ok(None)`). This record is durable audit metadata only; it is not
 read on the live write path (the routing decorator carries the active key),
 so a slightly stale reader cannot misroute a write.
 
-`t/<tenant_hash>/config` (ADR-0066 §6, epic EM) is the durable per-tenant
+`t/<tenant_hash>/config` (ADR-0066 §6) is the durable per-tenant
 config record that moves tenant lifecycle state, admission-limit overrides,
 retention, and indexed-field config off process flags and into durable state.
 A tenant-scoped object (not per-signal, since these apply across every signal)
@@ -191,9 +191,9 @@ a silent overwrite. On a tenant with no record the first write bootstraps with
 deployment defaults (`read_config` returns `Ok(None)`). This record is durable
 control state only; the bounded-staleness refresh loop that reads it on a
 horizon and re-invokes the admission controller's `set_tenant_limits` is a
-separate concern (epic EM, EM-T8).
+separate concern.
 
-`sys/auth` (ADR-0066 §6, epic EM) is the durable, deployment-wide bearer-token
+`sys/auth` (ADR-0066 §6) is the durable, deployment-wide bearer-token
 map replacing the startup-frozen `--tenant-token` allowlist: a bucket-root
 object (never under a tenant prefix, since an entry maps a token to whichever
 tenant it grants) holding a `format_version` floor, a 16-byte deployment-key
@@ -211,7 +211,7 @@ a first-class operation an append-only history cannot express. A deployment
 with no provisioned tokens (or one using only OIDC/mTLS) has no `sys/auth`
 object, which is not an error (`read_auth_map` returns `Ok(None)`). The
 resolver refresh loop (rate-limited on-miss re-read, fail-closed revocation) is
-EM-T8's concern; this module supplies only the object shape, the keyed hash,
+a separate concern; this module supplies only the object shape, the keyed hash,
 and the CAS read/write helpers.
 
 - `keyhash32` (idempotency marker keys only, ADR-0051 §5): 32 lowercase hex
@@ -223,8 +223,8 @@ and the CAS read/write helpers.
   orphan sweep lists `l0/…`; the fail-loud unknown-key rule below applies
   only to the `c/` prefix), and markers older than the dedup window
   (default 24h, from the `ingest_hour` in the file name) are deleted by
-  `ravel_maintain::sweep::sweep_idempotency_markers` (ADR-0051 §5, epic
-  #452 EB-9), not by this crate: it LISTs the coarser
+  `ravel_maintain::sweep::sweep_idempotency_markers` (ADR-0051 §5), not by
+  this crate: it LISTs the coarser
   `t/<tenant_hash>/<signal>/idem/` prefix (no `keyhash32`, since the sweep
   has no client key to scope by), deletes every marker whose `ingest_hour`
   is more than `CompactorConfig::idem_dedup_window_hours` (default 24h)
@@ -292,11 +292,9 @@ and the CAS read/write helpers.
     manifest (the tenant id encrypted under an AES-256-GCM key derived from
     the deployment key) at each tenant's first write.
 
-  Correction: this table and ADR-0010 §13 previously stated a
-  deployment-keyed variant was "available via config". It was never
-  implemented until ADR-0050 §3 (EC3); the keyed variant described above is
-  the real, default, durable design. There is no re-key migration between
-  schemes (ADR-0050 §3; docs/guides/operations.md).
+  The v2-keyed variant described above (ADR-0050 §3) is the real, default,
+  durable design. There is no re-key migration between schemes (ADR-0050 §3;
+  docs/guides/operations.md).
 - `m` = metrics signal. Logs `l`, spans `s`, profiles `p` reserved.
   Alerts `a` and audit `u` (ADR-0040) share `l`'s RLOG segment format
   verbatim - no new byte layout, only two new signal-keyspace prefixes.
@@ -318,7 +316,7 @@ and the CAS read/write helpers.
 - `signal` (catalog keys only): the same one-letter signal prefix as the
   data/commit keys (`m` for metrics), scoping the snapshot index per
   (tenant, signal) the same way `shard_count` and the commit layout already
-  are (docs/metric-index-plan.md 3).
+  are.
 - `watermark` (catalog keys only): the snapshot part's watermark hour,
   formatted as the same `YYYYMMDDTHH` text as `ingest_hour`. Informational
   for operators; HEAD's `watermark_hour` field is authoritative, never this
@@ -330,13 +328,12 @@ and the CAS read/write helpers.
   like data objects (ADR-0010 §7).
 - Superseded snapshot parts (`catalog/<signal>/snap/`) and name-postings
   objects (`catalog/<signal>/idx/`) are swept by
-  `ravel_maintain::sweep::sweep_unreferenced_catalog_objects` (EH-T4,
-  issue #741), the fifth GC sweep rule alongside orphan GC, the
+  `ravel_maintain::sweep::sweep_unreferenced_catalog_objects`, the fifth GC
+  sweep rule alongside orphan GC, the
   superseded-input and unreferenced-part sweeps, and the idempotency-marker
   sweep. Every fold that rewrites a part or postings object writes a new
-  content-addressed key and swaps HEAD, leaving the old object in place
-  (docs/metric-index-plan.md 4 step 8, the "orphan part" crash-matrix row);
-  without this rule each such fold leaks one object. The rule LISTs the two
+  content-addressed key and swaps HEAD, leaving the old object in place (the
+  "orphan part" crash case); without this rule each such fold leaks one object. The rule LISTs the two
   prefixes first, then GETs the current `catalog/<signal>/HEAD`, treats every
   `parts[].key` and the optional `postings.key` as referenced, and deletes any
   object under the two prefixes that HEAD does not name once its
@@ -445,7 +442,7 @@ be raised for writers after every folder's seal computation uses the raised
 values (deployment ordering: folders before writers). Lowering them is
 always safe for sealing.
 
-(docs/metric-index-plan.md 2, ADR-0020.)
+(ADR-0020.)
 
 ## Fold reconcile pass (ADR-0063 section 4)
 
@@ -456,11 +453,9 @@ a retention tombstone (`retire.tmb`), or a selective-erasure rewrite record
 (`rw.*.cmt`, ADR-0064) can be published into an hour long after that hour
 was sealed and folded into a past fold's output; because no later fold ever
 re-lists an already-folded hour, such a late record would otherwise never be
-applied to the snapshot short of a full HEAD-corruption rebuild. Under the
-single ever-rewritten part of the pre-EH design this was masked (the one
-part was recomputed every cycle). Under EH-T2's sealed parts, which are
-deliberately carried forward by reference and never rewritten, it must be
-addressed directly.
+applied to the snapshot short of a full HEAD-corruption rebuild. Because sealed parts are deliberately carried forward by reference and never
+rewritten, such a late record must be addressed directly rather than being
+absorbed by a full recompute.
 
 The rewrite-record trigger is load-bearing, not incidental: ADR-0064 §3.1
 scopes the rewrite pass to already-sealed buckets by construction, so a
@@ -537,8 +532,8 @@ time retention runs (tombstones normally have a retention period of days,
 so this path is legal but uncommon in practice; see
 `reconcile_applies_late_tombstone`). A late record whose bucket falls
 outside the window is deliberately not picked up: a stated, bounded
-staleness tradeoff, not a bug. (This closes a latent correctness gap that
-predates the epic; see ADR-0063 Consequences.)
+staleness tradeoff, not a bug. (This closes a latent correctness gap; see
+ADR-0063 Consequences.)
 
 ## Commit sequence (strict mode)
 
@@ -547,7 +542,7 @@ predates the epic; see ADR-0063 Consequences.)
    computed and verified locally before upload as a pre-flight guard; it is
    not sent to the store, because no shipped backend accepts a wire-level
    upload checksum (`capabilities().upload_checksum == false` on S3;
-   wire-level verification is pending issue #251). `AlreadyExists` is
+   wire-level verification is pending). `AlreadyExists` is
    success: the key embeds the content hash, so the stored bytes are
    identical by construction.
 3. PUT commit record with `PutMode::CreateIfAbsent`.
@@ -608,7 +603,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    Both traversals then partition the keys identically (step 2 onward).
 2. Partition the listed keys by shape (L0 commit record, compaction
    record, selective-erasure rewrite record, tombstone; ADR-0018, ADR-0019,
-   ADR-0064, docs/compaction-retention-plan.md §3.5). A key matching none of
+   ADR-0064). A key matching none of
    the four shapes is a fail-loud error, not a skip. Decode all records.
    Cache decoded records keyed by FULL object key; validate
    tenant_hash/signal/shard fields against the expected values on every hit;
@@ -644,7 +639,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      compaction/rewrite record (it should have been sealed before that ran).
    Two compaction records in one bucket with different input_set_hash:
    include both parts sets and all L0s not covered by either (correct
-   under overlap harmlessness; ADR-0018), and alarm loudly (§3.6 row 11).
+   under overlap harmlessness; ADR-0018), and alarm loudly.
 4. Filter the remaining L0 commit records: [min_event_ts, max_event_ts]
    overlaps the query range.
 5. For each `min_token`: reconstruct its commit key and GET it directly
@@ -673,7 +668,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    durable before a resolve is always seen by that resolve, so a query whose
    snapshot resolves after the request ack can never return matching records
    -- attachment depends on nothing a later rewrite pass does. The scan /
-   materialization layer (EJ-T3) is what filters query results against these
+   materialization layer is what filters query results against these
    predicates; resolution only discovers and attaches them.
 7. Snapshot = the resulting segment set plus `pending_erasure`, pinned for
    the query lifetime; later commits, compactions, rewrites, erasure
@@ -708,8 +703,8 @@ prefix scan collapses it to `O(objects / page_size)`, which is exactly why
 resolve switches to the prefix scan for wide windows (ADR-0056).
 
 `Catalog::estimated_catalog_requests` still reports the per-bucket worst case
-`shard_count * hour_buckets + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` (issue
-#635, ADR-0044 decision 3): it is a true upper envelope of whichever
+`shard_count * hour_buckets + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`
+(ADR-0044 decision 3): it is a true upper envelope of whichever
 traversal runs (the prefix scan issues strictly fewer requests than the
 per-bucket loop it replaces) and is threaded into the cost accounting. It is
 no longer the admission gate for wide windows. Instead:
@@ -731,7 +726,7 @@ endpoint.
 
 ## Snapshot resolution (Phase 2)
 
-Once folding (docs/metric-index-plan.md 4) is live, step 1 of the Phase 1
+Once folding is live, step 1 of the Phase 1
 algorithm above is replaced by a snapshot-backed lookup that degrades to
 Phase 1 listing on any index failure; min-token resolution and snapshot
 pinning are unchanged:
@@ -789,14 +784,14 @@ admission-time skew bounds that make it sound (ADR-0010 §8) are untouched.
 An index failure degrades performance only, never correctness: this is a
 derived, rebuildable index, never a durability or correctness dependency.
 
-(docs/metric-index-plan.md 5.1, ADR-0020.)
+(ADR-0020.)
 
 ## Query cost accounting
 
 `resolve` and `resolve_pruned` account for every store call and cache access
 they make on the caller's behalf when driven through their
 `*_with_accounting` counterparts (`resolve_with_accounting`,
-`resolve_pruned_with_accounting`; ADR-0044, issue #421). The plain `resolve`
+`resolve_pruned_with_accounting`; ADR-0044). The plain `resolve`
 and `resolve_pruned` entry points are unchanged and pass a discarded
 `QueryAccounting` handle, so every existing caller keeps its current
 signature and behavior.

@@ -3,7 +3,7 @@
 Coverage-guided (libFuzzer) fuzz targets for the RSEG reader's untrusted-input
 entry points: the footer/section parser and the v4/v5 catalog decoders. These
 complement, rather than duplicate, the byte-mutation proptests in
-`crates/ravel-segment` (issue #32): the proptests replay a fixed catalog of
+`crates/ravel-segment`: the proptests replay a fixed catalog of
 mutations (single-byte flips, truncation, block-boundary and cross-version
 edits), while libFuzzer explores the input space on its own under coverage
 feedback. This is a separately-invoked check; it is **not** part of `cargo test
@@ -42,13 +42,11 @@ cargo install cargo-fuzz             # the `cargo fuzz` subcommand
 | `decode_catalog_v5`          | `decode_catalog_v5` (v5 sparse whole-catalog decode)              |
 | `sparse_probe`               | `parse_series_idx` + `find_index_in_window` (v5 point-lookup path) |
 
-Note on naming: issue #48 refers to the catalog decoders as v1/v2 and to a
-`decode_catalog` / `decode_catalog_v2` pair. The current public API (post
-ADR-0027, v5-only readable/writable) names them `*_v4` (run-major catalog
+Note on naming: the current public API (post ADR-0027, v5-only
+readable/writable) names the catalog decoders `*_v4` (run-major catalog
 grammar) and `*_v5` (sparse catalog grammar); v5 has no single
 `decode_catalog_matching_v5`, its filtered/point-lookup surface is the sparse
-probe covered by the `sparse_probe` target. The targets above map onto the
-issue's intent 1:1.
+probe covered by the `sparse_probe` target.
 
 List targets any time with:
 

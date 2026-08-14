@@ -57,7 +57,7 @@ services (`services/ravel-server/src/otap_grpc.rs`), driving the per-stream
 `StreamState` and replying `BatchStatus` with commit tokens (see "Strict
 ack" and phase 3 below). The default build links neither `ravel-otap` nor
 its arrow dependency tree. Metrics only so far; the OTAP logs and traces
-services remain follow-up work under issue #12.
+services remain follow-up work.
 
 Dependency decisions:
 - Vendored OTAP `.proto` files (Apache-2.0) compiled with protox, same as
@@ -183,7 +183,7 @@ classic histogram exploding into several series, not a separate rule.
    `otelarrowexporter` (docker) against ravel-server.
 4. Bench panel: OTLP vs OTAP ingest on the same workloads (high attribute
    cardinality is OTAP's sweet spot); CPU/point, allocations/point, and
-   ack latency recorded in BENCHMARKS.md. Target from the mission: higher
+   ack latency measured. Target: higher
    ingest throughput per core than the OTLP path at high-cardinality
    attributes; report honestly if not met.
 5. Later, separate ADR: Arrow Flight DoPut ingest and Flight SQL query

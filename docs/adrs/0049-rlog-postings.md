@@ -1,6 +1,6 @@
 # ADR-0049: RLOG POSTINGS: exact block-level attribute pruning, opt-in per field
 
-Status: Accepted (2026-08-02)
+Status: Accepted
 
 ## Context
 
@@ -24,7 +24,7 @@ This ADR is that index.
 
 What already exists and constrains the design:
 
-- `ravel-codec` (issue #429) holds the nine-codec registry, the blocked
+- `ravel-codec` holds the nine-codec registry, the blocked
   bloom, its section framing, and the normative tokenizer, extracted
   precisely so a second format could use them.
 - RLOG's `BLOOM` section already gives cheap probabilistic pruning on word
@@ -52,8 +52,8 @@ lists and scans only the surviving blocks.
 
 Block granularity, not row. The scan already re-evaluates every predicate
 exactly on decoded values, so row-precise postings would buy nothing at
-read time and cost bytes at rest. This is ***REMOVED***'s `set`-index
-philosophy carried by Lucene's structure.
+read time and cost bytes at rest. This is a block-level set index
+carried by Lucene's structure.
 
 ### 2. Sorted term blocks with a sparse index, not an FST
 
@@ -70,8 +70,8 @@ one term block, and reads one posting list.
 ### 3. Opt-in per field, never automatic
 
 The indexed field list is explicit per-tenant configuration. Indexing
-every attribute is how ***REMOVED*** acquires its cost disease, and RLOG's
-existing 1000-column cap with visible overflow is the house style: bounded
+every attribute inflates cost without bound, and RLOG's existing
+1000-column cap with visible overflow is the house style: bounded
 by construction, with the excess still queryable and visibly unindexed.
 
 A sensible default list is small and operator-editable
@@ -161,7 +161,7 @@ from SQL, and it is named here rather than assumed.
   extended to the new grammar plus corrupt and truncated inputs, and the
   inspector taught to print it.
 
-  **Amended 2026-08-03: no trailer version bump.** This consequence
+  **Amended: no trailer version bump.** This consequence
   originally required one. It was wrong. ADR-0029 already carves out new
   section kinds: RLOG readers MUST skip an unknown kind, and an absent
   section is legal, so adding one is purely additive in both directions.
@@ -169,20 +169,19 @@ from SQL, and it is named here rather than assumed.
   it, and an old object without one is readable by a new reader, for which
   absence is legal by decision 5 above.
 
-  The correction matters beyond tidiness. Every trailer bump in this
-  program triggered a cascade of downstream breakage from version literals
-  mirrored by hand across crates, sixteen sites across three tasks for the
-  RSEG bump alone. Requiring a bump that the format does not need would
+  The correction matters beyond tidiness. Every trailer bump triggered a
+  cascade of downstream breakage from version literals mirrored by hand
+  across crates, sixteen sites for the RSEG bump alone. Requiring a bump
+  that the format does not need would
   have bought that cost for nothing. The rule this leaves behind: a new
   section kind is additive and needs no bump; a change to an existing
   section's grammar, or to the trailer, does.
 - Object size grows only for tenants that configure indexed fields.
   Indicative at the time of writing: 5 to 15% of object size for a four-field
-  list, to be measured before the default list is set. **Measured (issue #511,
-  see BENCHMARKS.md "RLOG POSTINGS storage overhead"): 0.13% for a
+  list, to be measured before the default list is set. **Measured: 0.13% for a
   four-field list over a 64k-record object, all four fields emitting
   postings** (three per-record HTTP attributes plus the resource-level
-  `service.name`, which issue #552 made indexable by giving every indexed
+  `service.name`, which was made indexable by giving every indexed
   stream-level key its own FIELD_DIR column). The 5-to-15% estimate did not
   hold; it was a guess made before
   the block-granularity design existed and is roughly two orders of
@@ -198,7 +197,7 @@ from SQL, and it is named here rather than assumed.
 - Nothing about durability, the commit protocol, the key layout, or
   snapshot resolution changes.
 
-## Amendment (2026-08-03): postings index the merged attribute view
+## Amendment: postings index the merged attribute view
 
 Decision 7 said the SQL path extracts attribute equality and `IN`, and that
 this closes ADR-0033 gap 2 and makes `attrs['k'] = 'v'` prunable end to end.
@@ -215,11 +214,11 @@ columns. SQL's `attrs` column is the merged view: resource and scope
 attributes with the record's own overriding them on a key collision. So the
 reader's per-record equality matches a strict subset of the SQL equality.
 Pushdown is `Inexact`, which requires the scan to return a superset, and a
-residual removes emitted rows but never restores a dropped one. Issue #510
-proved this empirically and shipped the finding instead of the push.
+residual removes emitted rows but never restores a dropped one. This was
+proved empirically, and the finding shipped instead of the push.
 
-Issue #538 answered it with a prune-only channel: arms that drive block
-pruning and never the per-row filter.
+A prune-only channel answers it: arms that drive block pruning and never
+the per-row filter.
 
 **A prune-only channel is not enough either, because the index covers one
 layer and the query spans two.** `FIELD_DIR` is object-wide, so one record
@@ -233,7 +232,7 @@ one tenant produce without arranging it.
 
 `IN` was also wrong in decision 7. An `IN` list is a disjunction and the
 prune channel intersects its arms, so one arm per element drops true
-results. Issue #519 tracks a sound disjunctive form.
+results. A sound disjunctive form is tracked separately.
 
 ### Decision
 
@@ -252,8 +251,8 @@ Readers keep both:
 - version 2: probe the term and prune, since the index covers the same union
   the query does.
 - version 1: prune only for a key that appears at no stream's resource or
-  scope level anywhere in the object, which is the conservative rule issue
-  #538 landed. Every pre-existing object stays correct without a rewrite.
+  scope level anywhere in the object, which is the conservative rule
+  previously landed. Every pre-existing object stays correct without a rewrite.
 
 Decision 6 is unchanged in principle and gains a requirement: the compaction
 rebuild indexes the merged view too, and writes version 2. A rebuild that
@@ -270,8 +269,8 @@ Because it excludes the keys the feature exists for. `service.name`,
 `k8s.namespace.name`, and `deployment.environment` are resource attributes in
 ordinary OTLP, and decision 3's own default indexed-field list names two of
 them. Under the version 1 rule an object carrying them that way prunes
-nothing at all. The epic would ship an index that is correct and close to
-useless, and every measurement decision 4 and issue #511 ask for would report
+nothing at all. This would ship an index that is correct and close to
+useless, and every measurement decision 4 asks for would report
 a constant.
 
 ### Rejected alternatives

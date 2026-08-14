@@ -1,7 +1,6 @@
 # ADR-0015: Prometheus Remote Write 1.0/2.0 ingest surface
 
-Status: Accepted (2026-07-27). Implementation plan and tickets:
-docs/ingest-breadth-plan.md (track A).
+Status: Accepted
 
 ## Context
 

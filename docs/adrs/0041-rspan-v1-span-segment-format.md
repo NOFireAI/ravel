@@ -1,12 +1,13 @@
 # ADR-0041: RSPAN v1 span segment format and trace routing
 
+Status: Accepted
+
 ## Context
 
-Epic 1 (traces + cross-signal correlation, issue TBD, program #333).
 `Signal::Spans` is already a reserved `ravel-types` enum variant with key
 prefix `s` (docs/catalog-and-mvcc.md), but no span segment format,
 ingest path, or query path exists (confirmed by codebase survey). This
-epic follows the Logs signal's precedent closely: a new segment format
+work follows the Logs signal's precedent closely: a new segment format
 crate, an ingest router mirroring the existing shard-actor pattern, a
 `SegmentCodec` compaction arm, and a `ravel-sql` table, in that order.
 `opentelemetry-proto`'s `trace` feature is already enabled workspace-wide
@@ -22,7 +23,7 @@ them before implementation starts:
    queries. A trace's spans usually cross multiple services (that is
    the entire value of a trace), so resource-based sharding would
    scatter one trace's spans across every shard, making trace-by-id
-   lookup - the epic's headline capability - a full fan-out across every
+   lookup - the headline capability - a full fan-out across every
    shard and hour bucket in the query window. That defeats the point.
 2. **Time shape.** RLOG's skip index stores one min/max timestamp per
    block. A span has a start and an end; pruning must be an interval
@@ -88,13 +89,13 @@ them before implementation starts:
    - Phase 3: compaction (`SpanCodec` behind the existing `SegmentCodec`
      trait, ADR-0032's seam) and the one-line `FOLD_SIGNALS` addition in
      `services/ravel-server/src/fold.rs` (currently hardcoded to
-     `[Signal::Metrics, Signal::Logs]` - a gap the Logs epic hit too and
+     `[Signal::Metrics, Signal::Logs]` - a gap the Logs work hit too and
      fixed the same way).
    - Phase 4: sweeper/retention - expected near-zero new code, since
      both already operate signal-generically on keys and timestamps.
    - Phase 5: `ravel-sql` `spans` table (schema/provider/pushdown/scan/
      UDFs mirroring the `logs` table pattern).
-   - **Explicitly out of this epic, deferred to follow-up epics**:
+   - **Explicitly out of scope, deferred to follow-up work**:
      trace-by-id lookup as a dedicated query endpoint, service-graph
      construction, and exemplar linkage from metrics to traces. Phase 5
      (SQL over `spans`, filterable by `trace_id`) already gives ad hoc
@@ -108,7 +109,7 @@ them before implementation starts:
 - **Shard by resource/service identity (mirror Logs exactly).**
   Rejected: makes trace-by-id lookup a full cross-shard fan-out for
   every multi-service trace, which is most of them - directly
-  undermines the epic's stated goal (metric spike -> exemplar -> trace
+  undermines the stated goal (metric spike -> exemplar -> trace
   -> logs pivot in one store).
   Instead, service-scoped span search pays the fan-out cost.
 - **A separate cross-shard trace-id index (a name-postings-style side
@@ -158,8 +159,8 @@ mechanics with different column content and skip-index semantics.
   it later is itself a format-change-ADR event.
 - Service-scoped span search is cross-shard by design; if that path
   turns out to be latency-critical, the name-postings-style index
-  rejected above becomes the follow-up ticket, not a redesign.
+  rejected above becomes the follow-up, not a redesign.
 - Trace-by-id fast lookup, service graph, and exemplar linkage remain
   open, unscoped work after this ADR's five phases land - tracked as
-  follow-up issues, not silently assumed to be "done" once Phase 5
+  follow-up work, not silently assumed to be "done" once Phase 5
   ships ad hoc SQL filtering.

@@ -1,6 +1,6 @@
 # ADR-0005: BLAKE3-128 canonical series identity with stored-label collision verification
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 

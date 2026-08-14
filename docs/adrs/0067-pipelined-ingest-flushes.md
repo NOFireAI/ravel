@@ -1,9 +1,6 @@
 # ADR-0067: Pipelined ingest flushes with adaptive flush delay
 
-Status: proposed (2026-08-09)
-Refs: 2026-08-09 architecture review (RAVEL-TIGERBEETLE-REVIEW.md R1-R3),
-docs/reviews/2026-07-30-performance-investigation.md sections 4 and 7,
-docs/ingest.md "Phase 1" flush note.
+Status: Accepted
 
 ## Context
 
@@ -15,7 +12,7 @@ and every waiter queues behind the in-flight flush. This is the documented
 Phase-1 simplification, and it is measured: the same ingest configuration
 that accepts ~303k points/s against MemoryStore accepts ~1,285 points/s
 against loopback MinIO (~236x collapse), with visibility lag at 57 s in the
-saturated regime (BENCHMARKS.md, S3/MinIO panel 2026-07-31). Real S3 round
+saturated regime (measured on the S3/MinIO panel). Real S3 round
 trips are 10-30x slower than loopback, so the production gap is larger.
 
 Independently, the age trigger is a fixed 500 ms regardless of arrival
@@ -91,7 +88,8 @@ flowchart LR
   buffered mode already exists as the explicit opt-out.
 - **WAL or local-disk staging to absorb PUT latency**: forfeits the
   disposability and recovery model (object storage as sole durable truth);
-  rejected on the same grounds as Model C in the 2026-07-30 investigation.
+  rejected on the same grounds as the local-staging model in the
+  performance investigation.
 - **Unbounded pipelining**: memory grows with in-flight count and the
   ordering pressure on downstream consumers becomes implicit; a bounded
   semaphore keeps both explicit.
@@ -111,6 +109,6 @@ flowchart LR
   depths 1 and 3 (interleaved flush failures, abandoned-flush interlock,
   duplicate-delivery on retry).
 - The ingest panel gains a pipeline-depth x delay-policy sweep; the flip
-  from default 1 to 3 is a measured decision recorded in BENCHMARKS.md.
+  from default 1 to 3 is a measured decision.
 - Encode leaves the actor task, so a slow encode no longer blocks channel
   drain even at depth 1.

@@ -1,8 +1,6 @@
 # ADR-0068: Deterministic whole-system simulation harness (ravel-sim)
 
-Status: proposed (2026-08-09)
-Refs: 2026-08-09 architecture review (RAVEL-TIGERBEETLE-REVIEW.md R4,
-section 15), issue #801.
+Status: Accepted
 
 ## Context
 
@@ -33,7 +31,7 @@ Known nondeterminism that a harness must control or eliminate: unseeded
 jitter (`rand::rng()` in commit publish backoff and the server's loop
 jitters), fresh UUIDv4 writer ids per process, `buffer_unordered`
 completion order, and the query engine's HashMap-iteration-order leak at
-the cross-plan combine (issue #801, in flight).
+the cross-plan combine.
 
 ## Decision
 
@@ -100,8 +98,8 @@ flowchart TB
 
 - A small `RngSource` seam lands in a few production crates (API addition,
   behavior unchanged by default).
-- Determinism defects become fix-first prerequisites; #801 (HashMap-order
-  combine) is the first and is already dispatched.
+- Determinism defects become fix-first prerequisites; the HashMap-order
+  combine is the first.
 - CI gains a nightly seed-batch job with a time budget; flaky seeds are
   bugs by definition (a seed either passes always or fails always).
 - New crate to maintain; deliberately dev-only so it can move fast without

@@ -1,13 +1,13 @@
 # ADR-0012: SIMD policy - dependencies and autovectorization first, explicit SIMD behind benchmark-gated review
 
-Status: Accepted (2026-07-27)
+Status: Accepted
 
 ## Context
 
 Telemetry databases invite hand-written SIMD: codecs, checksums, hashing,
 and filtering all look vectorizable. Ravel denies `unsafe` workspace-wide,
 `core::arch` intrinsics are unsafe, and `std::simd` is nightly-only. The
-measured Phase 1 bottlenecks (BENCHMARKS.md) are per-series fixed overhead
+measured Phase 1 bottlenecks are per-series fixed overhead
 and allocation churn, not scalar arithmetic in hot loops.
 
 ## Decision

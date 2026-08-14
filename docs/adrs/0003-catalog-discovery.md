@@ -1,6 +1,6 @@
 # ADR-0003: Listing-based discovery first, immutable catalog snapshots second
 
-Status: Accepted (2026-07-26)
+Status: Accepted
 
 ## Context
 

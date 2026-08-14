@@ -1,21 +1,20 @@
 # ADR-0024: Replace the built-in `sum` aggregate with a sequential-fold UDAF
 
-Status: Proposed, not decided (2026-07-28). Split out of ADR-0022 (floating
-aggregate exactness) at the orchestrating session's request: ADR-0022
-admits `avg` via a custom UDAF with its own internal summation, but does
-not touch the already-shipping, already-gated `sum` aggregate. This ADR
-takes up, as its own decision, whether `sum` should change too. Unlike
-ADR-0022 and ADR-0023, this document is not yet a chosen direction; it
-exists so the argument the ADR-0022 drafting agent made is preserved and
-reviewable on its own, separately from the admission policy ADR-0022
-sets. Do not file an implementation ticket from this ADR until its
-status changes to Accepted.
+Status: Proposed
+
+Split out of ADR-0022 (floating aggregate exactness): ADR-0022 admits
+`avg` via a custom UDAF with its own internal summation, but does not
+touch the already-shipping, already-gated `sum` aggregate. This ADR takes
+up, as its own decision, whether `sum` should change too. Unlike ADR-0022
+and ADR-0023, this document is not yet a chosen direction; it exists so
+the coherence argument is preserved and reviewable on its own, separately
+from the admission policy ADR-0022 sets.
 
 ## Context
 
-`sum` is already in the v1 SQL subset (docs/arrow-datafusion-plan.md
-section 2), gated by the two-layer differential gate
-(crates/ravel-sql/tests/differential.rs). Today it uses DataFusion's
+`sum` is already in the v1 SQL subset, gated by the two-layer
+differential gate (crates/ravel-sql/tests/differential.rs). Today it uses
+DataFusion's
 built-in `sum` accumulator directly. That accumulator computes a batch's
 partial sum with arrow's `compute::sum` kernel, which reduces internal
 lanes in parallel; the lane count and reduction order are

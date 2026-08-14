@@ -104,7 +104,7 @@ git and invites someone to copy it into a real cluster.
 ### The same environment in CI
 
 The `k8s-integration` job in `.github/workflows/ci.yml` runs these same three
-scripts on every pull request, so the local and CI paths cannot drift.
+scripts in CI, so the local and CI paths cannot drift.
 
 ![k8s-integration CI lane vs local dev](../diagrams/k8s-ci-integration.svg)
 
