@@ -70,6 +70,18 @@ pub enum MaintainError {
         /// Sum of `sample_count` over the built output parts.
         part_sample_count: u64,
     },
+    #[error(
+        "rspan compaction input record-count cross-check failed for object {object_key:?}: the streaming k-way merge decoded {decoded_record_count} records from this input but its footer declares {footer_record_count} (a logically inconsistent but CRC-valid input, silent decode-side record loss or gain, fatal invariant breach, issue #926); publish aborted, nothing written"
+    )]
+    SpanInputRecordCountMismatch {
+        /// Data-object key of the input whose decode diverged from its footer.
+        object_key: String,
+        /// Records the streaming merge actually decoded out of this input.
+        decoded_record_count: u64,
+        /// `record_count` this input's own RSPAN footer declares, the
+        /// independent authority the decode tally is checked against.
+        footer_record_count: u64,
+    },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     #[error(
