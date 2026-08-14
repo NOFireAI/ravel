@@ -1,4 +1,4 @@
-//! SQL conformance registry and scored table generation (issue #256, ADR-0035).
+//! SQL conformance registry and scored table generation (ADR-0035).
 //!
 //! ADR-0035 scores the query surface with a three-state classification per
 //! construct, over the surface Ravel actually claims -- not all of DataFusion
@@ -221,7 +221,7 @@ pub fn registry() -> Vec<Construct> {
     }
 
     // --- Clauses / operators ---------------------------------------------
-    // The operator subset the layer-2 differential gate covers (issue #22).
+    // The operator subset the layer-2 differential gate covers.
     let clauses = [
         (
             "Projection",

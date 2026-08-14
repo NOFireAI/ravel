@@ -6,8 +6,7 @@
 //! (ticket A1a), and produces one stream sorted by `(series_id, ts,
 //! created_unix_ns, writer_epoch, writer_seq, in_page_index)`. That full
 //! ordering is declared through `PlanProperties` so the optimizer honors it
-//! with a `SortPreservingMergeExec`, never a `CoalescePartitionsExec` (review
-//! F12).
+//! with a `SortPreservingMergeExec`, never a `CoalescePartitionsExec`.
 //!
 //! Emission is a streaming k-way merge, not a materialize-then-sort. Each
 //! segment decodes into its own sorted run (bounded by one segment), the runs
@@ -19,14 +18,13 @@
 //! the reduced fetch that pushdown enables. A partition's stream is still
 //! globally sorted across all its batches, so the declared ordering holds.
 //!
-//! Pushdown (ticket B2, docs/arrow-datafusion-plan.md "Filter pushdown"):
-//! label/series matchers are threaded into `fetch_soa` so the fetcher prunes
+//! Pushdown: label/series matchers are threaded into `fetch_soa` so the fetcher prunes
 //! series (and their page GETs) against SERIES_TABLE. A `series_id` allow-set
 //! is applied as a post-fetch row filter, because the fetcher's matcher API is
 //! label-only; segment-level ts pruning happens one level up in the provider.
 //! Every prune is widen-only (see crate::pushdown).
 //!
-//! Memory (review F10/F13; issue #188): each partition registers a
+//! Memory: each partition registers a
 //! `MemoryConsumer` against the `TaskContext`'s pool and grows one
 //! `MemoryReservation` in two phases:
 //!
@@ -58,7 +56,7 @@
 //! the shrink to the tenant accountant), and a query that outgrows its byte
 //! budget fails with the pool's `ResourcesExhausted`.
 //!
-//! `max_series` (issue #187) is enforced the same way: `prepare_partition`
+//! `max_series` is enforced the same way: `prepare_partition`
 //! tracks the distinct `series_id` count in the `labels` map it is already
 //! building, and fails with `SqlError::TooManySeries` the moment a new
 //! series pushes that count past `max_series`, before decoding that series'
@@ -157,22 +155,22 @@ pub struct RsegScanExec {
     /// Optional `series_id` allow-set applied as a post-fetch row filter.
     /// `None` means unconstrained.
     series_ids: Option<Arc<HashSet<[u8; 16]>>>,
-    /// Per-partition distinct-series_id budget (issue #187); see the module
+    /// Per-partition distinct-series_id budget; see the module
     /// doc for why this is per-partition, not a cross-partition total.
     max_series: usize,
-    /// Per-tenant bytes-scanned budget (ADR-0061 decision 1, issue #722),
+    /// Per-tenant bytes-scanned budget (ADR-0061 decision 1),
     /// checked once per completed segment fetch against the running
     /// `QueryAccounting` total. `Unlimited` never trips, so a caller that does
     /// not opt in behaves exactly as before this budget existed.
     max_bytes_scanned: ByteLimit,
-    /// Per-tenant S3 request budget (RH-T2, issue #902, ADR-0073 decision 4),
+    /// Per-tenant S3 request budget (ADR-0073 decision 4),
     /// checked once per completed segment fetch against the running
     /// `QueryAccounting` total, the same checkpoint as `max_bytes_scanned`.
     /// Mirrors `ravel_query::engine`'s PromQL enforcement so both query
     /// languages trip the same budget the same way.
     max_s3_requests: RequestLimit,
     /// Pending selective-erasure predicates from the resolved snapshot
-    /// (ADR-0064 decision 2, issue #829). Applied to each segment's decoded
+    /// (ADR-0064 decision 2). Applied to each segment's decoded
     /// `FetchedSeriesSoa` series via [`retain_series_soa`] immediately after
     /// `fetch_soa_accounted` returns -- after fetch, after the ADR-0046 read
     /// cache that fetch routes through, before any row reaches DataFusion.
@@ -188,8 +186,8 @@ impl RsegScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, with the given
     /// pushdown matchers, optional `series_id` allow-set, per-partition
-    /// `max_series` budget (issue #187), and per-tenant `max_bytes_scanned`
-    /// budget (ADR-0061 decision 1, issue #722).
+    /// `max_series` budget, and per-tenant `max_bytes_scanned`
+    /// budget (ADR-0061 decision 1).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_hash: TenantHash,
@@ -313,7 +311,7 @@ impl ExecutionPlan for RsegScanExec {
         // pool the TaskContext carries (the tenant-delegating pool in
         // production, an unbounded pool under bare `collect`). Owned by the
         // stream, so dropping the stream frees it and the pool forwards the
-        // shrink to the tenant accountant (review F13).
+        // shrink to the tenant accountant.
         let reservation = MemoryConsumer::new(format!("RsegScanExec[{partition}]"))
             .register(context.memory_pool());
 
@@ -350,11 +348,11 @@ struct Prepared {
 ///
 /// Enforces four budgets before the next segment is ever fetched: the
 /// per-tenant bytes-scanned budget against the running `QueryAccounting`
-/// total (ADR-0061 decision 1, issue #722), the per-tenant S3 request budget
-/// against the same running total (RH-T2, issue #902, ADR-0073 decision 4),
-/// the distinct-series count against `max_series` (issue #187), and the
-/// reservation's byte budget against this segment's decoded size (issue
-/// #188). `reservation` is threaded through and returned so the caller's
+/// total (ADR-0061 decision 1), the per-tenant S3 request budget
+/// against the same running total (ADR-0073 decision 4),
+/// the distinct-series count against `max_series`, and the
+/// reservation's byte budget against this segment's decoded size.
+/// `reservation` is threaded through and returned so the caller's
 /// batch phase continues growing the same one (see module doc).
 #[allow(clippy::too_many_arguments)]
 async fn prepare_partition(
@@ -378,7 +376,7 @@ async fn prepare_partition(
             .fetch_soa_accounted(tenant, seg, &matchers, &accounting)
             .await
             .map_err(SqlError::from)?;
-        // Selective-erasure exclusion (ADR-0064 decision 2, issue #829):
+        // Selective-erasure exclusion (ADR-0064 decision 2):
         // applied to the decoded series immediately after fetch, after the
         // ADR-0046 read cache `fetch_soa_accounted` routes through, before any
         // row below reaches DataFusion. A no-op when `erasure` is empty.
@@ -397,7 +395,7 @@ async fn prepare_partition(
             };
             return Err(SqlError::TooManyBytesScanned { scanned, max }.into());
         }
-        // Per-tenant S3 request budget (RH-T2, issue #902, ADR-0073 decision
+        // Per-tenant S3 request budget (ADR-0073 decision
         // 4): same checkpoint as the bytes-scanned budget above, so a trip
         // here also means the remaining segments' GETs never happen. Mirrors
         // `ravel_query::engine`'s PromQL enforcement exactly.

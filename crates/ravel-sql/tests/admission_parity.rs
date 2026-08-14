@@ -1,8 +1,8 @@
-//! SQL/PromQL admission parity (RH-T2, issue #902, ADR-0073 decision 4):
+//! SQL/PromQL admission parity (ADR-0073 decision 4):
 //! the SQL executor's whole-snapshot check in
 //! `crates/ravel-sql/src/executor.rs`'s `resolve` now calls the same
 //! `ravel_query::admit` seam PromQL's `QueryEngine::resolve_bounded` already
-//! used (RH-T1, issue #901). Every test here runs the identical published
+//! used. Every test here runs the identical published
 //! segments and `EngineConfig` through both engines and asserts they reach
 //! the same admission verdict.
 //!
@@ -10,7 +10,7 @@
 //! `resolve`, `admit(&snapshot, &origins, &self.config.engine)
 //! .map_err(admission_error_to_sql)?`. Revert that to a bare
 //! `snapshot.segments.len() > self.config.engine.max_segments` check (the
-//! pre-RH-T2 shape) and `sql_and_promql_agree_recent_hours_are_exempt` below
+//! shape) and `sql_and_promql_agree_recent_hours_are_exempt` below
 //! starts failing: SQL would count all 6 segments (1 sealed + 5 recent)
 //! against `max_segments: 1` and refuse a query PromQL still admits.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_arguments)]
@@ -132,8 +132,8 @@ fn sql_request(sql: &str, window: TimeRange, now_ns: i64) -> SqlRequest {
 }
 
 /// One sealed segment plus five recent segments under `max_segments: 1`:
-/// PromQL already proves this admits (RH-T1,
-/// `recent_hours_exempt_from_segment_cap`). SQL must reach the identical
+/// PromQL already proves this admits
+/// (`recent_hours_exempt_from_segment_cap`). SQL must reach the identical
 /// verdict now that `resolve` shares the same seam.
 #[tokio::test]
 async fn sql_and_promql_agree_recent_hours_are_exempt() {
@@ -229,7 +229,7 @@ async fn sql_and_promql_agree_recent_hours_are_exempt() {
 
 /// Four sealed segments under `max_segments: 2` must still be refused by
 /// both engines, with matching `count`/`max` (PromQL:
-/// `sealed_set_still_capped_when_oversized`). The exemption RH-T1 introduced
+/// `sealed_set_still_capped_when_oversized`). The recent-hours exemption
 /// must not widen the sealed-set cap itself, on either surface.
 #[tokio::test]
 async fn sql_and_promql_agree_sealed_set_still_capped() {
@@ -313,7 +313,7 @@ async fn sql_and_promql_agree_sealed_set_still_capped() {
 /// `SegmentOrigin::Recent`) segments must be admitted through
 /// `SqlExecutor::execute` even under `max_segments: 0`, mirroring PromQL's
 /// `token_segments_always_admitted`/`recent_hours_exempt_from_segment_cap`
-/// exemption (ADR-0073 decision 2). Pre-RH-T2, the SQL executor's own
+/// exemption (ADR-0073 decision 2). Previously, the SQL executor's own
 /// whole-snapshot count would have refused this with `TooManySegments { count:
 /// 5, max: 0 }`.
 #[tokio::test]
@@ -374,7 +374,7 @@ async fn sql_recent_hour_segments_are_exempt_from_max_segments() {
     assert_eq!(outcome.output.num_rows(), 5);
 }
 
-/// No-op regression (RH-T2 deliverable 3): with no recent-hour data (every
+/// No-op regression: with no recent-hour data (every
 /// segment folded/sealed) and the default, effectively-unbounded budgets
 /// (`EngineConfig::default()`: `max_segments` 1024, `max_s3_requests` bounded
 /// at 25,000), admission must behave exactly as it did before this

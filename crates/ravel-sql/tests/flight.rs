@@ -1,7 +1,7 @@
-//! Flight SQL service tests (ticket C1d, issue #152).
+//! Flight SQL service tests (ticket C1d).
 //!
 //! These drive [`RavelFlightSqlService`] directly rather than through a tonic
-//! listener. The trait methods are the contract this ticket delivers, and
+//! listener. The trait methods are the contract these tests exercise, and
 //! calling them in-process keeps the assertions about *behaviour* -- which
 //! rows, which status, which tenant -- instead of about transport plumbing,
 //! which services/ravel-server's own Flight test covers end to end over a
@@ -14,9 +14,9 @@
 //! expired ticket still reading, a metadata method answering an
 //! unauthenticated caller.
 //!
-//! The broader cross-cutting differential/tenancy/e2e suite is issue #153
-//! (tests/flight_differential.rs and tests/flight_tenancy.rs); these are this
-//! ticket's own tests. The shared in-process harness lives in
+//! The broader cross-cutting differential/tenancy/e2e suite lives in
+//! tests/flight_differential.rs and tests/flight_tenancy.rs; these are this
+//! file's own tests. The shared in-process harness lives in
 //! [`util::flight_harness`], which those suites reuse.
 
 #![cfg(feature = "flight-sql")]
@@ -89,7 +89,7 @@ async fn get_flight_info_then_do_get_returns_the_http_rows() {
 }
 
 // ---------------------------------------------------------------------------
-// Evidential audit at stream completion (ADR-0062 §2a, issue #413)
+// Evidential audit at stream completion (ADR-0062 §2a)
 // ---------------------------------------------------------------------------
 
 /// Captures every submitted audit event, reporting durability success.
@@ -208,7 +208,7 @@ async fn a_commit_landing_between_the_two_rpcs_is_not_visible() {
 // Tenancy
 // ---------------------------------------------------------------------------
 
-/// The security decision this ticket enforces: the ticket's embedded tenant is
+/// The security decision enforced here: the ticket's embedded tenant is
 /// a value to check, never a source of authority. A ticket minted for one
 /// tenant and presented with another's credentials is denied before the pinned
 /// snapshot is touched.
@@ -310,7 +310,7 @@ async fn the_ticket_deadline_is_bounded_by_the_gc_protection_horizon() {
     assert!(!decoded.segments.is_empty());
 }
 
-/// Issue #185: a ticket tampered with after minting -- here, its deadline
+/// A ticket tampered with after minting -- here, its deadline
 /// extended -- and re-signed under a key an attacker does not have (they
 /// cannot have the server's in-process secret, so any key they pick stands
 /// in for that) is refused at `DoGet` with a MAC mismatch, never silently
@@ -352,11 +352,11 @@ async fn a_tampered_ticket_is_rejected_by_do_get() {
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
 }
 
-/// Issue #186: a ticket honestly carrying a deadline far beyond this
+/// A ticket honestly carrying a deadline far beyond this
 /// deployment's GC protection horizon -- re-signed with the real key, not
 /// tampered -- must not hand `DoGet` a multi-hour wall budget. The read never
 /// completes ([`StallingStore`]), so the only way this call can end is a
-/// deadline firing; before the fix, `DoGet` trusted the ticket's own
+/// deadline firing; without the pin, `DoGet` would trust the ticket's own
 /// `deadline_ns` verbatim and this would have hung far past any reasonable
 /// test bound. The fix re-derives the deployment's own horizon-bounded budget
 /// at redemption and takes the minimum with the ticket's value, so the
@@ -486,7 +486,7 @@ async fn a_segment_that_stays_missing_fails_snapshot_invalidated() {
 }
 
 // ---------------------------------------------------------------------------
-// Cancellation (review F13)
+// Cancellation
 // ---------------------------------------------------------------------------
 
 /// Dropping a `DoGet` stream mid-flight returns the tenant's reserved bytes,
@@ -532,7 +532,7 @@ async fn dropping_a_do_get_stream_returns_the_tenant_reservation() {
 
 /// Every catalog/metadata method denies a caller with no valid tenant
 /// credentials. The payloads are constants, but default-deny is the invariant
-/// regardless (review F17).
+/// regardless.
 #[tokio::test]
 async fn catalog_and_metadata_methods_reject_a_request_without_a_tenant() {
     let tenant = tenant_id("acme");
@@ -707,7 +707,7 @@ async fn a_write_statement_is_rejected_before_any_catalog_work() {
 }
 
 // ---------------------------------------------------------------------------
-// Query audit (ADR-0042 decision 4, issue #395)
+// Query audit (ADR-0042 decision 4)
 // ---------------------------------------------------------------------------
 //
 // A statement executed over Flight SQL must leave the same durable, unforgeable
@@ -853,7 +853,7 @@ async fn a_successful_flight_statement_writes_one_ok_audit_record() {
 /// so snapshot resolution, the audit write (`/u/`), and the audit read-back all
 /// work: only the scan fails, which is what turns a planned statement into a
 /// failed execution -- and the audited status reflects that failure, not a
-/// blind "started" (issue #413).
+/// blind "started".
 #[tokio::test]
 async fn a_failed_flight_statement_writes_a_status_error_audit_record() {
     let tenant = tenant_id("acme");
@@ -950,7 +950,7 @@ async fn an_audit_write_failure_fails_the_flight_response_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-query cost recording (ADR-0044 section 4, issue #425)
+// Per-query cost recording (ADR-0044 section 4)
 // ---------------------------------------------------------------------------
 
 /// A recorder that keeps every fold, so a test can prove the Flight path folded
@@ -1036,7 +1036,7 @@ async fn a_flight_statement_folds_its_cost_into_the_recorder() {
 }
 
 // ---------------------------------------------------------------------------
-// Fleet-global query concurrency ceiling (ADR-0061 decision 2, issue #725)
+// Fleet-global query concurrency ceiling (ADR-0061 decision 2)
 // ---------------------------------------------------------------------------
 
 /// Build a harness whose Flight service shares `controller` as its concurrency
@@ -1109,7 +1109,7 @@ async fn get_flight_info_is_gated_at_the_ceiling() {
         .expect("a freed slot admits the next GetFlightInfo");
 }
 
-/// The load-bearing test for the EF-5 fix: `do_get_statement` -- the RPC that
+/// The load-bearing test: `do_get_statement` -- the RPC that
 /// actually scans segments and streams rows -- is itself gated, so the ceiling
 /// bounds Flight's *execution* phase, not merely its planning phase. A held
 /// `DoGet` stream occupies the one slot; a second `DoGet` redeeming a ticket

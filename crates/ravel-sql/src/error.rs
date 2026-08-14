@@ -6,7 +6,7 @@
 //! observes partial or silently-wrong data (docs/consistency-model.md
 //! "never silent partial results").
 //!
-//! # Redaction (ticket B3, mirroring finding a7-F02)
+//! # Redaction
 //!
 //! `/api/v1/sql` is a second, independent error-to-HTTP boundary alongside
 //! the PromQL one in crates/ravel-query/src/http/error.rs, and it carries
@@ -119,13 +119,13 @@ pub enum SqlError {
     Fetch(#[from] FetchError),
 
     /// An RLOG log-segment fetch or decode failed mid-scan (the `logs` table's
-    /// sibling of [`SqlError::Fetch`], issue #239). Its `Display` embeds the
+    /// sibling of [`SqlError::Fetch`]). Its `Display` embeds the
     /// object key, so it redacts the same way [`SqlError::Fetch`] does.
     #[error("log segment fetch failed: {0}")]
     LogFetch(#[from] LogFetchError),
 
     /// An RSPAN span-segment fetch or decode failed mid-scan (the `spans`
-    /// table's sibling of [`SqlError::Fetch`], issue #356). Its `Display`
+    /// table's sibling of [`SqlError::Fetch`]). Its `Display`
     /// embeds the object key, so it redacts the same way [`SqlError::Fetch`]
     /// does.
     #[error("span segment fetch failed: {0}")]
@@ -144,8 +144,7 @@ pub enum SqlError {
     CorruptStreamAttrs(String),
 
     /// A pinned segment vanished and the re-resolve-and-retry contract was
-    /// exhausted (docs/consistency-model.md; plan section 2 retry contract,
-    /// review F9).
+    /// exhausted (docs/consistency-model.md).
     #[error("the pinned snapshot was invalidated during execution")]
     SnapshotInvalidated,
 
@@ -163,15 +162,14 @@ pub enum SqlError {
     TooManySegments { count: usize, max: usize },
 
     /// The distinct `series_id` count exceeded `max_series` while a scan
-    /// partition was still building its runs (issues #187/#188). `count` is
+    /// partition was still building its runs. `count` is
     /// the distinct count observed by the one partition that tripped, not a
     /// cross-partition total; see crate::scan module doc.
     #[error("query matches too many series: {count} exceeds max {max}")]
     TooManySeries { count: usize, max: usize },
 
     /// The per-tenant bytes-scanned budget was exhausted mid-scan while a
-    /// partition was still fetching segments (ADR-0061 decision 1, issue
-    /// #722). Distinct from [`SqlError::ResourcesExhausted`]: that bounds the
+    /// partition was still fetching segments (ADR-0061 decision 1). Distinct from [`SqlError::ResourcesExhausted`]: that bounds the
     /// query's decoded-memory pool, this bounds total S3 bytes scanned, a
     /// different resource, and the ADR requires the two stay distinguishable.
     /// Mirrors `ravel_query::QueryError::TooManyBytesScanned` so both query
@@ -181,8 +179,7 @@ pub enum SqlError {
     #[error("query scanned too many bytes: {scanned} exceeds max {max}")]
     TooManyBytesScanned { scanned: u64, max: u64 },
 
-    /// The per-tenant S3 request budget was exhausted mid-scan (RH-T2, issue
-    /// #902), checked incrementally against
+    /// The per-tenant S3 request budget was exhausted mid-scan, checked incrementally against
     /// `QueryAccounting::total_s3_requests()` at the same checkpoints as
     /// [`SqlError::TooManyBytesScanned`]. Mirrors
     /// `ravel_query::QueryError::RequestBudgetExceeded` so both query
@@ -232,7 +229,7 @@ impl SqlError {
     pub fn class(&self) -> ErrorClass {
         match self {
             SqlError::Validation(_) | SqlError::CrossSignalQuery => ErrorClass::BadRequest,
-            // An over-wide window refused before any LIST (issue #635) is a
+            // An over-wide window refused before any LIST is a
             // resource-budget rejection, the same class as the segment/sample
             // budgets below: a well-formed request the server declines to
             // serve at this size (422), not a storage fault (503). Handled
@@ -273,7 +270,7 @@ impl SqlError {
             SqlError::CrossSignalQuery => self.to_string(),
             // Safe to echo: `WindowTooWide` carries only the estimate and the
             // limit (counts, no object key or tenant identity), and its text
-            // tells the caller to narrow the window (issue #635). Same
+            // tells the caller to narrow the window. Same
             // treatment as the budget errors below.
             SqlError::Catalog(catalog @ CatalogError::WindowTooWide { .. }) => catalog.to_string(),
             SqlError::Catalog(catalog) => redact_catalog(catalog).to_string(),
@@ -362,7 +359,7 @@ mod tests {
     const TENANT_HASH: &str = "deadbeefcafef00d";
     const RAW_STORE_TEXT: &str = "bucket=prod-telemetry endpoint=s3.internal request-id=abc";
 
-    /// Same assertion set the PromQL boundary's tests use (a7-F02).
+    /// Same assertion set the PromQL boundary's tests use.
     fn assert_redacted(message: &str) {
         assert!(!message.contains(LEAKY_KEY), "leaked full key: {message}");
         assert!(
@@ -489,7 +486,7 @@ mod tests {
         assert_eq!(budget.client_message(), budget.to_string());
         assert_eq!(budget.class(), ErrorClass::Unsupported);
 
-        // The S3 request budget (RH-T2, issue #902) is the same shape:
+        // The S3 request budget is the same shape:
         // counts and limits only, echoed verbatim, HTTP 422.
         let request_budget = SqlError::RequestBudgetExceeded {
             requests: 30_001,
@@ -521,7 +518,7 @@ mod tests {
 
     #[test]
     fn window_too_wide_is_a_422_that_keeps_its_counts() {
-        // Issue #635: an over-wide window refused before any LIST is a
+        // An over-wide window refused before any LIST is a
         // resource-budget rejection (422 Unsupported), not a storage fault
         // (503). Its text carries only the estimate and the limit, so it is
         // echoed to the client verbatim like the other budget errors, and it

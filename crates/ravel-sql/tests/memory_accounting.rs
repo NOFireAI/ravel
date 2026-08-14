@@ -1,14 +1,14 @@
-//! B3 end-to-end memory-pool byte accounting (issue #22), exercising B2's
+//! End-to-end memory-pool byte accounting, exercising the
 //! `TenantDelegatingPool` through a real DataFusion query rather than a
 //! hand-built `TaskContext`.
 //!
-//! B2's tests (tests/pushdown_memory.rs) prove the pool's own arithmetic and
+//! The pool unit tests (tests/pushdown_memory.rs) prove the pool's own arithmetic and
 //! that a dropped mid-scan stream returns the tenant's bytes. What they
-//! cannot prove is the property the plan actually cares about: that a query
+//! cannot prove is the property that actually matters: that a query
 //! which pushes **many** batches through the pool releases all of them.
 //!
 //! The distinction matters. `RsegScanExec` grows its reservation once per
-//! fetched/decoded segment and again per emitted batch (issue #188; see
+//! fetched/decoded segment and again per emitted batch (see
 //! crate::scan module doc), and releases the whole thing when the stream
 //! drops, so a single-batch test passes for either a correct implementation
 //! or one whose release path only ever covers the last batch. Every test
@@ -94,8 +94,8 @@ async fn drain(
         peak = peak.max(reserved);
     }
     // Dropping the stream is what releases every `MemoryReservation`; the
-    // pool forwards each drop-time shrink to the tenant accountant (B2
-    // module docs, review F13).
+    // pool forwards each drop-time shrink to the tenant accountant (see the
+    // pool module docs).
     drop(stream);
     (batches, after_first, peak)
 }
@@ -233,7 +233,7 @@ async fn the_executor_returns_tenant_bytes_after_a_multi_batch_query() {
 /// pool's typed error, and still leaves the tenant accountant at zero: a
 /// failed query must not leak either budget.
 ///
-/// Issue #188 moved the reservation's first growth from the batch phase into
+/// The reservation's first growth moved from the batch phase into
 /// the fetch/decode phase (`prepare_partition`): the single segment's
 /// decoded run alone (30,000 rows, 64 bytes each = ~1.9 MiB) already exceeds
 /// this test's 1.4 MiB ceiling, so the trip now happens before the scan ever
@@ -291,7 +291,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
     assert!(failed, "the query pool must trip");
     assert_eq!(
         batches, 0,
-        "the fetch/decode-phase charge (issue #188) must reject this query \
+        "the fetch/decode-phase charge must reject this query \
          before its one segment's decoded run ever reaches the batch phase"
     );
     assert_eq!(

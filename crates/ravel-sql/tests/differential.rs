@@ -1,7 +1,6 @@
-//! B3 layer-2 differential gate (issue #22):
-//! docs/arrow-datafusion-plan.md section 2 "Exactness", review F5 and F7.
+//! Layer-2 differential gate for the SQL aggregate surface.
 //!
-//! Layer 1 (B1, tests/pipeline.rs) gates the *scan* against an independent
+//! Layer 1 (tests/pipeline.rs) gates the *scan* against an independent
 //! greatest-wins oracle. This file gates the *operator layer*: a reference
 //! executor for the v1 SQL subset (project, filter, count/sum, group by,
 //! order by, limit, ungrouped min/max) evaluates over rows it pulls through
@@ -12,14 +11,14 @@
 //! The subset grammar itself -- the query shapes, the predicate language, the
 //! dataset strategies, the comparable [`util::gate::Cell`] form, and the
 //! reference aggregate folds -- lives in [`util::gate`], shared with the
-//! Flight-vs-HTTP transport parity gate (tests/flight_differential.rs, issue
-//! #153) so the two gates cannot disagree about what the subset is. This file
+//! Flight-vs-HTTP transport parity gate (tests/flight_differential.rs) so
+//! the two gates cannot disagree about what the subset is. This file
 //! owns the oracle comparison against `reference_rows`; the parity gate owns
 //! the transport comparison.
 //!
 //! # Why the reference is not "naive"
 //!
-//! Review F7's whole point is that "DataFusion == naive scalar arithmetic" is
+//! The whole point is that "DataFusion == naive scalar arithmetic" is
 //! false. Everything in [`util::gate`] was verified against the pinned
 //! datafusion 54.1.0 and arrow 58.4.0 in the workspace lockfile, reading the
 //! accumulators rather than guessing:
@@ -44,8 +43,8 @@
 //!   *independent* scalar reference possible: `min_total_order` and
 //!   `max_total_order` implement that order once, and the gate applies them
 //!   both ungrouped (over the whole selection) and per group. This is the
-//!   grouped differential gate the interim design (issue #143) called
-//!   impossible while the semantics were only the accumulator's fold order.
+//!   grouped differential gate that the total-order definition makes
+//!   possible; the accumulator's fold order alone would not.
 //!   Non-float MIN/MAX (for example `min(ts)` over a Timestamp column)
 //!   delegate to the built-in, whose `partial_cmp` is already total there;
 //!   [`golden_grouped_min_max_over_ts_delegates`] pins that path against an
@@ -72,12 +71,12 @@
 //!   architecture-independent result (finite sums, signed infinities, `-0.0`
 //!   preservation, empty -> NULL) and assert the *property* that a NaN result
 //!   is NaN, via [`avg_cells_match`]. This is the avg analogue of sum's
-//!   restricted-pool deviation and is flagged in the B3 report.
+//!   restricted-pool deviation.
 //!
 //! # The one restriction, and why
 //!
-//! The plan says of `sum`: "both sides add plain f64 in the same
-//! deterministic input order". Against the pinned versions that premise
+//! For `sum`, both sides add plain f64 in the same deterministic input
+//! order. Against the pinned versions that premise
 //! holds for GROUP BY sum (`PrimitiveGroupsAccumulator` folds `+=`
 //! sequentially in row order) but **not** for ungrouped sum: it calls
 //! `arrow::compute::sum`, which runs `PREFERRED_VECTOR_SIZE_NON_NULL /
@@ -86,16 +85,16 @@
 //! no portable sequential reference can be bit-identical to it for values
 //! where float addition is not associative.
 //!
-//! Rather than weaken the gate to a tolerance -- the exact failure mode F7
-//! warns about -- ungrouped `sum` is proptested only over values whose
+//! Rather than weaken the gate to a tolerance -- the exact failure mode to
+//! avoid -- ungrouped `sum` is proptested only over values whose
 //! partial sums are exactly representable (integer-valued f64 with a bounded
 //! magnitude), where every association order provably yields identical bits.
 //! Grouped `sum` keeps the full value pool. NaN and infinity in ungrouped
 //! `sum` are covered by golden cases that assert the properties that *are*
 //! well defined (a NaN result is NaN; an infinite result has the right sign)
-//! rather than a payload the lane order chooses. This is F7's amendment (a)
-//! applied to the one operator where amendment (b) is not portably possible,
-//! and it is flagged as a deviation in the B3 report.
+//! rather than a payload the lane order chooses. This applies property
+//! assertions to the one operator where exact-bit comparison is not portably
+//! possible.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -317,7 +316,7 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Adversarial pushdown cases (review F8)
+// Adversarial pushdown cases
 // ---------------------------------------------------------------------------
 
 /// The `ts` predicate shape the widen-only extractor *does* recognize (bare
@@ -476,7 +475,7 @@ async fn golden_ungrouped_min_max_use_total_order_nan_semantics() {
 /// are literal, not derived from the reference folds, so this pins both the
 /// UDAF (crate::minmax) and, transitively, the reference the proptests trust.
 ///
-/// The four behaviors the interim rejection existed to avoid (issue #143) are
+/// The four behaviors the interim rejection existed to avoid are
 /// all correct here, where the old `PrimitiveGroupsAccumulator` was wrong:
 /// a NaN survives as the group's extreme with its payload intact; a NaN plus a
 /// smaller value does not poison MIN; `-0.0`/`0.0` resolve by sign in both
@@ -550,13 +549,11 @@ async fn golden_grouped_min_max_use_total_order() {
     }
 }
 
-/// The issue #159 shapes: a grouped `min`/`max` reachable only through a
-/// query-level `ORDER BY` (a field of `Query`, not `Select`) and through
-/// `HAVING`. The interim validation walk had a hole for the `ORDER BY` case
-/// (#159) and rejected the `HAVING` case; both now execute to correct results
-/// against a per-group reference fold.
+/// Grouped `min`/`max` reachable only through a query-level `ORDER BY`
+/// (a field of `Query`, not `Select`) and through `HAVING`. Both shapes
+/// execute to correct results against a per-group reference fold.
 #[tokio::test]
-async fn grouped_min_max_issue_159_shapes_execute_correctly() {
+async fn grouped_min_max_shapes_execute_correctly() {
     let tenant = tenant_id("golden");
     let specs = overlap_dataset();
     let fixture = Fixture::memory(&[(&tenant, &specs)]).await;

@@ -1,5 +1,5 @@
 //! The `alerts` table schema (ADR-0040 "`Signal::Alerts` and `Signal::Audit`,
-//! sharing RLOG's format", epic #333 / issue #383).
+//! sharing RLOG's format").
 //!
 //! An alert record is structurally a log record (ADR-0040 decision 2): it rides
 //! RLOG v1 verbatim, with the alert-specific structured fields carried in the

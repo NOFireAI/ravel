@@ -1,11 +1,10 @@
-//! Integration tests for [`ravel_sql::LogsTableProvider`] (ADR-0033, issue
-//! #239), the `logs` SQL table over an already-resolved `Signal::Logs`
+//! Integration tests for [`ravel_sql::LogsTableProvider`] (ADR-0033), the `logs` SQL table over an already-resolved `Signal::Logs`
 //! snapshot.
 //!
 //! Two properties are pinned:
 //!
-//! - `scan_prunes_by_ts_and_word_returns_exact_rows` (the epic's acceptance
-//!   test for this task): a ts range + `has_word` combination returns exactly
+//! - `scan_prunes_by_ts_and_word_returns_exact_rows` (the acceptance test):
+//!   a ts range + `has_word` combination returns exactly
 //!   the records that should survive across several objects, with no false
 //!   positives and no false negatives. This is the pruning-soundness property:
 //!   segment/ts pruning and content pushdown may only ever widen, and the
@@ -50,9 +49,9 @@ use uuid::Uuid;
 
 fn identity() -> ObjectIdentity {
     ObjectIdentity {
-        // Matches the TenantHash([7u8; 16]) this test fetches as; issue #612
-        // added a footer tenant_hash check on the RLOG read path, so a footer
-        // naming a different tenant than the fetch now fails closed.
+        // Matches the TenantHash([7u8; 16]) this test fetches as; the RLOG
+        // read path enforces a footer tenant_hash check, so a footer naming a
+        // different tenant than the fetch fails closed.
         tenant_hash: [7u8; 16],
         shard: 0,
         writer_id: [2u8; 16],
@@ -391,7 +390,7 @@ async fn stream_attr_equality_is_resolved_by_the_residual() {
 /// while giving the residual `FilterExec` a real evaluator to run. The crate's
 /// DataFusion build registers no nested-expression planner (`features =
 /// ["sql"]`), which is why the `attrs['k']` SQL *text* cannot plan today
-/// (tracked as a gate item for #240); this test therefore builds the equivalent
+/// (nested-expression planning is not yet wired); this test therefore builds the equivalent
 /// expression programmatically.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct GetField {
@@ -482,14 +481,14 @@ impl ScalarUDFImpl for GetField {
     }
 }
 
-/// Regression test for the issue #239 data-loss bug: DataFusion's mandatory
+/// Regression test for a data-loss bug: DataFusion's mandatory
 /// `Inexact` residual re-applies `attrs['service.name'] = 'api'` against the
 /// `attrs` column, so that column must carry resource/scope data merged with the
 /// record's own attributes. If `attrs` holds only per-record dynamic attributes,
 /// a record whose `service.name` is a genuine *resource* attribute (the normal
 /// OTLP shape) is silently dropped by the residual — the bug the merged column
 /// closed. The residual is the sole correctness mechanism (no fetch prune or
-/// scan re-check narrows the attribute set; ADR-0033 amendment, issue #241).
+/// scan re-check narrows the attribute set; ADR-0033 amendment).
 ///
 /// This drives a REAL `TableProvider::scan` inside a `SessionContext` (unlike
 /// `scan_prunes_by_ts_and_word_returns_exact_rows`, which executes the scan leaf

@@ -1,6 +1,6 @@
 //! The v1 SQL subset's differential grammar, shared between the HTTP-path
 //! oracle gate (tests/differential.rs) and the Flight-vs-HTTP transport parity
-//! gate (tests/flight_differential.rs, issue #153).
+//! gate (tests/flight_differential.rs).
 //!
 //! Everything here is transport-agnostic: the query grammar ([`Pred`],
 //! [`Shape`], [`Query`]), the proptest dataset strategies, the reduced

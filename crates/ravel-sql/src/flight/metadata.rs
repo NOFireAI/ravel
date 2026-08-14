@@ -8,7 +8,7 @@
 //! therefore none can disclose another tenant's existence, table set, or
 //! naming. The caller is still authenticated first (see the service module) --
 //! default-deny does not become optional just because the payload is constant
-//! (review F17).
+//!.
 //!
 //! The row builders come from `arrow_flight::sql::metadata` rather than being
 //! hand-rolled: those types own the protocol's exact column names, types, and

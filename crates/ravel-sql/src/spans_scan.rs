@@ -90,16 +90,16 @@ pub struct SpansScanExec {
     service_name: Option<String>,
     /// The `name = <literal>` equality pushed, if any: a `COL_NAME` bloom probe.
     name: Option<String>,
-    /// The inclusive `[min, max]` `duration_ns` window pushed, if any (issue
-    /// #979): a skip-index prune dropping blocks whose duration range cannot
+    /// The inclusive `[min, max]` `duration_ns` window pushed, if any: a
+    /// skip-index prune dropping blocks whose duration range cannot
     /// overlap it. `None` when no duration filter was pushed. Widen-only.
     duration_ns: Option<(i64, i64)>,
-    /// The `status_code` bitmask pushed, if any (issue #979): a skip-index
+    /// The `status_code` bitmask pushed, if any: a skip-index
     /// prune dropping blocks that share no status bit with it. `None` when no
     /// status filter was pushed. Widen-only.
     status_mask: Option<u8>,
     /// Pending selective-erasure predicates from the resolved snapshot
-    /// (ADR-0064 decision 2, issue #829). Applied per decoded [`SpanRow`] via
+    /// (ADR-0064 decision 2). Applied per decoded [`SpanRow`] via
     /// [`is_erased_span`] immediately after `fetcher.fetch` returns, before
     /// rows are sorted or built into batches. A no-op when empty.
     erasure: Arc<Vec<ErasurePredicate>>,
@@ -111,8 +111,7 @@ impl SpansScanExec {
     /// Build a scan over `segments`, split round-robin into
     /// `min(target_partitions, segments.len())` partitions, driven by `query`,
     /// the optional `service_name`/`name` bloom-probe literals, and the
-    /// optional `duration_ns`/`status_mask` skip-index prune shapes (issue
-    /// #979).
+    /// optional `duration_ns`/`status_mask` skip-index prune shapes.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         fetcher: SpanSegmentFetcher,
@@ -289,7 +288,7 @@ async fn prepare_partition(
         };
         out.extend(output.records);
     }
-    // Selective-erasure exclusion (ADR-0064 decision 2, issue #829): applied
+    // Selective-erasure exclusion (ADR-0064 decision 2): applied
     // to each decoded row immediately after fetch, before sort/build. A
     // no-op when `erasure` is empty.
     if !erasure.is_empty() {
@@ -538,18 +537,18 @@ mod tests {
         }
     }
 
-    /// Issue #979 REACHABILITY test: a real SQL `spans` query carrying BOTH a
+    /// REACHABILITY test: a real SQL `spans` query carrying BOTH a
     /// `status_code` filter AND a `duration_ns` filter is parsed by DataFusion,
     /// extracted into `SpansPushdown`, and driven through the same
-    /// provider/fetcher path production uses. It proves the two things #979
-    /// exists to close:
+    /// provider/fetcher path production uses. It proves the two things this
+    /// scan closes:
     ///
     /// 1. Blocks are ACTUALLY SKIPPED: with the extracted `status_mask` and
     ///    `duration_window()` fed to the skip index (exactly what
     ///    `SpansTableProvider::build_scan` now passes into
     ///    `SpansScanExec::new`), the fetcher decodes strictly fewer blocks than
     ///    the same scan with both prune shapes disabled (`None, None`, the
-    ///    pre-#979 wire-up).
+    ///    unpruned wire-up).
     /// 2. Results are UNCHANGED under pruning: the exact set of matching rows
     ///    is identical whether the skip index prunes or not (the widen-safe
     ///    invariant), and equals the independently computed oracle. The full
@@ -558,7 +557,7 @@ mod tests {
     ///
     /// Flip to watch assertion (1) fail: in the `pruned` fetch below, pass
     /// `None, None` in place of `duration_window`/`status_mask` (equivalently,
-    /// revert `build_scan` to the pre-#979 `None, None`); the skip index then
+    /// revert `build_scan` to `None, None`); the skip index then
     /// keeps every block and `pruned.stats.blocks_scanned < full...` fails.
     #[tokio::test]
     async fn status_and_duration_filters_actually_skip_blocks_and_preserve_results() {
@@ -676,7 +675,7 @@ mod tests {
         );
 
         // (1) Blocks actually skipped. `pruned` passes exactly what build_scan
-        // now forwards; `full` disables both prune shapes (the pre-#979 call).
+        // now forwards; `full` disables both prune shapes (the unpruned call).
         let query = pushdown.span_query();
         let pruned = fetcher
             .fetch(
@@ -782,9 +781,9 @@ mod tests {
         }
     }
 
-    /// Issue #650 acceptance test: a `WHERE service_name = '<literal>'` query
+    /// Acceptance test: a `WHERE service_name = '<literal>'` query
     /// driven through the real [`SpansTableProvider`] (its SQL scan entry point,
-    /// not a crate-internal call -- the pattern of PR #555's read-cache test)
+    /// not a crate-internal call)
     /// returns exactly the matching rows AND decodes strictly fewer blocks than
     /// a full scan, proving the v3 bloom prune actually fired rather than just
     /// that pushdown parsing succeeded.

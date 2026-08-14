@@ -1,5 +1,4 @@
-//! B3 security tests (issue #22): the two invariants from
-//! docs/arrow-datafusion-plan.md section 2, review F16 and F17.
+//! Security tests: the two SQL surface invariants.
 //!
 //! Invariant 1 (read-only single statement) is asserted at the level the
 //! plan requires: *rejected before planning*. The proof is a side-effect
@@ -26,7 +25,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_sql::{ErrorClass, SqlConfig, SqlError, ValidationError};
 use util::{CountingStore, Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
-/// Every statement kind the plan names, plus a multi-statement body.
+/// Every statement kind checked, plus a multi-statement body.
 const REJECTED: &[(&str, &str)] = &[
     (
         "create external table",
@@ -217,7 +216,7 @@ async fn a_tenant_query_cannot_observe_another_tenants_rows() {
     assert_eq!(sum_b.to_bits(), 2703.0f64.to_bits());
 }
 
-/// Invariant 2, data half, adversarial query shapes (sql4-F03): the single
+/// Invariant 2, data half, adversarial query shapes: the single
 /// flat-aggregate positive test above proves the happy path, but tenant
 /// isolation is the invariant whose failure is an S0 cross-tenant
 /// disclosure, so it must be pinned against the query shapes an attacker
@@ -383,7 +382,7 @@ async fn a_tenant_query_cannot_move_another_tenants_memory_budget() {
         "tenant b's accountant must be untouched by tenant a's query"
     );
     // And tenant A's own accountant returned to zero: every reservation the
-    // query took was released when its streams dropped (review F13).
+    // query took was released when its streams dropped.
     assert_eq!(
         budget_a.reserved(),
         0,

@@ -3,7 +3,7 @@
 //! Label access in SQL goes through this UDF rather than map-subscript
 //! syntax so the endpoint controls the name and (later) pushdown
 //! recognition, insulating it from DataFusion's evolving map-function
-//! surface. B1 registers and implements it; pushdown is a later ticket.
+//! surface. This registers and implements it; pushdown is future work.
 
 use std::sync::Arc;
 

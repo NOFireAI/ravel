@@ -9,7 +9,7 @@
 //! [`ravel_logseg::LogRecord`]s into Arrow arrays matching
 //! [`crate::logs_schema::logs_schema`], and emits them sorted by `ts`
 //! ascending. That per-partition ordering is declared through
-//! `PlanProperties` so a later merge stage (#240) can honor it with a
+//! `PlanProperties` so a later merge stage can honor it with a
 //! `SortPreservingMergeExec`.
 //!
 //! `RlogReader::scan` (inside `fetch`) already emits a segment's records
@@ -55,7 +55,7 @@
 //! Correctness comes solely from the merged `attrs` column plus the residual.
 //! Pushdown is always `Inexact`, so DataFusion re-applies the *original*
 //! predicate against the emitted batch. [`build_batch`] populates the `attrs`
-//! column from the fully merged view (ADR-0033 amendment, issue #239), so the
+//! column from the fully merged view (ADR-0033 amendment), so the
 //! residual evaluates `attrs['k'] = 'v'` against exactly the data a row's SQL
 //! semantics demand: a resource-only match survives (the residual sees it in the
 //! merged column), and a record-attribute override survives (the merge resolves
@@ -123,7 +123,7 @@ pub struct LogsScanExec {
     /// fetch returns for a block it reads, only which blocks it reads.
     prune: Arc<Vec<Predicate>>,
     /// Pending selective-erasure predicates from the resolved snapshot
-    /// (ADR-0064 decision 2, issue #829). Fed to [`LogQuery::with_erasure`] so
+    /// (ADR-0064 decision 2). Fed to [`LogQuery::with_erasure`] so
     /// `LogSegmentFetcher::fetch`'s existing post-fetch, post-cache filter
     /// (`retain_log_records`) engages; empty when the snapshot has no pending
     /// erasure, which is a no-op there.
@@ -373,7 +373,7 @@ async fn prepare_partition(
         // so nothing here narrows below what DataFusion's residual keeps.
         out.extend(output.records);
     }
-    // Scan-layer selective-erasure exclusion (ADR-0064, issue #928). This is the
+    // Scan-layer selective-erasure exclusion (ADR-0064). This is the
     // authoritative exclusion because it sees the same merged `attrs` view the
     // surface returns (resource + scope + record), so a subject named only in a
     // resource/scope attribute is dropped; the fetcher-level filter matches
@@ -497,7 +497,7 @@ fn build_batch(records: &[LogRecord], schema: SchemaRef) -> DFResult<RecordBatch
     // against this column, and that residual is the sole exactness mechanism, so
     // the column must carry the fully merged view. Populating it from `r.attrs`
     // alone silently dropped every record whose matched attribute was a genuine
-    // resource attribute (ADR-0033 amendment, issue #239). See `merged_attrs`.
+    // resource attribute (ADR-0033 amendment). See `merged_attrs`.
     let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
     for r in records {
         for (k, v) in merged_attrs(r)? {

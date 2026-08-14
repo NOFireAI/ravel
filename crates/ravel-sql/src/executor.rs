@@ -1,7 +1,6 @@
 //! The per-query SQL execution driver: validate, resolve, plan, execute.
 //!
-//! Request handling order is fixed by docs/arrow-datafusion-plan.md section 2
-//! and is not an implementation detail:
+//! Request handling order is fixed and is not an implementation detail:
 //!
 //! 1. Parse and validate (security invariant 1, crate::validate) -- before
 //!    anything else, so a rejected statement costs no catalog LIST and
@@ -9,14 +8,14 @@
 //! 2. Resolve the snapshot exactly once, through
 //!    `catalog.resolve_pruned(&tenant_hash, signal, window, min_tokens,
 //!    now_ns, name_filter)`, with `now_ns` threaded in from the caller's
-//!    injected clock (review F11; no `SystemTime::now()` in library logic).
+//!    injected clock (no `SystemTime::now()` in library logic).
 //!    `signal` is chosen from the query's own `FROM` clause
 //!    ([`SqlExecutor::target_signal`], ADR-0033): `Signal::Logs` when the
 //!    query references the `logs` table, otherwise `Signal::Metrics`. A query
 //!    referencing both tables is rejected here, before the LIST, because v1
 //!    admits one signal per query (decision C). `name_filter` is the equality
-//!    `__name__` value derived from the query's pushed-down predicates (#278
-//!    item 4, [`SqlExecutor::pushed_down_name_filter`]), so a metrics query
+//!    `__name__` value derived from the query's pushed-down predicates
+//!    ([`SqlExecutor::pushed_down_name_filter`]), so a metrics query
 //!    naming one metric prunes by postings exactly as PromQL does; a logs
 //!    query or one with no such predicate resolves unpruned, identical to the
 //!    former plain `resolve`.
@@ -25,7 +24,7 @@
 //!    invariant 2, crate::session).
 //! 4. Plan, then execute, draining the stream under the wall deadline.
 //!
-//! # Snapshot retry contract (plan section 2, review F9)
+//! # Snapshot retry contract
 //!
 //! `docs/consistency-model.md` mandates re-resolve-and-retry-once when a
 //! pinned segment vanishes under a concurrent GC or compaction. On this path
@@ -63,7 +62,7 @@
 //! The wall deadline wraps the whole call, retry included, so a query cannot
 //! double its budget by tripping the retry path. On expiry the stream is
 //! dropped, which frees every `MemoryReservation` and returns the tenant's
-//! reserved bytes (crate::memory, review F13); partial state is discarded,
+//! reserved bytes (crate::memory); partial state is discarded,
 //! never returned (docs/query-engine.md "Budgets").
 
 use std::collections::HashMap;
@@ -122,7 +121,7 @@ impl TargetSignal {
 }
 
 /// The coordinator-side distributed samples scan for one query: the minted
-/// worker slices and the client that fetches each (ADR-0071, issue #868).
+/// worker slices and the client that fetches each (ADR-0071).
 /// Cloneable so the pinned retry loop can re-plan without re-minting (the slice
 /// `Vec` and the `Arc` client both clone cheaply).
 #[cfg(feature = "flight-sql")]
@@ -174,16 +173,16 @@ pub struct SqlStats {
     /// Segments in the snapshot the successful attempt used.
     pub segments: usize,
     /// Blocks the successful attempt's `LogsScanExec` saw, read straight off
-    /// its DataFusion counters after the stream drained (#544, reused rather
+    /// its DataFusion counters after the stream drained (reused rather
     /// than recounted). Zero for a metrics query, and for a logs query whose
     /// plan carries no scan node. `blocks_scanned` over `blocks_total` is the
-    /// prune selectivity ADR-0049 measures (issue #511).
+    /// prune selectivity ADR-0049 measures.
     pub blocks_total: u64,
     pub blocks_scanned: u64,
     pub blocks_pruned_by_postings: u64,
 }
 
-/// The `LogsScanExec` block counters, summed over a plan tree (issue #511).
+/// The `LogsScanExec` block counters, summed over a plan tree.
 #[derive(Clone, Copy, Default)]
 struct BlockCounts {
     total: u64,
@@ -246,8 +245,7 @@ pub struct SqlExecutor {
     ///
     /// Each entry also carries the tenant's last-touch (`now_ns` of its most
     /// recent query resolve), so the server's idle-tenant sweep can evict the
-    /// accountants of tenants idle past a threshold (ADR-0069 decision 2, issue
-    /// #820). Eviction is re-derivable: a `TenantMemoryAccountant` is pure
+    /// accountants of tenants idle past a threshold (ADR-0069 decision 2). Eviction is re-derivable: a `TenantMemoryAccountant` is pure
     /// process-local byte-counter state, rebuilt on the tenant's next query, so
     /// dropping an idle one with no outstanding reservations changes no result.
     tenants: Mutex<HashMap<TenantHash, TenantAccountantEntry>>,
@@ -340,7 +338,7 @@ impl SqlExecutor {
 
     /// Evict the memory accountant of every tenant last touched before
     /// `now_ns - ttl_ns` that also holds zero outstanding reservations
-    /// (ADR-0069 decision 2, issue #820). Returns the number evicted.
+    /// (ADR-0069 decision 2). Returns the number evicted.
     ///
     /// The zero-reservation guard is load-bearing: an accountant with live
     /// reservations is backing an in-flight query's memory budget, and dropping
@@ -428,7 +426,7 @@ impl SqlExecutor {
     /// for a transport that resolves and executes in two separate RPCs.
     ///
     /// Flight SQL resolves at `GetFlightInfo`, pins the resulting segment set
-    /// into its ticket, and executes against that pin at `DoGet` (review F18).
+    /// into its ticket, and executes against that pin at `DoGet`.
     /// It must reach `Catalog::resolve` through this call rather than its own,
     /// so both transports share one signature, one budget check, and one
     /// injected-clock discipline. Validation is *not* performed here: the
@@ -456,7 +454,7 @@ impl SqlExecutor {
     /// (security invariant 2, crate::session). Both [`Self::execute`] and the
     /// Flight SQL `DoGet` path go through it, which is what makes the two
     /// transports share the memory-accounting and cancellation behaviour
-    /// rather than merely resemble it (review F13): the pool the returned
+    /// rather than merely resemble it: the pool the returned
     /// query owns is dropped with it, and every `MemoryReservation` the plan
     /// took shrinks back through it into the tenant accountant.
     ///
@@ -482,7 +480,7 @@ impl SqlExecutor {
     }
 
     /// [`Self::plan_pinned`] with a coordinator-side distributed scan installed
-    /// on the metrics provider for THIS query only (ADR-0071, issue #868).
+    /// on the metrics provider for THIS query only (ADR-0071).
     ///
     /// `distributed`, when `Some`, carries the minted worker slices and the
     /// production [`WorkerSliceClient`](crate::distributed::WorkerSliceClient)
@@ -571,7 +569,7 @@ impl SqlExecutor {
     }
 
     /// Decide whether THIS pinned statement should distribute its samples scan,
-    /// and if so mint the per-worker slice tickets (ADR-0071, issue #868).
+    /// and if so mint the per-worker slice tickets (ADR-0071).
     ///
     /// Returns `Some(slices)` only for a metrics-target query whose pinned
     /// snapshot clears the cost gate, advertises more than one worker slice, and
@@ -600,8 +598,8 @@ impl SqlExecutor {
         crate::distributed::plan_distributed_slices(snapshot, &estimate, config, template)
     }
 
-    /// Execute the worker-side scan fragment for one distributed slice (ADR-0071,
-    /// issue #866), returning its internal-schema, `(series_id, ts)`-sorted
+    /// Execute the worker-side scan fragment for one distributed slice
+    /// (ADR-0071), returning its internal-schema, `(series_id, ts)`-sorted
     /// stream.
     ///
     /// This is the worker half of the SQL distributed lane: a coordinator's
@@ -679,7 +677,7 @@ impl SqlExecutor {
         self.touch_tenant(tenant_hash, req.now_ns);
         let target = Self::target_signal(&req.sql)?;
         // Postings pruning by the equality `__name__` predicate pushed down
-        // from the query's WHERE clause (#278 item 4). Without this the SQL
+        // from the query's WHERE clause. Without this the SQL
         // path called plain `Catalog::resolve`, so the measured 5.9-40.9x
         // postings pruning was structurally unreachable from SQL even for a
         // query whose `WHERE label(labels,'__name__') = '...'` names one
@@ -687,8 +685,7 @@ impl SqlExecutor {
         // logs query never prunes by it. Derivation is best-effort: any
         // planning hiccup yields no filter and the resolve simply does not
         // prune, exactly as before, and pruning itself already degrades
-        // safely when postings are absent or unusable
-        // (docs/metric-index-plan.md 5.4).
+        // safely when postings are absent or unusable.
         let name_filter = match target {
             TargetSignal::Metrics => self.pushed_down_name_filter(tenant_hash, &req.sql).await,
             TargetSignal::Logs => None,
@@ -711,7 +708,7 @@ impl SqlExecutor {
         // Sealed, below-watermark segments count against `max_segments`;
         // recent and token-resolved segments are exempt (ADR-0073 decision
         // 2), the same seam `ravel_query::engine::resolve_bounded` uses for
-        // PromQL (RH-T2, issue #902). Their cost is bounded separately by the
+        // PromQL. Their cost is bounded separately by the
         // request budget checked incrementally during fetch (see scan.rs).
         admit(&snapshot, &origins, &self.config.engine).map_err(admission_error_to_sql)?;
         let estimate = match target {
@@ -722,8 +719,7 @@ impl SqlExecutor {
     }
 
     /// The equality `__name__` value a metrics query's pushed-down predicates
-    /// pin, or `None` if none can be soundly used for postings pruning (#278
-    /// item 4).
+    /// pin, or `None` if none can be soundly used for postings pruning.
     ///
     /// This plans `sql` to a logical plan over a schema-only, empty-snapshot
     /// `samples` table (no storage I/O, no execution) purely to recover its
@@ -833,7 +829,7 @@ impl SqlExecutor {
         }
 
         // The stream drained cleanly: the plan's LogsScanExec counters are now
-        // final, so read them off the plan we kept (issue #511).
+        // final, so read them off the plan we kept.
         let blocks = stream.block_counts();
         (Ok(QueryOutput::new(schema, batches)), emitted, blocks)
     }
@@ -851,7 +847,7 @@ pub struct PinnedQuery {
     frame: DataFrame,
     schema: SchemaRef,
     /// The best-effort memory ceiling's abort flag, tripped by the pool's
-    /// `grow` and moved into the [`PinnedStream`] on execute (issue #163).
+    /// `grow` and moved into the [`PinnedStream`] on execute.
     breach: Arc<CeilingBreach>,
 }
 
@@ -873,7 +869,7 @@ impl PinnedQuery {
         // Build the physical plan explicitly rather than through
         // `frame.execute_stream()` (which does the same two steps internally)
         // so the plan handle survives the stream and its `LogsScanExec`
-        // DataFusion counters can be read after the drain (issue #511). The two
+        // DataFusion counters can be read after the drain. The two
         // are equivalent: `execute_stream` is `create_physical_plan` then
         // `execute_stream(plan, task_ctx)`.
         let plan = frame.create_physical_plan().await.map_err(plan_error)?;
@@ -893,19 +889,19 @@ impl PinnedQuery {
 /// Dropping this mid-stream is the cancellation path: the plan's operators
 /// and their `MemoryReservation`s drop with it, each reservation's `Drop`
 /// calls `MemoryPool::shrink`, and `TenantDelegatingPool` forwards that to
-/// the tenant accountant (crate::memory, review F13). No transport needs an
+/// the tenant accountant (crate::memory). No transport needs an
 /// explicit release step, and adding one would double-count.
 pub struct PinnedStream {
     _ctx: SessionContext,
     inner: SendableRecordBatchStream,
     schema: SchemaRef,
-    /// The best-effort memory ceiling's abort flag (issue #163). Checked
+    /// The best-effort memory ceiling's abort flag. Checked
     /// before every delegated poll; once the pool's `grow` has tripped it,
     /// the stream fails with [`SqlError::ResourcesExhausted`] instead of
     /// running the over-budget plan to completion.
     breach: Arc<CeilingBreach>,
     /// The physical plan behind `inner`, kept so its `LogsScanExec` block
-    /// counters can be read once the stream has drained (issue #511). Holding
+    /// counters can be read once the stream has drained. Holding
     /// it changes nothing about execution: the operators live in `inner`, and
     /// this is the same `Arc` handle.
     plan: Arc<dyn ExecutionPlan>,
@@ -920,7 +916,7 @@ impl PinnedStream {
     /// The `(blocks_total, blocks_scanned, blocks_pruned_by_postings)` the
     /// plan's logs scan recorded. Meaningful only once the stream has drained;
     /// zero on a plan with no logs scan. Reads the existing DataFusion counters
-    /// (issue #511).
+    ///.
     fn block_counts(&self) -> BlockCounts {
         let mut counts = BlockCounts::default();
         accumulate_block_counts(&self.plan, &mut counts);
@@ -932,7 +928,7 @@ impl Stream for PinnedStream {
     type Item = Result<RecordBatch, SqlError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // The best-effort memory ceiling's hard-abort seam (issue #163). The
+        // The best-effort memory ceiling's hard-abort seam. The
         // pool's `grow` cannot decline a reservation, so a join that overruns
         // a ceiling reserves the bytes and then trips the breach. This is the
         // one place every batch from every transport (HTTP SQL and Flight SQL,
@@ -946,7 +942,7 @@ impl Stream for PinnedStream {
         // DataFusion's operators is the next poll of this outer stream. Bounding
         // the overshoot to one more in-flight batch is the whole point of the
         // ticket -- it stops the query short of running to completion over
-        // budget, which is what happened before (#156).
+        // budget, which is what happened before.
         if let Some(message) = self.breach.message() {
             return Poll::Ready(Some(Err(SqlError::ResourcesExhausted(message.to_string()))));
         }
@@ -977,7 +973,7 @@ pub(crate) enum RetryDecision {
 /// `NotFound` always surfaces with `emitted == 0`. The branch exists because
 /// the consistency model requires the behavior, and it becomes reachable the
 /// moment the scan fetches lazily per segment (or Flight SQL streams to a
-/// slow consumer, Phase C / review F18). Deleting it as "dead" would silently
+/// slow consumer). Deleting it as "dead" would silently
 /// convert a future lazy scan into one that re-runs a partially-emitted
 /// query and duplicates rows.
 pub(crate) fn retry_decision(retryable: bool, emitted: usize, attempt: u32) -> RetryDecision {
@@ -997,7 +993,7 @@ pub(crate) fn retry_decision(retryable: bool, emitted: usize, attempt: u32) -> R
     }
 }
 
-/// Maps [`admit`]'s error into a [`SqlError`] (RH-T2, issue #902). `admit`
+/// Maps [`admit`]'s error into a [`SqlError`]. `admit`
 /// has exactly one failure variant
 /// (`QueryError::TooManySegments`); the wildcard arm exists only because
 /// `QueryError` is not restricted to that variant at the type level, and is
@@ -1140,7 +1136,7 @@ fn classify_shared(err: &DataFusionError) -> Option<SqlError> {
 }
 
 /// Collect every `WHERE`/`HAVING` predicate in `plan` as a top-level AND
-/// conjunct for [`crate::pushdown::extract`] (#278 item 4). Recurses through
+/// conjunct for [`crate::pushdown::extract`]. Recurses through
 /// the plan's inputs so a predicate under a projection or aggregate is still
 /// seen; the extractor treats each collected expression as an implicit
 /// top-level AND conjunct and splits nested `AND`s itself.
@@ -1154,13 +1150,13 @@ fn collect_filter_predicates(plan: &LogicalPlan, out: &mut Vec<Expr>) {
 }
 
 /// Leading sentinel marking a `name_filter` as a literal-prefix range key
-/// rather than an exact `__name__` value (ADR-0061 decision 3, EF-4/#724).
+/// rather than an exact `__name__` value (ADR-0061 decision 3).
 ///
 /// This MUST equal `ravel_catalog`'s
 /// `snapshot_resolve::PREFIX_FILTER_SENTINEL`, the byte the catalog strips to
 /// decide the prefix-vs-exact postings lookup. The value is duplicated inline
 /// here (matching this codebase's language-specific-enforcement precedent for
-/// name filters, #278, which already duplicates `equality_name_filter` across
+/// name filters, which already duplicates `equality_name_filter` across
 /// ravel-query and ravel-sql) rather than shared across the crate boundary; the
 /// catalog pins the value with a test and the postings-pruning oracles round-
 /// trip it end to end, so a silent drift cannot pass.
@@ -1220,7 +1216,7 @@ fn name_pruning_key(m: &LabelMatcher) -> Option<String> {
 }
 
 /// The lone `__name__` pruning key in `matchers`, or `None` if none can be
-/// soundly used to prune (#278 item 4, extended by ADR-0061 decision 3).
+/// soundly used to prune (extended by ADR-0061 decision 3).
 /// Mirrors the PromQL engine's `equality_name_filter`: a single `__name__`
 /// matcher that is either an exact `=` or a literal-prefix-anchored regex
 /// yields its (possibly sentinel-encoded) key; a second `__name__` matcher of
@@ -1515,7 +1511,7 @@ mod tests {
         SqlExecutor::new(catalog, fetcher, log_fetcher, SqlConfig::default(), 1 << 30)
     }
 
-    /// ADR-0069 decision 2 (issue #820): a tenant idle past the TTL has its
+    /// ADR-0069 decision 2: a tenant idle past the TTL has its
     /// memory accountant evicted, a subsequent access re-derives a fresh one,
     /// and a tenant still running queries (recently touched) survives the same
     /// sweep. Deterministic via injected `now_ns` (touch_tenant, the resolve
@@ -1589,7 +1585,7 @@ mod tests {
         assert_eq!(exec.evict_idle_accountants(10 * NS_PER_HOUR, ttl_ns), 1);
     }
 
-    /// ADR-0044 acceptance test (issue #424): one `execute` call, checked
+    /// ADR-0044 acceptance test: one `execute` call, checked
     /// against an `InstrumentedStore`'s own before/after deltas, the same
     /// cross-check `Catalog::resolve_with_accounting`'s own test uses
     /// (crates/ravel-catalog/src/catalog.rs). Proves the SQL path now
@@ -1723,8 +1719,8 @@ mod tests {
         assert!(
             acc.peak_intermediate_bytes > 0,
             "the tenant accountant's reserved high-water mark must feed \
-             observe_intermediate_bytes (issue #424 deliverable 2), so this \
-             is no longer always zero"
+             observe_intermediate_bytes, so this \
+             is not always zero"
         );
     }
 }

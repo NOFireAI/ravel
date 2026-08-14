@@ -1,5 +1,4 @@
-//! The tenant-delegating memory pool bridge (docs/arrow-datafusion-plan.md
-//! section 2 "Per-tenant accounting", review F13).
+//! The tenant-delegating memory pool bridge.
 //!
 //! DataFusion memory pools are per-`RuntimeEnv`, not hierarchical. Ravel needs
 //! two nested budgets: a per-query byte ceiling and a per-tenant ceiling that
@@ -9,7 +8,7 @@
 //! locally, and it forwards every `grow`/`try_grow`/`shrink` to the
 //! [`TenantMemoryAccountant`] so tenant usage is accounted across queries.
 //!
-//! The forwarding of `shrink` is load-bearing for cancellation (review F13):
+//! The forwarding of `shrink` is load-bearing for cancellation:
 //! DataFusion frees a `MemoryReservation` on `Drop`, which calls
 //! `MemoryPool::shrink`. A cancelled, timed-out, or client-disconnected query
 //! drops its streams, so every reservation shrinks to zero and the tenant's
@@ -71,7 +70,7 @@ impl CeilingBreach {
 ///
 /// This is a ravel-sql-local stand-in for Ravel's tenant accountant: nothing
 /// tenant-wide exists to delegate to yet (there is no cross-crate accountant
-/// type), so B2 defines the shape here. When a process-wide accountant lands,
+/// type), so this crate defines the shape here. When a process-wide accountant lands,
 /// this becomes a thin adapter over it; the pool bridge above does not change.
 #[derive(Debug)]
 pub struct TenantMemoryAccountant {
@@ -150,7 +149,7 @@ impl TenantMemoryAccountant {
 ///
 /// `try_grow` fails if either budget is exhausted, and it checks the query
 /// budget first so a high-cardinality query trips its own pool before it can
-/// threaten the tenant budget (the ordering review F10's sizing test asserts).
+/// threaten the tenant budget (the ordering the sizing test asserts).
 /// A failed `try_grow` reserves nothing on either budget.
 pub struct TenantDelegatingPool {
     query_limit: usize,
@@ -158,7 +157,7 @@ pub struct TenantDelegatingPool {
     tenant: Arc<TenantMemoryAccountant>,
     /// Tripped when `grow`'s unconditional path pushes either budget over its
     /// ceiling. Shared with the query's stream, which reads it each poll and
-    /// aborts once it is set (issue #163).
+    /// aborts once it is set.
     breach: Arc<CeilingBreach>,
     /// The query this pool was built for (ADR-0044 "1. A per-request
     /// accounting handle"). Every successful grow reports the query's new
@@ -277,7 +276,7 @@ impl MemoryPool for TenantDelegatingPool {
         // not hard caps against every DataFusion-internal growth path.
         // Accepted and documented: ADR-0013 amendment (2026-07-28).
         //
-        // What issue #163 adds: after the (still unconditional) increments,
+        // What the ceiling check adds: after the (still unconditional) increments,
         // note whether this grow pushed a budget over its ceiling and, if so,
         // trip the shared CeilingBreach. This does not prevent the overshoot
         // -- it cannot, per the paragraph above -- it lets the query's stream
@@ -309,7 +308,7 @@ impl MemoryPool for TenantDelegatingPool {
 
     fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
         // Forwarded to the tenant accountant, including the shrink DataFusion
-        // issues when a MemoryReservation is dropped (review F13): this is what
+        // issues when a MemoryReservation is dropped: this is what
         // makes a cancelled or dropped stream return its tenant reservation to
         // zero.
         self.query_shrink(shrink);
@@ -318,7 +317,7 @@ impl MemoryPool for TenantDelegatingPool {
 
     fn try_grow(&self, _reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
         // Query budget first: a query must trip its own pool before it can
-        // threaten the tenant budget (review F10).
+        // threaten the tenant budget.
         let query_total = self.query_try_grow(additional).map_err(|()| {
             DataFusionError::ResourcesExhausted(format!(
                 "query memory pool exhausted: {additional} more bytes exceeds per-query limit {}",

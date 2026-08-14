@@ -3,8 +3,7 @@
 //! [`QueryOutput`] owns the collected `RecordBatch`es and hides every arrow
 //! and DataFusion type behind its own surface. That is deliberate: the HTTP
 //! endpoint lives in services/ravel-server, which must not link datafusion
-//! (ADR-0013 / docs/arrow-datafusion-plan.md section 3 structural
-//! isolation). The endpoint picks an encoding from the `Accept` header and
+//! (ADR-0013 structural isolation). The endpoint picks an encoding from the `Accept` header and
 //! gets back bytes or a `serde_json::Value`; it never touches a batch.
 //!
 //! # JSON float encoding

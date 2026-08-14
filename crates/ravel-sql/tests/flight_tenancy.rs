@@ -1,11 +1,10 @@
 //! Flight SQL tenancy isolation, ticket replay, and stream cancellation
-//! (issue #153, docs/arrow-datafusion-plan.md Phase C tests; security
-//! invariant 2, review F13/F17/F18).
+//! (security invariant 2).
 //!
-//! flight.rs (issue #152) proves the individual rules at the unit level. This
-//! file is the systematic version the plan's "tenancy isolation test (tenant A
-//! cannot read tenant B through any Flight SQL method, including
-//! catalog/metadata methods)" calls for:
+//! flight.rs proves the individual rules at the unit level. This
+//! file is the systematic tenancy isolation test: tenant A cannot read
+//! tenant B through any Flight SQL method, including catalog/metadata
+//! methods:
 //!
 //! - **Statement isolation.** Two tenants with disjoint data run the identical
 //!   SQL; each sees only its own rows, and tenant A's result never contains a
@@ -18,9 +17,9 @@
 //!   for one tenant to read another's schema, table set, or existence out of.
 //!   The suite asserts the identity for all five methods on both RPCs.
 //! - **Ticket replay after expiry** fails `SnapshotInvalidated`, never with
-//!   data read under a pin the GC no longer protects (review F18).
+//!   data read under a pin the GC no longer protects.
 //! - **Stream cancellation** mid-transfer returns the tenant's reserved bytes
-//!   to zero through the delegating pool's drop-forwarding path (review F13),
+//!   to zero through the delegating pool's drop-forwarding path,
 //!   asserted against the shared `TenantMemoryAccountant`.
 
 #![cfg(feature = "flight-sql")]
@@ -251,7 +250,7 @@ async fn metadata_get_flight_info_is_identical_for_every_tenant() {
 }
 
 // ---------------------------------------------------------------------------
-// Ticket replay after deadline expiry (review F18)
+// Ticket replay after deadline expiry
 // ---------------------------------------------------------------------------
 
 /// A ticket used successfully once, replayed after its embedded deadline has
@@ -294,7 +293,7 @@ async fn a_ticket_replayed_after_its_deadline_fails_snapshot_invalidated() {
 }
 
 // ---------------------------------------------------------------------------
-// Stream cancellation releases the tenant reservation (review F13)
+// Stream cancellation releases the tenant reservation
 // ---------------------------------------------------------------------------
 
 /// Dropping a `DoGet` stream mid-transfer returns every reserved byte to the

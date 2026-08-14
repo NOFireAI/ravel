@@ -1,10 +1,11 @@
-//! EF-4/#724 (ADR-0061 decision 3): the SQL executor derives a literal-prefix
+//! Prefix-anchored postings pruning (ADR-0061 decision 3): the SQL executor
+//! derives a literal-prefix
 //! `__name__` filter from a pushed-down `label_match(labels, '__name__',
 //! '^foo.*$')` predicate and resolves through the catalog's sorted-name range
 //! scan, so prefix-anchored regex pruning is reachable from SQL, on the same
-//! path #278 wired equality pruning onto.
+//! path equality pruning uses.
 //!
-//! Mirrors `sql_postings_pruning_278.rs`: the observable proof is the resolved
+//! Mirrors `sql_postings_pruning.rs`: the observable proof is the resolved
 //! snapshot size, plus a correctness oracle that runs the SAME selection two
 //! ways -- once pruned (`^prefix.*$`, accepted by the detector) and once with
 //! pruning forcibly disabled (`^prefix.*.*$`, an extra `.*` the detector
@@ -114,7 +115,7 @@ async fn prefix_pruned_matches_unpruned_across_boundary_cases() {
     }
 }
 
-/// Effectiveness (mirrors `sql_postings_pruning_278.rs`): a prefix query
+/// Effectiveness (mirrors `sql_postings_pruning.rs`): a prefix query
 /// resolves strictly fewer segments than the same table with no name filter.
 #[tokio::test]
 async fn prefix_scan_narrows_the_resolve() {

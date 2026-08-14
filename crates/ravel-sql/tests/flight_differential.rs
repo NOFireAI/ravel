@@ -1,6 +1,5 @@
-//! Differential gate parity between the Flight SQL and HTTP transports
-//! (issue #153, docs/arrow-datafusion-plan.md Phase C "differential gate
-//! results identical over Flight SQL and HTTP SQL").
+//! Differential gate parity between the Flight SQL and HTTP transports:
+//! results are identical over Flight SQL and HTTP SQL.
 //!
 //! tests/differential.rs gates the HTTP path against an independent
 //! greatest-wins oracle. This file gates the *Flight* path against the *HTTP*
@@ -18,7 +17,7 @@
 //! [`util::gate::Row`] and compared as whole result sets, and every query
 //! carries a total `ORDER BY` so row order is itself part of the contract.
 //!
-//! Bit-for-bit is the whole point (review F7): the Flight encoder round-trips
+//! Bit-for-bit is the whole point: the Flight encoder round-trips
 //! the Arrow IPC frames a NaN payload or a signed zero lives in, and a lossy
 //! step anywhere on the DoGet path -- the ticket codec, the pinned re-plan, the
 //! stream encoder -- would surface here as a bit mismatch, not a silent

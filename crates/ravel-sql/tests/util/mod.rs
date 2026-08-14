@@ -1,4 +1,4 @@
-//! Shared fixtures for the B3 integration tests (issue #22).
+//! Shared fixtures for the integration tests.
 //!
 //! Everything here builds *real* artifacts: real RSEG segments written with
 //! `ravel_segment`, published with `ravel_commit` onto a `MemoryStore`, and
@@ -12,10 +12,10 @@
 //! docs/catalog-and-mvcc.md) over `SegmentFetcher::fetch` -- the AoS surface
 //! -- while the path under test decodes with `fetch_soa` and dedups in
 //! `RsegDedupExec`. The two sides share fetched *bytes* and share no merge
-//! or dedup code, which is what review F5 requires of the reference: the
+//! or dedup code, which the reference requires: the
 //! plan names `merge_segments` as the reference window, but that function is
-//! private to ravel-query and making it public is outside this ticket's
-//! crate scope, so the gate uses a separate implementation of the same
+//! private to ravel-query and making it public is outside this crate's
+//! scope, so the gate uses a separate implementation of the same
 //! normative order (the same choice, for the same reason, that B1's layer-1
 //! oracle in tests/pipeline.rs made).
 
@@ -23,7 +23,7 @@
 
 /// The shared v1 SQL differential grammar (query shapes, dataset strategies,
 /// reference folds, comparable rows), used by both the HTTP-path oracle gate
-/// and the Flight-vs-HTTP transport parity gate (issue #153).
+/// and the Flight-vs-HTTP transport parity gate.
 pub mod gate;
 
 /// The in-process Flight SQL harness, shared across the Flight test suites.
@@ -385,7 +385,7 @@ impl ObjectStoreBackend for CountingStore {
 
     fn capabilities(&self) -> ravel_object_store::Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         ravel_object_store::Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -466,7 +466,7 @@ impl ObjectStoreBackend for StallingStore {
 
     fn capabilities(&self) -> ravel_object_store::Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         ravel_object_store::Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -475,7 +475,7 @@ impl ObjectStoreBackend for StallingStore {
 }
 
 // ---------------------------------------------------------------------------
-// The independent reference row source (review F5 / F7)
+// The independent reference row source
 // ---------------------------------------------------------------------------
 
 /// One post-dedup sample, the unit the layer-2 reference executor consumes.

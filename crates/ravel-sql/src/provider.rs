@@ -2,7 +2,7 @@
 //! resolved, owned `Snapshot`.
 //!
 //! Snapshot resolution is the endpoint's job (it threads `now_ns` through
-//! `Catalog::resolve`, review F11); this provider takes an owned `Snapshot`
+//! `Catalog::resolve`); this provider takes an owned `Snapshot`
 //! and never resolves. `scan` (or the test-facing [`RavelTableProvider::plan`])
 //! builds the three-stage physical pipeline:
 //!
@@ -11,7 +11,7 @@
 //! ```
 //!
 //! The merge is `SortPreservingMergeExec`, never `CoalescePartitionsExec`:
-//! deterministic float ordering depends on it (review F12).
+//! deterministic float ordering depends on it.
 //!
 //! Pushdown (ticket B2): `supports_filters_pushdown` returns `Inexact` for
 //! every filter so DataFusion always re-applies them above the scan, and
@@ -49,7 +49,7 @@ use crate::pushdown::{Pushdown, extract};
 use crate::scan::RsegScanExec;
 use crate::schema::public_schema;
 
-/// A coordinator-side distributed scan context (ADR-0071, issue #866): the
+/// A coordinator-side distributed scan context (ADR-0071): the
 /// worker endpoints one query fans out to, and the client that fetches each
 /// slice. Present only on a coordinator provider built via
 /// [`RavelTableProvider::with_distributed_scan`]; absent (the default) means
@@ -72,9 +72,9 @@ pub struct RavelTableProvider {
     /// issues on this query's behalf is recorded against it.
     accounting: QueryAccounting,
     /// Pending selective-erasure predicates derived once from
-    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `RsegScanExec` the provider builds. On the distributed
-    /// coordinator path (ADR-0071, issue #866) a worker never resolves its own
+    /// coordinator path (ADR-0071) a worker never resolves its own
     /// snapshot: the coordinator resolves once, and `plan_distributed_slices`
     /// copies the coordinator's decoded predicate set into every slice
     /// `FlightTicket` it mints (`FlightTicket::pending_erasure`). The
@@ -83,7 +83,7 @@ pub struct RavelTableProvider {
     /// identically on both the local scan and the worker-side fragment.
     erasure: Arc<Vec<ErasurePredicate>>,
     /// The coordinator-side distributed fan-out, if this provider is acting as
-    /// a distributed coordinator (ADR-0071, issue #866). `None` -- the default,
+    /// a distributed coordinator (ADR-0071). `None` -- the default,
     /// and every non-Flight build -- is the local scan path unchanged.
     #[cfg(feature = "flight-sql")]
     distributed: Option<DistributedScanContext>,
@@ -116,8 +116,7 @@ impl RavelTableProvider {
         }
     }
 
-    /// Install a coordinator-side distributed scan context (ADR-0071, issue
-    /// #866). With it, [`TableProvider::scan`] fans the samples scan out to the
+    /// Install a coordinator-side distributed scan context (ADR-0071). With it, [`TableProvider::scan`] fans the samples scan out to the
     /// given worker endpoints -- one `DistributedScanExec` partition per slice,
     /// feeding the same merge -> dedup pair -- instead of scanning the local
     /// snapshot. Without it, the provider is unchanged. Only compiled with the
@@ -170,7 +169,7 @@ impl RavelTableProvider {
     ///
     /// Admission (the sealed-segment cap) is decided exactly once, at resolve
     /// time, by `SqlExecutor::resolve` calling `ravel_query::admit` over the
-    /// full, unpruned snapshot and its `SegmentOrigins` (RH-T2, issue #902).
+    /// full, unpruned snapshot and its `SegmentOrigins`.
     /// `segments` here is a `pruned_segments()` subset of that already-admitted
     /// snapshot, so re-checking a count against it here would be a second,
     /// weaker check over the wrong set (post-prune, origin-blind); it is not
@@ -211,8 +210,7 @@ impl RavelTableProvider {
         Ok(merge)
     }
 
-    /// The worker-side fragment for a distributed SQL scan (ADR-0071, issue
-    /// #866): the internal-schema, `(series_id, ts)`-sorted `RsegScanExec ->
+    /// The worker-side fragment for a distributed SQL scan (ADR-0071): the internal-schema, `(series_id, ts)`-sorted `RsegScanExec ->
     /// SortPreservingMergeExec` pipeline over `segments`, with no pushdown and
     /// NO dedup.
     ///
@@ -288,7 +286,7 @@ impl TableProvider for RavelTableProvider {
     /// Inexact for every filter: the provider prunes what it can (widen-only),
     /// but DataFusion must always re-apply the original filters above the scan.
     /// Never `Exact`, which would let DataFusion drop the residual and trust
-    /// the scan to have filtered precisely, which it never does (review F8).
+    /// the scan to have filtered precisely, which it never does.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -303,7 +301,7 @@ impl TableProvider for RavelTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Distributed coordinator path (ADR-0071, issue #866): fan out to
+        // Distributed coordinator path (ADR-0071): fan out to
         // worker slices instead of scanning locally. The scan's `_limit` is
         // honored here as a fetch-stop hint across the distributed partitions,
         // with the exact limit re-applied above the dedup (over-fetch is safe,
@@ -341,9 +339,9 @@ impl TableProvider for RavelTableProvider {
         // VAL/TS page GETs for unprojected columns: the `SegmentFetcher`
         // SoA API (`fetch_soa`) fetches TS and VAL pages together and exposes
         // no per-column toggle, so skipping VAL GETs would require a
-        // ravel-query API change outside this ticket's crate scope. The
+        // ravel-query API change outside this crate's scope. The
         // dangerous TS-page-skip/`sample_count` optimization stays off
-        // regardless (review F8): it is valid only when the post-dedup row
+        // regardless: it is valid only when the post-dedup row
         // count provably equals SERIES_TABLE `sample_count` for the exact
         // pruned case, which is not proven, so correctness keeps the GETs.
         self.apply_projection(plan, projection)

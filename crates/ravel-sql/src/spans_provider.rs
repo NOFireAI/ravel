@@ -43,7 +43,7 @@ pub struct SpansTableProvider {
     fetcher: SpanSegmentFetcher,
     schema: SchemaRef,
     /// Pending selective-erasure predicates derived once from
-    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `SpansScanExec` the provider builds.
     erasure: Arc<Vec<ErasurePredicate>>,
 }
@@ -51,7 +51,7 @@ pub struct SpansTableProvider {
 impl SpansTableProvider {
     /// Build a provider around an owned, already-resolved `Signal::Spans`
     /// snapshot. Admission and budget config live on the resolve-time seam
-    /// (RH-T2, issue #902), not on the provider, so this no longer takes a
+    ///, not on the provider, so this no longer takes a
     /// config parameter.
     pub fn new(snapshot: Snapshot, fetcher: SpanSegmentFetcher) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
@@ -86,7 +86,7 @@ impl SpansTableProvider {
     /// Admission (the sealed-segment cap) is decided exactly once, at
     /// resolve time, by whichever endpoint resolves this table's snapshot,
     /// calling `ravel_query::admit` over the full snapshot and its
-    /// `SegmentOrigins` (RH-T2, issue #902) -- the same pattern
+    /// `SegmentOrigins` -- the same pattern
     /// `SqlExecutor::resolve` uses for the two wired tables. No such endpoint
     /// exists yet for spans (see the module doc); `pruned_segments` below is
     /// a further, client-side, widen-only ts subset, so re-checking a count

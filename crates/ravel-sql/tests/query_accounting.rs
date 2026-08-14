@@ -1,4 +1,4 @@
-//! ADR-0044 acceptance tests for SQL query accounting (issue #424).
+//! ADR-0044 acceptance tests for SQL query accounting.
 //!
 //! `sql_execute_records_requests_bytes_and_peak_memory` (crate::executor's
 //! own unit test module) proves one query's counters cross-check against an
@@ -232,16 +232,15 @@ async fn a_logs_query_is_accounted() {
     assert_eq!(outcome.output.num_rows(), LOG_RECORD_COUNT);
     assert!(
         outcome.accounting.total_s3_requests() > 0,
-        "the logs fetch funnel must now be accounted (issue #424 deliverable 5); \
-         before this, LogSegmentFetcher::fetch was unaccounted and every logs \
-         query contributed nothing to per-query counters"
+        "the logs fetch funnel must be accounted: LogSegmentFetcher::fetch \
+         contributes to per-query counters"
     );
     assert!(
         outcome.accounting.s3_bytes(AccountedOp::Get) > 0,
         "the accounted logs GET must record bytes transferred"
     );
-    // The LogsScanExec block counters (#544) flow through to the outcome so the
-    // /metrics prune-selectivity family can reuse them (issue #511). This query
+    // The LogsScanExec block counters flow through to the outcome so the
+    // /metrics prune-selectivity family can reuse them. This query
     // has no pruning predicate, so every block the scan considered was scanned.
     assert!(
         outcome.stats.blocks_total > 0,
@@ -262,7 +261,7 @@ async fn a_logs_query_is_accounted() {
 /// distinct value of the per-record attribute `region` (`region-0` ..
 /// `region-5`). It must be a per-record attribute, not a resource one: a
 /// resource-only key gets no dynamic column and so no postings at all
-/// (ADR-0049, the same gap Fix 1 of this ticket documents).
+/// (ADR-0049).
 const POSTINGS_PRUNE_RECORD_COUNT: usize = 48;
 const POSTINGS_PRUNE_GROUP_SIZE: usize = 8;
 
@@ -357,7 +356,7 @@ async fn publish_logs_with_region_postings(store: &dyn ObjectStoreBackend, tenan
         .expect("publish logs commit record");
 }
 
-/// The anti-vacuity guard for issue #511 deliverable 2: `a_logs_query_is_accounted`
+/// The anti-vacuity guard for postings pruning: `a_logs_query_is_accounted`
 /// above proves `blocks_pruned_by_postings` is not spuriously nonzero (no
 /// predicate, so nothing is pruned); it does not prove the counter can ever
 /// be nonzero at all. A metric that is permanently zero passes every test
@@ -431,10 +430,10 @@ fn reduce_rows(batches: &[RecordBatch]) -> HashMap<[u8; 16], HashMap<i64, u64>> 
     out
 }
 
-/// The property that matters most for this ticket: threading accounting
+/// The property that matters most here: threading accounting
 /// through every fetch call is counting only, never a behavior change. The
 /// oracle side (`reference_rows`) fetches through the same plain,
-/// unaccounted `SegmentFetcher::fetch` the pre-#424 code path used; the
+/// unaccounted `SegmentFetcher::fetch` the unaccounted code path used; the
 /// executor side now runs fully accounted end to end. Row-for-row equality
 /// between the two proves the accounting wiring changed nothing.
 #[tokio::test]

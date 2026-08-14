@@ -56,7 +56,7 @@ pub(crate) fn merged_attrs(r: &LogRecord) -> DFResult<Vec<(String, AttrValue)>> 
 /// column exposes to the query surface. That is the authoritative exclusion: a
 /// subject named only in a resource or scope attribute (`user_id`, `host.name`,
 /// `service.instance.id`) is queryable through `attrs` yet invisible to a
-/// record-attribute-only filter, so it must be matched here (issue #928). This
+/// record-attribute-only filter, so it must be matched here. This
 /// mirrors [`ravel_query::erasure::is_erased_span`] but over the
 /// [`AttrValue`]-typed merged map.
 ///

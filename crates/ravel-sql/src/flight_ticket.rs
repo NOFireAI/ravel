@@ -1,19 +1,19 @@
-//! Flight SQL snapshot-pinning ticket codec (ticket C1b, issue #150).
+//! Flight SQL snapshot-pinning ticket codec.
 //!
-//! # Why this exists (review F18, docs/arrow-datafusion-plan.md Phase C)
+//! # Why this exists
 //!
 //! Flight SQL splits one query across two RPCs: `GetFlightInfo` plans the
 //! query and hands the client an opaque ticket; `DoGet` later redeems that
 //! ticket to stream results. If `DoGet` re-resolved the snapshot it would
 //! observe a *different* set of committed segments than `GetFlightInfo`
 //! planned against, so the same query could return two different answers
-//! across its own two RPCs. F18 fixes this by making the ticket carry the
+//! across its own two RPCs. The pin fixes this by making the ticket carry the
 //! exact resolved snapshot identity: `DoGet` executes against precisely the
 //! snapshot `GetFlightInfo` pinned, never a re-resolution.
 //!
 //! This module is only the wire contract. It does not resolve snapshots,
 //! implement `FlightSqlService`, or compare tenants; those live in
-//! [`crate::flight`], which binds to this format (ticket C1d, issue #152).
+//! [`crate::flight`], which binds to this format (ticket C1d).
 //!
 //! # Deadline and the GC protection horizon
 //!
@@ -57,7 +57,7 @@
 //!   flipped byte anywhere) a typed decode error rather than a silently
 //!   different pin, and -- unlike a plain checksum -- also makes the ticket
 //!   unforgeable by anyone who does not hold the minting process's secret key
-//!   (issue #185; version 2 used an unkeyed FNV-1a-64 checksum any client
+//!   (version 2 used an unkeyed FNV-1a-64 checksum any client
 //!   could recompute after tampering with a field).
 //!
 //! Layout (all integers little-endian, lengths are `u32`):
@@ -122,7 +122,7 @@
 //! `tenant` -- and produce a tag the minting process will accept, which the
 //! version-2 FNV-1a-64 checksum never prevented.
 //!
-//! # Segment identity fields (the judgment call from issue #150, settled by C1)
+//! # Segment identity fields
 //!
 //! Version 1 of this codec carried only `data_object_key`, `writer_epoch`,
 //! and `content_hash`, and left open "whether `DoGet` re-resolves the full
@@ -130,12 +130,12 @@
 //! decision. If it chooses full reconstruction, those fields are added under
 //! a bumped `version` byte; the codec is built for that extension."
 //!
-//! C1 (issue #152) chose full reconstruction, so version 2 carries every
+//! C1 chose full reconstruction, so version 2 carries every
 //! [`SegmentRef`] field and [`SegmentPin::to_segment_ref`] rebuilds the
 //! resolved `Snapshot` exactly. The alternative -- re-resolving at `DoGet`
 //! and intersecting against the pinned keys -- would have put a catalog LIST
 //! on the redemption path and made the pin depend on a second resolve
-//! observing the same committed state, which is the coupling F18 exists to
+//! observing the same committed state, which is the coupling the pin exists to
 //! remove. The three original fields keep their original roles inside the
 //! larger set:
 //!
@@ -155,11 +155,11 @@
 //! differently-shaped trailing checksum, a MAC or length mismatch), not
 //! upgraded. They are ephemeral by construction -- no ticket outlives its
 //! `deadline_ns`, and nothing on any released path ever minted one -- so
-//! there is no compatibility window to preserve. Version 3 (issue #185)
+//! there is no compatibility window to preserve. Version 3
 //! replaces the unkeyed FNV-1a-64 checksum with a keyed BLAKE3 MAC; see
 //! "Integrity: a keyed MAC, not a checksum" above.
 //!
-//! Version 4 (issue #866, ADR-0071 distributed read fan-out) carries a
+//! Version 4 (ADR-0071 distributed read fan-out) carries a
 //! [`slice_index`](FlightTicket::slice_index) /
 //! [`slice_count`](FlightTicket::slice_count) pair so a ticket can pin a
 //! *slice* of the resolved snapshot (a subset of segments) rather than the
@@ -179,12 +179,12 @@
 //! field is threaded into the current version's layout in place rather than
 //! behind a fresh version byte: there is no older-version ticket in flight to
 //! stay compatible with, and any that somehow were would fail the MAC or
-//! length check regardless. Issue #394 added the per-segment `level_tag`
+//! length check regardless. The per-segment `level_tag` is added
 //! (L0 vs L1, with an L1 part's `input_set_hash`/`part_index`) this way, so
 //! [`SegmentPin::to_segment_ref`] reconstructs the level and a rebuilt L1 part
 //! is verified against the v4 footer contract, not read as an L0 segment.
 //!
-//! Version 5 (issue #829, ADR-0064 decision 3) carries the resolved
+//! Version 5 (ADR-0064 decision 3) carries the resolved
 //! snapshot's pending selective-erasure predicates
 //! ([`FlightTicket::pending_erasure`]). Earlier versions minted `DoGet`
 //! against a snapshot rebuilt with an always-empty predicate set
@@ -192,7 +192,7 @@
 //! which meant a query whose snapshot had a pending erasure request still
 //! returned the erased rows over Flight SQL, in violation of ADR-0064's
 //! visibility bound; the HTTP `/api/v1/sql` path, which resolves and scans
-//! without going through this ticket, was never affected. This is a version
+//! without going through this codec, was never affected. This is a version
 //! bump, not a `.proto` schema change and not an ADR of its own: as stated
 //! above, the ticket is an ephemeral MAC'd blob bounded by `deadline_ns`, not
 //! one of the frozen persistent contracts, so a new field under a bumped
@@ -205,7 +205,7 @@
 //! `ravel_query::distrib::codec::encode_erasure` already carries in a
 //! distributed `FetchRequest` (`ravel-query/src/distrib/mod.rs`); this codec
 //! stays hand-rolled rather than reusing that proto message, consistent with
-//! this ticket avoiding prost by design.
+//! this codec avoiding prost by design.
 
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
@@ -237,7 +237,7 @@ pub const TICKET_KEY_LEN: usize = 32;
 /// ephemeral by construction and never expected to outlive the process that
 /// minted it.
 ///
-/// A distributed deployment (ADR-0071, issue #868) cannot use a per-process
+/// A distributed deployment (ADR-0071) cannot use a per-process
 /// random key: a coordinator mints a slice ticket that a *different* worker
 /// process must verify, so every process in the cluster must agree on the key.
 /// There the key is derived deterministically from the shared cluster secret
@@ -391,8 +391,8 @@ pub struct FlightTicket {
     /// is expired. Always set by the minter to at most the GC protection
     /// horizon (see module docs).
     pub deadline_ns: i64,
-    /// This ticket's 0-based position in a distributed fan-out (ADR-0071,
-    /// issue #866). A whole-snapshot ticket carries `0`. Carried so a
+    /// This ticket's 0-based position in a distributed fan-out
+    /// (ADR-0071). A whole-snapshot ticket carries `0`. Carried so a
     /// coordinator/worker can identify and log which slice a ticket pins; it
     /// is not a trust boundary and `snapshot()` ignores it.
     pub slice_index: u32,
@@ -402,7 +402,7 @@ pub struct FlightTicket {
     /// the whole set.
     pub slice_count: u32,
     /// Pending selective-erasure predicates from the resolved snapshot
-    /// (ADR-0064 decision 3, issue #829): [`FlightTicket::snapshot`] carries
+    /// (ADR-0064 decision 3): [`FlightTicket::snapshot`] carries
     /// this set into the rebuilt `Snapshot.pending_erasure` so `DoGet`
     /// excludes exactly what `GetFlightInfo`'s resolve saw pending, never a
     /// re-resolution and never an empty set.
@@ -613,7 +613,7 @@ impl FlightTicket {
     /// Rebuild the resolved `Snapshot` this ticket pinned.
     ///
     /// This is the whole point of the pin: `DoGet` executes against the
-    /// snapshot `GetFlightInfo` resolved, never a re-resolution (review F18).
+    /// snapshot `GetFlightInfo` resolved, never a re-resolution.
     /// Segment order is preserved from the resolve, which is already the
     /// catalog's deterministic provenance order.
     ///
@@ -622,7 +622,7 @@ impl FlightTicket {
     /// so this snapshot excludes nothing of its own.
     ///
     /// `pending_erasure` carries [`Self::pending_erasure`] back into the
-    /// proto-shaped `Snapshot` field (ADR-0064 decision 3, issue #829), so
+    /// proto-shaped `Snapshot` field (ADR-0064 decision 3), so
     /// `RavelTableProvider::new` derives the same predicate set from a
     /// redeemed ticket that `GetFlightInfo`'s resolve saw pending -- never an
     /// empty set regardless of what the resolve actually found.
@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     /// v4 (the predecessor of this ticket's `pending_erasure` field, ADR-0064
-    /// decision 3 / issue #829) is rejected the same way v3 is: a v4-shaped
+    /// decision 3) is rejected the same way v3 is: a v4-shaped
     /// envelope carrying a valid MAC under this process's key still fails on
     /// the version byte, never reinterpreted under the v5 layout -- which
     /// would otherwise silently read v4's `stmt_len` as `erasure_count` and
@@ -1300,7 +1300,7 @@ mod tests {
         }
     }
 
-    /// The vulnerability issue #185 fixes: tampering with a field (here, the
+    /// The vulnerability the keyed MAC closes: tampering with a field (here, the
     /// deadline the redemption path trusts) must be rejected as a MAC
     /// mismatch, not silently accepted because the tamperer recomputed some
     /// self-consistent checksum -- there is no key-independent way to make

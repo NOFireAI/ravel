@@ -1,8 +1,8 @@
-//! SQL-lane distributed read fan-out acceptance tests (ADR-0071, issue #866).
+//! SQL-lane distributed read fan-out acceptance tests (ADR-0071).
 //!
 //! These prove the deliverables end to end. Nothing in the shipping binary
 //! reaches the distributed scan or the slice-fragment `do_get` path until the
-//! coordinator wiring lands (issue #868); the callers here are the acceptance
+//! coordinator wiring lands; the callers here are the acceptance
 //! tests themselves. Two of them stand in for that future coordinator: the
 //! `InProcessWorker` calls the worker fragment directly, and the `WireWorker`
 //! redeems slice tickets through the real `RavelFlightSqlService::do_get`, so
@@ -938,7 +938,7 @@ async fn multi_endpoint_tickets_partition_pinned_snapshot() {
         .collect();
     assert_eq!(whole.len(), 2, "fixture spans two segments (two shards)");
 
-    // The INTERNAL coordinator slice plan (issue #868). This is never a
+    // The INTERNAL coordinator slice plan. This is never a
     // client-facing endpoint set (see `single_client_endpoint_even_when_distributed`);
     // it is the coordinator-to-worker fan-out the future service `do_get` will
     // drive. Each slice ticket carries the coordinator's resolved tenant.
@@ -1059,7 +1059,7 @@ async fn single_client_endpoint_even_when_distributed() {
     // Companion: the same pinned snapshot genuinely partitions into more than
     // one slice. So the single client endpoint is the deliberate contract, not
     // an artifact of a snapshot that happens not to distribute. Those slices are
-    // the INTERNAL coordinator-to-worker plan (issue #868), never endpoints.
+    // the INTERNAL coordinator-to-worker plan, never endpoints.
     let (snapshot, estimate) = executor
         .resolve_snapshot(tenant.hash(), &request(SQL), &QueryAccounting::new())
         .await

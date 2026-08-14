@@ -8,7 +8,7 @@
 //! by greatest `value.to_bits()`. Because that order is total over the
 //! provenance tuple plus the value bits, the winner does not depend on
 //! arrival order within a group, so merge interleaving at equal keys cannot
-//! change the result (review F6). The operator holds one candidate of state
+//! change the result. The operator holds one candidate of state
 //! per in-flight group, strips the provenance columns, emits the public
 //! schema, and counts yielded (post-dedup) rows against `max_samples`.
 
@@ -60,8 +60,7 @@ pub struct RsegDedupExec {
     /// `SortPreservingMergeExec` entirely (`EnforceDistribution` only
     /// re-adds what is required), collapsing the scan's partitions away
     /// without even a `CoalescePartitionsExec` in its place -- silently
-    /// executing only one scan partition. Found by Opus checkpoint review
-    /// of B1 (issue #20): reproduced via `SessionContext`/`DataFrame`,
+    /// executing only one scan partition. Reproduced via `SessionContext`/`DataFrame`,
     /// which runs the optimizer, vs. the crate's own tests, which all call
     /// `collect()` directly on a hand-built plan and never exercise it.
     input_ordering: OrderingRequirements,

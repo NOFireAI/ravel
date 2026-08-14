@@ -1,5 +1,5 @@
 //! `AlertsScanExec`: the leaf of the `alerts` pipeline, the alert-signal sibling
-//! of [`crate::logs_scan::LogsScanExec`] (ADR-0040, issue #383).
+//! of [`crate::logs_scan::LogsScanExec`] (ADR-0040).
 //!
 //! An alert record rides RLOG v1 verbatim, so this scan reads through the exact
 //! same [`LogSegmentFetcher`] the `logs` table uses; the only differences are
@@ -72,7 +72,7 @@ pub struct AlertsScanExec {
     /// `RlogReader::scan`, applied exactly there.
     content: Arc<Vec<Predicate>>,
     /// Pending selective-erasure predicates from the resolved snapshot
-    /// (ADR-0064 decision 2, issue #829); fed to [`LogQuery::with_erasure`].
+    /// (ADR-0064 decision 2); fed to [`LogQuery::with_erasure`].
     erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -243,7 +243,7 @@ async fn prepare_partition(
         };
         out.extend(output.records);
     }
-    // Scan-layer selective-erasure exclusion (ADR-0064, issue #928). This is the
+    // Scan-layer selective-erasure exclusion (ADR-0064). This is the
     // authoritative exclusion because it sees the same merged `attrs` view the
     // surface returns (resource + scope + record), so a subject named only in a
     // resource/scope attribute is dropped; the fetcher-level filter matches

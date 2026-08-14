@@ -1,5 +1,5 @@
 //! The Flight SQL statement-redemption path carries a request-level tracing
-//! span (issue #643, ADR-0044 section 5).
+//! span (ADR-0044 section 5).
 //!
 //! `do_get_statement` builds a `flight_sql_statement` span, the Flight SQL
 //! counterpart of the HTTP handlers' `sql_query`/`analytics_query` spans. This

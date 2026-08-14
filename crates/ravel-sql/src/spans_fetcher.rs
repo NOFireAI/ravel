@@ -10,21 +10,21 @@
 //! beside the scan is the least-coupling choice until a broader span query path
 //! (trace-by-id endpoint, service graph) earns a home in `ravel-query`.
 //!
-//! # Why this drives the block scan itself (issue #650, ADR-0054)
+//! # Why this drives the block scan itself (ADR-0054)
 //!
 //! v1 delegated the whole per-object scan to [`RspanReader::scan`], which prunes
 //! blocks by trace_id range and time interval and re-evaluates survivors
 //! exactly. v3 adds a per-block BLOOM over `service.name`/`name` tokens
-//! ([`SkipIndex::candidate_blocks_with_bloom`], issue #649), but the reader's
+//! ([`SkipIndex::candidate_blocks_with_bloom`]), but the reader's
 //! `scan` still only takes a [`SpanQuery`] (ts window + trace_id) and cannot
 //! carry a bloom predicate. `ravel-rspan` deliberately exposes the primitives
 //! for a caller to assemble a bloom-backed scan itself -- [`RspanReader::bloom`]
 //! and [`RspanReader::skip_index`], `candidate_blocks_with_bloom`,
 //! [`ravel_rspan::block::read_block`], and
-//! [`ravel_rspan::block::DecodedBlock::service_name`] -- and issue #650 is
-//! scoped to `ravel-sql`, so this fetcher assembles that scan here on top of the
+//! [`ravel_rspan::block::DecodedBlock::service_name`] -- and since this stays
+//! scoped to `ravel-sql`, this fetcher assembles that scan here on top of the
 //! public format surface rather than adding a bloom-aware `scan` to the reader.
-//! The block-slicing bounds check mirrors the reader's own (issue #349): a
+//! The block-slicing bounds check mirrors the reader's own: a
 //! `(block_offset, block_len)` decoded from SKIP_IDX is checked against the
 //! BLOCKS section's own length, never merely the whole object, so a corrupt
 //! offset can never return foreign bytes.
@@ -141,7 +141,7 @@ impl SpanSegmentFetcher {
     ///
     /// - candidate blocks are chosen by the skip index's trace_id/ts prune,
     ///   the `duration_ns`/`status_mask` skip-index prune when a duration or
-    ///   status filter was pushed (issue #979), and, when `predicates` is
+    ///   status filter was pushed, and, when `predicates` is
     ///   non-empty, the bloom-backed
     ///   [`SkipIndex::candidate_blocks_with_bloom`] prune (a block whose bloom
     ///   proves a predicate's token absent is dropped before decode);
@@ -150,8 +150,8 @@ impl SpanSegmentFetcher {
     ///   its `service_name` read straight from the v3 dictionary column.
     ///
     /// `duration_ns` and `status_mask` are the widen-only skip-index prune
-    /// shapes the `spans` pushdown extracts (issue #979,
-    /// [`crate::spans_pushdown::SpansPushdown::duration_window`] and
+    /// shapes the `spans` pushdown extracts
+    /// ([`crate::spans_pushdown::SpansPushdown::duration_window`] and
     /// `status_mask`): `duration_ns` is an inclusive `[min, max]` window a
     /// block's `[min_duration_ns, max_duration_ns]` must overlap, `status_mask`
     /// a bitmask a block's `status_mask` must share a bit with. Both `None`
@@ -221,7 +221,7 @@ impl SpanSegmentFetcher {
         }
 
         // Candidate blocks: the skip index's trace_id/ts prune, the
-        // duration_ns/status_mask prune (issue #979), plus the bloom-backed
+        // duration_ns/status_mask prune, plus the bloom-backed
         // prune when service_name/name predicates were pushed.
         let candidates = if predicates.is_empty() {
             skip.candidate_blocks(
@@ -246,7 +246,7 @@ impl SpanSegmentFetcher {
         stats.blocks_after_skip = candidates.len() as u32;
 
         // The BLOCKS section's absolute offset and length, for bounds-checked
-        // per-block slicing (mirrors RspanReader's own block_bytes, issue #349).
+        // per-block slicing (mirrors RspanReader's own block_bytes).
         let footer = open(bytes)?;
         let blocks = footer
             .section(kind::BLOCKS)
@@ -287,7 +287,7 @@ impl SpanSegmentFetcher {
 /// the BLOCKS section; the read is bounds-checked against the section's own
 /// length (`blocks_len`), not merely the whole object, so a corrupt
 /// `(offset, len)` decoded from SKIP_IDX can never land past the section end and
-/// return foreign SKIP_IDX/footer bytes (issue #349). Every violation is a typed
+/// return foreign SKIP_IDX/footer bytes. Every violation is a typed
 /// `Corrupted` error, never a panic. Mirrors `RspanReader::block_bytes`, which
 /// is private to `ravel-rspan`.
 fn block_bytes<'b>(

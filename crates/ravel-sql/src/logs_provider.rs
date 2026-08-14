@@ -3,7 +3,7 @@
 //! [`crate::provider::RavelTableProvider`].
 //!
 //! Like the metrics provider, this takes an owned, already-resolved `Snapshot`
-//! (resolution is the endpoint's job, #240) and a [`LogSegmentFetcher`], and
+//! (resolution is the endpoint's job) and a [`LogSegmentFetcher`], and
 //! never resolves. `scan` extracts widen-only pushdown from the filters
 //! (crate::logs_pushdown), prunes the snapshot's segments by
 //! [`LogSegmentFetcher::ts_range_relevant`] against the extracted ts bounds,
@@ -53,7 +53,7 @@ pub struct LogsTableProvider {
     /// issues on this query's behalf is recorded against it.
     accounting: QueryAccounting,
     /// Pending selective-erasure predicates derived once from
-    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `LogsScanExec` the provider builds.
     erasure: Arc<Vec<ErasurePredicate>>,
 }
@@ -61,7 +61,7 @@ pub struct LogsTableProvider {
 impl LogsTableProvider {
     /// Build a provider around an owned, already-resolved `Signal::Logs`
     /// snapshot. Admission and budget config live on the resolve-time seam
-    /// (RH-T2, issue #902), not on the provider, so this no longer takes a
+    ///, not on the provider, so this no longer takes a
     /// config parameter.
     pub fn new(
         snapshot: Snapshot,
@@ -99,8 +99,8 @@ impl LogsTableProvider {
 
     /// Admission (the sealed-segment cap) is decided exactly once, at
     /// resolve time, by `SqlExecutor::resolve` calling `ravel_query::admit`
-    /// over the full, unpruned snapshot and its `SegmentOrigins` (RH-T2,
-    /// issue #902). `pruned_segments` below is a further, client-side,
+    /// over the full, unpruned snapshot and its `SegmentOrigins`.
+    /// `pruned_segments` below is a further, client-side,
     /// widen-only ts subset of that already-admitted snapshot, so
     /// re-checking a count against it here would be a second, weaker check
     /// over the wrong set (post-prune, origin-blind); it is not
@@ -162,7 +162,7 @@ impl TableProvider for LogsTableProvider {
 
     /// Inexact for every filter: the provider prunes what it can (widen-only),
     /// but DataFusion must always re-apply the original filters above the scan.
-    /// Never `Exact` (review F8, carried over from the metrics provider).
+    /// Never `Exact` (carried over from the metrics provider).
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -224,13 +224,11 @@ mod tests {
     fn identity() -> ObjectIdentity {
         ObjectIdentity {
             // Must match the `TenantHash([7u8; 16])` every provider in these
-            // tests is constructed with: issue #612 added a footer tenant_hash
-            // check on the RLOG read path (`fetch_accounted_with_tenant`, which
+            // tests is constructed with: the RLOG read path enforces a footer
+            // tenant_hash check (`fetch_accounted_with_tenant`, which
             // `LogsScanExec` calls), so an object whose footer names a different
-            // tenant than the fetch now fails closed with
-            // `LogFetchError::Corrupt(IdentityMismatch("tenant_hash"))`. These
-            // fixtures previously wrote `[1u8; 16]` and only passed because the
-            // check did not exist.
+            // tenant than the fetch fails closed with
+            // `LogFetchError::Corrupt(IdentityMismatch("tenant_hash"))`.
             tenant_hash: [7u8; 16],
             shard: 0,
             writer_id: [2u8; 16],
@@ -319,7 +317,7 @@ mod tests {
     /// A `SessionContext` built through the real production path
     /// (`crate::session::build_session`), the same one the SQL endpoint and
     /// Flight SQL use, with `provider` registered as `logs`. This drives the
-    /// planner registration this task adds, not a bespoke test-only session.
+    /// planner registration this crate adds, not a bespoke test-only session.
     fn logs_session(provider: LogsTableProvider) -> DFResult<datafusion::prelude::SessionContext> {
         let config = SqlConfig::default();
         let tenant = TenantMemoryAccountant::new(1 << 30);
@@ -420,7 +418,7 @@ mod tests {
     /// are per-record only, which is what the prune can actually act on: a key
     /// that also appears at resource level is declined on a version 1 object,
     /// and a resource-only key has no FIELD_DIR column to key a posting by
-    /// (issue #552).
+    ///.
     fn per_record_key_records() -> Vec<LogRecord> {
         let worker = vec![("service.name".to_string(), s("worker"))];
         (1..=12)
@@ -438,7 +436,7 @@ mod tests {
             .collect()
     }
 
-    /// Issue #544's acceptance test: the same SQL query, with and without an
+    /// The acceptance test: the same SQL query, with and without an
     /// extractable prune arm, returns identical rows while reading a different
     /// number of blocks.
     ///
@@ -647,7 +645,7 @@ mod tests {
         );
     }
 
-    /// Issue #507's acceptance test: `attrs['k'] = 'v'` must plan (the whole
+    /// The acceptance test: `attrs['k'] = 'v'` must plan (the whole
     /// point of registering `crate::map_field_planner::MapFieldAccessPlanner`)
     /// and, once planned, filter to exactly the matching records over the
     /// merged, record-wins `attrs` column (ADR-0033).
@@ -704,7 +702,7 @@ mod tests {
         let ctx = logs_session(provider).expect("build session");
 
         // Planning: `attrs['service.name'] = 'api'` must not error with
-        // "GetFieldAccess not supported" -- the bug this task fixes.
+        // "GetFieldAccess not supported".
         let df = ctx
             .sql("SELECT ts, body FROM logs WHERE attrs['service.name'] = 'api'")
             .await
@@ -721,8 +719,8 @@ mod tests {
         );
     }
 
-    /// Predicate shapes that must NOT be extracted into a fetch prune
-    /// (issue #510 deliverable 3): an inequality, an `OR` across different
+    /// Predicate shapes that must NOT be extracted into a fetch prune:
+    /// an inequality, an `OR` across different
     /// keys, a `NOT`, and a comparison against a non-literal. `extract_logs`
     /// emits nothing for any of them (see
     /// `crate::logs_pushdown::tests::non_extractable_attribute_shapes_contribute_nothing`),
@@ -976,7 +974,7 @@ mod tests {
         );
     }
 
-    /// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): a pending selective-erasure
+    /// (ADR-0064 decision 3): a pending selective-erasure
     /// request on the resolved snapshot excludes matching rows through the real
     /// `LogsTableProvider` scan path, the one the SQL `logs` table uses in
     /// production. This covers `LogsTableProvider::build_scan` passing the
@@ -1025,7 +1023,7 @@ mod tests {
         );
     }
 
-    /// Issue #928 (ADR-0064): a subject named ONLY in a RESOURCE/scope
+    /// (ADR-0064): a subject named ONLY in a RESOURCE/scope
     /// (`stream_attrs`) attribute must also be excluded. The `attrs` column
     /// materializes the merged resource + scope + record view, so `user_id` is
     /// queryable, yet the fetcher-level filter (`retain_log_records`) matches

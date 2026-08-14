@@ -1,11 +1,11 @@
 //! `AlertsTableProvider`: the `alerts` table over one query's already-resolved,
-//! owned `Snapshot` for `Signal::Alerts` (ADR-0040, issue #383). The alert-signal
+//! owned `Snapshot` for `Signal::Alerts` (ADR-0040). The alert-signal
 //! sibling of [`crate::logs_provider::LogsTableProvider`].
 //!
 //! Like the `logs` provider, this takes an owned, already-resolved `Snapshot`
 //! and a [`LogSegmentFetcher`], and never resolves. Snapshot resolution -- which
 //! shard(s) the alert records live on, and which segments -- is the endpoint's
-//! job (the same staged split the `logs` table used, #239 before #240). This
+//! job (the same staged split the `logs` table used). This
 //! provider therefore never names a shard number: the resolved snapshot already
 //! carries exactly the [`SegmentRef`]s for whatever shard(s) alerts occupy (one
 //! stream per rule, spread across however many shards the write path uses), and
@@ -52,7 +52,7 @@ pub struct AlertsTableProvider {
     /// `AlertsScanExec` the provider builds.
     accounting: QueryAccounting,
     /// Pending selective-erasure predicates derived once from
-    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `AlertsScanExec` the provider builds.
     erasure: Arc<Vec<ErasurePredicate>>,
 }
@@ -60,7 +60,7 @@ pub struct AlertsTableProvider {
 impl AlertsTableProvider {
     /// Build a provider around an owned, already-resolved `Signal::Alerts`
     /// snapshot. Admission and budget config live on the resolve-time seam
-    /// (RH-T2, issue #902), not on the provider, so this no longer takes a
+    ///, not on the provider, so this no longer takes a
     /// config parameter.
     pub fn new(
         snapshot: Snapshot,
@@ -100,7 +100,7 @@ impl AlertsTableProvider {
     /// Admission (the sealed-segment cap) is decided exactly once, at
     /// resolve time, by whichever endpoint resolves this table's snapshot,
     /// calling `ravel_query::admit` over the full snapshot and its
-    /// `SegmentOrigins` (RH-T2, issue #902) -- the same pattern
+    /// `SegmentOrigins` -- the same pattern
     /// `SqlExecutor::resolve` uses for the two wired tables. No such endpoint
     /// exists yet for alerts; `pruned_segments` below is a further,
     /// client-side, widen-only ts subset, so re-checking a count against it

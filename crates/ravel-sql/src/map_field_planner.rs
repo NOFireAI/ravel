@@ -1,4 +1,4 @@
-//! Issue #507: make `col['key']` plannable without widening the DataFusion
+//! Make `col['key']` plannable without widening the DataFusion
 //! feature surface.
 //!
 //! `crates/ravel-sql/Cargo.toml` builds `datafusion` with

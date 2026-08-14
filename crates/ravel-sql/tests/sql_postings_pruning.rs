@@ -1,8 +1,7 @@
-//! #278 item 4: the SQL executor derives an equality `__name__` filter from
+//! The SQL executor derives an equality `__name__` filter from
 //! the query's pushed-down predicates and resolves through
 //! `Catalog::resolve_pruned`, so the measured postings pruning is reachable
-//! from SQL. Before this the executor called plain `Catalog::resolve` and no
-//! SQL query could ever prune by name.
+//! from SQL.
 //!
 //! The observable proof is the resolved snapshot size: a query whose
 //! `WHERE label(labels,'__name__') = 'aaa'` pins one metric resolves to only
@@ -54,7 +53,7 @@ async fn sql_pushed_down_name_filter_reaches_resolve_pruned() {
     // A query pinning __name__ = 'aaa' must prune to the single segment that
     // carries it. This is only possible because the executor derives the name
     // filter from the pushed-down predicate and resolves through
-    // `resolve_pruned` (#278 item 4).
+    // `resolve_pruned`.
     let pruned = fixture
         .executor
         .execute(

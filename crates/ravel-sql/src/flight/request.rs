@@ -85,7 +85,7 @@ pub(super) fn sql_request(
     }
 
     // A client may shorten its own deadline but never extend it past the
-    // server budget (finding a7-F01, same rule as the HTTP endpoint).
+    // server budget (same rule as the HTTP endpoint).
     let deadline = match seconds(metadata, TIMEOUT_KEY)? {
         Some(secs) if secs > 0.0 && secs.is_finite() => {
             Duration::from_secs_f64(secs).min(config.max_deadline)
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(request.window.start_ns, 5_000_000_000 - ONE_HOUR_NS);
     }
 
-    /// a7-F01 on this transport: a client timeout above the server maximum is
+    /// On this transport, a client timeout above the server maximum is
     /// clamped, never honored verbatim.
     #[test]
     fn a_timeout_above_the_server_maximum_is_clamped() {

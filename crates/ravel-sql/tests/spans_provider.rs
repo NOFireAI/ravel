@@ -1,11 +1,10 @@
-//! Integration tests for [`ravel_sql::SpansTableProvider`] (ADR-0041, issue
-//! #356), the `spans` SQL table over an already-resolved `Signal::Spans`
+//! Integration tests for [`ravel_sql::SpansTableProvider`] (ADR-0041), the `spans` SQL table over an already-resolved `Signal::Spans`
 //! snapshot.
 //!
 //! Two properties are pinned:
 //!
-//! - `scan_prunes_by_ts_window_returns_exact_rows` (the epic's acceptance test
-//!   for this task, the span sibling of the `logs`
+//! - `scan_prunes_by_ts_window_returns_exact_rows` (the acceptance test, the
+//!   span sibling of the `logs`
 //!   `scan_prunes_by_ts_and_word_returns_exact_rows`): a ts window returns
 //!   exactly the spans that overlap it across several objects, with no false
 //!   positives and no false negatives, checked against an independent oracle.
@@ -352,11 +351,10 @@ async fn trace_id_query_takes_the_cheap_trace_lookup() {
     );
 }
 
-/// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): the `spans` SQL table had no
-/// erasure wiring at all before this task -- `SpansTableProvider` never
-/// derived predicates from `snapshot.pending_erasure`, and `SpansScanExec`
-/// never called the `is_erased_span` filter `ravel-query`'s erasure module
-/// documents as built for this surface. This proves the gap is now closed:
+/// (ADR-0064 decision 3): the `spans` SQL table wires selective erasure --
+/// `SpansTableProvider` derives predicates from `snapshot.pending_erasure`,
+/// and `SpansScanExec` calls the `is_erased_span` filter `ravel-query`'s
+/// erasure module documents as built for this surface. This proves:
 /// a pending selective-erasure request on the resolved snapshot excludes
 /// matching spans through the real `SpansTableProvider` scan path. Covers
 /// `SpansTableProvider::new` computing `erasure` from

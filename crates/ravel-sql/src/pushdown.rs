@@ -1,6 +1,4 @@
-//! Filter pushdown under the pruning soundness invariant
-//! (docs/arrow-datafusion-plan.md section 2 "Filter pushdown and the pruning
-//! soundness invariant", review F8).
+//! Filter pushdown under the pruning soundness invariant.
 //!
 //! Source pruning (choosing what to fetch) is fundamentally different from
 //! residual filtering. A residual filter that misfires only wastes work:
@@ -413,7 +411,7 @@ mod tests {
         assert_eq!(
             (p.ts_lo, p.ts_hi),
             (None, None),
-            "a mixed OR predicate must widen to everything (review F8)"
+            "a mixed OR predicate must widen to everything"
         );
     }
 
