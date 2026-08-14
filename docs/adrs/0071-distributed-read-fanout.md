@@ -593,3 +593,142 @@ the epic's scope reads in one place:
   restart on rotation) for one internal listener.
 - No frozen persistent format changes; `queryfrag` evolves additively
   under its version field, as designed.
+
+## Amendment: partial results are consent-gated and envelope-visible
+
+Status: Accepted. Epic #1063. Amends the response-contract halves of two
+sentences above: the Decision's "a per-remote `skip_unavailable` opt-in
+returns partial results marked in the response `warnings` plus a `partial`
+stats block", and the Security section's "The query stats carry
+`partial: true` and one warning per degraded remote." Which remotes MAY be
+skipped, and the redaction rules for what a warning may name, are unchanged;
+what a skipped remote does to the response is re-decided here.
+
+### Context
+
+Adversarial review of the shipped fan-out found that a partial federated
+result is an HTTP 200 whose only incompleteness signals are prose strings in
+`warnings` and a `partial: true` flag nested inside `data.stats`. A client
+that reads `status` and `data` and nothing else - which is every naive
+programmatic consumer - takes an incomplete answer as complete, with no
+visible sign it is wrong. `skip_unavailable` exists precisely so operators
+can opt into partial answers, which makes the honest signal matter more,
+not less.
+
+The defect is not hypothetical; this repository contains it. The alert
+evaluator (`services/ravel-server/src/alerting.rs`, `run_query`) evaluates
+PromQL rules through `QueryEngine::instant`, whose signature is
+`Result<Value, QueryError>`: the stats and annotations that carry the
+partial flag are discarded inside the engine's own convenience wrapper
+(`crates/ravel-query/src/engine.rs`). An alert rule can fire, or worse
+resolve, on a partial federated answer, and no signal that the coverage was
+incomplete is even reachable from the alerting code. Warnings in the
+response body cannot help a caller that never sees a response body.
+
+The same review scope found the marker is not even uniform on the HTTP
+surface: `/api/v1/labels`, `/api/v1/label/{name}/values`, and
+`/api/v1/series` resolve series through the same federation fan-out and
+forward its
+warnings, but carry no partial marker at all - their envelopes have no
+stats block to bury one in (`crates/ravel-query/src/http/handlers.rs`).
+
+### Decision
+
+1. **Partial coverage is a query error unless the client opted in.** A
+   request that would produce partial coverage (any case the Security
+   section enumerates: skipped remote, soft-timed-out remote, undecodable
+   remote data kind) fails with the existing typed `unavailable` error -
+   HTTP 503, `errorType: "unavailable"`, the mapping already in
+   `crates/ravel-query/src/http/error.rs` - unless the request carries
+   `allow_partial=true`. The error message names the degraded clusters
+   (operator-facing names only, same redaction as warnings) and names the
+   `allow_partial` parameter so the remedy is in the failure itself.
+2. **An opted-in partial response is HTTP 200 with a required top-level
+   `partial` field.** The field is a sibling of `status`/`data`/`warnings`,
+   present on every response of the endpoints below - `false` on complete
+   coverage, `true` on partial - so generated clients and strict
+   deserializers cannot model the envelope without it. The `data.stats`
+   copy and the merged `warnings` stay as they are.
+3. **The contract is uniform across the read surface.** `/api/v1/query`,
+   `/api/v1/query_range`, `/api/v1/labels`,
+   `/api/v1/label/{name}/values`, and `/api/v1/series` all gate on
+   `allow_partial` and all carry the top-level `partial` field.
+   Intra-cluster execution still never returns
+   partial results, and the SQL lane has no federation, so nothing changes
+   there.
+4. **The engine API cannot hand a caller a value without its coverage.**
+   `ravel-query` gains a `#[must_use]` `Coverage` type
+   (`Complete | Partial { skipped }`), and the bare convenience wrappers
+   (`instant`, `range`, `resolve_series`) change signature to return
+   their result paired with its `Coverage`. No public entry point returns a
+   result that compiles away its coverage; a caller that wants to ignore
+   it must write that decision down where review can see it. The
+   stats-carrying variants are unchanged and remain the source for the
+   wire rendering.
+5. **The alert evaluator treats partial coverage as a failed evaluation.**
+   Wiring the new signature into `alerting.rs` is in this amendment's
+   implementation scope: `Coverage::Partial` takes the existing per-rule
+   failure path (log, count `rules_failed`, keep prior state, retry next
+   tick), so no transition record is ever written from partial data. Any
+   richer policy - a per-rule opt-in to evaluate on partial coverage -
+   belongs to epic #1052, which owns alerting; this amendment only
+   guarantees the safe default and makes the signal reachable.
+
+### Grafana compatibility
+
+ADR-0039's constraint is the deciding factor and was checked, not assumed.
+206 Partial Content is rejected: RFC 9110 defines it as the response to a
+Range request and requires `Content-Range`, no Prometheus-flavor server
+returns it so client handling is untested across the ecosystem, and it
+fails both audiences at once - a client that hard-fails on non-200 loses
+graceful degradation, while a client that never checks the status is still
+fooled by the body. Mutating the envelope's `status` value (a `"partial"`
+status) is rejected for breaking every client that checks
+`status == "success"`, Grafana included. An unconditional 200 with only a
+more prominent field is rejected because it fails this epic's acceptance
+test: a client ignoring warnings and ignoring the new field still mistakes
+partial for complete.
+
+Consent-gating keeps the Grafana path whole. Grafana's Prometheus
+datasource supports per-datasource custom query parameters; an operator
+who wants dashboards to degrade gracefully sets `allow_partial=true` there
+once, and Grafana gets exactly today's behavior: 200, rendered data, the
+warning banner from `warnings`. Every consumer that never asked - alert
+jobs, billing scripts, generated SDKs - fails safe with a typed 503. This
+is the repository invariant applied to the wire: exact semantics by
+default, approximation opt-in and visible.
+
+This is a behavior change for deployments already using `skip_unavailable`
+without the parameter. Accepted deliberately: distributed reads are off by
+default, `skip_unavailable` is a per-remote opt-in on a surface that just
+shipped, and the cost of changing this contract only grows.
+
+### Out of scope
+
+- The fragment surface's listener, transport encryption, and credential
+  model: a separate amendment to this ADR (epic #1055) owns those; this
+  amendment neither depends on nor constrains it.
+- The `--remote-cluster` federation TLS default (currently off). Flipping
+  it is federation transport hardening, not response honesty; it was
+  bundled into epic #1063 but belongs with #1055's transport work, and
+  this amendment recommends re-homing it there rather than deciding it
+  here.
+- The dead-endpoint ranking window after mass worker death (epic #1063's
+  P3 item): a recovery-latency tuning, no response-contract impact, stays
+  a separate task.
+- Per-rule partial-coverage policy in alerting: epic #1052, as decided
+  above.
+
+### Consequences
+
+- A naive client can no longer receive an incomplete answer shaped as a
+  complete one; the acceptance test asserts it verbatim: a client which
+  ignores warnings cannot mistake partial for complete.
+- The metadata endpoints gain the marker they were missing, so the
+  contract has no second-class endpoints.
+- The engine's bare wrappers change signature; every in-repo caller is
+  found by the compiler, which is the point.
+- Complete-coverage responses gain one additive top-level field
+  (`partial: false`), which unknown-field-tolerant Prometheus clients
+  ignore; no other wire shape changes, and no persistent format is
+  touched.
