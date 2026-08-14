@@ -136,26 +136,40 @@ build's git SHA when the build exported `RAVEL_GIT_SHA`, empty otherwise.
 captures no OTLP metric type, help, or unit metadata today, so there is
 nothing truthful to report.
 
-## PromQL subset
+## PromQL support
 
-Ravel's evaluator (`ravel-promql`) supports exactly one AST shape: a bare
-vector selector, optionally with `offset`. Everything else gets a
-`422 unprocessable_entity` error that names the construct:
+Ravel's evaluator (`ravel-promql`) is a full PromQL evaluator, differentially
+tested against real Prometheus (ADR-0021, ADR-0035). Function calls,
+aggregations, binary operators, subqueries, unary and paren expressions, the
+`@` modifier, and vector matching are all supported. The generated conformance
+table in [docs/query-engine.md](../query-engine.md#promql-conformance-adr-0035)
+is authoritative: at last regeneration it scored 124 supported constructs
+(including the 72 non-experimental functions and 12 aggregation operators
+promql-parser marks stable, all 16 binary operators, and the AST node and
+modifier categories) against 5 intentionally rejected and 2 accepted
+divergences.
+
+A handful of constructs are still intentionally rejected. Each answers with a
+typed `422 unprocessable_entity` error naming the construct, never a panic and
+never silently wrong data. The current set (from
+[crates/ravel-promql-difftest/src/scoring.rs](../../crates/ravel-promql-difftest/src/scoring.rs)'s
+`REJECTION_CASES`) is:
 
 | Rejected | Error names it as |
 |---|---|
-| `rate(x[5m])`, any function call | `function call: rate` |
-| `sum(x)`, any aggregation | `aggregation: sum` |
-| `x + y`, any binary operator | `binary expression: +` |
-| `-x`, unary expressions | `unary expression` |
-| `(x)`, parens | `paren expression` |
-| `x[5m]`, a bare matrix selector | `matrix selector` |
-| `x[5m:1m]`, a subquery | `subquery` |
-| `x @ 100`, the `@` modifier | `@` |
+| `histogram_stddev(x)` over native histograms | `histogram_stddev` |
+| `histogram_stdvar(x)` over native histograms | `histogram_stdvar` |
 | `x{job="a" or job="b"}`, an or-grouped matcher | `label matcher or-group` |
-| a number or string literal alone | `number literal` / `string literal` |
+| `a + fill(0) b`, vector-matching fill values | `fill-in values` |
+| `avg_over_time(x[5m:1m])` over native histograms, a subquery over native histograms | `subquery over native histograms` |
 
-What is supported, precisely:
+The experimental aggregation operators `limitk` and `limit_ratio` parse but are
+also rejected with a typed error naming the operator: they are outside the
+stable language and out of the scored surface, not implemented (see
+docs/query-engine.md). Subqueries themselves are supported; only a subquery
+whose inner expression matches native-histogram data is refused.
+
+Selector details that hold for a bare vector selector:
 
 - All four matcher operators: `=`, `!=`, `=~`, `!~`.
 - Absent-label semantics match Prometheus: an absent label reads as an

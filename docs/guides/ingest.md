@@ -21,7 +21,9 @@ default) or `--mode gateway`. `--mode query` starts none of them.
 Authentication, the strict/buffered mode header, the commit-token
 header, and the status-code mapping are identical on all four. A log export
 is a metrics export with a different payload and a different keyspace
-underneath. No transport accepts traces or profiles yet.
+underneath. Traces are also ingested, over the same two transports: `POST
+/v1/traces` over HTTP and `opentelemetry.proto.collector.trace.v1.TraceService/Export`
+over gRPC. No transport accepts profiles yet.
 
 ## Authentication
 
@@ -207,12 +209,13 @@ that flushed, exactly like a metrics export. An unresolvable tenant returns
 pipeline cannot accept returns `503`.
 
 Log records are durable in RLOG objects under the tenant's `l` keyspace after
-the strict ack returns. **There is no query surface over logs yet.** The
-catalog fold task still runs for metrics only. You therefore cannot pass a log
-commit token as `min_commit_token` to any endpoint, and no PromQL or SQL query
-reads log data. Today you read a log object back with
-`ravel-cli rlog inspect`
-([inspecting-data.md](inspecting-data.md)). Log query is a later phase.
+the strict ack returns. **Logs are queryable via SQL**: the `logs` table is
+registered on the `POST /api/v1/sql` endpoint (ravel-sql's `LOGS_TABLE`), and
+[query.md](query.md#sql-over-the-logs-table) documents its schema and usage.
+PromQL does not query logs: `ravel-promql` has no logs-reading path, so log
+data is reachable only through SQL. You can also read a log object back
+directly with `ravel-cli rlog inspect`
+([inspecting-data.md](inspecting-data.md)).
 
 ### Log admission limits
 
