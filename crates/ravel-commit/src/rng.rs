@@ -122,7 +122,7 @@ mod tests {
         (0..n).map(|_| rng.new_uuid()).collect()
     }
 
-    /// Acceptance test (issue #816): with a seeded source, the jitter sequence
+    /// With a seeded source, the jitter sequence
     /// and the generated writer ids are identical across two runs with the
     /// same seed, and differ across two different seeds.
     #[test]

@@ -16,9 +16,9 @@ use crate::signal;
 /// the page grammar is unchanged, only the trailer version and catalog
 /// differ.
 pub const DATA_SUFFIX: &str = "rseg";
-/// Commit record object suffix. Compaction records share this suffix
-/// (docs/compaction-retention-plan.md §3.1): they live in the same `c/`
-/// prefix and are told apart from L0 commit records by filename shape.
+/// Commit record object suffix. Compaction records share this suffix:
+/// they live in the same `c/` prefix and are told apart from L0 commit
+/// records by filename shape.
 pub const COMMIT_SUFFIX: &str = "cmt";
 /// Retention tombstone object suffix.
 pub const TOMBSTONE_SUFFIX: &str = "tmb";
@@ -511,11 +511,10 @@ pub fn verify_object_key(
     }
 }
 
-// --- Compaction and retention key shapes (docs/compaction-retention-plan.md
-// §3.1, ADR-0018, ADR-0019). All four are additive: new prefixes only,
-// existing key shapes above are untouched. ---
+// --- Compaction and retention key shapes (ADR-0018, ADR-0019). All four are
+// additive: new prefixes only, existing key shapes above are untouched. ---
 
-/// Build the L1 part key for a compacted sealed bucket (plan §3.1).
+/// Build the L1 part key for a compacted sealed bucket.
 ///
 /// `t/<tenant_hash_hex>/<signal>/l1/<shard>/<ingest_hour>/<input_set_hash16>.<part:04>.<hash16>.rseg`
 pub fn l1_part_key(
@@ -545,7 +544,7 @@ pub fn l1_part_key(
     ))
 }
 
-/// Build the compaction record key for a sealed bucket (plan §3.1).
+/// Build the compaction record key for a sealed bucket.
 ///
 /// `t/<tenant_hash_hex>/<signal>/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt`
 pub fn compaction_record_key(
@@ -1174,9 +1173,8 @@ pub fn verify_retention_tombstone_key(
 
 /// Reconstruct one part's key from its parent `CompactionRecord`'s identity
 /// fields plus the part's own `part_index` and `content_hash`. Never trust
-/// a stored key string for this (plan §3.5: "reconstruct the part key
-/// ADR-0010 §7 style"); callers verify it against an observed key with
-/// [`verify_l1_part_key`].
+/// a stored key string for this: reconstruct the part key ADR-0010 §7 style,
+/// and callers verify it against an observed key with [`verify_l1_part_key`].
 pub fn reconstruct_l1_part_key(
     record: &ravel_proto::commit::v1::CompactionRecord,
     part: &ravel_proto::commit::v1::CompactionPart,
@@ -1260,7 +1258,7 @@ pub enum BucketEntry {
 }
 
 /// Classify one key from a `c/<shard>/<hour>/` bucket listing by filename
-/// shape. Name patterns are disjoint by construction (plan §3.1, ADR-0064
+/// shape. Name patterns are disjoint by construction (ADR-0064
 /// decision 3): a tombstone is exactly `retire.tmb`; a compaction record's
 /// filename starts with `l1.`; a selective-erasure rewrite record's starts
 /// with `rw.`; an L0 commit record's filename is always a UUID (never `l1`
@@ -1270,7 +1268,7 @@ pub enum BucketEntry {
 /// A `rw.<hash16>.cmt` rewrite record is classified before the bare `.cmt`
 /// commit-record branch: it ends with `.cmt` but its `rw` filename head is
 /// not a UUID, so without this branch it would fall through and fail to
-/// parse (ADR-0064 EJ-T2 closed this gap).
+/// parse (ADR-0064 decision 3).
 pub fn partition_bucket_entry(key: &str) -> Result<BucketEntry, KeyError> {
     let filename = key.rsplit('/').next().unwrap_or(key);
     if filename == TOMBSTONE_FILENAME {
@@ -2077,7 +2075,7 @@ mod tests {
     }
 
     proptest! {
-        // Property/round-trip coverage for the rw. key parser (issue #831):
+        // Property/round-trip coverage for the rw. key parser:
         // every well-formed identity tuple must build then parse back to
         // itself, across the full shard/hour/signal/hash16 domain, not just
         // the fixed examples above. Bounded to hour buckets that keep the

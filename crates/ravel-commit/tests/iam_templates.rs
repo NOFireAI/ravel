@@ -25,8 +25,8 @@ use ravel_commit::keys::{
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
-/// Legal-hold shard for `Signal::Audit` (ADR-0055 section 3 as amended by
-/// EL-6, issue #763). Hardcoded rather than imported from `ravel-maintain`:
+/// Legal-hold shard for `Signal::Audit` (ADR-0055 section 3).
+/// Hardcoded rather than imported from `ravel-maintain`:
 /// that crate is out of this test's scope, and the shard number is a
 /// frozen part of the object-key contract, not an implementation detail.
 const AUDIT_HOLD_SHARD: u32 = 0;
@@ -301,12 +301,12 @@ fn write_roles_have_kms_generate_data_key() {
             actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
             "{role}: policy is missing kms:GenerateDataKey* -- its ingest/compaction/\
              catalog-fold PUTs under t/<hash>/... will fail closed against a \
-             --tenant-kms-config tenant (issues #929, #972). Found kms actions: {actions:?}"
+             --tenant-kms-config tenant. Found kms actions: {actions:?}"
         );
     }
 }
 
-/// Anti-drift guard (issue #972): for EVERY role, derive whether it PUTs any
+/// Anti-drift guard: for EVERY role, derive whether it PUTs any
 /// object that routes through `KmsRoutingStore`'s per-tenant key straight from
 /// the policy's own `s3:PutObject` resource patterns and the crate's real
 /// routing predicate (`ravel_object_store::routes_through_tenant_key`), then
@@ -320,10 +320,10 @@ fn write_roles_have_kms_generate_data_key() {
 /// keyspace some role already PUTs --- either of which would otherwise ship a
 /// write that fails closed under `--tenant-kms-config`.
 ///
-/// Demonstrated non-vacuous: before #972, `deploy/iam/query.json` PUT
-/// `t/*/catalog/*/{snap/*,HEAD,idx/*}` and `t/*/u/*` (all routed) while its
-/// `QueryTenantKms` statement granted only `kms:Decrypt`; this assertion failed
-/// naming `query` until `kms:Encrypt`/`kms:GenerateDataKey*` were added.
+/// Non-vacuous by construction: a role whose policy PUTs routed object classes
+/// such as `t/*/catalog/*/{snap/*,HEAD,idx/*}` or `t/*/u/*` while its
+/// tenant-KMS statement grants only `kms:Decrypt` makes this assertion fail,
+/// naming that role until `kms:Encrypt`/`kms:GenerateDataKey*` are added.
 #[test]
 fn roles_writing_routed_objects_have_kms_grant() {
     for role in ALL_ROLES {
@@ -352,13 +352,13 @@ fn roles_writing_routed_objects_have_kms_grant() {
             actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
             "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
              kms:GenerateDataKey* -- those writes fail closed under \
-             --tenant-kms-config (issue #972). Found kms actions: {actions:?}"
+             --tenant-kms-config. Found kms actions: {actions:?}"
         );
         assert!(
             actions.iter().any(|a| a == "kms:Encrypt"),
             "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
-             kms:Encrypt -- those writes fail closed under --tenant-kms-config \
-             (issue #972). Found kms actions: {actions:?}"
+             kms:Encrypt -- those writes fail closed under --tenant-kms-config. \
+             Found kms actions: {actions:?}"
         );
     }
 }
@@ -395,7 +395,7 @@ fn every_role_has_kms_decrypt() {
         assert!(
             actions.iter().any(|a| a == "kms:Decrypt"),
             "{role}: policy is missing kms:Decrypt -- its reads of SSE-KMS objects \
-             under a --tenant-kms-config tenant will fail closed (issue #929). \
+             under a --tenant-kms-config tenant will fail closed. \
              Found kms actions: {actions:?}"
         );
     }
