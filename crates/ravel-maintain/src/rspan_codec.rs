@@ -1092,6 +1092,101 @@ mod tests {
         let _ = format!("{err}");
     }
 
+    /// Re-stamp an RSPAN object's footer with a mutated `record_count`, keeping
+    /// the body (BLOCKS/SKIP_IDX/BLOOM) byte-identical and the footer CRC valid.
+    /// The result opens cleanly (`footer::open` succeeds) but its declared
+    /// `record_count` disagrees with the number of records the body decodes to
+    /// -- a logically inconsistent but CRC-valid object, the exact case the
+    /// per-input cross-check in `BlockCursor::refill` must catch (issue #926).
+    fn rewrite_footer_record_count(bytes: &[u8], new_count: u64) -> Bytes {
+        let trailer_len = 16usize; // footer::TRAILER_LEN
+        let n = bytes.len();
+        let footer_len = u32::from_le_bytes([
+            bytes[n - trailer_len],
+            bytes[n - trailer_len + 1],
+            bytes[n - trailer_len + 2],
+            bytes[n - trailer_len + 3],
+        ]) as usize;
+        // body is everything before the footer protobuf + trailer; its bytes and
+        // thus every section offset in the footer stay unchanged.
+        let body_end = n - trailer_len - footer_len;
+        let mut ftr = footer::open(bytes).expect("open original");
+        assert_eq!(
+            ftr.record_count,
+            new_count.wrapping_sub(1),
+            "helper assumes a +1 bump from the real count"
+        );
+        ftr.record_count = new_count;
+        let mut out = bytes[..body_end].to_vec();
+        footer::write_footer_and_trailer(&mut out, &ftr);
+        // Sanity: the rewritten object still opens and now over-declares.
+        let reopened = footer::open(&out).expect("rewritten object still opens");
+        assert_eq!(reopened.record_count, new_count);
+        Bytes::from(out)
+    }
+
+    /// Issue #926: a CRC-valid RSPAN input whose footer `record_count`
+    /// over-declares its actual body (footer says N+1, body decodes to N) must
+    /// fail the streaming compaction loud with the typed
+    /// [`MaintainError::SpanInputRecordCountMismatch`], never a silent merge
+    /// that drops the discrepancy.
+    ///
+    /// Flip proof (non-vacuous): against the pre-fix code -- with the per-cursor
+    /// `decoded_count != declared_record_count` check removed from
+    /// `BlockCursor::refill` -- this compaction succeeds and `expect_err` panics
+    /// here, so the `assert!(matches!(err, ...SpanInputRecordCountMismatch ...))`
+    /// below is what fails first. Verified by deleting the check: the test then
+    /// reports the compaction returned Ok instead of the mismatch error.
+    #[tokio::test]
+    async fn over_declared_footer_record_count_fails_loud() {
+        let store = MemoryStore::new();
+        // Input A: honest footer, distinct trace so both drain independently.
+        let a = vec![span(0, 0, 1, 2)];
+        seed(&store, Uuid::from_u128(1), 1, &a).await;
+        // Input B: two real records, footer will be bumped to claim three.
+        let b = vec![span(5, 0, 1, 2), span(5, 1, 3, 4)];
+        let b_bytes = seed(&store, Uuid::from_u128(2), 2, &b).await;
+
+        // Locate B's data object and overwrite it with a footer that claims one
+        // extra record than the body holds. The commit record is left untouched:
+        // it still points at this key and carries the honest sample_count, so the
+        // ADR-0048 conservation gate would pass -- only the per-input footer
+        // cross-check catches this.
+        let honest = footer::open(&b_bytes).expect("open b");
+        let declared = honest.record_count; // 2
+        let data_key = keys::data_key(
+            &tenant_hash(),
+            Signal::Spans,
+            SHARD,
+            Uuid::from_u128(2),
+            EPOCH,
+            2,
+            blake3::hash(&b_bytes).as_bytes(),
+        )
+        .expect("data key");
+        let bad = rewrite_footer_record_count(&b_bytes, declared + 1);
+        store
+            .put(&data_key, bad, PutOptions::default())
+            .await
+            .expect("overwrite b");
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let err = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect_err("over-declared footer must fail the compaction");
+        match err {
+            MaintainError::SpanInputRecordCountMismatch {
+                decoded_record_count,
+                footer_record_count,
+                ..
+            } => {
+                assert_eq!(decoded_record_count, declared, "decoded the honest N");
+                assert_eq!(footer_record_count, declared + 1, "footer over-declared");
+            }
+            other => panic!("expected SpanInputRecordCountMismatch, got {other:?}"),
+        }
+    }
+
     // --- issue #908: bounded-memory k-way merge -------------------------------
 
     /// L0 writer config for the tests below: 1000-record blocks, so an input
