@@ -1397,9 +1397,8 @@ mod tests {
     ///
     /// Before the supersession exclusion, `count_below_target`'s L0 branch
     /// counted every commit record's `segment_format_version` unconditionally,
-    /// with no check of whether the record's bucket also carried a
-    /// compaction/rewrite record. The `if superseded_hours.contains(&parsed
-    /// .ingest_hour_bucket) { continue; }` guard added by the fix is the
+    /// with no check of whether any compaction/rewrite record superseded it.
+    /// The `if superseded_commits.contains(&key) { continue; }` guard is the
     /// flipped line: delete it and the assertion below sees `(l0_below,
     /// l1_below) == (1, 1)` instead of `(0, 1)`, i.e. the bucket's own
     /// pre-rewrite record counts as a straggler alongside the genuinely
@@ -1464,6 +1463,83 @@ mod tests {
              the freshly rewritten L1 part, genuinely below the fictional FUTURE_VERSION \
              target, still correctly counts (l1_below == 1) -- the fix excludes exactly the \
              superseded L0 record, not the bucket's live output"
+        );
+    }
+
+    /// Regression for issue #923: the re-audit's supersession exclusion must be
+    /// keyed on the superseding record's explicit input set, not on membership
+    /// of its ingest-hour bucket. A commit record that no compaction or rewrite
+    /// record names is live, however many such records its bucket carries.
+    ///
+    /// The bucket here holds two L0 commit records but a compaction record over
+    /// only one of them: `alpha` is seeded, migrated (which publishes a
+    /// compaction record naming `alpha` alone), and only then is `beta` seeded
+    /// into the same bucket. Sealing is what makes that ordering impossible in
+    /// production today, which is exactly why the re-audit must not depend on
+    /// it: the re-audit's job is to verify the walk independently, and its
+    /// answer here has to come from the record's `inputs` list, the same
+    /// predicate sweep rule 2 deletes by.
+    ///
+    /// `beta` is below the target and superseded by nothing, so it must be
+    /// counted: `l0_below == 1` refuses the floor raise. The flipped line is
+    /// `count_below_target`'s exclusion key. Replace the input-set set with the
+    /// bucket-membership set the fix removed (collect `ingest_hour_bucket` from
+    /// each compaction/rewrite key and test `superseded_hours.contains(&parsed
+    /// .ingest_hour_bucket)` on the commit branch) and this test fails with
+    /// `l0_below == 0`: `beta` is excluded because a *different* record's
+    /// compaction record shares its bucket, and migrate raises the format floor
+    /// over live data still below the target. That is the durability regression
+    /// the input-set key removes; the assertion is not vacuous.
+    #[tokio::test]
+    async fn partial_coverage_record_does_not_exclude_the_l0_records_it_never_named() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
+        let clock = FixedClock::new(sealed_now_ns_for(100));
+
+        // One L0 record, migrated: the published compaction record's inputs
+        // name `alpha` and nothing else.
+        seed_at(&store, 0, 100, 1, "alpha", VERSION_V6 as u32).await;
+        let outcome = migrate_bucket_format(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &bucket,
+            FUTURE_VERSION,
+        )
+        .await
+        .expect("migrate bucket");
+        assert!(
+            matches!(outcome, MigrateOutcome::Rewritten { .. }),
+            "the below-target bucket must be rewritten, got {outcome:?}"
+        );
+        assert_eq!(compaction_record_count(&store, 0, 100).await, 1);
+
+        // A second below-target L0 record lands in the same bucket afterward,
+        // named by no compaction or rewrite record: still live, still
+        // un-migrated.
+        seed_at(&store, 0, 100, 2, "beta", VERSION_V6 as u32).await;
+        let l0_present = list_bucket(&store, &bucket)
+            .await
+            .expect("list bucket")
+            .commit_keys
+            .len();
+        assert_eq!(
+            l0_present, 2,
+            "the bucket now holds a superseded commit record and an uncovered one"
+        );
+
+        let (l0_below, l1_below) =
+            count_below_target(&store, &tenant_hash(), Signal::Metrics, 1, FUTURE_VERSION)
+                .await
+                .expect("re-audit");
+        assert_eq!(
+            (l0_below, l1_below),
+            (1, 1),
+            "the uncovered below-target commit record must count as a straggler \
+             (l0_below == 1) even though its bucket carries a compaction record: only \
+             the record that compaction actually named is superseded. Counting 0 here \
+             is a false floor raise over live un-migrated data"
         );
     }
 }
