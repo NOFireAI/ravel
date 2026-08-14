@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="780" viewBox="0 0 1180 780" font-family="system-ui, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#383e46"/>
+    </marker>
+    <marker id="arrowamber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a5a10"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1180" height="780" fill="#f4f5f7"/>
+
+  <text x="40" y="46" font-size="21" font-weight="640" fill="#1d2228">Where the S3 request bill comes from, and which levers reach it</text>
+  <text x="40" y="70" font-size="14" fill="#5b636d">Requests are ~97% of the bill. The commit protocol is not the cause.</text>
+
+  <!-- the equation -->
+  <rect x="40" y="96" width="1100" height="62" rx="6" fill="#fff" stroke="#c6ccd4"/>
+  <text x="60" y="134" font-size="16" font-family="ui-monospace, Menlo, monospace" fill="#1d2228">PUTs/day = 2 &#215; tenants &#215; signals &#215; <tspan fill="#2f5da8" font-weight="700">shards</tspan> &#215; <tspan fill="#2f5da8" font-weight="700">replicas</tspan> &#215; (86400 / <tspan fill="#8a5a10" font-weight="700">age_threshold</tspan>)</text>
+
+  <text x="60" y="182" font-size="12.5" fill="#5b636d">fixed by the protocol</text>
+  <text x="330" y="182" font-size="12.5" fill="#5b636d">set by the workload</text>
+  <text x="612" y="182" font-size="12.5" font-weight="600" fill="#2f5da8">free levers</text>
+  <text x="905" y="182" font-size="12.5" font-weight="600" fill="#8a5a10">costs latency</text>
+
+  <!-- why the size trigger never fires -->
+  <text x="40" y="230" font-size="14" font-weight="640" fill="#383e46">Why every flush is age-triggered</text>
+  <text x="40" y="252" font-size="12.5" fill="#5b636d">At ~9.6 KB/s per (tenant, signal, shard) buffer:</text>
+
+  <rect x="40" y="268" width="30" height="30" rx="3" fill="#dfe6f2" stroke="#2f5da8"/>
+  <text x="82" y="288" font-size="13" fill="#1d2228">a 500 ms flush writes <tspan font-weight="640">~4.7 KiB</tspan></text>
+
+  <rect x="360" y="268" width="640" height="30" rx="3" fill="#f6f0dc" stroke="#8a5a10"/>
+  <text x="1012" y="288" font-size="13" fill="#1d2228"><tspan font-weight="640">target_bytes = 8 MiB</tspan></text>
+  <text x="378" y="288" font-size="12.5" fill="#7a5410">the size trigger, ~1,750&#215; away &#8212; it never fires</text>
+
+  <!-- levers -->
+  <text x="40" y="348" font-size="14" font-weight="640" fill="#383e46">The decisions, ordered by what they cost to use</text>
+
+  <g>
+    <rect x="40" y="366" width="266" height="128" rx="6" fill="#fff" stroke="#2f5da8"/>
+    <text x="58" y="392" font-size="13" font-weight="700" fill="#2f5da8">1 &#183; replica affinity</text>
+    <text x="58" y="414" font-size="12.5" fill="#1d2228">route (tenant, signal) to a</text>
+    <text x="58" y="432" font-size="12.5" fill="#1d2228">stable 2-replica subset</text>
+    <text x="58" y="458" font-size="12.5" font-weight="600" fill="#2f5533">no latency cost</text>
+    <text x="58" y="476" font-size="12" fill="#5b636d">L7 LB keyed on tenant identity</text>
+
+    <rect x="322" y="366" width="266" height="128" rx="6" fill="#fff" stroke="#2f5da8"/>
+    <text x="340" y="392" font-size="13" font-weight="700" fill="#2f5da8">2 &#183; shard count</text>
+    <text x="340" y="414" font-size="12.5" fill="#1d2228">per-tenant, via ADR-0052</text>
+    <text x="340" y="432" font-size="12.5" fill="#1d2228">4 &#8594; 1 is 4&#215; PUTs and LISTs</text>
+    <text x="340" y="458" font-size="12.5" font-weight="600" fill="#2f5533">no latency cost</text>
+    <text x="340" y="476" font-size="12" fill="#5b636d">costs throughput headroom</text>
+
+    <rect x="604" y="366" width="266" height="128" rx="6" fill="#fff" stroke="#7a3f8a"/>
+    <text x="622" y="392" font-size="13" font-weight="700" fill="#7a3f8a">3 &#183; pipeline logs/spans</text>
+    <text x="622" y="414" font-size="12.5" fill="#1d2228">port ADR-0067 decision 1</text>
+    <text x="622" y="432" font-size="12.5" fill="#1d2228">unblocks 2 for two signals</text>
+    <text x="622" y="458" font-size="12.5" font-weight="600" fill="#7a3f8a">highest implementation risk</text>
+    <text x="622" y="476" font-size="12" fill="#5b636d">charges + shutdown join</text>
+
+    <rect x="886" y="366" width="254" height="128" rx="6" fill="#fff" stroke="#8a5a10"/>
+    <text x="904" y="392" font-size="13" font-weight="700" fill="#8a5a10">4 &#183; flush cadence</text>
+    <text x="904" y="414" font-size="12.5" fill="#1d2228">three knobs together;</text>
+    <text x="904" y="432" font-size="12.5" fill="#1d2228">default 500 ms &#8594; 2 s</text>
+    <text x="904" y="458" font-size="12.5" font-weight="600" fill="#8a5a10">costs strict-ack latency</text>
+    <text x="904" y="476" font-size="12" fill="#5b636d">bounded by client timeouts</text>
+  </g>
+
+  <path d="M306,430 L322,430" stroke="#383e46" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <path d="M588,430 L604,430" stroke="#383e46" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <path d="M870,430 L886,430" stroke="#8a5a10" stroke-width="1.4" marker-end="url(#arrowamber)"/>
+
+  <!-- what is not a lever -->
+  <text x="40" y="546" font-size="14" font-weight="640" fill="#383e46">Rejected, and why the protocol stays</text>
+  <rect x="40" y="564" width="1100" height="92" rx="6" fill="#fff" stroke="#c6ccd4"/>
+  <text x="60" y="590" font-size="12.5" fill="#1d2228"><tspan font-weight="640">cross-tenant objects</tspan> &#8212; would require redesigning key derivation, format identity, per-tenant encryption, retention and erasure together</text>
+  <text x="60" y="612" font-size="12.5" fill="#1d2228"><tspan font-weight="640">cross-shard objects</tspan> &#8212; a format change for a divisor decision 2 already gives free; the orphan sweeper would delete the object</text>
+  <text x="60" y="634" font-size="12.5" fill="#1d2228"><tspan font-weight="640">dropping the commit PUT</tspan> &#8212; visibility is atomic because create-if-absent is atomic; a LIST cannot replace it, and at most 2&#215; is available anyway</text>
+
+  <!-- durability line -->
+  <rect x="40" y="682" width="1100" height="56" rx="6" fill="#e6efe6" stroke="#3f7042"/>
+  <text x="60" y="706" font-size="13" font-weight="640" fill="#2f5533">Unchanged by every decision above: the acknowledgement still follows the commit PUT.</text>
+  <text x="60" y="726" font-size="12.5" fill="#2f5533">Flush identity is still pinned at flush-open and reused verbatim on retry; create-if-absent still elects a single winner. Durability is not traded here.</text>
+</svg>
