@@ -75,9 +75,7 @@ Wave 1 of this epic is measurement infrastructure, not optimization:
    evidence and confidence level, prioritized proposals, staged
    execution sequence) produced from Wave 1's actual measurements.
 
-Implementation waves (Wave 2 onward) are scoped from that document, not
-from this ADR, and each rides the epic's normal per-wave checkpoint
-review before landing.
+Later implementation phases are scoped from that plan, not from this ADR.
 
 ### Settled now, no further measurement needed
 
@@ -162,25 +160,24 @@ from that host as reliable
 would reintroduce exactly the kind of unrepresentative number this ADR
 exists to move away from.
 
-**Pursue true zero-copy RSEG decode as part of this epic's
-implementation waves.** Rejected: it requires an RSEG format change,
+**Pursue true zero-copy RSEG decode as part of this investigation's
+later phases.** Rejected: it requires an RSEG format change,
 which is a frozen-contract decision needing its own ADR and version
-bump. Bundling it into this epic would make the epic's implementation
-waves depend on a separate architectural decision this ADR is not
-making.
+bump. Bundling it in would make that work depend on a separate
+architectural decision this ADR is not making.
 
 ## Consequences
 
 - Wave 1 produces measurement infrastructure and a written Phase 7
   optimization plan, not merged performance changes. That plan, not
-  this ADR, is what subsequent implementation waves are decomposed
+  this ADR, is what subsequent implementation is decomposed
   from.
 - Two questions this investigation was asked to answer are answered
   now: io_uring is rejected structurally, and the Arrow
   zero-copy-adoption assumption is confirmed inaccurate: the SQL scan
   path performs a transpose, not buffer adoption.
 - Any proposal that would require changing the RSEG format is out of
-  scope for this epic's implementation waves; it is recorded as a
+  scope for this investigation; it is recorded as a
   deferred, separately-gated follow-up if the measurements support it.
 - Benchmarking and profiling standardize on reporting distributions and
   environment detail, and on running Linux-only tooling on the Linux

@@ -53,6 +53,10 @@ Start here to run Ravel, ingest into it, or query it.
   `RavelCluster` custom resource, the kind development environment
   (`scripts/kind-up.sh`), and what the `/healthz` and `/readyz` probes mean.
   Read this to deploy Ravel on Kubernetes.
+- [guides/disaster-recovery.md](guides/disaster-recovery.md): recovering a
+  deployment from object storage alone -- what state is reconstructable, the
+  commit-record and catalog rebuild path, and the operator steps. Read this
+  to plan or rehearse recovery.
 - [guides/inspecting-data.md](guides/inspecting-data.md): `ravel-cli`
   worked examples that read segments, commit records, and catalog listings
   directly from the object store. Read this to see what is actually stored.
@@ -75,12 +79,6 @@ code, not only to use it.
   includes the generated PromQL conformance table (ADR-0035). Its
   distributed-read sections are the internal specification behind
   [guides/distributed-query.md](guides/distributed-query.md).
-- [reviews/2026-08-adversarial-program/RAVEL-DISTRIBUTED-SEARCH-STATUS.md](reviews/2026-08-adversarial-program/RAVEL-DISTRIBUTED-SEARCH-STATUS.md):
-  the as-built status of the distributed read epic (ADR-0071) against the
-  pre-implementation review next to it -- what shipped file by file, the two
-  places the shipped code deviates from the design and why, the erasure
-  correctness gap the epic found and closed, the fault matrix with its
-  enforcement points, and the deferrals now tracked as their own epics.
 - [sql-conformance.md](sql-conformance.md): the generated SQL conformance
   table (ADR-0035). It classifies every construct in Ravel's claimed SQL
   surface as supported, intentionally rejected, or unclassified.
@@ -97,19 +95,14 @@ code, not only to use it.
   format (the only supported version pre-release, ADR-0027 and ADR-0047).
 - [log-segment-format.md](log-segment-format.md): the RLOG v1 on-object-store
   binary format for logs (ADR-0029).
+- [span-segment-format.md](span-segment-format.md): the RSPAN on-object-store
+  binary format for spans (ADR-0041).
 - [object-store-contract.md](object-store-contract.md): the
   `ObjectStoreBackend` trait that every storage vendor (memory, S3/MinIO) must
   satisfy, and the durability arguments made against it.
 - [otap-ingest.md](otap-ingest.md): plan for OTAP (OpenTelemetry Arrow)
   ingest. It describes a feature-gated crate and gateway wiring. It is not yet
   wired into `ravel-server`.
-- [arrow-datafusion-plan.md](arrow-datafusion-plan.md): the SQL query path
-  (ADR-0013): `ravel-sql`'s DataFusion scan/merge/dedup pipeline, pushdown
-  under the pruning-soundness invariant, and the planned HTTP/Flight SQL
-  endpoints. It is in progress. For the adversarial review that redesigned it
-  before implementation, see [reviews/2026-07-27-arrow-datafusion-plan-review.md](reviews/2026-07-27-arrow-datafusion-plan-review.md).
-- [benchmarking.md](benchmarking.md): benchmarking methodology. See
-  [BENCHMARKS.md](../BENCHMARKS.md) for the actual measured numbers.
 
 ## Decision records
 

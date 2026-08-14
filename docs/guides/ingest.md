@@ -179,8 +179,8 @@ admitted; only a span reported more than `max_ingest_lag_ns` after it *ended*
 is `TooOld`. The listing window stays sound because any span overlapping a
 query range has its end at or after the range start.
 
-Ravel also checks its own receiver clock at admission (ADR-0051 amendment,
-S1-12): a reading below a compiled floor (2020-01-01T00:00:00Z) or one that
+Ravel also checks its own receiver clock at admission (ADR-0051): a reading
+below a compiled floor (2020-01-01T00:00:00Z) or one that
 yields no representable ingest-hour bucket rejects the whole request with
 `503` / gRPC `UNAVAILABLE`, counted under
 `ravel_admission_rejected_total{reason="clock"}`. This is the replica's

@@ -7,7 +7,6 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.97"
-repository = "https://github.com/NOFireAI/ravel"
 
 [workspace.lints.rust]
 # forbid, not deny: deny can be silently overridden by a scoped
@@ -25,7 +24,7 @@ expect_used = "warn"
 [workspace.dependencies]
 # internal crates
 # Version fields pin each path dependency so cargo-deny does not count them as
-# wildcards (a11-F07). allow-wildcard-paths is not usable here because these
+# wildcards. allow-wildcard-paths is not usable here because these
 # crates are not marked publish = false, so it does not exempt them.
 ravel-types = { path = "crates/ravel-types", version = "0.1.0" }
 ravel-proto = { path = "crates/ravel-proto", version = "0.1.0" }
