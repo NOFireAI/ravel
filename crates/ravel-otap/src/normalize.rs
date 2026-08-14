@@ -1,5 +1,5 @@
-//! Columnar normalization of decoded OTAP METRICS payloads (Part 2 of
-//! issue #12) into Ravel's canonical metric point representation.
+//! Columnar normalization of decoded OTAP METRICS payloads into Ravel's
+//! canonical metric point representation.
 //!
 //! This mirrors `ravel_otlp::normalize::normalize_metrics` point-for-point:
 //! same admission limits (`ravel_otlp::IngestLimits`), same sanitization,
@@ -51,7 +51,7 @@
 //! them inline on the data point), with their attributes in the matching
 //! `*_DP_EXEMPLAR_ATTRS` table below each, so both are joined by id here
 //! rather than read from a field. The two tables have identical columns, so
-//! one decoder and one admission path serve both (issue #539).
+//! one decoder and one admission path serve both.
 //! Since ADR-0047 they are carried, not just counted: each is offered to the
 //! caller's [`ravel_types::ExemplarCap`] and attaches to the bucket series
 //! whose `le` bound is the smallest at or above its value for a histogram, or
@@ -87,11 +87,11 @@ use crate::stream::DecodedBatch;
 /// mapping table exactly (0=empty, 1=str, 2=int, 3=double, 4=bool, 5=map,
 /// 6=slice, 7=bytes). This is a wire contract: `normalize_decoded` reads
 /// these values out of real decoded OTAP batches, so they must be the
-/// spec's discriminants, not an internal convention. See issue #232: an
-/// earlier revision had these ordered after OTLP's `AnyValue` oneof field
-/// numbers (2=bool, 3=int, 4=double, 5=bytes, 6=array, 7=map), which
-/// disagrees with the OTAP spec on every slot from 2 upward and would
-/// misclassify real attributes (e.g. a spec `int`, type 2, read as bool).
+/// spec's discriminants, not an internal convention. These deliberately do
+/// not follow OTLP's `AnyValue` oneof field numbers (2=bool, 3=int, 4=double,
+/// 5=bytes, 6=array, 7=map), which disagree with the OTAP spec on every slot
+/// from 2 upward: ordering by those would misclassify real attributes (e.g. a
+/// spec `int`, type 2, read as bool).
 pub const ANY_VALUE_TYPE_EMPTY: u8 = 0;
 pub const ANY_VALUE_TYPE_STRING: u8 = 1;
 pub const ANY_VALUE_TYPE_INT: u8 = 2;
@@ -162,7 +162,7 @@ enum IdEncoding {
 const UNRECOGNIZED_ID_ENCODING: &str = "unrecognized_id_encoding";
 
 /// Resolve the declared encoding of a core `id`/`parent_id` column (the
-/// metric/data-point chain #205 handles) from its Arrow field metadata
+/// metric/data-point chain) from its Arrow field metadata
 /// (otap-spec.md section 6.4: key `"encoding"`). No declaration defaults to
 /// [`IdEncoding::Delta`], the spec's stated default for these columns
 /// (sections 5.3.1-5.3.4). Only `"plain"` and `"delta"` are valid here:
@@ -460,8 +460,8 @@ pub fn normalize_decoded(
 ///
 /// `exemplar_cap` is `&mut` and caller-owned rather than built here: a
 /// per-series-per-window cap only means something across many requests over
-/// wall-clock time, so whoever holds the long-lived per-shard state (issue
-/// #474) owns one `ExemplarCap` and passes it into every call that shard makes.
+/// wall-clock time, so whoever holds the long-lived per-shard state owns one
+/// `ExemplarCap` and passes it into every call that shard makes.
 ///
 /// See [`normalize_decoded`] for the panic and error-handling contract, which
 /// is identical here.
@@ -642,7 +642,7 @@ pub fn normalize_decoded_with_exemplars(
         // of series identity, so the canonical grouping key below is sorted;
         // this pre-check is the only place attribute order is observable, and
         // it must line up with the OTLP oracle or the two paths class the same
-        // input differently (ADR-0011; a9-F01 mechanism b).
+        // input differently (ADR-0011).
         if let Err(rejection) = check_attrs_in_input_order(&raw, limits) {
             rejected.push(rejection);
             continue;
@@ -671,7 +671,7 @@ pub fn normalize_decoded_with_exemplars(
                 });
                 // A number data point has no buckets, so its exemplars attach
                 // to the point's own series: there is no `le` bound to resolve
-                // (issue #539). This is the same rule `ravel_otlp::build_point`
+                // This is the same rule `ravel_otlp::build_point`
                 // applies to a gauge or sum exemplar, which is what keeps the
                 // two paths' exemplar decisions identical (ADR-0011).
                 number_exemplar_admission.admit(dp.id, limits, |_| series_id, &mut rejected);
@@ -794,8 +794,8 @@ fn count_total_points(batch: &DecodedBatch) -> usize {
 }
 
 /// Exponential histograms are the one remaining unsupported metric payload
-/// type (ADR-0017, out of B2's scope per docs/ingest-breadth-plan.md §7):
-/// counted as one [`Rejection::UnsupportedMetricType`], never a silent drop.
+/// type (ADR-0017): counted as one [`Rejection::UnsupportedMetricType`],
+/// never a silent drop.
 /// Histogram and summary payloads are normalized below instead of rejected
 /// here.
 fn push_unsupported_type_rejections(batch: &DecodedBatch, rejected: &mut Vec<Rejection>) {
@@ -813,7 +813,7 @@ fn push_unsupported_type_rejections(batch: &DecodedBatch, rejected: &mut Vec<Rej
     }
 }
 
-/// Count every `EXP_HISTOGRAM_DP_EXEMPLARS` row as dropped (issue #539).
+/// Count every `EXP_HISTOGRAM_DP_EXEMPLARS` row as dropped.
 ///
 /// None of these can be carried today, and the reason is structural rather
 /// than a missing decode: `EXP_HISTOGRAM_DATA_POINTS` is rejected outright by
@@ -1271,9 +1271,9 @@ fn build_metric_decisions(
                     // name is validated (MetricNameTooLong, then
                     // EmptyMetricName) before the Sum temporality check, so a
                     // delta Sum with a rejected name is classed on the name,
-                    // not on temporality. Reversing this diverged the two
+                    // not on temporality. Reversing this would diverge the two
                     // ingest paths' rejection classes (ADR-0011 identical-
-                    // rejection-class contract; a9-F01 mechanism a).
+                    // rejection-class contract).
                     let Some(name) = process_metric_name(&entry.name, limits, count, rejected)
                     else {
                         continue;
@@ -1357,7 +1357,7 @@ fn raw_cell_value(cell: &RawCell) -> Result<String, Rejection> {
 /// columnar path groups attributes by a sorted key for series identity, so
 /// this ordered pass is the only place the two paths' attribute order is
 /// observable; keeping it identical is what preserves the ADR-0011 identical-
-/// rejection-class contract (a9-F01 mechanism b). The length bounds here
+/// rejection-class contract. The length bounds here
 /// intentionally match [`push_checked`], which the canonical build applies to
 /// the sorted set; because a set that passes in input order also passes in any
 /// order, the sorted build only ever surfaces the order-independent
@@ -1712,11 +1712,10 @@ fn flatten_summary_dp(
 /// lets the admission pass mirror OTLP's per-data-point ordering.
 ///
 /// Called once per exemplar table; both tables have the same columns and the
-/// same encoding rules, so this is one decoder rather than two (issue #539).
+/// same encoding rules, so this is one decoder rather than two.
 ///
-/// This used to count rows and discard them, back when the exemplar's own
-/// columns had nowhere to go (ADR-0047 gave them an RSEG section). The
-/// `parent_id` decode is unchanged: still QUASI-DELTA by default with
+/// Exemplars are carried, not just counted: ADR-0047 gives them an RSEG
+/// section. The `parent_id` decode is QUASI-DELTA by default with
 /// `int_value`/`double_value` as its equality columns (otap-spec.md section
 /// 6.4.3), via the same [`decode_quasi_delta_column`] call.
 fn group_exemplars_by_parent_id(

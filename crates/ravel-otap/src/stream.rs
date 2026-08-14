@@ -1,9 +1,9 @@
 //! OTAP gRPC stream state machine: per-stream Arrow IPC decode.
 //!
-//! Scope (Part 1 of the `ravel-otap` decoder, issue #12): this module turns
-//! `BatchArrowRecords` messages into `RecordBatch`es. It does not interpret
-//! column semantics (ids, parent_id joins, AnyValue unions, delta encodings)
-//! at all -- that is the columnar normalizer's job (a later task). This is
+//! Scope: this module turns `BatchArrowRecords` messages into
+//! `RecordBatch`es. It does not interpret column semantics (ids, parent_id
+//! joins, AnyValue unions, delta encodings) at all -- that is the columnar
+//! normalizer's job. This is
 //! intentional: the OTAP spec's id-column transport encodings (plain, delta,
 //! quasi-delta; see otap-spec.md section 6.4) are a property of column
 //! *values*, not of Arrow IPC framing, so they do not affect how we decode
@@ -196,8 +196,7 @@ fn scan_messages(bytes: &[u8]) -> Result<Vec<ScannedMessage>, String> {
 
 /// A `std::io::Write` adapter over `MutableBuffer`, so zstd can decompress
 /// straight into arrow's 64-byte-aligned allocation instead of a plain
-/// `Vec<u8>` that would later need copying into an aligned buffer for hop 3
-/// (docs/arrow-datafusion-plan.md Hop 2).
+/// `Vec<u8>` that would later need copying into an aligned buffer.
 struct AlignedWriter<'a>(&'a mut MutableBuffer);
 
 impl Write for AlignedWriter<'_> {
@@ -280,8 +279,7 @@ fn batch_is_zero_copy(range: FrameRange, batch: &RecordBatch) -> bool {
 /// Running counts of decoded IPC record-batch frames, split by whether
 /// `StreamDecoder` returned a zero-copy view into our aligned decompress
 /// buffer or had to allocate and copy to realign a misaligned producer
-/// buffer (docs/arrow-datafusion-plan.md Hop 3; review finding F3: this is
-/// producer-dependent and must be measured, not assumed).
+/// buffer (this is producer-dependent and must be measured, not assumed).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecodeStats {
     pub zero_copy_frames: u64,

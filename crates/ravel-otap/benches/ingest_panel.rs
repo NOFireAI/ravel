@@ -1,4 +1,4 @@
-//! OTLP-vs-OTAP ingest panel (issue #12, docs/otap-ingest.md phases 1 and 4).
+//! OTLP-vs-OTAP ingest panel (docs/otap-ingest.md).
 //!
 //! Decodes identical logical content two ways and carries both all the way
 //! to normalized samples, so the comparison is wire-decode + normalize on
@@ -31,14 +31,12 @@
 //!   via `stats_alloc`'s instrumented global allocator (the workspace denies
 //!   `unsafe_code` everywhere including benches, so allocation counting must
 //!   go through a dependency that owns the `unsafe impl GlobalAlloc`), the
-//!   same measurement approach BENCHMARKS.md's `otap_decode` row uses.
+//!   same measurement approach as the OTAP decode bench.
 //!
-//! Ack latency (the third phase-4 metric) is deliberately not here: it needs
-//! the strict-commit ingest path (IngestRouter + object store + BatchStatus),
-//! which for OTAP is the unbuilt phase-3 gateway wiring
-//! (docs/otap-ingest.md: "services/ has no ravel-otap dependency"). It cannot
-//! be measured from this decode/normalize crate and is reported as pending in
-//! BENCHMARKS.md, not fabricated.
+//! Ack latency is deliberately not here: it needs the strict-commit ingest
+//! path (IngestRouter + object store + BatchStatus), which for OTAP is not yet
+//! wired into the gateway (docs/otap-ingest.md: "services/ has no ravel-otap
+//! dependency"). It cannot be measured from this decode/normalize crate.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::alloc::System;

@@ -1,4 +1,4 @@
-//! Integration tests for the OTAP stream state machine (issue #12, Part 1):
+//! Integration tests for the OTAP stream state machine:
 //! encode/decode roundtrip, schema resets, and the resource caps that
 //! protect a `StreamState` from a hostile or buggy exporter.
 #![allow(clippy::expect_used)]
@@ -400,9 +400,9 @@ fn max_schemas_per_stream_is_enforced() {
 // dictionary memory per stream"). Enforced in `decode_payload` at
 // stream.rs:382-394 by summing the `body_len` of every `DictionaryBatch` IPC
 // message and rejecting once the running per-stream total would exceed the
-// cap; the accumulation itself is stream.rs:405. This is issue #74 (a9-F02):
-// the sibling caps (decompressed-size, row-count, schema-count) each have a
-// test above, this one had none.
+// cap; the accumulation itself is stream.rs:405. The sibling caps
+// (decompressed-size, row-count, schema-count) each have a test above; this
+// covers the dictionary-bytes cap.
 //
 // The exact IPC framing size of a DictionaryBatch body is opaque (arrow-ipc
 // internals, out of scope to read), so the boundary caps below are measured,
@@ -457,12 +457,12 @@ fn min_dict_cap_admitting(names: &[&str]) -> u64 {
     hi
 }
 
-/// a9-F02 boundary: the cap fires exactly at the documented threshold
-/// (`used + bytes > limit`). A single batch is admitted when the cap equals
-/// its dictionary bytes, and rejected when the cap is one byte lower. This is
-/// deliverable 2 (a just-under-the-cap case that succeeds) paired with the
-/// smallest exceedance that trips it, pinning the boundary rather than an
-/// arbitrary tiny cap.
+/// Boundary: the dictionary-bytes cap fires exactly at the documented
+/// threshold (`used + bytes > limit`). A single batch is admitted when the cap
+/// equals its dictionary bytes, and rejected when the cap is one byte lower.
+/// A just-under-the-cap case that succeeds is paired with the smallest
+/// exceedance that trips it, pinning the boundary rather than an arbitrary
+/// tiny cap.
 #[test]
 fn dictionary_budget_cap_fires_at_exact_boundary() {
     let one_batch_bytes = min_dict_cap_admitting(&["cpu.load.aaa"]);
@@ -509,9 +509,9 @@ fn dictionary_budget_cap_fires_at_exact_boundary() {
     assert!(!state.is_poisoned());
 }
 
-/// a9-F02 accumulation: the cap is cumulative across batches, not per-batch.
-/// This is deliverable 1 -- the budget trips on a later batch once the
-/// running total crosses the cap, before dictionary memory grows unbounded.
+/// Accumulation: the cap is cumulative across batches, not per-batch. The
+/// budget trips on a later batch once the running total crosses the cap,
+/// before dictionary memory grows unbounded.
 /// The cap is set to exactly the dictionary bytes of the first two batches,
 /// so batch 1 and batch 2 are admitted (batch 2 lands the running total right
 /// on the cap) and batch 3, adding a fresh dictionary, is rejected. A
@@ -568,14 +568,12 @@ fn dictionary_budget_cap_is_cumulative_across_batches() {
     assert!(!state.is_poisoned());
 }
 
-/// Regression coverage for issue #18 (A2): prost `bytes::Bytes` decode,
-/// aligned-buffer decompression, and feeding `StreamDecoder` the shared
-/// buffer must not change one decoded bit versus what was encoded. There is
-/// no pre-existing OTLP-vs-OTAP differential gate or fuzz target in this
-/// repo to re-run (see final report); these tests are this crate's
-/// equivalent coverage: value-preservation across the new decode path
-/// (bit-for-bit on floats, per CLAUDE.md) and corrupt-input robustness.
-mod a2_regression {
+/// Coverage for the zero-copy `bytes::Bytes` decode path: prost
+/// `bytes::Bytes` decode, aligned-buffer decompression, and feeding
+/// `StreamDecoder` the shared buffer must not change one decoded bit versus
+/// what was encoded. These tests cover value-preservation across the decode
+/// path (bit-for-bit on floats, per CLAUDE.md) and corrupt-input robustness.
+mod decode_path_regression {
     use super::*;
 
     fn double_values(dp_batches: &[&RecordBatch]) -> Vec<f64> {
@@ -672,7 +670,7 @@ mod a2_regression {
         }
     }
 
-    /// The copy-fallback counter added for issue #18 must account for every
+    /// The copy-fallback counter must account for every
     /// decoded frame exactly once: over an ordinary roundtrip, zero-copy and
     /// copy-fallback frames must sum to the number of `RecordBatch`es
     /// decoded, and (with our own encoder producing standard 8-byte-padded

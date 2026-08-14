@@ -1,5 +1,5 @@
-//! Exemplar admission on the OTAP path (ADR-0047 decisions 1 and 2, issues
-//! #473 and #539): the `HISTOGRAM_DP_EXEMPLARS` and `NUMBER_DP_EXEMPLARS`
+//! Exemplar admission on the OTAP path (ADR-0047 decisions 1 and 2):
+//! the `HISTOGRAM_DP_EXEMPLARS` and `NUMBER_DP_EXEMPLARS`
 //! tables' own columns are carried into `ravel_types::Exemplar` values, capped
 //! at one per series per window by the caller's `ExemplarCap`, and whatever the
 //! cap turns away keeps incrementing the pre-existing
@@ -89,7 +89,7 @@ fn normalize(histograms: &[HistogramMetricRow], cap: &mut ExemplarCap) -> Metric
 }
 
 /// [`normalize`] with gauge/sum metrics too, for the `NUMBER_DP_EXEMPLARS`
-/// cases (issue #539). Same real IPC round trip, same fresh encoder per call.
+/// cases. Same real IPC round trip, same fresh encoder per call.
 fn normalize_ext(
     metrics: &[MetricRow],
     histograms: &[HistogramMetricRow],
@@ -905,7 +905,7 @@ fn duplicate_ids_each_join_to_that_ids_attributes() {
     );
 }
 
-// --- NUMBER_DP_EXEMPLARS: exemplars on gauge and sum points (issue #539) ---
+// --- NUMBER_DP_EXEMPLARS: exemplars on gauge and sum points ---
 
 /// A gauge exemplar carried end to end through the real Arrow IPC round trip,
 /// attributes and ids included. It attaches to the data point's own series:
@@ -1237,10 +1237,9 @@ fn an_orphan_number_exemplar_row_is_counted_as_dropped() {
 
 /// Every `EXP_HISTOGRAM_DP_EXEMPLARS` row is counted as dropped.
 ///
-/// This pins the point-3 decision of issue #539. Nothing can carry these yet:
-/// `EXP_HISTOGRAM_DATA_POINTS` is rejected as an unsupported metric type on
-/// this path (ADR-0017 is a separate ticket), so the series an exemplar would
-/// attach to is never built. The attachment rule for when that lands is the
+/// Nothing can carry these yet: `EXP_HISTOGRAM_DATA_POINTS` is rejected as an
+/// unsupported metric type on this path (ADR-0017), so the series an exemplar
+/// would attach to is never built. The attachment rule for when that lands is the
 /// data point's own series, matching `ravel_otlp::build_native_histogram_point`
 /// -- a native histogram is one series with one sample per timestamp, not a set
 /// of exploded `le`-bucket series, so a scale-resolved bucket index would name
