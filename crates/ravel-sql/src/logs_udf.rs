@@ -4,9 +4,9 @@
 //!
 //! Registered into the per-query `SessionContext` the same way the metrics
 //! `label`/`label_match` UDFs are (crate::udf); that registration lives in the
-//! session builder (a later ticket, #240), not here. This module only supplies
+//! session builder (the session layer), not here. This module only supplies
 //! the UDF and its name so [`crate::logs_pushdown`] can recognize the predicate
-//! shape and #240 can register it.
+//! shape so the session layer can register it.
 //!
 //! # Why the UDF, not `LIKE`, is the pushdown-sound text predicate
 //!

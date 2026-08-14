@@ -1,5 +1,4 @@
-//! AST-level keyed tokenization of SQL query text (ADR-0062 decision 2e,
-//! epic EL / issue #761).
+//! AST-level keyed tokenization of SQL query text (ADR-0062 decision 2e).
 //!
 //! The SQL counterpart of `ravel_promql::redact`: the audit trail's default
 //! posture stores a structure-preserving redacted form of every query, with
@@ -367,7 +366,7 @@ mod tests {
         assert!(matches!(err, RedactError::Parse));
     }
 
-    // --- F1: unsupported statement shapes fail loudly, never pass through ---
+    // --- Unsupported statement shapes fail loudly, never pass through ---
 
     #[test]
     fn explain_is_rejected_not_passed_through_unredacted() {
@@ -416,7 +415,7 @@ mod tests {
         assert_eq!(err, RedactError::Unsupported { kind: "EXPLAIN" });
     }
 
-    // --- F2: structural numeric literals stay readable, value literals do not ---
+    // --- Structural numeric literals stay readable, value literals do not ---
 
     #[test]
     fn limit_offset_and_positional_order_by_stay_readable() {
@@ -454,7 +453,7 @@ mod tests {
     fn non_ordinal_order_by_expression_still_redacts_hidden_values() {
         // The carve-out is only for a *bare* positional ordinal. A value buried
         // inside an ORDER BY expression is not structural and must tokenize, or
-        // the F1 no-passthrough guarantee would have a hole here.
+        // the no-passthrough guarantee would have a hole here.
         let out = redact(
             "SELECT a FROM t ORDER BY CASE WHEN a = 'alice' THEN 1 ELSE 2 END",
             &KEY_A,
@@ -533,12 +532,12 @@ mod tests {
         reparse(&out);
     }
 
-    // --- F3: RedactError never carries input-derived text ---
+    // --- RedactError never carries input-derived text ---
 
     #[test]
     fn error_display_never_leaks_input_literals() {
         // The raw parser message DOES quote the offending literal verbatim:
-        // this documents the leak F3 closes. A trailing unexpected string
+        // this documents the leak the redactor closes. A trailing unexpected string
         // literal makes sqlparser echo it (`... found: 'topsecret' ...`).
         let probe = "SELECT * FROM t WHERE a = 'ok' 'topsecret'";
         let raw = DFParser::parse_sql(probe)

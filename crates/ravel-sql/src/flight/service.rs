@@ -56,7 +56,7 @@ use crate::flight_ticket::{FlightTicket, SegmentPin, TicketKey};
 use crate::validate::validate;
 
 /// The message every prepared-statement method returns. Prepared statements
-/// are out of the v1 Flight SQL scope (docs/arrow-datafusion-plan.md Phase C);
+/// are out of the v1 Flight SQL scope;
 /// they are refused explicitly rather than left to arrow-flight's default
 /// bodies so the refusal is a decision this crate states and tests, not an
 /// accident of what happens to be unimplemented.
@@ -71,7 +71,7 @@ pub struct RavelFlightSqlService {
     clock: ClockRef,
     config: FlightSqlConfig,
     /// The in-process secret this service's tickets are signed and verified
-    /// with (issue #185). Generated once, here, at construction time and
+    /// with. Generated once, here, at construction time and
     /// held only in memory: never logged, never sent to a client, never
     /// persisted. A process restart mints a fresh key and invalidates every
     /// ticket the previous process signed, which is safe because a ticket is
@@ -81,7 +81,7 @@ pub struct RavelFlightSqlService {
     /// needs tickets to survive a restart.
     ticket_key: TicketKey,
     /// The evidential audit sink one event per executed statement is submitted
-    /// through (ADR-0042 decision 4, ADR-0062 §2a, issues #395/#762/#413).
+    /// through (ADR-0042 decision 4, ADR-0062 §2a).
     /// Migrated from the raw object-store handle this service previously wrote
     /// the record to directly at stream *construction*: the audit is now
     /// submitted at stream *completion* (see [`do_get_statement`]), so the
@@ -92,8 +92,7 @@ pub struct RavelFlightSqlService {
     /// [`NoopQueryAuditSink`](ravel_maintain::NoopQueryAuditSink); a deployment
     /// passes the one shared pipeline.
     audit_sink: Arc<dyn QueryAuditSink>,
-    /// The process-global per-query cost aggregator (ADR-0044 section 4, issue
-    /// #425). Each Flight statement folds its cost into it: `GetFlightInfo`
+    /// The process-global per-query cost aggregator (ADR-0044 section 4). Each Flight statement folds its cost into it: `GetFlightInfo`
     /// records the resolve-and-plan cost with the query's estimate, and `DoGet`
     /// records its execution cost when the result stream ends. Shared with the
     /// PromQL and HTTP SQL paths through one instance per process, so all the
@@ -109,7 +108,7 @@ pub struct RavelFlightSqlService {
     /// lifetime). The `do_get_statement` gate is the one that bounds the actual
     /// scan work -- see that method.
     query_admission: Arc<QueryAdmissionController>,
-    /// The coordinator-side distributed scan config (ADR-0071, issue #868), or
+    /// The coordinator-side distributed scan config (ADR-0071), or
     /// `None` when the deployment did not install one. `None` is byte-identical
     /// to the pre-distribution service: every statement runs whole-set on this
     /// coordinator. When `Some`, `do_get_statement` gates each whole-set
@@ -122,7 +121,7 @@ pub struct RavelFlightSqlService {
 }
 
 /// The bounded connect timeout the coordinator dials each worker slice with
-/// (ADR-0071, issue #868). A worker that does not complete the TCP + HTTP/2
+/// (ADR-0071). A worker that does not complete the TCP + HTTP/2
 /// handshake within this window fails the slice fetch with a typed error rather
 /// than hanging the whole distributed query; the ticket's own deadline still
 /// bounds the streaming phase after connect.
@@ -137,7 +136,7 @@ impl RavelFlightSqlService {
     /// budget rather than two independent ones.
     ///
     /// `audit_sink` is the evidential seam one event per executed statement is
-    /// submitted through (issues #395/#762). It defaults to the no-op when a
+    /// submitted through. It defaults to the no-op when a
     /// deployment installs no pipeline; use [`with_audit_sink`](Self::with_audit_sink)
     /// to attach the shared pipeline. Keeping it out of `new`'s signature lets
     /// existing call sites stay unchanged.
@@ -171,7 +170,7 @@ impl RavelFlightSqlService {
         self
     }
 
-    /// Install the coordinator-side distributed scan (ADR-0071, issue #868).
+    /// Install the coordinator-side distributed scan (ADR-0071).
     /// Returns `self` so it chains off [`new`](Self::new), mirroring
     /// [`with_audit_sink`](Self::with_audit_sink).
     ///
@@ -186,7 +185,7 @@ impl RavelFlightSqlService {
     pub fn with_distributed_scan(mut self, config: DistributedFlightConfig) -> Self {
         // A multi-process cluster keys every ticket MAC off one shared secret so
         // a coordinator's slice ticket verifies on a different worker process
-        // (ADR-0071, issue #868). When the config carries that derived key,
+        // (ADR-0071). When the config carries that derived key,
         // override the per-process random key minted in `new`. `None` (the
         // single-process default) keeps this service's own key.
         if let Some(key) = config.shared_ticket_key {
@@ -281,8 +280,8 @@ impl FlightSqlService for RavelFlightSqlService {
     /// Validate, resolve the snapshot exactly once, and mint a ticket pinning
     /// it.
     ///
-    /// The order is the one docs/arrow-datafusion-plan.md section 2 fixes and
-    /// `SqlExecutor::execute` follows: authenticate, then the security gate,
+    /// The order is the one `SqlExecutor::execute` follows: authenticate, then
+    /// the security gate,
     /// then one `Catalog::resolve`, then plan. A rejected statement costs no
     /// catalog LIST.
     async fn get_flight_info_statement(
@@ -320,14 +319,14 @@ impl FlightSqlService for RavelFlightSqlService {
         )?;
 
         // Step 2: resolve exactly once. This snapshot, and only this
-        // snapshot, is what DoGet will execute against (review F18).
+        // snapshot, is what DoGet will execute against.
         //
         // This accounting handle covers this RPC's resolve and logical plan.
         // DoGet (crate::flight::stream) builds its own handle for the execution
         // it runs, so a Flight SQL statement's cost is recorded as two folds,
         // one per RPC (ADR-0044's documented two-handle split): the resolve and
         // plan cost here, the execution cost there. Both now reach `/metrics`
-        // (issue #425). The `estimate` is this query's whole-query upper
+        //. The `estimate` is this query's whole-query upper
         // envelope, so it is recorded once, here, against this RPC's actual;
         // DoGet records its actual with a zero estimate so the two folds sum to
         // one whole-query estimate beside the summed whole-query actual.
@@ -343,7 +342,7 @@ impl FlightSqlService for RavelFlightSqlService {
             .map(SegmentPin::from_segment_ref)
             .collect();
         // Carried into the ticket below so `DoGet` excludes exactly what this
-        // resolve saw pending (ADR-0064 decision 3, issue #829): `snapshot` is
+        // resolve saw pending (ADR-0064 decision 3): `snapshot` is
         // moved into `plan_pinned` just below, so this must be derived first.
         let pending_erasure = ravel_query::erasure::snapshot_pending_erasure_predicates(&snapshot);
 
@@ -361,7 +360,7 @@ impl FlightSqlService for RavelFlightSqlService {
         drop(planned);
 
         // Fold this RPC's resolve-and-plan cost, with the query's estimate, into
-        // the process aggregator (ADR-0044 section 4, issue #425). Recorded here,
+        // the process aggregator (ADR-0044 section 4). Recorded here,
         // after planning succeeds, so a statement rejected at resolve or plan
         // records nothing, the same rule the HTTP paths follow. DoGet folds the
         // execution cost separately.
@@ -381,14 +380,14 @@ impl FlightSqlService for RavelFlightSqlService {
                 Status::internal("failed to build query plan")
             })?;
 
-        // ADR-0071 (issue #866): an external Flight SQL client ALWAYS receives
+        // ADR-0071: an external Flight SQL client ALWAYS receives
         // exactly ONE endpoint, distribution installed or not. Arrow Flight's
         // two-RPC contract makes the N endpoints of one FlightInfo the
         // partitions of a SINGLE result set that a client unions; a cross-shard
         // scan fan-out is not that (unioning N per-slice partial scans would
         // return cross-slice duplicates undeduped, N partial aggregates, and up
         // to n*N rows for a LIMIT n). Distribution is instead an internal
-        // coordinator-to-worker concern: the coordinator (issue #868) mints
+        // coordinator-to-worker concern: the coordinator mints
         // slice tickets with [`crate::distributed::plan_distributed_slices`] and
         // redeems them against workers' `do_get` slice-fragment path
         // (`slice_count > 1`, served by [`do_get_statement`]). This client-facing
@@ -415,7 +414,7 @@ impl FlightSqlService for RavelFlightSqlService {
 
     /// Redeem a statement ticket against its pinned snapshot.
     ///
-    /// The tenant comparison below is the security decision this ticket
+    /// The tenant comparison below is the security decision enforced
     /// exists to enforce: the metadata-resolved tenant is authoritative and
     /// the ticket's embedded tenant is only a value to check it against. A
     /// mismatch is denied before the pinned snapshot is touched, so a stolen
@@ -462,7 +461,7 @@ impl FlightSqlService for RavelFlightSqlService {
             Status::resource_exhausted("fleet query concurrency ceiling reached; retry")
         })?;
 
-        // ADR-0071 (issue #866): a slice ticket (`slice_count > 1`) is an
+        // ADR-0071: a slice ticket (`slice_count > 1`) is an
         // INTERNAL coordinator-to-worker request, never something an external
         // client holds -- `get_flight_info_statement` only ever mints the
         // whole-set ticket (`slice_count == 1`). When one arrives, serve the raw
@@ -508,7 +507,7 @@ impl FlightSqlService for RavelFlightSqlService {
         // early rejections.
         //
         // The audit is submitted at stream *completion*, not construction
-        // (issue #413). Writing it here from whether the first batch pulled
+        //. Writing it here from whether the first batch pulled
         // cleanly recorded "ok" for a query that then failed partway or was
         // cancelled by the client -- the status-accuracy gap this closes. The
         // returned stream is wrapped by `audited_stream` so the recorded status
@@ -521,7 +520,7 @@ impl FlightSqlService for RavelFlightSqlService {
         let now_ns = self.clock.now_ns();
         let query_text = decoded.statement.clone();
 
-        // ADR-0071 (issue #868): the ENGAGE decision for this whole-set
+        // ADR-0071: the ENGAGE decision for this whole-set
         // statement. With a distributed config installed, recompute the cost
         // estimate for this ticket's pinned snapshot and gate on it, then mint
         // slice tickets and build the production worker client for THIS query
@@ -610,7 +609,7 @@ impl FlightSqlService for RavelFlightSqlService {
         match result {
             // The stream started: wrap it so the audit fires at completion with
             // the stream's real terminal status, awaiting durability before the
-            // client observes the stream end (issue #413).
+            // client observes the stream end.
             Ok(stream) => Ok(Response::new(audited_stream(
                 stream,
                 Arc::clone(&self.audit_sink),

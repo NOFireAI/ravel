@@ -1,16 +1,15 @@
 //! ravel-sql query configuration.
 //!
 //! The series/segment/sample/deadline budgets live in `ravel_query::EngineConfig`
-//! (shared with the PromQL path). This ticket (B2, issue #21) adds a per-query
+//! (shared with the PromQL path). This ticket (B2) adds a per-query
 //! byte budget for the DataFusion memory pool. `EngineConfig` lives in
-//! ravel-query, which is out of this ticket's crate scope and must stay free of
+//! ravel-query, which is out of this crate's scope and must stay free of
 //! any SQL-only concern, so the byte budget lives here in a ravel-sql-local
 //! [`SqlConfig`] that embeds `EngineConfig` rather than growing it (the ticket
 //! leaves this call to the implementer; this is the choice made).
 //!
 //! `max_query_bytes` is consumed only when the query's DataFusion memory pool
-//! is built ([`SqlConfig::query_pool`], docs/arrow-datafusion-plan.md section 2
-//! "Session config, memory pool, budgets" / review F10). It is a measured
+//! is built ([`SqlConfig::query_pool`]). It is a measured
 //! RecordBatch-byte budget, never a sample-count-derived figure: per-row
 //! footprint is cardinality-dependent once labels materialize as columns, so a
 //! sample cap cannot stand in for a byte cap.
@@ -24,8 +23,7 @@ use ravel_types::accounting::QueryAccounting;
 use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 
 /// Default per-query RecordBatch byte budget: 256 MiB. A placeholder pending
-/// the Phase B measurements docs/arrow-datafusion-plan.md says will set it in
-/// BENCHMARKS.md; documented as such so it is not mistaken for a tuned value.
+/// measurement; documented as such so it is not mistaken for a tuned value.
 pub const DEFAULT_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Per-query ravel-sql configuration: the shared engine budgets plus the
@@ -35,7 +33,7 @@ pub struct SqlConfig {
     /// Series/segment/sample/deadline budgets shared with the PromQL path.
     pub engine: EngineConfig,
     /// Ceiling, in bytes, on the query's DataFusion memory pool. Fed by
-    /// measured `RecordBatch` sizes (review F10), never a sample count.
+    /// measured `RecordBatch` sizes, never a sample count.
     pub max_query_bytes: usize,
 }
 
@@ -68,7 +66,7 @@ impl SqlConfig {
     /// Returns the pool paired with the [`CeilingBreach`] it trips: the pool
     /// goes onto the `RuntimeEnv`, and the breach travels with the query's
     /// stream so a `grow` that overshoots either ceiling aborts the query at
-    /// its next poll (issue #163). The two are created together so the caller
+    /// its next poll. The two are created together so the caller
     /// cannot install a pool whose breach nothing observes.
     ///
     /// `accounting` is the calling query's [`QueryAccounting`] handle

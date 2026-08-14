@@ -2,25 +2,23 @@
 //!
 //! This crate is the structural isolation boundary that keeps `datafusion`
 //! (and, transitively, its own `arrow`) out of the PromQL and ingest paths
-//! (ADR-0013 / docs/arrow-datafusion-plan.md section 3). Nothing in the
+//! (ADR-0013). Nothing in the
 //! ingest-critical or PromQL crates links this crate.
 //!
-//! Ticket B1 (issue #20) implements the read pipeline skeleton described in
-//! docs/arrow-datafusion-plan.md section 2, redesigned per the F4/F5/F6/F8/
-//! F11/F12 findings in docs/reviews/2026-07-27-arrow-datafusion-plan-review.md:
+//! The read pipeline skeleton:
 //!
 //! ```text
 //! RsegScanExec (N partitions, each sorted by (series_id, ts, provenance))
 //!   -> SortPreservingMergeExec on (series_id, ts)
 //!   -> RsegDedupExec (single partition, streaming, full dedup total order)
-//!   -> DataFusion operators (later tickets)
+//!   -> DataFusion operators
 //! ```
 //!
 //! Arrow types are used exclusively through the `datafusion::arrow`
 //! re-export so this crate is internally version-consistent regardless of
 //! the workspace `arrow` pin.
 
-//! Ticket B3 (issue #22) adds the request-handling half: the read-only
+//! The request-handling half: the read-only
 //! single-statement gate (`validate`), the fresh per-query single-tenant
 //! session (`session`), the resolve/plan/execute driver with the snapshot
 //! retry contract (`executor`), the two wire encodings (`output`), and the
@@ -28,14 +26,14 @@
 //! lives in services/ravel-server behind its `sql` feature; nothing here
 //! links axum, and nothing there links datafusion.
 
-//! Ticket C1d (issue #152) adds the second transport behind the `flight-sql`
+//! The second transport, behind the `flight-sql`
 //! feature: `flight` is the `FlightSqlService` implementation and
 //! `flight_ticket` its snapshot-pinning ticket codec. It is a transport and
 //! nothing more -- it validates, resolves, plans, and executes through the
 //! same `SqlExecutor` the HTTP path uses, so the two cannot answer the same
 //! query differently. Its own additions are the ones the two-RPC shape forces:
 //! pinning the resolved snapshot into the ticket so `DoGet` never re-resolves
-//! (review F18), and checking the metadata-resolved tenant against the
+//! and checking the metadata-resolved tenant against the
 //! ticket's own before redeeming it.
 
 mod alerts_provider;

@@ -1,9 +1,9 @@
-//! B3 wall-deadline behavior (issue #22, plan section 2 "Session config,
+//! Wall-deadline behavior ("Session config,
 //! memory pool, budgets").
 //!
 //! On expiry the plan's streams are dropped, which releases every
 //! `MemoryReservation`; the pool forwards each drop-time shrink to the tenant
-//! accountant (review F13), so a timed-out query leaks no tenant budget.
+//! accountant, so a timed-out query leaks no tenant budget.
 //! Partial state is discarded, never returned.
 //!
 //! The stall comes from [`util::StallingStore`], not from a timing race:
@@ -97,7 +97,7 @@ async fn a_stalled_segment_read_trips_the_wall_deadline() {
 /// itself adds nothing and releases the empty reservation the stream
 /// registered. The load-bearing cancellation test -- a *mid-scan* stream
 /// dropped after real bytes were reserved -- lives in B2's
-/// tests/pushdown_memory.rs and in tests/memory_accounting.rs (review F13).
+/// tests/pushdown_memory.rs and in tests/memory_accounting.rs.
 #[tokio::test]
 async fn a_timed_out_query_leaks_no_tenant_budget() {
     let fixture = stalled_fixture().await;

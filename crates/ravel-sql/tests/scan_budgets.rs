@@ -1,4 +1,4 @@
-//! Scan-level budget enforcement (issues #187/#188).
+//! Scan-level budget enforcement.
 //!
 //! `max_samples` (crate::dedup) and `max_segments` (crate::provider,
 //! pre-scan) already had tests; `max_series` and the fetch/decode-phase byte
@@ -84,7 +84,7 @@ impl ObjectStoreBackend for CountingStore {
     }
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -219,7 +219,7 @@ fn five_segments_two_series_each() -> Vec<SegSpec> {
         .collect()
 }
 
-/// `max_series` (issue #187) must reject a partition before every remaining
+/// `max_series` must reject a partition before every remaining
 /// segment is fetched, not only after every segment's rows have already
 /// been decoded. Proven by comparing GET counts between a generous cap
 /// (every segment fetched) and a tiny one (tripped partway through).
@@ -294,7 +294,7 @@ fn total_rows(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> usize
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-/// The per-tenant bytes-scanned budget (ADR-0061 decision 1, issue #722) must
+/// The per-tenant bytes-scanned budget (ADR-0061 decision 1) must
 /// reject a partition before every remaining segment is fetched, not only
 /// after every segment's bytes have already been paid for. Proven the same
 /// way `max_series` is: compare GET counts between an `Unlimited` baseline
@@ -375,7 +375,7 @@ async fn max_bytes_scanned_rejects_before_every_segment_is_fetched() {
 
 /// No-regression: an `Unlimited` bytes-scanned budget must fetch every segment
 /// and return the identical full row set the scan produced before this budget
-/// existed. `Unlimited` is the code path every pre-#722 caller already took.
+/// existed. `Unlimited` is the code path an uncapped caller takes.
 #[tokio::test]
 async fn unlimited_bytes_scanned_matches_prior_behavior() {
     let specs = five_segments_two_series_each();
@@ -407,7 +407,7 @@ async fn unlimited_bytes_scanned_matches_prior_behavior() {
     );
 }
 
-/// The S3 request budget (RH-T2, issue #902, ADR-0073 decision 3) must
+/// The S3 request budget (ADR-0073 decision 3) must
 /// reject a partition before every remaining segment is fetched, the same
 /// early-exit contract `max_series` and `max_bytes_scanned` already have.
 /// Proven the same way: compare GET counts between an `Unlimited` baseline
@@ -490,8 +490,8 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
     Arc::new(TaskContext::default().with_runtime(rt))
 }
 
-/// A byte budget that the fetch/decode-phase charge alone overruns (issue
-/// #188) must reject the scan during that phase, before any `RecordBatch`
+/// A byte budget that the fetch/decode-phase charge alone overruns must
+/// reject the scan during that phase, before any `RecordBatch`
 /// is ever built: the stream's very first poll is the error, not a batch.
 #[tokio::test]
 async fn byte_budget_rejects_during_fetch_decode_not_only_after_batches() {

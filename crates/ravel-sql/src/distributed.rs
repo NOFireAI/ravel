@@ -1,4 +1,4 @@
-//! SQL-lane distributed read fan-out (ADR-0071, issue #866).
+//! SQL-lane distributed read fan-out (ADR-0071).
 //!
 //! # What this crate owns, and what it does not
 //!
@@ -45,7 +45,7 @@
 //! (internal schema, scan-only, no statement planning or dedup).
 //!
 //! The coordinator that mints slices and installs the fan-out lands with the
-//! server wiring (issue #868); until then the whole minting-plus-fan-out path
+//! server wiring; until then the whole minting-plus-fan-out path
 //! is exercised only by the in-process worker in the acceptance tests
 //! (`tests/flight_distributed.rs`), the sole caller of [`plan_distributed_slices`],
 //! [`DistributedScanExec`], and [`distributed_samples_plan`] today.
@@ -55,7 +55,7 @@
 //! Worker locations arrive through the [`WorkerEndpoints`] trait defined here;
 //! the coordinator fetches each slice through the [`WorkerSliceClient`] trait
 //! defined here. ravel-sql takes no dependency on `ravel-fleet` or any worker
-//! registry: the deployment (issue #868) implements both traits over the real
+//! registry: the deployment implements both traits over the real
 //! heartbeat/rendezvous membership and a real Arrow Flight client.
 
 use std::fmt;
@@ -98,7 +98,7 @@ use crate::schema::internal_schema;
 /// Advertised worker Flight locations for a distributed query.
 ///
 /// The deployment implements this over its real worker membership (ADR-0071:
-/// a heartbeat live-set with rendezvous hashing, issue #868); ravel-sql only
+/// a heartbeat live-set with rendezvous hashing); ravel-sql only
 /// states what it needs. An empty list means no workers are available, and the
 /// query runs fully local (a single self-endpoint over the whole pinned set).
 pub trait WorkerEndpoints: Send + Sync + 'static {
@@ -109,7 +109,7 @@ pub trait WorkerEndpoints: Send + Sync + 'static {
 
 /// A fixed worker-location list, for tests and for a deployment with a static
 /// roster. Deliberately trivial: real membership lives behind the same trait
-/// in the server crate (issue #868).
+/// in the server crate.
 #[derive(Debug, Clone, Default)]
 pub struct StaticWorkerEndpoints(Vec<String>);
 
@@ -141,7 +141,7 @@ pub struct DistributedFlightConfig {
     /// key.
     ///
     /// A coordinator mints slice tickets a *different* worker process verifies
-    /// (ADR-0071, issue #868), so both must key the MAC identically. A
+    /// (ADR-0071), so both must key the MAC identically. A
     /// multi-process deployment sets this to
     /// [`derive_ticket_key`](crate::flight_ticket::derive_ticket_key) over the
     /// shared cluster secret; installing the config then overrides the service's
@@ -185,7 +185,7 @@ pub trait WorkerSliceClient: Send + Sync + fmt::Debug {
 /// The production [`WorkerSliceClient`]: dials a worker's Arrow Flight location
 /// over tonic and redeems a slice ticket through its `DoGet`, decoding the
 /// internal-schema record batches the worker's scan-only fragment path streams
-/// back (ADR-0071, issue #868).
+/// back (ADR-0071).
 ///
 /// This is the real-wire twin of the acceptance tests' in-process worker
 /// (`tests/flight_distributed.rs`): the encode/redeem/decode steps are
@@ -302,7 +302,7 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
 }
 
 /// Verify a worker's slice stream carries the internal scan schema the
-/// coordinator's merge/dedup pipeline requires (ADR-0071, issue #868).
+/// coordinator's merge/dedup pipeline requires (ADR-0071).
 ///
 /// The coordinator declares [`internal_schema`] as the distributed scan's
 /// output, and its `SortPreservingMergeExec`/`RsegDedupExec` reference the
@@ -568,8 +568,8 @@ pub fn distributed_samples_plan(
 /// multi-slice tickets. It is deliberately NOT reachable from
 /// `get_flight_info_statement`: an external Flight SQL client always receives a
 /// single endpoint (the two-RPC contract makes N endpoints partitions of ONE
-/// result set, which a scan fan-out is not). The coordinator service (issue
-/// #868) is the intended caller -- it mints slice tickets here, hands them to
+/// result set, which a scan fan-out is not). The coordinator service is
+/// the intended caller -- it mints slice tickets here, hands them to
 /// [`DistributedScanExec`] through a [`WorkerSliceClient`], and redeems each one
 /// against a worker's `do_get` slice-fragment path.
 ///
@@ -633,7 +633,7 @@ pub fn plan_distributed_slices(
                     // as every other template-derived field above: a worker
                     // never independently resolves a snapshot, so this is the
                     // only way its slice excludes what the coordinator saw
-                    // pending (ADR-0064 decision 3, issue #829).
+                    // pending (ADR-0064 decision 3).
                     pending_erasure: template.pending_erasure.clone(),
                 };
                 WorkerSlice { location, ticket }

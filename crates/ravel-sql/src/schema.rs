@@ -1,4 +1,4 @@
-//! The `samples` table schema (docs/arrow-datafusion-plan.md "Table model")
+//! The `samples` table schema
 //! and the internal provenance-carrying scan schema.
 //!
 //! Public schema (what any DataFusion operator above the dedup sees):

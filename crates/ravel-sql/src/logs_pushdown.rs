@@ -1,6 +1,5 @@
 //! Filter pushdown for the `logs` table, under the same pruning-soundness
-//! invariant the metrics pushdown obeys (crate::pushdown,
-//! docs/arrow-datafusion-plan.md section 2 "Filter pushdown"): pruning may only
+//! invariant the metrics pushdown obeys (crate::pushdown): pruning may only
 //! ever *widen* the read set relative to the query's true need, never narrow
 //! it. `LogsTableProvider::supports_filters_pushdown` returns `Inexact` for
 //! every filter, so DataFusion always re-applies the originals above the scan;
@@ -61,10 +60,10 @@
 //!
 //! `attrs['k'] IN (...)` stays unextracted. An `IN` list is a disjunction, and
 //! the prune channel intersects its arms, so a sound disjunctive prune needs a
-//! different shape (tracked by #519). It contributes nothing to either channel.
+//! different shape. It contributes nothing to either channel.
 //!
 //! The `attrs['k']` subscript *syntax* plans through the hand-written
-//! `crate::map_field_planner` `ExprPlanner` (issue #507); the older note that it
+//! `crate::map_field_planner` `ExprPlanner`; the older note that it
 //! failed planning under `features = ["sql"]` is closed.
 
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
@@ -178,7 +177,7 @@ fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown) {
 /// string-literal comparison value is recognized; any other value contributes
 /// nothing. `attrs['k'] IN (...)` is an `Expr::InList`, not a `BinaryExpr`, so
 /// it never reaches here and stays unextracted (a disjunction the intersecting
-/// prune channel cannot soundly represent; tracked by #519).
+/// prune channel cannot soundly represent).
 fn attr_equality_predicate(be: &BinaryExpr) -> Option<Predicate> {
     if be.op != Operator::Eq {
         return None;
@@ -440,7 +439,7 @@ mod tests {
 
         // `attrs['k'] IN (...)` is a disjunction: it contributes nothing to
         // either channel. The intersecting prune channel cannot represent it
-        // soundly; #519 tracks a disjunctive form.
+        // soundly; a disjunctive form is not yet supported.
         let in_list = get_field(col("attrs"), "k").in_list(vec![lit("a"), lit("b")], false);
         let p = extract_logs(&[in_list]);
         assert!(p.content.is_empty());

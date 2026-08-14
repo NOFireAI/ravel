@@ -8,7 +8,7 @@
 //! three ways: a NaN in a group poisons every later comparison, `-0.0`/`0.0`
 //! compare `Equal` so arrival order decides the winner, and an all-infinite
 //! group never displaces the seed so MIN/MAX returns `f64::MAX`/`f64::MIN`
-//! instead of the actual value (issue #143).
+//! instead of the actual value.
 //!
 //! This module replaces the built-in `min`/`max` with a UDAF pair that uses
 //! `f64::total_cmp` for floating-point input, grouped and ungrouped alike, so

@@ -1,6 +1,4 @@
-//! Security invariant 1: read-only single-statement SQL
-//! (docs/arrow-datafusion-plan.md section 2 "Security invariants", review
-//! F16).
+//! Security invariant 1: read-only single-statement SQL.
 //!
 //! [`validate`] runs on the raw request text *before* any planning, catalog
 //! resolution, or `SessionContext` construction. It accepts exactly one
@@ -52,7 +50,7 @@
 //! cover the default registrations, so a DataFusion upgrade that adds a default
 //! aggregate fails closed instead of silently widening the surface.
 //!
-//! `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): they are
+//! `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): they are
 //! in the allowlist, not this reject list, and crate::session registers a
 //! custom sequential-fold UDAF (crate::avg) in place of the built-in whose
 //! lane-parallel batch sum was unpinnable.
@@ -89,7 +87,7 @@ use std::ops::ControlFlow;
 /// aggregate breaks that test rather than silently widening the SQL surface.
 /// `avg`/`mean` are not here: they are admitted through the allowlist, their
 /// built-in accumulator replaced by a custom sequential-fold UDAF (crate::avg,
-/// ADR-0022 decisions 3, 4, issue #172).
+/// ADR-0022 decisions 3, 4).
 pub(crate) const EXCLUDED_AGGREGATES: [&str; 39] = [
     "approx_distinct",
     "approx_median",
@@ -316,7 +314,7 @@ fn strip_prefix(msg: &str) -> String {
 }
 
 /// A stable, allocation-free name for a rejected ANSI statement kind. The
-/// arms named explicitly are the ones the plan calls out; everything else
+/// arms named explicitly are the ones called out; everything else
 /// collapses to a generic label rather than echoing the statement text back
 /// (statement `Display` re-renders the caller's own SQL, which is safe, but
 /// a fixed vocabulary keeps the client contract stable and the error body
@@ -624,7 +622,7 @@ mod tests {
         }
     }
 
-    /// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): the
+    /// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): the
     /// custom sequential-fold UDAF (crate::avg) replaces the built-in, so the
     /// validation walk no longer rejects them, grouped or ungrouped, and in
     /// every case spelling. Correctness of the bits is gated in

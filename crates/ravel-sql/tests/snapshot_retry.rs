@@ -1,4 +1,4 @@
-//! B3 snapshot retry contract (issue #22, plan section 2, review F9).
+//! Snapshot retry contract.
 //!
 //! `docs/consistency-model.md` mandates one re-resolve-and-retry when a
 //! pinned segment vanishes before any result has been emitted, and an

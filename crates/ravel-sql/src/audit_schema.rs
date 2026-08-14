@@ -1,5 +1,5 @@
 //! The `audit` table schema (ADR-0040 "`Signal::Alerts` and `Signal::Audit`,
-//! sharing RLOG's format", epic #333 / issue #383).
+//! sharing RLOG's format").
 //!
 //! An audit record is structurally a log record (ADR-0040 decision 2): it rides
 //! RLOG v1 verbatim. Unlike the `alerts` table, this table promotes *no*

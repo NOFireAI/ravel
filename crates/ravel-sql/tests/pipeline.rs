@@ -1,16 +1,16 @@
-//! B1 integration tests for the scan -> sort-preserving-merge -> dedup
-//! pipeline (issue #20).
+//! Integration tests for the scan -> sort-preserving-merge -> dedup
+//! pipeline.
 //!
-//! The layer-1 scan oracle (review F5) compares the post-dedup pipeline
+//! The layer-1 scan oracle compares the post-dedup pipeline
 //! output against an independent greatest-wins reference. That reference
 //! reimplements the exact total order of `is_greater`/`merge_segments`
 //! (docs/catalog-and-mvcc.md) over the same `SegmentFetcher` bytes:
 //! `merge_segments` itself is private to ravel-query, and making it public
-//! is outside this ticket's crate scope, so the oracle is a separate
+//! is outside this crate's scope, so the oracle is a separate
 //! implementation of the same normative order fed the same decoded samples
 //! (`SegmentFetcher::fetch`) as the path under test decodes with
-//! `fetch_soa`. Independent dedup code on each side is exactly what F5
-//! requires.
+//! `fetch_soa`. Independent dedup code on each side is exactly what the
+//! reference requires.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -348,7 +348,7 @@ async fn golden_multi_segment_overlap_each_field_decides() {
     assert_pipeline_matches_oracle(specs, None).await;
 }
 
-/// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): a pending selective-erasure
+/// A pending selective-erasure (ADR-0064 decision 3):
 /// request on the resolved snapshot excludes matching series through the real
 /// SQL metric scan path (`RavelTableProvider` -> `RsegScanExec`), which calls
 /// `SegmentFetcher::fetch_soa_accounted` directly rather than through
@@ -397,10 +397,10 @@ async fn pending_erasure_excludes_matching_series_on_the_metric_scan_path() {
     );
 }
 
-/// Issue #829 (ADR-0064 decision 3): a **windowed** pending erasure request
+/// A **windowed** pending erasure request (ADR-0064 decision 3):
 /// drops only the samples inside `[window_start_ns, window_end_ns)`, keeping
-/// the rest of the same series -- the partial-exclusion case the prior review
-/// found unexercised at the SQL seams (every other test here uses a windowless
+/// the rest of the same series -- the partial-exclusion case (every other
+/// test here uses a windowless
 /// predicate, which drops the whole series). Covers `retain_series_soa`'s
 /// `compact_parallel` branch (erasure.rs), reached from
 /// `RsegScanExec::prepare_partition` (scan.rs) once a predicate has a window.
@@ -545,7 +545,7 @@ async fn pending_erasure_excludes_matching_series_when_bytes_are_served_from_a_w
     );
 }
 
-/// Regression for the Opus checkpoint finding on B1 (issue #20): every other
+/// Regression: every other
 /// test in this file calls `provider.plan(n)` and hands the hand-built plan
 /// straight to `collect()`, which never runs the DataFusion optimizer. Only
 /// the `SessionContext`/`DataFrame` path does, and without
@@ -766,7 +766,7 @@ async fn mid_scan_get_failure_is_typed_error_and_fault_fires() {
     // Fail the 2nd GET (Nth is 1-indexed): the footer suffix GET succeeds,
     // then a page/section GET fails mid-scan. A tiny suffix length forces
     // more than one GET per segment, and the whole-object threshold is
-    // disabled (#278 item 5) so this small segment stays on the footer-suffix
+    // disabled so this small segment stays on the footer-suffix
     // path instead of being read in one whole-object GET.
     let plan = FaultPlan::empty().with_rule(
         Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))

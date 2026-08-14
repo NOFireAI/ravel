@@ -1,5 +1,5 @@
 //! `AuditTableProvider`: the `audit` table over one query's already-resolved,
-//! owned `Snapshot` for `Signal::Audit` (ADR-0040, issue #383). The audit-signal
+//! owned `Snapshot` for `Signal::Audit` (ADR-0040). The audit-signal
 //! sibling of [`crate::logs_provider::LogsTableProvider`].
 //!
 //! Like the `logs` provider, this takes an owned, already-resolved `Snapshot`
@@ -51,7 +51,7 @@ pub struct AuditTableProvider {
     /// `AuditScanExec` the provider builds.
     accounting: QueryAccounting,
     /// Pending selective-erasure predicates derived once from
-    /// `snapshot.pending_erasure` (ADR-0064 decision 2, issue #829), cloned
+    /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `AuditScanExec` the provider builds.
     erasure: Arc<Vec<ErasurePredicate>>,
 }
@@ -59,7 +59,7 @@ pub struct AuditTableProvider {
 impl AuditTableProvider {
     /// Build a provider around an owned, already-resolved `Signal::Audit`
     /// snapshot. Admission and budget config live on the resolve-time seam
-    /// (RH-T2, issue #902), not on the provider, so this no longer takes a
+    ///, not on the provider, so this no longer takes a
     /// config parameter.
     pub fn new(
         snapshot: Snapshot,
@@ -98,7 +98,7 @@ impl AuditTableProvider {
     /// Admission (the sealed-segment cap) is decided exactly once, at
     /// resolve time, by whichever endpoint resolves this table's snapshot,
     /// calling `ravel_query::admit` over the full snapshot and its
-    /// `SegmentOrigins` (RH-T2, issue #902) -- the same pattern
+    /// `SegmentOrigins` -- the same pattern
     /// `SqlExecutor::resolve` uses for the two wired tables. No such endpoint
     /// exists yet for audit; `pruned_segments` below is a further,
     /// client-side, widen-only ts subset, so re-checking a count against it

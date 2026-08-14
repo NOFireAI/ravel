@@ -1,4 +1,4 @@
-//! SQL conformance suite and table generator (issue #256, ADR-0035).
+//! SQL conformance suite and table generator (ADR-0035).
 //!
 //! This suite discharges three obligations of ADR-0035's SQL half:
 //!
@@ -47,7 +47,7 @@ use uuid::Uuid;
 /// The values are load-bearing, not just present: [`expectation`] states the
 /// exact aggregate each admitted aggregate must return over them and the exact
 /// row count each clause must produce, so a construct that executes but answers
-/// wrongly (or answers with nothing) is a state-3 row (issue #262 gap 3).
+/// wrongly (or answers with nothing) is a state-3 row.
 fn dataset() -> Vec<SegSpec> {
     vec![SegSpec::new(
         10,
@@ -377,7 +377,7 @@ fn doc_path() -> PathBuf {
 /// Every construct declared supported executes through the real pipeline *and*
 /// returns the result its expectation declares. This is the test the registry
 /// names as evidence for its state-1 rows, and the value check is what keeps an
-/// empty-but-successful answer from counting as coverage (issue #262 gap 3).
+/// empty-but-successful answer from counting as coverage.
 ///
 /// The name is load-bearing: the registry cites
 /// `tests/conformance.rs::supported_constructs_execute` as the evidence for
@@ -494,7 +494,7 @@ async fn registry_has_exactly_one_state_per_construct() {
     );
 }
 
-/// Issue #262 gap 3: a construct that executes but answers with nothing is
+/// A construct that executes but answers with nothing is
 /// broken, not covered.
 ///
 /// The synthetic regression is a real query that really succeeds and really

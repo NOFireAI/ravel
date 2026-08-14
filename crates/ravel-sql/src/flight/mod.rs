@@ -1,4 +1,4 @@
-//! Flight SQL transport for the SQL execution path (ticket C1d, issue #152),
+//! Flight SQL transport for the SQL execution path (ticket C1d),
 //! compiled only under the `flight-sql` feature.
 //!
 //! The service here answers the same queries `POST /api/v1/sql` answers,
@@ -10,7 +10,7 @@
 //! [`SqlExecutor::plan_pinned`](crate::SqlExecutor::plan_pinned) and neither
 //! builds a session of its own.
 //!
-//! # The two-RPC problem, and the pin (review F18)
+//! # The two-RPC problem, and the pin
 //!
 //! Flight SQL splits one query across two RPCs. `GetFlightInfo` plans it and
 //! hands back an opaque ticket; `DoGet` redeems the ticket and streams the
@@ -39,7 +39,7 @@
 //! metadata answers are therefore identical for every tenant, but "the answer
 //! happens to be constant" is not a reason to answer an unauthenticated
 //! caller: default-deny is the invariant, not a consequence of the data
-//! (review F17).
+//!.
 //!
 //! # Deadline and the GC protection horizon
 //!
@@ -60,7 +60,7 @@
 //! # Scope: prepared statements are not implemented
 //!
 //! Every prepared-statement method answers `UNIMPLEMENTED`
-//! (docs/arrow-datafusion-plan.md Phase C). Statement execution and the
+//! Statement execution and the
 //! catalog/metadata surface are the v1 Flight SQL contract.
 
 mod metadata;
@@ -132,8 +132,8 @@ pub const DEFAULT_GC_PROTECTION_HORIZON: Duration = Duration::from_secs(24 * 60 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlightSqlConfig {
     /// Server wall-deadline ceiling. A request's own timeout may only lower
-    /// it, never raise it (the rule finding a7-F01 established for the HTTP
-    /// endpoint, applied to this transport).
+    /// it, never raise it (the same rule the HTTP endpoint applies to this
+    /// transport).
     pub max_deadline: Duration,
     /// Upper bound on a ticket's validity, the deployment's GC protection
     /// horizon. See [`DEFAULT_GC_PROTECTION_HORIZON`].
@@ -170,7 +170,7 @@ impl FlightSqlConfig {
     }
 
     /// The effective deadline `DoGet` may use when redeeming a ticket whose
-    /// embedded deadline is `ticket_deadline_ns` (issue #186).
+    /// embedded deadline is `ticket_deadline_ns`.
     ///
     /// `DoGet` cannot simply trust `ticket_deadline_ns`: it is bytes a client
     /// holds, read back from the wire at redemption, possibly long after
@@ -214,7 +214,7 @@ mod tests {
         );
     }
 
-    /// The redemption-side half of issue #186: a ticket that honestly claims
+    /// The redemption-side half of the deadline contract: a ticket that honestly claims
     /// a deadline far beyond this deployment's GC protection horizon (minted
     /// under a looser config, or simply tampered with, though tampering is
     /// caught earlier by the ticket's MAC) must still be clamped down to the

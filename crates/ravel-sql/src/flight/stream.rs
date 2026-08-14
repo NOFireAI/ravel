@@ -1,7 +1,7 @@
 //! `DoGet`: execute a redeemed ticket against its pinned snapshot and stream
 //! the result as `FlightData`.
 //!
-//! # The retry contract on a streaming transport (review F9, plan Phase C)
+//! # The retry contract on a streaming transport
 //!
 //! The HTTP path re-resolves and retries once when a pinned segment vanishes
 //! before any batch was emitted. This path cannot re-resolve: the snapshot is
@@ -35,7 +35,7 @@
 //! capped by the GC protection horizon) and takes the minimum with the
 //! ticket's value, so the embedded deadline can only ever shorten the
 //! effective budget, never lengthen it past what this deployment would mint
-//! today (issue #186). That effective deadline is checked once before
+//! today. That effective deadline is checked once before
 //! execution starts, and again as each batch is handed out, so a consumer
 //! slow enough to cross it mid-stream fails `SnapshotInvalidated` rather than
 //! being served batches read under a pin that is no longer protected.
@@ -47,7 +47,7 @@
 //! session, which owns the `TenantDelegatingPool`. A client that disconnects
 //! or a server that drops the stream drops all of it; every
 //! `MemoryReservation` shrinks through the pool into the tenant accountant on
-//! the way down (crate::memory, review F13). A second release mechanism here
+//! the way down (crate::memory). A second release mechanism here
 //! would double-count against the tenant budget.
 
 use std::future::Future;
@@ -111,7 +111,7 @@ pub(super) async fn statement_stream(
     let now_ns = clock.now_ns();
     // The ticket's own deadline_ns is client-supplied and may only shorten
     // the effective budget below what this deployment's config would mint
-    // today, never lengthen it (issue #186).
+    // today, never lengthen it.
     let deadline_ns = config.clamp_ticket_deadline_ns(ticket.deadline_ns, now_ns);
     if now_ns >= deadline_ns {
         // The pin's GC protection window has closed. This is exactly the
@@ -137,7 +137,7 @@ pub(super) async fn statement_stream(
     let schema = stream.schema();
 
     // Fold this RPC's execution cost into the aggregator when the result stream
-    // ends (ADR-0044 section 4, issue #425). `accounting` is the successful
+    // ends (ADR-0044 section 4). `accounting` is the successful
     // attempt's handle; the executing stream holds clones of it
     // (SqlExecutor::plan_pinned), so its counters keep rising as batches are
     // pulled. The guard snapshots it on drop -- when the client finishes the
@@ -202,8 +202,7 @@ pub(super) async fn statement_stream(
     Ok(Box::pin(encoded))
 }
 
-/// Serve one distributed slice's worker fragment for `DoGet` (ADR-0071, issue
-/// #866) and return the encoded, internal-schema `FlightData` stream.
+/// Serve one distributed slice's worker fragment for `DoGet` (ADR-0071) and return the encoded, internal-schema `FlightData` stream.
 ///
 /// This is the worker half of the SQL distributed lane, engaged only when the
 /// redeemed ticket is a slice ticket (`slice_count > 1`). It differs from
@@ -239,7 +238,7 @@ pub(super) async fn fragment_stream(
     let now_ns = clock.now_ns();
     // Same deadline discipline as the statement path: the ticket's embedded
     // deadline can only shorten the effective budget, never lengthen it past
-    // what this deployment would mint today (issue #186). An expired slice
+    // what this deployment would mint today. An expired slice
     // ticket is a replay after its pin's GC protection closed: never different
     // data, always SnapshotInvalidated.
     let deadline_ns = config.clamp_ticket_deadline_ns(ticket.deadline_ns, now_ns);
@@ -251,7 +250,7 @@ pub(super) async fn fragment_stream(
     let snapshot = ticket.snapshot();
     // A fresh accounting handle, folded into the coordinator's aggregator when
     // this slice's stream ends, exactly as the statement path folds its own
-    // (issue #425). The executing fragment holds clones of it, so its counters
+    //. The executing fragment holds clones of it, so its counters
     // keep rising as batches are pulled.
     let accounting = QueryAccounting::new();
     let stream = tokio::time::timeout(
@@ -418,7 +417,7 @@ enum AuditPhase {
     /// client (never the flush's own error -- see the poll impl). This mirrors
     /// `Flushing`'s await-before-yield discipline for the error path, so the
     /// audit is submitted and awaited inline rather than fire-and-forget from
-    /// `Drop` (issue #413, ADR-0062 §2a).
+    /// `Drop` (ADR-0062 §2a).
     FlushingError(
         Pin<Box<dyn Future<Output = ravel_maintain::Result<()>> + Send>>,
         Status,
@@ -430,7 +429,7 @@ enum AuditPhase {
 /// Wraps a `DoGet` result stream so exactly one audit event is submitted at
 /// stream *completion*, with the stream's actual terminal status, and its
 /// durability is awaited before the client observes the stream's end (ADR-0062
-/// §2a, issue #413).
+/// §2a).
 ///
 /// This closes the status-accuracy gap of auditing at stream construction: the
 /// recorded status is `Ok` only when the inner stream ended with no error
@@ -518,7 +517,7 @@ impl Stream for AuditedStream {
                         // this is where the query's outcome must be audited and
                         // its durability awaited -- not later from `Drop`'s
                         // detached, unawaited task, which races the response the
-                        // client has already received (issue #413, ADR-0062
+                        // client has already received (ADR-0062
                         // §2a). Follow the same await-before-yield discipline as
                         // the terminal-`None` success path: take `ctx`, submit
                         // the `Error` audit, and hold the original `status` in
@@ -567,7 +566,7 @@ impl Drop for AuditedStream {
         // If `ctx` is still present the stream was dropped before its terminal
         // event: the client cancelled (disconnected) mid-stream. Record that
         // outcome as `Error` so the trail never shows a false "ok" for a
-        // cancelled query (issue #413). This is the one audit path that cannot
+        // cancelled query. This is the one audit path that cannot
         // await durability: `Drop` is synchronous and there is no response left
         // to gate -- the client is already gone -- so it is submitted
         // best-effort on a detached task rather than fire-and-forget on a live
@@ -587,7 +586,7 @@ impl Drop for AuditedStream {
 
 /// Wrap `inner` so exactly one audit event is submitted at stream completion
 /// with the stream's actual terminal status, its durability awaited before the
-/// client observes the end (issue #413). See [`AuditedStream`].
+/// client observes the end. See [`AuditedStream`].
 pub(super) fn audited_stream(
     inner: DoGetStream,
     sink: Arc<dyn QueryAuditSink>,
@@ -665,7 +664,7 @@ async fn first_batch(
     // A fresh handle per attempt, matching `SqlExecutor::run`'s per-attempt
     // accounting so a retried attempt's counters never bleed in. Returned to
     // the caller so the successful attempt's cost is folded into `/metrics`
-    // once the stream ends (issue #425); `plan_pinned` clones it into the
+    // once the stream ends; `plan_pinned` clones it into the
     // execution stream, so its counters keep rising as batches are pulled.
     let accounting = QueryAccounting::new();
     let planned = executor
@@ -729,7 +728,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Stream-completion audit (ADR-0062 §2a, issue #413)
+    // Stream-completion audit (ADR-0062 §2a)
     // -----------------------------------------------------------------
 
     use std::sync::Mutex;
@@ -809,7 +808,7 @@ mod tests {
         assert_eq!(status_text(&guard[0]), "INFO", "a clean stream records ok");
     }
 
-    /// THE #413 status-accuracy proof: a stream that fails partway records
+    /// The status-accuracy proof: a stream that fails partway records
     /// `error`, not the blind "started/ok" the construction-time audit would
     /// have written after the first batch pulled cleanly.
     #[tokio::test]

@@ -1,5 +1,5 @@
 //! In-process Flight SQL harness shared across the Flight test suites
-//! (issue #152 flight.rs, issue #153 flight_differential.rs / flight_tenancy.rs).
+//! (flight.rs, flight_differential.rs / flight_tenancy.rs).
 //!
 //! It drives [`RavelFlightSqlService`] directly rather than over a tonic
 //! listener: the trait methods are the contract, and calling them in-process
@@ -135,8 +135,7 @@ impl Harness {
     }
 
     /// Like [`Harness::build`], but with an explicit cost recorder so a test
-    /// can inspect what each Flight RPC folded into the aggregator (issue
-    /// #425).
+    /// can inspect what each Flight RPC folded into the aggregator.
     pub async fn build_with_recorder(
         store: Arc<dyn ObjectStoreBackend>,
         tenants: &[(&TenantId, &[SegSpec])],

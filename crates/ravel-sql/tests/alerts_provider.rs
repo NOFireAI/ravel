@@ -1,5 +1,4 @@
-//! Integration tests for [`ravel_sql::AlertsTableProvider`] (ADR-0040, issue
-//! #383), the `alerts` SQL table over an already-resolved `Signal::Alerts`
+//! Integration tests for [`ravel_sql::AlertsTableProvider`] (ADR-0040), the `alerts` SQL table over an already-resolved `Signal::Alerts`
 //! snapshot.
 //!
 //! Alert records ride RLOG v1 verbatim (ADR-0040 decision 2), so these fixtures
@@ -48,9 +47,9 @@ use uuid::Uuid;
 
 fn identity() -> ObjectIdentity {
     ObjectIdentity {
-        // Matches the TenantHash([7u8; 16]) this test fetches as; issue #612
-        // added a footer tenant_hash check on the RLOG read path, so a footer
-        // naming a different tenant than the fetch now fails closed.
+        // Matches the TenantHash([7u8; 16]) this test fetches as; the RLOG
+        // read path enforces a footer tenant_hash check, so a footer naming a
+        // different tenant than the fetch fails closed.
         tenant_hash: [7u8; 16],
         shard: 0,
         writer_id: [2u8; 16],
@@ -107,7 +106,7 @@ fn alert_record(
 /// [`alert_record`] whose alert stream carries `resource` attributes in its
 /// `stream_attrs` (the RESOURCE position) rather than only per-record `attrs`.
 /// Used to prove selective erasure catches a subject named only at the merged
-/// resource/scope level (issue #928).
+/// resource/scope level.
 fn alert_record_on_resource(
     resource: &[(String, AttrValue)],
     ts: i64,
@@ -524,7 +523,7 @@ async fn real_ravel_alerting_record_decodes_identically() {
     assert_eq!(map_get(&map, "label.team"), Some("sre".to_string()));
 }
 
-/// Issue #829 (ADR-0064 decision 3, EJ-T3 #753): a pending selective-erasure
+/// (ADR-0064 decision 3): a pending selective-erasure
 /// request on the resolved snapshot excludes matching rows through the real
 /// `AlertsTableProvider` scan path, the one the SQL `alerts` table uses in
 /// production. Covers `AlertsTableProvider::build_scan` passing the
@@ -569,7 +568,7 @@ async fn pending_erasure_excludes_matching_rows() {
     );
 }
 
-/// Issue #928 (ADR-0064): a subject named ONLY in a RESOURCE/scope
+/// (ADR-0064): a subject named ONLY in a RESOURCE/scope
 /// (`stream_attrs`) attribute must also be excluded from the `alerts` table.
 /// The `attrs` column materializes the merged resource + scope + record view, so
 /// `user_id` is queryable, yet the fetcher-level filter matches per-record

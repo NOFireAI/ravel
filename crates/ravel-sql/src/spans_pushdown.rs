@@ -1,7 +1,6 @@
 //! Filter pushdown for the `spans` table, under the same pruning-soundness
 //! invariant the `logs` and metrics pushdowns obey (crate::logs_pushdown,
-//! crate::pushdown, docs/arrow-datafusion-plan.md section 2 "Filter
-//! pushdown"): pruning may only ever *widen* the read set relative to the
+//! crate::pushdown): pruning may only ever *widen* the read set relative to the
 //! query's true need, never narrow it. `SpansTableProvider::
 //! supports_filters_pushdown` returns `Inexact` for every filter, so
 //! DataFusion always re-applies the originals above the scan; exactness comes
@@ -46,8 +45,8 @@
 //! conjunct rather than being soundly pushed, since refusing to push is
 //! always widen-safe (the `Inexact` residual re-applies it).
 //!
-//! The `status_code`/`duration_ns` axes are the exception (issue #519, first
-//! increment): a **same-axis** disjunction -- every disjunct constrains the
+//! The `status_code`/`duration_ns` axes are the exception: a
+//! **same-axis** disjunction -- every disjunct constrains the
 //! *one* axis, nothing else -- is recognized and pushed as the *union* of the
 //! per-disjunct constraints, not the AND-intersection ordinary sibling
 //! conjuncts use. `status_code IN (1, 2)`, `status_code = 1 OR status_code =
@@ -200,7 +199,7 @@ fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
     // An `Or`-rooted conjunct (the only place an `Or` can sit once
     // `walk_conjunct` has split every top-level `And`, see `contains_or`'s
     // doc) may still be soundly pushed when every disjunct constrains the
-    // same single axis (issue #519's same-axis increment): the union of the
+    // same single axis: the union of the
     // disjuncts' constraints is folded in as this conjunct's contribution,
     // exactly as a single equality would be. A cross-axis or otherwise
     // unrecognized `Or` shape falls through to the blanket refusal below.
@@ -408,7 +407,7 @@ fn flatten_or<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 ///
 /// This is the fallback refusal path: [`handle_leaf`] tries
 /// [`same_axis_status_union`]/[`same_axis_duration_union`] on an `Or`-rooted
-/// conjunct first (issue #519's same-axis increment), and only reaches this
+/// conjunct first, and only reaches this
 /// blanket check when neither recognizes the shape (cross-axis, a negated
 /// `BETWEEN`, an `Or` mixed with an unrelated column, or an `Or` nested
 /// somewhere other than this conjunct's root). Refusing is always widen-safe:
@@ -1132,12 +1131,12 @@ mod tests {
         );
     }
 
-    // --- issue #519 first increment: same-axis disjunction ---
+    // --- Same-axis disjunction ---
 
     #[test]
     fn same_axis_status_or_unions_the_masks() {
-        // `status_code = 1 OR status_code = 2` (issue #519's headline
-        // example): the union `OK | ERROR`, not the old widen-to-nothing.
+        // `status_code = 1 OR status_code = 2`: the union `OK | ERROR`,
+        // not a widen-to-nothing.
         let disjunctive = or(
             col("status_code").eq(lit(1i64)),
             col("status_code").eq(lit(2i64)),

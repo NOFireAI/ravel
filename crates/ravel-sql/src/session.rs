@@ -1,5 +1,4 @@
-//! Security invariant 2: per-query, single-tenant `SessionContext`
-//! (docs/arrow-datafusion-plan.md section 2, review F17).
+//! Security invariant 2: per-query, single-tenant `SessionContext`.
 //!
 //! [`build_session`] constructs a complete, throwaway DataFusion session for
 //! exactly one query: its own `SessionConfig`, its own `RuntimeEnv`, its own
@@ -17,10 +16,10 @@
 //! numeric aggregates are reachable from either table.
 //!
 //! This is the tenant-isolation mechanism, not a performance shortcut
-//! (review F17: framing it as "context construction is cheap enough" invites
-//! a later caching optimization that silently converts it into a
-//! cross-tenant leak). If context construction ever proves too expensive,
-//! the fix is cheaper construction; sharing state requires an ADR.
+//! (framing it as "context construction is cheap enough" invites a later
+//! caching optimization that silently converts it into a cross-tenant leak).
+//! If context construction ever proves too expensive, the fix is cheaper
+//! construction; sharing state requires an ADR.
 //!
 //! Defense in depth behind the parse gate (crate::validate):
 //!
@@ -38,7 +37,7 @@
 //!   `max`, `avg`, `mean`) is deregistered. This backstops the subset check in
 //!   crate::validate and fails closed under DataFusion upgrades -- a newly added
 //!   default aggregate is excluded by default rather than silently reachable.
-//!   `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): they stay
+//!   `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): they stay
 //!   in the admitted set so the deregistration loop keeps them, and their
 //!   built-in accumulator is then replaced by the sequential-fold UDAF
 //!   (crate::avg), the same registry-replacement pattern min/max use.
@@ -51,7 +50,7 @@
 //!   `SELECT count(*) FROM range(0, 1e18)` would otherwise reach the
 //!   planner as a second, ungoverned data source alongside `samples`.
 //!
-//! Determinism (docs/arrow-datafusion-plan.md section 2 "Exactness"):
+//! Determinism:
 //! every `repartition_*` knob is turned off. Float aggregation is
 //! order-dependent, so v1 requires aggregations to execute
 //! single-partitioned above the merged, deduplicated stream. Left on,
@@ -113,14 +112,13 @@ pub enum SessionTable {
 /// enumerates the aggregate UDAFs the default session registers and
 /// deregisters every name outside this set, so exclusion is the default state
 /// and a DataFusion upgrade that adds a default aggregate fails closed.
-/// `avg`/`mean` are admitted by a later ticket (ADR-0022 decision 7, issue
-/// #172) and stay excluded here until their custom UDAF lands.
+/// `avg`/`mean` are admitted (ADR-0022 decision 7) and stay excluded here until their custom UDAF lands.
 ///
 /// The complement within the default registrations lives in
 /// [`crate::validate::EXCLUDED_AGGREGATES`]; the two are kept exhaustive by
 /// `admitted_and_excluded_aggregates_cover_the_default_registrations` below.
 ///
-/// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4, issue #172): kept here so
+/// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): kept here so
 /// the deregistration loop does not drop them, then their built-in accumulator
 /// is displaced by the sequential-fold UDAF (crate::avg).
 pub const ADMITTED_AGGREGATES: [&str; 6] = ["count", "sum", "min", "max", "avg", "mean"];
@@ -195,7 +193,7 @@ pub fn build_session(
 
     let mut ctx = SessionContext::new_with_config_rt(session_config(config), runtime);
 
-    // Issue #507: register a hand-written `ExprPlanner` so `col['key']`
+    // Register a hand-written `ExprPlanner` so `col['key']`
     // (`logs.attrs`, `samples.labels`) plans instead of failing with
     // `GetFieldAccess not supported`. See `crate::map_field_planner` for why
     // this small planner is used instead of the `nested_expressions`

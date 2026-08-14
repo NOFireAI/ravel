@@ -1,5 +1,5 @@
 //! `AuditScanExec`: the leaf of the `audit` pipeline, the audit-signal sibling of
-//! [`crate::logs_scan::LogsScanExec`] (ADR-0040, issue #383).
+//! [`crate::logs_scan::LogsScanExec`] (ADR-0040).
 //!
 //! An audit record rides RLOG v1 verbatim, so this scan reads through the exact
 //! same [`LogSegmentFetcher`] the `logs` and `alerts` tables use. It pushes only
@@ -63,7 +63,7 @@ pub struct AuditScanExec {
     ts_min: i64,
     ts_max: i64,
     /// Pending selective-erasure predicates from the resolved snapshot
-    /// (ADR-0064 decision 2, issue #829); fed to [`LogQuery::with_erasure`].
+    /// (ADR-0064 decision 2); fed to [`LogQuery::with_erasure`].
     erasure: Arc<Vec<ErasurePredicate>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -219,7 +219,7 @@ async fn prepare_partition(
         };
         out.extend(output.records);
     }
-    // Scan-layer selective-erasure exclusion (ADR-0064, issue #928). This is the
+    // Scan-layer selective-erasure exclusion (ADR-0064). This is the
     // authoritative exclusion because it sees the same merged `attrs` view the
     // surface returns (resource + scope + record), so a subject named only in a
     // resource/scope attribute is dropped; the fetcher-level filter matches

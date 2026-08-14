@@ -1,14 +1,14 @@
-//! Flight SQL flip-proof tests for the ADR-0064 decision 3 ticket carry (issue
-//! #829). A prior review found that `FlightTicket::snapshot()` hardcoded
-//! `pending_erasure: Vec::new()`, so both `DoGet` data paths -- the whole-set
-//! statement path and the internal slice-fragment path -- executed with zero
-//! exclusion regardless of what `GetFlightInfo`'s resolve actually saw
-//! pending. These tests drive the real resolve -> mint -> redeem pipeline
+//! Flight SQL flip-proof tests for the ADR-0064 decision 3 ticket carry.
+//!
+//! `FlightTicket::snapshot()` carries `pending_erasure` so both `DoGet` data
+//! paths -- the whole-set statement path and the internal slice-fragment path
+//! -- execute the exclusion `GetFlightInfo`'s resolve saw pending. These
+//! tests drive the real resolve -> mint -> redeem pipeline
 //! (a real `.dreq` object in the store, the real `Catalog::resolve`, the real
 //! `get_flight_info_statement`/`do_get_statement` RPCs) and prove the carry
-//! both ways: the honest ticket excludes, and a ticket built the way the
-//! pre-fix code would have built it (empty `pending_erasure`, re-signed under
-//! the same real key so only the missing field is under test) does not.
+//! both ways: the honest ticket excludes, and a ticket built with empty
+//! `pending_erasure` (re-signed under the same real key so only the missing
+//! field is under test) does not.
 
 #![cfg(feature = "flight-sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -216,7 +216,7 @@ fn re_encode_with_erasure_cleared(ticket: &Ticket, key: &ravel_sql::TicketKey) -
         .expect("ticket decodes");
     // The exact line this suite proves matters: `flight/service.rs`'s
     // `let pending_erasure = ravel_query::erasure::snapshot_pending_erasure_predicates(&snapshot);`
-    // flipped back to the pre-fix `pending_erasure: Vec::new()` this ticket
+    // flipped back to an empty `pending_erasure: Vec::new()` this ticket
     // would have carried.
     decoded.pending_erasure = Vec::new();
     let handle = decoded.encode(key).expect("re-encode");
@@ -235,9 +235,9 @@ fn re_encode_with_erasure_cleared(ticket: &Ticket, key: &ravel_sql::TicketKey) -
 /// ticket and `DoGet` has redeemed it.
 ///
 /// Flip-proof: [`re_encode_with_erasure_cleared`] rebuilds the same honestly
-/// resolved ticket with `pending_erasure` forced back to empty (the shape
-/// `flight/service.rs`'s hardcoded `pending_erasure: Vec::new()` produced
-/// before the fix) and re-signs it under the real key. Redeeming that ticket
+/// resolved ticket with `pending_erasure` forced back to empty (the shape an
+/// empty `pending_erasure: Vec::new()` produces) and re-signs it under the
+/// real key. Redeeming that ticket
 /// must bring the erased `mem` row back, proving the exclusion in the
 /// honest-ticket assertion above is not vacuous.
 #[tokio::test]
@@ -270,7 +270,7 @@ async fn statement_do_get_excludes_what_the_resolve_saw_pending() {
     assert_eq!(
         merged(&leaked).num_rows(),
         4,
-        "with pending_erasure dropped, the erased mem row reappears (the pre-fix bug)"
+        "with pending_erasure dropped, the erased mem row reappears"
     );
 }
 

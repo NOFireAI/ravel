@@ -1,10 +1,10 @@
-//! B2 integration tests (issue #21): filter/pushdown under the pruning
+//! Integration tests: filter/pushdown under the pruning
 //! soundness invariant and the tenant-delegating memory bridge.
 //!
 //! Adversarial no-row-loss cases are checked against the same independent
-//! greatest-wins oracle B1 uses: an implementation of the `is_greater` total
+//! greatest-wins oracle the layer-1 gate uses: an implementation of the `is_greater` total
 //! order fed the same `SegmentFetcher::fetch` bytes but sharing no scan/dedup
-//! code with the path under test (review F5/F8). GET-count reduction is proven
+//! code with the path under test. GET-count reduction is proven
 //! with a counting store wrapper that records every object key fetched.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -123,7 +123,7 @@ impl ObjectStoreBackend for CountingStore {
     }
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -256,7 +256,7 @@ async fn build_snapshot(store: &dyn ObjectStoreBackend, specs: &[SegSpec]) -> Sn
 type Reduced = HashMap<[u8; 16], BTreeMap<i64, u64>>;
 
 /// Independent greatest-wins oracle over the same fetched bytes, sharing no
-/// scan/dedup code with the pipeline under test (review F5).
+/// scan/dedup code with the pipeline under test.
 async fn oracle(store: Arc<dyn ObjectStoreBackend>, snapshot: &Snapshot) -> Reduced {
     type Cand = ((i64, u64, u64, u32), u64);
     let fetcher = SegmentFetcher::new(store);
@@ -444,7 +444,7 @@ async fn label_equality_prunes_series_pages() {
 
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     // Small suffix so page sections need their own ranged GETs; the
-    // whole-object path is disabled (#278 item 5) so this small segment does
+    // whole-object path is disabled so this small segment does
     // not get read whole, which would fetch identical bytes with and without
     // the label filter and defeat the byte-reduction assertion below.
     let fetcher = SegmentFetcher::new(Arc::clone(&backend))
@@ -629,7 +629,7 @@ async fn between_predicate_matches_oracle() {
 // the prune form most able to silently under-fetch. Both cases assert
 // bit-exact equality against the independent no-prune `oracle`, and each
 // carries an absent-label series (and the regex case a partial-match series)
-// to pin the PromQL superset semantics the prune rests on (finding sql1-F01).
+// to pin the PromQL superset semantics the prune rests on.
 // ---------------------------------------------------------------------------
 
 fn labelled_series(metric: &str, extra: &[(&str, &str)], samples: &[(i64, f64)]) -> SeriesSpec {
@@ -835,7 +835,7 @@ async fn dropped_mid_scan_stream_releases_tenant_bytes() {
     // More than one BATCH_ROWS (8192) worth of samples: this test drops the
     // stream after its first batch while more data remains unread, so it is
     // genuinely mid-scan rather than a complete-then-drop of a single batch
-    // that happened to be the whole result (Opus checkpoint finding N1).
+    // that happened to be the whole result.
     let specs = vec![SegSpec {
         created_unix_ns: 1,
         writer_epoch: 1,
@@ -866,7 +866,7 @@ async fn dropped_mid_scan_stream_releases_tenant_bytes() {
     );
 
     // Drop the stream mid-scan (cancellation): the reservation's drop-time
-    // shrink is forwarded to the tenant accountant (review F13).
+    // shrink is forwarded to the tenant accountant.
     drop(stream);
     assert_eq!(
         tenant.reserved(),
@@ -924,7 +924,7 @@ async fn high_cardinality_trips_query_pool_before_tenant() {
     );
 }
 
-/// Opus checkpoint finding on B2: every existing memory test sets the tenant
+/// Regression: every existing memory test sets the tenant
 /// ceiling to `1 << 30`, so the tenant-exhausted branch in
 /// `TenantDelegatingPool::try_grow` never actually executes, and
 /// `high_cardinality_trips_query_pool_before_tenant` proves nothing about

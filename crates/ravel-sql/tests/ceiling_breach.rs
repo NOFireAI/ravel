@@ -1,5 +1,5 @@
 //! End-to-end coverage for aborting a join that overruns the per-query memory
-//! ceiling, and for the no-leak guarantee of that abort path (issue #163).
+//! ceiling, and for the no-leak guarantee of that abort path.
 //!
 //! # What this test asserts, and what it does not
 //!
@@ -8,7 +8,7 @@
 //! completed result, not a different error) and that afterward the tenant
 //! accountant is back at zero reserved bytes -- proving the abort still drops
 //! the stream and every `MemoryReservation` normally (crate::memory's
-//! shrink-on-drop), so the #163 fix adds no leak on the abort path. Both hold
+//! shrink-on-drop), so the abort path adds no leak. Both hold
 //! here.
 //!
 //! What path trips the overrun is a DataFusion-version detail the ticket calls

@@ -1,8 +1,7 @@
-//! Layer-1 scan-oracle differential gate for the `logs` SQL path (ADR-0033,
-//! epic #236, issue #241).
+//! Layer-1 scan-oracle differential gate for the `logs` SQL path (ADR-0033).
 //!
 //! This is the log-signal counterpart of the metrics layer-1 gate
-//! (`tests/pipeline.rs`, B1/review F5): an independent reference re-decodes the
+//! (`tests/pipeline.rs`): an independent reference re-decodes the
 //! same underlying RLOG object bytes and re-implements the relevant matching
 //! logic completely separately from the code under test, then the gate asserts
 //! the two agree by proptest over random corpora. Logs have no aggregation
@@ -24,7 +23,7 @@
 //!   `decode_stream_attrs`/`merged_attrs`; sharing that code would defeat the
 //!   oracle.
 //! - **`has_word`** is *not* re-implemented independently. Its semantics ARE
-//!   the thing the format layer's differential suite (#217) gates; here both
+//!   the thing the format layer's differential suite gates; here both
 //!   the scan and the reference call the one genuinely shared semantic source,
 //!   [`ravel_logseg::tokenizer::tokens`], per the ADR's `Inexact` discipline
 //!   (reproducing tokenization by hand would drift from the frozen tokenizer
@@ -357,9 +356,9 @@ async fn write_object(
     seq: u64,
 ) -> SegmentRef {
     let identity = ObjectIdentity {
-        // Matches the TenantHash([7u8; 16]) this test fetches as; issue #612
-        // added a footer tenant_hash check on the RLOG read path, so a footer
-        // naming a different tenant than the fetch now fails closed.
+        // Matches the TenantHash([7u8; 16]) this test fetches as; the RLOG
+        // read path enforces a footer tenant_hash check, so a footer naming a
+        // different tenant than the fetch fails closed.
         tenant_hash: [7u8; 16],
         shard: 0,
         writer_id: [2u8; 16],
@@ -559,7 +558,7 @@ fn ts_lit(v: i64) -> Expr {
 /// `body`. Uses the frozen tokenizer both the scan (via the pushed `HasWord`
 /// and the residual `has_word` UDF) and this reference share, so this is NOT an
 /// independent re-implementation (ADR-0033: `has_word`'s own correctness is the
-/// reader's / issue #217's job).
+/// reader's job).
 fn body_has_word(body: &str, word: &str) -> bool {
     let query = tokens(word);
     if query.is_empty() {
@@ -949,7 +948,7 @@ async fn scan_rows(
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(CASES))]
 
-    /// The epic's acceptance test (issue #241): over random log corpora and
+    /// The epic's acceptance test: over random log corpora and
     /// random ts-range / stream-attribute / has_word predicate combinations, the
     /// `logs` scan's output equals an independent record-by-record reference by
     /// exact multiset equality, every field byte-for-byte.
