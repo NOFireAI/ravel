@@ -260,8 +260,8 @@ pub(crate) fn multipart_finished(key: &str) -> StoreError {
 }
 
 /// The error a poisoned multipart handle returns from `put_part` and
-/// `complete` after a part upload failed (issue #296) or a part-sequence rule
-/// was violated (issue #297). Unlike a checksum mismatch, which leaves the
+/// `complete` after a part upload failed or a part-sequence rule
+/// was violated. Unlike a checksum mismatch, which leaves the
 /// upload open for a re-send, these are unrecoverable: `object_store`'s S3
 /// upload fixes each part's index at `put_part` call time and `complete`
 /// demands exactly that many parts, so a failed or rejected part leaves a
@@ -323,7 +323,7 @@ impl Capabilities {
     ///   `Mode::Maintain` gates on it, via ravel-server's
     ///   `required_capabilities`. That gate is forward-looking: no production
     ///   caller invokes `put_multipart` yet (ravel-maintain writes single-PUT
-    ///   content-addressed compaction outputs today, issue #243), so the flag
+    ///   content-addressed compaction outputs today), so the flag
     ///   reserves the capability for when compaction streams large L1/L2
     ///   segments as multipart uploads rather than describing current traffic.
     /// - `upload_checksum` is not required by any mode. It cannot be
@@ -334,7 +334,7 @@ impl Capabilities {
     ///   that module's "Known divergences" doc). That is a permanent
     ///   client-library limitation, not a per-endpoint or per-mode gap:
     ///   requiring the flag made `--store s3` fail startup against every
-    ///   S3-compatible endpoint unconditionally (issue #251), which blocks
+    ///   S3-compatible endpoint unconditionally, which blocks
     ///   the only durable backend instead of catching a real regression.
     ///   Upload checksums are a CRC32C-class transport-corruption check;
     ///   the actual backstop against corrupted data surviving is the

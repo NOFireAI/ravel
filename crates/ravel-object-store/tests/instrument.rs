@@ -1,4 +1,4 @@
-//! Behavioral tests for the instrumentation decorator (issue #272):
+//! Behavioral tests for the instrumentation decorator:
 //! per-operation counters and byte totals over the memory oracle, error-class
 //! counters over `FaultStore` with scripted faults, latency bucketing under an
 //! injected clock, and capability passthrough.

@@ -1090,7 +1090,7 @@ mod tests {
     /// a conditional-write (CAS) conflict under each mode -- as observed through
     /// a backend the conformance harness parameterizes (`FaultStore` over the
     /// `MemoryStore` oracle). The S3/MinIO adapter's own `Error::Generic`
-    /// classification is pinned complementarily in `s3.rs` (issue #906), where
+    /// classification is pinned complementarily in `s3.rs`, where
     /// `object_store::Error` values can be constructed directly; together they
     /// cover both the shared taxonomy and the S3-specific mapping.
     ///

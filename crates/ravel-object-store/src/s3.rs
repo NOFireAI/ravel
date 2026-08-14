@@ -53,7 +53,7 @@
 //!   even talk to S3, but that check proves nothing about bytes actually
 //!   received by the server. Because the limitation is permanent and affects
 //!   every S3-compatible endpoint, `upload_checksum` is not part of
-//!   [`Capabilities::mandatory`] and does not gate startup (issue #251);
+//!   [`Capabilities::mandatory`] and does not gate startup;
 //!   read-time integrity comes from the segment crc32c hierarchy instead.
 //!   See `capabilities()` below. The same gap applies per part: a multipart
 //!   part's checksum is a local pre-flight too.
@@ -527,7 +527,7 @@ fn outcome_of(key: &str, result: object_store::PutResult) -> Result<PutOutcome, 
 /// already retries each request internally.
 ///
 /// A part upload that still fails after those internal retries is
-/// unrecoverable, so it *poisons* the handle (issue #296) rather than inviting
+/// unrecoverable, so it *poisons* the handle rather than inviting
 /// the caller to retry the part. `object_store`'s `S3MultiPartUpload`
 /// increments its part index synchronously at `put_part` call time and
 /// `complete` errors unless it holds exactly that many parts, so a failed part
@@ -536,7 +536,7 @@ fn outcome_of(key: &str, result: object_store::PutResult) -> Result<PutOutcome, 
 /// would (so a diagnostic keeps the original cause), but every later `put_part`
 /// or `complete` returns a non-retryable [`multipart_poisoned`] error telling
 /// the caller to abort and restart. A part-sequence violation poisons the same
-/// way (issue #297). `abort` stays callable on a poisoned handle.
+/// way. `abort` stays callable on a poisoned handle.
 pub struct S3MultipartUpload {
     key: String,
     upload: Box<dyn OsMultipartUpload>,
@@ -544,8 +544,8 @@ pub struct S3MultipartUpload {
     /// Set by `complete`/`abort`; every later call on this handle fails
     /// instead of issuing a second request against a dead upload id.
     finished: bool,
-    /// Set once a part upload fails at the backend (issue #296) or a part
-    /// violates the sequence rules (issue #297). Carries the original cause's
+    /// Set once a part upload fails at the backend or a part
+    /// violates the sequence rules. Carries the original cause's
     /// text; every later `put_part`/`complete` fails with [`multipart_poisoned`]
     /// while `abort` stays callable. A checksum mismatch deliberately does not
     /// set this (it leaves the upload open for a re-send).
@@ -569,14 +569,14 @@ impl MultipartUpload for S3MultipartUpload {
         // is the one recoverable rejection: a mismatch is not a part, the
         // upload stays open, and the caller can re-send the same bytes.
         preflight_checksum(&data, checksum)?;
-        // A sequence-rule violation poisons the handle (issue #297): once
+        // A sequence-rule violation poisons the handle: once
         // `accept` counts a short non-final part or an empty part, the object
         // would be truncated, so no further part or completion may proceed.
         if let Err(e) = self.sequence.accept(&self.key, data.len()) {
             self.poison = Some(e.to_string());
             return Err(e);
         }
-        // A backend part failure poisons the handle (issue #296): the part
+        // A backend part failure poisons the handle: the part
         // index is already spent, so a retry would land at a new index and
         // `complete` could never assemble a whole object. The first failure
         // surfaces the classified cause; later calls get the poison error.
@@ -877,7 +877,7 @@ impl ObjectStoreBackend for S3Store {
             // adapter does not provide. The flag is not startup-gating: it is
             // not in `Capabilities::mandatory()` precisely because no
             // S3-compatible endpoint can satisfy it through this client
-            // (issue #251), and read-time integrity comes from the
+            //, and read-time integrity comes from the
             // footer/section/page crc32c hierarchy instead
             // (docs/object-store-contract.md "Upload checksums").
             upload_checksum: false,
@@ -887,7 +887,7 @@ impl ObjectStoreBackend for S3Store {
             // AbortMultipartUpload through `object_store`, and `put` itself
             // takes that path above `MULTIPART_THRESHOLD`. This is the flag
             // `required_capabilities(Mode::Maintain)` adds, so `--mode
-            // maintain` starts against an S3-compatible backend (issue #243).
+            // maintain` starts against an S3-compatible backend.
             multipart: true,
         }
     }
@@ -938,7 +938,7 @@ mod tests {
         }
     }
 
-    /// A backend `put_part` failure poisons the S3 handle (issue #296): the
+    /// A backend `put_part` failure poisons the S3 handle: the
     /// first failure surfaces the classified (here retryable) cause, but every
     /// later `put_part`/`complete` returns a non-retryable poison error telling
     /// the caller to abort and restart, breaking the retry-forever live-lock.
@@ -1018,7 +1018,7 @@ mod tests {
     /// `S3Store` declares the capability `required_capabilities(Mode::
     /// Maintain)` demands, and it is not a claim about the endpoint: the
     /// adapter implements the create/upload-part/complete/abort sequence for
-    /// every S3-compatible backend (issue #243). `S3Store::new` only validates
+    /// every S3-compatible backend. `S3Store::new` only validates
     /// configuration, so no endpoint is needed here.
     #[test]
     fn capabilities_declare_multipart() {
@@ -1131,7 +1131,7 @@ mod tests {
         );
     }
 
-    // --- Classification of Error::Generic (issue #906) ---
+    // --- Classification of Error::Generic ---
     //
     // These pin the StoreError kind AND retryable() that the S3/MinIO
     // get/put/list error path produces for each representative error shape.

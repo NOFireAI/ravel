@@ -127,11 +127,11 @@ pub struct MemoryMultipartUpload<'a> {
     sequence: PartSequence,
     /// Set by `complete`/`abort`; every later call on this handle fails.
     finished: bool,
-    /// Set once a part violates the sequence rules (issue #297): a rejected
+    /// Set once a part violates the sequence rules: a rejected
     /// non-final or empty part would truncate the object, so every later
     /// `put_part`/`complete` fails with [`multipart_poisoned`] while `abort`
     /// stays callable. Mirrors [`crate::s3::S3MultipartUpload`], whose backend
-    /// part failures poison the same field (issue #296); the oracle has no
+    /// part failures poison the same field; the oracle has no
     /// transport to fail, so only the sequence path sets this here. A checksum
     /// mismatch does not poison (it leaves the upload open for a re-send).
     poison: Option<String>,
@@ -154,7 +154,7 @@ impl MultipartUpload for MemoryMultipartUpload<'_> {
         // mismatch is the one recoverable rejection, so it is not a part and
         // the upload stays usable for a re-send (it must not poison).
         MemoryStore::verify_checksum(&data, checksum)?;
-        // A sequence-rule violation poisons the handle (issue #297) so a later
+        // A sequence-rule violation poisons the handle so a later
         // `complete` cannot publish a truncated object; `abort` stays callable.
         if let Err(e) = self.sequence.accept(&self.key, data.len()) {
             self.poison = Some(e.to_string());
@@ -517,7 +517,7 @@ mod tests {
 
     /// The oracle's multipart end state must be indistinguishable from the
     /// single put of the same bytes: same content, same size, and an
-    /// etag/version from the same counter (issue #243).
+    /// etag/version from the same counter.
     #[tokio::test]
     async fn multipart_matches_a_single_put_of_the_same_bytes() {
         let store = MemoryStore::new();

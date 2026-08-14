@@ -1283,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn sequence_fires_outcomes_in_order_then_falls_through() {
-        // a4-F02 shape: a transient blip, then a NotFound blip, then success
+        // Shape: a transient blip, then a NotFound blip, then success
         // on the same key.
         let plan = FaultPlan::empty().with_sequence(
             Sequence::new(Op::Get)
