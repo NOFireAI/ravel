@@ -1,4 +1,4 @@
-//! Exactness property for phase P5a (docs/metric-index-plan.md 3.3): the
+//! Exactness property for the name-postings index: the
 //! name-postings index a fold builds and attaches to HEAD must exactly
 //! match a brute-force scan of every covered segment's own catalog, across
 //! both RSEG v1 and v2 segment formats. This is an external test (it has no

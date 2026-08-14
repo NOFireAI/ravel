@@ -28,8 +28,8 @@ use crate::error::CatalogError;
 use crate::snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
-/// Bound on the object-store requests one resolve keeps in flight at once
-/// (#278 item 2). A cold resolve issues one LIST per (shard, hour) plus one
+/// Bound on the object-store requests one resolve keeps in flight at once.
+/// A cold resolve issues one LIST per (shard, hour) plus one
 /// GET per uncached commit/compaction record and per snapshot part; these
 /// used to run strictly one await at a time. They now run concurrently up to
 /// this bound, held by [`Catalog::request_semaphore`] and acquired only
@@ -95,7 +95,7 @@ pub struct Catalog {
     /// [`Catalog::guarded_get`] with no cache hit/miss accounting, exactly as
     /// a build with no byte-cache wiring would. This is how the server's
     /// `--disable-cache` disables the catalog byte cache alongside the fetcher
-    /// cache (issue #553).
+    /// cache.
     byte_cache: Option<Cache<std::convert::Infallible>>,
     /// Count of unlisted L0 records observed postdating a compaction record
     /// in their bucket (docs/catalog-and-mvcc.md step 3: an interlock
@@ -127,13 +127,11 @@ pub struct Catalog {
     /// these also fails the query: the count is a record of hard failures,
     /// not a harmless-overlap anomaly tally.
     isolation_breaches: AtomicU64,
-    /// Bounds the object-store requests one resolve keeps in flight (#278
-    /// item 2). Ephemeral, process-local, correctness-free: it changes only
+    /// Bounds the object-store requests one resolve keeps in flight. Ephemeral, process-local, correctness-free: it changes only
     /// how many round trips overlap, never which segments a resolve returns.
     request_semaphore: Arc<tokio::sync::Semaphore>,
     /// Whether resolve validates the configured `shard_count` against each
-    /// (tenant, signal)'s durable provisioning record (ADR-0050 section 5,
-    /// EC5). Off for the many in-crate and `ravel-query`/`ravel-sql` callers
+    /// (tenant, signal)'s durable provisioning record (ADR-0050 section 5). Off for the many in-crate and `ravel-query`/`ravel-sql` callers
     /// that build a `Catalog` directly; the server turns it on
     /// ([`Catalog::with_provisioning_enforcement`]) so a query for a tenant
     /// whose record disagrees fails with a typed error instead of silently
@@ -146,7 +144,7 @@ pub struct Catalog {
     /// action; a query-only node may hold write-restricted credentials).
     provisioning_checked: Mutex<HashSet<(TenantHash, Signal)>>,
     /// Last-touch wall-clock (`now_ns`) per tenant, stamped at the start of
-    /// every [`Catalog::resolve_impl`] (ADR-0069 decision 2, issue #820). The
+    /// every [`Catalog::resolve_impl`] (ADR-0069 decision 2). The
     /// idle-tenant sweep loop reads it to decide which tenants' re-derivable
     /// per-tenant cache entries to evict, and stamps nothing itself, so no
     /// clock is read in this crate. A tenant absent from this map has never
@@ -168,7 +166,7 @@ impl Catalog {
         if config.shard_count == 0 {
             return Err(CatalogError::InvalidConfig);
         }
-        // `byte_cache_max_bytes == 0` is the disabled sentinel (issue #553):
+        // `byte_cache_max_bytes == 0` is the disabled sentinel:
         // build no byte cache at all rather than a zero-capacity one, so the
         // resolve path reads straight through the store with no RAM tier and no
         // byte-cache accounting, byte-for-byte a build with no byte-cache
@@ -201,7 +199,7 @@ impl Catalog {
     }
 
     /// Enable durable `shard_count` enforcement on the resolve path (ADR-0050
-    /// section 5, EC5). With it on, the first resolve for each (tenant, signal)
+    /// section 5). With it on, the first resolve for each (tenant, signal)
     /// validates this catalog's configured `shard_count` against the
     /// `t/<tenant_hash>/<sig>/prov` record; a disagreement is a hard
     /// [`CatalogError`], never a silent resolve over a subset of shards. Absent
@@ -289,13 +287,11 @@ impl Catalog {
         }
     }
 
-    /// One store GET bounded by the resolve-wide in-flight semaphore (#278
-    /// item 2). The permit is released the moment the GET resolves and is
+    /// One store GET bounded by the resolve-wide in-flight semaphore. The permit is released the moment the GET resolves and is
     /// never held across another guarded request, so a resolve fanning out
     /// many records cannot wait on permits it already holds.
     ///
-    /// The sole funnel for every GET a query issues (ADR-0044 decision 2,
-    /// issue #421): `accounting` is credited one [`AccountedOp::Get`] request
+    /// The sole funnel for every GET a query issues (ADR-0044 decision 2): `accounting` is credited one [`AccountedOp::Get`] request
     /// unconditionally, and its bytes only on success (`got.data.len()`,
     /// mirroring `InstrumentedStore`'s convention that a failed GET moves no
     /// bytes). Call sites never account for themselves.
@@ -352,7 +348,7 @@ impl Catalog {
                 .await?
                 .data);
         };
-        // No byte cache (disabled via `byte_cache_max_bytes == 0`, issue #553):
+        // No byte cache (disabled via `byte_cache_max_bytes == 0`):
         // read straight through with no cache hit/miss accounting, exactly as
         // an uncached GET would.
         let Some(byte_cache) = &self.byte_cache else {
@@ -510,7 +506,7 @@ impl Catalog {
         self.isolation_breaches.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `pub(crate)`: lets `fold` (docs/metric-index-plan.md section 4) issue
+    /// `pub(crate)`: lets `fold` issue
     /// its own LIST/GET/PUT calls through the same store handle, in its own
     /// `impl Catalog` block in `fold.rs`, without duplicating the
     /// `store`/`config`/`cache` fields in a separate type.
@@ -518,7 +514,7 @@ impl Catalog {
         self.store.as_ref()
     }
 
-    /// `pub(crate)`: lets `snapshot_resolve` (docs/metric-index-plan.md 5.1)
+    /// `pub(crate)`: lets `snapshot_resolve`
     /// share the decoded-HEAD cache from its own `impl Catalog` block.
     pub(crate) fn head_cache(&self) -> &HeadCache {
         &self.head_cache
@@ -576,14 +572,13 @@ impl Catalog {
     }
 
     /// `pub(crate)`: lets `snapshot_resolve` share the decoded-postings
-    /// cache (P5b).
+    /// cache.
     pub(crate) fn postings_cache(&self) -> &PostingsCache {
         &self.postings_cache
     }
 
     /// The byte cache's counters handle (ADR-0046), or `None` when the byte
-    /// cache is disabled ([`CatalogConfig::byte_cache_max_bytes`] `== 0`, issue
-    /// #553). The server threads this to `/metrics` so the catalog byte cache's
+    /// cache is disabled ([`CatalogConfig::byte_cache_max_bytes`] `== 0`). The server threads this to `/metrics` so the catalog byte cache's
     /// hits/misses/bytes render alongside the fetcher cache's, and a
     /// `--disable-cache` process renders no catalog cache family at all, the
     /// same absence a disabled fetcher cache produces.
@@ -627,8 +622,8 @@ impl Catalog {
     /// The prefix path carries a runtime request cap: a scan that would issue
     /// more than
     /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests)
-    /// LISTs is refused with [`CatalogError::WindowTooWide`] (issue #635's
-    /// request bound, enforced at runtime; ADR-0044 decision 3 as amended for
+    /// LISTs is refused with [`CatalogError::WindowTooWide`] (the request bound,
+    /// enforced at runtime; ADR-0044 decision 3 as amended for
     /// ADR-0056). A wide-but-sparse window is served cheaply; only a scan whose
     /// actual object volume is unsustainable is refused. Callers should still
     /// keep `config.shard_count` bounded.
@@ -652,7 +647,7 @@ impl Catalog {
     }
 
     /// Like [`Catalog::resolve`], but records every S3 request and cache
-    /// access this resolve makes into `accounting` (ADR-0044, issue #421).
+    /// access this resolve makes into `accounting` (ADR-0044).
     /// A separate method rather than an added `resolve` parameter: `resolve`
     /// is called from `ravel-query`, `ravel-sql`, and `services/ravel-server`
     /// (out of this task's scope), so its signature and every existing call
@@ -673,7 +668,7 @@ impl Catalog {
     }
 
     /// Like [`Catalog::resolve`], but applies postings-based segment pruning
-    /// (P5b, docs/metric-index-plan.md 5.4) when `name_filter` is `Some`: an
+    /// when `name_filter` is `Some`: an
     /// equality `__name__` matcher value from the caller's query.
     ///
     /// Pruning only ever removes snapshot-sourced segments this snapshot's
@@ -681,7 +676,7 @@ impl Catalog {
     /// `min_token`-sourced segments are never touched (they never pass
     /// through the postings-aware code path at all), and missing or corrupt
     /// postings silently degrade to the same behavior as [`Catalog::resolve`]
-    /// (docs/metric-index-plan.md "exact semantics by default": approximate
+    /// (exact semantics by default: approximate
     /// or unavailable pruning data must never fail a query or drop a
     /// segment that a matcher could actually match).
     ///
@@ -711,8 +706,7 @@ impl Catalog {
     }
 
     /// Like [`Catalog::resolve_pruned`], but records every S3 request and
-    /// cache access this resolve makes into `accounting` (ADR-0044, issue
-    /// #421). See [`Catalog::resolve_with_accounting`] for why this is a
+    /// cache access this resolve makes into `accounting` (ADR-0044). See [`Catalog::resolve_with_accounting`] for why this is a
     /// separate method rather than a `resolve_pruned` parameter.
     #[allow(clippy::too_many_arguments)]
     pub async fn resolve_pruned_with_accounting(
@@ -772,7 +766,7 @@ impl Catalog {
     }
 
     /// Instruments the whole LIST/GET fan-out with the `catalog_resolve` span
-    /// (ADR-0044 decision 5, issue #642). The span lives here rather than on
+    /// (ADR-0044 decision 5). The span lives here rather than on
     /// ravel-query's `resolve_bounded` wrapper so that every caller of
     /// `Catalog::resolve*` gets it, including ravel-sql's executor which calls
     /// `resolve_pruned_with_accounting` directly. Per-call `s3_requests`,
@@ -792,7 +786,7 @@ impl Catalog {
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
     ) -> Result<(Snapshot, SegmentOrigins), CatalogError> {
-        // Idle-tenant eviction last-touch (ADR-0069 decision 2, issue #820):
+        // Idle-tenant eviction last-touch (ADR-0069 decision 2):
         // stamp this tenant's activity with the caller's injected `now_ns`
         // before the fan-out. Every resolve entry point funnels through here,
         // and the fan-out below is what populates the per-tenant caches the
@@ -854,8 +848,7 @@ impl Catalog {
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
     ) -> Result<(Snapshot, SegmentOrigins), CatalogError> {
-        // Durable shard_count enforcement on the read path (ADR-0050 section 5,
-        // EC5): fail before the `0..shard_count` listing loop below if this
+        // Durable shard_count enforcement on the read path (ADR-0050 section 5): fail before the `0..shard_count` listing loop below if this
         // catalog's configured shard_count disagrees with the (tenant, signal)'s
         // provisioning record, so a lower value never silently drops the shards
         // it omits. A no-op unless enforcement was opted into.
@@ -868,9 +861,9 @@ impl Catalog {
         // malformed generation history must never be read as "assume
         // generation 0" and silently under-scan.
         //
-        // Issue #635's original pre-execution refusal (a window whose
+        // The original pre-execution refusal (a window whose
         // per-(shard, hour) estimate exceeded `max_catalog_list_requests` was
-        // refused here, before any store read) is superseded by issue #636's
+        // refused here, before any store read) is superseded by the
         // prefix-path routing below (ADR-0056, "INTERACTION 1"): an
         // hour-counting estimate would refuse a wide-but-sparse window whose
         // real cost the prefix scan proves is tiny, the wrong direction to
@@ -892,12 +885,12 @@ impl Catalog {
 
         if let Some((window_start_hour, window_end_hour)) = self.window_hour_bounds(range, now_ns) {
             // A snapshot at watermark W serves every window hour <= W
-            // straight from its parts; only the suffix above W is listed
-            // (docs/metric-index-plan.md 5.1 step 3). No usable snapshot,
+            // straight from its parts; only the suffix above W is listed.
+            // No usable snapshot,
             // or a watermark below the window's start, falls back to
             // listing the whole window, unchanged from Phase 1.
             //
-            // `name_filter.is_some()` gates the postings GET (#278 item 3):
+            // `name_filter.is_some()` gates the postings GET:
             // the postings object is only ever consulted for an equality
             // `__name__` filter, so a query without one never fetches or
             // decodes it.
@@ -915,7 +908,7 @@ impl Catalog {
                     accounting,
                 )
                 .await?;
-            // Finding 4: when head validation performed a one-shot record
+            // When head validation performed a one-shot record
             // re-read, its fresher generation history (never staler than the
             // one that validated the head) must drive the Phase 1 scan-set
             // computation below too. Otherwise the listing suffix would scan
@@ -954,17 +947,16 @@ impl Catalog {
             // prefix scan issues `O(objects / page_size)` LISTs regardless of
             // width. Switch to the prefix scan once the suffix is wide enough
             // (config crossover), or once the per-bucket loop would exceed the
-            // request ceiling. The latter replaces issue #635's pre-execution
+            // request ceiling. The latter replaces the pre-execution
             // refusal: instead of refusing an over-wide window, route it to the
             // non-amplifying prefix path (runtime-capped inside
             // `list_window_by_prefix`), so a wide-but-sparse window is served
-            // rather than refused (issue #636 INTERACTION 1). The per-bucket
+            // rather than refused (ADR-0056 INTERACTION 1). The per-bucket
             // loop is chosen only when the suffix is within the ceiling, so it
             // can never exceed it.
             //
             // The per-bucket estimate must use the same generation-aware shard
-            // bound the prefix path will actually scan (ADR-0052 section 4,
-            // issue #659), not the static `self.config.shard_count`: on a
+            // bound the prefix path will actually scan (ADR-0052 section 4), not the static `self.config.shard_count`: on a
             // shard-count DECREASE the retiring larger generation's higher
             // shard indices stay in scope for `DEFAULT_SCAN_SLACK_HOURS` past
             // the successor's activation, and both this crossover/ceiling
@@ -1005,7 +997,7 @@ impl Catalog {
             } else {
                 // The (shard, hour) listing pass used to issue its LISTs one
                 // await at a time; run them concurrently under the
-                // resolve-wide semaphore instead (#278 item 2). Each bucket
+                // resolve-wide semaphore instead. Each bucket
                 // resolves into its own map (bucket keys never collide across
                 // buckets), and the per-bucket maps are merged back in the
                 // buffered (input) order so the resulting segment set is
@@ -1079,7 +1071,7 @@ impl Catalog {
         // from different writers can tie on (created_unix_ns, writer_epoch,
         // writer_seq) (seq is monotonic only per (writer_id, epoch, shard),
         // ADR-0010 §3), and without an identity tiebreak the stable sort would
-        // otherwise leave them in randomized HashMap iteration order (a4-F01).
+        // otherwise leave them in randomized HashMap iteration order.
         //
         // Mixed L0/L1 levels stay a deterministic total order
         // (docs/catalog-and-mvcc.md "Snapshot resolution"): an L1 part has
@@ -1126,8 +1118,7 @@ impl Catalog {
     ///   listed suffix (a watermark can only narrow the listed range, never
     ///   widen it, so this bound holds whether or not folding has run).
     /// - `SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`: the snapshot-window path
-    ///   (`Catalog::resolve_snapshot_window`, docs/metric-index-plan.md
-    ///   5.1/5.3) that `resolve_impl` tries first, whenever the window is
+    ///   (`Catalog::resolve_snapshot_window`) that `resolve_impl` tries first, whenever the window is
     ///   non-empty, before any LIST runs. This is not derivable from
     ///   `shard_count`/hour buckets and is folded in as a documented
     ///   constant instead -- see that constant's doc comment for the open
@@ -1167,8 +1158,8 @@ impl Catalog {
     /// per-bucket cost would exceed
     /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests),
     /// `resolve` routes it to the non-amplifying prefix path and caps that
-    /// path's LIST count at the same ceiling at runtime (issue #635's request
-    /// bound preserved; issue #636). It remains an upper envelope and never a
+    /// path's LIST count at the same ceiling at runtime (the request
+    /// bound preserved). It remains an upper envelope and never a
     /// prediction; a folded tenant's real LIST count is far lower.
     pub fn estimated_catalog_requests(&self, range: TimeRange, now_ns: i64) -> u64 {
         match self.window_hour_bounds(range, now_ns) {
@@ -1252,7 +1243,7 @@ impl Catalog {
     /// per-bucket compaction/tombstone/interlock logic is a pure function of
     /// the set of keys in one bucket, so grouping a wider listing by bucket and
     /// running this per group yields the identical snapshot the per-bucket loop
-    /// yields -- the property the differential test (issue #636 deliverable 3a)
+    /// yields -- the property the differential test
     /// pins.
     #[allow(clippy::too_many_arguments)]
     async fn process_bucket(
@@ -1270,7 +1261,7 @@ impl Catalog {
 
         // Partition the listed keys by shape (docs/catalog-and-mvcc.md step
         // 2). An unrecognized shape is a fail-loud error, never a silent
-        // skip (plan §3.1: fail-loud on layout drift).
+        // skip (fail-loud on layout drift).
         let mut l0_keys: Vec<String> = Vec::new();
         let mut compaction_keys: Vec<String> = Vec::new();
         let mut rewrite_keys: Vec<String> = Vec::new();
@@ -1295,7 +1286,7 @@ impl Catalog {
         }
 
         // Warm the record caches for this bucket concurrently before the
-        // sequential include logic runs (#278 item 2): the includes below
+        // sequential include logic runs: the includes below
         // then hit the cache instead of each paying a serial GET. A GET
         // failure surfaces here, exactly as it would have from the first
         // sequential load.
@@ -1499,14 +1490,14 @@ impl Catalog {
     /// start-after), so the scan reads every commit key in each shard subtree,
     /// including hours below `listing_start_hour`; those are dropped by the
     /// client-side filter, exactly the buckets the per-bucket loop would have
-    /// skipped. The range scanned is unchanged, only the scan method (issue
-    /// #636 INTERACTION 2): a key in any in-range bucket, however far below the
+    /// skipped. The range scanned is unchanged, only the scan method
+    /// (ADR-0056 INTERACTION 2): a key in any in-range bucket, however far below the
     /// window end, is still grouped and resolved.
     ///
     /// A running LIST count is capped at
     /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests)
     /// and aborts with [`CatalogError::WindowTooWide`] before issuing a page
-    /// that would exceed it. This is issue #635's request bound, enforced at
+    /// that would exceed it. This is the request bound, enforced at
     /// runtime on the one path whose cost is not knowable before listing: a
     /// wide-but-sparse window is served, and only a scan whose actual object
     /// volume is unsustainable is refused.
@@ -1525,14 +1516,14 @@ impl Catalog {
         // LISTs drain sequentially so the runtime request cap is checked
         // deterministically page by page; the expensive per-bucket record GETs
         // are what run concurrently below, mirroring the per-bucket loop's
-        // concurrency model (#278 item 2).
+        // concurrency model.
         let mut grouped: HashMap<(u32, u32), Vec<ObjectMeta>> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut lists_issued: u64 = 0;
         let cap = self.config.max_catalog_list_requests;
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         // Shard bound is the union scan set over every hour in the listing
-        // suffix (ADR-0052 section 4, issue #659), not the static
+        // suffix (ADR-0052 section 4), not the static
         // `self.config.shard_count`. `max_scan_count_over_range` keeps a
         // retiring larger generation's higher shard indices in scope for
         // `DEFAULT_SCAN_SLACK_HOURS` past its successor's activation, so on a
@@ -1551,7 +1542,7 @@ impl Catalog {
             let mut page_token = None;
             loop {
                 // Refuse before issuing a page that would exceed the ceiling,
-                // so at most `cap` LISTs are ever issued (issue #635's bound).
+                // so at most `cap` LISTs are ever issued (the request bound).
                 if lists_issued >= cap {
                     return Err(CatalogError::WindowTooWide {
                         estimate: lists_issued.saturating_add(1),
@@ -1629,7 +1620,7 @@ impl Catalog {
     }
 
     /// Concurrently load and cache every commit record in `keys` under the
-    /// resolve-wide semaphore (#278 item 2), so a later cache-first read of
+    /// resolve-wide semaphore, so a later cache-first read of
     /// each is a hit. Returns the first load error; the sequential include
     /// logic never re-issues a GET a successful prewarm already cached.
     async fn prewarm_commit_records(
@@ -1661,7 +1652,7 @@ impl Catalog {
     }
 
     /// Compaction-record counterpart to
-    /// [`prewarm_commit_records`](Self::prewarm_commit_records) (#278 item 2).
+    /// [`prewarm_commit_records`](Self::prewarm_commit_records).
     async fn prewarm_compaction_records(
         &self,
         tenant: &TenantHash,
@@ -1782,7 +1773,7 @@ impl Catalog {
 
     /// List `t/<th>/<sig>/del/` once and decode every pending erasure request
     /// (`.dreq`) into the resolved snapshot's `pending_erasure` (ADR-0064
-    /// decision 2, EJ-T2). Empty for the common no-erasure case, at the cost of
+    /// decision 2). Empty for the common no-erasure case, at the cost of
     /// exactly one LIST and nothing more. `.done` completion records (PII-free
     /// audit evidence) are recognized and skipped; any other shape under `del/`
     /// is layout drift and fails the resolve loudly, never silently dropped.
@@ -1878,7 +1869,7 @@ impl Catalog {
         // spend the single NotFound-propagation retry the spec grants
         // (docs/catalog-and-mvcc.md step 4: "Absent after one retry"), so a
         // real but briefly-unpropagated commit would surface as a spurious
-        // UnsatisfiableToken, violating read-your-write (a4-F02). NotFound
+        // UnsatisfiableToken, violating read-your-write. NotFound
         // keeps exactly one retry (two probes) as documented; transient
         // errors keep their own independent single retry.
         let mut notfound_retries: u32 = 1;
@@ -2105,8 +2096,7 @@ impl Catalog {
         Err(unsatisfiable_token(token))
     }
 
-    /// `pub(crate)`: also called by `fold` (docs/metric-index-plan.md
-    /// section 4) to load and validate commit records found by bucket
+    /// `pub(crate)`: also called by `fold` to load and validate commit records found by bucket
     /// listing, reusing this cache-first GET+decode+validate path.
     pub(crate) async fn load_and_validate(
         &self,
@@ -2197,7 +2187,7 @@ fn unsatisfiable_token(token: &CommitToken) -> CatalogError {
 /// commit record listed or addressed under one tenant's prefix that declares
 /// another tenant. It is recorded on `ravel_catalog_isolation_breach_total`
 /// before the hard `FieldMismatch` is returned, so an operator sees it on the
-/// same counter the HEAD and postings breaches increment (#529). The
+/// same counter the HEAD and postings breaches increment. The
 /// `catalog` handle is threaded in purely to reach that counter; the
 /// rejection itself is unchanged.
 fn validate_expected_fields(
@@ -2242,7 +2232,7 @@ fn validate_expected_fields(
 /// compaction-record analog of [`validate_expected_fields`], and like it a
 /// `tenant_hash` disagreement is recorded on
 /// `ravel_catalog_isolation_breach_total` before the hard `FieldMismatch`
-/// (ADR-0050 §2, #529). The `catalog` handle is threaded in purely to reach
+/// (ADR-0050 §2). The `catalog` handle is threaded in purely to reach
 /// that counter; the rejection itself is unchanged.
 fn validate_compaction_expected_fields(
     catalog: &Catalog,
@@ -2338,7 +2328,7 @@ fn validate_rewrite_expected_fields(
 /// reconstructing the part key from their identity fields (ADR-0010 §7,
 /// never a stored string). `observed_ckey` names the compaction record for
 /// error messages. The footer of the part object is later verified against
-/// these same fields by the reader (docs/compaction-retention-plan.md §3.5).
+/// these same fields by the reader.
 fn build_l1_segment_ref(
     record: &CompactionRecord,
     part: &CompactionPart,
@@ -2376,7 +2366,7 @@ fn build_l1_segment_ref(
         series_count: part.series_count,
         shard: record.shard,
         content_hash,
-        // A part has no writer identity of its own (plan §4): these are
+        // A part has no writer identity of its own: these are
         // never used for an L1 ref's identity or dedup.
         writer_id: Uuid::nil(),
         writer_epoch: 0,
@@ -2488,7 +2478,7 @@ fn build_rewrite_l1_segment_ref(
 /// cycle-checked; an over-deep or cyclic chain is a typed error, never a hang.
 ///
 /// Exposed for the erasure completion check in `ravel-maintain`: ADR-0064 §4
-/// (2026-08-08 correction) requires the rewrite pass to derive "is this
+/// requires the rewrite pass to derive "is this
 /// bucket's contribution current" through the SAME supersession logic a
 /// snapshot resolve and the fold use -- not a bucket LIST resolved in
 /// isolation, and not `ravel-maintain`'s own one-hop `resolve_live_record`,
@@ -2725,7 +2715,7 @@ mod tests {
         }
     }
 
-    /// ADR-0069 decision 2 (issue #820): a tenant idle past the TTL has its
+    /// ADR-0069 decision 2: a tenant idle past the TTL has its
     /// per-tenant catalog cache outer-map entry evicted, the evicted state is
     /// re-derived on the next resolve, and an active tenant's cache entry
     /// survives the same sweep. Deterministic via the injected `now_ns`.
@@ -3021,7 +3011,7 @@ mod tests {
             .expect("enforcement off: resolve ignores the provisioning record");
     }
 
-    /// Finding 2 (end to end): an older HEAD (`shard_generation_count` lower
+    /// End-to-end: an older HEAD (`shard_generation_count` lower
     /// than the reader's history) whose own watermark reaches into hours a
     /// newer, wider generation was already active for must NOT be served
     /// silently. The reader forces one record re-read and, finding the head
@@ -3097,7 +3087,7 @@ mod tests {
         }
     }
 
-    /// Finding 4 (end to end): when head validation performs a one-shot record
+    /// End-to-end: when head validation performs a one-shot record
     /// re-read, the fresher generation history it validated against must drive
     /// the Phase 1 listing scan set, not the stale view the resolve first read.
     /// A `NotFoundBlip` on the resolve's own generation read makes its initial
@@ -3213,7 +3203,7 @@ mod tests {
         );
     }
 
-    /// Finding 2 regression: a `FreshNoData` result (no record yet) must not be
+    /// Regression: a `FreshNoData` result (no record yet) must not be
     /// cached as validated. A query-only catalog resolves an empty-record tenant
     /// (passes as fresh), then a real record appears written under a higher
     /// shard_count; the next resolve must re-check and surface the mismatch, not
@@ -3792,7 +3782,7 @@ mod tests {
         assert!(!found.contains(&keys::reconstruct_data_key(&just_outside).expect("k3")));
     }
 
-    /// #278 item 2: the (shard, hour) listing pass and the per-bucket record
+    /// The (shard, hour) listing pass and the per-bucket record
     /// GETs now run concurrently under a semaphore. Concurrency must not drop,
     /// duplicate, or reorder segments: the resolved set must be complete and
     /// its total order deterministic across repeated resolves.
@@ -3864,7 +3854,7 @@ mod tests {
         );
     }
 
-    /// #278 item 2: a fault on a commit-record GET must still surface as an
+    /// A fault on a commit-record GET must still surface as an
     /// error through the concurrent prewarm, never be swallowed into a
     /// silently short snapshot. A permanent GET fault fires on the record read
     /// (the absent HEAD GET degrades to listing as always), and the resolve
@@ -3897,7 +3887,7 @@ mod tests {
         );
     }
 
-    /// a4-F02 regression: the exact-`min_token` GET must give transient
+    /// Regression: the exact-`min_token` GET must give transient
     /// store faults and NotFound propagation blips independent retry
     /// budgets. A transient blip followed by a NotFound blip against a real,
     /// acked commit must still resolve (read-your-write), not surface as
@@ -4312,7 +4302,7 @@ mod tests {
         assert_eq!(catalog.isolation_breaches(), 1);
     }
 
-    /// #529 / ADR-0050 §2: a commit record and a compaction record whose
+    /// ADR-0050 §2: a commit record and a compaction record whose
     /// tenant_hash disagrees with the prefix they were listed under are the
     /// highest-signal breach the metric must reflect. Both validators must
     /// count the breach on `ravel_catalog_isolation_breach_total`, not merely

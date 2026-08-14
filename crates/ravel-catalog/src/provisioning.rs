@@ -1,4 +1,4 @@
-//! Durable, startup-checked `shard_count` (ADR-0050 section 5, EC5).
+//! Durable, startup-checked `shard_count` (ADR-0050 section 5).
 //!
 //! Each (tenant, signal) carries an immutable provisioning record at
 //! `t/<tenant_hash>/<sig>/prov` recording the `shard_count` its data was
@@ -181,7 +181,7 @@ pub enum ProvisioningError {
     )]
     ReshardCountOutOfRange { shard_count: u32 },
     /// A concurrent append moved the record's version between this reshard's
-    /// read and its CasVersion write (ADR-0052 section 1, the EC4 set_gc_config
+    /// read and its CasVersion write (ADR-0052 section 1, the `set_gc_config` CAS
     /// pattern). The loser re-reads rather than silently overwriting the winner.
     #[error(
         "a concurrent reshard changed provisioning record {key:?} since this one read it \
@@ -357,14 +357,14 @@ pub const MAX_SHARD_COUNT: u32 = 10_000;
 pub const FLUSH_BOUND_SLACK_HOURS: u32 = 2;
 
 /// The tolerated inter-writer/reader clock skew folded into the read-side scan
-/// slack `S` (ADR-0052 section 3, finding NF-3). ADR-0052 section 3 always
+/// slack `S` (ADR-0052 section 3). ADR-0052 section 3 always
 /// named "max tolerated clock skew" as a term of `S = ceil(max_flush_delay +
 /// max_flush_lifetime + max tolerated clock skew)`, but the shipped constant
-/// (`DEFAULT_SCAN_SLACK_HOURS = 2`, pre-NF-3) omitted it -- the formula's own
+/// (the earlier `DEFAULT_SCAN_SLACK_HOURS = 2` constant) omitted it -- the formula's own
 /// worked example added no nonzero skew term, so a writer clock skewed by more
 /// than a few minutes past the flush-timing bound routed a decrease straggler
 /// into a shard index outside the scan set: silent invisibility, worst on a
-/// shard-count decrease (the load-bearing NF-3 fix this constant closes).
+/// shard-count decrease (the load-bearing gap this constant closes).
 ///
 /// One hour, mirroring [`crate::idempotency`]'s
 /// `IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` (`crates/ravel-ingest/src/
@@ -375,7 +375,7 @@ pub const FLUSH_BOUND_SLACK_HOURS: u32 = 2;
 /// formula but never a concrete number for this term (open question 2 fixes
 /// `C`/`L`'s inequality, not `S`'s skew term); a future ADR-0052 amendment
 /// should record this value normatively so it cannot silently drift back to
-/// zero the way the pre-NF-3 constant did.
+/// zero the way the earlier constant did.
 pub const TOLERATED_CLOCK_SKEW_HOURS: u32 = 1;
 
 /// The read-side scan slack window `S`, in ingest hours (ADR-0052 sections 3
@@ -424,7 +424,7 @@ pub struct ShardGeneration {
 /// covers every hour and the result is well-defined.
 ///
 /// A pure function with no I/O: the router calls it per flush against its cached
-/// view, and EK2's read side will call the same rule to derive per-hour scan
+/// view, and the read side will call the same rule to derive per-hour scan
 /// sets. Returns generation 0's count for an empty slice as a defensive floor
 /// (the divisor is never zero), but a validated history is never empty.
 pub fn active_shard_count(generations: &[ShardGeneration], hour: u32) -> u32 {
@@ -605,7 +605,7 @@ pub fn shard_ceiling(generations: &[ShardGeneration], watermark_hour: u32) -> u3
 
 /// Decode and validate a record's shard-generation history into the normalized
 /// form the routing rule consumes (ADR-0052 section 1). An empty `generations`
-/// list (every record EC5 wrote) becomes the single implicit generation 0 with
+/// list (every record written before generations existed) becomes the single implicit generation 0 with
 /// `activation_hour = 0` and the scalar `shard_count`, so a pre-ADR-0052 record
 /// decodes identically before and after this change. A non-empty list is
 /// validated fail-closed: dense 0-based generations, strictly increasing
@@ -927,7 +927,7 @@ fn build_record(
         // A first-write/adoption record has no reshard history: the empty list
         // is read as the single implicit generation 0 (ADR-0052 section 1), and
         // encoding omits the field entirely, so this record is byte-identical to
-        // one an EC5 build wrote before ADR-0052.
+        // one written before ADR-0052.
         generations: Vec::new(),
         // No floor is raised at first write: the empty list is "no floor ever
         // raised" (ADR-0066), and encoding omits the field, keeping a
@@ -1058,7 +1058,7 @@ pub struct ReshardOutcome {
 }
 
 /// Append one shard generation to a (tenant, signal)'s provisioning record
-/// under `CasVersion` (ADR-0052 section 1, mirroring EC4's `set_gc_config`).
+/// under `CasVersion` (ADR-0052 section 1, mirroring the `set_gc_config` CAS pattern).
 /// This is the only legal mutation of the record: it appends exactly one
 /// generation whose `activation_hour` is strictly in the future, and never
 /// touches an existing byte of history.
@@ -1186,7 +1186,7 @@ pub async fn append_generation(
     }
 }
 
-// ---- ADR-0066 format-floor history (epic EM, EM-T3) ----
+// ---- ADR-0066 format-floor history ----
 //
 // Format floors live on the SAME `ProvisioningRecord` at the SAME
 // `t/<hash>/<sig>/prov` key as the shard-generation history (field 7, additive,
@@ -2004,11 +2004,11 @@ mod tests {
         assert_eq!(scan_count(&gens, 202, 2), 2, "slack closed: gen2's count");
     }
 
-    /// NF-3 (issue #655): `DEFAULT_SCAN_SLACK_HOURS` is the sum of
+    /// `DEFAULT_SCAN_SLACK_HOURS` is the sum of
     /// `FLUSH_BOUND_SLACK_HOURS` and `TOLERATED_CLOCK_SKEW_HOURS`, not the
     /// flush-timing term alone. Pins the composition so a future edit to
     /// either summand cannot silently drop the clock-skew term back to the
-    /// pre-NF-3 omission this issue fixed.
+    /// earlier omission this test guards against.
     #[test]
     fn nf3_default_scan_slack_hours_includes_clock_skew_term() {
         assert_eq!(
@@ -2019,9 +2019,9 @@ mod tests {
         assert_eq!(DEFAULT_SCAN_SLACK_HOURS, 3);
     }
 
-    /// NF-3 load-bearing test (issue #655): a decrease straggler whose writer
+    /// Load-bearing skew test: a decrease straggler whose writer
     /// clock lags true time by exactly `TOLERATED_CLOCK_SKEW_HOURS` lands in an
-    /// ingest-hour bucket the pre-NF-3 slack window did not scan, and the
+    /// ingest-hour bucket the earlier slack window did not scan, and the
     /// widened window scans it.
     ///
     /// Setup: gen0 count 8 (shards 0..8) from hour 0, gen1 count 4 (shards
@@ -2032,7 +2032,7 @@ mod tests {
     /// `TOLERATED_CLOCK_SKEW_HOURS` (1) behind true time -- exactly the
     /// tolerated bound, not beyond it.
     ///
-    /// The flipped line is `DEFAULT_SCAN_SLACK_HOURS`'s pre-NF-3 definition,
+    /// The flipped line is `DEFAULT_SCAN_SLACK_HOURS`'s earlier definition,
     /// `pub const DEFAULT_SCAN_SLACK_HOURS: u32 = 2;` (the flush-timing term
     /// alone, skew omitted): with that value, `scan_count` at hour 102 excludes
     /// generation 0 (`102 < 100 + 2` is false), so the reader's scan domain is
@@ -2072,7 +2072,7 @@ mod tests {
         );
     }
 
-    /// NF-3 boundary case: a straggler exactly at the tolerated skew bound (this
+    /// Skew boundary case: a straggler exactly at the tolerated skew bound (this
     /// test) is covered; one hour further -- a writer skewed *beyond* the
     /// tolerated bound -- is the documented, unclosed hazard (no finite slack
     /// covers unbounded skew) and is correctly not covered. Also a determinism
@@ -2237,13 +2237,13 @@ mod tests {
     }
 
     /// The decode-compatibility test the ADR mandates: a record with the exact
-    /// byte shape EC5 wrote (no `generations` field set) decodes as generation 0
+    /// byte shape written before ADR-0052 (no `generations` field set) decodes as generation 0
     /// with the scalar `shard_count`, identical to before ADR-0052. Proven at the
     /// byte level: the encoded bytes are unchanged and the decode yields one
     /// implicit generation.
     #[test]
     fn empty_generations_decode_as_implicit_generation_zero() {
-        // An EC5-shaped record: no generations field.
+        // A pre-ADR-0052-shaped record: no generations field.
         let record = sysproto::ProvisioningRecord {
             format_version: 1,
             tenant_hash: tenant().0.to_vec(),
@@ -2554,7 +2554,7 @@ mod tests {
         );
     }
 
-    // ---- ADR-0066 format-floor tests (epic EM, EM-T3) ----
+    // ---- ADR-0066 format-floor tests ----
 
     const RSEG: &str = "rseg";
     const RLOG: &str = "rlog";

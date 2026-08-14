@@ -1,5 +1,4 @@
-//! Typed errors for the snapshot part envelope (docs/metric-index-plan.md
-//! 3.1) and HEAD record (3.2) codecs. Decode paths treat every byte as
+//! Typed errors for the snapshot part envelope and HEAD record codecs. Decode paths treat every byte as
 //! untrusted; encode paths defensively validate caller-supplied entries and
 //! HEAD fields against the same rules decode enforces, so an object this
 //! crate writes can never fail its own decode validation.

@@ -1,5 +1,4 @@
-//! Differential proof for compaction/retention folding (issue #142,
-//! docs/metric-index-plan.md section 7): for a population that mixes a plain
+//! Differential proof for compaction/retention folding: for a population that mixes a plain
 //! L0 bucket, a compacted bucket, and a tombstoned bucket, `Catalog::resolve`
 //! must return the exact same segment set whether it runs before any fold
 //! (pure Phase 1 listing, `Catalog::list_hour_bucket`) or after one (served

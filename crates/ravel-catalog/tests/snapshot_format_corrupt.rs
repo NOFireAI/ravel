@@ -1,8 +1,7 @@
 //! Corrupt-input corpus for the snapshot part envelope and HEAD record
-//! codec: every violation in docs/metric-index-plan.md 3.1's validation
+//! codec: every violation in the part envelope's validation
 //! list must surface as a typed error, never a panic, and truncation at
-//! every structural boundary must be safe (docs/metric-index-plan.md P1
-//! tests, .claude/skills/format-change).
+//! every structural boundary must be safe (.claude/skills/format-change).
 
 #![allow(clippy::expect_used)]
 

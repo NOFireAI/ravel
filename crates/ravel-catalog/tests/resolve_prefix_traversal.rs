@@ -1,4 +1,4 @@
-//! Issue #636 / ADR-0056: the per-shard recursive prefix LIST is a pure
+//! ADR-0056: the per-shard recursive prefix LIST is a pure
 //! traversal change. These tests prove it against the per-bucket loop.
 //!
 //! The traversal path is config-driven, so each path is forced directly:
@@ -349,7 +349,7 @@ async fn late_data_below_window_end_still_resolves() {
 
 /// (d) `estimated_catalog_requests` remains an upper envelope of the requests
 /// the prefix scan actually issues, for several window shapes. This is the
-/// property #635's ceiling rests on.
+/// property the request ceiling rests on.
 #[tokio::test]
 async fn estimate_is_an_upper_envelope() {
     let inner = Arc::new(MemoryStore::new());

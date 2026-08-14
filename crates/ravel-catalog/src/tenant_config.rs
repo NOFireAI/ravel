@@ -1,4 +1,4 @@
-//! Per-tenant durable config record (ADR-0066 decision 6, epic EM, EM-T7).
+//! Per-tenant durable config record (ADR-0066 decision 6).
 //!
 //! Each tenant carries a config record at `t/<tenant_hash>/config` recording the
 //! per-tenant overrides that used to live only in process flags: a lifecycle
@@ -31,7 +31,7 @@
 //! This module builds and verifies the durable record only. The bounded-staleness
 //! refresh loop that reads it on a horizon and re-invokes the admission
 //! controller's `set_tenant_limits` (the hot-path-untouched application of these
-//! overrides) is EM-T8's job, not this module's.
+//! overrides) is a separate hot-path step, not this module's.
 
 use prost::Message;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, Version};
@@ -63,7 +63,7 @@ pub enum TenantLifecycleState {
     /// Refuse ingest and query; keep maintenance running.
     Suspended,
     /// Refuse ingest and query; keep maintenance and retention running until the
-    /// tenant's data is gone (the hook epic EJ / #460 consumes).
+    /// tenant's data is gone (the offboarding hook consumes).
     Offboarding,
 }
 
@@ -91,7 +91,7 @@ impl TenantLifecycleState {
 }
 
 /// A tenant's durable config, decoded into a plain struct so consumers (the
-/// EM-T8 refresh loop, the admission controller) never touch the proto type. An
+/// refresh loop, the admission controller) never touch the proto type. An
 /// absent optional override means "use the deployment default"; a present one
 /// overrides it for this tenant (a present `0` is a real override, an explicit
 /// zero cap, never "unset").

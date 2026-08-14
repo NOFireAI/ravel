@@ -1,4 +1,4 @@
-//! Issue #659 / ADR-0052 section 4 + ADR-0056: the prefix-scan traversal path
+//! ADR-0052 section 4 + ADR-0056: the prefix-scan traversal path
 //! must derive its shard-index domain from the generation history, exactly as
 //! the per-bucket path does, so a shard-count reshard is resolved completely on
 //! either path.
@@ -10,7 +10,7 @@
 //! scan rule, `scan_count`); the prefix path never scanned them, so a straggler
 //! commit record routed under the old count into an early successor hour was
 //! silently dropped. The per-bucket path already got this right via
-//! `scan_count` per hour (EK2); these tests extend the differential property to
+//! `scan_count` per hour; these tests extend the differential property to
 //! the prefix path and pin the decrease case it used to miss.
 //!
 //! Enforcement must be on: only then is the durable generation history read
@@ -279,7 +279,7 @@ async fn prefix_decrease_finds_straggler_in_retiring_shard_and_matches_per_bucke
     assert!(
         got.contains(&straggler_key),
         "the straggler in retiring shard 6 inside the slack window must be found \
-         by the prefix path (issue #659): got {got:?}"
+         by the prefix path: got {got:?}"
     );
     assert!(got.contains(&new_key), "the new-count write is found");
     assert!(

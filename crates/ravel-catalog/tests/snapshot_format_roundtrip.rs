@@ -1,5 +1,5 @@
 //! Roundtrip and determinism property tests for the snapshot part envelope
-//! and HEAD record codec (docs/metric-index-plan.md 3.1, 3.2, P1 tests).
+//! and HEAD record codec.
 
 #![allow(clippy::expect_used)]
 
@@ -263,7 +263,7 @@ proptest! {
 /// A part mixing an L0 entry (16-byte writer_id) and an L1 compaction-part
 /// entry (level 1, 32-byte writer_id holding the input_set_hash) encodes and
 /// decodes byte-for-byte, proving the level-dependent field-length rule
-/// (docs/metric-index-plan.md section 7) accepts both shapes in one part.
+/// accepts both shapes in one part.
 #[test]
 fn mixed_l0_l1_part_roundtrips() {
     let l0 = SnapshotEntry {

@@ -1,16 +1,16 @@
-//! Admission and the catalog-request ceiling (issue #635, ADR-0044 decision 3;
-//! amended for issue #636 / ADR-0056).
+//! Admission and the catalog-request ceiling (ADR-0044 decision 3;
+//! amended per ADR-0056).
 //!
 //! Under ADR-0056 a wide window is no longer refused before any LIST purely
 //! because its per-bucket estimate `shard_count * hours + SNAPSHOT_...` exceeds
 //! `CatalogConfig::max_catalog_list_requests`. Instead it is routed to the
 //! single per-shard recursive prefix LIST, whose cost is `O(objects /
 //! page_size)` and independent of window width. That path carries a runtime
-//! LIST cap at the same ceiling, so #635's bound ("a resolve never issues more
+//! LIST cap at the same ceiling, so the request bound ("a resolve never issues more
 //! than the ceiling of catalog LISTs") is preserved -- now enforced at runtime
 //! on the one path whose cost is not knowable before listing. The net effect:
 //!
-//! - a wide-but-sparse window that #635 refused is now *served* cheaply
+//! - a wide-but-sparse window that the request ceiling refused is now *served* cheaply
 //!   (`wide_sparse_window_is_served_by_the_prefix_scan`);
 //! - a scan whose actual object volume would exceed the ceiling is refused at
 //!   runtime, having issued at most `ceiling` LISTs
@@ -207,8 +207,8 @@ async fn estimate_formula_is_unchanged() {
 }
 
 /// A window whose per-bucket estimate is far over the ceiling, over a *sparse*
-/// corpus, is SERVED by the prefix scan rather than refused (issue #636
-/// INTERACTION 1: the dangerous direction #635 would have refused a cheap
+/// corpus, is SERVED by the prefix scan rather than refused (ADR-0056
+/// INTERACTION 1: the direction the request-ceiling refusal would have refused a cheap
 /// query). The whole point of the change: the LIST count is O(objects), not
 /// O(hours).
 #[tokio::test]
@@ -242,7 +242,7 @@ async fn wide_sparse_window_is_served_by_the_prefix_scan() {
 
 /// A window whose actual corpus is large enough that the prefix scan would
 /// exceed the ceiling is refused at runtime, having issued at most `ceiling`
-/// LISTs. This is issue #635's request bound, preserved.
+/// LISTs. This is the request bound, preserved.
 #[tokio::test]
 async fn oversized_corpus_trips_the_runtime_cap() {
     // page_size 2 so a modest object count paginates past a small ceiling.

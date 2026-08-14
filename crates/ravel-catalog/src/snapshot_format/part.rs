@@ -1,5 +1,5 @@
 //! Snapshot part envelope: whole-object read, no per-section access
-//! protocol (docs/metric-index-plan.md 3.1).
+//! protocol.
 //!
 //! ```text
 //! magic           "RCS1" (4 bytes)
@@ -205,16 +205,16 @@ pub fn decode_part(bytes: &[u8], limits: &PartLimits) -> Result<DecodedPart, Sna
 }
 
 /// Sort/uniqueness/field validation shared by `encode_part` (defensive
-/// check of caller input) and `decode_part` (untrusted-bytes check):
-/// docs/metric-index-plan.md 3.1 "Sort order, mandatory and validated".
+/// check of caller input) and `decode_part` (untrusted-bytes check): the
+/// "Sort order, mandatory and validated" rule.
 fn validate_entries(
     entries: &[SnapshotEntry],
     min_hour: u32,
     watermark_hour: u32,
 ) -> Result<(), SnapshotFormatError> {
     for (i, entry) in entries.iter().enumerate() {
-        // Level 0 is an L0 commit; level 1 is a compaction (L1) part
-        // (docs/metric-index-plan.md section 7). An L0 entry's writer_id is
+        // Level 0 is an L0 commit; level 1 is a compaction (L1) part.
+        // An L0 entry's writer_id is
         // the 16-byte flush writer id; an L1 entry has no writer identity, so
         // its writer_id slot instead carries the parent compaction record's
         // 32-byte input_set_hash (fold.rs `build_l1_snapshot_entry`). A level

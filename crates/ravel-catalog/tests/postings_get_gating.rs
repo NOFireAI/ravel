@@ -1,4 +1,4 @@
-//! #278 item 3: the postings object is fetched only when an equality
+//! The postings object is fetched only when an equality
 //! `__name__` filter can actually use it.
 //!
 //! `snapshot_resolve` used to load the postings object unconditionally,
@@ -253,7 +253,7 @@ async fn postings_get_is_skipped_without_a_name_filter_and_issued_with_one() {
     assert_eq!(
         log.get_count_for(".npost"),
         0,
-        "no usable name filter: the postings GET must be skipped (#278 item 3)"
+        "no usable name filter: the postings GET must be skipped"
     );
 
     // An equality `__name__` filter: the postings object is fetched and used.

@@ -1,8 +1,7 @@
-//! Resolver integration tests for L0-to-L1 compaction (P5 of
-//! docs/compaction-retention-plan.md, §3.5): partition bucket listings by
+//! Resolver integration tests for L0-to-L1 compaction: partition bucket listings by
 //! shape, include compaction parts, exclude input-listed L0s, raise the
 //! interlock metric on unlisted postdating L0s, token fallback, and the
-//! FaultStore crash rows 5, 6, and 12 of the plan's §3.6 table.
+//! FaultStore crash-recovery coverage.
 //!
 //! Resolution never fetches L0 data or L1 part objects (it only reads
 //! records and reconstructs keys), so these tests build commit and
@@ -614,7 +613,7 @@ async fn token_fallback_unsatisfiable_when_not_in_any_input_list() {
     ));
 }
 
-// --- Crash rows 5 and 6 (docs/compaction-retention-plan.md §3.6) ---
+// --- Crash rows 5 and 6 ---
 
 #[tokio::test]
 async fn row5_l1_and_inputs_both_visible_do_not_double_count() {
