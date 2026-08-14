@@ -1,6 +1,6 @@
-//! Classic-bucket histogram functions (plan section 8/P9): `histogram_quantile`
+//! Classic-bucket histogram functions: `histogram_quantile`
 //! and `histogram_fraction` over `le`-labeled classic bucket series, as
-//! opposed to native histograms (out of scope until P11's blocked ticket).
+//! opposed to native histograms (out of scope for now).
 //! Both group the input instant vector by every label except `le`, treat
 //! each group's series as one classic histogram's cumulative buckets, and
 //! interpolate linearly within a bucket assuming a uniform distribution of
@@ -16,14 +16,13 @@
 //! or a NaN scalar argument, evaluates to `NaN` for that group rather than
 //! being omitted: the result vector always has one entry per group, exactly
 //! like Prometheus. These cases now raise the annotations Prometheus does
-//! (issues #178, #235), through the `&QueryWindow` threaded into both
+//! through the `&QueryWindow` threaded into both
 //! functions: a malformed bucket set (missing `+Inf`, or fewer than two
 //! usable buckets), a series excluded because its `le` label is missing or
 //! does not parse as a float, and an out-of-range quantile argument are
 //! `warnings`; a forced monotonicity fixup is an `info`. See
 //! [`crate::Annotations`] for the warning/info distinction. The
-//! native-histogram path's own Prometheus annotations are not wired here yet
-//! (see this ticket's final report).
+//! native-histogram path's own Prometheus annotations are not wired here yet.
 
 use std::collections::{HashMap, HashSet};
 
@@ -215,8 +214,8 @@ fn bucket_quantile(phi: f64, buckets: &[Bucket]) -> f64 {
     bucket_start + (bucket_end - bucket_start) * (rank / count)
 }
 
-/// Per-group annotation flags a classic-histogram computation raises (issue
-/// #178): `bad_buckets` when the group is not a usable classic histogram
+/// Per-group annotation flags a classic-histogram computation raises:
+/// `bad_buckets` when the group is not a usable classic histogram
 /// (fewer than two buckets, or no `+Inf`), `forced_monotonic` when its
 /// cumulative counts had to be clamped. The phi/quantile out-of-range
 /// warning is not per-group (it depends only on the scalar argument) and is
@@ -263,7 +262,7 @@ fn quantile_for_group(phi: f64, buckets: Vec<Bucket>) -> (f64, ClassicGroupDiag)
 /// labels with `__name__` dropped) and the remaining float elements (the
 /// classic `le`-bucket series). A native histogram and a classic bucket family
 /// that would land on the same output label set is the mixed case Prometheus
-/// warns about (#178); the native value wins here (see [`histogram_quantile`]).
+/// warns about; the native value wins here (see [`histogram_quantile`]).
 fn split_native_classic(vector: InstantVector) -> (Vec<(LabelSet, FloatHistogram)>, InstantVector) {
     let mut native = Vec::new();
     let mut classic = Vec::new();
@@ -316,7 +315,7 @@ fn histogram_quantile(phi: f64, vector: InstantVector, ctx: &QueryWindow) -> Vec
     for (labels, buckets) in groups {
         // Mixed native+classic on the same output labels: native already
         // produced this group; drop the classic form (Prometheus keeps the
-        // native value and warns, #178).
+        // native value and warns).
         if seen.contains(&labels) {
             continue;
         }

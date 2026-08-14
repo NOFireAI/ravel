@@ -3,8 +3,8 @@
 //! timestamp, independent of whether the evaluator itself currently
 //! implements the surrounding construct. A future phase's query engine uses
 //! this to prefetch every window a query needs in one pass instead of
-//! resolving one selector's window at a time (the current, Phase 1
-//! prefetch contract).
+//! resolving one selector's window at a time (the current prefetch
+//! contract).
 //!
 //! This module deliberately walks constructs `eval::Evaluator` still
 //! rejects (`Aggregate`, `Binary`, `Call`, `Subquery`, `Extension`): a plan

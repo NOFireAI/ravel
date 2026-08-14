@@ -1,5 +1,5 @@
 //! Integration coverage for `histogram_quantile`/`histogram_fraction`
-//! through the public `Evaluator` API (P9): parsing and registry dispatch,
+//! through the public `Evaluator` API: parsing and registry dispatch,
 //! grouping by labels-minus-`le` end to end, nested composition with
 //! another function's output (the plan's "rate-of-buckets" shape), and the
 //! typed error a range-query top-level call gets since neither function

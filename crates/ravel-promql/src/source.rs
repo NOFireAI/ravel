@@ -1,13 +1,13 @@
 //! Storage abstraction the evaluator queries against (ADR-0006).
 //!
-//! `SeriesSource` is deliberately synchronous. Phase 1's query engine
+//! `SeriesSource` is deliberately synchronous. The query engine
 //! resolves a snapshot, prunes segments and series by matchers/time range,
 //! and reads the matched pages into memory *before* handing anything to the
 //! PromQL evaluator (docs/query-engine.md "Flow"): by the time `query` is
 //! called, the window is already materialized as plain Rust structs, so
 //! there is nothing left to await. A future streaming or Arrow-backed
-//! engine (ADR-0006 Phase 3) can still implement this trait; only the
-//! materialization strategy changes, not the contract.
+//! engine can still implement this trait; only the materialization strategy
+//! changes, not the contract.
 
 use ravel_types::{LabelSet, Sample};
 use regex::Regex;
@@ -45,7 +45,7 @@ pub struct SeriesData {
 /// One native-histogram sample: an event timestamp paired with a native
 /// histogram value, the histogram counterpart of [`Sample`]
 /// (`ravel_segment::HistogramSample` converted to the evaluator's float
-/// working form, P11). `value` is already the float model the evaluator
+/// working form). `value` is already the float model the evaluator
 /// operates on; the read path converts integer histograms to float before
 /// building these, exactly as Prometheus does before evaluation.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,7 +55,7 @@ pub struct HistogramSample {
 }
 
 /// One matched native-histogram series: its label set and histogram samples,
-/// the histogram counterpart of [`SeriesData`] (P11). Kept a separate type,
+/// the histogram counterpart of [`SeriesData`]. Kept a separate type,
 /// and surfaced through a separate [`SeriesSource::query_histograms`] method,
 /// rather than widening [`SeriesData`]: `SeriesData`'s two-field shape is a
 /// struct literal in `ravel-query`'s merge path, so adding a field there would
@@ -189,7 +189,7 @@ impl LabelMatcher {
     }
 }
 
-/// Errors from a `SeriesSource` backend. Deliberately coarse in Phase 1;
+/// Errors from a `SeriesSource` backend. Deliberately coarse for now;
 /// real backends (segment reads, catalog resolution) will refine this once
 /// those layers land.
 #[derive(Debug, thiserror::Error)]
@@ -217,7 +217,7 @@ pub trait SeriesSource: Send + Sync {
     ) -> Result<Vec<SeriesData>, SourceError>;
 
     /// Return every native-histogram series matching all of `matchers`, with
-    /// samples restricted to `window` (P11). Defaulted to empty so existing
+    /// samples restricted to `window`. Defaulted to empty so existing
     /// scalar-only sources (e.g. `ravel-query`'s `MergedSource`, which does
     /// not decode RSEG HIST_PAGES yet) need no change; a source that carries
     /// native histograms overrides it. A native-histogram series and a float

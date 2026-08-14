@@ -71,7 +71,7 @@ impl TestSource {
         Ok(self)
     }
 
-    /// Add one native-histogram series (P11). `samples` are `(ts_ns, value)`
+    /// Add one native-histogram series. `samples` are `(ts_ns, value)`
     /// pairs, sorted by timestamp before storage (stably), the histogram
     /// counterpart of [`TestSource::with_series`].
     pub fn with_histogram_series(

@@ -1,4 +1,4 @@
-//! Integration coverage for the P5 `_over_time` family's dispatch wiring
+//! Integration coverage for the `_over_time` family's dispatch wiring
 //! through the public `Evaluator` API: instant vs. range call dispatch for
 //! the plain `RangeVector` shape, `quantile_over_time`'s reversed
 //! (scalar-first) argument order (`FunctionKind::ScalarRangeVector`), and
@@ -46,7 +46,7 @@ fn range_query_sum_over_time_advances_the_cursor_across_steps() {
 }
 
 /// `quantile_over_time(q, v)` puts the scalar argument first, the mirror
-/// image of `predict_linear(v, t)`; this is the only P5 shape that does,
+/// image of `predict_linear(v, t)`; this is the only `_over_time` shape that does,
 /// dispatched through `FunctionKind::ScalarRangeVector`.
 #[test]
 fn quantile_over_time_scalar_first_argument_dispatches_correctly() {

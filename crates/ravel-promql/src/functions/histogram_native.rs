@@ -1,4 +1,4 @@
-//! Native-histogram scalar-extraction functions (plan section 8/P11):
+//! Native-histogram scalar-extraction functions:
 //! `histogram_count`, `histogram_sum`, `histogram_avg`. Each maps an instant
 //! vector of native-histogram elements to floats, one output per histogram
 //! element, dropping `__name__` (every function result drops the metric name).
@@ -6,7 +6,7 @@
 //! Mirroring Prometheus (`promql/functions.go` `funcHistogramCount` etc.):
 //! these operate on native-histogram samples only. A float element in the
 //! input is dropped (Prometheus emits an info annotation and skips it; this
-//! crate has no annotation channel yet, see the P11 report and #178). So a
+//! crate has no annotation channel for this case yet). So a
 //! `histogram_count(some_float_series)` yields an empty vector here, matching
 //! Prometheus' value behavior (empty result) if not its annotation.
 

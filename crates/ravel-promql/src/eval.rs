@@ -6,7 +6,7 @@
 //! `start()`/`end()`), function calls (`crate::functions`), binary
 //! expressions (`crate::binop`), aggregations (`crate::aggregate`), and
 //! subqueries (`expr[range:step]`, recursively evaluated at epoch-aligned
-//! steps, plan section 8/P10). Every other AST node is rejected with
+//! steps). Every other AST node is rejected with
 //! [`Error::Unsupported`], naming the construct.
 //!
 //! ## Time precision
@@ -94,8 +94,8 @@ pub struct InstantSample {
     pub orig_sample_ts_ns: i64,
     pub value: f64,
     /// The native histogram this element carries, when the underlying series
-    /// is a native (exponential) histogram (P11). `None` for an ordinary
-    /// float sample, which is every element produced by the pre-P11 evaluator.
+    /// is a native (exponential) histogram. `None` for an ordinary
+    /// float sample, which is every element produced for float-only queries.
     /// When `Some`, `value` is not meaningful and is left `0.0`; histogram-
     /// aware functions (`histogram_count`/`_sum`/`_avg`, native
     /// `histogram_quantile`/`_fraction`, `rate`/`sum`/`avg` over histograms)
@@ -107,7 +107,7 @@ pub struct InstantSample {
 
 impl InstantSample {
     /// A plain float element (`histogram: None`): the constructor every
-    /// pre-P11 code path uses so adding the histogram field stayed a
+    /// float-only code path uses so adding the histogram field stayed a
     /// single-line change at each call site.
     pub(crate) fn scalar(labels: LabelSet, ts_ns: i64, orig_sample_ts_ns: i64, value: f64) -> Self {
         InstantSample {
@@ -119,7 +119,7 @@ impl InstantSample {
         }
     }
 
-    /// A native-histogram element (P11): carries the histogram value with a
+    /// A native-histogram element: carries the histogram value with a
     /// placeholder `value` of `0.0`.
     pub(crate) fn histogram(
         labels: LabelSet,
@@ -147,9 +147,9 @@ pub type RangeMatrix = Vec<(LabelSet, Vec<Sample>)>;
 
 /// The native-histogram counterpart of [`RangeMatrix`] for one instant: one
 /// entry per matched histogram series, each carrying that series' in-window
-/// histogram samples (P11). Only used internally by the histogram
+/// histogram samples. Only used internally by the histogram
 /// `rate`/`increase`/`delta` path; native histograms have no range-query
-/// result rendering yet (see the P11 report).
+/// result rendering yet.
 pub(crate) type HistogramMatrix = Vec<(LabelSet, Vec<crate::histogram::TimedHistogram>)>;
 
 /// A typed evaluation result. Internal to `ravel-promql`: AST types from
@@ -669,7 +669,7 @@ impl Evaluator {
             annotations: RefCell::new(Annotations::default()),
         };
 
-        // P1's supported grammar (paren, unary minus, literals, one
+        // The supported grammar (paren, unary minus, literals, one
         // selector) can contain at most one selector, so unlike a general
         // multi-selector tree there is no risk of re-querying storage once
         // per node: the grid below still issues exactly one `source.query`
@@ -738,8 +738,8 @@ impl Evaluator {
         }
     }
 
-    /// General recursive evaluator for a single instant. Handles the P1
-    /// grammar (paren, unary minus, literals, vector/matrix selectors), P4's
+    /// General recursive evaluator for a single instant. Handles the
+    /// grammar (paren, unary minus, literals, vector/matrix selectors),
     /// registered function calls, and rejects everything else, naming the
     /// construct.
     pub(crate) fn eval_expr(
@@ -811,7 +811,7 @@ impl Evaluator {
             }
         }
 
-        // Native-histogram series matching the same selector (P11). A series
+        // Native-histogram series matching the same selector. A series
         // is either float or histogram in storage, so these never collide with
         // the float results above; the lookback pick is the same left-open
         // `(sel_ts - lookback, sel_ts]` rule.
@@ -876,7 +876,7 @@ impl Evaluator {
 
     /// Evaluate a subquery (`expr[range:step]`) at one instant: the inner
     /// `expr` re-evaluated, fully recursively, at every epoch-aligned step in
-    /// the subquery's own window (plan section 8/P10). Not reachable from a
+    /// the subquery's own window. Not reachable from a
     /// bare top-level expression (a bare subquery is always a top-level
     /// [`Error::WrongType`], matching Prometheus, same as a bare matrix
     /// selector); reached through `eval_expr`'s own `Expr::Subquery` arm
@@ -895,8 +895,8 @@ impl Evaluator {
     /// another subquery re-derives this same check at every enclosing grid
     /// step, so an inner grid that is itself over budget is rejected on the
     /// very first attempt to build it rather than after the outer grid has
-    /// multiplied it out (plan section 3.1: "No cross-step caching beyond
-    /// cursors in the first implementation", so this check, like every other
+    /// multiplied it out (no cross-step caching beyond cursors, so this
+    /// check, like every other
     /// part of subquery evaluation, is deliberately redone from scratch at
     /// each enclosing step rather than memoized).
     pub(crate) fn eval_subquery_matrix(
@@ -960,7 +960,7 @@ impl Evaluator {
     }
 
     /// The native-histogram counterpart of [`Self::eval_matrix_selector`] at
-    /// one instant (P11): every native histogram in the left-open window
+    /// one instant: every native histogram in the left-open window
     /// `(sel_ts - range, sel_ts]`, per matched histogram series, with
     /// `__name__` dropped (every function result drops it). Used by the
     /// histogram `rate`/`increase`/`delta` path; the float and histogram
@@ -1000,7 +1000,7 @@ impl Evaluator {
 
     /// Build the range matrix for a single top-level vector selector
     /// (`resolve_range_core`'s `Selector` case), one `source.query` call for
-    /// the whole grid, generalized from the pre-P1 implementation to
+    /// the whole grid, generalized to
     /// support `@` (which, when present, pins every step to the same
     /// instant rather than shifting with `t`).
     #[allow(clippy::too_many_arguments)]
@@ -1080,7 +1080,7 @@ impl Evaluator {
     /// pins every step to the same instant, so its bounds are constant,
     /// which is still non-decreasing). So for each series a single forward-
     /// only `(lo, hi)` index cursor spans every step, giving O(samples +
-    /// steps) per series (plan section 3.1) instead of re-scanning the
+    /// steps) per series instead of re-scanning the
     /// series' samples from scratch per step.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn eval_range_matrix_reduction(
@@ -1175,7 +1175,7 @@ impl Evaluator {
 }
 
 /// A range query's top-level construct, after stripping any enclosing
-/// `Paren`/`Unary` wrappers (P1's grammar allows at most one selector, so
+/// `Paren`/`Unary` wrappers (the grammar allows at most one selector, so
 /// this identifies it directly rather than routing through the general
 /// per-instant `eval_expr`, which would re-query storage once per grid
 /// step).
@@ -1280,7 +1280,7 @@ pub(crate) fn selector_eval_ts(
 /// The general form of [`selector_eval_ts`]: `@`'s absolute instant (falling
 /// back to the ambient `eval_ts_ns`) shifted by `offset`, if any. Shared by
 /// vector/matrix selectors and subqueries, whose `offset`/`@` resolve exactly
-/// the same way (plan section 3.2).
+/// the same way.
 pub(crate) fn resolve_eval_ts(
     offset: Option<&promql_parser::parser::Offset>,
     at: Option<&promql_parser::parser::AtModifier>,
@@ -2030,7 +2030,7 @@ mod tests {
         let source = TestSource::new();
         let err = Evaluator::new()
             .instant(&source, r#"up{job="a" or job="b"}"#, 0)
-            .expect_err("or-grouped matchers are not Phase 1 scope");
+            .expect_err("or-grouped matchers are not in scope");
         let Error::Unsupported { construct } = err else {
             panic!("expected Unsupported, got {err:?}");
         };
