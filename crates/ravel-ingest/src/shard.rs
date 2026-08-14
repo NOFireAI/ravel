@@ -200,7 +200,7 @@ impl TenantBuf {
     /// seen), per docs/ingest.md's `est_bytes` rule.
     ///
     /// Fails loud on a series-id collision (ADR-0005) or a value-kind
-    /// mismatch (docs/rseg-v3-plan.md section 3.4: a series is scalar or
+    /// mismatch (a series is scalar or
     /// histogram for its whole life, never both): before mutating the
     /// buffer, every incoming point's `series_id` is checked against the
     /// canonical label set and value kind that id already claims, whether
@@ -627,7 +627,7 @@ impl FlushCtx {
     /// injected `Clock`, returning `None` if the deadline is already past or
     /// elapses while `fut` is still in flight. This is what stops a store
     /// call that is merely slow -- never errors, just never returns -- from
-    /// carrying a flush past `max_flush_lifetime` on its own (issue #182):
+    /// carrying a flush past `max_flush_lifetime` on its own:
     /// without this, `deadline_ns` was only ever consulted between retryable
     /// -error attempts, never against an attempt that is still running.
     ///
@@ -773,7 +773,7 @@ impl FlushCtx {
 /// [`FlushCtx::run_flush`] (the `SplitBrain` panic on a broken pinning
 /// invariant, or any other) must still take this shard actor down with it,
 /// exactly as it did before flush execution moved into its own spawned task
-/// (issue #65 / audit finding a8-F03, `tests/shard_death_observable.rs`):
+/// (`tests/shard_death_observable.rs`):
 /// resuming the unwind here propagates it out of `run()`'s own task, which
 /// drops this actor (and `rx` with it), so the router observes the closed
 /// mailbox and reports `ShardUnavailable` exactly as it did when the flush
@@ -883,7 +883,7 @@ impl ShardActor {
     pub(crate) async fn run(mut self) {
         // The flush-tick cadence runs on the injected `Clock`, not the tokio
         // timer, so age-based flush timing shares the one clock the age check
-        // itself reads (docs/ingest.md "Shard actor"; finding a8-F04). A test
+        // itself reads (docs/ingest.md "Shard actor"). A test
         // that advances the injected clock past `max_flush_delay` therefore
         // drives a flush tick deterministically, with no real sleep.
         //
@@ -1013,7 +1013,7 @@ impl ShardActor {
     /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
     /// already justifies a PUT on the fast age clock; anything else is idle
     /// and waits for the slower `max_flush_delay_idle` instead (ADR-0051
-    /// section 7, S2-06). Strict-mode ack latency is unaffected: a strict
+    /// section 7). Strict-mode ack latency is unaffected: a strict
     /// write always leaves `waiters` non-empty for its whole flush window.
     ///
     /// The fast clock itself is either the fixed `max_flush_delay` (today's

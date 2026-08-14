@@ -172,7 +172,7 @@ impl SpanIngestRouter {
     /// re-reading the provisioning record when the cached view is older than the
     /// refresh interval `C` (ADR-0052 section 3). When the re-read cannot
     /// complete, falls back to [`GenerationSwitch::try_grace_extend`]'s bounded
-    /// NF-2 grace window (issue #655) before failing closed: continuing on the
+    /// grace window before failing closed: continuing on the
     /// last-known-good view is only safe while that method's horizon predicate
     /// holds, so a genuinely unknowable generation change still fails the flush
     /// exactly as before.
@@ -623,7 +623,7 @@ mod tests {
 
     /// Base clock reading these tests anchor their relative hour offsets to,
     /// so a flush-open clock always sits above the plausibility floor
-    /// (ADR-0051 amendment, S1-12): `checked_ingest_hour_bucket` now rejects a
+    /// (ADR-0051 amendment): `checked_ingest_hour_bucket` now rejects a
     /// reading below `MIN_PLAUSIBLE_INGEST_CLOCK_NS`. Equal to that floor
     /// (2020-01-01T00:00:00Z), which is an exact hour multiple, so `hour N` in
     /// a test is absolute hour `BASE_HOUR + N`.
@@ -731,7 +731,7 @@ mod tests {
         );
     }
 
-    /// Flush-open floor fail-loud (ADR-0051 amendment §7 extension, S1-12): a
+    /// Flush-open floor fail-loud (ADR-0051 amendment §7 extension): a
     /// flush whose open clock reads below `MIN_PLAUSIBLE_INGEST_CLOCK_NS` (here
     /// hour 100, in 1970) fails the strict write loudly with
     /// `SegmentBuild`, rather than silently bucketing acked data into a
@@ -779,7 +779,7 @@ mod tests {
         );
     }
 
-    /// Staleness fail-closed, with the NF-2 bounded grace window (issue #655):
+    /// Staleness fail-closed, with the bounded grace window:
     /// once the router's cached view for a tenant ages past `C`, the router
     /// re-reads the provisioning record before routing; if that re-read
     /// cannot complete (here a store fault on the record GET), the router
@@ -791,8 +791,8 @@ mod tests {
     /// does the write fail closed with the typed error and the ordinary
     /// stale-flush counter (ADR-0052 section 3). Before the grace window
     /// existed, this test's first assertion was `expect_err` on the
-    /// still-within-horizon write -- that is the exact behavior issue #655
-    /// NF-2 replaces, since it turned any sustained store latency into a
+    /// still-within-horizon write -- that is the exact behavior the
+    /// grace window replaces, since it turned any sustained store latency into a
     /// total outage instead of a degraded-but-available router.
     #[tokio::test]
     async fn stale_view_routes_via_grace_window_then_fails_closed_past_horizon() {

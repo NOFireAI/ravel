@@ -1,11 +1,6 @@
-//! Regression test for issue #63 (audit finding a8-F01): the shard buffer
+//! Regression test: the shard buffer
 //! must fail loud when two points share one `series_id` under distinct
 //! canonical label sets, never silently merge them (ADR-0005 "Decision").
-//!
-//! Adapted from the `#[ignore]`d reproducer
-//! `crates/ravel-ingest/tests/audit_a8_repro.rs::a8_f01_colliding_series_ids_merge_silently`
-//! on branch `audit/repro-a8`, inverted from "asserts the silent merge" to
-//! "asserts the typed rejection and counter".
 #![allow(clippy::expect_used)]
 
 mod common;

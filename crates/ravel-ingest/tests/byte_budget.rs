@@ -1,4 +1,4 @@
-//! Process-wide ingest buffer byte budget (ADR-0069 decision 1, issue #819):
+//! Process-wide ingest buffer byte budget (ADR-0069 decision 1):
 //! a request's estimated buffered bytes are charged at admission and refunded
 //! when the flush holding them completes or fails. These tests drive the real
 //! [`IngestRouter`] with a bounded budget and a [`FaultStore`] whose hold gates

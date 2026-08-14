@@ -1,13 +1,7 @@
-//! Regression test for issue #65 (audit finding a8-F03): a shard actor that
-//! dies mid-flush must become observable, not silently partial.
+//! Regression test: a shard actor that dies mid-flush must become observable,
+//! not silently partial.
 //!
-//! Adapted from the a8-F03 reproducer on branch `audit/repro-a8`
-//! (`crates/ravel-ingest/tests/audit_a8_repro.rs`). The reproducer asserted
-//! the *defective* behavior: a live router returning `Ok` for the surviving
-//! shards and `ShardUnavailable` for the dead one, with `IngestMetricsSnapshot`
-//! unchanged, so a quarter of ingest capacity vanished uncounted.
-//!
-//! This test asserts the fixed behavior: routing to a dead shard still yields
+//! Routing to a dead shard still yields
 //! the typed `WriteError::ShardUnavailable` (not silence, not a hang), the
 //! surviving shards keep acking, and the router now counts the death exactly
 //! once in `IngestMetricsSnapshot::shard_deaths`.
@@ -135,7 +129,7 @@ impl ObjectStoreBackend for SplitBrainOnFirstCommit {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()

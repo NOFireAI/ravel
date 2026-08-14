@@ -61,8 +61,7 @@ pub struct IngestRouter {
     clock: Arc<dyn Clock>,
     metrics: Arc<IngestMetrics>,
     config: IngestConfig,
-    /// Process-wide ingest buffer byte budget (ADR-0069 decision 1, issue
-    /// #819). Shared by `Arc` with the log and span routers so one ceiling
+    /// Process-wide ingest buffer byte budget (ADR-0069 decision 1). Shared by `Arc` with the log and span routers so one ceiling
     /// bounds the sum across all signals. Defaults to `Unlimited` for callers
     /// (chiefly tests) that build a router without one via [`IngestRouter::new`];
     /// `services/ravel-server` installs the configured budget with
@@ -163,7 +162,7 @@ impl IngestRouter {
     /// re-reading the provisioning record when the cached view is older than the
     /// refresh interval `C` (ADR-0052 section 3). When the re-read cannot
     /// complete, falls back to [`GenerationSwitch::try_grace_extend`]'s bounded
-    /// NF-2 grace window (issue #655) before failing closed: continuing on the
+    /// grace window before failing closed: continuing on the
     /// last-known-good view is only safe while that method's horizon predicate
     /// holds, so a genuinely unknowable generation change still fails the flush
     /// exactly as before.
@@ -247,8 +246,8 @@ impl IngestRouter {
     }
 
     /// Like [`Self::write`], but for points that already carry their value
-    /// shape (scalar or histogram) rather than OTLP's `NormalizedPoint`
-    /// (docs/rseg-v3-plan.md section 7). Both entry points reach the same
+    /// shape (scalar or histogram) rather than OTLP's `NormalizedPoint`.
+    /// Both entry points reach the same
     /// shard buffer and the same RSEG v5 writer; this one is for callers
     /// that construct [`IngestPoint`]s directly, chiefly the wire surfaces
     /// mixing scalar and native-histogram points from one request.
@@ -384,7 +383,7 @@ impl IngestRouter {
                 // The actor task is gone (it never closes its own receiver
                 // while alive), so this shard is dead. Count it once and
                 // surface the typed error rather than acking as if the points
-                // landed (a8-F03).
+                // landed.
                 self.mark_shard_dead(&set[shard as usize]);
                 return Err(WriteError::ShardUnavailable);
             }
@@ -417,7 +416,7 @@ impl IngestRouter {
 
     /// Records the first observation of a shard actor's death, deduped so a
     /// permanently dead shard is counted once no matter how many later writes
-    /// route to it (docs/ingest.md "Metrics (self-observability)", a8-F03).
+    /// route to it (docs/ingest.md "Metrics (self-observability)").
     fn mark_shard_dead(&self, handle: &ShardHandle) {
         if !handle.dead.swap(true, Ordering::Relaxed) {
             self.metrics.record_shard_death();

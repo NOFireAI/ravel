@@ -1,10 +1,7 @@
-//! Regression test for issue #64 (audit finding a8-F02): dropping the router
-//! without calling `shutdown()` must not silently discard buffered points.
+//! Regression test: dropping the router without calling `shutdown()` must not
+//! silently discard buffered points.
 //!
-//! Adapted from the a8-F02 reproducer on branch `audit/repro-a8`
-//! (`crates/ravel-ingest/tests/audit_a8_repro.rs`). The reproducer asserted
-//! the *defective* behavior (store still empty after the drop); this test
-//! asserts the fixed behavior: the channel-close arm of `ShardActor::run`
+//! The channel-close arm of `ShardActor::run`
 //! flushes buffered tenants before stopping, so the acknowledged buffered-mode
 //! point reaches the store durably.
 //!
@@ -109,12 +106,12 @@ async fn dropping_router_flushes_buffered_points() {
     let objects = list_all(store.as_ref(), "t/").await.expect("list");
     assert!(
         !objects.is_empty(),
-        "issue #64: dropping the router must flush buffered points, but the \
+        "dropping the router must flush buffered points, but the \
          store is empty"
     );
     assert!(
         objects.iter().any(|o| o.key.contains("/c/")),
-        "issue #64: a commit record must exist after the graceful-close flush; \
+        "a commit record must exist after the graceful-close flush; \
          found only {objects:?}"
     );
 

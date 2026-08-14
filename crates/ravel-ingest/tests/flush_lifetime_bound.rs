@@ -1,4 +1,4 @@
-//! Regression test for issue #182: the shard actor must bound each store
+//! Regression test: the shard actor must bound each store
 //! call to `max_flush_lifetime` itself, not just check the deadline between
 //! retryable-error attempts. A call that is merely slow -- never errors,
 //! just never returns -- must not be allowed to publish a flush past its

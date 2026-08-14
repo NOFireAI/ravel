@@ -56,8 +56,7 @@
 //! `own_current_usage` is a *measured* rate, not a stock the threshold
 //! controls, so once the fleet crosses the cap every process reads "whatever I
 //! am already sending" as `own`, additive headroom returns exactly that, and
-//! the fleet sustains the sum of everyone's rate indefinitely (a bug the
-//! checkpoint reviewing this mechanism caught before it landed, 2026-08-06).
+//! the fleet sustains the sum of everyone's rate indefinitely (a bug caught in review before it landed).
 //! Dividing the cap into equal shares floors the fleet-wide sum at
 //! `configured_fleet_cap` (floor-rounding can only lose up to `N - 1` total,
 //! never exceed the cap). `N` is computed from the same non-stale sibling set

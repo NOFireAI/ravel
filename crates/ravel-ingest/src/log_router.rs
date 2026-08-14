@@ -27,7 +27,7 @@ use crate::log_shard::{LogShardActor, LogShardMsg, est_record_bytes};
 use crate::router::WriteMode;
 
 /// Resolves the POSTINGS indexed-field list for a tenant at flush time
-/// (ADR-0049 decision 3, issue #511). The shard actor calls this once per
+/// (ADR-0049 decision 3). The shard actor calls this once per
 /// object, just before building the writer, and hands the result to
 /// `RlogWriter::with_indexed_fields`.
 ///
@@ -44,7 +44,7 @@ pub trait LogIndexedFields: Send + Sync {
 /// The default resolver: no tenant indexes any field, so the writer emits no
 /// POSTINGS section. This is the behaviour of every call site that has not
 /// wired per-tenant configuration, which is exactly what the writer did before
-/// issue #511.
+/// per-tenant configuration existed.
 pub struct NoIndexedFields;
 
 impl LogIndexedFields for NoIndexedFields {
@@ -91,7 +91,7 @@ pub struct LogIngestRouter {
 impl LogIngestRouter {
     /// Builds a router whose shards index no POSTINGS field
     /// ([`NoIndexedFields`]). Use [`Self::new_with_indexed_fields`] to wire
-    /// per-tenant configuration (issue #511).
+    /// per-tenant configuration.
     pub fn new(
         config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
@@ -102,7 +102,7 @@ impl LogIngestRouter {
 
     /// Like [`Self::new`], but every shard resolves each tenant's POSTINGS
     /// indexed-field list through `indexed_fields` at flush time (ADR-0049
-    /// decision 3, issue #511). This is the production constructor; the server
+    /// decision 3). This is the production constructor; the server
     /// passes its per-tenant `IndexedFieldConfig` here.
     pub fn new_with_indexed_fields(
         config: IngestConfig,
@@ -179,7 +179,7 @@ impl LogIngestRouter {
     /// re-reading the provisioning record when the cached view is older than the
     /// refresh interval `C` (ADR-0052 section 3). When the re-read cannot
     /// complete, falls back to [`GenerationSwitch::try_grace_extend`]'s bounded
-    /// NF-2 grace window (issue #655) before failing closed: continuing on the
+    /// grace window before failing closed: continuing on the
     /// last-known-good view is only safe while that method's horizon predicate
     /// holds, so a genuinely unknowable generation change still fails the flush
     /// exactly as before.
@@ -439,7 +439,7 @@ mod tests {
         )
     }
 
-    /// NF-2 (issue #655): under sustained store latency, a router whose cached
+    /// Under sustained store latency, a router whose cached
     /// view has gone stale by `C` keeps routing every flush inside the bounded
     /// grace window rather than failing all of them closed, and still fails
     /// closed once the horizon is crossed.
@@ -452,7 +452,7 @@ mod tests {
     /// single one of the three `active_set` calls below -- at t0+C, well within
     /// the grace horizon, and past it -- would return `Err`: a total ingest
     /// outage for this tenant for as long as the store stays slow, exactly the
-    /// NF-2 finding. This test proves the fix: the first two calls succeed
+    /// sustained-latency finding. This test proves the fix: the first two calls succeed
     /// (degraded, metered), and only the third -- past the horizon, where an
     /// unseen generation change becomes possible -- fails closed.
     #[tokio::test]
@@ -518,7 +518,7 @@ mod tests {
         );
     }
 
-    /// NF-2: a tenant whose cached view has genuinely changed `shard_count`
+    /// A tenant whose cached view has genuinely changed `shard_count`
     /// (observed via a successful refresh, not grace-extension) routes at the
     /// new count immediately -- grace-extension is never on this router's path
     /// when the store is healthy, since `route_cached`/a successful re-read

@@ -87,8 +87,8 @@ async fn age_triggered_flush_lands_below_size_threshold() {
         1.0,
     )];
 
-    // The shard actor's flush tick now runs on the injected `TestClock`
-    // (finding a8-F04), so the two clocks that used to be raced with a real
+    // The shard actor's flush tick now runs on the injected `TestClock`,
+    // so the two clocks that used to be raced with a real
     // `tokio::time::sleep` are one. Wait cooperatively until the point is
     // actually buffered in the actor, then advance the injected clock past
     // `max_flush_delay`; that advance deterministically wakes the tick and
@@ -154,7 +154,7 @@ fn norm_span(start_ns: i64) -> NormalizedSpan {
     }
 }
 
-/// ADR-0051 section 7 (S1-12): a non-positive flush clock reading can never
+/// ADR-0051 section 7: a non-positive flush clock reading can never
 /// be a valid hour bucket. The old `unwrap_or(0)` silently mapped it to
 /// bucket 0 instead of surfacing the problem; each shard actor must now fail
 /// the flush with a typed `SegmentBuild` error, ack every waiter with it, and

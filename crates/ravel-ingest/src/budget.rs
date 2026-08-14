@@ -1,4 +1,4 @@
-//! Process-wide ingest buffer byte budget (ADR-0069 decision 1, issue #819).
+//! Process-wide ingest buffer byte budget (ADR-0069 decision 1).
 //!
 //! Ravel's memory model is configuration-bounded per tenant and per query, but
 //! nothing bounded the *sum* of buffered ingest state across tenants: the
@@ -49,7 +49,7 @@ pub enum IngestByteBudgetLimit {
 /// beyond this; there is exactly one thing this budget sheds for. The gateway
 /// maps it to HTTP 429 with a fixed `Retry-After` (a slot frees as soon as any
 /// in-flight flush completes, so there is no per-caller refill estimate to
-/// surface, the same shape #802's in-flight shed uses) or gRPC
+/// surface, the same shape the in-flight shed uses) or gRPC
 /// `RESOURCE_EXHAUSTED`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("process ingest buffer byte budget reached")]

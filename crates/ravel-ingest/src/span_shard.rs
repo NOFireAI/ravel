@@ -273,7 +273,7 @@ impl SpanShardActor {
     /// A buffer with a strict-mode waiter or at least `min_flush_bytes`
     /// already justifies a PUT on the fast `max_flush_delay` clock; anything
     /// else is idle and waits for the slower `max_flush_delay_idle` instead
-    /// (ADR-0051 section 7, S3-05). Strict-mode ack latency is unaffected:
+    /// (ADR-0051 section 7). Strict-mode ack latency is unaffected:
     /// a strict write always leaves `waiters` non-empty for its whole flush
     /// window.
     fn age_threshold_ns(&self, buf: &SpanTenantBuf) -> i64 {

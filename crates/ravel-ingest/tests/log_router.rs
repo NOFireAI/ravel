@@ -299,7 +299,7 @@ impl ObjectStoreBackend for SplitBrainOnFirstCommit {
 
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()

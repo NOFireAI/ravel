@@ -1,4 +1,4 @@
-//! Generalized ingest point/value shapes (docs/rseg-v3-plan.md section 7): a
+//! Generalized ingest point/value shapes: a
 //! point carries either a scalar sample or a native-histogram sample. Wire
 //! admission produces both: `ravel_otlp::NormalizedPoint` (scalar) and
 //! `ravel_otlp::NormalizedHistogramPoint` (native histogram) each convert
@@ -111,8 +111,7 @@ impl IngestExemplar {
     }
 }
 
-/// Which shape a series' points carry (`value_kind`,
-/// docs/rseg-v3-plan.md section 3.4): homogeneous per series for its
+/// Which shape a series' points carry (`value_kind`): homogeneous per series for its
 /// whole life in a segment, so a shard buffer rejects a series that
 /// receives both kinds within one flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
