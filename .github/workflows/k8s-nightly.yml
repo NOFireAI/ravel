@@ -46,13 +46,13 @@ jobs:
       RAVEL_SERVER_IMAGE: ravel-server:kind-ci
       RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: Swatinem/rust-cache@v2
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build the release binaries on the host
         run: |
           cargo build --release --locked -p ravel-server --features sql
@@ -74,7 +74,7 @@ jobs:
       - name: Save the assembled images
         run: docker save -o k8s-images.tar "$RAVEL_SERVER_IMAGE" "$RAVEL_OPERATOR_IMAGE"
       - name: Upload the assembled images
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: k8s-images-nightly
           path: k8s-images.tar
@@ -93,10 +93,10 @@ jobs:
       RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
       RAVEL_KIND_CLUSTER: ravel-ci
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/free-disk-space
       - name: Download the assembled images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: k8s-images-nightly
       - name: Load the assembled images into the docker daemon

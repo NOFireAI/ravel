@@ -17,9 +17,9 @@ runs:
     # below changes (a new action version installs a new sccache version, which
     # lands under a new tool-cache path; a stale key would pin the old binary).
     - name: Cache the sccache tool binary
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.tool_cache }}/sccache
         key: sccache-tool-${{ runner.os }}-${{ runner.arch }}-action-v0.0.10
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
