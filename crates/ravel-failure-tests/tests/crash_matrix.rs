@@ -122,8 +122,8 @@ async fn crash_before_data_put_leaves_nothing_stored_or_visible() {
 /// the data object is an orphan. The orphan-creation half is real production
 /// coverage. The GC half asserts the intended sweep behavior (no delete
 /// before `grace + max_flush_lifetime`, re-verify commit absence, then
-/// delete) against `spec_model_sweep_orphans`, a SPECIFICATION MODEL — no
-/// production GC exists yet (Phase 2). The test name carries `spec_model_gc`
+/// delete) against `spec_model_sweep_orphans`, a SPECIFICATION MODEL, not the
+/// shipped GC path. The test name carries `spec_model_gc`
 /// so a green run is never read as production-GC coverage. When the real GC
 /// lands, retarget these assertions at it.
 #[tokio::test]

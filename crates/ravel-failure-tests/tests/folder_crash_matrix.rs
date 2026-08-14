@@ -61,7 +61,7 @@ fn folder_catalog(store: Arc<dyn ObjectStoreBackend>) -> Catalog {
 
 /// Row: "folder down D hours" -> listed suffix widens, never loses data.
 /// Three sealed hours accumulate with no folder ever running; every sample
-/// resolves through pure Phase 1 listing. A folder then catches up in one
+/// resolves through pure commit-record listing. A folder then catches up in one
 /// shot, and the same queries must return byte-identical results, proving
 /// the index changed only the request shape, not the answer.
 #[tokio::test]
@@ -147,7 +147,7 @@ async fn folder_down_for_hours_never_loses_data_only_widens_listing() {
     }
 }
 
-/// Row: "HEAD missing/corrupt" -> full Phase 1 listing cost, never an
+/// Row: "HEAD missing/corrupt" -> full commit-record listing cost, never an
 /// error. A HEAD overwritten with garbage bytes must degrade
 /// `resolve_snapshot_window` to `None`, not surface `CatalogError` up through
 /// the query engine.
@@ -208,7 +208,7 @@ async fn corrupt_head_falls_back_to_listing_never_to_an_error() {
     assert_eq!(result[0].value, 42.0);
 }
 
-/// Row: "part missing/corrupt" -> full Phase 1 listing cost after one HEAD
+/// Row: "part missing/corrupt" -> full commit-record listing cost after one HEAD
 /// re-read. Deleting the part HEAD names (a GC race) must trigger exactly one
 /// bypass-cache HEAD re-read before falling back, never an error and never
 /// missing data.
