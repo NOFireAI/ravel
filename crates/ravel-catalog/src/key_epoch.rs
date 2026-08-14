@@ -1,4 +1,4 @@
-//! Per-tenant KMS key-epoch record (ADR-0062 decision 1b, epic EL wave 2).
+//! Per-tenant KMS key-epoch record (ADR-0062 decision 1b).
 //!
 //! Each tenant carries an append-only key-epoch record at `t/<tenant_hash>/enc`
 //! recording, in order, every KMS key the tenant's objects have been written
@@ -14,8 +14,8 @@
 //! time predates the tenant's first recorded epoch is a custody anomaly.
 //!
 //! This module builds and verifies the durable record independently of the
-//! live `KmsRoutingStore` routing decorator (EL-1); wiring the record into the
-//! decorator at server startup is EL-7's job, not this module's. EL-7's
+//! live `KmsRoutingStore` routing decorator; wiring the record into the
+//! decorator at server startup is a separate wiring step, not this module's. That
 //! bootstrap MUST record epoch 0 with `key_arn: ""` (deployment default) and
 //! an `activated_ns` at or before the tenant's earliest live object -- not
 //! only at the moment an operator first configures a per-tenant key -- or

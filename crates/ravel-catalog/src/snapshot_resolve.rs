@@ -1,4 +1,4 @@
-//! Snapshot-backed resolve (docs/metric-index-plan.md 5.1/5.3, ADR-0020).
+//! Snapshot-backed resolve (ADR-0020).
 //!
 //! Reads HEAD through a TTL cache and its parts through an immutable
 //! per-key cache, serves window hours at or below the watermark from part
@@ -33,8 +33,7 @@ use crate::snapshot::{SegmentLevel, SegmentRef};
 use crate::snapshot_format::{self, DecodedPart, DecodedPostings, PartLimits, PostingsLimits};
 
 /// Leading sentinel that marks a `name_filter` string as a literal-prefix
-/// range key rather than an exact `__name__` value (ADR-0061 decision 3,
-/// EF-4/#724).
+/// range key rather than an exact `__name__` value (ADR-0061 decision 3).
 ///
 /// The postings-pruning pipeline threads a single `Option<&str>` filter from
 /// each query language down through `Catalog::resolve_pruned` (which is out of
@@ -58,7 +57,7 @@ use crate::snapshot_format::{self, DecodedPart, DecodedPostings, PartLimits, Pos
 /// exists to prevent.
 ///
 /// The two producers duplicate this constant's value inline (matching this
-/// codebase's language-specific-enforcement precedent, #278 and ADR-0061
+/// codebase's language-specific-enforcement precedent and ADR-0061
 /// decision 1); [`PREFIX_FILTER_SENTINEL`]'s own value is pinned by a test so a
 /// silent drift is caught.
 pub(crate) const PREFIX_FILTER_SENTINEL: char = '\u{1}';
@@ -76,8 +75,7 @@ pub(crate) struct SnapshotWindow {
     /// list, so a postings object covering the full HEAD no longer binds and
     /// pruning safely declines.
     part_blake3: Vec<Vec<u8>>,
-    /// Decoded, part-bound name postings (P5b, docs/metric-index-plan.md
-    /// 5.4), or `None` when postings are absent, unreadable, corrupt, or
+    /// Decoded, part-bound name postings, or `None` when postings are absent, unreadable, corrupt, or
     /// don't cleanly bind to `parts`. Always safe to treat as absent:
     /// postings are a pure pruning optimization, never a correctness
     /// dependency (`extract_into` falls back to including every entry).
@@ -87,14 +85,13 @@ pub(crate) struct SnapshotWindow {
 impl SnapshotWindow {
     /// Extract entries for `[lower_hour, upper_hour]` (inclusive) from every
     /// part, filtered by event-time overlap with `query_range` exactly as
-    /// `Catalog::list_hour_bucket` does, deduped into `out` by data key
-    /// (docs/metric-index-plan.md 5.1 step 5). Entries are sorted
-    /// hour-major within each part (docs/metric-index-plan.md 3.1), so the
+    /// `Catalog::list_hour_bucket` does, deduped into `out` by data key. Entries are sorted
+    /// hour-major within each part, so the
     /// matching hour range is one contiguous slice found by
     /// `partition_point`.
     ///
-    /// `name_filter`, when `Some`, is the query's `__name__` pruning key (P5b,
-    /// ADR-0061 decision 3): either an exact equality value, or -- when it
+    /// `name_filter`, when `Some`, is the query's `__name__` pruning key
+    /// (ADR-0061 decision 3): either an exact equality value, or -- when it
     /// begins with [`PREFIX_FILTER_SENTINEL`] -- a literal prefix from a
     /// prefix-anchored `__name__` regex (`^foo.*$`). Either way, entries this
     /// snapshot's postings provably do not carry a matching name are skipped
@@ -323,8 +320,8 @@ impl SnapshotWindow {
 /// Outcome of loading every part a HEAD names.
 enum PartLoadOutcome {
     Loaded(Vec<Arc<DecodedPart>>),
-    /// A part GET returned `NotFound`: races GC of a just-superseded part
-    /// (docs/metric-index-plan.md 5.1 step 2). The caller re-reads HEAD
+    /// A part GET returned `NotFound`: races GC of a just-superseded part.
+    /// The caller re-reads HEAD
     /// once and retries before falling back.
     NotFoundRace,
     Unusable,
@@ -340,9 +337,9 @@ impl Catalog {
     /// Resolve the current snapshot window for (tenant, signal), or `None`
     /// if no snapshot is usable right now (absent, corrupt, or its parts
     /// unreadable). Never returns an error for index-only failures: the
-    /// index is a pure optimization (docs/metric-index-plan.md 5.1 step 2).
+    /// index is a pure optimization.
     ///
-    /// `want_postings` gates the postings GET (#278 item 3): the postings
+    /// `want_postings` gates the postings GET: the postings
     /// object is only ever consulted to prune by an equality `__name__`
     /// filter, so a resolve with no such filter passes `false` and never
     /// fetches or decodes it. Passing `false` is equivalent to postings being
@@ -354,7 +351,7 @@ impl Catalog {
     /// the head validated under the caller's passed-in `generations`. The
     /// caller (`resolve_fanout`) must build its Phase 1 scan set from `fresh`
     /// whenever it is present, so the listing suffix is never scanned over a
-    /// staler generation view than the one that validated the head (Finding 4).
+    /// staler generation view than the one that validated the head.
     /// The re-read's fresher view is propagated even when the window itself
     /// turns out unusable, so a fall-back-to-listing pass still scans the
     /// correct range.
@@ -415,8 +412,7 @@ impl Catalog {
             PartLoadOutcome::Unusable => Ok((None, revalidated)),
             PartLoadOutcome::IsolationBreach(err) => Err(err),
             PartLoadOutcome::NotFoundRace => {
-                // At most one HEAD re-read (docs/metric-index-plan.md 5.1
-                // step 2): bypass the TTL cache so a part GC'd since the
+                // At most one HEAD re-read: bypass the TTL cache so a part GC'd since the
                 // cached HEAD was read is not raced again.
                 let Some((fresh_head, fresh_revalidated)) = self
                     .read_head(
@@ -465,7 +461,7 @@ impl Catalog {
     }
 
     /// Load and verify this HEAD's name postings through the immutable
-    /// postings cache (P5b, docs/metric-index-plan.md 5.4). Every failure
+    /// postings cache. Every failure
     /// mode short of a `tenant_hash` mismatch (no postings ref, GET error,
     /// hash mismatch, decode error, part-binding mismatch, entry-count
     /// mismatch) degrades to `Ok(None)`: postings are a pure pruning
@@ -521,7 +517,7 @@ impl Catalog {
             tracing::warn!(key = %postings_ref.key, "postings hash mismatch, pruning disabled");
             return Ok(None);
         }
-        // ADR-0050 §2 (#528): the tenant_hash check runs BEFORE decode's
+        // ADR-0050 §2: the tenant_hash check runs BEFORE decode's
         // part-binding check. `decode_postings` rejects an object not bound to
         // this HEAD's exact part hashes with `PostingsPartBindingMismatch`,
         // which degrades to `Ok(None)` (stale derived data, no cross-tenant
@@ -576,7 +572,7 @@ impl Catalog {
     /// Read HEAD, through the TTL cache unless `bypass_cache`. Any failure
     /// short of a `shard_count` or `tenant_hash` mismatch is logged and
     /// folded into `None` (fall back to listing). A `shard_count` mismatch
-    /// is a loud error (docs/metric-index-plan.md 5.1 step 1), but under
+    /// is a loud error, but under
     /// ADR-0052 section 5 "mismatch" no longer means "not equal to this
     /// process's static `shard_count`": the head's `shard_count` is the
     /// fan-out ceiling at fold time, so it is validated against the ceiling
@@ -675,7 +671,7 @@ impl Catalog {
     ///   could under-scan; or
     /// - the head knew *fewer* generations than the reader but its own
     ///   watermark reaches into hours an unknown-to-the-head generation was
-    ///   already active for (Finding 2): silently accepting would omit data
+    ///   already active for: silently accepting would omit data
     ///   that landed in the newer, possibly-wider range within the head's own
     ///   watermark. `head_generations_acceptable` already rejected this case,
     ///   so it lands here rather than being served.
@@ -691,7 +687,7 @@ impl Catalog {
     /// re-read was performed and accepted -- the caller must then use `fresh`
     /// (never staler than the passed-in view) for its Phase 1 scan set, so the
     /// listing suffix is never scanned over a staler generation history than
-    /// the one that validated the head (Finding 4).
+    /// the one that validated the head.
     async fn validate_head_against_generations(
         &self,
         tenant: &TenantHash,
@@ -723,7 +719,7 @@ impl Catalog {
     /// re-verification.
     ///
     /// The uncached part GETs run concurrently under the resolve-wide
-    /// semaphore (#278 item 2) rather than one await at a time. `buffered`
+    /// semaphore rather than one await at a time. `buffered`
     /// preserves HEAD's part order, and the fold returns the first
     /// non-`Loaded` outcome in that order, so a multi-part snapshot yields
     /// exactly the same `NotFoundRace`/`Unusable` decision the sequential
@@ -759,7 +755,7 @@ impl Catalog {
 
     /// Load, verify, and decode one snapshot part through the immutable part
     /// cache. The per-part half of [`load_snapshot_parts`](Self::load_snapshot_parts),
-    /// factored out so the parts can be fetched concurrently (#278 item 2).
+    /// factored out so the parts can be fetched concurrently.
     async fn load_one_part(
         &self,
         tenant: &TenantHash,
@@ -809,7 +805,7 @@ impl Catalog {
         // per-part blake3 was already verified above, but a HEAD that passes
         // that check can still reference a part object belonging to another
         // tenant; the part header's tenant_hash is the independent binding to
-        // the requester (#527).
+        // the requester.
         if decoded.header.tenant_hash.as_slice() != tenant.0.as_slice() {
             self.record_isolation_breach();
             return OnePartOutcome::IsolationBreach(CatalogError::FieldMismatch {
@@ -836,7 +832,7 @@ enum OnePartOutcome {
     Loaded(Arc<DecodedPart>),
     NotFoundRace,
     Unusable,
-    /// This part's header names a foreign tenant (ADR-0050 §2, #527).
+    /// This part's header names a foreign tenant (ADR-0050 §2).
     IsolationBreach(CatalogError),
 }
 
@@ -850,7 +846,7 @@ enum OnePartOutcome {
 ///   its watermark predates the activation of the first generation it didn't
 ///   know about, so Phase 1 listing genuinely covers every hour the head lacks.
 ///
-/// The watermark check on the older-head arm is the Finding 2 fix: without it,
+/// The watermark check on the older-head arm guards a real gap: without it,
 /// this arm accepted any lower-`shard_generation_count` head unconditionally,
 /// so a head whose own watermark reached into hours a newer, wider generation
 /// was already active for would be served silently, omitting data that landed
@@ -946,7 +942,7 @@ fn build_segment_ref_from_entry(
     // exactly the `SegmentRef` a live listing produces from the compaction
     // record and part (`build_l1_segment_ref`): the L1 data key from
     // `keys::l1_part_key`, and writer_* left nil since an L1 part has no
-    // writer identity (docs/metric-index-plan.md section 7).
+    // writer identity.
     if entry.level != 0 {
         let input_set_hash: [u8; 32] =
             entry
@@ -1209,7 +1205,7 @@ mod tests {
         assert_eq!(catalog.isolation_breaches(), 1);
     }
 
-    /// #527 / ADR-0050 §2: a snapshot part whose own header names a foreign
+    /// ADR-0050 §2: a snapshot part whose own header names a foreign
     /// tenant, referenced by a HEAD that is otherwise valid for this tenant
     /// (correct HEAD tenant_hash, correct per-part blake3), must hard-fail on
     /// the part's tenant_hash, never be served, and must count the breach.
@@ -1293,7 +1289,7 @@ mod tests {
         );
     }
 
-    /// #528 / ADR-0050 §2: a postings object declaring a foreign tenant_hash
+    /// ADR-0050 §2: a postings object declaring a foreign tenant_hash
     /// that is NOT bound to this HEAD's part hashes must hard-fail on the
     /// tenant, not degrade to `Ok(None)` through the binding-mismatch path
     /// that runs first for a bound object.
@@ -1434,7 +1430,7 @@ mod tests {
         );
     }
 
-    /// Finding 1: after a decrease followed by a fold past the slack window, the
+    /// After a decrease followed by a fold past the slack window, the
     /// fold-time ceiling the writer stamps and the ceiling the reader recomputes
     /// must agree, or every query hard-fails forever. gen0 count 4 @ hour 0,
     /// gen1 count 2 @ hour 500000 (a decrease); a fold at watermark 500010 is
@@ -1478,7 +1474,7 @@ mod tests {
         );
     }
 
-    /// Finding 2: the older-head accept arm must not accept a head whose own
+    /// The older-head accept arm must not accept a head whose own
     /// watermark reaches into hours an unknown-to-the-head generation was
     /// already active for. Reader knows gen0 (count 4 @ 0) and gen1 (count 8 @
     /// 500000, an increase); a non-enforcing fold wrote a head that knew only
@@ -1533,7 +1529,7 @@ mod tests {
         );
     }
 
-    // ---- ADR-0061 decision 3 (EF-4/#724): literal-prefix range scan ----
+    // ---- ADR-0061 decision 3: literal-prefix range scan ----
 
     use crate::snapshot_format::NamePostings;
     use ravel_proto::catalog::v1::{SnapshotPartHeader, SnapshotPostingsHeader};

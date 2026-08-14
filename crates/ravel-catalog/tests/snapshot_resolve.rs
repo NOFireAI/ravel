@@ -1,6 +1,5 @@
-//! Integration tests for metric index phase 3 (docs/metric-index-plan.md
-//! 5.1/5.3, ADR-0020, issue #118): snapshot-backed resolve with listing
-//! fallback.
+//! Integration tests for snapshot-backed resolve with listing
+//! fallback (ADR-0020).
 //!
 //! Exercises `Catalog::resolve` against real `Catalog::fold` output built
 //! through the public API (this is an external test, so it has no access to
@@ -193,7 +192,7 @@ impl ObjectStoreBackend for CountingStore {
     }
     fn capabilities(&self) -> Capabilities {
         // multipart: false to match the refusing default `put_multipart` this
-        // double inherits (issue #298).
+        // double inherits.
         Capabilities {
             multipart: false,
             ..self.inner.capabilities()
@@ -374,7 +373,7 @@ async fn hours_above_watermark_are_listed_not_snapshot_served() {
 }
 
 // ---------------------------------------------------------------------------
-// Every failure mode in docs/metric-index-plan.md 5.3 falls back to listing
+// Every failure mode falls back to listing
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

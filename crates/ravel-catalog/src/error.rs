@@ -64,19 +64,18 @@ pub enum CatalogError {
         ingest_hour_bucket: u32,
     },
     /// A snapshot part or HEAD record `fold` produced or read failed the
-    /// envelope codec's own validation (docs/metric-index-plan.md 3.1, 3.2).
+    /// envelope codec's own validation.
     #[error("snapshot format error: {0}")]
     SnapshotFormat(#[from] SnapshotFormatError),
     /// `fold`'s HEAD CAS lost to a concurrent folder more times than the
-    /// bounded retry budget allows (docs/metric-index-plan.md section 4,
-    /// step 7). Not a correctness failure: the winning folder's HEAD is
+    /// bounded retry budget allows. Not a correctness failure: the winning folder's HEAD is
     /// intact and a later fold attempt can retry from scratch.
     #[error(
         "fold gave up after {attempts} HEAD CAS attempts at watermark_hour={watermark_hour}: a concurrent folder keeps winning"
     )]
     FoldCasRetriesExhausted { attempts: u32, watermark_hour: u32 },
     /// The window's pre-execution catalog-request estimate (ADR-0044
-    /// decision 3, amended 2026-08-05 for issue #635) exceeds the configured
+    /// decision 3) exceeds the configured
     /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests)
     /// ceiling. Fail-closed admission control: the resolve is refused before
     /// any LIST is issued, never silently narrowed, so an unbounded client
@@ -90,7 +89,7 @@ pub enum CatalogError {
     WindowTooWide { estimate: u64, limit: u64 },
     /// The configured `shard_count` disagrees with the (tenant, signal)'s
     /// durable provisioning record, or the record could not be read/decoded
-    /// (ADR-0050 section 5, EC5). Fails the resolve rather than iterating
+    /// (ADR-0050 section 5). Fails the resolve rather than iterating
     /// `0..shard_count` and silently dropping the shards a lower value omits.
     /// A `shard_count` disagreement carries the same loud, named semantics as
     /// the fold-HEAD [`CatalogError::FieldMismatch`] this extends to Phase 1

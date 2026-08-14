@@ -1,7 +1,7 @@
-//! Seal-divergence verification (ADR-0059 decision 2, issue #695): re-list a
+//! Seal-divergence verification (ADR-0059 decision 2): re-list a
 //! (tenant, signal)'s sealed commit records directly from the store and diff
 //! them against the folded snapshot, catching under-counting from clock-skew
-//! seal divergence (S2-04).
+//! seal divergence.
 //!
 //! This is the comparison logic `ravel-cli catalog verify`
 //! (`services/ravel-cli/src/catalog.rs`) has always run inline, factored out so
@@ -11,16 +11,16 @@
 //! object. It detects and reports; it never repairs (ADR-0059 consequences).
 //!
 //! The check reconstructs two maps keyed by the same entry identity
-//! ([`EntryIdentity`], `docs/metric-index-plan.md` section 4's dedup key) and
+//! ([`EntryIdentity`], the dedup key) and
 //! classifies every difference:
 //!
 //! - `missing`: a sealed commit record with no matching snapshot entry. The
-//!   folder under-counted (S2-04); a real divergence.
+//!   folder under-counted; a real divergence.
 //! - `mismatched`: present in both, different `content_hash`. Also a real
 //!   divergence.
 //! - `orphaned`: a snapshot entry with no matching sealed commit record. This
 //!   is *expected* once retention deletes a commit record after it has been
-//!   folded (`docs/metric-index-plan.md` section 7 reconciliation), so it is
+//!   folded (reconciliation), so it is
 //!   reported but never treated as a failure by any caller.
 
 use std::collections::BTreeMap;
@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::snapshot_format::{PartLimits, SnapshotFormatError, decode_head, decode_part};
 
-/// Entry identity matching `docs/metric-index-plan.md` section 4's dedup key:
+/// Entry identity, the dedup key:
 /// `(shard, ingest_hour_bucket, writer_id, writer_epoch, writer_seq)`. The same
 /// tuple the CLI's `catalog verify` has always used; kept public so callers can
 /// render the individual diverging entries.
@@ -56,7 +56,7 @@ pub struct SealDivergenceReport {
     pub sealed_record_count: usize,
     /// Count of entries in the folded snapshot.
     pub snapshot_entry_count: usize,
-    /// Sealed commit records absent from the snapshot (S2-04 under-count).
+    /// Sealed commit records absent from the snapshot (an under-count).
     pub missing: Vec<EntryIdentity>,
     /// Entries present in both but with a different `content_hash`.
     pub mismatched: Vec<EntryIdentity>,

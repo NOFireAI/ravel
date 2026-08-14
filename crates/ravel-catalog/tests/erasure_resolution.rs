@@ -1,4 +1,4 @@
-//! Resolver integration tests for selective erasure (ADR-0064, EJ-T2): the
+//! Resolver integration tests for selective erasure (ADR-0064): the
 //! per-resolve `del/` LIST that attaches pending `.dreq` predicates to the
 //! snapshot (the immediate query-time exclusion / visibility bound), and the
 //! `RewriteRecord` supersession that excludes rewritten inputs and superseded
@@ -338,7 +338,7 @@ async fn visibility_bound_predicate_attached_before_any_rewrite() {
     // The core visibility bound: a `.dreq` durable before a resolve is attached
     // by the very next resolve, with no rewrite record anywhere in the bucket.
     // The live L0 segment still resolves (attachment does not remove segments --
-    // filtering is EJ-T3's job); only the predicate rides along.
+    // filtering is the scan layer's job); only the predicate rides along.
     let store = Arc::new(MemoryStore::new());
     let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
     let (range, now) = hour_range_and_now();
@@ -783,7 +783,7 @@ async fn reconcile_picks_up_a_rewrite_published_into_an_already_folded_bucket() 
 /// genuinely absent predecessor by construction carries no inputs this
 /// resolve could discover here. The real safety net for the case the absent
 /// predecessor's OWN inputs are somehow still live (a sweep-ordering anomaly)
-/// is stated as a requirement on EJ-T4's completion verification, not
+/// is stated as a requirement on the rewrite pass's completion verification, not
 /// something this resolver-only task can close.
 #[tokio::test]
 async fn rewrite_naming_an_absent_predecessor_resolves_cleanly() {

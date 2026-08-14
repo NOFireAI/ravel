@@ -1,4 +1,4 @@
-//! Durable deployment-wide bearer-token map (ADR-0066 decision 6, epic EM, EM-T7).
+//! Durable deployment-wide bearer-token map (ADR-0066 decision 6).
 //!
 //! The static `--tenant-token` allowlist becomes a durable control object at the
 //! bucket root `sys/auth`: a map from a keyed hash of a bearer token to the
@@ -26,8 +26,8 @@
 //!
 //! This module builds and verifies the durable object and computes the keyed
 //! hash. The bounded-staleness resolver that refreshes it on a horizon, does the
-//! rate-limited on-miss re-read, and applies revocations fail-closed is EM-T8's
-//! job, not this module's; [`tenant_for_token`] is the pure lookup primitive that
+//! rate-limited on-miss re-read, and applies revocations fail-closed is a
+//! separate resolver's job, not this module's; [`tenant_for_token`] is the pure lookup primitive that
 //! resolver will call over an already-loaded map, nothing more.
 
 use prost::Message;
@@ -48,7 +48,7 @@ pub const AUTH_KEY: &str = "sys/auth";
 /// module for its exact check).
 ///
 /// Bumped 1 -> 2 for the `managed_by` ownership marker (ADR-0072 decision 4
-/// amendment, #897): `TokenHashEntry.managed_by` is `optional` and additive,
+/// amendment): `TokenHashEntry.managed_by` is `optional` and additive,
 /// so the bump is a floor signal, not a wire necessity. This build accepts a
 /// stored 1 or 2 unconditionally -- an absent `managed_by` decodes the same
 /// way under either version, as unmanaged -- and always writes 2.
@@ -56,12 +56,12 @@ pub const AUTH_TOKEN_MAP_FORMAT_VERSION: u32 = 2;
 
 /// [`TokenEntry::managed_by`] value the operator's reconcile loop stamps on
 /// every entry it writes from a `tenantTokensSecretRef` Secret (ADR-0072
-/// decision 4 amendment, #897). The operator's remove/replace pass touches
+/// decision 4 amendment). The operator's remove/replace pass touches
 /// only entries carrying this exact tag.
 pub const MANAGED_BY_OPERATOR: &str = "operator";
 
 /// [`TokenEntry::managed_by`] value `ravel-cli tenant token upsert` stamps by
-/// default (ADR-0072 decision 4 amendment, #897). Overridable at the CLI with
+/// default (ADR-0072 decision 4 amendment). Overridable at the CLI with
 /// `--managed-by` for a caller that wants a different owner tag.
 pub const MANAGED_BY_CLI: &str = "cli";
 
@@ -132,7 +132,7 @@ pub struct TokenEntry {
     /// post-amendment writer creates without declaring an owner). The
     /// operator's remove/replace pass touches only entries whose
     /// `managed_by` is exactly `Some(MANAGED_BY_OPERATOR)` (ADR-0072
-    /// decision 4 amendment, #897).
+    /// decision 4 amendment).
     pub managed_by: Option<String>,
 }
 
@@ -150,7 +150,7 @@ pub struct AuthTokenMap {
 
 impl AuthTokenMap {
     /// Resolve a token hash to its tenant id, if present. A pure lookup over the
-    /// decoded entries — the primitive the EM-T8 resolver calls; it does no I/O,
+    /// decoded entries — the primitive the bounded-staleness resolver calls; it does no I/O,
     /// refresh, or on-miss re-read.
     pub fn tenant_for_hash(&self, hash: &[u8; TOKEN_HASH_LEN]) -> Option<&str> {
         self.entries
@@ -251,8 +251,7 @@ pub enum AuthTokenMapError {
     )]
     CasConflict,
     /// Two different tenants presented a token that hashes to the same
-    /// `token_hash` (ADR-0072 decision 4, second amendment, #897 flap
-    /// follow-up). A token hash must resolve to exactly one tenant --
+    /// `token_hash` (ADR-0072 decision 4, second amendment). A token hash must resolve to exactly one tenant --
     /// [`tenant_for_token`] has no way to pick between two -- so this is
     /// refused before any write, never arbitrated by takeover. This is
     /// distinct from the same-tenant, different-`managed_by` case (the cli ->
@@ -387,7 +386,7 @@ pub enum SetOutcome {
 /// is ever written. A belt-and-suspenders guard alongside [`decode_map`]'s
 /// read-side check: no code path, present or future, may persist bytes
 /// `decode_map` would then refuse to read back (ADR-0072 decision 4
-/// amendment, #897 data-loss follow-up) -- a duplicate hash written once
+/// amendment) -- a duplicate hash written once
 /// bricks every subsequent read of `sys/auth`.
 fn validate_no_duplicate_hashes(map: &AuthTokenMap) -> Result<(), AuthTokenMapError> {
     let mut seen: std::collections::HashSet<[u8; TOKEN_HASH_LEN]> =
@@ -453,7 +452,7 @@ async fn write_map(
 /// [`AuthTokenMapError::CrossTenantTokenCollision`] before any write --
 /// re-pointing a token to a different tenant is not a single-call operation,
 /// since a token value cannot deterministically authenticate two tenants at
-/// once (ADR-0072 decision 4, second amendment, #897 flap follow-up); revoke
+/// once (ADR-0072 decision 4, second amendment); revoke
 /// the old tenant's token first, then upsert it for the new one. On a fresh
 /// bucket the object is created with `CreateIfAbsent`; a concurrent write is a
 /// [`AuthTokenMapError::CasConflict`] the caller re-reads and retries on.
@@ -471,16 +470,14 @@ pub async fn upsert_token(
 /// (overwriting whatever it carried before), so a later scoped remove/replace
 /// pass ([`remove_tokens_by_tenant_owned_by`], [`replace_tenant_tokens`]) can
 /// tell this write's owner from another writer's (ADR-0072 decision 4
-/// amendment, #897). `None` marks the entry unmanaged, matching every entry
+/// amendment). `None` marks the entry unmanaged, matching every entry
 /// [`upsert_token`] writes. Matches on `token_hash`: re-upserting a hash the
 /// SAME `tenant_id` already owns under a different owner re-tags it to this
 /// call's `managed_by` in place -- takeover, never a second entry for the
-/// same hash (the cli -> operator migration, ADR-0072 decision 4 amendment,
-/// #897). A hash already owned by a DIFFERENT tenant is refused outright with
+/// same hash (the cli -> operator migration, ADR-0072 decision 4 amendment). A hash already owned by a DIFFERENT tenant is refused outright with
 /// [`AuthTokenMapError::CrossTenantTokenCollision`] before any write -- one
 /// token value cannot deterministically authenticate two tenants, so this is
-/// never arbitrated by takeover (ADR-0072 decision 4, second amendment, #897
-/// flap follow-up).
+/// never arbitrated by takeover (ADR-0072 decision 4, second amendment).
 pub async fn upsert_token_owned(
     store: &dyn ObjectStoreBackend,
     deployment_key: &[u8; 32],
@@ -553,7 +550,7 @@ pub async fn remove_token(
 /// entries carry their `tenant_id` in the clear, so this filters on that field
 /// alone. This is what makes revocation correct after a restart with no
 /// in-memory history — the caller need not have ever seen this tenant's
-/// tokens, only its name (ADR-0072 decision 4, #875). Returns
+/// tokens, only its name (ADR-0072 decision 4). Returns
 /// [`SetOutcome::Unchanged`] (issuing no write) when no object exists or no
 /// entry matches `tenant_id`. A concurrent write to an existing object is a
 /// [`AuthTokenMapError::CasConflict`].
@@ -581,7 +578,7 @@ pub async fn remove_tokens_by_tenant(
 /// different writer (a different `managed_by` tag, or unmanaged/absent) is
 /// left untouched: the primitive the operator's reconcile loop uses so its
 /// remove pass never revokes a CLI-provisioned or v1-shaped unmanaged entry
-/// it never wrote (ADR-0072 decision 4 amendment, #897). Returns
+/// it never wrote (ADR-0072 decision 4 amendment). Returns
 /// [`SetOutcome::Unchanged`] (issuing no write) when no object exists or no
 /// entry matches both `tenant_id` and `managed_by`. A concurrent write to an
 /// existing object is a [`AuthTokenMapError::CasConflict`].
@@ -610,7 +607,7 @@ pub async fn remove_tokens_by_tenant_owned_by(
 /// whose `managed_by` matches exactly are dropped and replaced; entries for
 /// other tenants, and entries for the same tenant owned by a different
 /// writer (a different tag, or unmanaged), are otherwise untouched (ADR-0072
-/// decision 4 amendment, #897) -- a CLI-provisioned token for a tenant the
+/// decision 4 amendment) -- a CLI-provisioned token for a tenant the
 /// operator also manages via Secret survives an operator reconcile. Each
 /// new entry is stamped with `managed_by`. Each token is hashed under
 /// `deployment_key` before being stored; the plaintext is never persisted.
@@ -619,9 +616,9 @@ pub async fn remove_tokens_by_tenant_owned_by(
 /// is a scoped replace, not an incremental upsert/remove pair.
 ///
 /// `token_hash` is unique across the whole map (ADR-0072 decision 4
-/// amendment, #897 data-loss follow-up), but the rule for a collision depends
+/// amendment), but the rule for a collision depends
 /// on whether it crosses a tenant boundary (ADR-0072 decision 4, second
-/// amendment, #897 flap follow-up):
+/// amendment):
 ///
 /// - A `token_hash` already owned by THIS `tenant_id` (under a different
 ///   `managed_by`, or unmanaged) is dropped and the new entry takes over it
@@ -694,7 +691,7 @@ pub async fn replace_tenant_tokens(
     }
 
     // Refuse a cross-tenant collision before touching anything (ADR-0072
-    // decision 4, second amendment, #897 flap follow-up): a desired hash
+    // decision 4, second amendment): a desired hash
     // already present under a DIFFERENT tenant_id is never taken over here.
     // Checked against the map exactly as read, before any retain -- the
     // takeover below must never run on a candidate this loop would have
@@ -714,7 +711,7 @@ pub async fn replace_tenant_tokens(
     }
 
     // token_hash is unique within one tenant's entries (ADR-0072 decision 4
-    // amendment, #897 data-loss follow-up): the last writer of a hash this
+    // amendment): the last writer of a hash this
     // tenant already owns takes ownership of it, regardless of which
     // `managed_by` wrote it. Drop this tenant/owner's own prior entries AND
     // any pre-existing entry for this SAME tenant whose hash collides with a
@@ -847,7 +844,7 @@ mod tests {
     /// a typed [`AuthTokenMapError::CrossTenantTokenCollision`] before any
     /// write -- one token value cannot deterministically authenticate two
     /// tenants, so `upsert_token` must never re-point it the way it used to
-    /// (ADR-0072 decision 4, second amendment, #897 flap follow-up).
+    /// (ADR-0072 decision 4, second amendment).
     /// Flipped-line proof: this fails against the pre-fix code, where the
     /// `Some(entry)` match arm in `upsert_token_owned` unconditionally
     /// rewrote `entry.tenant_id` with no equality check against the caller's
@@ -896,7 +893,7 @@ mod tests {
     /// Re-upserting the same token for the SAME tenant is a harmless no-op
     /// rewrite, not a collision -- the same-tenant path the check in
     /// [`upsert_token_owned`] must still let through (door 1/2 regression
-    /// guard, ADR-0072 decision 4 amendment, #897).
+    /// guard, ADR-0072 decision 4 amendment).
     #[tokio::test]
     async fn upsert_same_token_same_tenant_is_idempotent() {
         let store = mem();
@@ -1383,8 +1380,7 @@ mod tests {
     }
 
     /// `replace_tenant_tokens` is a no-op -- no write issued -- when the
-    /// tenant's resulting scoped entry set already matches the desired one
-    /// (review blocker 3, #897): a converged Secret-driven reconcile must
+    /// tenant's resulting scoped entry set already matches the desired one: a converged Secret-driven reconcile must
     /// cost zero PUTs, not rewrite the whole map every interval.
     #[tokio::test]
     async fn replace_tenant_tokens_converged_is_unchanged() {
@@ -1446,7 +1442,7 @@ mod tests {
 
     /// `replace_tenant_tokens` is scoped by `managed_by`: replacing the
     /// operator-owned set for a tenant leaves that same tenant's
-    /// CLI-provisioned entries untouched (review blocker 1, #897) -- the
+    /// CLI-provisioned entries untouched -- the
     /// operator's remove/replace pass must never revoke a token it did not
     /// write.
     #[tokio::test]
@@ -1490,7 +1486,7 @@ mod tests {
     /// `remove_tokens_by_tenant_owned_by` only removes entries owned by the
     /// given `managed_by` tag: a CLI-provisioned tenant and a v1-shaped
     /// unmanaged entry both survive an operator-scoped remove for the same
-    /// tenant name (review blocker 1, #897); an operator-managed entry for
+    /// tenant name; an operator-managed entry for
     /// that tenant is still removed.
     #[tokio::test]
     async fn remove_tokens_by_tenant_owned_by_spares_other_owners() {
@@ -1554,7 +1550,7 @@ mod tests {
         );
     }
 
-    /// Door 1 (#897 data-loss follow-up): an unmanaged/v1 entry for
+    /// Door 1: an unmanaged/v1 entry for
     /// (tenant, token) followed by an operator-scoped `replace_tenant_tokens`
     /// for the SAME tenant and token must converge to one readable entry,
     /// not two sharing a hash. Against the pre-fix `retain` --
@@ -1601,7 +1597,7 @@ mod tests {
         );
     }
 
-    /// Door 2 (#897 data-loss follow-up): a CLI upsert flips an
+    /// Door 2: a CLI upsert flips an
     /// operator-owned token's `managed_by` to `"cli"` in place (expected,
     /// hash-keyed takeover semantics); the operator's next scoped replace for
     /// that same tenant/token must still converge to one entry, not append a
@@ -1663,7 +1659,7 @@ mod tests {
         );
     }
 
-    /// Door 3 / flap regression (#897, ADR-0072 decision 4 second amendment):
+    /// Door 3 / flap regression (ADR-0072 decision 4 second amendment):
     /// two tenants sharing one token value, each converged via its own
     /// `replace_tenant_tokens` call (what `reconcile_sys_auth` does, once per
     /// tenant key in the Secret). The prior round's fix took the hash over

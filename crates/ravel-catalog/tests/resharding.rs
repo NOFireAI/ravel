@@ -1,5 +1,5 @@
 //! Integration tests for generation-versioned resharding on the read side
-//! (ADR-0052 sections 4 and 5, EK2, issue #591). Drives `Catalog::resolve`
+//! (ADR-0052 sections 4 and 5). Drives `Catalog::resolve`
 //! and `Catalog::fold` through the public API against a durable provisioning
 //! record carrying a shard-generation history, proving the epic's acceptance
 //! property at the unit/integration level: a query spanning a reshard's

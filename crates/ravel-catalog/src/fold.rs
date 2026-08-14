@@ -1,5 +1,5 @@
 //! Metric index fold: catalog snapshot construction from commit records
-//! (docs/metric-index-plan.md section 4, ADR-0020).
+//! (ADR-0020).
 //!
 //! Never runs on the ingest or query path. A fold reads the current HEAD,
 //! computes the newly sealed watermark, folds previous parts plus newly
@@ -43,8 +43,7 @@ use crate::snapshot_format::{
 /// (LABEL_DICT/SERIES_TABLE); 5/6 are v2 (SERIES_IDS/SERIES_META).
 /// A failure while building the name-postings index for a fold. Every
 /// variant is caught by [`Catalog::build_postings`], logged, and turned into
-/// "fold succeeds without a postings ref" (docs/metric-index-plan.md P5a:
-/// "Postings build failures leave the fold successful without a postings
+/// "fold succeeds without a postings ref" ("Postings build failures leave the fold successful without a postings
 /// ref") -- never surfaced as a [`CatalogError`], and never a partial or
 /// approximate postings object (ravel CLAUDE.md: "Exact semantics by
 /// default").
@@ -70,14 +69,13 @@ pub enum PostingsBuildError {
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
-/// Bounded retry budget for HEAD's CAS loop (docs/metric-index-plan.md
-/// section 4, step 7): a folder that keeps losing to concurrent folders
+/// Bounded retry budget for HEAD's CAS loop: a folder that keeps losing to concurrent folders
 /// gives up with [`CatalogError::FoldCasRetriesExhausted`] rather than
 /// retrying forever.
 const MAX_HEAD_CAS_ATTEMPTS: u32 = 8;
 
-/// Placeholder for future compaction/retention transactions
-/// (docs/metric-index-plan.md section 7). `fold`'s entry point accepts a
+/// Placeholder for future compaction/retention transactions.
+/// `fold`'s entry point accepts a
 /// `&[Transaction]` today so a later phase can apply compaction/retention
 /// records without a signature change, but this phase never constructs one:
 /// no public constructor exists, so callers can only ever pass an empty
@@ -124,7 +122,7 @@ pub struct FoldReport {
     pub get_requests: u64,
     pub put_requests: u64,
     /// `true` if this fold successfully built and attached a name-postings
-    /// index (docs/metric-index-plan.md P5a). `false` covers both "no
+    /// index. `false` covers both "no
     /// postings work was needed" (a no-op fold) and "the build failed and
     /// the fold proceeded without a postings ref".
     pub postings_built: bool,
@@ -300,8 +298,7 @@ fn build_snapshot_entry(key: &str, record: &CommitRecord) -> Result<SnapshotEntr
     })
 }
 
-/// Build a level-1 [`SnapshotEntry`] for one part of a compaction record
-/// (docs/metric-index-plan.md section 7 point 2). The proto's frozen entry
+/// Build a level-1 [`SnapshotEntry`] for one part of a compaction record. The proto's frozen entry
 /// shape has no dedicated field for an L1 part's identity, so the writer_*
 /// slots -- which an L1 part has no native use for -- carry it: `writer_id`
 /// holds the 32-byte `input_set_hash` and `writer_epoch` holds the
@@ -643,8 +640,8 @@ fn part_covers_dirty_hour(part: &SnapshotPartRef, dirty_hours: &HashSet<u32>) ->
 
 impl Catalog {
     /// Fold previous snapshot parts plus newly sealed commit buckets into a
-    /// new snapshot part and CAS-swap HEAD to name it
-    /// (docs/metric-index-plan.md section 4). Never runs on the ingest or
+    /// new snapshot part and CAS-swap HEAD to name it.
+    /// Never runs on the ingest or
     /// query path.
     ///
     /// `now_ns` and `folder_id` are always caller-supplied: this crate never
@@ -653,8 +650,7 @@ impl Catalog {
     /// `SnapshotHead.folder_id`).
     ///
     /// Compaction and retention are folded in from the same per-bucket
-    /// listing this fold already performs (docs/metric-index-plan.md section
-    /// 7 point 1): a bucket's `CompactionRecord`s contribute their parts as
+    /// listing this fold already performs: a bucket's `CompactionRecord`s contribute their parts as
     /// level-1 entries and supersede their named L0 inputs, and a bucket
     /// holding a `RetentionTombstone` contributes nothing. No separate
     /// discovery mechanism is needed, so `transactions` stays an unused
@@ -691,8 +687,7 @@ impl Catalog {
         let mut attempt: u32 = 0;
         // Fold never runs on the query path (module docs above) and keeps
         // its own `RequestCounters`; this handle exists only to satisfy the
-        // shared cache/load API's new `QueryAccounting` parameter (issue
-        // #421) and is discarded.
+        // shared cache/load API's `QueryAccounting` parameter and is discarded.
         let accounting = QueryAccounting::new();
 
         loop {
@@ -784,7 +779,7 @@ impl Catalog {
 
             // Discover each (shard, hour) bucket's keys concurrently, bounded
             // by `fold_bucket_concurrency` (ADR-0063 section 3), mirroring the
-            // resolve path's #278 item 2 `buffered` fan-out. `buffered`
+            // resolve path's `buffered` fan-out. `buffered`
             // preserves input order, so the discovered buckets are merged in
             // the same deterministic bucket order the serial loop used, keeping
             // the fold byte-for-byte reproducible (content addressing depends
@@ -1100,8 +1095,7 @@ impl Catalog {
             // to load), decoding starts at 0 and every current entry is
             // fetched once -- a one-time full build, not a partial merge. A
             // build failure at any entry from `decode_start` onward aborts
-            // the whole index, never publishes a partial one
-            // (docs/metric-index-plan.md P5a).
+            // the whole index, never publishes a partial one.
             let postings_names = if entries.iter().all(|entry| entry.level == 0) {
                 let (postings_baseline, postings_decode_start): (Vec<NamePostings>, usize) =
                     if rebuilt || reconciled {
@@ -1138,8 +1132,7 @@ impl Catalog {
                 // with stable ordinals, which a compaction rewrite breaks, and
                 // an L1 part carries no L0 segment to decode `__name__` from.
                 // Publish no postings ref so a resolve considers every entry
-                // exactly rather than pruning against a stale or partial index
-                // (docs/metric-index-plan.md 3.1, section 7 point 6).
+                // exactly rather than pruning against a stale or partial index.
                 None
             };
             let mut postings_built = false;
@@ -1275,8 +1268,7 @@ impl Catalog {
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
                 // iteration: if the winner's watermark already covers ours,
                 // the top-of-loop no-op check stops cleanly; otherwise we
-                // rebase onto the winner's parts and retry
-                // (docs/metric-index-plan.md section 4, step 7).
+                // rebase onto the winner's parts and retry.
                 Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists) => {
                     counters.put_requests += 1;
                     attempt += 1;
@@ -1363,7 +1355,7 @@ impl Catalog {
     }
 
     /// Load and verify the previous fold's postings object before trusting
-    /// it as a merge baseline (docs/metric-index-plan.md P5a): same
+    /// it as a merge baseline: same
     /// hash/part-binding/decode checks `snapshot_resolve`'s
     /// `load_snapshot_postings` applies at query time, plus an
     /// `entry_count` check against `previous_entry_count` -- the ordinal
@@ -1458,8 +1450,7 @@ impl Catalog {
         Some(decoded.names.clone())
     }
 
-    /// Build the name-postings index for `entries` (docs/metric-index-plan.md
-    /// P5a), merging forward from `baseline` rather than re-decoding every
+    /// Build the name-postings index for `entries`, merging forward from `baseline` rather than re-decoding every
     /// historical segment on every fold: entries before `decode_start` keep
     /// exactly the ordinals `baseline` already recorded for them, and only
     /// entries at or past `decode_start` are fetched and decoded. Returns
@@ -1574,8 +1565,7 @@ impl Catalog {
     }
 
     /// Classify one `(shard, hour)` commit bucket's listing into the entries
-    /// it should contribute to the snapshot (docs/metric-index-plan.md section
-    /// 7), the single shared classifier for both the incremental fold loop and
+    /// it should contribute to the snapshot, the single shared classifier for both the incremental fold loop and
     /// the reconcile pass (ADR-0063 section 4). Partitioning the bucket's keys
     /// by shape mirrors the resolve-time listing (`Catalog::list_hour_bucket`,
     /// docs/catalog-and-mvcc.md step 2) so a fold and a live resolve derive
@@ -1736,8 +1726,7 @@ impl Catalog {
         }
 
         // L0 commit records: contribute every one not named by a compaction
-        // or rewrite input list above (docs/metric-index-plan.md section 7
-        // point 2). An unlisted L0 is included exactly as the resolver
+        // or rewrite input list above. An unlisted L0 is included exactly as the resolver
         // includes it.
         for key in &l0_keys {
             let record = self
@@ -2189,7 +2178,7 @@ mod tests {
     /// (ADR-0066 decision 2) must fail the fold loudly and, critically, never
     /// attempt a CAS write: an older process racing a rolling upgrade must not
     /// rebuild a single-part HEAD over a newer multi-part one written by an
-    /// upgraded peer (the EM/EH clobber bug, issue #765).
+    /// upgraded peer (the single-part-over-multipart clobber bug).
     #[tokio::test]
     async fn newer_format_head_fails_loudly_and_never_clobbers() {
         let inner = MemoryStore::new();
@@ -2259,7 +2248,7 @@ mod tests {
     /// carries the CURRENT format version but fails a LATER structural check
     /// (tenant_hash length) is genuine corruption, not a newer format, and
     /// must still take the self-healing rebuild-and-CAS-overwrite path. Proves
-    /// the split added for issue #765 is precise and did not block legitimate
+    /// the single-part/multipart split is precise and did not block legitimate
     /// self-healing.
     #[tokio::test]
     async fn head_failing_late_validation_still_rebuilds_via_corrupt_path() {
@@ -2518,7 +2507,7 @@ mod tests {
         assert_eq!(report.layout_drift_count, 1);
     }
 
-    /// Issue #183: a fold must decode only the entries newly folded since
+    /// A fold must decode only the entries newly folded since
     /// the last successful fold, carrying forward the previous postings
     /// object as a merge baseline rather than re-fetching every
     /// historically-covered entry's segment. `get_requests` is the proof:
@@ -2625,7 +2614,7 @@ mod tests {
         assert_eq!((spans[1].min_hour, spans[1].watermark_hour), (8, 8));
     }
 
-    /// Issue #739 acceptance: a fold whose entry count crosses
+    /// A fold whose entry count crosses
     /// `snapshot_part_max_entries` mid-run produces a multi-part HEAD that is
     /// sorted, disjoint, and self-consistent (`validate_head`); a later fold
     /// that adds no new data carries the sealed part forward by reference, so
@@ -2810,7 +2799,7 @@ mod tests {
         }
     }
 
-    /// Issue #739 acceptance: failing the crashing fold's HEAD CAS (after some
+    /// Failing the crashing fold's HEAD CAS (after some
     /// new part objects have already been PUT) must leave the previous HEAD
     /// exactly intact -- never half-updated. The orphaned new part objects are
     /// allowed garbage.
@@ -2889,7 +2878,7 @@ mod tests {
         assert_eq!(head.parts.len(), 2);
     }
 
-    /// Issue #739 acceptance: a resolve over a narrow hour window fetches only
+    /// A resolve over a narrow hour window fetches only
     /// the parts whose range intersects it, not every part in HEAD. Proven by a
     /// GET fault on the low part's object (its `/snap/` key embeds hour 10's
     /// watermark string): a narrow window must not fire it, a wide window must.
@@ -2964,7 +2953,7 @@ mod tests {
         );
     }
 
-    // ---- ADR-0063 T3 (#742): fold reconcile pass ----
+    // ---- ADR-0063: fold reconcile pass ----
 
     /// Publish a compaction record into `(shard, ingest_hour_bucket)` that
     /// supersedes the given L0 `inputs` and contributes one L1 part. Only the
@@ -3085,7 +3074,7 @@ mod tests {
         snapshot_format::decode_head(&got.data).expect("head decodes")
     }
 
-    /// #742 acceptance: a compaction record published into an hour that a
+    /// A compaction record published into an hour that a
     /// PREVIOUS fold already sealed and folded is discovered and applied by the
     /// reconcile pass of a later fold, and the sealed part covering that hour is
     /// actually re-PUT (its content changed) rather than carried forward by
@@ -3390,7 +3379,7 @@ mod tests {
     }
 
     /// A fold whose reconcile window finds nothing changed carries every
-    /// untouched sealed part forward by reference: no spurious PUT, EH-T2's
+    /// untouched sealed part forward by reference: no spurious PUT; the
     /// carry-forward optimization is not regressed by the reconcile pass.
     #[tokio::test]
     async fn reconcile_no_change_carries_sealed_parts_forward() {

@@ -1,5 +1,5 @@
 //! HEAD record: small, mutable, CAS-updated; bare protobuf (like commit
-//! records), no envelope (docs/metric-index-plan.md 3.2).
+//! records), no envelope.
 
 use prost::Message;
 use ravel_proto::catalog::v1::SnapshotHead;

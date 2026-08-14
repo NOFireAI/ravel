@@ -1,5 +1,5 @@
 //! Name-postings envelope: sorted `__name__` dictionary with delta-varint
-//! entry-ordinal postings lists (docs/metric-index-plan.md 3.3, P5a). Bound
+//! entry-ordinal postings lists. Bound
 //! to an exact covered-parts set via `part_blake3`, in `SnapshotHead.parts`
 //! order; postings decoded against a different part set are meaningless and
 //! must be rejected (`decode_postings`'s `expected_part_blake3` check).
@@ -249,7 +249,7 @@ pub fn decode_postings(
 /// degrades to a listing fallback (a postings object bound to a different
 /// part set is stale, not a breach), and if it ran first it would mask a
 /// foreign `tenant_hash` on an object that also happens not to bind, letting
-/// an isolation breach degrade silently instead of hard-failing (#528).
+/// an isolation breach degrade silently instead of hard-failing.
 ///
 /// The caller must have already verified `bytes` against the postings ref's
 /// blake3 (postings objects are content-addressed), so the framing is

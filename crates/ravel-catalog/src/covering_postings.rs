@@ -1,6 +1,6 @@
 //! Covering-postings load for the at-rest scrubber's postings tier (ADR-0059
-//! decision 1, issue #708). The library scrubber
-//! (`ravel_maintain::scrub::scrub_one_object`) already implements the S2-09
+//! decision 1). The library scrubber
+//! (`ravel_maintain::scrub::scrub_one_object`) already implements the
 //! false-negative check against a covering name-postings object, but it takes
 //! the postings bytes, the covered parts' blake3, and the covered-entry list
 //! as inputs it cannot fetch itself. This module resolves those inputs from a

@@ -1,4 +1,4 @@
-//! Regression test for a4-F01 (issue #52): the catalog snapshot segment sort
+//! Regression test: the catalog snapshot segment sort
 //! must be a deterministic total order.
 //!
 //! Adapted from the audit reproducer
@@ -75,7 +75,7 @@ async fn publish_segment_with_writer(
     rec
 }
 
-/// a4-F01: the snapshot segment order must be a total order over distinct
+/// The snapshot segment order must be a total order over distinct
 /// segments and reproducible across independent resolves.
 ///
 /// Two same-shard segments written by different writers tie on every
@@ -88,7 +88,7 @@ async fn publish_segment_with_writer(
 /// per-segment identity component, so the order is determined entirely by the
 /// segments and is identical on every resolve and across processes.
 #[tokio::test]
-async fn a4_f01_snapshot_order_is_a_deterministic_total_order() {
+async fn snapshot_order_is_a_deterministic_total_order() {
     let store = Arc::new(MemoryStore::new());
     let catalog = Catalog::new(
         store.clone(),

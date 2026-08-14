@@ -12,27 +12,25 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 pub const DEFAULT_CACHE_CAPACITY_PER_TENANT: usize = 10_000;
 /// Default `max_flush_lifetime`: 1 hour, in nanoseconds. The GC interlock
 /// (ADR-0010 §11) forbids publishing a commit record after this long past
-/// its ingest hour's end; the seal watermark relies on that bound
-/// (docs/metric-index-plan.md, ADR-0020).
+/// its ingest hour's end; the seal watermark relies on that bound (ADR-0020).
 pub const DEFAULT_MAX_FLUSH_LIFETIME_NS: i64 = 60 * 60 * 1_000_000_000;
 /// Default `fold_safety_margin`: 15 minutes, in nanoseconds. Extra padding
 /// past `max_flush_lifetime + clock_skew_allowance` before a fold trusts an
-/// ingest hour to be sealed (docs/metric-index-plan.md, ADR-0020).
+/// ingest hour to be sealed (ADR-0020).
 pub const DEFAULT_FOLD_SAFETY_MARGIN_NS: i64 = 15 * 60 * 1_000_000_000;
-/// Default `head_cache_ttl`: 30 seconds, in nanoseconds
-/// (docs/metric-index-plan.md 5.1, ADR-0020).
+/// Default `head_cache_ttl`: 30 seconds, in nanoseconds (ADR-0020).
 pub const DEFAULT_HEAD_CACHE_TTL_NS: i64 = 30 * 1_000_000_000;
 /// Default bound on decoded snapshot parts cached per tenant. Parts are
 /// content-addressed and immutable, so this cache never invalidates on
 /// write, only evicts by capacity.
 pub const DEFAULT_SNAPSHOT_CACHE_PARTS: usize = 32;
-/// Default bound on decoded name-postings objects cached per tenant (P5b).
+/// Default bound on decoded name-postings objects cached per tenant.
 /// Postings objects are content-addressed and immutable, same eviction
 /// rationale as [`DEFAULT_SNAPSHOT_CACHE_PARTS`].
 pub const DEFAULT_POSTINGS_CACHE_ENTRIES: usize = 32;
 /// Default bound on the total number of (tenant, signal) entries
-/// [`crate::cache::HeadCache`] holds at once, process-wide (issue #421: the
-/// cache had a TTL but no capacity bound, so it grew one entry per (tenant,
+/// [`crate::cache::HeadCache`] holds at once, process-wide (without this bound the
+/// cache would grow one entry per (tenant,
 /// signal) with no limit on the number of tenants). `Signal` has at most a
 /// handful of variants, so this bound admits thousands of actively-queried
 /// tenants per process before the oldest (tenant, signal) pair is evicted.
@@ -54,8 +52,7 @@ pub const DEFAULT_BYTE_CACHE_MAX_ENTRIES: usize = 512;
 /// [`DEFAULT_MAX_POSTINGS_BYTES`](snapshot_format::DEFAULT_MAX_POSTINGS_BYTES), both 256 MiB).
 pub const DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES: u64 = 256 << 20;
 /// Default ceiling on the pre-execution catalog-request estimate
-/// (`Catalog::estimated_catalog_requests`, ADR-0044 decision 3 as amended
-/// 2026-08-05 for issue #635): a resolve whose `shard_count * hour_buckets +
+/// (`Catalog::estimated_catalog_requests`, ADR-0044 decision 3): a resolve whose `shard_count * hour_buckets +
 /// SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` exceeds this is refused before any
 /// LIST is issued. 100,000 catalog requests permits roughly an 11-year window
 /// at `shard_count = 1` and roughly 8.5 months at `shard_count = 16`, while
@@ -73,7 +70,7 @@ pub const DEFAULT_MAX_CATALOG_LIST_REQUESTS: u64 = 100_000;
 pub const DEFAULT_SNAPSHOT_PART_MAX_ENTRIES: usize = 250_000;
 /// Default `fold_bucket_concurrency`: the number of per-(shard, hour) bucket
 /// discovery LISTs a single fold keeps in flight at once (ADR-0063 section 3,
-/// mirroring the resolve path's #278 item 2 bound). 8 matches the resolve
+/// mirroring the resolve path's in-flight bound). 8 matches the resolve
 /// path's fan-out order without saturating a small backend.
 pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
 /// Default `fold_reconcile_window_hours`: how far back of the previous fold's
@@ -140,8 +137,7 @@ pub struct CatalogConfig {
     /// [`DEFAULT_CACHE_CAPACITY_PER_TENANT`].
     pub cache_capacity_per_tenant: usize,
     /// Longest a writer may take to publish a commit record after its
-    /// ingest hour ends, in nanoseconds. Part of the seal-watermark margin
-    /// (docs/metric-index-plan.md, ADR-0020). Default
+    /// ingest hour ends, in nanoseconds. Part of the seal-watermark margin (ADR-0020). Default
     /// [`DEFAULT_MAX_FLUSH_LIFETIME_NS`].
     pub max_flush_lifetime_ns: i64,
     /// Extra margin added past `max_flush_lifetime_ns +
@@ -149,7 +145,7 @@ pub struct CatalogConfig {
     /// sealed, in nanoseconds. Default [`DEFAULT_FOLD_SAFETY_MARGIN_NS`].
     pub fold_safety_margin_ns: i64,
     /// How long a decoded HEAD may be served from cache before `resolve`
-    /// re-reads it, in nanoseconds (docs/metric-index-plan.md 5.1, 5.3: a
+    /// re-reads it, in nanoseconds (a
     /// stale cache only ever widens the listed suffix by up to this much,
     /// never a correctness issue). Default [`DEFAULT_HEAD_CACHE_TTL_NS`].
     pub head_cache_ttl_ns: i64,
@@ -157,14 +153,13 @@ pub struct CatalogConfig {
     /// [`DEFAULT_SNAPSHOT_CACHE_PARTS`].
     pub snapshot_cache_parts: usize,
     /// Resource cap applied to a snapshot part's declared decompressed size
-    /// at resolve time (docs/metric-index-plan.md 3.1). Default
+    /// at resolve time. Default
     /// [`snapshot_format::DEFAULT_MAX_SNAPSHOT_PART_BYTES`].
     pub max_snapshot_part_bytes: u64,
     /// Resource cap applied to a name-postings object's declared
-    /// decompressed body size at decode time (docs/metric-index-plan.md
-    /// 3.3). Default [`snapshot_format::DEFAULT_MAX_POSTINGS_BYTES`].
+    /// decompressed body size at decode time. Default [`snapshot_format::DEFAULT_MAX_POSTINGS_BYTES`].
     pub max_postings_bytes: u64,
-    /// Bound on decoded name-postings objects cached per tenant (P5b).
+    /// Bound on decoded name-postings objects cached per tenant.
     /// Default [`DEFAULT_POSTINGS_CACHE_ENTRIES`].
     pub postings_cache_entries: usize,
     /// Bound on the total number of (tenant, signal) entries
@@ -180,7 +175,7 @@ pub struct CatalogConfig {
     /// straight through [`crate::Catalog`]'s store funnel with no RAM tier in
     /// front of it and no cache hit/miss accounting for it. This is how the
     /// server's `--disable-cache` reaches the catalog byte cache, not just the
-    /// fetcher cache (issue #553); it is the byte-cache analogue of building
+    /// fetcher cache; it is the byte-cache analogue of building
     /// the query fetchers with no `Cache` attached.
     pub byte_cache_max_bytes: u64,
     /// Entry-count bound for the byte cache. Default
@@ -190,7 +185,7 @@ pub struct CatalogConfig {
     /// never admitted. Default [`DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES`].
     pub byte_cache_max_entry_bytes: u64,
     /// Ceiling on the pre-execution catalog-request estimate (ADR-0044
-    /// decision 3, amended 2026-08-05 for issue #635). A resolve whose
+    /// decision 3). A resolve whose
     /// estimate ([`Catalog::estimated_catalog_requests`](crate::Catalog::estimated_catalog_requests))
     /// exceeds this is refused with [`CatalogError::WindowTooWide`](crate::CatalogError::WindowTooWide)
     /// before any LIST is issued, so an unbounded client window cannot make a
@@ -216,7 +211,7 @@ pub struct CatalogConfig {
     pub snapshot_part_max_entries: usize,
     /// Number of per-(shard, hour) bucket discovery LISTs the fold keeps in
     /// flight at once (ADR-0063 section 3). Bounds the fold's concurrent
-    /// discovery I/O, mirroring the resolve path's #278 item 2 semaphore.
+    /// discovery I/O, mirroring the resolve path's in-flight semaphore.
     /// Default [`DEFAULT_FOLD_BUCKET_CONCURRENCY`].
     pub fold_bucket_concurrency: usize,
     /// How far back of the previous fold's watermark the post-fold reconcile

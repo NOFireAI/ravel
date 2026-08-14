@@ -10,7 +10,7 @@
 //! here: the cache only stores and evicts.
 //!
 //! Every `get()` below also records a hit or a miss, and a hit's stored byte
-//! size, into the caller's [`QueryAccounting`] (ADR-0044, issue #421): the
+//! size, into the caller's [`QueryAccounting`] (ADR-0044): the
 //! byte count is the size of the raw object the cached value was originally
 //! decoded from, captured once at `insert()` time so a hit never re-derives
 //! it. This is the only place cache bytes are counted; a miss falls through
@@ -219,8 +219,7 @@ struct HeadCacheEntry {
 }
 
 /// State behind [`HeadCache`]'s single lock: the entry map plus its
-/// insertion order, so capacity-cap eviction (issue #421: this cache had a
-/// TTL but no capacity bound) can pop the oldest (tenant, signal) pair
+/// insertion order, so capacity-cap eviction can pop the oldest (tenant, signal) pair
 /// without a second, separately-lockable structure racing the first.
 #[derive(Default)]
 struct HeadCacheState {
@@ -229,9 +228,8 @@ struct HeadCacheState {
 }
 
 /// Decoded-HEAD cache, one entry per (tenant, signal), with a caller-checked
-/// TTL (docs/metric-index-plan.md 5.1: `head_cache_ttl`, default 30s) and a
-/// capacity-cap bound on the number of (tenant, signal) pairs held at once
-/// (issue #421). `now_ns` is always caller-supplied: this cache never reads
+/// TTL (`head_cache_ttl`, default 30s) and a
+/// capacity-cap bound on the number of (tenant, signal) pairs held at once. `now_ns` is always caller-supplied: this cache never reads
 /// a clock.
 #[derive(Default)]
 pub(crate) struct HeadCache {
@@ -335,8 +333,7 @@ impl PartTenantCache {
 
 /// Decoded snapshot-part cache, partitioned by tenant. Parts are
 /// content-addressed and immutable, so entries never need invalidating,
-/// only capacity-cap eviction (docs/metric-index-plan.md 5.1:
-/// `snapshot_cache_parts`).
+/// only capacity-cap eviction (`snapshot_cache_parts`).
 #[derive(Default)]
 pub(crate) struct PartCache {
     tenants: Mutex<HashMap<TenantHash, PartTenantCache>>,
@@ -413,8 +410,7 @@ impl PostingsTenantCache {
     }
 }
 
-/// Decoded name-postings cache, partitioned by tenant (P5b,
-/// docs/metric-index-plan.md 5.4). Postings objects are content-addressed
+/// Decoded name-postings cache, partitioned by tenant. Postings objects are content-addressed
 /// and immutable, so entries never need invalidating, only capacity-cap
 /// eviction, mirroring [`PartCache`].
 #[derive(Default)]
@@ -648,8 +644,8 @@ mod tests {
         );
     }
 
-    /// Issue #421: `HeadCache` used to hold one entry per (tenant, signal)
-    /// with no capacity bound at all. Inserting more tenants than the
+    /// `HeadCache` holds a bounded number of (tenant, signal) entries.
+    /// Inserting more tenants than the
     /// configured cap must evict the oldest rather than growing without
     /// limit.
     #[test]
@@ -807,7 +803,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Byte cache (ADR-0046, issue #443): Catalog::fetch_content_addressed,
+    // Byte cache (ADR-0046): Catalog::fetch_content_addressed,
     // consulted from load_one_part/load_snapshot_postings ahead of the
     // decoded PartCache/PostingsCache above.
     // -----------------------------------------------------------------
@@ -1149,7 +1145,7 @@ mod tests {
         );
     }
 
-    /// Issue #553: `byte_cache_max_bytes == 0` (the config `--disable-cache`
+    /// `byte_cache_max_bytes == 0` (the config `--disable-cache`
     /// resolves to) builds a catalog with no byte cache constructed at all,
     /// not a zero-capacity one. Asserts on the absence of the cache handle,
     /// the same style as the fetcher cache's "--disable-cache leaves no cache
@@ -1184,7 +1180,7 @@ mod tests {
         assert!(
             catalog.byte_cache_metrics().is_none(),
             "byte_cache_max_bytes == 0 must construct no byte cache, so there is no \
-             counters handle to expose (issue #553)"
+             counters handle to expose"
         );
 
         // An enabled catalog over the same store must, by contrast, expose the
