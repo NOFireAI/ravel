@@ -1,6 +1,6 @@
 //! Gated differential test: runs the selector, error, and counter/regression
-//! function (P4) corpora against a real pinned Prometheus binary and the
-//! in-process Ravel stack (docs/promql-evaluator-plan.md section 5.5). Skips
+//! function corpora against a real pinned Prometheus binary and the
+//! in-process Ravel stack. Skips
 //! cleanly unless both `RAVEL_DIFFTEST=1` and `RAVEL_DIFFTEST_PROM_BIN` are
 //! set, since the pinned binary is not available in every environment (this
 //! sandbox has no network egress to fetch it, for one).

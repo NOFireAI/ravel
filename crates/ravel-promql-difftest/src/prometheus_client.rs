@@ -1,11 +1,9 @@
 //! HTTP client for the pinned Prometheus instance: pushes the encoded
 //! Remote Write 1.0 payload, then issues the same `/api/v1/query` and
-//! `/api/v1/query_range` calls the runner also issues against Ravel
-//! (docs/promql-evaluator-plan.md section 5.1).
+//! `/api/v1/query_range` calls the runner also issues against Ravel.
 //!
-//! `reqwest` is the one genuinely new external dependency this ticket adds
-//! (crates/ravel-promql-difftest/Cargo.toml only); flagged in the phase
-//! report per CLAUDE.md's dependency rule.
+//! `reqwest` is a crate-local external dependency
+//! (crates/ravel-promql-difftest/Cargo.toml only).
 
 use serde_json::Value as Json;
 use std::time::Duration;

@@ -1,10 +1,10 @@
-//! Seeded, deterministic dataset generator (docs/promql-evaluator-plan.md
-//! section 5.2). Same seed and [`DatasetConfig`] always produce the same
-//! series, labels, and samples, following the bench-generator discipline
-//! (`crates/ravel-bench/src/generator.rs`): timestamps are derived from
-//! `config.base_ts_ms`, never sampled from the clock.
+//! Seeded, deterministic dataset generator. Same seed and [`DatasetConfig`]
+//! always produce the same series, labels, and samples, following the
+//! bench-generator discipline (`crates/ravel-bench/src/generator.rs`):
+//! timestamps are derived from `config.base_ts_ms`, never sampled from the
+//! clock.
 //!
-//! Constraints imposed by the Prometheus side of the harness (section 5.2):
+//! Constraints imposed by the Prometheus side of the harness:
 //! every series is in strictly ascending timestamp order, no timestamp
 //! repeats with a different value, and no sample accidentally carries the
 //! stale-marker bit pattern ([`STALE_MARKER_BITS`]) unless the scenario is
@@ -13,8 +13,8 @@
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-/// Bit pattern Prometheus (and, since P1, Ravel) treats as "series absent at
-/// this instant" rather than a live value (a10-F01, docs/adrs/0010.md
+/// Bit pattern Prometheus and Ravel treat as "series absent at
+/// this instant" rather than a live value (docs/adrs/0010.md
 /// section 5). Distinct from a quiet NaN ([`f64::NAN`]'s bit pattern is
 /// `0x7ff8_0000_0000_0000`), so ordinary NaN injections never collide with
 /// it by accident.
@@ -42,7 +42,7 @@ impl GeneratedSeries {
     }
 }
 
-/// One native-histogram sample in the generated dataset (P11). Deliberately
+/// One native-histogram sample in the generated dataset. Deliberately
 /// minimal: positive buckets only, integer counts, a fixed schema, which is
 /// enough to exercise the native `histogram_count`/`_sum`/`_avg`,
 /// `histogram_quantile`, `rate`, and `sum`/`avg` forms. `positive_buckets`
@@ -64,7 +64,7 @@ pub struct GeneratedHistogramPoint {
 }
 
 /// One generated native-histogram series: label set and histogram samples in
-/// ascending timestamp order (P11).
+/// ascending timestamp order.
 #[derive(Debug, Clone)]
 pub struct GeneratedHistogramSeries {
     pub labels: Vec<(String, String)>,
@@ -83,13 +83,13 @@ impl GeneratedHistogramSeries {
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub series: Vec<GeneratedSeries>,
-    /// Native-histogram series (P11). Pushed to Prometheus over remote write
+    /// Native-histogram series. Pushed to Prometheus over remote write
     /// by the encoder. NOTE: the in-process Ravel side (`ravel_stack`) cannot
     /// ingest these yet: its ingest path (`NormalizedPoint`) and the query
-    /// read path are still f64-only (see the P11 report), so a native-
-    /// histogram corpus entry has no Ravel data to compare against until that
-    /// gap closes. Kept here so the generator and remote-write encoder support
-    /// lands with P11, ready for the moment the read path carries histograms.
+    /// read path are still f64-only, so a native-histogram corpus entry has no
+    /// Ravel data to compare against until that gap closes. Kept here so the
+    /// generator and remote-write encoder support are ready for the moment the
+    /// read path carries histograms.
     pub histogram_series: Vec<GeneratedHistogramSeries>,
 }
 
@@ -130,9 +130,9 @@ fn metric(name: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
     out
 }
 
-/// Builds the full P3 selector-corpus dataset: every shape section 5.2
-/// requires, each under a distinct `diff_*` metric name so corpus entries
-/// can select exactly one scenario by name.
+/// Builds the full selector-corpus dataset: every shape the harness requires,
+/// each under a distinct `diff_*` metric name so corpus entries can select
+/// exactly one scenario by name.
 pub fn generate(config: &DatasetConfig) -> Dataset {
     let mut rng = StdRng::seed_from_u64(config.seed);
     let mut series = vec![
@@ -157,7 +157,7 @@ pub fn generate(config: &DatasetConfig) -> Dataset {
     }
 }
 
-/// Native-histogram series for the P11 corpus: a monotonic counter histogram
+/// Native-histogram series for the native-histogram corpus: a monotonic counter histogram
 /// (`diff_native_hist`, cumulative bucket counts growing each scrape, reset
 /// hint NO after the first sample) and a two-series family
 /// (`diff_native_hist_agg`, `i="1"`/`i="2"`) for `sum`/`avg` aggregation.
@@ -247,8 +247,8 @@ fn gauge_walk(rng: &mut StdRng, config: &DatasetConfig) -> GeneratedSeries {
 }
 
 /// A monotonically increasing counter with one deliberate reset (value
-/// drops back near zero) partway through, exercising the P4 rate-family
-/// counter-reset path once it lands; for P3 it is exercised only as a plain
+/// drops back near zero) partway through, exercising the rate-family
+/// counter-reset path; in the selector corpus it is exercised only as a plain
 /// selector.
 fn counter_with_reset(rng: &mut StdRng, config: &DatasetConfig) -> GeneratedSeries {
     let reset_at = config.sample_count / 2;
@@ -354,7 +354,7 @@ fn special_values(config: &DatasetConfig) -> GeneratedSeries {
 }
 
 /// A live sample, then a stale marker, then another live sample: the
-/// a10-F01 acceptance shape (series absent exactly at the stale instant,
+/// staleness acceptance shape (series absent exactly at the stale instant,
 /// present again after).
 fn stale_then_live(config: &DatasetConfig) -> GeneratedSeries {
     let samples = vec![
@@ -411,9 +411,9 @@ fn classic_histogram_family(
     per_bucket_series
 }
 
-/// Label shapes for vector-matching (P7): a one-to-one matching pair, a
-/// non-matching pair, a many-to-one (`group_left`) shape, and (added for
-/// P7's binary-operator corpus) duplicate-signature shapes for
+/// Label shapes for vector-matching: a one-to-one matching pair, a
+/// non-matching pair, a many-to-one (`group_left`) shape, and (for the
+/// binary-operator corpus) duplicate-signature shapes for
 /// matching-cardinality error cases plus an extra `group_left` "one" side
 /// carrying a label absent from the "many" side, for the label-copy
 /// delete case.
@@ -457,8 +457,8 @@ fn vector_matching_shapes(rng: &mut StdRng, config: &DatasetConfig) -> Vec<Gener
     ]
 }
 
-/// Label/value shapes for the aggregation corpus (ticket #129, plan section
-/// P8): two `job` groups, each with three `instance`s, and constant values
+/// Label/value shapes for the aggregation corpus: two `job` groups, each with
+/// three `instance`s, and constant values
 /// (not randomized) so a `topk`/`bottomk` tie is exact and stable at every
 /// timestamp rather than depending on where in the walk the query lands.
 /// `job="a"` carries an exact duplicate at its own maximum (`instance`s `2`

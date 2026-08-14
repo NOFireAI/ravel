@@ -1,7 +1,7 @@
 //! In-process Ravel side of the differential harness: the ingest crate's
 //! public path (`IngestRouter::write_values`) over a `MemoryStore`, served by the
 //! same `Catalog` / `QueryEngine` / HTTP router the production query
-//! service uses (docs/promql-evaluator-plan.md section 5.1).
+//! service uses.
 //!
 //! Ingest deliberately goes through `IngestRouter`, not hand-built RSEG
 //! segments (contrast `crates/ravel-query/tests/e2e.rs`): using the real
@@ -116,11 +116,11 @@ impl RavelStack {
 
 fn to_points(tenant: &TenantId, dataset: &Dataset) -> Result<Vec<IngestPoint>, RavelStackError> {
     // Both scalar and native-histogram series flow through `IngestRouter::
-    // write_values` as `IngestPoint`s. Native histograms became end-to-end
-    // ingestible in #218 stage 1 (RSEG v5 histogram storage plus ravel-query's
-    // histogram read path), so `dataset.histogram_series` is now ingested here
-    // rather than dropped: a native-histogram corpus entry has real Ravel data
-    // to compare against the pinned Prometheus side.
+    // write_values` as `IngestPoint`s. Native histograms are end-to-end
+    // ingestible (RSEG histogram storage plus ravel-query's histogram read
+    // path), so `dataset.histogram_series` is ingested here rather than
+    // dropped: a native-histogram corpus entry has real Ravel data to compare
+    // against the pinned Prometheus side.
     let mut points = Vec::new();
     for series in &dataset.series {
         let labels = build_label_set(&series.labels)?;
@@ -293,8 +293,8 @@ mod tests {
         let dataset = crate::generator::generate(&crate::generator::DatasetConfig::default());
         let points = to_points(&tenant, &dataset).expect("build ingest points");
         // Every generated histogram sample reaches the ingest points as a
-        // histogram-valued point (this is what stage 1 unblocked; before it,
-        // histogram series were dropped on the Ravel side).
+        // histogram-valued point (histogram series are no longer dropped on
+        // the Ravel side).
         let expected_histogram_points: usize = dataset
             .histogram_series
             .iter()

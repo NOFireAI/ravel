@@ -3,9 +3,8 @@
 //! with protox; no protoc or network needed.
 //!
 //! This crate vendors its own copy of the compile step rather than
-//! depending on ravel-remote-write's generated types (docs/promql-
-//! evaluator-plan.md section 5.1: "the remote-write proto is vendored
-//! crate-locally"). ravel-remote-write is a production ingest-decode
+//! depending on ravel-remote-write's generated types: the remote-write proto
+//! is vendored crate-locally. ravel-remote-write is a production ingest-decode
 //! surface; this crate only ever encodes a `WriteRequest` to push fixtures
 //! into the differential harness's pinned Prometheus instance, so it is
 //! kept independent. Only `types.proto` and `remote.proto` are compiled:

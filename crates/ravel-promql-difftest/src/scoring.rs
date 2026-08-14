@@ -1,4 +1,4 @@
-//! Conformance scoring for the PromQL surface (ADR-0035, issue #133).
+//! Conformance scoring for the PromQL surface (ADR-0035).
 //!
 //! [`REGISTRY`] enumerates every stable Prometheus PromQL function and every
 //! major promql-parser AST construct category, each mapped to exactly one
@@ -2412,7 +2412,7 @@ mod tests {
         );
     }
 
-    /// Gap 2 of issue #262, from the other side: a row proven by a
+    /// A row proven by a
     /// `ravel-promql` unit test used to need no evidence at all, so a renamed
     /// or deleted test kept publishing "supported". The synthetic regression
     /// here is a name set that no longer carries the cited test.
@@ -2522,7 +2522,7 @@ fn an_attributed_helper() {}
         assert!(!names.contains("an_attributed_helper"));
     }
 
-    /// Gap 1 of issue #262 at the registry end: every state-2 row must declare
+    /// At the registry end: every state-2 row must declare
     /// a status/`errorType` pair a run can actually compare against.
     #[test]
     fn every_rejected_row_declares_a_parseable_typed_error() {
@@ -2575,7 +2575,7 @@ fn an_attributed_helper() {}
         ));
     }
 
-    /// Gap 3 of issue #262: a `status: "success"` envelope carrying an empty
+    /// A `status: "success"` envelope carrying an empty
     /// result set used to count as a passing entry, so a construct that
     /// silently stopped returning data still published as supported.
     #[test]
