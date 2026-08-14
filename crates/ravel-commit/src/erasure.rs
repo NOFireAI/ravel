@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn compute_rewrite_input_set_hash_differs_on_request_ids() {
-        // The collision the checkpoint reproduced: two batches over the same
+        // The collision this guards against: two batches over the same
         // inputs that applied a different set of requests must diverge.
         let inputs = vec![CompactionInputIdentity {
             writer_id: Uuid::from_u128(9).to_string(),
@@ -1009,7 +1009,7 @@ mod tests {
         assert_ne!(via_inputs, via_superseded);
     }
 
-    /// The end-to-end regression for the collision the checkpoint reproduced:
+    /// End-to-end guard against the input-set-hash collision:
     /// two full `RewriteRecord`s over the same inputs but different applied
     /// request sets must produce two different `rw.<hash16>.cmt` object
     /// keys via `keys::rewrite_record_key_for`, not just two different
