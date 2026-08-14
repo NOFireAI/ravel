@@ -195,7 +195,7 @@ fi
 log "bucket ${BUCKET} ready on ${S3_ENDPOINT}"
 
 # ---- 4b. store qualification --------------------------------------------
-# ADR-0050 section 6 (EC7, issue #623): server startup on a non-Memory store
+# ADR-0050 section 6 (EC7): server startup on a non-Memory store
 # refuses unless `sys/qualification` is already present. Unlike the tenancy
 # marker and gc-config objects, there is deliberately no bootstrap-and-continue
 # path for this one -- it is only ever written by an explicit `ravel-cli store

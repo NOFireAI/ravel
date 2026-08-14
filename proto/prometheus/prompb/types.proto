@@ -12,7 +12,7 @@
 // limitations under the License.
 //
 // Vendored from github.com/prometheus/prometheus, tag v3.13.1, path
-// prompb/types.proto (ADR-0015, docs/ingest-breadth-plan.md track A).
+// prompb/types.proto (ADR-0015).
 // Two adaptations from the upstream file:
 //   - The `import "gogoproto/gogo.proto"` and every `[(gogoproto.nullable)
 //     = false]` field option are dropped. Those options only change how

@@ -63,7 +63,7 @@ async-trait = "0.1"
 # two crates resolve the same reqwest.
 reqwest = { version = "0.13", features = ["json"] }
 
-# JWT validation for OIDC tenant resolution (ADR-0042 decision 6, issue #392).
+# JWT validation for OIDC tenant resolution (ADR-0042 decision 6).
 # Pinned to >= 10.3.0: 9.3.1 is vulnerable to CVE-2026-25537 / GHSA-h395-gr6q-cpjc
 # (a claim sent with the wrong JSON type is treated as absent rather than
 # malformed unless it is also in required_spec_claims); 10.3.0 is the first patched
@@ -90,7 +90,7 @@ arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-ipc = { version = "59", features = ["zstd"] }
 
 # Flight SQL transport, used only by ravel-sql and services/ravel-server behind
-# their `flight-sql` features (docs/arrow-datafusion-plan.md section 3). Pinned
+# their `flight-sql` features. Pinned
 # to 58 on purpose: it must share arrow with the arrow 58 that datafusion 54
 # carries, which is a different major than the direct `arrow = "59"` pin above
 # that ravel-otap and ravel-segment use. The two arrow majors coexist in the

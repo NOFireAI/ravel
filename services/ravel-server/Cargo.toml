@@ -13,7 +13,7 @@ ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-maintain = { workspace = true }
 # Query-worker registration/liveness and rendezvous slice ownership for the
-# ADR-0071 distributed read fan-out (issue #865): sys/query/workers heartbeats
+# ADR-0071 distributed read fan-out: sys/query/workers heartbeats
 # (ravel_fleet::query_workers) and highest-random-weight slice ownership
 # (ravel_fleet::worker_set).
 ravel-fleet = { workspace = true }
@@ -23,7 +23,7 @@ ravel-otlp = { workspace = true }
 ravel-remote-write = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
-# The exemplars endpoint (issue #475, ADR-0047 decision 4) reads the RSEG
+# The exemplars endpoint (ADR-0047 decision 4) reads the RSEG
 # EXEMPLARS section back out of the segments a query already matched, using
 # ravel-segment's public `open_from_full`/`decode_catalog_v5`/
 # `decode_exemplars_section`. It was previously only a dev-dependency (for
@@ -46,7 +46,7 @@ parking_lot = { workspace = true }
 # outside this task's scope). No new crate enters Cargo.lock: 0.17.x is already
 # resolved.
 ring = "0.17"
-# The gRPC wire-byte-count admission layer (issue #803) is a `tower::Layer`
+# The gRPC wire-byte-count admission layer is a `tower::Layer`
 # operating on `http::Request<tonic::body::Body>`. `tower` is already a
 # normal (workspace) dependency version; promoted here from dev-only because
 # `wire_byte_count.rs` is production code, not test code. `http` and
@@ -60,7 +60,7 @@ http-body = "1.1"
 # pulls the arrow / arrow-ipc dependency tree, so it stays out of the default
 # build (docs/otap-ingest.md risk mitigation).
 ravel-otap = { workspace = true, optional = true }
-# Stream combinators. The ADR-0071 coordinator (`distrib.rs`, issue #865)
+# Stream combinators. The ADR-0071 coordinator (`distrib.rs`)
 # drives the in-process fragment service's `SeriesFetch` frame stream to
 # completion for a self-mapped (no-hop) slice, so `futures` is production code
 # in the default build, not only under `otap` or in tests. The `otap` gRPC
@@ -76,7 +76,7 @@ tokio = { workspace = true }
 # Flight startup test).
 #
 # `tls-ring` + `tls-native-roots` add the client TLS transport the ADR-0071
-# cross-cluster federation client (issue #868) dials a `tls=on` remote cluster
+# cross-cluster federation client dials a `tls=on` remote cluster
 # over (`--remote-cluster ...,tls=on`): `ClientTlsConfig`/`with_native_roots`
 # come from these features. They are additive over `channel` and inert for a
 # plaintext (`tls=off`) remote and for the intra-cluster coordinator, which
@@ -134,8 +134,8 @@ ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.1.0" }
 
 # ravel-sql is declared here as a path dependency rather than through
 # `[workspace.dependencies]` because the workspace root Cargo.toml is outside
-# ticket B3's scope. The version is pinned so cargo-deny does not count it as
-# a wildcard path dependency (finding a11-F07), matching how every other
+# this task's scope. The version is pinned so cargo-deny does not count it as
+# a wildcard path dependency, matching how every other
 # internal crate is pinned.
 ravel-sql = { path = "../../crates/ravel-sql", version = "0.1.0", optional = true }
 
@@ -155,15 +155,15 @@ otap = ["dep:ravel-otap"]
 
 # `POST /api/v1/sql`. Off by default: enabling it links datafusion into the
 # server binary, and the SQL surface is opt-in per deployment
-# (docs/arrow-datafusion-plan.md section 3, ADR-0013 structural isolation).
+# (ADR-0013 structural isolation).
 sql = ["dep:ravel-sql"]
 
 # Flight SQL on the gRPC listener. Implies `sql`: both surfaces execute through
 # ravel-sql, so there is no deployment that wants Flight without it
-# (docs/arrow-datafusion-plan.md section 3 feature matrix). Off by default for
+# (the ravel-sql feature matrix). Off by default for
 # the same reason `sql` is. Today this registers an unimplemented service so
 # the wiring and the version pairing are proven; the real methods arrive with
-# ravel-sql's `flight` module under issue #152.
+# ravel-sql's `flight` module.
 flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
 
 [dev-dependencies]

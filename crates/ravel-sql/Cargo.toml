@@ -15,7 +15,7 @@ ravel-catalog = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-object-store = { workspace = true }
-# The query-audit writer (ADR-0042 decision 4, issue #395). The Flight SQL
+# The query-audit writer (ADR-0042 decision 4). The Flight SQL
 # statement path writes one `Signal::Audit` record per executed statement
 # through `ravel_maintain::write_query_audit`, the same writer the HTTP
 # `POST /api/v1/sql` endpoint uses, so a tenant's Flight query activity is
@@ -24,12 +24,12 @@ ravel-object-store = { workspace = true }
 # feature gates. ravel-maintain does not depend on ravel-sql, so this adds no
 # dependency cycle.
 ravel-maintain = { workspace = true, optional = true }
-# The `logs` table (issue #239) uses the RLOG record/predicate/tokenizer types
+# The `logs` table uses the RLOG record/predicate/tokenizer types
 # directly (Predicate, FieldSel, LogRecord, AttrValue, tokenizer::tokens);
 # ravel-query re-exports the LogSegmentFetcher surface but not these logseg
 # types, so ravel-logseg is a direct dependency here.
 ravel-logseg = { workspace = true }
-# The `spans` table (issue #356) reads RSPAN span segments through the
+# The `spans` table reads RSPAN span segments through the
 # ravel-rspan reader/record/query types (RspanReader, SpanQuery, SpanRecord,
 # ScanStats, SpanSegError) directly; ravel-query has no span fetcher yet
 # (ADR-0041 phase 5 is the SQL table alone), so ravel-rspan is a direct
@@ -38,7 +38,7 @@ ravel-rspan = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the
-# module docs and the B1 report for the arrow 58 vs workspace-59 pinning note.
+# module docs for the arrow 58 vs workspace-59 pinning note.
 #
 # `sql` is the only feature enabled on top of `default-features = false`: it is
 # what supplies `datafusion-sql` (the sqlparser front end and the SQL-to-
@@ -47,7 +47,7 @@ ravel-rspan = { workspace = true }
 # deliberate: no parquet/csv/avro/json file formats, no compression codecs, no
 # nested/regex/crypto expression packs. A file-format factory that is not linked
 # cannot be reached by a `CREATE EXTERNAL TABLE` that slipped a parse gate
-# (docs/arrow-datafusion-plan.md section 2 security invariant 1, review F16).
+# (security invariant 1).
 datafusion = { version = "54", default-features = false, features = ["sql"] }
 
 # `url::Url` appears in the `ObjectStoreRegistry` trait signature, which
@@ -73,12 +73,12 @@ arrow-flight = { workspace = true, optional = true }
 #    snapshot-pinning ticket carries.
 #  - `tracing` records the full, unredacted error at the Flight error
 #    boundary, the same discipline the HTTP endpoint follows.
-#  - `blake3` keys the ticket's integrity MAC (issue #185); already a
+#  - `blake3` keys the ticket's integrity MAC; already a
 #    workspace pin, used the same way `content_hash` fields are hashed
 #    elsewhere in the workspace, just keyed here instead of unkeyed.
 #  - `rand` generates the ticket's in-process MAC key once at construction.
 #  - `ravel-proto` supplies `ErasureRequest`/`ErasurePredicateMatcher`
-#    (issue #829, ADR-0064 decision 3): `flight_ticket::FlightTicket::snapshot`
+#    (ADR-0064 decision 3): `flight_ticket::FlightTicket::snapshot`
 #    adapts the ticket's carried `pending_erasure` predicates into these types
 #    to populate `Snapshot.pending_erasure`, the same proto types the
 #    dev-only fixtures below already use.
@@ -100,11 +100,11 @@ serde_json = { workspace = true }
 [features]
 # Flight SQL transport. Off by default: it links arrow-flight and tonic on top
 # of datafusion, and the Flight surface is opt-in per deployment
-# (docs/arrow-datafusion-plan.md section 3, ADR-0013 structural isolation).
-# Gates the `flight` module (the future FlightSqlService, issue #152) and the
-# `flight_ticket` module (the snapshot-pinning ticket codec, issue #150).
+# (ADR-0013 structural isolation).
+# Gates the `flight` module (the future FlightSqlService) and the
+# `flight_ticket` module (the snapshot-pinning ticket codec).
 #
-# The feature matrix in section 3 writes this as "flight-sql implies sql". This
+# The feature matrix writes this as "flight-sql implies sql". This
 # crate has no `sql` feature to imply: its SQL surface is unconditional
 # (datafusion is a hard dependency, and the `sql` in its feature list is
 # datafusion's own feature, not one of ours). The implication is stated where a
@@ -128,7 +128,7 @@ proptest = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 # Dev-only: the distributed Flight acceptance test
-# (tests/flight_distributed.rs, issue #866) hand-crafts an old-version (v3)
+# (tests/flight_distributed.rs) hand-crafts an old-version (v3)
 # ticket envelope with a MAC that is valid under the service's in-process key,
 # so the decode rejects it on the version byte (not the MAC). Computing that MAC
 # needs the same keyed BLAKE3 the codec uses; blake3 is already a workspace pin.
@@ -150,7 +150,7 @@ ravel-commit = { workspace = true }
 # together at runtime.
 ravel-alerting = { workspace = true }
 # Dev-only, unconditional: the ADR-0064 selective-erasure regression tests
-# (issue #829) build `Snapshot.pending_erasure` fixtures directly with the
+# build `Snapshot.pending_erasure` fixtures directly with the
 # real commit proto types, and these tests run whether or not `flight-sql` is
 # enabled. `ravel-proto` also appears above as an optional `flight-sql` main
 # dependency (`flight_ticket::FlightTicket::snapshot`'s predicate adapter);

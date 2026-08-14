@@ -34,7 +34,7 @@ env:
 
 jobs:
   # Mirrors ci.yml's k8s-build. See that job's own comments for the full
-  # rationale (ADR-0034 decision 7, ADR-0053 D5, issue #250); this copy omits
+  # rationale (ADR-0034 decision 7, ADR-0053 D5); this copy omits
   # only the `needs: changes` / `if:` gating, since this workflow always runs
   # the full pipeline against main rather than diffing a PR's changed paths.
   k8s-build:

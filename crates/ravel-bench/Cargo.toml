@@ -32,7 +32,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# The distrib crossover bench (issue #869) spins in-process `tonic` loopback
+# The distrib crossover bench spins in-process `tonic` loopback
 # `SeriesFetch` workers to drive the real ADR-0071 distributed fan-out, exactly
 # as ravel-query's own acceptance test does. `tonic` (default features: the
 # server transport plus the client `channel`) is already a workspace pin used by
@@ -43,7 +43,7 @@ tonic = { workspace = true }
 stats_alloc = "0.1.10"
 # Gated behind `parquet-baseline` (off by default). arrow reuses the
 # workspace pin (identical to ravel-otap's); parquet is pinned lockstep to
-# the same major and is a new external dependency (see issue #97 report).
+# the same major and is a new external dependency.
 # `async` + `object_store` give the read-side accounting harness (phase b)
 # the async Parquet reader over an object store; `object_store` and
 # `futures` reuse the workspace pins already used by ravel-object-store.
@@ -56,7 +56,7 @@ parquet = { version = "59", optional = true, features = ["async", "object_store"
 # RSEG path still goes through ravel-object-store (0.14) unchanged.
 object_store = { version = "0.13", optional = true, features = ["aws"] }
 futures = { workspace = true, optional = true }
-# Gated behind `flight-egress` (off by default; issue #154). The egress bench
+# Gated behind `flight-egress` (off by default). The egress bench
 # drives the real Flight SQL service and the JSON encoder in-process, so it
 # links ravel-sql with its `flight-sql` feature (which pulls datafusion, arrow
 # 58, and arrow-flight) plus the transport types the DoGet path speaks.
@@ -67,7 +67,7 @@ ravel-sql = { path = "../ravel-sql", version = "0.1.0", optional = true, feature
 arrow-flight = { workspace = true, optional = true }
 
 [features]
-# Parquet baseline harness (issue #97). Off by default: the standard build
+# Parquet baseline harness. Off by default: the standard build
 # and gates never compile arrow/parquet/object_store or the gated bins.
 # Phase a (write-side `parquet_baseline`) and phase b (read-side
 # `read_path_accounting`) share this one feature. `async-trait` moved to a
@@ -79,7 +79,7 @@ parquet-baseline = [
     "dep:object_store",
     "dep:futures",
 ]
-# Flight SQL vs JSON result-egress bench (issue #154). Off by default: it links
+# Flight SQL vs JSON result-egress bench. Off by default: it links
 # ravel-sql/datafusion/arrow-flight on top of the standard build, so the plain
 # gates never compile it or the `flight_sql_egress` bin.
 # `tonic` is a plain (non-optional) dependency now (the distrib crossover bench

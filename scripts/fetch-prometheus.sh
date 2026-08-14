@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads and verifies the pinned Prometheus release binary used by the
 # PromQL differential test harness (ADR-0021 decision 4,
-# docs/promql-evaluator-plan.md section 5.1, crates/ravel-promql-difftest).
+# crates/ravel-promql-difftest).
 #
 # The version is pinned to the same tag this repo already vendors the
 # Remote Write proto from (see proto/prometheus/prompb/*.proto: "Vendored

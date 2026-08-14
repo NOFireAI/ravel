@@ -1,5 +1,5 @@
 // Metric index: catalog snapshot part and HEAD formats
-// (docs/metric-index-plan.md, ADR-0020). Persistent contract: field
+// (ADR-0020). Persistent contract: field
 // numbers are frozen; only additive changes are allowed.
 syntax = "proto3";
 
@@ -24,8 +24,8 @@ message SnapshotPartHeader {
 }
 
 message SnapshotEntry {
-  // 0 = L0. Reserved for compaction outputs (docs/metric-index-plan.md
-  // section 7); readers reject levels they do not understand.
+  // 0 = L0. Reserved for compaction outputs; readers reject levels they
+  // do not understand.
   uint32 level = 1;
   uint32 shard = 2;
   uint32 ingest_hour_bucket = 3;
@@ -51,7 +51,7 @@ message SnapshotHead {
   repeated SnapshotPartRef parts = 6;
   bytes folder_id = 7;      // 16; UUIDv4 per folder process start
   sint64 created_unix_ns = 8;  // informational
-  // Additive, phase P5a (docs/metric-index-plan.md). Absent when no
+  // Additive, phase P5a. Absent when no
   // postings index has been built yet, or when the last fold's postings
   // build failed; readers must never treat absence as an error.
   SnapshotPostingsRef postings = 9;
@@ -80,8 +80,8 @@ message SnapshotPartRef {
   uint32 min_hour = 6;
 }
 
-// Reference to a name-postings object (RNP1 envelope), phase P5a
-// (docs/metric-index-plan.md). Bound to the exact set of parts it was
+// Reference to a name-postings object (RNP1 envelope), phase P5a.
+// Bound to the exact set of parts it was
 // built from: a postings object is only trustworthy against the parts
 // whose blake3 hashes it names here, in the same order as
 // `SnapshotHead.parts`.

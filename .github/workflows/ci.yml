@@ -154,7 +154,7 @@ jobs:
           echo "::notice::areas server_or_operator=$server_or_operator sql=$sql_area promql=$promql_area object_store=$object_store_area"
           emit false "$server_or_operator" "$sql_area" "$promql_area" "$object_store_area"
 
-  # Cheap, build-free guards wired in from ADR-0053 D6 / T2 (issue #596):
+  # Cheap, build-free guards wired in from ADR-0053 D6:
   #   - scripts/check-doc-drift.sh recomputes the derived counts in
   #     docs/query-engine.md's generated conformance block and diffs them, so
   #     a stale block (the textually-clean-but-wrong parallel-merge case that
@@ -228,7 +228,7 @@ jobs:
       - name: Clippy (sql feature)
         run: cargo clippy --locked -p ravel-server --features sql --all-targets -- -D warnings
       # `sql` does not imply `flight-sql`, so the step above leaves the Flight
-      # SQL service, its stream, and their tests unlinted (issue #616).
+      # SQL service, its stream, and their tests unlinted.
       - name: Clippy (flight-sql feature)
         run: cargo clippy --locked -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings
 
@@ -264,7 +264,7 @@ jobs:
       - name: Doctests
         run: cargo test --locked --doc --workspace
 
-  # The SQL surface (ticket B3, issue #22). Two things the `check` job cannot
+  # The SQL surface. Two things the `check` job cannot
   # cover:
   #
   # 1. `POST /api/v1/sql` is behind ravel-server's `sql` cargo feature, so
@@ -278,7 +278,7 @@ jobs:
   #    signed-zero, denormal, duplicate-timestamp and multi-segment-overlap
   #    space is explored properly.
   #
-  # docs/arrow-datafusion-plan.md section 2 requires the gate to be a
+  # The gate must be a
   # required test in ravel-sql CI and to re-run on every DataFusion version
   # bump; the golden cases in that file pin DataFusion's min/max NaN and
   # signed-zero semantics, so a bump that changes them fails here.
@@ -317,7 +317,7 @@ jobs:
           PROPTEST_CASES: 512
         run: cargo nextest run --locked -p ravel-sql --test differential
 
-  # The Flight SQL surface (issue #616). Until this job existed, every test
+  # The Flight SQL surface. Until this job existed, every test
   # behind ravel-server's `flight-sql` feature was compiled and discarded: the
   # `features` lane below ran `cargo check` on the combination and nothing
   # else, and no `cargo test` or `cargo nextest run` anywhere in this workflow
@@ -360,7 +360,7 @@ jobs:
       - name: Flight SQL tests
         run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
 
-  # Never-compiled feature combinations (ADR-0053 D6, issue #601). Four cargo
+  # Never-compiled feature combinations (ADR-0053 D6). Four cargo
   # features are off by default and no other job builds them, so a break in
   # any of them -- an unreachable e2e test path, three bench binaries that
   # never link -- ships undetected. This lane only proves each combination
@@ -369,11 +369,11 @@ jobs:
   #   - ravel-server --features otap        (links ravel-otap + arrow tree)
   #
   # `flight-sql` used to be probed here too. It moved to the `flight-sql` job
-  # above (issue #616), which lints and RUNS it: a compile-only probe let
+  # above, which lints and RUNS it: a compile-only probe let
   # every test behind that feature ship unexecuted, and this lane is not a
   # required check, so even its type check could fail unnoticed. It did, and
   # does: `ravel-bench --features parquet-baseline` has not compiled since
-  # 2026-07-28 (issue #621).
+  # 2026-07-28.
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
   features:
@@ -407,7 +407,7 @@ jobs:
       - name: Check ravel-bench --features flight-egress
         run: cargo check --locked -p ravel-bench --features flight-egress
 
-  # Supply-chain gate (finding a11-F01). deny.toml encodes an advisory,
+  # Supply-chain gate. deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
   # CI job enforced, so a new advisory, banned license, or unknown source
   # could merge to main undetected while CI signalled "clean". This job
@@ -415,7 +415,7 @@ jobs:
   # advisories check subsumes cargo-audit, so cargo-audit is not run
   # separately. cargo-deny is provisioned from a pinned action rather than
   # `cargo install` to avoid a from-source build on every run. The gate
-  # passes because deny.toml is green (F06-F08 fixed): the bincode
+  # passes because deny.toml is green: the bincode
   # advisory is scoped-ignored, tiny-keccak's CC0-1.0 is a scoped license
   # exception, and internal path deps are version-pinned.
   supply-chain:
@@ -430,8 +430,8 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
-  # Corrupt-input mutation fuzzing for the byte parsers (issue #82, audit
-  # finding a11-F05). Runs the stable-only proptest mutation targets for the
+  # Corrupt-input mutation fuzzing for the byte parsers. Runs the stable-only
+  # proptest mutation targets for the
   # RSEG codecs (varint, gorilla, delta-varint), the RSEG footer/section
   # reader, and the OTAP Arrow IPC decode path with an elevated but bounded
   # case count for deeper exploration than the default `check` run. These
@@ -476,7 +476,7 @@ jobs:
   # crates/ravel-object-store/tests/contract.rs early-return
   # (RAVEL_MINIO_URL / RAVEL_FLOCI_URL unset), so the only durable backend
   # Ravel ships against -- S3 -- gets zero CI coverage and an S3Store
-  # regression passes green (finding a11-F02). This job is required: object
+  # regression passes green. This job is required: object
   # storage is the source of truth, so a break in the S3 adapter must fail
   # CI, not be waved through.
   #
@@ -745,8 +745,8 @@ jobs:
         if: always()
         run: docker rm -f minio || true
 
-  # PromQL differential test (issue #124, docs/promql-evaluator-plan.md
-  # section 5, ADR-0021 decisions 4-5): checks Ravel's PromQL evaluator
+  # PromQL differential test (ADR-0021 decisions 4-5): checks Ravel's PromQL
+  # evaluator
   # against a pinned real Prometheus binary for bit-exact correctness on
   # the selector and error corpora in crates/ravel-promql-difftest/corpus.
   #
@@ -754,7 +754,7 @@ jobs:
   # before extracting it and refuses to proceed otherwise. The pinned
   # checksums are the real published digests from
   # https://github.com/prometheus/prometheus/releases/tag/v3.13.1's
-  # sha256sums.txt (issue #141), so this job fetches and verifies the real
+  # sha256sums.txt, so this job fetches and verifies the real
   # binary and runs the differential comparison rather than skipping.
   promql-difftest:
     needs: changes
@@ -813,7 +813,7 @@ jobs:
             exit 1
           fi
 
-  # The Kubernetes lane (ADR-0034 decision 7, issue #250). Runs the same three
+  # The Kubernetes lane (ADR-0034 decision 7). Runs the same three
   # scripts a developer runs locally -- scripts/kind-up.sh, scripts/kind-demo.sh,
   # scripts/kind-down.sh -- against a real kind cluster, so the local and CI
   # paths cannot drift.
@@ -966,7 +966,7 @@ jobs:
           name: k8s-images
       - name: Load the assembled images into the docker daemon
         run: docker load -i k8s-images.tar
-      # kubectl download is a known flake (issue #587). Install it explicitly,
+      # kubectl download is a known flake. Install it explicitly,
       # pinned to the cluster's Kubernetes minor (v1.32, matching the pinned
       # kindest/node:v1.32.2 that kind-up.sh sets) rather than helm/kind-action's
       # newer default, and wrap the download in a retry loop so a transient
@@ -1027,14 +1027,14 @@ jobs:
           node_image: ${{ steps.node-image.outputs.image }}
           cluster_name: ravel-ci
           # Pin kubectl to the cluster's own minor rather than the action's
-          # newer default (issue #587: version skew plus a flaky download).
+          # newer default (version skew plus a flaky download).
           # The action installs its own copy of this same version regardless
           # (its own download has no retry); the step right after this one
           # re-asserts the explicit retried install's directory at the front
           # of PATH so that copy, not the action's, is what every later step
           # actually runs.
           kubectl_version: v1.32.2
-          # Raised from 120s to 300s (issue #587: readiness timeout with no
+          # Raised from 120s to 300s (readiness timeout with no
           # headroom). This is the action's control-plane readiness wait before
           # kind-up.sh runs; 300s matches the per-condition readiness timeouts
           # kind-up.sh itself uses so control-plane bring-up on a disk-cleared
@@ -1072,7 +1072,7 @@ jobs:
           scripts/kind-up.sh
       - name: OTLP round trip through the gateway and query Services
         run: scripts/kind-demo.sh
-      # On any failure above (issue #587's readiness-timeout mode leaves only a
+      # On any failure above (the readiness-timeout mode leaves only a
       # bare `kubectl wait` timeout otherwise), dump what a human would ask for
       # before the cluster is torn down. Ordered broad-to-specific: every pod's
       # scheduling/state, then the full describe (restarts, probe failures,
@@ -1100,8 +1100,8 @@ jobs:
         run: scripts/kind-down.sh
 
   # Builds the root Dockerfile's two shipping images (`server` and `operator`)
-  # to prove the images the project actually ships still build (issue #292,
-  # found at epic #244's Wave 4 checkpoint review). No other job runs this
+  # to prove the images the project actually ships still build. No other job
+  # runs this
   # Dockerfile: k8s-integration builds from Dockerfile.prebuilt with
   # RAVEL_SKIP_IMAGE_BUILD=1 specifically to avoid this slow, OOM-prone build on
   # every PR, so a broken COPY path, a bad `--target` stage name, or a
@@ -1114,7 +1114,7 @@ jobs:
   #
   # Path-gated rather than run on every push. This Dockerfile recompiles the
   # whole workspace inside Docker at CARGO_BUILD_JOBS=2 (the cap that keeps it
-  # from OOM-killing, issue #251) with no access to this workflow's sccache --
+  # from OOM-killing) with no access to this workflow's sccache --
   # 57 minutes measured on an 8 GiB arm64 host, per k8s-integration's notes --
   # so running it on every PR push would be by far the most expensive job here.
   # Every regression the issue names (a broken COPY path, a bad stage name, a
@@ -1178,7 +1178,7 @@ jobs:
       - name: Free disk space
         if: steps.dockerfile-changed.outputs.build == 'true'
         uses: ./.github/actions/free-disk-space
-      # CARGO_BUILD_JOBS stays at the Dockerfile's own cap of 2 (issue #251); it
+      # CARGO_BUILD_JOBS stays at the Dockerfile's own cap of 2; it
       # is deliberately not raised here.
       - name: Build the server image
         if: steps.dockerfile-changed.outputs.build == 'true'

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Shared segment codecs: the encoding tag registry, the blocked token bloom filter, and the normative word tokenizer (issue #429)."
+description = "Shared segment codecs: the encoding tag registry, the blocked token bloom filter, and the normative word tokenizer."
 
 [dependencies]
 thiserror = { workspace = true }

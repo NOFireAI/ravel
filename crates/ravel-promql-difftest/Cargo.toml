@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Differential test harness: pinned Prometheus vs. Ravel's PromQL evaluator (ADR-0021, docs/promql-evaluator-plan.md section 5). Dev-only; never a dependency of any production crate."
+description = "Differential test harness: pinned Prometheus vs. Ravel's PromQL evaluator (ADR-0021). Dev-only; never a dependency of any production crate."
 
 [dependencies]
 ravel-types = { workspace = true }

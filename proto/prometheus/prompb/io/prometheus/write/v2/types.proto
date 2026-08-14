@@ -12,9 +12,8 @@
 // limitations under the License.
 //
 // Vendored from github.com/prometheus/prometheus, tag v3.13.1, path
-// prompb/io/prometheus/write/v2/types.proto (ADR-0015,
-// docs/ingest-breadth-plan.md track A). Kept essentially complete since
-// every message here is relevant to the RW2 decode work in ticket A2; the
+// prompb/io/prometheus/write/v2/types.proto (ADR-0015). Kept essentially
+// complete since every message here is relevant to the RW2 decode work; the
 // only adaptation is dropping `import "gogoproto/gogo.proto"` and the
 // `[(gogoproto.nullable) = false]` field options it enables (Go-only
 // codegen hint, no wire-format effect, no equivalent needed since prost
