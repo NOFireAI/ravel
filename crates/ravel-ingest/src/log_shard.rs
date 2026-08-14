@@ -1,12 +1,26 @@
-//! One actor per log shard: actor-local buffering, adaptive flush, and the
+//! One actor per log shard: actor-local buffering, pipelined flush, and the
 //! pinned-identity commit sequence, the log-pipeline counterpart of
 //! [`crate::shard`] (docs/ingest.md "Shard actor", docs/catalog-and-mvcc.md
 //! "Pinned flush identity" and "Commit sequence").
 //!
-//! The divergences from the metrics shard actor are deliberate and narrow:
-//! the buffer holds [`NormalizedLogRecord`]s instead of points, the flush
-//! builds an RLOG object with [`RlogWriter`] instead of an RSEG segment, and
-//! identity is a `stream_id` rather than a `series_id`. One difference is
+//! Buffer ownership and flush execution are split (ADR-0067 decision 1): the
+//! actor is the single-threaded owner of buffered state and, at flush trigger,
+//! pins the flush's identity and moves its `LogTenantBuf` (including its
+//! waiters and its ADR-0069 byte charges) into a task spawned onto
+//! [`LogFlushCtx::run_flush`], then keeps draining its channel.
+//! `max_inflight_flushes` (ADR-0067 decision 2) bounds how many such tasks may
+//! run at once per shard via a semaphore acquired before spawning; at the
+//! bound, the acquire blocks the flush trigger (and therefore the actor's
+//! ability to pull its next message), which is exactly where backpressure is
+//! meant to propagate. This ports ADR-0067 decisions 1 and 2 from the metrics
+//! [`crate::shard`]; the adaptive flush delay (decision 3) is metrics-only and
+//! deliberately absent here (the age trigger stays the fixed
+//! `max_flush_delay`/`max_flush_delay_idle` in [`LogShardActor::age_threshold_ns`]).
+//!
+//! The divergences from the metrics shard actor are otherwise deliberate and
+//! narrow: the buffer holds [`NormalizedLogRecord`]s instead of points, the
+//! flush builds an RLOG object with [`RlogWriter`] instead of an RSEG segment,
+//! and identity is a `stream_id` rather than a `series_id`. One difference is
 //! worth restating: this buffer performs no stream-identity collision check
 //! of its own. Unlike [`crate::shard::TenantBuf::merge`]'s ADR-0005 series-id
 //! check, the equivalent fail-loud check for logs already lives in
@@ -32,7 +46,8 @@ use ravel_types::logstream::{AttrValue, LogStreamId};
 use ravel_types::{CommitToken, Signal, TenantId};
 
 use crate::log_router::LogIndexedFields;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::Duration;
 use uuid::Uuid;
 
@@ -159,21 +174,388 @@ impl LogTenantBuf {
     }
 }
 
-pub(crate) struct LogShardActor {
+/// Everything one log flush task needs to encode, PUT twice, and ack, bundled
+/// so it can be handed to a spawned task by move (ADR-0067 decision 1: "no
+/// shared mutable state is introduced"). Built once per shard actor and shared
+/// by every flush's task through an `Arc`; nothing here is mutated after
+/// construction (the atomics inside `metrics` are already safe for concurrent
+/// access from many in-flight flush tasks at once).
+struct LogFlushCtx {
     shard: u32,
     writer_id: Uuid,
     epoch: u64,
-    next_seq: u64,
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<dyn Clock>,
     rng: Arc<dyn RngSource>,
     config: IngestConfig,
     metrics: Arc<LogIngestMetrics>,
-    rx: mpsc::Receiver<LogShardMsg>,
-    tenants: HashMap<TenantId, LogTenantBuf>,
     /// Resolves each tenant's POSTINGS indexed-field list at flush time
     /// (ADR-0049 decision 3). Shared across shards.
     indexed_fields: Arc<dyn LogIndexedFields>,
+}
+
+/// One log flush's identity and payload, pinned by the actor before the flush
+/// task takes over (docs/catalog-and-mvcc.md "Pinned flush identity"): `seq`,
+/// `ingest_hour_bucket`, and every field derived from the clock are fixed here
+/// and carried verbatim into the task. Nothing in [`LogFlushCtx::run_flush`]
+/// may re-read the clock or re-derive any of these.
+struct LogPinnedFlush {
+    tenant_hash: ravel_types::TenantHash,
+    seq: u64,
+    identity: ObjectIdentity,
+    ingest_hour_bucket: u32,
+    flush_open_ns: i64,
+    deadline_ns: i64,
+    min_ingest_ts_ns: i64,
+    max_ingest_ts_ns: i64,
+    records: Vec<NormalizedLogRecord>,
+    waiters: Vec<LogAck>,
+    /// The global ingest-byte-budget charges this flush's buffer held (ADR-0069).
+    /// Carried into the flush task purely so they are dropped -- and the bytes
+    /// refunded -- when the flush's terminal outcome is reached, no earlier.
+    charges: Vec<Arc<IngestByteCharge>>,
+}
+
+impl LogFlushCtx {
+    /// Runs the full pinned-identity commit sequence for one flush, mirroring
+    /// [`crate::shard::FlushCtx::run_flush`] step for step: the serialized RLOG
+    /// object and its blake3 hash are each computed exactly once here and reused
+    /// verbatim by every retry (docs/catalog-and-mvcc.md "Pinned flush
+    /// identity"). Nothing below may re-serialize, accrete new records, or
+    /// re-read the clock for identity purposes.
+    ///
+    /// The one log-specific step is `finish()` error mapping: an
+    /// `InconsistentStreamAttrs` becomes [`LogWriteError::StreamIdCollision`]
+    /// and increments `stream_id_collisions`; every other `LogSegError` becomes
+    /// [`LogWriteError::SegmentBuild`]. This is the only site that constructs
+    /// `StreamIdCollision`, because the collision check itself lives in
+    /// `finish()`, not in this module.
+    async fn run_flush(&self, pinned: LogPinnedFlush) {
+        let LogPinnedFlush {
+            tenant_hash,
+            seq,
+            identity,
+            ingest_hour_bucket,
+            flush_open_ns,
+            deadline_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            records,
+            waiters,
+            charges,
+        } = pinned;
+        // Held to this flush's terminal outcome (every early `return` below is
+        // still inside this scope), then dropped here: that drop is the
+        // ADR-0069 budget refund for exactly the bytes this buffer held.
+        let _charges = charges;
+
+        // One pass over the batch computes the commit-record fields RlogWriter
+        // does not surface after `finish()`: the distinct stream count (the log
+        // analogue of series_count) and the event-time bounds. `records` is
+        // never empty here: the actor's `flush_tenant` returns before spawning
+        // for an empty buffer, so `min_event_ts_ns`/`max_event_ts_ns` always
+        // see at least one record.
+        let mut stream_ids: HashSet<LogStreamId> = HashSet::new();
+        let mut min_event_ts_ns = i64::MAX;
+        let mut max_event_ts_ns = i64::MIN;
+        for rec in &records {
+            stream_ids.insert(rec.stream_id);
+            min_event_ts_ns = min_event_ts_ns.min(rec.ts_ns);
+            max_event_ts_ns = max_event_ts_ns.max(rec.ts_ns);
+        }
+        let series_count = stream_ids.len() as u64;
+        let sample_count = records.len() as u64;
+
+        // Resolve this tenant's POSTINGS indexed-field list (ADR-0049 decision
+        // 3) once per object and hand it to the writer. An empty list leaves the
+        // object without a POSTINGS section, which is always legal (decision 5).
+        let indexed_fields = self.indexed_fields.fields_for(&tenant_hash);
+        let mut writer =
+            RlogWriter::new(RlogConfig::default(), identity).with_indexed_fields(indexed_fields);
+        for rec in records {
+            if let Err(e) = writer.push(to_logseg_record(rec)) {
+                self.metrics.record_abandoned_input_rejected();
+                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
+                return;
+            }
+        }
+        let bytes = match writer.finish_with_stats() {
+            Ok((bytes, stats)) => {
+                // Write-side POSTINGS metrics: section bytes, per-field distinct
+                // counts, and the cap-exceeded counter.
+                self.metrics.record_postings(stats);
+                bytes
+            }
+            Err(LogSegError::InconsistentStreamAttrs(msg)) => {
+                self.metrics.record_stream_id_collision();
+                self.ack_waiters(waiters, Err(LogWriteError::StreamIdCollision(msg)));
+                return;
+            }
+            Err(e) => {
+                self.metrics.record_abandoned_input_rejected();
+                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
+                return;
+            }
+        };
+
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data = Bytes::from(bytes);
+
+        let data_key = match keys::data_key(
+            &tenant_hash,
+            Signal::Logs,
+            self.shard,
+            self.writer_id,
+            self.epoch,
+            seq,
+            &content_hash,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                self.metrics.record_abandoned_input_rejected();
+                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
+                return;
+            }
+        };
+
+        if !self
+            .put_data_object_with_retry(&data_key, data.clone(), deadline_ns)
+            .await
+        {
+            self.metrics.record_abandoned_retry_exhausted();
+            self.ack_waiters(
+                waiters,
+                Err(LogWriteError::Abandoned(
+                    "data object put exhausted retry budget or exceeded max_flush_lifetime".into(),
+                )),
+            );
+            return;
+        }
+
+        let record = match record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Logs,
+            shard: self.shard,
+            writer_id: self.writer_id,
+            writer_epoch: self.epoch,
+            writer_seq: seq,
+            object_size: data.len() as u64,
+            content_hash,
+            sample_count,
+            series_count,
+            min_event_ts_ns,
+            max_event_ts_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            segment_format_version: u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: flush_open_ns,
+            ingest_hour_bucket,
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                self.metrics.record_abandoned_input_rejected();
+                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
+                return;
+            }
+        };
+
+        match self.publish_with_retry(&record, deadline_ns).await {
+            Some(token) => {
+                self.ack_waiters(waiters, Ok(token));
+            }
+            None => {
+                self.metrics.record_abandoned_retry_exhausted();
+                self.ack_waiters(
+                    waiters,
+                    Err(LogWriteError::Abandoned(
+                        "commit publish exhausted retry budget or exceeded max_flush_lifetime"
+                            .into(),
+                    )),
+                );
+            }
+        }
+    }
+
+    /// Acks exactly this flush's own waiters with exactly this flush's own
+    /// result: `waiters` was moved out of this flush's `LogTenantBuf` at pin
+    /// time and never merged with another flush's, so there is no other waiter
+    /// list this call could reach.
+    fn ack_waiters(&self, waiters: Vec<LogAck>, result: Result<CommitToken, LogWriteError>) {
+        let ok = result.is_ok();
+        self.metrics.record_acks(waiters.len(), ok);
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+
+    /// Races `fut` against the remaining budget to `deadline_ns` on the injected
+    /// `Clock`, returning `None` if the deadline is already past or elapses
+    /// while `fut` is still in flight. Built on `tokio::select!` racing
+    /// `self.clock.sleep(..)` rather than `tokio::time::timeout`, so the
+    /// deadline stays on the injected clock a test can pin and advance.
+    async fn bound_to_deadline<F, T>(&self, deadline_ns: i64, fut: F) -> Option<T>
+    where
+        F: Future<Output = T>,
+    {
+        let remaining_ns = deadline_ns.saturating_sub(self.clock.now_ns());
+        if remaining_ns <= 0 {
+            return None;
+        }
+        let remaining = Duration::from_nanos(u64::try_from(remaining_ns).unwrap_or(u64::MAX));
+        tokio::select! {
+            result = fut => Some(result),
+            () = self.clock.sleep(remaining) => None,
+        }
+    }
+
+    /// Retries the data-object PUT with the caller's own budget, reusing the
+    /// pinned `key`/`bytes` on every attempt. Each attempt is bounded to
+    /// `deadline_ns` via [`Self::bound_to_deadline`], so a timeout never retries
+    /// past the deadline and is treated exactly like the abandonment path.
+    async fn put_data_object_with_retry(&self, key: &str, bytes: Bytes, deadline_ns: i64) -> bool {
+        let mut attempt: u32 = 0;
+        loop {
+            let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
+            match self.bound_to_deadline(deadline_ns, call).await {
+                Some(Ok(())) => return true,
+                Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
+                    // `put_retry_max_attempts` is the number of retries after
+                    // the first attempt (total attempts = this + 1), matching
+                    // `ravel_commit::publish::RetryPolicy`. Check the budget
+                    // before consuming a retry so the first attempt is not
+                    // itself counted against it.
+                    if attempt >= self.config.put_retry_max_attempts
+                        || self.clock.now_ns() >= deadline_ns
+                    {
+                        return false;
+                    }
+                    self.metrics.record_put_retry();
+                    self.backoff_sleep(attempt).await;
+                    attempt += 1;
+                }
+                Some(Err(_)) | None => return false,
+            }
+        }
+    }
+
+    /// Retries the commit-record PUT with the caller's own budget, passing
+    /// `publish` a zero-retry policy so it attempts once per call and this loop
+    /// checks `deadline_ns` between attempts. Includes the pinned-identity
+    /// split-brain panic: identity is fixed at flush open, so a split-brain
+    /// cannot fire on a benign retry and means the pinning invariant was broken
+    /// upstream.
+    async fn publish_with_retry(
+        &self,
+        record: &CommitRecord,
+        deadline_ns: i64,
+    ) -> Option<CommitToken> {
+        let single_attempt = RetryPolicy {
+            max_attempts: 0,
+            base_delay: self.config.put_retry_base_delay,
+            max_delay: self.config.put_retry_max_delay,
+        };
+        let mut attempt: u32 = 0;
+        loop {
+            let call = publish::publish(self.store.as_ref(), record, &single_attempt);
+            match self.bound_to_deadline(deadline_ns, call).await {
+                Some(Ok(token)) => return Some(token),
+                Some(Err(PublishError::SplitBrain { this, stored })) => {
+                    panic!(
+                        "ravel-ingest: fatal split-brain on pinned log flush identity: this={this} stored={stored}"
+                    );
+                }
+                Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
+                    // See `put_data_object_with_retry`: `put_retry_max_attempts`
+                    // is retries after the first attempt (total = this + 1).
+                    if attempt >= self.config.put_retry_max_attempts
+                        || self.clock.now_ns() >= deadline_ns
+                    {
+                        return None;
+                    }
+                    self.metrics.record_put_retry();
+                    self.backoff_sleep(attempt).await;
+                    attempt += 1;
+                }
+                Some(Err(_)) | None => return None,
+            }
+        }
+    }
+
+    async fn backoff_sleep(&self, attempt: u32) {
+        let shift = attempt.min(20);
+        let exp = self
+            .config
+            .put_retry_base_delay
+            .saturating_mul(1u32 << shift);
+        let capped = exp.min(self.config.put_retry_max_delay);
+        let capped_ms = u64::try_from(capped.as_millis()).unwrap_or(u64::MAX);
+        let jittered_ms = self.rng.jitter_ms(capped_ms);
+        // Route the backoff wait through the injected `Clock`, not the tokio
+        // timer, so retry timing shares the one clock the rest of the flush path
+        // already uses (`bound_to_deadline`) and a test can drive it
+        // deterministically by advancing that clock, with no real sleep.
+        self.clock.sleep(Duration::from_millis(jittered_ms)).await;
+    }
+}
+
+/// Handles one reaped flush task's outcome. A panic inside
+/// [`LogFlushCtx::run_flush`] (the `SplitBrain` panic on a broken pinning
+/// invariant, or any other) must still take this shard actor down with it,
+/// exactly as it did before flush execution moved into its own spawned task:
+/// resuming the unwind here propagates it out of `run()`'s own task, which
+/// drops this actor (and `rx` with it), so the router observes the closed
+/// mailbox and reports `ShardUnavailable`. A task ending by cancellation (never
+/// triggered in today's code; `flushes` is never explicitly aborted) is merely
+/// logged, since it carries no panic payload to propagate.
+fn handle_flush_join_result(shard: u32, result: Result<(), tokio::task::JoinError>) {
+    if let Err(join_err) = result {
+        if join_err.is_panic() {
+            std::panic::resume_unwind(join_err.into_panic());
+        }
+        tracing::error!(
+            shard,
+            error = %join_err,
+            "ravel-ingest: log flush task ended abnormally (cancelled)"
+        );
+    }
+}
+
+/// RAII in-flight-flush accounting: incremented when a flush task is spawned,
+/// decremented on `Drop` when it ends, including on panic. Moved into the
+/// spawned task itself (not held by the actor) so the decrement fires exactly
+/// once, whenever that task's future is finally dropped, with no separate
+/// bookkeeping the actor could get out of sync with.
+struct InFlightFlushGuard {
+    metrics: Arc<LogIngestMetrics>,
+    shard: u32,
+}
+
+impl Drop for InFlightFlushGuard {
+    fn drop(&mut self) {
+        self.metrics.record_inflight_flush_delta(self.shard, -1);
+    }
+}
+
+pub(crate) struct LogShardActor {
+    shard: u32,
+    writer_id: Uuid,
+    epoch: u64,
+    next_seq: u64,
+    clock: Arc<dyn Clock>,
+    config: IngestConfig,
+    metrics: Arc<LogIngestMetrics>,
+    /// Immutable bundle handed by `Arc::clone` to every spawned flush task
+    /// (ADR-0067 decision 1).
+    ctx: Arc<LogFlushCtx>,
+    /// Bounds concurrently in-flight flush tasks (ADR-0067 decision 2).
+    semaphore: Arc<Semaphore>,
+    /// Tracks spawned flush tasks so `join_all_flushes` can await durability
+    /// before `FlushNow`/`Shutdown`/the channel-close drain return, and so the
+    /// actor loop can opportunistically reap finished ones (the `select!` branch
+    /// in `run`) rather than growing this set for the shard's whole lifetime.
+    flushes: JoinSet<()>,
+    rx: mpsc::Receiver<LogShardMsg>,
+    tenants: HashMap<TenantId, LogTenantBuf>,
 }
 
 impl LogShardActor {
@@ -190,19 +572,30 @@ impl LogShardActor {
         rx: mpsc::Receiver<LogShardMsg>,
         indexed_fields: Arc<dyn LogIndexedFields>,
     ) -> Self {
+        let ctx = Arc::new(LogFlushCtx {
+            shard,
+            writer_id,
+            epoch,
+            store,
+            clock: Arc::clone(&clock),
+            rng,
+            config,
+            metrics: Arc::clone(&metrics),
+            indexed_fields,
+        });
         LogShardActor {
             shard,
             writer_id,
             epoch,
             next_seq: 0,
-            store,
             clock,
-            rng,
             config,
             metrics,
+            ctx,
+            semaphore: Arc::new(Semaphore::new(config.max_inflight_flushes as usize)),
+            flushes: JoinSet::new(),
             rx,
             tenants: HashMap::new(),
-            indexed_fields,
         }
     }
 
@@ -258,6 +651,9 @@ impl LogShardActor {
                 _ = clock.sleep(until) => {
                     self.flush_aged().await;
                     next_tick_ns = clock.now_ns().saturating_add(flush_tick_ns);
+                }
+                Some(result) = self.flushes.join_next(), if !self.flushes.is_empty() => {
+                    handle_flush_join_result(self.shard, result);
                 }
             }
         }
@@ -353,21 +749,36 @@ impl LogShardActor {
                 self.flush_tenant(tenant, buf, trigger).await;
             }
         }
+        self.join_all_flushes().await;
     }
 
-    /// Runs the full pinned-identity commit sequence for one tenant's buffer,
-    /// mirroring [`crate::shard::ShardActor::flush_tenant`] step for step:
-    /// `seq`, `ingest_hour_bucket`, the serialized RLOG object, and its blake3
-    /// hash are each computed exactly once here and reused verbatim by every
-    /// retry (docs/catalog-and-mvcc.md "Pinned flush identity"). Nothing below
-    /// may re-serialize, accrete new records, or re-read the clock.
+    /// Awaits every spawned flush task, not only ones triggered by this call:
+    /// any still in flight from an earlier size/age trigger too. So a caller of
+    /// `flush_all` (`FlushNow`, `Shutdown`, or the channel-close drain) only
+    /// observes completion once every flush this shard has ever opened is
+    /// durable or abandoned. Without this, pipelining would let `Shutdown`
+    /// return (and the process exit) while an earlier flush's PUT was still in
+    /// flight, silently discarding an acknowledged record -- and
+    /// docs/consistency-model.md's buffered-mode contract tolerates only crash
+    /// loss, not a graceful shutdown racing its own flushes.
+    async fn join_all_flushes(&mut self) {
+        while let Some(result) = self.flushes.join_next().await {
+            handle_flush_join_result(self.shard, result);
+        }
+    }
+
+    /// Pins `buf`'s flush identity, then moves `buf`'s payload, waiters, and
+    /// ADR-0069 charges into a task spawned onto [`LogFlushCtx::run_flush`]
+    /// (ADR-0067 decision 1), mirroring [`crate::shard::ShardActor::flush_tenant`].
+    /// Everything up to and including the semaphore acquire runs here, on the
+    /// actor; nothing after it does, so a slow encode or a slow PUT never blocks
+    /// the actor from processing its next message once a permit is free (true
+    /// even at `max_inflight_flushes == 1`: the actor still returns from this
+    /// call, and therefore drains its channel, the moment the task is spawned).
     ///
-    /// The one log-specific step is `finish()` error mapping: an
-    /// `InconsistentStreamAttrs` becomes [`LogWriteError::StreamIdCollision`]
-    /// and increments `stream_id_collisions`; every other `LogSegError`
-    /// becomes [`LogWriteError::SegmentBuild`]. This is the only site that
-    /// constructs `StreamIdCollision`, because the collision check itself now
-    /// lives in `finish()`, not in this module.
+    /// An empty buffer never reaches the semaphore or a spawned task: there is
+    /// nothing to encode, and a flush identity pinned for nothing would burn a
+    /// `seq` for no object.
     async fn flush_tenant(&mut self, tenant: TenantId, buf: LogTenantBuf, trigger: FlushTrigger) {
         let LogTenantBuf {
             records,
@@ -378,14 +789,19 @@ impl LogShardActor {
             ..
         } = buf;
         if records.is_empty() {
-            // Dropping `charges` here refunds their bytes: no object is written.
+            // Nothing to write, so no flush task runs: dropping `charges` here
+            // is the ADR-0069 refund for this (record-less) buffer.
+            drop(charges);
+            // `waiters` is empty here by construction: the log router mints a
+            // strict-mode ack only for a shard that actually received records
+            // (`by_shard` only holds shards with at least one record, and the
+            // ack rides that same shard message), so a record-less buffer has
+            // nobody to answer. If that ever changes, this returns without
+            // acking and the router reads the dropped oneshot as a dead shard;
+            // the assert makes the invariant loud rather than silently dropping.
+            debug_assert!(waiters.is_empty());
             return;
         }
-        // The log flush runs inline (not pipelined, docs/ingest.md): holding
-        // `charges` in this scope refunds the budget (ADR-0069) exactly when
-        // this flush reaches its terminal outcome, whichever `return` below it
-        // takes -- a build/publish failure or a successful commit.
-        let _charges = charges;
         self.metrics.record_flush(trigger);
 
         let tenant_hash = tenant.hash();
@@ -396,28 +812,13 @@ impl LogShardActor {
             Ok(bucket) => bucket,
             Err(msg) => {
                 self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
+                self.ctx
+                    .ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
                 return;
             }
         };
         let deadline_ns =
             flush_open_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
-
-        // One pass over the batch computes the commit-record fields RlogWriter
-        // does not surface after `finish()`: the distinct stream count (the
-        // log analogue of series_count) and the event-time bounds. Tracked
-        // locally, the same way min/max ingest ts are, rather than re-derived
-        // from the written bytes.
-        let mut stream_ids: HashSet<LogStreamId> = HashSet::new();
-        let mut min_event_ts_ns = i64::MAX;
-        let mut max_event_ts_ns = i64::MIN;
-        for rec in &records {
-            stream_ids.insert(rec.stream_id);
-            min_event_ts_ns = min_event_ts_ns.min(rec.ts_ns);
-            max_event_ts_ns = max_event_ts_ns.max(rec.ts_ns);
-        }
-        let series_count = stream_ids.len() as u64;
-        let sample_count = records.len() as u64;
 
         let identity = ObjectIdentity {
             tenant_hash: tenant_hash.0,
@@ -426,239 +827,47 @@ impl LogShardActor {
             writer_epoch: self.epoch,
             writer_seq: seq,
         };
-        // Resolve this tenant's POSTINGS indexed-field list (ADR-0049 decision
-        // 3) once per object and hand it to the writer. An empty
-        // list leaves the object without a POSTINGS section, which is always
-        // legal (decision 5).
-        let indexed_fields = self.indexed_fields.fields_for(&tenant_hash);
-        let mut writer =
-            RlogWriter::new(RlogConfig::default(), identity).with_indexed_fields(indexed_fields);
-        for rec in records {
-            if let Err(e) = writer.push(to_logseg_record(rec)) {
-                self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
-                return;
-            }
-        }
-        let bytes = match writer.finish_with_stats() {
-            Ok((bytes, stats)) => {
-                // Write-side POSTINGS metrics: section bytes,
-                // per-field distinct counts, and the cap-exceeded counter, all
-                // aggregated label-free by the /metrics renderer.
-                self.metrics.record_postings(stats);
-                bytes
-            }
-            Err(LogSegError::InconsistentStreamAttrs(msg)) => {
-                self.metrics.record_stream_id_collision();
-                self.ack_waiters(waiters, Err(LogWriteError::StreamIdCollision(msg)));
-                return;
-            }
-            Err(e) => {
-                self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
-                return;
-            }
-        };
-
-        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
-        let data = Bytes::from(bytes);
-
-        let data_key = match keys::data_key(
-            &tenant_hash,
-            Signal::Logs,
-            self.shard,
-            self.writer_id,
-            self.epoch,
-            seq,
-            &content_hash,
-        ) {
-            Ok(k) => k,
-            Err(e) => {
-                self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
-                return;
-            }
-        };
-
-        if !self
-            .put_data_object_with_retry(&data_key, data.clone(), deadline_ns)
-            .await
-        {
-            self.metrics.record_abandoned_retry_exhausted();
-            self.ack_waiters(
-                waiters,
-                Err(LogWriteError::Abandoned(
-                    "data object put exhausted retry budget or exceeded max_flush_lifetime".into(),
-                )),
-            );
-            return;
-        }
-
         let min_ingest_ts_ns = min_ingest_ts_ns.unwrap_or(flush_open_ns);
         let max_ingest_ts_ns = max_ingest_ts_ns.unwrap_or(flush_open_ns);
-        let record = match record::build(NewCommitRecord {
+
+        let pinned = LogPinnedFlush {
             tenant_hash,
-            signal: Signal::Logs,
-            shard: self.shard,
-            writer_id: self.writer_id,
-            writer_epoch: self.epoch,
-            writer_seq: seq,
-            object_size: data.len() as u64,
-            content_hash,
-            sample_count,
-            series_count,
-            min_event_ts_ns,
-            max_event_ts_ns,
+            seq,
+            identity,
+            ingest_hour_bucket,
+            flush_open_ns,
+            deadline_ns,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
-            segment_format_version: u32::from(LOG_SEGMENT_FORMAT_VERSION),
-            created_unix_ns: flush_open_ns,
-            ingest_hour_bucket,
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
-                return;
-            }
+            records,
+            waiters,
+            charges,
         };
 
-        match self.publish_with_retry(&record, deadline_ns).await {
-            Some(token) => {
-                self.ack_waiters(waiters, Ok(token));
-            }
-            None => {
-                self.metrics.record_abandoned_retry_exhausted();
-                self.ack_waiters(
-                    waiters,
-                    Err(LogWriteError::Abandoned(
-                        "commit publish exhausted retry budget or exceeded max_flush_lifetime"
-                            .into(),
-                    )),
-                );
-            }
-        }
-    }
-
-    fn ack_waiters(&self, waiters: Vec<LogAck>, result: Result<CommitToken, LogWriteError>) {
-        let ok = result.is_ok();
-        self.metrics.record_acks(waiters.len(), ok);
-        for waiter in waiters {
-            let _ = waiter.send(result.clone());
-        }
-    }
-
-    /// Races `fut` against the remaining budget to `deadline_ns` on the
-    /// injected `Clock`, returning `None` if the deadline is already past or
-    /// elapses while `fut` is still in flight. Identical in construction to
-    /// [`crate::shard::ShardActor`]'s own `bound_to_deadline`: built on
-    /// `tokio::select!` racing `self.clock.sleep(..)` rather than
-    /// `tokio::time::timeout`, so the deadline stays on the injected clock a
-    /// test can pin and advance.
-    async fn bound_to_deadline<F, T>(&self, deadline_ns: i64, fut: F) -> Option<T>
-    where
-        F: Future<Output = T>,
-    {
-        let remaining_ns = deadline_ns.saturating_sub(self.clock.now_ns());
-        if remaining_ns <= 0 {
-            return None;
-        }
-        let remaining = Duration::from_nanos(u64::try_from(remaining_ns).unwrap_or(u64::MAX));
-        tokio::select! {
-            result = fut => Some(result),
-            () = self.clock.sleep(remaining) => None,
-        }
-    }
-
-    /// Retries the data-object PUT with the caller's own budget, reusing the
-    /// pinned `key`/`bytes` on every attempt. Each attempt is bounded to
-    /// `deadline_ns` via [`Self::bound_to_deadline`], so a timeout never
-    /// retries past the deadline and is treated exactly like the abandonment
-    /// path. Mirrors [`crate::shard::ShardActor`]'s equivalent.
-    async fn put_data_object_with_retry(&self, key: &str, bytes: Bytes, deadline_ns: i64) -> bool {
-        let mut attempt: u32 = 0;
-        loop {
-            let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
-            match self.bound_to_deadline(deadline_ns, call).await {
-                Some(Ok(())) => return true,
-                Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
-                    // `put_retry_max_attempts` is the number of retries after
-                    // the first attempt (total attempts = this + 1), matching
-                    // `ravel_commit::publish::RetryPolicy`. Check the budget
-                    // before consuming a retry so the first attempt is not
-                    // itself counted against it.
-                    if attempt >= self.config.put_retry_max_attempts
-                        || self.clock.now_ns() >= deadline_ns
-                    {
-                        return false;
-                    }
-                    self.metrics.record_put_retry();
-                    self.backoff_sleep(attempt).await;
-                    attempt += 1;
-                }
-                Some(Err(_)) | None => return false,
-            }
-        }
-    }
-
-    /// Retries the commit-record PUT with the caller's own budget, passing
-    /// `publish` a zero-retry policy so it attempts once per call and this loop
-    /// checks `deadline_ns` between attempts. Mirrors
-    /// [`crate::shard::ShardActor`]'s equivalent, including the pinned-identity
-    /// split-brain panic: identity is fixed at flush open, so a split-brain
-    /// cannot fire on a benign retry and means the pinning invariant was
-    /// broken upstream.
-    async fn publish_with_retry(
-        &self,
-        record: &CommitRecord,
-        deadline_ns: i64,
-    ) -> Option<CommitToken> {
-        let single_attempt = RetryPolicy {
-            max_attempts: 0,
-            base_delay: self.config.put_retry_base_delay,
-            max_delay: self.config.put_retry_max_delay,
+        // ADR-0067 decision 2: the only place a flush trigger blocks. At
+        // `max_inflight_flushes` already-spawned tasks, this await parks until
+        // one ends and releases its permit; because `flush_tenant` is itself
+        // awaited from `handle_write`/`flush_aged`/`flush_all`, that park keeps
+        // the actor from pulling its next channel message, exactly the
+        // backpressure path the bounded mpsc already relies on.
+        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => panic!(
+                "ravel-ingest: log flush semaphore closed unexpectedly on shard {}",
+                self.shard
+            ),
         };
-        let mut attempt: u32 = 0;
-        loop {
-            let call = publish::publish(self.store.as_ref(), record, &single_attempt);
-            match self.bound_to_deadline(deadline_ns, call).await {
-                Some(Ok(token)) => return Some(token),
-                Some(Err(PublishError::SplitBrain { this, stored })) => {
-                    panic!(
-                        "ravel-ingest: fatal split-brain on pinned log flush identity: this={this} stored={stored}"
-                    );
-                }
-                Some(Err(PublishError::Store { source, .. })) if source.is_retryable() => {
-                    // See `put_data_object_with_retry`: `put_retry_max_attempts`
-                    // is retries after the first attempt (total = this + 1).
-                    if attempt >= self.config.put_retry_max_attempts
-                        || self.clock.now_ns() >= deadline_ns
-                    {
-                        return None;
-                    }
-                    self.metrics.record_put_retry();
-                    self.backoff_sleep(attempt).await;
-                    attempt += 1;
-                }
-                Some(Err(_)) | None => return None,
-            }
-        }
-    }
-
-    async fn backoff_sleep(&self, attempt: u32) {
-        let shift = attempt.min(20);
-        let exp = self
-            .config
-            .put_retry_base_delay
-            .saturating_mul(1u32 << shift);
-        let capped = exp.min(self.config.put_retry_max_delay);
-        let capped_ms = u64::try_from(capped.as_millis()).unwrap_or(u64::MAX);
-        let jittered_ms = self.rng.jitter_ms(capped_ms);
-        // Route the backoff wait through the injected `Clock`, not the tokio
-        // timer, so retry timing shares the one clock the rest of the flush
-        // path already uses (`bound_to_deadline`) and a test can drive it
-        // deterministically by advancing that clock, with no real sleep.
-        self.clock.sleep(Duration::from_millis(jittered_ms)).await;
+        self.metrics.record_inflight_flush_delta(self.shard, 1);
+        let guard = InFlightFlushGuard {
+            metrics: Arc::clone(&self.metrics),
+            shard: self.shard,
+        };
+        let ctx = Arc::clone(&self.ctx);
+        self.flushes.spawn(async move {
+            let _permit = permit;
+            let _guard = guard;
+            ctx.run_flush(pinned).await;
+        });
     }
 }
 
@@ -668,10 +877,11 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicI64, Ordering};
 
+    use ravel_commit::rng::RngSource;
     use ravel_commit::{keys, record};
     use ravel_logseg::{Predicate, RlogReader, stream_attrs_bytes};
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, list_all};
@@ -681,6 +891,7 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
+    use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
 
     const BASE_NS: i64 = 1_700_000_000_000_000_000;
 
@@ -1235,6 +1446,313 @@ mod tests {
         let (_rec, scanned) = read_back(h.store.as_ref(), &tenant.hash(), &token).await;
         assert_eq!(scanned.len(), 1);
         assert_eq!(h.metrics.snapshot().put_retries, 1);
+        h.shutdown().await;
+    }
+
+    /// An `RngSource` whose jitter draw panics, used only to inject a panic
+    /// inside a spawned flush task's retry backoff (`backoff_sleep` is the one
+    /// call site that touches the rng). `new_uuid` is never reached on that
+    /// path, so it returns a fixed value rather than panicking.
+    struct PanicOnJitterRng;
+
+    impl RngSource for PanicOnJitterRng {
+        fn jitter_ms(&self, _max_ms: u64) -> u64 {
+            panic!("injected panic inside the flush task");
+        }
+
+        fn new_uuid(&self) -> Uuid {
+            Uuid::nil()
+        }
+    }
+
+    /// ADR-0067 decision 1 + requirement 5: `Shutdown` must not return until
+    /// every in-flight flush is durable. The flush's data PUT is held so the
+    /// flush is provably in flight when `Shutdown` is requested; the actor must
+    /// stay inside `join_all_flushes` (its `done` unfired) until the PUT is
+    /// released and the object and commit record are durable.
+    ///
+    /// Flip proof: deleting `self.join_all_flushes().await;` from
+    /// `LogShardActor::flush_all` makes this test fail -- `done` then fires while
+    /// the data PUT is still held, so the `try_recv() == Empty` assertion below
+    /// trips and no `/l0/` object is durable. Verified by removing that one line
+    /// during development, observing the failure, and restoring it.
+    #[tokio::test]
+    async fn shutdown_joins_inflight_flush_before_returning() {
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(flush_on_first(), Arc::clone(&store));
+        // Hold the data-object PUT: the spawned flush task parks on it.
+        let gate = fault.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+        // target_bytes == 1, so this write triggers a size flush at once.
+        h.tx.send(LogShardMsg::Write {
+            tenant: TenantId::new("acme"),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            ack: None,
+            charge: None,
+        })
+        .await
+        .expect("send write");
+        gate.wait_until_held(1).await;
+
+        // Request shutdown while the flush is parked mid-PUT.
+        let (done_tx, mut done_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Shutdown { done: done_tx })
+            .await
+            .expect("send shutdown");
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(
+                done_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "shutdown returned while a flush PUT was still in flight"
+        );
+        let before = list_all(store.as_ref(), "t/").await.expect("list");
+        assert!(
+            !before.iter().any(|o| o.key.contains("/l0/")),
+            "the held PUT has written no object yet"
+        );
+
+        // Release the PUT: the flush drains, and only now may shutdown return.
+        let ids = gate.held();
+        assert_eq!(ids.len(), 1, "exactly one PUT is held");
+        gate.release(ids[0]);
+        done_rx
+            .await
+            .expect("shutdown completes once the flush is durable");
+
+        let objects = list_all(store.as_ref(), "t/").await.expect("list");
+        assert!(
+            objects.iter().any(|o| o.key.contains("/l0/")),
+            "the joined flush stored its data object before shutdown returned"
+        );
+        assert!(
+            objects.iter().any(|o| o.key.contains("/c/")),
+            "the joined flush stored its commit record before shutdown returned"
+        );
+        let _ = h.task.await;
+    }
+
+    /// ADR-0069 refund on the happy path: the charge the buffer held is dropped
+    /// inside the flush task at its terminal outcome, so the process-wide gauge
+    /// returns to exactly the sentinel it started at (never leaking the flush's
+    /// bytes, never double-refunding below the sentinel). Asserted against the
+    /// budget's own `in_flight_bytes` counter.
+    #[tokio::test]
+    async fn charge_refunded_once_on_successful_flush() {
+        const SENTINEL: u64 = 4_242;
+        const FLUSH: u64 = 777;
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1_000_000));
+        let _sentinel = budget.try_charge(SENTINEL).expect("sentinel charge");
+        let charge = Arc::new(budget.try_charge(FLUSH).expect("flush charge"));
+        assert_eq!(budget.in_flight_bytes(), SENTINEL + FLUSH);
+
+        let h = Harness::spawn(flush_on_first());
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: TenantId::new("acme"),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            ack: Some(ack_tx),
+            charge: Some(charge),
+        })
+        .await
+        .expect("send write");
+        ack_rx.await.expect("ack").expect("strict write commits");
+        // shutdown joins the flush task, so `_charges` is provably dropped.
+        h.shutdown().await;
+        assert_eq!(
+            budget.in_flight_bytes(),
+            SENTINEL,
+            "the flush charge refunded exactly once on a successful flush"
+        );
+    }
+
+    /// ADR-0069 refund when the flush is abandoned at the commit PUT: the charge
+    /// must still refund exactly once. Same sentinel assertion.
+    #[tokio::test]
+    async fn charge_refunded_once_on_publish_failure() {
+        const SENTINEL: u64 = 4_242;
+        const FLUSH: u64 = 777;
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1_000_000));
+        let _sentinel = budget.try_charge(SENTINEL).expect("sentinel charge");
+        let charge = Arc::new(budget.try_charge(FLUSH).expect("flush charge"));
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Transient("commit down".into()))
+                .with_key_contains("/c/"),
+        );
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let h = Harness::spawn_with_store(exhaustion_config(2), Arc::clone(&store));
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: TenantId::new("acme"),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            ack: Some(ack_tx),
+            charge: Some(charge),
+        })
+        .await
+        .expect("send write");
+        let err = ack_rx
+            .await
+            .expect("ack")
+            .expect_err("commit PUT that always fails abandons the flush");
+        assert!(matches!(err, LogWriteError::Abandoned(_)));
+        h.shutdown().await;
+        assert_eq!(
+            budget.in_flight_bytes(),
+            SENTINEL,
+            "the flush charge refunded exactly once on publish failure"
+        );
+    }
+
+    /// ADR-0069 refund when the flush task panics: `_charges` is on the task's
+    /// stack, so its `Drop` runs during the unwind and the bytes still refund
+    /// exactly once. A panicking rng in the retry backoff supplies the panic;
+    /// the actor is constructed directly here to inject it.
+    #[tokio::test]
+    async fn charge_refunded_once_on_flush_task_panic() {
+        const SENTINEL: u64 = 4_242;
+        const FLUSH: u64 = 777;
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1_000_000));
+        let _sentinel = budget.try_charge(SENTINEL).expect("sentinel charge");
+        let charge = Arc::new(budget.try_charge(FLUSH).expect("flush charge"));
+
+        // A permanently-retryable data PUT drives the flush into its retry
+        // backoff, where the panicking rng fires.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Transient("data down".into()))
+                .with_key_contains("/l0/"),
+        );
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let clock = TestClock::new(BASE_NS);
+        let metrics = Arc::new(LogIngestMetrics::default());
+        let (tx, rx) = mpsc::channel(64);
+        let actor = LogShardActor::new(
+            0,
+            Uuid::new_v4(),
+            7,
+            Arc::clone(&store),
+            clock.clone(),
+            Arc::new(PanicOnJitterRng),
+            exhaustion_config(4),
+            Arc::clone(&metrics),
+            rx,
+            Arc::new(crate::log_router::NoIndexedFields),
+        );
+        let task = tokio::spawn(actor.run());
+
+        tx.send(LogShardMsg::Write {
+            tenant: TenantId::new("acme"),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "x")],
+            ack: None,
+            charge: Some(charge),
+        })
+        .await
+        .expect("send write");
+
+        // The flush task panics during backoff; its `_charges` drop refunds the
+        // bytes. Poll the budget until it returns to the sentinel.
+        let mut refunded = false;
+        for _ in 0..100_000 {
+            if budget.in_flight_bytes() == SENTINEL {
+                refunded = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            refunded,
+            "the panicking flush task must still refund the charge exactly once (gauge {} != {SENTINEL})",
+            budget.in_flight_bytes()
+        );
+        // The actor reaps the panicked task and resumes the unwind, so its own
+        // task ends by panic; awaiting it here just drains that outcome.
+        let _ = task.await;
+    }
+
+    /// Logs do not dedup at query time (docs/consistency-model.md), so
+    /// resolution over pipelined flushes must include BOTH landed commits even
+    /// when a higher seq lands first. Two concurrent flushes are forced
+    /// out-of-order: seq0's commit PUT is held so seq1 commits first, then seq0
+    /// is released. Both objects resolve independently and every record survives
+    /// with no loss and no duplication.
+    #[tokio::test]
+    async fn catalog_resolve_correct_over_out_of_order_commit_landings() {
+        let config = IngestConfig {
+            max_inflight_flushes: 2,
+            ..flush_on_first()
+        };
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(config, Arc::clone(&store));
+        let tenant = TenantId::new("acme");
+        // Hold the first commit-record PUT: that is seq0's.
+        let gate = fault.hold(Op::Put, Some("/c/".to_string()), Occurrence::Nth(1));
+
+        // Write A -> flush seq0. Its data PUT lands; its commit PUT is held.
+        let (ack_a_tx, mut ack_a_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: tenant.clone(),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 1_000, "a")],
+            ack: Some(ack_a_tx),
+            charge: None,
+        })
+        .await
+        .expect("send A");
+        gate.wait_until_held(1).await;
+
+        // Write B -> flush seq1. Nothing is held for it, so it commits while A
+        // is still parked: seq1 lands before seq0.
+        let (ack_b_tx, ack_b_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: tenant.clone(),
+            records: vec![norm_record(&[("service.name", "api")], "scope", 2_000, "b")],
+            ack: Some(ack_b_tx),
+            charge: None,
+        })
+        .await
+        .expect("send B");
+        let token_b = ack_b_rx.await.expect("ack B").expect("B commits first");
+        assert!(
+            matches!(
+                ack_a_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "seq0 must still be in flight while seq1 has already committed"
+        );
+
+        // Release seq0's commit; A now commits too.
+        let ids = gate.held();
+        assert_eq!(ids.len(), 1);
+        gate.release(ids[0]);
+        let token_a = ack_a_rx
+            .await
+            .expect("ack A")
+            .expect("A commits after release");
+
+        let (rec_a, recs_a) = read_back(store.as_ref(), &tenant.hash(), &token_a).await;
+        let (rec_b, recs_b) = read_back(store.as_ref(), &tenant.hash(), &token_b).await;
+        assert_eq!(rec_a.writer_seq, 0, "A pinned first -> seq 0");
+        assert_eq!(
+            rec_b.writer_seq, 1,
+            "B pinned second -> seq 1, though it landed first"
+        );
+        assert_ne!(token_a, token_b, "each flush resolves to its own object");
+        assert_eq!(recs_a.len(), 1);
+        assert_eq!(recs_b.len(), 1);
+        assert_eq!(
+            recs_a[0].body, "a",
+            "seq0's record resolves to its own body"
+        );
+        assert_eq!(
+            recs_b[0].body, "b",
+            "seq1's record resolves to its own body"
+        );
         h.shutdown().await;
     }
 }

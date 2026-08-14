@@ -264,9 +264,11 @@ under concurrency greater than 1 instead of an edge case. Nothing about
 resolution or read-your-write changes: a commit token still names its
 exact object directly.
 
-This applies to the metrics ingest pipeline only. The log and span
-shard actors (below) keep their existing inline flush; extending
-pipelining to them is follow-up work.
+This applies to all three ingest pipelines. The log and span shard
+actors (below) pipeline their flushes on the same terms (ADR-0076
+decision 3): the same `max_inflight_flushes` bound, the same spawned
+flush task, and the same shutdown join. Only the adaptive flush delay
+(decision 3 of ADR-0067, next section) stayed metrics-only.
 
 ### Adaptive flush delay (ADR-0067 decision 3)
 
@@ -303,7 +305,10 @@ write ack latency for a buffer that already has a waiter is bounded by
 whichever threshold applies the same way it always was; adaptive delay
 changes only where in `[floor, ceiling]` that threshold sits, never
 whether a strict waiter's flush eventually fires. Applies to the metrics
-ingest pipeline only, same as `max_inflight_flushes` above.
+ingest pipeline only. Unlike `max_inflight_flushes` above, which bounds
+in-flight flushes on all three pipelines, the adaptive delay was
+deliberately not extended to logs and spans: those actors keep the fixed
+`max_flush_delay` / `max_flush_delay_idle` age trigger.
 
 ## Log pipeline
 
@@ -319,8 +324,10 @@ POST /v1/logs (axum) | logs.v1.LogsService/Export (tonic)
 `LogIngestRouter` and `LogShardActor` mirror `IngestRouter`/`ShardActor`
 structurally (one bounded mpsc channel and one actor task per shard, the
 same `IngestConfig` knobs, the same flush triggers, the same pinned
-writer identity, the same commit sequence) and diverge in exactly four
-places:
+writer identity, the same commit sequence, and the same pipelined flush:
+ADR-0067 decisions 1 and 2 apply here too, so a flush runs in a spawned
+task bounded by `max_inflight_flushes` and shutdown joins every in-flight
+flush before the actor completes) and diverge in exactly four places:
 
 - Objects are RLOG, built with `ravel_logseg::RlogWriter`, not RSEG built
   with `SegmentWriter`. They land under the `l` keyspace
@@ -377,8 +384,9 @@ POST /v1/traces (axum) | trace.v1.TraceService/Export (tonic)
 `SpanIngestRouter` and `SpanShardActor` mirror `LogIngestRouter`/
 `LogShardActor` structurally (one bounded mpsc channel and one actor task
 per shard, the same `IngestConfig` knobs, the same flush triggers, the same
-pinned writer identity, the same commit sequence) and diverge in these
-places:
+pinned writer identity, the same commit sequence, and the same pipelined
+flush under `max_inflight_flushes` with a shutdown join) and diverge in
+these places:
 
 - Objects are RSPAN, built with `ravel_rspan::RspanWriter`. They land under
   the `s` keyspace (`t/<tenant>/s/l0/...`); commit records under
@@ -601,7 +609,7 @@ carries max token per shard).
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
-| max_inflight_flushes (per shard, metrics pipeline only) | 1 (`--max-inflight-flushes`, rejects 0) |
+| max_inflight_flushes (per shard, all three pipelines) | 1 (`--max-inflight-flushes`, rejects 0) |
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 | idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |
 

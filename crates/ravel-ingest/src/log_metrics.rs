@@ -32,6 +32,8 @@
 //! series). Everything else matches name for name and semantics for
 //! semantics.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::metrics::FlushTrigger;
@@ -114,6 +116,14 @@ pub struct LogIngestMetrics {
     /// Indexed fields dropped from POSTINGS for exceeding the per-field
     /// distinct-value cap (ADR-0049 decision 4), summed over objects.
     postings_capped_fields_total: AtomicU64,
+    /// Per-shard count of flushes whose flush task has been spawned but has
+    /// not yet acked its waiters (ADR-0067 decisions 1-2, the log-pipeline
+    /// counterpart of [`crate::IngestMetrics`]'s own gauge). Keyed by shard
+    /// index; a shard with no flush in flight has no entry, equivalent to 0.
+    /// Not part of [`LogIngestMetricsSnapshot`]'s flat counters because it is a
+    /// gauge with a per-shard dimension, unlike everything else here; read it
+    /// via [`LogIngestMetrics::in_flight_flushes_by_shard`].
+    in_flight_flushes: Mutex<HashMap<u32, i64>>,
 }
 
 /// Point-in-time copy of [`LogIngestMetrics`] for scraping. See the
@@ -192,6 +202,36 @@ impl LogIngestMetrics {
 
     pub(crate) fn record_shard_death(&self) {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta` (+1 when a
+    /// flush task is spawned, -1 when it ends, including on panic via
+    /// `log_shard`'s `InFlightFlushGuard`). Poison recovery rather than a panic
+    /// on a poisoned lock: a gauge is best-effort self-observability, not a
+    /// durability path, so a prior panicked holder must not take this one down
+    /// with it.
+    pub(crate) fn record_inflight_flush_delta(&self, shard: u32, delta: i64) {
+        let mut map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(shard).or_insert(0);
+        *entry += delta;
+    }
+
+    /// Point-in-time per-shard in-flight-flush counts, sorted by shard index.
+    /// A shard with none in flight is simply absent, equivalent to 0.
+    pub fn in_flight_flushes_by_shard(&self) -> Vec<(u32, u64)> {
+        let map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counts: Vec<(u32, u64)> = map
+            .iter()
+            .map(|(&shard, &count)| (shard, count.max(0) as u64))
+            .collect();
+        counts.sort_unstable_by_key(|&(shard, _)| shard);
+        counts
     }
 
     pub(crate) fn record_stale_provisioning_flush(&self) {
