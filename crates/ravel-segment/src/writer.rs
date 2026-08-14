@@ -2835,7 +2835,10 @@ mod direct_v6_emit_bit_parity {
         }
     }
 
-    fn reference_frame_ts_page(series_id: &SeriesId, ts_values: &[i64]) -> Result<Vec<u8>, WriteError> {
+    fn reference_frame_ts_page(
+        series_id: &SeriesId,
+        ts_values: &[i64],
+    ) -> Result<Vec<u8>, WriteError> {
         let mut payload = Vec::new();
         encode_ts_deltas_into(&mut payload, ts_values).ok_or(WriteError::TimestampDeltaOverflow)?;
         let enc = page_enc::TS_DELTA_VARINT;
