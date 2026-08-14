@@ -1,4 +1,4 @@
-//! `ravel-cli commit reconstruct` (ADR-0058 decision 2, issue #693): rebuild
+//! `ravel-cli commit reconstruct` (ADR-0058 decision 2): rebuild
 //! the L0 commit records for a single shard that have been lost out of band
 //! (an accidental delete, a bad S3 lifecycle rule, a fat-fingered prefix
 //! delete), from the record-less data objects' own footers.

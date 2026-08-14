@@ -1,5 +1,5 @@
-//! `ravel-cli catalog` subcommands beyond `list` (docs/metric-index-plan.md
-//! section 4, ADR-0020): `fold` (one-shot), `inspect` (decode HEAD and every
+//! `ravel-cli catalog` subcommands beyond `list` (ADR-0020): `fold`
+//! (one-shot), `inspect` (decode HEAD and every
 //! referenced snapshot part), and `verify` (re-list sealed commit records
 //! and diff against the snapshot). Built strictly against `ravel-catalog`'s
 //! public API: no new methods added to that crate for this tool.
@@ -179,9 +179,8 @@ fn format_uuid_bytes(bytes: &[u8]) -> String {
 /// sealed commit records missing from the snapshot, or present with a
 /// mismatched `content_hash`. Snapshot entries with no matching commit
 /// record are reported but never fail verification: retention deleting a
-/// commit record after it has been folded (docs/metric-index-plan.md
-/// section 7 reconciliation) produces exactly this shape and is expected,
-/// not a divergence.
+/// commit record after it has been folded produces exactly this shape and is
+/// expected, not a divergence.
 pub async fn verify(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
 

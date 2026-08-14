@@ -54,10 +54,10 @@ pub fn configured_scheme_from_flags(
 /// Resolve the tenant-hash scheme the CLI must hash tenants under, reading the
 /// bucket's real `sys/tenancy` marker and validating the configured scheme
 /// against it through the same fail-closed decision the server uses at startup
-/// ([`resolve_scheme_against_marker`]). This is EC3/#566: without it, every
-/// tenant-hashing CLI command silently used the v1-unkeyed default even on a
-/// v2-keyed bucket, writing (for example) a legal hold under the wrong `t/`
-/// prefix while the server's sweeper checked the right one.
+/// ([`resolve_scheme_against_marker`]). Without it, a tenant-hashing CLI
+/// command would silently use the v1-unkeyed default even on a v2-keyed
+/// bucket, writing (for example) a legal hold under the wrong `t/` prefix
+/// while the server's sweeper checks the right one.
 ///
 /// The CLI never bootstraps a bucket, so it only decides the marker-present
 /// case plus a read-only default for an absent marker: a keyed config against a
@@ -280,9 +280,9 @@ mod tests {
         );
     }
 
-    /// EC3/#566 finding 1: on a v2-keyed bucket, a CLI command run WITHOUT the
-    /// key file must refuse rather than silently fall back to the v1-unkeyed
-    /// default (which is what wrote holds/folds under the wrong `t/` prefix).
+    /// On a v2-keyed bucket, a CLI command run WITHOUT the key file must refuse
+    /// rather than silently fall back to the v1-unkeyed default, which would
+    /// write holds/folds under the wrong `t/` prefix.
     #[tokio::test]
     async fn keyed_bucket_without_key_refuses() {
         use ravel_types::tenant_key_fingerprint;

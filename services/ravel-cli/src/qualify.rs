@@ -1,4 +1,4 @@
-//! `ravel-cli store qualify` (ADR-0050 section 6, issue #478): runs
+//! `ravel-cli store qualify` (ADR-0050 section 6): runs
 //! `ravel_object_store::conformance`'s empirical suite against a configured
 //! backend and, on a pass, records the outcome at `sys/qualification` via
 //! `CreateIfAbsent` -- once per bucket, never overwritten.

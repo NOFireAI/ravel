@@ -50,7 +50,7 @@ struct Cli {
     command: Command,
 }
 
-/// Global tenant-hash scheme selection (ADR-0050 section 3, EC3/#566). Every
+/// Global tenant-hash scheme selection (ADR-0050 section 3). Every
 /// subcommand that computes a `t/<tenant_hash>/` prefix resolves the bucket's
 /// scheme from `sys/tenancy` before running (see `resolve_and_install_scheme`);
 /// these flags supply the deployment key, or the unkeyed opt-out, that
@@ -77,7 +77,7 @@ struct TenancyArgs {
 }
 
 /// Whether a subcommand computes a `t/<tenant_hash>/` prefix and therefore
-/// needs the bucket's scheme resolved and installed first (EC3/#566). The
+/// needs the bucket's scheme resolved and installed first. The
 /// inspection commands that take an explicit object key or a local file, and
 /// `tenancy show` (which reads the marker directly), do not.
 fn command_hashes_tenant(command: &Command) -> bool {
@@ -133,8 +133,7 @@ enum Command {
         #[command(subcommand)]
         command: CatalogCommand,
     },
-    /// Run and inspect maintenance: compaction, sweep, retention, version audit
-    /// (docs/compaction-retention-plan.md P8).
+    /// Run and inspect maintenance: compaction, sweep, retention, version audit.
     Maintain {
         #[command(subcommand)]
         command: MaintainCommand,
@@ -144,20 +143,20 @@ enum Command {
         #[command(subcommand)]
         command: StoreCommand,
     },
-    /// Place, clear, and list legal holds (ADR-0048 decision 2, issue #505):
+    /// Place, clear, and list legal holds (ADR-0048 decision 2):
     /// the only production mechanism to set a hold.
     Hold {
         #[command(subcommand)]
         command: HoldCommand,
     },
     /// Submit and inspect selective (GDPR/CCPA subject) erasure requests
-    /// (ADR-0064 decision 1, issue #751). Runs under the Admin credential, the
+    /// (ADR-0064 decision 1). Runs under the Admin credential, the
     /// same operator-only posture as `hold`.
     Erase {
         #[command(subcommand)]
         command: EraseCommand,
     },
-    /// Inspect an idempotency marker object (ADR-0051 section 5, issue #532).
+    /// Inspect an idempotency marker object (ADR-0051 section 5).
     Idem {
         #[command(subcommand)]
         command: IdemCommand,
@@ -179,7 +178,7 @@ enum Command {
         command: GcConfigCommand,
     },
     /// Manage the durable deployment-wide bearer-token map `sys/auth`
-    /// (ADR-0072 decision 4, #875): the first shipped writer of `sys/auth`.
+    /// (ADR-0072 decision 4): the writer of `sys/auth`.
     Tenant {
         #[command(subcommand)]
         command: TenantCommand,
@@ -212,7 +211,7 @@ enum TenantTokenCommand {
         #[arg(long)]
         tenant: String,
         /// Which writer owns this entry's lifecycle, stamped onto it
-        /// (ADR-0072 decision 4 amendment, #897). The operator's
+        /// (ADR-0072 decision 4 amendment). The operator's
         /// reconcile loop only ever removes or replaces entries tagged
         /// "operator"; anything else (the "cli" default, or a caller's own
         /// tag) is never touched by an operator reconcile.
@@ -470,7 +469,7 @@ enum CommitCommand {
         key: String,
     },
     /// Reconstruct lost L0 commit records for one shard from the record-less
-    /// data objects' own footers (ADR-0058 decision 2, issue #693). Scoped to
+    /// data objects' own footers (ADR-0058 decision 2). Scoped to
     /// a single (tenant, signal, shard) to bound blast radius. Writes
     /// CreateIfAbsent only, never overwrites or deletes an existing record;
     /// exits nonzero if any candidate failed.
@@ -538,11 +537,11 @@ enum MaintainCommand {
     },
     /// Migrate a (tenant, signal, format family) up to a target format version,
     /// then raise its recorded format floor once a fresh re-audit confirms
-    /// nothing below the target survives (epic EM, EM-T5). Resumable and
-    /// bounded: re-run to resume from the durable cursor after a budget stop.
+    /// nothing below the target survives. Resumable and bounded: re-run to
+    /// resume from the durable cursor after a budget stop.
     /// The re-audit already excludes a bucket's pre-rewrite commit records
     /// once that bucket has been rewritten (they are dead, sweepable
-    /// leftovers, not stragglers; issue #826), so a clean run converges and
+    /// leftovers, not stragglers), so a clean run converges and
     /// raises the floor in one invocation with no interleaved `sweep` needed.
     /// A refused raise ("FOUND STRAGGLERS") therefore means genuine
     /// below-target live data (e.g. still-unsealed or newly landed); re-run
@@ -598,7 +597,7 @@ enum CatalogCommand {
         #[arg(long, default_value_t = 4)]
         shards: u32,
     },
-    /// One-shot catalog fold for a tenant (docs/metric-index-plan.md section 4).
+    /// One-shot catalog fold for a tenant.
     Fold {
         #[arg(long)]
         tenant: String,
@@ -622,11 +621,11 @@ enum CatalogCommand {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // EC3/#566: before running any subcommand that computes a tenant hash,
-    // resolve the bucket's real tenant-hash scheme from `sys/tenancy` and
-    // install it process-wide. Without this every hashing command silently
-    // used the v1-unkeyed default, so on a v2-keyed bucket it addressed the
-    // wrong `t/` prefix (a legal hold written where the server's sweeper never
+    // Before running any subcommand that computes a tenant hash, resolve the
+    // bucket's real tenant-hash scheme from `sys/tenancy` and install it
+    // process-wide. Without this a hashing command would silently use the
+    // v1-unkeyed default, so on a v2-keyed bucket it would address the wrong
+    // `t/` prefix (a legal hold written where the server's sweeper never
     // looks, for example). A keyed bucket with no key configured refuses here
     // rather than proceeding under the wrong derivation.
     if command_hashes_tenant(&cli.command) {
@@ -1071,8 +1070,8 @@ fn section_kind_name(kind: u32) -> &'static str {
 }
 
 /// Human-readable name for a `ravel_segment::ValueKind`, matching the wire
-/// names from SERIES_META column 10 (docs/rseg-v3-plan.md section 3.4:
-/// `0 = VAL_SCALAR, 1 = HIST_SPANS`), not `ValueKind`'s Rust variant names.
+/// names from SERIES_META column 10 (`0 = VAL_SCALAR, 1 = HIST_SPANS`), not
+/// `ValueKind`'s Rust variant names.
 fn value_kind_name(kind: ravel_segment::ValueKind) -> &'static str {
     match kind {
         ravel_segment::ValueKind::Scalar => "VAL_SCALAR",
@@ -1081,7 +1080,7 @@ fn value_kind_name(kind: ravel_segment::ValueKind) -> &'static str {
 }
 
 /// Human-readable name for a `ravel_segment::ResetHint`, matching
-/// Prometheus's four reset-hint states (docs/rseg-v3-plan.md section 3.5).
+/// Prometheus's four reset-hint states.
 fn reset_hint_name(hint: ravel_segment::ResetHint) -> &'static str {
     match hint {
         ravel_segment::ResetHint::Unknown => "UNKNOWN",
@@ -1128,7 +1127,7 @@ fn absolute_range(bytes: &[u8], range: (u64, u64)) -> anyhow::Result<&[u8]> {
         .ok_or_else(|| anyhow::anyhow!("byte range is out of bounds"))
 }
 
-/// Prints one decoded histogram record (docs/rseg-v3-plan.md section 3.5):
+/// Prints one decoded histogram record:
 /// scale, zero bucket, count, sum, reset_hint, then per-side spans and
 /// bucket counts. A histogram series can hold more than one sample
 /// (`sample_count` in its SERIES_META row), so this is called once per

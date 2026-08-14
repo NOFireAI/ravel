@@ -548,7 +548,7 @@ async fn migrate_raises_floor_on_a_clean_tenant() {
 /// `maintain migrate` glue: a below-target record that the walk cannot migrate
 /// (here, one still in the current, unsealed ingest hour) is caught by the
 /// fresh re-audit, so migrate exits nonzero and does NOT raise the floor. This
-/// is the CLI surface of the EM-T10 race-safety guarantee.
+/// is the CLI surface of the race-safety guarantee.
 #[tokio::test]
 async fn migrate_exits_nonzero_and_holds_the_floor_when_a_straggler_survives() {
     let mem = Arc::new(MemoryStore::new());

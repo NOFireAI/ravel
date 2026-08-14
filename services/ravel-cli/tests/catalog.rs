@@ -1,5 +1,5 @@
-//! In-process coverage for `ravel-cli catalog fold/inspect/verify`
-//! (docs/metric-index-plan.md section 4). Run in-process against a single
+//! In-process coverage for `ravel-cli catalog fold/inspect/verify`.
+//! Run in-process against a single
 //! shared `MemoryStore` rather than as `segment_inspect.rs`'s subprocess
 //! pattern: each subprocess invocation of the binary gets its own empty
 //! `MemoryStore`, so a chained fold -> inspect -> verify scenario cannot be
@@ -22,8 +22,8 @@ use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
 
 /// Default seal margins sum to 1h20m (max_flush_lifetime 1h +
-/// clock_skew_allowance 5m + fold_safety_margin 15m, docs/metric-index-plan.md
-/// section 2), but hour-bucket quantization means anything under ~2h20m can
+/// clock_skew_allowance 5m + fold_safety_margin 15m), but hour-bucket
+/// quantization means anything under ~2h20m can
 /// land on the wrong side of `sealed_watermark_hour`'s boundary depending on
 /// which minute of the hour the test happens to run in. 3h clears that
 /// margin with room to spare (matches `services/ravel-server/tests/fold_e2e.rs`'s

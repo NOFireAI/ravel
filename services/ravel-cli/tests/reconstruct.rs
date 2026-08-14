@@ -1,5 +1,5 @@
 //! In-process coverage for `ravel-cli commit reconstruct` (ADR-0058 decision
-//! 2, issue #693). Driven in-process against a single shared `MemoryStore`,
+//! 2). Driven in-process against a single shared `MemoryStore`,
 //! the same pattern `tests/catalog.rs` uses and for the same reason: a
 //! subprocess-per-invocation of the binary gets its own empty in-memory store,
 //! so a seed -> reconstruct -> resolve scenario cannot be built that way

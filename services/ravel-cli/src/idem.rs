@@ -1,4 +1,4 @@
-//! `ravel-cli idem inspect` (ADR-0051 section 5, issue #532 / EB-12): decode
+//! `ravel-cli idem inspect` (ADR-0051 section 5): decode
 //! and render one idempotency marker object by its exact key
 //! (`t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm`).
 //!

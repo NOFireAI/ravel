@@ -1,5 +1,5 @@
 //! Subprocess coverage that `ravel-cli store qualify` prints the informational
-//! Object Lock / versioning probe result (ADR-0055 section 3, issue #663).
+//! Object Lock / versioning probe result (ADR-0055 section 3).
 //!
 //! Driven through the real CLI entry point (the built binary), not by calling
 //! the conformance function directly, so it proves the operator actually sees
