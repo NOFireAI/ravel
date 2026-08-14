@@ -386,6 +386,14 @@ struct BlockCursor<'a> {
     block_bytes: u64,
     /// The next record to merge, or `None` once the cursor is exhausted.
     head: Option<SpanRecord>,
+    /// Running count of records this cursor has decoded and handed to the
+    /// merge (bumped in [`Self::take_head`]). Cross-checked against
+    /// `declared_record_count` at exhaustion (issue #926).
+    decoded_count: u64,
+    /// This input's own footer `record_count`, the independent authority the
+    /// decode tally is checked against when the cursor drains. The whole-read
+    /// compaction path asserted this per input; the streaming path restores it.
+    declared_record_count: u64,
 }
 
 impl<'a> BlockCursor<'a> {
@@ -401,13 +409,19 @@ impl<'a> BlockCursor<'a> {
             block: Vec::new().into_iter(),
             block_bytes: 0,
             head: None,
+            decoded_count: 0,
+            declared_record_count: catalog.footer.record_count,
         }
     }
 
-    /// Take the current head record; the caller must [`Self::refill`] before
-    /// the next merge step.
+    /// Take the current head record, counting it toward this cursor's decoded
+    /// tally; the caller must [`Self::refill`] before the next merge step.
     fn take_head(&mut self) -> Option<SpanRecord> {
-        self.head.take()
+        let rec = self.head.take();
+        if rec.is_some() {
+            self.decoded_count = self.decoded_count.saturating_add(1);
+        }
+        rec
     }
 
     /// Release the current decoded block's residency from the tracker.
@@ -462,6 +476,22 @@ impl<'a> BlockCursor<'a> {
             // not assumed impossible from an untrusted input): release and
             // try the next.
             self.release_block(tracker);
+        }
+        // This input is drained. Cross-check the records the merge actually
+        // decoded against the footer's own `record_count` -- the whole-read
+        // compaction path asserted `decoded_record_count == footer.record_count`
+        // per input and failed loud on mismatch; the streaming merge dropped it
+        // (issue #926). Only a logically inconsistent but CRC-valid object
+        // (truncation kills the suffix footer, mid-object damage trips block
+        // CRCs) reaches here with a mismatch, but that is exactly the case the
+        // per-input check catches. Fires exactly once per cursor: once `head`
+        // is `None` the merge never selects this cursor again.
+        if self.decoded_count != self.declared_record_count {
+            return Err(MaintainError::SpanInputRecordCountMismatch {
+                object_key: self.object_key.to_string(),
+                decoded_record_count: self.decoded_count,
+                footer_record_count: self.declared_record_count,
+            });
         }
         self.head = None;
         Ok(())
