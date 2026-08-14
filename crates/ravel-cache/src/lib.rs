@@ -28,9 +28,9 @@
 //! background sweep drops over-age idle entries on [`DEFAULT_SWEEP_INTERVAL_NS`]
 //! regardless of access, so raw bytes of a subject erased by ADR-0064's sweep
 //! persist in a query node's RAM at most the max-age plus one sweep interval
-//! past the sweep, a sum the defaults keep within 24 h (issue #988).
+//! past the sweep, a sum the defaults keep within 24 h.
 //! The maintain node's erasure sweep cannot reach a query node's memory, so the
-//! bound is enforced locally, exactly as issue #998 did for the disk tier.
+//! bound is enforced locally, the same way it is for the disk tier.
 //!
 //! [`disk::DiskCache`] is the local-disk tier: content-addressed raw byte
 //! ranges under a configured directory, opt-in (no directory, no disk
@@ -49,7 +49,7 @@
 //! as a miss and dropped, so raw bytes of a subject erased by ADR-0064's
 //! sweep persist on a node's disposable local disk at most the max-age plus
 //! one sweep interval past the sweep -- the defaults are tuned to keep that
-//! sum within ADR-0064's 24 h bound (issue #753). Time is injected through
+//! sum within ADR-0064's 24 h bound. Time is injected through
 //! [`Clock`] so this ageing is deterministic under test.
 
 mod cache;

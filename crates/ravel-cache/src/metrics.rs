@@ -64,7 +64,7 @@ impl CacheMetrics {
 
     /// A disk-tier read (or the startup scan) found a well-formed entry whose
     /// stamped write time is older than the configured max-age and dropped it
-    /// rather than serving it (ADR-0064, issue #753). Distinct from
+    /// rather than serving it (ADR-0064). Distinct from
     /// [`Self::record_disk_error`]: the entry was not corrupt or foreign, it
     /// simply aged out. The dropped read still records a plain miss.
     pub(crate) fn record_expired_max_age(&self) {
