@@ -138,6 +138,26 @@ pub struct FoldReport {
     /// aborting the fold, since either condition is a permanent property of
     /// the sealed layout and aborting would block the watermark forever.
     pub layout_drift_count: u64,
+    /// Retention-frontier hours this fold re-listed (ADR-0020 delete-blocker,
+    /// the retirement-frontier half). In addition to the fixed
+    /// [`CatalogConfig::fold_reconcile_window_hours`](crate::CatalogConfig::fold_reconcile_window_hours)
+    /// window behind the watermark, the reconcile pass covers snapshot-named
+    /// hours at or approaching the tenant's retention frontier so a tombstone
+    /// written `R` days behind the watermark is applied before the retention
+    /// sweep's horizon lets it delete the objects that hour's snapshot entries
+    /// still name. Zero when the tenant has no durable retention window, on a
+    /// first fold, and on a rebuild (which re-derives every hour anyway).
+    pub frontier_hours_reconciled: u64,
+    /// Retention-frontier hours that were at or approaching the frontier this
+    /// fold but exceeded
+    /// [`CatalogConfig::frontier_reconcile_max_hours`](crate::CatalogConfig::frontier_reconcile_max_hours)
+    /// and were carried to the next fold rather than reconciled now (a jump:
+    /// a shortened retention window, or a folder that was stopped for a long
+    /// time). Never a silent skip: the deferred hours are still named by the
+    /// snapshot, so the next fold recomputes them as frontier candidates and
+    /// drains the backlog oldest-first. Nonzero here is the signal that the
+    /// frontier is behind; steady state is always zero.
+    pub frontier_hours_deferred: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -626,6 +646,48 @@ fn hour_range_buckets(generations: &[ShardGeneration], lo: u32, hi: u32) -> Vec<
     buckets
 }
 
+/// The newest ingest hour at or approaching the retention frontier for a
+/// tenant with retention window `R` (`retention_window_ns`) and protection
+/// horizon `protection_horizon_ns` at fold time `now_ns` (ADR-0020
+/// delete-blocker, retirement-frontier half). Retention (ADR-0019) tombstones
+/// a bucket once its newest event is older than `R`; conservatively every hour
+/// whose end is at or before `now - R` may already be tombstoned, so `now - R`
+/// is the frontier. The `+ protection_horizon` look-ahead extends it so hours
+/// approaching the frontier are pre-listed and an appearing tombstone is caught
+/// the fold it lands, a full horizon before the sweep may delete the objects
+/// that hour still names. `None` when the cutoff predates the epoch (no hour is
+/// near the frontier yet).
+fn retirement_frontier_hour(
+    now_ns: i64,
+    retention_window_ns: i64,
+    protection_horizon_ns: i64,
+) -> Option<u32> {
+    let cutoff_ns = now_ns
+        .saturating_sub(retention_window_ns)
+        .saturating_add(protection_horizon_ns);
+    if cutoff_ns < 0 {
+        return None;
+    }
+    u32::try_from(cutoff_ns.div_euclid(NS_PER_HOUR)).ok()
+}
+
+/// `(shard, hour)` pairs for an explicit, arbitrary set of ingest hours, one
+/// per shard in each hour's own `scan_count(h)` fan-out (ADR-0052 section 4).
+/// The retention-frontier reconcile (ADR-0020) needs the shard buckets for a
+/// sparse, non-contiguous hour set (the snapshot-named hours at or below the
+/// frontier), which [`hour_range_buckets`]' contiguous `[lo, hi]` range cannot
+/// express.
+fn frontier_hour_set_buckets(generations: &[ShardGeneration], hours: &[u32]) -> Vec<(u32, u32)> {
+    let mut buckets = Vec::new();
+    for &hour in hours {
+        let scan = scan_count(generations, hour, DEFAULT_SCAN_SLACK_HOURS);
+        for shard in 0..scan {
+            buckets.push((shard, hour));
+        }
+    }
+    buckets
+}
+
 /// Whether a previous HEAD's part covers any dirty reconcile hour, so it must
 /// NOT be carried forward by reference this fold (ADR-0063 section 4). A dirty
 /// part is always re-encoded and re-PUT through the normal path: fail toward
@@ -689,6 +751,30 @@ impl Catalog {
         // its own `RequestCounters`; this handle exists only to satisfy the
         // shared cache/load API's `QueryAccounting` parameter and is discarded.
         let accounting = QueryAccounting::new();
+
+        // The tenant's durable retention window (TenantConfig.retention_ns),
+        // read once per fold (loop-invariant). Bounds the retention-frontier
+        // reconcile pass below (ADR-0020 delete-blocker). A tenant with no
+        // per-tenant window, or a transient config-read fault, degrades to "no
+        // frontier reconcile this fold": the fold's index role is a pure
+        // optimization and the sweep's HEAD-reachability gate is the durable
+        // delete blocker, so this never fails the fold. (A tenant retired only
+        // by a deployment-wide RetentionConfig default, with no per-tenant
+        // config record, is not frontier-reconciled here; its sweep still
+        // blocks safely on the HEAD gate.)
+        let tenant_retention_ns: Option<i64> =
+            match crate::tenant_config::read_config_values(self.store(), tenant).await {
+                Ok(Some(cfg)) => cfg.retention_ns,
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        tenant = %tenant.to_hex(),
+                        "tenant config read failed; skipping retention-frontier reconcile this fold"
+                    );
+                    None
+                }
+            };
 
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
@@ -839,6 +925,8 @@ impl Catalog {
             // already re-derives every hour from the commit layout, so a
             // reconcile pass would redo the same work over the same buckets).
             let mut dirty_hours: HashSet<u32> = HashSet::new();
+            let mut frontier_hours_reconciled: u64 = 0;
+            let mut frontier_hours_deferred: u64 = 0;
             if let Some(watermark_hour_old) = reconcile_watermark {
                 let window = self.config().fold_reconcile_window_hours;
                 let lo = watermark_hour_old.saturating_sub(window);
@@ -853,80 +941,108 @@ impl Catalog {
                 counters.list_requests += reconcile_buckets.len() as u64;
 
                 for (shard, hour, listing) in &reconcile_listings {
-                    // A bucket with only immutable L0 records cannot have
-                    // changed since it was folded (seal lemma). Skip it with no
-                    // GET; only a late compaction record or tombstone triggers
-                    // real reconcile work.
-                    if !bucket_needs_reconcile(listing) {
-                        continue;
+                    self.reconcile_one_bucket(
+                        tenant,
+                        signal,
+                        *shard,
+                        *hour,
+                        listing,
+                        &accounting,
+                        &mut entries,
+                        &mut seen,
+                        &mut dirty_hours,
+                        &mut counters,
+                        &mut layout_drift_count,
+                    )
+                    .await?;
+                }
+
+                // ---- Retention-frontier reconcile (ADR-0020 delete-blocker) ----
+                //
+                // The fixed window above reaches only `fold_reconcile_window_hours`
+                // behind the watermark. A retention tombstone (ADR-0019) is
+                // written at its own bucket's ingest-hour key, which is `R` (the
+                // tenant's retention window) behind the watermark -- far outside
+                // that window for any realistic `R`. Left unobserved, the snapshot
+                // keeps naming the retired bucket's segments forever, and the
+                // horizon-gated physical sweep would (absent its own HEAD gate)
+                // delete objects a HEAD-referenced snapshot still names. So the
+                // fold ALSO reconciles the bounded set of snapshot-named hours at
+                // or approaching the tenant's retirement frontier. This is the
+                // fold half of ADR-0020's "GC must treat reachability from
+                // HEAD-referenced snapshots (within the protection horizon) as a
+                // delete blocker": it makes the sweep's block clear on its own by
+                // dropping a tombstoned bucket from the snapshot promptly, rather
+                // than leaving the sweep permanently blocked on a bucket no fold
+                // ever drops.
+                //
+                // Frontier derivation (docs/catalog-and-mvcc.md): a bucket whose
+                // end is at or before `now - R` may already be tombstoned;
+                // `frontier_hi` pushes that forward by the protection horizon so
+                // hours *approaching* the frontier are pre-listed and an appearing
+                // tombstone is caught the fold it lands, a full horizon before the
+                // sweep may delete. Candidates are the snapshot-named hours at or
+                // below `frontier_hi` and below the fixed window (which already
+                // covers the near-watermark region), reconciled oldest-first (an
+                // object is deletable `protection_horizon` after its tombstone, so
+                // the oldest still-named hours are closest to deletion) and capped
+                // at `frontier_reconcile_max_hours`; the remainder is carried to
+                // the next fold via `frontier_hours_deferred` (the snapshot still
+                // names those hours, so the next fold recomputes them), never
+                // dropped. `tenant_retention_ns` is the tenant's durable
+                // TenantConfig.retention_ns; a tenant with no per-tenant window
+                // gets no frontier reconcile (nothing is being retired).
+                if let Some(retention_window_ns) = tenant_retention_ns
+                    && let Some(frontier_hi_raw) = retirement_frontier_hour(
+                        now_ns,
+                        retention_window_ns,
+                        self.config().protection_horizon_ns,
+                    )
+                {
+                    // Cap the band's top strictly below the fixed window so no
+                    // bucket is listed by both passes.
+                    let frontier_hi = frontier_hi_raw.min(lo.saturating_sub(1));
+                    let mut candidate_hours: Vec<u32> = {
+                        let mut hs: HashSet<u32> = HashSet::new();
+                        for entry in entries.iter() {
+                            if entry.ingest_hour_bucket <= frontier_hi {
+                                hs.insert(entry.ingest_hour_bucket);
+                            }
+                        }
+                        hs.into_iter().collect()
+                    };
+                    // Oldest-first: the hours closest to physical deletion are
+                    // reconciled before the cap is spent.
+                    candidate_hours.sort_unstable();
+                    let cap = self.config().frontier_reconcile_max_hours as usize;
+                    let take = candidate_hours.len().min(cap);
+                    frontier_hours_deferred = (candidate_hours.len() - take) as u64;
+                    let frontier_hours = &candidate_hours[..take];
+                    if !frontier_hours.is_empty() {
+                        let frontier_buckets =
+                            frontier_hour_set_buckets(&generations, frontier_hours);
+                        let frontier_listings = self
+                            .discover_bucket_listings(tenant, signal, &frontier_buckets)
+                            .await?;
+                        counters.list_requests += frontier_buckets.len() as u64;
+                        frontier_hours_reconciled = frontier_hours.len() as u64;
+                        for (shard, hour, listing) in &frontier_listings {
+                            self.reconcile_one_bucket(
+                                tenant,
+                                signal,
+                                *shard,
+                                *hour,
+                                listing,
+                                &accounting,
+                                &mut entries,
+                                &mut seen,
+                                &mut dirty_hours,
+                                &mut counters,
+                                &mut layout_drift_count,
+                            )
+                            .await?;
+                        }
                     }
-                    let contribution = self
-                        .classify_bucket(
-                            tenant,
-                            signal,
-                            *shard,
-                            *hour,
-                            listing,
-                            &accounting,
-                            &mut counters,
-                            &mut layout_drift_count,
-                        )
-                        .await?;
-                    let mut desired = dedup_contribution(contribution);
-                    // What `entries` currently reflects for this (shard, hour):
-                    // found by each entry's own shard and ingest_hour_bucket.
-                    let mut current: Vec<SnapshotEntry> = entries
-                        .iter()
-                        .filter(|e| e.shard == *shard && e.ingest_hour_bucket == *hour)
-                        .cloned()
-                        .collect();
-                    if same_entry_set(&mut current, &mut desired) {
-                        continue;
-                    }
-                    // The bucket's contribution changed (a late compaction
-                    // superseded L0 inputs previously folded in directly, or a
-                    // late tombstone means the hour now contributes nothing):
-                    // replace exactly this bucket's entries, leave every other
-                    // entry untouched, and mark the hour dirty.
-                    entries.retain(|e| !(e.shard == *shard && e.ingest_hour_bucket == *hour));
-                    // `seen`'s cached indices go stale the instant `entries`
-                    // is mutated by anything other than `fold_in_entry` (the
-                    // `retain` above shifts every later index); rebuild it
-                    // from the post-retain entries, seeded as trivially
-                    // canonical exactly like the initial seeding above, so
-                    // the fold-in below can detect a `desired` identity that
-                    // already exists elsewhere in `entries` instead of a
-                    // blind `extend`. That case is real: a commit record
-                    // physically stored under this bucket's directory but
-                    // whose own embedded `ingest_hour_bucket` names a
-                    // different hour (`classify_bucket`'s drift tolerance)
-                    // can already be present in `entries` under its true
-                    // home bucket; re-adding it unconditionally here would
-                    // insert a second occurrence of the same identity and
-                    // permanently break every later fold with
-                    // `SnapshotFormat(DuplicateEntry)`, since the reconcile
-                    // pass runs again every fold and would keep reproducing
-                    // it. `fold_in_entry` resolves the collision the same
-                    // way the incremental loop above already does: the
-                    // already-resident occurrence wins, the duplicate is
-                    // dropped and counted as layout drift, and reconciling
-                    // this bucket still proceeds rather than failing.
-                    seen = entries
-                        .iter()
-                        .enumerate()
-                        .map(|(index, entry)| (entry_identity(entry), (index, true)))
-                        .collect();
-                    for entry in desired {
-                        let is_canonical = entry.ingest_hour_bucket == *hour;
-                        fold_in_entry(
-                            &mut entries,
-                            &mut seen,
-                            &mut layout_drift_count,
-                            entry,
-                            is_canonical,
-                        );
-                    }
-                    dirty_hours.insert(*hour);
                 }
             }
             // A reconcile that changed any hour invalidates the append-only,
@@ -1263,6 +1379,8 @@ impl Catalog {
                         postings_built,
                         postings_bytes: postings_size,
                         layout_drift_count,
+                        frontier_hours_reconciled,
+                        frontier_hours_deferred,
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -1562,6 +1680,85 @@ impl Catalog {
         }
         buckets.sort_unstable();
         Ok(buckets)
+    }
+
+    /// Reconcile one already-sealed, already-folded bucket against its current
+    /// on-store state, replacing exactly this bucket's entries in the
+    /// in-progress `entries` set when its contribution changed and marking the
+    /// hour dirty. Shared by the fixed reconcile window and the
+    /// retention-frontier reconcile (ADR-0063 section 4, ADR-0020
+    /// delete-blocker) so both derive a re-listed bucket's state one way only.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_one_bucket(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour: u32,
+        listing: &[ObjectMeta],
+        accounting: &QueryAccounting,
+        entries: &mut Vec<SnapshotEntry>,
+        seen: &mut HashMap<EntryIdentity, (usize, bool)>,
+        dirty_hours: &mut HashSet<u32>,
+        counters: &mut RequestCounters,
+        layout_drift_count: &mut u64,
+    ) -> Result<(), CatalogError> {
+        // A bucket with only immutable L0 records cannot have changed since it
+        // was folded (seal lemma). Skip it with no GET; only a late compaction
+        // record, rewrite record, or retention tombstone triggers real
+        // reconcile work.
+        if !bucket_needs_reconcile(listing) {
+            return Ok(());
+        }
+        let contribution = self
+            .classify_bucket(
+                tenant,
+                signal,
+                shard,
+                hour,
+                listing,
+                accounting,
+                counters,
+                layout_drift_count,
+            )
+            .await?;
+        let mut desired = dedup_contribution(contribution);
+        // What `entries` currently reflects for this (shard, hour): found by
+        // each entry's own shard and ingest_hour_bucket.
+        let mut current: Vec<SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.shard == shard && e.ingest_hour_bucket == hour)
+            .cloned()
+            .collect();
+        if same_entry_set(&mut current, &mut desired) {
+            return Ok(());
+        }
+        // The bucket's contribution changed (a late compaction superseded L0
+        // inputs previously folded in directly, or a late tombstone means the
+        // hour now contributes nothing): replace exactly this bucket's entries,
+        // leave every other entry untouched, and mark the hour dirty.
+        entries.retain(|e| !(e.shard == shard && e.ingest_hour_bucket == hour));
+        // `seen`'s cached indices go stale the instant `entries` is mutated by
+        // anything other than `fold_in_entry` (the `retain` above shifts every
+        // later index); rebuild it from the post-retain entries, seeded as
+        // trivially canonical, so the fold-in below can detect a `desired`
+        // identity that already exists elsewhere in `entries` (a drift-relocated
+        // commit record present under its true home bucket) instead of a blind
+        // `extend` that would insert a duplicate identity and break every later
+        // fold with `SnapshotFormat(DuplicateEntry)`. `fold_in_entry` resolves
+        // the collision exactly as the incremental loop does: the resident
+        // occurrence wins, the duplicate is dropped and counted as layout drift.
+        *seen = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry_identity(entry), (index, true)))
+            .collect();
+        for entry in desired {
+            let is_canonical = entry.ingest_hour_bucket == hour;
+            fold_in_entry(entries, seen, layout_drift_count, entry, is_canonical);
+        }
+        dirty_hours.insert(hour);
+        Ok(())
     }
 
     /// Classify one `(shard, hour)` commit bucket's listing into the entries
@@ -1875,6 +2072,8 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         postings_built: false,
         postings_bytes: 0,
         layout_drift_count: 0,
+        frontier_hours_reconciled: 0,
+        frontier_hours_deferred: 0,
     }
 }
 
@@ -3376,6 +3575,206 @@ mod tests {
             entries.iter().any(|e| e.ingest_hour_bucket == 11),
             "the untouched hour 11 is preserved"
         );
+    }
+
+    /// Write a per-tenant durable retention window (TenantConfig.retention_ns)
+    /// so the fold's retention-frontier reconcile has a frontier to derive.
+    async fn write_retention_config(store: &dyn ObjectStoreBackend, retention_ns: i64) {
+        let cfg = crate::tenant_config::TenantConfig {
+            retention_ns: Some(retention_ns),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant retention config");
+    }
+
+    /// A retention tombstone written into an hour FAR behind the watermark
+    /// (well outside `fold_reconcile_window_hours`) is applied by the next
+    /// fold's retention-frontier reconcile, and the resulting snapshot no
+    /// longer names that bucket's segments (deliverable 2, fold side; ADR-0020
+    /// delete-blocker, retirement-frontier half). To watch this FAIL against
+    /// pre-fix code, set `frontier_reconcile_max_hours: 0` in the config below
+    /// (or `retention_ns: None`): the frontier pass then never runs, hour 5's
+    /// tombstone stays outside the fixed 26h window forever, and the snapshot
+    /// keeps naming hour 5.
+    #[tokio::test]
+    async fn frontier_reconcile_applies_out_of_window_tombstone() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            frontier_reconcile_max_hours: 168,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Retention window 200h: with the ~25h protection-horizon look-ahead,
+        // the retirement frontier at fold time sits near hour 28 -- well above
+        // the retired hour 5, and well below the fixed reconcile window behind
+        // the hour-200 watermark ([174, 200]). So only the frontier pass can
+        // reach hour 5's tombstone.
+        write_retention_config(store.as_ref(), 200 * NS_PER_HOUR).await;
+
+        let now_1 = now_at_seal(200);
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            5,
+            5 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            200,
+            200 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        let entries0 = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        assert!(
+            entries0.iter().any(|e| e.ingest_hour_bucket == 5),
+            "the first fold's snapshot names hour 5"
+        );
+
+        // Retire hour 5 long after it was folded: the tombstone lands at hour
+        // 5's key, ~195 hours behind the watermark -- far outside [174, 200].
+        publish_tombstone(&store, 0, 5).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(202),
+                &[],
+            )
+            .await
+            .expect("second fold");
+        assert!(
+            !second.rebuilt,
+            "the second fold is incremental, not a rebuild"
+        );
+        assert!(
+            second.frontier_hours_reconciled >= 1,
+            "the frontier pass re-listed hour 5's bucket (got {})",
+            second.frontier_hours_reconciled
+        );
+        assert_eq!(
+            second.frontier_hours_deferred, 0,
+            "the single frontier hour is well under the cap"
+        );
+
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        assert!(
+            !entries.iter().any(|e| e.ingest_hour_bucket == 5),
+            "the out-of-window tombstoned hour 5 contributes nothing after the frontier reconcile"
+        );
+        assert!(
+            entries.iter().any(|e| e.ingest_hour_bucket == 200),
+            "the untouched recent hour 200 is preserved"
+        );
+    }
+
+    /// A frontier jump -- the retention window is short, so many already-sealed
+    /// hours sit below the frontier at once -- does NOT make one fold re-list an
+    /// unbounded number of buckets: the frontier pass reconciles at most
+    /// `frontier_reconcile_max_hours` per fold and carries the remainder to the
+    /// next fold (deliverable 5). The carried hours are never silently dropped:
+    /// they are still named by the snapshot and counted on
+    /// `frontier_hours_deferred`. To watch this FAIL, remove the cap in the
+    /// fold (`let take = candidate_hours.len()`): `frontier_hours_reconciled`
+    /// then jumps to the full candidate count and `frontier_hours_deferred`
+    /// collapses to 0.
+    #[tokio::test]
+    async fn frontier_reconcile_is_bounded_and_carries_remainder() {
+        let store = Arc::new(MemoryStore::new());
+        let cap: u32 = 3;
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            frontier_reconcile_max_hours: cap,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // A dramatically short window: every sealed hour below ~28 is at or
+        // past the frontier at once. Hours 5..=15 (eleven hours) all sit below
+        // both the frontier and the fixed window behind the hour-200 watermark.
+        write_retention_config(store.as_ref(), 200 * NS_PER_HOUR).await;
+
+        let old_hours: Vec<u32> = (5..=15).collect();
+        for &h in &old_hours {
+            publish_segment(
+                &store,
+                0,
+                Uuid::new_v4(),
+                1,
+                h,
+                i64::from(h) * NS_PER_HOUR + 60_000_000_000,
+            )
+            .await;
+        }
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            200,
+            200 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(200),
+                &[],
+            )
+            .await
+            .expect("first fold");
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(202),
+                &[],
+            )
+            .await
+            .expect("second fold");
+        assert_eq!(
+            second.frontier_hours_reconciled,
+            u64::from(cap),
+            "the frontier pass re-lists at most the cap per fold"
+        );
+        assert_eq!(
+            second.frontier_hours_deferred,
+            old_hours.len() as u64 - u64::from(cap),
+            "every frontier hour beyond the cap is carried, not dropped"
+        );
+
+        // Carried, not dropped: no tombstones exist yet, so every old hour is
+        // still named by the snapshot after the capped fold -- none was
+        // silently skipped out of the snapshot.
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        for &h in &old_hours {
+            assert!(
+                entries.iter().any(|e| e.ingest_hour_bucket == h),
+                "hour {h} is still named (carried, never dropped without a tombstone)"
+            );
+        }
     }
 
     /// A fold whose reconcile window finds nothing changed carries every

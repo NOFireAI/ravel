@@ -13,18 +13,24 @@ use proptest::prelude::*;
 use ravel_commit::keys;
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
 use ravel_maintain::retention::{is_expired, max_event_ts};
+use ravel_maintain::scan::scan_and_maintain;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, RetentionConfig,
-    RetentionConfigError, RetentionOutcome, RetentionPolicy, compact_bucket, maintain_bucket,
-    retention_sweep_bucket,
+    RetentionConfigError, RetentionOutcome, RetentionPolicy, SnapshotBlock, compact_bucket,
+    maintain_bucket, retention_sweep_bucket,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, list_all};
+use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{CommitRecord, Signal as ProtoSignal};
+use std::sync::Arc;
 use uuid::Uuid;
+
+use bytes::Bytes;
+use ravel_maintain::Clock;
+use ravel_types::{Signal, TimeRange};
 
 #[derive(Debug, Clone, Copy)]
 enum Sig {
@@ -574,4 +580,556 @@ async fn no_policy_is_a_noop() {
     assert_eq!(out, RetentionOutcome::NoPolicy);
     assert!(!has_tombstone(&store, &bucket).await);
     assert!(!bucket_is_empty(&store, &bucket).await);
+}
+
+// --- HEAD-reachability delete blocker (ADR-0020, issue #1075) ----------------
+
+/// The catalog HEAD key for the shared test tenant/signal (frozen key layout).
+fn head_key(signal: Signal) -> String {
+    format!(
+        "t/{}/catalog/{}/HEAD",
+        tenant_hash().to_hex(),
+        signal.key_prefix()
+    )
+}
+
+/// Fold the seeded commit layout into a catalog HEAD naming the seeded
+/// bucket's segments. `shard_count = SHARD + 1` so the fold's scan set covers
+/// the fixture shard `SHARD`.
+async fn fold_head(store: &Arc<MemoryStore>, signal: Signal, now_ns: i64) {
+    let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        dyn_store,
+        ravel_catalog::CatalogConfig {
+            shard_count: SHARD + 1,
+            ..Default::default()
+        },
+    )
+    .expect("catalog");
+    catalog
+        .fold(&tenant_hash(), signal, Uuid::new_v4(), now_ns, &[])
+        .await
+        .expect("fold builds a HEAD naming the seeded bucket");
+}
+
+/// Write the tenant's durable retention window so the fold's frontier reconcile
+/// has a frontier to derive (deliverable 1 half of the e2e).
+async fn write_tenant_retention(store: &dyn ObjectStoreBackend, retention_ns: i64) {
+    let cfg = ravel_catalog::TenantConfig {
+        retention_ns: Some(retention_ns),
+        ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+    };
+    ravel_catalog::set_tenant_config(store, &tenant_hash(), &cfg, 1)
+        .await
+        .expect("write tenant retention config");
+}
+
+/// Deliverable 3, case 1: the physical sweep is BLOCKED when the live HEAD
+/// snapshot still names an object inside the bucket. Nothing is deleted, the
+/// `BlockedBySnapshot(Named)` outcome is returned, and the tombstone is left in
+/// place. To watch this FAIL against pre-fix code, replace the HEAD gate at the
+/// top of `physical_sweep` with `SnapshotGate::Clear` (or delete it): the sweep
+/// then deletes the bucket's objects while the snapshot still names them.
+#[tokio::test]
+async fn sweep_blocked_when_head_names_bucket() {
+    let store = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = seed_two(store.as_ref(), Sig::Metrics).await;
+    let config = cfg();
+
+    // A HEAD naming the bucket's segments.
+    fold_head(&store, Signal::Metrics, created).await;
+    assert!(store.head(&head_key(Signal::Metrics)).await.is_ok());
+
+    let retention = retention_at_floor(&config);
+    let tombstoned = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("tombstone pass");
+    assert_eq!(tombstoned, RetentionOutcome::Tombstoned);
+
+    // Past the horizon: the sweep would delete, but HEAD still names the bucket.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let blocked = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("gate pass");
+    assert_eq!(
+        blocked,
+        RetentionOutcome::BlockedBySnapshot(SnapshotBlock::Named),
+        "a HEAD-referenced snapshot blocks the physical delete"
+    );
+    assert!(
+        has_tombstone(store.as_ref(), &bucket).await,
+        "the tombstone is left in place so exclusion still holds"
+    );
+    assert!(
+        !bucket_is_empty(store.as_ref(), &bucket).await,
+        "nothing is deleted while the HEAD snapshot names the bucket"
+    );
+}
+
+/// Deliverable 3, case 2: an ABSENT HEAD is not a block. With no snapshot
+/// naming anything, the sweep proceeds to completion (ADR-0020: the index is a
+/// pure optimization; a missing HEAD degrades to listing).
+#[tokio::test]
+async fn sweep_proceeds_when_head_absent() {
+    let store = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = seed_two(store.as_ref(), Sig::Metrics).await;
+    let config = cfg();
+
+    // Deliberately NO fold: HEAD is absent.
+    assert!(store.head(&head_key(Signal::Metrics)).await.is_err());
+
+    let retention = retention_at_floor(&config);
+    let tombstoned = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("tombstone");
+    assert_eq!(tombstoned, RetentionOutcome::Tombstoned);
+
+    clock.set(created + config.protection_horizon_ns + 1);
+    let swept = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(
+        swept,
+        RetentionOutcome::Swept,
+        "an absent HEAD does not block; the sweep completes"
+    );
+    assert!(bucket_is_empty(store.as_ref(), &bucket).await);
+    assert!(!has_tombstone(store.as_ref(), &bucket).await);
+}
+
+/// Deliverable 3, case 3: a HEAD present but UNDECODABLE fails closed. The
+/// sweep is blocked with `BlockedBySnapshot(Unreadable)` and nothing is
+/// deleted: non-reachability cannot be proven from a HEAD that cannot be read.
+/// To watch this FAIL, make `ensure_head` map a decode error to
+/// `HeadLoad::Absent` instead of `HeadLoad::Unreadable`.
+#[tokio::test]
+async fn sweep_blocked_fail_closed_when_head_undecodable() {
+    let store = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = seed_two(store.as_ref(), Sig::Metrics).await;
+    let config = cfg();
+
+    // A present but garbage HEAD object.
+    store
+        .put(
+            &head_key(Signal::Metrics),
+            Bytes::from_static(b"not a valid HEAD record"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put garbage HEAD");
+
+    let retention = retention_at_floor(&config);
+    let tombstoned = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("tombstone");
+    assert_eq!(tombstoned, RetentionOutcome::Tombstoned);
+
+    clock.set(created + config.protection_horizon_ns + 1);
+    let blocked = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("gate");
+    assert_eq!(
+        blocked,
+        RetentionOutcome::BlockedBySnapshot(SnapshotBlock::Unreadable),
+        "an unreadable HEAD blocks the delete fail-closed"
+    );
+    assert!(
+        !bucket_is_empty(store.as_ref(), &bucket).await,
+        "fail-closed: nothing deleted when HEAD cannot be read"
+    );
+    assert!(has_tombstone(store.as_ref(), &bucket).await);
+}
+
+/// Deliverable 4 (interleaving): the two serialized fold/sweep orderings. A
+/// sweep whose gate reads the PRE-fold HEAD (which still names the bucket) must
+/// not delete the bucket's objects; only after a later fold drops the bucket
+/// does the sweep proceed. This covers both orderings a genuine concurrent
+/// fold+sweep collapses to, since the gate reads one atomic HEAD version: the
+/// pre-fold version (blocks) or the post-fold version (bucket already dropped,
+/// safe to delete).
+#[tokio::test]
+async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
+    let store = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = seed_two(store.as_ref(), Sig::Metrics).await;
+    let config = cfg();
+
+    // Pre-fold HEAD names the bucket.
+    fold_head(&store, Signal::Metrics, created).await;
+    let retention = retention_at_floor(&config);
+    retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("tombstone");
+    clock.set(created + config.protection_horizon_ns + 1);
+
+    // Ordering A: the sweep's gate reads the pre-fold HEAD (still names the
+    // bucket) -> blocked, nothing deleted.
+    let blocked = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("gate");
+    assert_eq!(
+        blocked,
+        RetentionOutcome::BlockedBySnapshot(SnapshotBlock::Named)
+    );
+    assert!(
+        !bucket_is_empty(store.as_ref(), &bucket).await,
+        "the pre-fold HEAD named the bucket, so nothing was deleted"
+    );
+
+    // The fold completes and drops the tombstoned bucket from the snapshot.
+    fold_head(&store, Signal::Metrics, clock.now_ns()).await;
+
+    // Ordering B: the sweep's gate now reads the post-fold HEAD (bucket
+    // dropped) -> proceeds and deletes.
+    let swept = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket,
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(swept, RetentionOutcome::Swept);
+    assert!(bucket_is_empty(store.as_ref(), &bucket).await);
+}
+
+/// The epic exit criterion (issue #1075): retention of an hour whose tombstone
+/// lands FAR behind the fold watermark (outside the fixed reconcile window)
+/// never leaves the snapshot naming a deleted object. The fold's
+/// retention-frontier reconcile drops the out-of-window hour, then the sweep
+/// deletes it; a resolve spanning the retired hour returns only live segments,
+/// never a reference to a deleted object (the catalog-layer condition that
+/// produces `SnapshotInvalidated` / 503 downstream), and it stays true across
+/// repeated resolves.
+///
+/// To watch this FAIL against pre-fix code, disable the fold's frontier
+/// reconcile (`frontier_reconcile_max_hours: 0`) AND the sweep's HEAD gate
+/// (`SnapshotGate::Clear`): the out-of-window hour is never dropped, the sweep
+/// deletes its objects while HEAD still names them, and the resolved snapshot
+/// then names a deleted object.
+#[tokio::test]
+async fn retention_of_out_of_window_hour_never_leaves_snapshot_naming_deleted_objects() {
+    let store = Arc::new(MemoryStore::new());
+    let config = cfg();
+
+    // Two hours: an old hour retention will retire, and a recent hour at the
+    // watermark that survives. The gap (100 hours) puts the old hour far
+    // outside the fixed 26h reconcile window behind the watermark.
+    let recent_hour = HOUR;
+    let old_hour = HOUR - 100;
+
+    // Consistent event timestamps at each hour (so a resolve by event time
+    // matches the ingest hour), via the seed helper's sample timestamps.
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            old_hour,
+            Uuid::from_u128(0xA1),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "old")],
+                &[(i64::from(old_hour) * NS_PER_HOUR + 1_000, 1.0)],
+            )],
+        ),
+    )
+    .await;
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            recent_hour,
+            Uuid::from_u128(0xB2),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "recent")],
+                &[(i64::from(recent_hour) * NS_PER_HOUR + 1_000, 2.0)],
+            )],
+        ),
+    )
+    .await;
+
+    // Retention window 90h, matched between the sweep (RetentionConfig) and the
+    // fold (durable TenantConfig.retention_ns), so both agree on the frontier.
+    let retention_window_ns = 90 * NS_PER_HOUR;
+    let retention = RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: None,
+            tenants: vec![(TENANT.to_string(), retention_window_ns)],
+        },
+        &config,
+        DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("retention config");
+    write_tenant_retention(store.as_ref(), retention_window_ns).await;
+
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let old_bucket = bucket_at(old_hour);
+
+    // 1. Fold: the snapshot names both hours.
+    fold_head(&store, Signal::Metrics, created).await;
+
+    // 2. Retire the old hour (tombstone written far behind the watermark).
+    let tombstoned = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &old_bucket,
+    )
+    .await
+    .expect("tombstone");
+    assert_eq!(tombstoned, RetentionOutcome::Tombstoned);
+
+    // 3. Fold again, a few hours later so the watermark advances and the
+    //    reconcile pass runs (a fold at the same instant seals no new hour and
+    //    is a no-op): the retention-frontier reconcile observes the
+    //    out-of-window tombstone and drops the old hour from the snapshot.
+    fold_head(&store, Signal::Metrics, created + 3 * NS_PER_HOUR).await;
+
+    // 4. Past the protection horizon, run the sweep to completion.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let mut outcome = RetentionOutcome::Tombstoned;
+    for _ in 0..8 {
+        outcome = retention_sweep_bucket(
+            store.as_ref(),
+            &clock,
+            &config,
+            &retention,
+            &NoLeases,
+            &old_bucket,
+        )
+        .await
+        .expect("sweep pass");
+        if outcome == RetentionOutcome::Swept {
+            break;
+        }
+    }
+    assert_eq!(
+        outcome,
+        RetentionOutcome::Swept,
+        "the sweep completes once the fold has dropped the out-of-window hour"
+    );
+    assert!(bucket_is_empty(store.as_ref(), &old_bucket).await);
+
+    // 5. Resolve a window spanning the retired hour, repeatedly. The resolve
+    //    must never name a deleted object (no SnapshotInvalidated) and must
+    //    exclude the retired hour.
+    let resolver = ravel_catalog::Catalog::new(
+        {
+            let s: Arc<dyn ObjectStoreBackend> = store.clone();
+            s
+        },
+        ravel_catalog::CatalogConfig {
+            shard_count: SHARD + 1,
+            ..Default::default()
+        },
+    )
+    .expect("resolver catalog");
+    let range = TimeRange {
+        start_ns: i64::from(old_hour) * NS_PER_HOUR,
+        end_ns: (i64::from(recent_hour) + 1) * NS_PER_HOUR,
+    };
+    for _ in 0..3 {
+        let snapshot = resolver
+            .resolve(&tenant_hash(), Signal::Metrics, range, &[], clock.now_ns())
+            .await
+            .expect("resolve must never return a 5xx-shaped error for the retired range");
+        for seg in &snapshot.segments {
+            assert_ne!(
+                seg.ingest_hour_bucket, old_hour,
+                "the retired hour must not be named by any resolved segment"
+            );
+            assert!(
+                store.head(&seg.data_object_key).await.is_ok(),
+                "a resolved segment names a DELETED object ({}): this is the \
+                 SnapshotInvalidated condition the fix must prevent",
+                seg.data_object_key
+            );
+        }
+        assert!(
+            snapshot
+                .segments
+                .iter()
+                .any(|s| s.ingest_hour_bucket == recent_hour),
+            "the surviving recent hour is still resolvable"
+        );
+    }
+}
+
+/// Deliverable 5 (counters): the blocked-by-snapshot outcome is observable
+/// through `MaintainReport::blocked_by_snapshot`, driven end to end through the
+/// production `scan_and_maintain` pass over the shard.
+#[tokio::test]
+async fn scan_reports_blocked_by_snapshot_counter() {
+    let store = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    seed_two(store.as_ref(), Sig::Metrics).await;
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+
+    // A HEAD naming the bucket: the sweep will block on it.
+    fold_head(&store, Signal::Metrics, created).await;
+
+    // Pass 1: tombstone the expired bucket.
+    let r1 = scan_and_maintain(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("scan pass 1");
+    assert_eq!(r1.blocked_by_snapshot, 0);
+
+    // Pass 2, past the horizon: the physical sweep is blocked by the HEAD.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let r2 = scan_and_maintain(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("scan pass 2");
+    assert_eq!(
+        r2.blocked_by_snapshot, 1,
+        "the HEAD-reachability block is counted on MaintainReport"
+    );
+    assert_eq!(r2.blocked_by_unreadable_head, 0);
+}
+
+/// Deliverable 5 (counters): the fail-closed undecodable-HEAD block is
+/// observable through `MaintainReport::blocked_by_unreadable_head`, distinct
+/// from the named-block counter.
+#[tokio::test]
+async fn scan_reports_blocked_by_unreadable_head_counter() {
+    let store = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    seed_two(store.as_ref(), Sig::Metrics).await;
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+
+    // A present but garbage HEAD: the sweep blocks fail-closed.
+    store
+        .put(
+            &head_key(Signal::Metrics),
+            Bytes::from_static(b"garbage HEAD"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put garbage HEAD");
+
+    // Pass 1: tombstone.
+    scan_and_maintain(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("scan pass 1");
+
+    // Pass 2, past the horizon: fail-closed block, counted distinctly.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let r2 = scan_and_maintain(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("scan pass 2");
+    assert_eq!(
+        r2.blocked_by_unreadable_head, 1,
+        "the fail-closed unreadable-HEAD block is counted distinctly"
+    );
+    assert_eq!(r2.blocked_by_snapshot, 0);
 }

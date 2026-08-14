@@ -16,7 +16,9 @@ use crate::clock::Clock;
 use crate::compact::{CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
-use crate::retention::{RetentionOutcome, maintain_bucket};
+use crate::retention::{
+    RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket_with_reach,
+};
 use crate::sweep::LeaseCheck;
 
 /// One-byte version tag on the advisory cursor payload. The cursor is not a
@@ -113,6 +115,22 @@ pub struct MaintainReport {
     pub already_done: usize,
     /// Buckets skipped because not yet sealed.
     pub not_sealed: usize,
+    /// Expired buckets whose physical sweep was blocked because the live
+    /// catalog HEAD snapshot still names an object inside the bucket
+    /// (ADR-0020 delete-blocker, [`RetentionOutcome::BlockedBySnapshot`] with
+    /// [`crate::retention::SnapshotBlock::Named`]). Nothing was deleted and the
+    /// tombstone was left in place; a later sweep finishes once the fold's
+    /// retention-frontier reconcile drops the bucket from the snapshot. A
+    /// nonzero steady-state value means the fold is lagging the sweep.
+    pub blocked_by_snapshot: usize,
+    /// Expired buckets whose physical sweep was blocked fail-closed because
+    /// HEAD, or a snapshot part covering the bucket's hour, could not be read
+    /// ([`RetentionOutcome::BlockedBySnapshot`] with
+    /// [`crate::retention::SnapshotBlock::Unreadable`]). Non-reachability
+    /// cannot be proven from data that cannot be read, so the delete is
+    /// refused. A persistent nonzero value is an operator signal that a HEAD or
+    /// part object is corrupt or missing, not the ordinary lagging-fold case.
+    pub blocked_by_unreadable_head: usize,
     /// Buckets skipped this pass because the [`MaintainMemo`] already knows them
     /// terminal, so no per-bucket LIST/GET was issued for them.
     /// Always zero on a cold pass and for the non-memoized
@@ -1027,8 +1045,13 @@ fn classify_terminal(
         // Physically swept empty: nothing remains in the bucket.
         RetentionOutcome::Swept => Some(TerminalState::SweptEmpty),
         // A tombstone is present but the horizon-gated sweep is still pending,
-        // or a sweep left residue: real work is due on a later tick.
-        RetentionOutcome::Tombstoned | RetentionOutcome::SweptPartial => None,
+        // a sweep left residue, or the sweep is blocked because the snapshot
+        // still reaches the bucket (ADR-0020): real work is due on a later tick
+        // (once the fold drops the bucket, or the residue/HEAD read clears), so
+        // never memoize it as terminal.
+        RetentionOutcome::Tombstoned
+        | RetentionOutcome::SweptPartial
+        | RetentionOutcome::BlockedBySnapshot(_) => None,
         // Retention left the bucket live; the compaction outcome decides.
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
             match compaction {
@@ -1122,6 +1145,12 @@ pub async fn scan_and_maintain_with_memo(
     let present: HashSet<u32> = hours.iter().copied().collect();
     let retention_window_ns = retention.window_for(&tenant_hash);
 
+    // One HEAD-reachability cache for the whole pass: the delete-blocker gate
+    // (ADR-0020) reads the catalog HEAD at most once and each covering snapshot
+    // part at most once across every bucket of this (tenant, signal, shard),
+    // never once per bucket (ADR-0076 request cost).
+    let mut reach = SnapshotReachability::new();
+
     let mut report = MaintainReport::default();
     for hour in hours {
         let key: BucketKey = (tenant_hash, signal, shard, hour);
@@ -1142,13 +1171,24 @@ pub async fn scan_and_maintain_with_memo(
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
         let (retention_outcome, compaction) =
-            maintain_bucket(store, clock, config, retention, lease, &bucket).await?;
+            maintain_bucket_with_reach(&mut reach, store, clock, config, retention, lease, &bucket)
+                .await?;
         match retention_outcome {
             // The bucket is (being) retired; compaction was skipped by design.
             RetentionOutcome::Tombstoned
             | RetentionOutcome::Swept
             | RetentionOutcome::SweptPartial => {
                 report.retired += 1;
+            }
+            // The expired bucket's physical sweep was blocked by HEAD
+            // reachability (ADR-0020): count by reason and treat as retired
+            // work-in-progress (compaction was skipped, same as a tombstone).
+            RetentionOutcome::BlockedBySnapshot(reason) => {
+                report.retired += 1;
+                match reason {
+                    SnapshotBlock::Named => report.blocked_by_snapshot += 1,
+                    SnapshotBlock::Unreadable => report.blocked_by_unreadable_head += 1,
+                }
             }
             // Retention left the bucket live; the compaction outcome classifies
             // it (compaction always ran in these arms; see maintain_bucket).

@@ -523,17 +523,76 @@ already-sealed hours:
 Invariant this closes: a compaction record or retention tombstone landing in
 an already-folded hour is now eventually applied — once that hour's own
 bucket falls within `[watermark_hour_old - fold_reconcile_window_hours,
-watermark_hour_old]` on some later fold — rather than never. The window is
+watermark_hour_old]` on some later fold, OR (for a tombstone) within the
+retention-frontier band below — rather than never. The fixed window is
 on the *target hour bucket*, not on how recently the late record was
 published: a compaction landing hours after its bucket sealed is caught on
-the very next fold (this is the common case the window is sized for), while
-a retention tombstone's bucket is typically far outside the window by the
-time retention runs (tombstones normally have a retention period of days,
-so this path is legal but uncommon in practice; see
-`reconcile_applies_late_tombstone`). A late record whose bucket falls
-outside the window is deliberately not picked up: a stated, bounded
-staleness tradeoff, not a bug. (This closes a latent correctness gap; see
-ADR-0063 Consequences.)
+the very next fold (this is the common case the window is sized for). A
+retention tombstone's bucket, by contrast, is typically far outside the
+fixed window by the time retention runs — a tombstone is written at its
+bucket's ingest-hour key, which is `R` (the tenant's retention window,
+normally days) behind the watermark — so the fixed window alone would never
+observe it, and the snapshot would keep naming the retired bucket's segments
+forever. The retention-frontier reconcile below covers exactly that case.
+(This closes a latent correctness gap; see ADR-0063 Consequences and
+ADR-0020.)
+
+## Retention-frontier reconcile (ADR-0020 delete blocker)
+
+ADR-0020 requires that GC treat reachability from HEAD-referenced snapshots
+(within the protection horizon) as a delete blocker. That has two halves; this
+is the fold half, and it makes the sweep's block (docs/consistency-model.md
+"Deletion and GC", the HEAD-reachability gate) clear on its own rather than
+leaving the sweep permanently blocked on a bucket no fold ever drops.
+
+Because a retention tombstone lands `R` behind the watermark, far outside the
+fixed reconcile window, each incremental fold ALSO reconciles the bounded set
+of snapshot-named hours at or approaching the tenant's retirement frontier:
+
+- **Which hours.** The tenant's retention window `R` comes from its durable
+  per-tenant config record (`t/<tenant_hash>/config`, `retention_ns`). A tenant
+  with no per-tenant window gets no frontier reconcile (nothing is being
+  retired). The retirement frontier is the newest ingest hour at or approaching
+  retirement, `frontier_hi = (now - R + protection_horizon) / hour`: retention
+  tombstones a bucket once its newest event is older than `R`, so every hour
+  whose end is at or before `now - R` may already be tombstoned, and the
+  `+ protection_horizon` look-ahead pre-lists hours approaching the frontier so
+  an appearing tombstone is caught the fold it lands — a full horizon before the
+  sweep may delete the objects that hour still names. Candidates are the
+  snapshot-named hours at or below `frontier_hi` and below the fixed window
+  (which already covers the near-watermark region).
+- **Bounded per fold.** In steady state the frontier advances one hour per hour
+  and folds run far more often than hourly, so this is a handful of buckets. On
+  a jump — a shortened retention window, or a folder stopped for a long time —
+  the candidate set is capped at `frontier_reconcile_max_hours` (default 168,
+  seven days), reconciled oldest-first (an object is physically deletable
+  `protection_horizon` after its tombstone, so the oldest still-named hours are
+  closest to deletion). The remainder is NOT silently skipped: the snapshot
+  still names those hours, so the next fold recomputes them as candidates and
+  drains the backlog oldest-first, and the count carried is reported on
+  `FoldReport::frontier_hours_deferred` (with `frontier_hours_reconciled` for
+  the hours re-listed this fold).
+- **Same diff-and-apply.** A candidate bucket is re-listed and, if it holds a
+  tombstone (or a late compaction/rewrite record), reconciled by the identical
+  `Catalog::classify_bucket` diff the fixed window uses: a tombstoned hour now
+  contributes nothing, so its entries are dropped from the snapshot and its
+  covering part is marked dirty and re-PUT under the same single HEAD CAS.
+- **Skipped when redundant.** Like the fixed window, the frontier pass does not
+  run on a first fold or a rebuilt fold.
+
+Once the fold drops a tombstoned bucket, HEAD no longer names it and the
+retention sweep's HEAD-reachability gate clears, so the physical delete
+proceeds. Both halves are required: the sweep gate alone would turn a permanent
+`SnapshotInvalidated` (503) into permanent non-deletion (a compliance failure),
+because the tombstone stays outside the fixed window forever; the frontier
+reconcile is what lets retention actually complete. The frontier band is
+derived from the tenant's retention window and the protection horizon, never a
+hardcoded age, so it tracks each tenant's own frontier. The protection horizon
+here is the catalog's configured `protection_horizon_ns` (mirrored from
+ravel-maintain's default, since the dependency runs the other way); a drift from
+a deployment's true horizon only resizes the bounded band and is never a
+correctness property, because the sweep's HEAD gate is the actual delete
+blocker.
 
 ## Commit sequence (strict mode)
 
@@ -824,7 +883,14 @@ no bound on the number of tenants it could grow to hold.
   lease-protected, and older than grace + max_flush_lifetime; commit-record
   absence (for orphans) is re-verified immediately before each delete.
 - Deletion (retention/tombstone) is a durable transaction that excludes
-  segments from new snapshots first; physical removal follows via GC.
+  segments from new snapshots first; physical removal follows via GC. The
+  retention sweep enforces the "unreachable from any snapshot" precondition
+  directly: before deleting a bucket it loads the `(tenant, signal)` HEAD and
+  the parts covering the bucket's hour and refuses the delete if any snapshot
+  entry still names an object inside the bucket, or fail-closed if HEAD or a
+  covering part cannot be read (ADR-0020 delete blocker; see the
+  retention-frontier reconcile above and docs/consistency-model.md "Deletion
+  and GC"). An absent HEAD is not a block (the index is a pure optimization).
 
 ## Cross-segment duplicate samples
 

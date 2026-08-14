@@ -102,7 +102,10 @@ pub use publish::{
 };
 pub use query_audit::{QUERY_AUDIT_SHARD, QueryStatus, query_audit_event, write_query_audit};
 pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
-pub use retention::{RetentionOutcome, maintain_bucket, retention_sweep_bucket};
+pub use retention::{
+    RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket,
+    maintain_bucket_with_reach, retention_sweep_bucket, retention_sweep_bucket_with_reach,
+};
 pub use rewrite::{MigrateOutcome, RewriteOutcome, migrate_bucket_format, rewrite_and_publish};
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;

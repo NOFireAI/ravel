@@ -412,8 +412,41 @@ own parameters, not gaps a correctly declared config leaves open.
 | orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden) | object last_modified |
 | superseded input (ADR-0018) | L0 commit records + data objects named in a compaction record's input list | now >= record.created_unix_ns + protection_horizon | compaction record created_unix_ns |
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
-| retention (ADR-0019) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
+| retention (ADR-0019, HEAD-reachability gate ADR-0020) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; the live catalog HEAD snapshot names no object inside the bucket (delete blocker, see below); bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
 | idempotency marker (ADR-0051 §5; logs and spans only, run once per signal rather than per shard) | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` marker object | marker's `<ingest_hour>` older than `now_hour - idem_dedup_window_hours - IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`; a key that fails to parse as `<keyhash32>.<ingest_hour>.idm` is skipped, never deleted | marker key's own `<ingest_hour>` |
+
+**A HEAD-referenced snapshot blocks retention deletion (ADR-0020).** The
+protection-horizon arithmetic above bounds a *pinned in-flight reader* against
+the current snapshot's history; it does not on its own prove that the *current*
+HEAD snapshot has stopped naming the bucket. A retention tombstone is written at
+its own bucket's ingest-hour key, which is `R` (the tenant's retention window)
+behind the fold watermark, so it lands far outside the fold's fixed
+near-watermark reconcile window. To close the gap, the physical retention sweep,
+before deleting anything in a bucket, loads the `(tenant, signal)` HEAD and the
+snapshot part(s) whose hour range covers the bucket's ingest hour, and refuses
+the delete if any snapshot entry names an object inside the bucket (same shard
+and ingest hour). Nothing is deleted and the tombstone is left in place, so
+bucket-wide exclusion still holds and a later sweep finishes the job. The block
+is cleared by the fold: its retention-frontier reconcile pass re-lists the
+snapshot-named hours at or approaching the tenant's retirement frontier (derived
+from the tenant's durable retention window and the protection horizon, bounded
+per fold and carried across folds), observes the out-of-window tombstone, and
+drops the bucket from the next published snapshot. Once HEAD no longer names the
+bucket, the sweep proceeds. Together these guarantee that **no object a
+HEAD-referenced snapshot still names is ever deleted by retention**, while
+retention still completes (it is not permanently blocked): the shipped failure
+was a permanent `SnapshotInvalidated` (503) when a query resolved against a
+stale snapshot naming an already-deleted object.
+
+HEAD read failures are explicit. An **absent** HEAD is NOT a block: with no
+snapshot naming anything, the sweep proceeds (ADR-0020: the catalog index is a
+pure optimization; a missing HEAD degrades to listing). A HEAD, or a covering
+part, that is **present but unreadable** (undecodable, checksum/blake3 mismatch,
+an unsupported newer format, or a HEAD-named part that is missing) blocks the
+sweep **fail-closed**: non-reachability cannot be proven from data that cannot
+be read, and a wrongly-permitted delete is unrecoverable while a delayed one is
+not. HEAD and each covering part are read at most once per sweep pass (cached
+across the pass's buckets), not once per bucket.
 
 The idempotency-marker rule's age gate subtracts
 `IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` (1 h) from its lower bound, the

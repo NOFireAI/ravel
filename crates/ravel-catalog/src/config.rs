@@ -83,6 +83,32 @@ pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
 /// can be physically deleted. A late record older than this bound is not
 /// picked up: a stated, bounded staleness tradeoff, not a bug.
 pub const DEFAULT_FOLD_RECONCILE_WINDOW_HOURS: u32 = 26;
+/// Default `protection_horizon_ns`, mirrored from ravel-maintain's
+/// `DEFAULT_PROTECTION_HORIZON_NS` (`max_query_duration` 1h + `grace` 24h +
+/// `clock_skew_allowance` 5m = 25h05m). ravel-catalog cannot depend on
+/// ravel-maintain (the dependency runs the other way, and ravel-maintain
+/// already mirrors [`DEFAULT_MAX_INGEST_LAG_NS`] from this crate for the same
+/// reason), so the value is duplicated here and this comment is the sync
+/// contract. The fold uses it only to size the bounded retention-frontier
+/// reconcile band (ADR-0020, docs/catalog-and-mvcc.md); a drift from a
+/// deployment's true horizon only widens or narrows that bounded band and is
+/// never a correctness property, because the sweep's HEAD-reachability gate
+/// (crates/ravel-maintain/src/retention.rs) is the actual delete blocker.
+pub const DEFAULT_PROTECTION_HORIZON_NS: i64 = 25 * 3_600 * 1_000_000_000 + 5 * 60 * 1_000_000_000;
+/// Default `frontier_reconcile_max_hours`: the per-fold cap on how many
+/// retention-frontier hours the reconcile pass re-lists (ADR-0020, the
+/// retirement-frontier half of the delete-blocker mechanism). Deliberately far
+/// above `DEFAULT_PROTECTION_HORIZON_NS` expressed in hours (~25), so in steady
+/// state (the frontier advances one hour per hour, folds run far more often
+/// than once per hour) the fold never defers a frontier hour and every
+/// retention tombstone is observed well within the protection horizon of being
+/// written. The cap bounds only the recovery case (a shortened retention
+/// window or a long-stopped folder produces a backlog of frontier hours): the
+/// oldest `frontier_reconcile_max_hours` are reconciled this fold and the
+/// remainder is carried to the next fold, never silently skipped
+/// ([`crate::FoldReport::frontier_hours_deferred`]). 168 = seven days of
+/// hourly buckets.
+pub const DEFAULT_FRONTIER_RECONCILE_MAX_HOURS: u32 = 168;
 /// Default crossover at which `Catalog::resolve` switches from the
 /// per-(shard, ingest-hour) LIST loop to a single per-shard recursive prefix
 /// LIST (ADR-0056). Expressed in per-bucket request units, i.e. the number of
@@ -224,6 +250,27 @@ pub struct CatalogConfig {
     /// staleness tradeoff, never applied. Default
     /// [`DEFAULT_FOLD_RECONCILE_WINDOW_HOURS`].
     pub fold_reconcile_window_hours: u32,
+    /// Protection horizon in nanoseconds, used by the fold ONLY to size the
+    /// bounded retention-frontier reconcile band (ADR-0020,
+    /// docs/catalog-and-mvcc.md). The frontier reconcile catches a retention
+    /// tombstone that lands in an hour `R` days behind the watermark, far
+    /// outside [`fold_reconcile_window_hours`](Self::fold_reconcile_window_hours):
+    /// the fold re-lists snapshot-named hours at or approaching the tenant's
+    /// retirement frontier (derived from the tenant's durable retention window
+    /// and this horizon) so the snapshot stops naming a bucket before the
+    /// retention sweep's own horizon lets it delete that bucket's objects. Not
+    /// a correctness input: a value that drifts from a deployment's true
+    /// horizon only resizes the bounded band, and the sweep's HEAD-reachability
+    /// gate is the actual delete blocker. Default
+    /// [`DEFAULT_PROTECTION_HORIZON_NS`].
+    pub protection_horizon_ns: i64,
+    /// Per-fold cap on retention-frontier hours the reconcile pass re-lists
+    /// (ADR-0020). Bounds the recovery case (a shortened retention window or a
+    /// long-stopped folder): the oldest capped hours are reconciled this fold
+    /// and the remainder is carried to the next fold and reported on
+    /// [`crate::FoldReport::frontier_hours_deferred`], never silently skipped.
+    /// Default [`DEFAULT_FRONTIER_RECONCILE_MAX_HOURS`].
+    pub frontier_reconcile_max_hours: u32,
 }
 
 impl Default for CatalogConfig {
@@ -249,6 +296,8 @@ impl Default for CatalogConfig {
             snapshot_part_max_entries: DEFAULT_SNAPSHOT_PART_MAX_ENTRIES,
             fold_bucket_concurrency: DEFAULT_FOLD_BUCKET_CONCURRENCY,
             fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
+            protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
+            frontier_reconcile_max_hours: DEFAULT_FRONTIER_RECONCILE_MAX_HOURS,
         }
     }
 }
