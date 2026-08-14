@@ -1,5 +1,4 @@
-//! Negative-path coverage for the RSEG structural footer/section validator
-//! (finding a1-F02 of the 2026-07-27 storage-engine quality audit, issue #50).
+//! Negative-path coverage for the RSEG structural footer/section validator.
 //! A byte-flip test cannot reach these branches: a flip in a length/offset/
 //! count field also invalidates the covering crc and is caught earlier. Each
 //! test below violates exactly one structural rule of `validate_sections_v6`
@@ -40,7 +39,7 @@ fn identity() -> SegmentIdentity {
     SegmentIdentity {
         tenant_hash: [3u8; 16],
         shard: 1,
-        writer_id: "audit-a1".to_string(),
+        writer_id: "test-writer".to_string(),
         writer_epoch: 1,
         writer_seq: 1,
     }

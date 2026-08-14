@@ -261,8 +261,8 @@ pub fn open_from_suffix(
     }
 }
 
-/// A series' value model, from SERIES_META column 10 in v3
-/// (docs/rseg-v3-plan.md section 3.4). v1/v2 series are always `Scalar`
+/// A series' value model, from SERIES_META column 10 in v3. v1/v2 series
+/// are always `Scalar`
 /// (the column does not exist pre-v3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
@@ -287,8 +287,7 @@ pub struct SeriesEntry {
     pub hist_page: (u64, u64),
 }
 
-/// One compaction-input run within a v4 series
-/// (docs/compaction-retention-plan.md section 4): dedup-priority
+/// One compaction-input run within a v4 series: dedup-priority
 /// provenance (`created_unix_ns`, `writer_epoch`, `writer_seq`) plus this
 /// run's own TS and VAL-or-HIST page ranges, relative to their section.
 /// `val_page`/`hist_page` follow the same "(0, 0) means not applicable"
@@ -307,8 +306,8 @@ pub struct RunEntry {
     pub hist_page: (u64, u64),
 }
 
-/// A decoded v4 SERIES_META entry (docs/compaction-retention-plan.md
-/// section 4): `entry` is the folded per-series view callers keyed by
+/// A decoded v4 SERIES_META entry: `entry` is the folded per-series view
+/// callers keyed by
 /// [`SeriesEntry`] already expect (`sample_count` summed over every run,
 /// `min_ts_ns`/`max_ts_ns` spanning every run, `ts_page`/`val_page`/
 /// `hist_page` always `(0, 0)` sentinels since a multi-run series has no
@@ -328,7 +327,7 @@ pub(crate) fn to_usize(v: u64) -> Result<usize, SegmentError> {
     usize::try_from(v).map_err(|_| SegmentError::SectionOutOfBounds)
 }
 
-/// Test-only decode-count hook (#282). Counts how many times LABEL_DICT is
+/// Test-only decode-count hook. Counts how many times LABEL_DICT is
 /// decompressed by [`decode_section_bytes`], so a test can pin that a
 /// below-threshold v5 catalog decode decompresses it exactly once. The
 /// pre-fix `decode_catalog_v5` decoded LABEL_DICT (and SERIES_IDS) itself and
@@ -496,8 +495,8 @@ fn dict_str<'a>(
 /// validated anyway, but a bare `dict_str` re-validates on every one of the
 /// many references (in the 10k-series/6-label bench shape, ~120k
 /// references over ~500 distinct strings). Profiling attributed that
-/// repeated `str::from_utf8` as the RSEG v2 eager-decode regression
-/// (issue #94). Memoizing collapses it to one validation per referenced
+/// repeated `str::from_utf8` as the RSEG v2 eager-decode regression.
+/// Memoizing collapses it to one validation per referenced
 /// ordinal.
 ///
 /// Behavior is identical to calling `dict_str` per reference: ordinals are
@@ -554,8 +553,7 @@ pub struct PlannedRunRange {
 /// least one selected run is `ValueKind::Scalar` and HIST_PAGES only if at
 /// least one is `ValueKind::Histogram` -- the same conditional lookup
 /// `plan_ranges_v3` uses, since v4 keeps VAL_PAGES/HIST_PAGES each
-/// optional (docs/compaction-retention-plan.md section 4: "strict
-/// superset of v3").
+/// optional (v4 is a strict superset of v3).
 pub fn plan_ranges_v4(
     footer: &Footer,
     selected: &[&SeriesEntryV4],
@@ -726,7 +724,7 @@ fn decode_ts_page_into(
 /// Decodes `count` little-endian f64s, *appending* them to `out` (existing
 /// contents preserved; on error the appended tail is unspecified). Appending
 /// matches the other page decoders so the query fetcher's L0 branch can
-/// concatenate a series' runs into one buffer (#283).
+/// concatenate a series' runs into one buffer.
 fn decode_raw_f64_into(bytes: &[u8], count: usize, out: &mut Vec<f64>) -> Result<(), SegmentError> {
     let expected_len = count.checked_mul(8).ok_or(SegmentError::FieldOverflow)?;
     if bytes.len() != expected_len {
@@ -741,9 +739,8 @@ fn decode_raw_f64_into(bytes: &[u8], count: usize, out: &mut Vec<f64>) -> Result
 }
 
 /// Which encoding a VAL page was actually stored with. Surfaced by the SoA
-/// decode path so callers can account for encoding mix
-/// (docs/arrow-datafusion-plan.md hop 7: the RSEG v2 alignment decision
-/// needs a measured raw-f64 fraction).
+/// decode path so callers can account for encoding mix (an alignment
+/// decision needs a measured raw-f64 fraction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValPageKind {
     Gorilla,
@@ -789,8 +786,7 @@ fn take_f64_le(bytes: &[u8], pos: &mut usize) -> Result<f64, SegmentError> {
     Ok(f64::from_le_bytes(arr))
 }
 
-/// Decodes one histogram side's spans (docs/rseg-v3-plan.md section 3.5):
-/// `uvarint span_count`, then `span_count` pairs of `(zigzag varint offset,
+/// Decodes one histogram side's spans: `uvarint span_count`, then `span_count` pairs of `(zigzag varint offset,
 /// uvarint length)`. Every `length` MUST be `> 0`. Returns the spans and
 /// the side's total bucket count (`sum(length)`, overflow-checked).
 fn decode_hist_spans(
@@ -841,8 +837,7 @@ fn decode_hist_float_counts(
     Ok(out)
 }
 
-/// Decodes one HIST_SPANS record (docs/rseg-v3-plan.md section 3.5),
-/// enforcing every Corrupted rule: reserved flag bits zero, `scale >=
+/// Decodes one HIST_SPANS record, enforcing every Corrupted rule: reserved flag bits zero, `scale >=
 /// -53`, `custom_values` present (non-empty, strictly ascending) iff
 /// `scale == -53`, every span `length > 0`, and `count >= zero_count`
 /// and `>= sum(all bucket_counts, both sides)`. The count check uses
@@ -962,7 +957,7 @@ fn decode_histogram_record(bytes: &[u8], pos: &mut usize) -> Result<HistogramVal
     })
 }
 
-/// Decodes one HIST_SPANS page (docs/rseg-v3-plan.md section 3.5): verifies
+/// Decodes one HIST_SPANS page: verifies
 /// the page header/crc, requires `enc == HIST_SPANS`, decompresses via the
 /// generic page-payload path (`comp` is writer policy, not a format
 /// restriction -- a HIST page may legally use the same `comp` enum as
@@ -1041,8 +1036,7 @@ pub fn decode_run_pages_soa(
 }
 
 /// Decodes one v4 run's TS and HIST pages into histogram samples, the
-/// per-run counterpart of [`decode_histogram_pages`] for a v4 [`RunEntry`]
-/// (docs/compaction-retention-plan.md section 4).
+/// per-run counterpart of [`decode_histogram_pages`] for a v4 [`RunEntry`].
 pub fn decode_run_histogram_pages(
     series_id: &SeriesId,
     run: &RunEntry,
@@ -1082,7 +1076,7 @@ pub fn decode_run_histogram_pages(
 }
 
 // --- RSEG v2 decode path (ADR-0027, docs/segment-format.md "RSEG v2
-// amendment", docs/rseg-v2-plan.md phase P3, issue #31). SERIES_IDS +
+// amendment"). SERIES_IDS +
 // SERIES_META decode producing the same `SeriesEntry` shape v1's
 // `decode_catalog`/`decode_catalog_matching` already produce.
 //
@@ -1252,7 +1246,7 @@ pub(crate) fn parse_schema_ref_block_v2(
 /// flat vector, walked at materialization time with a running cursor over
 /// each series' `name_ords.len()` slice, removes those allocations while
 /// preserving the exact series-major order the block already stores. This
-/// was the residual half of the RSEG v2 eager-decode regression (issue #94)
+/// was the residual half of the RSEG v2 eager-decode regression
 /// after per-reference dictionary UTF-8 revalidation was fixed.
 pub(crate) fn parse_value_ord_block_all_v2(
     meta_bytes: &[u8],
@@ -1281,8 +1275,8 @@ pub(crate) fn parse_value_ord_block_all_v2(
 /// SERIES_META block 2 (`value_ord`), selective/lazy form: for a series
 /// whose `schema_plausible[schema_ref[i]]` is `false`, the value ordinals
 /// are walked (to keep the shared byte position correct) but never stored
-/// or dictionary-resolved -- the "column skipping" docs/rseg-v2-plan.md
-/// describes, computed once per schema by the caller rather than once per
+/// or dictionary-resolved -- the "column skipping" the v2 format allows,
+/// computed once per schema by the caller rather than once per
 /// series. Returns `None` for skipped series, `Some(vals)` otherwise.
 fn parse_value_ord_block_selective_v2(
     meta_bytes: &[u8],
@@ -1364,8 +1358,7 @@ struct SeriesMetaTailV4 {
     runs: Vec<RunEntry>,
 }
 
-/// SERIES_META blocks 3-16 (docs/compaction-retention-plan.md section 4):
-/// `value_kind` and `run_count` (series-major, identical shape to v3's
+/// SERIES_META blocks 3-16: `value_kind` and `run_count` (series-major, identical shape to v3's
 /// value_kind block plus a new run-count column, each `run_count` entry
 /// validated non-zero and summed against `run_total`), then ten run-major
 /// columns folded into `run_total`-length [`RunEntry`] values. VAL_PAGES/
@@ -1681,7 +1674,7 @@ fn parse_series_meta_tail_v4(
 }
 
 /// Footer-level cross-checks that need the fully parsed SERIES_META tail
-/// (docs/compaction-retention-plan.md section 4), the run-weighted
+/// the run-weighted
 /// counterpart of `check_value_kind_pages_v3`: since a v4 series' pages
 /// live per-run rather than per-series, the "value_kind count must equal
 /// non-empty page count" rule is now over *runs* weighted by each series'
@@ -1731,8 +1724,8 @@ fn check_value_kind_pages_v4(
 
 /// Decodes LABEL_DICT + SERIES_IDS + SERIES_META (verifying section crcs)
 /// into [`SeriesEntryV4`] values with materialized [`LabelSet`]s, including
-/// the v4-only run-major columns (docs/compaction-retention-plan.md
-/// section 4). The v4 counterpart of [`decode_catalog_v3`]: same eager
+/// the v4-only run-major columns. The v4 counterpart of
+/// [`decode_catalog_v3`]: same eager
 /// (everyone materialized) semantics and the same schema_ref/value_ord
 /// reuse of v2's primitives, but each output pairs a folded [`SeriesEntry`]
 /// (`sample_count` summed, `min_ts_ns`/`max_ts_ns` spanning every run) with
@@ -1775,7 +1768,7 @@ pub fn decode_catalog_v4(
 /// below-threshold path: the v5 whole-object path decompresses LABEL_DICT and
 /// SERIES_IDS to run its own structural checks, and passing the decoded bytes
 /// straight in here means those two sections are not decompressed a second
-/// time (#282). SERIES_META is decompressed exactly once, by whichever caller
+/// time. SERIES_META is decompressed exactly once, by whichever caller
 /// holds the raw section bytes.
 pub(crate) fn decode_catalog_v4_from_decoded(
     footer: &Footer,
@@ -2102,7 +2095,7 @@ mod dict_resolver_tests {
         assert!(index_label_dict(&dict).is_ok());
     }
 
-    /// Issue #200: before `index_label_dict` rejected duplicates, the
+    /// Before `index_label_dict` rejected duplicates, the
     /// matcher-resolution path (byte-equal search over the raw dictionary,
     /// first occurrence wins) and the decode-then-select path (resolve a
     /// series' stored ordinal, then compare the resulting string) disagreed

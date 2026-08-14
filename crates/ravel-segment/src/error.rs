@@ -28,8 +28,8 @@ pub enum WriteError {
     #[error("more than u32::MAX distinct label-name schemas in one segment")]
     TooManySchemas,
 
-    // --- RSEG v3 only (ADR-0017, docs/rseg-v3-plan.md section 3.5):
-    // HIST_SPANS record encoding. v1/v2 objects never produce these. ---
+    // --- RSEG v3 only (ADR-0017): HIST_SPANS record encoding. v1/v2 objects
+    // never produce these. ---
     #[error("histogram scale {0} is below the -53 custom-boundaries sentinel")]
     HistogramScaleTooSmall(i32),
     #[error(
@@ -43,9 +43,8 @@ pub enum WriteError {
     #[error("histogram count is inconsistent with zero_count and its bucket counts")]
     HistogramCountInconsistent,
 
-    // --- RSEG v4 only (ADR-0018, docs/compaction-retention-plan.md
-    // section 4): multi-run verbatim-copy writer. v1/v2/v3 objects never
-    // produce these. ---
+    // --- RSEG v4 only (ADR-0018): multi-run verbatim-copy writer. v1/v2/v3
+    // objects never produce these. ---
     #[error("series has runs with more than one distinct value_kind")]
     MixedValueKindInSeries,
     #[error("pre-encoded run page is shorter than the 6-byte page header")]
@@ -171,9 +170,8 @@ pub enum SegmentError {
     #[error("SERIES_META timestamp bounds arithmetic overflowed i64")]
     TimestampBoundsOverflow,
 
-    // --- RSEG v3 only (ADR-0017, docs/rseg-v3-plan.md section 3.4/3.5):
-    // SERIES_META value_kind/HIST_PAGES columns and HIST_SPANS record
-    // decode. v1/v2 objects never produce these. ---
+    // --- RSEG v3 only (ADR-0017): SERIES_META value_kind/HIST_PAGES columns
+    // and HIST_SPANS record decode. v1/v2 objects never produce these. ---
     #[error("SERIES_META value_kind byte {0} is neither VAL_SCALAR (0) nor HIST_SPANS (1)")]
     InvalidValueKind(u8),
     #[error("scalar-kind series has a nonzero hist_page_gap/hist_page_len")]
@@ -205,9 +203,8 @@ pub enum SegmentError {
     #[error("histogram count is inconsistent with zero_count and its bucket counts")]
     HistogramCountInconsistent,
 
-    // --- RSEG v4 only (ADR-0018, docs/compaction-retention-plan.md section
-    // 4): run-major SERIES_META decode. v1/v2/v3 objects never produce
-    // these. ---
+    // --- RSEG v4 only (ADR-0018): run-major SERIES_META decode. v1/v2/v3
+    // objects never produce these. ---
     #[error("SERIES_META run_count is zero for a series")]
     ZeroRunCount,
     #[error(

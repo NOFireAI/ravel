@@ -1,6 +1,6 @@
 #![no_main]
 
-//! Coverage-guided fuzz target for RSEG footer/section parsing (issue #48).
+//! Coverage-guided fuzz target for RSEG footer/section parsing.
 //!
 //! ADR-0004 mandates that parsers treat all stored lengths and offsets as
 //! untrusted and that fuzz targets exercise them. Per CLAUDE.md's corrupt-input

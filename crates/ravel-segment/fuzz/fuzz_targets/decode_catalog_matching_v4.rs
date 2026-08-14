@@ -1,7 +1,6 @@
 #![no_main]
 
-//! Coverage-guided fuzz target for the RSEG v4 filtered catalog decoder
-//! (issue #48).
+//! Coverage-guided fuzz target for the RSEG v4 filtered catalog decoder.
 //!
 //! `decode_catalog_matching_v4` is `decode_catalog_v4` plus an equality
 //! predicate list applied against the label dictionary while decoding. It has

@@ -1,5 +1,5 @@
 //! Native-histogram value model and HIST_SPANS record encoding for RSEG v3
-//! (ADR-0017, docs/rseg-v3-plan.md section 2/3.5). Span-based, the superset
+//! (ADR-0017). Span-based, the superset
 //! of OTLP's contiguous shape and Prometheus's sparse shape.
 
 use crate::error::WriteError;
@@ -29,8 +29,7 @@ impl ResetHint {
 
 /// One populated run on a histogram side. `offset` is relative to the end
 /// of the previous span on that side (relative to index 0 for the first
-/// span); `length` is the run's bucket count and MUST be `> 0`
-/// (docs/rseg-v3-plan.md section 3.5).
+/// span); `length` is the run's bucket count and MUST be `> 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistogramSpan {
     pub offset: i32,
@@ -38,8 +37,8 @@ pub struct HistogramSpan {
 }
 
 /// Bucket/zero/total counts for one histogram sample: all-integer or
-/// all-float, never mixed within one sample (docs/rseg-v3-plan.md
-/// section 2). `positive`/`negative` must have exactly
+/// all-float, never mixed within one sample. `positive`/`negative` must have
+/// exactly
 /// `sum(span.length)` entries for their respective side.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HistogramCounts {
@@ -57,7 +56,7 @@ pub enum HistogramCounts {
     },
 }
 
-/// One native-histogram sample value (docs/rseg-v3-plan.md section 2/3.5).
+/// One native-histogram sample value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistogramValue {
     pub scale: i32,
@@ -94,7 +93,7 @@ fn write_side_spans(out: &mut Vec<u8>, spans: &[HistogramSpan]) -> Result<(), Wr
 }
 
 /// Validates `value` against the writer-side structural invariants
-/// (docs/rseg-v3-plan.md section 3.5) and appends its HIST_SPANS record
+/// and appends its HIST_SPANS record
 /// encoding to `out`. Also enforces `count >= zero_count` and `count >=
 /// sum(bucket_counts)`, the same consistency rule the reader checks at
 /// decode time (`SegmentError::HistogramCountInconsistent`), so an

@@ -124,7 +124,7 @@ pub mod page_enc {
     pub const VAL_RAW_F64: u8 = 17;
     /// RSEG v3 only (ADR-0017); native-histogram record grammar
     /// (docs/segment-format.md "RSEG v3 amendment", HIST_PAGES). Emitted by
-    /// `SegmentWriter::write_v3` (docs/rseg-v3-plan.md C3).
+    /// `SegmentWriter::write_v3`.
     pub const HIST_SPANS: u8 = 32;
 }
 

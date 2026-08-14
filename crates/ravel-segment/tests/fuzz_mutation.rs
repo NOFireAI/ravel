@@ -1,5 +1,5 @@
-//! Corrupt-input mutation harness for the RSEG byte parsers (issue #82,
-//! audit finding a11-F05). Object-storage bytes are subject to bit rot and
+//! Corrupt-input mutation harness for the RSEG byte parsers. Object-storage
+//! bytes are subject to bit rot and
 //! partial writes; every decoder that reads them must return a typed error
 //! or a valid decode, never panic and never yield wrong data
 //! (docs/segment-format.md, CLAUDE.md testing patterns).
@@ -22,7 +22,7 @@
 //! Runs on the pinned stable toolchain (proptest only, no cargo-fuzz).
 //! Case count honours `PROPTEST_CASES`; the CI fuzz job raises it.
 //!
-//! Point-probe coverage (issue #201): `decode_catalog_v5` walks every series
+//! Point-probe coverage: `decode_catalog_v5` walks every series
 //! unconditionally, but a live point lookup ("does series id X exist, and
 //! where are its chunks") instead calls `SparseIdIndex::locate`,
 //! `find_index_in_window`, `chunk_for`, and `decode_chunk_runs`, which parse
