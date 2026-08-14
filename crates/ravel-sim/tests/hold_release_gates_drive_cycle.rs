@@ -73,6 +73,8 @@ fn single_reachable_gate() -> FaultSchedule {
             occurrence: Occurrence::Nth(1),
         }],
         expected_faults: Vec::new(),
+        // No compaction/sweep faults: this test isolates the hold/release path.
+        ..FaultSchedule::none()
     }
 }
 
@@ -155,6 +157,7 @@ fn never_hit_gate_fails_the_cycle() {
             occurrence: Occurrence::Nth(1_000_000),
         }],
         expected_faults: Vec::new(),
+        ..FaultSchedule::none()
     };
     let config = CycleConfig {
         enable_gates: true,
@@ -165,7 +168,59 @@ fn never_hit_gate_fails_the_cycle() {
     let err = run_cycle(MasterSeed::new(1), &config)
         .expect_err("a gate that never matches must fail the cycle, not pass it");
     assert!(
-        matches!(err, CycleError::GateNeverHit { armed: 1, .. }),
+        matches!(err, CycleError::GateNeverHit { armed: 1, gate_index: 0, .. }),
         "expected GateNeverHit, got: {err}"
+    );
+}
+
+/// Issue #931 deliverable 4: with two gates armed but only one reachable, the
+/// unreachable gate must fail the cycle per gate. Before the per-gate fix,
+/// `gates_held` was a single shared total, so the reachable gate's releases
+/// pushed it positive and the whole schedule passed vacuously with the second
+/// gate never held. This is the flip that proves the fix: pre-fix this
+/// returned `Ok`; post-fix it returns `GateNeverHit { gate_index: 1 }`.
+#[test]
+fn per_gate_never_hit_fails_when_one_of_two_gates_is_unreachable() {
+    let two_gates = FaultSchedule {
+        plan: FaultPlan::empty(),
+        gates: vec![
+            // Gate 0: reachable -- every tenant's ingest writes an L0 data PUT.
+            GateScript {
+                op: Op::Put,
+                key_contains: Some(L0_DATA_SUBSTR.to_string()),
+                occurrence: Occurrence::Nth(1),
+            },
+            // Gate 1: unreachable -- no call's key contains this substring, so
+            // it never holds anything. Distinct target from gate 0 so this is
+            // an honest "one reachable, one not", not a shadowed duplicate.
+            GateScript {
+                op: Op::Put,
+                key_contains: Some("zzz-no-such-object-key".to_string()),
+                occurrence: Occurrence::Nth(1),
+            },
+        ],
+        expected_faults: Vec::new(),
+        ..FaultSchedule::none()
+    };
+    let config = CycleConfig {
+        enable_gates: true,
+        fault_schedule_override: Some(two_gates),
+        ..CycleConfig::default()
+    };
+
+    let err = run_cycle(MasterSeed::new(1), &config).expect_err(
+        "two gates armed with one unreachable must fail per gate, not pass because the \
+         reachable gate absorbed the shared release count",
+    );
+    assert!(
+        matches!(
+            err,
+            CycleError::GateNeverHit {
+                armed: 2,
+                gate_index: 1,
+                ..
+            }
+        ),
+        "expected per-gate GateNeverHit on gate 1, got: {err}"
     );
 }

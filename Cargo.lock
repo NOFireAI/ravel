@@ -4818,6 +4818,8 @@ dependencies = [
 name = "ravel-sim"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "rand 0.10.2",
  "ravel-catalog",
  "ravel-commit",
