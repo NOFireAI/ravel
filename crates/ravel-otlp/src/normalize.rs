@@ -160,7 +160,7 @@ pub struct MetricsNormalizeResult {
 /// [`normalize_metrics_with_exemplars`] with a throwaway, request-scoped
 /// [`ExemplarCap`], so the reported [`Rejection::HistogramExemplarsDropped`]
 /// count is accurate (cap-based) rather than "every exemplar, always."
-/// Callers that have somewhere to put admitted exemplars (issue #474) should
+/// Callers that have somewhere to put admitted exemplars should
 /// call [`normalize_metrics_with_exemplars`] instead, with a cap that
 /// outlives a single request so the per-series window means something.
 ///
@@ -195,7 +195,7 @@ pub fn normalize_metrics(
 /// exemplars through `exemplar_cap` (ADR-0047 decisions 1 and 2). `cap` is
 /// `&mut` and caller-owned rather than built here: a per-series-per-window
 /// cap only means something across many requests over wall-clock time, so
-/// whoever holds the long-lived per-shard state (issue #474) must own one
+/// whoever holds the long-lived per-shard state must own one
 /// `ExemplarCap` and pass it into every call this shard makes, exactly like
 /// the existing `SeriesIdMemo` pattern but living longer than one request.
 ///
@@ -1088,9 +1088,8 @@ fn finish_point(
         labels: label_set,
         sample: Sample { ts_ns, value },
         // Whether an exploded bucket/sum/count series behaves like a
-        // monotonic counter downstream is not decided by this ticket
-        // (docs/ingest-breadth-plan.md §7: "no change to is_monotonic_sum
-        // handling"); the field is carried but never consumed today.
+        // monotonic counter downstream is not decided here; the field is
+        // carried but never consumed today.
         is_monotonic_sum: false,
     })
 }
@@ -1733,7 +1732,7 @@ mod tests {
 
     #[test]
     fn allowlisted_resource_attribute_name_is_sanitized_like_metric_attributes() {
-        // Regression for a8-F08. An allowlist entry that is invalid as a
+        // An allowlist entry that is invalid as a
         // Prometheus label name (leading digit, plus a dash beyond the dots)
         // must pass through sanitize_label_name, not merely have its dots
         // replaced. The sanitized name must equal the one the data-point
@@ -2218,7 +2217,7 @@ mod tests {
         // A StringValueStrindex (string-table reference) attribute is
         // rejected like the other complex kinds, but the diagnostic must
         // name the string-reference case so a sender using string-table
-        // references can tell what shape was rejected (a8-F10).
+        // references can tell what shape was rejected.
         let rm = resource_metrics(
             vec![],
             vec![gauge_metric(
@@ -2279,12 +2278,12 @@ mod tests {
 
     #[test]
     fn whole_resource_rejection_over_many_points_is_one_aggregated_entry() {
-        // The scenario issue #209 targets: a request with a huge number of
-        // data points, all under one resource whose labels fail to build.
-        // The fix must produce exactly one `Rejection` value (not N clones)
-        // whose `rejected_count()` still equals the point total (the #69
-        // counting invariant), so the response can be built without
-        // materializing or joining one string per point.
+        // The scenario: a request with a huge number of data points, all
+        // under one resource whose labels fail to build. Normalization must
+        // produce exactly one `Rejection` value (not N clones) whose
+        // `rejected_count()` still equals the point total (the counting
+        // invariant), so the response can be built without materializing or
+        // joining one string per point.
         const POINT_COUNT: usize = 50_000;
         let points = (0..POINT_COUNT)
             .map(|i| number_point(vec![], 1_000, NumberValue::AsDouble(i as f64)))
@@ -2968,7 +2967,7 @@ mod tests {
         assert_eq!(ids_forward, ids_reversed);
     }
 
-    // --- series-id memoization (issue #96) ---
+    // --- series-id memoization ---
 
     #[test]
     fn memoized_and_recomputed_series_ids_are_bit_identical() {
@@ -3103,12 +3102,12 @@ mod tests {
     // --- histogram/summary explosion (ADR-0016) ---
 
     #[test]
-    fn ch1_histogram_explosion_matches_cross_protocol_identity_vector() {
-        // docs/ingest-breadth-plan.md §4.1 (CH-1): the same logical histogram
-        // ingested OTLP-exploded and RW-classic must land on identical
-        // SeriesIds and values. The RW-classic side has its own test in its
-        // own crate (track A); this asserts the OTLP side reaches the exact
-        // canonical label sets that side would also construct.
+    fn histogram_explosion_matches_cross_protocol_identity_vector() {
+        // The same logical histogram ingested OTLP-exploded and RW-classic
+        // must land on identical SeriesIds and values. The RW-classic side
+        // has its own test in its own crate; this asserts the OTLP side
+        // reaches the exact canonical label sets that side would also
+        // construct.
         let tenant_fixture = TenantId::new("t-fixture");
         let rm = resource_metrics(
             vec![
@@ -3859,7 +3858,7 @@ mod tests {
     }
 
     #[test]
-    fn ch1_summary_explosion_basic_shape_and_identity() {
+    fn summary_explosion_basic_shape_and_identity() {
         let rm = resource_metrics(
             vec![string_kv("service.name", "svc")],
             vec![summary_metric(
@@ -4017,9 +4016,8 @@ mod tests {
 
     #[test]
     fn gauge_no_recorded_value_flag_maps_to_stale_marker() {
-        // Gauge/Sum flags handling was previously entirely ignored; part of
-        // this ticket per docs/ingest-breadth-plan.md §8 ("B1 fixes
-        // gauge/sum staleness mapping in the same change").
+        // A gauge/sum data point carrying the NoRecordedValue flag maps to a
+        // stale marker rather than having its flags ignored.
         let mut dp = number_point(vec![], 1_000, NumberValue::AsDouble(5.0));
         dp.flags = DataPointFlags::NoRecordedValueMask as u32;
         let rm = resource_metrics(vec![], vec![gauge_metric("widgets", vec![dp])]);
