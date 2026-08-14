@@ -1,10 +1,7 @@
 //! Regression tests for Prometheus staleness-marker handling at the PromQL
-//! selector surface (issue #75, audit finding a10-F01).
-//!
-//! Adapted from the `audit/repro-a10` reproducer
-//! (`stale_marker_should_make_series_absent`, originally `#[ignore]`d): the
-//! ignore is removed so these run in the normal gate. They fail before the
-//! fix (a NaN-valued row is surfaced) and pass after it (series absent).
+//! selector surface. A NaN-valued row must not be surfaced when the newest
+//! in-window sample is a staleness marker; the series is reported absent
+//! instead.
 #![allow(clippy::expect_used)]
 
 use ravel_promql::{Evaluator, ms_to_ns, testsource::TestSource};
@@ -23,8 +20,8 @@ fn minutes(m: i64) -> i64 {
     m * 60_000
 }
 
-/// a10-F01 (instant): a series whose newest in-window sample is the staleness
-/// marker returns no row for that series.
+/// Instant: a series whose newest in-window sample is the staleness marker
+/// returns no row for that series.
 #[test]
 fn stale_marker_makes_series_absent_instant() {
     let t_ms = minutes(10);
@@ -92,7 +89,7 @@ fn non_marker_nan_passes_through_bit_exactly() {
     );
 }
 
-/// a10-F01 (range): a range query excludes marker samples from its per-step
+/// Range: a range query excludes marker samples from its per-step
 /// windows. Steps whose newest in-window sample is a marker yield no point;
 /// steps that reach a live sample do.
 #[test]

@@ -272,7 +272,7 @@ pub(crate) fn forced_monotonicity_info() -> String {
 /// with a `_total`, `_sum`, `_count`, or `_bucket` suffix. A name with none
 /// of those probably was not meant to be used this way. An info, not a
 /// warning: the computed value is unaffected, this only flags a likely
-/// naming/usage mismatch (issue #234).
+/// naming/usage mismatch.
 pub(crate) fn possible_non_counter_info(metric_name: &str) -> String {
     format!(
         "metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \
@@ -340,7 +340,7 @@ pub const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 pub const DEFAULT_MAX_RANGE_POINTS: usize = 11_000;
 
 /// Default shared budget on total evaluation-grid points touched across
-/// *every* subquery nesting level of one query (issue #193). Unlike
+/// *every* subquery nesting level of one query. Unlike
 /// [`DEFAULT_MAX_RANGE_POINTS`], which caps a single subquery/range node's
 /// own grid independently, this one counter accumulates across the whole
 /// recursive evaluation tree ([`QueryWindow::charge_budget`], charged by
@@ -377,14 +377,14 @@ const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 pub(crate) struct QueryWindow {
     start_ns: i64,
     end_ns: i64,
-    /// Shared cross-level evaluation-grid-point budget (issue #193), charged
+    /// Shared cross-level evaluation-grid-point budget, charged
     /// down by [`Self::charge_budget`] on every subquery-grid evaluation
     /// ([`Evaluator::eval_subquery_matrix`]) regardless of nesting depth or
     /// how many times an enclosing grid re-evaluates it from scratch.
     budget: Cell<u64>,
     /// Wall-clock instant after which evaluation must stop with
     /// [`Error::DeadlineExceeded`], checked by [`Self::check_deadline`] once
-    /// per subquery grid step (issue #193): the evaluator is otherwise fully
+    /// per subquery grid step: the evaluator is otherwise fully
     /// synchronous with no yield point for `ravel-query`'s
     /// `tokio::time::timeout` to preempt at, so a runaway nested evaluation
     /// would otherwise always run to completion before the timeout could
@@ -534,7 +534,7 @@ impl Evaluator {
 
     /// Set a wall-clock deadline: once past, evaluation stops with
     /// [`Error::DeadlineExceeded`] the next time a subquery grid step checks
-    /// it (issue #193), rather than running to completion regardless of an
+    /// it, rather than running to completion regardless of an
     /// enclosing caller's own timeout. `ravel-query`'s `QueryEngine` derives
     /// this from its own `deadline: Duration` parameter
     /// (`Instant::now() + deadline`) before evaluating. Unset by default
@@ -947,7 +947,7 @@ impl Evaluator {
             // fetched window, not the subquery's syntactic shape: a float-only
             // subquery (including `rate(x[5m:1m])` over float series) sees no
             // histogram element here and keeps working exactly as before.
-            // Real histogram subquery support is tracked by issue #220.
+            // Full histogram subquery support is not yet implemented.
             if let Value::Vector(ref v) = value
                 && v.iter().any(|s| s.histogram.is_some())
             {
@@ -1553,7 +1553,7 @@ mod tests {
         m * 60_000
     }
 
-    // --- Warning/info annotations (issue #178) ---
+    // --- Warning/info annotations ---
 
     #[test]
     fn quantile_out_of_range_surfaces_a_warning() {
@@ -1669,7 +1669,7 @@ mod tests {
 
     #[test]
     fn rate_over_a_non_counter_named_metric_surfaces_an_info() {
-        // issue #234: `http_requests` has none of the counter-naming
+        // `http_requests` has none of the counter-naming
         // suffixes (`_total`/`_sum`/`_count`/`_bucket`), so `rate()` over it
         // should raise `PossibleNonCounterInfo` even though the computed
         // value is correct.
@@ -2173,7 +2173,7 @@ mod tests {
         // 90 is not a multiple of 60; the next one up is 120.
         assert_eq!(align_up_to_step(90, 60).expect("fits"), 120);
         // Already a multiple: left-open, so it still advances past it
-        // rather than returning it (issue #190).
+        // rather than returning it.
         assert_eq!(align_up_to_step(120, 60).expect("fits"), 180);
     }
 
@@ -2232,7 +2232,7 @@ mod tests {
         // `[2m:1m]`. At eval_ts=0 both the outer grid's own target
         // (0 - 2m = -120s) and, at every outer step, the inner grid's own
         // target land exactly on a 1m step multiple; the left-open rule
-        // (issue #190) excludes that boundary point from each grid, so
+        // excludes that boundary point from each grid, so
         // both grids have 2 points instead of 3. The single sample sits far
         // enough in the past (-240s) that every remaining inner grid point,
         // at every outer step, still finds it within the default 5m
@@ -2255,7 +2255,7 @@ mod tests {
 
     #[test]
     fn range_function_over_subquery_is_an_instant_vector_inside_an_outer_subquery() {
-        // Regression for issue #224 mismatch #1: the exact nesting shape
+        // Regression: the exact nesting shape
         // `max_over_time(rate(<selector>[2m])[5m:1m])[10m:2m]`. The inner
         // expression of the outer subquery is itself a range-vector-consuming
         // function (`max_over_time`) wrapped around a subquery whose own inner
@@ -2317,7 +2317,7 @@ mod tests {
         assert_eq!(matrix.len(), 1);
         let (_, samples) = &matrix[0];
         // Outer grid: end 18m, range 10m, step 2m -> target is 8m exactly,
-        // excluded by the left-open grid-start rule (issue #190), so the
+        // excluded by the left-open grid-start rule, so the
         // grid starts at the next step multiple: 10m, 12m, 14m, 16m, 18m.
         assert_eq!(samples.len(), 5);
         assert!(samples.iter().all(|s| (s.value - 1.0 / 30.0).abs() < 1e-9));
@@ -2328,7 +2328,7 @@ mod tests {
         // `up[2m:1m] offset 1m` at t=0 ends its grid at -1m (the grid start
         // is then epoch-aligned from that shifted end), not at t=0 itself.
         // The target (-1m - 2m = -180s) lands exactly on a 1m step
-        // multiple, so the left-open rule (issue #190) excludes it: the
+        // multiple, so the left-open rule excludes it: the
         // grid starts at -120s, not -180s, one point short of the
         // pre-fix grid. The sample sits at -180s, still within lookback of
         // every remaining grid point exercised below, in both the offset
@@ -2359,7 +2359,7 @@ mod tests {
 
     /// One native histogram, mirroring the fixture in
     /// `functions::histogram_native`'s tests, for the subquery-over-histogram
-    /// rejection cases below (issue #220).
+    /// rejection cases below.
     fn nh(count: f64, sum: f64) -> crate::histogram::FloatHistogram {
         crate::histogram::FloatHistogram {
             counter_reset_hint: crate::histogram::ResetHint::Unknown,
@@ -2394,7 +2394,7 @@ mod tests {
         // `rate(h[10m:1m])`: the inner selector `h` matches a native-histogram
         // series, so the subquery grid would otherwise silently drop it and
         // return a wrong (empty) answer. It must be a typed Unsupported error
-        // instead (issue #220).
+        // instead.
         let source = TestSource::new()
             .with_histogram_series(&[("__name__", "h"), ("job", "a")], &[(0, nh(6.0, 42.0))])
             .expect("valid histogram series");
@@ -2471,7 +2471,7 @@ mod tests {
 
     #[test]
     fn subquery_grid_excludes_a_boundary_point_exactly_at_end_minus_range() {
-        // Regression test for issue #190: the subquery grid's start must be
+        // Regression test: the subquery grid's start must be
         // left-open (`> end - range`), matching this crate's own
         // matrix-selector windows, not closed (`>= end - range`).
         //
@@ -2504,7 +2504,7 @@ mod tests {
     #[test]
     fn subquery_grid_is_unchanged_when_the_boundary_is_not_step_aligned() {
         // Regression guard: when `end - range` does NOT land on a step
-        // multiple, the left-open fix (issue #190) must not change the
+        // multiple, the left-open fix must not change the
         // grid at all, since `align_up_to_step` already rounded strictly
         // past a non-aligned target before and after the fix.
         //
@@ -2898,7 +2898,7 @@ mod tests {
 
     #[test]
     fn pathological_range_is_rejected_without_building_a_grid() {
-        // The a10-F03 reproducer: the widest representable span at the
+        // Pathological input: the widest representable span at the
         // finest step. Unbounded, this asks for ~9.2e12 grid entries
         // (~1.5e14 bytes) and OOMs the process; bounded, it is arithmetic.
         // That this test terminates at all is the assertion that no grid was
@@ -2947,7 +2947,7 @@ mod tests {
         // `max_over_time(up[10d:1s])`. The inner subquery alone asks for
         // 10 days at a 1s step. Every outer grid step lands on a whole
         // second, so the inner target (`t - 10d`) is always an exact
-        // multiple of the inner 1s step; the left-open rule (issue #190)
+        // multiple of the inner 1s step; the left-open rule
         // excludes that boundary point, giving 864_000 points, not
         // 864_001, still far over the default 11_000 cap. The very first
         // outer step must already trip the inner cap check before building
@@ -2983,7 +2983,7 @@ mod tests {
     fn repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget() {
         // A range query over `max_over_time(up[5m:1m])` re-evaluates the
         // inner `up[5m:1m]` subquery from scratch at every one of its 6
-        // outer grid steps (issue #193): each step's own inner grid is only
+        // outer grid steps: each step's own inner grid is only
         // 5 points (one `source.query` call apiece, since the inner
         // expression is the bare selector `up`), far under any per-node
         // `max_range_points` cap, so `TooManyPoints` never fires no matter
@@ -3028,7 +3028,7 @@ mod tests {
     fn short_deadline_cancels_a_long_running_nested_subquery_evaluation() {
         // `max_over_time(up[1000s:1s])` over a 1000-step outer range (1000
         // points, 1s step) re-evaluates its ~1000-point inner subquery from
-        // scratch at every outer step (issue #193): ~1,000,000 total
+        // scratch at every outer step: ~1,000,000 total
         // evaluation points, comfortably under both the per-node
         // `max_range_points` cap and the shared `max_total_eval_points`
         // budget, so without a deadline this runs to completion -- measured

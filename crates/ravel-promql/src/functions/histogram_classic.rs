@@ -61,11 +61,11 @@ struct Bucket {
 /// The result of [`group_by_bucket`]: the per-group cumulative buckets, plus
 /// whether any input series was excluded because its `le` label was missing
 /// or did not parse as a float. That exclusion is Prometheus'
-/// `BadBucketLabelWarning` (issue #235); like the out-of-range quantile
-/// warning it is a whole-input property rather than a per-output-group one,
-/// so it is surfaced as a single flag here and raised once by the caller via
-/// `ctx.warn`, matching the compute-detects/caller-raises split the rest of
-/// this module already uses for its #178 annotations.
+/// `BadBucketLabelWarning`; like the out-of-range quantile warning it is a
+/// whole-input property rather than a per-output-group one, so it is surfaced
+/// as a single flag here and raised once by the caller via `ctx.warn`,
+/// matching the compute-detects/caller-raises split the rest of this module
+/// already uses for its annotations.
 struct GroupedBuckets {
     groups: Vec<(LabelSet, Vec<Bucket>)>,
     bad_le_label: bool,
@@ -76,7 +76,7 @@ struct GroupedBuckets {
 /// label, or one that does not parse as a float, is not a valid classic
 /// bucket and is dropped from the histogram entirely (the pinned Prometheus
 /// excludes it too); such an exclusion sets [`GroupedBuckets::bad_le_label`]
-/// so the caller can raise the matching `BadBucketLabelWarning` (issue #235).
+/// so the caller can raise the matching `BadBucketLabelWarning`.
 fn group_by_bucket(vector: InstantVector) -> GroupedBuckets {
     let mut groups: Vec<(LabelSet, Vec<Bucket>)> = Vec::new();
     let mut index: HashMap<LabelSet, usize> = HashMap::new();
@@ -130,7 +130,7 @@ fn bad_bucket_label_warning() -> String {
 
 /// The outcome of [`prepare`]: the cleaned bucket list plus whether its
 /// counts had to be clamped back into monotonic order (which the caller
-/// surfaces as a `HistogramQuantileForcedMonotonicityInfo` info, issue #178).
+/// surfaces as a `HistogramQuantileForcedMonotonicityInfo` info).
 struct Prepared {
     buckets: Vec<Bucket>,
     forced_monotonic: bool,
