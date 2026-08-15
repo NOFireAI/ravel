@@ -16,7 +16,7 @@ ravel-logseg = { workspace = true }
 # Used for the span record's StatusCode and the frozen resource+scope+span
 # attribute merge rule, so trace normalization and the RSPAN writer cannot
 # drift apart on either.
-ravel-rspan = { path = "../ravel-rspan", version = "0.1.0" }
+ravel-rspan = { path = "../ravel-rspan", version = "0.9.2" }
 opentelemetry-proto = { workspace = true }
 # Span events and links are stored as an opaque serialized blob in RSPAN v1
 # (ADR-0041 decision 4), which needs prost's own length-delimited encoding.

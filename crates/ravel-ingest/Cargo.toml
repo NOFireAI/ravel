@@ -22,7 +22,7 @@ ravel-catalog = { workspace = true }
 # [workspace.dependencies]; the root Cargo.toml is out of this task's scope, so
 # this is a version-pinned path dependency (the pin keeps cargo-deny from
 # counting it as a wildcard, matching the workspace's path-dep convention).
-ravel-rspan = { path = "../ravel-rspan", version = "0.1.0" }
+ravel-rspan = { path = "../ravel-rspan", version = "0.9.2" }
 # The router live switch (ADR-0052) decodes the provisioning record read for a
 # generation refresh; prost's Message trait provides `decode`.
 prost = { workspace = true }
