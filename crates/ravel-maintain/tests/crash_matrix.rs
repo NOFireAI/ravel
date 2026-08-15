@@ -5,6 +5,8 @@
 
 mod common;
 
+use std::collections::HashSet;
+
 use common::*;
 use prost::Message;
 use ravel_maintain::{
@@ -193,9 +195,17 @@ async fn row10_racing_compactors_loser_converges_and_repairs() {
     for i in &inputs {
         catalogs.push(read::load_input_catalog(&store, &cfg(), i).await.unwrap());
     }
-    let parts = build::build_parts(&store, &cfg(), &bucket, &inputs, catalogs, &hash)
-        .await
-        .unwrap();
+    let parts = build::build_parts(
+        &store,
+        &cfg(),
+        &bucket,
+        &inputs,
+        catalogs,
+        &HashSet::new(),
+        &hash,
+    )
+    .await
+    .unwrap();
 
     // ... then a winner part goes missing (e.g. a stray delete), so the
     // loser's converging publish must HEAD-and-repair it.
@@ -286,9 +296,17 @@ async fn row11_already_exists_different_hash_alarms() {
     for i in &inputs {
         catalogs.push(read::load_input_catalog(&store, &cfg(), i).await.unwrap());
     }
-    let parts = build::build_parts(&store, &cfg(), &bucket, &inputs, catalogs, &our_hash)
-        .await
-        .unwrap();
+    let parts = build::build_parts(
+        &store,
+        &cfg(),
+        &bucket,
+        &inputs,
+        catalogs,
+        &HashSet::new(),
+        &our_hash,
+    )
+    .await
+    .unwrap();
     let err = publish::publish_record(
         &store,
         &cfg(),
@@ -338,9 +356,17 @@ async fn row13_past_deadline_abandons_without_publishing() {
     for i in &inputs {
         catalogs.push(read::load_input_catalog(&store, &config, i).await.unwrap());
     }
-    let parts = build::build_parts(&store, &config, &bucket, &inputs, catalogs, &hash)
-        .await
-        .unwrap();
+    let parts = build::build_parts(
+        &store,
+        &config,
+        &bucket,
+        &inputs,
+        catalogs,
+        &HashSet::new(),
+        &hash,
+    )
+    .await
+    .unwrap();
     let outcome = publish::publish_record(
         &store, &config, &clock, &bucket, &inputs, &hash, &parts, start_ns,
     )

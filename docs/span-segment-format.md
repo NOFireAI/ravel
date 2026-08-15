@@ -19,6 +19,22 @@ bump: since no dual reader exists, code built against v3 cannot open a v1 or
 v2 object to compact it forward. A v1 or v2 object outside development
 buckets that must remain queryable has to be re-ingested from source under
 v3; this is Ravel's accepted pre-release posture, not a gap to close later.
+
+**Version lifecycle and migration (ADR-0066, normative).** The pre-release
+posture above expires at first public release. RSPAN is a Class A bulk
+data-object format; from first release onward the supported-version window is
+N/N-1 (single-sourced as `ravel_rspan::footer::SUPPORTED_VERSIONS`; the writer,
+reader gate, `audit-versions`, `migrate`, and the compactor's output-version
+constant all read it), rolled out readers-before-writers: a release writing N+1
+requires a fleet already reading N+1, so the "no dual reader" statement above is
+the pre-release state, not a standing rule. Once an N-1 reader exists, RSPAN
+compaction already decodes every input's span records and re-encodes them from
+scratch, so an old-version object is migrated forward by the normal compaction
+and `maintain migrate` paths with no special carve-out; retention also ages old
+objects out. The migrate job verifies and raises the per-(tenant, signal) format
+floor, and N-1 read support is deleted only once every bucket's floor is >= N,
+citing those floors.
+
 Parsers treat every offset, length, count, and tag read from stored bytes as
 untrusted input: bounds-check everything, overflow-check every accumulation,
 fuzz all decoders. No `unsafe`. Every violation is a typed `Corrupted` error,

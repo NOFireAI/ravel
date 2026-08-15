@@ -113,11 +113,14 @@ use crate::read::InputRecord;
 /// [`crate::build::OUTPUT_FORMAT_VERSION`] and RLOG's
 /// [`crate::rlog::OUTPUT_FORMAT_VERSION`].
 ///
-/// Tied to `ravel_rspan`'s own trailer version at compile time. As a mirrored
-/// literal it went stale on the RSPAN v2 bump: `finish_compacted` stamps
-/// `footer::VERSION` into the trailer while this recorded 1, so the compactor
-/// wrote v2 parts that claimed to be v1.
-pub const OUTPUT_FORMAT_VERSION: u32 = ravel_rspan::footer::VERSION as u32;
+/// Read from `ravel_rspan`'s single-sourced supported-version window
+/// (`SUPPORTED_VERSIONS.newest()`, ADR-0066 decision 1, slice A), the same
+/// single source the reader gate and the CLI `audit-versions`/`migrate` paths
+/// use. As a mirrored literal it went stale on the RSPAN v2 bump:
+/// `finish_compacted` stamps the trailer from the writer while the literal
+/// recorded 1, so the compactor wrote v2 parts that claimed to be v1; routing
+/// through the window keeps the recorded number and the emitted trailer in step.
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_rspan::footer::SUPPORTED_VERSIONS.newest() as u32;
 
 /// One RSPAN input's retained catalog metadata: the data-object key, its
 /// decoded footer, and an [`RspanRangeReader`] over its SKIP_IDX. Block bytes

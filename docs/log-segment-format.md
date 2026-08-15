@@ -4,6 +4,21 @@ Persistent contract (ADR-0029). Any change bumps the trailer version. The
 current trailer version is 2 (ADR-0032 added the footer's compaction-identity
 fields; version 1 was the format-only initial release and no reader accepts it
 any longer).
+
+**Version lifecycle and migration (ADR-0066, normative).** RLOG is a Class A
+bulk data-object format. Until first public release, ADR-0032's
+single-supported-version rule stands: the reader accepts only the current
+trailer version. From first release onward the supported-version window is
+N/N-1 (single-sourced as `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer,
+reader gate, `audit-versions`, `migrate`, and the compactor's output-version
+constant all read it), rolled out readers-before-writers: a release writing N+1
+requires a fleet already reading N+1. RLOG compaction already decodes every
+input's records and re-encodes them from scratch, so an old-version object is
+migrated forward by the normal compaction and `maintain migrate` paths with no
+special page-copy carve-out; retention also ages old objects out. The migrate
+job verifies and raises the per-(tenant, signal) format floor, and N-1 read
+support is deleted only once every bucket's floor is >= N, citing those floors.
+
 Parsers treat every offset, length, count, and tag read from stored bytes
 as untrusted input: bounds-check everything, overflow-check every
 accumulation, fuzz all decoders. No `unsafe`. Every violation is a typed

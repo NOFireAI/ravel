@@ -125,13 +125,14 @@ use crate::read::InputRecord;
 /// version 2). Recorded in each part's `CompactionPart.segment_format_version`,
 /// the log analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`].
 ///
-/// Tied to `ravel_logseg`'s own trailer version at compile time, for the reason
-/// [`crate::rspan_codec::OUTPUT_FORMAT_VERSION`] records: as a mirrored literal
-/// this goes stale on the next bump, and it goes stale silently, because the
-/// writer stamps `footer::VERSION` into the trailer while this constant keeps
-/// reporting the old number. The compactor would then write parts that claim a
-/// version they are not.
-pub const OUTPUT_FORMAT_VERSION: u32 = ravel_logseg::footer::VERSION as u32;
+/// Read from `ravel_logseg`'s single-sourced supported-version window
+/// (`SUPPORTED_VERSIONS.newest()`, ADR-0066 decision 1, slice A), the same
+/// single source the reader gate and the CLI `audit-versions`/`migrate` paths
+/// use. As a mirrored literal this would go stale silently on the next bump --
+/// the writer stamps the trailer from the window while a stale literal kept
+/// reporting the old number, so the compactor would write parts claiming a
+/// version they are not; routing through the window moves both together.
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_logseg::footer::SUPPORTED_VERSIONS.newest() as u32;
 
 /// Untrusted-input cap on an input's FIELD_DIR entry count for the compactor's
 /// own decode of that section (the indexed-field recovery below needs the

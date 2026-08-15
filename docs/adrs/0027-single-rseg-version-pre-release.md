@@ -1,6 +1,15 @@
 # ADR-0027: Single supported RSEG version until first release
 
-Status: Accepted
+Status: Accepted (superseded at first public release by ADR-0066)
+
+> ADR-0066 decision 1 supersedes this ADR's single-supported-version policy
+> *at, and only at, first public release* -- exactly the expiry this ADR's
+> own decision 7 anticipated. Until first release the single-version policy
+> below stands unchanged; from first release onward the bulk data-object
+> formats move to an N/N-1 reader window with evidence-based (format-floor)
+> retirement of the old reader, and the RSEG decode-and-re-encode migration
+> primitive (ADR-0066 decision 5) replaces the wipe-or-re-ingest disposition
+> this ADR's decision 6 accepted. This historical content is left intact.
 
 This ADR changes the format lifecycle policy, not any byte of the v5
 layout, building on the RSEG v5 implementation (ADR-0026).

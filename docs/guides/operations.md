@@ -1401,6 +1401,29 @@ superseded-input rule (above) still physically deletes those pre-rewrite
 records on its own schedule, independent of `migrate` -- that is a storage-
 reclamation concern, not a correctness precondition for the floor raise.
 
+**Rollout order across a format bump: readers before writers (ADR-0066
+decision 1).** When a release bumps a bulk data-object format (RSEG, RLOG, or
+RSPAN) from version N to N+1, roll the fleet in this order, never the reverse:
+
+1. Deploy the release that *reads* N+1 (the N/N-1 window with N+1 as the new
+   newest) to every process that opens objects -- query, maintenance, and the
+   catalog fold -- and confirm it is live fleet-wide. A process that writes N+1
+   before its peers can read N+1 produces objects the rest of the fleet
+   fail-closes on (typed `UnsupportedVersion`, never a silent misread), so
+   writers must never lead.
+2. Only then enable writing N+1 (compaction and flush emit the new version).
+   From this point new and rewritten objects are N+1; existing N objects stay
+   readable through the N-1 half of the window.
+3. Converge the existing N objects toward N+1: retention ages them out for
+   free, and `ravel-cli maintain migrate --tenant T --signal S` rewrites the
+   rest and raises each `(tenant, signal, family)` format floor once a fresh
+   re-audit confirms nothing below N+1 survives. Watch `audit-versions` for the
+   remaining below-target population.
+4. Delete the reader for the now-retired version N only after every bucket's
+   recorded floor is >= N+1 -- a checkable fact from the floors `migrate`
+   raised, in its own later reviewed change. Deleting an old reader on any
+   other basis is the wipe-and-hope ADR-0066 replaced.
+
 ### Maintenance safety metrics and alerts
 
 `--mode maintain` renders five additional samples on the existing `GET

@@ -7,6 +7,23 @@ error as any unknown future version. Any change to the layout bumps the
 version and retires the previous one in the same change (an ADR plus a
 version bump, never an in-place edit under the same number).
 
+**Version lifecycle and migration (ADR-0066, normative).** RSEG is a Class A
+bulk data-object format. Until the first public release, ADR-0027's
+single-supported-version rule above stands. From first release onward the
+supported-version window is N/N-1: the writer always emits the current version
+N, and the reader accepts N and N-1 (the window is single-sourced as
+`ravel_segment::SUPPORTED_VERSIONS`; the writer, reader gate, `audit-versions`,
+and the `migrate` job all read it). Rollout is readers-before-writers: a release
+that writes N+1 requires a fleet already reading N+1. Old-version objects
+converge to the current version three ways, in preference order: retention ages
+them out; compaction and the `maintain migrate` job rewrite them
+(`ravel-maintain` decodes an input recorded below the current output version and
+re-encodes its pages at the current version -- a real decode-and-re-encode, not
+a verbatim page copy -- conserving the sample count exactly, ADR-0066 decision
+5); and the migrate job then verifies and raises the per-(tenant, signal) format
+floor. Support for reading N-1 is deleted only once every bucket's recorded
+floor is >= N, in a separate change that cites those floors.
+
 Parsers treat every offset, length, and count as untrusted input:
 bounds-check everything, fuzz all decoders, return typed errors and never
 panic. No `unsafe`. All integers little-endian. "varint" means

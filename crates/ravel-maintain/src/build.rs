@@ -13,6 +13,23 @@
 //! bytes are retained in the returned `Vec` until publish so the
 //! convergence-repair path can re-PUT a part a racing winner is missing.
 //!
+//! Format-migration exception (ADR-0066 decision 5): an input recorded *below*
+//! the current output version (its commit record's `segment_format_version` is
+//! older than [`OUTPUT_FORMAT_VERSION`]) cannot be copied verbatim -- copying an
+//! older layout's pages under a current-version trailer would be a mislabeled
+//! object, not a migration. Its object key is passed in `migrate_keys`, and
+//! every one of its runs is instead fully decoded
+//! ([`ravel_segment::decode_run_pages_soa`] /
+//! [`ravel_segment::decode_run_histogram_pages`]) and re-encoded at the current
+//! version ([`ravel_segment::encode_run_v4`]) at the page-materialization step,
+//! the exact point a current-version run is copied. Everything else -- the
+//! series group-by, the size-capped part split, exemplar assignment, and the
+//! record-count conservation gate -- is the one shared merge, unchanged. When
+//! `migrate_keys` is empty (every input at the current version, the normal
+//! compaction case) the fast verbatim path runs exactly as before. RLOG and
+//! RSPAN already decode and re-encode on every merge, so this
+//! decode-and-re-encode primitive is RSEG-specific.
+//!
 //! Page fetch mechanics: the pages for one part are
 //! fetched as a batch, not one blocking GET per page. First the per-run TS and
 //! VAL-or-HIST byte ranges of every series in the batch are grouped by input
@@ -30,7 +47,7 @@
 //! under `max_l1_part_bytes`; the encoded parts held until publish still
 //! dominate peak memory.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -40,10 +57,11 @@ use ravel_commit::keys;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
 use ravel_segment::{
-    CompactionMetaV4, ExemplarInput, IngestBounds, RunInputV4, RunValuePageV4, SegmentIdentity,
-    SegmentWriter, SeriesInputV4, ValueKind,
+    CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunEntry, RunInputV4,
+    RunValuePageV4, SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
+    decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
 };
-use ravel_types::{LabelSet, SeriesId};
+use ravel_types::{LabelSet, Sample, SeriesId};
 use tokio::sync::Semaphore;
 
 use crate::bucket::Bucket;
@@ -66,9 +84,14 @@ const FETCH_CONCURRENCY: usize = 16;
 /// modest.
 const COALESCE_GAP: u64 = 64 * 1024;
 
-/// The current RSEG output version (ADR-0026, made the only version by
-/// ADR-0027). Recorded in each part's `CompactionPart.segment_format_version`.
-pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::VERSION_V6 as u32;
+/// The current RSEG output version: the newest version RSEG's single-sourced
+/// supported-version window writes (ADR-0066 decision 1, slice A). Recorded in
+/// each part's `CompactionPart.segment_format_version`. Read from
+/// `ravel_segment::SUPPORTED_VERSIONS.newest()` rather than a mirrored literal
+/// so a future format bump moves the writer, the reader gate, `audit-versions`,
+/// and this compactor constant together (the sixteen-hand-edited-sites hazard
+/// ADR-0049 measured). Today the window is `single(VERSION_V6)`, so this is 6.
+pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::SUPPORTED_VERSIONS.newest() as u32;
 
 /// One built (not yet published) L1 part: its content-addressed key, its
 /// bytes, and the [`CompactionPart`] describing it for the record.
@@ -89,12 +112,20 @@ pub struct BuiltPart {
 /// what keeps them inside `read.rs`'s stated catalog-metadata memory bound.
 /// Only the borrowed page-range metadata (`&SeriesPlan`,
 /// `object_key`) is read after the take.
+///
+/// `migrate_keys` holds the object keys of any input recorded below the current
+/// output version (ADR-0066 decision 5): a run whose input key is in this set is
+/// decoded and re-encoded at the current version rather than page-copied
+/// verbatim (see the module doc and [`materialize_batch`]). It is empty for
+/// ordinary compaction, where every input is already at the current version, and
+/// the verbatim path then runs unchanged.
 pub async fn build_parts(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
     bucket: &Bucket,
     inputs: &[InputRecord],
     mut catalogs: Vec<InputCatalog>,
+    migrate_keys: &HashSet<String>,
     input_set_hash: &[u8; 32],
 ) -> Result<Vec<BuiltPart>> {
     if inputs.len() != catalogs.len() {
@@ -218,6 +249,7 @@ pub async fn build_parts(
                 part_index,
                 batch,
                 batch_exemplars,
+                migrate_keys,
             )
             .await?;
             parts.push(part);
@@ -242,6 +274,7 @@ pub async fn build_parts(
             part_index,
             batch,
             batch_exemplars,
+            migrate_keys,
         )
         .await?;
         parts.push(part);
@@ -321,9 +354,10 @@ async fn build_part_from_batch(
     part_index: u32,
     builds: &[SeriesBuild<'_>],
     exemplars: Vec<ExemplarInput>,
+    migrate_keys: &HashSet<String>,
 ) -> Result<BuiltPart> {
     let regions = fetch_batch_pages(store, semaphore, builds).await?;
-    let batch = materialize_batch(builds, &regions)?;
+    let batch = materialize_batch(builds, &regions, migrate_keys)?;
     let part = flush_part(
         bucket,
         config,
@@ -433,7 +467,9 @@ async fn fetch_one_range<'a>(
 fn materialize_batch(
     builds: &[SeriesBuild<'_>],
     regions: &BatchRegions<'_>,
+    migrate_keys: &HashSet<String>,
 ) -> Result<Vec<SeriesInputV4>> {
+    let limits = ReaderLimits::default();
     let mut batch = Vec::with_capacity(builds.len());
     for build in builds {
         let mut runs = Vec::with_capacity(build.runs.len());
@@ -447,6 +483,23 @@ fn materialize_batch(
             let page = slice_region(object, run.page_abs).ok_or_else(|| {
                 MaintainError::Invariant("coalesced fetch missing a value page range".into())
             })?;
+            if migrate_keys.contains(*key) {
+                // Format-migration path (ADR-0066 decision 5): this run's input
+                // is recorded below the current output version, so its pages are
+                // decoded to samples and re-encoded at the current version
+                // rather than copied verbatim. Run provenance
+                // (`created_unix_ns`/`writer_epoch`/`writer_seq`) and the sample
+                // multiset are preserved -- a migration changes the byte format,
+                // never the run's dedup-priority identity or its samples.
+                runs.push(reencode_run_to_current_version(
+                    &build.series_id,
+                    run,
+                    ts_page.as_ref(),
+                    page.as_ref(),
+                    limits,
+                )?);
+                continue;
+            }
             let value_page = match run.kind {
                 ValueKind::Scalar => RunValuePageV4::Scalar(page.to_vec()),
                 ValueKind::Histogram => RunValuePageV4::Histogram(page.to_vec()),
@@ -469,6 +522,75 @@ fn materialize_batch(
         });
     }
     Ok(batch)
+}
+
+/// Decode one run's TS and VAL-or-HIST pages to samples and re-encode them at
+/// the current output version (ADR-0066 decision 5, the RSEG decode-and-
+/// re-encode rewrite primitive). This is the migration counterpart of the
+/// verbatim page copy in [`materialize_batch`]: the same
+/// [`ravel_segment::decode_run_pages_soa`] /
+/// [`ravel_segment::decode_run_histogram_pages`] read primitives the query and
+/// erasure paths use, then [`ravel_segment::encode_run_v4`] (the encode half the
+/// erasure-rewrite pass already shares) to re-frame the survivors -- here, every
+/// sample, since a migration drops nothing. The run's dedup-priority provenance
+/// is passed through unchanged; only the on-object byte format moves forward.
+fn reencode_run_to_current_version(
+    series_id: &SeriesId,
+    run: &RunPlan,
+    ts_page: &[u8],
+    value_page: &[u8],
+    limits: ReaderLimits,
+) -> Result<RunInputV4> {
+    // `decode_run_pages_soa`/`decode_run_histogram_pages` read only the run's
+    // provenance, sample count, and event-time bounds from the entry; the page
+    // byte ranges are supplied directly, so the `(0, 0)` section-range sentinels
+    // are correct (mirrors the erasure-rewrite decode path).
+    let entry = RunEntry {
+        created_unix_ns: run.created_unix_ns,
+        writer_epoch: run.writer_epoch,
+        writer_seq: run.writer_seq,
+        sample_count: run.sample_count,
+        min_ts_ns: run.min_ts_ns,
+        max_ts_ns: run.max_ts_ns,
+        ts_page: (0, 0),
+        val_page: (0, 0),
+        hist_page: (0, 0),
+    };
+    let values = match run.kind {
+        ValueKind::Scalar => {
+            let mut scratch = Vec::new();
+            let mut timestamps = Vec::new();
+            let mut vals = Vec::new();
+            decode_run_pages_soa(
+                series_id,
+                &entry,
+                ts_page,
+                value_page,
+                limits,
+                &mut scratch,
+                &mut timestamps,
+                &mut vals,
+            )?;
+            let samples = timestamps
+                .into_iter()
+                .zip(vals)
+                .map(|(ts_ns, value)| Sample { ts_ns, value })
+                .collect();
+            SeriesValues::Scalar(samples)
+        }
+        ValueKind::Histogram => {
+            let samples =
+                decode_run_histogram_pages(series_id, &entry, ts_page, value_page, limits)?;
+            SeriesValues::Histogram(samples)
+        }
+    };
+    Ok(encode_run_v4(
+        series_id,
+        run.created_unix_ns,
+        run.writer_epoch,
+        run.writer_seq,
+        &values,
+    )?)
 }
 
 /// Merge `(start, end)` half-open ranges into ordered, non-overlapping groups,

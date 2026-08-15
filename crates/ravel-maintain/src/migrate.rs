@@ -1001,6 +1001,74 @@ mod tests {
         assert_eq!((l0_below, l1_below), (0, 0));
     }
 
+    /// Slice B end to end (ADR-0066 decision 5, issue #1111): a
+    /// below-output-recorded RSEG input migrates to the current version and the
+    /// format floor is then raised. Before slice B this was unreachable for RSEG
+    /// -- its rewrite could only re-publish at the current writer version, so
+    /// reaching "below target" eligibility required a target *above* the writer
+    /// ([`FUTURE_VERSION`]), which then made the rewrite's own output count as
+    /// below target and blocked the floor. Now, targeting the current version, an
+    /// input recorded at `VERSION_V6 - 1` (real v6 bytes, older recorded version
+    /// -- the synthetic-N-1 shape, since no real N-1 RSEG version has shipped) is
+    /// decoded and re-encoded to `VERSION_V6 == target`, the fresh re-audit finds
+    /// nothing below the target, and the floor is raised to `VERSION_V6`.
+    #[tokio::test]
+    async fn rseg_below_output_input_migrates_and_raises_floor() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V6 as u32;
+        // Real v6 bytes recorded below the target: eligible for the walk, and now
+        // genuinely rewritable up to the target rather than refused.
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+
+        let clock = FixedClock::new(sealed_now_ns_for(100));
+        let report = migrate_family(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            target,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("migrate");
+
+        assert!(report.walk_complete, "the walk drained within budget");
+        assert_eq!(
+            report.buckets_migrated, 1,
+            "the below-target bucket was rewritten"
+        );
+        assert!(
+            !report.stragglers_found(),
+            "the rewrite lifted the only input to the target, so no straggler remains, got {:?}",
+            report.verification
+        );
+        assert_eq!(
+            report.verification,
+            Some(Verification::FloorRaised {
+                floor_version: target
+            }),
+            "a clean re-audit raises the floor to the current version"
+        );
+
+        // The floor is durably recorded at the target, and a fresh audit finds
+        // nothing below it: the pre-rewrite L0 record is superseded (excluded)
+        // and the rewritten L1 part is at the target.
+        let floor = current_floor_from_store(&store, &tenant_hash(), Signal::Metrics, FAMILY)
+            .await
+            .expect("read floor");
+        assert_eq!(floor, Some(target));
+        let (l0_below, l1_below) =
+            count_below_target(&store, &tenant_hash(), Signal::Metrics, 1, target)
+                .await
+                .expect("re-audit");
+        assert_eq!((l0_below, l1_below), (0, 0));
+    }
+
     /// What an [`InjectingStore`] writes when it fires, i.e. what "lands"
     /// during the window between the walk finishing and the re-audit reading.
     #[derive(Debug, Clone, Copy)]
@@ -1380,20 +1448,21 @@ mod tests {
     /// deletes it) but must no longer be live.
     ///
     /// This asserts against [`count_below_target`] directly rather than
-    /// `migrate_family`'s end-to-end `Verification::FloorRaised`, because
-    /// RSEG cannot produce that end-to-end signal in a test at all: its
-    /// rewrite path copies page bytes verbatim without decoding (see the
-    /// module doc on `rewrite.rs`), so a rewrite always re-publishes at the
-    /// real current writer version, `VERSION_V6`, never at whatever target
-    /// drove the walk. Reaching this bucket's below-target rewrite
-    /// eligibility at all requires `FUTURE_VERSION` (a target above
-    /// `VERSION_V6`, same trick every other test in this module uses); but
-    /// that same fictional target then makes the rewrite's own L1 output
-    /// (recorded at `VERSION_V6`, genuinely `< FUTURE_VERSION`) count as
-    /// below target too, independent of this fix -- a `FloorRaised` result
-    /// is structurally unreachable here, orthogonal to the just-rewrote case. Calling
-    /// `count_below_target` directly isolates exactly the mechanism the fix
-    /// changes (the L0 branch) from that unrelated, expected L1 count.
+    /// `migrate_family`'s end-to-end `Verification::FloorRaised`, because of the
+    /// target this particular test uses, not any RSEG limitation. Since ADR-0066
+    /// decision 5 (slice B) RSEG genuinely decodes and re-encodes an
+    /// older-recorded input to the current version, so it *can* drive a
+    /// `FloorRaised` end to end when the target is the current version -- see
+    /// [`rseg_below_output_input_migrates_and_raises_floor`]. This test instead
+    /// seeds an at-`VERSION_V6` record and uses `FUTURE_VERSION` (a target above
+    /// the writer, the trick that makes an at-current record count as "below
+    /// target" and eligible for the walk); that same fictional target then makes
+    /// the rewrite's own L1 output (recorded at `VERSION_V6`, genuinely
+    /// `< FUTURE_VERSION`) count as below target too, so a `FloorRaised` result
+    /// is structurally unreachable in *this* setup, orthogonal to the
+    /// just-rewrote case. Calling `count_below_target` directly isolates exactly
+    /// the mechanism the fix changes (the L0 branch) from that unrelated,
+    /// expected L1 count.
     ///
     /// Before the supersession exclusion, `count_below_target`'s L0 branch
     /// counted every commit record's `segment_format_version` unconditionally,

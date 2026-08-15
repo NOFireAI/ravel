@@ -23,22 +23,25 @@
 //! The primitive does not contain a decoder; it calls
 //! [`SegmentCodec::load_input_catalog`] and [`SegmentCodec::build_parts`],
 //! exactly as [`crate::compact::compact_bucket`] does. For RLOG and RSPAN
-//! those genuinely decode and re-encode, so once ravel-logseg/ravel-rspan
-//! gain an N-1 reader (ADR-0066 decision 1, at first public release), the
-//! codec's read path accepts the older version and this primitive migrates
-//! real old-version objects with no change here. RSEG is different: its
-//! `build_parts` (`build.rs`) copies page bytes verbatim without decoding
-//! them (ADR-0066 Context), so an RSEG rewrite can never be a real format
-//! migration -- only a same-version round trip. [`RsegCodec`] enforces this:
-//! [`SegmentCodec::validate_rewrite_inputs`] refuses any input recorded below
-//! the current output version before this function decodes or PUTs anything.
-//! Today every real object is at the current version (ADR-0027), so this
-//! guard cannot yet fire; it exists so the day ravel-segment's reader relaxes
-//! to accept N-1, an RSEG rewrite still fails loudly on an old input instead
-//! of silently re-publishing verbatim old-format pages under a current-format
-//! trailer. A true RSEG page-grammar migration needs a real decode-and-
-//! re-encode primitive that does not exist today (ADR-0066 Decision 5); when
-//! it lands, it replaces this guard rather than removing it blind.
+//! those genuinely decode and re-encode on every merge, so once
+//! ravel-logseg/ravel-rspan gain an N-1 reader (ADR-0066 decision 1, at first
+//! public release), the codec's read path accepts the older version and this
+//! primitive migrates real old-version objects with no change here.
+//!
+//! RSEG is now the same shape: since ADR-0066 decision 5 (issue #1111), its
+//! `build_parts` (`build.rs`) still copies a *current*-version input's pages
+//! verbatim, but decodes and re-encodes an input recorded *below* the current
+//! output version at the current version before the shared merge/plan step, so
+//! an RSEG rewrite is a real format migration, not just a same-version round
+//! trip. [`RsegCodec::validate_rewrite_inputs`] no longer refuses an older
+//! input; it now fails closed only on an input recorded *newer* than the
+//! current output version (ADR-0066 decision 2), which a forward migration
+//! cannot write. Whether an older object's bytes are actually decodable is the
+//! ravel-segment reader's `SUPPORTED_VERSIONS` window to enforce at open time;
+//! today that window is a single version (ADR-0027), so the decode-and-re-encode
+//! path is exercised by tests and dry-runs rather than by carrying real dual
+//! versions in anger (ADR-0066 Consequences), and it converges an
+//! older-recorded input to the current version the day the window opens.
 //!
 //! ## Durability is unchanged
 //!
@@ -476,6 +479,55 @@ mod tests {
         entries.iter().map(|e| e.entry.series_id.0).collect()
     }
 
+    /// Every scalar sample an RSEG object carries, as a canonical multiset of
+    /// `(series_id, ts_ns, value_bits)` -- value compared by bit pattern, never
+    /// `==`, per the storage-path float rule. Decodes the whole object (catalog
+    /// plus every run's TS/VAL pages) so a round-trip check can assert real data
+    /// survived, not just that the sample counts matched.
+    fn decode_scalar_multiset(obj: &[u8]) -> Vec<([u8; 16], i64, u64)> {
+        use ravel_segment::{ValueKind, decode_run_pages_soa, plan_ranges_v4};
+        let limits = ReaderLimits::default();
+        let loc = ravel_segment::open_from_full(obj, limits).expect("open object");
+        let entries = ravel_segment::decode_catalog_v5(&loc.footer, obj, limits).expect("catalog");
+        let refs: Vec<&ravel_segment::SeriesEntryV4> = entries.iter().collect();
+        let planned = plan_ranges_v4(&loc.footer, &refs).expect("plan ranges");
+        let mut planned = planned.into_iter();
+        let mut out = Vec::new();
+        for entry in &entries {
+            let series_id = entry.entry.series_id;
+            for run in &entry.runs {
+                let range = planned.next().expect("a range per run");
+                assert!(
+                    matches!(entry.entry.value_kind, ValueKind::Scalar),
+                    "helper only handles scalar series"
+                );
+                let ts =
+                    &obj[range.ts_range.0 as usize..(range.ts_range.0 + range.ts_range.1) as usize];
+                let val = &obj
+                    [range.val_range.0 as usize..(range.val_range.0 + range.val_range.1) as usize];
+                let mut scratch = Vec::new();
+                let mut timestamps = Vec::new();
+                let mut values = Vec::new();
+                decode_run_pages_soa(
+                    &series_id,
+                    run,
+                    ts,
+                    val,
+                    limits,
+                    &mut scratch,
+                    &mut timestamps,
+                    &mut values,
+                )
+                .expect("decode run");
+                for (ts_ns, value) in timestamps.into_iter().zip(values) {
+                    out.push((series_id.0, ts_ns, value.to_bits()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// The migration round trip: two real v6 L0 objects decode, re-encode, and
     /// publish into a current-version L1 part carrying the same series content,
     /// with the record-count conserved exactly.
@@ -545,6 +597,154 @@ mod tests {
         ];
         want.sort();
         assert_eq!(got, want, "L1 carries exactly the inputs' series");
+    }
+
+    /// Slice B headline (ADR-0066 decision 5, issue #1111): the
+    /// synthetic-N-1 mixed-fleet convergence case. An RSEG object recorded
+    /// *below* the current output version is genuinely decoded and re-encoded to
+    /// the current version by the rewrite primitive -- not refused (the
+    /// pre-slice-B guard), and not verbatim-copied under a mislabeled trailer.
+    ///
+    /// No real N-1 RSEG version has ever shipped, so the "old" object is built
+    /// the way slice A's window tests use a synthetic version number
+    /// (`n_and_prev_window_is_exactly_two_wide_with_a_floor`): real, fully
+    /// decodable v6 bytes under a commit record that records an older version.
+    /// The reader accepts the bytes (they are real v6); the compactor's
+    /// `build_parts` sees an input recorded below the output version and routes
+    /// its runs through the decode-and-re-encode path
+    /// ([`crate::build::build_parts`]'s `migrate_keys` branch) rather than the
+    /// verbatim page copy; every sample round-trips and the record count is
+    /// conserved exactly by the shared publish gate.
+    ///
+    /// Flip proof (non-vacuous): against `RsegCodec::validate_rewrite_inputs`'s
+    /// pre-slice-B refusal (reject any input recorded `!= OUTPUT_FORMAT_VERSION`)
+    /// this test fails at `expect("migrate")` -- the migration returns the
+    /// guard's `Invariant` error instead of `Rewritten`. Verified by running it
+    /// against the old guard before the build/codec change landed.
+    #[tokio::test]
+    async fn migrates_an_input_recorded_below_the_output_version() {
+        let store = MemoryStore::new();
+        let old = VERSION_V6 as u32 - 1;
+        // Two inputs recorded below the output version, over real v6 bytes; one
+        // carries two series (one of them with two samples) so the round-trip
+        // check spans multiple series and a multi-sample run.
+        let a = seed_with_version(
+            &store,
+            1,
+            vec![
+                series("alpha", &[(10, 1.0), (11, 1.5)]),
+                series("gamma", &[(30, 3.0)]),
+            ],
+            old,
+        )
+        .await;
+        let b = seed_with_version(&store, 2, vec![series("beta", &[(20, 2.0)])], old).await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        // Target the current output version: eligibility is `recorded < target`,
+        // and the rewrite re-encodes to the current version (== target), so the
+        // output lands at the target -- the convergence RSEG could not reach
+        // before slice B, because its verbatim path could never lift an
+        // older-recorded input to the current version.
+        let outcome = migrate_bucket_format(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &bucket(),
+            VERSION_V6 as u32,
+        )
+        .await
+        .expect("migrate");
+
+        let (parts, publish) = match outcome {
+            MigrateOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(publish, PublishOutcome::Published);
+        assert_eq!(parts, 1, "small corpus fits one part");
+
+        let record = read_record(&store).await.expect("a record was published");
+        assert_eq!(record.parts.len(), 1);
+        let part = &record.parts[0];
+        assert_eq!(
+            part.segment_format_version, VERSION_V6 as u32,
+            "the re-encoded output is stamped the current writer version"
+        );
+
+        // Record count conserved: the L1 part carries every input sample. The
+        // input total is read from the objects' own footers (the real v6 bytes),
+        // independent of the commit records' (deliberately older) version tag.
+        let input_samples: u64 = [&a, &b]
+            .iter()
+            .map(|obj| {
+                ravel_segment::open_from_full(obj, ReaderLimits::default())
+                    .expect("open input")
+                    .footer
+                    .sample_count
+            })
+            .sum();
+        assert_eq!(part.sample_count, input_samples, "sample count conserved");
+
+        // Real data round-trips: the L1 part's decoded (series, ts, value-bits)
+        // multiset equals the union of the inputs', proving the decode-and-
+        // re-encode preserved every sample's value, not merely its count.
+        let part_key = keys::reconstruct_l1_part_key(&record, part).expect("part key");
+        let part_bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data;
+        let mut got = decode_scalar_multiset(&part_bytes);
+        let mut want: Vec<([u8; 16], i64, u64)> = decode_scalar_multiset(&a)
+            .into_iter()
+            .chain(decode_scalar_multiset(&b))
+            .collect();
+        got.sort();
+        want.sort();
+        assert_eq!(
+            got, want,
+            "every input sample round-trips through the rewrite"
+        );
+    }
+
+    /// Fail-closed-on-newer (ADR-0066 decision 2): an input recorded *above* the
+    /// current output version -- newer than this build can read or write -- is
+    /// refused before any decode or PUT, never mislabeled downward. This is the
+    /// half of the old below-output refusal that survives slice B: the guard
+    /// stopped rejecting older (migratable) inputs and now rejects only
+    /// newer-than-writable ones.
+    #[tokio::test]
+    async fn rseg_rewrite_rejects_input_recorded_above_output_version() {
+        let store = MemoryStore::new();
+        seed_with_version(
+            &store,
+            1,
+            vec![series("alpha", &[(10, 1.0)])],
+            VERSION_V6 as u32 + 1,
+        )
+        .await;
+        let listing = list_bucket(&store, &bucket()).await.expect("list");
+        let clock = FixedClock::new(sealed_now_ns());
+
+        let err = rewrite_and_publish::<RsegCodec>(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &bucket(),
+            &listing.commit_keys,
+            conserve_exact(),
+            sealed_now_ns(),
+        )
+        .await
+        .expect_err("an input recorded above the output version must be rejected");
+        assert!(
+            matches!(err, MaintainError::Invariant(_)),
+            "expected the validate_rewrite_inputs fail-closed-on-newer guard, got {err:?}"
+        );
+        assert!(
+            read_record(&store).await.is_none(),
+            "a rejected input set publishes nothing and PUTs nothing"
+        );
     }
 
     /// A conservation predicate that rejects the built parts' true count aborts
@@ -675,47 +875,6 @@ mod tests {
         assert!(
             read_record(&store).await.is_none(),
             "an up-to-date bucket publishes nothing"
-        );
-    }
-
-    /// RSEG's `build_parts` copies page bytes verbatim without decoding them,
-    /// so an input recorded below the codec's current output version must be
-    /// refused before any decode or PUT, not silently republished under a
-    /// current-format trailer. The guard reads only the commit record's
-    /// `segment_format_version`, so this seeds a real v6 object under a
-    /// commit record that claims an older version -- exactly the shape a
-    /// relaxed N-1 reader would hand the primitive once one exists.
-    #[tokio::test]
-    async fn rseg_rewrite_rejects_input_recorded_below_output_version() {
-        let store = MemoryStore::new();
-        seed_with_version(
-            &store,
-            1,
-            vec![series("alpha", &[(10, 1.0)])],
-            VERSION_V6 as u32 - 1,
-        )
-        .await;
-        let listing = list_bucket(&store, &bucket()).await.expect("list");
-        let clock = FixedClock::new(sealed_now_ns());
-
-        let err = rewrite_and_publish::<RsegCodec>(
-            &store,
-            &clock,
-            &CompactorConfig::default(),
-            &bucket(),
-            &listing.commit_keys,
-            conserve_exact(),
-            sealed_now_ns(),
-        )
-        .await
-        .expect_err("an input recorded below the output version must be rejected");
-        assert!(
-            matches!(err, MaintainError::Invariant(_)),
-            "expected the validate_rewrite_inputs guard error, got {err:?}"
-        );
-        assert!(
-            read_record(&store).await.is_none(),
-            "a rejected input set publishes nothing and PUTs nothing"
         );
     }
 
