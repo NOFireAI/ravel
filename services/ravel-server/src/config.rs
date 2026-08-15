@@ -681,11 +681,19 @@ pub struct Cli {
     /// (the cluster's stable label, surfaced in the `warnings` field when it is
     /// skipped), `endpoint` (`host:port` of the remote's fragment `SeriesFetch`
     /// surface), and `credential-file` (a file holding the bearer token this
-    /// coordinator presents to the remote). Optional keys: `tls` (`on`/`off`,
-    /// default `off`), `tls-ca-file` (a CA bundle for the remote's server
-    /// certificate, meaningful only with `tls=on`), `skip-unavailable`
-    /// (`true`/`false`, default `false`), and `soft-timeout` (a per-remote
-    /// override of `--remote-cluster-soft-timeout`).
+    /// coordinator presents to the remote). Optional keys: `tls`
+    /// (`true`/`false`, default `true`), `tls-ca-file` (a CA bundle for the
+    /// remote's server certificate, meaningful only with TLS on),
+    /// `skip-unavailable` (`true`/`false`, default `false`), and `soft-timeout`
+    /// (a per-remote override of `--remote-cluster-soft-timeout`).
+    ///
+    /// TLS is ON by default: a spec with no `tls` key dials `https://` and
+    /// verifies the remote against the system trust roots, plus `tls-ca-file`
+    /// when set. `tls=false` is the escape hatch for a path that is already
+    /// encrypted at a lower layer; it sends the operator credential, the query,
+    /// and every returned result stream in cleartext, and startup logs a
+    /// SECURITY warning naming that remote. `tls-ca-file` alongside `tls=false`
+    /// fails startup: the CA bundle would be inert.
     ///
     /// The credential is an OPERATOR secret read from a file, never an inline
     /// value: it is the principal the remote sees, resolved through the remote's
@@ -695,7 +703,7 @@ pub struct Cli {
     /// never appear in query text.
     ///
     /// Example:
-    /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tls=on,skip-unavailable=true`
+    /// `--remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,skip-unavailable=true`
     #[arg(long = "remote-cluster", value_name = "SPEC")]
     pub remote_clusters: Vec<String>,
 
@@ -848,7 +856,9 @@ pub struct RemoteClusterConfig {
     /// `credential-file`. This is the ONLY principal the remote sees for a
     /// federated fetch: the calling client's credential is never forwarded.
     pub credential: String,
-    /// Whether to dial the remote over TLS.
+    /// Whether to dial the remote over TLS. Defaults to `true` when the spec
+    /// carries no `tls` key: plaintext federation is an explicit, logged choice,
+    /// never the fallback (ADR-0071 amendment, federation TLS by default).
     pub tls: bool,
     /// A CA bundle for the remote's server certificate, `Some` only when a
     /// `tls-ca-file` key was given (meaningful only with `tls`).
@@ -1313,6 +1323,11 @@ impl Cli {
     /// principal is validated at the same point every other credential file is.
     /// Cluster names must be unique: a duplicate name would make the `warnings`
     /// field ambiguous about which remote was skipped.
+    ///
+    /// `tls` defaults to `true`. A spec that carries `tls-ca-file` and no `tls`
+    /// key therefore means "TLS on, with this CA trusted" and is accepted; only
+    /// the contradictory `tls=false,tls-ca-file=...` spelling fails startup,
+    /// because there the CA bundle would be inert.
     pub fn parse_remote_clusters(&self) -> anyhow::Result<Vec<RemoteClusterConfig>> {
         let default_timeout = self.parse_remote_cluster_soft_timeout()?;
         let mut clusters = Vec::with_capacity(self.remote_clusters.len());
@@ -1321,7 +1336,11 @@ impl Cli {
             let mut name = None;
             let mut endpoint = None;
             let mut credential_file = None;
-            let mut tls = false;
+            // TLS on unless the spec explicitly turns it off: the credential,
+            // the query, and the result stream all cross this hop, so plaintext
+            // is an opt-in the operator states and startup logs, never a silent
+            // default (ADR-0071 amendment, federation TLS by default).
+            let mut tls = true;
             let mut tls_ca_file = None;
             let mut skip_unavailable = false;
             let mut soft_timeout = default_timeout;
@@ -2619,6 +2638,104 @@ mod tests {
         // The non-secret fields are still present, so the redaction did not
         // blank the whole struct.
         assert!(rendered.contains("beta") && rendered.contains("beta.internal:9443"));
+    }
+
+    /// A `--remote-cluster` spec with no `tls` key means TLS ON (ADR-0071
+    /// amendment: federation TLS on by default). The old default was plaintext,
+    /// which silently sent the operator credential in cleartext for any spec
+    /// that forgot the key.
+    #[test]
+    fn remote_cluster_without_tls_key_defaults_to_tls_on() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={}",
+            token.path().display()
+        );
+
+        let clusters = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect("a spec with no tls key parses");
+
+        assert_eq!(clusters.len(), 1);
+        assert!(
+            clusters[0].tls,
+            "no tls key must mean TLS on, got {:?}",
+            clusters[0]
+        );
+        assert_eq!(clusters[0].tls_ca_file, None);
+    }
+
+    /// The plaintext escape hatch stays available on its own: `tls=false` needs
+    /// no companion flag, and yields a plaintext remote (which `main.rs` then
+    /// warns about via `warn_plaintext_federation`).
+    #[test]
+    fn remote_cluster_tls_false_still_yields_plaintext() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tls=false",
+            token.path().display()
+        );
+
+        let clusters = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect("tls=false alone parses");
+
+        assert_eq!(clusters.len(), 1);
+        assert!(
+            !clusters[0].tls,
+            "tls=false must yield a plaintext remote, got {:?}",
+            clusters[0]
+        );
+    }
+
+    /// `tls-ca-file` with no `tls` key means "TLS on, with this CA trusted".
+    /// Under the old plaintext default this exact spec failed startup with the
+    /// inert-CA error, because the CA landed next to an implicit `tls=false`.
+    #[test]
+    fn remote_cluster_ca_file_without_tls_key_now_succeeds() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let ca = tempfile::NamedTempFile::new().expect("temp CA file");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tls-ca-file={}",
+            token.path().display(),
+            ca.path().display()
+        );
+
+        let clusters = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect("tls-ca-file with no tls key must parse now that TLS is the default");
+
+        assert_eq!(clusters.len(), 1);
+        assert!(clusters[0].tls, "the CA must come with TLS on");
+        assert_eq!(clusters[0].tls_ca_file.as_deref(), Some(ca.path()));
+    }
+
+    /// The contradictory spelling still fails startup: an explicit `tls=false`
+    /// next to a `tls-ca-file` leaves the CA bundle inert, so it is a config
+    /// error rather than a silently ignored key.
+    #[test]
+    fn remote_cluster_ca_file_with_explicit_tls_false_fails() {
+        let token = tempfile::NamedTempFile::new().expect("temp credential file");
+        std::fs::write(token.path(), "operator-token\n").expect("write credential");
+        let ca = tempfile::NamedTempFile::new().expect("temp CA file");
+        let spec = format!(
+            "name=eu,endpoint=eu.internal:9443,credential-file={},tls=false,tls-ca-file={}",
+            token.path().display(),
+            ca.path().display()
+        );
+
+        let err = cli(&["--remote-cluster", &spec])
+            .parse_remote_clusters()
+            .expect_err("tls=false with a tls-ca-file must refuse startup");
+
+        assert!(
+            err.to_string()
+                .contains("tls-ca-file was set but tls is off"),
+            "expected the inert-CA error, got: {err}"
+        );
     }
 
     /// A zero (or negative) `--gc-*` duration must be rejected at parse time,

@@ -376,6 +376,14 @@ async fn main() -> anyhow::Result<()> {
         .zip(resolver_bundle.mtls_resolver)
         .map(|(addr, resolver)| ravel_server::MtlsListenerConfig { addr, resolver });
 
+    // Federation TLS is on by default (ADR-0071 amendment), so a remote with
+    // `tls` off is a deliberate operator choice; log it by name once here,
+    // where the resolved remote-cluster config first exists.
+    let remote_clusters = cli
+        .parse_remote_clusters()
+        .context("failed to resolve --remote-cluster settings")?;
+    ravel_server::warn_plaintext_federation(&remote_clusters);
+
     let config = ServerConfig {
         mode: cli.mode,
         listen_http: cli.listen_http,
@@ -443,9 +451,7 @@ async fn main() -> anyhow::Result<()> {
         distrib: cli
             .parse_distrib_settings()
             .context("failed to resolve --distributed-query settings")?,
-        remote_clusters: cli
-            .parse_remote_clusters()
-            .context("failed to resolve --remote-cluster settings")?,
+        remote_clusters,
     };
 
     let running =

@@ -54,6 +54,8 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--fragment-listener <addr>` | | none | The dedicated TLS fragment listener (ADR-0071 amendment decision 1): a fourth listener, alongside `--listen-http`, `--listen-grpc`, and `--mtls-listener`, that terminates TLS in-process and serves `Pinned` intra-cluster fragment fetches ONLY. When set, the public gRPC listener stops serving `Pinned` scope (it keeps serving `Resolve`/federation with ordinary tenant credentials), and this listener rejects `Resolve` outright. Requires `--distributed-query` and all three of `--fragment-tls-cert`/`--fragment-tls-key`/`--fragment-tls-ca`, and must not equal any other listener address (startup refuses an alias). Without this flag the fragment surface stays on the public gRPC listener (the pre-amendment layout), so distribution keeps working during a rolling deploy. See [Dedicated fragment listener TLS](#dedicated-fragment-listener-tls-adr-0071-amendment-decision-1). |
 | `--fragment-tls-cert <path>` | | none | PEM server certificate the dedicated fragment listener presents. Operator-provisioned; Ravel mints no certificates. Must carry a `ravel-fragment` dNSName SAN, the one fixed name every coordinator verifies against. Read once at startup; rotation is a rolling restart. Required with `--fragment-listener`. |
 | `--fragment-tls-key <path>` | | none | PEM private key for `--fragment-tls-cert`. Operator-provisioned; read once at startup. Required with `--fragment-listener`. |
+| `--remote-cluster <spec>` | | none, repeatable | A remote cluster this coordinator federates queries out to (ADR-0071 cross-cluster federation), as a comma-separated `key=value` spec. Required keys: `name`, `endpoint` (`host:port`), `credential-file` (a file holding the operator bearer token this coordinator presents to that remote). Optional: `tls` (`true`/`false`, **default `true`**), `tls-ca-file`, `skip-unavailable` (`true`/`false`, default `false`), `soft-timeout`. TLS on verifies the remote against the system trust roots, plus `tls-ca-file` when set; a spec carrying `tls-ca-file` and no `tls` key means "TLS on, with this CA trusted". `tls=false` is the plaintext escape hatch, and startup logs a `SECURITY:` WARN naming that remote and endpoint. `tls=false` together with `tls-ca-file` fails startup: the CA bundle would be inert. See [Federating to a remote cluster](#federating-to-a-remote-cluster-adr-0071). |
+| `--remote-cluster-soft-timeout <duration>` | | `ravel_query::distrib::DEFAULT_REMOTE_SOFT_TIMEOUT` | The default per-remote soft timeout for a federated fetch: a remote that does not answer within this bound is treated as unavailable (failing the query, or skipped, per that remote's `skip-unavailable`). A `soft-timeout` key on an individual `--remote-cluster` overrides it for that remote. A zero duration fails startup. |
 | `--fragment-tls-ca <path>` | | none | PEM CA bundle the coordinator's outbound fragment dial verifies remote workers against. The CA is dedicated to this surface, so any certificate it signed means "a fragment worker of this cluster"; per-process certificate identity is deliberately not required (the capability, not the certificate, is the authorization). Read once at startup. Required with `--fragment-listener`. |
 
 `--store s3` without `--s3-bucket`/`--s3-access-key`/`--s3-secret-key` (through
@@ -1164,6 +1166,46 @@ time: nodes that have the flag advertise their TLS fragment endpoint and refuse
 `Pinned` on the public port, while nodes that do not keep serving it there.
 Results stay byte-identical throughout; only which nodes a slice can fan out to
 changes during the roll.
+
+## Federating to a remote cluster (ADR-0071)
+
+`--remote-cluster` points this coordinator at another Ravel cluster's fragment
+`SeriesFetch` surface. One flag per remote:
+
+```
+ravel-server --mode query \
+  --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token \
+  --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,tls-ca-file=/etc/ravel/apac-ca.pem,soft-timeout=15s
+```
+
+The credential is an operator secret read from a file, never an inline value:
+it is the principal the remote sees. A federated query never forwards the
+calling client's credential across a cluster boundary.
+
+### TLS is the default
+
+Neither spec above names `tls`, and both dial `https://`. TLS is on unless the
+spec says otherwise, verifying the remote against the system trust roots plus
+`tls-ca-file` when one is set. A spec that carries `tls-ca-file` and no `tls`
+key means "TLS on, with this CA trusted"; there is no need to pair the two.
+
+`tls=false` is the escape hatch for a hop that is already encrypted and
+access-controlled at a lower layer (a service mesh sidecar, an encrypted
+tunnel). It is an explicit, logged choice: startup emits a warning naming that
+remote, because with TLS off the operator bearer credential, the federated
+query, and every returned result stream cross the network in cleartext, where
+anyone on the path can read and replay the credential.
+
+```
+WARN SECURITY: --remote-cluster 'eu' is configured with tls=off. The operator
+bearer credential presented to this remote, every federated query, and every
+returned result stream travel in cleartext to 'eu.internal:9443'. ...
+```
+
+One such line is logged per plaintext remote; a TLS remote logs nothing. If you
+see this warning and did not intend plaintext, drop the `tls=false` key. Setting
+`tls=false` together with `tls-ca-file` fails startup outright, since the CA
+bundle would be inert.
 
 ## Store qualification (ADR-0050 section 6)
 

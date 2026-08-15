@@ -129,6 +129,31 @@ pub fn warn_mtls_trusted_header(header_name: Option<&str>) {
     }
 }
 
+/// Warn loudly, once per remote, when a `--remote-cluster` is configured for
+/// plaintext federation (ADR-0071 amendment: federation TLS on by default;
+/// plaintext is an explicit, logged choice). TLS is the default for a spec that
+/// carries no `tls` key, so reaching this warning means the operator wrote
+/// `tls=false` and every hop to that remote (the operator bearer credential,
+/// the federated query, the returned result stream) crosses the network in
+/// cleartext. No-op for a remote with TLS on. Call this once at startup, after
+/// `Cli::parse_remote_clusters`.
+pub fn warn_plaintext_federation(clusters: &[config::RemoteClusterConfig]) {
+    for cluster in clusters.iter().filter(|c| !c.tls) {
+        tracing::warn!(
+            remote_cluster = %cluster.name,
+            endpoint = %cluster.endpoint,
+            "SECURITY: --remote-cluster '{}' is configured with tls=off. The operator bearer \
+             credential presented to this remote, every federated query, and every returned \
+             result stream travel in cleartext to '{}'. Anyone on that network path can read and \
+             replay the credential. Use this only on a path that is already encrypted and \
+             access-controlled at a lower layer; the default (tls=on) verifies the remote against \
+             the system trust roots, plus tls-ca-file when set.",
+            cluster.name,
+            cluster.endpoint
+        );
+    }
+}
+
 /// The dedicated listener the mTLS resolver runs on (ADR-0050 section 1).
 /// `resolver` is wired only into this listener's router chain; the public
 /// HTTP and gRPC/Flight chains are built from `ServerConfig::tenant_resolver`
