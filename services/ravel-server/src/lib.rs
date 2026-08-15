@@ -329,9 +329,9 @@ pub struct ServerConfig {
     pub idle_tenant_state_ttl: Duration,
     /// The resolved ADR-0071 distributed read fan-out settings,
     /// `Some` only under `--distributed-query` (which requires
-    /// `--fragment-auth-token-file`). In a query-serving mode
+    /// `--fragment-key-file`). In a query-serving mode
     /// ([`Mode::All`]/[`Mode::Query`]) [`start`] then registers the
-    /// cluster-internal, token-guarded fragment `SeriesFetch` service on the
+    /// cluster-internal, capability-guarded fragment `SeriesFetch` service on the
     /// gRPC listener (never the public HTTP or mTLS listeners), spawns the
     /// query-worker heartbeat under `sys/query/workers/`, and wires a
     /// coordinator [`ravel_query::distrib::Distributed`] context into the query
@@ -879,8 +879,11 @@ pub async fn start(
         let metrics = Arc::new(distrib::FragmentMetrics::new());
         let admission =
             distrib::FragmentAdmission::new(settings.max_inflight_fragments, metrics.clone());
+        // Shared by the worker (verifies against every key) and the coordinator
+        // (mints under the first): ADR-0071 amendment, decision 2.
+        let fragment_keys = Arc::new(settings.fragment_keys.clone());
         let service = distrib::FragmentService::new(
-            settings.auth_token.clone(),
+            fragment_keys.clone(),
             config.tenant_resolver.clone(),
             admission,
             catalog.clone(),
@@ -892,7 +895,7 @@ pub async fn start(
         let fetcher = Arc::new(distrib::RoutingSliceFetcher::new(
             distrib_self_id.clone(),
             distrib_live_workers.clone(),
-            settings.auth_token.clone(),
+            fragment_keys,
             service.clone(),
             metrics.clone(),
         ));
@@ -1317,10 +1320,13 @@ pub async fn start(
             .as_ref()
             .filter(|_| matches!(config.mode, Mode::All | Mode::Query))
             .map(|settings| {
+                // The Flight SQL lane derives its ticket-signing key from a
+                // stable cluster secret; feed it the fragment-key-derived secret
+                // so the whole cluster agrees (ADR-0071 amendment, decision 2).
                 sql_distrib::distributed_flight_config(
                     distrib_live_workers.clone(),
                     settings.thresholds,
-                    &settings.auth_token,
+                    &settings.sql_ticket_secret(),
                 )
             });
         sql_state

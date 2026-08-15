@@ -4,8 +4,9 @@
 //! into a running cluster surface. It has three parts:
 //!
 //! * [`FragmentService`] -- the worker side. It implements the generated
-//!   `SeriesFetch` gRPC service, guarding every call with a shared
-//!   cluster-internal bearer token and admitting it against a distinct
+//!   `SeriesFetch` gRPC service, guarding every `Pinned` call with a per-tenant,
+//!   per-query fragment capability (ADR-0071 amendment, decision 2) and
+//!   admitting it against a distinct
 //!   [`FragmentAdmission`] class (never the client-query cap). Per request it
 //!   resolves a snapshot for the request's tenant over the request's event-time
 //!   window, builds an interim content-hash
@@ -83,16 +84,77 @@ use uuid::Uuid;
 /// the kernel's TCP SYN timeout (often over two minutes).
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The closed reason label for a rejected fragment capability (ADR-0071
+/// amendment, decision 2). Every `Pinned` fetch's capability check that fails
+/// increments exactly one of these; the set is fixed and cardinality-safe, so it
+/// is a legitimate metric label (ADR-0044 section 4). A signal mismatch counts
+/// as [`CapabilityReject::QueryMismatch`]: the signal is part of a query's
+/// identity, so a capability whose signal differs from the request's was not
+/// minted for this query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityReject {
+    /// The request carried no fragment capability at all.
+    Missing,
+    /// The capability was malformed (wrong length) or its MAC did not verify
+    /// under any configured key.
+    BadMac,
+    /// The capability's `expires_unix_ns` is at or before the injected clock.
+    Expired,
+    /// The request's `tenant_hash` did not equal the capability's claimed tenant.
+    TenantMismatch,
+    /// The request's `query_id` or `signal` did not equal the capability's
+    /// claims.
+    QueryMismatch,
+}
+
+impl CapabilityReject {
+    /// Every reason, in the fixed label order the counters are indexed by.
+    const ALL: [CapabilityReject; 5] = [
+        CapabilityReject::Missing,
+        CapabilityReject::BadMac,
+        CapabilityReject::Expired,
+        CapabilityReject::TenantMismatch,
+        CapabilityReject::QueryMismatch,
+    ];
+
+    /// The stable `reason` metric label value.
+    pub fn reason(self) -> &'static str {
+        match self {
+            CapabilityReject::Missing => "missing",
+            CapabilityReject::BadMac => "bad_mac",
+            CapabilityReject::Expired => "expired",
+            CapabilityReject::TenantMismatch => "tenant_mismatch",
+            CapabilityReject::QueryMismatch => "query_mismatch",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            CapabilityReject::Missing => 0,
+            CapabilityReject::BadMac => 1,
+            CapabilityReject::Expired => 2,
+            CapabilityReject::TenantMismatch => 3,
+            CapabilityReject::QueryMismatch => 4,
+        }
+    }
+}
+
 /// The `ravel_distrib_*` metric family (ADR-0071). Process-global
 /// atomics, read at `/metrics` scrape time. Carries only the closed `mode`
 /// label at render time; never a per-shard, per-worker, or per-tenant label
 /// (ADR-0044 section 4).
 #[derive(Debug)]
 pub struct FragmentMetrics {
-    /// Inbound fragment requests served after passing token auth and admission.
+    /// Inbound fragment requests served after passing capability auth and
+    /// admission.
     fragment_requests_total: AtomicU64,
-    /// Inbound fragment requests refused for a missing or invalid bearer token.
+    /// Inbound cross-cluster federation (resolve-scope) requests refused because
+    /// the presented credential is not a valid tenant credential.
     fragment_auth_failures_total: AtomicU64,
+    /// Inbound `Pinned` fetches refused by capability verification, indexed by
+    /// [`CapabilityReject`] (ADR-0071 amendment, decision 2). Rendered under the
+    /// closed `reason` label.
+    fragment_capability_rejects: [AtomicU64; 5],
     /// Fragment requests currently holding an admission permit (gauge).
     fragment_inflight: AtomicU64,
     /// Slices this coordinator executed locally (self-mapped, no network hop).
@@ -117,6 +179,7 @@ impl Default for FragmentMetrics {
         FragmentMetrics {
             fragment_requests_total: AtomicU64::new(0),
             fragment_auth_failures_total: AtomicU64::new(0),
+            fragment_capability_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_inflight: AtomicU64::new(0),
             slices_local_total: AtomicU64::new(0),
             slices_remote_total: AtomicU64::new(0),
@@ -140,6 +203,10 @@ impl FragmentMetrics {
     fn record_fragment_auth_failure(&self) {
         self.fragment_auth_failures_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_capability_reject(&self, reason: CapabilityReject) {
+        self.fragment_capability_rejects[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_inflight(&self) {
@@ -188,6 +255,18 @@ impl FragmentMetrics {
 
     pub fn fragment_auth_failures_total(&self) -> u64 {
         self.fragment_auth_failures_total.load(Ordering::Relaxed)
+    }
+
+    /// The count of `Pinned` fetches rejected for `reason` (ADR-0071 amendment,
+    /// decision 2).
+    pub fn capability_rejects(&self, reason: CapabilityReject) -> u64 {
+        self.fragment_capability_rejects[reason.index()].load(Ordering::Relaxed)
+    }
+
+    /// The per-reason capability-reject counts paired with their stable `reason`
+    /// label, for the `/metrics` renderer to emit one series per reason.
+    pub fn capability_rejects_by_reason(&self) -> [(&'static str, u64); 5] {
+        CapabilityReject::ALL.map(|reason| (reason.reason(), self.capability_rejects(reason)))
     }
 
     pub fn fragment_inflight(&self) -> u64 {
@@ -306,7 +385,12 @@ pub struct FragmentService {
 }
 
 struct FragmentServiceInner {
-    auth_token: String,
+    /// The cluster fragment keys (ADR-0071 amendment, decision 2). The worker
+    /// verifies a `Pinned` fetch's capability MAC against ALL of them, so key
+    /// rotation needs no flag day: a capability minted under any current key
+    /// verifies. Only the first mints, but the mint side lives on the
+    /// coordinator ([`RoutingSliceFetcher`]); a pure worker never reads index 0.
+    fragment_keys: Arc<Vec<[u8; 32]>>,
     /// The deployment's ordinary tenant resolver chain. Used only for
     /// cross-cluster federation (resolve-scope) requests, where a federating
     /// coordinator's credential is an ordinary tenant credential and the tenant
@@ -328,7 +412,7 @@ type FragmentStream =
 impl FragmentService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        auth_token: String,
+        fragment_keys: Arc<Vec<[u8; 32]>>,
         tenant_resolver: Arc<dyn TenantResolver>,
         admission: FragmentAdmission,
         catalog: Arc<Catalog>,
@@ -339,7 +423,7 @@ impl FragmentService {
     ) -> Self {
         FragmentService {
             inner: Arc::new(FragmentServiceInner {
-                auth_token,
+                fragment_keys,
                 tenant_resolver,
                 admission,
                 catalog,
@@ -358,28 +442,85 @@ impl FragmentService {
         SeriesFetchServer::new(self.clone())
     }
 
-    /// Constant-time bearer-token check against the shared cluster-internal
-    /// token. A missing header, a non-`Bearer` scheme, or an unequal token all
-    /// refuse the request; the comparison is constant-time to avoid leaking the
-    /// token through timing.
-    fn check_auth(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), tonic::Status> {
-        let presented = metadata
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .map(str::trim);
-        let ok = match presented {
-            Some(token) => constant_time_eq(token.as_bytes(), self.inner.auth_token.as_bytes()),
-            None => false,
+    /// Stateless verification of a `Pinned` fetch's fragment capability
+    /// (ADR-0071 amendment, decision 2). Replaces the shared bearer-token check.
+    ///
+    /// The capability travels in `request.fragment_capability`, never in gRPC
+    /// metadata. Verification recomputes the keyed-BLAKE3 MAC over the claims and
+    /// compares it in constant time against ALL configured fragment keys (so a
+    /// capability minted under any current key verifies, and rotation needs no
+    /// flag day), checks `expires_unix_ns` against the injected clock, and
+    /// requires the request's `tenant_hash`, `signal`, and `query_id` to equal
+    /// the claims. No store read, no cache, no coordination, no durable state.
+    ///
+    /// Every failure is a typed [`CapabilityReject`], counted under its closed
+    /// `reason` label, and mapped to `Unauthenticated`. The checks run in a fixed
+    /// order (present, MAC, expiry, tenant, query) so a capability that fails
+    /// multiple ways is attributed to the first, most-fundamental reason.
+    fn verify_capability(&self, request: &pb::FetchRequest) -> Result<(), tonic::Status> {
+        let reject = |reason: CapabilityReject, message: &'static str| {
+            self.inner.metrics.record_capability_reject(reason);
+            Err(tonic::Status::unauthenticated(message))
         };
-        if ok {
-            Ok(())
-        } else {
-            self.inner.metrics.record_fragment_auth_failure();
-            Err(tonic::Status::unauthenticated(
-                "fragment request rejected: missing or invalid bearer token",
-            ))
+
+        if request.fragment_capability.is_empty() {
+            return reject(
+                CapabilityReject::Missing,
+                "fragment request rejected: missing capability",
+            );
         }
+        let (claims, presented_mac) = match codec::decode_capability(&request.fragment_capability) {
+            Ok(parts) => parts,
+            Err(_) => {
+                return reject(
+                    CapabilityReject::BadMac,
+                    "fragment request rejected: malformed capability",
+                );
+            }
+        };
+        // Constant-time MAC compare against every configured key; a match under
+        // any current key accepts. `constant_time_eq` already runs without an
+        // early exit for equal-length inputs.
+        let mac_ok = self
+            .inner
+            .fragment_keys
+            .iter()
+            .any(|key| constant_time_eq(&codec::capability_mac(key, &claims), &presented_mac));
+        if !mac_ok {
+            return reject(
+                CapabilityReject::BadMac,
+                "fragment request rejected: capability MAC did not verify",
+            );
+        }
+        // Expiry reuses the deadline the protocol already enforces cluster-wide.
+        // A capability whose expiry is at or before now is dead.
+        if claims.expires_unix_ns <= self.inner.clock.now_ns() {
+            return reject(
+                CapabilityReject::Expired,
+                "fragment request rejected: capability expired",
+            );
+        }
+        // The wire tenant must equal the authorized tenant: a capability minted
+        // for one tenant cannot authorize a fetch that names another. This is
+        // the F-1 cross-tenant boundary.
+        if request.tenant_hash.as_slice() != claims.tenant_hash.as_slice() {
+            return reject(
+                CapabilityReject::TenantMismatch,
+                "fragment request rejected: capability tenant does not match request",
+            );
+        }
+        // The query id and signal must equal the claims: a capability minted for
+        // one query cannot authorize another (the signal is part of a query's
+        // identity, so a signal mismatch is a query mismatch).
+        if request.query_id.as_slice() != claims.query_id.as_slice()
+            || request.signal != claims.signal
+        {
+            return reject(
+                CapabilityReject::QueryMismatch,
+                "fragment request rejected: capability query does not match request",
+            );
+        }
+        Ok(())
     }
 
     /// Authenticate a cross-cluster federation (resolve-scope) request and
@@ -590,21 +731,22 @@ impl SeriesFetch for FragmentService {
     ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
         let (metadata, _extensions, mut inner) = request.into_parts();
         // Two distinct trust models share this surface (ADR-0071 security):
-        //  - Pinned scope (intra-cluster fan-out): the shared cluster-internal
-        //    fragment token, with the tenant taken from the wire. Coordinator
-        //    and worker are one trust domain, and the token conveys no
-        //    privilege over the bucket's S3 credentials.
+        //  - Pinned scope (intra-cluster fan-out): a per-tenant, per-query
+        //    fragment capability carried in the request, with the tenant taken
+        //    from the wire. Coordinator and worker are one trust domain, and the
+        //    capability conveys no privilege over the bucket's S3 credentials
+        //    (ADR-0071 amendment, decision 2).
         //  - Resolve scope (cross-cluster federation): the presented credential
         //    is an ordinary tenant credential. The tenant is resolved from it
         //    through the normal resolver chain and OVERRIDES any wire
         //    tenant_hash, so a federating cluster reads only the tenant its
-        //    credential authorizes. The fragment token is never accepted here.
+        //    credential authorizes. A fragment capability is never accepted here.
         match &inner.scope {
             Some(pb::fetch_request::Scope::Resolve(_)) => {
                 let tenant = self.resolve_federation_tenant(&metadata)?;
                 inner.tenant_hash = tenant.0.to_vec();
             }
-            _ => self.check_auth(&metadata)?,
+            _ => self.verify_capability(&inner)?,
         }
         let Some(_permit) = self.inner.admission.acquire().await else {
             return Err(tonic::Status::unavailable("fragment admission unavailable"));
@@ -758,8 +900,11 @@ pub struct RoutingSliceFetcher {
     self_id: Arc<OnceLock<Uuid>>,
     /// The live worker set, refreshed by [`spawn_heartbeat`]. Starts empty.
     live_workers: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>>,
-    /// The shared cluster-internal bearer token presented on each dispatch.
-    auth_token: String,
+    /// The cluster fragment keys (ADR-0071 amendment, decision 2). The first key
+    /// mints; every slice of a query gets a capability under it, including
+    /// re-dispatches. Held as an `Arc` shared with the local [`FragmentService`],
+    /// which verifies against the whole list.
+    fragment_keys: Arc<Vec<[u8; 32]>>,
     /// The local fragment surface, used for self-mapped and fallback slices.
     local: FragmentService,
     /// Cached `tonic` channels, keyed by endpoint (a channel is cheap to clone
@@ -772,18 +917,41 @@ impl RoutingSliceFetcher {
     pub fn new(
         self_id: Arc<OnceLock<Uuid>>,
         live_workers: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>>,
-        auth_token: String,
+        fragment_keys: Arc<Vec<[u8; 32]>>,
         local: FragmentService,
         metrics: Arc<FragmentMetrics>,
     ) -> Self {
         RoutingSliceFetcher {
             self_id,
             live_workers,
-            auth_token,
+            fragment_keys,
             local,
             channels: Mutex::new(HashMap::new()),
             metrics,
         }
+    }
+
+    /// Mint the `Pinned` fragment capability for a slice under the first
+    /// (minting) fragment key (ADR-0071 amendment, decision 2). The claims come
+    /// from the request the coordinator already threaded: its `tenant_hash`,
+    /// `signal`, `query_id`, and absolute `deadline_unix_ns` as the expiry. A
+    /// query has exactly one tenant/signal/query, so every slice of a query mints
+    /// a byte-identical capability, including re-dispatches. Returns `None` when
+    /// no key is configured or the wire tenant/query id is not 16 bytes; the
+    /// worker then rejects the missing/short capability and the coordinator falls
+    /// back to local execution, never a wrong answer.
+    fn mint_capability(&self, request: &pb::FetchRequest) -> Option<Vec<u8>> {
+        let key = self.fragment_keys.first()?;
+        let tenant_hash: [u8; 16] = request.tenant_hash.as_slice().try_into().ok()?;
+        let query_id: [u8; 16] = request.query_id.as_slice().try_into().ok()?;
+        let claims = codec::FragmentClaims {
+            capability_version: codec::CAPABILITY_VERSION,
+            tenant_hash,
+            signal: request.signal,
+            query_id,
+            expires_unix_ns: request.deadline_unix_ns,
+        };
+        Some(codec::mint_capability(key, &claims))
     }
 
     /// Rendezvous-rank the live worker set for a slice, top owner first.
@@ -886,14 +1054,17 @@ impl RoutingSliceFetcher {
     async fn remote_fetch(
         &self,
         endpoint: &str,
-        request: pb::FetchRequest,
+        mut request: pb::FetchRequest,
     ) -> Result<SliceResponse, DistribError> {
         let channel = self.channel(endpoint).await?;
-        let mut tonic_request = tonic::Request::new(request);
-        let value = format!("Bearer {}", self.auth_token)
-            .parse()
-            .map_err(|_| DistribError::Transport("invalid bearer token metadata".to_string()))?;
-        tonic_request.metadata_mut().insert("authorization", value);
+        // Mint and attach the per-query capability (ADR-0071 amendment, decision
+        // 2): it travels in the request body, not in gRPC metadata. Every slice
+        // of a query, including this re-dispatch, mints a byte-identical
+        // capability under the first fragment key.
+        if let Some(capability) = self.mint_capability(&request) {
+            request.fragment_capability = capability;
+        }
+        let tonic_request = tonic::Request::new(request);
         let mut client = SeriesFetchClient::new(channel);
         let response = client
             .fetch(tonic_request)
@@ -1160,6 +1331,36 @@ mod tests {
         codec::signal_to_u32(Signal::Metrics)
     }
 
+    /// The minting/verify key every test that does not exercise rotation uses.
+    const TEST_KEY: [u8; 32] = [0x11; 32];
+
+    /// The single-key configuration for a test service or coordinator.
+    fn test_keys() -> Arc<Vec<[u8; 32]>> {
+        Arc::new(vec![TEST_KEY])
+    }
+
+    /// Mint a capability for the request's own `(tenant, signal, query_id)` with
+    /// `expires` under `key`, exactly as a coordinator does. Used to hand a
+    /// worker-side `fetch` a valid or a deliberately-mismatched capability.
+    fn mint(
+        key: &[u8; 32],
+        tenant_hash: [u8; 16],
+        signal: u32,
+        query_id: [u8; 16],
+        expires_unix_ns: i64,
+    ) -> Vec<u8> {
+        codec::mint_capability(
+            key,
+            &codec::FragmentClaims {
+                capability_version: codec::CAPABILITY_VERSION,
+                tenant_hash,
+                signal,
+                query_id,
+                expires_unix_ns,
+            },
+        )
+    }
+
     /// A minimal pinned `FetchRequest` for `tenant_hash`, with one segment per
     /// shard in `shards` (each with a distinct content hash), enough to drive
     /// routing and the local no-hop fetch.
@@ -1185,7 +1386,7 @@ mod tests {
     }
 
     /// A resolver that never authenticates any credential: the intra-cluster
-    /// pinned-scope tests only exercise the shared fragment token, never the
+    /// pinned-scope tests only exercise capability verification, never the
     /// tenant resolver, so an empty one keeps them focused.
     fn empty_resolver() -> Arc<dyn TenantResolver> {
         Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
@@ -1200,7 +1401,7 @@ mod tests {
         let admission = FragmentAdmission::new(8, metrics.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         FragmentService::new(
-            "cluster-token".to_string(),
+            test_keys(),
             empty_resolver(),
             admission,
             catalog,
@@ -1286,38 +1487,347 @@ mod tests {
         assert_eq!(metrics.fragment_inflight(), 0);
     }
 
+    /// A worker-side `FragmentService` with a fixed clock and the given keys, for
+    /// deterministic capability-verification tests (ADR-0071 amendment,
+    /// decision 2).
+    fn capability_service(
+        now_ns: i64,
+        keys: Arc<Vec<[u8; 32]>>,
+        metrics: Arc<FragmentMetrics>,
+    ) -> FragmentService {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        FragmentService::new(
+            keys,
+            empty_resolver(),
+            FragmentAdmission::new(8, metrics.clone()),
+            catalog,
+            store,
+            None,
+            Arc::new(FixedClock(now_ns)),
+            metrics,
+        )
+    }
+
+    /// A pinned single-shard request carrying `query_id` and `capability`.
+    fn pinned_with_cap(
+        tenant_hash: [u8; 16],
+        query_id: [u8; 16],
+        capability: Vec<u8>,
+    ) -> pb::FetchRequest {
+        let mut req = pinned_request(tenant_hash, &[0]);
+        req.query_id = query_id.to_vec();
+        req.fragment_capability = capability;
+        req
+    }
+
+    /// Drive the worker's `fetch` on a `Pinned` request and decode its frames.
+    /// Returns the transport-level `Status` on a rejected capability.
+    async fn pinned_fetch(
+        service: &FragmentService,
+        request: pb::FetchRequest,
+    ) -> Result<SliceResponse, tonic::Status> {
+        let response = service.fetch(tonic::Request::new(request)).await?;
+        let mut frames = Vec::new();
+        let mut stream = response.into_inner();
+        while let Some(frame) = stream.next().await {
+            frames.push(frame.expect("in-crate stream never errors"));
+        }
+        Ok(decode_slice_frames(frames).expect("frames decode"))
+    }
+
+    /// A valid capability naming the request's own tenant, signal, and query is
+    /// accepted: the fetch is admitted (no `Unauthenticated`), the request is
+    /// counted, and no reject counter fires. (An empty store yields a non-Ok
+    /// slice status, which is orthogonal to authorization.)
     #[tokio::test]
-    async fn missing_or_wrong_token_is_rejected_valid_token_passes() {
+    async fn valid_capability_is_accepted() {
+        let now = 1_000;
         let metrics = Arc::new(FragmentMetrics::new());
-        let service = test_service(metrics.clone());
+        let service = capability_service(now, test_keys(), metrics.clone());
+        let tenant = [1u8; 16];
+        let query = [2u8; 16];
+        let cap = mint(&TEST_KEY, tenant, metrics_signal(), query, now + 1_000);
 
-        let mut missing = tonic::Request::new(pinned_request([1u8; 16], &[0]));
-        let _ = &mut missing;
-        let err = service
-            .check_auth(missing.metadata())
-            .expect_err("missing token rejected");
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-
-        let mut wrong = tonic::Request::new(pinned_request([1u8; 16], &[0]));
-        wrong
-            .metadata_mut()
-            .insert("authorization", "Bearer nope".parse().unwrap());
-        let err = service
-            .check_auth(wrong.metadata())
-            .expect_err("wrong token rejected");
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-
-        let mut ok = tonic::Request::new(pinned_request([1u8; 16], &[0]));
-        ok.metadata_mut()
-            .insert("authorization", "Bearer cluster-token".parse().unwrap());
-        service
-            .check_auth(ok.metadata())
-            .expect("valid token accepted");
-
+        pinned_fetch(&service, pinned_with_cap(tenant, query, cap))
+            .await
+            .expect("valid capability is accepted, not an Unauthenticated status");
         assert_eq!(
-            metrics.fragment_auth_failures_total(),
-            2,
-            "both rejections counted, the acceptance not"
+            metrics.fragment_requests_total(),
+            1,
+            "the request was served"
+        );
+        for reason in CapabilityReject::ALL {
+            assert_eq!(
+                metrics.capability_rejects(reason),
+                0,
+                "no reject fires on a valid capability"
+            );
+        }
+    }
+
+    /// Each reject reason fires independently, increments only its own labeled
+    /// counter, refuses the request with `Unauthenticated`, and short-circuits
+    /// before the request is served (so `fragment_requests_total` stays 0).
+    #[tokio::test]
+    async fn each_capability_reject_reason_is_labeled_and_counted() {
+        let now = 1_000;
+        let tenant = [1u8; 16];
+        let query = [2u8; 16];
+        let signal = metrics_signal();
+
+        // A distinct (service, request) per reason so counters do not interleave.
+        struct Case {
+            reason: CapabilityReject,
+            request: pb::FetchRequest,
+        }
+        // missing: no capability at all.
+        let missing = pinned_with_cap(tenant, query, Vec::new());
+        // bad MAC: a valid capability with one flipped byte.
+        let mut tampered = mint(&TEST_KEY, tenant, signal, query, now + 1_000);
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let bad_mac = pinned_with_cap(tenant, query, tampered);
+        // expired: expiry at the clock (rejected as `<=`).
+        let expired = pinned_with_cap(tenant, query, mint(&TEST_KEY, tenant, signal, query, now));
+        // tenant mismatch: capability names a different tenant.
+        let tenant_mismatch = pinned_with_cap(
+            [9u8; 16],
+            query,
+            mint(&TEST_KEY, tenant, signal, query, now + 1_000),
+        );
+        // query mismatch: capability names a different query id.
+        let query_mismatch = pinned_with_cap(
+            tenant,
+            [8u8; 16],
+            mint(&TEST_KEY, tenant, signal, query, now + 1_000),
+        );
+
+        let cases = [
+            Case {
+                reason: CapabilityReject::Missing,
+                request: missing,
+            },
+            Case {
+                reason: CapabilityReject::BadMac,
+                request: bad_mac,
+            },
+            Case {
+                reason: CapabilityReject::Expired,
+                request: expired,
+            },
+            Case {
+                reason: CapabilityReject::TenantMismatch,
+                request: tenant_mismatch,
+            },
+            Case {
+                reason: CapabilityReject::QueryMismatch,
+                request: query_mismatch,
+            },
+        ];
+
+        for case in cases {
+            let metrics = Arc::new(FragmentMetrics::new());
+            let service = capability_service(now, test_keys(), metrics.clone());
+            let err = pinned_fetch(&service, case.request)
+                .await
+                .expect_err("a mismatched capability is rejected");
+            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(
+                metrics.capability_rejects(case.reason),
+                1,
+                "{} reject fires exactly once",
+                case.reason.reason()
+            );
+            // Only the expected reason fired.
+            for other in CapabilityReject::ALL {
+                if other != case.reason {
+                    assert_eq!(
+                        metrics.capability_rejects(other),
+                        0,
+                        "{} must not fire for a {} case",
+                        other.reason(),
+                        case.reason.reason()
+                    );
+                }
+            }
+            assert_eq!(
+                metrics.fragment_requests_total(),
+                0,
+                "a rejected capability is refused before the request is served"
+            );
+        }
+    }
+
+    /// The epic's F-1 reproduction, now a permanent test: a capability MINTED for
+    /// tenant A, presented on a `Pinned` fetch that NAMES tenant B, is rejected
+    /// as a tenant mismatch before any snapshot resolve or admission
+    /// (`fragment_requests_total` stays 0). This is the concrete cross-tenant
+    /// proof: a held capability for one tenant grants no read of another.
+    #[tokio::test]
+    async fn capability_for_tenant_a_cannot_fetch_tenant_b() {
+        let now = 1_000;
+        let tenant_a = [0xAAu8; 16];
+        let tenant_b = [0xBBu8; 16];
+        let query = [7u8; 16];
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = capability_service(now, test_keys(), metrics.clone());
+
+        // A genuine, MAC-valid, unexpired capability for tenant A.
+        let cap_for_a = mint(&TEST_KEY, tenant_a, metrics_signal(), query, now + 1_000);
+        // Present it on a fetch that names tenant B on the wire.
+        let request = pinned_with_cap(tenant_b, query, cap_for_a);
+
+        let err = pinned_fetch(&service, request)
+            .await
+            .expect_err("a tenant-A capability cannot authorize a tenant-B fetch");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            metrics.capability_rejects(CapabilityReject::TenantMismatch),
+            1,
+            "the cross-tenant attempt is a tenant mismatch"
+        );
+        assert_eq!(
+            metrics.fragment_requests_total(),
+            0,
+            "rejected before any snapshot resolve or admission"
+        );
+    }
+
+    /// Key rotation: a file with two keys mints under the first but verifies a
+    /// capability minted under EITHER, so a rolling rotation needs no flag day.
+    #[tokio::test]
+    async fn rotation_verifies_capability_under_any_configured_key() {
+        let now = 1_000;
+        let key_new = [0x22u8; 32];
+        let key_old = [0x33u8; 32];
+        let keys = Arc::new(vec![key_new, key_old]);
+        let tenant = [4u8; 16];
+        let query = [5u8; 16];
+        let signal = metrics_signal();
+
+        // Minted under the new (first) key: accepted.
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = capability_service(now, keys.clone(), metrics.clone());
+        pinned_fetch(
+            &service,
+            pinned_with_cap(
+                tenant,
+                query,
+                mint(&key_new, tenant, signal, query, now + 1_000),
+            ),
+        )
+        .await
+        .expect("capability under the minting key verifies");
+        assert_eq!(metrics.capability_rejects(CapabilityReject::BadMac), 0);
+
+        // Minted under the old (still-listed) key: also accepted, so an in-flight
+        // capability survives the roll that prepends the new key.
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = capability_service(now, keys, metrics.clone());
+        pinned_fetch(
+            &service,
+            pinned_with_cap(
+                tenant,
+                query,
+                mint(&key_old, tenant, signal, query, now + 1_000),
+            ),
+        )
+        .await
+        .expect("capability under a retained rotation key verifies");
+        assert_eq!(metrics.capability_rejects(CapabilityReject::BadMac), 0);
+    }
+
+    /// The coordinator mints under the FIRST key: a `RoutingSliceFetcher` holding
+    /// `[key_new, key_old]` produces a capability that verifies under `key_new`,
+    /// never `key_old`. Pairs with the verify-any-key rotation test above.
+    #[test]
+    fn coordinator_mints_under_the_first_key() {
+        let key_new = [0x22u8; 32];
+        let key_old = [0x33u8; 32];
+        let metrics = Arc::new(FragmentMetrics::new());
+        let fetcher = RoutingSliceFetcher::new(
+            Arc::new(OnceLock::new()),
+            Arc::new(RwLock::new(Arc::new(Vec::new()))),
+            Arc::new(vec![key_new, key_old]),
+            test_service(metrics.clone()),
+            metrics,
+        );
+        let tenant = [4u8; 16];
+        let query = [5u8; 16];
+        let mut request = pinned_with_cap(tenant, query, Vec::new());
+        request.deadline_unix_ns = 9_000;
+        let minted = fetcher
+            .mint_capability(&request)
+            .expect("coordinator mints for a well-formed request");
+        let (claims, mac) = codec::decode_capability(&minted).expect("decode");
+        assert_eq!(claims.tenant_hash, tenant);
+        assert_eq!(claims.query_id, query);
+        assert_eq!(
+            claims.expires_unix_ns, 9_000,
+            "expiry is the query deadline"
+        );
+        assert_eq!(
+            codec::capability_mac(&key_new, &claims),
+            mac,
+            "minted under the first key"
+        );
+        assert_ne!(
+            codec::capability_mac(&key_old, &claims),
+            mac,
+            "not under the second key"
+        );
+    }
+
+    /// A worker reporting `protocol_version` 1 is excluded from
+    /// `ranked_owners`'s candidate set when the coordinator speaks version 2:
+    /// the EXISTING version-skew filter (`record.protocol_version ==
+    /// codec::PROTOCOL_VERSION`) drops it at routing time, so its slices run
+    /// coordinator-local with no round trip. A version-matched worker at the
+    /// same endpoint is kept, proving the exclusion is the version filter, not
+    /// an unrelated routing miss.
+    #[test]
+    fn version_skewed_worker_is_dropped_from_ranked_owners() {
+        assert_eq!(codec::PROTOCOL_VERSION, 2, "coordinator speaks version 2");
+        let metrics = Arc::new(FragmentMetrics::new());
+        let self_id = uuid::Uuid::from_u128(1);
+        let other_id = uuid::Uuid::from_u128(2);
+        let self_cell = Arc::new(OnceLock::new());
+        self_cell.set(self_id).expect("set self id");
+
+        let make = |version: u32| {
+            let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+                process_id: other_id.to_string(),
+                fragment_endpoint: "192.0.2.1:9".to_string(),
+                protocol_version: version,
+                started_unix_ns: 0,
+            }])));
+            RoutingSliceFetcher::new(
+                self_cell.clone(),
+                live,
+                test_keys(),
+                test_service(metrics.clone()),
+                metrics.clone(),
+            )
+        };
+
+        // Only a v1 worker in the set: it is filtered out, no owner remains, so
+        // the slice routes local (empty ranked list).
+        let v1 = make(codec::PROTOCOL_VERSION - 1);
+        assert!(
+            v1.ranked_owners(&pinned_request([9u8; 16], &[0]))
+                .is_empty(),
+            "a v1 worker is excluded, leaving no remote owner"
+        );
+
+        // The same worker at v2 is kept as a remote owner: the exclusion above is
+        // the version filter, not the worker being unroutable for another reason.
+        let v2 = make(codec::PROTOCOL_VERSION);
+        assert_eq!(
+            v2.ranked_owners(&pinned_request([9u8; 16], &[0])),
+            vec![Owner::Remote("192.0.2.1:9".to_string())],
+            "a version-matched worker is a remote owner"
         );
     }
 
@@ -1328,7 +1838,7 @@ mod tests {
         let fetcher = RoutingSliceFetcher::new(
             Arc::new(OnceLock::new()),
             Arc::new(RwLock::new(Arc::new(Vec::new()))),
-            "cluster-token".to_string(),
+            test_keys(),
             service,
             metrics.clone(),
         );
@@ -1372,13 +1882,8 @@ mod tests {
                 started_unix_ns: 0,
             },
         ])));
-        let fetcher = RoutingSliceFetcher::new(
-            self_cell,
-            live,
-            "cluster-token".to_string(),
-            service,
-            metrics.clone(),
-        );
+        let fetcher =
+            RoutingSliceFetcher::new(self_cell, live, test_keys(), service, metrics.clone());
 
         // Drive distinct rendezvous units until one maps to the unreachable
         // remote worker and one maps to self. A remote-mapped slice attempts
@@ -1455,7 +1960,7 @@ mod tests {
         let fetcher = RoutingSliceFetcher::new(
             self_cell,
             live.clone(),
-            "cluster-token".to_string(),
+            test_keys(),
             service,
             metrics.clone(),
         );
@@ -1581,13 +2086,8 @@ mod tests {
                 started_unix_ns: 0,
             },
         ])));
-        let fetcher = RoutingSliceFetcher::new(
-            self_cell,
-            live,
-            "cluster-token".to_string(),
-            service,
-            metrics.clone(),
-        );
+        let fetcher =
+            RoutingSliceFetcher::new(self_cell, live, test_keys(), service, metrics.clone());
 
         // Outside a scope: recording is a no-op (must not panic, records
         // nothing).
@@ -1760,7 +2260,7 @@ mod tests {
         let resolver: Arc<dyn TenantResolver> =
             Arc::new(ravel_query::http::StaticBearerTokenResolver::new(tokens));
         FragmentService::new(
-            "cluster-token".to_string(),
+            test_keys(),
             resolver,
             FragmentAdmission::new(8, metrics.clone()),
             catalog,
@@ -1895,14 +2395,14 @@ mod tests {
     // --- Windowed fragment resolve ------------------------------------------
 
     /// A `FragmentService` over `store` on the intra-cluster pinned path: a
-    /// fixed clock and no tenant credentials (the pinned path only checks the
-    /// shared fragment token).
+    /// fixed clock and no tenant credentials (the pinned path only verifies the
+    /// fragment capability).
     fn pinned_service(store: Arc<dyn ObjectStoreBackend>, now_ns: i64) -> FragmentService {
         let metrics = Arc::new(FragmentMetrics::new());
         let catalog =
             Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
         FragmentService::new(
-            "cluster-token".to_string(),
+            test_keys(),
             empty_resolver(),
             FragmentAdmission::new(8, metrics.clone()),
             catalog,

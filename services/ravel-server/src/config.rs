@@ -575,24 +575,30 @@ pub struct Cli {
     /// When set, a query-serving process (`all`, `query`) both registers the
     /// `SeriesFetch` fragment service on its cluster-internal gRPC listener AND
     /// runs as a coordinator that may fan a large query's snapshot out to live
-    /// query workers. Requires `--fragment-auth-token-file`: the fragment
-    /// surface is only ever exposed behind a shared cluster-internal bearer
-    /// token, so `--distributed-query` without a token file fails startup rather
-    /// than exposing an unauthenticated fetch surface.
+    /// query workers. Requires `--fragment-key-file`: a `Pinned` fetch is only
+    /// ever authorized by a per-tenant, per-query capability minted from a
+    /// cluster fragment key, so `--distributed-query` without a key file fails
+    /// startup rather than exposing an unauthenticated fetch surface.
     #[arg(long = "distributed-query")]
     pub distributed_query: bool,
 
-    /// Path to the shared cluster-internal bearer token that guards the ADR-0071
-    /// fragment `SeriesFetch` surface. A file, never an inline
-    /// value or env var, so the secret never appears in a process listing
-    /// (mirrors `--tenant-hash-key-file`). Every worker and coordinator in one
-    /// cluster reads the same file: a coordinator presents this exact token on
-    /// each slice dispatch, and a worker refuses any fragment request whose
-    /// bearer token is missing or unequal. The fragment surface is bound only on
-    /// the cluster-internal gRPC listener, never on the external client HTTP or
-    /// mTLS listeners. Meaningful only with `--distributed-query`.
-    #[arg(long = "fragment-auth-token-file", value_name = "PATH")]
-    pub fragment_auth_token_file: Option<PathBuf>,
+    /// Path to the cluster fragment key file that mints and verifies the ADR-0071
+    /// per-tenant, per-query capabilities guarding the fragment `SeriesFetch`
+    /// surface (amendment, decision 2). A file, never an inline value or env var,
+    /// so the secret never appears in a process listing (mirrors
+    /// `--tenant-hash-key-file`).
+    ///
+    /// The file holds a short list of 32-byte keys, one per non-empty line, each
+    /// line 64 hex characters (blank lines and `#` comment lines are ignored).
+    /// The FIRST key mints; ALL keys verify. Rotation therefore needs no flag
+    /// day: append the new key as the first line and roll the fleet, then drop
+    /// the retired key on a later roll once no capability minted under it can
+    /// still be in flight. Every worker and coordinator in one cluster reads the
+    /// same file. The fragment surface is bound only on the cluster-internal gRPC
+    /// listener, never on the external client HTTP or mTLS listeners. Meaningful
+    /// only with `--distributed-query`. Replaces the v1 `--fragment-auth-token-file`.
+    #[arg(long = "fragment-key-file", value_name = "PATH")]
+    pub fragment_key_file: Option<PathBuf>,
 
     /// The distinct internal-workload admission cap for inbound fragment
     /// (`SeriesFetch`) requests (ADR-0071): the maximum number of
@@ -726,19 +732,36 @@ pub struct AuthResolverSettings {
 }
 
 /// The resolved ADR-0071 distributed read fan-out settings,
-/// `Some` only when `--distributed-query` is set. Carries the shared
-/// cluster-internal bearer token (read from `--fragment-auth-token-file`), the
-/// fragment admission cap, and the cost gate/fan-out thresholds.
+/// `Some` only when `--distributed-query` is set. Carries the cluster fragment
+/// keys (read from `--fragment-key-file`), the fragment admission cap, and the
+/// cost gate/fan-out thresholds.
 #[derive(Debug, Clone)]
 pub struct DistribSettings {
-    /// The shared cluster-internal bearer token guarding the fragment surface,
-    /// read and trimmed from `--fragment-auth-token-file`.
-    pub auth_token: String,
+    /// The cluster fragment keys guarding the fragment surface (ADR-0071
+    /// amendment, decision 2), read from `--fragment-key-file`. The first mints
+    /// capabilities; all verify. Never empty when this struct exists (startup
+    /// rejects an empty key file).
+    pub fragment_keys: Vec<[u8; 32]>,
     /// The fragment (`SeriesFetch`) admission cap, a distinct workload class
     /// from client-query admission (`--max-inflight-fragments`, clamped `>= 1`).
     pub max_inflight_fragments: usize,
     /// The cost gate and fan-out width (`DistribThresholds`).
     pub thresholds: ravel_query::distrib::partition::DistribThresholds,
+}
+
+impl DistribSettings {
+    /// The stable shared secret the Flight SQL distributed lane derives its
+    /// ticket-signing key from (`ravel_sql::derive_ticket_key`). Derived from the
+    /// first fragment key so the whole cluster, reading the same key file, agrees
+    /// on one ticket key. The SQL lane needs an opaque cluster secret, not the
+    /// fragment capability itself; this bridges the two without a second key
+    /// file. Empty only if `fragment_keys` is empty, which startup forbids.
+    pub fn sql_ticket_secret(&self) -> String {
+        self.fragment_keys
+            .first()
+            .map(hex::encode)
+            .unwrap_or_default()
+    }
 }
 
 /// One resolved `--remote-cluster` (ADR-0071 cross-cluster federation).
@@ -1127,33 +1150,26 @@ impl Cli {
 
     /// Resolve the ADR-0071 distributed read fan-out settings.
     /// `Ok(None)` when `--distributed-query` is off (the local-only default).
-    /// When on, reads and trims the `--fragment-auth-token-file` bearer token
-    /// (failing on an unreadable or empty file), and packages the admission cap
-    /// and cost-gate thresholds. The token file, not an inline value, keeps the
-    /// secret out of the process listing (mirrors `--tenant-hash-key-file`).
+    /// When on, reads and parses the `--fragment-key-file` cluster fragment keys
+    /// (failing on an unreadable, empty, or malformed file), and packages the
+    /// admission cap and cost-gate thresholds. The key file, not an inline value,
+    /// keeps the secret out of the process listing (mirrors
+    /// `--tenant-hash-key-file`).
     pub fn parse_distrib_settings(&self) -> anyhow::Result<Option<DistribSettings>> {
         if !self.distributed_query {
             return Ok(None);
         }
-        let path = self.fragment_auth_token_file.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("--distributed-query requires --fragment-auth-token-file")
-        })?;
+        let path = self
+            .fragment_key_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--distributed-query requires --fragment-key-file"))?;
         let raw = std::fs::read_to_string(path).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to read --fragment-auth-token-file {}: {e}",
-                path.display()
-            )
+            anyhow::anyhow!("failed to read --fragment-key-file {}: {e}", path.display())
         })?;
-        let auth_token = raw.trim().to_string();
-        if auth_token.is_empty() {
-            anyhow::bail!(
-                "--fragment-auth-token-file {} is empty; the fragment bearer token must be \
-                 non-empty",
-                path.display()
-            );
-        }
+        let fragment_keys = parse_fragment_keys(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid --fragment-key-file {}: {e}", path.display()))?;
         Ok(Some(DistribSettings {
-            auth_token,
+            fragment_keys,
             max_inflight_fragments: self.max_inflight_fragments.max(1) as usize,
             thresholds: ravel_query::distrib::partition::DistribThresholds {
                 min_store_bytes: self.distribute_bytes_threshold,
@@ -1442,30 +1458,31 @@ impl Cli {
             );
         }
 
-        // ADR-0071 fragment surface pairing: the cluster-internal
-        // SeriesFetch surface is only ever exposed behind a shared bearer
-        // token, and the token file is only read when the surface is enabled.
-        // Reject either half of the pair on its own so a misconfiguration fails
-        // startup rather than exposing an unauthenticated fetch surface or
+        // ADR-0071 fragment surface pairing: a `Pinned` fetch is only ever
+        // authorized by a per-tenant, per-query capability minted from a cluster
+        // fragment key, and the key file is only read when the surface is
+        // enabled. Reject either half of the pair on its own so a misconfiguration
+        // fails startup rather than exposing an unauthenticated fetch surface or
         // leaving a configured secret inert.
-        if self.distributed_query && self.fragment_auth_token_file.is_none() {
+        if self.distributed_query && self.fragment_key_file.is_none() {
             anyhow::bail!(
-                "--distributed-query requires --fragment-auth-token-file: the ADR-0071 fragment \
-                 SeriesFetch surface is only exposed behind a shared cluster-internal bearer \
-                 token. Provide the token file, or drop --distributed-query."
+                "--distributed-query requires --fragment-key-file: the ADR-0071 fragment \
+                 SeriesFetch surface authorizes Pinned fetches only with a per-tenant capability \
+                 minted from a cluster fragment key. Provide the key file, or drop \
+                 --distributed-query."
             );
         }
-        if self.fragment_auth_token_file.is_some() && !self.distributed_query {
+        if self.fragment_key_file.is_some() && !self.distributed_query {
             anyhow::bail!(
-                "--fragment-auth-token-file was set but --distributed-query was not: the fragment \
-                 surface is only registered under --distributed-query, so the token file would be \
-                 inert. Set --distributed-query, or drop --fragment-auth-token-file."
+                "--fragment-key-file was set but --distributed-query was not: the fragment \
+                 surface is only registered under --distributed-query, so the key file would be \
+                 inert. Set --distributed-query, or drop --fragment-key-file."
             );
         }
         if self.distributed_query {
             // Reading it here (not only in `parse_distrib_settings`) fails
-            // startup on an unreadable or empty token file at the same point
-            // every other credential file is validated.
+            // startup on an unreadable, empty, or malformed key file at the same
+            // point every other credential file is validated.
             self.parse_distrib_settings()?;
         }
         if self.max_parallel_slices == 0 {
@@ -1742,6 +1759,41 @@ fn parse_deployment_key(raw: &[u8]) -> anyhow::Result<[u8; 32]> {
          bytes (got {} bytes)",
         raw.len()
     );
+}
+
+/// Parse the `--fragment-key-file` contents into the cluster fragment key list
+/// (ADR-0071 amendment, decision 2). One key per non-empty line, each line 64
+/// hex characters (32 bytes); blank lines and `#` comment lines are ignored. The
+/// first key is the minting key, the rest are additional verify keys for
+/// rotation. A file with no key line, or any line that is not exactly 64 hex
+/// characters, fails rather than truncating or padding a wrong-length key into
+/// place.
+fn parse_fragment_keys(raw: &str) -> anyhow::Result<Vec<[u8; 32]>> {
+    let mut keys = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "line {} is not a 32-byte key: expected exactly 64 hex characters",
+                i + 1
+            );
+        }
+        let bytes = hex::decode(trimmed)
+            .map_err(|e| anyhow::anyhow!("line {} is not valid hex: {e}", i + 1))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("line {} did not decode to 32 bytes", i + 1))?;
+        keys.push(arr);
+    }
+    if keys.is_empty() {
+        anyhow::bail!(
+            "must contain at least one 32-byte fragment key (64 hex characters on its own line)"
+        );
+    }
+    Ok(keys)
 }
 
 /// Parse a humantime duration string into a nanosecond window, rejecting
@@ -2532,16 +2584,16 @@ mod tests {
         use ravel_query::distrib::partition::should_distribute;
         use ravel_types::accounting::CostEstimate;
 
-        // A non-empty token file so --distributed-query resolves settings.
-        let token = tempfile::NamedTempFile::new().expect("temp token file");
-        std::fs::write(token.path(), "cluster-token").expect("write token");
+        // A valid fragment key file so --distributed-query resolves settings.
+        let key = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
 
         // No --distribute-*-threshold flags: the defaults come straight from
         // the ravel-query constants via `default_value_t`.
         let thresholds = cli(&[
             "--distributed-query",
-            "--fragment-auth-token-file",
-            token.path().to_str().expect("utf8 path"),
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8 path"),
         ])
         .parse_distrib_settings()
         .expect("distrib settings resolve")

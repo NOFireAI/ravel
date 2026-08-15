@@ -136,6 +136,7 @@ impl Distributed {
         erasure: &[ErasurePredicate],
         accounting: &QueryAccounting,
         config: &EngineConfig,
+        deadline_unix_ns: i64,
     ) -> Result<Option<FetchedTriple>, QueryError> {
         let slices = partition_snapshot(snapshot, self.thresholds.max_parallel_slices);
         if slices.is_empty() {
@@ -149,6 +150,17 @@ impl Distributed {
         let budgets = encode_budgets(config);
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
+        // One query id for the whole query (ADR-0071 amendment, decision 2): the
+        // server-side coordinator mints one capability per query from this id and
+        // the absolute deadline, and every slice of the query, including a
+        // re-dispatch, carries the same id so the same capability authorizes them
+        // all. Derived deterministically from the query's own identity so it is
+        // stable across the slices of one fetch without threading a random source
+        // through the engine; the value only needs to be a stable 16 bytes the
+        // mint and verify sides agree on. `deadline_unix_ns` is the query's
+        // absolute deadline (the same one the engine enforces), which the mint
+        // uses as the capability expiry.
+        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
 
         let concurrency = self.thresholds.max_parallel_slices.max(1);
         let mut stream = stream::iter(slices)
@@ -167,7 +179,7 @@ impl Distributed {
                 let (window_start_ns, window_end_ns) = slice_event_window(&slice.segments);
                 let request = pb::FetchRequest {
                     protocol_version: codec::PROTOCOL_VERSION,
-                    query_id: Vec::new(),
+                    query_id: query_id.to_vec(),
                     tenant_hash: tenant_bytes.clone(),
                     signal: signal_disc,
                     scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
@@ -181,9 +193,17 @@ impl Distributed {
                     window_start_ns,
                     window_end_ns,
                     budgets: Some(budgets),
-                    deadline_unix_ns: 0,
+                    deadline_unix_ns,
                     erasure: encoded_erasure.clone(),
                     trace_context: String::new(),
+                    // The Pinned fragment capability (ADR-0071 amendment,
+                    // decision 2) is minted per query from this request's
+                    // query_id/tenant/signal/deadline and attached at dispatch
+                    // time by the server-side SliceFetcher
+                    // (RoutingSliceFetcher::mint_capability); the crate-internal
+                    // builder leaves the bytes empty. A coordinator-local slice
+                    // needs no capability.
+                    fragment_capability: Vec::new(),
                 };
                 let fetcher = Arc::clone(&self.fetcher);
                 async move { fetcher.fetch(request).await }
@@ -353,6 +373,32 @@ fn encode_budgets(config: &EngineConfig) -> pb::Budgets {
         },
         max_segments: config.max_segments as u64,
     }
+}
+
+/// A stable 16-byte query id for one distributed query's fragment capabilities
+/// (ADR-0071 amendment, decision 2). Derived from the query's own identity
+/// (tenant, signal, absolute deadline, and the pinned segment set) so every
+/// slice of one `fetch` call, including a re-dispatch, carries the same id and
+/// the same minted capability authorizes them all, without threading a random
+/// source through the engine. The value only needs to be a stable 16 bytes the
+/// mint and verify sides agree on; the first 16 bytes of a BLAKE3 hash suffice.
+fn query_id_bytes(
+    tenant_bytes: &[u8],
+    signal_disc: u32,
+    deadline_unix_ns: i64,
+    snapshot: &Snapshot,
+) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(tenant_bytes);
+    hasher.update(&signal_disc.to_be_bytes());
+    hasher.update(&deadline_unix_ns.to_be_bytes());
+    for segment in &snapshot.segments {
+        hasher.update(&segment.content_hash);
+    }
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    id
 }
 
 fn distrib_error(err: DistribError) -> QueryError {

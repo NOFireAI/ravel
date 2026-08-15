@@ -59,7 +59,9 @@ use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
 const TOKEN: &str = "acme-token";
 const TENANT: &str = "acme";
 const METRIC: &str = "m";
-const FRAGMENT_TOKEN: &str = "cluster-internal-secret";
+/// The cluster fragment key every distributed test mints and verifies
+/// capabilities under (ADR-0071 amendment, decision 2).
+const FRAGMENT_KEY: [u8; 32] = [0x5au8; 32];
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
@@ -161,7 +163,7 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, tenant: &TenantId, base
 /// segment distributes. `max_parallel_slices` is clamped `>= 1` by the engine.
 fn always_distribute_settings() -> DistribSettings {
     DistribSettings {
-        auth_token: FRAGMENT_TOKEN.to_string(),
+        fragment_keys: vec![FRAGMENT_KEY],
         max_inflight_fragments: 32,
         thresholds: DistribThresholds {
             min_store_bytes: 0,
@@ -169,6 +171,50 @@ fn always_distribute_settings() -> DistribSettings {
             max_parallel_slices: 8,
         },
     }
+}
+
+/// A fixed claim set (one tenant, one query) with a far-future expiry, for
+/// capability-authorized fragment probes (ADR-0071 amendment, decision 2). The
+/// signal is deliberately non-metrics: only metrics are distributed, so the
+/// worker's `build_resolver` short-circuits to an empty resolver before any
+/// catalog/store read, letting a probe prove admission without depending on
+/// store availability (some probes run against a gated store). Capability
+/// verification is signal-agnostic: it only requires the request's signal to
+/// equal the claims', which holds by construction here.
+fn capability_claims() -> ravel_query::distrib::codec::FragmentClaims {
+    use ravel_query::distrib::codec;
+    codec::FragmentClaims {
+        capability_version: codec::CAPABILITY_VERSION,
+        tenant_hash: [0u8; 16],
+        signal: codec::signal_to_u32(Signal::Logs),
+        query_id: [0u8; 16],
+        expires_unix_ns: now_ns() + NS_PER_HOUR,
+    }
+}
+
+/// A minimal `Pinned`-path fetch request whose wire tenant/signal/query match
+/// `claims`, carrying `capability` (which the caller mints, tampers, or omits).
+fn request_for(
+    claims: &ravel_query::distrib::codec::FragmentClaims,
+    capability: Vec<u8>,
+) -> pb::FetchRequest {
+    pb::FetchRequest {
+        protocol_version: ravel_query::distrib::codec::PROTOCOL_VERSION,
+        tenant_hash: claims.tenant_hash.to_vec(),
+        signal: claims.signal,
+        query_id: claims.query_id.to_vec(),
+        deadline_unix_ns: claims.expires_unix_ns,
+        fragment_capability: capability,
+        ..Default::default()
+    }
+}
+
+/// A fetch request carrying a valid capability minted under [`FRAGMENT_KEY`], so
+/// the worker admits and serves it (an empty scope resolves to an empty result).
+fn valid_capability_request() -> pb::FetchRequest {
+    let claims = capability_claims();
+    let capability = ravel_query::distrib::codec::mint_capability(&FRAGMENT_KEY, &claims);
+    request_for(&claims, capability)
 }
 
 async fn start_server(
@@ -383,58 +429,61 @@ fn metric_value(metrics: &str, name: &str) -> f64 {
     0.0
 }
 
-/// The internal `SeriesFetch` surface is guarded by the cluster bearer token
-/// and only exists under `--distributed-query`.
+/// The internal `SeriesFetch` surface authorizes a `Pinned` fetch only with a
+/// valid fragment capability minted under the cluster key (ADR-0071 amendment,
+/// decision 2), and only exists under `--distributed-query`.
 #[tokio::test]
-async fn fragment_surface_requires_token_and_flag() {
+async fn fragment_surface_requires_capability_and_flag() {
+    use ravel_query::distrib::codec;
+
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
-    // Server A: --distributed-query on, guarded by FRAGMENT_TOKEN.
+    // Server A: --distributed-query on, guarded by capabilities under FRAGMENT_KEY.
     let distributed = start_server(Arc::clone(&store), Some(always_distribute_settings())).await;
     let grpc_addr = distributed
         .grpc_addr
         .expect("gRPC listener binds in All mode");
     let endpoint = format!("http://{grpc_addr}");
 
-    let fetch = |token: Option<&'static str>| {
+    let fetch = |capability: Vec<u8>| {
         let endpoint = endpoint.clone();
         async move {
             let mut client = SeriesFetchClient::connect(endpoint)
                 .await
                 .expect("connect to fragment surface");
-            let mut request = tonic::Request::new(pb::FetchRequest::default());
-            if let Some(token) = token {
-                request.metadata_mut().insert(
-                    "authorization",
-                    format!("Bearer {token}").parse().expect("valid metadata"),
-                );
-            }
-            client.fetch(request).await
+            let claims = capability_claims();
+            let request = request_for(&claims, capability);
+            client.fetch(tonic::Request::new(request)).await
         }
     };
 
-    // No token: rejected.
-    let missing = fetch(None).await;
+    // No capability: rejected.
+    let missing = fetch(Vec::new()).await;
     assert_eq!(
-        missing.expect_err("no token must be rejected").code(),
+        missing.expect_err("no capability must be rejected").code(),
         tonic::Code::Unauthenticated,
-        "a fragment request with no bearer token must be Unauthenticated"
+        "a fragment request with no capability must be Unauthenticated"
     );
 
-    // Wrong token: rejected.
-    let wrong = fetch(Some("not-the-cluster-token")).await;
+    // A capability minted under the WRONG key: its MAC does not verify, rejected.
+    let wrong = codec::mint_capability(&[0u8; 32], &capability_claims());
+    let wrong = fetch(wrong).await;
     assert_eq!(
-        wrong.expect_err("wrong token must be rejected").code(),
+        wrong
+            .expect_err("wrong-key capability must be rejected")
+            .code(),
         tonic::Code::Unauthenticated,
-        "a fragment request with a wrong bearer token must be Unauthenticated"
+        "a capability minted under a foreign key must be Unauthenticated"
     );
 
-    // Correct token: accepted. An empty (scope-less) request resolves to an
-    // empty result, so the call returns an OK stream rather than an auth error.
-    let ok = fetch(Some(FRAGMENT_TOKEN)).await;
+    // A valid capability under the configured key: accepted. An empty
+    // (scope-less) request resolves to an empty result, so the call returns an
+    // OK stream rather than an auth error.
+    let good = codec::mint_capability(&FRAGMENT_KEY, &capability_claims());
+    let ok = fetch(good).await;
     assert!(
         ok.is_ok(),
-        "the configured cluster token must be accepted, got: {:?}",
+        "a valid capability under the cluster key must be accepted, got: {:?}",
         ok.err()
     );
 
@@ -444,14 +493,9 @@ async fn fragment_surface_requires_token_and_flag() {
     let mut client = SeriesFetchClient::connect(format!("http://{local_grpc}"))
         .await
         .expect("connect to local server gRPC");
-    let mut request = tonic::Request::new(pb::FetchRequest::default());
-    request.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {FRAGMENT_TOKEN}")
-            .parse()
-            .expect("valid metadata"),
-    );
-    let unregistered = client.fetch(request).await;
+    let unregistered = client
+        .fetch(tonic::Request::new(valid_capability_request()))
+        .await;
     assert_eq!(
         unregistered
             .expect_err("the fragment service must not exist without --distributed-query")
@@ -514,7 +558,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
             std::collections::HashMap::new(),
         )),
@@ -538,7 +582,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
     let fetcher = Arc::new(RoutingSliceFetcher::new(
         self_cell,
         live,
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
     ));
@@ -786,14 +830,8 @@ async fn fragment_admits_while_client_cap_saturated_no_deadlock() {
         let mut client = SeriesFetchClient::connect(format!("http://{grpc}"))
             .await
             .expect("connect to fragment gRPC");
-        let mut request = tonic::Request::new(pb::FetchRequest::default());
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {FRAGMENT_TOKEN}")
-                .parse()
-                .expect("valid metadata"),
-        );
-        client.fetch(request).await
+        let request = valid_capability_request();
+        client.fetch(tonic::Request::new(request)).await
     })
     .await;
     assert!(
@@ -894,14 +932,8 @@ async fn fragment_admits_while_client_cap_saturated_no_deadlock_single_fragment_
         let mut client = SeriesFetchClient::connect(format!("http://{grpc}"))
             .await
             .expect("connect to fragment gRPC");
-        let mut request = tonic::Request::new(pb::FetchRequest::default());
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {FRAGMENT_TOKEN}")
-                .parse()
-                .expect("valid metadata"),
-        );
-        client.fetch(request).await
+        let request = valid_capability_request();
+        client.fetch(tonic::Request::new(request)).await
     })
     .await;
     assert!(
@@ -1173,7 +1205,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
             std::collections::HashMap::new(),
         )),
@@ -1192,7 +1224,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
     let fetcher = Arc::new(RoutingSliceFetcher::new(
         self_cell,
         live,
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
     ));
@@ -1302,7 +1334,7 @@ async fn version_mismatch_falls_back_to_local() {
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
             std::collections::HashMap::new(),
         )),
@@ -1327,7 +1359,7 @@ async fn version_mismatch_falls_back_to_local() {
     let fetcher = Arc::new(RoutingSliceFetcher::new(
         self_cell,
         live,
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
     ));
@@ -1459,7 +1491,7 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
             std::collections::HashMap::new(),
         )),
@@ -1477,7 +1509,7 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
     let fetcher = RoutingSliceFetcher::new(
         self_cell,
         live,
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
     );
@@ -1583,7 +1615,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
             .expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
             std::collections::HashMap::new(),
         )),
@@ -1607,7 +1639,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
     let fetcher = Arc::new(RoutingSliceFetcher::new(
         self_cell,
         live,
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
     ));
@@ -1756,7 +1788,7 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
         ravel_server::query::build_catalog(store.clone(), 1, false, CACHE_BYTES).expect("catalog");
     let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
     let local_service = FragmentService::new(
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
             std::collections::HashMap::new(),
         )),
@@ -1774,7 +1806,7 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
     let fetcher = Arc::new(RoutingSliceFetcher::new(
         self_cell,
         live,
-        FRAGMENT_TOKEN.to_string(),
+        Arc::new(vec![FRAGMENT_KEY]),
         local_service,
         metrics.clone(),
     ));

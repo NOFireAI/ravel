@@ -249,6 +249,10 @@ impl Federation {
                 deadline_unix_ns: 0,
                 erasure: encoded_erasure.clone(),
                 trace_context: String::new(),
+                // A Resolve (federation) request carries no fragment capability
+                // (ADR-0071 amendment, decision 2): it authenticates through an
+                // ordinary tenant credential on the remote, never a capability.
+                fragment_capability: Vec::new(),
             };
             let handle =
                 tokio::spawn(

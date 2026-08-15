@@ -304,6 +304,7 @@ async fn assert_distributed_matches_local(
             &[],
             &accounting,
             &config,
+            i64::MAX,
         )
         .await
         .expect("distributed fetch")
@@ -444,6 +445,7 @@ async fn distributed_metric_names(
             erasure,
             &accounting,
             &EngineConfig::default(),
+            i64::MAX,
         )
         .await
         .expect("distributed fetch")
@@ -647,6 +649,7 @@ fn coordinator_reenforces_series_budget_over_honest_worker() {
                 &[],
                 &accounting,
                 &config,
+                i64::MAX,
             )
             .await
             .expect_err("budget must trip");
@@ -702,6 +705,7 @@ fn worker_trips_bytes_budget_per_segment() {
             deadline_unix_ns: 0,
             erasure: Vec::new(),
             trace_context: String::new(),
+            fragment_capability: Vec::new(),
         };
         let response = SliceFetcher::fetch(&fetcher, request)
             .await
@@ -796,6 +800,7 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
                 &[],
                 &accounting,
                 &config,
+                i64::MAX,
             )
             .await
             .expect_err("coordinator must re-enforce the bytes budget");
@@ -891,6 +896,7 @@ fn many_invalidated_slices_map_to_one_retryable_error() {
                 &[],
                 &accounting,
                 &EngineConfig::default(),
+                i64::MAX,
             )
             .await
             .expect_err("invalidation must surface as an error");
@@ -952,6 +958,7 @@ fn worker_rejects_non_metrics_and_unknown_signals() {
             deadline_unix_ns: 0,
             erasure: Vec::new(),
             trace_context: String::new(),
+            fragment_capability: Vec::new(),
         };
 
         let logs = SliceFetcher::fetch(
@@ -1071,6 +1078,7 @@ fn coordinator_fold_saturates_overflowing_worker_reports() {
                 &[],
                 &accounting,
                 &config,
+                i64::MAX,
             )
             .await
             .expect_err("a wrapped fold would let the overflowing report through");
@@ -1192,6 +1200,7 @@ fn histogram_slice_falls_back_with_spend_folded() {
                 &[],
                 &accounting,
                 &EngineConfig::default(),
+                i64::MAX,
             )
             .await
             .expect("unsupported must not be an error");

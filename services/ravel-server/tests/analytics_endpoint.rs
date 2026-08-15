@@ -178,7 +178,7 @@ fn build_router_distributed(
     let metrics = Arc::new(FragmentMetrics::new());
     let clock: Arc<dyn Clock> = Arc::new(FixedClock);
     let service = FragmentService::new(
-        "cluster-token".to_string(),
+        Arc::new(vec![[0u8; 32]]),
         Arc::new(StaticBearerTokenResolver::new(
             std::collections::HashMap::new(),
         )),
@@ -192,7 +192,7 @@ fn build_router_distributed(
     let fetcher = Arc::new(RoutingSliceFetcher::new(
         Arc::new(OnceLock::new()),
         Arc::new(RwLock::new(Arc::new(Vec::new()))),
-        "cluster-token".to_string(),
+        Arc::new(vec![[0u8; 32]]),
         service,
         metrics,
     ));

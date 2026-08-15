@@ -758,6 +758,14 @@ impl QueryEngine {
         let max_bytes_scanned = self.config.max_bytes_scanned;
         let max_s3_requests = self.config.max_s3_requests;
         let concurrency = self.config.fetch_concurrency.max(1);
+        // The query's absolute deadline in unix nanoseconds, from the injected
+        // `now_ns` and the configured engine deadline. Threaded into the
+        // distributed fan-out (ADR-0071 amendment, decision 2) so the coordinator
+        // mints each fragment capability with this exact expiry: expiry reuses
+        // the deadline the query already enforces, adding no new clock
+        // assumption. Unused by the local path.
+        let deadline_unix_ns = now_ns
+            .saturating_add(i64::try_from(self.config.deadline.as_nanos()).unwrap_or(i64::MAX));
         // One independent fetch per selector against the same snapshot
         // (below): an N-selector query re-opens every snapshot segment up to
         // N times, so the pre-fetch cost estimate must scale by this same
@@ -830,6 +838,7 @@ impl QueryEngine {
                                 accounting,
                                 max_bytes_scanned,
                                 max_s3_requests,
+                                deadline_unix_ns,
                             )
                             .await?;
                         let histograms =
@@ -1188,6 +1197,7 @@ impl QueryEngine {
     /// `self.distributed` is `None` this is exactly a call to the local
     /// fetch, which is why an engine that never opts in behaves precisely as
     /// it did before this seam existed.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_samples_and_histograms_maybe_distributed(
         &self,
         tenant_hash: TenantHash,
@@ -1196,6 +1206,7 @@ impl QueryEngine {
         accounting: &QueryAccounting,
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestLimit,
+        deadline_unix_ns: i64,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -1221,6 +1232,7 @@ impl QueryEngine {
                         &erasure,
                         accounting,
                         &self.config,
+                        deadline_unix_ns,
                     )
                     .await?
                 {

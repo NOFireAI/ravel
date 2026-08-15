@@ -32,7 +32,119 @@ use crate::fetcher::FetchedSeriesSoa;
 /// any other value is rejected by [`check_protocol_version`] so the coordinator
 /// falls back to fully local execution (ADR-0071 version-skew rule), never
 /// misinterprets a future frame layout.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Bumped 1 -> 2 for the ADR-0071 amendment (epic #1055 finding F-1): the shared
+/// bearer token on `Pinned` fetches is replaced by a per-tenant, per-query
+/// fragment capability ([`FragmentClaims`]). This is a version bump on an
+/// existing versioned wire field, not a frozen persistent-format change. A
+/// version-skewed worker is dropped at routing time (never a hard error), so a
+/// rolling deploy degrades to coordinator-local execution, never to a wrong
+/// answer.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
+/// Distinct from [`PROTOCOL_VERSION`]: it versions the canonical claim encoding
+/// [`encode_claims`] produces and the MAC covers, so the claim layout can evolve
+/// under its own number without moving the wire protocol version. A verifier
+/// recomputes the MAC over the exact bytes the minter signed, so a mismatched
+/// claim version simply fails the MAC check.
+pub const CAPABILITY_VERSION: u32 = 1;
+
+/// The fixed width of the canonical claim encoding [`encode_claims`] produces:
+/// `capability_version` (u32) + `tenant_hash` (16) + `signal` (u32) +
+/// `query_id` (16) + `expires_unix_ns` (i64), big-endian, no padding.
+pub const CAPABILITY_CLAIMS_LEN: usize = 4 + 16 + 4 + 16 + 8;
+
+/// The width of the keyed-BLAKE3 MAC appended to the claims.
+pub const CAPABILITY_MAC_LEN: usize = 32;
+
+/// The total on-wire width of a fragment capability: the canonical claims
+/// followed by their MAC.
+pub const CAPABILITY_LEN: usize = CAPABILITY_CLAIMS_LEN + CAPABILITY_MAC_LEN;
+
+/// The claim set of a fragment capability (ADR-0071 amendment, decision 2): the
+/// exact authority a `Pinned` fetch carries, naming one tenant, one signal, one
+/// query, and an absolute expiry. Transient, never stored. A capability is these
+/// claims in their canonical fixed-width encoding followed by a keyed-BLAKE3 MAC
+/// over that encoding; the worker recomputes the MAC and requires the request's
+/// `tenant_hash`/`signal`/`query_id` to equal the claims, so a capability minted
+/// for one tenant cannot authorize a fetch that names another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentClaims {
+    /// The claim-set version ([`CAPABILITY_VERSION`]).
+    pub capability_version: u32,
+    /// The 16-byte tenant hash the capability authorizes.
+    pub tenant_hash: [u8; 16],
+    /// The signal discriminant ([`signal_to_u32`]) the capability authorizes.
+    pub signal: u32,
+    /// The 16-byte query id the capability is scoped to.
+    pub query_id: [u8; 16],
+    /// The absolute deadline, in unix nanoseconds, past which the capability is
+    /// rejected. The coordinator sets this to the query's own deadline, so
+    /// expiry reuses the clock the protocol already enforces cluster-wide.
+    pub expires_unix_ns: i64,
+}
+
+/// The canonical fixed-width big-endian encoding of a claim set. Total and
+/// infallible: the same claims always produce the same [`CAPABILITY_CLAIMS_LEN`]
+/// bytes, so the minter and every verifier compute the MAC over identical input.
+fn encode_claims(claims: &FragmentClaims) -> [u8; CAPABILITY_CLAIMS_LEN] {
+    let mut out = [0u8; CAPABILITY_CLAIMS_LEN];
+    out[0..4].copy_from_slice(&claims.capability_version.to_be_bytes());
+    out[4..20].copy_from_slice(&claims.tenant_hash);
+    out[20..24].copy_from_slice(&claims.signal.to_be_bytes());
+    out[24..40].copy_from_slice(&claims.query_id);
+    out[40..48].copy_from_slice(&claims.expires_unix_ns.to_be_bytes());
+    out
+}
+
+/// The keyed-BLAKE3 MAC of a claim set under `key`. BLAKE3 is the workspace's
+/// content-hash primitive; this is its keyed/MAC mode, the same construction
+/// `ravel_catalog::auth_token_map` and `ravel_query::http::tenant` use. The MAC
+/// covers the canonical claim bytes, so any flipped claim byte changes the MAC.
+pub fn capability_mac(key: &[u8; 32], claims: &FragmentClaims) -> [u8; 32] {
+    *blake3::keyed_hash(key, &encode_claims(claims)).as_bytes()
+}
+
+/// Mint a capability: the canonical claims followed by their MAC under `key`.
+/// The coordinator mints one per query and attaches it to every slice; the bytes
+/// are transient wire only, never stored. Deterministic in `(key, claims)`, so a
+/// re-dispatch of the same slice mints byte-identical bytes.
+pub fn mint_capability(key: &[u8; 32], claims: &FragmentClaims) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CAPABILITY_LEN);
+    out.extend_from_slice(&encode_claims(claims));
+    out.extend_from_slice(&capability_mac(key, claims));
+    out
+}
+
+/// Split a capability's on-wire bytes into its claims and presented MAC, without
+/// verifying the MAC (the verifier recomputes it with [`capability_mac`] and
+/// compares in constant time). A capability of any other length is a typed
+/// error, never a truncated or zero-padded claim set.
+pub fn decode_capability(bytes: &[u8]) -> Result<(FragmentClaims, [u8; 32]), CodecError> {
+    if bytes.len() != CAPABILITY_LEN {
+        return Err(CodecError::BadCapabilityLength { got: bytes.len() });
+    }
+    let (claim_bytes, mac_bytes) = bytes.split_at(CAPABILITY_CLAIMS_LEN);
+    let capability_version = u32::from_be_bytes(claim_bytes[0..4].try_into().unwrap_or_default());
+    let tenant_hash: [u8; 16] = claim_bytes[4..20].try_into().unwrap_or_default();
+    let signal = u32::from_be_bytes(claim_bytes[20..24].try_into().unwrap_or_default());
+    let query_id: [u8; 16] = claim_bytes[24..40].try_into().unwrap_or_default();
+    let expires_unix_ns = i64::from_be_bytes(claim_bytes[40..48].try_into().unwrap_or_default());
+    let mac: [u8; 32] = mac_bytes
+        .try_into()
+        .map_err(|_| CodecError::BadCapabilityLength { got: bytes.len() })?;
+    Ok((
+        FragmentClaims {
+            capability_version,
+            tenant_hash,
+            signal,
+            query_id,
+            expires_unix_ns,
+        },
+        mac,
+    ))
+}
 
 /// A queryfrag message could not be mapped to or from its in-memory shape.
 /// Every variant names a specific malformation; none is recoverable by
@@ -72,6 +184,8 @@ pub enum CodecError {
     InvalidLabels(String),
     #[error("segment level discriminant {0} is neither L0 (0) nor L1 (1)")]
     UnknownSegmentLevel(u32),
+    #[error("fragment capability is {got} bytes, expected {CAPABILITY_LEN}")]
+    BadCapabilityLength { got: usize },
 }
 
 /// Rejects any protocol version this build does not speak. `Ok(())` only for
@@ -705,6 +819,94 @@ mod tests {
         assert_eq!(
             identity_content_hash(&bad),
             Err(CodecError::BadContentHash { got: 31 })
+        );
+    }
+
+    fn sample_claims() -> FragmentClaims {
+        FragmentClaims {
+            capability_version: CAPABILITY_VERSION,
+            tenant_hash: [7u8; 16],
+            signal: signal_to_u32(Signal::Metrics),
+            query_id: [9u8; 16],
+            expires_unix_ns: 1_700_000_000_000_000_000,
+        }
+    }
+
+    /// A minted capability decodes back to the exact claims it was minted from,
+    /// and its MAC recomputes to the presented MAC under the mint key. This is
+    /// the accept path: same key, same claims, MAC matches.
+    #[test]
+    fn capability_mints_and_decodes_round_trip() {
+        let key = [3u8; 32];
+        let claims = sample_claims();
+        let cap = mint_capability(&key, &claims);
+        assert_eq!(cap.len(), CAPABILITY_LEN);
+        let (decoded, mac) = decode_capability(&cap).expect("decode");
+        assert_eq!(
+            decoded, claims,
+            "claims survive the round trip byte-for-byte"
+        );
+        assert_eq!(
+            capability_mac(&key, &decoded),
+            mac,
+            "the MAC recomputes to the presented MAC under the mint key"
+        );
+    }
+
+    /// A capability minted under one key does NOT verify under another: the
+    /// recomputed MAC differs, so a holder of a wrong key cannot forge authority.
+    #[test]
+    fn capability_mac_differs_under_a_different_key() {
+        let claims = sample_claims();
+        let cap = mint_capability(&[1u8; 32], &claims);
+        let (decoded, presented) = decode_capability(&cap).expect("decode");
+        assert_ne!(
+            capability_mac(&[2u8; 32], &decoded),
+            presented,
+            "a different key recomputes a different MAC"
+        );
+    }
+
+    /// A single flipped bit anywhere in the capability (claims region or MAC
+    /// region) breaks verification: either the claims decode to a different set
+    /// whose MAC no longer matches, or the MAC bytes themselves no longer match
+    /// the claims' recomputed MAC.
+    #[test]
+    fn capability_tamper_is_detected_at_every_byte() {
+        let key = [5u8; 32];
+        let claims = sample_claims();
+        let cap = mint_capability(&key, &claims);
+        for i in 0..cap.len() {
+            let mut bad = cap.clone();
+            bad[i] ^= 0x01;
+            let (decoded, presented) = decode_capability(&bad).expect("still CAPABILITY_LEN bytes");
+            assert_ne!(
+                capability_mac(&key, &decoded),
+                presented,
+                "a flipped bit at offset {i} must break the MAC"
+            );
+        }
+    }
+
+    /// A capability of any length other than [`CAPABILITY_LEN`] is a typed
+    /// error, never a truncated or zero-padded claim set.
+    #[test]
+    fn capability_wrong_length_is_typed_error() {
+        assert_eq!(
+            decode_capability(&[]),
+            Err(CodecError::BadCapabilityLength { got: 0 })
+        );
+        assert_eq!(
+            decode_capability(&[0u8; CAPABILITY_LEN - 1]),
+            Err(CodecError::BadCapabilityLength {
+                got: CAPABILITY_LEN - 1
+            })
+        );
+        assert_eq!(
+            decode_capability(&[0u8; CAPABILITY_LEN + 1]),
+            Err(CodecError::BadCapabilityLength {
+                got: CAPABILITY_LEN + 1
+            })
         );
     }
 

@@ -192,8 +192,10 @@ async fn spawn_remote(
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let tokens = std::collections::HashMap::from([(credential.to_string(), tenant.clone())]);
     let resolver: Arc<dyn TenantResolver> = Arc::new(StaticBearerTokenResolver::new(tokens));
+    // Federation authenticates through the tenant resolver, never a fragment
+    // capability, so the capability key list is irrelevant here (a dummy key).
     let service = FragmentService::new(
-        credential.to_string(),
+        Arc::new(vec![[0u8; 32]]),
         resolver,
         admission,
         catalog,
