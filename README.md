@@ -134,7 +134,8 @@ covered in the [query guide](docs/guides/query.md) and the
 - [Decision records](docs/adrs/) — one per architectural choice
 - [SQL conformance](docs/sql-conformance.md) — every construct classified as
   supported, intentionally rejected, or unclassified
-- [Contributing](CONTRIBUTING.md) and the [changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md), the [changelog](CHANGELOG.md), and the
+  [AI policy](AI_POLICY.md)
 
 ## License
 
