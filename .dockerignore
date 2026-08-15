@@ -25,9 +25,6 @@ node_modules/
 .github/
 .gitignore
 
-# Benchmark outputs and large reports.
-bench/reports/
-
 # Docs and top-level markdown: not read by any build.rs or by cargo.
 docs/
 *.md

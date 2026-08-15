@@ -209,8 +209,8 @@ exists for disk-hungry jobs.
    `docs/guides/kubernetes.md` (operator install, CRD field reference,
    kind quickstart, probe semantics), a deployment section and the
    liveness correction in `docs/architecture.md` (which already governs
-   `services/*` in the doc map), an index entry in `docs/README.md`, a
-   README.md pointer, and a PROGRESS.md entry.
+   `services/*` in the doc map), an index entry in `docs/README.md`,
+   and a README.md pointer.
 
 ## Rejected alternatives
 

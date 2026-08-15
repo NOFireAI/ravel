@@ -199,6 +199,6 @@ construction once the codec seam exists.
   crash-matrix coverage for the merge/publish/sweep paths specific to
   RLOG's merge (STREAM_DIR remap correctness under partial-input
   crashes).
-- `docs/log-segment-format.md`, `proto/ravel/logseg.proto`, and
-  `docs/PROGRESS.md` are amended in the same commits as the code that
-  implements each change, per the doc-currency rule.
+- `docs/log-segment-format.md` and `proto/ravel/logseg.proto` are
+  amended in the same commits as the code that implements each change,
+  per the doc-currency rule.

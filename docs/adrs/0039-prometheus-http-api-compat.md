@@ -4,8 +4,8 @@ Status: Accepted
 
 ## Context
 
-Ravel's PromQL query surface is further along than README.md and
-PROGRESS.md currently claim. A codebase survey found:
+Ravel's PromQL query surface is further along than README.md
+currently claims. A codebase survey found:
 
 - Aggregation operators (`sum`, `avg`, `min`, `max`, `count`, `group`,
   `stddev`, `stdvar`, `topk`, `bottomk`, `quantile`, `count_values`) are
@@ -65,10 +65,8 @@ additive only, no existing route changed:
    Prometheus datasource at a running `ravel-server`, confirm "Save &
    Test" succeeds, and that Explore / a basic dashboard panel render a
    query. This is acceptance evidence, not a new code surface.
-5. Fix README.md and PROGRESS.md to state the true current status of
-   aggregations, subqueries, and Remote Write (done, not planned), and
-   correct PROGRESS.md's stale `## Failing tests - (none yet; no tests
-   written)` line.
+5. Fix README.md to state the true current status of aggregations,
+   subqueries, and Remote Write (done, not planned).
 
 ## Rejected alternatives
 
