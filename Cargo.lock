@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-alerting"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "blake3",
  "hex",
@@ -4270,14 +4270,14 @@ dependencies = [
 
 [[package]]
 name = "ravel-analytics"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "ravel-bench"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "arrow 59.1.0",
  "arrow-flight",
@@ -4318,7 +4318,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-cache"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "bytes",
  "crc32c",
@@ -4329,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-catalog"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4355,7 +4355,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-cli"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4386,7 +4386,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-codec"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "blake3",
  "crc32c",
@@ -4396,7 +4396,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-commit"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "blake3",
  "bytes",
@@ -4418,7 +4418,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-failure-tests"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "bytes",
  "futures",
@@ -4439,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-fleet"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "blake3",
  "futures",
@@ -4456,7 +4456,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-ingest"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4486,7 +4486,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-logseg"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "blake3",
  "crc32c",
@@ -4502,7 +4502,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-maintain"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4530,7 +4530,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-object-store"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -4550,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-operator"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "clap",
  "futures",
@@ -4573,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-otap"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "arrow 59.1.0",
  "arrow-ipc 59.1.0",
@@ -4599,7 +4599,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-otlp"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "blake3",
  "hex",
@@ -4616,7 +4616,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-promql"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "blake3",
  "promql-parser",
@@ -4629,7 +4629,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-promql-difftest"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "axum",
  "bytes",
@@ -4657,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-proto"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "prost",
  "prost-build",
@@ -4666,7 +4666,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-query"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -4708,7 +4708,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-remote-write"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "bytes",
  "hex",
@@ -4726,7 +4726,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-rspan"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "crc32c",
  "proptest",
@@ -4740,7 +4740,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-segment"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "blake3",
  "bytes",
@@ -4758,7 +4758,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-server"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "arrow 59.1.0",
@@ -4820,7 +4820,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-sim"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4841,7 +4841,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-sql"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -4877,7 +4877,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-tracing-export"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4893,7 +4893,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-types"
-version = "0.1.0"
+version = "0.9.2"
 dependencies = [
  "base64 0.23.0",
  "blake3",
