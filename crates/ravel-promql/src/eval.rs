@@ -251,8 +251,7 @@ pub(crate) fn invalid_quantile_warning(q: f64) -> String {
 /// be computed and the group evaluates to `NaN`. A warning: the `NaN` result
 /// signals a malformed input, not a benign one. Note this fires only for the
 /// too-few-buckets case; a group that is merely missing its `+Inf` top bucket
-/// is NaN with no annotation, matching the pinned Prometheus binary (issue
-/// #1099).
+/// is NaN with no annotation, matching the pinned Prometheus binary.
 pub(crate) fn classic_histogram_bad_buckets_warning() -> String {
     "input to histogram function was not a valid classic histogram: it needs \
      at least two buckets, the highest being a +Inf bucket"
@@ -1610,7 +1609,7 @@ mod tests {
         // A classic histogram with two or more buckets but no +Inf top bucket
         // (an incomplete shape, e.g. a `le!="+Inf"` matcher) is NaN, and,
         // matching the pinned Prometheus binary, raises NO warning: its
-        // `bucketQuantile` returns NaN silently for that shape (issue #1099).
+        // `bucketQuantile` returns NaN silently for that shape.
         // Before this fix Ravel emitted an extra bad-buckets warning here,
         // which is the divergence the over_time/histogram_classic difftest
         // corpora surfaced.
@@ -1637,8 +1636,8 @@ mod tests {
     fn histogram_quantile_single_bucket_still_surfaces_a_bad_buckets_warning() {
         // A genuinely degenerate group (fewer than two usable buckets) is a
         // distinct case from the missing-+Inf shape above: it keeps the
-        // bad-buckets warning. This pins that the #1099 narrowing touched only
-        // the missing-+Inf reason, not the too-few-buckets one.
+        // bad-buckets warning. This pins that the missing-+Inf narrowing
+        // touched only that reason, not the too-few-buckets one.
         let source = TestSource::new()
             .with_series(&[("__name__", "http_bucket"), ("le", "+Inf")], &[(0, 10.0)])
             .expect("valid series");

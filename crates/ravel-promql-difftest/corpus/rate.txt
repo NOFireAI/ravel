@@ -1,4 +1,4 @@
-# Counter/regression function corpus (ticket P4, docs/promql-evaluator-plan.md
+# Counter/regression function corpus (docs/promql-evaluator-plan.md
 # section 8): rate, irate, increase, delta, idelta, resets, changes, deriv,
 # predict_linear, all against crates/ravel-promql-difftest/src/generator.rs's
 # fixed dataset. Every offset is relative to the dataset's base_ts_ms.
@@ -7,7 +7,7 @@
 # (generator.rs's own doc comment) means a zero-sampled-interval scenario
 # (irate/idelta's shared "last two samples share a timestamp" guard) cannot
 # be expressed here without changing the generator, which is out of scope
-# for this ticket; that edge is covered instead by
+# for this corpus; that edge is covered instead by
 # `functions::rate::tests::zero_sampled_interval_drops_the_series_for_irate_and_idelta`.
 #
 # `mode: unordered` is correct for every entry here, for the same reason as
@@ -29,7 +29,7 @@ mode: unordered
 # extrapolated_rate is a deliberate operation-for-operation port
 # (rate.rs's module doc), so this is very likely a real, findable
 # arithmetic difference upstream of this function, not an inherent
-# limit; tracked separately in issue #170 rather than investigated here.
+# limit; it is left for a separate investigation rather than pursued here.
 # tolerance: 2 is 1 ULP of headroom over the measured gap.
 name: range_rate_across_reset_at_boundary
 query: rate(diff_counter_total{shape="reset_at_boundary"}[5m])
@@ -76,7 +76,7 @@ mode: unordered
 # the five allowlisted cases). linear_regression's operation order
 # reads as a faithful port, so this is very likely upstream input
 # drift or a subtle order difference not yet found, not an inherent
-# limit; see ADR-0025 and issue #170 rather than re-deriving here.
+# limit; see ADR-0025 rather than re-deriving here.
 # tolerance: 1024 rounds up to the next power of two over the measured gap.
 name: instant_deriv_gauge_walk
 query: deriv(diff_gauge_walk[5m])

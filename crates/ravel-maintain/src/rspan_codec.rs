@@ -52,8 +52,8 @@
 //!
 //! The merge itself is a **k-way block-streaming merge**, so its peak resident
 //! memory is bounded independently of any one trace's size, the same fix RLOG
-//! got in #745. Unlike RLOG, there is no per-stream (here, per-trace) outer
-//! loop: RSPAN's SKIP_IDX has no directory of the distinct `trace_id`s an
+//! got. Unlike RLOG, there is no per-stream (here, per-trace) outer loop:
+//! RSPAN's SKIP_IDX has no directory of the distinct `trace_id`s an
 //! object holds (a block entry records only its own boundary
 //! `min_trace_id`/`max_trace_id`, not every trace_id that starts inside it),
 //! so "the next trace_id in this object" cannot be discovered without decoding
@@ -370,8 +370,8 @@ impl PartBuilder {
 /// stored (already `(trace_id, start_ts_ns)`-ascending) order one block at a
 /// time. At most one decoded block is resident: `head` is the next record to
 /// merge, `block` holds the rest of the current block, and the next block's
-/// bytes are fetched by range only once the current block is drained (issue
-/// #908). Unlike RLOG's `StreamCursor`, this walks *every* block of the input
+/// bytes are fetched by range only once the current block is drained. Unlike
+/// RLOG's `StreamCursor`, this walks *every* block of the input
 /// unconditionally -- there is no per-trace filter, because RSPAN has no
 /// directory of which traces a block holds (see the module memory note).
 /// `input_index` is the cursor's canonical position in `catalogs`, the k-way
@@ -1128,9 +1128,9 @@ mod tests {
         Bytes::from(out)
     }
 
-    /// Issue #926: a CRC-valid RSPAN input whose footer `record_count`
-    /// over-declares its actual body (footer says N+1, body decodes to N) must
-    /// fail the streaming compaction loud with the typed
+    /// A CRC-valid RSPAN input whose footer `record_count` over-declares its
+    /// actual body (footer says N+1, body decodes to N) must fail the
+    /// streaming compaction loud with the typed
     /// [`MaintainError::SpanInputRecordCountMismatch`], never a silent merge
     /// that drops the discrepancy.
     ///
@@ -1228,11 +1228,11 @@ mod tests {
     /// one fetched raw block plus one decoded block per input -- must stay
     /// under a fixed bound and must NOT grow with the trace. Flipped-line
     /// proof: reverting `BlockCursor::refill`'s one-block-at-a-time discipline
-    /// to whole-object decode (the pre-#908 shape, e.g. by making `refill`
-    /// eagerly decode every remaining block into `self.block` on first call
-    /// instead of one block per call) makes `decoded` scale with the trace and
-    /// pushes `transient` over `TRANSIENT_BOUND` at the 10x scale -- this test
-    /// fails against that whole-read shape.
+    /// to whole-object decode (e.g. by making `refill` eagerly decode every
+    /// remaining block into `self.block` on first call instead of one block
+    /// per call) makes `decoded` scale with the trace and pushes `transient`
+    /// over `TRANSIENT_BOUND` at the 10x scale -- this test fails against that
+    /// whole-read shape.
     ///
     /// Deterministic: it asserts on the tracker's accounting, never on process
     /// RSS or allocator hooks, and runs against [`MemoryStore`].

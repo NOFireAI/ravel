@@ -1,8 +1,7 @@
-//! Machine-readable benchmark report CLI (epic #1053, T2). Runs one
-//! ingest-then-query workload via `ravel_bench::report::run` and writes a
-//! single JSON document to `--out`, so a performance/cost number can be
-//! committed next to the command and environment that produced it instead of
-//! pasted from a log.
+//! Machine-readable benchmark report CLI. Runs one ingest-then-query
+//! workload via `ravel_bench::report::run` and writes a single JSON document
+//! to `--out`, so a performance/cost number can be committed next to the
+//! command and environment that produced it instead of pasted from a log.
 //!
 //! `--store memory|s3` selects the backend (`ravel_bench::harness`); the `s3`
 //! store reads `RAVEL_S3_*` env vars. The emitted `environment.store_backend`

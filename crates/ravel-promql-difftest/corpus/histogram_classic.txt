@@ -1,27 +1,26 @@
-# Classic-bucket histogram function corpus (ticket P9,
-# docs/promql-evaluator-plan.md section 8): histogram_quantile and
-# histogram_fraction over `le`-labeled classic bucket series, against
-# crates/ravel-promql-difftest/src/generator.rs's fixed dataset. Every
-# offset is relative to the dataset's base_ts_ms.
+# Classic-bucket histogram function corpus (docs/promql-evaluator-plan.md
+# section 8): histogram_quantile and histogram_fraction over `le`-labeled
+# classic bucket series, against the fixed dataset in
+# crates/ravel-promql-difftest/src/generator.rs. Every offset is relative
+# to the dataset's base_ts_ms.
 #
 # generator.rs's classic_histogram_family has no "missing +Inf bucket"
-# variant (adding one is out of this ticket's corpus/-only scope); that
+# variant (adding one is out of scope for this corpus/-only change); that
 # scenario is instead synthesized here with a `le!="+Inf"` matcher against
 # the "wellformed" series.
 #
 # histogram_quantile/histogram_fraction have no matrix-reducing shape, so
-# they are not usable at a range query's top level (see this ticket's final
-# report); the "rate of buckets" composition below is written as an instant
-# query for the same reason. Every entry is `mode: unordered` for the same
-# reason as selectors.txt (ADR-0021 decision 3).
+# they are not usable at a range query's top level; the "rate of buckets"
+# composition below is written as an instant query for the same reason.
+# Every entry is `mode: unordered` for the same reason as selectors.txt
+# (ADR-0021 decision 3).
 #
-# `ravel-promql` now carries warning/info annotations (issue #178): the
-# missing-+Inf and non-monotonic entries below are scenarios Prometheus
-# attaches a warning to, and `ravel-promql` now raises the matching warning
-# through the same evaluator path, so the differential comparator's
-# presence-equality check on both passes rather than being an expected
-# failure. Verified against the real pinned Prometheus binary after #178
-# landed (0 mismatches on this file's entries).
+# `ravel-promql` carries warning/info annotations: the missing-+Inf and
+# non-monotonic entries below are scenarios Prometheus attaches a warning
+# to, and `ravel-promql` raises the matching warning through the same
+# evaluator path, so the differential comparator's presence-equality check
+# on both passes rather than being an expected failure. Verified against
+# the real pinned Prometheus binary (0 mismatches on this file's entries).
 
 name: instant_histogram_quantile_wellformed_buckets
 query: histogram_quantile(0.9, diff_histogram_bucket{variant="wellformed"})

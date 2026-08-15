@@ -1,7 +1,7 @@
 name: bench-s3
 
-# Real-S3 benchmark lane (epic #1053, T2). Runs the `bench_report` bin against
-# the real object-storage backend and uploads the machine-readable JSON so a
+# Real-S3 benchmark lane. Runs the `bench_report` bin against the real
+# object-storage backend and uploads the machine-readable JSON so a
 # performance/cost number can be committed alongside the command and
 # environment that produced it. ADR-0075 decision 3: a request-budget defect is
 # free on a store with no request charges and billable on real S3, so published

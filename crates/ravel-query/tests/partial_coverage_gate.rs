@@ -1,10 +1,10 @@
 //! Acceptance proof for ADR-0071's "partial results are consent-gated and
-//! envelope-visible" amendment (epic #1063, decisions 1-3): the read HTTP
-//! surface refuses partial coverage unless the client opted in with
-//! `allow_partial`, and when it does return partial data it flags it with a
-//! required top-level `partial` field.
+//! envelope-visible" amendment (decisions 1-3): the read HTTP surface refuses
+//! partial coverage unless the client opted in with `allow_partial`, and when
+//! it does return partial data it flags it with a required top-level `partial`
+//! field.
 //!
-//! The epic's verbatim acceptance property: **a client which ignores warnings
+//! The amendment's acceptance property: **a client which ignores warnings
 //! cannot mistake partial for complete.** This is proven two ways here:
 //!
 //! 1. Without `allow_partial`, a partial-coverage request fails with the typed
@@ -216,12 +216,12 @@ async fn series_complete_is_200_partial_false_present() {
 
 // ---- the load-bearing proof ----------------------------------------------
 
-/// The epic's acceptance property, made executable: a naive client that reads
-/// only `status` and `data` sees an IDENTICAL shape for an opted-in partial
-/// response and a complete response. The `partial` field is therefore the sole
-/// top-level signal distinguishing them; without it (the pre-amendment wire, or
-/// any regression that drops/omits it) the two are indistinguishable and the
-/// client silently accepts partial as complete.
+/// The amendment's acceptance property, made executable: a naive client that
+/// reads only `status` and `data` sees an IDENTICAL shape for an opted-in
+/// partial response and a complete response. The `partial` field is therefore
+/// the sole top-level signal distinguishing them; without it (the
+/// pre-amendment wire, or any regression that drops/omits it) the two are
+/// indistinguishable and the client silently accepts partial as complete.
 #[tokio::test]
 async fn partial_field_is_the_sole_top_level_discriminator() {
     let (_, partial_json) = get(&app(true), "/api/v1/query?query=up&allow_partial=true").await;

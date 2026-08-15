@@ -33,13 +33,12 @@ use crate::fetcher::FetchedSeriesSoa;
 /// falls back to fully local execution (ADR-0071 version-skew rule), never
 /// misinterprets a future frame layout.
 ///
-/// Bumped 1 -> 2 for the ADR-0071 amendment (epic #1055 finding F-1): the shared
-/// bearer token on `Pinned` fetches is replaced by a per-tenant, per-query
-/// fragment capability ([`FragmentClaims`]). This is a version bump on an
-/// existing versioned wire field, not a frozen persistent-format change. A
-/// version-skewed worker is dropped at routing time (never a hard error), so a
-/// rolling deploy degrades to coordinator-local execution, never to a wrong
-/// answer.
+/// Bumped 1 -> 2 for the ADR-0071 amendment: the shared bearer token on
+/// `Pinned` fetches is replaced by a per-tenant, per-query fragment capability
+/// ([`FragmentClaims`]). This is a version bump on an existing versioned wire
+/// field, not a frozen persistent-format change. A version-skewed worker is
+/// dropped at routing time (never a hard error), so a rolling deploy degrades
+/// to coordinator-local execution, never to a wrong answer.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).

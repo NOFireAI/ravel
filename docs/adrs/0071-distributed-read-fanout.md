@@ -161,7 +161,7 @@ credentials lacks.
 > **Superseded in part** for `Pinned` fetches by the amendment below
 > ("Dedicated fragment listener and per-tenant fragment capabilities"):
 > the shared-listener, shared-token design this section describes is the
-> defect epic #1055 finding F-1 identified. `Resolve` (federation)
+> defect finding F-1 identified. `Resolve` (federation)
 > authorization is unchanged. Remote endpoints come only from operator config, never
 from query text. Remote responses are size- and shape-validated data; a
 remote cannot escalate through the coordinator.
@@ -270,7 +270,7 @@ exists).
 
 ## Amendment: dedicated fragment listener and per-tenant fragment capabilities
 
-Epic #1055, finding F-1 (risk R7, P2). The Security section above made two
+Finding F-1 (risk R7, P2). The Security section above made two
 claims that the adversarial review showed compose into a fleet-wide
 cross-tenant read credential. This ADR said:
 
@@ -469,8 +469,8 @@ into the rollout:
    window requires a token leaked *during* the rollout itself. (Token
    rotation is itself a rolling restart of the v1 fleet; the sequence is
    two rolls, not one, and both are bounded.)
-2. Land the H-1 NetworkPolicy (epic #1055, restricting fragment-port
-   reachability to cluster peers) before the rollout, so network reach,
+2. Land the H-1 NetworkPolicy (restricting fragment-port reachability to
+   cluster peers) before the rollout, so network reach,
    the second precondition of R7, is already withdrawn from
    outside-cluster holders.
 
@@ -529,9 +529,9 @@ KMS templates, per the doc-currency rule.
 
 ### Amendment-adjacent fixes that need no ADR
 
-Two epic #1055 items are deliberately *not* gated on this amendment,
+Two related review items are deliberately *not* gated on this amendment,
 because they decide nothing architectural; they are recorded here only so
-the epic's scope reads in one place:
+that work reads in one place:
 
 - `crates/ravel-query/src/http/tenant.rs` line 51:
   `StaticBearerTokenResolver` resolves by `HashMap` lookup keyed on the
@@ -596,7 +596,7 @@ the epic's scope reads in one place:
 
 ## Amendment: partial results are consent-gated and envelope-visible
 
-Status: Accepted. Epic #1063. Amends the response-contract halves of two
+Status: Accepted. Amends the response-contract halves of two
 sentences above: the Decision's "a per-remote `skip_unavailable` opt-in
 returns partial results marked in the response `warnings` plus a `partial`
 stats block", and the Security section's "The query stats carry
@@ -671,8 +671,8 @@ stats block to bury one in (`crates/ravel-query/src/http/handlers.rs`).
    failure path (log, count `rules_failed`, keep prior state, retry next
    tick), so no transition record is ever written from partial data. Any
    richer policy - a per-rule opt-in to evaluate on partial coverage -
-   belongs to epic #1052, which owns alerting; this amendment only
-   guarantees the safe default and makes the signal reachable.
+   belongs with the alerting work that owns that surface; this amendment
+   only guarantees the safe default and makes the signal reachable.
 
 ### Grafana compatibility
 
@@ -706,18 +706,19 @@ shipped, and the cost of changing this contract only grows.
 ### Out of scope
 
 - The fragment surface's listener, transport encryption, and credential
-  model: a separate amendment to this ADR (epic #1055) owns those; this
-  amendment neither depends on nor constrains it.
+  model: the "Dedicated fragment listener and per-tenant fragment
+  capabilities" amendment above owns those; this amendment neither
+  depends on nor constrains it.
 - The `--remote-cluster` federation TLS default (currently off). Flipping
   it is federation transport hardening, not response honesty; it was
-  bundled into epic #1063 but belongs with #1055's transport work, and
-  this amendment recommends re-homing it there rather than deciding it
-  here.
-- The dead-endpoint ranking window after mass worker death (epic #1063's
-  P3 item): a recovery-latency tuning, no response-contract impact, stays
-  a separate task.
-- Per-rule partial-coverage policy in alerting: epic #1052, as decided
-  above.
+  bundled into this amendment's scope but belongs with the
+  fragment-listener amendment's transport work above, and this amendment
+  recommends re-homing it there rather than deciding it here.
+- The dead-endpoint ranking window after mass worker death (a P3 item): a
+  recovery-latency tuning, no response-contract impact, stays a separate
+  task.
+- Per-rule partial-coverage policy in alerting: belongs with the alerting
+  work that owns that surface, as decided above.
 
 ### Consequences
 
@@ -735,8 +736,8 @@ shipped, and the cost of changing this contract only grows.
 
 ## Amendment: federation TLS by default, engine-direct caller honesty, and dead-endpoint quarantine
 
-Status: Accepted. Epic #1063, the three remaining items. This amendment
-decides: (1) the `--remote-cluster` federation transport default flips
+Status: Accepted. This amendment decides the three remaining items:
+(1) the `--remote-cluster` federation transport default flips
 from plaintext to TLS, with plaintext demoted to an explicit, loudly
 logged choice; (2) the two production callers that reach the query engine
 directly, bypassing the HTTP-boundary consent gate the previous amendment
@@ -749,9 +750,9 @@ worker's own next heartbeat.
 
 One prior thread is resolved here rather than left dangling: the previous
 amendment's Out-of-scope section recommended re-homing the federation TLS
-default under epic #1055's transport work. The epic kept it in #1063, and
-this amendment decides it under #1063; that recommendation is superseded,
-not silently dropped.
+default under the fragment-listener amendment's transport work. That
+re-homing was not taken up there, and this amendment decides the default
+here instead; the recommendation is superseded, not silently dropped.
 
 ### 1. Federation TLS on by default; plaintext is an explicit, logged choice
 
@@ -908,8 +909,8 @@ reasoning the epic asked for, having weighed the alternative honestly:
   meta-alert on, instead of a silent gap.
 
 Any richer policy — a per-rule opt-in to evaluate on partial coverage,
-with a marked notification — remains assigned to epic #1052, which owns
-alerting, exactly as the previous amendment already recorded.
+with a marked notification — remains assigned to the alerting work that
+owns that surface, exactly as the previous amendment already recorded.
 
 **Decision (analytics): a request-body opt-in, mirroring the HTTP gate.**
 `AnalyticsBody` (`analytics.rs`) gains `allow_partial: bool`
@@ -935,8 +936,8 @@ different channel than all the others.
    partial-coverage-derived.* Rejected for the reasons argued above:
    false resolves are confident silence, durable records written from
    partial data need later reconciliation, and a marker cannot un-page or
-   un-silence. Revisit per-rule under #1052 if a concrete rule class
-   needs it.
+   un-silence. Revisit per-rule under that alerting work if a concrete
+   rule class needs it.
 2. *Skip the analytics gate and rely on the stats block.* That is the
    exact defect class the previous amendment removed from the query
    endpoints: an incompleteness signal buried where naive consumers never

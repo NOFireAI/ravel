@@ -3,7 +3,7 @@
 //! compactor-racing-tombstone ordering interlock, partial-sweep crash
 //! convergence, and the config validation floor. The convergence/interlock
 //! tests run once over an RSEG (metrics) fixture and once over an RLOG (logs)
-//! fixture through one seeding helper, per the issue text.
+//! fixture through one seeding helper.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -582,7 +582,7 @@ async fn no_policy_is_a_noop() {
     assert!(!bucket_is_empty(&store, &bucket).await);
 }
 
-// --- HEAD-reachability delete blocker (ADR-0020, issue #1075) ----------------
+// --- HEAD-reachability delete blocker (ADR-0020) ---------------------------
 
 /// The catalog HEAD key for the shared test tenant/signal (frozen key layout).
 fn head_key(signal: Signal) -> String {
@@ -858,14 +858,14 @@ async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
     assert!(bucket_is_empty(store.as_ref(), &bucket).await);
 }
 
-/// The epic exit criterion (issue #1075): retention of an hour whose tombstone
-/// lands FAR behind the fold watermark (outside the fixed reconcile window)
-/// never leaves the snapshot naming a deleted object. The fold's
-/// retention-frontier reconcile drops the out-of-window hour, then the sweep
-/// deletes it; a resolve spanning the retired hour returns only live segments,
-/// never a reference to a deleted object (the catalog-layer condition that
-/// produces `SnapshotInvalidated` / 503 downstream), and it stays true across
-/// repeated resolves.
+/// The epic exit criterion: retention of an hour whose tombstone lands FAR
+/// behind the fold watermark (outside the fixed reconcile window) never leaves
+/// the snapshot naming a deleted object. The fold's retention-frontier
+/// reconcile drops the out-of-window hour, then the sweep deletes it; a
+/// resolve spanning the retired hour returns only live segments, never a
+/// reference to a deleted object (the catalog-layer condition that produces
+/// `SnapshotInvalidated` / 503 downstream), and it stays true across repeated
+/// resolves.
 ///
 /// To watch this FAIL against pre-fix code, disable the fold's frontier
 /// reconcile (`frontier_reconcile_max_hours: 0`) AND the sweep's HEAD gate

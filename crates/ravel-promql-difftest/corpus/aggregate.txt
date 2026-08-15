@@ -1,5 +1,5 @@
-# Aggregation operator corpus (ticket #129, docs/promql-evaluator-plan.md
-# section P8), against crates/ravel-promql-difftest/src/generator.rs's
+# Aggregation operator corpus (docs/promql-evaluator-plan.md section P8),
+# against crates/ravel-promql-difftest/src/generator.rs's
 # `diff_agg_group` and `diff_agg_special` series. Every offset is relative
 # to the dataset's base_ts_ms.
 #
@@ -10,20 +10,20 @@
 # against the combined six-series vector, where the tied maximum (job a's
 # two 20s) and tied minimum (job b's two 5s) are each fully retained by
 # `k=2` rather than split at a tie boundary. These two entries are
-# `mode: unordered`, not `ordered`: issue #177 found that the two engines'
-# tie-break order among exactly-equal boundary values genuinely differs
-# (see crates/ravel-promql/src/aggregate.rs's module doc comment), which
-# has no defined PromQL semantics to begin with; retention (the right set
-# of members survives the tie) is what these entries test, and unordered
+# `mode: unordered`, not `ordered`: the two engines' tie-break order
+# among exactly-equal boundary values genuinely differs (see
+# crates/ravel-promql/src/aggregate.rs's module doc comment), which has
+# no defined PromQL semantics to begin with; retention (the right set of
+# members survives the tie) is what these entries test, and unordered
 # comparison still verifies that.
 #
 # `diff_agg_special` (NaN, -0.0, 1.0, one series each, all present at the
 # same instant) exercises NaN-skipping min/max, NaN-propagating sum, and
 # NaN-sorts-last topk/bottomk. Three entries that would otherwise exercise
-# this dataset's -0.0 member are excluded below (issue #177): the pinned
-# Prometheus binary does not preserve the sign of zero through its own
+# this dataset's -0.0 member are excluded below: the pinned Prometheus
+# binary does not preserve the sign of zero through its own
 # aggregation/storage path the way this project's comparator requires
-# (ADR-0025, issue #170's `instant_special_values_negative_zero`), an
+# (ADR-0025, recorded by `instant_special_values_negative_zero`), an
 # already-accepted divergence recurring here rather than a new one.
 
 name: agg_sum_no_modifier
@@ -54,7 +54,7 @@ mode: unordered
 # predict_linear entries): measured 1 ULP off Prometheus on job "b"'s
 # average. avg's Kahan-compensated fold is a deliberate port (module doc),
 # so this is very likely the same kind of findable-but-unfound divergence,
-# not an inherent limit; not investigated further here (issue #177).
+# not an inherent limit; not investigated further here.
 # tolerance: 2 is 1 ULP of headroom over the measured gap.
 name: agg_avg_by_job
 query: avg by (job) (diff_agg_group)
@@ -106,10 +106,10 @@ time: +0s
 mode: unordered
 
 # quantile(1.5, ...) clamps to +Inf on both sides, and both now emit the
-# out-of-range warning (issue #178 gave Ravel the annotation channel and
-# wired this InvalidQuantileWarning through it; the comparator checks
-# warning presence). Removed under issue #177 while Ravel had no warning
-# mechanism; re-added here now that it does.
+# out-of-range warning (Ravel's annotation channel carries this
+# InvalidQuantileWarning; the comparator checks warning presence). This
+# entry was removed while Ravel had no warning mechanism, and re-added
+# here now that it has one.
 name: agg_quantile_out_of_range_clamps
 query: quantile(1.5, diff_agg_group)
 kind: instant
@@ -154,12 +154,12 @@ kind: instant
 time: +0s
 mode: unordered
 
-# agg_special_min_skips_nan removed (issue #177): min(diff_agg_special)'s
-# winning value here is the dataset's -0.0 member itself (nothing in the
-# group beats it under `<`), so this is the same -0.0-preservation
-# divergence as the header comment above, not a NaN-skipping bug; NaN-
-# skipping itself is still exercised by agg_special_max_skips_nan, whose
-# winner (1.0) is unambiguous.
+# agg_special_min_skips_nan removed: min(diff_agg_special)'s winning
+# value here is the dataset's -0.0 member itself (nothing in the group
+# beats it under `<`), so this is the same -0.0-preservation divergence
+# as the header comment above, not a NaN-skipping bug; NaN-skipping
+# itself is still exercised by agg_special_max_skips_nan, whose winner
+# (1.0) is unambiguous.
 
 name: agg_special_sum_propagates_nan
 query: sum(diff_agg_special)
@@ -168,8 +168,8 @@ time: +0s
 mode: unordered
 
 # agg_special_topk_nan_sorts_last and agg_special_bottomk_nan_sorts_last
-# removed (issue #177): both engines already agree on order (one, negzero,
-# nan for topk; nan last either way) -- the mismatch was purely the
+# removed: both engines already agree on order (one, negzero, nan for
+# topk; nan last either way), and the mismatch was purely the
 # -0.0-preservation divergence on the "negzero" member's value, the same
 # class as agg_special_min_skips_nan above. Removing loses this dataset's
 # cross-engine check of "NaN sorts last under topk/bottomk"; that behavior

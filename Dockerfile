@@ -72,7 +72,7 @@ ENTRYPOINT ["/usr/local/bin/ravel-server"]
 # ---- Runtime: operator image ------------------------------------------------
 # The Kubernetes operator (ADR-0034 decision 5): same distroless/cc:nonroot
 # base and the same CARGO_BUILD_JOBS=2 builder stage as the server image, so it
-# inherits the OOM fix (issue #251) without a second build configuration.
+# inherits the OOM fix without a second build configuration.
 # `--target operator` builds only this image.
 FROM gcr.io/distroless/cc-debian12:nonroot AS operator
 

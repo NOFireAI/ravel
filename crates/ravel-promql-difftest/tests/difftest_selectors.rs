@@ -29,13 +29,13 @@ const HISTOGRAM_NATIVE_CORPUS: &str = include_str!("../corpus/histogram_native.t
 const OVER_TIME_CORPUS: &str = include_str!("../corpus/over_time.txt");
 const HISTOGRAM_CLASSIC_CORPUS: &str = include_str!("../corpus/histogram_classic.txt");
 
-/// Issue #947 exclusion: the exact PromQL queries whose difference from the
-/// pinned Prometheus binary is a 1-ULP summation-order residue in the last
-/// digit (e.g. `-4.235967390124592` vs `-4.235967390124591`), not a semantic
-/// bug. `avg_over_time`'s incremental Kahan mean and `rate()`'s Kahan sum
+/// The exact PromQL queries whose difference from the pinned Prometheus
+/// binary is a 1-ULP summation-order residue in the last digit (e.g.
+/// `-4.235967390124592` vs `-4.235967390124591`), not a semantic bug.
+/// `avg_over_time`'s incremental Kahan mean and `rate()`'s Kahan sum
 /// reduce their windows in an order Prometheus does not reproduce bit-for-bit;
 /// making the output bit-exact would mean changing Ravel's reduction strategy,
-/// a decision epic #947 owns and gates behind a not-yet-written tolerance ADR.
+/// a decision deferred to a tolerance ADR that is not yet written.
 /// Until then these two queries (and only these two) compare within a small
 /// ULP tolerance instead of exact bits. Every other corpus entry, in both new
 /// files and the existing ones, stays exact-match. Keyed by query text so it
@@ -64,7 +64,7 @@ const ISSUE_947_ULP_TOLERANCE_QUERIES: &[&str] = &[
 /// bug.
 const ISSUE_947_ULP_TOLERANCE: u32 = 8;
 
-/// Apply the issue #947 exclusion in place: any entry whose query is one of
+/// Apply the ULP-tolerance exclusion in place: any entry whose query is one of
 /// [`ISSUE_947_ULP_TOLERANCE_QUERIES`] and that has not already declared its
 /// own `tolerance:` gets [`ISSUE_947_ULP_TOLERANCE`]. Returns how many entries
 /// were adjusted so the caller can assert the allowlist actually matched
@@ -132,15 +132,15 @@ async fn selector_and_error_corpus_match_pinned_prometheus() {
     entries.extend(parse_corpus(OVER_TIME_CORPUS).expect("parse over_time corpus"));
     entries.extend(parse_corpus(HISTOGRAM_CLASSIC_CORPUS).expect("parse histogram_classic corpus"));
 
-    // Issue #947: two named queries carry a last-digit summation-order residue
-    // that is out of scope to make bit-exact here; everything else stays
+    // Two named queries carry a last-digit summation-order residue that is
+    // out of scope to make bit-exact here; everything else stays
     // exact-match. Assert the allowlist matched so a future rename cannot
     // silently drop the exclusion and turn this into a spurious failure.
     let applied = apply_issue_947_tolerance(&mut entries);
     assert!(
         applied >= 2,
-        "issue #947 float-tolerance allowlist matched {applied} entries, expected at least the \
-         two named queries; a corpus query was likely renamed"
+        "float-tolerance allowlist matched {applied} entries, expected at least the two \
+         named queries; a corpus query was likely renamed"
     );
 
     let report = run_corpus(

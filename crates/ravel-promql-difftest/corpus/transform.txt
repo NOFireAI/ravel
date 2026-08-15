@@ -1,28 +1,27 @@
-# Elementwise math, clamp, sort, label, time/calendar function corpus
-# (ticket P6, docs/promql-evaluator-plan.md section 9/10/11), against
-# crates/ravel-promql-difftest/src/generator.rs's fixed dataset. Every
-# offset is relative to the dataset's base_ts_ms (1_700_000_000_000 ms,
-# i.e. 2023-11-14T22:13:20Z).
+# Elementwise math, clamp, sort, label, and time/calendar function
+# corpus, against crates/ravel-promql-difftest/src/generator.rs's fixed
+# dataset. Every offset is relative to the dataset's base_ts_ms
+# (1_700_000_000_000 ms, i.e. 2023-11-14T22:13:20Z).
 #
 # sort/sort_desc entries are deliberately kind: instant with mode: ordered
-# only (plan section 4/9): a real Prometheus sort is not stable, so tied or
-# NaN-valued inputs would make an ordered comparison flaky. Every sort/
-# sort_desc query here selects series whose values are continuous random
-# walks (vanishingly unlikely to tie) and excludes any NaN-bearing series.
+# only: a real Prometheus sort is not stable, so tied or NaN-valued
+# inputs would make an ordered comparison flaky. Every sort/sort_desc
+# query here selects series whose values are continuous random walks
+# (vanishingly unlikely to tie) and excludes any NaN-bearing series.
 #
 # label_replace's dst-validation and regex-compile errors are runtime
 # errors (the query parses fine on both sides, validation fails only at
 # eval time), not the syntax errors errors.txt is scoped to, so they live
-# here instead alongside the rest of P6's own semantics.
+# here instead alongside the rest of this corpus's own semantics.
 #
 # No entry here relies on a binary expression (arithmetic or set operator:
 # `or`/`and`/`unless`, `+`, `/`, ...) or an aggregation: eval.rs does not
 # implement Expr::Binary or Expr::Aggregate yet (both return a typed
 # Unsupported error), which is a different phase's scope, not this one's.
-# Where P6's own semantics call for a NaN scalar (clamp's NaN-bound cases),
-# the bare `NaN` number literal is used instead of a `0/0` binary
-# expression, since PromQL's grammar (and this evaluator's parser) accepts
-# `NaN`/`Inf`/`-Inf` directly as number tokens.
+# Where this corpus's own semantics call for a NaN scalar (clamp's
+# NaN-bound cases), the bare `NaN` number literal is used instead of a
+# `0/0` binary expression, since PromQL's grammar (and this evaluator's
+# parser) accepts `NaN`/`Inf`/`-Inf` directly as number tokens.
 
 name: instant_abs_over_special_values
 query: abs(diff_special_values)
@@ -269,8 +268,7 @@ mode: unordered
 # same check from Prometheus' own `model.LabelNameRE`. Ravel deliberately
 # keeps the stricter legacy-name validation and rejects it. This is a
 # real, accepted engine divergence pending its own decision (relax Ravel
-# to match, or keep the stricter check), not a corpus mistake; see
-# issue #170.
+# to match, or keep the stricter check), not a corpus mistake.
 
 name: error_label_replace_invalid_regex
 query: label_replace(diff_match_left, "region", "$1", "job", "(unterminated")
@@ -292,7 +290,7 @@ mode: unordered
 
 # Same accepted divergence as error_label_replace_invalid_dst_label_name
 # above (Prometheus v3.13.1 accepts an invalid destination label name;
-# Ravel deliberately keeps stricter validation): see issue #170.
+# Ravel deliberately keeps stricter validation).
 
 name: instant_absent_over_present_series_is_empty
 query: absent(diff_gauge_walk)

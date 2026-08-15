@@ -648,7 +648,7 @@ async fn sweep_unreferenced_result(
     .await
 }
 
-// --- Issue #273: abandoned-compaction L1 leak (option (b)) ------------------
+// --- Abandoned-compaction L1 leak (option (b)) ------------------------------
 //
 // The fix collects record-less `l1/` parts ONLY in buckets that hold a
 // retention tombstone (which makes any future compaction impossible), and

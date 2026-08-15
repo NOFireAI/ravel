@@ -22,10 +22,10 @@
 //! quantile argument are `warnings`; a forced monotonicity fixup is an
 //! `info`. A group that is merely missing its `+Inf` top bucket is the one
 //! `NaN` case that raises NO annotation, matching the pinned Prometheus
-//! binary (issue #1099): its `bucketQuantile` returns `NaN` silently for that
-//! incomplete shape. See [`crate::Annotations`] for the warning/info
-//! distinction. The native-histogram path's own Prometheus annotations are
-//! not wired here yet.
+//! binary: its `bucketQuantile` returns `NaN` silently for that incomplete
+//! shape. See [`crate::Annotations`] for the warning/info distinction. The
+//! native-histogram path's own Prometheus annotations are not wired here
+//! yet.
 
 use std::collections::{HashMap, HashSet};
 
@@ -147,8 +147,8 @@ struct Prepared {
 ///   not `+Inf` (an incomplete classic histogram, e.g. a `le!="+Inf"`
 ///   matcher). Prometheus' `bucketQuantile` returns `NaN` for this shape and
 ///   raises NO warning; matching that silence is the whole point of keeping
-///   this reason separate (issue #1099: the pinned binary emits no annotation
-///   here, so neither may Ravel).
+///   this reason separate: the pinned binary emits no annotation here, so
+///   neither may Ravel.
 /// * `TooFewBuckets` — fewer than two usable buckets before or after
 ///   coalescing duplicate `le` values: too degenerate to interpolate at all.
 ///   This still carries the bad-buckets warning.
@@ -275,7 +275,7 @@ fn quantile_for_group(phi: f64, buckets: Vec<Bucket>) -> (f64, ClassicGroupDiag)
             },
         ),
         // Missing the `+Inf` top bucket: NaN with no annotation, matching
-        // Prometheus' `bucketQuantile` (issue #1099).
+        // Prometheus' `bucketQuantile`.
         PrepareOutcome::MissingInfBucket => (f64::NAN, ClassicGroupDiag::default()),
         PrepareOutcome::TooFewBuckets => (
             f64::NAN,
@@ -421,7 +421,7 @@ fn fraction_for_group(lower: f64, upper: f64, buckets: Vec<Bucket>) -> (f64, Cla
     let prepared = match prepare(buckets) {
         PrepareOutcome::Ready(prepared) => prepared,
         // Missing the `+Inf` top bucket: NaN with no annotation, matching
-        // Prometheus (issue #1099).
+        // Prometheus.
         PrepareOutcome::MissingInfBucket => return (f64::NAN, ClassicGroupDiag::default()),
         PrepareOutcome::TooFewBuckets => {
             return (

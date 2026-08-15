@@ -187,8 +187,8 @@ repo config).
 
 ## Amendment: verifiable release artifacts
 
-An independent due-diligence review (epic #1056, findings K-1 and K-2)
-rated the release artifact itself as the weak half of an otherwise strong
+An independent due-diligence review (findings K-1 and K-2) rated the
+release artifact itself as the weak half of an otherwise strong
 build-and-test story: images publish under mutable tags, unsigned, with
 no SBOM, and nothing gates the release tag on CI. This amendment adds
 signing, SBOM and provenance attestation, an explicit CI gate on tag
@@ -232,9 +232,9 @@ current `main` rather than assumed:
   mirror has already shipped `v0.9.0`; the Prometheus-compat buildinfo
   endpoint reports `env!("CARGO_PKG_VERSION")`
   (crates/ravel-query/src/http/compat.rs:67), so the `0.9.0` release
-  reported itself as `0.1.0`. Contrary to the epic's text, PR #1050
-  fixed only the committed symlink; the version mismatch is still live
-  and is addressed by decision 11.
+  reported itself as `0.1.0`. Contrary to the review's text, the change
+  that landed fixed only the committed symlink; the version mismatch is
+  still live and is addressed by decision 11.
 
 ### Decision 7: signing is cosign keyless (Sigstore), not a managed key
 

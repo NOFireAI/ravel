@@ -87,13 +87,13 @@
 //! `Vec<LogRecord>` batch.
 //!
 //! Peak resident memory is then: per-input catalog metadata (KBs per input,
-//! unchanged from #275), plus at most one decoded block per input carrying the
-//! current stream (`O(input_count * block_size)`, independent of stream size),
-//! plus the in-progress part's writer buffer. The writer buffer is bounded by
-//! `max_l1_part_bytes` -- a part is flushed on a stream boundary once its
-//! record-byte estimate reaches the cap -- and holding a whole part before its
-//! content-addressed key exists is unavoidable, not a regression. The
-//! [`MergeMemoryTracker`] seam accounts these terms at their real
+//! unchanged by the k-way merge), plus at most one decoded block per input
+//! carrying the current stream (`O(input_count * block_size)`, independent of
+//! stream size), plus the in-progress part's writer buffer. The writer buffer
+//! is bounded by `max_l1_part_bytes` -- a part is flushed on a stream boundary
+//! once its record-byte estimate reaches the cap -- and holding a whole part
+//! before its content-addressed key exists is unavoidable, not a regression.
+//! The [`MergeMemoryTracker`] seam accounts these terms at their real
 //! allocation/decode points and records a high-water mark; the acceptance test
 //! asserts that mark stays under a fixed bound while a hot stream grows.
 //!
@@ -563,9 +563,9 @@ async fn merge_stream_into_part(
 ///
 /// The writer was built with the same [`RlogWriter::with_indexed_fields`] the
 /// L0 write path uses, so this part's POSTINGS is built by the one writer
-/// implementation from this part's own blocks (ADR-0049 decision 6, issue
-/// #509). The per-field distinct-value cap therefore applies to the merged
-/// part; when it fires the writer drops that field's postings and reports it in
+/// implementation from this part's own blocks (ADR-0049 decision 6). The
+/// per-field distinct-value cap therefore applies to the merged part; when it
+/// fires the writer drops that field's postings and reports it in
 /// `WriteStats`, which is logged here because a silently unindexed field is
 /// invisible in the object bytes (they are simply absent, which is always
 /// legal).
@@ -715,11 +715,11 @@ fn attr_value_estimate(v: &AttrValue) -> u64 {
 /// past corruption because absence is legal, but a compactor rewriting the
 /// object should not quietly bake a corrupt input's damage into the output.
 ///
-/// Issue #511 replaces this whole function with a read of the tenant's
-/// configured list. That changes behaviour in two ways the inputs cannot express:
-/// a newly configured field becomes indexed at the next compaction even though
-/// no input indexed it, and a de-configured field stops being indexed even
-/// though its inputs still carry postings.
+/// Once per-tenant configuration of the indexed-field list exists, a read of
+/// that list replaces this whole function. That changes behaviour in two ways
+/// the inputs cannot express: a newly configured field becomes indexed at the
+/// next compaction even though no input indexed it, and a de-configured field
+/// stops being indexed even though its inputs still carry postings.
 async fn input_indexed_fields(
     store: &dyn ObjectStoreBackend,
     object_key: &str,
