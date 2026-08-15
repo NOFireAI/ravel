@@ -49,8 +49,8 @@ ravel-types
   <- ravel-analytics    (types only; pure post-evaluation compute stage)
   <- ravel-alerting     (types, logseg; pure rule/condition/state/record
                           logic, no I/O and no scheduler)
-  <- ravel-sql          (query, catalog, types; arrow + datafusion, in
-                          progress -- see below)
+  <- ravel-sql          (query, catalog, types; arrow + datafusion,
+                          shipped -- see below)
   <- services/ravel-server, services/ravel-cli
 ravel-test-util (types, object-store) used by all dev-deps
 ```
@@ -204,7 +204,7 @@ contract is that only a TLS-terminating, header-stripping proxy is network-
 reachable on the mTLS listener's address; the public listeners are safe
 against header forgery by construction, independent of that proxy hygiene.
 
-## SQL query path (in progress)
+## SQL query path
 
 `ravel-sql` (ADR-0013) adds a second query
 path alongside PromQL: `RsegScanExec -> SortPreservingMergeExec ->
@@ -214,13 +214,15 @@ same total order as `is_greater` in `ravel-query` (bit-for-bit, including
 the `value.to_bits()` tiebreak). Arrow and DataFusion stay isolated to this
 crate; PromQL numerics never lower to SQL, and vice versa.
 
-Status: the scan/merge/dedup pipeline and predicate/projection pushdown
-under a pruning-soundness invariant (pruning may only ever widen the read
-set, never narrow it) are implemented and tested against an independent
-oracle. Not yet built: the HTTP endpoint (`POST /api/v1/sql`, feature
-`sql`) and Flight SQL (feature `flight-sql`) -- both follow-up work, gated
-behind cargo features so the default build stays free of Arrow and DataFusion
-outside `ravel-otap`.
+Status: shipped. The scan/merge/dedup pipeline and predicate/projection
+pushdown under a pruning-soundness invariant (pruning may only ever widen
+the read set, never narrow it) are implemented and tested against an
+independent oracle. Both transports are served too: the HTTP endpoint
+(`POST /api/v1/sql`, feature `sql`) on `--listen-http`, and Flight SQL
+(feature `flight-sql`) on `--listen-grpc`, as the Listener topology section
+above lists. Both stay behind cargo features, off by default, so the default
+build stays free of Arrow and DataFusion outside `ravel-otap`; a build that
+does not enable them serves neither surface.
 
 ## Distributed reads and cross-cluster federation (ADR-0071)
 

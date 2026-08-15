@@ -25,10 +25,13 @@ metric path. SQL queries over the `logs` table use the log path.
 
 Two query surfaces do not use the cache today:
 
-- **Spans (traces).** There is no SQL query surface over spans yet (see
-  the main [README](../../README.md#whats-next)). When that surface
-  lands, it will need its own cache wiring; the trace fetcher has none
-  yet.
+- **Spans (traces).** The `spans` SQL table is queryable on
+  `POST /api/v1/sql`, but its reads are uncached. The span scan fetches
+  each RSPAN segment straight from the object store on every query: the
+  fetch is accounted and tenant-checked, and the tenant identity the log
+  path uses to key its cache entries serves only as that tenant check
+  here. A repeated span query therefore re-reads the same objects. Wiring
+  spans into this cache is still open work.
 - **The `alerts` and `audit` SQL tables.** These tables exist in
   `ravel-sql`, but nothing in production reaches them through a real SQL
   query today, so they have no cached read path to speak of.
@@ -134,6 +137,8 @@ bytes_admitted)`. Filter by the `cache` label for one cache's rate, or omit it
   as a crate, but the query fetchers only accept a RAM cache today. Until
   that attachment point is added, `--cache-dir` fails startup instead of
   silently doing nothing.
-- **Spans have no cache path**, because spans have no query surface yet.
+- **Spans have no cache path**, because span reads are not wired into the
+  cache layer yet: the `spans` SQL table's fetcher has no `with_cache`
+  seam, unlike the RSEG/RLOG fetchers.
 - **The `alerts` and `audit` SQL tables are not reachable in
   production**, so caching them is not meaningful yet.

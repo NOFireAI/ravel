@@ -17,7 +17,7 @@ its local disk.
 
 Metrics and logs run end to end today, from OTLP or Remote Write ingest through
 PromQL, SQL, and Flight SQL query. Traces ingest, compact, and retain end to
-end; a query surface over them is not built yet.
+end, and are queryable through the `spans` SQL table on `POST /api/v1/sql`.
 
 ## Run it
 

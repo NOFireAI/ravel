@@ -231,13 +231,14 @@ limit is on the query's *start*: a narrow `start`/`end` pair costs little
 however recent it is, so the fix is always to move `start` forward, never to
 change `end`.
 
-## SQL over the `logs` table
+## SQL over `samples`, `logs`, and `spans`
 
-`POST /api/v1/sql` (see README "SQL") serves two tables from one endpoint:
-`samples` (metrics) and `logs`. The server parses the query's `FROM` clause
-before it plans, and registers only that one table for the query. A single
-query may reference one table or the other, never both; a query that names
-both gets an HTTP 400. The request body, auth, window
+`POST /api/v1/sql` (see README "SQL") serves three tables from one endpoint:
+`samples` (metrics), `logs`, and `spans`. The server parses the query's `FROM`
+clause before it plans, and registers only that one table for the query. A
+single query may reference exactly one of the three; naming two or more of
+them crosses signals and is rejected with an HTTP 400, before any catalog
+listing. The request body, auth, window
 (`start`/`end`), and `min_commit_token` handling are identical to the `samples`
 case.
 
@@ -300,8 +301,10 @@ one, for any window a retry may have touched. The `x-ravel-idempotency-key`
 suppresses this for keyed sequential retries; unkeyed ingest gets plain
 at-least-once. See
 [consistency-model.md](../consistency-model.md#duplicates-and-idempotency)
-for the full contract. The same applies to spans once a span query surface
-lands.
+for the full contract. The same applies to spans, which are queryable through
+the `spans` table on the same endpoint: span rows are at-least-once with no
+query-time dedup either, so a `COUNT` over `spans` is a lower-bounded count on
+the same terms.
 
 ## HTTP status codes
 

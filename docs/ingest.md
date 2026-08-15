@@ -364,11 +364,11 @@ since `finish()` does not report it back), and `segment_format_version` is
 renames that follow the unit change: `buffered_records_total` for
 `buffered_points_total`, `stream_id_collisions` for `series_id_collisions`.
 
-Snapshot resolution for logs is not wired: `services/ravel-server/src/fold.rs`
-still folds `Signal::Metrics` only, so `catalog/l/HEAD` is never produced
-and there is no query path over log objects yet. Ingest durability does not
-depend on it (a commit token resolves to its commit record directly), but a
-catalog-based read does; that is the log query phase's prerequisite.
+Snapshot resolution for logs is wired: `services/ravel-server/src/fold.rs`
+folds `Signal::Logs` alongside metrics, so `catalog/l/HEAD` and its snapshot
+parts are produced the same way they are for metrics, and a catalog-based
+read over log objects works from them. Ingest durability never depended on
+it either way (a commit token resolves to its commit record directly).
 
 ## Span pipeline
 
@@ -430,10 +430,10 @@ commit record advertises the same interval RSPAN's skip index prunes with.
 `stream_id_collisions` and with `buffered_spans_total` in place of
 `buffered_records_total`.
 
-Snapshot resolution for spans is not wired: `services/ravel-server/src/fold.rs`
-folds metrics and logs only, so `catalog/s/HEAD` is never produced and there is
-no query path over span objects yet (ADR-0041 phases 3 and 5). Ingest
-durability does not depend on it.
+Spans fold and are queryable the same way logs are:
+`services/ravel-server/src/fold.rs` folds metrics, logs, and spans, and the
+`spans` SQL table on `POST /api/v1/sql` reads them back. Ingest durability
+never depended on this fold either way.
 
 ## Admission control (ADR-0051)
 

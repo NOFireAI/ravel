@@ -123,6 +123,32 @@ evaluator scheduler mirrors, not a new scheduling mechanism.
   same assumption the rest of the system makes about its own
   strict-mode acknowledgement.
 
+  That idempotency assumption is narrower than it reads, so state its
+  limit explicitly. The duplicate suppressor for the repeat pass,
+  `repeat_marks` in `services/ravel-server/src/alerting.rs`, is a
+  process-local map, not a durable record. It is lost whenever the
+  evaluating process changes, which includes a lease handover to
+  another live process, not only a restart. `k` is re-derived from the
+  durable record on every tick, so losing the mark can never cause a
+  silence; it can cause one extra send for the alert's current repeat
+  window.
+
+  What that extra send costs depends on the sink. An Alertmanager sink
+  satisfies the assumption: Alertmanager dedupes on the label set, so
+  the duplicate is absorbed with no operator-visible effect. A plain
+  webhook sink does not: it forwards both POSTs, and a consumer that
+  opens a ticket or pages per POST sees two distinct events. A
+  webhook-shaped sink must therefore dedupe on its own, but nothing in
+  the payload distinguishes the duplicate from an intended repeat: a
+  repeat and its duplicate carry the same `alert_id`, `ts_unix_nano`,
+  and `generation`, and a `null` `previous_state`, because every repeat
+  is built from the same durable record for the whole firing episode.
+  Dedupe on `alert_id` within a window shorter than the rule's
+  `repeat_interval` instead, or set `repeat_interval: 0s` (the
+  amendment's decision 3) to disable repeats for that rule entirely.
+  This ADR does not guarantee exactly-once delivery to a sink that does
+  neither.
+
 ## Consequences
 
 - No new frozen format beyond ADR-0040's `Signal::Alerts` (already
@@ -234,10 +260,13 @@ This amendment gives that mechanism a cadence.
    already emits `startsAt` and omits `endsAt` for a `Firing` record,
    which is exactly the shape of a Prometheus re-send, and Alertmanager
    identity is the label set, so a re-POST simply refreshes its timer.
-   The webhook body shape is also unchanged; a repeat sets
-   `previous_state` equal to `state` (firing to firing is the truthful
-   description of a non-transition send), so an idempotent consumer can
-   discard repeats on one comparison. One documented approximation: a
+   The webhook body shape is also unchanged; a repeat carries a `null`
+   `previous_state` (there is no prior transition to report for a
+   non-transition send), the same shape a fresh bootstrap re-send uses.
+   This means a repeat is not distinguishable from an unintended
+   duplicate by payload alone - see the idempotency-assumption
+   narrowing in "Rejected alternatives" above for what a webhook-shaped
+   sink needs to dedupe on instead. One documented approximation: a
    repeat built from the folded latest record alone reports
    `started_at_ns` as the firing record's `ts_ns`, which for an episode
    with a pending phase is slightly later than the original
