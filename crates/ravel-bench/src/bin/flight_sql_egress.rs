@@ -56,8 +56,8 @@ use ravel_query::{
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{
-    FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService, SqlConfig, SqlExecutor,
-    SqlRequest,
+    FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService, SpanSegmentFetcher, SqlConfig,
+    SqlExecutor, SqlRequest,
 };
 use ravel_types::accounting::NoopQueryCostRecorder;
 use ravel_types::{CommitToken, Signal, TenantHash, TenantId, TimeRange};
@@ -185,6 +185,7 @@ async fn run(args: &Args) -> Report {
         catalog,
         SegmentFetcher::new(Arc::clone(&store)),
         LogSegmentFetcher::new(Arc::clone(&store)),
+        SpanSegmentFetcher::new(Arc::clone(&store)),
         SqlConfig::default(),
         1 << 30,
     ));
