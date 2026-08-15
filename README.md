@@ -40,6 +40,48 @@ scripts/kind-demo.sh   # ingest via the gateway, query via the query tier
 scripts/kind-down.sh
 ```
 
+## Container images
+
+`ravel-server` and `ravel-operator` publish to the GitHub Container Registry
+(GHCR) on every `vX.Y.Z` release tag, built from the root `Dockerfile` (see
+[ADR-0037](docs/adrs/0037-container-image-ci-registry.md)). Only `linux/amd64`
+is published; each published object is an OCI image index carrying an SBOM and
+full build provenance.
+
+```sh
+docker pull ghcr.io/nofireai/ravel-server:latest
+docker pull ghcr.io/nofireai/ravel-operator:latest
+```
+
+Tag scheme:
+
+- `X.Y.Z` is write-once: a bad release is superseded by a new patch release,
+  never by re-pushing the tag.
+- `latest`, `X`, and `X.Y` are moving tags that track the newest matching
+  release.
+
+Consumers who need an immutable reference pin by digest
+(`ghcr.io/nofireai/ravel-server@sha256:...`); consumers who need trust verify
+the signature.
+
+### Verifying signatures
+
+Every published index digest is signed with
+[cosign](https://github.com/sigstore/cosign) in keyless mode. The signing
+certificate binds the signature to the release workflow's identity, so a pull
+can be verified without any pre-shared key. Releases are cut from the public
+mirror `NOFireAI/ravel`, so that is the identity in the certificate:
+
+```sh
+cosign verify \
+  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.9.0' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  ghcr.io/nofireai/ravel-server:0.9.0
+```
+
+Replace `v0.9.0`/`0.9.0` with the release you are verifying; the tag ref in
+`--certificate-identity` must be the exact tag that produced the image.
+
 ## How it fits together
 
 ![architecture](docs/diagrams/architecture.svg)
