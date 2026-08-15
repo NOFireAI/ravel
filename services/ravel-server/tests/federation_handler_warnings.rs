@@ -203,7 +203,12 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
 /// partial-coverage warning naming the skipped cluster, for both `/query` and
 /// `/query_range` -- the two handler paths whose merge loops
 /// (`handlers.rs::handle_query` / `handle_query_range`) fold `stats.warnings`
-/// into the envelope.
+/// into the envelope. Both requests pass `allow_partial=true`: the ADR-0071
+/// "partial results are consent-gated" amendment (decision 1) makes partial
+/// coverage a 503 `unavailable` refusal by default (see
+/// `params::allow_partial_absent_is_not_opted_in` and
+/// `handlers::gate_partial`), so a client must opt in before this test's
+/// 200-with-warnings path is reachable at all.
 ///
 /// Flip-line proof (the prove-the-test evidence): delete the
 /// `for w in &stats.warnings { ... warnings.push(w.clone()); }` loop in
@@ -225,8 +230,17 @@ async fn federation_warning_reaches_the_query_envelope_warnings() {
     let now_s = now_ns() / NS_PER_SEC;
 
     // Instant query.
-    let (status, body) = get(&app, &format!("/api/v1/query?query={METRIC}&time={now_s}")).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/query?query={METRIC}&time={now_s}&allow_partial=true"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "query failed: {body}");
+    assert_eq!(
+        body["partial"],
+        serde_json::json!(true),
+        "the envelope's top-level partial field must state the coverage: {body:?}"
+    );
     let warnings = body["warnings"]
         .as_array()
         .expect("the envelope must carry a warnings array when a remote is skipped");
@@ -241,10 +255,17 @@ async fn federation_warning_reaches_the_query_envelope_warnings() {
     let start_s = (base - NS_PER_MIN) / NS_PER_SEC;
     let (status, body) = get(
         &app,
-        &format!("/api/v1/query_range?query={METRIC}&start={start_s}&end={now_s}&step=60s"),
+        &format!(
+            "/api/v1/query_range?query={METRIC}&start={start_s}&end={now_s}&step=60s&allow_partial=true"
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "range query failed: {body}");
+    assert_eq!(
+        body["partial"],
+        serde_json::json!(true),
+        "the range envelope's top-level partial field must state the coverage: {body:?}"
+    );
     let warnings = body["warnings"]
         .as_array()
         .expect("the range envelope must carry a warnings array when a remote is skipped");
