@@ -94,8 +94,7 @@ Every rejection reason ([crates/ravel-otlp/src/limits.rs](../../crates/ravel-otl
 | `DuplicateLabelName` | Two attributes sanitize to the same label name (or a data-point attribute collides with a synthesized `job`/`instance` label). |
 | `ComplexAttributeValue` | An attribute value is an array, kvlist, or bytes value, which has no label representation. For a resource attribute, this rejects every point under that resource. |
 | `MissingValue` | The data point has neither an int nor a double value set. |
-| `UnsupportedMetricType` | The metric is a Histogram, ExponentialHistogram, or Summary. Phase 1 supports only Gauge and cumulative Sum. Ravel rejects the whole metric's points; it never drops them as if they did not exist. |
-| `UnsupportedTemporality` | A Sum metric has delta (or unspecified) temporality. Ravel accepts only cumulative sums. |
+| `UnsupportedTemporality` | A Sum, Histogram, or ExponentialHistogram metric has delta (or unspecified) temporality. Ravel accepts only cumulative aggregations. |
 | `ZeroTimestamp` | The data point's event timestamp is zero. |
 | `FutureSkew` | The event timestamp is ahead of ingest time by more than `max_future_skew_ns`. |
 | `TooOld` | The event timestamp is behind ingest time by more than `max_ingest_lag_ns`. |

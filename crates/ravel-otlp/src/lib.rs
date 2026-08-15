@@ -29,7 +29,8 @@ pub use limits::{IngestLimits, Rejection};
 pub use logs_limits::{LogIngestLimits, LogRejection};
 pub use logs_normalize::{LogNormalizeOutput, NormalizedLogRecord, normalize_logs};
 pub use normalize::{
-    NormalizeOutput, NormalizedHistogramPoint, NormalizedPoint, normalize_metrics,
+    MetricsNormalizeResult, NormalizeOutput, NormalizedHistogramPoint, NormalizedPoint,
+    normalize_metrics, normalize_metrics_with_exemplars,
 };
 pub use traces_limits::{SpanIngestLimits, SpanRejection};
 pub use traces_normalize::{NormalizedSpan, SpanNormalizeOutput, normalize_traces};
