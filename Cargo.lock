@@ -4802,6 +4802,7 @@ dependencies = [
  "ravel-types",
  "reqwest 0.13.4",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "snap",

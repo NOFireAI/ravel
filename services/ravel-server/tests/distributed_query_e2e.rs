@@ -170,6 +170,11 @@ fn always_distribute_settings() -> DistribSettings {
             min_segments: 0,
             max_parallel_slices: 8,
         },
+        // No dedicated fragment listener (ADR-0071 amendment decision 1): these
+        // tests exercise the pre-amendment combined surface on the public gRPC
+        // listener. Naming the new field is forced by Rust's exhaustive struct
+        // literal; the value is the legacy default and changes no behavior here.
+        fragment_listener: None,
     }
 }
 

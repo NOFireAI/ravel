@@ -358,12 +358,18 @@ pub struct Running {
     /// Bound address of the dedicated mTLS listener (ADR-0050 section 1),
     /// `Some` exactly when `ServerConfig::mtls_listener` was.
     pub mtls_addr: Option<SocketAddr>,
+    /// Bound address of the dedicated TLS fragment listener (ADR-0071 amendment
+    /// decision 1), `Some` exactly when `--fragment-listener` was configured on a
+    /// `--distributed-query` query-serving process.
+    pub fragment_addr: Option<SocketAddr>,
     http_shutdown: oneshot::Sender<()>,
     http_task: JoinHandle<anyhow::Result<()>>,
     grpc_shutdown: Option<oneshot::Sender<()>>,
     grpc_task: Option<JoinHandle<anyhow::Result<()>>>,
     mtls_shutdown: Option<oneshot::Sender<()>>,
     mtls_task: Option<JoinHandle<anyhow::Result<()>>>,
+    fragment_shutdown: Option<oneshot::Sender<()>>,
+    fragment_task: Option<JoinHandle<anyhow::Result<()>>>,
     ingest_router: Option<Arc<IngestRouter>>,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
     span_ingest_router: Option<Arc<SpanIngestRouter>>,
@@ -398,6 +404,13 @@ impl Running {
             let _ = tx.send(());
         }
         if let Some(task) = self.mtls_task {
+            task.await??;
+        }
+
+        if let Some(tx) = self.fragment_shutdown {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.fragment_task {
             task.await??;
         }
 
@@ -540,6 +553,17 @@ pub async fn start(
     store_metrics: Arc<StoreMetrics>,
     cache: Option<Arc<ravel_cache::Cache<ravel_query::CacheFetchError>>>,
 ) -> anyhow::Result<Running> {
+    // Install the rustls process-level crypto provider before any TLS endpoint
+    // is built (ADR-0071 amendment decision 1: the dedicated fragment listener
+    // terminates TLS in-process). This binary links both the `ring` and
+    // `aws-lc-rs` providers, which rustls refuses to disambiguate on its own, so
+    // it panics on first use unless a default is installed. Pick `ring`
+    // explicitly, matching services/ravel-operator/src/main.rs and tonic's
+    // `tls-ring` feature. `install_default` only errors if a provider was already
+    // installed (harmless and possible when a process builds an S3/TLS client
+    // first), so the result is discarded.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // The process-wide ingest buffer byte budget (ADR-0069 decision 1). One
     // gauge shared by `Arc` across the metrics, log, and span routers so a
     // single `--max-ingest-buffer-bytes` ceiling bounds the sum of buffered
@@ -892,13 +916,26 @@ pub async fn start(
             Arc::new(SystemClock),
             metrics.clone(),
         );
-        let fetcher = Arc::new(distrib::RoutingSliceFetcher::new(
-            distrib_self_id.clone(),
-            distrib_live_workers.clone(),
-            fragment_keys,
-            service.clone(),
-            metrics.clone(),
-        ));
+        // When this process runs a dedicated TLS fragment listener (ADR-0071
+        // amendment decision 1), its coordinator dials remote workers' TLS
+        // fragment endpoints: pin the operator CA and verify the fixed
+        // `ravel-fragment` server name. `None` under the pre-amendment layout,
+        // where the dial stays plaintext against the public gRPC listener.
+        let fragment_client_tls = settings.fragment_listener.as_ref().map(|fl| {
+            tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(&fl.tls_ca_pem))
+                .domain_name(distrib::FRAGMENT_TLS_SERVER_NAME)
+        });
+        let fetcher = Arc::new(
+            distrib::RoutingSliceFetcher::new(
+                distrib_self_id.clone(),
+                distrib_live_workers.clone(),
+                fragment_keys,
+                service.clone(),
+                metrics.clone(),
+            )
+            .with_client_tls(fragment_client_tls),
+        );
         distributed = Some(Arc::new(ravel_query::distrib::Distributed::new(
             fetcher,
             settings.thresholds,
@@ -1362,10 +1399,29 @@ pub async fn start(
         let grpc = grpc.add_optional_service(flight_service);
         #[cfg(feature = "otap")]
         let grpc = grpc.add_optional_service(arrow_metrics_service);
-        // ADR-0071 fragment service, token-guarded inside the
-        // handler. Present only when `--distributed-query` is on; absent
-        // entirely otherwise, so the service cannot be reached without the flag.
-        let grpc = grpc.add_optional_service(fragment_service.as_ref().map(|s| s.into_server()));
+        // ADR-0071 fragment service, capability-guarded inside the handler.
+        // Present only when `--distributed-query` is on; absent entirely
+        // otherwise, so the service cannot be reached without the flag. The role
+        // it is mounted with depends on whether a dedicated `--fragment-listener`
+        // is configured (ADR-0071 amendment decision 1): with one, this public
+        // listener serves Resolve/federation only and rejects Pinned outright
+        // (`PublicFederation`); without one, it keeps the pre-amendment combined
+        // surface so distribution works before the dedicated listener is stood up
+        // (`Combined`).
+        let public_fragment_role = if config
+            .distrib
+            .as_ref()
+            .is_some_and(|s| s.fragment_listener.is_some())
+        {
+            distrib::FragmentListenerRole::PublicFederation
+        } else {
+            distrib::FragmentListenerRole::Combined
+        };
+        let grpc = grpc.add_optional_service(
+            fragment_service
+                .as_ref()
+                .map(|s| s.with_role(public_fragment_role).into_server()),
+        );
         let (tx, rx) = oneshot::channel::<()>();
         // Bound here rather than inside `serve_with_shutdown` so the reported
         // address is the one actually bound; with port 0 the configured value
@@ -1387,6 +1443,61 @@ pub async fn start(
         (None, None, None)
     };
 
+    // The dedicated TLS fragment listener (ADR-0071 amendment decision 1): a
+    // fourth listener, bound only when `--fragment-listener` is configured (and
+    // then only in a query-serving mode with `--distributed-query`, where
+    // `fragment_service` exists). It terminates TLS in-process (rustls, the same
+    // provider the federation client already uses) presenting the operator's
+    // `--fragment-tls-cert`/`--fragment-tls-key`, and serves the `SeriesFetch`
+    // surface with the `DedicatedFragment` role: Pinned capability-authorized
+    // fetches only, Resolve rejected outright. The public gRPC listener above was
+    // built with `PublicFederation` in this same configuration, so Pinned traffic
+    // lives here and nowhere else.
+    let fragment_dedicated: Option<(
+        SocketAddr,
+        oneshot::Sender<()>,
+        JoinHandle<anyhow::Result<()>>,
+    )> = match (
+        fragment_service.as_ref(),
+        config
+            .distrib
+            .as_ref()
+            .and_then(|s| s.fragment_listener.as_ref()),
+    ) {
+        (Some(service), Some(fl)) => {
+            let identity = tonic::transport::Identity::from_pem(&fl.tls_cert_pem, &fl.tls_key_pem);
+            let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+            let server = tonic::transport::Server::builder()
+                .tls_config(tls)
+                .map_err(|e| anyhow::anyhow!("failed to configure fragment listener TLS: {e}"))?
+                .add_service(
+                    service
+                        .with_role(distrib::FragmentListenerRole::DedicatedFragment)
+                        .into_server(),
+                );
+            let listener = tokio::net::TcpListener::bind(fl.addr).await?;
+            let addr = listener.local_addr()?;
+            let (tx, rx) = oneshot::channel::<()>();
+            let task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                server
+                    .serve_with_incoming_shutdown(
+                        tonic::transport::server::TcpIncoming::from(listener),
+                        async {
+                            let _ = rx.await;
+                        },
+                    )
+                    .await?;
+                Ok(())
+            });
+            Some((addr, tx, task))
+        }
+        _ => None,
+    };
+    let (fragment_addr, fragment_shutdown, fragment_task) = match fragment_dedicated {
+        Some((addr, tx, task)) => (Some(addr), Some(tx), Some(task)),
+        None => (None, None, None),
+    };
+
     // ADR-0071 query-worker heartbeat. The fragment endpoint other
     // coordinators dial is the address the gRPC listener actually bound, known
     // only now, so the `QueryWorkers` identity is built here rather than with
@@ -1398,8 +1509,14 @@ pub async fn start(
     // and needs no join at shutdown (a stale record ages out on its own).
     let _query_worker_heartbeat: Option<JoinHandle<()>> = match (distributed.as_ref(), grpc_addr) {
         (Some(_), Some(addr)) => {
+            // Advertise the dedicated TLS fragment listener as the endpoint
+            // remote coordinators dial (ADR-0071 amendment decision 1 and section
+            // 3: `fragment_endpoint` now names the dedicated TLS listener). When
+            // no dedicated listener is configured, fall back to the public gRPC
+            // address, the pre-amendment behavior.
+            let fragment_endpoint = fragment_addr.unwrap_or(addr);
             let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
-                addr.to_string(),
+                fragment_endpoint.to_string(),
                 ravel_query::distrib::codec::PROTOCOL_VERSION,
             ));
             // Ignore a set() race: `start` sets this exactly once, so the
@@ -1592,12 +1709,15 @@ pub async fn start(
         http_addr,
         grpc_addr,
         mtls_addr,
+        fragment_addr,
         http_shutdown: http_shutdown_tx,
         http_task,
         grpc_shutdown,
         grpc_task,
         mtls_shutdown,
         mtls_task,
+        fragment_shutdown,
+        fragment_task,
         ingest_router,
         log_ingest_router,
         span_ingest_router,

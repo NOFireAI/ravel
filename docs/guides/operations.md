@@ -51,6 +51,10 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--distribute-bytes-threshold <n>` | | `268435456` (256 MiB) | The estimated-store-bytes axis of the fan-out cost gate. A query whose pre-fetch cost estimate reaches this many bytes is distributed; a query below both axes runs fully locally. Meaningful only with `--distributed-query`. |
 | `--distribute-segments-threshold <n>` | | `256` | The segment-count axis of the fan-out cost gate. Either axis alone trips the gate. Meaningful only with `--distributed-query`. |
 | `--max-parallel-slices <n>` | | `8` | Ceiling on concurrently dispatched slices per distributed query, bounding fan-out width so a wide snapshot cannot spawn an unbounded number of remote fetches. Clamped to at least 1. Meaningful only with `--distributed-query`. |
+| `--fragment-listener <addr>` | | none | The dedicated TLS fragment listener (ADR-0071 amendment decision 1): a fourth listener, alongside `--listen-http`, `--listen-grpc`, and `--mtls-listener`, that terminates TLS in-process and serves `Pinned` intra-cluster fragment fetches ONLY. When set, the public gRPC listener stops serving `Pinned` scope (it keeps serving `Resolve`/federation with ordinary tenant credentials), and this listener rejects `Resolve` outright. Requires `--distributed-query` and all three of `--fragment-tls-cert`/`--fragment-tls-key`/`--fragment-tls-ca`, and must not equal any other listener address (startup refuses an alias). Without this flag the fragment surface stays on the public gRPC listener (the pre-amendment layout), so distribution keeps working during a rolling deploy. See [Dedicated fragment listener TLS](#dedicated-fragment-listener-tls-adr-0071-amendment-decision-1). |
+| `--fragment-tls-cert <path>` | | none | PEM server certificate the dedicated fragment listener presents. Operator-provisioned; Ravel mints no certificates. Must carry a `ravel-fragment` dNSName SAN, the one fixed name every coordinator verifies against. Read once at startup; rotation is a rolling restart. Required with `--fragment-listener`. |
+| `--fragment-tls-key <path>` | | none | PEM private key for `--fragment-tls-cert`. Operator-provisioned; read once at startup. Required with `--fragment-listener`. |
+| `--fragment-tls-ca <path>` | | none | PEM CA bundle the coordinator's outbound fragment dial verifies remote workers against. The CA is dedicated to this surface, so any certificate it signed means "a fragment worker of this cluster"; per-process certificate identity is deliberately not required (the capability, not the certificate, is the authorization). Read once at startup. Required with `--fragment-listener`. |
 
 `--store s3` without `--s3-bucket`/`--s3-access-key`/`--s3-secret-key` (through
 flag or env) fails at startup with an explicit error that names the missing
@@ -1042,6 +1046,124 @@ operator credential, not a service credential:
   delete anything else either — it has no delete grant at all. A leaked Admin
   key can forge or overwrite control objects within its write grant, but it
   cannot make existing data disappear.
+
+## Dedicated fragment listener TLS (ADR-0071 amendment decision 1)
+
+Under `--distributed-query`, the cluster-internal `Pinned` fragment surface
+(one query worker fetching a slice for another) moves off the public gRPC
+listener onto a dedicated listener that terminates TLS in-process:
+`--fragment-listener <addr>`, with `--fragment-tls-cert`, `--fragment-tls-key`,
+and `--fragment-tls-ca`. The public gRPC listener then serves only `Resolve`
+(cross-cluster federation) with ordinary tenant credentials and refuses
+`Pinned`; the dedicated listener serves `Pinned` only and refuses `Resolve`.
+Startup refuses a `--fragment-listener` address equal to `--listen-http`,
+`--listen-grpc`, or `--mtls-listener`, so the separation holds by construction.
+
+TLS here provides channel confidentiality (per-tenant, per-query capabilities
+travel on it) and server authenticity (a coordinator confirms it dialed a real
+cluster worker, not an interceptor that could harvest capabilities).
+Authorization is always the capability, never the certificate: **coordinators
+verify every worker certificate against the pinned `--fragment-tls-ca` with one
+fixed expected server name, `ravel-fragment`**, carried as a dNSName SAN in
+every worker certificate. Per-process certificate identity is deliberately not
+required — any certificate the dedicated CA signed means "a fragment worker of
+this cluster". This is not the external-proxy mTLS posture of ADR-0050: no
+identity is ever parsed from a certificate.
+
+**Ravel mints no certificates or keys.** The operator provisions the PEM files
+out of band. The certificate/key are read once at startup: **certificate
+rotation is a rolling restart** (there is no live reload in this release), which
+cluster-internal CA lifetimes make an operator-scheduled event.
+
+Requirements for the worker certificate:
+
+- A `ravel-fragment` dNSName SAN (rustls verifies the SAN, not the CN).
+- `extendedKeyUsage = serverAuth`.
+- Signed by the CA distributed as `--fragment-tls-ca` to every query node.
+
+### Kubernetes with cert-manager
+
+Issue one certificate per query node (or a shared one, since identity is not
+per-process) from a cluster-internal `Issuer`, with the fixed SAN:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ravel-fragment
+spec:
+  secretName: ravel-fragment-tls   # projects tls.crt, tls.key, ca.crt
+  duration: 720h                    # 30d; rotation = a rolling restart
+  renewBefore: 168h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - server auth
+  dnsNames:
+    - ravel-fragment                # the one fixed expected server name
+  issuerRef:
+    name: ravel-fragment-ca         # a dedicated cluster-internal CA Issuer
+    kind: Issuer
+    group: cert-manager.io
+```
+
+Mount the Secret and point the flags at the projected paths:
+
+```sh
+ravel-server --mode all --distributed-query \
+  --fragment-key-file /etc/ravel/fragment-keys \
+  --fragment-listener 0.0.0.0:4319 \
+  --fragment-tls-cert /etc/ravel/fragment-tls/tls.crt \
+  --fragment-tls-key  /etc/ravel/fragment-tls/tls.key \
+  --fragment-tls-ca   /etc/ravel/fragment-tls/ca.crt
+```
+
+cert-manager rewrites the Secret on renewal, but Ravel reads the files only at
+startup, so schedule a rolling restart of the query fleet on the renewal
+cadence (for example, a `renewBefore` window ahead of `duration`).
+
+### Hand-provisioned CA (no cert-manager)
+
+Run a small cluster-internal CA by hand and issue a worker certificate with the
+fixed SAN. With OpenSSL:
+
+```sh
+# One dedicated CA for the fragment surface.
+openssl ecparam -genkey -name prime256v1 -out fragment-ca.key
+openssl req -x509 -new -key fragment-ca.key -sha256 -days 3650 \
+  -subj "/CN=ravel-fragment-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out fragment-ca.crt
+
+# One worker certificate, SAN = ravel-fragment, EKU serverAuth.
+openssl ecparam -genkey -name prime256v1 -out fragment.key
+openssl req -new -key fragment.key -subj "/CN=ravel-fragment" -out fragment.csr
+cat > fragment.ext <<'EOF'
+subjectAltName = DNS:ravel-fragment
+extendedKeyUsage = serverAuth
+basicConstraints = CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+EOF
+openssl x509 -req -in fragment.csr -CA fragment-ca.crt -CAkey fragment-ca.key \
+  -CAcreateserial -days 365 -sha256 -extfile fragment.ext -out fragment.crt
+```
+
+Distribute `fragment-ca.crt` to every query node as `--fragment-tls-ca`, and
+`fragment.crt`/`fragment.key` as `--fragment-tls-cert`/`--fragment-tls-key`.
+Reissuing the worker certificate (or rotating the CA) takes effect on the next
+rolling restart.
+
+### Rolling deploy and mixed versions
+
+The dedicated listener is opt-in per process. A query node without
+`--fragment-listener` keeps the pre-amendment layout (the `Pinned` surface on
+the public gRPC listener), so a fleet can be migrated one rolling restart at a
+time: nodes that have the flag advertise their TLS fragment endpoint and refuse
+`Pinned` on the public port, while nodes that do not keep serving it there.
+Results stay byte-identical throughout; only which nodes a slice can fan out to
+changes during the roll.
 
 ## Store qualification (ADR-0050 section 6)
 

@@ -375,6 +375,35 @@ impl Drop for FragmentPermit {
     }
 }
 
+/// The fixed dNSName SAN every fragment worker certificate carries, and the one
+/// server name a coordinator's outbound fragment dial verifies against (ADR-0071
+/// amendment decision 1). The CA is dedicated to this surface, so any
+/// certificate it signed for this name means "a fragment worker of this
+/// cluster"; per-process certificate identity is deliberately not required (the
+/// capability, not the certificate, is the authorization).
+pub const FRAGMENT_TLS_SERVER_NAME: &str = "ravel-fragment";
+
+/// Which listener a [`FragmentService`] instance is mounted on, and therefore
+/// which request scopes it serves (ADR-0071 amendment decision 1). One
+/// `FragmentServiceInner` is shared by every mounted clone; the role is the only
+/// per-listener difference, so it lives outside the `Arc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FragmentListenerRole {
+    /// The pre-amendment layout: one listener serves both `Pinned` (intra-cluster
+    /// fan-out) and `Resolve` (cross-cluster federation). Used on the public gRPC
+    /// listener when no dedicated `--fragment-listener` is configured, so
+    /// distribution keeps working before an operator stands the dedicated
+    /// listener up (and across a rolling deploy).
+    Combined,
+    /// The public gRPC listener under the amendment: serves `Resolve`/federation
+    /// with ordinary tenant credentials only, and rejects `Pinned` outright. The
+    /// dedicated fragment listener carries all `Pinned` traffic instead.
+    PublicFederation,
+    /// The dedicated TLS fragment listener under the amendment: serves `Pinned`
+    /// capability-authorized fetches only, and rejects `Resolve` outright.
+    DedicatedFragment,
+}
+
 /// The worker-side fragment surface (ADR-0071 deliverables 1 and 2). Cheap to
 /// clone (every field is an `Arc` or a small value): the gRPC server owns one
 /// clone and the coordinator's [`RoutingSliceFetcher`] holds another for
@@ -382,6 +411,14 @@ impl Drop for FragmentPermit {
 #[derive(Clone)]
 pub struct FragmentService {
     inner: Arc<FragmentServiceInner>,
+    /// The listener this clone is mounted on, gating which scopes `fetch`
+    /// accepts (ADR-0071 amendment decision 1). Defaults to [`Combined`]; the
+    /// listener assembly in `lib.rs` overrides it per listener with
+    /// [`FragmentService::with_role`]. Irrelevant for the coordinator's
+    /// no-hop local execution, which bypasses `fetch` entirely.
+    ///
+    /// [`Combined`]: FragmentListenerRole::Combined
+    role: FragmentListenerRole,
 }
 
 struct FragmentServiceInner {
@@ -432,12 +469,37 @@ impl FragmentService {
                 clock,
                 metrics,
             }),
+            // Backward-compatible default: a directly-constructed service serves
+            // both scopes. `lib.rs` sets an explicit role per listener via
+            // `with_role`.
+            role: FragmentListenerRole::Combined,
         }
     }
 
-    /// Wrap this service in the generated gRPC server, ready to add to the
-    /// cluster-internal `tonic` router. Only ever mounted on the gRPC listener,
-    /// never the public HTTP or mTLS client listeners.
+    /// Return a clone of this service bound to `role`, sharing the same
+    /// `FragmentServiceInner` (ADR-0071 amendment decision 1). The listener
+    /// assembly builds one service and mounts a role-specialized clone on each
+    /// listener: [`PublicFederation`] on the public gRPC listener and
+    /// [`DedicatedFragment`] on the dedicated TLS listener.
+    ///
+    /// [`PublicFederation`]: FragmentListenerRole::PublicFederation
+    /// [`DedicatedFragment`]: FragmentListenerRole::DedicatedFragment
+    pub fn with_role(&self, role: FragmentListenerRole) -> Self {
+        FragmentService {
+            inner: self.inner.clone(),
+            role,
+        }
+    }
+
+    /// Wrap this service in the generated gRPC server, ready to add to a
+    /// cluster-internal `tonic` router. Mounted on the public gRPC listener
+    /// (as [`PublicFederation`] or [`Combined`]) and, when configured, the
+    /// dedicated TLS fragment listener (as [`DedicatedFragment`]); never the
+    /// public HTTP or mTLS client listeners.
+    ///
+    /// [`PublicFederation`]: FragmentListenerRole::PublicFederation
+    /// [`DedicatedFragment`]: FragmentListenerRole::DedicatedFragment
+    /// [`Combined`]: FragmentListenerRole::Combined
     pub fn into_server(&self) -> SeriesFetchServer<FragmentService> {
         SeriesFetchServer::new(self.clone())
     }
@@ -741,12 +803,36 @@ impl SeriesFetch for FragmentService {
         //    through the normal resolver chain and OVERRIDES any wire
         //    tenant_hash, so a federating cluster reads only the tenant its
         //    credential authorizes. A fragment capability is never accepted here.
+        // The listener this clone is mounted on decides which scopes it serves
+        // (ADR-0071 amendment decision 1). The scope check runs BEFORE any
+        // credential is inspected: a Pinned request on the public listener is
+        // refused whether or not it carries a valid capability, and a Resolve
+        // request on the dedicated fragment listener is refused before the
+        // resolver chain runs. The rejection is a typed `tonic::Status`; because
+        // the SeriesFetch service is still registered on both listeners, the
+        // caller sees this handler-level status, not a gRPC "unimplemented".
         match &inner.scope {
             Some(pb::fetch_request::Scope::Resolve(_)) => {
+                if self.role == FragmentListenerRole::DedicatedFragment {
+                    return Err(tonic::Status::permission_denied(
+                        "resolve/federation scope is not served on the dedicated fragment \
+                         listener; it carries Pinned intra-cluster fetches only. Federate to the \
+                         cluster's public gRPC listener instead (ADR-0071 amendment decision 1).",
+                    ));
+                }
                 let tenant = self.resolve_federation_tenant(&metadata)?;
                 inner.tenant_hash = tenant.0.to_vec();
             }
-            _ => self.verify_capability(&inner)?,
+            _ => {
+                if self.role == FragmentListenerRole::PublicFederation {
+                    return Err(tonic::Status::permission_denied(
+                        "pinned fragment scope is not served on the public gRPC listener; it \
+                         serves Resolve/federation only. Dispatch Pinned fetches to the dedicated \
+                         --fragment-listener over TLS (ADR-0071 amendment decision 1).",
+                    ));
+                }
+                self.verify_capability(&inner)?;
+            }
         }
         let Some(_permit) = self.inner.admission.acquire().await else {
             return Err(tonic::Status::unavailable("fragment admission unavailable"));
@@ -910,6 +996,14 @@ pub struct RoutingSliceFetcher {
     /// Cached `tonic` channels, keyed by endpoint (a channel is cheap to clone
     /// but expensive to reconnect).
     channels: Mutex<HashMap<String, Channel>>,
+    /// The client TLS configuration for dialing a remote worker's dedicated
+    /// fragment listener (ADR-0071 amendment decision 1). `Some` when this
+    /// process runs a `--fragment-listener` (workers advertise that TLS address
+    /// as their `fragment_endpoint`), pinning the operator CA and verifying the
+    /// fixed [`FRAGMENT_TLS_SERVER_NAME`] server name. `None` under the
+    /// pre-amendment layout, where fragment endpoints are the plaintext public
+    /// gRPC listener; the dial then stays plaintext, byte-identical to before.
+    client_tls: Option<tonic::transport::ClientTlsConfig>,
     metrics: Arc<FragmentMetrics>,
 }
 
@@ -927,8 +1021,28 @@ impl RoutingSliceFetcher {
             fragment_keys,
             local,
             channels: Mutex::new(HashMap::new()),
+            // Plaintext dial by default (the pre-amendment layout). A coordinator
+            // running a dedicated fragment listener enables TLS via
+            // `with_client_tls`.
+            client_tls: None,
             metrics,
         }
+    }
+
+    /// Enable TLS on this coordinator's outbound fragment dials (ADR-0071
+    /// amendment decision 1), pinning the operator CA and the fixed
+    /// [`FRAGMENT_TLS_SERVER_NAME`] server name. Set when the process runs a
+    /// `--fragment-listener`, so remote workers advertise their TLS fragment
+    /// endpoint. A `None` argument leaves the dial plaintext, so this is a no-op
+    /// under the pre-amendment layout. Added as a post-construction builder (not
+    /// a `new` parameter) so existing call sites that dial plaintext are
+    /// unchanged.
+    pub fn with_client_tls(
+        mut self,
+        client_tls: Option<tonic::transport::ClientTlsConfig>,
+    ) -> Self {
+        self.client_tls = client_tls;
+        self
     }
 
     /// Mint the `Pinned` fragment capability for a slice under the first
@@ -1030,16 +1144,37 @@ impl RoutingSliceFetcher {
     }
 
     /// Get (or open and cache) a channel to a remote worker's fragment endpoint.
+    ///
+    /// When this coordinator runs a dedicated fragment listener (`client_tls` is
+    /// `Some`), the dial terminates TLS against the pinned operator CA with the
+    /// fixed [`FRAGMENT_TLS_SERVER_NAME`] server name (ADR-0071 amendment
+    /// decision 1): the coordinator authenticates that it reached a real cluster
+    /// worker before any capability crosses the wire. Under the pre-amendment
+    /// layout (`client_tls` is `None`) the dial stays plaintext `http://`,
+    /// byte-identical to before. The channel cache is unchanged either way.
     async fn channel(&self, endpoint: &str) -> Result<Channel, DistribError> {
         if let Some(channel) = self.channels.lock().get(endpoint).cloned() {
             return Ok(channel);
         }
-        let uri = format!("http://{endpoint}");
-        let channel = Channel::from_shared(uri)
+        let scheme = if self.client_tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let uri = format!("{scheme}://{endpoint}");
+        let mut endpoint_builder = Channel::from_shared(uri)
             .map_err(|e| {
                 DistribError::Transport(format!("invalid worker endpoint {endpoint}: {e}"))
             })?
-            .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+            .connect_timeout(REMOTE_CONNECT_TIMEOUT);
+        if let Some(tls) = &self.client_tls {
+            endpoint_builder = endpoint_builder.tls_config(tls.clone()).map_err(|e| {
+                DistribError::Transport(format!(
+                    "failed to configure fragment TLS for {endpoint}: {e}"
+                ))
+            })?;
+        }
+        let channel = endpoint_builder
             .connect()
             .await
             .map_err(|e| DistribError::Transport(format!("connect to {endpoint} failed: {e}")))?;
@@ -2550,5 +2685,335 @@ mod tests {
             let fb: Vec<u64> = f.values.iter().map(|v| v.to_bits()).collect();
             assert_eq!(wb, fb, "value bit patterns differ");
         }
+    }
+
+    // ---- ADR-0071 amendment decision 1: the dedicated TLS fragment listener ----
+    //
+    // Operator-provisioned test PEM material, generated offline (EC P-256). The
+    // server certificate carries a `ravel-fragment` dNSName SAN, the one fixed
+    // name a coordinator verifies against; `TEST_FRAGMENT_CA_PEM` signed it, and
+    // `TEST_FRAGMENT_OTHER_CA_PEM` is an unrelated CA used to prove a cert that
+    // does not chain to the pinned CA is refused at the TLS layer. Ravel mints no
+    // certificates; these stand in for what an operator provisions.
+    const TEST_FRAGMENT_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBqTCCAU+gAwIBAgIUVJl8k+Zv3fZCuFxgwwDs+IDXi1YwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQtdGVzdC1jYTAgFw0yNjA4MTUwNDQz
+MDlaGA8yMTI2MDcyMjA0NDMwOVowITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQt
+dGVzdC1jYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABHARUVbKgBCYpY/wf8zK
++I6Ba4PD6+G+9cLPWeqvsgvY78Y2zyP7yYCLmWQ10Sit30vp0bupQbGmGuXe/iph
+doOjYzBhMB0GA1UdDgQWBBRDv2J6Cr7h+j5wtBdmBPkvMvasPzAfBgNVHSMEGDAW
+gBRDv2J6Cr7h+j5wtBdmBPkvMvasPzAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB
+/wQEAwIBBjAKBggqhkjOPQQDAgNIADBFAiBJuvZFS9FxJvCt+NchycR0qO/eh2b3
+T3iSUGCKdOHAGgIhAMz/4iLhm6S+EbNrFxoowxwEpKJvxMy4z/OmOySX49/U
+-----END CERTIFICATE-----
+";
+    const TEST_FRAGMENT_SERVER_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBzTCCAXOgAwIBAgIUGu6Gl5XZWJWXYbk8jUnm3jAoqg8wCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWcmF2ZWwtZnJhZ21lbnQtdGVzdC1jYTAgFw0yNjA4MTUwNDQz
+MDlaGA8yMTI2MDcyMjA0NDMwOVowGTEXMBUGA1UEAwwOcmF2ZWwtZnJhZ21lbnQw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATnxslJqa2rlRO4+IZHvSUWDtAjdBby
+pAHeZOgG859pbt5w9fhwXheNPZfapeuAkL1bv5LMpDUoWWP4gWiPKG8uo4GOMIGL
+MBkGA1UdEQQSMBCCDnJhdmVsLWZyYWdtZW50MBMGA1UdJQQMMAoGCCsGAQUFBwMB
+MAkGA1UdEwQCMAAwDgYDVR0PAQH/BAQDAgWgMB0GA1UdDgQWBBTurdD+8LWadPBh
+rTFdh/lcRqM4bDAfBgNVHSMEGDAWgBRDv2J6Cr7h+j5wtBdmBPkvMvasPzAKBggq
+hkjOPQQDAgNIADBFAiBoj7omC/MJ8TOEDDQ7aunzgyAOhlTSU4rBuf6NUBePWAIh
+AJg5IscLR29+D4diqUZFUlHNr+xfY7gbM6jiJCYMH0xx
+-----END CERTIFICATE-----
+";
+    const TEST_FRAGMENT_SERVER_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN7yMZh0X1IoHOzzB
+/g+1z36NBvVjUQVXs4PTS/QT9bShRANCAATnxslJqa2rlRO4+IZHvSUWDtAjdBby
+pAHeZOgG859pbt5w9fhwXheNPZfapeuAkL1bv5LMpDUoWWP4gWiPKG8u
+-----END PRIVATE KEY-----
+";
+    const TEST_FRAGMENT_OTHER_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBrDCCAVGgAwIBAgIULqSB2f/Xm0w0CMNBVGjjXWDp0fowCgYIKoZIzj0EAwIw
+IjEgMB4GA1UEAwwXcmF2ZWwtZnJhZ21lbnQtb3RoZXItY2EwIBcNMjYwODE1MDQ0
+MzA5WhgPMjEyNjA3MjIwNDQzMDlaMCIxIDAeBgNVBAMMF3JhdmVsLWZyYWdtZW50
+LW90aGVyLWNhMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEWMJQ2Erg2dYe+8q
+3g2VkkzeTjAU5MCI4lIvrxTnk2JJK0EnF7UyrFtaNc8WY60+8QXNZMtOdZGUKtqG
+C7xceaNjMGEwHQYDVR0OBBYEFEwWujPqBV9auGmo0WLYbhyZ1qqVMB8GA1UdIwQY
+MBaAFEwWujPqBV9auGmo0WLYbhyZ1qqVMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P
+AQH/BAQDAgEGMAoGCCqGSM49BAMCA0kAMEYCIQDzu2Xnqcrx1lAxDXuPSTlKQVvV
+iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
+-----END CERTIFICATE-----
+";
+
+    /// Stand up a real TLS-terminating fragment listener over `service` (mounted
+    /// with the `DedicatedFragment` role, exactly as `lib.rs` mounts it) on an
+    /// ephemeral loopback port. Returns the bound address and a shutdown handle;
+    /// dropping the handle without sending stops the task at test end.
+    async fn spawn_tls_fragment_listener(
+        service: FragmentService,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        // The unit tests do not call `start()`, which installs the provider in a
+        // real process; install it here too (idempotent, `Err` when already set).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let identity = tonic::transport::Identity::from_pem(
+            TEST_FRAGMENT_SERVER_CERT_PEM,
+            TEST_FRAGMENT_SERVER_KEY_PEM,
+        );
+        let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+        let server = tonic::transport::Server::builder()
+            .tls_config(tls)
+            .expect("server TLS config")
+            .add_service(
+                service
+                    .with_role(FragmentListenerRole::DedicatedFragment)
+                    .into_server(),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            server
+                .serve_with_incoming_shutdown(
+                    tonic::transport::server::TcpIncoming::from(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await
+                .expect("fragment listener serves");
+        });
+        (addr, tx)
+    }
+
+    /// Dial `addr` over TLS with `ca_pem` pinned and `server_name` expected,
+    /// mirroring the coordinator's outbound fragment dial. Eagerly connects, so
+    /// a CA or server-name mismatch surfaces here as the TLS handshake failure.
+    async fn dial_fragment_tls(
+        addr: std::net::SocketAddr,
+        ca_pem: &str,
+        server_name: &str,
+    ) -> Result<Channel, tonic::transport::Error> {
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(ca_pem))
+            .domain_name(server_name);
+        Channel::from_shared(format!("https://{addr}"))
+            .expect("valid uri")
+            .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+            .tls_config(tls)
+            .expect("client TLS config")
+            .connect()
+            .await
+    }
+
+    /// Collect and decode a `SeriesFetch` response stream into a `SliceResponse`.
+    async fn collect_fetch(
+        response: tonic::Response<tonic::Streaming<pb::FetchResponse>>,
+    ) -> SliceResponse {
+        let mut frames = Vec::new();
+        let mut stream = response.into_inner();
+        while let Some(frame) = stream.message().await.expect("stream frame") {
+            frames.push(frame);
+        }
+        decode_slice_frames(frames).expect("frames decode")
+    }
+
+    /// Drive `service.fetch` in-process (no metadata) and decode the frames.
+    async fn fetch_pinned_inproc(
+        service: &FragmentService,
+        request: pb::FetchRequest,
+    ) -> Result<SliceResponse, tonic::Status> {
+        let response = service.fetch(tonic::Request::new(request)).await?;
+        let mut frames = Vec::new();
+        let mut stream = response.into_inner();
+        while let Some(frame) = stream.next().await {
+            frames.push(frame.expect("in-crate stream never errors"));
+        }
+        Ok(decode_slice_frames(frames).expect("frames decode"))
+    }
+
+    /// End to end over a REAL TLS channel: a dedicated fragment listener with
+    /// operator test certificates, dialed with the correct CA and the fixed
+    /// `ravel-fragment` server name, serves a `Pinned` fetch carrying a REAL
+    /// minted capability and returns the pinned segment's data. This is the
+    /// happy path of ADR-0071 amendment decision 1 tests deliverable 2.
+    #[tokio::test]
+    async fn dedicated_tls_listener_serves_pinned_with_real_capability() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("tls-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let service = pinned_service(store, now);
+        let (addr, _shutdown) = spawn_tls_fragment_listener(service).await;
+
+        let channel = dial_fragment_tls(addr, TEST_FRAGMENT_CA_PEM, FRAGMENT_TLS_SERVER_NAME)
+            .await
+            .expect("TLS dial with the correct CA and server name connects");
+
+        let envelope = TimeRange {
+            start_ns: seg.min_event_ts_ns,
+            end_ns: seg.max_event_ts_ns,
+        };
+        let mut request = pinned_over_window(tenant.hash(), &seg, envelope);
+        let query_id = [0x5A; 16];
+        request.query_id = query_id.to_vec();
+        // A real capability, minted exactly as `RoutingSliceFetcher` would.
+        request.fragment_capability = mint(
+            &TEST_KEY,
+            tenant.hash().0,
+            metrics_signal(),
+            query_id,
+            now + HOUR_NS,
+        );
+
+        let mut client = SeriesFetchClient::new(channel);
+        let response = client
+            .fetch(request)
+            .await
+            .expect("a valid Pinned fetch over the TLS channel succeeds");
+        let decoded = collect_fetch(response).await;
+        assert_eq!(decoded.status, pb::status::Code::Ok);
+        assert_eq!(
+            decoded.series_returned, 1,
+            "the pinned segment was served through the real TLS channel"
+        );
+    }
+
+    /// The TLS layer refuses a coordinator that pins the WRONG CA (the worker's
+    /// certificate does not chain to it) and one that expects the WRONG server
+    /// name (the certificate's SAN is `ravel-fragment`). Both fail at the
+    /// handshake, before any capability is inspected (ADR-0071 amendment decision
+    /// 1 tests deliverable 3).
+    #[tokio::test]
+    async fn dedicated_tls_listener_rejects_wrong_ca_and_wrong_server_name() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let service = pinned_service(store, 4 * HOUR_NS);
+        let (addr, _shutdown) = spawn_tls_fragment_listener(service).await;
+
+        let wrong_ca =
+            dial_fragment_tls(addr, TEST_FRAGMENT_OTHER_CA_PEM, FRAGMENT_TLS_SERVER_NAME)
+                .await
+                .map(|_| ());
+        assert!(
+            wrong_ca.is_err(),
+            "a worker certificate that does not chain to the pinned CA must be refused at TLS"
+        );
+
+        let wrong_name = dial_fragment_tls(addr, TEST_FRAGMENT_CA_PEM, "not-ravel-fragment")
+            .await
+            .map(|_| ());
+        assert!(
+            wrong_name.is_err(),
+            "a server-name mismatch must be refused at the TLS layer"
+        );
+    }
+
+    /// A `Resolve` (federation) request reaching the dedicated fragment listener
+    /// is rejected with a typed `PermissionDenied`, before the resolver runs: the
+    /// dedicated listener carries `Pinned` traffic only (ADR-0071 amendment
+    /// decision 1 tests deliverable 4). Exercised in-process against the same
+    /// role the TLS listener mounts, so the assertion is deterministic.
+    #[tokio::test]
+    async fn dedicated_listener_rejects_resolve_with_typed_error() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let service = federation_service(store, &[("operator-cred", "some-tenant")], 4 * HOUR_NS)
+            .with_role(FragmentListenerRole::DedicatedFragment);
+        let mut req = tonic::Request::new(resolve_request(TenantHash([9u8; 16]), 4 * HOUR_NS));
+        req.metadata_mut()
+            .insert("authorization", "Bearer operator-cred".parse().unwrap());
+        let err = service
+            .fetch(req)
+            .await
+            .err()
+            .expect("Resolve is rejected on the dedicated fragment listener");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("dedicated fragment listener"),
+            "the rejection names the surface: {}",
+            err.message()
+        );
+    }
+
+    /// The public gRPC listener (mounted `PublicFederation` when a dedicated
+    /// fragment listener exists) refuses a `Pinned` fetch with a typed
+    /// `PermissionDenied`, whether or not it carries a valid capability: the scope
+    /// is rejected before the capability is inspected (ADR-0071 amendment decision
+    /// 1 tests deliverable 5).
+    ///
+    /// The `SeriesFetch` service is still registered on the public listener (it
+    /// serves `Resolve`), so a `Pinned` request reaches this handler and receives
+    /// a handler-level status; it is NOT a gRPC "unimplemented service".
+    #[tokio::test]
+    async fn public_listener_rejects_pinned_even_with_valid_capability() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("pub-tenant".to_string());
+        let now = 4 * HOUR_NS;
+        let service = pinned_service(store, now).with_role(FragmentListenerRole::PublicFederation);
+        let query_id = [0x33; 16];
+        let mut request = pinned_request(tenant.hash().0, &[0]);
+        request.query_id = query_id.to_vec();
+        // A VALID capability: the point is it is refused on scope grounds anyway.
+        request.fragment_capability = mint(
+            &TEST_KEY,
+            tenant.hash().0,
+            metrics_signal(),
+            query_id,
+            now + HOUR_NS,
+        );
+        let err = service
+            .fetch(tonic::Request::new(request))
+            .await
+            .err()
+            .expect("Pinned is rejected on the public listener");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("public gRPC listener"),
+            "the rejection names the surface: {}",
+            err.message()
+        );
+    }
+
+    /// The capability mechanism and the transport are genuinely decoupled: one
+    /// capability, minted with no knowledge of which listener will serve it
+    /// (the mint side is `RoutingSliceFetcher`, transport-agnostic), verifies
+    /// byte-for-byte the same on the new dedicated `Pinned` listener as on the
+    /// legacy combined surface (ADR-0071 amendment decision 1 tests deliverable
+    /// 6). This proves the two listeners are not incompatible islands.
+    #[tokio::test]
+    async fn capability_is_decoupled_from_listener_transport() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("decoupled-tenant".to_string());
+        publish_metric(store.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let seg = only_segment(&store, tenant.hash(), now).await;
+        let envelope = TimeRange {
+            start_ns: seg.min_event_ts_ns,
+            end_ns: seg.max_event_ts_ns,
+        };
+        let query_id = [0xC0; 16];
+        let capability = mint(
+            &TEST_KEY,
+            tenant.hash().0,
+            metrics_signal(),
+            query_id,
+            now + HOUR_NS,
+        );
+        let mut request = pinned_over_window(tenant.hash(), &seg, envelope);
+        request.query_id = query_id.to_vec();
+        request.fragment_capability = capability;
+
+        let dedicated =
+            pinned_service(store.clone(), now).with_role(FragmentListenerRole::DedicatedFragment);
+        let on_dedicated = fetch_pinned_inproc(&dedicated, request.clone())
+            .await
+            .expect("the dedicated Pinned listener accepts the capability");
+        assert_eq!(on_dedicated.status, pb::status::Code::Ok);
+
+        let combined = pinned_service(store, now).with_role(FragmentListenerRole::Combined);
+        let on_combined = fetch_pinned_inproc(&combined, request)
+            .await
+            .expect("the legacy combined surface accepts the identical capability");
+        assert_eq!(on_combined.status, pb::status::Code::Ok);
+
+        assert_eq!(
+            on_dedicated.series_returned, on_combined.series_returned,
+            "the same capability yields the same result regardless of transport"
+        );
     }
 }

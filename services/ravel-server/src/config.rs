@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
@@ -600,6 +600,44 @@ pub struct Cli {
     #[arg(long = "fragment-key-file", value_name = "PATH")]
     pub fragment_key_file: Option<PathBuf>,
 
+    /// The dedicated TLS fragment listener address (ADR-0071 amendment decision
+    /// 1): a fourth listener, alongside `--listen-http`, `--listen-grpc`, and
+    /// `--mtls-listener`, that terminates TLS in-process and serves `Pinned`
+    /// fragment fetches ONLY. When set, the public gRPC listener stops serving
+    /// `Pinned` scope entirely (`Resolve`/federation stays there with ordinary
+    /// tenant credentials), and this listener rejects `Resolve` outright.
+    /// Requires `--distributed-query` and all three of `--fragment-tls-cert`,
+    /// `--fragment-tls-key`, and `--fragment-tls-ca`. Must not equal any other
+    /// listener address. Without this flag the fragment surface stays on the
+    /// public gRPC listener (the pre-amendment layout), so distribution keeps
+    /// working during a rolling deploy.
+    #[arg(long = "fragment-listener", value_name = "ADDR")]
+    pub fragment_listener: Option<SocketAddr>,
+
+    /// PEM server certificate the dedicated fragment listener presents
+    /// (ADR-0071 amendment decision 1). Operator-provisioned; Ravel mints no
+    /// certificates. The certificate must carry a `ravel-fragment` dNSName SAN,
+    /// the one fixed name every coordinator verifies against. Read once at
+    /// startup; rotation is a rolling restart. Required with
+    /// `--fragment-listener`.
+    #[arg(long = "fragment-tls-cert", value_name = "PATH")]
+    pub fragment_tls_cert: Option<PathBuf>,
+
+    /// PEM private key for `--fragment-tls-cert` (ADR-0071 amendment decision
+    /// 1). Operator-provisioned; read once at startup. Required with
+    /// `--fragment-listener`.
+    #[arg(long = "fragment-tls-key", value_name = "PATH")]
+    pub fragment_tls_key: Option<PathBuf>,
+
+    /// PEM CA bundle the coordinator's outbound fragment dial verifies remote
+    /// workers against (ADR-0071 amendment decision 1). The CA is dedicated to
+    /// this surface, so any certificate it signed means "a fragment worker of
+    /// this cluster"; per-process certificate identity is deliberately not
+    /// required (the capability, not the certificate, is the authorization).
+    /// Read once at startup. Required with `--fragment-listener`.
+    #[arg(long = "fragment-tls-ca", value_name = "PATH")]
+    pub fragment_tls_ca: Option<PathBuf>,
+
     /// The distinct internal-workload admission cap for inbound fragment
     /// (`SeriesFetch`) requests (ADR-0071): the maximum number of
     /// slice fetches this process serves concurrently for remote coordinators.
@@ -747,6 +785,37 @@ pub struct DistribSettings {
     pub max_inflight_fragments: usize,
     /// The cost gate and fan-out width (`DistribThresholds`).
     pub thresholds: ravel_query::distrib::partition::DistribThresholds,
+    /// The dedicated TLS fragment listener (ADR-0071 amendment decision 1).
+    /// `Some` only when `--fragment-listener` was set; carries the bound address
+    /// and the PEM material read once at startup. When `None`, the fragment
+    /// surface stays on the public gRPC listener (the pre-amendment layout).
+    pub fragment_listener: Option<FragmentListenerSettings>,
+}
+
+/// The dedicated TLS fragment listener's resolved configuration (ADR-0071
+/// amendment decision 1). The three PEM blobs are read from the operator's
+/// `--fragment-tls-{cert,key,ca}` files once at startup: `tls_cert_pem`/
+/// `tls_key_pem` are the server identity this listener presents, and `tls_ca_pem`
+/// is the CA the coordinator's outbound fragment dial pins remote workers to.
+#[derive(Clone)]
+pub struct FragmentListenerSettings {
+    pub addr: SocketAddr,
+    pub tls_cert_pem: Vec<u8>,
+    pub tls_key_pem: Vec<u8>,
+    pub tls_ca_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for FragmentListenerSettings {
+    /// Redacts the PEM bytes (the private key in particular must never reach a
+    /// log), printing only the bound address and the material's presence.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FragmentListenerSettings")
+            .field("addr", &self.addr)
+            .field("tls_cert_pem", &"<redacted>")
+            .field("tls_key_pem", &"<redacted>")
+            .field("tls_ca_pem", &"<redacted>")
+            .finish()
+    }
 }
 
 impl DistribSettings {
@@ -1168,6 +1237,37 @@ impl Cli {
         })?;
         let fragment_keys = parse_fragment_keys(&raw)
             .map_err(|e| anyhow::anyhow!("invalid --fragment-key-file {}: {e}", path.display()))?;
+        // The dedicated TLS fragment listener (ADR-0071 amendment decision 1).
+        // `validate()` already guaranteed that whenever `--fragment-listener` is
+        // set all three PEM paths are present and `--distributed-query` is on, so
+        // this reads them unconditionally when the address is configured. The PEM
+        // blobs are read once here; rotation is a rolling restart.
+        let fragment_listener = match self.fragment_listener {
+            Some(addr) => {
+                let read_pem = |flag: &str, path: Option<&Path>| -> anyhow::Result<Vec<u8>> {
+                    // `validate()` already rejected `--fragment-listener` without
+                    // all three PEM paths, so a missing one here is a bug, not an
+                    // operator error; surface it as a typed error rather than
+                    // panic (no `expect` on a production path).
+                    let path = path.ok_or_else(|| {
+                        anyhow::anyhow!("{flag} is required with --fragment-listener")
+                    })?;
+                    std::fs::read(path).map_err(|e| {
+                        anyhow::anyhow!("failed to read {flag} {}: {e}", path.display())
+                    })
+                };
+                Some(FragmentListenerSettings {
+                    addr,
+                    tls_cert_pem: read_pem(
+                        "--fragment-tls-cert",
+                        self.fragment_tls_cert.as_deref(),
+                    )?,
+                    tls_key_pem: read_pem("--fragment-tls-key", self.fragment_tls_key.as_deref())?,
+                    tls_ca_pem: read_pem("--fragment-tls-ca", self.fragment_tls_ca.as_deref())?,
+                })
+            }
+            None => None,
+        };
         Ok(Some(DistribSettings {
             fragment_keys,
             max_inflight_fragments: self.max_inflight_fragments.max(1) as usize,
@@ -1176,6 +1276,7 @@ impl Cli {
                 min_segments: self.distribute_segments_threshold,
                 max_parallel_slices: self.max_parallel_slices.max(1),
             },
+            fragment_listener,
         }))
     }
 
@@ -1477,6 +1578,77 @@ impl Cli {
                 "--fragment-key-file was set but --distributed-query was not: the fragment \
                  surface is only registered under --distributed-query, so the key file would be \
                  inert. Set --distributed-query, or drop --fragment-key-file."
+            );
+        }
+        // The dedicated TLS fragment listener (ADR-0071 amendment decision 1).
+        // Every misconfiguration fails startup here rather than at first fetch,
+        // so "genuinely separate listener with TLS" holds by construction, not by
+        // operator care (the same posture ADR-0050 section 1 takes for
+        // `--mtls-listener`).
+        if let Some(fragment_listener) = self.fragment_listener {
+            if !self.distributed_query {
+                anyhow::bail!(
+                    "--fragment-listener '{fragment_listener}' requires --distributed-query: the \
+                     fragment SeriesFetch surface only exists under --distributed-query, so a \
+                     dedicated listener for it would be inert without the flag."
+                );
+            }
+            // The three PEM files are read at startup; TLS is not optional on this
+            // listener (capabilities travel on it, and a coordinator authenticates
+            // the worker by the pinned CA). Refuse a listener with incomplete
+            // material rather than binding a plaintext fragment port.
+            if self.fragment_tls_cert.is_none()
+                || self.fragment_tls_key.is_none()
+                || self.fragment_tls_ca.is_none()
+            {
+                anyhow::bail!(
+                    "--fragment-listener '{fragment_listener}' requires --fragment-tls-cert, \
+                     --fragment-tls-key, and --fragment-tls-ca: the dedicated fragment listener \
+                     terminates TLS in-process (ADR-0071 amendment decision 1) and never binds a \
+                     plaintext fragment port."
+                );
+            }
+            // Collision refusal, mirroring the `--mtls-listener` checks below and
+            // extended to name `--mtls-listener` too: the fragment listener must
+            // be a genuinely separate address, or the Pinned-only isolation (and
+            // the public listener's Pinned-refusal) would be defeated by an alias.
+            if fragment_listener == self.listen_http {
+                anyhow::bail!(
+                    "--fragment-listener '{fragment_listener}' must not equal --listen-http \
+                     '{}': the dedicated Pinned fragment surface would become reachable on the \
+                     public HTTP address, defeating the ADR-0071 amendment decision 1 isolation.",
+                    self.listen_http
+                );
+            }
+            if fragment_listener == self.listen_grpc {
+                anyhow::bail!(
+                    "--fragment-listener '{fragment_listener}' must not equal --listen-grpc \
+                     '{}': the dedicated Pinned fragment surface would collide with the public \
+                     gRPC listener, which serves Resolve/federation only under the amendment.",
+                    self.listen_grpc
+                );
+            }
+            if self.mtls_listener == Some(fragment_listener) {
+                anyhow::bail!(
+                    "--fragment-listener '{fragment_listener}' must not equal --mtls-listener \
+                     '{fragment_listener}': each dedicated listener (mTLS, fragment) must bind its \
+                     own address so neither surface is reachable through the other."
+                );
+            }
+        }
+        // Symmetry: a TLS PEM flag set without `--fragment-listener` is inert and
+        // almost certainly a misconfiguration; refuse it rather than silently
+        // ignore an operator's certificate intent.
+        if self.fragment_listener.is_none()
+            && (self.fragment_tls_cert.is_some()
+                || self.fragment_tls_key.is_some()
+                || self.fragment_tls_ca.is_some())
+        {
+            anyhow::bail!(
+                "--fragment-tls-cert/--fragment-tls-key/--fragment-tls-ca were set but \
+                 --fragment-listener was not: the fragment TLS material is only used to stand up \
+                 the dedicated fragment listener, so without it these files are inert. Set \
+                 --fragment-listener, or drop the TLS flags."
             );
         }
         if self.distributed_query {
@@ -2991,6 +3163,171 @@ mod tests {
         assert!(
             err.to_string().contains("--dev-insecure-tenant-header"),
             "error names the specific dev-header case, not just the generic alias: {err}"
+        );
+    }
+
+    /// A valid single-key fragment key file, so `--distributed-query` resolves
+    /// past its key-file requirement to reach the `--fragment-listener` checks.
+    fn fragment_key_tmp() -> tempfile::NamedTempFile {
+        let key = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
+        key
+    }
+
+    /// The `--fragment-listener` flags shared by the collision tests: a full,
+    /// otherwise-valid distributed-query configuration with all three TLS PEM
+    /// paths present (their contents are never read, because a collision bails
+    /// before `parse_distrib_settings`). Callers append the colliding listener.
+    fn fragment_base_args<'a>(key_path: &'a str, listener: &'a str) -> Vec<&'a str> {
+        vec![
+            "--distributed-query",
+            "--fragment-key-file",
+            key_path,
+            "--fragment-listener",
+            listener,
+            "--fragment-tls-cert",
+            "/tmp/frag-cert.pem",
+            "--fragment-tls-key",
+            "/tmp/frag-key.pem",
+            "--fragment-tls-ca",
+            "/tmp/frag-ca.pem",
+        ]
+    }
+
+    #[test]
+    fn fragment_listener_equal_to_listen_http_fails_validate() {
+        let key = fragment_key_tmp();
+        let mut args = fragment_base_args(key.path().to_str().expect("utf8"), "127.0.0.1:4319");
+        args.extend_from_slice(&["--listen-http", "127.0.0.1:4319"]);
+        let err = cli(&args)
+            .validate()
+            .expect_err("--fragment-listener aliasing --listen-http must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--fragment-listener"),
+            "names fragment flag: {msg}"
+        );
+        assert!(msg.contains("--listen-http"), "names colliding flag: {msg}");
+        assert!(
+            msg.contains("127.0.0.1:4319"),
+            "names both addresses: {msg}"
+        );
+    }
+
+    #[test]
+    fn fragment_listener_equal_to_listen_grpc_fails_validate() {
+        let key = fragment_key_tmp();
+        let mut args = fragment_base_args(key.path().to_str().expect("utf8"), "127.0.0.1:4320");
+        args.extend_from_slice(&[
+            "--listen-http",
+            "127.0.0.1:4318",
+            "--listen-grpc",
+            "127.0.0.1:4320",
+        ]);
+        let err = cli(&args)
+            .validate()
+            .expect_err("--fragment-listener aliasing --listen-grpc must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--fragment-listener"),
+            "names fragment flag: {msg}"
+        );
+        assert!(msg.contains("--listen-grpc"), "names colliding flag: {msg}");
+        assert!(
+            msg.contains("127.0.0.1:4320"),
+            "names both addresses: {msg}"
+        );
+    }
+
+    #[test]
+    fn fragment_listener_equal_to_mtls_listener_fails_validate() {
+        let key = fragment_key_tmp();
+        let mut args = fragment_base_args(key.path().to_str().expect("utf8"), "127.0.0.1:4321");
+        args.extend_from_slice(&[
+            "--listen-http",
+            "127.0.0.1:4318",
+            "--listen-grpc",
+            "127.0.0.1:4317",
+            "--mtls-enabled",
+            "--mtls-listener",
+            "127.0.0.1:4321",
+        ]);
+        let err = cli(&args)
+            .validate()
+            .expect_err("--fragment-listener aliasing --mtls-listener must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--fragment-listener"),
+            "names fragment flag: {msg}"
+        );
+        assert!(
+            msg.contains("--mtls-listener"),
+            "names colliding flag: {msg}"
+        );
+        assert!(
+            msg.contains("127.0.0.1:4321"),
+            "names both addresses: {msg}"
+        );
+    }
+
+    #[test]
+    fn fragment_listener_without_tls_material_fails_validate() {
+        let key = fragment_key_tmp();
+        let err = cli(&[
+            "--distributed-query",
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8"),
+            "--fragment-listener",
+            "127.0.0.1:4319",
+            "--listen-http",
+            "127.0.0.1:4318",
+            "--listen-grpc",
+            "127.0.0.1:4317",
+        ])
+        .validate()
+        .expect_err("--fragment-listener without TLS material must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--fragment-tls-cert"),
+            "names the missing flags: {msg}"
+        );
+    }
+
+    #[test]
+    fn fragment_listener_requires_distributed_query() {
+        let err = cli(&[
+            "--fragment-listener",
+            "127.0.0.1:4319",
+            "--fragment-tls-cert",
+            "/tmp/frag-cert.pem",
+            "--fragment-tls-key",
+            "/tmp/frag-key.pem",
+            "--fragment-tls-ca",
+            "/tmp/frag-ca.pem",
+        ])
+        .validate()
+        .expect_err("--fragment-listener without --distributed-query must refuse startup");
+        assert!(
+            err.to_string().contains("--distributed-query"),
+            "names the required flag: {err}"
+        );
+    }
+
+    #[test]
+    fn fragment_tls_material_without_listener_fails_validate() {
+        let err = cli(&[
+            "--fragment-tls-cert",
+            "/tmp/frag-cert.pem",
+            "--fragment-tls-key",
+            "/tmp/frag-key.pem",
+            "--fragment-tls-ca",
+            "/tmp/frag-ca.pem",
+        ])
+        .validate()
+        .expect_err("fragment TLS material without --fragment-listener must refuse startup");
+        assert!(
+            err.to_string().contains("--fragment-listener"),
+            "names the required flag: {err}"
         );
     }
 

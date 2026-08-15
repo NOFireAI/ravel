@@ -83,6 +83,16 @@ tokio = { workspace = true }
 # stays plaintext `http://`.
 tonic = { workspace = true, features = ["channel", "tls-ring", "tls-native-roots"] }
 tonic-prost = { workspace = true }
+# rustls 0.23 links a process-level default crypto provider that must be
+# installed before the first TLS endpoint is built. This binary transitively
+# links BOTH the `ring` provider (tonic's `tls-ring` above, kube's `rustls-tls`)
+# and `aws-lc-rs` (ravel-object-store's jsonwebtoken pin), which rustls refuses
+# to disambiguate on its own -- it panics on first use. `start()` installs the
+# `ring` provider explicitly (mirroring services/ravel-operator/src/main.rs) so
+# the ADR-0071 dedicated fragment listener (`tls-ring`) can terminate TLS. The
+# dep is pinned directly, matching the operator crate; it is the same rustls
+# already resolved in the graph, not a new TLS stack.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # The ADR-0071 `SliceFetcher` trait (ravel_query::distrib::client) is an
 # `#[async_trait]` trait the coordinator's routing fetcher implements, so
 # async-trait is production code here, not only a test dependency.
