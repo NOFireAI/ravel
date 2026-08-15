@@ -838,7 +838,7 @@ async fn pre_reshard_snapshot_head_still_validates_after_reshard() {
     let (catalog, _engine) = engine(store.clone(), 4);
     let fold_now = (BASE_HOUR as i64 + 10) * NS_PER_HOUR;
     let report = catalog
-        .fold(&tenant_hash(), SIGNAL, Uuid::new_v4(), fold_now, &[])
+        .fold(&tenant_hash(), SIGNAL, Uuid::new_v4(), fold_now, &[], None)
         .await
         .expect("fold succeeds");
     let watermark = report

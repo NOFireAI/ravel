@@ -222,7 +222,14 @@ async fn postings_get_is_skipped_without_a_name_filter_and_issued_with_one() {
 
     let fold_catalog = Catalog::new(inner.clone(), config(1)).expect("catalog");
     let report = fold_catalog
-        .fold(&tenant_hash, Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant_hash,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
     assert!(

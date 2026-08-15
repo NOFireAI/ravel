@@ -201,7 +201,7 @@ async fn pruned_and_bypassed_queries_are_bit_identical_across_formats_and_duplic
 
     let catalog = catalog(store.clone());
     let report = catalog
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
     assert!(
@@ -276,7 +276,7 @@ async fn negative_name_matcher_bypasses_pruning() {
 
     let catalog = catalog(store.clone());
     catalog
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
 
@@ -339,7 +339,7 @@ async fn absent_name_matcher_bypasses_pruning() {
 
     let catalog = catalog(store.clone());
     catalog
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
 
@@ -398,7 +398,7 @@ async fn missing_postings_degrade_to_no_pruning() {
 
     let catalog = catalog(store.clone());
     catalog
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
 
@@ -461,7 +461,7 @@ async fn corrupt_postings_degrade_to_no_pruning() {
 
     let catalog = catalog(store.clone());
     catalog
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
 
@@ -541,7 +541,7 @@ async fn pruning_rescues_a_query_from_the_segment_budget() {
 
     let catalog = catalog(store.clone());
     catalog
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
 

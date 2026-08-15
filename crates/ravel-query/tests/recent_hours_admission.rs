@@ -182,7 +182,7 @@ async fn recent_hours_exempt_from_segment_cap() {
     .await;
 
     let cat = catalog(store.clone());
-    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold seals sealed_hour");
 
@@ -297,7 +297,7 @@ async fn sealed_set_still_capped_when_oversized() {
         publish_segment(store.as_ref(), &tid, th, seq, hour, "m", ts, seq as f64).await;
     }
     let cat = catalog(store.clone());
-    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
 
@@ -390,7 +390,7 @@ async fn exactness_stable_across_fold() {
 
     let cat_a = catalog(store.clone());
     cat_a
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now1, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now1, &[], None)
         .await
         .expect("fold seals sealed_hour only");
     let engine_a = QueryEngine::new(Arc::new(cat_a), store.clone(), config);
@@ -405,7 +405,7 @@ async fn exactness_stable_across_fold() {
     let now2 = now_at_seal(recent_hour);
     let cat_b = catalog(store.clone());
     cat_b
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now2, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now2, &[], None)
         .await
         .expect("fold seals recent_hour too");
     let engine_b = QueryEngine::new(Arc::new(cat_b), store, config);

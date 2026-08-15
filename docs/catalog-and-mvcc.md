@@ -549,10 +549,16 @@ Because a retention tombstone lands `R` behind the watermark, far outside the
 fixed reconcile window, each incremental fold ALSO reconciles the bounded set
 of snapshot-named hours at or approaching the tenant's retirement frontier:
 
-- **Which hours.** The tenant's retention window `R` comes from its durable
-  per-tenant config record (`t/<tenant_hash>/config`, `retention_ns`). A tenant
-  with no per-tenant window gets no frontier reconcile (nothing is being
-  retired). The retirement frontier is the newest ingest hour at or approaching
+- **Which hours.** The tenant's effective retention window `R` is resolved as an
+  override-over-default overlay (ADR-0078), mirroring how ingest resolves
+  admission limits: the durable per-tenant config record
+  (`t/<tenant_hash>/config`, `retention_ns`) when it exists and carries a value,
+  otherwise the deployment-wide default the caller resolves from the CLI-derived
+  `RetentionConfig` (`--retention-default` / `--retention-tenant`) — the same
+  source the physical sweep uses. A `TenantConfig` read failure or an absent
+  record falls back to that deployment default, not to "skip"; only a tenant with
+  neither a per-tenant override nor a deployment default gets no frontier
+  reconcile (nothing is being retired). The retirement frontier is the newest ingest hour at or approaching
   retirement, `frontier_hi = (now - R + protection_horizon) / hour`: retention
   tombstones a bucket once its newest event is older than `R`, so every hour
   whose end is at or before `now - R` may already be tombstoned, and the

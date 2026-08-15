@@ -617,7 +617,7 @@ async fn fold_recognizes_rewrite_records_and_matches_resolve() {
     assert_eq!(before.segments.len(), 1);
 
     let report = catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
     assert_eq!(report.watermark_hour, Some(HOUR));
@@ -682,7 +682,7 @@ async fn reconcile_picks_up_a_rewrite_published_into_an_already_folded_bucket() 
 
     let now_1 = now_at_seal(HOUR + 1);
     let first = catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
         .await
         .expect("first fold");
     assert_eq!(first.watermark_hour, Some(HOUR + 1));
@@ -721,7 +721,7 @@ async fn reconcile_picks_up_a_rewrite_published_into_an_already_folded_bucket() 
     // the rewrite.
     let now_2 = now_at_seal(HOUR + 3);
     let second = catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
         .await
         .expect("second fold");
     assert!(
@@ -1033,7 +1033,7 @@ async fn reconciled_rewrite_part_resolves_to_the_real_part_key() {
 
     let now_1 = now_at_seal(HOUR + 1);
     catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
         .await
         .expect("first fold");
 
@@ -1050,7 +1050,7 @@ async fn reconciled_rewrite_part_resolves_to_the_real_part_key() {
 
     let now_2 = now_at_seal(HOUR + 3);
     let second = catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
         .await
         .expect("second fold");
     assert!(!second.rebuilt);
@@ -1115,7 +1115,7 @@ async fn sibling_rewrites_alarm_on_the_folded_snapshot_path_too() {
 
     let now_1 = now_at_seal(HOUR + 1);
     catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
         .await
         .expect("first fold");
 
@@ -1143,7 +1143,7 @@ async fn sibling_rewrites_alarm_on_the_folded_snapshot_path_too() {
 
     let now_2 = now_at_seal(HOUR + 3);
     catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
         .await
         .expect("second fold");
 

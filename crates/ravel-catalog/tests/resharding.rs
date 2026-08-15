@@ -254,6 +254,7 @@ async fn fold_records_ceiling_and_generation_count() {
             Uuid::new_v4(),
             now_at_seal(watermark),
             &[],
+            None,
         )
         .await
         .expect("fold");
@@ -305,6 +306,7 @@ async fn pre_reshard_head_is_accepted_after_a_later_reshard() {
             Uuid::new_v4(),
             now_at_seal(folded_hour),
             &[],
+            None,
         )
         .await
         .expect("fold under a single generation");

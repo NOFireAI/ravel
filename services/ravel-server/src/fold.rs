@@ -25,6 +25,7 @@ use std::time::Duration;
 use ravel_catalog::Catalog;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_ingest::{Clock, SystemClock};
+use ravel_maintain::RetentionConfig;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
@@ -117,11 +118,21 @@ const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans]
 /// carrying a config record is maintained unconditionally, so no flag can
 /// exclude it. Returns immediately; tasks run in the background until
 /// [`FoldTasks::shutdown`].
+///
+/// `retention` is the same CLI-derived [`RetentionConfig`] the Maintain-mode
+/// physical sweep uses (`main.rs`, threaded into `MaintenanceTaskConfig`).
+/// Each tick resolves `retention.window_for(tenant)` per tenant and passes it
+/// into [`Catalog::fold`] as the deployment-default retention window, so the
+/// fold's retention-frontier reconcile runs for a tenant configured only by
+/// CLI flags with no durable `TenantConfig.retention_ns` record (ADR-0078).
+/// An unconfigured `RetentionConfig` resolves to `None` for every tenant, so
+/// this is inert when no retention flag is set.
 pub fn spawn(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     fallback_allow: &[TenantHash],
     config: FoldTaskConfig,
+    retention: Arc<RetentionConfig>,
 ) -> FoldTasks {
     if !config.enabled {
         return FoldTasks::none();
@@ -150,6 +161,7 @@ pub fn spawn(
         let fallback_allow = fallback_allow.clone();
         let interval = config.fold_interval;
         let rng = Arc::clone(&rng);
+        let retention = Arc::clone(&retention);
         let handle = tokio::spawn(async move {
             run_loop(
                 catalog,
@@ -159,6 +171,7 @@ pub fn spawn(
                 folder_id,
                 interval,
                 rng,
+                retention,
                 rx,
             )
             .await;
@@ -178,6 +191,7 @@ async fn run_loop(
     folder_id: Uuid,
     interval: Duration,
     rng: Arc<dyn RngSource>,
+    retention: Arc<RetentionConfig>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -211,6 +225,10 @@ async fn run_loop(
         }
 
         for tenant in outcome.maintained {
+            // The deployment-default retention window for this tenant, resolved
+            // per tick from the CLI-derived RetentionConfig (ADR-0078). The fold
+            // overlays the durable TenantConfig.retention_ns on top of it.
+            let default_retention_ns = retention.window_for(&tenant);
             run_tenant_tick(
                 catalog.as_ref(),
                 store.as_ref(),
@@ -218,6 +236,7 @@ async fn run_loop(
                 signal,
                 folder_id,
                 interval,
+                default_retention_ns,
             )
             .await;
         }
@@ -235,6 +254,7 @@ async fn run_tenant_tick(
     signal: Signal,
     folder_id: Uuid,
     interval: Duration,
+    default_retention_ns: Option<i64>,
 ) {
     let now_ns = SystemClock.now_ns();
     if head_fresh_enough(store, tenant, signal, interval, now_ns).await {
@@ -246,7 +266,10 @@ async fn run_tenant_tick(
         return;
     }
 
-    match catalog.fold(tenant, signal, folder_id, now_ns, &[]).await {
+    match catalog
+        .fold(tenant, signal, folder_id, now_ns, &[], default_retention_ns)
+        .await
+    {
         Ok(report) => {
             tracing::info!(
                 tenant = %tenant.to_hex(),

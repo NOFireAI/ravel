@@ -1270,11 +1270,17 @@ pub async fn start(
         (fold::FoldTasks::none(), maintenance_tasks)
     } else {
         // Background class (ADR-0070): fold is deferred maintenance traffic.
+        // The fold's retention-frontier reconcile shares the same CLI-derived
+        // RetentionConfig the Maintain-mode sweep uses (ADR-0078), so a tenant
+        // configured only by --retention-default/--retention-tenant still gets
+        // frontier-reconciled even with no durable TenantConfig.retention_ns.
+        let fold_retention = Arc::new(config.maintain.retention.clone());
         let fold_tasks = fold::spawn(
             catalog,
             store_background.clone(),
             &config.fold_tenants,
             config.fold,
+            fold_retention,
         );
         (fold_tasks, maintain::MaintenanceTasks::none())
     };

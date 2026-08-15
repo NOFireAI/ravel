@@ -130,7 +130,7 @@ async fn measure_selective_query_before_after() {
 
         let catalog = Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog");
         catalog
-            .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+            .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
             .await
             .expect("fold");
         let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());

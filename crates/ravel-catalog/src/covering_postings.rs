@@ -331,6 +331,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_ns,
                 &[],
+                None,
             )
             .await
             .expect("fold produces a HEAD");

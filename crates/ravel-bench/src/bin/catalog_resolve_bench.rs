@@ -367,7 +367,14 @@ async fn run_resolve_scenario(raw_store: Arc<dyn ObjectStoreBackend>, args: &Arg
 
     let fold_catalog = build_catalog(Arc::clone(&raw_store), shards);
     let fold_report = fold_catalog
-        .fold(&tenant_hash, Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant_hash,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
 
@@ -458,7 +465,14 @@ async fn run_gate_scenario(raw_store: Arc<dyn ObjectStoreBackend>, args: &Args) 
     // fold does NOT eliminate, since it prunes by hour, not by name).
     let fold_catalog = build_catalog(Arc::clone(&raw_store), 1);
     fold_catalog
-        .fold(&tenant_hash, Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant_hash,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold gate bucket");
 

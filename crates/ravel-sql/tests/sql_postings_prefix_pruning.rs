@@ -44,7 +44,14 @@ async fn folded_fixture() -> Fixture {
 
     let report = fixture
         .catalog
-        .fold(&tenant.hash(), Signal::Metrics, Uuid::new_v4(), NOW_NS, &[])
+        .fold(
+            &tenant.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            NOW_NS,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
     assert!(

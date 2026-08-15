@@ -888,7 +888,7 @@ async fn multi_part_ceiling_crossing_folds_queries_and_compacts() {
 
     // Fold: crosses the ceiling, producing a multi-part HEAD.
     let report_a = folded
-        .fold(&tenant, Signal::Metrics, Uuid::new_v4(), now_a, &[])
+        .fold(&tenant, Signal::Metrics, Uuid::new_v4(), now_a, &[], None)
         .await
         .expect("first fold");
     assert!(!report_a.no_op, "sealed hours must fold");
@@ -986,7 +986,7 @@ async fn multi_part_ceiling_crossing_folds_queries_and_compacts() {
     // Reconcile fold: discovers the late compaction and tombstone within its
     // window and rewrites only the covering sealed parts.
     let report_b = folded
-        .fold(&tenant, Signal::Metrics, Uuid::new_v4(), now_b, &[])
+        .fold(&tenant, Signal::Metrics, Uuid::new_v4(), now_b, &[], None)
         .await
         .expect("reconcile fold");
     assert!(!report_b.no_op, "the watermark advanced, so not a no-op");

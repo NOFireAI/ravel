@@ -901,6 +901,7 @@ mod tests {
                 uuid::Uuid::new_v4(),
                 now_ns,
                 &[],
+                None,
             )
             .await
             .expect("fold produces a snapshot part");
@@ -958,6 +959,7 @@ mod tests {
                 uuid::Uuid::new_v4(),
                 now_ns,
                 &[],
+                None,
             )
             .await
             .expect("fold produces a snapshot part");
@@ -999,6 +1001,7 @@ mod tests {
                 uuid::Uuid::new_v4(),
                 now_ns,
                 &[],
+                None,
             )
             .await
             .expect("fold produces a snapshot part");
@@ -1070,6 +1073,7 @@ mod tests {
                 uuid::Uuid::new_v4(),
                 now_ns,
                 &[],
+                None,
             )
             .await
             .expect("fold produces a snapshot part");
@@ -1172,6 +1176,7 @@ mod tests {
                 uuid::Uuid::new_v4(),
                 now_ns,
                 &[],
+                None,
             )
             .await
             .expect("fold produces a snapshot part");

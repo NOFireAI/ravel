@@ -595,8 +595,16 @@ fn head_key(signal: Signal) -> String {
 
 /// Fold the seeded commit layout into a catalog HEAD naming the seeded
 /// bucket's segments. `shard_count = SHARD + 1` so the fold's scan set covers
-/// the fixture shard `SHARD`.
-async fn fold_head(store: &Arc<MemoryStore>, signal: Signal, now_ns: i64) {
+/// the fixture shard `SHARD`. `default_retention_ns` is the caller-resolved
+/// deployment-wide retention default (from `RetentionConfig::window_for`) the
+/// production fold loop passes into `Catalog::fold`; `None` for the tests that
+/// rely on the durable `TenantConfig.retention_ns` override instead.
+async fn fold_head(
+    store: &Arc<MemoryStore>,
+    signal: Signal,
+    now_ns: i64,
+    default_retention_ns: Option<i64>,
+) {
     let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
     let catalog = ravel_catalog::Catalog::new(
         dyn_store,
@@ -607,7 +615,14 @@ async fn fold_head(store: &Arc<MemoryStore>, signal: Signal, now_ns: i64) {
     )
     .expect("catalog");
     catalog
-        .fold(&tenant_hash(), signal, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant_hash(),
+            signal,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            default_retention_ns,
+        )
         .await
         .expect("fold builds a HEAD naming the seeded bucket");
 }
@@ -639,7 +654,7 @@ async fn sweep_blocked_when_head_names_bucket() {
     let config = cfg();
 
     // A HEAD naming the bucket's segments.
-    fold_head(&store, Signal::Metrics, created).await;
+    fold_head(&store, Signal::Metrics, created, None).await;
     assert!(store.head(&head_key(Signal::Metrics)).await.is_ok());
 
     let retention = retention_at_floor(&config);
@@ -804,7 +819,7 @@ async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
     let config = cfg();
 
     // Pre-fold HEAD names the bucket.
-    fold_head(&store, Signal::Metrics, created).await;
+    fold_head(&store, Signal::Metrics, created, None).await;
     let retention = retention_at_floor(&config);
     retention_sweep_bucket(
         store.as_ref(),
@@ -840,7 +855,7 @@ async fn sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket() {
     );
 
     // The fold completes and drops the tombstoned bucket from the snapshot.
-    fold_head(&store, Signal::Metrics, clock.now_ns()).await;
+    fold_head(&store, Signal::Metrics, clock.now_ns(), None).await;
 
     // Ordering B: the sweep's gate now reads the post-fold HEAD (bucket
     // dropped) -> proceeds and deletes.
@@ -935,7 +950,7 @@ async fn retention_of_out_of_window_hour_never_leaves_snapshot_naming_deleted_ob
     let old_bucket = bucket_at(old_hour);
 
     // 1. Fold: the snapshot names both hours.
-    fold_head(&store, Signal::Metrics, created).await;
+    fold_head(&store, Signal::Metrics, created, None).await;
 
     // 2. Retire the old hour (tombstone written far behind the watermark).
     let tombstoned = retention_sweep_bucket(
@@ -954,7 +969,7 @@ async fn retention_of_out_of_window_hour_never_leaves_snapshot_naming_deleted_ob
     //    reconcile pass runs (a fold at the same instant seals no new hour and
     //    is a no-op): the retention-frontier reconcile observes the
     //    out-of-window tombstone and drops the old hour from the snapshot.
-    fold_head(&store, Signal::Metrics, created + 3 * NS_PER_HOUR).await;
+    fold_head(&store, Signal::Metrics, created + 3 * NS_PER_HOUR, None).await;
 
     // 4. Past the protection horizon, run the sweep to completion.
     clock.set(created + config.protection_horizon_ns + 1);
@@ -1026,6 +1041,192 @@ async fn retention_of_out_of_window_hour_never_leaves_snapshot_naming_deleted_ob
     }
 }
 
+/// ADR-0078 acceptance test: a deployment configured with ONLY a
+/// `RetentionConfig` deployment default (the CLI-flag path: `--retention-default`
+/// / `--retention-tenant`) and NO durable `TenantConfig.retention_ns` write must
+/// still get the fold's retention-frontier reconcile pass, so the physical sweep
+/// completes the delete. This is the exact gap #134 closes: before the fix, the
+/// fold read only `TenantConfig.retention_ns` (never written by the running
+/// server), so `tenant_retention_ns` was always `None`, the frontier reconcile
+/// never ran, HEAD kept naming the retired hour, and the sweep stayed blocked
+/// forever.
+///
+/// It mirrors `retention_of_out_of_window_hour_never_leaves_snapshot_naming_
+/// deleted_objects` and drives retention through the real `Catalog::fold`
+/// (via `fold_head`) and the real `retention_sweep_bucket`, but resolves the
+/// window from the same `RetentionConfig::window_for` the production fold loop
+/// uses (`services/ravel-server/src/fold.rs`) and passes it as the new
+/// deployment-default parameter -- with no `write_tenant_retention` call at all.
+///
+/// To watch this FAIL against pre-fix code, restore the old resolution in
+/// `crates/ravel-catalog/src/fold.rs` (`Ok(None) => None` and the `Err` arm
+/// returning `None`, ignoring `default_retention_ns`): with no TenantConfig
+/// record present, `tenant_retention_ns` is `None`, the frontier reconcile is
+/// skipped, the old hour is never dropped from the snapshot, the sweep stays
+/// `BlockedBySnapshot`, and the final `RetentionOutcome::Swept` assertion fails.
+#[tokio::test]
+async fn deployment_default_retention_drives_frontier_reconcile_and_sweep() {
+    let store = Arc::new(MemoryStore::new());
+    let config = cfg();
+
+    // Same two-hour layout as the TenantConfig-driven e2e: an old hour far
+    // behind the watermark (outside the fixed 26h reconcile window) that
+    // retention retires, and a recent hour at the watermark that survives.
+    let recent_hour = HOUR;
+    let old_hour = HOUR - 100;
+
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            old_hour,
+            Uuid::from_u128(0xA1),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "old")],
+                &[(i64::from(old_hour) * NS_PER_HOUR + 1_000, 1.0)],
+            )],
+        ),
+    )
+    .await;
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            recent_hour,
+            Uuid::from_u128(0xB2),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "recent")],
+                &[(i64::from(recent_hour) * NS_PER_HOUR + 1_000, 2.0)],
+            )],
+        ),
+    )
+    .await;
+
+    // The ONLY retention source: a deployment-wide default (the CLI
+    // `--retention-default` path). No `write_tenant_retention` / TenantConfig
+    // record is written, so the fold's frontier reconcile can only run if it
+    // honors this deployment default (the #134 fix).
+    let retention_window_ns = 90 * NS_PER_HOUR;
+    let retention = RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: Some(retention_window_ns),
+            tenants: vec![],
+        },
+        &config,
+        DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("retention config");
+    // The value the production fold loop resolves per tenant and hands to
+    // `Catalog::fold` as its new deployment-default parameter.
+    let default_retention_ns = retention.window_for(&tenant_hash());
+    assert_eq!(default_retention_ns, Some(retention_window_ns));
+
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let old_bucket = bucket_at(old_hour);
+
+    // 1. Fold: the snapshot names both hours.
+    fold_head(&store, Signal::Metrics, created, default_retention_ns).await;
+
+    // 2. Retire the old hour (tombstone written far behind the watermark).
+    let tombstoned = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &old_bucket,
+    )
+    .await
+    .expect("tombstone");
+    assert_eq!(tombstoned, RetentionOutcome::Tombstoned);
+
+    // 3. Fold again a few hours later so the watermark advances and the
+    //    reconcile pass runs. With the fix, the frontier reconcile derived from
+    //    the deployment default observes the out-of-window tombstone and drops
+    //    the old hour from the snapshot.
+    fold_head(
+        &store,
+        Signal::Metrics,
+        created + 3 * NS_PER_HOUR,
+        default_retention_ns,
+    )
+    .await;
+
+    // 4. Past the protection horizon, run the sweep to completion. It can only
+    //    reach `Swept` if step 3 dropped the old hour from the HEAD snapshot.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let mut outcome = RetentionOutcome::Tombstoned;
+    for _ in 0..8 {
+        outcome = retention_sweep_bucket(
+            store.as_ref(),
+            &clock,
+            &config,
+            &retention,
+            &NoLeases,
+            &old_bucket,
+        )
+        .await
+        .expect("sweep pass");
+        if outcome == RetentionOutcome::Swept {
+            break;
+        }
+    }
+    assert_eq!(
+        outcome,
+        RetentionOutcome::Swept,
+        "with only a RetentionConfig deployment default (no TenantConfig write), \
+         the fold's frontier reconcile must still drop the retired hour so the \
+         sweep completes -- this is the #134 fix"
+    );
+    assert!(bucket_is_empty(store.as_ref(), &old_bucket).await);
+
+    // 5. A resolve spanning the retired hour never names a deleted object and
+    //    excludes the retired hour, while the recent hour stays resolvable.
+    let resolver = ravel_catalog::Catalog::new(
+        {
+            let s: Arc<dyn ObjectStoreBackend> = store.clone();
+            s
+        },
+        ravel_catalog::CatalogConfig {
+            shard_count: SHARD + 1,
+            ..Default::default()
+        },
+    )
+    .expect("resolver catalog");
+    let range = TimeRange {
+        start_ns: i64::from(old_hour) * NS_PER_HOUR,
+        end_ns: (i64::from(recent_hour) + 1) * NS_PER_HOUR,
+    };
+    let snapshot = resolver
+        .resolve(&tenant_hash(), Signal::Metrics, range, &[], clock.now_ns())
+        .await
+        .expect("resolve must never return a 5xx-shaped error for the retired range");
+    for seg in &snapshot.segments {
+        assert_ne!(
+            seg.ingest_hour_bucket, old_hour,
+            "the retired hour must not be named by any resolved segment"
+        );
+        assert!(
+            store.head(&seg.data_object_key).await.is_ok(),
+            "a resolved segment names a DELETED object ({}): this is the \
+             SnapshotInvalidated condition the fix must prevent",
+            seg.data_object_key
+        );
+    }
+    assert!(
+        snapshot
+            .segments
+            .iter()
+            .any(|s| s.ingest_hour_bucket == recent_hour),
+        "the surviving recent hour is still resolvable"
+    );
+}
+
 /// Deliverable 5 (counters): the blocked-by-snapshot outcome is observable
 /// through `MaintainReport::blocked_by_snapshot`, driven end to end through the
 /// production `scan_and_maintain` pass over the shard.
@@ -1039,7 +1240,7 @@ async fn scan_reports_blocked_by_snapshot_counter() {
     let retention = retention_at_floor(&config);
 
     // A HEAD naming the bucket: the sweep will block on it.
-    fold_head(&store, Signal::Metrics, created).await;
+    fold_head(&store, Signal::Metrics, created, None).await;
 
     // Pass 1: tombstone the expired bucket.
     let r1 = scan_and_maintain(
