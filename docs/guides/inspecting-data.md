@@ -26,7 +26,11 @@ t/<tenant_hash>/m/c/<shard>/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt commit r
 ```
 
 `tenant_hash` is BLAKE3 of the tenant name, hex-encoded. `m` is the signal
-(metrics; logs and spans would be `l`/`s`, not implemented yet). `shard` is
+letter for metrics; logs use `l` and spans use `s`, and all three are
+implemented. Logs have their own RLOG object format and an `rlog inspect`
+walkthrough further down this guide; spans have the RSPAN format
+([span-segment-format.md](../span-segment-format.md), ADR-0041) and a SQL
+query path over the `spans` table. `shard` is
 the ingest shard, zero-padded to 4 digits. `ingest_hour` is the UTC hour the
 commit landed in (`YYYYMMDDTHH`). This lets the catalog find recent
 commits by listing a small, bounded set of prefixes instead of the whole
@@ -169,10 +173,11 @@ Field by field:
 Log data lives in RLOG objects (`.rlog`), the columnar log segment format
 (docs/log-segment-format.md, ADR-0029; trailer version 2, ADR-0032). RLOG is
 a sibling of RSEG. It shares the same 16-byte trailer, protobuf footer, and
-crc32c discipline, but it has its own sections and none of the bytes. As of
-log storage phase 1, the format crate (`ravel-logseg`) ships on its own.
-Ingest, query, and lifecycle are later phases. Today the writer produces an
-RLOG object directly (in tests and tooling), not the ingest path. The
+crc32c discipline, but it has its own sections and none of the bytes. Ingest, query, and lifecycle all run today: the production ingest path writes
+RLOG objects through `ravel-ingest`'s log shard, the `logs` SQL table on
+`POST /api/v1/sql` reads them back, and `ravel-maintain` compacts and retains
+them. The walkthrough below drives the writer directly (in tests and
+tooling), not through the ingest path, to show the format in isolation. The
 command is:
 
 ```sh

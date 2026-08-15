@@ -105,9 +105,11 @@ code, not only to use it.
 - [object-store-contract.md](object-store-contract.md): the
   `ObjectStoreBackend` trait that every storage vendor (memory, S3/MinIO) must
   satisfy, and the durability arguments made against it.
-- [otap-ingest.md](otap-ingest.md): plan for OTAP (OpenTelemetry Arrow)
-  ingest. It describes a feature-gated crate and gateway wiring. It is not yet
-  wired into `ravel-server`.
+- [otap-ingest.md](otap-ingest.md): OTAP (OpenTelemetry Arrow) ingest. The
+  decode stack is a feature-gated crate, linked by `ravel-server`'s `otap`
+  cargo feature, and the service is registered at runtime only when the
+  process is started with `--otap` (ADR-0011). An end-to-end test drives a
+  real OpenTelemetry collector against that endpoint.
 
 ## Decision records
 
