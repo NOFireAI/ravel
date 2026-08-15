@@ -15,6 +15,22 @@ pub enum ApiResponse<T> {
     #[serde(rename = "success")]
     Success {
         data: T,
+        /// Coverage marker (ADR-0071 "partial results are consent-gated and
+        /// envelope-visible" amendment, decision 2): a required top-level
+        /// sibling of `status`/`data`/`warnings`, `false` on complete coverage
+        /// and `true` on partial. Unlike `warnings`/`infos` it is NOT omitted
+        /// when its value is the "empty" case: a strict deserializer modelling a
+        /// read-endpoint envelope must always see it, so a naive client cannot
+        /// mistake a partial answer for a complete one.
+        ///
+        /// `Option` only so the stateless compatibility routes (buildinfo,
+        /// metadata) that build a bare success envelope via [`Self::success`]
+        /// omit it entirely rather than assert a coverage claim they never
+        /// evaluate; the five read endpoints always pass `Some(_)` through
+        /// [`Self::success_with_annotations`], so on those endpoints the field is
+        /// unconditionally present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partial: Option<bool>,
         /// Prometheus' top-level `warnings` array: non-fatal diagnostics that
         /// very likely indicate a result the caller did not intend. Omitted
         /// when empty (Prometheus' own `omitempty`), which most responses
@@ -37,20 +53,32 @@ pub enum ApiResponse<T> {
 }
 
 impl<T> ApiResponse<T> {
-    /// A success envelope with no annotations, for endpoints that never
-    /// produce warnings or infos (labels, series, label-values).
+    /// A bare success envelope with no annotations and no coverage marker, for
+    /// the stateless compatibility routes (buildinfo, metadata) that run no
+    /// query and so make no coverage claim. The `partial` field is omitted
+    /// here; the five read endpoints use [`Self::success_with_annotations`],
+    /// which always renders it.
     pub fn success(data: T) -> Self {
         ApiResponse::Success {
             data,
+            partial: None,
             warnings: Vec::new(),
             infos: Vec::new(),
         }
     }
 
-    /// A success envelope carrying the query's evaluation annotations.
-    pub fn success_with_annotations(data: T, warnings: Vec<String>, infos: Vec<String>) -> Self {
+    /// A success envelope for a read endpoint: carries the query's evaluation
+    /// annotations and the always-present top-level `partial` coverage marker
+    /// (ADR-0071 amendment decision 2).
+    pub fn success_with_annotations(
+        data: T,
+        partial: bool,
+        warnings: Vec<String>,
+        infos: Vec<String>,
+    ) -> Self {
         ApiResponse::Success {
             data,
+            partial: Some(partial),
             warnings,
             infos,
         }
@@ -645,6 +673,7 @@ mod tests {
         // Prometheus' `warnings`/`infos` fields.
         let resp = ApiResponse::success_with_annotations(
             "data-goes-here",
+            false,
             vec!["quantile value should be between 0 and 1, got 1.5".to_string()],
             vec!["needed to be fixed for monotonicity".to_string()],
         );
@@ -669,6 +698,48 @@ mod tests {
         let json = serde_json::to_value(&resp).expect("serializes");
         assert!(json.get("warnings").is_none(), "empty warnings omitted");
         assert!(json.get("infos").is_none(), "empty infos omitted");
+    }
+
+    #[test]
+    fn read_endpoint_envelope_always_carries_partial_even_when_false() {
+        // ADR-0071 amendment decision 2: the top-level `partial` field is
+        // present on every read-endpoint response, false on complete coverage
+        // (NOT omitted like the annotation arrays). A strict client that models
+        // status+data+partial then cannot deserialize a complete response
+        // without acknowledging the coverage contract.
+        //
+        // Flip-line proof: switching `partial` to `skip_serializing_if` (the
+        // omitempty treatment the ADR rejects) drops the field here and this
+        // assertion fails.
+        let complete =
+            ApiResponse::success_with_annotations("data-goes-here", false, Vec::new(), Vec::new());
+        let json = serde_json::to_value(&complete).expect("serializes");
+        assert_eq!(json["status"], "success");
+        assert_eq!(
+            json["partial"],
+            serde_json::json!(false),
+            "partial:false must be present on a complete read response, not omitted"
+        );
+
+        let partial =
+            ApiResponse::success_with_annotations("data-goes-here", true, Vec::new(), Vec::new());
+        let json = serde_json::to_value(&partial).expect("serializes");
+        assert_eq!(json["partial"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn bare_success_envelope_omits_partial() {
+        // The stateless compatibility routes (buildinfo, metadata) make no
+        // coverage claim, so their bare success envelope omits `partial`
+        // entirely rather than assert `false`. This keeps the field off
+        // responses Grafana's datasource parses for version detection, where an
+        // unrelated coverage marker would be noise.
+        let resp = ApiResponse::success("data-goes-here");
+        let json = serde_json::to_value(&resp).expect("serializes");
+        assert!(
+            json.get("partial").is_none(),
+            "bare success envelope must not carry a coverage marker"
+        );
     }
 
     #[test]

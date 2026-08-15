@@ -151,6 +151,22 @@ fn seconds_to_ms(name: &'static str, raw: &str, secs: f64) -> Result<i64, ParamE
     Ok(ms as i64)
 }
 
+/// Whether the client opted into partial (degraded-coverage) results
+/// (ADR-0071 "partial results are consent-gated and envelope-visible"
+/// amendment, decision 1). Absent or any non-truthy value means not opted in
+/// (the safe default: partial coverage then fails with a typed `unavailable`
+/// error). Truthy values are `true` and `1`, case-insensitive, matching the
+/// bool-like query parameters Prometheus and Grafana already pass. An
+/// unrecognized value is treated as not opted in rather than a parse error, so
+/// a client that fat-fingers the flag fails safe (503) instead of silently
+/// receiving partial data.
+pub fn parse_allow_partial(params: &Params) -> bool {
+    match params.first("allow_partial") {
+        Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"),
+        None => false,
+    }
+}
+
 pub fn decode_commit_tokens(raw: &[String]) -> Result<Vec<CommitToken>, ParamError> {
     raw.iter()
         .map(|s| {
@@ -240,5 +256,41 @@ mod tests {
     fn non_positive_timeout_is_rejected() {
         let params = params_with_timeout("0");
         assert!(parse_deadline(&params, SERVER_MAX).is_err());
+    }
+
+    #[test]
+    fn allow_partial_absent_is_not_opted_in() {
+        // The safe default: no `allow_partial` means partial coverage fails
+        // with a typed 503, never silently returns partial data.
+        assert!(!parse_allow_partial(&Params::parse(None, None)));
+    }
+
+    #[test]
+    fn allow_partial_truthy_values_opt_in() {
+        for raw in [
+            "allow_partial=true",
+            "allow_partial=1",
+            "allow_partial=TRUE",
+        ] {
+            assert!(
+                parse_allow_partial(&Params::parse(Some(raw), None)),
+                "{raw} must opt in"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_partial_falsey_or_garbage_is_not_opted_in() {
+        for raw in [
+            "allow_partial=false",
+            "allow_partial=0",
+            "allow_partial=yes",
+            "allow_partial=",
+        ] {
+            assert!(
+                !parse_allow_partial(&Params::parse(Some(raw), None)),
+                "{raw} must NOT opt in (fail safe)"
+            );
+        }
     }
 }

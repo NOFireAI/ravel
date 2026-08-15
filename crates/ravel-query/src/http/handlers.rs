@@ -12,13 +12,16 @@ use ravel_promql::LabelMatcher;
 use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot, QueryWorkloadClass};
 use ravel_types::{LabelSet, SeriesId, TenantHash, TimeRange};
 
+use crate::Coverage;
 use crate::engine::parse_match_selector;
 use crate::http::error::{ApiError, MSG_UNAVAILABLE};
 use crate::http::json::{
     ApiResponse, QueryResponseData, instant_value_to_json, range_value_to_json, series_to_json,
     with_stats,
 };
-use crate::http::params::{Params, decode_commit_tokens, parse_deadline, parse_timestamp_ms};
+use crate::http::params::{
+    Params, decode_commit_tokens, parse_allow_partial, parse_deadline, parse_timestamp_ms,
+};
 use crate::http::{AppState, ONE_HOUR_NS};
 
 /// Caps the size of a request body read into memory. There is no
@@ -71,14 +74,64 @@ fn now_ns() -> i64 {
 /// byte-identical to a bare `{"status":"success","data":...}`.
 fn success_annotated<T: serde::Serialize>(
     data: T,
+    partial: bool,
     warnings: Vec<String>,
     infos: Vec<String>,
 ) -> Response {
     (
         StatusCode::OK,
-        Json(ApiResponse::success_with_annotations(data, warnings, infos)),
+        Json(ApiResponse::success_with_annotations(
+            data, partial, warnings, infos,
+        )),
     )
         .into_response()
+}
+
+/// The consent gate (ADR-0071 "partial results are consent-gated and
+/// envelope-visible" amendment, decision 1). Partial coverage the client did
+/// not opt into fails with the EXISTING typed `unavailable` error (HTTP 503,
+/// `errorType: "unavailable"`), so a consumer that never asked for partial
+/// answers fails safe instead of silently accepting one. Complete coverage, or
+/// partial coverage with `allow_partial=true`, passes and the response is a
+/// normal 200 whose top-level `partial` field states the coverage.
+///
+/// The refusal message names the degraded clusters (the same operator-facing,
+/// already-redacted names the `warnings` array carries) and names
+/// `allow_partial` as the remedy, so the fix is in the failure itself.
+fn gate_partial(coverage: &Coverage, allow_partial: bool) -> Result<(), ApiError> {
+    if coverage.is_partial() && !allow_partial {
+        return Err(ApiError::Unavailable(partial_refusal_message(
+            coverage.skipped(),
+        )));
+    }
+    Ok(())
+}
+
+/// Builds a [`Coverage`] from the metadata path's accumulated partial flag and
+/// its skipped-cluster warnings. The value-bearing endpoints derive coverage
+/// from a `QueryStats` via [`Coverage::from_stats`]; the metadata endpoints
+/// carry no `QueryStats` on their response envelope, so they thread the flag and
+/// warnings through directly and reconstruct the same shape here.
+fn coverage_of(partial: bool, skipped: &[String]) -> Coverage {
+    if partial {
+        Coverage::Partial {
+            skipped: skipped.to_vec(),
+        }
+    } else {
+        Coverage::Complete
+    }
+}
+
+fn partial_refusal_message(skipped: &[String]) -> String {
+    let clusters = if skipped.is_empty() {
+        "one or more federated clusters were skipped".to_string()
+    } else {
+        skipped.join("; ")
+    };
+    format!(
+        "partial results: coverage is incomplete ({clusters}); \
+         set allow_partial=true to receive partial results"
+    )
 }
 
 async fn authenticate(
@@ -151,7 +204,7 @@ pub async fn query(State(state): State<AppState>, req: Request<Body>) -> Respons
         Err(_) => return concurrency_rejected_response(),
     };
     match handle_query(&state, req).await {
-        Ok((data, warnings, infos)) => success_annotated(data, warnings, infos),
+        Ok((data, partial, warnings, infos)) => success_annotated(data, partial, warnings, infos),
         Err(e) => e.into_response(),
     }
 }
@@ -159,10 +212,11 @@ pub async fn query(State(state): State<AppState>, req: Request<Body>) -> Respons
 async fn handle_query(
     state: &AppState,
     req: Request<Body>,
-) -> Result<(QueryResponseData, Vec<String>, Vec<String>), ApiError> {
+) -> Result<(QueryResponseData, bool, Vec<String>, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
+    let allow_partial = parse_allow_partial(&params);
 
     let query = params.require("query")?;
     let now = now_ns();
@@ -194,13 +248,21 @@ async fn handle_query(
         exec,
     )
     .await?;
+    // Consent gate (ADR-0071 amendment decision 1): the query executed and was
+    // audited, but partial coverage the client did not opt into is refused with
+    // a typed 503 before any body is built, so a naive consumer cannot mistake
+    // it for a complete answer. Coverage is derived from the stats the engine
+    // already produced (decision 4); the value is never released without it.
+    let coverage = Coverage::from_stats(&stats);
+    gate_partial(&coverage, allow_partial)?;
+    let partial = coverage.is_partial();
     let (mut warnings, infos) = annotations.into_parts();
     // Merge the federation fan-out's partial-coverage warnings (ADR-0071) into the top-level `warnings` array alongside the evaluator's own
     // annotations, so a `skip_unavailable=true` federated query returns a
-    // response a client can tell is partial (the `partial` stats marker) and
-    // that names the skipped cluster. These are already redacted at the
-    // federation seam: they name the operator-facing cluster only, never its
-    // endpoint or transport error text.
+    // response a client can tell is partial (the top-level `partial` field and
+    // the `partial` stats marker) and that names the skipped cluster. These are
+    // already redacted at the federation seam: they name the operator-facing
+    // cluster only, never its endpoint or transport error text.
     for w in &stats.warnings {
         if !warnings.contains(w) {
             warnings.push(w.clone());
@@ -219,7 +281,7 @@ async fn handle_query(
         tenant_hash,
         QueryWorkloadClass::Interactive,
     );
-    Ok((data, warnings, infos))
+    Ok((data, partial, warnings, infos))
 }
 
 pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -228,7 +290,7 @@ pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> R
         Err(_) => return concurrency_rejected_response(),
     };
     match handle_query_range(&state, req).await {
-        Ok((data, warnings, infos)) => success_annotated(data, warnings, infos),
+        Ok((data, partial, warnings, infos)) => success_annotated(data, partial, warnings, infos),
         Err(e) => e.into_response(),
     }
 }
@@ -236,10 +298,11 @@ pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> R
 async fn handle_query_range(
     state: &AppState,
     req: Request<Body>,
-) -> Result<(QueryResponseData, Vec<String>, Vec<String>), ApiError> {
+) -> Result<(QueryResponseData, bool, Vec<String>, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
+    let allow_partial = parse_allow_partial(&params);
 
     let query = params.require("query")?;
     let start_ms = parse_timestamp_ms("start", params.require("start")?)?;
@@ -277,6 +340,10 @@ async fn handle_query_range(
         exec,
     )
     .await?;
+    // Consent gate (ADR-0071 amendment decision 1), same as handle_query.
+    let coverage = Coverage::from_stats(&stats);
+    gate_partial(&coverage, allow_partial)?;
+    let partial = coverage.is_partial();
     let (mut warnings, infos) = annotations.into_parts();
     // Merge the federation fan-out's partial-coverage warnings (ADR-0071) into the top-level `warnings` array, same as handle_query. Already
     // redacted at the federation seam (cluster name only, no endpoint/errno).
@@ -299,7 +366,7 @@ async fn handle_query_range(
         tenant_hash,
         QueryWorkloadClass::Interactive,
     );
-    Ok((data, warnings, infos))
+    Ok((data, partial, warnings, infos))
 }
 
 fn parse_duration_ms_field(params: &Params) -> Result<i64, ApiError> {
@@ -313,7 +380,7 @@ pub async fn labels(State(state): State<AppState>, req: Request<Body>) -> Respon
         Err(_) => return concurrency_rejected_response(),
     };
     match handle_labels(&state, req).await {
-        Ok((data, warnings)) => success_annotated(data, warnings, Vec::new()),
+        Ok((data, partial, warnings)) => success_annotated(data, partial, warnings, Vec::new()),
         Err(e) => e.into_response(),
     }
 }
@@ -321,12 +388,18 @@ pub async fn labels(State(state): State<AppState>, req: Request<Body>) -> Respon
 async fn handle_labels(
     state: &AppState,
     req: Request<Body>,
-) -> Result<(Vec<String>, Vec<String>), ApiError> {
+) -> Result<(Vec<String>, bool, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
-    let (series, warnings) =
+    let allow_partial = parse_allow_partial(&params);
+    let (series, partial, warnings) =
         resolve_and_audit_series(state, tenant_hash, &params, "labels").await?;
+    // Consent gate (ADR-0071 amendment decisions 1 and 3): the metadata surface
+    // gates on `allow_partial` and carries the top-level `partial` field
+    // exactly as the value-bearing endpoints do, so the contract has no
+    // second-class endpoints.
+    gate_partial(&coverage_of(partial, &warnings), allow_partial)?;
 
     let mut names: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &series {
@@ -334,7 +407,7 @@ async fn handle_labels(
             names.insert(label.name.clone());
         }
     }
-    Ok((names.into_iter().collect(), warnings))
+    Ok((names.into_iter().collect(), partial, warnings))
 }
 
 pub async fn label_values(
@@ -347,7 +420,7 @@ pub async fn label_values(
         Err(_) => return concurrency_rejected_response(),
     };
     match handle_label_values(&state, name, req).await {
-        Ok((data, warnings)) => success_annotated(data, warnings, Vec::new()),
+        Ok((data, partial, warnings)) => success_annotated(data, partial, warnings, Vec::new()),
         Err(e) => e.into_response(),
     }
 }
@@ -356,12 +429,14 @@ async fn handle_label_values(
     state: &AppState,
     name: String,
     req: Request<Body>,
-) -> Result<(Vec<String>, Vec<String>), ApiError> {
+) -> Result<(Vec<String>, bool, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
-    let (series, warnings) =
+    let allow_partial = parse_allow_partial(&params);
+    let (series, partial, warnings) =
         resolve_and_audit_series(state, tenant_hash, &params, "labels").await?;
+    gate_partial(&coverage_of(partial, &warnings), allow_partial)?;
 
     let mut values: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &series {
@@ -369,7 +444,7 @@ async fn handle_label_values(
             values.insert(v.to_string());
         }
     }
-    Ok((values.into_iter().collect(), warnings))
+    Ok((values.into_iter().collect(), partial, warnings))
 }
 
 pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -378,7 +453,7 @@ pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Respon
         Err(_) => return concurrency_rejected_response(),
     };
     match handle_series(&state, req).await {
-        Ok((data, warnings)) => success_annotated(data, warnings, Vec::new()),
+        Ok((data, partial, warnings)) => success_annotated(data, partial, warnings, Vec::new()),
         Err(e) => e.into_response(),
     }
 }
@@ -386,18 +461,20 @@ pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Respon
 async fn handle_series(
     state: &AppState,
     req: Request<Body>,
-) -> Result<(Vec<HashMap<String, String>>, Vec<String>), ApiError> {
+) -> Result<(Vec<HashMap<String, String>>, bool, Vec<String>), ApiError> {
     let headers = req.headers().clone();
     let tenant_hash = authenticate(state, &headers).await?;
     let params = read_params(req).await?;
+    let allow_partial = parse_allow_partial(&params);
     if params.all("match[]").is_empty() {
         return Err(ApiError::BadData(
             "missing required parameter \"match[]\"".to_string(),
         ));
     }
-    let (series, warnings) =
+    let (series, partial, warnings) =
         resolve_and_audit_series(state, tenant_hash, &params, "series").await?;
-    Ok((series_to_json(series), warnings))
+    gate_partial(&coverage_of(partial, &warnings), allow_partial)?;
+    Ok((series_to_json(series), partial, warnings))
 }
 
 fn resolve_window(params: &Params, now: i64) -> Result<TimeRange, ApiError> {
@@ -427,7 +504,7 @@ async fn resolve_and_audit_series(
     tenant_hash: TenantHash,
     params: &Params,
     language: &str,
-) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>), ApiError> {
+) -> Result<(Vec<(SeriesId, LabelSet)>, bool, Vec<String>), ApiError> {
     // Window bounds parse before any read; a bad `start`/`end` is a request
     // error, not an executed read, so it is not audited (it returns here).
     let now = now_ns();
@@ -450,7 +527,7 @@ async fn resolve_matched_series(
     state: &AppState,
     tenant_hash: ravel_types::TenantHash,
     params: &Params,
-) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>), ApiError> {
+) -> Result<(Vec<(SeriesId, LabelSet)>, bool, Vec<String>), ApiError> {
     let now = now_ns();
     let window = resolve_window(params, now)?;
     let min_tokens = decode_commit_tokens(params.all("min_commit_token"))?;
@@ -483,6 +560,11 @@ async fn resolve_matched_series(
     // skipped cluster regardless of how many `match[]` selectors the request
     // carried.
     let mut warnings: Vec<String> = Vec::new();
+    // Partial coverage (ADR-0071 amendment) accumulates across selectors: the
+    // whole request is partial if ANY selector's federated resolve skipped a
+    // remote, so a client cannot mistake a request that dropped one selector's
+    // remote coverage for a complete one.
+    let mut partial = false;
 
     if selectors.is_empty() {
         let remaining = remaining_budget(request_deadline, deadline)?;
@@ -491,13 +573,14 @@ async fn resolve_matched_series(
             .resolve_series_with_stats(tenant_hash, &[], window, &min_tokens, now, remaining)
             .await?;
         accumulate_cost(&mut combined, &stats);
+        partial |= stats.partial;
         for w in stats.warnings {
             if !warnings.contains(&w) {
                 warnings.push(w);
             }
         }
         record_combined(state, tenant_hash, combined);
-        return Ok((series, warnings));
+        return Ok((series, partial, warnings));
     }
 
     // Deliberate deviation: each match[] selector resolves its own
@@ -521,6 +604,7 @@ async fn resolve_matched_series(
             .resolve_series_with_stats(tenant_hash, &matchers, window, &min_tokens, now, remaining)
             .await?;
         accumulate_cost(&mut combined, &stats);
+        partial |= stats.partial;
         for w in stats.warnings {
             if !warnings.contains(&w) {
                 warnings.push(w);
@@ -531,7 +615,7 @@ async fn resolve_matched_series(
         }
     }
     record_combined(state, tenant_hash, combined);
-    Ok((by_id.into_iter().collect(), warnings))
+    Ok((by_id.into_iter().collect(), partial, warnings))
 }
 
 /// Fold one sub-query's [`QueryStats`](crate::QueryStats) into the request's

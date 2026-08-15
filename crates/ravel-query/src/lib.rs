@@ -19,7 +19,7 @@ pub use config::{
     DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig, REQUEST_BUDGET_FIXED_OVERHEAD,
     RequestLimit, derive_max_s3_requests,
 };
-pub use engine::{QueryEngine, QueryStats, snapshot_erasure_predicates};
+pub use engine::{Coverage, QueryEngine, QueryStats, snapshot_erasure_predicates};
 pub use error::QueryError;
 pub use fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, SegmentFetcher,

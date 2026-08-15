@@ -126,6 +126,67 @@ impl Default for QueryStats {
     }
 }
 
+/// Whether a query's result covers every cluster it targeted, or a federated
+/// remote was skipped so the result omits that cluster's data (ADR-0071
+/// "partial results are consent-gated and envelope-visible" amendment,
+/// decision 4).
+///
+/// `#[must_use]`: a caller handed a value paired with its `Coverage` cannot
+/// discard the coverage silently. Ignoring partial coverage must be a visible,
+/// deliberate decision, so that a naive consumer can never mistake a partial
+/// answer for a complete one.
+///
+/// This is derived from the [`QueryStats`] the stats-carrying engine wrappers
+/// already produce (see [`Coverage::from_stats`]); it adds no new tracking, it
+/// exposes what the fan-out already recorded.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Coverage {
+    /// Every targeted cluster contributed; the result is complete. Always the
+    /// case for a fully cluster-local query (intra-cluster execution never
+    /// returns partial results, ADR-0071).
+    Complete,
+    /// At least one federated remote was skipped (unavailable with its
+    /// `skip_unavailable` opt-in set, soft-timed-out, or returned a data kind
+    /// this build cannot decode across the slice boundary), so the result omits
+    /// its data. `skipped` names the degraded clusters, operator-facing names
+    /// only, redacted exactly as the response `warnings` are (cluster name,
+    /// never endpoint or errno).
+    Partial { skipped: Vec<String> },
+}
+
+impl Coverage {
+    /// Derives coverage from a completed query's [`QueryStats`], the same source
+    /// the wire rendering already reads (ADR-0071 amendment decision 4: coverage
+    /// is exposed from what the stats-carrying variants already track, never
+    /// newly computed). Partial exactly when `stats.partial` is set; the skipped
+    /// clusters are the federation fan-out's already-redacted warnings.
+    pub fn from_stats(stats: &QueryStats) -> Self {
+        if stats.partial {
+            Coverage::Partial {
+                skipped: stats.warnings.clone(),
+            }
+        } else {
+            Coverage::Complete
+        }
+    }
+
+    /// True when coverage is [`Coverage::Partial`].
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        matches!(self, Coverage::Partial { .. })
+    }
+
+    /// The degraded cluster names when partial, an empty slice when complete.
+    #[must_use]
+    pub fn skipped(&self) -> &[String] {
+        match self {
+            Coverage::Partial { skipped } => skipped,
+            Coverage::Complete => &[],
+        }
+    }
+}
+
 /// Requests one segment open (`fetcher.rs::open_segment`) can cost in the
 /// worst case: the initial suffix/full GET, plus exactly one more GET if the
 /// footer chase reports `NeedRange` (a second `NeedRange` there is treated
@@ -3059,6 +3120,36 @@ mod tests {
     use ravel_types::{Label, LabelSet, SeriesId};
 
     use super::*;
+
+    /// A cluster-local (or all-remotes-healthy) query is `Complete`: its stats
+    /// carry `partial = false`, so no coverage gap is reported (ADR-0071
+    /// amendment decision 4).
+    #[test]
+    fn coverage_from_complete_stats_is_complete() {
+        let cov = Coverage::from_stats(&QueryStats::default());
+        assert_eq!(cov, Coverage::Complete);
+        assert!(!cov.is_partial());
+        assert!(cov.skipped().is_empty());
+    }
+
+    /// A query whose stats mark it partial yields `Partial`, carrying the
+    /// federation fan-out's already-redacted skipped-cluster warnings. Flip-line
+    /// proof: sourcing `skipped` from anything but `stats.warnings`, or dropping
+    /// the `stats.partial` branch, makes one of these assertions fail.
+    #[test]
+    fn coverage_from_partial_stats_carries_skipped_clusters() {
+        let stats = QueryStats {
+            partial: true,
+            warnings: vec!["remote cluster eu-west unavailable; results are partial".to_string()],
+            ..Default::default()
+        };
+        let cov = Coverage::from_stats(&stats);
+        assert!(cov.is_partial());
+        assert_eq!(
+            cov.skipped(),
+            ["remote cluster eu-west unavailable; results are partial"]
+        );
+    }
 
     fn label_set() -> LabelSet {
         LabelSet::new(vec![Label {
