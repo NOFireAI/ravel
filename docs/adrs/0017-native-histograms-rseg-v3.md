@@ -105,8 +105,8 @@ and the writer default is still v1.
    verbatim.
 3. Defer entirely; keep rejecting native histograms at admission.
    Honest but wrong on the merits: native histograms are the default
-   direction of the Prometheus ecosystem, PROGRESS.md names them as
-   Phase 2 scope, and rejection is sender-visible loss (ADR-0015
+   direction of the Prometheus ecosystem, they are Phase 2 scope, and
+   rejection is sender-visible loss (ADR-0015
    documents that RW senders do not retry admission-rejected
    histograms). Deferral of the *storage* is however exactly what
    happens until v3 lands: ingest rejects native histograms at

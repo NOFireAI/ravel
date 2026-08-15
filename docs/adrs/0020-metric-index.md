@@ -11,8 +11,8 @@ Phase 1 discovery is pure listing (ADR-0003 option 2): every
 `Catalog::resolve` issues one LIST per (shard, ingest-hour bucket) in the
 window `[range.start - max_ingest_lag, now + clock_skew_allowance]` and
 GETs every commit record it has not cached
-(crates/ravel-catalog/src/catalog.rs). PROGRESS.md names the bottleneck:
-this will not scale past ~10^4 commits per (tenant, shard, hour) bucket,
+(crates/ravel-catalog/src/catalog.rs). The bottleneck is known: this
+will not scale past ~10^4 commits per (tenant, shard, hour) bucket,
 and it must be fixed before Phase 2 load tests. The cost has two axes:
 commit density per bucket (paginated LISTs plus per-record GETs) and
 window width (a 24 h query over 4 shards lists ~108 buckets because the
