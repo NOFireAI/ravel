@@ -1,7 +1,7 @@
 // The ADR-0071 fragment RPC service. The message contract is frozen in
-// proto/ravel/queryfrag.proto (ravel.queryfrag.v1, ticket #863); this file adds
-// only the gRPC service that carries those messages, in a separate package so
-// the frozen message file needs no service block. The message types are reused
+// proto/ravel/queryfrag.proto (ravel.queryfrag.v1); this file adds only the
+// gRPC service that carries those messages, in a separate package so the
+// frozen message file needs no service block. The message types are reused
 // verbatim from ravel-proto via a build-time extern_path mapping, never
 // regenerated here.
 //

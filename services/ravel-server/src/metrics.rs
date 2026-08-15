@@ -3518,14 +3518,14 @@ mod tests {
         assert!(body.contains("# TYPE ravel_store_probe_failures_total counter"));
     }
 
-    /// THE deliverable-4 test (issue #1079): all three durable-auth
-    /// refresh-loop counters reach `/metrics` and carry the real values their
-    /// underlying conditions produced, not zero placeholders. Each of the three
-    /// is driven by its genuine trigger on a real [`DurableAuthState`] -- a
-    /// failed refresh (a faulting sys/auth GET), an on-miss re-read, and a
-    /// hard-stale fail-closed resolution -- then that state's counters are
-    /// snapshotted and rendered exactly as the `/metrics` handler does, so the
-    /// full condition->counter->exposition chain is asserted end to end.
+    /// Proves all three durable-auth refresh-loop counters reach `/metrics`
+    /// and carry the real values their underlying conditions produced, not
+    /// zero placeholders. Each of the three is driven by its genuine trigger
+    /// on a real [`DurableAuthState`] -- a failed refresh (a faulting
+    /// sys/auth GET), an on-miss re-read, and a hard-stale fail-closed
+    /// resolution -- then that state's counters are snapshotted and rendered
+    /// exactly as the `/metrics` handler does, so the full
+    /// condition->counter->exposition chain is asserted end to end.
     #[tokio::test]
     async fn render_includes_durable_auth_counters_that_incremented() {
         use ravel_object_store::ObjectStoreBackend;

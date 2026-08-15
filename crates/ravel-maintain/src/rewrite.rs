@@ -8,11 +8,11 @@
 //! exact match. That one generalization is what lets a single primitive serve
 //! two epics:
 //!
-//! - EM (#463, this crate's caller below): format migration. An old-format
+//! - EM (this crate's caller below): format migration. An old-format
 //!   object is decoded and re-encoded into the current format, conserving the
 //!   record count exactly ([`crate::publish::conserve_exact`]). Nothing is
 //!   dropped; the bytes change format, not content.
-//! - EJ (#460, a later task, not built here): selective erasure. The same read
+//! - EJ (a later task, not built here): selective erasure. The same read
 //!   -> re-encode -> publish shape, but the writer drops the erased subject's
 //!   records and the predicate is "input equals output plus the erased count"
 //!   (ADR-0064 decision 3 point 4). EJ supplies that predicate; it does not
@@ -28,12 +28,12 @@
 //! public release), the codec's read path accepts the older version and this
 //! primitive migrates real old-version objects with no change here.
 //!
-//! RSEG is now the same shape: since ADR-0066 decision 5 (issue #1111), its
-//! `build_parts` (`build.rs`) still copies a *current*-version input's pages
-//! verbatim, but decodes and re-encodes an input recorded *below* the current
-//! output version at the current version before the shared merge/plan step, so
-//! an RSEG rewrite is a real format migration, not just a same-version round
-//! trip. [`RsegCodec::validate_rewrite_inputs`] no longer refuses an older
+//! RSEG is now the same shape: since ADR-0066 decision 5, its `build_parts`
+//! (`build.rs`) still copies a *current*-version input's pages verbatim, but
+//! decodes and re-encodes an input recorded *below* the current output version
+//! at the current version before the shared merge/plan step, so an RSEG
+//! rewrite is a real format migration, not just a same-version round trip.
+//! [`RsegCodec::validate_rewrite_inputs`] no longer refuses an older
 //! input; it now fails closed only on an input recorded *newer* than the
 //! current output version (ADR-0066 decision 2), which a forward migration
 //! cannot write. Whether an older object's bytes are actually decodable is the
@@ -599,11 +599,11 @@ mod tests {
         assert_eq!(got, want, "L1 carries exactly the inputs' series");
     }
 
-    /// Slice B headline (ADR-0066 decision 5, issue #1111): the
-    /// synthetic-N-1 mixed-fleet convergence case. An RSEG object recorded
-    /// *below* the current output version is genuinely decoded and re-encoded to
-    /// the current version by the rewrite primitive -- not refused (the
-    /// pre-slice-B guard), and not verbatim-copied under a mislabeled trailer.
+    /// Slice B headline (ADR-0066 decision 5): the synthetic-N-1 mixed-fleet
+    /// convergence case. An RSEG object recorded *below* the current output
+    /// version is genuinely decoded and re-encoded to the current version by
+    /// the rewrite primitive -- not refused (the pre-slice-B guard), and not
+    /// verbatim-copied under a mislabeled trailer.
     ///
     /// No real N-1 RSEG version has ever shipped, so the "old" object is built
     /// the way slice A's window tests use a synthetic version number

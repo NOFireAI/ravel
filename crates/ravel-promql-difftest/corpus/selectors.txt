@@ -130,7 +130,7 @@ mode: unordered
 # Prometheus here
 # would mean Ravel deliberately discarding a bit it currently preserves
 # correctly. This is a real, accepted engine-behavior divergence, not a
-# corpus mistake; see issue #170.
+# corpus mistake.
 
 name: instant_stale_marker_is_absent
 query: diff_stale

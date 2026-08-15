@@ -195,10 +195,10 @@ script pair is deleted.
 
 ## Amendment: main-push coverage ratchet
 
-External review finding J-7 (epic #1061) observes that coverage is
-measured and badged but never gated, so the number can only fall
-silently. Read quickly, that asks this ADR to reverse one of its own
-rejected alternatives:
+External review finding J-7 observes that coverage is measured and
+badged but never gated, so the number can only fall silently. Read
+quickly, that asks this ADR to reverse one of its own rejected
+alternatives:
 
 > Keep `coverage` required with a threshold gate: a hard threshold on a
 > codebase growing 2,000+ lines/day generates noise merges can trip
@@ -270,8 +270,8 @@ wording targets unobserved decay, not the existence of a PR gate. If a
 recurring pattern emerges of drops that a PR-time signal would have
 cheaply prevented, that is new evidence, and a future amendment can
 weigh a diff-coverage advisory comment (never a required check) against
-it. Epic #1061's exit criterion "a floor that fails the build" is met
-by the main-push build failing; the epic ledger should read it so.
+it. The epic exit criterion "a floor that fails the build" is met by
+the main-push build failing; the epic ledger should read it so.
 
 ### Consequences
 

@@ -15,7 +15,7 @@
 //! be the one that never admits a payload under a key that does not describe
 //! it (decision 4's amendment). A successful upstream fetch populates *both*
 //! tiers (decision 3), not RAM alone, so a later RAM eviction is served from
-//! disk instead of re-paying the S3 round trip this epic exists to remove.
+//! disk instead of re-paying the S3 round trip the disk tier exists to remove.
 //!
 //! **Single-flight spans both tiers** (decision 5). A RAM hit is the fast
 //! path and needs no coordination. Every RAM miss for one key collapses onto
@@ -29,7 +29,7 @@
 //! mode), a disk-served hit is corrupted by the identical byte transform a
 //! RAM hit uses (see [`crate::cache::corrupt_bytes`]), applied at serve time
 //! only -- the bytes admitted to either tier stay clean, so corruption is a
-//! read-time view, never stored. Without this, the epic's "correctness never
+//! read-time view, never stored. Without this, ADR-0046's "correctness never
 //! depends on cached state" gate would silently stop covering the disk tier
 //! the moment the funnels started serving hits from it. Clean bytes freshly
 //! returned by an upstream fetch are never corrupted: they did not come from a
@@ -216,13 +216,13 @@ mod fixtures {
     }
 }
 
-/// The named acceptance test for issue #1135, at the exact path the task
-/// specifies (`ravel_cache::tiered::corrupted_disk_hit_is_corrupted_through_ram_readthrough`):
+/// The named acceptance test, at the exact required path
+/// (`ravel_cache::tiered::corrupted_disk_hit_is_corrupted_through_ram_readthrough`):
 /// a key resident only on disk, RAM empty, corruption mode on. The bytes it
 /// serves must arrive corrupted -- not the clean disk bytes -- proving
 /// ADR-0046 decision 4's gate reaches a disk-served hit read through this
 /// handle and not just a RAM hit. Placed at module scope (not under a `tests`
-/// child) so its path is exactly the one the epic's gate cites.
+/// child) so its path is exactly the one the acceptance gate cites.
 #[cfg(test)]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -411,7 +411,7 @@ mod tests {
     /// A successful upstream fetch populates BOTH tiers (ADR-0046 decision 3),
     /// not RAM alone. Proven by evicting the RAM entry and reading again: the
     /// key is served from disk with no second upstream fetch, the exact cold
-    /// -path round trip this epic removes.
+    /// -path round trip the disk tier removes.
     #[tokio::test]
     async fn upstream_fetch_populates_both_tiers_and_disk_serves_after_ram_eviction() {
         let tmp = TempDir::new().unwrap();

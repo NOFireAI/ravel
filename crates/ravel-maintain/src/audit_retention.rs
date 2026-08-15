@@ -89,8 +89,8 @@ pub struct AuditRetentionOutcome {
     /// horizon, or lease/legal-hold protected.
     pub kept: usize,
     /// L0 commit records whose GET+decode was skipped because the key's
-    /// `ingest_hour_bucket` alone proved the record cannot be expired (issue
-    /// #850). A subset of `kept`.
+    /// `ingest_hour_bucket` alone proved the record cannot be expired. A
+    /// subset of `kept`.
     pub gets_skipped_by_hour_prefilter: usize,
 }
 
@@ -340,8 +340,8 @@ mod tests {
         list_all(store, &prefix).await.unwrap().len()
     }
 
-    /// Deliverable 1: Signal::Audit / QUERY_AUDIT_SHARD records compact through
-    /// the existing RLOG machinery, parameterized only by the new signal/shard.
+    /// Signal::Audit / QUERY_AUDIT_SHARD records compact through the existing
+    /// RLOG machinery, parameterized only by the new signal/shard.
     /// Two L0 audit records in one sealed bucket merge into one L1 part carrying
     /// both records (conservation), proving the codec seam handles Audit.
     #[tokio::test]
@@ -414,8 +414,8 @@ mod tests {
         assert!(matches!(err, MaintainError::Invariant(_)), "got {err:?}");
     }
 
-    /// Deliverable 2: an expired query-audit record (past the 90-day window and
-    /// past the horizon) is swept; one still inside the window is not.
+    /// An expired query-audit record (past the 90-day window and past the
+    /// horizon) is swept; one still inside the window is not.
     #[tokio::test]
     async fn expired_record_swept_recent_kept() {
         let store = MemoryStore::new();
@@ -447,8 +447,8 @@ mod tests {
         assert_eq!(commit_count(&store, &tenant).await, 1);
     }
 
-    /// Issue #850: on a shard with many hours of retained-but-unexpired audit
-    /// records, the sweep must not GET or decode any of them -- the key's
+    /// On a shard with many hours of retained-but-unexpired audit records,
+    /// the sweep must not GET or decode any of them -- the key's
     /// `ingest_hour_bucket` alone proves every one of them is still within
     /// the 90-day window. Before the fix, `sweep_audit_retention` GET'd and
     /// decoded every commit record to read `max_event_ts_ns`; this asserts
@@ -488,12 +488,12 @@ mod tests {
         assert_eq!(outcome.records_deleted, 0);
     }
 
-    /// Issue #850: GET volume must scale with the number of records whose
-    /// hour could plausibly hold expired data, not with the total record
-    /// count. 50 recent (unexpired) records plus 3 genuinely-expired records
-    /// (past both the window and the horizon) must cost exactly 3 GETs, and
-    /// the 3 expired records must still be swept -- exact retention
-    /// semantics are preserved, the prefilter only removes wasted GETs.
+    /// GET volume must scale with the number of records whose hour could
+    /// plausibly hold expired data, not with the total record count. 50
+    /// recent (unexpired) records plus 3 genuinely-expired records (past
+    /// both the window and the horizon) must cost exactly 3 GETs, and the 3
+    /// expired records must still be swept -- exact retention semantics are
+    /// preserved, the prefilter only removes wasted GETs.
     #[tokio::test]
     async fn hour_prefilter_get_count_bounded_by_expired_hours_not_total_records() {
         let store = InstrumentedStore::new(MemoryStore::new());
@@ -541,10 +541,10 @@ mod tests {
         );
     }
 
-    /// Issue #850: a record whose hour straddles `expiry_floor` (the hour's
-    /// start is before the floor, so the prefilter cannot clear it, but the
-    /// record's own timestamp may fall on either side) must be resolved by
-    /// the authoritative GET+decode check, never by the hour alone. Two
+    /// A record whose hour straddles `expiry_floor` (the hour's start is
+    /// before the floor, so the prefilter cannot clear it, but the record's
+    /// own timestamp may fall on either side) must be resolved by the
+    /// authoritative GET+decode check, never by the hour alone. Two
     /// records share one ambiguous hour: one just past `expiry_floor` (not
     /// expired, must be kept) and one just before it (expired, must be
     /// swept). Both must cost a GET; neither may be decided by the prefilter.
@@ -658,8 +658,8 @@ mod tests {
         );
     }
 
-    /// Deliverable 3: the legal-hold shard (shard 0) is excluded from the delete
-    /// path forever. An old hold record on shard 0 survives a sweep that would
+    /// The legal-hold shard (shard 0) is excluded from the delete path forever.
+    /// An old hold record on shard 0 survives a sweep that would
     /// have deleted it by age if the sweep ever reached shard 0.
     #[tokio::test]
     async fn legal_hold_shard_zero_survives_the_sweep() {
@@ -707,7 +707,7 @@ mod tests {
         );
     }
 
-    /// Deliverable: LegalHoldCheck genuinely gates the new sweep. A held
+    /// LegalHoldCheck genuinely gates the new sweep. A held
     /// query-audit record past its retention window is NOT deleted; the same
     /// record with no hold IS deleted (the control), so the assertion is not
     /// vacuous.

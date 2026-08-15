@@ -449,15 +449,14 @@ async fn collect_once(
         .map_err(|e| CollectError::Api(ApiError::from_query(e)))?;
 
     // Pending selective-erasure predicates carried on the resolved snapshot
-    // (ADR-0064 decision 1, issue #915). The resolver attaches every pending
-    // request to `Snapshot::pending_erasure`; this converts them into the
-    // scan-time predicate shape once, here, and the record loop excludes any
-    // exemplar an erased subject owns. Without this pass an erased subject's
-    // exemplars (trace ids included) would still be served, while the sample,
-    // series, and log surfaces exclude them: the same data-deletion leak #928
-    // closed for the log-family scan. A snapshot with no pending erasure yields
-    // an empty set and the loop below is a no-op, so the common path is
-    // unchanged.
+    // (ADR-0064 decision 1). The resolver attaches every pending request to
+    // `Snapshot::pending_erasure`; this converts them into the scan-time
+    // predicate shape once, here, and the record loop excludes any exemplar an
+    // erased subject owns. Without this pass an erased subject's exemplars
+    // (trace ids included) would still be served, while the sample, series, and
+    // log surfaces exclude them: the same data-deletion leak already closed for
+    // the log-family scan. A snapshot with no pending erasure yields an empty
+    // set and the loop below is a no-op, so the common path is unchanged.
     let preds = snapshot_erasure_predicates(&snapshot);
 
     // Segments are read sequentially. The sample path fans this out under a
@@ -506,11 +505,11 @@ async fn collect_once(
 }
 
 /// Whether an exemplar owned by `labels` at `ts_ns` is erased by any pending
-/// predicate (ADR-0064 decision 1, issue #915). Erased when a predicate's
-/// conjunction matches the series labels and, if the predicate is windowed,
-/// `ts_ns` falls in its half-open window; a windowless predicate erases every
-/// matching record regardless of timestamp. This is the metric-shape analogue
-/// of `ravel_query::erasure::is_erased_span`, which `ravel_query` keeps for the
+/// predicate (ADR-0064 decision 1). Erased when a predicate's conjunction
+/// matches the series labels and, if the predicate is windowed, `ts_ns` falls
+/// in its half-open window; a windowless predicate erases every matching record
+/// regardless of timestamp. This is the metric-shape analogue of
+/// `ravel_query::erasure::is_erased_span`, which `ravel_query` keeps for the
 /// span surface but does not expose for a bare `(LabelSet, ts_ns)` pair.
 fn is_erased_exemplar(labels: &LabelSet, ts_ns: i64, preds: &[ErasurePredicate]) -> bool {
     preds
@@ -667,14 +666,14 @@ async fn read_segment_exemplars(
         if !matched[idx] {
             continue;
         }
-        // Exclude a record owned by an erased subject (ADR-0064 decision 1,
-        // issue #915). This filters against `entry.entry.labels`, the exact
-        // series-label view this endpoint materializes into `seriesLabels`
-        // below, so a green result means the shipping surface never emits the
-        // erased subject's exemplars: a windowless predicate erases every
-        // matching record regardless of timestamp, a windowed one only records
-        // whose `ts_ns` fall in its half-open window. Mirrors `is_erased_span`
-        // and the metric `retain_*` rule in `ravel_query::erasure`.
+        // Exclude a record owned by an erased subject (ADR-0064 decision 1).
+        // This filters against `entry.entry.labels`, the exact series-label
+        // view this endpoint materializes into `seriesLabels` below, so a green
+        // result means the shipping surface never emits the erased subject's
+        // exemplars: a windowless predicate erases every matching record
+        // regardless of timestamp, a windowed one only records whose `ts_ns`
+        // fall in its half-open window. Mirrors `is_erased_span` and the metric
+        // `retain_*` rule in `ravel_query::erasure`.
         if is_erased_exemplar(&entry.entry.labels, rec.ts_ns, preds) {
             continue;
         }
@@ -1590,9 +1589,9 @@ mod tests {
     /// Writes a real metrics `.dreq` erasure request into `tenant`'s `del/`
     /// prefix, exactly as the erasure submit path does, so the next
     /// `Catalog::resolve` attaches it to `Snapshot::pending_erasure` and the
-    /// exemplar surface excludes the matching subject (ADR-0064 decision 1,
-    /// issue #915). The predicate is the conjunction of every `(key, value)` in
-    /// `matchers`; `window_start_ns`/`window_end_ns` are `0` for a windowless
+    /// exemplar surface excludes the matching subject (ADR-0064 decision 1).
+    /// The predicate is the conjunction of every `(key, value)` in `matchers`;
+    /// `window_start_ns`/`window_end_ns` are `0` for a windowless
     /// (whole-subject) request, the same zero-as-unset convention
     /// `ErasurePredicate` uses.
     async fn put_dreq(
@@ -1977,15 +1976,15 @@ mod tests {
         assert_eq!(ex0["timestamp"], (NOW - 30 * NS_PER_SEC) / NS_PER_SEC);
     }
 
-    /// Data-deletion regression (issue #915): a pending selective-erasure
-    /// request must exclude the erased subject's exemplars from
-    /// `query_exemplars`, while a non-erased subject matched by the same
-    /// selector keeps its exemplars. Drives the real handler end to end (a real
-    /// `.dreq` in the store, the real resolve that attaches it to
-    /// `Snapshot::pending_erasure`, and the shipping `run`/`collect_once` path),
-    /// so a filter dropped from the record loop serves the erased trace ids and
-    /// fails here. Two subjects, not one, so a filter-everything bug (which
-    /// would also make the erased subject "absent") fails on the retained one.
+    /// Data-deletion regression: a pending selective-erasure request must
+    /// exclude the erased subject's exemplars from `query_exemplars`, while a
+    /// non-erased subject matched by the same selector keeps its exemplars.
+    /// Drives the real handler end to end (a real `.dreq` in the store, the
+    /// real resolve that attaches it to `Snapshot::pending_erasure`, and the
+    /// shipping `run`/`collect_once` path), so a filter dropped from the record
+    /// loop serves the erased trace ids and fails here. Two subjects, not one,
+    /// so a filter-everything bug (which would also make the erased subject
+    /// "absent") fails on the retained one.
     #[tokio::test]
     async fn erased_subject_exemplars_are_excluded() {
         let store = Arc::new(MemoryStore::new());

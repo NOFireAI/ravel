@@ -614,7 +614,7 @@ mod tests {
         }
     }
 
-    /// Issue #558: exemplars on the sparse-catalog decode path.
+    /// Exemplars on the sparse-catalog decode path.
     ///
     /// `read.rs` routes an input with `series_count >= V5_SPARSE_THRESHOLD`
     /// (4096) to the whole-object `decode_catalog_v5`, and every other test

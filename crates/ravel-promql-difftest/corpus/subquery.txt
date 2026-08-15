@@ -58,10 +58,9 @@ mode: unordered
 # rate/deriv/predict_linear entries): avg_over_time sums the subquery
 # grid's values then divides by the count, using only IEEE 754 +/- and /,
 # so any gap is arithmetic residue, not a transcendental libm difference.
-# Measured up to 5 ULPs across this range's grid points (issue #224
-# mismatch #2); the representative pair there, -4.242539167465618 vs
-# -4.242539167465619, is 1 ULP by f64::to_bits, and only that one grid
-# point is observable from the issue text.
+# Measured up to 5 ULPs across this range's grid points; the
+# representative pair, -4.242539167465618 vs -4.242539167465619, is 1 ULP
+# by f64::to_bits, and it is the only grid point directly observed.
 # tolerance: 8 is the next power of two above the 5-ULP worst case;
 # tighten it if a live run shows a smaller observed max (ADR-0025
 # Consequences: a tightenable tolerance is a signal worth checking).
@@ -83,7 +82,7 @@ mode: unordered
 # ADR-0025 allowlist (arithmetic residue, same class as rate.txt's
 # rate/deriv/predict_linear entries): avg_over_time sums then divides,
 # IEEE 754 arithmetic only, so this is residue rather than a libm
-# difference. Measured 1 ULP: the exact values in issue #224 mismatch #3
+# difference. Measured 1 ULP: the exact values
 # (-3.4712031303800788 vs -3.4712031303800783) are adjacent doubles by
 # f64::to_bits. This is a single, fully observed value (one instant
 # result), not a sampled worst case, so the measurement is exact.
@@ -100,9 +99,9 @@ tolerance: 2
 # 30_000ms or 60_000ms, see the epoch-aligned entry above), so choosing a
 # 20s step plus offsets/ranges that are themselves whole multiples of 20s
 # makes every `end - range` target land exactly on a step boundary in
-# absolute epoch time. Before issue #190's fix, `align_up_to_step` used a
-# closed `>=` rule and would have admitted that boundary point into the
-# grid; the corrected left-open `>` rule excludes it. Every corpus entry
+# absolute epoch time. Before the fix, `align_up_to_step` used a closed
+# `>=` rule and would have admitted that boundary point into the grid;
+# the corrected left-open `>` rule excludes it. Every corpus entry
 # above this point has a target that is never step-aligned (by construction
 # or by accident), so none of them actually exercised the closed-vs-open
 # difference; these two are chosen specifically so they do.
@@ -111,7 +110,7 @@ name: instant_subquery_grid_start_excludes_a_step_aligned_boundary
 # time=+600s, range=2m, step=20s: target = base + 600s - 120s = base +
 # 480s, a multiple of 20s in absolute epoch time. Left-open start is
 # base + 500s, giving grid points {500, 520, 540, 560, 580, 600}s relative
-# to base_ts_ms -- 6 points. Before #190's fix the closed rule would have
+# to base_ts_ms -- 6 points. Before the fix the closed rule would have
 # also admitted 480s, giving 7. Every point is well inside the dataset's
 # continuous 30s-sampled span (0..1170s) and the default 5m lookback, so
 # `diff_gauge_walk` resolves at every grid instant and count_over_time
@@ -127,8 +126,9 @@ name: nested_subquery_grid_start_excludes_a_step_aligned_boundary_at_both_levels
 # multiples of 20s and base_ts_ms is itself a multiple of 20s, the outer
 # target (base + 480s) *and* the inner target at every one of the outer's
 # 6 grid instants (t - 120s, for t in {500..600}s step 20s, i.e.
-# {380..480}s) each land exactly on a 20s epoch boundary -- the left-open
-# rule (#190) excludes all of them, at both nesting levels simultaneously.
+# {380..480}s) each land exactly on a 20s epoch boundary -- the
+# left-open rule excludes all of them, at both nesting levels
+# simultaneously.
 # Outer grid: {500, 520, 540, 560, 580, 600}s (6 points, as above). At each
 # outer instant t, the inner count_over_time(diff_gauge_walk[2m:20s])
 # grid is {t-100, t-80, t-60, t-40, t-20, t}s (6 points), all within
@@ -142,14 +142,14 @@ time: +600s
 mode: unordered
 
 # Cap-exceeded entries: Ravel enforces a resolution cap (11_000 points,
-# docs/query-engine.md "Budgets", issue #77) independently at every
-# subquery evaluation node, before that node's grid is built. Both
-# entries below ask for a single node's grid alone to exceed it, one
-# directly and one through one level of nesting.
+# docs/query-engine.md "Budgets") independently at every subquery
+# evaluation node, before that node's grid is built. Both entries below
+# ask for a single node's grid alone to exceed it, one directly and one
+# through one level of nesting.
 #
-# Verified against the pinned Prometheus v3.13.1 binary (issue #224
-# mismatches #4 and #5): Prometheus SUCCEEDS on both, Ravel errors by
-# design. This is intentional, documented divergence, not a bug and not
+# Verified against the pinned Prometheus v3.13.1 binary: Prometheus
+# SUCCEEDS on both, Ravel errors by design. This is intentional,
+# documented divergence, not a bug and not
 # a missing prometheus_process.rs flag. Prometheus has no per-subquery-
 # node step-count cap, and neither of its query resource limits fires
 # here: --query.max-samples is a yielded-sample memory budget (these
@@ -168,8 +168,8 @@ mode: unordered
 # shape, Ravel errors by design and Prometheus succeeds, and treats any
 # other outcome (both erroring, both succeeding, Prometheus erroring) as a
 # real mismatch. ADR-0030 recorded this as a follow-up when it first
-# accepted the divergence with the entries still `mode: error`; issue #228
-# is that follow-up, adding the comparator mode so the entries turn green
+# accepted the divergence with the entries still `mode: error`, and a
+# later follow-up added the comparator mode so the entries turn green
 # rather than staying manually known-divergent. The per-node cap itself
 # stays covered by ravel-promql's eval.rs unit tests.
 

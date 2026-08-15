@@ -1,9 +1,8 @@
-//! Machine-readable benchmark report (epic #1053, T2). Drives one
-//! ingest-then-query workload against a real or in-memory object store and
-//! emits a single JSON document that carries the measured numbers *together
-//! with the environment that produced them*, so a performance or cost figure
-//! can be committed alongside the command and machine that measured it instead
-//! of pasted from a log.
+//! Machine-readable benchmark report. Drives one ingest-then-query workload
+//! against a real or in-memory object store and emits a single JSON document
+//! that carries the measured numbers *together with the environment that
+//! produced them*, so a performance or cost figure can be committed alongside
+//! the command and machine that measured it instead of pasted from a log.
 //!
 //! Report-only: like the rest of `ravel-bench`, this never changes library
 //! behavior, it only measures it. It reuses `ravel_bench::generator` for the
@@ -583,9 +582,9 @@ mod tests {
         assert!(l.max > 0.0, "{what}: max must be > 0");
     }
 
-    /// Acceptance test (epic #1053 T2): a run against `MemoryStore` populates
-    /// every field of the schema -- no nulls (guaranteed structurally: no
-    /// `Option` in `BenchReport`), and no zero standing in for "not measured".
+    /// Acceptance test: a run against `MemoryStore` populates every field of
+    /// the schema -- no nulls (guaranteed structurally: no `Option` in
+    /// `BenchReport`), and no zero standing in for "not measured".
     ///
     /// Request counts are the field that "cannot be measured as a billable S3
     /// cost" on `MemoryStore`. The schema represents that explicitly with

@@ -1001,17 +1001,18 @@ mod tests {
         assert_eq!((l0_below, l1_below), (0, 0));
     }
 
-    /// Slice B end to end (ADR-0066 decision 5, issue #1111): a
-    /// below-output-recorded RSEG input migrates to the current version and the
-    /// format floor is then raised. Before slice B this was unreachable for RSEG
-    /// -- its rewrite could only re-publish at the current writer version, so
-    /// reaching "below target" eligibility required a target *above* the writer
+    /// Slice B end to end (ADR-0066 decision 5): a below-output-recorded RSEG
+    /// input migrates to the current version and the format floor is then
+    /// raised. Before slice B this was unreachable for RSEG -- its rewrite
+    /// could only re-publish at the current writer version, so reaching
+    /// "below target" eligibility required a target *above* the writer
     /// ([`FUTURE_VERSION`]), which then made the rewrite's own output count as
-    /// below target and blocked the floor. Now, targeting the current version, an
-    /// input recorded at `VERSION_V6 - 1` (real v6 bytes, older recorded version
-    /// -- the synthetic-N-1 shape, since no real N-1 RSEG version has shipped) is
-    /// decoded and re-encoded to `VERSION_V6 == target`, the fresh re-audit finds
-    /// nothing below the target, and the floor is raised to `VERSION_V6`.
+    /// below target and blocked the floor. Now, targeting the current version,
+    /// an input recorded at `VERSION_V6 - 1` (real v6 bytes, older recorded
+    /// version -- the synthetic-N-1 shape, since no real N-1 RSEG version has
+    /// shipped) is decoded and re-encoded to `VERSION_V6 == target`, the fresh
+    /// re-audit finds nothing below the target, and the floor is raised to
+    /// `VERSION_V6`.
     #[tokio::test]
     async fn rseg_below_output_input_migrates_and_raises_floor() {
         let store = MemoryStore::new();

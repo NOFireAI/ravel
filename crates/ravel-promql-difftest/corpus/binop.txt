@@ -1,6 +1,6 @@
-# Binary operator corpus (ticket #128, docs/promql-evaluator-plan.md
-# section P7), against crates/ravel-promql-difftest/src/generator.rs's
-# fixed dataset. Every offset is relative to the dataset's base_ts_ms
+# Binary operator corpus (docs/promql-evaluator-plan.md section P7),
+# against crates/ravel-promql-difftest/src/generator.rs's fixed dataset.
+# Every offset is relative to the dataset's base_ts_ms
 # (1_700_000_000_000 ms, i.e. 2023-11-14T22:13:20Z).
 #
 # Covers: scalar/scalar and scalar/vector arithmetic (including atan2),
@@ -62,8 +62,8 @@ mode: unordered
 # `diff_agg_group` rather than `diff_gauge_walk`: the walk's sign at any
 # instant depends on the dataset seed, so `diff_gauge_walk > 0` answered with
 # an empty vector for the default seed and this entry pinned nothing about
-# keeping the metric name (issue #262). The agg-group values are fixed
-# (10/20/20 and 5/5/15), so `> 10` always drops three series and keeps three.
+# keeping the metric name. The agg-group values are fixed (10/20/20 and
+# 5/5/15), so `> 10` always drops three series and keeps three.
 name: instant_filter_comparison_keeps_name
 query: diff_agg_group > 10
 kind: instant

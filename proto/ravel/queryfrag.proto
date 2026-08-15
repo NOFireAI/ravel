@@ -47,16 +47,16 @@ message FetchRequest {
   string trace_context = 13;    // propagated tracing context (e.g. traceparent)
 
   // The per-tenant, per-query fragment capability for a Pinned fetch (ADR-0071
-  // amendment, epic #1055 finding F-1): a fixed-width canonical claim set
-  // (capability version, tenant_hash, signal, query_id, expires_unix_ns)
-  // followed by a keyed-BLAKE3 MAC over it. The coordinator mints one per query
-  // and attaches it to every slice; the worker recomputes the MAC and requires
-  // this request's tenant_hash/signal/query_id to equal the claims, so a
-  // capability minted for one tenant cannot authorize a fetch naming another.
-  // Replaces the shared bearer token that guarded Pinned fetches in protocol
-  // version 1. Empty on a Resolve (federation) request, which authenticates
-  // through an ordinary tenant credential instead. Additive field on this
-  // transient wire contract, exactly the evolution this file's header sanctions.
+  // amendment): a fixed-width canonical claim set (capability version,
+  // tenant_hash, signal, query_id, expires_unix_ns) followed by a keyed-BLAKE3
+  // MAC over it. The coordinator mints one per query and attaches it to every
+  // slice; the worker recomputes the MAC and requires this request's
+  // tenant_hash/signal/query_id to equal the claims, so a capability minted
+  // for one tenant cannot authorize a fetch naming another. Replaces the
+  // shared bearer token that guarded Pinned fetches in protocol version 1.
+  // Empty on a Resolve (federation) request, which authenticates through an
+  // ordinary tenant credential instead. Additive field on this transient wire
+  // contract, exactly the evolution this file's header sanctions.
   bytes fragment_capability = 14;
 }
 

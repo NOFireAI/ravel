@@ -147,8 +147,7 @@ nothing for as long as the condition holds. Alertmanager auto-resolves
 any alert it has not heard about within `resolve_timeout` (default 5
 minutes), so at default configuration every persistently firing alert
 produces a false all-clear to on-call while the problem continues. That
-is worse than no alerting. (Epic #1052 finding G-2, risk R3: P1, high
-likelihood.)
+is worse than no alerting. The risk was rated P1 at high likelihood.
 
 The gap is in delivery cadence, not in the data model. Decision 4 is
 correct and unchanged: the durable record is state, and "still firing"
@@ -301,16 +300,16 @@ flowchart TB
 
 ### Consequences
 
-- Closes #1052 G-2 / risk R3. The interim mitigation (raising
+- Closes the false all-clear gap. The interim mitigation (raising
   `resolve_timeout` per deployment) is no longer required.
-- The acceptance proof is the epic's exit criterion verbatim: a test
-  that holds a rule firing across injected-clock advances spanning more
-  than one default `resolve_timeout` and asserts the notification count
-  grows, plus a restart-mid-episode test asserting repeats resume on
-  the schedule derived from the durable record.
+- The acceptance proof is a test that holds a rule firing across
+  injected-clock advances spanning more than one default
+  `resolve_timeout` and asserts the notification count grows, plus a
+  restart-mid-episode test asserting repeats resume on the schedule
+  derived from the durable record.
 - `docs/architecture.md`'s alerting section gains one sentence on
   repeat cadence in the same commit that implements it.
 - The rules file grows an optional field; existing files parse
   unchanged and silently gain the 1-minute default, which is the point:
-  the safe behavior must be the default, because R3's likelihood was
-  rated high specifically at default configuration.
+  the safe behavior must be the default, because this failure's
+  likelihood was rated high specifically at default configuration.
