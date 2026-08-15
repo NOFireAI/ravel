@@ -15,14 +15,17 @@
 //! group failing either requirement, or with fewer than two usable buckets,
 //! or a NaN scalar argument, evaluates to `NaN` for that group rather than
 //! being omitted: the result vector always has one entry per group, exactly
-//! like Prometheus. These cases now raise the annotations Prometheus does
-//! through the `&QueryWindow` threaded into both
-//! functions: a malformed bucket set (missing `+Inf`, or fewer than two
-//! usable buckets), a series excluded because its `le` label is missing or
-//! does not parse as a float, and an out-of-range quantile argument are
-//! `warnings`; a forced monotonicity fixup is an `info`. See
-//! [`crate::Annotations`] for the warning/info distinction. The
-//! native-histogram path's own Prometheus annotations are not wired here yet.
+//! like Prometheus. Most of these cases raise the annotations Prometheus does
+//! through the `&QueryWindow` threaded into both functions: a degenerate
+//! bucket set (fewer than two usable buckets), a series excluded because its
+//! `le` label is missing or does not parse as a float, and an out-of-range
+//! quantile argument are `warnings`; a forced monotonicity fixup is an
+//! `info`. A group that is merely missing its `+Inf` top bucket is the one
+//! `NaN` case that raises NO annotation, matching the pinned Prometheus
+//! binary (issue #1099): its `bucketQuantile` returns `NaN` silently for that
+//! incomplete shape. See [`crate::Annotations`] for the warning/info
+//! distinction. The native-histogram path's own Prometheus annotations are
+//! not wired here yet.
 
 use std::collections::{HashMap, HashSet};
 
@@ -127,30 +130,51 @@ fn bad_bucket_label_warning() -> String {
         .to_string()
 }
 
-/// The outcome of [`prepare`]: the cleaned bucket list plus whether its
-/// counts had to be clamped back into monotonic order (which the caller
+/// The success outcome of [`prepare`]: the cleaned bucket list plus whether
+/// its counts had to be clamped back into monotonic order (which the caller
 /// surfaces as a `HistogramQuantileForcedMonotonicityInfo` info).
 struct Prepared {
     buckets: Vec<Bucket>,
     forced_monotonic: bool,
 }
 
+/// What [`prepare`] made of a group's raw buckets: either a usable histogram
+/// or the specific reason it is not one. The two failure reasons annotate
+/// differently, so they are kept distinct rather than folded into a single
+/// `None`:
+///
+/// * `MissingInfBucket` — two or more buckets, but the highest upper bound is
+///   not `+Inf` (an incomplete classic histogram, e.g. a `le!="+Inf"`
+///   matcher). Prometheus' `bucketQuantile` returns `NaN` for this shape and
+///   raises NO warning; matching that silence is the whole point of keeping
+///   this reason separate (issue #1099: the pinned binary emits no annotation
+///   here, so neither may Ravel).
+/// * `TooFewBuckets` — fewer than two usable buckets before or after
+///   coalescing duplicate `le` values: too degenerate to interpolate at all.
+///   This still carries the bad-buckets warning.
+enum PrepareOutcome {
+    Ready(Prepared),
+    MissingInfBucket,
+    TooFewBuckets,
+}
+
 /// Sorts `buckets` ascending by upper bound, requires a `+Inf` top bucket,
 /// coalesces duplicate upper bounds by summing their counts (a repeated
 /// `le` value, e.g. from a mis-scraped target), and clamps each bucket's
 /// count to the running maximum seen so far so the cumulative sequence is
-/// non-decreasing (Prometheus' `ensureMonotonic`). Returns `None` if the
-/// group has fewer than two buckets before or after coalescing, or its
-/// highest upper bound is not `+Inf`: not a well-formed classic histogram.
-/// The returned `forced_monotonic` flag records whether any count actually
-/// had to be clamped, so the caller can raise the matching info annotation.
-fn prepare(mut buckets: Vec<Bucket>) -> Option<Prepared> {
+/// non-decreasing (Prometheus' `ensureMonotonic`). Returns a
+/// [`PrepareOutcome`] naming why a group is not a well-formed classic
+/// histogram (missing `+Inf`, or fewer than two usable buckets) so the caller
+/// can annotate each reason as Prometheus does. The `forced_monotonic` flag
+/// on the ready outcome records whether any count actually had to be clamped,
+/// so the caller can raise the matching info annotation.
+fn prepare(mut buckets: Vec<Bucket>) -> PrepareOutcome {
     if buckets.len() < 2 {
-        return None;
+        return PrepareOutcome::TooFewBuckets;
     }
     buckets.sort_by(|a, b| a.upper_bound.total_cmp(&b.upper_bound));
     if buckets[buckets.len() - 1].upper_bound != f64::INFINITY {
-        return None;
+        return PrepareOutcome::MissingInfBucket;
     }
 
     let mut coalesced: Vec<Bucket> = Vec::with_capacity(buckets.len());
@@ -161,7 +185,7 @@ fn prepare(mut buckets: Vec<Bucket>) -> Option<Prepared> {
         }
     }
     if coalesced.len() < 2 {
-        return None;
+        return PrepareOutcome::TooFewBuckets;
     }
 
     let mut forced_monotonic = false;
@@ -174,7 +198,7 @@ fn prepare(mut buckets: Vec<Bucket>) -> Option<Prepared> {
             running_max = b.count;
         }
     }
-    Some(Prepared {
+    PrepareOutcome::Ready(Prepared {
         buckets: coalesced,
         forced_monotonic,
     })
@@ -215,9 +239,11 @@ fn bucket_quantile(phi: f64, buckets: &[Bucket]) -> f64 {
 }
 
 /// Per-group annotation flags a classic-histogram computation raises:
-/// `bad_buckets` when the group is not a usable classic histogram
-/// (fewer than two buckets, or no `+Inf`), `forced_monotonic` when its
-/// cumulative counts had to be clamped. The phi/quantile out-of-range
+/// `bad_buckets` when the group is degenerate (fewer than two usable
+/// buckets), `forced_monotonic` when its cumulative counts had to be clamped.
+/// A group that is merely missing its `+Inf` top bucket is NaN but sets
+/// neither flag, matching Prometheus' silence for that shape (see
+/// [`PrepareOutcome::MissingInfBucket`]). The phi/quantile out-of-range
 /// warning is not per-group (it depends only on the scalar argument) and is
 /// raised once by the caller instead.
 #[derive(Default, Clone, Copy)]
@@ -241,14 +267,17 @@ fn quantile_for_group(phi: f64, buckets: Vec<Bucket>) -> (f64, ClassicGroupDiag)
         return (f64::INFINITY, ClassicGroupDiag::default());
     }
     match prepare(buckets) {
-        Some(prepared) => (
+        PrepareOutcome::Ready(prepared) => (
             bucket_quantile(phi, &prepared.buckets),
             ClassicGroupDiag {
                 bad_buckets: false,
                 forced_monotonic: prepared.forced_monotonic,
             },
         ),
-        None => (
+        // Missing the `+Inf` top bucket: NaN with no annotation, matching
+        // Prometheus' `bucketQuantile` (issue #1099).
+        PrepareOutcome::MissingInfBucket => (f64::NAN, ClassicGroupDiag::default()),
+        PrepareOutcome::TooFewBuckets => (
             f64::NAN,
             ClassicGroupDiag {
                 bad_buckets: true,
@@ -389,14 +418,20 @@ fn fraction_for_group(lower: f64, upper: f64, buckets: Vec<Bucket>) -> (f64, Cla
     if lower.is_nan() || upper.is_nan() {
         return (f64::NAN, ClassicGroupDiag::default());
     }
-    let Some(prepared) = prepare(buckets) else {
-        return (
-            f64::NAN,
-            ClassicGroupDiag {
-                bad_buckets: true,
-                forced_monotonic: false,
-            },
-        );
+    let prepared = match prepare(buckets) {
+        PrepareOutcome::Ready(prepared) => prepared,
+        // Missing the `+Inf` top bucket: NaN with no annotation, matching
+        // Prometheus (issue #1099).
+        PrepareOutcome::MissingInfBucket => return (f64::NAN, ClassicGroupDiag::default()),
+        PrepareOutcome::TooFewBuckets => {
+            return (
+                f64::NAN,
+                ClassicGroupDiag {
+                    bad_buckets: true,
+                    forced_monotonic: false,
+                },
+            );
+        }
     };
     let diag = ClassicGroupDiag {
         bad_buckets: false,

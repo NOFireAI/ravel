@@ -23,7 +23,8 @@ use ravel_types::{LabelSet, Sample};
 
 use crate::eval::{
     Error, Evaluator, InstantSample, InstantVector, QueryWindow, RangeMatrix, Value,
-    drop_metric_name, duration_to_ns, possible_non_counter_info, resolve_eval_ts, selector_eval_ts,
+    drop_metric_name, duration_to_ns, invalid_quantile_warning, possible_non_counter_info,
+    resolve_eval_ts, selector_eval_ts,
 };
 use crate::histogram::{FloatHistogram, TimedHistogram};
 use crate::source::SeriesSource;
@@ -180,24 +181,31 @@ pub(crate) fn eval_call(
             let arg = matrix_arg(&call.args.args[0])?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
-            Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
-                f(samples, window)
-            })))
+            let keep_name = range_vector_keeps_metric_name(call.func.name);
+            Ok(Value::Vector(apply_reduce(
+                matrix,
+                eval_ts_ns,
+                keep_name,
+                |samples| f(samples, window),
+            )))
         }
         FunctionKind::RangeVectorScalar(f) => {
             let arg = matrix_arg(&call.args.args[0])?;
             let t = scalar_arg(evaluator, source, &call.args.args[1], eval_ts_ns, ctx)?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
-            Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
-                f(samples, window, t)
-            })))
+            Ok(Value::Vector(apply_reduce(
+                matrix,
+                eval_ts_ns,
+                false,
+                |samples| f(samples, window, t),
+            )))
         }
         FunctionKind::RangeVectorFloatOrHist { float, hist } => {
             let arg = matrix_arg(&call.args.args[0])?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
-            let mut out = apply_reduce(matrix, eval_ts_ns, |samples| float(samples, window));
+            let mut out = apply_reduce(matrix, eval_ts_ns, false, |samples| float(samples, window));
             // Gated on the *reduced* output, not the raw matrix: Prometheus'
             // own check only runs once a rate/increase value was actually
             // computed (its early return for fewer than two samples happens
@@ -244,9 +252,21 @@ pub(crate) fn eval_call(
             let arg = matrix_arg(&call.args.args[1])?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
             let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
-            Ok(Value::Vector(apply_reduce(matrix, eval_ts_ns, |samples| {
-                f(q, samples, window)
-            })))
+            // `quantile_over_time` clamps a q outside [0, 1] to +-Inf and warns,
+            // exactly like `quantile()`/`histogram_quantile` (Prometheus'
+            // `funcQuantileOverTime` raises `InvalidQuantileWarning`). The warn
+            // sits inside the reduce closure so it fires once per matched series
+            // (deduped by the annotation sink) and, like Prometheus, not at all
+            // when no series matched.
+            Ok(Value::Vector(apply_reduce(
+                matrix,
+                eval_ts_ns,
+                false,
+                |samples| {
+                    maybe_warn_invalid_quantile(q, ctx);
+                    f(q, samples, window)
+                },
+            )))
         }
         FunctionKind::AbsentOverTime => {
             let arg = matrix_arg(&call.args.args[0])?;
@@ -285,6 +305,7 @@ pub(crate) fn eval_range_call(
     match def.kind {
         FunctionKind::RangeVector(f) => {
             let arg = matrix_arg(&call.args.args[0])?;
+            let keep_name = range_vector_keeps_metric_name(call.func.name);
             eval_matrix_arg_range_reduction(
                 evaluator,
                 source,
@@ -294,6 +315,7 @@ pub(crate) fn eval_range_call(
                 step_ns,
                 points,
                 ctx,
+                keep_name,
                 |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
                     f(
                         samples,
@@ -327,6 +349,7 @@ pub(crate) fn eval_range_call(
                 step_ns,
                 points,
                 ctx,
+                false,
                 |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| match scalar_arg(
                     evaluator,
                     source,
@@ -370,6 +393,7 @@ pub(crate) fn eval_range_call(
                 step_ns,
                 points,
                 ctx,
+                false,
                 |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| {
                     float(
                         samples,
@@ -435,6 +459,7 @@ pub(crate) fn eval_range_call(
                 step_ns,
                 points,
                 ctx,
+                false,
                 |samples, window_start_ns, sel_ts_ns, range_ns, reported_ts_ns| match scalar_arg(
                     evaluator,
                     source,
@@ -442,16 +467,19 @@ pub(crate) fn eval_range_call(
                     reported_ts_ns,
                     ctx,
                 ) {
-                    Ok(q) => f(
-                        q,
-                        samples,
-                        RangeWindow {
-                            start_ns: window_start_ns,
-                            end_ns: sel_ts_ns,
-                            range_ns,
-                            eval_ts_ns: reported_ts_ns,
-                        },
-                    ),
+                    Ok(q) => {
+                        maybe_warn_invalid_quantile(q, ctx);
+                        f(
+                            q,
+                            samples,
+                            RangeWindow {
+                                start_ns: window_start_ns,
+                                end_ns: sel_ts_ns,
+                                range_ns,
+                                eval_ts_ns: reported_ts_ns,
+                            },
+                        )
+                    }
                     Err(e) => {
                         *err.borrow_mut() = Some(e);
                         None
@@ -558,11 +586,20 @@ fn eval_matrix_arg_range_reduction(
     step_ns: i64,
     points: u64,
     ctx: &QueryWindow,
+    keep_metric_name: bool,
     reduce: impl Fn(&[Sample], i64, i64, i64, i64) -> Option<f64>,
 ) -> Result<RangeMatrix, Error> {
     match arg {
         MatrixArg::Selector(ms) => evaluator.eval_range_matrix_reduction(
-            source, ms, start_ns, end_ns, step_ns, points, ctx, reduce,
+            source,
+            ms,
+            start_ns,
+            end_ns,
+            step_ns,
+            points,
+            ctx,
+            keep_metric_name,
+            reduce,
         ),
         MatrixArg::Subquery(sq) => {
             let range_ns = duration_to_ns(sq.range)?;
@@ -578,7 +615,11 @@ fn eval_matrix_arg_range_reduction(
                         continue;
                     }
                     if let Some(value) = reduce(&samples, window_start_ns, sel_ts_ns, range_ns, t) {
-                        let labels = drop_metric_name(labels);
+                        let labels = if keep_metric_name {
+                            labels
+                        } else {
+                            drop_metric_name(labels)
+                        };
                         match series.iter_mut().find(|(l, _)| *l == labels) {
                             Some((_, out)) => out.push(Sample { ts_ns: t, value }),
                             None => series.push((labels, vec![Sample { ts_ns: t, value }])),
@@ -795,17 +836,25 @@ fn to_instant_vector(groups: Vec<(LabelSet, f64)>, eval_ts_ns: i64) -> InstantVe
 /// Reduce each matched series' matrix window through `reduce`, dropping
 /// `__name__` (Prometheus drops the metric name on the result of any
 /// function call) and omitting series for which `reduce` returns `None`
-/// (too few samples, a zero sampled interval, etc.).
+/// (too few samples, a zero sampled interval, etc.). `keep_metric_name`
+/// suppresses that drop for the one range-vector function that preserves the
+/// input series' identity verbatim (`last_over_time`; see
+/// [`range_vector_keeps_metric_name`]).
 fn apply_reduce(
     matrix: RangeMatrix,
     eval_ts_ns: i64,
+    keep_metric_name: bool,
     reduce: impl Fn(&[Sample]) -> Option<f64>,
 ) -> InstantVector {
     let mut out = Vec::with_capacity(matrix.len());
     for (labels, samples) in matrix {
         if let Some(value) = reduce(&samples) {
             out.push(InstantSample {
-                labels: drop_metric_name(labels),
+                labels: if keep_metric_name {
+                    labels
+                } else {
+                    drop_metric_name(labels)
+                },
                 ts_ns: eval_ts_ns,
                 orig_sample_ts_ns: eval_ts_ns,
                 value,
@@ -814,6 +863,26 @@ fn apply_reduce(
         }
     }
     out
+}
+
+/// PromQL drops `__name__` from a function call's result, since the output is
+/// a computed value rather than a literal sample. The range-vector family has
+/// one exception: `last_over_time` returns the input sample verbatim, so it
+/// preserves every label including `__name__`, matching Prometheus'
+/// `funcLastOverTime` (which appends `el.Metric` unchanged, unlike its
+/// siblings that call `DropMetricName`).
+fn range_vector_keeps_metric_name(func_name: &str) -> bool {
+    func_name == "last_over_time"
+}
+
+/// Raise Prometheus' `InvalidQuantileWarning` when a quantile argument falls
+/// outside `[0, 1]` (NaN included, since it is in no range). Shared by
+/// `quantile_over_time`'s instant and range dispatch arms; the annotation
+/// sink de-duplicates, so a per-series or per-step repeat is reported once.
+fn maybe_warn_invalid_quantile(q: f64, ctx: &QueryWindow) {
+    if !(0.0..=1.0).contains(&q) {
+        ctx.warn(invalid_quantile_warning(q));
+    }
 }
 
 #[cfg(test)]
@@ -825,6 +894,123 @@ mod tests {
 
     fn ms_ns(ms: i64) -> i64 {
         ms * 1_000_000
+    }
+
+    #[test]
+    fn last_over_time_preserves_metric_name_while_siblings_drop_it() {
+        // `last_over_time` returns the input sample verbatim, so it keeps every
+        // label including `__name__`; every other `_over_time` function drops
+        // `__name__` (the output is a computed value). This pins Prometheus'
+        // one-function exception in both the instant and range dispatch paths,
+        // which are distinct code (`apply_reduce` vs
+        // `eval_range_matrix_reduction`). Pre-fix, both paths dropped
+        // `__name__` unconditionally.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "diff_boundary"), ("shape", "boundary")],
+                &[(ms_ns(0), 1.0), (ms_ns(60_000), 2.0)],
+            )
+            .expect("valid series");
+
+        // Instant path.
+        let got = Evaluator::new()
+            .instant(&source, "last_over_time(diff_boundary[5m])", 60_000)
+            .expect("evaluates");
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].labels.get("__name__"),
+            Some("diff_boundary"),
+            "last_over_time keeps __name__"
+        );
+        assert_eq!(got[0].labels.get("shape"), Some("boundary"));
+
+        // Range path.
+        let range = Evaluator::new()
+            .range(
+                &source,
+                "last_over_time(diff_boundary[5m])",
+                60_000,
+                60_000,
+                60_000,
+            )
+            .expect("evaluates");
+        assert_eq!(range.len(), 1);
+        assert_eq!(
+            range[0].0.get("__name__"),
+            Some("diff_boundary"),
+            "range last_over_time keeps __name__ too"
+        );
+
+        // A sibling function drops __name__ but keeps the other labels.
+        let avg = Evaluator::new()
+            .instant(&source, "avg_over_time(diff_boundary[5m])", 60_000)
+            .expect("evaluates");
+        assert_eq!(avg.len(), 1);
+        assert_eq!(
+            avg[0].labels.get("__name__"),
+            None,
+            "avg_over_time drops __name__"
+        );
+        assert_eq!(avg[0].labels.get("shape"), Some("boundary"));
+    }
+
+    #[test]
+    fn quantile_over_time_out_of_range_q_raises_the_invalid_quantile_warning() {
+        // A q outside [0, 1] clamps to +-Inf and, matching Prometheus'
+        // `funcQuantileOverTime`, raises an `InvalidQuantileWarning`. Pre-fix
+        // Ravel clamped correctly but emitted no warning, the divergence the
+        // over_time difftest corpus surfaced. Both directions warn; a q in
+        // range does not.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "g")],
+                &[(ms_ns(0), 1.0), (ms_ns(60_000), 2.0)],
+            )
+            .expect("valid series");
+
+        for q in ["1.5", "-0.5"] {
+            let query = format!("quantile_over_time({q}, g[5m])");
+            let (_value, annotations) = Evaluator::new()
+                .eval_instant_annotated(&source, &query, 60_000)
+                .expect("evaluates");
+            assert_eq!(
+                annotations.warnings().len(),
+                1,
+                "q={q} out of range warns once: {annotations:?}"
+            );
+            assert!(
+                annotations.warnings()[0].contains("quantile value should be between 0 and 1"),
+                "warning is the invalid-quantile one: {:?}",
+                annotations.warnings()
+            );
+        }
+
+        // In-range q: no annotation at all.
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "quantile_over_time(0.5, g[5m])", 60_000)
+            .expect("evaluates");
+        assert!(
+            annotations.is_empty(),
+            "an in-range quantile_over_time is annotation-free: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn quantile_over_time_out_of_range_q_does_not_warn_when_no_series_match() {
+        // Prometheus calls the range-vector function once per matched series,
+        // so a q out of range over a selector that matches nothing raises no
+        // warning (the function never runs). The warn lives inside the reduce
+        // closure precisely so it inherits this per-series gating.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "g")], &[(ms_ns(0), 1.0)])
+            .expect("valid series");
+        let (_value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "quantile_over_time(1.5, nosuch[5m])", 60_000)
+            .expect("evaluates");
+        assert!(
+            annotations.is_empty(),
+            "no matched series means no warning: {annotations:?}"
+        );
     }
 
     /// The `diff_native_hist` counter sample at difftest sample index `i`

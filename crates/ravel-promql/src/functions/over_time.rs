@@ -176,8 +176,11 @@ fn quantile_over_time(q: f64, samples: &[Sample], _w: RangeWindow) -> Option<f64
 /// Port of Prometheus' `quantile()` (`promql/quantile.go`), shared by the
 /// `quantile` aggregation operator and `quantile_over_time`: `q < 0` and
 /// `q > 1` clamp to `-Inf`/`+Inf` rather than erroring (Prometheus emits a
-/// warning annotation alongside, which this evaluator has no channel for
-/// yet), `q` itself being NaN produces NaN, and otherwise linear
+/// warning annotation alongside; `quantile_over_time`'s dispatch raises the
+/// matching `InvalidQuantileWarning` via
+/// [`super::maybe_warn_invalid_quantile`], since this pure numeric helper has
+/// no annotation channel of its own), `q` itself being NaN produces NaN, and
+/// otherwise linear
 /// interpolation between the two nearest ranks after sorting with NaN
 /// values treated as smaller than every real number.
 pub(crate) fn quantile(q: f64, mut values: Vec<f64>) -> f64 {

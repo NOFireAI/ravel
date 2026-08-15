@@ -247,9 +247,12 @@ pub(crate) fn invalid_quantile_warning(q: f64) -> String {
 }
 
 /// Prometheus' bad-bucket warning for a classic histogram whose bucket set
-/// is not usable: fewer than two buckets, or no `+Inf` bucket, so no
-/// quantile/fraction can be computed and the group evaluates to `NaN`. A
-/// warning: the `NaN` result signals a malformed input, not a benign one.
+/// is degenerate: fewer than two usable buckets, so no quantile/fraction can
+/// be computed and the group evaluates to `NaN`. A warning: the `NaN` result
+/// signals a malformed input, not a benign one. Note this fires only for the
+/// too-few-buckets case; a group that is merely missing its `+Inf` top bucket
+/// is NaN with no annotation, matching the pinned Prometheus binary (issue
+/// #1099).
 pub(crate) fn classic_histogram_bad_buckets_warning() -> String {
     "input to histogram function was not a valid classic histogram: it needs \
      at least two buckets, the highest being a +Inf bucket"
@@ -1092,6 +1095,7 @@ impl Evaluator {
         step_ns: i64,
         points: u64,
         ctx: &QueryWindow,
+        keep_metric_name: bool,
         reduce: impl Fn(&[Sample], i64, i64, i64, i64) -> Option<f64>,
     ) -> Result<RangeMatrix, Error> {
         let selector_matchers = build_matchers(&ms.vs)?;
@@ -1167,7 +1171,12 @@ impl Evaluator {
                 }
             }
             if !out_samples.is_empty() {
-                out.push((drop_metric_name(s.labels), out_samples));
+                let labels = if keep_metric_name {
+                    s.labels
+                } else {
+                    drop_metric_name(s.labels)
+                };
+                out.push((labels, out_samples));
             }
         }
         Ok(out)
@@ -1597,9 +1606,14 @@ mod tests {
     }
 
     #[test]
-    fn histogram_quantile_missing_inf_bucket_surfaces_a_warning() {
-        // A classic histogram whose buckets have no +Inf is not usable: the
-        // group is NaN and a bucket-count warning surfaces.
+    fn histogram_quantile_missing_inf_bucket_is_nan_without_a_warning() {
+        // A classic histogram with two or more buckets but no +Inf top bucket
+        // (an incomplete shape, e.g. a `le!="+Inf"` matcher) is NaN, and,
+        // matching the pinned Prometheus binary, raises NO warning: its
+        // `bucketQuantile` returns NaN silently for that shape (issue #1099).
+        // Before this fix Ravel emitted an extra bad-buckets warning here,
+        // which is the divergence the over_time/histogram_classic difftest
+        // corpora surfaced.
         let source = TestSource::new()
             .with_series(&[("__name__", "http_bucket"), ("le", "0.1")], &[(0, 10.0)])
             .expect("valid series")
@@ -1609,10 +1623,33 @@ mod tests {
             .eval_instant_annotated(&source, "histogram_quantile(0.9, http_bucket)", 0)
             .expect("evaluates");
         match value {
-            Value::Vector(v) => assert!(v[0].value.is_nan(), "malformed histogram is NaN"),
+            Value::Vector(v) => assert!(v[0].value.is_nan(), "incomplete histogram is NaN"),
             other => panic!("expected vector, got {}", other.type_name()),
         }
-        assert_eq!(annotations.warnings().len(), 1, "one bucket-count warning");
+        assert!(
+            annotations.is_empty(),
+            "a missing-+Inf classic histogram raises no annotation, matching \
+             Prometheus: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn histogram_quantile_single_bucket_still_surfaces_a_bad_buckets_warning() {
+        // A genuinely degenerate group (fewer than two usable buckets) is a
+        // distinct case from the missing-+Inf shape above: it keeps the
+        // bad-buckets warning. This pins that the #1099 narrowing touched only
+        // the missing-+Inf reason, not the too-few-buckets one.
+        let source = TestSource::new()
+            .with_series(&[("__name__", "http_bucket"), ("le", "+Inf")], &[(0, 10.0)])
+            .expect("valid series");
+        let (value, annotations) = Evaluator::new()
+            .eval_instant_annotated(&source, "histogram_quantile(0.9, http_bucket)", 0)
+            .expect("evaluates");
+        match value {
+            Value::Vector(v) => assert!(v[0].value.is_nan(), "degenerate histogram is NaN"),
+            other => panic!("expected vector, got {}", other.type_name()),
+        }
+        assert_eq!(annotations.warnings().len(), 1, "one bad-buckets warning");
         assert!(
             annotations.warnings()[0].contains("classic histogram"),
             "warning names the malformed classic histogram: {:?}",

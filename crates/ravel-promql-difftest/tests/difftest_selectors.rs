@@ -26,6 +26,51 @@ const BINOP_CORPUS: &str = include_str!("../corpus/binop.txt");
 const AGGREGATE_CORPUS: &str = include_str!("../corpus/aggregate.txt");
 const SUBQUERY_CORPUS: &str = include_str!("../corpus/subquery.txt");
 const HISTOGRAM_NATIVE_CORPUS: &str = include_str!("../corpus/histogram_native.txt");
+const OVER_TIME_CORPUS: &str = include_str!("../corpus/over_time.txt");
+const HISTOGRAM_CLASSIC_CORPUS: &str = include_str!("../corpus/histogram_classic.txt");
+
+/// Issue #947 exclusion: the exact PromQL queries whose difference from the
+/// pinned Prometheus binary is a 1-ULP summation-order residue in the last
+/// digit (e.g. `-4.235967390124592` vs `-4.235967390124591`), not a semantic
+/// bug. `avg_over_time`'s incremental Kahan mean and `rate()`'s Kahan sum
+/// reduce their windows in an order Prometheus does not reproduce bit-for-bit;
+/// making the output bit-exact would mean changing Ravel's reduction strategy,
+/// a decision epic #947 owns and gates behind a not-yet-written tolerance ADR.
+/// Until then these two queries (and only these two) compare within a small
+/// ULP tolerance instead of exact bits. Every other corpus entry, in both new
+/// files and the existing ones, stays exact-match. Keyed by query text so it
+/// applies to whichever `kind` (instant or range) a corpus entry runs the
+/// query at; an entry's declared `tolerance:` field, if any, still wins.
+const ISSUE_947_ULP_TOLERANCE_QUERIES: &[&str] = &[
+    "avg_over_time(diff_gauge_walk[5m])",
+    "histogram_quantile(0.9, rate(diff_histogram_bucket{variant=\"wellformed\"}[5m]))",
+];
+
+/// The ULP tolerance applied to the [`ISSUE_947_ULP_TOLERANCE_QUERIES`]: small
+/// enough that it only ever absorbs a last-digit summation-order residue (a
+/// handful of representable f64 steps), never a real numeric divergence. The
+/// comparator still refuses any tolerance across the zero boundary, a sign
+/// change, or a non-finite value (see `comparator::within_ulps`), so this
+/// cannot mask a wrong sign or an Inf/NaN mistake.
+const ISSUE_947_ULP_TOLERANCE: u32 = 4;
+
+/// Apply the issue #947 exclusion in place: any entry whose query is one of
+/// [`ISSUE_947_ULP_TOLERANCE_QUERIES`] and that has not already declared its
+/// own `tolerance:` gets [`ISSUE_947_ULP_TOLERANCE`]. Returns how many entries
+/// were adjusted so the caller can assert the allowlist actually matched
+/// something (a renamed query would otherwise silently re-tighten these).
+fn apply_issue_947_tolerance(entries: &mut [ravel_promql_difftest::corpus::CorpusEntry]) -> usize {
+    let mut applied = 0;
+    for entry in entries.iter_mut() {
+        if entry.tolerance_ulps.is_none()
+            && ISSUE_947_ULP_TOLERANCE_QUERIES.contains(&entry.query.as_str())
+        {
+            entry.tolerance_ulps = Some(ISSUE_947_ULP_TOLERANCE);
+            applied += 1;
+        }
+    }
+    applied
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used)]
@@ -74,6 +119,19 @@ async fn selector_and_error_corpus_match_pinned_prometheus() {
     entries.extend(parse_corpus(AGGREGATE_CORPUS).expect("parse aggregate corpus"));
     entries.extend(parse_corpus(SUBQUERY_CORPUS).expect("parse subquery corpus"));
     entries.extend(parse_corpus(HISTOGRAM_NATIVE_CORPUS).expect("parse histogram_native corpus"));
+    entries.extend(parse_corpus(OVER_TIME_CORPUS).expect("parse over_time corpus"));
+    entries.extend(parse_corpus(HISTOGRAM_CLASSIC_CORPUS).expect("parse histogram_classic corpus"));
+
+    // Issue #947: two named queries carry a last-digit summation-order residue
+    // that is out of scope to make bit-exact here; everything else stays
+    // exact-match. Assert the allowlist matched so a future rename cannot
+    // silently drop the exclusion and turn this into a spurious failure.
+    let applied = apply_issue_947_tolerance(&mut entries);
+    assert!(
+        applied >= 2,
+        "issue #947 float-tolerance allowlist matched {applied} entries, expected at least the \
+         two named queries; a corpus query was likely renamed"
+    );
 
     let report = run_corpus(
         &entries,
