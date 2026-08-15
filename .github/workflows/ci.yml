@@ -1254,11 +1254,13 @@ jobs:
           cargo llvm-cov --locked --no-report --workspace
           cargo llvm-cov report --locked | tee -a "$GITHUB_STEP_SUMMARY"
           cargo llvm-cov report --locked --lcov --output-path lcov.info
-      # Public repo, tokenless upload via GitHub Actions OIDC: no secret to
-      # provision or rotate. Renders the README badge and per-file/diff
-      # coverage on codecov.io; never fails the job on an upload hiccup.
-      - name: Upload coverage to Codecov
+      # CODECOV_TOKEN authenticates the upload; id-token: write (job
+      # permissions above) is kept as a fallback path. Renders the README
+      # badge and per-file/diff coverage on codecov.io; never fails the job
+      # on an upload hiccup.
+      - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: false
