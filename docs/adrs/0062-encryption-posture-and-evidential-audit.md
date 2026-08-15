@@ -110,7 +110,7 @@ Gaps closed: per-tenant KMS by 1a-1e; coverage by 2a; lossiness by 2b; unbounded
 - **IAM/role interaction**: per-tenant BYOK key policies must grant the ADR-0055 role principals (Gateway/Query/Maintain) usage; operations.md's policy templates gain the KMS statements. Revoked key = that tenant fails closed, others unaffected (new failure-path tests with `FaultStore` asserting the injected fault fired).
 - **verify-custody** gains key-epoch consistency checking; audit records for admin actions (key configured/rotated) are written like every other admin audit record.
 - **The legal-hold shard remains unbounded** — deliberately: growth is per operator action, and its deny-delete protection is load-bearing. Recorded so a successor review doesn't re-flag it as an oversight.
-- **PROGRESS.md, README, docs/guides/operations.md, docs/catalog-and-mvcc.md (new `enc` key), and the query-audit module docs** update in the same commits as the behavior, per doc-currency rule.
+- **README, docs/guides/operations.md, docs/catalog-and-mvcc.md (new `enc` key), and the query-audit module docs** update in the same commits as the behavior, per doc-currency rule.
 
 ## Amendment: correct section 2d's audit-prefix transcription
 

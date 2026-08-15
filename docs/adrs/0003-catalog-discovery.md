@@ -33,8 +33,8 @@ included, giving read-your-write after an ack.
 ## Consequences
 
 - Phase 1 queries pay one LIST per (shard, ingest-hour bucket) in range;
-  acceptable for the vertical slice, called out in PROGRESS.md as a bottleneck
-  gate before Phase 2 load tests.
+  acceptable for the vertical slice, and a known bottleneck gate before
+  Phase 2 load tests.
 - Catalog nodes cache decoded snapshots in memory only; losing them costs
   latency, never correctness.
 - HEAD CAS requires etag/generation preconditions, a mandatory capability.

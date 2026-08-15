@@ -14,8 +14,8 @@ stored byte today.
 Phase 1 never deletes or rewrites anything. Every flush leaves one L0
 object and one commit record forever. At one flush per second per shard
 that is 3,600 objects per (tenant, shard, hour) and 86,400 per day;
-PROGRESS.md already names listing-based discovery unscalable past ~10^4
-commits per bucket, and the query budget (max_segments = 1024,
+listing-based discovery is known to be unscalable past ~10^4 commits
+per bucket, and the query budget (max_segments = 1024,
 docs/query-engine.md) makes an hour of such data unqueryable outright.
 ADR-0027 (RSEG v2) additionally accepted a permanent dual-reader burden
 "until a compactor exists". This ADR is that compactor.

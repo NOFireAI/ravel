@@ -227,8 +227,7 @@ tenant's resulting entry set against its current one and returns
 rewrote the whole map every call), and the operator wraps each `sys/auth`
 primitive call in a bounded CAS retry and no longer aborts Deployment/
 Service reconciliation on a sys/auth failure -- both were reconcile-loop
-defects the ownership marker didn't by itself fix. See PROGRESS.md for
-the full defect list.
+defects the ownership marker didn't by itself fix.
 
 ## Amendment: `token_hash` is globally unique; last writer takes ownership
 
