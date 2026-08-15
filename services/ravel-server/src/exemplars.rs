@@ -1976,6 +1976,167 @@ mod tests {
         assert_eq!(ex0["timestamp"], (NOW - 30 * NS_PER_SEC) / NS_PER_SEC);
     }
 
+    /// Epic acceptance criterion (#130): the real OTLP HTTP metrics ingest
+    /// handler stores an exemplar carried on a histogram data point, and the
+    /// real `/api/v1/query_exemplars` handler returns it over that window with
+    /// the tenant, series, trace id, span id, and filtered attribute intact.
+    ///
+    /// This drives the shipping ingest handler (`crate::ingest::handle_export`,
+    /// the function `POST /v1/metrics` calls after decoding wire bytes) writing
+    /// through a real `IngestRouter` into a `MemoryStore`, then the shipping
+    /// exemplars router reading that same store. Storage is never constructed
+    /// directly.
+    ///
+    /// Non-vacuity (prove-the-test): reverting `handle_export` to the old
+    /// `normalize_metrics` + `write_values` pair -- which discards admitted
+    /// exemplars and counts them dropped -- makes this fail, because nothing
+    /// exemplar-shaped is ever written and `data` comes back with no matching
+    /// exemplar.
+    #[tokio::test]
+    async fn otlp_http_histogram_exemplar_round_trips_to_query_exemplars() {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::metrics::v1::exemplar::Value as ExemplarValue;
+        use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            AggregationTemporality, Exemplar as OtlpExemplar, Histogram, HistogramDataPoint,
+            Metric, ResourceMetrics, ScopeMetrics,
+        };
+        use ravel_ingest::{
+            AdmissionController, AdmissionLimits, IngestConfig, IngestRouter, WriteMode,
+        };
+
+        use crate::ingest::{IngestState, handle_export};
+
+        let store = Arc::new(MemoryStore::new());
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+
+        // A router that flushes synchronously under a strict write (small
+        // target, fixed clock at NOW so the commit record's hour bucket matches
+        // the query window), writing into the same store the query side reads.
+        let router = Arc::new(IngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 8,
+                max_flush_delay: Duration::from_secs(3600),
+                flush_tick: Duration::from_millis(20),
+                ..IngestConfig::default()
+            },
+            backend.clone(),
+            Signal::Metrics,
+            Arc::new(FixedClock(NOW)),
+        ));
+        let limits = ravel_otlp::IngestLimits::default();
+        let ingest = IngestState {
+            router: router.clone(),
+            limits,
+            ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(FixedClock(NOW)),
+                AdmissionLimits::default(),
+            )),
+            recovery: None,
+            provisioning: None,
+        };
+
+        // A classic histogram data point (le bounds [0.5]) carrying one
+        // exemplar for value 0.25, which attaches to the
+        // `latency_bucket{le="0.5"}` series (smallest bound at or above 0.25).
+        let ex = OtlpExemplar {
+            time_unix_nano: (NOW - 30 * NS_PER_SEC) as u64,
+            value: Some(ExemplarValue::AsDouble(0.25)),
+            trace_id: TRACE_ID.to_vec(),
+            span_id: SPAN_ID.to_vec(),
+            filtered_attributes: vec![KeyValue {
+                key: "region".to_string(),
+                value: Some(AnyValue {
+                    value: Some(AnyValueVariant::StringValue("us-east-1".to_string())),
+                }),
+                ..Default::default()
+            }],
+        };
+        let dp = HistogramDataPoint {
+            time_unix_nano: (NOW - 60 * NS_PER_SEC) as u64,
+            count: 1,
+            sum: Some(0.25),
+            bucket_counts: vec![1, 0],
+            explicit_bounds: vec![0.5],
+            exemplars: vec![ex],
+            ..Default::default()
+        };
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "latency".to_string(),
+                        data: Some(MetricData::Histogram(Histogram {
+                            data_points: vec![dp],
+                            aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let outcome = handle_export(&ingest, tenant(), WriteMode::Strict, request, NOW)
+            .await
+            .expect("ingest accepts the histogram and its exemplar");
+        assert_eq!(
+            outcome.tokens.len(),
+            1,
+            "the strict write flushed one shard's object"
+        );
+        // Drop the state's router clone so the last `Arc` can be unwrapped and
+        // the shard actors drained.
+        drop(ingest);
+        match Arc::try_unwrap(router) {
+            Ok(router) => router.shutdown().await,
+            Err(_) => panic!("router still shared after ingest"),
+        }
+
+        // Query the real exemplars handler over the same store. `latency_bucket`
+        // (equality `__name__`) matches every le-bucket series, so the exemplar
+        // comes back whichever bucket its value landed in.
+        let app = build_router(store, Duration::from_secs(30), 1000);
+        let (status, body) = query(&app, "latency_bucket").await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["status"], "success");
+
+        let data = body["data"].as_array().expect("data array");
+        // Find the series carrying our ingested exemplar.
+        let mut found = None;
+        for series in data {
+            assert_eq!(
+                series["seriesLabels"]["__name__"], "latency_bucket",
+                "every matched series is a histogram bucket"
+            );
+            for exemplar in series["exemplars"].as_array().expect("exemplars array") {
+                if exemplar["labels"]["trace_id"] == "0a1b2c3d4e5f60718293a4b5c6d7e8f9" {
+                    found = Some((series.clone(), exemplar.clone()));
+                }
+            }
+        }
+        let (series, exemplar) =
+            found.expect("the ingested exemplar is returned by query_exemplars");
+
+        // Series identity intact: the matched series is the histogram bucket,
+        // so it carries an `le` label.
+        assert!(
+            series["seriesLabels"]["le"].is_string(),
+            "the matched series is a histogram bucket: {series}"
+        );
+        // Exemplar identity intact: span id and the filtered attribute survive
+        // the full ingest-to-query round trip.
+        assert_eq!(exemplar["labels"]["span_id"], "1122334455667788");
+        assert_eq!(exemplar["labels"]["region"], "us-east-1");
+        assert_eq!(exemplar["value"], "0.25");
+        assert_eq!(exemplar["timestamp"], (NOW - 30 * NS_PER_SEC) / NS_PER_SEC);
+    }
+
     /// Data-deletion regression: a pending selective-erasure request must
     /// exclude the erased subject's exemplars from `query_exemplars`, while a
     /// non-erased subject matched by the same selector keeps its exemplars.

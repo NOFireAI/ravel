@@ -120,5 +120,18 @@ the sweep drives with the injected `now_ns` and the TTL:
   concurrent queries). Last touch is stamped in the shared `resolve` funnel, so
   both the HTTP and Flight SQL paths keep an active tenant out of the sweep.
 
-The admission-controller maps are not evictors and are never registered with
-the sweep, so decision 2's exclusion is structural, not merely a convention.
+The admission-controller maps (active-series/stream sets, token buckets,
+usage counters) are the one long-lived per-tenant map family that is
+deliberately *not* an evictor and never registered with the sweep, so its
+exclusion from decision 2 is structural, not merely a convention.
+
+The OTLP HTTP handler's exemplar admission (`services/ravel-server/src/ingest.rs`,
+wired through `normalize_metrics_with_exemplars`) does not add a second one:
+its `ExemplarCap` (ADR-0047 decision 2) is built fresh per request and
+dropped at the end of the call, the same shape every other OTLP normalize
+entry point already uses. The real per-series-per-window budget is enforced
+per shard actor with no cross-shard coordination (`crates/ravel-ingest/src/shard.rs`),
+which already builds and drops its own cap per flush -- a shard-lived (or
+longer) cap was considered and rejected there as an unbounded memory-growth
+vector, since `ExemplarCap`'s per-series map has no eviction. Nothing at the
+transport layer needs to, or should, outlive one request.

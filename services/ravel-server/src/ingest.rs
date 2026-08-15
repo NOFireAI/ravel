@@ -9,11 +9,11 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use ravel_ingest::{
-    AdmissionController, IngestPoint, IngestRouter, RequestRejection, WriteError, WriteMode,
-    plausible_ingest_clock,
+    AdmissionController, IngestExemplar, IngestPoint, IngestRouter, RequestRejection, WriteError,
+    WriteMode, plausible_ingest_clock,
 };
-use ravel_otlp::{IngestLimits, Rejection, normalize_metrics};
-use ravel_types::{CommitToken, SeriesId, TenantId};
+use ravel_otlp::{IngestLimits, Rejection, normalize_metrics_with_exemplars};
+use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
 
 pub struct IngestState {
     pub router: Arc<IngestRouter>,
@@ -136,7 +136,29 @@ pub async fn handle_export(
     .await
     .map_err(|e| IngestRequestError::Provisioning(e.to_string()))?;
 
-    let normalized = normalize_metrics(&tenant, request, &state.limits, ingest_ts_ns);
+    // Admit points AND exemplars through a per-request cap, rather than the
+    // `normalize_metrics` wrapper that builds the same throwaway cap and then
+    // counts every admitted exemplar as dropped because it has nowhere to
+    // store them. ADR-0047 decision 2 enforces the real per-series-per-window
+    // budget per shard actor, with no cross-shard coordination
+    // (`crates/ravel-ingest/src/shard.rs`); a transport-level cap only needs
+    // to exist long enough to admit this request's exemplars into that path,
+    // so it is built fresh here and dropped at the end of the call, exactly
+    // like every other OTLP normalize entry point. A tenant-lived cap at this
+    // layer was tried and reverted: `ExemplarCap`'s per-series map has no
+    // eviction, so anything that outlives one request grows unbounded with
+    // tenant x lifetime series cardinality (the same growth vector
+    // `shard.rs`'s per-flush cap comment already rejected building one layer
+    // lower).
+    let mut cap = ExemplarCap::new(state.limits.exemplar_cap_window_ns);
+    let result =
+        normalize_metrics_with_exemplars(&tenant, request, &state.limits, ingest_ts_ns, &mut cap);
+    let exemplars: Vec<IngestExemplar> = result
+        .exemplars
+        .into_iter()
+        .map(IngestExemplar::from)
+        .collect();
+    let normalized = result.output;
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
 
     // Scalar and native-histogram points arrive in separate vectors; both
@@ -172,7 +194,7 @@ pub async fn handle_export(
 
     let receipt = state
         .router
-        .write_values(tenant, points, mode, state.ack_deadline)
+        .write_values_with_exemplars(tenant, points, exemplars, mode, state.ack_deadline)
         .await
         .map_err(IngestRequestError::Write)?;
 
