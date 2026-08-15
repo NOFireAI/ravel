@@ -732,3 +732,359 @@ shipped, and the cost of changing this contract only grows.
   (`partial: false`), which unknown-field-tolerant Prometheus clients
   ignore; no other wire shape changes, and no persistent format is
   touched.
+
+## Amendment: federation TLS by default, engine-direct caller honesty, and dead-endpoint quarantine
+
+Status: Accepted. Epic #1063, the three remaining items. This amendment
+decides: (1) the `--remote-cluster` federation transport default flips
+from plaintext to TLS, with plaintext demoted to an explicit, loudly
+logged choice; (2) the two production callers that reach the query engine
+directly, bypassing the HTTP-boundary consent gate the previous amendment
+decided (the alert evaluator and the analytics endpoint), each get an
+explicit partial-coverage policy instead of inheriting silence; (3) the
+coordinator stops re-paying connect timeouts to a dead worker endpoint
+for the up-to-four-heartbeat-interval window it currently stays ranked
+after death, via a passive endpoint quarantine readmitted by the
+worker's own next heartbeat.
+
+One prior thread is resolved here rather than left dangling: the previous
+amendment's Out-of-scope section recommended re-homing the federation TLS
+default under epic #1055's transport work. The epic kept it in #1063, and
+this amendment decides it under #1063; that recommendation is superseded,
+not silently dropped.
+
+### 1. Federation TLS on by default; plaintext is an explicit, logged choice
+
+Today `parse_remote_clusters` (`services/ravel-server/src/config.rs`)
+defaults `tls = false` when a `--remote-cluster` spec carries no `tls=`
+key, and `FederationSliceFetcher::connect`
+(`services/ravel-server/src/distrib.rs`) then dials plain `http://`. No
+warning exists near either path. The operator bearer credential for the
+remote (the only principal the remote ever sees for federated fetches),
+the query matchers and window, and every returned series frame all cross
+a trust-domain boundary in cleartext, silently, as the out-of-the-box
+behavior. Federation is precisely the hop in this design that leaves the
+cluster's own network and its operator's control: the public listeners
+delegate TLS to a fronting proxy the same operator runs (ADR-0050), and
+the fragment surface now terminates TLS in-process (first amendment),
+but the federation dial crosses infrastructure neither cluster's
+operator fully owns, with no proxy of ours in front of it.
+
+**Decision.**
+
+- The default flips: a `--remote-cluster` spec with no `tls=` key now
+  means `tls=on`. The parse-time default in `parse_remote_clusters`
+  changes from `false` to `true`; `FederationSliceFetcher::connect` is
+  untouched (it already branches correctly on `config.tls`).
+- The escape hatch is the existing `tls=off` key, alone. No companion
+  flag is added. Writing `tls=off` in the spec *is* the explicit choice
+  the epic requires; a second flag would only repeat consent already
+  given, per remote, in the spec itself.
+- Choosing plaintext is loudly logged at startup, once per plaintext
+  remote, by a new `warn_plaintext_federation` in
+  `services/ravel-server/src/lib.rs`, beside the two precedents it
+  mirrors (`warn_dev_insecure_tenant_header`, `warn_mtls_trusted_header`),
+  called from `main.rs` where `parse_remote_clusters` resolves. The
+  message, in the precedents' shape:
+
+  > SECURITY: --remote-cluster '{name}' is configured with tls=off. The
+  > operator bearer credential presented to this remote, every federated
+  > query, and every returned result stream travel in cleartext to
+  > '{endpoint}'. Anyone on that network path can read and replay the
+  > credential. Use this only on a path that is already encrypted and
+  > access-controlled at a lower layer; the default (tls=on) verifies the
+  > remote against the system trust roots, plus tls-ca-file when set.
+
+- `tls=on` without a `tls-ca-file` verifies against the system/native
+  trust roots, which is what `connect` already does
+  (`ClientTlsConfig::new().with_native_roots()`). The flipped default
+  therefore does not refuse to start without a CA path: native-root
+  verification is real verification (webpki against the platform store),
+  not a downgrade, and it is the norm for a hop that crosses trust
+  domains where a public or organization-wide CA is typical. Pinning via
+  `tls-ca-file` remains the stricter option. This is a deliberate
+  contrast with the fragment listener (first amendment), which pins a
+  dedicated operator CA: that surface is cluster-internal with an
+  operator-run CA by construction; federation is not. One precision on
+  what `tls-ca-file` means, because this amendment's warning text states
+  it: `connect` builds native roots first and then *adds* the file's CA
+  (`with_native_roots()` then `.ca_certificate(...)`), so `tls-ca-file`
+  extends the trust set for a private-CA remote; it is not exclusive
+  pinning. That shipped semantic is kept as-is here; making it exclusive
+  would be a separate, breaking decision this amendment does not need.
+- The existing startup rejection of `tls-ca-file` alongside `tls=off`
+  (`config.rs`, "the CA bundle would be inert") stays. With the new
+  default it fires only for the contradictory spelling
+  `tls=off,tls-ca-file=...`. A side effect worth naming: a spec carrying
+  `tls-ca-file` with no `tls=` key, which today fails startup, now works
+  and means "TLS on, with this CA trusted", which is what its author
+  plainly meant.
+
+**Compatibility, stated plainly.** Every existing `--remote-cluster` spec
+with no `tls=` key changes behavior on upgrade, for every current
+deployment: the coordinator dials `https://` where it dialed `http://`.
+Startup still succeeds either way (the channel is deliberately lazy so a
+down remote never blocks process start), so a remote that actually serves
+plaintext surfaces at query time as an unavailable remote: a typed query
+failure by default, or partial coverage under that remote's
+`skip_unavailable` with the consent gate of the previous amendment. The
+remedy is one of two explicit acts: enable TLS on the remote's public
+gRPC surface (preferred), or write `tls=off` and own the logged warning.
+The implementation commit updates `docs/guides/operations.md` and the
+`--remote-cluster` help text in the same change, per the doc-currency
+rule.
+
+**Rejected alternatives.**
+
+1. *A companion flag (`--allow-plaintext-federation`) required alongside
+   `tls=off`.* Double opt-in with no added information: the operator
+   already wrote `tls=off` per remote, and a process-global flag is
+   coarser than the per-remote decision it would gate — one legacy
+   plaintext remote would force a flag that reads as blessing plaintext
+   for all remotes. The repo's precedent for a legitimate-but-risky
+   choice is a single explicit setting plus a loud startup warning
+   (`warn_mtls_trusted_header`), not stacked consent.
+2. *Making the `tls=` key required, no default.* Maximally explicit and
+   fails at startup rather than query time, but it converts every spec
+   that omits the key into a hard startup failure and permanently taxes
+   the safe configuration with ceremony to make the unsafe one explicit.
+   The epic's direction is safe-by-default, not mandatory ceremony.
+3. *Refusing to start under `tls=on` with no `tls-ca-file`.* Would turn
+   the default flip into a mandatory-config break for every spec that
+   names neither key, and would claim native-root verification is not
+   verification. It is; the stricter private-CA mode remains one key
+   away.
+
+### 2. Partial-coverage policy for the callers that bypass the HTTP gate
+
+The previous amendment decided the consent gate for the HTTP read
+surface (its implementation lands with that amendment's scope, in flight
+as of this writing). Two production callers reach the engine directly
+and will never pass that boundary regardless:
+
+- The alert evaluator: `run_query`
+  (`services/ravel-server/src/alerting.rs`) calls the bare
+  `QueryEngine::instant`, whose signature discards `QueryStats` entirely,
+  so a firing rule cannot even observe that it evaluated over partial
+  coverage.
+- The analytics endpoint: `run`
+  (`services/ravel-server/src/analytics.rs`) calls `range_with_stats`,
+  has `stats` in hand, and never reads `stats.partial` or
+  `stats.warnings`; it returns 200 with a stats block built from
+  accounting alone, dropping both signals. A partial federated answer is
+  indistinguishable from a complete one on this endpoint today.
+
+**Decision (alerting): a rule refuses to evaluate on partial coverage.**
+Partial coverage takes the existing per-rule failure path
+(`alerting.rs`: log, count `rules_failed`, keep prior state, retry next
+tick). This affirms the previous amendment's decision 5 and supplies the
+reasoning the epic asked for, having weighed the alternative honestly:
+
+- The failure mode of evaluate-anyway is worse than the failure mode of
+  refusing. Evaluating over partial coverage can produce a false
+  *resolve* — the firing series lived on the remote that just went
+  unreachable, the rule sees no data, the alert clears — which is
+  confident silence during an outage, the exact opposite of what alerting
+  exists for. Refusing keeps the prior state frozen: an alert that was
+  firing stays firing (ADR-0043 repeat notifications keep paging), an
+  alert that was resolved stays resolved, and no durable transition
+  record is ever written from an incomplete view.
+- Refusing is transient and self-healing where marking is durable and
+  sticky. Rules retry every tick; coverage returning heals the freeze
+  with no reconciliation. Evaluate-and-mark writes transition records and
+  notifications derived from partial data, and a marker on a page that
+  already fired (or a resolve that already silenced) helps no one — the
+  paging system acted before anyone read the marker.
+- The blast radius of refusing is narrow and operator-chosen.
+  Intra-cluster execution never returns partial results (unchanged
+  invariant above), so only rules whose queries federate across a
+  `skip_unavailable` remote can hit this path at all. For a query an
+  operator marked skippable, the safe alerting reading of "skippable" is
+  "retry next tick", not "pretend complete".
+- The refusal is itself observable, which answers the
+  blind-when-it-matters objection: `rules_failed` increments and the
+  per-rule warning logs each tick, so "alerting cannot currently evaluate
+  rule X over full coverage" is a signal an operator can (and should)
+  meta-alert on, instead of a silent gap.
+
+Any richer policy — a per-rule opt-in to evaluate on partial coverage,
+with a marked notification — remains assigned to epic #1052, which owns
+alerting, exactly as the previous amendment already recorded.
+
+**Decision (analytics): a request-body opt-in, mirroring the HTTP gate.**
+`AnalyticsBody` (`analytics.rs`) gains `allow_partial: bool`
+(`serde(default)`, so absent means `false`). After evaluation — coverage
+is only knowable then — the handler gates: `stats.partial` with no opt-in
+fails with the same typed shape the HTTP endpoints use,
+`ApiError::Unavailable` (HTTP 503, `errorType: "unavailable"`,
+`crates/ravel-query/src/http/error.rs`), naming the degraded clusters
+(operator-facing names only, the standing redaction rule) and naming the
+`allow_partial` body field so the remedy is in the failure itself. An
+opted-in partial response is 200 and the envelope gains the same
+top-level `partial` field the previous amendment gave the query
+endpoints (required, `false` on complete coverage) plus a top-level
+`warnings` array carrying `stats.warnings`, both of which this endpoint
+currently drops. A body field rather than a query-string parameter
+because this endpoint's request contract is the JSON body; splitting
+consent into the query string would put one field of the contract in a
+different channel than all the others.
+
+**Rejected alternatives.**
+
+1. *Evaluate alert rules anyway and mark the notification/record as
+   partial-coverage-derived.* Rejected for the reasons argued above:
+   false resolves are confident silence, durable records written from
+   partial data need later reconciliation, and a marker cannot un-page or
+   un-silence. Revisit per-rule under #1052 if a concrete rule class
+   needs it.
+2. *Skip the analytics gate and rely on the stats block.* That is the
+   exact defect class the previous amendment removed from the query
+   endpoints: an incompleteness signal buried where naive consumers never
+   look. The contract must be uniform or it has second-class endpoints.
+3. *A query-string `allow_partial` on the analytics endpoint.* Contract
+   splitting, as above.
+
+### 3. Dead-endpoint quarantine after worker death
+
+The liveness window (`crates/ravel-fleet/src/worker_set.rs`:
+`DEFAULT_HEARTBEAT_INTERVAL` H = 60s, `DEFAULT_LIVENESS_FACTOR` 3, reused
+by `QueryWorkers::with_defaults` in `query_workers.rs`) keeps a dead
+worker's record in the live set until its last heartbeat stamp ages past
+3H, and the coordinator's view (`RoutingSliceFetcher::live_workers`,
+`services/ravel-server/src/distrib.rs`) refreshes only once per H in
+`spawn_heartbeat`. A worker that dies right after heartbeating is
+therefore still ranked by `ranked_owners` for up to 3H plus one refresh
+cycle — about four minutes at defaults. During that window every slice
+rendezvous-mapped to it pays `REMOTE_CONNECT_TIMEOUT` (3s, `distrib.rs`)
+on the primary dispatch, possibly again on a dead second owner, before
+the local fallback. After a mass death (an AZ loss, a node-pool
+scale-down) that is 3-6 seconds added to nearly every distributed query
+for minutes, cluster-wide. Correctness is never at stake — the fallback
+chain ends coordinator-local — this is purely the bounded-added-latency
+item (P3).
+
+**Decision: passive endpoint quarantine, readmitted by the worker's own
+next heartbeat.** Coordinator-local soft state in `RoutingSliceFetcher`:
+a map from fragment endpoint to the worker's heartbeat stamp
+(`QueryWorkerRecord::started_unix_ns`) as seen in the live view at the
+moment the endpoint failed.
+
+- **Mark.** `dispatch` already classifies transport loss and an
+  `Unavailable` summary as `Attempt::Retry` before re-dispatching; that
+  classification point additionally records the endpoint and its
+  current live-view stamp into the quarantine map. No new failure
+  detection is invented; the signal is the dispatch that already failed.
+- **Skip.** `ranked_owners` drops a candidate whose endpoint is
+  quarantined *and* whose live-view record still carries a stamp no newer
+  than the one recorded at mark time. The slice routes to the next
+  rendezvous owner or `SelfLocal` with zero added latency.
+- **Readmit.** A strictly newer heartbeat stamp readmits the endpoint
+  (and clears its entry). The worker's own heartbeat is the half-open
+  probe: only the worker writes its record (single-writer key,
+  `query_workers.rs`), so a newer stamp is first-hand evidence of life,
+  not an inference. Because mark-stamp and readmit-stamp are both the
+  worker's own clock, the comparison crosses no clock domain and adds no
+  skew assumption beyond what the 3H liveness window already makes.
+  Worst-case readmission lag for a recovered (or merely briefly
+  overloaded) worker is one heartbeat interval plus one refresh cycle,
+  about 2H.
+- **Prune.** Entries whose endpoint is absent from the current live view
+  are dropped opportunistically (such endpoints are never ranked anyway),
+  bounding the map by the historical worker-set size.
+
+Cost profile after a mass death: each coordinator pays the connect
+timeout once per dead endpoint (the marking dispatch), and every
+subsequent query routes past the corpse instantly instead of re-paying it
+for up to four minutes. No baseline, no threshold, no tunable, no new
+task, no cross-process coordination, no durable state: object storage
+remains the only durable backend, untouched. A drained worker (the
+designed drain path is heartbeat staleness) stops heartbeating, so it
+never readmits and ages out of the live set as today. The `Unavailable`
+summary case (a worker that is alive but refusing) self-clears within
+about one interval, since its heartbeats continue. Observability:
+`ravel_distrib_*` gains quarantine mark/readmit counters and a
+currently-quarantined gauge; tests fault-inject a transport failure and
+assert the second query routes local with no dial, then assert a fresh
+stamp readmits.
+
+**Rejected alternatives.**
+
+1. *A rolling live-count baseline that shrinks the liveness window (or
+   bypasses ranking) when the observed live fraction drops in one refresh
+   cycle.* Two tunables (fraction, baseline horizon) with no principled
+   values, reaction latency of a refresh cycle (up to 60s, versus 3s for
+   the first failed dial), a group-level trigger for what is observable
+   per endpoint, and a false-trip mode: mass death correlates with
+   store-side incidents, exactly when a LIST hiccup could distort the
+   baseline. The per-endpoint signal is strictly earlier and strictly
+   simpler.
+2. *A full circuit breaker with half-open probing.* The half-open probe
+   already exists and is better than anything a coordinator could send:
+   the worker-authored heartbeat, written on its own key, read on the
+   refresh cycle the coordinator already runs. A prober adds a state
+   machine and background dials to reproduce evidence the membership
+   system already delivers.
+3. *Shrinking `DEFAULT_LIVENESS_FACTOR` or the heartbeat interval.*
+   Shared constants with the maintain plane (`worker_set.rs`), and a
+   tighter window makes legitimately slow workers flap during exactly the
+   correlated-latency incidents that accompany mass death. The window is
+   doing its job (absorbing skew and jitter); the defect is paying
+   connect timeouts repeatedly inside it.
+
+### Implementation scope and sequencing
+
+All three decisions are code changes inside `services/ravel-server`
+(decision 2 also touches nothing outside it: the engine-side `Coverage`
+plumbing was decided and scoped by the previous amendment). Per decision,
+the files:
+
+1. **TLS default flip:** `services/ravel-server/src/config.rs`
+   (`parse_remote_clusters` default, key docs, parse tests),
+   `services/ravel-server/src/lib.rs` (`warn_plaintext_federation`),
+   `services/ravel-server/src/main.rs` (the call, beside the existing
+   warn calls), `docs/guides/operations.md`. `distrib.rs` is not edited.
+2. **Engine-direct caller honesty:** `services/ravel-server/src/analytics.rs`
+   (`AnalyticsBody.allow_partial`, the gate, the two new envelope
+   fields, tests). The alerting half is *not* re-dispatched: wiring
+   `Coverage::Partial` into `alerting.rs` was already placed in the
+   previous amendment's implementation scope and stays there; this
+   amendment only supplied its rationale. If that work has not landed
+   when this dispatches, the analytics task must not touch `alerting.rs`
+   anyway.
+3. **Dead-endpoint quarantine:** `services/ravel-server/src/distrib.rs`
+   only (`RoutingSliceFetcher` state, `ranked_owners` skip,
+   `dispatch`/`try_remote` mark, metrics, tests). `crates/ravel-fleet`
+   is unchanged.
+
+Decisions 1 and 2 both touch `services/ravel-server` but on disjoint
+files (`config.rs`/`lib.rs`/`main.rs` versus `analytics.rs`), and neither
+adds a dependency or touches the crate's `Cargo.toml`. They do not need
+to be one combined task: dispatch them as separate tasks and merge them
+sequentially (same crate, so sequential merges keep each PR's gates
+honest against the other's landed state). Decision 3's file (`distrib.rs`)
+is disjoint from both. All three can be in flight concurrently in
+dedicated clones; only the merges serialize.
+
+### Consequences (amendment)
+
+- Upgrade behavior change, deliberate and stated: a `--remote-cluster`
+  spec with no `tls=` key dials TLS after upgrade, and a remote still
+  serving plaintext becomes unavailable at query time until the operator
+  enables TLS there or writes `tls=off`. Plaintext federation now
+  announces itself in the startup log, every start.
+- During a partial-coverage window, federated alert rules freeze at prior
+  state rather than transitioning on incomplete data; the freeze is
+  visible in `rules_failed` and per-rule logs, and operators should
+  meta-alert on it.
+- The analytics endpoint joins the uniform partial-results contract: a
+  naive caller gets a typed 503 instead of a silently incomplete 200, and
+  an opted-in caller gets the same top-level `partial` and `warnings`
+  fields as the query endpoints. Additive envelope change only.
+- Coordinators carry transient per-endpoint quarantine state. Added
+  latency after mass worker death drops from 3-6s on nearly every
+  distributed query for up to ~4 minutes to one 3s connect timeout per
+  dead endpoint per coordinator; readmission of a recovered worker takes
+  at most about two heartbeat intervals.
+- No persistent format, protocol version, proto schema, or durable state
+  changes anywhere in this amendment. `queryfrag` is untouched; all new
+  state is config-time or in-memory.
