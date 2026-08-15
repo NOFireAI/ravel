@@ -2,20 +2,29 @@
 //! (docs/span-segment-format.md).
 //!
 //! [`RspanWriter::finish`] runs the full pipeline: sort records by
-//! `(trace_id, start_ts)`, chunk into blocks, build each block and its
-//! interval-aware SKIP_IDX entry, then emit the BLOCKS and SKIP_IDX sections,
-//! the footer, and the trailer. Identical input yields byte-identical output.
+//! `(trace_id, start_ts)`, resolve each into storage form (lift `service.name`,
+//! split the remaining attributes into per-key string columns under the
+//! 1000-column budget with overflow folded into `attrs_raw`, and decode the
+//! `_events_raw` blob into nested event columns), chunk into blocks, build each
+//! block and its interval-aware SKIP_IDX entry plus its token bloom, then emit
+//! the BLOCKS, SKIP_IDX, and BLOOM sections, the footer, and the trailer.
+//! Identical input yields byte-identical output.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ravel_codec::bloom::BloomBuilder;
 use ravel_codec::bloom_section::encode_bloom_section;
 use ravel_codec::tokenizer::tokens;
 
-use crate::block::{BlockWriteOut, write_block};
+use crate::block::{BlockWriteOut, ColumnPlan, write_block};
 use crate::error::SpanSegError;
 use crate::footer::{
     COMP_NONE, COMP_ZSTD, SectionDesc, SpanFooter, kind, write_footer_and_trailer,
 };
-use crate::record::{COL_NAME, COL_SERVICE_NAME, SpanRecord, service_name_of};
+use crate::record::{
+    COL_NAME, COL_SERVICE_NAME, EVENTS_RAW_KEY, FIRST_DYNAMIC_COL, ResolvedSpanRow,
+    SERVICE_NAME_KEY, SpanEvent, SpanRecord, encode_attrs, parse_events,
+};
 use crate::skip_index::{BlockEntry, SkipIndex};
 
 /// Seed for every RSPAN block bloom (ADR-0054). Fixed, not configurable: the
@@ -23,6 +32,12 @@ use crate::skip_index::{BlockEntry, SkipIndex};
 /// from the bytes and a query never needs to know it. A constant keeps writer
 /// output byte-deterministic for identical input.
 const BLOOM_SEED: u64 = 0;
+
+/// The most dynamic per-key attribute columns one object may carry (v4, ports
+/// RLOG's cap). Object-wide: the distinct attribute keys are sorted and the
+/// first this-many get columns; keys past it fold into `attrs_raw` per row. A
+/// single record with more than this many distinct keys therefore overflows.
+const MAX_DYNAMIC_COLUMNS: usize = 1000;
 
 /// Writer configuration and format constants (docs/span-segment-format.md).
 #[derive(Clone, Copy, Debug)]
@@ -115,21 +130,64 @@ impl RspanWriter {
                 .then_with(|| a.start_ts_ns.cmp(&b.start_ts_ns))
         });
 
-        let spans = chunk_blocks(&self.records, &self.cfg);
+        let min_trace_id = self.records[0].trace_id;
+        let max_trace_id = self.records[self.records.len() - 1].trace_id;
+        let record_count = self.records.len() as u64;
+
+        // Pass 1: canonicalize each record's attrs and split off service.name,
+        // events, and the remaining ("other") attribute pairs.
+        let pre: Vec<PreResolved> = self.records.iter().map(pre_resolve).collect();
+
+        // Object-wide dynamic column assignment: distinct "other" attribute
+        // keys, sorted, the first MAX_DYNAMIC_COLUMNS get columns.
+        let mut distinct: BTreeSet<&str> = BTreeSet::new();
+        for p in &pre {
+            for (k, _) in &p.other {
+                distinct.insert(k.as_str());
+            }
+        }
+        let mut column_of: HashMap<String, u32> = HashMap::new();
+        let mut plans: Vec<ColumnPlan> = Vec::new();
+        for (idx, name) in distinct.into_iter().enumerate() {
+            if idx >= MAX_DYNAMIC_COLUMNS {
+                break;
+            }
+            let column_id = FIRST_DYNAMIC_COL + idx as u32;
+            column_of.insert(name.to_string(), column_id);
+            plans.push(ColumnPlan {
+                column_id,
+                name: name.to_string(),
+            });
+        }
+
+        // Pass 2: resolve each row, folding out-of-budget keys into attrs_raw.
+        let rows: Vec<ResolvedSpanRow> = pre
+            .into_iter()
+            .map(|p| resolve_row(p, &column_of))
+            .collect();
+
+        let spans = chunk_blocks(&rows, &self.cfg);
 
         let mut blocks_bytes: Vec<u8> = Vec::new();
         let mut entries: Vec<BlockEntry> = Vec::with_capacity(spans.len());
-        // One serialized bloom per block, positionally addressed: entry i covers
-        // block i (ADR-0054). Over span-name tokens (field COL_NAME) and
-        // service.name tokens (field COL_SERVICE_NAME).
         let mut bloom_entries: Vec<Vec<u8>> = Vec::with_capacity(spans.len());
         let mut min_start = i64::MAX;
         let mut max_end = i64::MIN;
 
         for span in &spans {
-            let rows = &self.records[span.clone()];
-            let out: BlockWriteOut = write_block(rows, self.cfg.zstd_level)?;
-            bloom_entries.push(build_block_bloom(rows));
+            let block_rows = &rows[span.clone()];
+            // Dynamic columns present in this block, in ascending id order.
+            let present: BTreeSet<u32> = block_rows
+                .iter()
+                .flat_map(|r| r.columns.iter().map(|(cid, _)| *cid))
+                .collect();
+            let block_plans: Vec<ColumnPlan> = plans
+                .iter()
+                .filter(|p| present.contains(&p.column_id))
+                .cloned()
+                .collect();
+            let out: BlockWriteOut = write_block(block_rows, &block_plans, self.cfg.zstd_level)?;
+            bloom_entries.push(build_block_bloom(block_rows));
             min_start = min_start.min(out.min_start_ts);
             max_end = max_end.max(out.max_end_ts);
             let block_offset = blocks_bytes.len() as u64;
@@ -152,9 +210,7 @@ impl RspanWriter {
         let skip = SkipIndex::new(entries);
 
         // Assemble sections in kind order: BLOCKS (raw), SKIP_IDX (zstd),
-        // BLOOM (raw). The bloom bit arrays are near-incompressible, so the
-        // section is stored raw; its per-entry crc32c framing (ravel-codec)
-        // plus the section's own Section.crc32c cover it (ADR-0054).
+        // BLOOM (raw).
         let mut object = Vec::new();
         let mut sections: Vec<SectionDesc> = Vec::new();
         push_section(
@@ -171,10 +227,6 @@ impl RspanWriter {
             kind::BLOOM,
             Stored::raw(encode_bloom_section(&bloom_entries)),
         );
-
-        let record_count = self.records.len() as u64;
-        let min_trace_id = self.records[0].trace_id;
-        let max_trace_id = self.records[self.records.len() - 1].trace_id;
 
         let footer = SpanFooter {
             tenant_hash: self.identity.tenant_hash,
@@ -198,18 +250,100 @@ impl RspanWriter {
     }
 }
 
+/// A record after canonicalizing its attrs and splitting off the lifted
+/// `service.name`, the decoded events, and the remaining attribute pairs
+/// (sorted, unique keys) that become dynamic columns or attrs_raw overflow.
+struct PreResolved {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    parent_span_id: Option<[u8; 8]>,
+    name: String,
+    start_ts_ns: i64,
+    end_ts_ns: i64,
+    status_code: crate::record::StatusCode,
+    status_message: Option<String>,
+    service_name: Option<String>,
+    events: Vec<SpanEvent>,
+    other: Vec<(String, String)>,
+}
+
+/// Pass 1: canonicalize `rec.attrs` (sorted, duplicate keys collapsed last-wins,
+/// exactly [`encode_attrs`]'s canonical form) and split off `service.name` and
+/// a parseable `_events_raw`. An unparseable `_events_raw` stays in `other` and
+/// round-trips as an ordinary attribute.
+fn pre_resolve(rec: &SpanRecord) -> PreResolved {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in &rec.attrs {
+        map.insert(k.clone(), v.clone());
+    }
+    let service_name = map.remove(SERVICE_NAME_KEY);
+    let mut events = Vec::new();
+    if let Some(v) = map.get(EVENTS_RAW_KEY)
+        && let Some(evs) = parse_events(v)
+    {
+        events = evs;
+        map.remove(EVENTS_RAW_KEY);
+    }
+    let other: Vec<(String, String)> = map.into_iter().collect();
+    PreResolved {
+        trace_id: rec.trace_id,
+        span_id: rec.span_id,
+        parent_span_id: rec.parent_span_id,
+        name: rec.name.clone(),
+        start_ts_ns: rec.start_ts_ns,
+        end_ts_ns: rec.end_ts_ns,
+        status_code: rec.status_code,
+        status_message: rec.status_message.clone(),
+        service_name,
+        events,
+        other,
+    }
+}
+
+/// Pass 2: split the "other" attributes into in-budget columns and overflow.
+fn resolve_row(p: PreResolved, column_of: &HashMap<String, u32>) -> ResolvedSpanRow {
+    let mut columns: Vec<(u32, String)> = Vec::new();
+    let mut overflow: Vec<(String, String)> = Vec::new();
+    for (k, v) in p.other {
+        match column_of.get(&k) {
+            Some(&cid) => columns.push((cid, v)),
+            None => overflow.push((k, v)),
+        }
+    }
+    columns.sort_by_key(|(cid, _)| *cid);
+    let attrs_raw = if overflow.is_empty() {
+        None
+    } else {
+        Some(encode_attrs(&overflow))
+    };
+    ResolvedSpanRow {
+        trace_id: p.trace_id,
+        span_id: p.span_id,
+        parent_span_id: p.parent_span_id,
+        name: p.name,
+        start_ts_ns: p.start_ts_ns,
+        end_ts_ns: p.end_ts_ns,
+        status_code: p.status_code,
+        status_message: p.status_message,
+        service_name: p.service_name,
+        columns,
+        attrs_raw,
+        events: p.events,
+    }
+}
+
 /// Builds one block's serialized bloom entry (ADR-0054): span-name tokens
 /// scoped to field [`COL_NAME`], and `service.name` tokens scoped to field
 /// [`COL_SERVICE_NAME`], so a `name = <lit>` probe and a `service_name = <lit>`
 /// probe read the same bloom through disjoint field ids. Token rule is
 /// `ravel-codec`'s normative tokenizer, shared with RLOG.
-fn build_block_bloom(rows: &[SpanRecord]) -> Vec<u8> {
+fn build_block_bloom(rows: &[ResolvedSpanRow]) -> Vec<u8> {
     let mut builder = BloomBuilder::new(BLOOM_SEED);
     for r in rows {
         for tok in tokens(&r.name) {
             builder.insert(COL_NAME, &tok);
         }
-        if let Some(service) = service_name_of(&r.attrs) {
+        if let Some(service) = &r.service_name {
             for tok in tokens(service) {
                 builder.insert(COL_SERVICE_NAME, &tok);
             }
@@ -220,7 +354,7 @@ fn build_block_bloom(rows: &[SpanRecord]) -> Vec<u8> {
 
 /// Splits row indices into block spans by record target and an estimated
 /// uncompressed byte cap.
-fn chunk_blocks(rows: &[SpanRecord], cfg: &RspanConfig) -> Vec<std::ops::Range<usize>> {
+fn chunk_blocks(rows: &[ResolvedSpanRow], cfg: &RspanConfig) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
     let mut start = 0usize;
     let mut bytes = 0usize;
@@ -240,15 +374,25 @@ fn chunk_blocks(rows: &[SpanRecord], cfg: &RspanConfig) -> Vec<std::ops::Range<u
     spans
 }
 
-/// A rough uncompressed byte estimate for one span, for the block byte cap.
-fn row_estimate(row: &SpanRecord) -> usize {
+/// A rough uncompressed byte estimate for one resolved span, for the block byte
+/// cap.
+fn row_estimate(row: &ResolvedSpanRow) -> usize {
     let mut est = 48; // fixed-field overhead (ids, timestamps, status)
     est += row.name.len();
     if let Some(m) = &row.status_message {
         est += m.len();
     }
-    for (k, v) in &row.attrs {
-        est += k.len() + v.len() + 4;
+    if let Some(s) = &row.service_name {
+        est += s.len();
+    }
+    if let Some(raw) = &row.attrs_raw {
+        est += raw.len();
+    }
+    for (_, v) in &row.columns {
+        est += v.len() + 4;
+    }
+    for ev in &row.events {
+        est += 12 + ev.name.len() + ev.attrs_blob.len();
     }
     est
 }
@@ -344,7 +488,10 @@ mod tests {
             for i in 0..1000i64 {
                 let trace = (i % 4) as u8;
                 let mut r = span(trace, i as u8, i, i + 10);
-                r.attrs = vec![("svc".into(), format!("s{trace}"))];
+                r.attrs = vec![
+                    ("service.name".into(), format!("s{trace}")),
+                    ("http.method".into(), "GET".into()),
+                ];
                 w.push(r);
             }
             w.finish().expect("finish")
@@ -356,7 +503,6 @@ mod tests {
         let footer = open(&a).expect("open");
         assert_eq!(footer.record_count, 1000);
         assert_eq!(footer.block_count, 10);
-        // Whole-object bounds.
         assert_eq!(footer.min_start_ts_ns, 0);
         assert_eq!(footer.max_end_ts_ns, 1009);
         assert_eq!(footer.min_trace_id, [0u8; 16]);
@@ -365,14 +511,8 @@ mod tests {
 
     /// `finish_compacted` stamps the caller's compaction identity, shares its
     /// section bodies byte-for-byte with a plain `finish` of the same records,
-    /// and -- the property RSPAN compaction crash-recovery convergence depends
-    /// on (rspan_codec.rs, plan Section 3.4) -- reproduces byte-identical
-    /// *whole-object* bytes when the same inputs and identity are compacted
-    /// again from scratch. That last property is what a crashed run does on
-    /// retry: it rebuilds the L1 part and republishes it under a
-    /// content-addressed CreateIfAbsent key computed over the whole part, so
-    /// the retry converges only if every byte (footer and trailer included, not
-    /// just the shared section bodies) reproduces exactly.
+    /// and reproduces byte-identical whole-object bytes on an independent
+    /// rebuild (the crash-recovery convergence property).
     #[test]
     fn finish_compacted_stamps_identity_shares_body_and_is_rebuild_stable() {
         let build = |records: &[SpanRecord]| {
@@ -383,7 +523,11 @@ mod tests {
             w
         };
         let records: Vec<SpanRecord> = (0..50i64)
-            .map(|i| span((i % 3) as u8, i as u8, i, i + 5))
+            .map(|i| {
+                let mut r = span((i % 3) as u8, i as u8, i, i + 5);
+                r.attrs = vec![("k".into(), format!("v{i}"))];
+                r
+            })
             .collect();
 
         let l0 = build(&records).finish().expect("finish");
@@ -400,21 +544,12 @@ mod tests {
         assert_eq!(f1.level, 1);
         assert_eq!(f1.input_set_hash, hash);
         assert_eq!(f1.part_index, 2);
-        // Sections are byte-identical; only footer identity differs.
         assert_eq!(f0.sections, f1.sections);
         for s in &f0.sections {
             let range = |o: u64, l: u64| (o as usize)..((o + l) as usize);
             assert_eq!(&l0[range(s.offset, s.len)], &l1[range(s.offset, s.len)]);
         }
 
-        // Crash-recovery convergence: an independent rebuild from the same
-        // records and the same compaction identity -- exactly what a crashed
-        // compaction does when it is retried from scratch -- must yield
-        // byte-identical whole-object bytes, footer and trailer included, so the
-        // retry's content-addressed part key matches the original and the
-        // republish converges instead of forking a divergent part. The
-        // section-body checks above stop short of this: they never compare the
-        // trailing footer/trailer bytes across a second finish_compacted call.
         let l1_rebuild = build(&records)
             .finish_compacted(1, hash.clone(), 2)
             .expect("finish_compacted rebuild");

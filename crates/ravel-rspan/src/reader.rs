@@ -619,10 +619,26 @@ mod proptests {
             // space ("[a-z.]{1,8}" caps at 8 chars, "service.name" is 12), so it
             // never collides with a random attr.
             service in proptest::option::of("[a-z][a-z0-9 ./_-]{0,20}"),
+            // Zero or more span events, each an arbitrary opaque payload. Framed
+            // as the ingest path frames `_events_raw` (length-delimited, hex),
+            // so the round trip exercises the nested event columns: the writer
+            // promotes the blob into columns and the reader reconstructs the
+            // identical value.
+            event_payloads in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..8), 0..3),
         ) -> SpanRecord {
             let mut attrs: Vec<(String, String)> = attrs.into_iter().collect();
             if let Some(s) = service {
                 attrs.push(("service.name".to_string(), s));
+            }
+            if !event_payloads.is_empty() {
+                let mut raw = Vec::new();
+                for p in &event_payloads {
+                    crate::varint::put_uvarint(&mut raw, p.len() as u64);
+                    raw.extend_from_slice(p);
+                }
+                let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+                attrs.push(("_events_raw".to_string(), hex));
             }
             SpanRecord {
                 trace_id: [trace; 16],

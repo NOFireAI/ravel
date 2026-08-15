@@ -1720,27 +1720,39 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
         println!("bloom ({} block(s))", bloom.len());
 
         // One line per span, in the object's stored (trace_id, start_ts) order.
-        // `service_name` is the v3 dictionary column lifted out of the attrs
-        // blob (ADR-0054); print it as its own column and list the remaining
-        // attrs with `service.name` filtered out, mirroring the on-disk split
-        // rather than the reader-reconstructed record where it is re-inserted.
+        // `service_name` is the column lifted out of the attribute map (v3,
+        // ADR-0054); print it as its own column. The remaining attributes come
+        // from the v4 per-key columns and the `attrs_raw` overflow, reassembled
+        // by the reader; list them with `service.name` and the events blob
+        // filtered out (events are printed structurally below). Span events
+        // (v4, ADR-0045 decision 3) are decoded from the reconstructed
+        // `_events_raw` value back into their nested fields.
         let (records, _stats) = reader
             .scan(&ravel_rspan::SpanQuery::ts_range(i64::MIN, i64::MAX))
             .map_err(|err| anyhow::anyhow!("failed to scan span records: {err}"))?;
         println!("records ({}):", records.len());
         for (i, rec) in records.iter().enumerate() {
             let service = ravel_rspan::record::service_name_of(&rec.attrs).unwrap_or("");
+            let events = rec
+                .attrs
+                .iter()
+                .find(|(k, _)| k == ravel_rspan::record::EVENTS_RAW_KEY)
+                .and_then(|(_, v)| ravel_rspan::record::parse_events(v))
+                .unwrap_or_default();
             let attrs = rec
                 .attrs
                 .iter()
-                .filter(|(k, _)| k != ravel_rspan::record::SERVICE_NAME_KEY)
+                .filter(|(k, _)| {
+                    k != ravel_rspan::record::SERVICE_NAME_KEY
+                        && k != ravel_rspan::record::EVENTS_RAW_KEY
+                })
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(",");
             println!(
                 "  record[{i}] trace_id={} span_id={} parent_span_id={} name={} \
                  start_ts_ns={} end_ts_ns={} status={} status_message={} \
-                 service_name={} attrs={}",
+                 service_name={} attrs={} events={}",
                 hex::encode(rec.trace_id),
                 hex::encode(rec.span_id),
                 rec.parent_span_id.map(hex::encode).unwrap_or_default(),
@@ -1751,7 +1763,16 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
                 rec.status_message.as_deref().unwrap_or(""),
                 service,
                 attrs,
+                events.len(),
             );
+            for (j, ev) in events.iter().enumerate() {
+                println!(
+                    "    event[{j}] ts_ns={} name={} attrs_blob={}",
+                    ev.ts_ns,
+                    ev.name,
+                    hex::encode(&ev.attrs_blob),
+                );
+            }
         }
     }
 

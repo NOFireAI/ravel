@@ -13,14 +13,15 @@
 //! SKIP_IDX plus one trace's blocks, not the whole object -- the RSPAN
 //! analogue of RLOG's `RlogRangeReader`
 //! (`ravel-logseg/src/ranged.rs`), the model this follows (ADR-0045 decision
-//! 6). RSPAN needs no STREAM_DIR/FIELD_DIR equivalent: every field of a
-//! `SpanRecord` is stored inline per row with no per-object directory to
-//! remap (docs/span-segment-format.md), so this reader is simpler than
-//! RLOG's: one section to decode, and no column-plan indirection to rebuild
-//! a record.
+//! 6). RSPAN needs no STREAM_DIR/FIELD_DIR *section* to remap: even v4's
+//! per-key attribute columns are self-describing, because each block embeds its
+//! own `(column_id, name)` directory (docs/span-segment-format.md "BLOCKS"). So
+//! this reader is still simpler than RLOG's: one section to decode, and no
+//! external column-plan indirection to rebuild a record --
+//! [`crate::block::read_block`] resolves every column from the block alone.
 //!
-//! The format is unchanged: this reader parses exactly the bytes
-//! docs/span-segment-format.md already defines. Record decode reuses
+//! This reader parses exactly the bytes docs/span-segment-format.md defines for
+//! the current trailer version. Record decode reuses
 //! [`crate::block::read_block`] and `DecodedBlock::record`, the same path the
 //! whole-object reader uses, so a record decoded through a selective fetch is
 //! byte-for-byte the record a whole-object scan would produce.

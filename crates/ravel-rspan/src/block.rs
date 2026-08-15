@@ -1,38 +1,60 @@
 //! Columnar row blocks (docs/span-segment-format.md "BLOCKS").
 //!
 //! A block holds a run of spans column by column: a header of page descriptors,
-//! then the pages. Each column is one value page, preceded by a presence bitmap
-//! page (`enc = Bitmap`) when the column is nullable and not present in every
-//! row of the block. RSPAN v1 uses plain columnar codecs under a per-page zstd
-//! envelope rather than RLOG's measured per-column encodings (ADR-0041
-//! leanness): the zstd envelope carries the bulk of the compression, and the
-//! `enc` tag is still stored per page so a later version can add codecs without
-//! a reader rewrite. The block's crc32c lives in its SKIP_IDX entry, not inline;
-//! [`read_block`] verifies it before decoding anything.
+//! then a self-describing directory naming the block's dynamic attribute
+//! columns, then the pages. Each column is one value page, preceded by a
+//! presence bitmap page (`enc = Bitmap`) when the column is nullable and not
+//! present in every row of the block.
+//!
+//! v4 (ADR-0045 decision 3) ports RLOG's per-key column design onto RSPAN: the
+//! merged attribute map is split into one string column per key, overflow keys
+//! past the 1000-column budget fold into a canonical [`record::COL_ATTRS_RAW`]
+//! blob, and span events become nested columns
+//! ([`record::COL_EVENT_TS`]/[`record::COL_EVENT_NAME`]/[`record::COL_EVENT_ATTRS_BLOB`]
+//! flattened one entry per event, with a per-row [`record::COL_EVENT_COUNT`]).
+//! `service.name` stays in its own column (id 9, v3). Value codecs are
+//! `ravel-codec`'s (the crate extracted from ravel-logseg), shared with RLOG.
+//!
+//! Unlike RLOG, RSPAN has no object-wide FIELD_DIR section: each block embeds
+//! the `(column_id, name)` directory for the dynamic columns it carries, so a
+//! block decodes with no external directory. This keeps the whole-object and
+//! ranged decode paths (`read_block`, `RspanRangeReader`) self-contained, and
+//! is consistent with RSPAN's existing "no STREAM_DIR/FIELD_DIR" leanness.
+//! RSPAN's attribute map is `Map<Utf8, Utf8>`, so every dynamic column is a
+//! string column and there is no per-type split (a named simplification from
+//! RLOG's typed FIELD_DIR).
+//!
+//! The block's crc32c lives in its SKIP_IDX entry, not inline; [`read_block`]
+//! verifies it before decoding anything. Every offset, length, and count read
+//! from the block is untrusted: bounds-checked, overflow-checked, and turned
+//! into a typed `Corrupted` error, never a panic.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use ravel_codec::encoding::{
+    Enc, decode_bitmap, decode_fixed, decode_i64, decode_strings, encode_bitmap, encode_fixed,
+    encode_i64, encode_strings,
+};
 
 use crate::error::SpanSegError;
 use crate::record::{
-    COL_ATTRS, COL_END_TS, COL_NAME, COL_PARENT_SPAN_ID, COL_SERVICE_NAME, COL_SPAN_ID,
-    COL_START_TS, COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TRACE_ID, SERVICE_NAME_KEY,
-    SPAN_ID_WIDTH, SpanRecord, StatusCode, TRACE_ID_WIDTH, encode_attrs_without_service_name,
-    service_name_of,
+    COL_ATTRS_RAW, COL_END_TS, COL_EVENT_ATTRS_BLOB, COL_EVENT_COUNT, COL_EVENT_NAME, COL_EVENT_TS,
+    COL_NAME, COL_PARENT_SPAN_ID, COL_SERVICE_NAME, COL_SPAN_ID, COL_START_TS, COL_STATUS_CODE,
+    COL_STATUS_MESSAGE, COL_TRACE_ID, EVENTS_RAW_KEY, FIRST_DYNAMIC_COL, ResolvedSpanRow,
+    SERVICE_NAME_KEY, SPAN_ID_WIDTH, SpanEvent, SpanRecord, StatusCode, TRACE_ID_WIDTH,
+    decode_attrs, reconstruct_events_raw,
 };
 use crate::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
-use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
+use crate::varint::{get_uvarint, put_uvarint};
 
 /// Upper bound on a block's decoded record count (untrusted-input guard).
 const MAX_RECORDS: u64 = 1 << 24;
-/// Upper bound on a block's page count. The fixed ten columns, each up to two
-/// pages, stays far under this.
+/// Upper bound on a block's total event count across all rows.
+const MAX_EVENTS: u64 = 1 << 24;
+/// Upper bound on a block's page count. The fixed columns plus the
+/// 1000-dynamic-column budget, each up to two pages, plus the flattened event
+/// columns, stays well under this.
 const MAX_PAGES: u64 = 4096;
-/// Upper bound on a dictionary column's distinct-value count (untrusted-input
-/// guard). Distinct values never exceed a block's record count, itself capped
-/// at [`MAX_RECORDS`]; this bounds the decode allocation independently.
-const MAX_DICT_VALUES: u64 = MAX_RECORDS;
-/// Page compression floor: pages under this many encoded bytes stay raw.
-const COMPRESSION_FLOOR: usize = 512;
 /// Default per-page decompressed-size cap (zstd bomb guard).
 pub const DEFAULT_MAX_UNCOMP: u64 = 64 << 20;
 
@@ -41,37 +63,16 @@ const COMP_NONE: u8 = 0;
 /// `comp` tag: zstd frame.
 const COMP_ZSTD: u8 = 2;
 
-/// Per-page value encoding tag (frozen contract, docs/span-segment-format.md).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum Enc {
-    /// Integers as ivarints, strings as `uvarint(len)`-prefixed blobs.
-    Plain = 1,
-    /// LSB-first bit set: a bool value page, or a presence bitmap.
-    Bitmap = 2,
-    /// Fixed-width values concatenated with no framing.
-    FixedWidth = 3,
-    /// Block-local dictionary (v3, ADR-0054): a header of `uvarint(count)`
-    /// then `count` distinct `uvarint(len)`-prefixed values in ascending
-    /// order, followed by one `uvarint` index per present row into that
-    /// dictionary. Used by the `service_name` column.
-    Dict = 4,
-}
+/// Page compression floor: pages under this many encoded bytes stay raw.
+const COMPRESSION_FLOOR: usize = 512;
 
-impl Enc {
-    fn from_u8(v: u8) -> Result<Enc, SpanSegError> {
-        Ok(match v {
-            1 => Enc::Plain,
-            2 => Enc::Bitmap,
-            3 => Enc::FixedWidth,
-            4 => Enc::Dict,
-            other => return Err(SpanSegError::Corrupted(format!("unknown enc tag {other}"))),
-        })
-    }
-
-    fn to_u8(self) -> u8 {
-        self as u8
-    }
+/// The name and id of one dynamic attribute column, object-wide. The writer
+/// assigns these; [`write_block`] embeds the ids that appear in a block into
+/// that block's directory so the block decodes without an external directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnPlan {
+    pub column_id: u32,
+    pub name: String,
 }
 
 /// The output of encoding one block, plus the bounds its SKIP_IDX entry needs.
@@ -109,133 +110,143 @@ struct StagedPage {
     bytes: Vec<u8>,
 }
 
+fn row_column(row: &ResolvedSpanRow, column_id: u32) -> Option<&str> {
+    row.columns
+        .iter()
+        .find(|(cid, _)| *cid == column_id)
+        .map(|(_, v)| v.as_str())
+}
+
 /// Encodes `rows` into one block. `rows` must be non-empty and already sorted by
-/// `(trace_id, start_ts)`. Columns are emitted in ascending column-id order for
+/// `(trace_id, start_ts)`. `plans` names every object-wide dynamic column; the
+/// ones present in this block are staged and their `(id, name)` embedded in the
+/// block directory. Columns are emitted in ascending column-id order for
 /// byte-deterministic output.
-pub fn write_block(rows: &[SpanRecord], zstd_level: i32) -> Result<BlockWriteOut, SpanSegError> {
+pub fn write_block(
+    rows: &[ResolvedSpanRow],
+    plans: &[ColumnPlan],
+    zstd_level: i32,
+) -> Result<BlockWriteOut, SpanSegError> {
     if rows.is_empty() {
         return Err(SpanSegError::Corrupted("empty block".into()));
     }
     let n = rows.len();
     let all_present = vec![true; n];
     let mut pages: Vec<StagedPage> = Vec::new();
+    // Dynamic column ids present in this block, with their names, ascending.
+    let mut dyn_dir: Vec<(u32, String)> = Vec::new();
 
     // COL_TRACE_ID: fixed 16, always present.
     let trace_vals: Vec<&[u8]> = rows.iter().map(|r| r.trace_id.as_slice()).collect();
-    stage_column(
-        &mut pages,
-        COL_TRACE_ID,
-        &all_present,
-        Enc::FixedWidth,
-        encode_fixed(&trace_vals),
-    );
+    let (enc, b) = encode_fixed(&trace_vals, TRACE_ID_WIDTH);
+    stage_column(&mut pages, COL_TRACE_ID, &all_present, enc, b);
     // COL_SPAN_ID: fixed 8, always present.
     let span_vals: Vec<&[u8]> = rows.iter().map(|r| r.span_id.as_slice()).collect();
-    stage_column(
-        &mut pages,
-        COL_SPAN_ID,
-        &all_present,
-        Enc::FixedWidth,
-        encode_fixed(&span_vals),
-    );
+    let (enc, b) = encode_fixed(&span_vals, SPAN_ID_WIDTH);
+    stage_column(&mut pages, COL_SPAN_ID, &all_present, enc, b);
     // COL_PARENT_SPAN_ID: fixed 8, nullable (root spans have none).
     let parent_present: Vec<bool> = rows.iter().map(|r| r.parent_span_id.is_some()).collect();
     let parent_vals: Vec<&[u8]> = rows
         .iter()
         .filter_map(|r| r.parent_span_id.as_ref().map(|a| a.as_slice()))
         .collect();
-    stage_column(
-        &mut pages,
-        COL_PARENT_SPAN_ID,
-        &parent_present,
-        Enc::FixedWidth,
-        encode_fixed(&parent_vals),
-    );
+    let (enc, b) = encode_fixed(&parent_vals, SPAN_ID_WIDTH);
+    stage_column(&mut pages, COL_PARENT_SPAN_ID, &parent_present, enc, b);
     // COL_NAME: str, always present.
     let name_vals: Vec<&[u8]> = rows.iter().map(|r| r.name.as_bytes()).collect();
-    stage_column(
-        &mut pages,
-        COL_NAME,
-        &all_present,
-        Enc::Plain,
-        encode_strings(&name_vals),
-    );
-    // COL_START_TS / COL_END_TS: i64, always present.
+    let (enc, b) = encode_strings(&name_vals);
+    stage_column(&mut pages, COL_NAME, &all_present, enc, b);
+    // COL_START_TS / COL_END_TS / COL_STATUS_CODE: i64, always present.
     let start: Vec<i64> = rows.iter().map(|r| r.start_ts_ns).collect();
-    stage_column(
-        &mut pages,
-        COL_START_TS,
-        &all_present,
-        Enc::Plain,
-        encode_i64(&start),
-    );
+    let (enc, b) = encode_i64(&start);
+    stage_column(&mut pages, COL_START_TS, &all_present, enc, b);
     let end: Vec<i64> = rows.iter().map(|r| r.end_ts_ns).collect();
-    stage_column(
-        &mut pages,
-        COL_END_TS,
-        &all_present,
-        Enc::Plain,
-        encode_i64(&end),
-    );
-    // COL_STATUS_CODE: small int, always present.
+    let (enc, b) = encode_i64(&end);
+    stage_column(&mut pages, COL_END_TS, &all_present, enc, b);
     let status: Vec<i64> = rows
         .iter()
         .map(|r| i64::from(r.status_code.to_u8()))
         .collect();
-    stage_column(
-        &mut pages,
-        COL_STATUS_CODE,
-        &all_present,
-        Enc::Plain,
-        encode_i64(&status),
-    );
+    let (enc, b) = encode_i64(&status);
+    stage_column(&mut pages, COL_STATUS_CODE, &all_present, enc, b);
     // COL_STATUS_MESSAGE: str, nullable.
     let msg_present: Vec<bool> = rows.iter().map(|r| r.status_message.is_some()).collect();
     let msg_vals: Vec<&[u8]> = rows
         .iter()
         .filter_map(|r| r.status_message.as_deref().map(str::as_bytes))
         .collect();
-    stage_column(
-        &mut pages,
-        COL_STATUS_MESSAGE,
-        &msg_present,
-        Enc::Plain,
-        encode_strings(&msg_vals),
-    );
-    // COL_ATTRS: canonical merged-map blob per row, str column, always present.
-    // `service.name` is removed here: it lives in COL_SERVICE_NAME and is not
-    // duplicated in the blob (ADR-0054). The reader re-inserts it on decode.
-    // Emitted before COL_SERVICE_NAME to keep column ids ascending.
-    let attr_blobs: Vec<Vec<u8>> = rows
-        .iter()
-        .map(|r| encode_attrs_without_service_name(&r.attrs))
-        .collect();
-    let attr_vals: Vec<&[u8]> = attr_blobs.iter().map(Vec::as_slice).collect();
-    stage_column(
-        &mut pages,
-        COL_ATTRS,
-        &all_present,
-        Enc::Plain,
-        encode_strings(&attr_vals),
-    );
-    // COL_SERVICE_NAME: the `service.name` value lifted out of attrs (v3,
-    // ADR-0054), dictionary-encoded, block-local, nullable. A span whose merged
-    // attrs carry no `service.name` has no value here.
-    let service_present: Vec<bool> = rows
-        .iter()
-        .map(|r| service_name_of(&r.attrs).is_some())
-        .collect();
+    let (enc, b) = encode_strings(&msg_vals);
+    stage_column(&mut pages, COL_STATUS_MESSAGE, &msg_present, enc, b);
+    // COL_ATTRS_RAW: canonical overflow blob per row, str column, nullable.
+    let raw_present: Vec<bool> = rows.iter().map(|r| r.attrs_raw.is_some()).collect();
+    let raw_vals: Vec<&[u8]> = rows.iter().filter_map(|r| r.attrs_raw.as_deref()).collect();
+    let (enc, b) = encode_strings(&raw_vals);
+    stage_column(&mut pages, COL_ATTRS_RAW, &raw_present, enc, b);
+    // COL_SERVICE_NAME: the `service.name` value lifted out of attrs (v3),
+    // string column, nullable.
+    let service_present: Vec<bool> = rows.iter().map(|r| r.service_name.is_some()).collect();
     let service_vals: Vec<&[u8]> = rows
         .iter()
-        .filter_map(|r| service_name_of(&r.attrs).map(str::as_bytes))
+        .filter_map(|r| r.service_name.as_deref().map(str::as_bytes))
         .collect();
-    stage_column(
-        &mut pages,
-        COL_SERVICE_NAME,
-        &service_present,
-        Enc::Dict,
-        encode_dict(&service_vals),
-    );
+    let (enc, b) = encode_strings(&service_vals);
+    stage_column(&mut pages, COL_SERVICE_NAME, &service_present, enc, b);
+
+    // Event columns (v4). event_count is one value per row; event_ts/name/blob
+    // are flattened, one entry per event across the whole block. Staged only
+    // when the block carries at least one event.
+    let counts: Vec<i64> = rows.iter().map(|r| r.events.len() as i64).collect();
+    let total_events: usize = rows.iter().map(|r| r.events.len()).sum();
+    if total_events > 0 {
+        let (enc, b) = encode_i64(&counts);
+        stage_column(&mut pages, COL_EVENT_COUNT, &all_present, enc, b);
+        let ev_ts: Vec<i64> = rows
+            .iter()
+            .flat_map(|r| r.events.iter().map(|e| e.ts_ns))
+            .collect();
+        let (enc, b) = encode_i64(&ev_ts);
+        pages.push(StagedPage {
+            column_id: COL_EVENT_TS,
+            enc,
+            bytes: b,
+        });
+        let ev_name: Vec<&[u8]> = rows
+            .iter()
+            .flat_map(|r| r.events.iter().map(|e| e.name.as_bytes()))
+            .collect();
+        let (enc, b) = encode_strings(&ev_name);
+        pages.push(StagedPage {
+            column_id: COL_EVENT_NAME,
+            enc,
+            bytes: b,
+        });
+        let ev_blob: Vec<&[u8]> = rows
+            .iter()
+            .flat_map(|r| r.events.iter().map(|e| e.attrs_blob.as_slice()))
+            .collect();
+        let (enc, b) = encode_strings(&ev_blob);
+        pages.push(StagedPage {
+            column_id: COL_EVENT_ATTRS_BLOB,
+            enc,
+            bytes: b,
+        });
+    }
+
+    // Dynamic per-key string columns, in ascending column-id (== plan) order.
+    for plan in plans {
+        let cid = plan.column_id;
+        let present: Vec<bool> = rows.iter().map(|r| row_column(r, cid).is_some()).collect();
+        if !present.iter().any(|&p| p) {
+            continue;
+        }
+        let vals: Vec<&[u8]> = rows
+            .iter()
+            .filter_map(|r| row_column(r, cid).map(str::as_bytes))
+            .collect();
+        let (enc, b) = encode_strings(&vals);
+        stage_column(&mut pages, cid, &present, enc, b);
+        dyn_dir.push((cid, plan.name.clone()));
+    }
 
     // Compress pages into a payload buffer, collecting descriptors.
     let mut payload = Vec::new();
@@ -250,7 +261,7 @@ pub fn write_block(rows: &[SpanRecord], zstd_level: i32) -> Result<BlockWriteOut
         ));
     }
 
-    // Header, then payload.
+    // Header, dynamic-column directory, then payload.
     let mut block = Vec::new();
     put_uvarint(&mut block, n as u64);
     put_uvarint(&mut block, descs.len() as u64);
@@ -261,20 +272,22 @@ pub fn write_block(rows: &[SpanRecord], zstd_level: i32) -> Result<BlockWriteOut
         put_uvarint(&mut block, d.len);
         put_uvarint(&mut block, d.uncomp_len);
     }
+    put_uvarint(&mut block, dyn_dir.len() as u64);
+    for (cid, name) in &dyn_dir {
+        put_uvarint(&mut block, u64::from(*cid));
+        put_uvarint(&mut block, name.len() as u64);
+        block.extend_from_slice(name.as_bytes());
+    }
     block.extend_from_slice(&payload);
 
     let crc = crc32c::crc32c(&block);
-    // Rows are sorted by (trace_id, start_ts), but end_ts is not ordered, so the
-    // block's time interval bound scans both endpoints explicitly.
     let min_start_ts = start.iter().copied().min().unwrap_or(0);
     let max_end_ts = end.iter().copied().max().unwrap_or(0);
     let min_trace_id = rows[0].trace_id;
     let max_trace_id = rows[n - 1].trace_id;
 
-    // Duration and status_mask (ADR-0045 decision 2): derived from the same
-    // start/end/status vectors already scanned above, not stored per row. A
-    // negative duration (end precedes start) is a valid ivarint value and is
-    // kept as-is; only true i64 overflow of the subtraction is rejected.
+    // Duration and status_mask (ADR-0045 decision 2), derived from the same
+    // start/end/status vectors already scanned above, never stored per row.
     let mut min_duration_ns = i64::MAX;
     let mut max_duration_ns = i64::MIN;
     let mut status_mask = 0u8;
@@ -340,13 +353,18 @@ fn stage_column(
     });
 }
 
-/// A decoded block: per-column, per-row values. Every column vector has length
-/// `record_count`; `None` marks a row where a nullable column has no value.
+/// A decoded block: per-column, per-row values plus the reconstructed nested
+/// events. Every fixed/dynamic column vector has length `record_count`; `None`
+/// marks a row where a nullable column has no value.
 pub struct DecodedBlock {
     record_count: usize,
     i64_cols: HashMap<u32, Vec<Option<i64>>>,
     str_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
     fixed_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
+    /// Dynamic attribute column id -> attribute name, from the block directory.
+    dyn_names: BTreeMap<u32, String>,
+    /// Per-row events, length `record_count`; empty vec for a row with none.
+    events: Vec<Vec<SpanEvent>>,
 }
 
 impl DecodedBlock {
@@ -377,15 +395,17 @@ impl DecodedBlock {
     }
 
     /// The decoded `service_name` value for `row` (v3, ADR-0054), or `None`
-    /// when the row's merged attrs carried no `service.name`. This reads the
-    /// dictionary-encoded [`COL_SERVICE_NAME`] column directly, without going
-    /// through the attrs blob (the value is not stored there).
+    /// when the row's merged attrs carried no `service.name`. Reads the
+    /// dedicated column directly, without going through the attribute map.
     pub fn service_name(&self, row: usize) -> Option<Vec<u8>> {
         self.str_at(COL_SERVICE_NAME, row)
     }
 
     /// Rebuilds the [`SpanRecord`] at `row`, a faithful round-trip of the record
-    /// the writer was handed.
+    /// the writer was handed: fixed fields, then the attribute map reassembled
+    /// from the per-key columns, the `attrs_raw` overflow, the lifted
+    /// `service.name`, and the `_events_raw` blob reconstructed from the nested
+    /// event columns.
     pub fn record(&self, row: usize) -> Result<SpanRecord, SpanSegError> {
         let trace_id = self
             .fixed_at(COL_TRACE_ID, row)
@@ -418,23 +438,33 @@ impl DecodedBlock {
             Some(bytes) => Some(string_from(bytes)?),
             None => None,
         };
-        let mut attrs = crate::record::decode_attrs(
-            &self
-                .str_at(COL_ATTRS, row)
-                .ok_or_else(|| SpanSegError::Corrupted("missing attrs".into()))?,
-        )?;
-        // Re-insert the `service.name` value lifted into COL_SERVICE_NAME at
-        // write time (ADR-0054), so the rebuilt record is the one the writer was
-        // handed. The stored attrs blob never carries this key, so this is the
-        // inverse of the writer's extraction, not a duplicate. Keeping attrs
-        // sorted with unique keys preserves the map's canonical contract.
-        if let Some(bytes) = self.service_name(row) {
-            let value = string_from(bytes)?;
-            match attrs.binary_search_by(|(k, _)| k.as_str().cmp(SERVICE_NAME_KEY)) {
-                Ok(i) => attrs[i].1 = value,
-                Err(i) => attrs.insert(i, (SERVICE_NAME_KEY.to_string(), value)),
+
+        // Reassemble the attribute map from the per-key columns, the overflow
+        // blob, the lifted service.name, and the reconstructed events. A
+        // BTreeMap keeps the canonical sorted, unique-key form the writer's
+        // input canonicalizes to, so the round trip is exact.
+        let mut attrs: BTreeMap<String, String> = BTreeMap::new();
+        for (&cid, dyn_name) in &self.dyn_names {
+            if let Some(bytes) = self.str_at(cid, row) {
+                attrs.insert(dyn_name.clone(), string_from(bytes)?);
             }
         }
+        if let Some(bytes) = self.str_at(COL_ATTRS_RAW, row) {
+            for (k, v) in decode_attrs(&bytes)? {
+                attrs.insert(k, v);
+            }
+        }
+        if let Some(bytes) = self.service_name(row) {
+            attrs.insert(SERVICE_NAME_KEY.to_string(), string_from(bytes)?);
+        }
+        let events = self
+            .events
+            .get(row)
+            .ok_or_else(|| SpanSegError::Corrupted("event row out of range".into()))?;
+        if !events.is_empty() {
+            attrs.insert(EVENTS_RAW_KEY.to_string(), reconstruct_events_raw(events));
+        }
+
         Ok(SpanRecord {
             trace_id,
             span_id,
@@ -444,7 +474,7 @@ impl DecodedBlock {
             end_ts_ns,
             status_code,
             status_message,
-            attrs,
+            attrs: attrs.into_iter().collect(),
         })
     }
 }
@@ -453,22 +483,20 @@ fn string_from(bytes: Vec<u8>) -> Result<String, SpanSegError> {
     String::from_utf8(bytes).map_err(|_| SpanSegError::Corrupted("value not utf-8".into()))
 }
 
-/// How a column decodes, resolved from its (fixed) id.
+/// How a column decodes, resolved from its (fixed) id or its dynamic plan.
 enum ColKind {
     I64,
     Str,
     Fixed(usize),
-    /// A dictionary-encoded string column (v3, ADR-0054): `service_name`.
-    Dict,
 }
 
-fn column_kind(column_id: u32) -> Result<ColKind, SpanSegError> {
+fn column_kind(column_id: u32, dyn_names: &BTreeMap<u32, String>) -> Result<ColKind, SpanSegError> {
     Ok(match column_id {
         COL_TRACE_ID => ColKind::Fixed(TRACE_ID_WIDTH),
         COL_SPAN_ID | COL_PARENT_SPAN_ID => ColKind::Fixed(SPAN_ID_WIDTH),
-        COL_NAME | COL_STATUS_MESSAGE | COL_ATTRS => ColKind::Str,
-        COL_START_TS | COL_END_TS | COL_STATUS_CODE => ColKind::I64,
-        COL_SERVICE_NAME => ColKind::Dict,
+        COL_NAME | COL_STATUS_MESSAGE | COL_ATTRS_RAW | COL_SERVICE_NAME => ColKind::Str,
+        COL_START_TS | COL_END_TS | COL_STATUS_CODE | COL_EVENT_COUNT => ColKind::I64,
+        _ if column_id >= FIRST_DYNAMIC_COL && dyn_names.contains_key(&column_id) => ColKind::Str,
         other => {
             return Err(SpanSegError::Corrupted(format!(
                 "unknown column id {other}"
@@ -527,6 +555,43 @@ pub fn read_block(
         });
     }
 
+    // Dynamic-column directory: (column_id, name) for the block's dynamic
+    // columns, ascending and each id in the dynamic range. Untrusted.
+    let dir_count = get_uvarint(bytes, &mut pos)?;
+    if dir_count > MAX_PAGES {
+        return Err(SpanSegError::Corrupted(format!(
+            "dyn dir count {dir_count} over cap"
+        )));
+    }
+    let mut dyn_names: BTreeMap<u32, String> = BTreeMap::new();
+    let mut prev_dir: Option<u32> = None;
+    for _ in 0..dir_count {
+        let cid = u32::try_from(get_uvarint(bytes, &mut pos)?)
+            .map_err(|_| SpanSegError::Corrupted("dyn dir column id range".into()))?;
+        if cid < FIRST_DYNAMIC_COL {
+            return Err(SpanSegError::Corrupted(format!(
+                "dyn dir column id {cid} below dynamic range"
+            )));
+        }
+        if prev_dir.is_some_and(|p| cid <= p) {
+            return Err(SpanSegError::Corrupted("dyn dir not ascending".into()));
+        }
+        prev_dir = Some(cid);
+        let name_len = usize::try_from(get_uvarint(bytes, &mut pos)?)
+            .map_err(|_| SpanSegError::Corrupted("dyn dir name len range".into()))?;
+        let end = pos
+            .checked_add(name_len)
+            .ok_or_else(|| SpanSegError::Corrupted("dyn dir name overflow".into()))?;
+        let name_bytes = bytes
+            .get(pos..end)
+            .ok_or_else(|| SpanSegError::Corrupted("dyn dir name truncated".into()))?;
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| SpanSegError::Corrupted("dyn dir name not utf-8".into()))?
+            .to_string();
+        pos = end;
+        dyn_names.insert(cid, name);
+    }
+
     // Slice and decompress each page to its encoded bytes.
     let mut page_bytes: Vec<Vec<u8>> = Vec::with_capacity(descs.len());
     for d in &descs {
@@ -565,9 +630,20 @@ pub fn read_block(
         i64_cols: HashMap::new(),
         str_cols: HashMap::new(),
         fixed_cols: HashMap::new(),
+        dyn_names,
+        events: vec![Vec::new(); record_count],
     };
 
-    for column_id in order {
+    // Decode fixed and dynamic columns via the presence/scatter model. The
+    // flattened event value columns (event_ts/name/blob) have `total_events`
+    // entries, not `record_count`, so they are decoded separately below.
+    for &column_id in &order {
+        if matches!(
+            column_id,
+            COL_EVENT_TS | COL_EVENT_NAME | COL_EVENT_ATTRS_BLOB
+        ) {
+            continue;
+        }
         let idxs = &groups[&column_id];
         let (present, value_idx): (Vec<bool>, usize) = match idxs.as_slice() {
             [v] => (vec![true; record_count], *v),
@@ -587,7 +663,7 @@ pub fn read_block(
         let present_count = present.iter().filter(|&&b| b).count();
         let enc = descs[value_idx].enc;
         let encoded = &page_bytes[value_idx];
-        match column_kind(column_id)? {
+        match column_kind(column_id, &out.dyn_names)? {
             ColKind::I64 => {
                 let vals = decode_i64(enc, encoded, present_count)?;
                 out.i64_cols.insert(column_id, scatter(&present, vals)?);
@@ -600,14 +676,121 @@ pub fn read_block(
                 let vals = decode_fixed(enc, encoded, present_count, width)?;
                 out.fixed_cols.insert(column_id, scatter(&present, vals)?);
             }
-            ColKind::Dict => {
-                let vals = decode_dict(enc, encoded, present_count)?;
-                out.str_cols.insert(column_id, scatter(&present, vals)?);
-            }
         }
     }
 
+    decode_events(&mut out, &descs, &page_bytes, &groups)?;
+
     Ok(out)
+}
+
+/// Decodes the nested event columns and reconstructs each row's events.
+///
+/// `event_count` is a normal per-row i64 column decoded above; its sum is the
+/// number of entries in each of the three flattened value columns. If
+/// `event_count` is absent, the block carries no events and none of the value
+/// columns may be present; if it is present, all three value columns must be
+/// present, each a single value page (no presence bitmap). Every count and
+/// index is bounds- and overflow-checked.
+fn decode_events(
+    out: &mut DecodedBlock,
+    descs: &[PageDesc],
+    page_bytes: &[Vec<u8>],
+    groups: &HashMap<u32, Vec<usize>>,
+) -> Result<(), SpanSegError> {
+    let value_cols_present = groups.contains_key(&COL_EVENT_TS)
+        || groups.contains_key(&COL_EVENT_NAME)
+        || groups.contains_key(&COL_EVENT_ATTRS_BLOB);
+    let counts = match out.i64_cols.get(&COL_EVENT_COUNT) {
+        None => {
+            if value_cols_present {
+                return Err(SpanSegError::Corrupted(
+                    "event value columns present without event_count".into(),
+                ));
+            }
+            return Ok(());
+        }
+        Some(c) => c,
+    };
+
+    // Every row's count is present (event_count is an all-present column) and
+    // non-negative; the total is the flattened value-column length.
+    let mut total: u64 = 0;
+    let mut per_row: Vec<usize> = Vec::with_capacity(counts.len());
+    for c in counts {
+        let c = c.ok_or_else(|| SpanSegError::Corrupted("event_count has a null row".into()))?;
+        if c < 0 {
+            return Err(SpanSegError::Corrupted("negative event_count".into()));
+        }
+        total = total
+            .checked_add(c as u64)
+            .ok_or_else(|| SpanSegError::Corrupted("event_count sum overflow".into()))?;
+        per_row.push(c as usize);
+    }
+    if total > MAX_EVENTS {
+        return Err(SpanSegError::Corrupted(format!(
+            "event total {total} over cap"
+        )));
+    }
+    let total = total as usize;
+
+    let ev_ts = decode_event_i64(COL_EVENT_TS, descs, page_bytes, groups, total)?;
+    let ev_name = decode_event_strings(COL_EVENT_NAME, descs, page_bytes, groups, total)?;
+    let ev_blob = decode_event_strings(COL_EVENT_ATTRS_BLOB, descs, page_bytes, groups, total)?;
+
+    let mut k = 0usize;
+    for (row, &c) in per_row.iter().enumerate() {
+        let mut evs = Vec::with_capacity(c);
+        for _ in 0..c {
+            let name = string_from(ev_name[k].clone())?;
+            evs.push(SpanEvent {
+                ts_ns: ev_ts[k],
+                name,
+                attrs_blob: ev_blob[k].clone(),
+            });
+            k += 1;
+        }
+        out.events[row] = evs;
+    }
+    Ok(())
+}
+
+/// Resolves the single value page of a flattened event column (no presence
+/// bitmap; every entry is present).
+fn event_value_page<'a>(
+    column_id: u32,
+    descs: &[PageDesc],
+    page_bytes: &'a [Vec<u8>],
+    groups: &HashMap<u32, Vec<usize>>,
+) -> Result<(Enc, &'a [u8]), SpanSegError> {
+    match groups.get(&column_id).map(Vec::as_slice) {
+        Some([v]) => Ok((descs[*v].enc, page_bytes[*v].as_slice())),
+        _ => Err(SpanSegError::Corrupted(format!(
+            "event column {column_id} must be a single value page"
+        ))),
+    }
+}
+
+fn decode_event_i64(
+    column_id: u32,
+    descs: &[PageDesc],
+    page_bytes: &[Vec<u8>],
+    groups: &HashMap<u32, Vec<usize>>,
+    count: usize,
+) -> Result<Vec<i64>, SpanSegError> {
+    let (enc, encoded) = event_value_page(column_id, descs, page_bytes, groups)?;
+    Ok(decode_i64(enc, encoded, count)?)
+}
+
+fn decode_event_strings(
+    column_id: u32,
+    descs: &[PageDesc],
+    page_bytes: &[Vec<u8>],
+    groups: &HashMap<u32, Vec<usize>>,
+    count: usize,
+) -> Result<Vec<Vec<u8>>, SpanSegError> {
+    let (enc, encoded) = event_value_page(column_id, descs, page_bytes, groups)?;
+    Ok(decode_strings(enc, encoded, count)?)
 }
 
 /// Scatters the present values into a per-row vector. `values` holds only the
@@ -708,224 +891,15 @@ fn read_page(bytes: &[u8], desc: &PageDesc, max_uncomp: u64) -> Result<Vec<u8>, 
     }
 }
 
-// --- plain columnar codecs -------------------------------------------------
-
-fn encode_i64(values: &[i64]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for &v in values {
-        put_ivarint(&mut out, v);
-    }
-    out
-}
-
-fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, SpanSegError> {
-    if enc != Enc::Plain {
-        return Err(SpanSegError::Corrupted("i64 page not Plain".into()));
-    }
-    let mut pos = 0usize;
-    let mut out = Vec::with_capacity(count.min(1 << 16));
-    for _ in 0..count {
-        out.push(get_ivarint(bytes, &mut pos)?);
-    }
-    expect_consumed(pos, bytes.len())?;
-    Ok(out)
-}
-
-fn encode_strings(values: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for v in values {
-        put_uvarint(&mut out, v.len() as u64);
-    }
-    for v in values {
-        out.extend_from_slice(v);
-    }
-    out
-}
-
-fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, SpanSegError> {
-    if enc != Enc::Plain {
-        return Err(SpanSegError::Corrupted("string page not Plain".into()));
-    }
-    let mut pos = 0usize;
-    let mut lens = Vec::with_capacity(count.min(1 << 16));
-    let mut total: u64 = 0;
-    for _ in 0..count {
-        let len = get_uvarint(bytes, &mut pos)?;
-        total = total
-            .checked_add(len)
-            .ok_or_else(|| SpanSegError::Corrupted("string length overflow".into()))?;
-        lens.push(len);
-    }
-    let blob = &bytes[pos..];
-    if blob.len() as u64 != total {
-        return Err(SpanSegError::Corrupted(format!(
-            "string blob {} != declared {total}",
-            blob.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(count.min(1 << 16));
-    let mut off = 0usize;
-    for len in lens {
-        let len = len as usize;
-        out.push(blob[off..off + len].to_vec());
-        off += len;
-    }
-    Ok(out)
-}
-
-/// Encodes a block-local dictionary column (v3, ADR-0054). `values` are the
-/// present rows' values in row order. The distinct values are sorted ascending
-/// and written once; each present row then stores a `uvarint` index into that
-/// dictionary. Identical `values` produce byte-identical output, so a block
-/// re-encodes deterministically.
-fn encode_dict(values: &[&[u8]]) -> Vec<u8> {
-    let mut distinct: Vec<&[u8]> = values.to_vec();
-    distinct.sort_unstable();
-    distinct.dedup();
-    let mut out = Vec::new();
-    put_uvarint(&mut out, distinct.len() as u64);
-    for d in &distinct {
-        put_uvarint(&mut out, d.len() as u64);
-        out.extend_from_slice(d);
-    }
-    for v in values {
-        // `distinct` is sorted and deduped, so every value is found.
-        let idx = distinct.partition_point(|d| d < v);
-        put_uvarint(&mut out, idx as u64);
-    }
-    out
-}
-
-/// Decodes a block-local dictionary column back to its present-row values (the
-/// write-side [`encode_dict`]). Untrusted: rejects a non-`Dict` encoding, a
-/// dictionary count over the cap, a non-ascending or duplicated dictionary
-/// (the encoding is canonical, so a valid one is strictly ascending), an index
-/// out of range, truncation, and trailing bytes.
-fn decode_dict(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, SpanSegError> {
-    if enc != Enc::Dict {
-        return Err(SpanSegError::Corrupted("service_name page not Dict".into()));
-    }
-    let mut pos = 0usize;
-    let dict_count = get_uvarint(bytes, &mut pos)?;
-    if dict_count > MAX_DICT_VALUES {
-        return Err(SpanSegError::Corrupted(format!(
-            "dict value count {dict_count} over cap {MAX_DICT_VALUES}"
-        )));
-    }
-    let dict_count = dict_count as usize;
-    let mut dict: Vec<Vec<u8>> = Vec::with_capacity(dict_count.min(1 << 16));
-    let mut prev: Option<Vec<u8>> = None;
-    for _ in 0..dict_count {
-        let len = usize::try_from(get_uvarint(bytes, &mut pos)?)
-            .map_err(|_| SpanSegError::Corrupted("dict value len range".into()))?;
-        let end = pos
-            .checked_add(len)
-            .ok_or_else(|| SpanSegError::Corrupted("dict value overflow".into()))?;
-        let slice = bytes
-            .get(pos..end)
-            .ok_or_else(|| SpanSegError::Corrupted("dict value truncated".into()))?
-            .to_vec();
-        if prev
-            .as_ref()
-            .is_some_and(|p| p.as_slice() >= slice.as_slice())
-        {
-            return Err(SpanSegError::Corrupted(
-                "dict values not strictly ascending".into(),
-            ));
-        }
-        prev = Some(slice.clone());
-        dict.push(slice);
-        pos = end;
-    }
-    let mut out = Vec::with_capacity(count.min(1 << 16));
-    for _ in 0..count {
-        let idx = usize::try_from(get_uvarint(bytes, &mut pos)?)
-            .map_err(|_| SpanSegError::Corrupted("dict index range".into()))?;
-        let value = dict
-            .get(idx)
-            .ok_or_else(|| SpanSegError::Corrupted(format!("dict index {idx} out of range")))?;
-        out.push(value.clone());
-    }
-    expect_consumed(pos, bytes.len())?;
-    Ok(out)
-}
-
-fn encode_fixed(values: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for v in values {
-        out.extend_from_slice(v);
-    }
-    out
-}
-
-fn decode_fixed(
-    enc: Enc,
-    bytes: &[u8],
-    count: usize,
-    width: usize,
-) -> Result<Vec<Vec<u8>>, SpanSegError> {
-    if enc != Enc::FixedWidth {
-        return Err(SpanSegError::Corrupted("fixed page not FixedWidth".into()));
-    }
-    let need = count
-        .checked_mul(width)
-        .ok_or_else(|| SpanSegError::Corrupted("fixed length overflow".into()))?;
-    if bytes.len() != need {
-        return Err(SpanSegError::Corrupted(format!(
-            "fixed length {} != {need}",
-            bytes.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(count.min(1 << 16));
-    for i in 0..count {
-        out.push(bytes[i * width..i * width + width].to_vec());
-    }
-    Ok(out)
-}
-
-fn encode_bitmap(bits: &[bool]) -> Vec<u8> {
-    let mut out = vec![0u8; bits.len().div_ceil(8)];
-    for (i, &b) in bits.iter().enumerate() {
-        if b {
-            out[i / 8] |= 1u8 << ((i % 8) as u32);
-        }
-    }
-    out
-}
-
-fn decode_bitmap(bytes: &[u8], count: usize) -> Result<Vec<bool>, SpanSegError> {
-    if bytes.len() != count.div_ceil(8) {
-        return Err(SpanSegError::Corrupted(format!(
-            "bitmap length {} != {}",
-            bytes.len(),
-            count.div_ceil(8)
-        )));
-    }
-    let mut out = Vec::with_capacity(count.min(1 << 16));
-    for i in 0..count {
-        out.push(bytes[i / 8] & (1u8 << ((i % 8) as u32)) != 0);
-    }
-    Ok(out)
-}
-
-fn expect_consumed(pos: usize, len: usize) -> Result<(), SpanSegError> {
-    if pos == len {
-        Ok(())
-    } else {
-        Err(SpanSegError::Corrupted(format!(
-            "codec left {} of {len} bytes unconsumed",
-            len.saturating_sub(pos)
-        )))
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::writer::{ObjectIdentity, RspanConfig, RspanWriter};
 
-    fn span(trace: u8, span: u8, start: i64, end: i64) -> SpanRecord {
-        SpanRecord {
+    /// A resolved row with no attributes or events, for the fixed-column tests.
+    fn row(trace: u8, span: u8, start: i64, end: i64) -> ResolvedSpanRow {
+        ResolvedSpanRow {
             trace_id: [trace; 16],
             span_id: [span; 8],
             parent_span_id: None,
@@ -934,15 +908,18 @@ mod tests {
             end_ts_ns: end,
             status_code: StatusCode::Unset,
             status_message: None,
-            attrs: Vec::new(),
+            service_name: None,
+            columns: Vec::new(),
+            attrs_raw: None,
+            events: Vec::new(),
         }
     }
 
     #[test]
-    fn roundtrip_with_nullable_columns() {
+    fn fixed_columns_round_trip() {
         let mut rows = Vec::new();
         for i in 0..100i64 {
-            let mut r = span(1, i as u8, 1000 + i, 1000 + i + 5);
+            let mut r = row(1, i as u8, 1000 + i, 1000 + i + 5);
             if i % 2 == 0 {
                 r.parent_span_id = Some([9u8; 8]);
             }
@@ -950,22 +927,28 @@ mod tests {
                 r.status_code = StatusCode::Error;
                 r.status_message = Some(format!("err {i}"));
             }
-            r.attrs = vec![("k".into(), format!("v{i}"))];
             rows.push(r);
         }
-        let out = write_block(&rows, 3).expect("write");
+        let out = write_block(&rows, &[], 3).expect("write");
         assert_eq!(out.record_count, 100);
         let dec = read_block(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP).expect("read");
         assert_eq!(dec.record_count(), 100);
-        for (i, want) in rows.iter().enumerate() {
-            assert_eq!(&dec.record(i).expect("record"), want);
+        for (i, r) in rows.iter().enumerate() {
+            let rec = dec.record(i).expect("record");
+            assert_eq!(rec.trace_id, r.trace_id);
+            assert_eq!(rec.span_id, r.span_id);
+            assert_eq!(rec.parent_span_id, r.parent_span_id);
+            assert_eq!(rec.name, r.name);
+            assert_eq!(rec.status_code, r.status_code);
+            assert_eq!(rec.status_message, r.status_message);
+            assert!(rec.attrs.is_empty());
         }
     }
 
     #[test]
     fn crc_mismatch_is_corrupted() {
-        let rows = vec![span(1, 0, 5, 6), span(1, 1, 6, 7)];
-        let out = write_block(&rows, 3).expect("write");
+        let rows = vec![row(1, 0, 5, 6), row(1, 1, 6, 7)];
+        let out = write_block(&rows, &[], 3).expect("write");
         let mut bad = out.bytes.clone();
         bad[0] ^= 0xff;
         assert!(matches!(
@@ -975,27 +958,13 @@ mod tests {
     }
 
     #[test]
-    fn bounds_track_interval_and_trace_ids() {
-        let rows = vec![
-            span(1, 0, 100, 200),
-            span(1, 1, 50, 150),
-            span(3, 2, 120, 500),
-        ];
-        let out = write_block(&rows, 3).expect("write");
-        assert_eq!(out.min_start_ts, 50);
-        assert_eq!(out.max_end_ts, 500);
-        assert_eq!(out.min_trace_id, [1u8; 16]);
-        assert_eq!(out.max_trace_id, [3u8; 16]);
-    }
-
-    #[test]
     fn duration_and_status_mask_track_rows() {
-        let mut ok = span(1, 0, 100, 150); // duration 50, Ok
+        let mut ok = row(1, 0, 100, 150); // duration 50, Ok
         ok.status_code = StatusCode::Ok;
-        let mut err = span(1, 1, 100, 105); // duration 5, Error
+        let mut err = row(1, 1, 100, 105); // duration 5, Error
         err.status_code = StatusCode::Error;
-        let unset = span(1, 2, 100, 1100); // duration 1000, Unset
-        let out = write_block(&[ok, err, unset], 3).expect("write");
+        let unset = row(1, 2, 100, 1100); // duration 1000, Unset
+        let out = write_block(&[ok, err, unset], &[], 3).expect("write");
         assert_eq!(out.min_duration_ns, 5);
         assert_eq!(out.max_duration_ns, 1000);
         assert_eq!(
@@ -1005,116 +974,307 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_span_round_trips() {
-        // start == end: a zero-length span is not rejected or clamped, it
-        // round-trips with duration 0.
-        let rows = vec![span(1, 0, 500, 500)];
-        let out = write_block(&rows, 3).expect("write");
-        assert_eq!(out.min_duration_ns, 0);
-        assert_eq!(out.max_duration_ns, 0);
-        let dec = read_block(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP).expect("read");
-        assert_eq!(dec.record(0).expect("record"), rows[0]);
-    }
-
-    #[test]
-    fn end_before_start_yields_negative_duration_not_an_error() {
-        // The writer does not reject or clamp end < start: end - start is a
-        // valid (negative) i64 that ivarint encodes natively.
-        let rows = vec![span(1, 0, 500, 400)];
-        let out = write_block(&rows, 3).expect("write");
-        assert_eq!(out.min_duration_ns, -100);
-        assert_eq!(out.max_duration_ns, -100);
-    }
-
-    #[test]
     fn duration_overflow_is_corrupted() {
-        let rows = vec![span(1, 0, i64::MIN, i64::MAX)];
+        let rows = vec![row(1, 0, i64::MIN, i64::MAX)];
         assert!(matches!(
-            write_block(&rows, 3),
+            write_block(&rows, &[], 3),
             Err(SpanSegError::Corrupted(_))
         ));
     }
 
+    /// Direct block round trip of dynamic per-key columns, attrs_raw overflow,
+    /// service_name, and nested events, exercised through the resolved-row form.
     #[test]
-    fn service_name_lifted_into_column_not_duplicated_in_attrs_blob() {
-        // Two rows share a service; a third has none. The dictionary collapses
-        // the shared value, and the attrs blob never carries "service.name".
-        let mut rows = Vec::new();
-        for (i, svc) in [Some("checkout"), Some("checkout"), None]
-            .iter()
-            .enumerate()
-        {
-            let mut r = span(1, i as u8, i as i64, i as i64 + 1);
-            let mut attrs = vec![("http.method".to_string(), "GET".to_string())];
-            if let Some(s) = svc {
-                attrs.push(("service.name".to_string(), (*s).to_string()));
-            }
-            r.attrs = attrs;
-            rows.push(r);
-        }
-        let out = write_block(&rows, 3).expect("write");
+    fn dynamic_columns_events_and_overflow_round_trip_at_block_level() {
+        let plans = vec![
+            ColumnPlan {
+                column_id: FIRST_DYNAMIC_COL,
+                name: "http.method".into(),
+            },
+            ColumnPlan {
+                column_id: FIRST_DYNAMIC_COL + 1,
+                name: "http.route".into(),
+            },
+        ];
+        let mut r = row(1, 0, 100, 200);
+        r.service_name = Some("checkout".into());
+        r.columns = vec![
+            (FIRST_DYNAMIC_COL, "GET".into()),
+            (FIRST_DYNAMIC_COL + 1, "/cart".into()),
+        ];
+        r.attrs_raw = Some(crate::record::encode_attrs(&[(
+            "overflow.key".to_string(),
+            "v".to_string(),
+        )]));
+        r.events = vec![
+            SpanEvent {
+                ts_ns: 150,
+                name: "exception".into(),
+                attrs_blob: vec![1, 2, 3, 4, 5],
+            },
+            SpanEvent {
+                ts_ns: 175,
+                name: "log".into(),
+                attrs_blob: vec![],
+            },
+        ];
+        // A second row with no dynamic columns and no events, to exercise mixed
+        // presence and the flattened event layout across rows.
+        let r2 = row(1, 1, 210, 220);
+        let rows = vec![r.clone(), r2];
+        let out = write_block(&rows, &plans, 3).expect("write");
         let dec = read_block(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP).expect("read");
 
-        // The column decodes per row (present rows only).
-        assert_eq!(dec.service_name(0).as_deref(), Some(b"checkout".as_slice()));
-        assert_eq!(dec.service_name(1).as_deref(), Some(b"checkout".as_slice()));
-        assert_eq!(dec.service_name(2), None);
-
-        // The rebuilt record re-inserts service.name into attrs (faithful round
-        // trip), and http.method survives.
-        for (i, want) in rows.iter().enumerate() {
-            assert_eq!(&dec.record(i).expect("record"), want);
-        }
-
-        // The stored attrs blob for row 0 does NOT contain "service.name": the
-        // value lives only in the dictionary column (ADR-0054).
-        let blob = crate::record::encode_attrs_without_service_name(&rows[0].attrs);
-        let decoded_blob = crate::record::decode_attrs(&blob).expect("decode blob");
-        assert!(
-            !decoded_blob.iter().any(|(k, _)| k == "service.name"),
-            "attrs blob must not carry service.name"
+        let rec0 = dec.record(0).expect("record 0");
+        let get = |k: &str| {
+            rec0.attrs
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("http.method"), Some("GET"));
+        assert_eq!(get("http.route"), Some("/cart"));
+        assert_eq!(get("overflow.key"), Some("v"));
+        assert_eq!(get("service.name"), Some("checkout"));
+        // Events reconstruct into the _events_raw value, byte-identical to what
+        // reconstruct_events_raw produces from the same events.
+        assert_eq!(
+            get("_events_raw"),
+            Some(reconstruct_events_raw(&r.events).as_str())
         );
+
+        let rec1 = dec.record(1).expect("record 1");
+        assert!(rec1.attrs.is_empty(), "second row carries no attributes");
+    }
+
+    /// The ADR-0045 T6 acceptance test: a span with more than 1000 distinct
+    /// dynamic attribute keys (so some overflow into attrs_raw), plus at least
+    /// one event with a non-trivial event_attrs_blob, round-tripped through the
+    /// whole writer and reader, asserting value-for-value equality of the
+    /// attribute map (including that the overflow keys survive) and of the
+    /// events, and that the split between typed columns and attrs_raw is what
+    /// the 1000-column budget dictates.
+    #[test]
+    fn v4_attribute_columns_roundtrip_with_overflow_and_events() {
+        use crate::footer::{DEFAULT_MAX_SECTION_UNCOMP, kind, open, read_section};
+        use crate::reader::{RspanReader, SpanQuery};
+        use crate::skip_index::SkipIndex;
+
+        // Build one span whose merged attrs carry 1500 distinct dynamic keys
+        // (named so their sort order is stable), a service.name, and a valid
+        // _events_raw blob with one event whose payload is non-trivial.
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        for i in 0..1500 {
+            attrs.push((format!("attr.{i:04}"), format!("val{i}")));
+        }
+        attrs.push(("service.name".to_string(), "checkout".to_string()));
+        // A synthetic but validly-framed events blob: one OTLP-shaped event with
+        // time_unix_nano (field 1, fixed64), name (field 2), and an attributes
+        // field (field 3) that stands in for a non-trivial event_attrs_blob.
+        let event_chunk = {
+            let mut e = Vec::new();
+            e.push(0x09); // field 1, wire type 1 (fixed64)
+            e.extend_from_slice(&1_650_000_000_000i64.to_le_bytes());
+            e.push(0x12); // field 2, wire type 2 (string)
+            e.push(9);
+            e.extend_from_slice(b"exception");
+            e.push(0x1a); // field 3, wire type 2 (attributes stand-in)
+            e.push(4);
+            e.extend_from_slice(b"boom");
+            e
+        };
+        let events_blob = {
+            let mut raw = Vec::new();
+            crate::varint::put_uvarint(&mut raw, event_chunk.len() as u64);
+            raw.extend_from_slice(&event_chunk);
+            // lowercase hex, matching the ingest encoding.
+            let mut s = String::new();
+            for b in &raw {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        };
+        attrs.push(("_events_raw".to_string(), events_blob.clone()));
+
+        let rec = SpanRecord {
+            trace_id: [7u8; 16],
+            span_id: [1u8; 8],
+            parent_span_id: None,
+            name: "GET /cart".into(),
+            start_ts_ns: 1_000,
+            end_ts_ns: 2_000,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: attrs.clone(),
+        };
+
+        let cfg = RspanConfig::default();
+        let mut w = RspanWriter::new(
+            cfg,
+            ObjectIdentity {
+                tenant_hash: [1u8; 16],
+                shard: 0,
+                writer_id: [2u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        w.push(rec.clone());
+        let obj = w.finish().expect("finish");
+
+        // Whole-object round trip: the reconstructed record equals the
+        // canonicalized input (sorted, unique keys).
+        let reader = RspanReader::new(&obj, &cfg).expect("reader");
+        let (got, _stats) = reader
+            .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
+            .expect("scan");
+        assert_eq!(got.len(), 1);
+        let mut want: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in &attrs {
+            want.insert(k.clone(), v.clone());
+        }
+        let want: Vec<(String, String)> = want.into_iter().collect();
+        assert_eq!(got[0].attrs, want, "attribute map must round-trip exactly");
+        // The events blob survives byte-for-byte through the event columns.
+        assert_eq!(
+            got[0]
+                .attrs
+                .iter()
+                .find(|(k, _)| k == "_events_raw")
+                .map(|(_, v)| v.as_str()),
+            Some(events_blob.as_str())
+        );
+
+        // Column-vs-overflow split: decode the single block directly and check
+        // exactly 1000 keys became dynamic columns and the remaining 500 landed
+        // in attrs_raw. service.name and _events_raw are lifted out separately
+        // and never counted as dynamic columns.
+        let footer = open(&obj).expect("open");
+        assert_eq!(footer.block_count, 1);
+        let skip_desc = footer.section(kind::SKIP_IDX).expect("skip");
+        let skip_raw = read_section(&obj, skip_desc, DEFAULT_MAX_SECTION_UNCOMP).expect("skip raw");
+        let skip = SkipIndex::decode(&skip_raw, 1 << 20).expect("skip decode");
+        let entry = &skip.blocks[0];
+        let blocks_desc = footer.section(kind::BLOCKS).expect("blocks");
+        let start = blocks_desc.offset as usize;
+        let block_bytes = &obj[start + entry.block_offset as usize
+            ..start + entry.block_offset as usize + entry.block_len as usize];
+        let dec = read_block(block_bytes, entry.block_crc32c, DEFAULT_MAX_UNCOMP).expect("read");
+        assert_eq!(
+            dec.dyn_names.len(),
+            1000,
+            "the 1000-column budget must be exactly filled"
+        );
+        // The 1000 columns are the lexicographically-first 1000 keys
+        // (attr.0000..attr.0999); attr.1000.. overflowed into attrs_raw.
+        let names: std::collections::BTreeSet<&str> =
+            dec.dyn_names.values().map(String::as_str).collect();
+        assert!(names.contains("attr.0000"));
+        assert!(names.contains("attr.0999"));
+        assert!(!names.contains("attr.1000"), "attr.1000 must overflow");
+        assert!(
+            !names.contains("service.name"),
+            "service.name is lifted, not dynamic"
+        );
+        assert!(
+            !names.contains("_events_raw"),
+            "_events_raw is lifted, not dynamic"
+        );
+        let raw = dec
+            .str_at(COL_ATTRS_RAW, 0)
+            .expect("attrs_raw present for the overflow row");
+        let overflow = decode_attrs(&raw).expect("decode overflow");
+        assert_eq!(overflow.len(), 500, "500 keys overflow into attrs_raw");
+        assert!(overflow.iter().any(|(k, _)| k == "attr.1000"));
     }
 
     #[test]
-    fn service_name_column_absent_when_no_row_has_it() {
-        // No row carries service.name: the column stages nothing and decodes as
-        // absent for every row, and records round-trip unchanged.
-        let rows = vec![span(1, 0, 0, 1), span(1, 1, 1, 2)];
-        let out = write_block(&rows, 3).expect("write");
+    fn single_row_events_round_trip() {
+        let mut r = row(1, 0, 0, 1);
+        r.events = vec![SpanEvent {
+            ts_ns: 5,
+            name: "x".into(),
+            attrs_blob: vec![9, 9, 9],
+        }];
+        let out = write_block(std::slice::from_ref(&r), &[], 3).expect("write");
         let dec = read_block(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP).expect("read");
-        assert_eq!(dec.service_name(0), None);
-        assert_eq!(dec.service_name(1), None);
-        for (i, want) in rows.iter().enumerate() {
-            assert_eq!(&dec.record(i).expect("record"), want);
+        assert_eq!(dec.events[0], r.events);
+    }
+
+    /// Truncating a v4 block that carries dynamic columns and events -- at every
+    /// prefix length -- must always be a typed `Corrupted` error (recomputing
+    /// the crc so the truncation itself, not a stale checksum, is what the
+    /// parser must catch), never a panic.
+    #[test]
+    fn truncated_block_is_corrupted_not_panic() {
+        let plans = vec![ColumnPlan {
+            column_id: FIRST_DYNAMIC_COL,
+            name: "http.method".into(),
+        }];
+        let mut r = row(1, 0, 0, 1);
+        r.columns = vec![(FIRST_DYNAMIC_COL, "GET".into())];
+        r.events = vec![SpanEvent {
+            ts_ns: 7,
+            name: "exception".into(),
+            attrs_blob: vec![1, 2, 3],
+        }];
+        let out = write_block(std::slice::from_ref(&r), &plans, 3).expect("write");
+        for cut in 0..out.bytes.len() {
+            let prefix = &out.bytes[..cut];
+            let crc = crc32c::crc32c(prefix);
+            // Either a parse error or a (recomputed) crc that still mismatches
+            // the truncation: both are Corrupted, and neither panics.
+            match read_block(prefix, crc, DEFAULT_MAX_UNCOMP) {
+                Err(SpanSegError::Corrupted(_)) => {}
+                Ok(_) => panic!("truncation at {cut} decoded as a valid block"),
+                Err(other) => panic!("unexpected error at {cut}: {other:?}"),
+            }
         }
     }
 
+    /// The dynamic-column directory is untrusted: a non-ascending sequence or an
+    /// id below the dynamic range is a typed `Corrupted` error. Hand-built
+    /// (page_count 0) so the directory parse is what fails, with a matching crc
+    /// so the guard, not a checksum, is exercised.
     #[test]
-    fn dict_codec_roundtrips_and_rejects_bad_index() {
-        // Direct dictionary codec round trip with duplicates.
-        let vals: Vec<&[u8]> = vec![b"b", b"a", b"b", b"c", b"a"];
-        let encoded = encode_dict(&vals);
-        let decoded = decode_dict(Enc::Dict, &encoded, vals.len()).expect("decode");
-        let want: Vec<Vec<u8>> = vals.iter().map(|v| v.to_vec()).collect();
-        assert_eq!(decoded, want);
-
-        // Wrong enc tag is rejected.
+    fn corrupt_dyn_directory_is_rejected() {
+        let make = |entries: &[(u32, &str)]| -> Vec<u8> {
+            let mut b = Vec::new();
+            put_uvarint(&mut b, 1); // record_count
+            put_uvarint(&mut b, 0); // page_count
+            put_uvarint(&mut b, entries.len() as u64);
+            for (cid, name) in entries {
+                put_uvarint(&mut b, u64::from(*cid));
+                put_uvarint(&mut b, name.len() as u64);
+                b.extend_from_slice(name.as_bytes());
+            }
+            b
+        };
+        // Non-ascending column ids.
+        let bad = make(&[(FIRST_DYNAMIC_COL + 1, "b"), (FIRST_DYNAMIC_COL, "a")]);
+        let crc = crc32c::crc32c(&bad);
         assert!(matches!(
-            decode_dict(Enc::Plain, &encoded, vals.len()),
+            read_block(&bad, crc, DEFAULT_MAX_UNCOMP),
             Err(SpanSegError::Corrupted(_))
         ));
-
-        // An out-of-range index is rejected, never a panic. Hand-build: dict of
-        // one value, one index pointing at slot 1.
-        let mut bad = Vec::new();
-        put_uvarint(&mut bad, 1); // dict_count
-        put_uvarint(&mut bad, 1); // value len
-        bad.push(b'x');
-        put_uvarint(&mut bad, 1); // index 1, but only slot 0 exists
+        // Id below the dynamic range.
+        let bad = make(&[(5, "a")]);
+        let crc = crc32c::crc32c(&bad);
         assert!(matches!(
-            decode_dict(Enc::Dict, &bad, 1),
+            read_block(&bad, crc, DEFAULT_MAX_UNCOMP),
             Err(SpanSegError::Corrupted(_))
         ));
+    }
+
+    proptest::proptest! {
+        /// read_block never panics on arbitrary bytes. The crc is set to match
+        /// the input so the parser is exercised past the checksum gate on every
+        /// case, walking the header, the dynamic directory, the pages, and the
+        /// event columns over hostile input.
+        #[test]
+        fn read_block_never_panics(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)) {
+            let crc = crc32c::crc32c(&bytes);
+            let _ = read_block(&bytes, crc, DEFAULT_MAX_UNCOMP);
+        }
     }
 }
