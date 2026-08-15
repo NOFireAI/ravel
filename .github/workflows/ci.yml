@@ -1218,6 +1218,12 @@ jobs:
       && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # id-token:write is the Codecov upload's tokenless-OIDC grant (public
+    # repo, no CODECOV_TOKEN secret); contents:read matches the job's only
+    # other need, checking out the tree.
+    permissions:
+      contents: read
+      id-token: write
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -1239,20 +1245,20 @@ jobs:
         with:
           tool: cargo-llvm-cov
       # Run the workspace suite once and keep the raw coverage data
-      # (`--no-report`), then render it twice from that same data: once as the
-      # text summary for the step summary, once as JSON for the badge/artifact.
-      # This replaces two full `cargo llvm-cov` invocations that each re-ran the
-      # entire test suite (ADR-0053 D2).
+      # (`--no-report`), then render it from that same data in every format a
+      # consumer needs: the text summary for the step summary, and lcov for
+      # Codecov. This replaces separate `cargo llvm-cov` invocations that
+      # would each re-run the entire test suite (ADR-0053 D2).
       - name: Measure coverage
         run: |
           cargo llvm-cov --locked --no-report --workspace
           cargo llvm-cov report --locked | tee -a "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov report --locked --summary-only --json --output-path coverage.json
-      # Updates the badge data gist read by the README's shields.io endpoint
-      # badge. Only on pushes to main, since the badge reflects main's state
-      # and pull_request runs (including from forks) never see GIST_PAT.
-      - name: Update coverage badge
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GIST_PAT: ${{ secrets.GIST_PAT }}
-        run: python3 scripts/update-coverage-badge.py
+          cargo llvm-cov report --locked --lcov --output-path lcov.info
+      # Public repo, tokenless upload via GitHub Actions OIDC: no secret to
+      # provision or rotate. Renders the README badge and per-file/diff
+      # coverage on codecov.io; never fails the job on an upload hiccup.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
