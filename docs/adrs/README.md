@@ -80,3 +80,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0075](0075-shard-aware-query-request-budget.md) | Shard-aware query request budget | Accepted |
 | [0076](0076-reducing-s3-request-cost.md) | Reducing S3 request cost without weakening durability | Accepted |
 | [0077](0077-dr-posture-and-chaos-evidence.md) | Operator-owned DR via replicated-bucket controls, a rehearsed restore, and a process-kill evidence lane | Accepted |
+| [0078](0078-fold-retention-frontier-deployment-default.md) | Fold retention-frontier reconcile honors the deployment-wide retention default | Accepted |
