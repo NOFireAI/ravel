@@ -18,6 +18,21 @@ use crate::single_flight::{Role, SingleFlight, SingleFlightError};
 /// that "unchanged" would not reliably mean "not corrupted".
 const CORRUPTION_XOR: u8 = 0xA5;
 
+/// The exact byte transformation a corruption-mode hit applies. Shared with
+/// the tiered handle ([`crate::tiered`]) so a disk-served hit read through it
+/// is corrupted by the identical operation as a RAM hit, rather than by a
+/// second copy that could drift: ADR-0046 decision 4's acceptance gate must
+/// reach every tier the same way. Never mutates in place; a fresh [`Bytes`]
+/// is returned so the tier's own clean copy is untouched.
+pub(crate) fn corrupt_bytes(bytes: &Bytes) -> Bytes {
+    Bytes::from(
+        bytes
+            .iter()
+            .map(|b| b ^ CORRUPTION_XOR)
+            .collect::<Vec<u8>>(),
+    )
+}
+
 /// One RAM-tier entry: the cached bytes plus the wall-clock time they were
 /// admitted, in nanoseconds since the Unix epoch, read from the injected
 /// [`Clock`]. The stamp is what the per-`get` age check and the background
@@ -156,16 +171,19 @@ where
         self.inner.insert(key, value);
     }
 
+    /// Whether this cache is in the ADR-0046 acceptance-gate corruption mode
+    /// (built with [`Cache::with_corruption`]). The tiered handle reads this
+    /// to decide whether a disk-served hit it serves must be corrupted too,
+    /// so the gate covers both tiers rather than only the RAM one.
+    pub fn corrupts_hits(&self) -> bool {
+        self.corrupt_hits
+    }
+
     fn maybe_corrupt(&self, bytes: Bytes) -> Bytes {
         if !self.corrupt_hits {
             return bytes;
         }
-        Bytes::from(
-            bytes
-                .iter()
-                .map(|b| b ^ CORRUPTION_XOR)
-                .collect::<Vec<u8>>(),
-        )
+        crate::cache::corrupt_bytes(&bytes)
     }
 
     /// Collapses concurrent misses on the same key into one call to `fetch`

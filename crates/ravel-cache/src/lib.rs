@@ -51,6 +51,18 @@
 //! one sweep interval past the sweep -- the defaults are tuned to keep that
 //! sum within ADR-0064's 24 h bound. Time is injected through
 //! [`Clock`] so this ageing is deterministic under test.
+//!
+//! [`tiered::TieredCache`] composes the two tiers behind one handle the three
+//! ADR-0046 read funnels can hold (decision 3). It is read-through: a RAM miss
+//! consults the disk tier before the caller's upstream fetch is allowed to
+//! run, and a successful upstream fetch populates *both* tiers, not only RAM,
+//! so a later RAM eviction is served from disk instead of paying an S3 round
+//! trip again. Single-flight spans both tiers: concurrent callers for one key
+//! collapse to a single disk consult and, on a disk miss, a single upstream
+//! fetch. When its RAM tier is in [`Cache::with_corruption`] mode, a
+//! disk-served hit is corrupted by the identical transform a RAM hit uses, so
+//! ADR-0046 decision 4's acceptance gate reaches the disk tier the moment the
+//! funnels start using this handle.
 
 mod cache;
 mod clock;
@@ -60,6 +72,7 @@ mod limits;
 mod metrics;
 mod s3fifo;
 mod single_flight;
+pub mod tiered;
 
 pub use cache::Cache;
 pub use clock::{Clock, SystemClock};
@@ -68,6 +81,7 @@ pub use key::CacheKey;
 pub use limits::{CacheLimits, DEFAULT_MAX_ENTRY_AGE_NS, DEFAULT_SWEEP_INTERVAL_NS};
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use single_flight::{Role, SingleFlight, SingleFlightError};
+pub use tiered::{Source, TieredCache};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
