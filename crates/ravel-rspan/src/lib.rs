@@ -1,7 +1,12 @@
-//! RSPAN: Ravel's columnar span segment format (ADR-0041). Trailer version 3
-//! (ADR-0054): a mandatory per-block BLOOM section over `service.name` and
-//! span-name tokens, and a block-local dictionary-encoded `service_name`
-//! column (id 9), on top of v2's SKIP_IDX duration/status bounds (ADR-0045).
+//! RSPAN: Ravel's columnar span segment format (ADR-0041). Trailer version 4
+//! (ADR-0045 decision 3): per-key string attribute columns (RLOG's design: a
+//! 1000-column budget with overflow folded into an `attrs_raw` blob) replacing
+//! v3's single opaque `attrs` blob, and span events promoted into nested
+//! columns (`event_ts`/`event_name`/`event_attrs_blob` with a per-row
+//! `event_count`). It keeps v3's mandatory per-block BLOOM section over
+//! `service.name` and span-name tokens and the lifted `service_name` column
+//! (id 9, ADR-0054), and v2's SKIP_IDX duration/status bounds (ADR-0045).
+//! v4 retires v3 with no dual reader.
 //!
 //! A self-describing immutable object holding span records in columnar row
 //! blocks, with an interval-aware skip index. RSPAN is a sibling of RLOG (crate
@@ -41,7 +46,9 @@ pub use error::SpanSegError;
 pub use footer::{SpanFooter, SuffixOutcome, decode_section, open, open_from_suffix, read_section};
 pub use ranged::{BlockLoc, RspanRangeReader, TraceBlockSpan};
 pub use reader::{RspanReader, ScanStats, SpanQuery};
-pub use record::{COL_NAME, COL_SERVICE_NAME, SpanRecord, StatusCode, merge_attrs};
+pub use record::{
+    COL_NAME, COL_SERVICE_NAME, ResolvedSpanRow, SpanEvent, SpanRecord, StatusCode, merge_attrs,
+};
 pub use skip_index::{BloomPredicate, SkipIndex};
 pub use writer::{ObjectIdentity, RspanConfig, RspanWriter};
 

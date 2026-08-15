@@ -1,24 +1,26 @@
 # RSPAN: Ravel Span Segment Format
 
 Persistent contract (ADR-0041). Any change bumps the trailer version. The
-current trailer version is 3 (ADR-0054 added a mandatory per-block BLOOM
-section over `service.name` and span-name tokens, and a block-local
-dictionary-encoded `service_name` column, id 9). Trailer version history:
+current trailer version is 4 (ADR-0045 decision 3 replaced v3's single opaque
+`attrs` blob column with per-key string attribute columns and promoted span
+events into nested columns). Trailer version history:
 
 | version | ADR | added |
 |---|---|---|
 | 1 | ADR-0041 | initial RSPAN format (BLOCKS, SKIP_IDX) |
 | 2 | ADR-0045 decision 2 | per-block duration bounds and a status mask in SKIP_IDX |
 | 3 | ADR-0054 | mandatory BLOOM section and the `service_name` column |
+| 4 | ADR-0045 decision 3 | per-key attribute columns (`attrs_raw` overflow) and nested span-event columns |
 
 Ravel is pre-release: one supported version at a time, earlier versions
-rejected with the same typed `Corrupted` error as an unknown future version,
-never carried by a dual reader (ADR-0045 decision 4, ADR-0054 decision 1,
-ADR-0027 precedent). There is no in-place migration path across a version
-bump: since no dual reader exists, code built against v3 cannot open a v1 or
-v2 object to compact it forward. A v1 or v2 object outside development
-buckets that must remain queryable has to be re-ingested from source under
-v3; this is Ravel's accepted pre-release posture, not a gap to close later.
+rejected with a typed `UnsupportedVersion` error, never carried by a dual
+reader (ADR-0045 decision 4, ADR-0054 decision 1, ADR-0027 precedent). v4
+retires v3 the same way v3 retired v2 and v2 retired v1: the reader accepts
+only the current version. There is no in-place migration path across a version
+bump: since no dual reader exists, code built against v4 cannot open a v1, v2,
+or v3 object to compact it forward. An older object outside development buckets
+that must remain queryable has to be re-ingested from source under v4; this is
+Ravel's accepted pre-release posture, not a gap to close later.
 
 **Version lifecycle and migration (ADR-0066, normative).** The pre-release
 posture above expires at first public release. RSPAN is a Class A bulk
@@ -65,12 +67,18 @@ both driven by the shape of span data rather than by a new mechanism:
    containment. A query window `[T1, T2]` prunes a block when
    `max_end_ts < T1 || min_start_ts > T2`.
 
-RSPAN is deliberately leaner than RLOG: it has **no STREAM_DIR** (no derived
-stream identity to catalog) and **no FIELD_DIR** (the merged attribute map is a
-single `Map<Utf8, Utf8>` with one value type and no attr-level pruning, so it
-is stored as one canonical blob per row rather than split into per-key
-columns). The skip index is a single level, since a span object is one sorted
-run with no second (stream-ref) dimension to summarize.
+RSPAN is leaner than RLOG in two ways: it has **no STREAM_DIR** (no derived
+stream identity to catalog) and **no FIELD_DIR section**. As of v4 (ADR-0045
+decision 3) the merged attribute map *is* split into per-key columns (RLOG's
+design), but RSPAN carries the `(column_id, name)` directory **inside each
+block** rather than in an object-wide FIELD_DIR section: a block is
+self-describing, so the whole-object and ranged decode paths rebuild a record
+from the block alone with no external directory. RSPAN's map is
+`Map<Utf8, Utf8>`, so every dynamic column is a Utf8 string column and there is
+no per-type split (RLOG's typed FIELD_DIR splits a key seen with two value
+types into two columns; RSPAN's single value type makes that inapplicable, a
+named simplification). The skip index is a single level, since a span object is
+one sorted run with no second (stream-ref) dimension to summarize.
 
 As of v3 (ADR-0054) RSPAN does carry a **BLOOM section**: service dependency
 queries make `service.name` equality the entry point of most trace
@@ -79,8 +87,11 @@ is a per-block token filter over `service.name` and span-name tokens; unlike
 RLOG's degrade-on-corrupt bloom, RSPAN's BLOOM is mandatory and a missing or
 malformed section is a typed `Corrupted` error, the same as a missing
 SKIP_IDX. The `service.name` value is also lifted out of the attrs blob into
-its own dictionary-encoded column (id 9) so a query reads it directly rather
-than scanning the map. Span-events/links remain out of scope.
+its own column (id 9) so a query reads it directly rather than scanning the map. As
+of v4, span **events** are also promoted out of the attribute blob into nested
+columns (see "Record shape" and "BLOCKS"); span **links** remain out of scope
+and are not promoted (a `_links_raw` value round-trips as an ordinary
+attribute, a named gap, not an oversight).
 
 ## Object layout
 
@@ -93,7 +104,7 @@ than scanning the map. Span-events/links remain out of scope.
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 3)                       |
+|   version:      u16   (= 4)                       |
 |   signal:       u8    (3 = spans)                 |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RSP1"                   |
@@ -153,50 +164,76 @@ Fields:
 
 ## Record shape
 
-One row per span (`ravel_rspan::SpanRecord`), columnar in BLOCKS. Fixed column
-ids (there are no dynamic columns):
+One row per span (`ravel_rspan::SpanRecord`), columnar in BLOCKS. Ids 0..=13
+are reserved fixed columns; ids 14+ are dynamic per-key attribute columns:
 
-| id | column          | type                | notes |
-|----|-----------------|---------------------|-------|
-| 0  | trace_id        | fixed 16 bytes      | always present; primary sort key |
-| 1  | span_id         | fixed 8 bytes       | always present |
-| 2  | parent_span_id  | fixed 8 bytes       | nullable (root spans have none) |
-| 3  | name            | Utf8                | always present |
-| 4  | start_ts_ns     | i64 (ns)            | always present |
-| 5  | end_ts_ns       | i64 (ns)            | always present |
-| 6  | status_code     | u8                  | OTLP status: 0 Unset, 1 Ok, 2 Error |
-| 7  | status_message  | Utf8                | nullable |
-| 8  | attrs           | Map<Utf8, Utf8>     | always present; canonical blob per row, minus `service.name` |
-| 9  | service_name    | Utf8                | v3, ADR-0054; nullable; block-local dictionary |
+| id | column           | type            | notes |
+|----|------------------|-----------------|-------|
+| 0  | trace_id         | fixed 16 bytes  | always present; primary sort key |
+| 1  | span_id          | fixed 8 bytes   | always present |
+| 2  | parent_span_id   | fixed 8 bytes   | nullable (root spans have none) |
+| 3  | name             | Utf8            | always present |
+| 4  | start_ts_ns      | i64 (ns)        | always present |
+| 5  | end_ts_ns        | i64 (ns)        | always present |
+| 6  | status_code      | u8              | OTLP status: 0 Unset, 1 Ok, 2 Error |
+| 7  | status_message   | Utf8            | nullable |
+| 8  | attrs_raw        | Utf8            | v4; nullable; canonical blob of overflow attributes |
+| 9  | service_name     | Utf8            | v3, ADR-0054; nullable |
+| 10 | event_count      | i64             | v4; per-row event count; present iff the block has events |
+| 11 | event_ts         | i64             | v4; flattened, one entry per event |
+| 12 | event_name       | Utf8            | v4; flattened, one entry per event |
+| 13 | event_attrs_blob | bytes           | v4; flattened, one entry per event |
+| 14+| `<attr name>`    | Utf8            | v4; one per in-budget attribute key, name in the block directory |
 
-The `attrs` column merges the resource, scope, and span attribute sets into one
-map, following the exact resource+scope-wins-over-record convention
-docs/log-segment-format.md documents for logs (reused, not redesigned): on a
-key collision the resource/scope value wins over the span-level value, and
-resource wins over scope. `ravel_rspan::merge_attrs` builds it. The map is
-stored per row as one canonical blob (`uvarint(count)` then, per pair,
-`uvarint(klen) key uvarint(vlen) value`, sorted ascending by key with unique
-keys), so identical maps encode byte-identically.
+The caller-facing `attrs` map (`ravel_rspan::SpanRecord`, `Map<Utf8, Utf8>`)
+merges the resource, scope, and span attribute sets following the exact
+resource+scope-wins-over-record convention docs/log-segment-format.md documents
+for logs (reused, not redesigned): on a key collision the resource/scope value
+wins, and resource wins over scope. `ravel_rspan::merge_attrs` builds it. The
+map is stored **not** as one blob but split across the columns below; the
+reader reassembles the identical map, sorted ascending by key with unique keys,
+so a `SpanRecord` round-trips byte-identically.
+
+**Per-key attribute columns (ids 14+, v4, ADR-0045 decision 3).** Each
+attribute key (after lifting out `service.name` and `_events_raw`) becomes its
+own Utf8 column. Column ids are assigned object-wide: the distinct keys are
+sorted ascending and the first 1000 get ids `14, 15, ...`. Each block records
+the `(column_id, name)` of the dynamic columns it carries in its own directory
+(see BLOCKS), so a block decodes with no object-wide FIELD_DIR.
+
+**`attrs_raw` (id 8, v4).** Keys past the 1000-column budget fold, per row, into
+this canonical blob (`uvarint(count)` then, per pair, `uvarint(klen) key
+uvarint(vlen) value`, sorted ascending, unique keys). It is scan-queryable but
+carries no per-key column, so it is never pruned by a field predicate. Nullable:
+a row with no overflow has no value. This reuses v3's `attrs` blob column id;
+v4 retires v3 with no dual reader, so the id is repurposed rather than
+versioned.
 
 **`service_name` (id 9, v3, ADR-0054).** The `service.name` value is lifted out
-of the merged map into its own column at write time and is **not** duplicated
-in the `attrs` blob. `merge_attrs` is unchanged and still produces the full
-map; the extraction happens after. The reader re-inserts `service.name` into
-the map when it rebuilds a `SpanRecord`, so a record round-trips byte-
-identically. The column is nullable (a span whose merged attrs carry no
-`service.name` has no value) and its id (9) also scopes the `service.name`
-bloom (see BLOOM below). Its encoding is block-local dictionary (see BLOCKS).
+of the map into its own column and is **not** duplicated among the per-key
+columns or `attrs_raw`. The reader re-inserts `service.name` into the map when
+it rebuilds a `SpanRecord`. Nullable; its id (9) also scopes the `service.name`
+bloom (see BLOOM below).
 
-**Span events and links** (OTLP's nested repeated fields) are out of scope for
-v1. They are never decoded into first-class columns; if a producer decodes them
-at all, they belong in `attrs` as an opaque blob value (for example
-`"_events_raw"`), never silently dropped (ADR-0041: approximation opt-in and
-visible).
+**Span events (ids 10-13, v4, ADR-0045 decision 3).** OTLP span events (which
+carry the exception stack traces that are a primary investigation target) were
+stored in v1 as an opaque `_events_raw` attribute value (a hex blob of
+concatenated length-delimited `Span.Event` messages). v4 promotes them into
+nested columns: a per-row `event_count`, and three columns flattened one entry
+per event across the block — `event_ts` (the event `time_unix_nano`),
+`event_name`, and `event_attrs_blob` (the event's opaque serialized bytes, the
+round-trip source of truth). The writer decodes a parseable `_events_raw` value
+into these columns; the reader reconstructs the identical `_events_raw` value
+from the verbatim `event_attrs_blob`s, so a `SpanRecord` round-trips
+byte-identically. A `_events_raw` value that is not a valid events blob stays an
+ordinary attribute. Span **links** stay out of scope: a `_links_raw` value (or
+any other reserved key RSPAN does not name) round-trips as an ordinary
+attribute, never promoted to columns (a named gap, ADR-0045).
 
 ## BLOCKS
 
 A block holds a run of spans column by column: a header of page descriptors,
-then the pages.
+then a directory naming the block's dynamic attribute columns, then the pages.
 
 ```
 block:
@@ -204,10 +241,17 @@ block:
   uvarint  page_count
   page_descs[page_count]:
     uvarint  column_id
-    u8       enc          (1 Plain, 2 Bitmap, 3 FixedWidth, 4 Dict)
+    u8       enc          (ravel-codec registry: 1 Plain, 2 Constant, 3 Rle,
+                           4 DeltaZigzag, 5 DoubleDelta, 6 ForBitpack, 7 Dict,
+                           8 Bitmap, 9 FixedWidth)
     u8       comp         (0 none, 2 zstd)
     uvarint  len          (stored, possibly compressed)
     uvarint  uncomp_len
+  uvarint  dyn_dir_count
+  dyn_dir[dyn_dir_count]:                    (ascending by column_id)
+    uvarint  column_id     (>= 14, the dynamic range)
+    uvarint  name_len
+    name:    name_len UTF-8 bytes
   payload: the stored page bytes, in descriptor order
 ```
 
@@ -216,35 +260,39 @@ A nullable column that is present in some but not all rows of the block carries
 a presence bitmap page (`enc = Bitmap`) immediately before its value page; a
 nullable column absent from every row of the block occupies zero bytes.
 
-Value encodings are plain (integers as ivarints; strings as
-`uvarint(len)`-prefixed blobs; fixed-width values concatenated) except the
-`service_name` column, which is dictionary-encoded (`enc = Dict`, v3). Each page
-is independently wrapped in a zstd envelope (`comp = zstd`) when its encoded
-form is at least 512 bytes and zstd is strictly smaller, else stored raw. The
-`enc` tag is stored per page so a later version can add richer codecs without a
-reader rewrite. A block's crc32c lives in its SKIP_IDX entry, not inline; the
-reader verifies it before decoding anything.
+Value encodings are `ravel-codec`'s (the crate shared with RLOG, ADR-0045
+decision 1): the writer measures the applicable codecs per page and keeps the
+smallest, and the self-describing `enc` tag records the choice. Each page is
+independently wrapped in a zstd envelope (`comp = zstd`) when its encoded form
+is at least 512 bytes and zstd is strictly smaller, else stored raw. A block's
+crc32c lives in its SKIP_IDX entry, not inline; the reader verifies it before
+decoding anything, so every byte below — page descriptors, the dynamic
+directory, and every page — is under that one checksum.
 
-The `service_name` column (id 9) uses a **block-local dictionary** (`enc =
-Dict`, v3, ADR-0054). RSPAN has no segment-wide FIELD_DIR/STREAM_DIR to hold a
-shared dictionary, and a block-local one needs no new section: the distinct
-values of the block are written once, and each present row stores an index into
-them. The page is:
+**Dynamic-column directory (v4).** RSPAN has no object-wide FIELD_DIR section;
+each block instead lists, ascending by column id, the `(column_id, name)` of
+the dynamic attribute columns (ids >= 14) it carries. The reader reads the
+directory to map a decoded column back to its attribute name. It rejects a
+count over its cap, a non-ascending sequence, an id below the dynamic range, a
+truncated name, and non-UTF-8 names as `Corrupted`. Fixed columns (ids 0..=13)
+are implicit and never appear in the directory.
 
-```
-dict page (enc = Dict):
-  uvarint  dict_count
-  values[dict_count]:  uvarint(len) bytes   (distinct, strictly ascending)
-  indices[present]:    uvarint index         (< dict_count, one per present row)
-```
+**Per-key attribute columns (ids 14+).** Each is a Utf8 string column, nullable
+(a row that lacks the key has no value), decoded via `ravel-codec`'s string
+codec. A row's keys past the 1000-column budget are not columns; they live in
+`attrs_raw` (id 8) instead.
 
-The values are strictly ascending and deduplicated, so the encoding is
-canonical and a block re-encodes byte-identically. Being nullable, the column
-carries a presence bitmap page before the value page when it is present in some
-but not all rows of the block, and occupies zero bytes when no row has a
-`service.name` (the same nullable-column rule as `parent_span_id` and
-`status_message`). The reader rejects a `dict_count` over its cap, a
-non-ascending dictionary, and an out-of-range index as `Corrupted`.
+**Nested event columns (ids 10-13, v4).** When any row of the block has an
+event, the block carries `event_count` (id 10), one i64 per row (0 for a row
+with no events), and three **flattened** columns — `event_ts` (id 11, i64),
+`event_name` (id 12, Utf8), `event_attrs_blob` (id 13, bytes) — each with
+`sum(event_count)` entries, one per event across the whole block in row order,
+with no presence bitmap (every entry is present). The reader decodes
+`event_count`, sums it to learn the flattened length, then decodes the three
+value columns and slices them back into per-row event lists. It rejects a
+negative `event_count`, a sum over its cap, an event value column present
+without `event_count` (or vice versa), and an event value column that is not a
+single value page. A block with no events carries none of ids 10-13.
 
 ## SKIP_IDX
 
@@ -381,6 +429,18 @@ The v2 `min_duration_ns`/`max_duration_ns`/`status_mask` fields add no new
 checksum surface of their own: SKIP_IDX is read and verified as one
 whole-section zstd blob under its `Section.crc32c`, so those fields inherit that
 existing coverage exactly as the v1 fields did.
+
+The v4 grammar adds new byte ranges only *inside* the block: the
+dynamic-column directory, the per-key attribute column pages, the `attrs_raw`
+page, and the four event columns. Every one of those bytes lives within the
+block body, and the reader verifies the block's `crc32c` (from its SKIP_IDX
+entry) over the whole block before it reads a single one of them — the block
+crc32c is recomputed and compared first thing in `read_block`, and decoding
+stops on a mismatch. So each new range a v4 reader interprets is under a
+checksum the reader verifies on its access path (ADR-0010 §4). No v4 field is
+read from bytes outside that crc, and RSPAN adds no separate per-column or
+per-event checksum: the whole-block crc32c is the single covering checksum for
+all of them, exactly as it already was for the v1..v3 columns.
 
 ## Compaction (L0 → L1)
 

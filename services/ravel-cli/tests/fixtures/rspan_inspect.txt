@@ -1,5 +1,5 @@
-total_size: 707
-version: 3
+total_size: 768
+version: 4
 signal: 3
 tenant_hash: abababababababababababababababab
 shard: 3
@@ -16,15 +16,16 @@ level: 0
 input_set_hash: 
 part_index: 0
 sections:
-  kind=1 name=BLOCKS offset=0 len=319 comp=none uncompressed_len=319
-  kind=2 name=SKIP_IDX offset=319 len=57 comp=zstd uncompressed_len=102
-  kind=3 name=BLOOM offset=376 len=164 comp=none uncompressed_len=164
+  kind=1 name=BLOCKS offset=0 len=380 comp=none uncompressed_len=380
+  kind=2 name=SKIP_IDX offset=380 len=57 comp=zstd uncompressed_len=102
+  kind=3 name=BLOOM offset=437 len=164 comp=none uncompressed_len=164
 skip_index (2 block(s)):
-  block[0] offset=0 len=149 crc32c=3f6bdbad record_count=2 trace_id_range=[01010101010101010101010101010101, 01010101010101010101010101010101] start_ts_min=100 end_ts_max=200 duration_ns=[60, 100] status_mask=011 (unset|ok)
-  block[1] offset=149 len=170 crc32c=4eeeb76a record_count=2 trace_id_range=[02020202020202020202020202020202, 02020202020202020202020202020202] start_ts_min=150 end_ts_max=400 duration_ns=[140, 250] status_mask=110 (ok|error)
+  block[0] offset=0 len=210 crc32c=4618ec28 record_count=2 trace_id_range=[01010101010101010101010101010101, 01010101010101010101010101010101] start_ts_min=100 end_ts_max=200 duration_ns=[60, 100] status_mask=011 (unset|ok)
+  block[1] offset=210 len=170 crc32c=32947f49 record_count=2 trace_id_range=[02020202020202020202020202020202, 02020202020202020202020202020202] start_ts_min=150 end_ts_max=400 duration_ns=[140, 250] status_mask=110 (ok|error)
 bloom (2 block(s))
 records (4):
-  record[0] trace_id=01010101010101010101010101010101 span_id=0000000000000000 parent_span_id= name=GET /api start_ts_ns=100 end_ts_ns=200 status=ok status_message= service_name=svc1 attrs=
-  record[1] trace_id=01010101010101010101010101010101 span_id=0101010101010101 parent_span_id=0000000000000000 name=db.query start_ts_ns=120 end_ts_ns=180 status=unset status_message= service_name=svc1 attrs=
-  record[2] trace_id=02020202020202020202020202020202 span_id=0000000000000000 parent_span_id= name=POST /login start_ts_ns=150 end_ts_ns=400 status=error status_message=boom service_name=svc2 attrs=
-  record[3] trace_id=02020202020202020202020202020202 span_id=0101010101010101 parent_span_id=0000000000000000 name=auth.check start_ts_ns=160 end_ts_ns=300 status=ok status_message= service_name=svc2 attrs=
+  record[0] trace_id=01010101010101010101010101010101 span_id=0000000000000000 parent_span_id= name=GET /api start_ts_ns=100 end_ts_ns=200 status=ok status_message= service_name=svc1 attrs=http.method=GET events=1
+    event[0] ts_ns=170 name=exception attrs_blob=09aa000000000000001209657863657074696f6e1a05737461636b
+  record[1] trace_id=01010101010101010101010101010101 span_id=0101010101010101 parent_span_id=0000000000000000 name=db.query start_ts_ns=120 end_ts_ns=180 status=unset status_message= service_name=svc1 attrs=http.method=GET events=0
+  record[2] trace_id=02020202020202020202020202020202 span_id=0000000000000000 parent_span_id= name=POST /login start_ts_ns=150 end_ts_ns=400 status=error status_message=boom service_name=svc2 attrs=http.method=GET events=0
+  record[3] trace_id=02020202020202020202020202020202 span_id=0101010101010101 parent_span_id=0000000000000000 name=auth.check start_ts_ns=160 end_ts_ns=300 status=ok status_message= service_name=svc2 attrs=http.method=GET events=0

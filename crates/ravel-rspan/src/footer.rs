@@ -14,14 +14,17 @@ use crate::pb;
 
 /// Trailer magic, last 4 bytes of every RSPAN object.
 pub const MAGIC: [u8; 4] = *b"RSP1";
-/// RSPAN trailer version. v3 (ADR-0054) added a mandatory per-block BLOOM
-/// section over `service.name` and span-name tokens ([`kind::BLOOM`]) and a
-/// block-local dictionary-encoded `service_name` column (id 9); v2 (ADR-0045)
-/// had added per-block duration bounds and a status mask to SKIP_IDX. Any
-/// earlier version (v1, v2) is rejected with the same typed `unsupported
-/// version` error as any other unknown version (ADR-0045 decision 4, ADR-0054
-/// decision 1: single supported version, no dual reader).
-pub const VERSION: u16 = 3;
+/// RSPAN trailer version. v4 (ADR-0045 decision 3) replaces v3's single opaque
+/// `attrs` blob column with RLOG's per-key string columns (1000-column budget,
+/// `attrs_raw` overflow) and promotes span events into nested columns
+/// (`event_ts`/`event_name`/`event_attrs_blob` with a per-row `event_count`),
+/// keeping v3's mandatory BLOOM section ([`kind::BLOOM`]) and lifted
+/// `service_name` column (id 9). v2 (ADR-0045 decision 2) had added per-block
+/// duration bounds and a status mask to SKIP_IDX. Any earlier version (v1, v2,
+/// v3) is rejected with the same typed `unsupported version` error as any other
+/// unknown version (ADR-0045 decision 4, ADR-0054 decision 1: single supported
+/// version, no dual reader; v4 retires v3 with no dual reader).
+pub const VERSION: u16 = 4;
 
 /// The set of RSPAN trailer versions this build's reader accepts (ADR-0066
 /// decision 1: "N/N-1 window, readers first"). Writers always emit the current
@@ -722,16 +725,16 @@ mod tests {
         assert!(matches!(open(&obj), Err(SpanSegError::Corrupted(_))));
     }
 
-    /// Round-trip of a v3 segment (ADR-0054). Writes a v3
-    /// segment with known service names and span names across multiple blocks,
-    /// reads it back, and confirms: the trailer is at the live `footer::VERSION`
+    /// Round-trip of a v4 segment. Writes a segment with known service names and
+    /// span names across multiple blocks, reads it back, and confirms: the
+    /// trailer is at the live `footer::VERSION`
     /// (never a mirrored literal); the mandatory BLOOM section
     /// exists and answers membership with no false negatives (a false positive
     /// is allowed); the `service_name` column decodes correctly per row; and a
     /// corrupted or truncated BLOOM section is a typed `Corrupted` error, not a
     /// panic.
     #[test]
-    fn v3_bloom_and_service_name_column_roundtrip() {
+    fn v4_bloom_and_service_name_column_roundtrip() {
         use ravel_codec::bloom_section::BloomSection;
         use ravel_codec::tokenizer::tokens;
 
