@@ -36,6 +36,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ravel_types::TenantHash;
+
+use crate::attribution::TenantPutAttribution;
 use crate::metrics::FlushTrigger;
 
 #[derive(Debug, Default)]
@@ -124,6 +127,13 @@ pub struct LogIngestMetrics {
     /// gauge with a per-shard dimension, unlike everything else here; read it
     /// via [`LogIngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Bounded-cardinality per-tenant PUT attribution (ADR-0076 decision 2),
+    /// the log-pipeline counterpart of [`crate::IngestMetrics`]'s own. Carries
+    /// a per-tenant dimension, so it stays bounded by a top-K cap rather than
+    /// an unbounded label, and is read via
+    /// [`LogIngestMetrics::tenant_put_attribution`] rather than folded into the
+    /// `Copy` snapshot. See [`crate::attribution`] for the policy.
+    put_attribution: TenantPutAttribution,
 }
 
 /// Point-in-time copy of [`LogIngestMetrics`] for scraping. See the
@@ -163,6 +173,20 @@ impl LogIngestMetrics {
             FlushTrigger::Manual => &self.flushes_manual,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Attribute one completed flush's PUTs to `tenant` (success-time,
+    /// ADR-0076 decision 2). Called from the terminal success path of
+    /// `log_shard.rs`'s `run_flush`, after both PUTs have landed.
+    pub(crate) fn record_flush_puts(&self, tenant: TenantHash) {
+        self.put_attribution.record_flush(tenant);
+    }
+
+    /// The bounded-cardinality per-tenant PUT attribution (ADR-0076 decision
+    /// 2). Reachable from `LogIngestRouter` through
+    /// [`crate::LogIngestRouter::metrics`].
+    pub fn tenant_put_attribution(&self) -> &TenantPutAttribution {
+        &self.put_attribution
     }
 
     pub(crate) fn record_put_retry(&self) {

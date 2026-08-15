@@ -39,6 +39,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ravel_types::TenantHash;
+
+use crate::attribution::TenantPutAttribution;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushTrigger {
     Size,
@@ -147,6 +151,13 @@ pub struct IngestMetrics {
     /// struct (see the module docs' "no per-shard dimension" note); read it
     /// via [`IngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Bounded-cardinality per-tenant PUT attribution (ADR-0076 decision 2).
+    /// Unlike every flat counter above it carries a per-tenant dimension, so
+    /// it is kept bounded by a top-K cap rather than exposed as an unbounded
+    /// label, and is read via [`IngestMetrics::tenant_put_attribution`] rather
+    /// than folded into [`IngestMetricsSnapshot`] (which is `Copy`). See
+    /// [`crate::attribution`] for the counting convention and eviction policy.
+    put_attribution: TenantPutAttribution,
 }
 
 /// Point-in-time copy of [`IngestMetrics`] for scraping. See the
@@ -215,6 +226,23 @@ impl IngestMetrics {
             .collect();
         counts.sort_unstable_by_key(|&(shard, _)| shard);
         counts
+    }
+
+    /// Attribute one completed flush's PUTs to `tenant` (success-time,
+    /// ADR-0076 decision 2). Called from the terminal success path of
+    /// `shard.rs`'s `run_flush`, after both the data-object and commit-record
+    /// PUTs have landed.
+    pub(crate) fn record_flush_puts(&self, tenant: TenantHash) {
+        self.put_attribution.record_flush(tenant);
+    }
+
+    /// The bounded-cardinality per-tenant PUT attribution (ADR-0076 decision
+    /// 2). A caller outside this crate reads the current top-K via
+    /// [`TenantPutAttribution::top_n`]; a later operator-facing endpoint (T4)
+    /// consumes it. Reachable from `IngestRouter` through
+    /// [`crate::IngestRouter::metrics`].
+    pub fn tenant_put_attribution(&self) -> &TenantPutAttribution {
+        &self.put_attribution
     }
 
     pub(crate) fn record_put_retry(&self) {

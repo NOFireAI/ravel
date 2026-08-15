@@ -361,6 +361,10 @@ impl LogFlushCtx {
 
         match self.publish_with_retry(&record, deadline_ns).await {
             Some(token) => {
+                // Both PUTs landed: attribute this flush's PUT cost to the
+                // tenant (ADR-0076 decision 2, success-time). `tenant_hash` is
+                // `Copy` and untouched by the commit-record build above.
+                self.metrics.record_flush_puts(tenant_hash);
                 self.ack_waiters(waiters, Ok(token));
             }
             None => {
