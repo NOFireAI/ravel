@@ -209,6 +209,18 @@ fn threshold_rule(for_duration: Option<Duration>) -> Rule {
         annotations: vec![("summary".to_string(), "cpu is hot".to_string())],
         for_duration,
         max_alert_generation: None,
+        repeat_interval: None,
+    }
+}
+
+/// A firing rule with an explicit repeat cadence, for the "repeat notifications
+/// while firing" tests (ADR-0043 amendment). `for_duration` is `None` so the
+/// first tick fires immediately; `repeat_interval` is `Some` so the default is
+/// not silently under test.
+fn repeat_rule(repeat_interval: Option<Duration>) -> Rule {
+    Rule {
+        repeat_interval,
+        ..threshold_rule(None)
     }
 }
 
@@ -247,6 +259,25 @@ async fn seeded_store() -> Arc<dyn ObjectStoreBackend> {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new(TENANT);
     publish_metric(store.as_ref(), &tenant, &[(NOW_NS - 30 * NS_PER_SEC, 1.0)]).await;
+    store
+}
+
+/// A store seeded with above-threshold samples every 60 seconds from just
+/// before `NOW_NS` through `last_ns`, so the instant query keeps finding a fresh
+/// sample (within PromQL's 5-minute lookback) at every tick and the alert stays
+/// `Firing` across the whole span. `last_ns` stays inside the first ingest hour
+/// so the one seeded segment is always listed. Used by the repeat-cadence tests,
+/// which must hold a rule firing across more than one 5-minute resolve timeout.
+async fn seeded_store_spanning(last_ns: i64) -> Arc<dyn ObjectStoreBackend> {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    let mut samples = Vec::new();
+    let mut ts = NOW_NS - 30 * NS_PER_SEC;
+    while ts <= last_ns {
+        samples.push((ts, 1.0));
+        ts += 60 * NS_PER_SEC;
+    }
+    publish_metric(store.as_ref(), &tenant, &samples).await;
     store
 }
 
@@ -823,5 +854,433 @@ async fn a_restarted_evaluator_redelivers_a_notification_stuck_at_the_old_proces
         2,
         "at-least-once across a restart: the stuck notification is now delivered"
     );
+    server.stop().await;
+}
+
+// --- Repeat notifications while firing (ADR-0043 amendment) -----------------
+
+/// Every alertmanager alert object in a captured call, asserting each carries a
+/// `startsAt` and never an `endsAt` (the firing re-send shape the amendment's
+/// decision 6 requires).
+fn assert_firing_shape(calls: &[(String, Json)]) {
+    for (path, body) in calls {
+        assert_eq!(
+            path, "/api/v2/alerts",
+            "posted to the alertmanager endpoint"
+        );
+        let alerts = body.as_array().expect("api/v2/alerts takes an array");
+        for alert in alerts {
+            assert!(
+                alert["startsAt"].is_string(),
+                "a firing send carries startsAt: {alert:?}"
+            );
+            assert!(
+                alert.get("endsAt").is_none(),
+                "a firing repeat must never carry endsAt: {alert:?}"
+            );
+        }
+    }
+}
+
+/// Exit criterion 1: a rule held firing across more than one default
+/// Alertmanager `resolve_timeout` (5 minutes) re-notifies at the repeat cadence
+/// (1 minute), so the notification count grows and Alertmanager never sees the
+/// silence that would false-clear the alert. Every send is a firing re-send
+/// (`startsAt`, no `endsAt`) and no repeat writes a durable record.
+#[tokio::test]
+async fn a_persistently_firing_rule_repeats_across_the_resolve_timeout() {
+    let server = SinkServer::start(StatusCode::OK).await;
+    let store = seeded_store_spanning(NOW_NS + 420 * NS_PER_SEC).await;
+    let tenant = TenantId::new(TENANT).hash();
+    let clock = TestClock::at(NOW_NS);
+    let mut evaluator = evaluator(
+        Arc::clone(&store),
+        clock.clone(),
+        vec![repeat_rule(Some(Duration::from_secs(60)))],
+        vec![AlertSink::alertmanager(server.base_url())],
+    );
+
+    // Onset: one firing transition, delivered once, no repeat yet.
+    let onset = evaluator.run_tick().await;
+    assert_eq!(onset.records_written, 1, "the onset is a transition");
+    assert_eq!(onset.notifications_delivered, 1);
+    assert_eq!(
+        onset.repeats_queued, 0,
+        "window 0 is the onset, not a repeat"
+    );
+
+    // Tick once a minute across a >5-minute firing span. Each minute is a new
+    // repeat window; none writes a record.
+    let mut repeats = 0;
+    for _ in 0..6 {
+        clock.advance(Duration::from_secs(60));
+        let tick = evaluator.run_tick().await;
+        assert_eq!(
+            tick.records_written, 0,
+            "a repeat is a re-send, never a durable record"
+        );
+        repeats += tick.repeats_queued;
+    }
+    assert!(
+        repeats >= 5,
+        "at least five repeats inside the 5-minute resolve timeout, got {repeats}"
+    );
+
+    // Nothing was written for the repeats: the whole episode is one record.
+    assert_eq!(
+        read_alert_records(store.as_ref(), tenant).await.len(),
+        1,
+        "the durable history is one firing record; repeats add none"
+    );
+
+    // Onset plus every repeat crossed the socket as a firing re-send.
+    let calls = server.capture.calls();
+    assert!(
+        calls.len() >= 6,
+        "onset plus repeats delivered, got {} calls",
+        calls.len()
+    );
+    assert_firing_shape(&calls);
+
+    server.stop().await;
+}
+
+/// Exit criterion 2: a restart mid-firing-episode resumes repeats on the
+/// schedule derived from the durable record, not reset to zero. A fresh
+/// evaluator re-derives the window index from the firing record's own timestamp
+/// (`k = (now - record.ts_ns) / repeat_interval`), so its first repeat lands on
+/// the current window, not on window 1. The proof that the schedule is
+/// record-derived and not an in-memory timer reset to zero: the restart's own
+/// tick already queues a repeat (a from-zero timer would compute window 0 there
+/// and stay silent until a full interval later). `bootstrap_undelivered` covers
+/// the restart instant regardless of the lease, so there is never a silence,
+/// and the two compose into a single send (one entry per `alert_id`).
+///
+/// The dead process's lease lingers in the store, so the new sole replica only
+/// repeats once it takes that expired lease over -- realistic single-replica
+/// restart behavior. The clock is advanced past the old lease's expiry so the
+/// new replica legitimately holds it.
+#[tokio::test]
+async fn repeats_resume_from_the_durable_record_after_a_restart() {
+    let server = SinkServer::start(StatusCode::OK).await;
+    let store = seeded_store_spanning(NOW_NS + 400 * NS_PER_SEC).await;
+    let clock = TestClock::at(NOW_NS);
+
+    {
+        let mut a = evaluator(
+            Arc::clone(&store),
+            clock.clone(),
+            vec![repeat_rule(Some(Duration::from_secs(60)))],
+            vec![AlertSink::alertmanager(server.base_url())],
+        );
+        assert_eq!(a.run_tick().await.records_written, 1, "onset fires");
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(a.run_tick().await.repeats_queued, 1, "window 1 repeats");
+    }
+    let before_restart = server.capture.calls().len();
+
+    // Process "restarts": fresh in-memory state, same durable store. Advance
+    // past the dead replica's lease expiry (3 * 60s from its last renewal at
+    // t+60s, i.e. t+240s) so the new replica can take the lease and repeat.
+    clock.advance(Duration::from_secs(200)); // now t+260s => window 4 of the record
+    let mut b = evaluator(
+        Arc::clone(&store),
+        clock.clone(),
+        vec![repeat_rule(Some(Duration::from_secs(60)))],
+        vec![AlertSink::alertmanager(server.base_url())],
+    );
+    let restart = b.run_tick().await;
+    assert_eq!(
+        restart.records_written, 0,
+        "a restart mid-episode writes no new record"
+    );
+    assert_eq!(
+        restart.repeats_queued, 1,
+        "the restart tick itself repeats on the record-derived window (4), proving the \
+         schedule is not reset to zero"
+    );
+    assert_eq!(
+        server.capture.calls().len() - before_restart,
+        1,
+        "at most one duplicate across the restart: bootstrap and the repeat compose to one send"
+    );
+
+    // The schedule continues from the record: the next window fires with no gap.
+    clock.advance(Duration::from_secs(60)); // t+320s => window 5
+    assert_eq!(
+        b.run_tick().await.repeats_queued,
+        1,
+        "the next window repeats on schedule; no gap after the restart"
+    );
+
+    assert_firing_shape(&server.capture.calls());
+    server.stop().await;
+}
+
+/// Exit criterion 3: a resolve-then-refire cycle re-anchors the repeat schedule
+/// on the new episode's firing record. The old episode's window mark (here
+/// window 4) does not suppress the new episode's first repeat (window 1), which
+/// is exactly the anchor-staleness bug the ADR's self-review caught. The old
+/// episode reaching a strictly higher window than the new one's first repeat is
+/// what makes this non-vacuous: a numeric-only mark would suppress it.
+#[tokio::test]
+async fn a_refire_is_not_suppressed_by_the_old_episodes_window_mark() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT).hash();
+    // One firing sample at onset, then a >5-minute gap (the alert resolves),
+    // then a fresh burst that refires the alert on a new episode.
+    publish_metric(
+        store.as_ref(),
+        &TenantId::new(TENANT),
+        &[
+            (NOW_NS - 30 * NS_PER_SEC, 1.0),
+            (NOW_NS + 400 * NS_PER_SEC, 1.0),
+            (NOW_NS + 460 * NS_PER_SEC, 1.0),
+            (NOW_NS + 520 * NS_PER_SEC, 1.0),
+        ],
+    )
+    .await;
+    let clock = TestClock::at(NOW_NS);
+    let mut ev = evaluator(
+        Arc::clone(&store),
+        clock.clone(),
+        vec![repeat_rule(Some(Duration::from_secs(60)))],
+        Vec::new(),
+    );
+
+    // Old episode fires and repeats through window 4 (the onset sample stays
+    // fresh for 5 minutes).
+    assert_eq!(ev.run_tick().await.records_written, 1, "old episode fires");
+    let mut old_repeats = 0;
+    for _ in 0..4 {
+        clock.advance(Duration::from_secs(60));
+        old_repeats += ev.run_tick().await.repeats_queued;
+    }
+    assert_eq!(
+        old_repeats, 4,
+        "the old episode reached window 4 before resolving"
+    );
+
+    // Onset sample now stale (age > 5 minutes) and the refire burst not yet in
+    // range: the alert resolves.
+    clock.advance(Duration::from_secs(60)); // NOW + 300s
+    assert_eq!(
+        ev.run_tick().await.records_written,
+        1,
+        "the old episode resolves"
+    );
+    assert_eq!(
+        ev.run_tick().await.repeats_queued,
+        0,
+        "a resolved alert never repeats"
+    );
+
+    // Refire: the burst at NOW+400s is now in range, opening a new episode.
+    clock.advance(Duration::from_secs(120)); // NOW + 420s, sample at 400s is fresh
+    let refire = ev.run_tick().await;
+    assert_eq!(refire.records_written, 1, "the alert refires");
+    assert_eq!(
+        refire.repeats_queued, 0,
+        "window 0 of the new episode is the transition, not a repeat"
+    );
+
+    // Window 1 of the NEW episode. The stale mark sits at window 4 of the old
+    // episode; without the anchor-staleness check, 4 >= 1 would suppress this
+    // send and the refired alert would silently never repeat.
+    clock.advance(Duration::from_secs(60)); // NOW + 480s
+    assert_eq!(
+        ev.run_tick().await.repeats_queued,
+        1,
+        "the refired episode re-anchors and repeats despite the old window-4 mark"
+    );
+
+    // Exactly two firing records exist in history (old onset, new onset); no
+    // repeat wrote one.
+    let records = read_alert_records(store.as_ref(), tenant).await;
+    let firing = records
+        .iter()
+        .filter(|r| r.state == AlertState::Firing)
+        .count();
+    assert_eq!(firing, 2, "two firing transitions, no repeat records");
+}
+
+/// Exit criterion 4: a tick less than one `repeat_interval` past the firing
+/// record queues no repeat and sends nothing.
+#[tokio::test]
+async fn a_quiet_tick_within_the_interval_does_not_repeat() {
+    let server = SinkServer::start(StatusCode::OK).await;
+    let store = seeded_store().await;
+    let clock = TestClock::at(NOW_NS);
+    let mut ev = evaluator(
+        Arc::clone(&store),
+        clock.clone(),
+        vec![repeat_rule(Some(Duration::from_secs(60)))],
+        vec![AlertSink::alertmanager(server.base_url())],
+    );
+
+    assert_eq!(ev.run_tick().await.notifications_delivered, 1, "onset sent");
+    assert_eq!(server.capture.calls().len(), 1);
+
+    // Half an interval later: still firing, but no repeat window has elapsed.
+    clock.advance(Duration::from_secs(30));
+    let quiet = ev.run_tick().await;
+    assert_eq!(quiet.repeats_queued, 0, "no window elapsed, no repeat");
+    assert_eq!(quiet.notifications_delivered, 0, "nothing to deliver");
+    assert_eq!(
+        server.capture.calls().len(),
+        1,
+        "the notification count did not grow on a quiet tick"
+    );
+
+    server.stop().await;
+}
+
+/// Exit criterion 5: a repeat whose delivery fails stays in `undelivered` and
+/// retries on the next tick, without corrupting the window mark into either a
+/// flood (re-queuing every tick) or a permanent gap (never sending again).
+#[tokio::test]
+async fn a_failed_repeat_retries_without_flooding_or_gapping() {
+    let server = SinkServer::start(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let store = seeded_store().await;
+    let clock = TestClock::at(NOW_NS);
+    let mut ev = evaluator(
+        Arc::clone(&store),
+        clock.clone(),
+        vec![repeat_rule(Some(Duration::from_secs(60)))],
+        vec![AlertSink::webhook(format!("{}/hook", server.base_url()))],
+    );
+
+    // Onset fails to deliver; the firing notification is stuck in undelivered.
+    let onset = ev.run_tick().await;
+    assert_eq!(onset.records_written, 1);
+    assert_eq!(onset.notifications_failed, 1, "sink is 500ing");
+    let after_onset = server.capture.calls().len();
+
+    // Window 1, still failing: one repeat queued, one failed delivery, one POST.
+    clock.advance(Duration::from_secs(60));
+    let w1 = ev.run_tick().await;
+    assert_eq!(w1.repeats_queued, 1, "window 1 repeat queued");
+    assert_eq!(w1.records_written, 0, "no durable record for a repeat");
+    assert_eq!(w1.notifications_failed, 1, "the repeat delivery failed");
+    let after_w1 = server.capture.calls().len();
+    assert_eq!(
+        after_w1,
+        after_onset + 1,
+        "the failed repeat was attempted once"
+    );
+
+    // Still window 1 (advance < interval), still failing: the mark is not
+    // re-queued (no flood), but the stuck entry retries.
+    clock.advance(Duration::from_secs(30));
+    let quiet = ev.run_tick().await;
+    assert_eq!(
+        quiet.repeats_queued, 0,
+        "the same window does not re-queue: no flood into undelivered"
+    );
+    assert_eq!(quiet.notifications_failed, 1, "the stuck repeat retries");
+    assert_eq!(
+        server.capture.calls().len(),
+        after_w1 + 1,
+        "the retry crossed the socket rather than being skipped"
+    );
+
+    // Sink recovers; window 2: the mark advances by exactly one and the stuck
+    // notification finally drains. No permanent gap.
+    server.capture.set_status(StatusCode::OK);
+    clock.advance(Duration::from_secs(30)); // NOW + 120s => window 2
+    let w2 = ev.run_tick().await;
+    assert_eq!(w2.repeats_queued, 1, "window 2 repeats: no permanent gap");
+    assert_eq!(
+        w2.notifications_delivered, 1,
+        "the repeat finally delivered"
+    );
+    assert_eq!(w2.notifications_failed, 0);
+
+    server.stop().await;
+}
+
+/// Exit criterion 6 (pending): a `Pending` alert never repeats, even once more
+/// than `repeat_interval` has elapsed, because `for` exists precisely to keep
+/// pending quiet.
+#[tokio::test]
+async fn a_pending_alert_does_not_repeat() {
+    let store = seeded_store().await;
+    let tenant = TenantId::new(TENANT).hash();
+    let clock = TestClock::at(NOW_NS);
+    let rule = Rule {
+        for_duration: Some(Duration::from_secs(600)),
+        repeat_interval: Some(Duration::from_secs(60)),
+        ..threshold_rule(None)
+    };
+    let mut ev = evaluator(Arc::clone(&store), clock.clone(), vec![rule], Vec::new());
+
+    assert_eq!(ev.run_tick().await.records_written, 1, "onset is pending");
+    assert_eq!(
+        read_alert_records(store.as_ref(), tenant).await[0].state,
+        AlertState::Pending
+    );
+
+    // Well past repeat_interval but still inside `for`: still pending, no repeat.
+    clock.advance(Duration::from_secs(120));
+    let tick = ev.run_tick().await;
+    assert_eq!(tick.records_written, 0, "still pending, no transition");
+    assert_eq!(tick.repeats_queued, 0, "a pending alert never repeats");
+}
+
+/// Exit criterion 6 (removed rule): an alert whose rule is gone from the config
+/// never repeats. The removed rule is not iterated, so no repeat is ever queued;
+/// `bootstrap_undelivered` still redelivers the still-firing alert exactly once
+/// across the restart (that is bootstrap, not a repeat), after which it falls
+/// silent for Alertmanager to auto-resolve.
+#[tokio::test]
+async fn a_rule_removed_from_config_never_repeats() {
+    let server = SinkServer::start(StatusCode::OK).await;
+    let store = seeded_store().await;
+    let clock = TestClock::at(NOW_NS);
+
+    {
+        let mut a = evaluator(
+            Arc::clone(&store),
+            clock.clone(),
+            vec![repeat_rule(Some(Duration::from_secs(60)))],
+            vec![AlertSink::alertmanager(server.base_url())],
+        );
+        assert_eq!(a.run_tick().await.records_written, 1, "the alert fires");
+    }
+    let after_fire = server.capture.calls().len();
+
+    // Rule removed: a fresh evaluator with an empty rule set, same firing store.
+    clock.advance(Duration::from_secs(60));
+    let mut b = evaluator(
+        Arc::clone(&store),
+        clock.clone(),
+        Vec::new(),
+        vec![AlertSink::alertmanager(server.base_url())],
+    );
+    let restart = b.run_tick().await;
+    assert_eq!(
+        restart.repeats_queued, 0,
+        "a removed rule is not iterated, so it never repeats"
+    );
+    let after_bootstrap = server.capture.calls().len();
+    assert_eq!(
+        after_bootstrap,
+        after_fire + 1,
+        "bootstrap redelivers the still-firing alert exactly once across the restart"
+    );
+
+    // Many intervals later: no repeat, no further send.
+    clock.advance(Duration::from_secs(300));
+    let later = b.run_tick().await;
+    assert_eq!(
+        later.repeats_queued, 0,
+        "still no repeat for a removed rule"
+    );
+    assert_eq!(
+        server.capture.calls().len(),
+        after_bootstrap,
+        "no repeat send after the single bootstrap redelivery"
+    );
+
     server.stop().await;
 }

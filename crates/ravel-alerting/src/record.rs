@@ -484,6 +484,7 @@ mod tests {
             annotations: vec![],
             for_duration: None,
             max_alert_generation: None,
+            repeat_interval: None,
         };
         let keep = StateTransition {
             next_state: AlertState::Firing,
@@ -512,6 +513,7 @@ mod tests {
             annotations: vec![],
             for_duration: None,
             max_alert_generation: Some(2),
+            repeat_interval: None,
         };
         let fire = StateTransition {
             next_state: AlertState::Firing,
@@ -546,6 +548,7 @@ mod tests {
             annotations: vec![],
             for_duration: None,
             max_alert_generation: None,
+            repeat_interval: None,
         };
         let firing_record = build_transition_record(&rule, AlertState::Firing, 5, 0);
         let resolve = StateTransition {

@@ -244,6 +244,7 @@ mod tests {
             annotations: vec![],
             for_duration,
             max_alert_generation: None,
+            repeat_interval: None,
         }
     }
 

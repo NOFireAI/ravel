@@ -467,6 +467,7 @@ async fn real_ravel_alerting_record_decodes_identically() {
         annotations: vec![],
         for_duration: None,
         max_alert_generation: None,
+        repeat_interval: None,
     };
     let record = build_transition_record(&rule, AlertState::Firing, 4, 5);
     let object = encode_record_object(&record, small_blocks(), identity()).expect("encode");

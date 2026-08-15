@@ -69,5 +69,5 @@ pub use record::{
     AlertRecord, LABEL_PREFIX, build_transition_record, compute_alert_id, encode_record_object,
     write_alert_record,
 };
-pub use rule::{Rule, RuleCondition, RuleQuery, ThresholdOp};
+pub use rule::{DEFAULT_REPEAT_INTERVAL, Rule, RuleCondition, RuleQuery, ThresholdOp};
 pub use state::{AlertState, StateTransition, evaluate_suppression, evaluate_transition};

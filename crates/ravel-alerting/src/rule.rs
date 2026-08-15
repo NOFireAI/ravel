@@ -9,6 +9,17 @@ use std::time::Duration;
 
 use crate::error::AlertError;
 
+/// Default cadence at which a rule that stays `Firing` re-notifies its sinks
+/// (ADR-0043 "repeat notifications while firing" amendment, decision 3).
+///
+/// One minute, the same default as Prometheus's `--rules.alert.resend-delay`,
+/// so several sends land inside Alertmanager's default 5-minute
+/// `resolve_timeout` and a few missed ticks cannot false-clear a still-firing
+/// alert. Used when a [`Rule`]'s `repeat_interval` is `None`. An explicit
+/// `Some(Duration::ZERO)` disables repeats for that rule instead of applying
+/// this default.
+pub const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The query a rule evaluates. This crate never executes the query itself
 /// (that is the caller's `QueryEngine`/`SqlExecutor` wiring); the variant only
 /// records the language and text so the evaluator can route it and so the
@@ -177,6 +188,14 @@ pub struct Rule {
     /// Per-rule override of the generation circuit breaker. `None` uses
     /// [`crate::DEFAULT_MAX_ALERT_GENERATION`] (ADR-0040's global default).
     pub max_alert_generation: Option<u32>,
+    /// How often a rule that stays `Firing` re-notifies its sinks (ADR-0043
+    /// "repeat notifications while firing" amendment). `None` uses
+    /// [`DEFAULT_REPEAT_INTERVAL`]; `Some(Duration::ZERO)` disables repeats for
+    /// this rule (for a consumer that opens a ticket per POST). The repeat is a
+    /// re-send of the folded latest record, never a new durable record, and the
+    /// schedule is anchored to that record's own timestamp rather than stored,
+    /// so it survives a restart by construction.
+    pub repeat_interval: Option<Duration>,
 }
 
 impl Rule {
@@ -286,6 +305,7 @@ mod tests {
             annotations: vec![],
             for_duration: None,
             max_alert_generation: None,
+            repeat_interval: None,
         }
     }
 

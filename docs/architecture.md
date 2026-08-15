@@ -382,3 +382,10 @@ payload shape). Both fire only after the record is durable, and a sink failure
 is logged and retried on a later tick from the latest record -- delivery is
 at-least-once and never blocks, delays, or alters the write (ADR-0043 decision
 6).
+
+A rule that stays firing is re-notified every `repeat_interval` (a per-rule
+field, default one minute; `0s` disables it) so Alertmanager's own
+`resolve_timeout` (default five minutes) never expires and false-clears an
+alert whose condition still holds. The repeat is a re-send of the folded latest
+record, not a new durable record: its schedule is anchored to that record's own
+timestamp, so it survives a restart, and only the lease holder repeats.

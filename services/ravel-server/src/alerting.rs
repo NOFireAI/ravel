@@ -56,8 +56,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ravel_alerting::{
-    AlertId, AlertRecord, AlertState, QueryResultSummary, Rule, RuleCondition, RuleQuery,
-    ThresholdOp, compute_alert_id, condition_met, evaluate_transition, write_alert_record,
+    AlertId, AlertRecord, AlertState, DEFAULT_REPEAT_INTERVAL, QueryResultSummary, Rule,
+    RuleCondition, RuleQuery, ThresholdOp, compute_alert_id, condition_met, evaluate_transition,
+    write_alert_record,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -249,6 +250,27 @@ pub fn spawn(
             rules.clone(),
             &config,
         )?;
+        // Warn once per rule whose repeat cadence is finer than the tick can
+        // deliver: the effective cadence is `repeat_interval` rounded up to the
+        // next tick, so a sub-tick interval is silently coarsened to the tick
+        // (ADR-0043 "repeat notifications while firing", decision 3). A `None`
+        // interval uses the default and an explicit zero disables repeats, so
+        // neither warns.
+        for rule in rules.iter() {
+            if let Some(repeat) = rule.repeat_interval
+                && !repeat.is_zero()
+                && repeat < config.interval
+            {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    rule_id = %rule.rule_id,
+                    repeat_interval_secs = repeat.as_secs(),
+                    eval_interval_secs = config.interval.as_secs(),
+                    "alert rule repeat_interval is shorter than the evaluation interval; the \
+                     tick bounds the effective repeat cadence"
+                );
+            }
+        }
         let (tx, rx) = oneshot::channel();
         let interval = config.interval;
         // Production OS-entropy jitter (ADR-0068 decision 2); the harness does
@@ -286,6 +308,7 @@ async fn run_loop(
             rules_evaluated = report.rules_evaluated,
             rules_failed = report.rules_failed,
             records_written = report.records_written,
+            repeats_queued = report.repeats_queued,
             notifications_delivered = report.notifications_delivered,
             notifications_failed = report.notifications_failed,
             "alert evaluation tick complete"
@@ -314,6 +337,12 @@ pub struct AlertEvalReport {
     pub rules_failed: u32,
     /// Transition records durably written this tick.
     pub records_written: u32,
+    /// Repeat notifications this tick queued for a still-`Firing` alert
+    /// (ADR-0043 "repeat notifications while firing" amendment). A repeat
+    /// re-sends the folded latest record with no new durable write; it is
+    /// delivered by the same `flush_sinks` path, so it is also counted in
+    /// `notifications_delivered` once a sink accepts it.
+    pub repeats_queued: u32,
     /// Notifications this tick delivered to every configured sink, including
     /// ones carried over from an earlier tick's failure.
     pub notifications_delivered: u32,
@@ -360,6 +389,18 @@ pub struct AlertEvaluator {
     /// `alert_id` so a newer transition supersedes an older undelivered one.
     /// Bounded by the rule count.
     undelivered: HashMap<AlertId, AlertNotification>,
+    /// Per-alert duplicate suppressor for the repeat pass (ADR-0043 "repeat
+    /// notifications while firing" amendment, decision 2): the
+    /// `(anchor_ts_ns, window)` of the last repeat window a notification was
+    /// queued in. `anchor_ts_ns` is the firing record's own `ts_ns`; a mark
+    /// whose anchor differs from the current firing record's `ts_ns` is stale
+    /// (a resolve-then-refire re-anchored the episode) and is ignored, so the
+    /// new episode re-anchors cleanly instead of inheriting the old window
+    /// count. This is a suppressor, not the schedule: the schedule is derived
+    /// from `record.ts_ns` plus the clock every tick, so losing this map
+    /// (restart, lease failover) costs at most one extra send and never a
+    /// silence.
+    repeat_marks: HashMap<AlertId, (i64, u64)>,
     /// Set after the first tick that successfully reads alert history.
     /// `undelivered` is process-local, so a restart loses whatever was
     /// in flight; without this, that loss is permanent (a still-firing alert
@@ -399,6 +440,7 @@ impl AlertEvaluator {
             writer_id: Uuid::new_v4(),
             next_seq: 1,
             undelivered: HashMap::new(),
+            repeat_marks: HashMap::new(),
             bootstrapped: false,
         })
     }
@@ -484,6 +526,17 @@ impl AlertEvaluator {
                         );
                     }
                 }
+            }
+            // Repeat pass (ADR-0043 "repeat notifications while firing"): after
+            // rule evaluation, on the lease holder only, re-queue a notification
+            // for each rule whose folded latest record is still Firing and whose
+            // repeat window has advanced. This reads the same `latest` the loop
+            // above updated on any transition, so a rule that just resolved this
+            // tick folds to Resolved here and does not repeat. No durable record
+            // is written for a repeat (decision 4 stands); it rides the existing
+            // `undelivered` map and `flush_sinks` drain.
+            for rule in &rules {
+                self.queue_repeat_if_due(rule, &latest, now_ns, &mut report);
             }
             self.rules = rules;
         } else if !report.lease_unavailable {
@@ -597,6 +650,97 @@ impl AlertEvaluator {
                     .or_insert_with(|| AlertNotification::new(record.clone(), None));
             }
         }
+    }
+
+    /// Re-queue a repeat notification for `rule` when its folded latest record
+    /// is still `Firing` and the current repeat window has not yet been queued
+    /// (ADR-0043 "repeat notifications while firing" amendment).
+    ///
+    /// The window index is
+    ///
+    /// ```text
+    /// k = (now_ns - record.ts_ns) / repeat_interval
+    /// ```
+    ///
+    /// with integer division and a backward-clock-step clamp to zero (matching
+    /// the pending-duration clamp elsewhere in this file). A repeat is due when
+    /// `k >= 1` and the per-alert mark shows window `k` was not already queued
+    /// for this firing episode.
+    ///
+    /// # No durable write, ever
+    ///
+    /// This method touches only `undelivered` and `repeat_marks`. It never calls
+    /// [`Self::publish`] or [`write_alert_record`], so a repeat can never write a
+    /// durable record: the record is state, a notification is not (decision 4).
+    ///
+    /// # Anchor staleness
+    ///
+    /// A mark whose `anchor_ts_ns` differs from the current firing record's
+    /// `ts_ns` is from a prior episode (a resolve-then-refire re-anchored the
+    /// alert) and is ignored, so a new episode re-anchors cleanly instead of
+    /// inheriting the old episode's window count and staying silent. Losing the
+    /// mark entirely (restart, lease failover) costs at most one extra send, not
+    /// a silence, because `k` is re-derived from the durable record every tick.
+    ///
+    /// # Only firing repeats
+    ///
+    /// `Pending`, `Resolved`, and `Suppressed` never repeat, and a rule with no
+    /// folded record (it never fired) has nothing to repeat. A rule removed from
+    /// the config is not in `self.rules`, so this method is never called for it
+    /// and its alert falls silent for Alertmanager to auto-resolve.
+    fn queue_repeat_if_due(
+        &mut self,
+        rule: &Rule,
+        latest: &HashMap<AlertId, AlertRecord>,
+        now_ns: i64,
+        report: &mut AlertEvalReport,
+    ) {
+        // `None` is the default cadence; an explicit zero disables repeats for
+        // this rule (a consumer that opens a ticket per POST).
+        let interval = rule.repeat_interval.unwrap_or(DEFAULT_REPEAT_INTERVAL);
+        if interval.is_zero() {
+            return;
+        }
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        let Some(record) = latest.get(&alert_id) else {
+            return;
+        };
+        if record.state != AlertState::Firing {
+            return;
+        }
+        // `.max(1)` guards against a zero interval_ns from an overflow saturation
+        // (unreachable: the zero interval already returned above), keeping the
+        // division well-defined.
+        let interval_ns = i64::try_from(interval.as_nanos())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let elapsed_ns = now_ns.saturating_sub(record.ts_ns).max(0);
+        let window = (elapsed_ns / interval_ns) as u64;
+        if window < 1 {
+            return;
+        }
+        let already_queued = match self.repeat_marks.get(&alert_id) {
+            // Same episode: this window is already covered only if a mark at or
+            // beyond it exists.
+            Some((anchor, marked)) if *anchor == record.ts_ns => *marked >= window,
+            // No mark, or a mark from a prior (resolved) episode: not covered.
+            _ => false,
+        };
+        if already_queued {
+            return;
+        }
+        // Compose with any entry already queued for this alert this tick (a
+        // fresh transition write, or a bootstrap redelivery): the map is keyed
+        // by `alert_id`, so `or_insert_with` never doubles a send, and that
+        // existing send counts as this window's send. `previous_state: None`
+        // mirrors `bootstrap_undelivered`: a repeat is a non-transition re-send
+        // with no prior record to pair, the same single-step-fold approximation
+        // `AlertNotification::new` already documents.
+        self.undelivered
+            .entry(alert_id)
+            .or_insert_with(|| AlertNotification::new(record.clone(), None));
+        self.repeat_marks.insert(alert_id, (record.ts_ns, window));
+        report.repeats_queued += 1;
     }
 
     /// Evaluate one rule: run its query, decide the condition, fold to the
@@ -986,6 +1130,13 @@ pub struct RuleSpec {
     pub for_duration: Option<String>,
     #[serde(default)]
     pub max_alert_generation: Option<u32>,
+    /// How often a rule that stays firing re-notifies its sinks, as a humantime
+    /// duration (`1m`, `30s`), the ADR-0043 "repeat notifications while firing"
+    /// amendment. Omitted uses [`ravel_alerting::DEFAULT_REPEAT_INTERVAL`];
+    /// `0s` disables repeats for this rule. Parsed exactly like `for`, so an
+    /// unparseable value rejects the rules file at startup with the rule id.
+    #[serde(default)]
+    pub repeat_interval: Option<String>,
 }
 
 /// How a rule's query result maps to firing.
@@ -1091,6 +1242,15 @@ pub fn parse_rules(text: &str) -> anyhow::Result<HashMap<TenantHash, Vec<Rule>>>
             })?),
             None => None,
         };
+        let repeat_interval = match &spec.repeat_interval {
+            Some(text) => Some(humantime::parse_duration(text).map_err(|e| {
+                anyhow::anyhow!(
+                    "rule {:?} has an invalid \"repeat_interval\" {text:?}: {e}",
+                    spec.rule_id
+                )
+            })?),
+            None => None,
+        };
 
         let labels = sorted_pairs(spec.labels);
         let rule = Rule {
@@ -1101,6 +1261,7 @@ pub fn parse_rules(text: &str) -> anyhow::Result<HashMap<TenantHash, Vec<Rule>>>
             annotations: sorted_pairs(spec.annotations),
             for_duration,
             max_alert_generation: spec.max_alert_generation,
+            repeat_interval,
         };
 
         let tenant = TenantId::new(&spec.tenant).hash();
@@ -1276,6 +1437,46 @@ mod tests {
         let bad_for = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x",
           "condition": {"type": "threshold", "op": "gt", "value": 1}, "for": "soon"}]}"#;
         assert!(parse_rules(bad_for).is_err());
+    }
+
+    #[test]
+    fn parses_repeat_interval_with_default_and_disable() {
+        let doc = |ri: &str| {
+            format!(
+                r#"{{"rules": [{{"tenant": "a", "rule_id": "r", "promql": "x",
+              "condition": {{"type": "threshold", "op": "gt", "value": 1}},
+              "repeat_interval": "{ri}"}}]}}"#
+            )
+        };
+        // An explicit duration parses like `for`.
+        assert_eq!(
+            rules_for(&doc("2m"), "a")[0].repeat_interval,
+            Some(Duration::from_secs(120))
+        );
+        // An explicit zero is legal and disables repeats for the rule.
+        assert_eq!(
+            rules_for(&doc("0s"), "a")[0].repeat_interval,
+            Some(Duration::ZERO)
+        );
+        // Absent means None, so the evaluator applies DEFAULT_REPEAT_INTERVAL.
+        let absent = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x",
+          "condition": {"type": "threshold", "op": "gt", "value": 1}}]}"#;
+        assert_eq!(rules_for(absent, "a")[0].repeat_interval, None);
+    }
+
+    #[test]
+    fn rejects_an_unparseable_repeat_interval_naming_the_rule() {
+        let bad = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x",
+          "condition": {"type": "threshold", "op": "gt", "value": 1},
+          "repeat_interval": "soon"}]}"#;
+        let err = parse_rules(bad)
+            .expect_err("an unparseable repeat_interval rejects the rules file")
+            .to_string();
+        assert!(
+            err.contains("repeat_interval"),
+            "the error names the field: {err}"
+        );
+        assert!(err.contains("\"r\""), "the error names the rule id: {err}");
     }
 
     #[test]
@@ -1514,7 +1715,25 @@ mod tick_tests {
             annotations: vec![("summary".to_string(), "cpu is hot".to_string())],
             for_duration: None,
             max_alert_generation: None,
+            repeat_interval: None,
         }
+    }
+
+    /// `threshold_rule` with an explicit repeat cadence.
+    fn repeat_rule(repeat_interval: Option<Duration>) -> Rule {
+        Rule {
+            repeat_interval,
+            ..threshold_rule()
+        }
+    }
+
+    /// A one-entry folded-latest map holding `rule`'s alert in `state` at
+    /// `ts_ns`, keyed exactly as the evaluator folds it.
+    fn latest_with(rule: &Rule, state: AlertState, ts_ns: i64) -> HashMap<AlertId, AlertRecord> {
+        let record = ravel_alerting::build_transition_record(rule, state, 0, ts_ns);
+        let mut latest = HashMap::new();
+        latest.insert(compute_alert_id(&rule.rule_id, &rule.labels), record);
+        latest
     }
 
     /// Build an evaluator over `store`, sharing `clock` so a test can move time.
@@ -1757,6 +1976,144 @@ mod tick_tests {
         assert!(
             !a.acquire_lease(past_expiry).await.expect("a now blocked"),
             "a no longer holds the lease after b took it over"
+        );
+    }
+
+    // --- Repeat pass (ADR-0043 "repeat notifications while firing") ----------
+    //
+    // These drive `queue_repeat_if_due` directly with a hand-built folded-latest
+    // map, so the state gate, the anchor-staleness rule, the backward-clock
+    // clamp, the disable switch, and the default cadence are each pinned without
+    // the query stack. `queue_repeat_if_due` writes no durable record by
+    // construction (it calls neither `publish` nor `write_alert_record`), which
+    // the tick-level e2e tests confirm end to end.
+
+    /// Only a `Firing` folded record repeats. `Pending`, `Resolved`, and
+    /// `Suppressed` never do, even long past the interval.
+    #[tokio::test]
+    async fn repeat_pass_only_queues_for_a_firing_record() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(Some(Duration::from_secs(60)));
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        // Five windows past a record stamped at NOW_NS.
+        let due = NOW_NS + 300 * NS_PER_SEC;
+
+        for state in [
+            AlertState::Pending,
+            AlertState::Resolved,
+            AlertState::Suppressed,
+        ] {
+            let latest = latest_with(&rule, state, NOW_NS);
+            let mut report = AlertEvalReport::default();
+            ev.repeat_marks.clear();
+            ev.undelivered.clear();
+            ev.queue_repeat_if_due(&rule, &latest, due, &mut report);
+            assert_eq!(report.repeats_queued, 0, "{state:?} must never repeat");
+            assert!(
+                ev.undelivered.is_empty(),
+                "{state:?} queues no notification"
+            );
+        }
+
+        let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
+        let mut report = AlertEvalReport::default();
+        ev.repeat_marks.clear();
+        ev.undelivered.clear();
+        ev.queue_repeat_if_due(&rule, &latest, due, &mut report);
+        assert_eq!(report.repeats_queued, 1, "a firing record repeats when due");
+        assert!(
+            ev.undelivered.contains_key(&alert_id),
+            "the repeat is queued into undelivered"
+        );
+    }
+
+    /// A window mark left by a prior (resolved) episode must not suppress the
+    /// new episode's repeats: the mark's anchor differs from the new firing
+    /// record's `ts_ns`, so it is ignored and the schedule re-anchors. Made
+    /// non-vacuous by the old mark sitting at a strictly higher window (5) than
+    /// the new episode's first repeat (1).
+    #[tokio::test]
+    async fn a_stale_window_mark_does_not_suppress_a_new_firing_episode() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(Some(Duration::from_secs(60)));
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // A mark from a prior episode that reached window 5.
+        ev.repeat_marks.insert(alert_id, (NOW_NS, 5));
+
+        // The new firing episode is anchored much later; only window 1 elapsed.
+        let new_anchor = NOW_NS + 10_000 * NS_PER_SEC;
+        let latest = latest_with(&rule, AlertState::Firing, new_anchor);
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(&rule, &latest, new_anchor + 60 * NS_PER_SEC, &mut report);
+
+        assert_eq!(
+            report.repeats_queued, 1,
+            "window 1 of the new episode repeats despite the stale window-5 mark"
+        );
+        assert_eq!(
+            ev.repeat_marks[&alert_id],
+            (new_anchor, 1),
+            "the mark re-anchored to the new episode's firing record"
+        );
+    }
+
+    /// A backward clock step clamps the window to zero, so no repeat is queued
+    /// (matching the pending-duration clamp).
+    #[tokio::test]
+    async fn a_backward_clock_step_queues_no_repeat() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(Some(Duration::from_secs(60)));
+        let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
+
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(&rule, &latest, NOW_NS - 120 * NS_PER_SEC, &mut report);
+        assert_eq!(
+            report.repeats_queued, 0,
+            "a clock behind the firing record clamps to window 0"
+        );
+    }
+
+    /// An explicit `0s` repeat_interval disables repeats for the rule, no matter
+    /// how much time has elapsed.
+    #[tokio::test]
+    async fn an_explicit_zero_interval_disables_repeats() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(Some(Duration::ZERO));
+        let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
+
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(&rule, &latest, NOW_NS + 600 * NS_PER_SEC, &mut report);
+        assert_eq!(report.repeats_queued, 0, "0s disables repeats for the rule");
+    }
+
+    /// An absent repeat_interval uses `DEFAULT_REPEAT_INTERVAL` (60s): no repeat
+    /// just under it, one repeat at it.
+    #[tokio::test]
+    async fn an_absent_interval_uses_the_default_cadence() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(None);
+        let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
+
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(&rule, &latest, NOW_NS + 59 * NS_PER_SEC, &mut report);
+        assert_eq!(
+            report.repeats_queued, 0,
+            "just under the 60s default: no repeat"
+        );
+
+        ev.repeat_marks.clear();
+        ev.undelivered.clear();
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(&rule, &latest, NOW_NS + 60 * NS_PER_SEC, &mut report);
+        assert_eq!(
+            report.repeats_queued, 1,
+            "at the 60s default cadence a repeat is due"
         );
     }
 }
