@@ -1,0 +1,10 @@
+{
+  "enabledPlugins": {
+    "cc-skills-golang@samber": false,
+    "chrome-devtools-mcp@claude-plugins-official": false
+  },
+  "skillOverrides": {
+    "claude-in-chrome": "off",
+    "dataviz": "off"
+  }
+}
