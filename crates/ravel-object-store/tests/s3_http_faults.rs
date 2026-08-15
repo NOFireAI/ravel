@@ -810,19 +810,16 @@ async fn access_denied_is_never_retried() {
 /// rather than `Permanent`. The attempt count proves the client exhausted a
 /// retry budget instead of failing on the first response.
 ///
-/// **Observed divergence from docs/object-store-contract.md.** The contract
+/// **Retry classification per docs/object-store-contract.md.** The contract
 /// classifies a throttle as `Throttled { retry_after_ms }`, and `s3.rs`'s
 /// tier-2 heuristic has a branch for exactly that ("429"/"503"/"slow
-/// down"/"throttl"). Over real HTTP that branch is unreachable: the error text
-/// `classify_generic` sees is `object_store`'s `RetryError` `Display`, which
-/// writes `", after {retries} retries, max_retries: {n}, retry_timeout: {d} "`
-/// whenever `retries != 0` -- and the earlier `lower.contains("timeout")`
-/// branch matches that literal `retry_timeout` first. So every
-/// exhausted-retry throttle arrives as `StoreError::Timeout`. Both variants
-/// are retryable, so caller behavior is unaffected, but the reported class is
-/// wrong; this is reported rather than fixed here (test-only task scope). The
-/// assertion below accepts either variant so it stays honest today and green
-/// once the classifier is corrected.
+/// down"/"throttl"). Over real HTTP the error text `classify_generic` sees is
+/// `object_store`'s `RetryError` `Display`, which writes `", after {retries}
+/// retries, max_retries: {n}, retry_timeout: {d} "` whenever `retries != 0`.
+/// That literal `retry_timeout` substring once shadowed the throttle branch
+/// (the bare `timeout` check ran first), classifying every exhausted-retry
+/// throttle as `Timeout`; #1105 reordered the heuristic so the throttle branch
+/// wins. The assertion below now pins `Throttled` specifically.
 #[tokio::test]
 async fn persistent_slow_down_surfaces_throttled_after_retrying() {
     let fake = FakeS3::start().await;
@@ -835,9 +832,10 @@ async fn persistent_slow_down_surfaces_throttled_after_retrying() {
         .await
         .expect_err("an endpoint that only ever throttles must eventually fail the get");
     assert!(
-        matches!(error, StoreError::Throttled { .. } | StoreError::Timeout),
-        "a persistent SlowDown must surface as a throttle-class error \
-         (Throttled per the contract, Timeout as classified today), got {error:?}"
+        matches!(error, StoreError::Throttled { .. }),
+        "a persistent SlowDown must surface as Throttled per the contract \
+         (#1105: retry_timeout no longer shadows the throttle branch), \
+         got {error:?}"
     );
     assert!(
         error.is_retryable(),

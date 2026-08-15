@@ -468,12 +468,18 @@ fn classify_generic(
     // whose HTTP status is not reachable through any nameable type here.
     let msg = source.to_string();
     let lower = msg.to_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline") {
-        return StoreError::Timeout;
-    }
+    // Throttle takes precedence over the timeout heuristic. `object_store`'s
+    // `RetryError` Display appends ", ..., retry_timeout: {d} " on every
+    // exhausted-retry message (whenever retries != 0), and the literal
+    // substring "retry_timeout" contains "timeout": checking the bare
+    // "timeout" substring first would misclassify every exhausted-retry
+    // throttle (429/503/SlowDown) as Timeout. Genuine timeouts are matched by
+    // "timed out"/"deadline", which that wrapper text does not carry, so the
+    // real timeout case is preserved while the throttle case wins.
     if lower.contains("429")
         || lower.contains("too many requests")
         || lower.contains("slow down")
+        || lower.contains("slowdown")
         || lower.contains("throttl")
         || lower.contains("503")
         || lower.contains("service unavailable")
@@ -481,6 +487,9 @@ fn classify_generic(
         return StoreError::Throttled {
             retry_after_ms: 1000,
         };
+    }
+    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline") {
+        return StoreError::Timeout;
     }
     StoreError::Transient(format!("{store}: {msg}"))
 }
@@ -1279,6 +1288,48 @@ mod tests {
             // Every Generic classification outcome is retryable.
             assert!(mapped.is_retryable(), "{} must be retryable", case.text);
         }
+    }
+
+    /// Regression for #1105: `object_store`'s real `RetryError` `Display`
+    /// appends `", after {n} retries, max_retries: {m}, retry_timeout: {d}ms "`
+    /// on every exhausted-retry message, and that literal `retry_timeout`
+    /// substring contains `timeout`. A message that also carries a genuine
+    /// throttle token (`429`/`SlowDown`) must classify as `Throttled`, not
+    /// `Timeout`: the throttle branch is checked before the bare `timeout`
+    /// heuristic. Uses the exact wrapper format object_store emits so this
+    /// pins the real interaction, not a hand-written approximation.
+    #[test]
+    fn retry_timeout_wrapper_does_not_shadow_throttle() {
+        for text in [
+            "Server returned non-2xx status code: 429 Too Many Requests, \
+             after 10 retries, max_retries: 10, retry_timeout: 180000ms ",
+            "response error \"SlowDown\", after 10 retries, max_retries: 10, \
+             retry_timeout: 180000ms ",
+        ] {
+            let mapped = map_error_common(generic(TextError(text)));
+            assert!(
+                matches!(mapped, StoreError::Throttled { .. }),
+                "exhausted-retry throttle carrying `retry_timeout` must be \
+                 Throttled, not Timeout, got {mapped:?} for {text:?}"
+            );
+            assert!(mapped.is_retryable(), "{text:?} must be retryable");
+        }
+    }
+
+    /// A genuine timeout message that carries no throttle token still
+    /// classifies as `Timeout`, even wrapped in the same exhausted-retry
+    /// suffix: the throttle branch does not fire, so the timeout heuristic
+    /// (`timed out`/`deadline`/bare `timeout`) still wins.
+    #[test]
+    fn genuine_timeout_still_classifies_as_timeout() {
+        let text = "request timed out, after 10 retries, max_retries: 10, \
+                    retry_timeout: 180000ms ";
+        let mapped = map_error_common(generic(TextError(text)));
+        assert!(
+            matches!(mapped, StoreError::Timeout),
+            "a genuine timeout without throttle language must stay Timeout, \
+             got {mapped:?}"
+        );
     }
 
     /// The typed variants object_store already surfaces are mapped by variant,
