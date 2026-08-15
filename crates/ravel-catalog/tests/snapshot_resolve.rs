@@ -242,7 +242,7 @@ proptest! {
 
             let fold_catalog = Catalog::new(store.clone(), config(3)).expect("catalog");
             fold_catalog
-                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[], None)
                 .await
                 .expect("fold");
 
@@ -287,7 +287,14 @@ async fn snapshot_watermark_serves_sealed_hours_without_listing() {
 
     let fold_catalog = Catalog::new(inner.clone(), config(1)).expect("catalog");
     let report = fold_catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
     assert_eq!(report.watermark_hour, Some(base_hour + 1));
@@ -336,7 +343,14 @@ async fn hours_above_watermark_are_listed_not_snapshot_served() {
 
     let fold_catalog = Catalog::new(inner.clone(), config(1)).expect("catalog");
     fold_catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
 
@@ -420,7 +434,14 @@ async fn corrupt_head_falls_back_to_full_listing() {
 
     let fold_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
     fold_catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
 
@@ -463,7 +484,14 @@ async fn corrupt_part_falls_back_to_full_listing() {
 
     let fold_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
     fold_catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("first fold never reads an existing part");
 
@@ -502,7 +530,14 @@ async fn part_notfound_race_recovers_after_one_head_reread() {
 
     let fold_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
     fold_catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("first fold");
 
@@ -546,7 +581,14 @@ async fn second_part_notfound_after_head_reread_gives_up_without_further_retry()
 
     let fold_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
     fold_catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("first fold");
 
@@ -581,7 +623,14 @@ async fn shard_count_mismatch_against_snapshot_head_is_a_loud_error() {
 
     let fold_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
     fold_catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tenant(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
 
@@ -630,7 +679,7 @@ async fn stale_head_cache_widens_listed_suffix_but_stays_correct() {
     let (counting, log) = CountingStore::new(inner.clone());
     let catalog = Catalog::new(counting, config(1)).expect("catalog");
     catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
         .await
         .expect("first fold seals base_hour");
 
@@ -662,6 +711,7 @@ async fn stale_head_cache_widens_listed_suffix_but_stays_correct() {
             Uuid::new_v4(),
             now_at_seal(base_hour + 1),
             &[],
+            None,
         )
         .await
         .expect("second fold advances the watermark in the store to base_hour + 1");

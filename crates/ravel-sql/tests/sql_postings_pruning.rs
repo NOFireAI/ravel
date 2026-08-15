@@ -42,7 +42,14 @@ async fn sql_pushed_down_name_filter_reaches_resolve_pruned() {
     // at NOW_NS (4h) under the default seal margins (~80m).
     let report = fixture
         .catalog
-        .fold(&tenant.hash(), Signal::Metrics, Uuid::new_v4(), NOW_NS, &[])
+        .fold(
+            &tenant.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            NOW_NS,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
     assert!(

@@ -1040,6 +1040,7 @@ async fn run_cycle_async(
                 fold_rng.new_uuid(),
                 fold_now_ns,
                 &[],
+                None,
             )
             .await
             .map_err(|source| CycleError::Fold { seed, source })?;
@@ -1136,6 +1137,7 @@ async fn run_cycle_async(
                 fold_rng.new_uuid(),
                 compact_now_ns,
                 &[],
+                None,
             )
             .await
             .map_err(|source| CycleError::Fold { seed, source })?;

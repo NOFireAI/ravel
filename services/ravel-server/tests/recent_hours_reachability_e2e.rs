@@ -394,7 +394,7 @@ async fn post_compaction_bits(
 
     let fold_cat = Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog");
     fold_cat
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), seal_now_ns, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), seal_now_ns, &[], None)
         .await
         .expect("fold seals the open hour");
 

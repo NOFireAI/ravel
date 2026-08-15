@@ -2292,7 +2292,14 @@ mod tests {
         let fold_catalog =
             Catalog::new(backend, CatalogConfig::default()).expect("catalog for fold");
         fold_catalog
-            .fold(&tenant().hash(), Signal::Metrics, Uuid::new_v4(), NOW, &[])
+            .fold(
+                &tenant().hash(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                NOW,
+                &[],
+                None,
+            )
             .await
             .expect("fold seals sealed_hour");
 

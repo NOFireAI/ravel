@@ -242,7 +242,14 @@ async fn postings_match_brute_force_scan_across_v1_and_v2_segments() {
     .await;
 
     let report = catalog
-        .fold(&tenant_hash, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(
+            &tenant_hash,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now,
+            &[],
+            None,
+        )
         .await
         .expect("fold");
     assert!(!report.no_op);

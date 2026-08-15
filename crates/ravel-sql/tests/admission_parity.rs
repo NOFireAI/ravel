@@ -157,7 +157,7 @@ async fn sql_and_promql_agree_recent_hours_are_exempt() {
     .await;
 
     let cat = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold seals sealed_hour");
 
@@ -245,7 +245,7 @@ async fn sql_and_promql_agree_sealed_set_still_capped() {
         publish_segment(store.as_ref(), &tid, th, seq, hour, "m", ts, seq as f64).await;
     }
     let cat = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
 
@@ -404,7 +404,7 @@ async fn no_recent_hour_data_default_config_is_unaffected() {
         .await;
     }
     let cat = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+    cat.fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold seals hour, leaving no recent-hour data");
 

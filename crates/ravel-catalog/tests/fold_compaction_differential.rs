@@ -313,7 +313,7 @@ async fn fold_then_resolve_matches_direct_listing_with_compaction_and_tombstone(
     // Fold, then resolve from the snapshot through a store that counts LISTs.
     let fold_catalog = Catalog::new(inner.clone(), config(1)).expect("catalog");
     let report = fold_catalog
-        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
     assert!(!report.no_op);

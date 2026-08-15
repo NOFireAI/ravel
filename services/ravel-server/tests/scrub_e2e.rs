@@ -332,7 +332,14 @@ async fn seal_divergence_surfaces_on_metrics_through_the_real_scrub_task() {
     .expect("catalog")
     .with_provisioning_enforcement();
     catalog
-        .fold(&tenant.hash(), Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(
+            &tenant.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now,
+            &[],
+            None,
+        )
         .await
         .expect("fold produces a HEAD");
 
@@ -413,7 +420,14 @@ async fn postings_disagreement_surfaces_on_metrics_through_the_real_scrub_task()
     .expect("catalog")
     .with_provisioning_enforcement();
     catalog
-        .fold(&tenant.hash(), Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(
+            &tenant.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now,
+            &[],
+            None,
+        )
         .await
         .expect("fold produces a HEAD with postings");
 

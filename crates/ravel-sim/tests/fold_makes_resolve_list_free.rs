@@ -243,6 +243,7 @@ fn fold_makes_resolve_list_free() {
                 Uuid::new_v4(),
                 fold_now_ns,
                 &[],
+                None,
             )
             .await
             .expect("fold");

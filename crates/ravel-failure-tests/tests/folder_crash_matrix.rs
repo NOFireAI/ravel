@@ -119,7 +119,14 @@ async fn folder_down_for_hours_never_loses_data_only_widens_listing() {
 
     let folder = folder_catalog(Arc::clone(&store));
     folder
-        .fold(&tid.hash(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tid.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold catches up in one shot");
 
@@ -178,7 +185,14 @@ async fn corrupt_head_falls_back_to_listing_never_to_an_error() {
 
     let now_ns = now_sealing(hour);
     folder_catalog(Arc::clone(&store))
-        .fold(&tid.hash(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tid.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold seals hour 10");
 
@@ -234,7 +248,14 @@ async fn missing_snapshot_part_falls_back_to_listing_after_one_head_reread() {
 
     let now_ns = now_sealing(hour);
     folder_catalog(Arc::clone(&store))
-        .fold(&tid.hash(), Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+        .fold(
+            &tid.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
         .await
         .expect("fold seals hour 10");
 
@@ -297,8 +318,22 @@ async fn concurrent_folders_race_head_cas_without_losing_or_duplicating_data() {
     let folder_b = folder_catalog(Arc::clone(&store));
     let tenant_hash = tid.hash();
     let (result_a, result_b) = tokio::join!(
-        folder_a.fold(&tenant_hash, Signal::Metrics, Uuid::new_v4(), now_ns, &[]),
-        folder_b.fold(&tenant_hash, Signal::Metrics, Uuid::new_v4(), now_ns, &[]),
+        folder_a.fold(
+            &tenant_hash,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None
+        ),
+        folder_b.fold(
+            &tenant_hash,
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None
+        ),
     );
     result_a.expect("folder a's fold");
     result_b.expect("folder b's fold");
@@ -358,7 +393,14 @@ async fn stale_head_cache_widens_listing_but_never_misses_new_data() {
 
     let now_1 = now_sealing(hour_a);
     folder_catalog(Arc::clone(&store))
-        .fold(&tid.hash(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .fold(
+            &tid.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_1,
+            &[],
+            None,
+        )
         .await
         .expect("first fold seals hour_a");
 
@@ -414,6 +456,7 @@ async fn stale_head_cache_widens_listing_but_never_misses_new_data() {
             Uuid::new_v4(),
             now_sealing(hour_b),
             &[],
+            None,
         )
         .await
         .expect("second fold advances the real HEAD past hour_b");
@@ -477,7 +520,14 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
 
     let now_1 = now_sealing(hour);
     folder_catalog(Arc::clone(&store))
-        .fold(&tid.hash(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .fold(
+            &tid.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_1,
+            &[],
+            None,
+        )
         .await
         .expect("fold seals hour 10 with only the on-time sample");
 
@@ -560,7 +610,14 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
         .await
         .expect("delete HEAD to force a rebuild");
     folder_catalog(Arc::clone(&store))
-        .fold(&tid.hash(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+        .fold(
+            &tid.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_1,
+            &[],
+            None,
+        )
         .await
         .expect("rebuild fold after HEAD deletion");
 

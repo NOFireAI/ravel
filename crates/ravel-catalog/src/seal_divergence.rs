@@ -332,7 +332,14 @@ mod tests {
         .expect("catalog")
         .with_provisioning_enforcement();
         catalog
-            .fold(&tenant_hash, Signal::Metrics, Uuid::new_v4(), now_ns, &[])
+            .fold(
+                &tenant_hash,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
             .await
             .expect("fold");
     }

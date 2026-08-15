@@ -730,6 +730,16 @@ impl Catalog {
     /// offending key/identity, and skipped (see the bucket-processing loop
     /// below). Only a malformed commit record or exhausted HEAD CAS retries
     /// surface as [`CatalogError`].
+    ///
+    /// `default_retention_ns` is the caller-resolved deployment-level default
+    /// retention window for this tenant (from the CLI-derived `RetentionConfig`
+    /// in ravel-maintain, resolved by the caller via `window_for`), or `None`
+    /// if no deployment default is configured. `ravel-catalog` never sees
+    /// `RetentionConfig` itself: the dependency runs the other way (see
+    /// [`crate::config::DEFAULT_PROTECTION_HORIZON_NS`] for the same
+    /// one-directional mirroring precedent). The frontier reconcile below
+    /// overlays the durable per-tenant `TenantConfig.retention_ns` on top of
+    /// this default.
     pub async fn fold(
         &self,
         tenant: &TenantHash,
@@ -737,6 +747,7 @@ impl Catalog {
         folder_id: Uuid,
         now_ns: i64,
         _transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
     ) -> Result<FoldReport, CatalogError> {
         let head_key = head_object_key(tenant, signal);
         // The generation history for the read-side scan rule (ADR-0052 section
@@ -752,29 +763,37 @@ impl Catalog {
         // shared cache/load API's `QueryAccounting` parameter and is discarded.
         let accounting = QueryAccounting::new();
 
-        // The tenant's durable retention window (TenantConfig.retention_ns),
-        // read once per fold (loop-invariant). Bounds the retention-frontier
-        // reconcile pass below (ADR-0020 delete-blocker). A tenant with no
-        // per-tenant window, or a transient config-read fault, degrades to "no
-        // frontier reconcile this fold": the fold's index role is a pure
+        // The tenant's effective retention window, read once per fold
+        // (loop-invariant). Bounds the retention-frontier reconcile pass below
+        // (ADR-0020 delete-blocker). Resolution mirrors the admission-limit
+        // overlay in crates/ravel-ingest/src/lifecycle.rs (ADR-0078): the
+        // durable per-tenant `TenantConfig.retention_ns` override wins when the
+        // record exists and carries `Some`; otherwise the effective window is
+        // `default_retention_ns`, the caller-resolved deployment-wide default.
+        // A `TenantConfig` read failure or absent record is NOT "skip the
+        // frontier reconcile": it means "fall back to the deployment default,"
+        // which does not depend on that read at all. Only a tenant with neither
+        // a per-tenant override nor a deployment default gets no frontier
+        // reconcile (nothing is being retired). The fold's index role is a pure
         // optimization and the sweep's HEAD-reachability gate is the durable
-        // delete blocker, so this never fails the fold. (A tenant retired only
-        // by a deployment-wide RetentionConfig default, with no per-tenant
-        // config record, is not frontier-reconciled here; its sweep still
-        // blocks safely on the HEAD gate.)
-        let tenant_retention_ns: Option<i64> =
-            match crate::tenant_config::read_config_values(self.store(), tenant).await {
-                Ok(Some(cfg)) => cfg.retention_ns,
-                Ok(None) => None,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        tenant = %tenant.to_hex(),
-                        "tenant config read failed; skipping retention-frontier reconcile this fold"
-                    );
-                    None
-                }
-            };
+        // delete blocker, so a config-read fault never fails the fold.
+        let tenant_retention_ns: Option<i64> = match crate::tenant_config::read_config_values(
+            self.store(),
+            tenant,
+        )
+        .await
+        {
+            Ok(Some(cfg)) => cfg.retention_ns.or(default_retention_ns),
+            Ok(None) => default_retention_ns,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    tenant = %tenant.to_hex(),
+                    "tenant config read failed; falling back to deployment-default retention for frontier reconcile"
+                );
+                default_retention_ns
+            }
+        };
 
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
@@ -989,9 +1008,11 @@ impl Catalog {
                 // at `frontier_reconcile_max_hours`; the remainder is carried to
                 // the next fold via `frontier_hours_deferred` (the snapshot still
                 // names those hours, so the next fold recomputes them), never
-                // dropped. `tenant_retention_ns` is the tenant's durable
-                // TenantConfig.retention_ns; a tenant with no per-tenant window
-                // gets no frontier reconcile (nothing is being retired).
+                // dropped. `tenant_retention_ns` is the tenant's effective
+                // retention window: the durable `TenantConfig.retention_ns`
+                // override when present, else the deployment-wide default
+                // (ADR-0078). A tenant with neither gets no frontier reconcile
+                // (nothing is being retired).
                 if let Some(retention_window_ns) = tenant_retention_ns
                     && let Some(frontier_hi_raw) = retirement_frontier_hour(
                         now_ns,
@@ -2254,7 +2275,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let catalog = Catalog::new(store, config(1)).expect("catalog");
         let report = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), 0, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), 0, &[], None)
             .await
             .expect("fold");
         assert!(report.no_op);
@@ -2273,6 +2294,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(5),
                 &[],
+                None,
             )
             .await
             .expect("fold");
@@ -2291,7 +2313,7 @@ mod tests {
         publish_segment(&store, 0, Uuid::new_v4(), 2, 10, now - NS_PER_HOUR).await;
 
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
             .await
             .expect("first fold");
         assert!(first.rebuilt);
@@ -2303,7 +2325,7 @@ mod tests {
         // Same now_ns: nothing new sealed, so this must be a clean no-op
         // that touches neither the part nor HEAD.
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
             .await
             .expect("second fold");
         assert!(second.no_op);
@@ -2318,7 +2340,7 @@ mod tests {
         let now_1 = now_at_seal(10);
         publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert_eq!(first.entry_count, 1);
@@ -2326,7 +2348,7 @@ mod tests {
         let now_2 = now_at_seal(12);
         publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("second fold");
         assert!(!second.rebuilt, "a valid HEAD must fold incrementally");
@@ -2346,7 +2368,7 @@ mod tests {
         let now_1 = now_at_seal(10);
         publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
         catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
 
@@ -2364,7 +2386,7 @@ mod tests {
         let now_2 = now_at_seal(12);
         publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
         let report = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("fold after corruption");
         assert!(report.rebuilt);
@@ -2414,7 +2436,7 @@ mod tests {
 
         let now = now_at_seal(12);
         let err = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
             .await
             .expect_err("fold must fail on a newer-format HEAD");
         assert!(
@@ -2481,7 +2503,7 @@ mod tests {
         let now_2 = now_at_seal(12);
         publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
         let report = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("corrupt head self-heals via rebuild");
         assert!(report.rebuilt);
@@ -2511,7 +2533,7 @@ mod tests {
         let now_1 = now_at_seal(10);
         publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert_eq!(first.entry_count, 1);
@@ -2519,7 +2541,7 @@ mod tests {
         let now_2 = now_at_seal(12);
         publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("fold falls back to rebuild");
         assert!(second.rebuilt);
@@ -2559,7 +2581,7 @@ mod tests {
         .await;
 
         let report = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
             .await
             .expect("fold succeeds despite postings-build fault");
 
@@ -2590,8 +2612,8 @@ mod tests {
         let catalog_b = Catalog::new(store.clone(), config(1)).expect("catalog b");
         let tenant = tenant();
         let (result_a, result_b) = tokio::join!(
-            catalog_a.fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[]),
-            catalog_b.fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[]),
+            catalog_a.fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[], None),
+            catalog_b.fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[], None),
         );
         let report_a = result_a.expect("fold a");
         let report_b = result_b.expect("fold b");
@@ -2663,7 +2685,7 @@ mod tests {
             .expect("put b");
 
         let report = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
             .await
             .expect("duplicate identity must not be fold-fatal");
         assert!(!report.no_op);
@@ -2696,7 +2718,7 @@ mod tests {
             .expect("put unrecognized key");
 
         let report = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
             .await
             .expect("unrecognized key shape must not be fold-fatal");
         assert!(!report.no_op);
@@ -2733,7 +2755,7 @@ mod tests {
         )
         .await;
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert!(!first.no_op);
@@ -2755,7 +2777,7 @@ mod tests {
         )
         .await;
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("second fold");
         assert!(!second.rebuilt, "a valid HEAD must fold incrementally");
@@ -2835,7 +2857,7 @@ mod tests {
         publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
 
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert!(!first.no_op);
@@ -2880,7 +2902,7 @@ mod tests {
         // part is carried by reference, no PUT for it.
         let now_2 = now_at_seal(13);
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("second fold");
         assert!(!second.no_op);
@@ -2937,7 +2959,7 @@ mod tests {
         publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
 
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert_eq!(
@@ -2964,7 +2986,7 @@ mod tests {
         let now_2 = now_at_seal(13);
         publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("fold falls back to rebuild and restores the missing part");
         assert!(
@@ -3032,7 +3054,7 @@ mod tests {
         .await;
         publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert_eq!(first.parts_total, 2);
@@ -3050,7 +3072,7 @@ mod tests {
         let now_2 = now_at_seal(13);
         publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 13, now_2 - NS_PER_HOUR).await;
         let err = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect_err("HEAD CAS crash must surface as an error");
         assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
@@ -3110,7 +3132,7 @@ mod tests {
         .await;
         publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 20, now - NS_PER_HOUR).await;
         let report = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
             .await
             .expect("fold");
         assert_eq!(report.parts_total, 2);
@@ -3294,7 +3316,7 @@ mod tests {
         let seg_a = publish_segment(&store, 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
         publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert_eq!(first.parts_total, 2);
@@ -3316,7 +3338,7 @@ mod tests {
         // A later fold: the reconcile window covers hour 10 and applies it.
         let now_2 = now_at_seal(13);
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("second fold");
         assert!(!second.no_op);
@@ -3416,7 +3438,7 @@ mod tests {
         publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
 
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert_eq!(
@@ -3436,6 +3458,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(13),
                 &[],
+                None,
             )
             .await
             .expect("reconcile must not fail with DuplicateEntry");
@@ -3469,6 +3492,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(14),
                 &[],
+                None,
             )
             .await
             .expect("a third fold must also succeed, not fail forever");
@@ -3494,6 +3518,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(40),
                 &[],
+                None,
             )
             .await
             .expect("first fold");
@@ -3510,6 +3535,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(41),
                 &[],
+                None,
             )
             .await
             .expect("second fold");
@@ -3545,7 +3571,7 @@ mod tests {
         publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
         publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert_eq!(first.entry_count, 2);
@@ -3560,6 +3586,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(13),
                 &[],
+                None,
             )
             .await
             .expect("second fold");
@@ -3637,7 +3664,7 @@ mod tests {
         )
         .await;
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert!(first.rebuilt, "first fold rebuilds from the commit layout");
@@ -3658,6 +3685,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(202),
                 &[],
+                None,
             )
             .await
             .expect("second fold");
@@ -3740,6 +3768,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(200),
                 &[],
+                None,
             )
             .await
             .expect("first fold");
@@ -3751,6 +3780,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(202),
                 &[],
+                None,
             )
             .await
             .expect("second fold");
@@ -3777,6 +3807,137 @@ mod tests {
         }
     }
 
+    /// Run the out-of-window frontier scenario (hour 5 retired far behind an
+    /// hour-200 watermark) with a chosen `TenantConfig.retention_ns` state and a
+    /// chosen deployment default, and return the second fold's
+    /// `frontier_hours_reconciled`. `tenant_config` is `None` to write no config
+    /// record at all, `Some(inner)` to write a record whose `retention_ns` is
+    /// `inner`. `default_retention_ns` is the value the caller (the production
+    /// fold loop) resolves from `RetentionConfig::window_for` and passes into
+    /// `Catalog::fold`; it is passed to both folds, as a real tick would.
+    async fn frontier_reconciled_with(
+        tenant_config: Option<Option<i64>>,
+        default_retention_ns: Option<i64>,
+    ) -> u64 {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            frontier_reconcile_max_hours: 168,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        if let Some(inner) = tenant_config {
+            let tc = crate::tenant_config::TenantConfig {
+                retention_ns: inner,
+                ..crate::tenant_config::TenantConfig::new(
+                    crate::tenant_config::TenantLifecycleState::Active,
+                )
+            };
+            crate::tenant_config::set_tenant_config(store.as_ref(), &tenant(), &tc, 1)
+                .await
+                .expect("write tenant config");
+        }
+
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            5,
+            5 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            200,
+            200 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(200),
+                &[],
+                default_retention_ns,
+            )
+            .await
+            .expect("first fold");
+
+        publish_tombstone(&store, 0, 5).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(202),
+                &[],
+                default_retention_ns,
+            )
+            .await
+            .expect("second fold");
+        second.frontier_hours_reconciled
+    }
+
+    /// The retention-window overlay (ADR-0078, deliverable 2): the frontier
+    /// reconcile resolves its window as the durable `TenantConfig.retention_ns`
+    /// override when present, else the caller-supplied deployment default. A
+    /// window of 200h retires hour 5 (frontier ~hour 28); a window of 100_000h
+    /// pushes the frontier before the epoch, so `retirement_frontier_hour`
+    /// returns `None` and no frontier reconcile runs. That gap makes each
+    /// precedence branch observable through `frontier_hours_reconciled`.
+    ///
+    /// To watch this FAIL against pre-fix code, restore the old resolution
+    /// (`Ok(None) => None`, `Err(..) => None`, and `Ok(Some(cfg)) =>
+    /// cfg.retention_ns` without `.or(default_retention_ns)`): the two
+    /// deployment-default-only cases below then report 0 reconciled hours.
+    #[tokio::test]
+    async fn retention_overlay_precedence() {
+        const RETIRES: i64 = 200 * NS_PER_HOUR;
+        // A window so large the retirement frontier predates the epoch, so no
+        // frontier pass runs even though a window is set.
+        const NO_FRONTIER: i64 = 100_000 * NS_PER_HOUR;
+
+        // 1. TenantConfig override present wins over the deployment default:
+        //    override retires (200h) while the default would not (NO_FRONTIER).
+        assert!(
+            frontier_reconciled_with(Some(Some(RETIRES)), Some(NO_FRONTIER)).await >= 1,
+            "the TenantConfig override must win over the deployment default"
+        );
+
+        // 2. No TenantConfig record at all: the deployment default applies.
+        assert!(
+            frontier_reconciled_with(None, Some(RETIRES)).await >= 1,
+            "the deployment default must apply when no TenantConfig record exists"
+        );
+
+        // 3. TenantConfig record present but retention_ns is None: the
+        //    deployment default applies (the record does not veto the default).
+        assert!(
+            frontier_reconciled_with(Some(None), Some(RETIRES)).await >= 1,
+            "the deployment default must apply when TenantConfig.retention_ns is None"
+        );
+
+        // 4. Neither a per-tenant override nor a deployment default: no frontier
+        //    reconcile, identical to pre-ADR-0078 behavior.
+        assert_eq!(
+            frontier_reconciled_with(None, None).await,
+            0,
+            "no override and no default means no frontier reconcile"
+        );
+        assert_eq!(
+            frontier_reconciled_with(Some(None), None).await,
+            0,
+            "a None-valued TenantConfig record with no default still means no reconcile"
+        );
+    }
+
     /// A fold whose reconcile window finds nothing changed carries every
     /// untouched sealed part forward by reference: no spurious PUT; the
     /// carry-forward optimization is not regressed by the reconcile pass.
@@ -3794,7 +3955,7 @@ mod tests {
         publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
         publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
         catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
 
@@ -3819,6 +3980,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(13),
                 &[],
+                None,
             )
             .await
             .expect("second fold");
@@ -3867,7 +4029,7 @@ mod tests {
         let now_1 = now_at_seal(10);
         publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
         assert!(first.rebuilt);
@@ -3891,7 +4053,7 @@ mod tests {
         let now_2 = now_at_seal(12);
         publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
             .expect("second fold");
         assert!(second.rebuilt);
@@ -3931,7 +4093,7 @@ mod tests {
             publish_segment(store.inner(), 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
         publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
         catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[])
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
             .await
             .expect("first fold");
 
@@ -3944,6 +4106,7 @@ mod tests {
                 Uuid::new_v4(),
                 now_at_seal(13),
                 &[],
+                None,
             )
             .await
             .expect("second fold applies reconcile under one HEAD CAS");

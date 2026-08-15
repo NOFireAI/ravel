@@ -166,7 +166,7 @@ async fn folded_engine(tid: &TenantId, hour: u32) -> (QueryEngine, i64, i64) {
 
     let catalog = Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog");
     let report = catalog
-        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[])
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
         .await
         .expect("fold");
     assert!(

@@ -42,7 +42,7 @@ pub async fn fold(
     let now = crate::now_ns()?;
     let folder_id = Uuid::new_v4();
     let report = catalog
-        .fold(&tenant_hash, Signal::Metrics, folder_id, now, &[])
+        .fold(&tenant_hash, Signal::Metrics, folder_id, now, &[], None)
         .await
         .map_err(|err| anyhow::anyhow!("fold failed: {err}"))?;
 
