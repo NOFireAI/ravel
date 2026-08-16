@@ -95,13 +95,39 @@ the hash has nothing to distribute over. The affinity would silently do nothing.
 The controller's own default is `false`, but it is settable cluster-wide in the
 ingress-nginx ConfigMap, so the operator always renders it explicitly.
 
-If you run HAProxy, Traefik, Istio, or a cloud L7 load balancer instead, the
-equivalent configuration exists (`balance hdr(...)` with consistent hashing;
-Istio's `DestinationRule.trafficPolicy.loadBalancer.consistentHash.httpHeaderName`)
-but the operator does not generate it. Use
-`spec.gateway.ingestAffinity.annotations` to carry your controller's
-annotations onto the same Ingress objects, or configure that layer yourself and
-leave `ingestAffinity` unset.
+If you run HAProxy, Traefik, Istio, Envoy, or a cloud L7 load balancer instead,
+**there is no equivalent configuration, and the closest thing is weaker.** What
+those layers offer is single-backend consistent hashing: HAProxy's
+`balance hdr(...)`, Istio's
+`DestinationRule.trafficPolicy.loadBalancer.consistentHash.httpHeaderName`,
+Envoy's ring-hash and Maglev policies, and the session-persistence extensions in
+Gateway API implementations all map one key onto **one** backend. That is `S=1`.
+It is a real and useful mode — it still divides the flush cost by `replicas` —
+but it is not what `subsetSize: 2` means: a tenant pinned to a single replica
+loses all of its capacity when that replica restarts and has to be rehashed
+somewhere else, which is exactly the failure the default subset of two exists to
+avoid. Ravel does not present those configurations as a migration of subset
+affinity, and neither should a runbook. The operator does not generate them
+either. You can use `spec.gateway.ingestAffinity.annotations` to carry your
+controller's own annotations onto the same Ingress objects, or configure that
+layer yourself and leave `ingestAffinity` unset — but read what you configure as
+`S=1` unless the layer genuinely implements subset-of-`S` selection.
+
+### The ingress-nginx backend is deprecated
+
+`backend: ingressNginx` is the default and it keeps working unchanged, but
+ingress-nginx is retiring upstream, so it is deprecated (ADR-0080 decision 1).
+A cluster on it gets an `IngestAffinityBackendDeprecated` condition on its
+`RavelCluster` status, with reason `IngressNginxRetired`; the condition
+disappears once the cluster moves off that backend. Nothing about an existing CR
+changes on upgrade: a CR that never set `backend` deserializes to
+`ingressNginx`, with the same `subsetSize` and the same key. The migration
+target is `backend: ravelNative`, Ravel's own subset router, which does
+rendezvous-hash subset-of-`S` selection independent of whichever ingress or
+Gateway implementation terminates the connection. That backend ships in a later
+change; until it does, `ravelNative` is accepted by the CRD and silences the
+condition but the rendered objects are still today's. Do not switch a production
+cluster to it before its own release note says the router is rendered.
 
 ## Turning it on
 
@@ -128,6 +154,7 @@ That is the whole thing. Everything else defaults: enabled, subset size 2, key
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | boolean | `true` | `false` deletes the Ingress objects and returns to the pre-affinity render. The incident switch. |
+| `backend` | enum | `ingressNginx` | `ingressNginx` (deprecated, see above) or `ravelNative`. Omitting it keeps the backend an existing CR already runs. |
 | `subsetSize` | integer | `2` | Replicas per tenant. Must be at least 1. |
 | `key.source` | enum | `authorizationHeader` | `authorizationHeader`, `header`, or `mtlsSubject`. |
 | `key.headerName` | string | — | Required when `key.source` is `header`. |
