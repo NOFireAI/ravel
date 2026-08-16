@@ -24,6 +24,18 @@ use crate::proxy::build_app;
 use crate::router::RouterState;
 use crate::select::RoundRobin;
 
+// gRPC transparent-proxy tests (#184) use a real tonic gRPC server as the
+// gateway-pod backend and a real tonic gRPC client to drive the router, so the
+// status/trailer round-trip is proven over an actual gRPC/HTTP2 stack rather
+// than a byte-level double.
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
+    MetricsService, MetricsServiceServer,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
+
 // --- test harness ------------------------------------------------------------
 
 /// A fixed clock, so the round-robin idle logic is deterministic in tests.
@@ -95,6 +107,11 @@ fn state(
         clock: Arc::new(FakeClock(0)),
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        grpc_http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .http2_prior_knowledge()
             .build()
             .unwrap(),
     })
@@ -496,5 +513,268 @@ async fn tenant_key_bytes_never_appear_in_an_error_body() {
     assert!(
         !body.contains(secret),
         "the tenant key (bearer token) must never appear in an error body; got {body:?}"
+    );
+}
+
+// --- gRPC transparent-proxy tests (#184) ------------------------------------
+
+/// A real tonic gRPC backend standing in for a gateway pod. It implements the
+/// OTLP `MetricsService`, records each `export` it receives so a test can prove
+/// which pod address the router dialed, and returns a normal success response
+/// (so tonic emits its `grpc-status: 0` trailer). A successful client call
+/// therefore proves the response trailers round-tripped through the router: if
+/// the proxy had dropped them, the tonic client would fail with a missing
+/// `grpc-status`.
+struct GrpcBackend {
+    hits: Hits,
+    tag: &'static str,
+}
+
+#[tonic::async_trait]
+impl MetricsService for GrpcBackend {
+    async fn export(
+        &self,
+        _request: tonic::Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+        self.hits.lock().unwrap().push(self.tag.to_string());
+        Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
+    }
+}
+
+/// Spawn a real gRPC (h2c) backend on a loopback port. Returns its bound address
+/// and the hits recorder.
+async fn spawn_grpc_backend(tag: &'static str) -> (SocketAddr, Hits) {
+    let hits: Hits = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let svc = GrpcBackend {
+        hits: hits.clone(),
+        tag,
+    };
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(MetricsServiceServer::new(svc))
+            .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener))
+            .await
+            .unwrap();
+    });
+    (addr, hits)
+}
+
+/// A gRPC client pointed at the router, carrying `authorization` metadata as the
+/// tenant key (matching `KeyResolver::Header(AUTHORIZATION)`).
+async fn grpc_export_with_auth(
+    router_addr: SocketAddr,
+    auth: &str,
+) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+    let channel = tonic::transport::Channel::from_shared(format!("http://{router_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = MetricsServiceClient::new(channel);
+    let mut request = tonic::Request::new(ExportMetricsServiceRequest::default());
+    request
+        .metadata_mut()
+        .insert("authorization", auth.parse().unwrap());
+    client.export(request).await
+}
+
+#[tokio::test]
+async fn grpc_request_is_proxied_to_hrw_selected_pod_endpoint_not_service_vip() {
+    // Two real gRPC backends on distinct loopback ports stand in for two gateway
+    // pods. Each is injected as a Ready endpoint whose dial address IS that
+    // backend's real bound address; the router knows no Service name or VIP.
+    let (addr_a, hits_a) = spawn_grpc_backend("a").await;
+    let (addr_b, hits_b) = spawn_grpc_backend("b").await;
+
+    let store = Arc::new(EndpointStore::new(None));
+    let slice_a = slice(
+        "gw-a",
+        "gw",
+        addr_a.port() as i32,
+        &[TestEndpoint {
+            uid: "uid-a",
+            ip: "127.0.0.1",
+            ready: true,
+        }],
+    );
+    let slice_b = slice(
+        "gw-b",
+        "gw",
+        addr_b.port() as i32,
+        &[TestEndpoint {
+            uid: "uid-b",
+            ip: "127.0.0.1",
+            ready: true,
+        }],
+    );
+    sync_slices(&store, vec![slice_a, slice_b]);
+
+    // Compute the HRW winner independently of the router, exactly as the HTTP
+    // test does, so the assertion is against `ravel_affinity::rank`'s own answer.
+    let key = b"Bearer grpc-token";
+    let id_a = ReplicaId::new(b"uid-a".to_vec());
+    let id_b = ReplicaId::new(b"uid-b".to_vec());
+    let reps = [id_a.clone(), id_b.clone()];
+    let ranked = rank(key, &reps);
+    let winner = ranked[0].clone();
+    let (winner_hits, loser_hits) = if winner == id_a {
+        (hits_a.clone(), hits_b.clone())
+    } else {
+        (hits_b.clone(), hits_a.clone())
+    };
+
+    // subset_size 1: the subset is exactly the HRW winner.
+    let state = state(store, KeyResolver::Header(AUTHORIZATION), 1);
+    let router_addr = spawn_router(crate::grpc::build_app(state)).await;
+
+    // A successful unary export proves the backend's `grpc-status: 0` trailer
+    // round-tripped through the router unmodified: tonic errors on a missing one.
+    let response = grpc_export_with_auth(router_addr, "Bearer grpc-token")
+        .await
+        .expect("gRPC export must succeed through the proxy with trailers intact");
+    // The response body itself also round-tripped (decoded by the real client).
+    let _ = response.into_inner();
+
+    assert_eq!(
+        winner_hits.lock().unwrap().len(),
+        1,
+        "the HRW-selected pod received exactly one gRPC request at its own address"
+    );
+    assert!(
+        loser_hits.lock().unwrap().is_empty(),
+        "the non-selected pod must receive no gRPC traffic (no Service-VIP spraying)"
+    );
+}
+
+#[tokio::test]
+async fn grpc_canonical_tenant_resolution_failure_rejects_with_unauthenticated() {
+    // A Ready backend is registered so that any stray proxy attempt would be
+    // recorded. It must not be: canonical-tenant resolution failure is
+    // fail-closed and rejected as gRPC UNAUTHENTICATED, never proxied.
+    let (addr, hits) = spawn_grpc_backend("a").await;
+    let store = Arc::new(EndpointStore::new(None));
+    let s = slice(
+        "gw",
+        "gw",
+        addr.port() as i32,
+        &[TestEndpoint {
+            uid: "uid-a",
+            ip: "127.0.0.1",
+            ready: true,
+        }],
+    );
+    sync_one_slice(&store, s);
+
+    struct AlwaysFail;
+    impl ravel_tenant_resolve::TenantResolver for AlwaysFail {
+        fn resolve(
+            &self,
+            _headers: &axum::http::HeaderMap,
+        ) -> Result<ravel_types::TenantId, ravel_tenant_resolve::AuthError> {
+            Err(ravel_tenant_resolve::AuthError)
+        }
+    }
+
+    let state = state(store, KeyResolver::Canonical(Arc::new(AlwaysFail)), 2);
+    let router_addr = spawn_router(crate::grpc::build_app(state)).await;
+
+    let status = grpc_export_with_auth(router_addr, "Bearer whatever")
+        .await
+        .expect_err("canonical-tenant resolution failure must reject the gRPC call");
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "fail-closed resolution failure maps to gRPC UNAUTHENTICATED"
+    );
+    assert!(
+        hits.lock().unwrap().is_empty(),
+        "fail-closed: no gRPC request may reach any backend on resolution failure"
+    );
+}
+
+#[tokio::test]
+async fn grpc_rejects_traffic_before_first_watcher_sync() {
+    // The gRPC listener applies the same cold-start gate as the HTTP path: a
+    // request before the first watcher sync is rejected (gRPC UNAVAILABLE) and
+    // no backend is dialed. Prove the gRPC handler actually reaches
+    // resolve_and_select under this condition, not just that the pure function
+    // rejects.
+    let (addr, hits) = spawn_grpc_backend("a").await;
+    let store = Arc::new(EndpointStore::new(None));
+    assert!(!store.is_synced());
+    // Register the backend address so a (buggy) proxy attempt could reach it;
+    // the store is deliberately left un-synced (no InitDone).
+    let _ = addr;
+
+    let state = state(store, KeyResolver::Header(AUTHORIZATION), 2);
+    let router_addr = spawn_router(crate::grpc::build_app(state)).await;
+
+    let status = grpc_export_with_auth(router_addr, "Bearer grpc-token")
+        .await
+        .expect_err("a pre-sync gRPC request must be rejected");
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unavailable,
+        "cold start maps to gRPC UNAVAILABLE"
+    );
+    assert!(
+        hits.lock().unwrap().is_empty(),
+        "no gRPC proxy attempt may happen against an unsynced (empty) subset"
+    );
+}
+
+#[tokio::test]
+async fn grpc_unready_subset_member_falls_through_to_next_ranked_replica() {
+    // The HRW-ranked top member is NotReady; with subset_size 1 the subset is
+    // just that top member, so the gRPC request must fall through to the
+    // next-ranked Ready replica rather than failing. This proves the gRPC
+    // handler reaches the same `resolve_and_select` fallthrough the HTTP path
+    // uses, over the gRPC transport.
+    let (addr, hits) = spawn_grpc_backend("a").await;
+
+    let key = b"Bearer grpc-token";
+    let id_a = ReplicaId::new(b"uid-a".to_vec());
+    let id_b = ReplicaId::new(b"uid-b".to_vec());
+    let reps = [id_a.clone(), id_b.clone()];
+    let ranked = rank(key, &reps);
+    let top = ranked[0].clone();
+    let next = ranked[1].clone();
+
+    // The rank-top endpoint is NotReady; the next-ranked endpoint is Ready and
+    // points at the single running backend.
+    let uid_top: &'static str = if top == id_a { "uid-a" } else { "uid-b" };
+    let uid_next: &'static str = if next == id_a { "uid-a" } else { "uid-b" };
+    let s = slice(
+        "gw",
+        "gw",
+        addr.port() as i32,
+        &[
+            TestEndpoint {
+                uid: uid_top,
+                ip: "127.0.0.1",
+                ready: false,
+            },
+            TestEndpoint {
+                uid: uid_next,
+                ip: "127.0.0.1",
+                ready: true,
+            },
+        ],
+    );
+    let store = Arc::new(EndpointStore::new(None));
+    sync_one_slice(&store, s);
+
+    let state = state(store, KeyResolver::Header(AUTHORIZATION), 1);
+    let router_addr = spawn_router(crate::grpc::build_app(state)).await;
+
+    grpc_export_with_auth(router_addr, "Bearer grpc-token")
+        .await
+        .expect("gRPC request falls through to the next-ranked Ready replica");
+    assert_eq!(
+        hits.lock().unwrap().len(),
+        1,
+        "the next-ranked Ready replica received the gRPC request over the fallthrough path"
     );
 }

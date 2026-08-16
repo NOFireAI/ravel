@@ -4504,6 +4504,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kube-runtime",
+ "opentelemetry-proto",
  "ravel-affinity",
  "ravel-tenant-resolve",
  "ravel-types",
@@ -4512,6 +4513,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

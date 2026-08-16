@@ -80,6 +80,13 @@ pub struct Cli {
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub listen_http: SocketAddr,
 
+    /// Address the gRPC (HTTP/2 cleartext, h2c) transparent proxy listens on.
+    /// Unset binds no gRPC listener at all: "absent means off", matching this
+    /// crate's existing optional-listener convention. A router that only proxies
+    /// HTTP needs no gRPC socket (#184).
+    #[arg(long, value_name = "ADDR")]
+    pub listen_grpc: Option<SocketAddr>,
+
     // --- Bounded per-tenant round-robin state (ADR-0069 idle eviction) --------
     /// Hard cap on distinct tenant-key entries in the round-robin map. Under
     /// `authorization-header` every distinct token mints an entry and tokens
@@ -181,6 +188,7 @@ pub struct RouterConfig {
     pub subset_size: usize,
     pub key: KeyConfig,
     pub listen_http: SocketAddr,
+    pub listen_grpc: Option<SocketAddr>,
     pub round_robin_max_entries: usize,
     pub round_robin_idle_ttl: Duration,
 }
@@ -240,6 +248,7 @@ impl Cli {
             subset_size: self.subset_size as usize,
             key,
             listen_http: self.listen_http,
+            listen_grpc: self.listen_grpc,
             round_robin_max_entries: self.round_robin_max_entries,
             round_robin_idle_ttl,
         })
@@ -524,6 +533,26 @@ mod tests {
         .into_config()
         .expect_err("OIDC without an audience must fail");
         assert!(err.to_string().contains("--oidc-audience"));
+    }
+
+    #[test]
+    fn listen_grpc_absent_by_default() {
+        let config = cli(&[]).into_config().expect("valid config");
+        assert!(
+            config.listen_grpc.is_none(),
+            "no --listen-grpc means no gRPC listener is bound"
+        );
+    }
+
+    #[test]
+    fn listen_grpc_parses_when_set() {
+        let config = cli(&["--listen-grpc", "0.0.0.0:4317"])
+            .into_config()
+            .expect("valid config");
+        assert_eq!(
+            config.listen_grpc,
+            Some("0.0.0.0:4317".parse().expect("addr"))
+        );
     }
 
     #[test]

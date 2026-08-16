@@ -27,15 +27,30 @@ kube = { workspace = true }
 kube-runtime = { workspace = true }
 k8s-openapi = { workspace = true }
 
-axum = { workspace = true }
+# `http2` is added on top of the workspace pin (axum 0.8's default feature set is
+# HTTP/1 only) so the gRPC listener can speak cleartext HTTP/2 (h2c); the gateway
+# pods serve gRPC over h2c internally, no TLS (#184).
+axum = { workspace = true, features = ["http2"] }
 tokio = { workspace = true }
 # StreamExt over the watcher event stream and the response byte stream.
 futures = { workspace = true }
 # The reverse-proxy HTTP client. `stream` adds streaming request/response bodies
 # (Body::wrap_stream / Response::bytes_stream) so the router proxies bytes
-# without buffering a whole ingest payload in memory. Unions with the workspace
-# pin's `json` feature; the version is unchanged.
-reqwest = { workspace = true, features = ["stream"] }
+# without buffering a whole ingest payload in memory. `http2` enables the
+# cleartext HTTP/2 client mode used by the gRPC proxy (built with
+# `http2_prior_knowledge()`); it is already in reqwest's default feature set, but
+# is named explicitly so a future default change cannot silently drop it (#184).
+# Unions with the workspace pin's `json` feature; the version is unchanged.
+reqwest = { workspace = true, features = ["stream", "http2"] }
+# gRPC status projection only: `tonic::Code`/`tonic::Status` map a RouteError to
+# a gRPC status and build the trailers-only reject response. No service codegen,
+# no `.proto` files: this is a byte-transparent HTTP/2 proxy, not a decoded gRPC
+# service, so the default server/transport/codegen features are turned off (#184).
+# Pinned directly rather than via `workspace = true` because a workspace-inherited
+# dependency cannot turn off `default-features` (cargo rejects the override); the
+# version matches the workspace `tonic` pin, the same convention this crate
+# already uses for `rustls` above.
+tonic = { version = "0.14", default-features = false }
 # blake3 keys the bounded round-robin map by a hash of the tenant key rather
 # than the raw bytes, so no raw bearer token is ever held as a map key.
 blake3 = { workspace = true }
@@ -61,6 +76,16 @@ serde_json = { workspace = true }
 # A local axum backend stands in for a gateway pod; the test client drives the
 # router over a real loopback socket.
 tokio = { workspace = true, features = ["test-util"] }
+# gRPC end-to-end tests: `channel` (a client) and the default server/transport
+# features let a real tonic gRPC server stand in for a gateway pod and a real
+# tonic gRPC client drive the router, proving the transparent proxy round-trips
+# status and trailers with an actual gRPC/HTTP2 stack rather than a byte double.
+tonic = { workspace = true, features = ["channel"] }
+# The OTLP metrics gRPC service definition (generated tonic server + client)
+# reused as the concrete gRPC surface the transparent-proxy tests exercise; it is
+# the real ingest gRPC surface the gateway serves, so no throwaway `.proto` is
+# needed.
+opentelemetry-proto = { workspace = true }
 
 [lints]
 workspace = true
