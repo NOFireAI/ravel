@@ -1,11 +1,18 @@
-//! Ravel-native subset-affinity ingest router (ADR-0080 decision 3, T6a).
+//! Ravel-native subset-affinity ingest router (ADR-0080 decision 3, T6a/T6b).
 //!
-//! A horizontally-scalable HTTP reverse proxy that pins each tenant's ingest
-//! traffic to a stable subset-of-`S` gateway pods, computed with rendezvous
-//! (HRW) hashing over the pods' own `EndpointSlice` identities. Requests are
-//! dialed **directly to the chosen pod address**, never through the gateway
-//! Service's cluster IP, so kube-proxy's own load balancing cannot undo the
-//! subset selection.
+//! A horizontally-scalable reverse proxy that pins each tenant's ingest traffic
+//! to a stable subset-of-`S` gateway pods, computed with rendezvous (HRW)
+//! hashing over the pods' own `EndpointSlice` identities. Requests are dialed
+//! **directly to the chosen pod address**, never through the gateway Service's
+//! cluster IP, so kube-proxy's own load balancing cannot undo the subset
+//! selection.
+//!
+//! Two transports share one selection core: an HTTP reverse proxy on
+//! `--listen-http` ([`proxy`]) and, when `--listen-grpc` is set, a transparent
+//! gRPC (HTTP/2 cleartext) proxy ([`grpc`]) that preserves gRPC framing and
+//! trailers without decoding the message envelope. Both call the same
+//! [`router::RouterState::resolve_and_select`]; the gRPC path is the transport
+//! analogue of the HTTP one, not a second selection implementation.
 //!
 //! # Request path
 //!
@@ -19,11 +26,12 @@
 //!    the top `subset_size` as the working subset, pick one member by bounded
 //!    per-tenant round-robin, and fall through the HRW order past position `S`
 //!    for any member not present in the Ready snapshot.
-//! 3. [`proxy`]: reverse-proxy the request to the selected pod's dial address.
+//! 3. [`proxy`] (HTTP) or [`grpc`] (gRPC/HTTP2): reverse-proxy the request to
+//!    the selected pod's dial address.
 //!
 //! The protocol-agnostic core of steps 1-2 is
-//! [`router::RouterState::resolve_and_select`]; the follow-up gRPC task (#184)
-//! calls it directly rather than reimplementing selection.
+//! [`router::RouterState::resolve_and_select`]; the gRPC transport ([`grpc`],
+//! #184) calls it directly rather than reimplementing selection.
 //!
 //! # Cold start
 //!
@@ -38,6 +46,7 @@ pub mod config;
 pub(crate) mod auth;
 pub(crate) mod clock;
 pub(crate) mod endpoints;
+pub(crate) mod grpc;
 pub(crate) mod key;
 pub(crate) mod proxy;
 pub(crate) mod router;
@@ -95,6 +104,16 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
+    // The gRPC forwarding client. `http2_prior_knowledge()` forces cleartext
+    // HTTP/2 (h2c) with no ALPN/upgrade dance, matching how the gateway pods
+    // serve gRPC internally (the HTTP proxy already dials plain `http://`). It is
+    // a separate client from `http` because prior-knowledge mode cannot also
+    // serve the HTTP/1 proxy path.
+    let grpc_http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .http2_prior_knowledge()
+        .build()?;
+
     let state = Arc::new(router::RouterState {
         endpoints: store,
         key_resolver,
@@ -102,6 +121,7 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
         round_robin: select::RoundRobin::new(config.round_robin_max_entries, idle_ttl_ns),
         clock: Arc::new(clock::SystemClock),
         http,
+        grpc_http,
     });
 
     // Bound the round-robin map over time: sweep entries idle past the TTL on
@@ -111,15 +131,33 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen_http).await?;
     tracing::info!(addr = %config.listen_http, "ravel-ingest-router listening");
 
+    // Bind the gRPC listener only when configured ("absent means off"): an unset
+    // `--listen-grpc` binds no socket and spawns no task. When set, it joins the
+    // same watcher race below as a third arm.
+    let grpc_listener = match config.listen_grpc {
+        Some(addr) => {
+            let l = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(addr = %addr, "ravel-ingest-router gRPC listening");
+            Some(l)
+        }
+        None => None,
+    };
+    let grpc_app = grpc::build_app(state.clone());
+
     // The watcher normally never returns (kube_runtime::watcher turns errors
     // into stream items and retries with backoff internally, per watch::run's
     // own doc comment). If its task does return or panic, the process must not
     // keep serving on an endpoint snapshot that will never update again: a
     // silently-dead watcher would route tenant ingest to an increasingly stale
     // (and, after enough pod churn, wrong) set of addresses while /readyz kept
-    // reporting healthy. Race it against the HTTP server and exit on either.
+    // reporting healthy. Race it against BOTH listeners and exit on any arm, so a
+    // dead watcher tears the whole process down regardless of which listener(s)
+    // are active.
     tokio::select! {
         result = axum::serve(listener, proxy::build_app(state)) => {
+            result?;
+        }
+        result = serve_optional_grpc(grpc_listener, grpc_app) => {
             result?;
         }
         watch_result = watch_handle => {
@@ -133,6 +171,20 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Serve the gRPC listener when one is bound, or park forever when it is not, so
+/// this can be a `tokio::select!` arm whether or not `--listen-grpc` was set.
+/// When absent, it never resolves, so the select is driven only by the HTTP
+/// server and the watcher, and nothing is bound or spawned for gRPC.
+async fn serve_optional_grpc(
+    listener: Option<tokio::net::TcpListener>,
+    app: axum::Router,
+) -> std::io::Result<()> {
+    match listener {
+        Some(listener) => axum::serve(listener, app).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Periodically evict idle round-robin entries. A swept entry restarts at

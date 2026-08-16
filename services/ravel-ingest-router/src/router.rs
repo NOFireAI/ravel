@@ -25,6 +25,11 @@ pub(crate) struct RouterState {
     pub round_robin: RoundRobin,
     pub clock: Arc<dyn Clock>,
     pub http: reqwest::Client,
+    /// The forwarding client for the gRPC listener ([`crate::grpc`]). Separate
+    /// from `http` because it is built with `http2_prior_knowledge()`, which
+    /// forces every request onto cleartext HTTP/2 (h2c) and so cannot serve the
+    /// HTTP/1 proxy path.
+    pub grpc_http: reqwest::Client,
 }
 
 impl RouterState {
@@ -66,6 +71,26 @@ impl RouteError {
             RouteError::Unauthenticated => StatusCode::UNAUTHORIZED,
             RouteError::Exhausted => StatusCode::SERVICE_UNAVAILABLE,
             RouteError::Upstream => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    /// The gRPC status code a [`RouteError`] maps to (deliverable 2 of #184).
+    ///
+    /// This is the same enum's second status-code projection, alongside
+    /// [`RouteError::status`], for the gRPC transport ([`crate::grpc`]). The
+    /// mapping is not identical to the HTTP one: a cold-start/not-ready or
+    /// exhausted-subset condition and an upstream forwarding failure are all
+    /// retryable *availability* problems to a gRPC caller, so they map to
+    /// `Unavailable` (the HTTP projection distinguishes 503 from a 502 bad
+    /// gateway, a distinction gRPC's code space does not carry). A resolution
+    /// failure is `Unauthenticated`, matching the 401 projection and ADR-0080's
+    /// fail-closed rule. Like `status`, it carries no key bytes.
+    pub(crate) fn grpc_code(&self) -> tonic::Code {
+        match self {
+            RouteError::NotSynced => tonic::Code::Unavailable,
+            RouteError::Unauthenticated => tonic::Code::Unauthenticated,
+            RouteError::Exhausted => tonic::Code::Unavailable,
+            RouteError::Upstream => tonic::Code::Unavailable,
         }
     }
 }
