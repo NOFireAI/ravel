@@ -195,6 +195,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         )),
         metrics_tenant_labels: false,
         query_accounting: Arc::clone(&query_accounting),
+        metrics_tenant_allowlist: Arc::new(HashSet::new()),
         ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
             ravel_ingest::IngestByteBudgetLimit::Unlimited,
         ),
@@ -591,6 +592,7 @@ mod flight {
             )),
             metrics_tenant_labels: false,
             query_accounting: Arc::clone(&query_accounting),
+            metrics_tenant_allowlist: Arc::new(HashSet::new()),
             ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
                 ravel_ingest::IngestByteBudgetLimit::Unlimited,
             ),
