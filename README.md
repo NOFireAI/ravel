@@ -62,6 +62,9 @@ Every Ravel process is disposable because the object store holds everything
 durable. [demo/kill-and-recover.sh](demo/kill-and-recover.sh) demonstrates that
 against the running stack rather than asserting it in prose:
 
+![Ingesting one sample under strict acknowledgement, SIGKILLing the ravel-server container, replacing it with a fresh one, and reading the pre-kill sample back by its commit token.](docs/demo.gif)
+
+
 ```sh
 demo/kill-and-recover.sh
 ```
