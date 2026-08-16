@@ -8,6 +8,74 @@
 An OpenTelemetry-native observability database whose only durable backend is
 object storage.
 
+## Quickstart
+
+One command brings up the whole stack from published images — MinIO for
+object storage, `ravel-server`, an OpenTelemetry Collector feeding it your
+host's own metrics, and Grafana with a provisioned Ravel datasource. No Rust
+toolchain, no cargo, no compile.
+
+```sh
+docker compose -f deploy/docker-compose/ravel.yml up -d
+```
+
+Open Grafana at <http://127.0.0.1:3000> (`admin` / `admin`); the Ravel
+datasource is already wired up and the first dashboard shows your machine's
+metrics within a few scrape intervals.
+
+Query the data back over Ravel's Prometheus-compatible API. Every query needs
+the demo bearer token, exactly as a real deployment requires a real one:
+
+<!-- ravel:run status=200; json:.status=success -->
+```sh
+curl -s -H "Authorization: Bearer demo-token" \
+  'http://127.0.0.1:4318/api/v1/query?query=system_cpu_load_average_1m'
+```
+
+The published image is built with `--features sql`, so `POST /api/v1/sql`
+answers out of the box. The registered tables are `samples` (metrics), `logs`,
+and `spans`:
+
+<!-- ravel:run status=200; nonempty:.data.rows -->
+```sh
+curl -s -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer demo-token" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"SELECT * FROM samples LIMIT 5"}'
+```
+
+To see Ravel's read-your-write path directly — ingest one export, capture its
+commit token, and read that exact write back — run
+[demo/walkthrough.sh](demo/walkthrough.sh) while the stack is up. Stop the
+stack with:
+
+```sh
+docker compose -f deploy/docker-compose/ravel.yml down
+```
+
+The [getting started guide](docs/guides/getting-started.md) walks the same path
+with expected output.
+
+### Capabilities and the from-source path
+
+The quickstart's SQL surface exists because the published image carries
+`--features sql`. The from-source contributor path, `make demo`, does **not**
+build that feature, so `POST /api/v1/sql` is unavailable there; PromQL,
+ingest, and the rest work on both. If you are changing Ravel's code and need to
+run your own build, use `make demo` — see the
+[development guide](docs/guides/development.md).
+
+### Security
+
+Everything in [deploy/docker-compose/ravel.yml](deploy/docker-compose/ravel.yml)
+is a fixed **development** value: the demo bearer token (`demo-token`) and the
+MinIO credentials (`ravel` / `ravel-dev-secret`). Every published host port
+binds loopback (`127.0.0.1`) only, so the checked-in token never fronts an
+ingest endpoint on your LAN. None of these values are for any deployment
+reachable from a network.
+
+## Why object storage
+
 Metrics, logs, and traces land as immutable segments and commit records on S3
 or MinIO. Every Ravel process — gateway, ingest shard, query frontend,
 maintenance worker — is disposable: when Ravel acknowledges a write in strict
@@ -19,34 +87,15 @@ Metrics and logs run end to end today, from OTLP or Remote Write ingest through
 PromQL, SQL, and Flight SQL query. Traces ingest, compact, and retain end to
 end, and are queryable through the `spans` SQL table on `POST /api/v1/sql`.
 
-## Run it
-
-```sh
-make minio   # MinIO plus bucket creation, via docker compose
-make demo    # ingest one OTLP export and query it back
-```
-
-`make demo` starts `ravel-server` against MinIO, sends a generated OTLP metrics
-export, prints the commit token it receives, and queries the metric back by
-`min_commit_token`. For the walkthrough with expected output, see the
-[getting started guide](docs/guides/getting-started.md).
-
-The same round trip on a real Kubernetes cluster, driven by the operator, needs
-`docker`, `kind`, and `kubectl`:
-
-```sh
-scripts/kind-up.sh     # cluster, images, fake S3, operator, RavelCluster
-scripts/kind-demo.sh   # ingest via the gateway, query via the query tier
-scripts/kind-down.sh
-```
-
 ## Container images
 
 `ravel-server` and `ravel-operator` publish to the GitHub Container Registry
 (GHCR) on every `vX.Y.Z` release tag, built from the root `Dockerfile` (see
 [ADR-0037](docs/adrs/0037-container-image-ci-registry.md)). Only `linux/amd64`
 is published; each published object is an OCI image index carrying an SBOM and
-full build provenance.
+full build provenance. The quickstart pins
+`ghcr.io/nofireai/ravel-server:0.9.2` by default; override it by setting
+`RAVEL_IMAGE` before `docker compose up`.
 
 ```sh
 docker pull ghcr.io/nofireai/ravel-server:latest
@@ -82,6 +131,19 @@ cosign verify \
 Replace `v0.9.0`/`0.9.0` with the release you are verifying; the tag ref in
 `--certificate-identity` must be the exact tag that produced the image.
 
+## Kubernetes
+
+The same ingest/query round trip on a real Kubernetes cluster, driven by the
+operator, needs `docker`, `kind`, and `kubectl`:
+
+```sh
+scripts/kind-up.sh     # cluster, images, fake S3, operator, RavelCluster
+scripts/kind-demo.sh   # ingest via the gateway, query via the query tier
+scripts/kind-down.sh
+```
+
+See the [Kubernetes guide](docs/guides/kubernetes.md) for details.
+
 ## How it fits together
 
 ![architecture](docs/diagrams/architecture.svg)
@@ -95,18 +157,12 @@ acknowledgement, visibility, and crash recovery mean.
 
 ![ingest and commit sequence](docs/diagrams/ingest-commit-sequence.svg)
 
-## Query it
+## Query surfaces
 
-```sh
-# PromQL, instant
-curl -s 'localhost:8080/api/v1/query?query=http_requests_total'
-
-# SQL over metrics, with ravel-server built and run with --features sql
-curl -s localhost:8080/api/v1/sql -d '{"query":"SELECT * FROM metrics LIMIT 10"}'
-```
-
-PromQL, SQL, Flight SQL, exemplars, alerting, and analytics surfaces are each
-covered in the [query guide](docs/guides/query.md) and the
+All query endpoints live under `/api/v1` on the HTTP listener (default bind
+`127.0.0.1:4318`) and require `Authorization: Bearer <token>`, the same as
+ingest. PromQL, SQL, Flight SQL, exemplars, alerting, and analytics surfaces
+are each covered in the [query guide](docs/guides/query.md) and the
 [distributed query guide](docs/guides/distributed-query.md).
 
 ## Where things live
@@ -118,7 +174,8 @@ covered in the [query guide](docs/guides/query.md) and the
   one binary), `ravel-cli` (segment, commit, and catalog inspector), and the
   Kubernetes operator
 - `docs/` — specs, decision records, diagrams, and guides
-- `deploy/` — local MinIO stack and Kubernetes manifests
+- `deploy/` — the container-first compose stack, the local MinIO stack, the
+  OpenTelemetry Collector and Grafana provisioning, and Kubernetes manifests
 
 ## Documentation
 
