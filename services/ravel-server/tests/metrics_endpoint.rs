@@ -643,4 +643,10 @@ async fn attribution_family_folds_unconfigured_tenant_to_other() {
         "an unconfigured tenant must never get its own tenant_hash series, only fold into \
          \"other\", got {hashes:?}:\n{body}"
     );
+    assert!(
+        hashes.contains("other"),
+        "the unconfigured tenant's traffic must actually appear folded into \"other\" -- \
+         without this, the two asserts above pass vacuously if the unconfigured tenant's \
+         PUTs never rendered at all, got {hashes:?}:\n{body}"
+    );
 }
