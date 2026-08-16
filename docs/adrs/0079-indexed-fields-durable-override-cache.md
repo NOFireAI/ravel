@@ -86,8 +86,10 @@ Safety below).
   `log_router.rs::active_set` already uses: a sync
   `IndexedFieldsOverlay::fields_for_cached(tenant, now_ns)` fast path
   returns the cached resolved list if fresh (`<=` a staleness horizon,
-  reusing `crate::lifecycle::StalenessGate`'s math rather than duplicating
-  it); on a miss or stale entry, `.await`
+  mirroring `GenerationSwitch::TenantView`'s inclusive-fresh boundary and
+  60s horizon rather than `crate::lifecycle::StalenessGate`, which is a
+  process-wide fail-closed gate and not a fit for a per-tenant cache); on
+  a miss or stale entry, `.await`
   `IndexedFieldsOverlay::refresh(tenant, now_ns)`, which reads
   `TenantConfig` for that one tenant (`read_config_values`) and overlays
   it onto the wrapped base's own `fields_for` resolution exactly as
@@ -240,7 +242,10 @@ call site (`run_flush`).
   concrete `IndexedFieldsOverlay` wraps it; `LogFlushCtx::run_flush` gains
   the cache-aside orchestration `log_router.rs::active_set` already has a
   working, tested precedent for, using its own pinned `flush_open_ns` as
-  the staleness clock.
+  the staleness clock. `LogIngestRouter::new_with_indexed_fields` and
+  `LogShardActor::new`'s parameter type changes from
+  `Arc<dyn LogIndexedFields>` to `Arc<IndexedFieldsOverlay>` — the trait
+  is untouched, but these two constructor signatures are not.
 - No new CLI flags, no new background task, no new tenant-discovery
   mechanism.
 - A tenant's very first flush(es) after a durable override is written may
