@@ -157,14 +157,14 @@
                             "type": "boolean"
                           },
                           "hosts": {
-                            "description": "Hostnames the ingest Ingress answers on. Empty renders a single\nhost-less rule, which matches any host reaching the controller.",
+                            "description": "Hostnames the ingest Ingress answers on. Empty renders a single\nhost-less rule, which matches any host reaching the controller.\n\nLegacy `backend: ingressNginx` only. `gateway.exposure.gatewayAPI\n.hostnames` is the equivalent field for Gateway API exposure; the two\nare independent and neither reads the other.",
                             "items": {
                               "type": "string"
                             },
                             "type": "array"
                           },
                           "ingressClassName": {
-                            "description": "`spec.ingressClassName` on the rendered Ingress objects. Omit to let the\ncluster's default IngressClass apply.",
+                            "description": "`spec.ingressClassName` on the rendered Ingress objects. Omit to let the\ncluster's default IngressClass apply.\n\nLegacy `backend: ingressNginx` only. Has no effect under\n`backend: ravelNative`, and no effect on `gateway.exposure.gatewayAPI`\nrouting (Gateway API attachment goes through `exposure.gatewayAPI\n.gatewayRef` instead, ADR-0080 decision 2).",
                             "nullable": true,
                             "type": "string"
                           },
@@ -201,7 +201,7 @@
                             "type": "integer"
                           },
                           "tlsSecretName": {
-                            "description": "TLS Secret for `spec.tls` on the rendered Ingress objects. Strongly\nrecommended and effectively required for the gRPC Ingress: ingress-nginx\nserves HTTP/2 to clients over TLS, and OTLP/gRPC needs HTTP/2. Tenant\ntokens are bearer tokens, so plaintext ingest exposes them.",
+                            "description": "TLS Secret for `spec.tls` on the rendered Ingress objects. Strongly\nrecommended and effectively required for the gRPC Ingress: ingress-nginx\nserves HTTP/2 to clients over TLS, and OTLP/gRPC needs HTTP/2. Tenant\ntokens are bearer tokens, so plaintext ingest exposes them.\n\nLegacy `backend: ingressNginx` only. Gateway API exposure terminates\nTLS at the referenced `Gateway`'s own listener, which this operator\ndoes not render; configure `tls.certificateRefs` on that Gateway\ndirectly (ADR-0080 decision 2).",
                             "nullable": true,
                             "type": "string"
                           }
