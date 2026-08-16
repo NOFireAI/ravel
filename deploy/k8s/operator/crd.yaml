@@ -186,12 +186,18 @@
                                 "enum": [
                                   "authorizationHeader",
                                   "header",
-                                  "mtlsSubject"
+                                  "mtlsSubject",
+                                  "canonicalTenant"
                                 ],
                                 "type": "string"
                               }
                             },
                             "type": "object"
+                          },
+                          "routerImage": {
+                            "description": "Container image for the `ravel-ingest-router` Deployment rendered under\n[`AffinityBackend::RavelNative`] (ADR-0080 decision 3).\n\nThe router is a DIFFERENT binary from `spec.image` (which is\n`ravel-server`), so its image cannot be derived from `spec.image` and is\nnamed explicitly here. Deriving it by string-manipulating `spec.image`\nwould be fragile: an image reference host can carry a port\n(`localhost:5000/ravel-server:v1`), so any split-on-`:` guess breaks.\n\nRequired when `backend: ravelNative`: the operator surfaces a `Degraded`\nstatus condition (reason `RouterImageMissing`) and renders no router\nobjects when it is absent, rather than a Deployment with an empty\n`image:` that would never schedule. Has no effect under\n`backend: ingressNginx`.",
+                            "nullable": true,
+                            "type": "string"
                           },
                           "subsetSize": {
                             "default": 2,
@@ -250,6 +256,10 @@
                       {
                         "message": "gateway.exposure.gatewayApi cannot be combined with an enabled gateway.ingestAffinity on backend: ingressNginx -- traffic on the Gateway API path would bypass the nginx subset annotations entirely; use backend: ravelNative or disable ingestAffinity",
                         "rule": "!has(self.exposure) || !has(self.exposure.gatewayApi) || !has(self.ingestAffinity) || !has(self.ingestAffinity.enabled) || !self.ingestAffinity.enabled || !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'"
+                      },
+                      {
+                        "message": "gateway.ingestAffinity.key.source canonicalTenant requires backend: ravelNative -- ingress-nginx cannot run the ravel-tenant-resolve auth chain that canonical-tenant hashing needs",
+                        "rule": "!has(self.ingestAffinity) || !has(self.ingestAffinity.key) || !has(self.ingestAffinity.key.source) || self.ingestAffinity.key.source != 'canonicalTenant' || !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'"
                       }
                     ]
                   },

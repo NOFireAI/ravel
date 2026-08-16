@@ -16,21 +16,42 @@ use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy}
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction, KeyToPath, PodSpec,
     PodTemplateSpec, Probe, ResourceRequirements, SecretKeySelector, SecretVolumeSource, Service,
-    ServicePort, ServiceSpec, Volume, VolumeMount,
+    ServiceAccount, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, IngressTLS, ServiceBackendPort,
 };
+use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 
 use crate::crd::{
-    AffinityKeySource, GatewayReference, IngestAffinitySpec, LocalSecretRef, RavelClusterSpec,
-    ResourceRequirementsSpec,
+    AffinityBackend, AffinityKeySource, GatewayReference, IngestAffinitySpec, LocalSecretRef,
+    RavelClusterSpec, ResourceRequirementsSpec,
 };
+
+/// A spec that cannot be rendered into a valid object set.
+///
+/// Surfaced by [`desired_objects`] (and the router renderers it calls) rather
+/// than panicking or emitting a broken object, so the controller records a
+/// `Degraded` status the same way a missing Secret does (ADR-0080 decision 3,
+/// deliverable 1). Kept typed and `PartialEq` so a reconcile unit test can
+/// assert the exact variant.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenderError {
+    /// `backend: ravelNative` is selected but `ingestAffinity.routerImage` is
+    /// unset. The router is a different binary from `spec.image`, so there is no
+    /// image to fall back to; rendering a Deployment with an empty `image:`
+    /// would never schedule and hide the misconfiguration.
+    #[error(
+        "gateway.ingestAffinity.backend is ravelNative but gateway.ingestAffinity.routerImage \
+         is not set; set routerImage to the ravel-ingest-router container image"
+    )]
+    RouterImageMissing,
+}
 
 /// HTTP listener port (OTLP/HTTP, query API, and the `/healthz` `/readyz`
 /// probes). Fixed to match the Dockerfile's `EXPOSE` and the server's default.
@@ -386,12 +407,19 @@ fn resources(spec: Option<&ResourceRequirementsSpec>) -> Option<ResourceRequirem
 }
 
 /// Liveness and readiness probes pointed at `/healthz` and `/readyz` on the
-/// HTTP port (ADR-0034 decision 4). Returned as
-/// `(liveness, readiness)`.
+/// gateway/query/maintain HTTP port ([`HTTP_PORT`], ADR-0034 decision 4).
+/// Returned as `(liveness, readiness)`.
 fn probes() -> (Probe, Probe) {
+    probes_on(HTTP_PORT)
+}
+
+/// [`probes`] parameterized by port, so the ravel-native router (which listens
+/// on its own [`ROUTER_HTTP_PORT`], not the ravel-server `HTTP_PORT`) shares the
+/// exact same `/healthz` `/readyz` probe shape.
+fn probes_on(port: i32) -> (Probe, Probe) {
     let http_get = |path: &str| HTTPGetAction {
         path: Some(path.to_string()),
-        port: IntOrString::Int(HTTP_PORT),
+        port: IntOrString::Int(port),
         ..Default::default()
     };
     let liveness = Probe {
@@ -815,6 +843,13 @@ fn affinity_hash_variable(key: &crate::crd::AffinityKeySpec) -> String {
     match key.source {
         AffinityKeySource::AuthorizationHeader => "$http_authorization".to_string(),
         AffinityKeySource::MtlsSubject => "$ssl_client_s_dn".to_string(),
+        // canonical-tenant hashing is a ravel-native-router concern; ingress-nginx
+        // cannot run the resolver chain, and the CANONICAL_TENANT_BACKEND_RULE CEL
+        // rule (crd.rs) rejects this key source under backend: ingressNginx at
+        // admission, so this ingress-nginx-only renderer can never see it.
+        AffinityKeySource::CanonicalTenant => {
+            unreachable!("CEL admission rejects canonical-tenant under backend: ingressNginx")
+        }
         AffinityKeySource::Header => {
             let name = key.header_name.as_deref().unwrap_or("authorization");
             let mangled: String = name
@@ -967,7 +1002,11 @@ pub fn desired_gateway_ingresses(spec: &RavelClusterSpec, instance: &str) -> Vec
     let Some(affinity) = spec.gateway.ingest_affinity.as_ref() else {
         return Vec::new();
     };
-    if !affinity.enabled {
+    // nginx Ingress objects are the `ingressNginx` backend's exposure. Under
+    // `backend: ravelNative` the router renders instead (ADR-0080 decision 3),
+    // so this path renders nothing -- and would otherwise reach
+    // `affinity_hash_variable`'s `CanonicalTenant` unreachable arm.
+    if !affinity.enabled || !matches!(affinity.backend, AffinityBackend::IngressNginx) {
         return Vec::new();
     }
     let mut ingresses = vec![ingest_ingress(
@@ -989,6 +1028,305 @@ pub fn desired_gateway_ingresses(spec: &RavelClusterSpec, instance: &str) -> Vec
         ));
     }
     ingresses
+}
+
+/// Component suffix of the ravel-native ingest router's managed objects:
+/// `<cluster>-ingest-router`. The Deployment, Service, ServiceAccount, Role, and
+/// RoleBinding all share this one base name (ADR-0080 decision 3).
+const ROUTER_COMPONENT: &str = "ingest-router";
+
+/// The router's HTTP listener and container port, matching the frozen
+/// `services/ravel-ingest-router` CLI default (`--listen-http 0.0.0.0:8080`).
+///
+/// There is intentionally no gRPC port: the router has no `--listen-grpc` flag
+/// on main (#184, T6b, adds it concurrently in a different crate), so this task
+/// renders an HTTP-only Deployment with this single container port. Wiring the
+/// gRPC listener and a second container port once #184 lands is a documented
+/// follow-up, not guessed at here.
+pub const ROUTER_HTTP_PORT: i32 = 8080;
+
+/// Default replica count for the router Deployment.
+///
+/// The CRD has no per-router replica field yet (a `ingestAffinity.routerReplicas`
+/// surface is a documented follow-up); two, so a single router pod loss does not
+/// take ingest down.
+const DEFAULT_ROUTER_REPLICAS: i32 = 2;
+
+/// The ingest-affinity spec when the ravel-native router should be rendered:
+/// affinity present, `enabled`, and `backend: ravelNative`. `None` otherwise.
+///
+/// Every router renderer and the Gateway-API backendRef switch
+/// ([`desired_gateway_routes`]) share this one gate, so they cannot disagree
+/// about when the router exists: a route can only point at a router Service the
+/// renderers also produce.
+fn ravel_native_affinity(spec: &RavelClusterSpec) -> Option<&IngestAffinitySpec> {
+    let affinity = spec.gateway.ingest_affinity.as_ref()?;
+    (affinity.enabled && matches!(affinity.backend, AffinityBackend::RavelNative))
+        .then_some(affinity)
+}
+
+/// The `--key-source` CLI value for a key source, matching the frozen
+/// `services/ravel-ingest-router` contract byte for byte.
+///
+/// A mismatch here compiles and passes CI yet crashloops the router pod (its own
+/// CLI rejects an unknown value at startup), which is exactly why
+/// [`backend_ravel_native_renders_router_deployment_with_frozen_cli_args`] pins
+/// the whole rendered arg list against a hardcoded expected vector.
+fn router_key_source_value(source: AffinityKeySource) -> &'static str {
+    match source {
+        AffinityKeySource::AuthorizationHeader => "authorization-header",
+        AffinityKeySource::Header => "header",
+        AffinityKeySource::MtlsSubject => "mtls-subject",
+        AffinityKeySource::CanonicalTenant => "canonical-tenant",
+    }
+}
+
+/// The router container's args, rendered from the frozen CLI contract.
+///
+/// `--gateway-service-name`/`--gateway-service-namespace` name this
+/// `RavelCluster`'s own gateway Service (the router watches its EndpointSlices);
+/// `--subset-size` and `--key-source` come from the affinity spec. The
+/// OIDC/mTLS/tenant-token/dev-header flags are REJECTED by the router's own CLI
+/// unless `--key-source canonical-tenant`, so the only such flag rendered here
+/// (`--tenant-token`, when a `tenantTokensSecretRef` exists) is gated on that
+/// source. The router's OIDC and mTLS configuration has NO operator-side CRD
+/// surface today -- `ravel-server`'s own OIDC/mTLS config is CLI-flag-only with
+/// no CRD field the operator threads -- so those flags are intentionally not
+/// rendered; giving the canonical-tenant resolver its OIDC/mTLS config is a
+/// separate, larger CRD design task (documented in the task report), not
+/// invented here.
+fn router_args(
+    affinity: &IngestAffinitySpec,
+    instance: &str,
+    namespace: &str,
+    spec: &RavelClusterSpec,
+    ctx: &RenderCtx,
+) -> Vec<String> {
+    let mut args = vec![
+        "--gateway-service-name".to_string(),
+        child_name(instance, "gateway"),
+        "--gateway-service-namespace".to_string(),
+        namespace.to_string(),
+        "--subset-size".to_string(),
+        affinity.subset_size.to_string(),
+        "--key-source".to_string(),
+        router_key_source_value(affinity.key.source).to_string(),
+    ];
+    // The router CLI requires --key-header-name iff --key-source header.
+    if affinity.key.source == AffinityKeySource::Header
+        && let Some(header_name) = affinity.key.header_name.as_ref()
+    {
+        args.push("--key-header-name".to_string());
+        args.push(header_name.clone());
+    }
+    args.push("--listen-http".to_string());
+    args.push(format!("0.0.0.0:{ROUTER_HTTP_PORT}"));
+    // tenant-token flags are rejected by the router CLI unless the key source is
+    // canonical-tenant, so render them only then. Reuses the same
+    // $(VAR)-expansion machinery ravel-server's tiers use (see
+    // [`tenant_token_args`]/[`tenant_token_env`]), so a raw token never appears
+    // in the Pod spec.
+    if affinity.key.source == AffinityKeySource::CanonicalTenant {
+        args.extend(tenant_token_args(spec, ctx));
+    }
+    args
+}
+
+/// The ravel-native ingest router's Deployment (ADR-0080 decision 3), or `None`
+/// when `backend` is not `ravelNative` or affinity is absent/disabled.
+///
+/// Returns [`RenderError::RouterImageMissing`] when the router is called for but
+/// `ingestAffinity.routerImage` is unset: the router is a different binary from
+/// `spec.image`, so there is nothing to fall back to, and rendering an empty
+/// `image:` would only surface as an un-schedulable pod. The controller turns
+/// this error into a `Degraded` status condition (deliverable 1), so a
+/// misconfigured CR fails visibly at reconcile time rather than silently.
+///
+/// The container image is always `routerImage`, never `spec.image`. Health
+/// probes hit `/healthz` `/readyz` on [`ROUTER_HTTP_PORT`], and the pod runs
+/// under the router's own ServiceAccount ([`desired_router_service_account`]) so
+/// its EndpointSlice/Service reads use the least-privilege Role, not the
+/// operator's identity.
+pub fn desired_router_deployment(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    namespace: &str,
+    ctx: &RenderCtx,
+) -> Result<Option<Deployment>, RenderError> {
+    let Some(affinity) = ravel_native_affinity(spec) else {
+        return Ok(None);
+    };
+    let Some(image) = affinity.router_image.as_ref() else {
+        return Err(RenderError::RouterImageMissing);
+    };
+    let args = router_args(affinity, instance, namespace, spec, ctx);
+    let env = if affinity.key.source == AffinityKeySource::CanonicalTenant {
+        tenant_token_env(spec, ctx)
+    } else {
+        Vec::new()
+    };
+    let labels = labels(instance, ROUTER_COMPONENT);
+    let (liveness, readiness) = probes_on(ROUTER_HTTP_PORT);
+    let container = Container {
+        name: "ravel-ingest-router".to_string(),
+        image: Some(image.clone()),
+        image_pull_policy: spec.image_pull_policy.clone(),
+        args: Some(args),
+        env: if env.is_empty() { None } else { Some(env) },
+        ports: Some(vec![ContainerPort {
+            name: Some("http".to_string()),
+            container_port: ROUTER_HTTP_PORT,
+            ..Default::default()
+        }]),
+        liveness_probe: Some(liveness),
+        readiness_probe: Some(readiness),
+        ..Default::default()
+    };
+    Ok(Some(Deployment {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, ROUTER_COMPONENT)),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(DeploymentSpec {
+            replicas: Some(DEFAULT_ROUTER_REPLICAS),
+            selector: LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            strategy: Some(DeploymentStrategy {
+                type_: Some("RollingUpdate".to_string()),
+                rolling_update: None,
+            }),
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    containers: vec![container],
+                    // The router reads EndpointSlices/Services under its own
+                    // least-privilege ServiceAccount (deliverable 7).
+                    service_account_name: Some(child_name(instance, ROUTER_COMPONENT)),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        status: None,
+    }))
+}
+
+/// The router's ClusterIP Service on [`ROUTER_HTTP_PORT`], or `None` when the
+/// router is not rendered. The Gateway-API routes point their backendRef at this
+/// Service under `backend: ravelNative` (deliverable 4).
+pub fn desired_router_service(spec: &RavelClusterSpec, instance: &str) -> Option<Service> {
+    ravel_native_affinity(spec)?;
+    Some(service(
+        instance,
+        ROUTER_COMPONENT,
+        vec![ServicePort {
+            name: Some("http".to_string()),
+            port: ROUTER_HTTP_PORT,
+            target_port: Some(IntOrString::Int(ROUTER_HTTP_PORT)),
+            ..Default::default()
+        }],
+    ))
+}
+
+/// The router's ServiceAccount, or `None` when the router is not rendered. The
+/// Deployment runs as this account and the Role/RoleBinding
+/// ([`desired_router_role`]/[`desired_router_role_binding`]) scope its
+/// permissions to EndpointSlices and Services in its own namespace only.
+pub fn desired_router_service_account(
+    spec: &RavelClusterSpec,
+    instance: &str,
+) -> Option<ServiceAccount> {
+    ravel_native_affinity(spec)?;
+    Some(ServiceAccount {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, ROUTER_COMPONENT)),
+            labels: Some(labels(instance, ROUTER_COMPONENT)),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
+/// The router's namespaced Role granting `get`/`list`/`watch` on
+/// `endpointslices` (discovery.k8s.io) and `services` (core) ONLY, or `None`
+/// when the router is not rendered.
+///
+/// Least-privilege, consistent with this repo's per-role credential-scoping
+/// convention (ADR-0055, ADR-0072): no cluster-wide grant, no other resource,
+/// and no write verbs. This is exactly what the router's EndpointSlice watcher
+/// needs to compute subsets and dial gateway pods directly.
+pub fn desired_router_role(spec: &RavelClusterSpec, instance: &str) -> Option<Role> {
+    ravel_native_affinity(spec)?;
+    Some(Role {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, ROUTER_COMPONENT)),
+            labels: Some(labels(instance, ROUTER_COMPONENT)),
+            ..Default::default()
+        },
+        rules: Some(vec![
+            PolicyRule {
+                api_groups: Some(vec!["discovery.k8s.io".to_string()]),
+                resources: Some(vec!["endpointslices".to_string()]),
+                verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
+                ..Default::default()
+            },
+            PolicyRule {
+                api_groups: Some(vec![String::new()]),
+                resources: Some(vec!["services".to_string()]),
+                verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
+                ..Default::default()
+            },
+        ]),
+    })
+}
+
+/// The router's namespaced RoleBinding tying its ServiceAccount to its Role, or
+/// `None` when the router is not rendered. `namespace` scopes the Subject to the
+/// `RavelCluster`'s own namespace.
+pub fn desired_router_role_binding(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    namespace: &str,
+) -> Option<RoleBinding> {
+    ravel_native_affinity(spec)?;
+    let name = child_name(instance, ROUTER_COMPONENT);
+    Some(RoleBinding {
+        metadata: ObjectMeta {
+            name: Some(name.clone()),
+            labels: Some(labels(instance, ROUTER_COMPONENT)),
+            ..Default::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "Role".to_string(),
+            name: name.clone(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name,
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        }]),
+    })
+}
+
+/// Every router-owned object name the render can produce for `instance`, in a
+/// fixed order, whether or not the current spec asks for them.
+///
+/// The Deployment, Service, ServiceAccount, Role, and RoleBinding all share this
+/// one base name, so a single-element list covers every kind: the controller
+/// sweeps this name across each kind's own `Api`, deleting whichever objects the
+/// current mode did not render (deliverable 6). Switching `backend` away from
+/// `ravelNative`, or disabling affinity, therefore cleans up every router-owned
+/// object instead of orphaning it.
+pub fn possible_router_object_names(instance: &str) -> Vec<String> {
+    vec![child_name(instance, ROUTER_COMPONENT)]
 }
 
 /// Gateway API group for the exposure routes (ADR-0080 decision 2).
@@ -1049,13 +1387,15 @@ pub fn possible_gateway_route_names(instance: &str) -> Vec<String> {
 /// API, to the route's own namespace, which the controller renders into the
 /// `RavelCluster`'s namespace -- exactly the "defaults to the CR's own
 /// namespace" contract, without this pure function needing to know the
-/// namespace. `backendRefs` always points at the gateway Service directly (ADR-
-/// 0080 decision 2); pointing it at the ravel-native router's Service under
-/// `backend: RavelNative` is a later task (#158), not anticipated here.
+/// namespace. `backendRefs` targets `backend_name` on `port`: the gateway
+/// Service directly for every existing CR, or the ravel-native router's Service
+/// under `backend: ravelNative` (ADR-0080 decision 3, deliverable 4), decided by
+/// the one caller [`desired_gateway_routes`].
 fn gateway_route(
     instance: &str,
     component: &str,
     api_resource: &ApiResource,
+    backend_name: &str,
     port: i32,
     gateway_ref: &GatewayReference,
     hostnames: &[String],
@@ -1068,9 +1408,9 @@ fn gateway_route(
         "parentRefs": [parent_ref],
         "rules": [{
             "backendRefs": [{
-                // The gateway Service, by numeric port: Gateway API backendRefs
-                // reference a port number, not the named port an Ingress uses.
-                "name": child_name(instance, "gateway"),
+                // By numeric port: Gateway API backendRefs reference a port
+                // number, not the named port an Ingress uses.
+                "name": backend_name,
                 "port": port,
             }],
         }],
@@ -1110,11 +1450,31 @@ pub fn desired_gateway_routes(
     else {
         return (None, None);
     };
+    // Backend-aware backendRef (ADR-0080 decision 3, deliverable 4). Under
+    // `backend: ravelNative` the routes point at the router's Service so ingest
+    // traffic is subset-pinned; for every other CR (affinity absent, disabled,
+    // or ingressNginx) they keep targeting the gateway Service exactly as
+    // before -- zero behavior change. The router listens HTTP-only on
+    // ROUTER_HTTP_PORT today; the GRPCRoute still targets the router by name (so
+    // gRPC traffic does not silently bypass affinity by hitting the gateway
+    // directly), but at the router's HTTP port until #184 adds the router's gRPC
+    // listener and a dedicated port -- a documented follow-up.
+    let (http_backend, http_port, grpc_backend, grpc_port) = match ravel_native_affinity(spec) {
+        Some(_) => {
+            let router = child_name(instance, ROUTER_COMPONENT);
+            (router.clone(), ROUTER_HTTP_PORT, router, ROUTER_HTTP_PORT)
+        }
+        None => {
+            let gateway = child_name(instance, "gateway");
+            (gateway.clone(), HTTP_PORT, gateway, GRPC_PORT)
+        }
+    };
     let httproute = gateway_route(
         instance,
         GATEWAY_HTTPROUTE_COMPONENT,
         &httproute_api_resource(),
-        HTTP_PORT,
+        &http_backend,
+        http_port,
         &gateway_api.gateway_ref,
         &gateway_api.hostnames,
     );
@@ -1123,7 +1483,8 @@ pub fn desired_gateway_routes(
             instance,
             GATEWAY_GRPCROUTE_COMPONENT,
             &grpcroute_api_resource(),
-            GRPC_PORT,
+            &grpc_backend,
+            grpc_port,
             &gateway_api.gateway_ref,
             &gateway_api.hostnames,
         )
@@ -1148,6 +1509,18 @@ pub struct DesiredObjects {
     /// decision 2); each `None` when exposure is off or, for the GRPCRoute, when
     /// `grpc` is false.
     pub gateway_routes: (Option<DynamicObject>, Option<DynamicObject>),
+    /// The ravel-native ingest router's objects (ADR-0080 decision 3); every
+    /// field `None` unless `backend: ravelNative` affinity is enabled. Rendered
+    /// as a set so the controller applies (and sweeps) them together.
+    pub router_deployment: Option<Deployment>,
+    /// The router's Service.
+    pub router_service: Option<Service>,
+    /// The router's ServiceAccount.
+    pub router_service_account: Option<ServiceAccount>,
+    /// The router's namespaced Role.
+    pub router_role: Option<Role>,
+    /// The router's namespaced RoleBinding.
+    pub router_role_binding: Option<RoleBinding>,
     /// The query Deployment.
     pub query_deployment: Deployment,
     /// The query Service.
@@ -1158,16 +1531,31 @@ pub struct DesiredObjects {
 }
 
 /// Render every Kubernetes object a `RavelCluster` reconcile applies.
-pub fn desired_objects(spec: &RavelClusterSpec, instance: &str, ctx: &RenderCtx) -> DesiredObjects {
-    DesiredObjects {
+///
+/// Fallible because the ravel-native router cannot be rendered without a
+/// `routerImage` (ADR-0080 decision 3, deliverable 1): a misconfigured CR yields
+/// [`RenderError::RouterImageMissing`], which the controller turns into a
+/// `Degraded` status rather than applying a broken Deployment.
+pub fn desired_objects(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    namespace: &str,
+    ctx: &RenderCtx,
+) -> Result<DesiredObjects, RenderError> {
+    Ok(DesiredObjects {
         gateway_deployment: desired_gateway_deployment(spec, instance, ctx),
         gateway_service: desired_gateway_service(spec, instance),
         gateway_ingresses: desired_gateway_ingresses(spec, instance),
         gateway_routes: desired_gateway_routes(spec, instance),
+        router_deployment: desired_router_deployment(spec, instance, namespace, ctx)?,
+        router_service: desired_router_service(spec, instance),
+        router_service_account: desired_router_service_account(spec, instance),
+        router_role: desired_router_role(spec, instance),
+        router_role_binding: desired_router_role_binding(spec, instance, namespace),
         query_deployment: desired_query_deployment(spec, instance, ctx),
         query_service: desired_query_service(spec, instance),
         maintain_deployment: desired_maintain_deployment(spec, instance, ctx),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2138,7 +2526,7 @@ mod tests {
             tls_secret_name: Some("ingest-tls".to_string()),
             ..default_affinity()
         });
-        let objects = desired_objects(&spec, "prod", &ctx());
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
 
         let names: Vec<String> = objects
             .gateway_ingresses
@@ -2391,7 +2779,7 @@ mod tests {
         // this change (it managed only Deployments and Services).
         let spec = base_spec();
         assert!(spec.gateway.ingest_affinity.is_none());
-        let objects = desired_objects(&spec, "prod", &ctx());
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
         assert!(
             objects.gateway_ingresses.is_empty(),
             "a RavelCluster with no affinity field must render no Ingress"
@@ -2404,7 +2792,8 @@ mod tests {
         // render of every other object is necessarily unchanged from today.
         let mut affinity_spec = base_spec();
         affinity_spec.gateway.ingest_affinity = Some(default_affinity());
-        let with_affinity = desired_objects(&affinity_spec, "prod", &ctx());
+        let with_affinity =
+            desired_objects(&affinity_spec, "prod", "default", &ctx()).expect("render");
         for (off, on, what) in [
             (
                 serde_json::to_value(&objects.gateway_deployment),
@@ -2712,7 +3101,7 @@ mod tests {
             vec!["ingest.example.com".to_string()],
             true,
         );
-        let objects = desired_objects(&spec, "prod", &ctx());
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
         let (http, grpc) = objects.gateway_routes;
         let http = http.expect("HTTPRoute always rendered when exposure is set");
         let grpc = grpc.expect("GRPCRoute rendered when grpc is true");
@@ -2851,5 +3240,324 @@ mod tests {
             ],
             "the delete-sweep must name both route kinds so both are removed"
         );
+    }
+
+    /// A spec with `backend: ravelNative` affinity, `routerImage` set, and no
+    /// tenant-tokens Secret (so the frozen-args assertion stays clean).
+    fn ravel_native_spec(subset_size: u32, source: AffinityKeySource) -> RavelClusterSpec {
+        let mut spec = base_spec();
+        spec.tenant_tokens_secret_ref = None;
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            backend: AffinityBackend::RavelNative,
+            router_image: Some("registry.example/ravel-ingest-router:v1".to_string()),
+            subset_size,
+            key: AffinityKeySpec {
+                source,
+                header_name: None,
+            },
+            ..IngestAffinitySpec::default()
+        });
+        spec
+    }
+
+    #[test]
+    fn backend_ravel_native_renders_router_deployment_with_frozen_cli_args() {
+        // ADR-0080 decision 3, deliverables 3 and 5. The whole point of this
+        // test: a future accidental rename of the router's own flag names (in
+        // #184's crate) becomes a caught test failure here instead of a
+        // crashlooping pod. The args are pinned as a full ordered vector, not a
+        // contains-check.
+        let spec = ravel_native_spec(3, AffinityKeySource::CanonicalTenant);
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
+        let deployment = objects
+            .router_deployment
+            .expect("ravelNative renders a router Deployment");
+
+        assert_eq!(
+            args_of(&deployment),
+            vec![
+                "--gateway-service-name",
+                "prod-gateway",
+                "--gateway-service-namespace",
+                "default",
+                "--subset-size",
+                "3",
+                "--key-source",
+                "canonical-tenant",
+                "--listen-http",
+                "0.0.0.0:8080",
+            ]
+        );
+
+        // The image is routerImage, NEVER spec.image (a different binary).
+        let container = container_of(&deployment);
+        assert_eq!(
+            container.image.as_deref(),
+            Some("registry.example/ravel-ingest-router:v1")
+        );
+        assert_ne!(container.image.as_deref(), Some(spec.image.as_str()));
+        assert_eq!(container.name, "ravel-ingest-router");
+
+        // HTTP-only: exactly one container port, 8080, no gRPC port (#184).
+        let ports = container.ports.as_ref().expect("router ports");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].container_port, ROUTER_HTTP_PORT);
+
+        // Runs under its own ServiceAccount (deliverable 7).
+        let pod = deployment
+            .spec
+            .as_ref()
+            .expect("spec")
+            .template
+            .spec
+            .as_ref()
+            .expect("pod spec");
+        assert_eq!(
+            pod.service_account_name.as_deref(),
+            Some("prod-ingest-router")
+        );
+
+        // The full router object set is rendered.
+        assert!(objects.router_service.is_some());
+        assert!(objects.router_service_account.is_some());
+        assert!(objects.router_role.is_some());
+        assert!(objects.router_role_binding.is_some());
+
+        // The Role is least-privilege: get/list/watch on endpointslices and
+        // services only, no write verbs, no other resource.
+        let role = objects.router_role.expect("router Role");
+        let rules = role.rules.expect("role rules");
+        assert_eq!(rules.len(), 2);
+        for rule in &rules {
+            assert_eq!(
+                rule.verbs,
+                vec!["get".to_string(), "list".to_string(), "watch".to_string()]
+            );
+        }
+        assert_eq!(
+            rules[0].api_groups.as_deref(),
+            Some(["discovery.k8s.io".to_string()].as_slice())
+        );
+        assert_eq!(
+            rules[0].resources.as_deref(),
+            Some(["endpointslices".to_string()].as_slice())
+        );
+        assert_eq!(
+            rules[1].api_groups.as_deref(),
+            Some([String::new()].as_slice())
+        );
+        assert_eq!(
+            rules[1].resources.as_deref(),
+            Some(["services".to_string()].as_slice())
+        );
+
+        // The RoleBinding subject is the router SA in this namespace, bound to
+        // the router Role.
+        let binding = objects.router_role_binding.expect("router RoleBinding");
+        assert_eq!(binding.role_ref.kind, "Role");
+        assert_eq!(binding.role_ref.name, "prod-ingest-router");
+        let subjects = binding.subjects.expect("subjects");
+        assert_eq!(subjects[0].kind, "ServiceAccount");
+        assert_eq!(subjects[0].name, "prod-ingest-router");
+        assert_eq!(subjects[0].namespace.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn router_renders_key_header_name_and_tenant_tokens_only_where_valid() {
+        // key.source header renders --key-header-name; a non-canonical source
+        // renders NO --tenant-token even with a tenant-tokens Secret (the router
+        // CLI rejects those flags unless --key-source canonical-tenant).
+        let mut spec = ravel_native_spec(2, AffinityKeySource::Header);
+        spec.tenant_tokens_secret_ref = Some(LocalSecretRef {
+            name: "ravel-tokens".to_string(),
+        });
+        if let Some(a) = spec.gateway.ingest_affinity.as_mut() {
+            a.key.header_name = Some("X-Scope-OrgID".to_string());
+        }
+        let args = args_of(
+            &desired_router_deployment(&spec, "prod", "ns", &ctx())
+                .expect("render")
+                .expect("router deployment"),
+        );
+        assert_eq!(arg_value(&args, "--key-source").as_deref(), Some("header"));
+        assert_eq!(
+            arg_value(&args, "--key-header-name").as_deref(),
+            Some("X-Scope-OrgID")
+        );
+        assert!(
+            !args.iter().any(|a| a == "--tenant-token"),
+            "non-canonical key source must render no --tenant-token: {args:?}"
+        );
+
+        // canonical-tenant WITH a tenant-tokens Secret renders --tenant-token.
+        let mut spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+        spec.tenant_tokens_secret_ref = Some(LocalSecretRef {
+            name: "ravel-tokens".to_string(),
+        });
+        let deployment = desired_router_deployment(&spec, "prod", "ns", &ctx())
+            .expect("render")
+            .expect("router deployment");
+        let args = args_of(&deployment);
+        assert!(
+            args.iter().any(|a| a == "--tenant-token"),
+            "canonical-tenant with a tokens Secret must render --tenant-token: {args:?}"
+        );
+        // And the token reaches the container via $(VAR) env, never inline.
+        assert!(
+            container_of(&deployment)
+                .env
+                .as_ref()
+                .expect("token env")
+                .iter()
+                .any(|e| e.name.starts_with("RAVEL_TENANT_TOKEN_"))
+        );
+    }
+
+    #[test]
+    fn backend_ingress_nginx_renders_no_router_objects() {
+        // Default backend: zero router objects, zero behavior change for every
+        // existing CR. Also true when affinity is absent entirely.
+        for affinity in [
+            None,
+            Some(IngestAffinitySpec::default()), // backend: ingressNginx (default)
+            Some(IngestAffinitySpec {
+                enabled: false,
+                backend: AffinityBackend::RavelNative,
+                router_image: Some("x".to_string()),
+                ..IngestAffinitySpec::default()
+            }), // ravelNative but disabled
+        ] {
+            let mut spec = base_spec();
+            spec.gateway.ingest_affinity = affinity;
+            let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
+            assert!(objects.router_deployment.is_none());
+            assert!(objects.router_service.is_none());
+            assert!(objects.router_service_account.is_none());
+            assert!(objects.router_role.is_none());
+            assert!(objects.router_role_binding.is_none());
+        }
+    }
+
+    #[test]
+    fn router_image_absent_under_ravel_native_is_a_typed_error_not_a_panic() {
+        // ADR-0080 decision 3, deliverable 1: routerImage is required under
+        // ravelNative. Absent -> a typed RenderError (which the controller turns
+        // into a Degraded condition), never a panic and never a Deployment with
+        // an empty image.
+        let mut spec = base_spec();
+        spec.gateway.ingest_affinity = Some(IngestAffinitySpec {
+            backend: AffinityBackend::RavelNative,
+            router_image: None,
+            ..IngestAffinitySpec::default()
+        });
+        assert_eq!(
+            desired_router_deployment(&spec, "prod", "default", &ctx()),
+            Err(RenderError::RouterImageMissing)
+        );
+        // DesiredObjects holds DynamicObjects (no PartialEq), so match the Err
+        // arm rather than comparing the whole Result.
+        assert!(matches!(
+            desired_objects(&spec, "prod", "default", &ctx()),
+            Err(RenderError::RouterImageMissing)
+        ));
+    }
+
+    #[test]
+    fn gateway_route_backend_ref_targets_router_service_under_ravel_native() {
+        // ADR-0080 decision 3, deliverable 4. Exposure + ravelNative affinity:
+        // both routes point at the router Service. The same exposure under the
+        // default ingressNginx backend still targets the gateway Service
+        // (regression guard on Wave 2 behavior).
+        let router_gw = GatewayReference {
+            name: "public-gw".to_string(),
+            namespace: None,
+        };
+
+        // ravelNative: backendRefs -> router Service, on the router's HTTP port.
+        let mut spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+        spec.gateway.exposure = exposure_with(router_gw.clone(), Vec::new(), true).exposure;
+        let (http, grpc) = desired_gateway_routes(&spec, "prod");
+        let http = http.expect("HTTPRoute");
+        let grpc = grpc.expect("GRPCRoute");
+        assert_eq!(
+            route_spec(&http)["rules"][0]["backendRefs"][0]["name"],
+            serde_json::json!("prod-ingest-router")
+        );
+        assert_eq!(
+            route_spec(&http)["rules"][0]["backendRefs"][0]["port"],
+            serde_json::json!(ROUTER_HTTP_PORT)
+        );
+        assert_eq!(
+            route_spec(&grpc)["rules"][0]["backendRefs"][0]["name"],
+            serde_json::json!("prod-ingest-router"),
+            "GRPCRoute must also target the router by name so gRPC does not \
+             silently bypass affinity by hitting the gateway"
+        );
+
+        // Default ingressNginx backend + same exposure: still the gateway
+        // Service on 4318/4317, exactly as before.
+        let mut spec = base_spec();
+        spec.gateway = exposure_with(router_gw, Vec::new(), true);
+        let (http, grpc) = desired_gateway_routes(&spec, "prod");
+        assert_eq!(
+            route_spec(&http.expect("HTTPRoute"))["rules"][0]["backendRefs"][0]["name"],
+            serde_json::json!("prod-gateway")
+        );
+        assert_eq!(
+            route_spec(&grpc.expect("GRPCRoute"))["rules"][0]["backendRefs"][0]["name"],
+            serde_json::json!("prod-gateway")
+        );
+    }
+
+    #[test]
+    fn switching_backend_away_from_ravel_native_sweeps_router_objects() {
+        // ADR-0080 decision 3, deliverable 6. When ravelNative is active the
+        // render produces the router objects under one shared name; the
+        // controller's apply-then-sweep (controller.rs) deletes every name in
+        // `possible_router_object_names` the current render did NOT produce.
+        // Prove both halves: the names produced under ravelNative, and that
+        // switching back renders nothing under those very names (so the sweep
+        // deletes them), rather than merely that the possible-names list grew.
+        let sweep = possible_router_object_names("prod");
+        assert_eq!(sweep, vec!["prod-ingest-router".to_string()]);
+
+        // Active: every router object carries the swept name.
+        let spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
+        assert_eq!(
+            objects
+                .router_deployment
+                .as_ref()
+                .and_then(|d| d.metadata.name.as_deref()),
+            Some("prod-ingest-router")
+        );
+        assert_eq!(
+            objects
+                .router_service
+                .as_ref()
+                .and_then(|s| s.metadata.name.as_deref()),
+            Some("prod-ingest-router")
+        );
+        assert!(sweep.contains(&"prod-ingest-router".to_string()));
+
+        // Switched back to ingressNginx: nothing rendered under that name, so
+        // the sweep (which iterates `possible_router_object_names` and deletes
+        // whatever the render omitted) removes every router-owned object. The
+        // key source is reset to a legacy-valid one too, since canonicalTenant +
+        // ingressNginx is a CEL-rejected combination that cannot reach reconcile.
+        let mut switched = spec.clone();
+        if let Some(a) = switched.gateway.ingest_affinity.as_mut() {
+            a.backend = AffinityBackend::IngressNginx;
+            a.key.source = AffinityKeySource::AuthorizationHeader;
+        }
+        let objects = desired_objects(&switched, "prod", "default", &ctx()).expect("render");
+        assert!(objects.router_deployment.is_none());
+        assert!(objects.router_service.is_none());
+        assert!(objects.router_service_account.is_none());
+        assert!(objects.router_role.is_none());
+        assert!(objects.router_role_binding.is_none());
+        // The name the previous mode created is still in the sweep list, so the
+        // controller deletes it on this pass.
+        assert!(possible_router_object_names("prod").contains(&"prod-ingest-router".to_string()));
     }
 }

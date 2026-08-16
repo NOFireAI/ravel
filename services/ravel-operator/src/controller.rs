@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
@@ -32,9 +33,9 @@ use crate::crd::{
     RavelClusterSpec, RavelClusterStatus, ShardOverridesSpec,
 };
 use crate::reconcile::{
-    DEPLOYMENT_KEY_SECRET_KEY, RenderCtx, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
-    desired_objects, grpcroute_api_resource, httproute_api_resource, possible_gateway_route_names,
-    possible_ingest_ingress_names,
+    DEPLOYMENT_KEY_SECRET_KEY, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY,
+    S3_SECRET_ACCESS_KEY_KEY, desired_objects, grpcroute_api_resource, httproute_api_resource,
+    possible_gateway_route_names, possible_ingest_ingress_names, possible_router_object_names,
 };
 
 /// Server-side-apply field manager name.
@@ -101,6 +102,13 @@ pub enum Error {
     /// Building the S3 backend for `sys/auth` reconciliation failed.
     #[error("object store error: {0}")]
     Store(#[from] ravel_object_store::StoreError),
+
+    /// The spec cannot be rendered into a valid object set (ADR-0080 decision
+    /// 3): e.g. `backend: ravelNative` with no `routerImage`. Surfaced as a
+    /// `Degraded` status condition before the error propagates, so a
+    /// misconfigured CR fails visibly at reconcile time.
+    #[error("invalid spec: {0}")]
+    Render(#[from] RenderError),
 }
 
 /// Shared reconcile context.
@@ -836,6 +844,22 @@ async fn apply_dynamic(
     Ok(())
 }
 
+/// Delete `name` via `api`, treating a 404 as success. Used by the delete-sweeps
+/// that converge a resource kind back to "not present" when the spec stops
+/// asking for it: the object may never have existed, which is the steady state
+/// for a cluster that never enables the feature that renders it.
+async fn delete_if_present<K>(api: &Api<K>, name: &str) -> Result<(), Error>
+where
+    K: Resource<DynamicType = ()> + Clone + DeserializeOwned + std::fmt::Debug,
+{
+    if let Err(err) = api.delete(name, &DeleteParams::default()).await
+        && !is_not_found(&err)
+    {
+        return Err(err.into());
+    }
+    Ok(())
+}
+
 /// Reconcile one `RavelCluster` to its desired Deployments and Services.
 ///
 /// Wraps [`reconcile_inner`] so that any failure before the success-path status
@@ -973,8 +997,10 @@ async fn reconcile_inner(
     let ingresses: Api<Ingress> = Api::namespaced(client.clone(), namespace);
 
     // One render call produces everything this reconcile applies, so a test
-    // asserting on `desired_objects` is asserting on what actually ships.
-    let desired = desired_objects(&obj.spec, instance, &render_ctx);
+    // asserting on `desired_objects` is asserting on what actually ships. A
+    // render error (e.g. backend: ravelNative with no routerImage, ADR-0080
+    // decision 3) propagates to `reconcile`, which records a Degraded status.
+    let desired = desired_objects(&obj.spec, instance, namespace, &render_ctx)?;
 
     // Gateway.
     let mut gateway = desired.gateway_deployment;
@@ -1051,6 +1077,67 @@ async fn reconcile_inner(
         {
             return Err(err.into());
         }
+    }
+
+    // Ravel-native ingest router (ADR-0080 decision 3): apply the router's
+    // Deployment/Service/ServiceAccount/Role/RoleBinding when
+    // backend: ravelNative, then delete every router-owned name the render did
+    // not produce, so switching backend away (or disabling affinity) cleans up
+    // every router object instead of orphaning it. The RBAC kinds get their own
+    // namespaced Api clients; the Deployment/Service reuse the clients above.
+    // All five share one base name (`possible_router_object_names`), so the
+    // sweep deletes that name from every kind.
+    let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    let roles: Api<Role> = Api::namespaced(client.clone(), namespace);
+    let role_bindings: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
+    let mut desired_router_names: BTreeSet<String> = BTreeSet::new();
+    if let Some(mut sa) = desired.router_service_account {
+        let name = sa.name_any();
+        sa.metadata.namespace = Some(namespace.to_string());
+        sa.metadata.owner_references = owner.clone();
+        apply(&service_accounts, &name, &sa).await?;
+        desired_router_names.insert(name);
+    }
+    if let Some(mut role) = desired.router_role {
+        let name = role.name_any();
+        role.metadata.namespace = Some(namespace.to_string());
+        role.metadata.owner_references = owner.clone();
+        apply(&roles, &name, &role).await?;
+        desired_router_names.insert(name);
+    }
+    if let Some(mut binding) = desired.router_role_binding {
+        let name = binding.name_any();
+        binding.metadata.namespace = Some(namespace.to_string());
+        binding.metadata.owner_references = owner.clone();
+        apply(&role_bindings, &name, &binding).await?;
+        desired_router_names.insert(name);
+    }
+    if let Some(mut router) = desired.router_deployment {
+        let name = router.name_any();
+        router.metadata.namespace = Some(namespace.to_string());
+        router.metadata.owner_references = owner.clone();
+        apply(&deployments, &name, &router).await?;
+        desired_router_names.insert(name);
+    }
+    if let Some(mut router_svc) = desired.router_service {
+        let name = router_svc.name_any();
+        router_svc.metadata.namespace = Some(namespace.to_string());
+        router_svc.metadata.owner_references = owner.clone();
+        apply(&services, &name, &router_svc).await?;
+        desired_router_names.insert(name);
+    }
+    for name in possible_router_object_names(instance) {
+        if desired_router_names.contains(&name) {
+            continue;
+        }
+        // Delete this name from every router-owned kind. Ignore not-found: the
+        // object may never have existed (the steady state for a cluster that
+        // never selects backend: ravelNative).
+        delete_if_present(&deployments, &name).await?;
+        delete_if_present(&services, &name).await?;
+        delete_if_present(&service_accounts, &name).await?;
+        delete_if_present(&roles, &name).await?;
+        delete_if_present(&role_bindings, &name).await?;
     }
 
     // Query.
@@ -1313,6 +1400,9 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "InvalidSecretValue".to_string(),
             format!("Secret \"{name}\" field \"{field}\": {reason}"),
         ),
+        Error::Render(RenderError::RouterImageMissing) => {
+            ("RouterImageMissing".to_string(), err.to_string())
+        }
         other => ("ReconcileError".to_string(), other.to_string()),
     }
 }
