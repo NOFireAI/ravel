@@ -188,6 +188,23 @@ pub struct GatewaySpec {
     /// object key, so a reroute is always correct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingest_affinity: Option<IngestAffinitySpec>,
+
+    /// Gateway API exposure (ADR-0080 decision 2), independent of
+    /// [`GatewaySpec::ingest_affinity`]. Omit to keep today's behavior exactly:
+    /// no `HTTPRoute`/`GRPCRoute` is rendered and exposure for a plain
+    /// deployment stays entirely user-managed outside Ravel.
+    ///
+    /// Unlike `ingest_affinity`, this renders standard
+    /// `gateway.networking.k8s.io` routes onto a user-provided `Gateway`; it can
+    /// be set with affinity disabled (plain routing, no tenant pinning) or
+    /// combined with `backend: ravelNative`. It cannot be combined with an
+    /// enabled `ingestAffinity` on `backend: ingressNginx`: the Gateway API path
+    /// and the annotation-driven Ingress path are two independent routes to the
+    /// same Service, so traffic on the Gateway API route would bypass the nginx
+    /// subset annotations entirely. That combination is rejected at admission by
+    /// a CEL rule attached to the `gateway` object (see [`ravel_cluster_crd`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<GatewayExposureSpec>,
 }
 
 impl Default for GatewaySpec {
@@ -198,8 +215,61 @@ impl Default for GatewaySpec {
             credentials_secret_ref: None,
             fold: None,
             ingest_affinity: None,
+            exposure: None,
         }
     }
+}
+
+/// Ravel-owned exposure for the gateway tier (ADR-0080 decision 2), separate
+/// from ingest affinity.
+///
+/// A single wrapper struct so a later exposure mechanism (an alternative to
+/// Gateway API) becomes a new sibling field here rather than another optional
+/// on `GatewaySpec`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayExposureSpec {
+    /// Gateway API (`gateway.networking.k8s.io`) exposure: the operator renders
+    /// one `HTTPRoute` and, when `grpc` is true, one `GRPCRoute` attached to an
+    /// existing `Gateway`. Omit for no Gateway API routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_api: Option<GatewayApiExposureSpec>,
+}
+
+/// Gateway API exposure config (ADR-0080 decision 2).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayApiExposureSpec {
+    /// The existing `Gateway` the rendered routes attach to via `parentRefs`.
+    pub gateway_ref: GatewayReference,
+
+    /// Hostnames the rendered routes answer on. Empty renders routes with no
+    /// `hostnames`, which match every hostname the parent `Gateway`'s listeners
+    /// accept.
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+
+    /// Also render a `GRPCRoute` for OTLP/gRPC (port 4317). Defaults to true,
+    /// mirroring [`IngestAffinitySpec::grpc`]: gRPC is the main OTLP ingest
+    /// path.
+    #[serde(default = "default_true")]
+    pub grpc: bool,
+}
+
+/// Reference to an existing `Gateway` (`gateway.networking.k8s.io`) the rendered
+/// routes attach to.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayReference {
+    /// Name of the `Gateway`.
+    pub name: String,
+
+    /// Namespace of the `Gateway`. Defaults to the `RavelCluster`'s own
+    /// namespace when omitted (Gateway API resolves an omitted `parentRefs`
+    /// namespace to the route's own namespace, which the operator renders into
+    /// the `RavelCluster`'s namespace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// Layer-7 ingest affinity for the gateway tier (ADR-0076 decision 1).
@@ -637,6 +707,7 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     inject_shards_immutability(&mut crd);
     inject_minimum_bounds(&mut crd);
     inject_ingest_affinity_constraints(&mut crd);
+    inject_gateway_exposure_affinity_guard(&mut crd);
     crd
 }
 
@@ -799,6 +870,77 @@ fn inject_ingest_affinity_constraints(crd: &mut CustomResourceDefinition) {
         {
             header_name.pattern = Some(AFFINITY_HEADER_NAME_PATTERN.to_string());
         }
+    }
+}
+
+/// Message surfaced to a user who combines Gateway API exposure with an enabled
+/// ingress-nginx ingest affinity (ADR-0080 decision 2).
+const GATEWAY_EXPOSURE_AFFINITY_MESSAGE: &str = "gateway.exposure.gatewayApi cannot be \
+    combined with an enabled gateway.ingestAffinity on backend: ingressNginx -- traffic on the \
+    Gateway API path would bypass the nginx subset annotations entirely; use backend: \
+    ravelNative or disable ingestAffinity";
+
+/// The CEL rule rejecting Gateway API exposure alongside an enabled
+/// ingress-nginx affinity (ADR-0080 decision 2), kept as a constant so the
+/// injected rule and the logic unit test cannot drift.
+///
+/// It passes (no rejection) unless ALL of these hold at once: `exposure.gatewayApi`
+/// is set, `ingestAffinity` is present and `enabled`, and its `backend` is
+/// `ingressNginx`. The disjunction reads as "the combination is fine if any
+/// precondition of the bad case is absent".
+const GATEWAY_EXPOSURE_AFFINITY_RULE: &str = "!has(self.exposure) || \
+    !has(self.exposure.gatewayApi) || !has(self.ingestAffinity) || \
+    !has(self.ingestAffinity.enabled) || !self.ingestAffinity.enabled || \
+    !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'";
+
+/// Attach the Gateway-API-exposure-versus-legacy-affinity guard (ADR-0080
+/// decision 2) to the `gateway` property itself.
+///
+/// The rule spans two sibling fields (`exposure` and `ingestAffinity`) rather
+/// than validating one struct against its own fields as the `headerName`
+/// precedent does, so it is attached at the `gateway` object level, not nested
+/// inside `ingestAffinity`. Injected post-hoc for the same reason the other
+/// injectors are: it keeps the rule directly unit-testable without a live API
+/// server, and does not depend on which validation attributes this `schemars`
+/// major happens to emit. Every step bails out rather than panicking if the
+/// schema shape is not what it expects, matching the existing injectors.
+fn inject_gateway_exposure_affinity_guard(crd: &mut CustomResourceDefinition) {
+    // `has()` guards on every field in the path -- exposure, exposure.gatewayApi,
+    // ingestAffinity, ingestAffinity.enabled, ingestAffinity.backend -- because
+    // each is optional or carries a serde default: a submitted manifest may omit
+    // any of them, and a CEL rule that reads a missing field errors instead of
+    // passing. `backend` is materialized to `ingressNginx` by the schema default
+    // before CEL evaluates, so the `has(self.ingestAffinity.backend)` guard is a
+    // defensive belt, not the load-bearing check.
+    let rule = ValidationRule {
+        rule: GATEWAY_EXPOSURE_AFFINITY_RULE.to_string(),
+        message: Some(GATEWAY_EXPOSURE_AFFINITY_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(gateway) = spec_props.get_mut("gateway") else {
+            continue;
+        };
+        // Append rather than replace: leave room for a future rule on `gateway`
+        // without silently dropping this one.
+        let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
+        rules.push(rule.clone());
+        gateway.x_kubernetes_validations = Some(rules);
     }
 }
 
@@ -1279,5 +1421,188 @@ mod tests {
         assert_eq!(spec.maintain.replicas, 1);
         assert!(spec.maintain.enabled);
         assert_eq!(spec.image_pull_policy, None);
+    }
+
+    /// The `gateway` schema property for `ravel_cluster_crd()`.
+    fn gateway_schema_props() -> BTreeMap<
+        String,
+        k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps,
+    > {
+        ravel_cluster_crd().spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .clone()
+            .expect("gateway props")
+    }
+
+    #[test]
+    fn exposure_is_optional_and_defaults_to_none_with_grpc_defaulting_true() {
+        // ADR-0080 decision 2. The block is a new sibling of ingestAffinity and
+        // is optional: an existing RavelCluster that never heard of exposure
+        // deserializes with None, so it renders zero routes -- zero behavior
+        // change. GatewaySpec::default() also carries exposure: None.
+        assert_eq!(GatewaySpec::default().exposure, None);
+        assert!(
+            gateway_schema_props().contains_key("exposure"),
+            "gateway must expose the exposure block in its schema"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.gateway.exposure, None);
+
+        // Declaring gatewayApi with only a gatewayRef enables it with grpc
+        // defaulting to true and empty hostnames, and the gatewayRef namespace
+        // defaulting to None (rendered as the CR's own namespace).
+        let mut with_exposure = base;
+        with_exposure["gateway"] = serde_json::json!({
+            "exposure": { "gatewayApi": { "gatewayRef": { "name": "public-gw" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(with_exposure).expect("deserialize");
+        let gateway_api = spec
+            .gateway
+            .exposure
+            .expect("exposure present")
+            .gateway_api
+            .expect("gatewayApi present");
+        assert_eq!(gateway_api.gateway_ref.name, "public-gw");
+        assert_eq!(gateway_api.gateway_ref.namespace, None);
+        assert!(gateway_api.grpc, "grpc defaults to true");
+        assert_eq!(gateway_api.hostnames, Vec::<String>::new());
+    }
+
+    #[test]
+    fn exposure_gateway_api_carries_the_cel_guard_at_the_gateway_property() {
+        // ADR-0080 decision 2: the rule spans two sibling fields (exposure and
+        // ingestAffinity), so it must sit on the `gateway` object itself, NOT
+        // nested inside ingestAffinity where the headerName rule lives. A
+        // reconcile unit test cannot exercise admission-time CEL at all; this
+        // asserts the generated schema carries the correct rule and message.
+        let crd = ravel_cluster_crd();
+        let gateway = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .clone();
+
+        let rules = gateway
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("gateway must carry the exposure/affinity CEL rule");
+        let guard = rules
+            .iter()
+            .find(|r| r.rule == GATEWAY_EXPOSURE_AFFINITY_RULE)
+            .expect("gateway must carry the exact exposure/affinity rule");
+        assert_eq!(
+            guard.message.as_deref(),
+            Some(GATEWAY_EXPOSURE_AFFINITY_MESSAGE)
+        );
+        // The rule keys off both sibling fields.
+        assert!(guard.rule.contains("self.exposure.gatewayApi"));
+        assert!(guard.rule.contains("self.ingestAffinity"));
+        assert!(guard.rule.contains("ingressNginx"));
+
+        // The rule is NOT nested inside ingestAffinity (that property keeps only
+        // its own headerName rule).
+        let affinity_rules = gateway
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .x_kubernetes_validations
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            affinity_rules
+                .iter()
+                .all(|r| r.rule != GATEWAY_EXPOSURE_AFFINITY_RULE),
+            "the cross-field guard must live on `gateway`, not on `ingestAffinity`"
+        );
+    }
+
+    /// Rust mirror of [`GATEWAY_EXPOSURE_AFFINITY_RULE`]: returns whether the
+    /// combination is ADMITTED (the CEL rule evaluates true). `enabled` and
+    /// `backend` are always materialized when the affinity block is present
+    /// (serde/schema defaults), so they are modeled as present whenever the
+    /// block is. A separate test
+    /// ([`exposure_gateway_api_carries_the_cel_guard_at_the_gateway_property`])
+    /// pins the exact rule string in the schema, so a change to the real rule
+    /// that diverges from this model is caught there.
+    fn cel_admits(exposure_gateway_api: bool, affinity: Option<(bool, &str)>) -> bool {
+        if !exposure_gateway_api {
+            return true; // !has(self.exposure.gatewayApi)
+        }
+        let Some((enabled, backend)) = affinity else {
+            return true; // !has(self.ingestAffinity)
+        };
+        if !enabled {
+            return true; // !self.ingestAffinity.enabled
+        }
+        backend != "ingressNginx"
+    }
+
+    #[test]
+    fn cel_rule_rejects_only_exposure_plus_enabled_ingress_nginx_affinity() {
+        // ADR-0080 decision 2. The one rejected combination:
+        assert!(
+            !cel_admits(true, Some((true, "ingressNginx"))),
+            "exposure + enabled ingressNginx affinity must be rejected"
+        );
+
+        // Every allowed combination named in the deliverable:
+        assert!(
+            cel_admits(true, None),
+            "exposure alone (affinity absent) is allowed"
+        );
+        assert!(
+            cel_admits(true, Some((true, "ravelNative"))),
+            "exposure + enabled ravelNative affinity is allowed"
+        );
+        assert!(
+            cel_admits(false, Some((true, "ingressNginx"))),
+            "ingressNginx affinity alone (no exposure) is allowed"
+        );
+        assert!(
+            cel_admits(true, Some((false, "ingressNginx"))),
+            "exposure + disabled ingressNginx affinity is allowed"
+        );
+        // And the remaining benign corner: exposure + disabled ravelNative.
+        assert!(
+            cel_admits(true, Some((false, "ravelNative"))),
+            "exposure + disabled ravelNative affinity is allowed"
+        );
     }
 }

@@ -59,6 +59,54 @@
                         ],
                         "type": "object"
                       },
+                      "exposure": {
+                        "description": "Gateway API exposure (ADR-0080 decision 2), independent of\n[`GatewaySpec::ingest_affinity`]. Omit to keep today's behavior exactly:\nno `HTTPRoute`/`GRPCRoute` is rendered and exposure for a plain\ndeployment stays entirely user-managed outside Ravel.\n\nUnlike `ingest_affinity`, this renders standard\n`gateway.networking.k8s.io` routes onto a user-provided `Gateway`; it can\nbe set with affinity disabled (plain routing, no tenant pinning) or\ncombined with `backend: ravelNative`. It cannot be combined with an\nenabled `ingestAffinity` on `backend: ingressNginx`: the Gateway API path\nand the annotation-driven Ingress path are two independent routes to the\nsame Service, so traffic on the Gateway API route would bypass the nginx\nsubset annotations entirely. That combination is rejected at admission by\na CEL rule attached to the `gateway` object (see [`ravel_cluster_crd`]).",
+                        "nullable": true,
+                        "properties": {
+                          "gatewayApi": {
+                            "description": "Gateway API (`gateway.networking.k8s.io`) exposure: the operator renders\none `HTTPRoute` and, when `grpc` is true, one `GRPCRoute` attached to an\nexisting `Gateway`. Omit for no Gateway API routing.",
+                            "nullable": true,
+                            "properties": {
+                              "gatewayRef": {
+                                "description": "The existing `Gateway` the rendered routes attach to via `parentRefs`.",
+                                "properties": {
+                                  "name": {
+                                    "description": "Name of the `Gateway`.",
+                                    "type": "string"
+                                  },
+                                  "namespace": {
+                                    "description": "Namespace of the `Gateway`. Defaults to the `RavelCluster`'s own\nnamespace when omitted (Gateway API resolves an omitted `parentRefs`\nnamespace to the route's own namespace, which the operator renders into\nthe `RavelCluster`'s namespace).",
+                                    "nullable": true,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              },
+                              "grpc": {
+                                "default": true,
+                                "description": "Also render a `GRPCRoute` for OTLP/gRPC (port 4317). Defaults to true,\nmirroring [`IngestAffinitySpec::grpc`]: gRPC is the main OTLP ingest\npath.",
+                                "type": "boolean"
+                              },
+                              "hostnames": {
+                                "default": [],
+                                "description": "Hostnames the rendered routes answer on. Empty renders routes with no\n`hostnames`, which match every hostname the parent `Gateway`'s listeners\naccept.",
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "gatewayRef"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
                       "fold": {
                         "description": "Catalog fold tuning. Fold is a pure query-cost optimization and only\nruns in the gateway tier, so it is a gateway-only field.",
                         "nullable": true,
@@ -197,7 +245,13 @@
                         "type": "object"
                       }
                     },
-                    "type": "object"
+                    "type": "object",
+                    "x-kubernetes-validations": [
+                      {
+                        "message": "gateway.exposure.gatewayApi cannot be combined with an enabled gateway.ingestAffinity on backend: ingressNginx -- traffic on the Gateway API path would bypass the nginx subset annotations entirely; use backend: ravelNative or disable ingestAffinity",
+                        "rule": "!has(self.exposure) || !has(self.exposure.gatewayApi) || !has(self.ingestAffinity) || !has(self.ingestAffinity.enabled) || !self.ingestAffinity.enabled || !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'"
+                      }
+                    ]
                   },
                   "image": {
                     "description": "Container image for every mode's pod (`ravel-server`).",
