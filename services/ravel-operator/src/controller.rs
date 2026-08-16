@@ -998,8 +998,12 @@ async fn reconcile_inner(
 
     // One render call produces everything this reconcile applies, so a test
     // asserting on `desired_objects` is asserting on what actually ships. A
-    // render error (e.g. backend: ravelNative with no routerImage, ADR-0080
-    // decision 3) propagates to `reconcile`, which records a Degraded status.
+    // router render error (e.g. backend: ravelNative with no routerImage, or
+    // canonicalTenant with no resolver, ADR-0080 decision 3) does NOT abort the
+    // reconcile: `desired_objects` captures it in `router_render_error` (all
+    // `router_*` fields then `None`) rather than propagating it, so only the
+    // router degrades -- the block below records a Degraded condition for it while
+    // every other tier's apply and sweep still runs this pass.
     let desired = desired_objects(&obj.spec, instance, namespace, &render_ctx)?;
 
     // Gateway.

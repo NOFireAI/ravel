@@ -257,9 +257,13 @@ independently testable:
    configured. When
    `backend: RavelNative`, the operator renders this service's
    Deployment/Service (parameterized with `subset_size` and `key`) and, if
-   `exposure.gateway_api` is set, points the rendered `HTTPRoute`/
-   `GRPCRoute` at the router's Service instead of the gateway Service
-   directly; it also renders a namespaced `Role`/`RoleBinding` granting the
+   `exposure.gateway_api` is set, points the rendered `HTTPRoute` at the
+   router's Service instead of the gateway Service directly; the `GRPCRoute`
+   continues to target the gateway Service, because the router serves HTTP
+   only today (a single `port_name` per process cannot proxy HTTP and gRPC
+   to the gateway's distinct listener ports at once) — wiring gRPC through
+   the router (a per-listener-port surface or a two-Deployment split) is
+   tracked as follow-up #194. It also renders a namespaced `Role`/`RoleBinding` granting the
    router's `ServiceAccount` `get`/`list`/`watch` on `endpointslices` and
    `services` in that namespace only — least-privilege, consistent with
    this repo's existing per-tenant/per-role credential scoping conventions
