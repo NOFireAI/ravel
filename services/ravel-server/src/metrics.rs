@@ -2384,7 +2384,10 @@ pub fn attribution_rows(
     allowlist: &HashSet<TenantHash>,
 ) -> Vec<TenantAttributionRow> {
     let mut folded: HashMap<Option<TenantHash>, u64> = HashMap::new();
-    for entry in attribution.top_n(attribution.tracked_len()) {
+    // usize::MAX, not tracked_len(): a separate lock-then-len() call here would
+    // race a growing table between the two locks and silently drop the newest
+    // entries from the fold instead of all of them.
+    for entry in attribution.top_n(usize::MAX) {
         let bucket = allowlist.contains(&entry.tenant).then_some(entry.tenant);
         *folded.entry(bucket).or_default() += entry.puts;
     }
