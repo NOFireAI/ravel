@@ -60,6 +60,9 @@ services:
     # the performance story Ravel wants a first-time reader to measure, so this
     # is a usability floor, not the fix: publishing multi-arch images is #197.
     platform: linux/amd64
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
     entrypoint: ["/usr/local/bin/ravel-cli"]
     command: ["--store", "s3", "store", "qualify"]
     environment:
