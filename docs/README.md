@@ -54,9 +54,12 @@ Start here to run Ravel, ingest into it, or query it.
   (`scripts/kind-up.sh`), and what the `/healthz` and `/readyz` probes mean.
   Read this to deploy Ravel on Kubernetes.
 - [guides/ingest-affinity.md](guides/ingest-affinity.md): pinning each tenant to
-  a stable subset of gateway replicas (ADR-0076 decision 1) -- what it saves,
-  the throughput ceiling it costs, how to size the subset, and what a rolling
-  restart or replica loss does. Read this to cut object-storage request cost
+  a stable subset of gateway replicas (ADR-0076 decision 1, ADR-0080) -- what it
+  saves, the throughput ceiling it costs, how to size the subset, and what a
+  rolling restart or replica loss does. Also the routing landscape it splits
+  into: the deprecated legacy `ingressNginx` backend, the Ravel-native subset
+  router (`ravelNative`), Gateway API exposure, and why single-backend
+  consistent hashing is only `S=1`. Read this to cut object-storage request cost
   without touching latency or any format.
 - [guides/shard-overrides.md](guides/shard-overrides.md): lowering one
   tenant's shard count via `spec.shardOverrides` (ADR-0076 decision 2,

@@ -150,9 +150,12 @@ regenerate it, run `cargo run -p ravel-operator -- --print-crd`.
 
 The operator watches `RavelCluster` cluster-wide and manages Deployments and
 Services in whatever namespace each `RavelCluster` lives in. Its ClusterRole
-grants the full lifecycle of Deployments and Services, `RavelCluster` plus its
-status subresource, and `get` on Secrets. It never lists, writes, or watches
-Secrets.
+grants the full lifecycle of Deployments, Services, Ingresses,
+`gateway.networking.k8s.io` HTTPRoutes/GRPCRoutes, and the ServiceAccounts,
+Roles, and RoleBindings it renders for the `ravelNative` ingest router (ADR-0080),
+plus `RavelCluster` and its status subresource, `get` on Secrets, and
+`get`/`list`/`watch` on `endpointslices` (needed to create the router's own
+least-privilege Role). It never lists, writes, or watches Secrets.
 
 ## `RavelCluster` reference
 
@@ -180,15 +183,18 @@ A minimal example is in
 | `spec.gateway.resources` | object | — | `requests` / `limits` maps, as in a Pod spec. |
 | `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
 | `spec.gateway.fold.intervalSecs` | integer | — | `--fold-interval-secs`. |
-| `spec.gateway.ingestAffinity` | object | — | Layer-7 ingest affinity (ADR-0076 decision 1). Omit for today's behaviour: no Ingress is rendered. Present, it renders one or two Ingress objects that hash tenant identity to a stable subset of gateway replicas, cutting flush PUTs by `replicas / subsetSize`. Needs an ingress controller in the cluster; ingress-nginx is the supported target. Full reference and sizing guidance in [ingest-affinity.md](ingest-affinity.md). |
-| `spec.gateway.ingestAffinity.enabled` | boolean | `true` | `false` deletes the Ingress objects and returns to the affinity-absent render. |
+| `spec.gateway.ingestAffinity` | object | — | Layer-7 ingest affinity (ADR-0076 decision 1, ADR-0080). Omit for today's behaviour: nothing is rendered. Present, it pins tenant identity to a stable subset of gateway replicas, cutting flush PUTs by `replicas / subsetSize`, via one of two backends. Full reference, backend comparison, and sizing guidance in [ingest-affinity.md](ingest-affinity.md). |
+| `spec.gateway.ingestAffinity.enabled` | boolean | `true` | `false` deletes the rendered objects and returns to the affinity-absent render. |
+| `spec.gateway.ingestAffinity.backend` | string | `ingressNginx` | `ingressNginx` (deprecated, renders Ingress objects) or `ravelNative` (renders the `ravel-ingest-router` service). Omitting it keeps an existing CR's backend. |
+| `spec.gateway.ingestAffinity.routerImage` | string | — | The `ravel-ingest-router` image. Required under `backend: ravelNative` (a different binary from `spec.image`); unset there degrades the router with reason `RouterImageMissing`. No effect under `ingressNginx`. |
 | `spec.gateway.ingestAffinity.subsetSize` | integer | `2` | Replicas a tenant is pinned to. Two, not one, so a single replica loss does not concentrate a tenant on one process. A subset is a throughput ceiling; raise it for a high-volume tenant. |
-| `spec.gateway.ingestAffinity.key.source` | string | `authorizationHeader` | `authorizationHeader`, `header` (with `key.headerName`), or `mtlsSubject`. The key must come from authentication material: Ravel resolves tenancy server-side from the credential, so a URL path carries nothing routable. |
-| `spec.gateway.ingestAffinity.ingressClassName` | string | — | |
-| `spec.gateway.ingestAffinity.hosts` | list | `[]` | Empty renders one host-less rule. |
-| `spec.gateway.ingestAffinity.tlsSecretName` | string | — | Renders `spec.tls`. Effectively required for OTLP/gRPC, which needs HTTP/2. |
-| `spec.gateway.ingestAffinity.grpc` | boolean | `true` | Also render the OTLP/gRPC Ingress. |
-| `spec.gateway.ingestAffinity.annotations` | map | `{}` | Extra Ingress annotations, merged before the affinity annotations. `nginx.ingress.kubernetes.io/proxy-body-size` belongs here: the ingress-nginx default of `1m` rejects larger OTLP/HTTP exports. |
+| `spec.gateway.ingestAffinity.key.source` | string | `authorizationHeader` | `authorizationHeader`, `header` (with `key.headerName`), `mtlsSubject`, or `canonicalTenant` (requires `backend: ravelNative`). The key must come from authentication material: Ravel resolves tenancy server-side from the credential, so a URL path carries nothing routable. |
+| `spec.gateway.ingestAffinity.ingressClassName` | string | — | Legacy `ingressNginx` only. |
+| `spec.gateway.ingestAffinity.hosts` | list | `[]` | Legacy `ingressNginx` only. Empty renders one host-less rule. |
+| `spec.gateway.ingestAffinity.tlsSecretName` | string | — | Legacy `ingressNginx` only. Renders `spec.tls`. Effectively required for OTLP/gRPC, which needs HTTP/2. |
+| `spec.gateway.ingestAffinity.grpc` | boolean | `true` | Legacy `ingressNginx` only. Also render the OTLP/gRPC Ingress. |
+| `spec.gateway.ingestAffinity.annotations` | map | `{}` | Legacy `ingressNginx` only. Extra Ingress annotations, merged before the affinity annotations. `nginx.ingress.kubernetes.io/proxy-body-size` belongs here: the ingress-nginx default of `1m` rejects larger OTLP/HTTP exports. |
+| `spec.gateway.exposure.gatewayAPI` | object | — | Gateway API exposure (ADR-0080 decision 2), independent of `ingestAffinity`. Renders `HTTPRoute`/`GRPCRoute` onto an existing `Gateway` instead of Ingress objects. Fields `gatewayRef.name`/`gatewayRef.namespace`, `hostnames`, `grpc` (default true). See [ingest-affinity.md](ingest-affinity.md). |
 | `spec.query.replicas` | integer | `1` | |
 | `spec.query.resources` | object | — | |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
@@ -262,8 +268,11 @@ For a `RavelCluster` named `dev`:
 | `dev-query` | Deployment | `--mode query`, RollingUpdate. |
 | `dev-query` | Service | Port 4318. |
 | `dev-maintain` | Deployment | `--mode maintain`, one replica, `Recreate` strategy. Absent when `maintain.enabled` is `false`. |
-| `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Absent unless `gateway.ingestAffinity` is present and enabled. |
+| `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
 | `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
+| `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative` (ADR-0080). See [ingest-affinity.md](ingest-affinity.md). |
+| `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayAPI` (ADR-0080), independent of the backend. |
+| `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayAPI.grpc` is `false`. |
 
 Maintain is pinned to one replica with `Recreate` to avoid rolling-update
 overlap. This is not an at-most-one guarantee, and correctness does not need
@@ -319,11 +328,14 @@ cluster.
   credentials in the Secret.
 - Bucket lifecycle is the platform owner's job. The operator provisions no
   buckets; the create-bucket Jobs exist only in the dev manifests.
-- The operator does not expose the query Service outside the cluster, and it
-  exposes the gateway Service only when `gateway.ingestAffinity` is set (which
-  renders an ingest Ingress, see [ingest-affinity.md](ingest-affinity.md)).
-  Otherwise add an Ingress or a `LoadBalancer` Service yourself. Either way put
-  TLS in front of it: tenant tokens are bearer tokens.
+- The operator does not expose the query Service outside the cluster. It renders
+  ingest exposure only when you ask for it: `gateway.ingestAffinity` on
+  `backend: ingressNginx` renders an ingest Ingress, `backend: ravelNative`
+  renders the subset router, and `gateway.exposure.gatewayAPI` renders
+  `HTTPRoute`/`GRPCRoute` onto a `Gateway` you provide (all in
+  [ingest-affinity.md](ingest-affinity.md)). Otherwise add an Ingress or a
+  `LoadBalancer` Service yourself. Either way put TLS in front of it: tenant
+  tokens are bearer tokens.
 - On a multi-replica gateway, consider turning on `gateway.ingestAffinity`.
   Ingest buffers are per replica, so a tenant spraying across every replica pays
   one flush stream per replica for the same data; object-storage request
