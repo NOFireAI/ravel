@@ -44,6 +44,20 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._respond(404, b"not found")
 
+    def do_POST(self):  # noqa: N802 (name mandated by BaseHTTPRequestHandler)
+        # The README-realistic ingest endpoint, unauthenticated here: it answers
+        # 401 with an EMPTY body. That empty body is exactly what made the pre-fix
+        # concatenation vacuous -- an empty 401 body followed by a valid 200
+        # envelope left the concatenated buffer valid JSON. Draining the request
+        # body first keeps the connection well-behaved.
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length:
+            self.rfile.read(length)
+        if self.path.startswith("/v1/metrics"):
+            self._respond(401, b"")
+        else:
+            self._respond(404, b"not found")
+
     def _respond(self, code, body):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -261,6 +275,130 @@ class TestReadinessQueryRequired(unittest.TestCase):
             os.unlink(md_path)
         self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
         self.assertIn("RAVEL_READY_QUERY_URL is unset", result.stderr)
+
+
+class TestMultiRequestBlockIsAccountedFor(unittest.TestCase):
+    def test_ingest_401_then_query_200_fails(self):
+        # F1: a single block issuing two requests -- an ingest that is rejected
+        # 401 with an empty body, then a query that answers 200 with a success
+        # envelope -- under ONE `status=200; json:.status=success` marker. The
+        # pre-fix driver kept only the LAST request's status (200) in its single
+        # truncating slot and concatenated both bodies (the empty 401 body left
+        # the buffer valid JSON), so it reported PASS while the documented ingest
+        # command was being rejected. The fix records every request's status; the
+        # two differ (401, 200), which a single `status=` cannot map to, so the
+        # block must FAIL closed.
+        md = (
+            "# ingest then query\n\n"
+            "<!-- ravel:run status=200; json:.status=success -->\n"
+            "```sh\n"
+            "curl -s {base}/v1/metrics --data-binary '{}' -X POST\n"
+            "curl -s {base}/api/v1/query?query=probe\n"
+            "```\n"
+        )
+        with _StubServer() as server:
+            md = md.replace("{base}", server.base)
+            result = _run_script(md, server.base)
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            msg=(
+                "an ingest rejected 401 inside a two-request block must fail the "
+                "block; a pass means the query's status/body masked the ingest.\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            ),
+        )
+        self.assertIn("differing HTTP statuses", result.stderr)
+
+    def test_both_requests_200_still_passes(self):
+        # Control: when both requests in the block return the same status, the
+        # block is judged normally (status against all requests, body against the
+        # last), so a genuine ingest(200)-then-query(200) flow still passes.
+        md = (
+            "# query twice\n\n"
+            "<!-- ravel:run status=200; json:.status=success -->\n"
+            "```sh\n"
+            "curl -s {base}/api/v1/query?query=a\n"
+            "curl -s {base}/api/v1/query?query=b\n"
+            "```\n"
+        )
+        with _StubServer() as server:
+            md = md.replace("{base}", server.base)
+            result = _run_script(md, server.base)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+
+class TestBlockWallClockBound(unittest.TestCase):
+    def test_shim_bypassing_block_that_hangs_is_bounded(self):
+        # F2: a block whose first token is not the literal `curl`
+        # (`RAVEL_TOKEN=demo curl ...`) never resolves to the shim, so the
+        # per-request --max-time is never injected. Pointed at a socket that
+        # accepts and never writes, the bare curl hangs. The per-block wall-clock
+        # bound must terminate it and fail the block; without it the whole CI job
+        # hangs. Readiness runs against a healthy stub so the run reaches the
+        # block at all.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        dead_port = listener.getsockname()[1]
+        accepted = []
+
+        def accept_loop():
+            listener.settimeout(0.5)
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                accepted.append(conn)  # hold open, never respond
+
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+        dead_base = f"http://127.0.0.1:{dead_port}"
+
+        md = (
+            "# hang\n\n"
+            "<!-- ravel:run status=200 -->\n"
+            "```sh\n"
+            f"RAVEL_TOKEN=demo curl -s {dead_base}/x\n"
+            "```\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".md", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(md)
+            md_path = handle.name
+
+        try:
+            with _StubServer() as server:
+                env = dict(os.environ)
+                env["RAVEL_HTTP_BASE"] = server.base
+                env["RAVEL_HEALTH_PATH"] = "/healthz"
+                env["RAVEL_READY_QUERY_URL"] = f"{server.base}/api/v1/query?query=probe"
+                env["RAVEL_READINESS_TIMEOUT_SECONDS"] = "10"
+                env["RAVEL_READINESS_POLL_SECONDS"] = "1"
+                env["RAVEL_BLOCK_TIMEOUT_SECONDS"] = "3"
+                env["RAVEL_BLOCK_TIMEOUT_KILL_SECONDS"] = "2"
+                # A subprocess timeout well under a hang but well over the block
+                # bound: with the fix the script returns in ~3s; against the
+                # pre-fix code the bare curl hangs and this raises TimeoutExpired.
+                result = subprocess.run(
+                    ["bash", SCRIPT, md_path],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+        finally:
+            os.unlink(md_path)
+            listener.close()
+            for conn in accepted:
+                conn.close()
+            thread.join(timeout=5)
+
+        self.assertNotEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertIn("wall-clock bound", result.stderr)
 
 
 if __name__ == "__main__":
