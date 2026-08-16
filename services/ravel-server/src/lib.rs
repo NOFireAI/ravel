@@ -775,18 +775,22 @@ pub async fn start(
     // opt-in the admission family's per-tenant series are (ADR-0044
     // consequences; ADR-0051 section 6). Off (the default), the allowlist is
     // empty and every tenant folds into `tenant_hash="other"`.
+    let metrics_tenant_allowlist: std::collections::HashSet<_> = if config.metrics_tenant_labels {
+        config
+            .limits
+            .tenants
+            .keys()
+            .map(|tenant| tenant.hash())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let query_accounting = Arc::new(metrics::QueryAccountingMetrics::new(
-        if config.metrics_tenant_labels {
-            config
-                .limits
-                .tenants
-                .keys()
-                .map(|tenant| tenant.hash())
-                .collect()
-        } else {
-            std::collections::HashSet::new()
-        },
+        metrics_tenant_allowlist.clone(),
     ));
+    // Shared with `query_accounting` above: the same allowlist bounds the
+    // ADR-0076 decision 2 per-tenant PUT attribution family the same way.
+    let metrics_tenant_allowlist = Arc::new(metrics_tenant_allowlist);
 
     // Liveness/readiness routes are served in every mode, including
     // maintain (whose router is otherwise empty). `readiness` starts false
@@ -998,6 +1002,7 @@ pub async fn start(
         admission: admission.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),
+        metrics_tenant_allowlist: metrics_tenant_allowlist.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
         ingest_buffer_budget: ingest_buffer_budget.clone(),
         distrib: distrib_metrics.clone(),

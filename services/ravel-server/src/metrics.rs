@@ -50,7 +50,8 @@ use ravel_cache::CacheMetricsSnapshot;
 use ravel_catalog::Catalog;
 use ravel_ingest::{
     AdmissionController, IngestMetricsSnapshot, IngestRouter, LogIngestMetricsSnapshot,
-    LogIngestRouter, SpanIngestMetricsSnapshot, SpanIngestRouter, TenantUsage,
+    LogIngestRouter, SpanIngestMetricsSnapshot, SpanIngestRouter, TenantPutAttribution,
+    TenantUsage,
 };
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::instrument::{
@@ -2355,6 +2356,87 @@ fn render_query_family(out: &mut String, mode: Mode, rows: &[QueryAccountingRow]
     }
 }
 
+/// One rendered row of the per-tenant PUT attribution family: the (signal,
+/// tenant bucket) key plus the accounted PUT count. `tenant` is `None` for the
+/// folded `other` bucket and `Some(hash)` for an allowlisted tenant, the same
+/// convention [`tenant_label`] renders everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantAttributionRow {
+    pub signal: Signal,
+    pub tenant: Option<TenantHash>,
+    pub puts: u64,
+}
+
+/// Fold one signal's [`TenantPutAttribution::top_n`] snapshot into rendered
+/// rows, bounded the same way [`QueryAccountingMetrics`] bounds the per-query
+/// family: `allowlist` is the `--metrics-tenant-labels` (ADR-0051 section 6)
+/// per-tenant set built from `config.limits.tenants` at server start, shared
+/// with `query_accounting`. A tenant outside it folds into the shared `other`
+/// bucket for this signal, summing its PUTs rather than allocating a series of
+/// its own. `TenantPutAttribution` already bounds its own tracked set to
+/// `MAX_TRACKED_TENANTS` (ADR-0076 decision 2); this fold is the second,
+/// narrower bound the unauthenticated `/metrics` route needs on top of that,
+/// matching every other tenant-labeled family here (ADR-0076: "never an
+/// unbounded per-tenant Prometheus label").
+pub fn attribution_rows(
+    signal: Signal,
+    attribution: &TenantPutAttribution,
+    allowlist: &HashSet<TenantHash>,
+) -> Vec<TenantAttributionRow> {
+    let mut folded: HashMap<Option<TenantHash>, u64> = HashMap::new();
+    for entry in attribution.top_n(attribution.tracked_len()) {
+        let bucket = allowlist.contains(&entry.tenant).then_some(entry.tenant);
+        *folded.entry(bucket).or_default() += entry.puts;
+    }
+    let mut rows: Vec<TenantAttributionRow> = folded
+        .into_iter()
+        .map(|(tenant, puts)| TenantAttributionRow {
+            signal,
+            tenant,
+            puts,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        tenant_label(a.tenant)
+            .value()
+            .cmp(&tenant_label(b.tenant).value())
+    });
+    rows
+}
+
+/// The per-tenant PUT attribution family (ADR-0076 decision 2 / T3): answers
+/// "which tenant is generating the PUT bill" per signal, the gap the ADR names
+/// as blocking a per-tenant shard-count cost lever. `rows` already folded
+/// unconfigured tenants into `other` in [`attribution_rows`], so this function
+/// only renders whatever it is handed, the same discipline
+/// [`render_query_family`] follows.
+fn render_attribution_family(out: &mut String, mode: Mode, rows: &[TenantAttributionRow]) {
+    fn labels(mode: Mode, row: &TenantAttributionRow) -> [Label; 3] {
+        [
+            Label::Mode(mode),
+            Label::TenantHash(tenant_label(row.tenant)),
+            Label::Signal(row.signal),
+        ]
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_attribution_puts_total",
+        "Object-store PUT requests attributed to completed ingest flushes, by tenant and \
+         signal (ADR-0076 decision 2). Tenants outside --metrics-tenant-labels' allowlist fold \
+         into tenant_hash=\"other\".",
+        "counter",
+    );
+    for row in rows {
+        write_sample(
+            out,
+            "ravel_ingest_attribution_puts_total",
+            &labels(mode, row),
+            row.puts,
+        );
+    }
+}
+
 /// One scrape's ADR-0071 distributed read fan-out counters. Read
 /// at scrape time from [`crate::distrib::FragmentMetrics`]; `Some` only when the
 /// process serves queries with `--distributed-query` on. Carries no per-shard,
@@ -2534,6 +2616,7 @@ pub fn render(
     ingest_buffer_budget: IngestBufferBudgetSnapshot,
     distrib: Option<&DistribSnapshot>,
     durable_auth: Option<&DurableAuthCountersSnapshot>,
+    attribution: &[TenantAttributionRow],
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -2583,6 +2666,7 @@ pub fn render(
     }
     render_admission_family(&mut out, mode, admission);
     render_query_family(&mut out, mode, query_accounting);
+    render_attribution_family(&mut out, mode, attribution);
     render_ingest_concurrency_family(&mut out, mode, ingest_concurrency_shed_total);
     render_ingest_buffer_budget_family(
         &mut out,
@@ -2660,6 +2744,12 @@ pub struct MetricsState {
     /// section 4), written by every query handler and read here at scrape time.
     /// Always present; renders no samples until a query records into it.
     pub query_accounting: Arc<QueryAccountingMetrics>,
+    /// The per-tenant allowlist the PUT attribution family (ADR-0076 decision
+    /// 2) folds against, same set and same `--metrics-tenant-labels` gate as
+    /// `query_accounting`'s `configured` set: empty unless the flag is on, in
+    /// which case it is `config.limits.tenants.keys()`. A tenant outside it
+    /// folds into `tenant_hash="other"` at render time.
+    pub metrics_tenant_allowlist: Arc<HashSet<TenantHash>>,
     /// The process-wide in-flight ingest-request ceiling, shared
     /// with every OTLP HTTP/gRPC service and Remote Write on both the public
     /// and mTLS listeners. Always present; its `shed_total` is simply `0`
@@ -2819,6 +2909,33 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
                 stale_fail_closed: auth.stale_fail_closed(),
             });
 
+    // Per-tenant PUT attribution (ADR-0076 decision 2), read at scrape time
+    // from each present router's `TenantPutAttribution` and folded through the
+    // same allowlist `query_accounting` uses. One signal's router missing
+    // (`Mode::Query`/`Mode::Maintain` build none) simply contributes no rows.
+    let mut attribution = Vec::new();
+    if let Some(router) = &state.ingest_router {
+        attribution.extend(attribution_rows(
+            Signal::Metrics,
+            router.metrics().tenant_put_attribution(),
+            &state.metrics_tenant_allowlist,
+        ));
+    }
+    if let Some(router) = &state.log_ingest_router {
+        attribution.extend(attribution_rows(
+            Signal::Logs,
+            router.metrics().tenant_put_attribution(),
+            &state.metrics_tenant_allowlist,
+        ));
+    }
+    if let Some(router) = &state.span_ingest_router {
+        attribution.extend(attribution_rows(
+            Signal::Spans,
+            router.metrics().tenant_put_attribution(),
+            &state.metrics_tenant_allowlist,
+        ));
+    }
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -2837,6 +2954,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ingest_buffer_budget,
         distrib_snapshot.as_ref(),
         durable_auth_snapshot.as_ref(),
+        &attribution,
     );
     (
         StatusCode::OK,
@@ -2908,6 +3026,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert!(
@@ -3045,6 +3164,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         let postings_lines: Vec<&str> = body
@@ -3175,6 +3295,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -3331,6 +3452,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert!(
@@ -3359,6 +3481,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -3419,6 +3542,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert!(
@@ -3465,6 +3589,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert!(
@@ -3503,6 +3628,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -3599,6 +3725,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             Some(&snapshot),
+            &[],
         );
 
         // All three counters appear, mode-labeled, carrying the driven value.
@@ -3644,6 +3771,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
         assert!(
             !body.contains("ravel_durable_auth_"),
@@ -3693,6 +3821,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert!(
@@ -3774,6 +3903,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             Some(&snapshot),
             None,
+            &[],
         );
 
         for expected in [
@@ -3841,6 +3971,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
         assert!(
             !off.contains("ravel_distrib_"),
@@ -3888,6 +4019,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert!(
@@ -3967,6 +4099,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -4014,6 +4147,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         for line in body.lines() {
@@ -4088,6 +4222,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         // Fetcher cache, labeled cache="fetch".
@@ -4194,6 +4329,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -4227,6 +4363,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert!(
@@ -4311,6 +4448,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         assert_eq!(
@@ -4383,6 +4521,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -4454,6 +4593,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         );
         assert!(
             body.contains(&format!(
@@ -4502,6 +4642,7 @@ mod tests {
             IngestBufferBudgetSnapshot::default(),
             None,
             None,
+            &[],
         )
     }
 

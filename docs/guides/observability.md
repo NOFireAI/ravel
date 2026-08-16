@@ -65,11 +65,12 @@ the dimension Ravel controls least.
 
 ### The `tenant_hash="other"` fold
 
-Two families can carry a `tenant_hash` label: the admission family and the
-per-query cost family. By default every tenant folds into the single bucket
-`tenant_hash="other"`, and that bucket sums every folded tenant's counters.
-The scrape then holds one series per (signal or workload class), never one per
-tenant, regardless of how many tenants send traffic.
+Three families can carry a `tenant_hash` label: the admission family, the
+per-query cost family, and the ingest PUT attribution family. By default
+every tenant folds into the single bucket `tenant_hash="other"`, and that
+bucket sums every folded tenant's counters. The scrape then holds one series
+per (signal or workload class), never one per tenant, regardless of how many
+tenants send traffic.
 
 The `--metrics-tenant-labels` flag opts out of the fold (ADR-0051 section 6).
 With the flag on, each configured tenant keeps its own real `tenant_hash`, and
@@ -128,6 +129,23 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 
 The collisions family carries no `signal="spans"` series. Spans derive no
 identity that can collide, so that sample is structurally absent, not zero.
+
+#### Per-tenant PUT attribution (ADR-0076 decision 2)
+
+| Metric | Meaning |
+|---|---|
+| `ravel_ingest_attribution_puts_total` | Object-store PUT requests attributed to completed flushes, by tenant and signal. |
+
+Labels: `mode`, `tenant_hash`, `signal`. This is the answer to "which tenant is
+generating the PUT bill": each completed flush charges 2 PUTs (a data object
+and a commit record) to the flushing tenant, tracked per signal by a bounded
+top-K structure in the ingest router (`MAX_TRACKED_TENANTS = 1024`, see
+`crates/ravel-ingest/src/attribution.rs`). That top-K bound protects the
+router's internal accounting; the `tenant_hash` label on this family is
+bounded separately, by the same `--metrics-tenant-labels` allowlist and the
+same `tenant_hash="other"` fold described above — a tenant outside the
+allowlist never gets a series of its own here, regardless of how much it
+contributes to the top-K table.
 
 ### Catalog integrity (`ravel_catalog_*`)
 

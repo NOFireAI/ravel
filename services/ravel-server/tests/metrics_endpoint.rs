@@ -468,3 +468,179 @@ async fn admission_family_tenant_labels_bounded() {
         );
     }
 }
+
+// --- ADR-0076 decision 2 / #146: the /metrics PUT attribution family ---
+
+const ATTR_CONFIGURED_TENANT: &str = "attr-configured";
+const ATTR_CONFIGURED_TOKEN: &str = "attr-configured-token";
+const ATTR_OTHER_TENANT: &str = "attr-unconfigured";
+const ATTR_OTHER_TOKEN: &str = "attr-unconfigured-token";
+
+/// Starts a server in `Mode::All` with both attribution-test tenants' tokens
+/// installed and `--metrics-tenant-labels` on, but only
+/// `ATTR_CONFIGURED_TENANT` present in `limits.tenants` -- the allowlist the
+/// attribution family folds against, the same set and gate
+/// `query_accounting` uses.
+async fn start_attribution_server() -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(
+        ATTR_CONFIGURED_TOKEN.to_string(),
+        TenantId::new(ATTR_CONFIGURED_TENANT),
+    );
+    tokens.insert(
+        ATTR_OTHER_TOKEN.to_string(),
+        TenantId::new(ATTR_OTHER_TENANT),
+    );
+    let mut tenants = HashMap::new();
+    tenants.insert(
+        TenantId::new(ATTR_CONFIGURED_TENANT),
+        AdmissionLimits::default(),
+    );
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let store = Arc::new(MemoryStore::new());
+    let config = ServerConfig {
+        max_inflight_flushes: 1,
+        adaptive_flush_delay: false,
+        mode: Mode::All,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        metrics_tenant_labels: true,
+        deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
+        scrub_period: std::time::Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
+        distrib: None,
+        remote_clusters: Vec::new(),
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
+        limits: LimitsConfig {
+            defaults: ravel_server::config::limits::shipped_defaults(),
+            tenants,
+            ..LimitsConfig::default()
+        },
+    };
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
+}
+
+/// Drives one clean-admit metrics export per attribution tenant. Strict mode
+/// (the default: no `x-ravel-ingest-mode` header) blocks the response until
+/// the flush's commit-token ack, so a completed POST already guarantees
+/// `record_flush` -- and therefore this tenant's `TenantPutAttribution` entry
+/// -- has fired; no sleep or poll is needed to observe it on the next scrape.
+async fn drive_attribution_activity(base: &str) {
+    let client = reqwest::Client::new();
+    for token in [ATTR_CONFIGURED_TOKEN, ATTR_OTHER_TOKEN] {
+        let request = export_request(2, admission_now_ns());
+        let response = client
+            .post(format!("{base}/v1/metrics"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/x-protobuf")
+            .body(request.encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes");
+        assert_eq!(
+            response.status(),
+            200,
+            "clean-admit attribution scenario must be admitted, not rejected"
+        );
+    }
+}
+
+/// Distinct `tenant_hash` label values across every
+/// `ravel_ingest_attribution_puts_total` sample line for `signal="metrics"`.
+fn attribution_tenant_hashes(body: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in body.lines() {
+        if !line.starts_with("ravel_ingest_attribution_puts_total{") {
+            continue;
+        }
+        if !line.contains("signal=\"metrics\"") {
+            continue;
+        }
+        let brace = line.find('{').expect("attribution sample carries labels");
+        let close = line.find('}').expect("closed label block");
+        for pair in line[brace + 1..close].split(',') {
+            if let Some(value) = pair.strip_prefix("tenant_hash=\"") {
+                out.insert(value.trim_end_matches('"').to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The soundness test for ADR-0076 decision 2 / #146: a tenant outside the
+/// `--metrics-tenant-labels` allowlist must never get its own `tenant_hash`
+/// series on the per-tenant PUT attribution family, no matter how much ingest
+/// traffic it drives through the real router -- it must fold into
+/// `tenant_hash="other"`, the same bounded-cardinality contract
+/// `query_accounting` and the admission family already hold on this
+/// unauthenticated route. This is written to fail against a naive
+/// unbounded-label implementation: an `attribution_rows` that always keeps
+/// `Some(entry.tenant)` regardless of `allowlist` would render
+/// `ATTR_OTHER_TENANT`'s real hash here instead of folding it, and the
+/// "no unlisted hash" assertion below would catch it.
+#[tokio::test]
+async fn attribution_family_folds_unconfigured_tenant_to_other() {
+    let running = start_attribution_server().await;
+    let base = format!("http://{}", running.http_addr);
+    drive_attribution_activity(&base).await;
+
+    let client = reqwest::Client::new();
+    let body = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+    running.shutdown().await.expect("graceful shutdown");
+
+    assert!(
+        body.contains("ravel_ingest_attribution_puts_total{"),
+        "attribution family must be present once ingest has flushed:\n{body}"
+    );
+
+    let hashes = attribution_tenant_hashes(&body);
+    let configured_hash = TenantId::new(ATTR_CONFIGURED_TENANT).hash().to_hex();
+    assert!(
+        hashes.contains(&configured_hash),
+        "the configured tenant must render its real hash:\n{body}"
+    );
+    assert!(
+        hashes.iter().all(|h| h == &configured_hash || h == "other"),
+        "an unconfigured tenant must never get its own tenant_hash series, only fold into \
+         \"other\", got {hashes:?}:\n{body}"
+    );
+}
