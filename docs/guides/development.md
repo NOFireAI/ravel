@@ -3,6 +3,31 @@
 This guide is for contributors who change Ravel's code. It covers the fast
 local iteration loop and how CI accelerates the same gates.
 
+## Running Ravel from your own build (`make demo`)
+
+The container-first quickstart in the [README](../../README.md) and the
+[getting started guide](getting-started.md) runs a published image and needs no
+toolchain. That is the right path for evaluating Ravel; it is the wrong path
+when you are changing Ravel's code, because it does not run your build.
+
+`make demo` is the from-source path for contributors:
+
+```sh
+make demo
+```
+
+It builds `ravel-server` and `ravel-cli` in release mode from the current tree,
+starts `ravel-server --store s3` against the local MinIO stack, ingests one
+generated OTLP export, and queries it back by commit token
+([scripts/demo.sh](../../scripts/demo.sh)).
+
+One capability difference to keep in mind: the published image is built with
+`--features sql`, so `POST /api/v1/sql` works in the compose quickstart. `make
+demo` builds the default feature set and does **not** enable `sql`, so the SQL
+endpoint is unavailable on the from-source path. PromQL, ingest, and the rest
+are identical on both. To exercise the SQL surface from source, run
+`ravel-server` yourself with `--features sql`, or use the compose quickstart.
+
 ## Fast local iteration
 
 Every commit must pass this gate list (it is also in CLAUDE.md):

@@ -1264,3 +1264,157 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: false
+
+  # Container-first quickstart verification (ADR-0081 decisions 5, 6, 7). Builds
+  # the pull request's OWN ravel-server (--features sql) and ravel-cli on the
+  # runner with the shared sccache/rust-cache, assembles a runtime image from
+  # them via Dockerfile.prebuilt (both binaries, because that file's `server`
+  # target COPYs ravel-cli for the store-qualification path too), brings up
+  # deploy/docker-compose/ravel.yml pointed at that image, drives real telemetry
+  # through it, then asserts the README's marked command blocks and the
+  # read-your-write walkthrough against the live stack.
+  #
+  # This is the epic's end-to-end reachability gate: OTLP ingest and PromQL/SQL
+  # query through the shipping binary inside the shipping image over a real
+  # network entry point, not a crate-level unit test.
+  #
+  # EXEMPT from the docs_only short-circuit (decision 7): a README-only edit is
+  # exactly the change this job exists to catch, so it does not gate on the
+  # `changes` job's docs_only/area outputs. It carries its own merge-base path
+  # filter inline (the same technique docker-build uses), and its heavy steps run
+  # only when a path in that filter changed.
+  #
+  # ADVISORY (ADR-0081 Consequences): deliberately NOT added to main's
+  # required-checks set. Its warm-cache budget is observed first, then it is
+  # promoted, matching how ADR-0070's Tier B gate was introduced.
+  quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # The tag the assemble step writes and compose consumes via RAVEL_IMAGE.
+      RAVEL_IMAGE: ravel-server:quickstart-ci
+      COMPOSE_FILE: deploy/docker-compose/ravel.yml
+      # The readiness query has NO default in check-readme-commands.sh and hard
+      # errors when empty. `gen` is the series telemetrygen emits, which this job
+      # runs deterministically alongside the collector (ADR-0081 D5); no host
+      # metric name is guaranteed non-empty across both generators.
+      RAVEL_HTTP_BASE: http://127.0.0.1:4318
+      RAVEL_TENANT_TOKEN: demo-token
+      RAVEL_READY_QUERY_URL: http://127.0.0.1:4318/api/v1/query?query=gen
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      # Inline merge-base path filter (decision 7). Runs on a README-only change
+      # but skips the expensive build/bring-up when nothing this job covers
+      # changed, the same shape docker-build uses for its Dockerfile guard.
+      - id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            base="${{ github.event.merge_group.base_sha }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "::notice::no usable base commit, running quickstart to be safe"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          merge_base=$(git merge-base "$base" "${{ github.sha }}")
+          changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
+          filter='^README\.md$|^deploy/docker-compose/|^deploy/otel/|^deploy/grafana/|^demo/|^scripts/check-readme-commands\.sh$|^scripts/check_readme_commands\.py$|^Dockerfile\.prebuilt$|^services/ravel-server/'
+          if echo "$changed" | grep -qE "$filter"; then
+            echo "::notice::quickstart-relevant path changed, running the job"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no quickstart-relevant path changed, skipping build/bring-up"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Free disk space
+        if: steps.filter.outputs.run == 'true'
+        uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        if: steps.filter.outputs.run == 'true'
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        if: steps.filter.outputs.run == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.filter.outputs.run == 'true' && steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.filter.outputs.run == 'true'
+      # Both binaries: Dockerfile.prebuilt's `server` target COPYs ravel-server
+      # AND ravel-cli, so a context missing the CLI fails the docker build.
+      - name: Build ravel-server (sql) and ravel-cli on the host
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-cli
+      - name: Assemble the runtime image from the prebuilt binaries
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          # A staging dir as the context: the repo root cannot be used because
+          # .dockerignore excludes target/ from it. Only the two binaries the
+          # server target COPYs are needed.
+          ctx=$(mktemp -d)
+          cp target/release/ravel-server target/release/ravel-cli "$ctx/"
+          docker build --file Dockerfile.prebuilt --target server \
+            --tag "$RAVEL_IMAGE" "$ctx"
+          rm -rf "$ctx"
+      - name: Bring up the compose stack
+        if: steps.filter.outputs.run == 'true'
+        run: docker compose -f "$COMPOSE_FILE" up -d
+      - name: Wait for ravel-server readiness
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS "${RAVEL_HTTP_BASE}/readyz" >/dev/null 2>&1; then
+              echo "ravel-server ready"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::ravel-server did not become ready in time"
+          docker compose -f "$COMPOSE_FILE" logs --no-color || true
+          exit 1
+      # telemetrygen injects a deterministic series (`gen`) for the assertions,
+      # alongside the collector's host metrics (ADR-0081 D5). OTLP/HTTP to the
+      # published loopback port, with the demo bearer token; --network host so
+      # 127.0.0.1:4318 resolves to the mapped port.
+      - name: Generate deterministic telemetry with telemetrygen
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          docker run --rm --network host \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            metrics \
+            --otlp-http \
+            --otlp-endpoint 127.0.0.1:4318 \
+            --otlp-insecure \
+            --otlp-header 'Authorization="Bearer demo-token"' \
+            --metric-type Gauge \
+            --metrics 500
+      # Waits for readiness (health, then a non-empty `gen` query), then runs
+      # every marked README block and asserts its declared outcome.
+      - name: Assert the README's marked command blocks
+        if: steps.filter.outputs.run == 'true'
+        run: scripts/check-readme-commands.sh README.md
+      # The read-your-write walkthrough: ingest one export, capture its commit
+      # token, read that exact write back. Assertive on its own.
+      - name: Run the read-your-write walkthrough
+        if: steps.filter.outputs.run == 'true'
+        run: demo/walkthrough.sh
+      # Always capture logs on failure: a CI failure nobody can diagnose is a job
+      # that gets disabled (ADR-0081 D6).
+      - name: Dump compose logs on failure
+        if: failure() && steps.filter.outputs.run == 'true'
+        run: docker compose -f "$COMPOSE_FILE" logs --no-color || true
+      - name: Tear down the compose stack
+        if: always() && steps.filter.outputs.run == 'true'
+        run: docker compose -f "$COMPOSE_FILE" down -v || true

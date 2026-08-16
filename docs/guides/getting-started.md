@@ -1,5 +1,81 @@
 # Getting started
 
+There are two ways to run Ravel. The **container-first quickstart** pulls a
+published image and needs only Docker — it is the fastest way to see Ravel
+work, and it is presented first. The **from-source path** (`make demo`) builds
+Ravel from the current tree and is for contributors changing the code; it comes
+second here and is covered in more depth in the
+[development guide](development.md).
+
+One capability difference matters up front: the published image is built with
+`--features sql`, so `POST /api/v1/sql` works in the compose quickstart. `make
+demo` builds the default feature set and does not enable `sql`, so the SQL
+endpoint is unavailable on the from-source path. PromQL and ingest behave the
+same on both.
+
+## Container-first quickstart
+
+The only prerequisite is Docker with `docker compose`. No Rust toolchain.
+
+```sh
+docker compose -f deploy/docker-compose/ravel.yml up -d
+```
+
+This brings up, all from published images:
+
+- MinIO on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (console), plus a
+  one-shot that creates the `ravel-dev` bucket and a one-shot that qualifies the
+  store (ADR-0050 section 6) so `ravel-server` will start against it.
+- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.9.2` (override the pin
+  with the `RAVEL_IMAGE` environment variable), listening on `127.0.0.1:4318`
+  (HTTP/OTLP) and `127.0.0.1:4317` (gRPC/OTLP), with the tenant token
+  `demo-token` mapped to tenant `demo-tenant`.
+- An OpenTelemetry Collector scraping your host's CPU, load, memory, and network
+  metrics and exporting them to Ravel over OTLP, authenticating with the demo
+  bearer token.
+- Grafana on `127.0.0.1:3000` (`admin` / `admin`) with the Ravel datasource
+  already provisioned.
+
+Every published port binds loopback (`127.0.0.1`) only, and every credential is
+a fixed development value (`demo-token`, and `ravel` / `ravel-dev-secret` for
+MinIO). None of it is for a network-reachable deployment.
+
+Open Grafana at <http://127.0.0.1:3000> to see your machine's metrics, or query
+Ravel directly. A PromQL instant query (the bearer token is required, the same
+as ingest):
+
+```sh
+curl -s -H "Authorization: Bearer demo-token" \
+  'http://127.0.0.1:4318/api/v1/query?query=system_cpu_load_average_1m'
+```
+
+SQL over the `samples` (metrics) table, which the image serves out of the box
+because it is built `--features sql`:
+
+```sh
+curl -s -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer demo-token" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"SELECT * FROM samples LIMIT 5"}'
+```
+
+To watch the read-your-write path end to end — ingest one export, capture its
+`x-ravel-commit-token`, and read that exact write back with `min_commit_token` —
+run [demo/walkthrough.sh](../../demo/walkthrough.sh) while the stack is up. Stop
+everything with:
+
+```sh
+docker compose -f deploy/docker-compose/ravel.yml down
+```
+
+`minio-data/` on your machine persists across runs; the store-qualify one-shot
+is idempotent, so bringing the stack up again on the same directory is safe.
+
+## The from-source path
+
+The rest of this guide builds Ravel from the current tree with `make demo`. Use
+it when you are changing Ravel's code; otherwise the quickstart above is faster.
+
 ## Prerequisites
 
 - Rust, pinned by [`rust-toolchain.toml`](../../rust-toolchain.toml) to
