@@ -30,8 +30,10 @@ rejected point counts and reasons.
 - A batch becomes visible to queries when its commit record exists; commit
   record creation is atomic (create-if-absent), so visibility is atomic per
   L0 object.
-- Visibility latency = flush delay + data PUT + commit PUT. The p99 target in
-  strict mode under target load is < 1 s.
+- Visibility latency = flush delay + data PUT + commit PUT. The flush delay
+  is a configurable operator budget (`--max-flush-delay`), default 2 s in
+  strict mode (ADR-0076 decision 4); the p99 visibility target under target
+  load tracks that budget, not a fixed sub-second constant.
 - There is no cross-shard ordering guarantee. A query snapshot may include
   commit N+1 of shard A and not commit M of shard B, regardless of wall-clock
   order. Per (writer, shard), commits are sequenced by `seq`.

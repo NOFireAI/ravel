@@ -170,6 +170,17 @@ pub struct IngestConfig {
     /// (the default) keeps today's fixed-delay behavior for a clean A/B
     /// against the adaptive corridor in the ingest bench.
     pub adaptive_flush_delay: bool,
+    /// Strict-mode visibility budget (ADR-0067 decision 3's corridor
+    /// ceiling, ADR-0076 decision 4): `visibility_ceiling_ns` subtracts two
+    /// PUT round trips plus retry headroom from this to get the adaptive
+    /// corridor's cap. Metrics-only; the log and span actors do not read
+    /// this field. Must follow whatever `max_flush_delay` is actually
+    /// configured to, or the adaptive corridor contradicts the operator's
+    /// chosen visibility budget (a 2s cadence next to a stale 1s corridor
+    /// ceiling being exactly the contradiction the ADR warns against); the
+    /// default therefore matches the new `max_flush_delay` default (2s)
+    /// rather than retaining the old hard-coded 1s value.
+    pub strict_visibility_budget_ns: i64,
 }
 
 impl Default for IngestConfig {
@@ -178,10 +189,16 @@ impl Default for IngestConfig {
             shard_count: 4,
             channel_depth: 256,
             target_bytes: 8 * 1024 * 1024,
-            max_flush_delay: Duration::from_millis(500),
+            // ADR-0076 decision 4: the three flush-cadence knobs move as a
+            // set, scaled 4x together (500ms/10s/64KiB -> 2s/40s/256KiB). At
+            // the ~9.6 KB/s buffer fill rate the ADR measures, 256KiB is
+            // reached in ~27s, comfortably under the new 40s idle ceiling,
+            // so buffered-mode tenants keep the same "size trigger fires
+            // before the idle timer" property they had before the bump.
+            max_flush_delay: Duration::from_secs(2),
             flush_tick: Duration::from_millis(200),
-            max_flush_delay_idle: Duration::from_secs(10),
-            min_flush_bytes: 64 * 1024,
+            max_flush_delay_idle: Duration::from_secs(40),
+            min_flush_bytes: 256 * 1024,
             put_retry_max_attempts: 4,
             put_retry_base_delay: Duration::from_millis(100),
             put_retry_max_delay: Duration::from_secs(2),
@@ -189,6 +206,7 @@ impl Default for IngestConfig {
             exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
             max_inflight_flushes: 1,
             adaptive_flush_delay: false,
+            strict_visibility_budget_ns: 2_000_000_000,
         }
     }
 }
@@ -203,10 +221,10 @@ mod tests {
         assert_eq!(cfg.shard_count, 4);
         assert_eq!(cfg.channel_depth, 256);
         assert_eq!(cfg.target_bytes, 8 * 1024 * 1024);
-        assert_eq!(cfg.max_flush_delay, Duration::from_millis(500));
+        assert_eq!(cfg.max_flush_delay, Duration::from_secs(2));
         assert_eq!(cfg.flush_tick, Duration::from_millis(200));
-        assert_eq!(cfg.max_flush_delay_idle, Duration::from_secs(10));
-        assert_eq!(cfg.min_flush_bytes, 64 * 1024);
+        assert_eq!(cfg.max_flush_delay_idle, Duration::from_secs(40));
+        assert_eq!(cfg.min_flush_bytes, 256 * 1024);
         assert_eq!(cfg.put_retry_max_attempts, 4);
         assert_eq!(cfg.put_retry_base_delay, Duration::from_millis(100));
         assert_eq!(cfg.put_retry_max_delay, Duration::from_secs(2));
@@ -221,6 +239,9 @@ mod tests {
         // behavior bit for bit; the flip to 3 is a later measured decision.
         assert_eq!(cfg.max_inflight_flushes, 1);
         assert!(!cfg.adaptive_flush_delay);
+        // ADR-0076 decision 4: must follow the new max_flush_delay default
+        // (2s), not the old hard-coded 1s STRICT_VISIBILITY_BUDGET_NS.
+        assert_eq!(cfg.strict_visibility_budget_ns, 2_000_000_000);
     }
 
     #[test]

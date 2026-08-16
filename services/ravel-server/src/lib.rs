@@ -168,17 +168,29 @@ pub struct ServerConfig {
     pub listen_http: SocketAddr,
     pub listen_grpc: SocketAddr,
     pub shard_count: u32,
-    /// Per-shard in-flight flush bound for the metrics ingest pipeline
-    /// (ADR-0067 decision 2), forwarded to
-    /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]. Does not apply
-    /// to the log or span ingest pipelines, which keep their existing inline
-    /// flush. See `--max-inflight-flushes`.
+    /// Per-shard in-flight flush bound, forwarded to
+    /// [`ravel_ingest::IngestConfig::max_inflight_flushes`] on all three
+    /// ingest pipelines (metrics, logs, spans -- ADR-0067 decision 2,
+    /// extended to logs and spans by ADR-0076 decision 3). See
+    /// `--max-inflight-flushes`.
     pub max_inflight_flushes: u32,
     /// Enables the adaptive flush-delay corridor for the metrics ingest
     /// pipeline (ADR-0067 decision 3), forwarded to
     /// [`ravel_ingest::IngestConfig::adaptive_flush_delay`]. Does not apply
     /// to the log or span ingest pipelines. See `--adaptive-flush-delay`.
     pub adaptive_flush_delay: bool,
+    /// Fast-tier flush age threshold, forwarded to
+    /// [`ravel_ingest::IngestConfig::max_flush_delay`] on all three ingest
+    /// pipelines (ADR-0076 decision 4). See `--max-flush-delay`.
+    pub max_flush_delay: Duration,
+    /// Idle-tier flush age threshold, forwarded to
+    /// [`ravel_ingest::IngestConfig::max_flush_delay_idle`] on all three
+    /// ingest pipelines (ADR-0076 decision 4). See `--max-flush-delay-idle`.
+    pub max_flush_delay_idle: Duration,
+    /// Byte threshold below which a buffer is idle-eligible, forwarded to
+    /// [`ravel_ingest::IngestConfig::min_flush_bytes`] on all three ingest
+    /// pipelines (ADR-0076 decision 4). See `--min-flush-bytes`.
+    pub min_flush_bytes: usize,
     pub tenant_resolver: Arc<dyn TenantResolver>,
     /// The dedicated mTLS listener (ADR-0050 section 1), `None` unless
     /// `--mtls-enabled`. Serves the same ingest and query surface as the
@@ -604,6 +616,13 @@ pub async fn start(
                     shard_count: config.shard_count,
                     max_inflight_flushes: config.max_inflight_flushes,
                     adaptive_flush_delay: config.adaptive_flush_delay,
+                    max_flush_delay: config.max_flush_delay,
+                    max_flush_delay_idle: config.max_flush_delay_idle,
+                    min_flush_bytes: config.min_flush_bytes,
+                    // ADR-0076 decision 4: follows the actually-configured
+                    // max_flush_delay, not just its default, so the adaptive
+                    // corridor never contradicts the operator's chosen budget.
+                    strict_visibility_budget_ns: config.max_flush_delay.as_nanos() as i64,
                     ..IngestConfig::default()
                 },
                 store.clone(),
@@ -634,6 +653,10 @@ pub async fn start(
             LogIngestRouter::new_with_indexed_fields(
                 IngestConfig {
                     shard_count: config.shard_count,
+                    max_inflight_flushes: config.max_inflight_flushes,
+                    max_flush_delay: config.max_flush_delay,
+                    max_flush_delay_idle: config.max_flush_delay_idle,
+                    min_flush_bytes: config.min_flush_bytes,
                     ..IngestConfig::default()
                 },
                 store.clone(),
@@ -656,6 +679,10 @@ pub async fn start(
             SpanIngestRouter::new(
                 IngestConfig {
                     shard_count: config.shard_count,
+                    max_inflight_flushes: config.max_inflight_flushes,
+                    max_flush_delay: config.max_flush_delay,
+                    max_flush_delay_idle: config.max_flush_delay_idle,
+                    min_flush_bytes: config.min_flush_bytes,
                     ..IngestConfig::default()
                 },
                 store.clone(),

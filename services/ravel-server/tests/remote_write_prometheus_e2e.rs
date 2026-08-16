@@ -47,6 +47,9 @@ async fn start_test_server() -> ravel_server::Running {
     let config = ServerConfig {
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
+        max_flush_delay: std::time::Duration::from_secs(2),
+        max_flush_delay_idle: std::time::Duration::from_secs(40),
+        min_flush_bytes: 256 * 1024,
         mode: Mode::All,
         // Bound to loopback but reachable from the Prometheus container via
         // `--network host`, which puts the container on the host's network
