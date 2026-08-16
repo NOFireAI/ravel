@@ -330,11 +330,20 @@ pub struct IngestAffinitySpec {
 
     /// `spec.ingressClassName` on the rendered Ingress objects. Omit to let the
     /// cluster's default IngressClass apply.
+    ///
+    /// Legacy `backend: ingressNginx` only. Has no effect under
+    /// `backend: ravelNative`, and no effect on `gateway.exposure.gatewayAPI`
+    /// routing (Gateway API attachment goes through `exposure.gatewayAPI
+    /// .gatewayRef` instead, ADR-0080 decision 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_class_name: Option<String>,
 
     /// Hostnames the ingest Ingress answers on. Empty renders a single
     /// host-less rule, which matches any host reaching the controller.
+    ///
+    /// Legacy `backend: ingressNginx` only. `gateway.exposure.gatewayAPI
+    /// .hostnames` is the equivalent field for Gateway API exposure; the two
+    /// are independent and neither reads the other.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
 
@@ -342,6 +351,11 @@ pub struct IngestAffinitySpec {
     /// recommended and effectively required for the gRPC Ingress: ingress-nginx
     /// serves HTTP/2 to clients over TLS, and OTLP/gRPC needs HTTP/2. Tenant
     /// tokens are bearer tokens, so plaintext ingest exposes them.
+    ///
+    /// Legacy `backend: ingressNginx` only. Gateway API exposure terminates
+    /// TLS at the referenced `Gateway`'s own listener, which this operator
+    /// does not render; configure `tls.certificateRefs` on that Gateway
+    /// directly (ADR-0080 decision 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_secret_name: Option<String>,
 
@@ -1550,6 +1564,45 @@ mod tests {
                 .iter()
                 .all(|r| r.rule != GATEWAY_EXPOSURE_AFFINITY_RULE),
             "the cross-field guard must live on `gateway`, not on `ingestAffinity`"
+        );
+
+        // The rule's `!has(...)` guards fail OPEN (admit) when `backend` or
+        // `enabled` is omitted from a submitted manifest, relying entirely on
+        // schema defaulting (which the API server applies before CEL runs) to
+        // materialize `backend: ingressNginx` and `enabled: true` first. If
+        // either default is ever removed, the rejected combination
+        // (exposure.gatewayAPI + an omitted-affinity-config CR) silently
+        // starts being admitted instead -- exactly the silent degrade this
+        // rule exists to forbid -- with every other test here still green.
+        // Pin both defaults so that regression fails loudly.
+        let affinity_props = gateway
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .properties
+            .as_ref()
+            .expect("ingestAffinity props");
+        assert_eq!(
+            affinity_props
+                .get("backend")
+                .expect("backend prop")
+                .default
+                .as_ref()
+                .map(|j| &j.0),
+            Some(&serde_json::json!("ingressNginx")),
+            "the omitted-backend CEL case relies on this default"
+        );
+        assert_eq!(
+            affinity_props
+                .get("enabled")
+                .expect("enabled prop")
+                .default
+                .as_ref()
+                .map(|j| &j.0),
+            Some(&serde_json::json!(true)),
+            "the omitted-enabled CEL case relies on this default"
         );
     }
 

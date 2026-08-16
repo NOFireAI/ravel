@@ -129,6 +129,49 @@ change; until it does, `ravelNative` is accepted by the CRD and silences the
 condition but the rendered objects are still today's. Do not switch a production
 cluster to it before its own release note says the router is rendered.
 
+### Gateway API exposure
+
+`gateway.exposure.gatewayAPI` is a separate, independent field from
+`ingestAffinity` (ADR-0080 decision 2): it renders standard
+`gateway.networking.k8s.io` `HTTPRoute` and `GRPCRoute` objects attached to an
+existing `Gateway`, instead of the ingress-nginx-specific `Ingress` objects
+above. It carries no vendor extension, so it works with any conformant
+Gateway API implementation (Envoy Gateway, NGINX Gateway Fabric, Cilium,
+Istio, a managed cloud implementation) — Ravel does not couple its CRD to one.
+
+```yaml
+spec:
+  gateway:
+    exposure:
+      gatewayAPI:
+        gatewayRef:
+          name: public-gateway
+          # namespace: defaults to this RavelCluster's own namespace
+        hostnames: [ingest.example.com]
+        grpc: true   # also render a GRPCRoute; default true
+```
+
+This has no tenant-affinity effect by itself: routing goes straight to the
+gateway Service, load-balanced however the Gateway implementation load-balances
+a Service backendRef (typically endpoint-aware round robin, not subset-of-`S`).
+It can be combined with `backend: ravelNative` affinity once that backend ships
+(a later change points the rendered routes at the router's Service instead);
+it **cannot** be combined with an *enabled* `backend: ingressNginx` affinity —
+the CRD rejects that combination at admission with a CEL rule, because traffic
+on the Gateway API path would bypass the nginx subset annotations entirely,
+silently losing tenant pinning on that path while the Ingress objects keep
+enforcing it on theirs. If you need Gateway API exposure today, either leave
+`ingestAffinity` unset/disabled, or wait for `backend: ravelNative`.
+
+TLS is not rendered by the operator here: Gateway API exposure terminates TLS
+at the referenced `Gateway`'s own listener, which you configure directly
+(`tls.certificateRefs`) — there is no `tlsSecretName` equivalent under
+`exposure.gatewayAPI`, unlike the legacy `ingestAffinity.tlsSecretName`.
+
+Requires Gateway API **v1.1 or newer** in the cluster: `GRPCRoute` only
+reached the stable `v1` API version in Gateway API v1.1 (it was `v1alpha2`
+in v1.0), and the operator renders it at `v1`.
+
 ## Turning it on
 
 ```yaml
