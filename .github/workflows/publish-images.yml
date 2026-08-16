@@ -1,7 +1,7 @@
 name: publish-images
 
-# ADR-0037. Publishes ravel-server and ravel-operator from the root
-# Dockerfile to GHCR. Deliberately its own workflow, not a job added to
+# ADR-0037. Publishes ravel-server, ravel-operator, and ravel-ingest-router
+# from the root Dockerfile to GHCR. Deliberately its own workflow, not a job added to
 # ci.yml: this is the only job in the repo that holds packages: write, and
 # it never runs on a plain push to main (see ADR-0037 decision 4 for why
 # the root Dockerfile's single COPY-then-build layer makes GHA caching
@@ -132,7 +132,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [server, operator]
+        target: [server, operator, ingest-router]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
