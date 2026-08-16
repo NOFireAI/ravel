@@ -626,8 +626,10 @@ pub async fn start(
                     // IngestConfig::default() uses -- setting it equal (as
                     // this call site once did) collapses the adaptive
                     // corridor to the floor unconditionally.
-                    strict_visibility_budget_ns: config.max_flush_delay.as_nanos() as i64
-                        + ravel_ingest::STRICT_VISIBILITY_RESERVE_NS,
+                    strict_visibility_budget_ns: crate::config::duration_nanos_saturating(
+                        config.max_flush_delay,
+                    )
+                    .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
                     ..IngestConfig::default()
                 },
                 store.clone(),
