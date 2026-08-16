@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 use ravel_maintain::RetentionPolicy;
 use ravel_types::{TenantHash, TenantId};
 
-use crate::alert_sink::AlertSink;
+use crate::alert_sink::{AlertSink, Credential};
 use crate::postings_config::IndexedFieldPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -234,6 +234,22 @@ pub struct Cli {
     /// the well-known path is appended when it is missing.
     #[arg(long = "alertmanager-url", value_name = "URL")]
     pub alertmanager_urls: Vec<String>,
+
+    /// Repeatable authenticated webhook sink (ADR-0083). A comma-separated
+    /// `key=value` spec: `url=...` is required, and exactly one credential is
+    /// given as either `bearer-file=PATH` or `basic-user=NAME,basic-pass-file=
+    /// PATH`. The secret is read from a file, never inline, so it never appears
+    /// in a process listing, the same convention `--remote-cluster` uses. For
+    /// an unauthenticated webhook use `--alert-webhook-url`.
+    #[arg(long = "alert-webhook", value_name = "SPEC")]
+    pub alert_webhooks: Vec<String>,
+
+    /// Repeatable authenticated Alertmanager sink (ADR-0083). Same spec as
+    /// `--alert-webhook`; `url` may be a base URL or the full `/api/v2/alerts`
+    /// endpoint, exactly as `--alertmanager-url` accepts. For an
+    /// unauthenticated Alertmanager use `--alertmanager-url`.
+    #[arg(long = "alertmanager", value_name = "SPEC")]
+    pub alertmanagers: Vec<String>,
 
     /// Event-time window a SQL detection rule's query resolves over, ending at
     /// the tick's clock reading, as a humantime duration (e.g. `5m`). Only
@@ -1124,23 +1140,43 @@ impl Cli {
         Ok(IndexedFieldPolicy { default, tenants })
     }
 
-    /// Build the alert sink list from `--alert-webhook-url` and
-    /// `--alertmanager-url`. Webhooks first, then Alertmanager, so delivery
-    /// order is the flag order within each kind and stable across runs.
+    /// Build the alert sink list from the unauthenticated `--alert-webhook-url`
+    /// / `--alertmanager-url` flags and the authenticated `--alert-webhook` /
+    /// `--alertmanager` specs (ADR-0083). Webhooks first, then Alertmanager, so
+    /// delivery order is stable across runs; within each kind the plain URLs
+    /// come before the authenticated specs, both in flag order.
     pub fn parse_alert_sinks(&self) -> anyhow::Result<Vec<AlertSink>> {
-        let mut sinks =
-            Vec::with_capacity(self.alert_webhook_urls.len() + self.alertmanager_urls.len());
+        let mut sinks = Vec::with_capacity(
+            self.alert_webhook_urls.len()
+                + self.alertmanager_urls.len()
+                + self.alert_webhooks.len()
+                + self.alertmanagers.len(),
+        );
         for url in &self.alert_webhook_urls {
             sinks.push(AlertSink::webhook(validated_sink_url(
                 "--alert-webhook-url",
                 url,
             )?));
         }
+        for spec in &self.alert_webhooks {
+            let (url, credential) = parse_authenticated_sink("--alert-webhook", spec)?;
+            sinks.push(
+                AlertSink::webhook(validated_sink_url("--alert-webhook", &url)?)
+                    .with_credential(credential),
+            );
+        }
         for url in &self.alertmanager_urls {
             sinks.push(AlertSink::alertmanager(validated_sink_url(
                 "--alertmanager-url",
                 url,
             )?));
+        }
+        for spec in &self.alertmanagers {
+            let (url, credential) = parse_authenticated_sink("--alertmanager", spec)?;
+            sinks.push(
+                AlertSink::alertmanager(validated_sink_url("--alertmanager", &url)?)
+                    .with_credential(credential),
+            );
         }
         Ok(sinks)
     }
@@ -2163,6 +2199,96 @@ fn validated_sink_url<'a>(flag: &str, url: &'a str) -> anyhow::Result<&'a str> {
     Ok(url)
 }
 
+/// Parse an authenticated sink spec: a comma-separated `key=value` list with a
+/// required `url` and exactly one credential (ADR-0083). A bearer credential is
+/// `bearer-file=PATH`; HTTP Basic is `basic-user=NAME` plus
+/// `basic-pass-file=PATH`. The secret is read from a file here, failing startup
+/// on an unreadable or empty file, so a delivery failure is not deferred to
+/// once-a-minute-forever and the secret never appears in a process listing --
+/// the same file-backed convention `--remote-cluster` uses.
+fn parse_authenticated_sink(flag: &str, spec: &str) -> anyhow::Result<(String, Credential)> {
+    let mut url = None;
+    let mut bearer_file: Option<PathBuf> = None;
+    let mut basic_user: Option<String> = None;
+    let mut basic_pass_file: Option<PathBuf> = None;
+
+    for field in spec.split(',') {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let (key, value) = field.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid {flag} '{spec}': field '{field}' is not KEY=VALUE")
+        })?;
+        let value = value.trim();
+        match key.trim() {
+            "url" => url = Some(value.to_string()),
+            "bearer-file" => bearer_file = Some(PathBuf::from(value)),
+            "basic-user" => basic_user = Some(value.to_string()),
+            "basic-pass-file" => basic_pass_file = Some(PathBuf::from(value)),
+            other => anyhow::bail!(
+                "invalid {flag} '{spec}': unknown key '{other}' (expected url, bearer-file, \
+                 basic-user, basic-pass-file)"
+            ),
+        }
+    }
+
+    let url = url
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("invalid {flag} '{spec}': missing required key 'url'"))?;
+
+    let has_basic = basic_user.is_some() || basic_pass_file.is_some();
+    let credential = match (bearer_file, has_basic) {
+        (Some(_), true) => anyhow::bail!(
+            "invalid {flag} '{spec}': set either bearer-file or basic-user/basic-pass-file, \
+             not both"
+        ),
+        (Some(path), false) => {
+            let token = read_secret_file(flag, spec, "bearer-file", &path)?;
+            Credential::Bearer(token)
+        }
+        (None, true) => {
+            let user = basic_user.filter(|u| !u.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid {flag} '{spec}': basic-pass-file requires a non-empty basic-user"
+                )
+            })?;
+            let pass_file = basic_pass_file.ok_or_else(|| {
+                anyhow::anyhow!("invalid {flag} '{spec}': basic-user requires basic-pass-file")
+            })?;
+            let pass = read_secret_file(flag, spec, "basic-pass-file", &pass_file)?;
+            Credential::Basic { user, pass }
+        }
+        (None, false) => anyhow::bail!(
+            "invalid {flag} '{spec}': missing a credential (bearer-file or \
+             basic-user/basic-pass-file); use the unauthenticated flag for a plain sink"
+        ),
+    };
+
+    Ok((url, credential))
+}
+
+/// Read and validate a sink secret from `path`: a leading/trailing-newline
+/// tolerant, non-empty string. Mirrors how `--remote-cluster`'s
+/// `credential-file` is read (trim then reject empty), so a stray trailing
+/// newline in the file does not become part of the token or password.
+fn read_secret_file(flag: &str, spec: &str, key: &str, path: &Path) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid {flag} '{spec}': failed to read {key} {}: {e}",
+            path.display()
+        )
+    })?;
+    let secret = raw.trim().to_string();
+    if secret.is_empty() {
+        anyhow::bail!(
+            "invalid {flag} '{spec}': {key} {} is empty; the secret must be non-empty",
+            path.display()
+        );
+    }
+    Ok(secret)
+}
+
 /// Parse a 32-byte deployment key from a `--tenant-hash-key-file`'s raw
 /// bytes. Accepts 64 hex characters (whitespace-trimmed, the operator-friendly
 /// form that tolerates a trailing newline) or exactly 32 raw bytes. Any other
@@ -2879,6 +3005,137 @@ mod tests {
         // The non-secret fields are still present, so the redaction did not
         // blank the whole struct.
         assert!(rendered.contains("beta") && rendered.contains("beta.internal:9443"));
+    }
+
+    /// ADR-0083: the plain `--alert-webhook-url` / `--alertmanager-url` flags
+    /// still yield unauthenticated sinks, unchanged.
+    #[test]
+    fn unauthenticated_alert_sinks_carry_no_credential() {
+        let sinks = cli(&[
+            "--alert-webhook-url",
+            "http://hook.internal/x",
+            "--alertmanager-url",
+            "http://am:9093",
+        ])
+        .parse_alert_sinks()
+        .expect("plain sinks parse");
+        assert_eq!(sinks.len(), 2);
+        assert!(
+            sinks.iter().all(|s| s.credential().is_none()),
+            "plain flags stay unauthenticated"
+        );
+        assert_eq!(sinks[0].url(), "http://hook.internal/x");
+        assert_eq!(sinks[1].url(), "http://am:9093/api/v2/alerts");
+    }
+
+    /// A `--alert-webhook` spec with `bearer-file` reads the token from the file
+    /// and attaches it as a bearer credential; a trailing newline is trimmed.
+    #[test]
+    fn alert_webhook_bearer_file_parses() {
+        let token = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(token.path(), "hook-token\n").expect("write token");
+        let spec = format!(
+            "url=http://hook.internal/x,bearer-file={}",
+            token.path().display()
+        );
+        let sinks = cli(&["--alert-webhook", &spec])
+            .parse_alert_sinks()
+            .expect("bearer webhook parses");
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].url(), "http://hook.internal/x");
+        assert_eq!(
+            sinks[0].credential(),
+            Some(&Credential::Bearer("hook-token".to_string()))
+        );
+    }
+
+    /// A `--alertmanager` spec with a Basic credential reads the password from
+    /// its file, carries the username inline, and still appends the well-known
+    /// Alertmanager path to the URL.
+    #[test]
+    fn alertmanager_basic_spec_parses() {
+        let pass = tempfile::NamedTempFile::new().expect("temp pass file");
+        std::fs::write(pass.path(), "hunter2\n").expect("write pass");
+        let spec = format!(
+            "url=http://am:9093,basic-user=alice,basic-pass-file={}",
+            pass.path().display()
+        );
+        let sinks = cli(&["--alertmanager", &spec])
+            .parse_alert_sinks()
+            .expect("basic alertmanager parses");
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].url(), "http://am:9093/api/v2/alerts");
+        assert_eq!(
+            sinks[0].credential(),
+            Some(&Credential::Basic {
+                user: "alice".to_string(),
+                pass: "hunter2".to_string(),
+            })
+        );
+    }
+
+    /// Configuring both a bearer and a Basic credential on one sink is a config
+    /// error, not a silent pick-one.
+    #[test]
+    fn alert_webhook_rejects_two_credential_schemes() {
+        let token = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(token.path(), "t\n").expect("write token");
+        let pass = tempfile::NamedTempFile::new().expect("temp pass file");
+        std::fs::write(pass.path(), "p\n").expect("write pass");
+        let spec = format!(
+            "url=http://hook/x,bearer-file={},basic-user=a,basic-pass-file={}",
+            token.path().display(),
+            pass.path().display()
+        );
+        let err = cli(&["--alert-webhook", &spec])
+            .parse_alert_sinks()
+            .expect_err("two schemes must fail");
+        assert!(
+            err.to_string().contains("not both"),
+            "expected the two-scheme error, got: {err}"
+        );
+    }
+
+    /// An authenticated spec with a URL but no credential is a config error:
+    /// the plain flag exists for unauthenticated sinks.
+    #[test]
+    fn alert_webhook_requires_a_credential() {
+        let err = cli(&["--alert-webhook", "url=http://hook/x"])
+            .parse_alert_sinks()
+            .expect_err("a spec with no credential must fail");
+        assert!(
+            err.to_string().contains("missing a credential"),
+            "got: {err}"
+        );
+    }
+
+    /// A missing `url` key fails startup rather than building a sink with no
+    /// target.
+    #[test]
+    fn alert_webhook_requires_a_url() {
+        let token = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(token.path(), "t\n").expect("write token");
+        let spec = format!("bearer-file={}", token.path().display());
+        let err = cli(&["--alert-webhook", &spec])
+            .parse_alert_sinks()
+            .expect_err("no url must fail");
+        assert!(
+            err.to_string().contains("missing required key 'url'"),
+            "got: {err}"
+        );
+    }
+
+    /// An empty secret file fails startup: an empty token or password would
+    /// authenticate as nobody and fail once a minute forever.
+    #[test]
+    fn alert_webhook_rejects_an_empty_secret_file() {
+        let token = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(token.path(), "\n").expect("write empty token");
+        let spec = format!("url=http://hook/x,bearer-file={}", token.path().display());
+        let err = cli(&["--alert-webhook", &spec])
+            .parse_alert_sinks()
+            .expect_err("empty secret must fail");
+        assert!(err.to_string().contains("is empty"), "got: {err}");
     }
 
     /// A `--remote-cluster` spec with no `tls` key means TLS ON (ADR-0071

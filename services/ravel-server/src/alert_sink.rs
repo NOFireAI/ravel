@@ -26,20 +26,112 @@ pub const DEFAULT_SINK_TIMEOUT: Duration = Duration::from_secs(10);
 /// that does not already end in it.
 pub const ALERTMANAGER_PATH: &str = "/api/v2/alerts";
 
+/// A credential a sink attaches to its POST as an `Authorization` header
+/// (ADR-0083).
+///
+/// The secret material -- a bearer token, or Basic's password -- never crosses
+/// a `Debug` or `Serialize` boundary: only the scheme, and Basic's username,
+/// are printed or serialized. That keeps the secret out of the control-plane
+/// record, the database, and any log line, which is what the ADR means by
+/// storing it in the secret envelope. `deliver` reads the live secret straight
+/// off this value and hands it to reqwest; it is never rendered to a string
+/// anywhere else.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Credential {
+    /// Sent as `Authorization: Bearer <token>`.
+    Bearer(String),
+    /// Sent as `Authorization: Basic base64(user:pass)`.
+    Basic { user: String, pass: String },
+}
+
+impl Credential {
+    /// A short static name for the auth scheme, for log lines and the
+    /// non-secret serialized form.
+    pub fn scheme(&self) -> &'static str {
+        match self {
+            Credential::Bearer(_) => "bearer",
+            Credential::Basic { .. } => "basic",
+        }
+    }
+
+    /// Attach this credential to `request` as an `Authorization` header.
+    /// reqwest builds `Bearer <token>` and `Basic base64(user:pass)`
+    /// respectively, so the secret is encoded by the HTTP client and never
+    /// formatted into a string this crate holds.
+    fn attach(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Credential::Bearer(token) => request.bearer_auth(token),
+            Credential::Basic { user, pass } => request.basic_auth(user, Some(pass)),
+        }
+    }
+}
+
+impl std::fmt::Debug for Credential {
+    /// Redacts the secret. A derived `Debug` would print the bearer token or
+    /// the Basic password into any log or error that formats a sink; never
+    /// widen this back to a derive.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::Bearer(_) => f.debug_tuple("Bearer").field(&"<redacted>").finish(),
+            Credential::Basic { user, .. } => f
+                .debug_struct("Basic")
+                .field("user", user)
+                .field("pass", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl serde::Serialize for Credential {
+    /// Serializes only the non-secret parts (the scheme, and Basic's
+    /// username). The token and password are omitted, so a serialized sink
+    /// record carries no secret; the live secret is supplied out of band from
+    /// the secret envelope, exactly as the ADR requires.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self {
+            Credential::Bearer(_) => {
+                let mut s = serializer.serialize_struct("Credential", 1)?;
+                s.serialize_field("scheme", "bearer")?;
+                s.end()
+            }
+            Credential::Basic { user, .. } => {
+                let mut s = serializer.serialize_struct("Credential", 2)?;
+                s.serialize_field("scheme", "basic")?;
+                s.serialize_field("user", user)?;
+                s.end()
+            }
+        }
+    }
+}
+
 /// One configured notification target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlertSink {
     /// POSTs [`webhook_payload`] to `url`.
-    Webhook { url: String },
+    Webhook {
+        url: String,
+        /// An optional credential attached to every POST (ADR-0083). `None`
+        /// preserves the pre-ADR unauthenticated behavior.
+        credential: Option<Credential>,
+    },
     /// POSTs [`alertmanager_payload`] to `url`, which is already the full
     /// `/api/v2/alerts` endpoint (see [`AlertSink::alertmanager`]).
-    Alertmanager { url: String },
+    Alertmanager {
+        url: String,
+        /// An optional credential attached to every POST (ADR-0083). `None`
+        /// preserves the pre-ADR unauthenticated behavior.
+        credential: Option<Credential>,
+    },
 }
 
 impl AlertSink {
-    /// A webhook sink posting to `url` verbatim.
+    /// A webhook sink posting to `url` verbatim, unauthenticated.
     pub fn webhook(url: impl Into<String>) -> AlertSink {
-        AlertSink::Webhook { url: url.into() }
+        AlertSink::Webhook {
+            url: url.into(),
+            credential: None,
+        }
     }
 
     /// An Alertmanager sink for `base`, which may be either an Alertmanager
@@ -54,13 +146,37 @@ impl AlertSink {
         } else {
             format!("{trimmed}{ALERTMANAGER_PATH}")
         };
-        AlertSink::Alertmanager { url }
+        AlertSink::Alertmanager {
+            url,
+            credential: None,
+        }
+    }
+
+    /// Attach `credential` to this sink, returning the sink (builder style).
+    /// Keeps the plain [`AlertSink::webhook`] / [`AlertSink::alertmanager`]
+    /// constructors backward-compatible while letting authenticated sinks be
+    /// built with one call.
+    pub fn with_credential(mut self, credential: Credential) -> AlertSink {
+        match &mut self {
+            AlertSink::Webhook { credential: c, .. }
+            | AlertSink::Alertmanager { credential: c, .. } => *c = Some(credential),
+        }
+        self
     }
 
     /// The URL this sink POSTs to.
     pub fn url(&self) -> &str {
         match self {
-            AlertSink::Webhook { url } | AlertSink::Alertmanager { url } => url,
+            AlertSink::Webhook { url, .. } | AlertSink::Alertmanager { url, .. } => url,
+        }
+    }
+
+    /// The credential this sink attaches to its POST, if any.
+    pub fn credential(&self) -> Option<&Credential> {
+        match self {
+            AlertSink::Webhook { credential, .. } | AlertSink::Alertmanager { credential, .. } => {
+                credential.as_ref()
+            }
         }
     }
 
@@ -260,7 +376,11 @@ pub async fn deliver(
     let Some(body) = sink.payload(notification) else {
         return Ok(());
     };
-    let response = client.post(sink.url()).json(&body).send().await?;
+    let mut request = client.post(sink.url()).json(&body);
+    if let Some(credential) = sink.credential() {
+        request = credential.attach(request);
+    }
+    let response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
         anyhow::bail!("sink {} returned HTTP {}", sink.url(), status);
@@ -440,5 +560,71 @@ mod tests {
     fn pre_epoch_timestamps_clamp_instead_of_panicking() {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000000000Z");
         assert_eq!(rfc3339(-1), "1970-01-01T00:00:00.000000000Z");
+    }
+
+    #[test]
+    fn credential_debug_never_prints_the_secret() {
+        let bearer = Credential::Bearer("super-secret-token".to_string());
+        let rendered = format!("{bearer:?}");
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "the bearer token must not appear in Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+
+        let basic = Credential::Basic {
+            user: "alice".to_string(),
+            pass: "hunter2".to_string(),
+        };
+        let rendered = format!("{basic:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the password must not appear in Debug: {rendered}"
+        );
+        // The username is not a secret and stays visible for diagnosis.
+        assert!(rendered.contains("alice"), "{rendered}");
+
+        // The sink's own derived Debug goes through the redacting one.
+        let sink = AlertSink::webhook("http://x").with_credential(basic);
+        let rendered = format!("{sink:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+    }
+
+    #[test]
+    fn credential_serialize_omits_the_secret() {
+        let bearer =
+            serde_json::to_value(Credential::Bearer("tok".to_string())).expect("serialize");
+        assert_eq!(bearer, serde_json::json!({ "scheme": "bearer" }));
+
+        let basic = serde_json::to_value(Credential::Basic {
+            user: "alice".to_string(),
+            pass: "hunter2".to_string(),
+        })
+        .expect("serialize");
+        assert_eq!(
+            basic,
+            serde_json::json!({ "scheme": "basic", "user": "alice" })
+        );
+        // Belt and braces: the password text is nowhere in the serialized form.
+        assert!(
+            !serde_json::to_string(&basic)
+                .expect("string")
+                .contains("hunter2")
+        );
+    }
+
+    #[test]
+    fn with_credential_attaches_to_either_variant() {
+        let webhook =
+            AlertSink::webhook("http://x").with_credential(Credential::Bearer("t".into()));
+        assert_eq!(
+            webhook.credential(),
+            Some(&Credential::Bearer("t".to_string()))
+        );
+        let am = AlertSink::alertmanager("http://am:9093")
+            .with_credential(Credential::Bearer("t".into()));
+        assert_eq!(am.credential(), Some(&Credential::Bearer("t".to_string())));
+        // The plain constructors stay unauthenticated.
+        assert_eq!(AlertSink::webhook("http://x").credential(), None);
     }
 }
