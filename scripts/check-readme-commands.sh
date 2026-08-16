@@ -58,11 +58,28 @@ READINESS_POLL_SECONDS=${RAVEL_READINESS_POLL_SECONDS:-2}
 # Per-request bounds (ADR-0081 D5: a bounded poll, not just a bounded loop). A
 # server that accepts a connection and never responds must not hang a single
 # request past these, so the overall READINESS_TIMEOUT_SECONDS budget stays the
-# real ceiling. These apply to every curl this script issues, including the ones
-# that run marked README blocks: a hung server otherwise hangs the whole CI job,
-# not just the readiness phase. Timing out is a failure, never a pass.
+# real ceiling. These reach the readiness curls (issued directly here) and every
+# curl invocation the shim fronts while a marked block runs, because the shim
+# injects them as argv. They do NOT reach a block that never resolves to the
+# shim: a first token that is not the literal `curl` (`env curl ...`,
+# `RAVEL_TOKEN=demo curl ...`, `/usr/bin/curl ...`, a leading comment) runs a
+# bare curl with no --max-time. BLOCK_TIMEOUT_SECONDS below is the bound that
+# covers those, so a hung request in any block shape still fails the job rather
+# than hanging it. Timing out is a failure, never a pass.
 CONNECT_TIMEOUT_SECONDS=${RAVEL_CONNECT_TIMEOUT_SECONDS:-5}
 REQUEST_TIMEOUT_SECONDS=${RAVEL_REQUEST_TIMEOUT_SECONDS:-10}
+
+# Wall-clock ceiling for one marked block, enforced with `timeout` regardless of
+# the block's text: the per-request bounds above only reach curls the shim
+# fronts, so a block whose first token is not `curl` (and therefore bypasses the
+# shim) would otherwise run an unbounded bare curl and hang the whole CI job. It
+# must exceed the sum of per-request budgets a legitimate block can incur (a
+# handful of sequential requests, each up to REQUEST_TIMEOUT_SECONDS); the
+# default leaves generous headroom over that. Hitting it is a hard failure that
+# names the block, never a pass. `-k` escalates to SIGKILL if the block ignores
+# SIGTERM, so a `trap '' TERM` in README text cannot outlast the bound.
+BLOCK_TIMEOUT_SECONDS=${RAVEL_BLOCK_TIMEOUT_SECONDS:-90}
+BLOCK_TIMEOUT_KILL_SECONDS=${RAVEL_BLOCK_TIMEOUT_KILL_SECONDS:-5}
 
 # Real curl path and the on-PATH shim dir that fronts it while a marked block
 # runs. Resolved once, before any shim is on PATH. See setup_curl_shim.
@@ -139,6 +156,14 @@ wait_for_ready() {
 # the pipeline; the shim still runs and still writes the status file). A 000
 # code (connection refused, or a --max-time timeout with no response) is written
 # as-is, so a timeout fails a `status=` assertion rather than passing it.
+#
+# A block may issue MORE THAN ONE request (the README's ingest-then-query
+# shape). One truncating status slot would keep only the last request's status,
+# so a failing ingest followed by a healthy query would look healthy. The shim
+# therefore APPENDS one status line per invocation to RAVEL_STATUS_FILE and one
+# body-file path per invocation to RAVEL_BODY_INDEX, both in execution order, so
+# run_one_command sees every request. Each body is kept in RAVEL_CAPTURE_DIR (not
+# deleted here) for the driver to evaluate and reap.
 setup_curl_shim() {
   [[ -n $CURL_SHIM_DIR ]] && return 0
   if [[ -z $REAL_CURL ]]; then
@@ -151,7 +176,7 @@ setup_curl_shim() {
 # On-PATH shim for scripts/check-readme-commands.sh. Injects request timeouts
 # and captures the HTTP status out of band into RAVEL_STATUS_FILE.
 set -uo pipefail
-body=$(mktemp)
+body=$(mktemp "$RAVEL_CAPTURE_DIR/body.XXXXXX")
 code=$("$RAVEL_REAL_CURL" \
   --silent \
   --connect-timeout "$RAVEL_CURL_CONNECT_TIMEOUT_SECONDS" \
@@ -160,9 +185,11 @@ code=$("$RAVEL_REAL_CURL" \
   --write-out '%{http_code}' \
   "$@")
 rc=$?
-printf '%s' "$code" >"$RAVEL_STATUS_FILE"
+# Append (not overwrite): a block may make several requests, and every one must
+# be accounted for. One status line and one body-file path per invocation.
+printf '%s\n' "$code" >>"$RAVEL_STATUS_FILE"
+printf '%s\n' "$body" >>"$RAVEL_BODY_INDEX"
 cat "$body"
-rm -f "$body"
 exit "$rc"
 SHIM
   chmod +x "$CURL_SHIM_DIR/curl"
@@ -171,12 +198,44 @@ SHIM
 }
 
 # --- Running one command --------------------------------------------------
-# Runs `cmd`, writes its stdout to `body_file`, and prints two space-separated
-# tokens on one line: the captured HTTP status (or "none") and the command's
-# own exit code. A curl command runs with the shim on PATH so the HTTP status is
-# captured out of band even when curl exits 0 on a 4xx/5xx. If the status cannot
-# be determined, "none" is reported and a `status=` assertion fails on it, never
-# passes.
+# Reduce the per-request statuses a block captured to a single token for the
+# `status=` assertion. Reads one code per line (execution order) from
+# `status_file` and prints:
+#   "none"      no request was captured (a shim-bypassed or non-curl block)
+#   "mismatch"  the block's requests returned two or more DIFFERENT codes, so a
+#               single `status=` cannot map to them: fail closed, never guess
+#   <code>      every request returned this one code; the assertion applies to
+#               all of them, not to whichever ran last
+resolve_block_status() {
+  local status_file=$1
+  local -a codes=()
+  mapfile -t codes <"$status_file"
+  if (( ${#codes[@]} == 0 )); then
+    printf 'none'
+    return 0
+  fi
+  local first=${codes[0]}
+  local c
+  for c in "${codes[@]}"; do
+    if [[ $c != "$first" ]]; then
+      printf 'mismatch'
+      return 0
+    fi
+  done
+  printf '%s' "$first"
+}
+
+# Runs `cmd`, writes the body to evaluate into `body_file`, and prints two
+# space-separated tokens on one line: the block's status token (see
+# resolve_block_status, or "timeout") and the command's own exit code. A curl
+# command runs with the shim on PATH so every request's HTTP status is captured
+# out of band even when curl exits 0 on a 4xx/5xx. When the shim fronted at least
+# one request, `body_file` is overwritten with the LAST request's body, so a
+# `json:`/`nonempty:` assertion evaluates one coherent response rather than the
+# concatenation of every request's output (which let an empty 401 body followed
+# by a valid 200 envelope satisfy the check vacuously). Every block, whatever its
+# text, runs under a BLOCK_TIMEOUT_SECONDS wall-clock bound; a block that exceeds
+# it reports "timeout" and fails.
 run_one_command() {
   local cmd=$1
   local body_file=$2
@@ -185,23 +244,39 @@ run_one_command() {
 
   if [[ $cmd == curl* ]]; then
     setup_curl_shim
-    local status_file
-    status_file=$(mktemp)
+    local cap_dir
+    cap_dir=$(mktemp -d)
+    local status_file="$cap_dir/status"
+    local body_index="$cap_dir/bodyindex"
     : >"$status_file"
+    : >"$body_index"
     PATH="$CURL_SHIM_DIR:$PATH" \
       RAVEL_REAL_CURL="$REAL_CURL" \
       RAVEL_STATUS_FILE="$status_file" \
+      RAVEL_BODY_INDEX="$body_index" \
+      RAVEL_CAPTURE_DIR="$cap_dir" \
       RAVEL_CURL_CONNECT_TIMEOUT_SECONDS="$CONNECT_TIMEOUT_SECONDS" \
       RAVEL_CURL_MAX_TIME_SECONDS="$REQUEST_TIMEOUT_SECONDS" \
+      timeout -k "$BLOCK_TIMEOUT_KILL_SECONDS" "$BLOCK_TIMEOUT_SECONDS" \
       bash -c "$cmd" >"$body_file" 2>/dev/null || run_code=$?
-    local code_read
-    code_read=$(cat "$status_file")
-    rm -f "$status_file"
-    if [[ -n $code_read ]]; then
-      captured=$code_read
+    if [[ $run_code -eq 124 || $run_code -eq 137 ]]; then
+      captured="timeout"
+    else
+      captured=$(resolve_block_status "$status_file")
+      # Evaluate the last request's body, not the concatenated block stdout.
+      local -a body_paths=()
+      mapfile -t body_paths <"$body_index"
+      if (( ${#body_paths[@]} > 0 )); then
+        cp "${body_paths[-1]}" "$body_file"
+      fi
     fi
+    rm -rf "$cap_dir"
   else
-    bash -c "$cmd" >"$body_file" 2>/dev/null || run_code=$?
+    timeout -k "$BLOCK_TIMEOUT_KILL_SECONDS" "$BLOCK_TIMEOUT_SECONDS" \
+      bash -c "$cmd" >"$body_file" 2>/dev/null || run_code=$?
+    if [[ $run_code -eq 124 || $run_code -eq 137 ]]; then
+      captured="timeout"
+    fi
   fi
   printf '%s %s' "$captured" "$run_code"
 }
@@ -245,6 +320,23 @@ run_blocks() {
     http_status=${run_out%% *}
     run_code=${run_out##* }
     echo "exit=${run_code} http=${http_status}"
+
+    # Fail closed BEFORE evaluation on the two shapes the evaluator cannot judge:
+    # a block that outran its wall-clock bound, and a block whose requests
+    # returned differing statuses (a single `status=` cannot map to N requests,
+    # and a body-only marker would otherwise pass on the last request while an
+    # earlier one had already failed).
+    if [[ $http_status == "timeout" ]]; then
+      rm -f "$body_file"
+      echo "FAIL: block at ${md}:${line_no} exceeded the ${BLOCK_TIMEOUT_SECONDS}s wall-clock bound" >&2
+      return 1
+    fi
+    if [[ $http_status == "mismatch" ]]; then
+      rm -f "$body_file"
+      echo "FAIL: block at ${md}:${line_no} issued requests with differing HTTP statuses;" \
+           "a single status= cannot map to them (fail closed, not a guess)" >&2
+      return 1
+    fi
 
     local eval_rc=0
     python3 "$py_module" evaluate "$exp_raw" \
