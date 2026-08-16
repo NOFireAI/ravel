@@ -337,6 +337,29 @@
                     },
                     "type": "object"
                   },
+                  "shardOverrides": {
+                    "description": "Per-tenant shard-count overrides (#147, ADR-0076 decision 2): the\nprimary operator-facing cost control, wired to the already-shipped\nADR-0052 online-resharding mechanism. Distinct from the immutable,\ncluster-wide `shards` field above: this drives a durable\n`append_generation` call per named tenant, never a Deployment\n`--shards` flag, and does not relax `shards`'s own CEL immutability\nrule (see [`ravel_cluster_crd`]).",
+                    "nullable": true,
+                    "properties": {
+                      "leadHours": {
+                        "default": 2,
+                        "description": "Hours of lead time before the new count activates, passed to\n`append_generation` as `activation_hour = now_hour + leadHours`.\nEnforced to be at least [`MIN_RESHARD_LEAD_HOURS`] -- the same bound\n`ravel-cli provision reshard` enforces (`services/ravel-cli/src/\nprovision.rs`) -- rejected outright rather than silently clamped up,\nsince a shorter lead could let a live writer route past the\nactivation on a view it had not yet refreshed.",
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "tenants": {
+                        "additionalProperties": {
+                          "format": "uint32",
+                          "minimum": 0.0,
+                          "type": "integer"
+                        },
+                        "description": "Per-tenant shard-count targets: tenant name to desired shard count.\nApplied independently to every ingested signal (metrics, logs, spans).\nA tenant absent here keeps whatever count its provisioning record (or,\nabsent one, the cluster's day-one `spec.shards`) already has.",
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "shards": {
                     "description": "Shard count, rendered into `--shards` for gateway, query, and maintain\nalike so the must-match invariant is unrepresentable to break\n(ADR-0034 decision 2). Immutable after creation, enforced by a CEL\ntransition rule on this field's schema (see [`ravel_cluster_crd`]).",
                     "format": "uint32",
@@ -344,7 +367,7 @@
                     "type": "integer",
                     "x-kubernetes-validations": [
                       {
-                        "message": "shards is immutable after creation; resharding is out of scope (ADR-0034)",
+                        "message": "shards is immutable after creation; use spec.shardOverrides for per-tenant resharding (ADR-0052)",
                         "rule": "self == oldSelf"
                       }
                     ]
