@@ -45,7 +45,7 @@ use ravel_proto::commit::v1::CommitRecord;
 use ravel_types::logstream::{AttrValue, LogStreamId};
 use ravel_types::{CommitToken, Signal, TenantId};
 
-use crate::log_router::LogIndexedFields;
+use crate::indexed_fields::IndexedFieldsOverlay;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Duration;
@@ -190,8 +190,10 @@ struct LogFlushCtx {
     config: IngestConfig,
     metrics: Arc<LogIngestMetrics>,
     /// Resolves each tenant's POSTINGS indexed-field list at flush time
-    /// (ADR-0049 decision 3). Shared across shards.
-    indexed_fields: Arc<dyn LogIndexedFields>,
+    /// (ADR-0049 decision 3), now via the durable-override cache-aside overlay
+    /// (ADR-0079). Shared across shards by `Arc`; its per-tenant cache is the
+    /// one place a tenant's `TenantConfig.indexed_fields` override is read.
+    indexed_fields: Arc<IndexedFieldsOverlay>,
 }
 
 /// One log flush's identity and payload, pinned by the actor before the flush
@@ -269,7 +271,32 @@ impl LogFlushCtx {
         // Resolve this tenant's POSTINGS indexed-field list (ADR-0049 decision
         // 3) once per object and hand it to the writer. An empty list leaves the
         // object without a POSTINGS section, which is always legal (decision 5).
-        let indexed_fields = self.indexed_fields.fields_for(&tenant_hash);
+        //
+        // Cache-aside over the durable per-tenant override (ADR-0079), the same
+        // two-step dance `log_router.rs::active_set` uses: a sync fast path on a
+        // fresh cached entry, else an async single-GET refresh installed and
+        // proceeded on. `now_ns` is the flush's own pinned `flush_open_ns`
+        // (log_shard.rs's pinned-identity contract forbids re-reading the clock
+        // in `run_flush`), which also keeps the cache deterministic under test.
+        // A stale-cache/failed-read/validation fallback is degraded, never fatal:
+        // it counts the visibility metric and proceeds on the last-known-good or
+        // CLI-only list, never failing the flush closed (ADR-0079 Safety).
+        let indexed_fields = match self
+            .indexed_fields
+            .fields_for_cached(&tenant_hash, flush_open_ns)
+        {
+            Some(fields) => fields,
+            None => {
+                let outcome = self
+                    .indexed_fields
+                    .refresh(self.store.as_ref(), &tenant_hash, flush_open_ns)
+                    .await;
+                if outcome.is_fallback() {
+                    self.metrics.record_indexed_fields_stale_fallback();
+                }
+                outcome.into_fields()
+            }
+        };
         let mut writer =
             RlogWriter::new(RlogConfig::default(), identity).with_indexed_fields(indexed_fields);
         for rec in records {
@@ -574,7 +601,7 @@ impl LogShardActor {
         config: IngestConfig,
         metrics: Arc<LogIngestMetrics>,
         rx: mpsc::Receiver<LogShardMsg>,
-        indexed_fields: Arc<dyn LogIndexedFields>,
+        indexed_fields: Arc<IndexedFieldsOverlay>,
     ) -> Self {
         let ctx = Arc::new(LogFlushCtx {
             shard,
@@ -999,7 +1026,9 @@ mod tests {
                 config,
                 Arc::clone(&metrics),
                 rx,
-                Arc::new(crate::log_router::NoIndexedFields),
+                Arc::new(IndexedFieldsOverlay::new(Arc::new(
+                    crate::log_router::NoIndexedFields,
+                ))),
             );
             let task = tokio::spawn(actor.run());
             Harness {
@@ -1646,7 +1675,9 @@ mod tests {
             exhaustion_config(4),
             Arc::clone(&metrics),
             rx,
-            Arc::new(crate::log_router::NoIndexedFields),
+            Arc::new(IndexedFieldsOverlay::new(Arc::new(
+                crate::log_router::NoIndexedFields,
+            ))),
         );
         let task = tokio::spawn(actor.run());
 
@@ -1758,5 +1789,145 @@ mod tests {
             "seq1's record resolves to its own body"
         );
         h.shutdown().await;
+    }
+
+    /// A log record on a fixed stream carrying one per-record attribute, so a
+    /// durable indexed-field override on that attribute has something to index.
+    fn norm_record_with_status(status: &str) -> NormalizedLogRecord {
+        let mut rec = norm_record(&[("service.name", "api")], "scope", 1_000, "x");
+        rec.attrs = vec![(
+            "http.status_code".to_string(),
+            AttrValue::Str(status.to_string()),
+        )];
+        rec
+    }
+
+    /// ADR-0079 acceptance test: a durable `TenantConfig.indexed_fields` override
+    /// genuinely changes what a REAL log flush indexes, driven end to end through
+    /// `LogFlushCtx::run_flush` (not a bare overlay unit test). The overlay's base
+    /// is `NoIndexedFields` (indexes nothing), so any indexing observed comes
+    /// solely from the durable override the overlay read off the store the flush
+    /// path passes it. Then the override is cleared and, once the cache goes stale
+    /// past the horizon, a second real flush reverts to indexing nothing -- a
+    /// no-restart change in both directions.
+    ///
+    /// Observed through the write-side POSTINGS counters, the same "observable
+    /// behaviour changed" signal `postings_config.rs`'s acceptance tests use, and
+    /// templated on `lifecycle.rs`'s
+    /// `refresh_reinvokes_set_tenant_limits_and_admission_behaviour_changes`
+    /// (write override, drive the real refresh, assert live behaviour changed,
+    /// clear it, assert it reverts).
+    ///
+    /// Prove-the-test: stubbing the overlay's durable branch to always resolve the
+    /// base (i.e. ignoring `TenantConfig.indexed_fields`) makes the first
+    /// assertion below fail -- `postings_indexed_fields_total` stays 0 because the
+    /// `NoIndexedFields` base indexes nothing, so the override never took effect.
+    #[tokio::test]
+    async fn durable_indexed_fields_override_changes_a_real_flush_then_reverts() {
+        use ravel_catalog::{TenantConfig, TenantLifecycleState, set_tenant_config};
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("acme");
+
+        // Write the durable override: index `http.status_code`. The overlay's base
+        // is NoIndexedFields, so this is the only thing that can index anything.
+        set_tenant_config(
+            store.as_ref(),
+            &tenant.hash(),
+            &TenantConfig {
+                indexed_fields: Some(vec!["http.status_code".to_string()]),
+                ..TenantConfig::new(TenantLifecycleState::Active)
+            },
+            1,
+        )
+        .await
+        .expect("write durable override");
+
+        let h = Harness::spawn_with_store(flush_on_first(), Arc::clone(&store));
+
+        // First real flush: the override applies, so the object carries a POSTINGS
+        // section indexing exactly the one overridden field.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: tenant.clone(),
+            records: vec![
+                norm_record_with_status("200"),
+                norm_record_with_status("500"),
+            ],
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send first write");
+        ack_rx.await.expect("ack").expect("first flush commits");
+
+        let snap = h.metrics.snapshot();
+        assert_eq!(
+            snap.postings_objects, 1,
+            "the durable override made the first flush index a field, so the object \
+             carries a POSTINGS section"
+        );
+        assert_eq!(
+            snap.postings_indexed_fields_total, 1,
+            "exactly the one overridden field (http.status_code) is indexed"
+        );
+        assert_eq!(
+            snap.indexed_fields_stale_fallbacks, 0,
+            "a healthy store resolves the override from a fresh durable read, not a fallback"
+        );
+
+        // Clear the override (no per-tenant indexed-field record => the base
+        // NoIndexedFields governs again).
+        set_tenant_config(
+            store.as_ref(),
+            &tenant.hash(),
+            &TenantConfig::new(TenantLifecycleState::Active),
+            2,
+        )
+        .await
+        .expect("clear durable override");
+
+        // Age the overlay's cached entry past the staleness horizon so the next
+        // flush re-reads the (now cleared) durable config rather than serving the
+        // still-fresh cached override.
+        h.clock
+            .advance_ns(ravel_ingest_default_lifecycle_horizon_ns().saturating_add(1_000_000_000));
+
+        // Second real flush: the override is gone, so the object indexes nothing
+        // and the POSTINGS counters do not move.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::Write {
+            tenant: tenant.clone(),
+            records: vec![norm_record_with_status("200")],
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send second write");
+        ack_rx.await.expect("ack").expect("second flush commits");
+
+        let snap = h.metrics.snapshot();
+        assert_eq!(
+            snap.postings_objects, 1,
+            "clearing the override reverts to indexing nothing: the second object \
+             carries no POSTINGS section, so the object count does not move"
+        );
+        assert_eq!(
+            snap.postings_indexed_fields_total, 1,
+            "the second flush indexed no field, so the cumulative indexed-fields \
+             count stays at the first flush's 1"
+        );
+        assert_eq!(
+            snap.indexed_fields_stale_fallbacks, 0,
+            "both re-reads succeeded against a healthy store; nothing fell back"
+        );
+        h.shutdown().await;
+    }
+
+    /// The staleness horizon the overlay uses by default, restated here so the
+    /// acceptance test can age the cache past it without depending on the private
+    /// constant. Kept in sync with `IndexedFieldsOverlay::new`'s horizon.
+    fn ravel_ingest_default_lifecycle_horizon_ns() -> i64 {
+        crate::DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS
     }
 }
