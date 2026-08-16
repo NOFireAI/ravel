@@ -49,12 +49,14 @@ mod tests;
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 
 use crate::config::{KeyConfig, RouterConfig};
 
 /// Wire the watcher, resolver, selector, and HTTP proxy into one running
-/// process and serve until the listener closes (deliverable 6).
+/// process and serve until the listener closes, or exit with an error if the
+/// EndpointSlice watcher task returns or panics (deliverable 6).
 ///
 /// The stages are wired through [`router::RouterState::resolve_and_select`], the
 /// same boundary a unit test drives directly, so "reachable" here means the real
@@ -72,7 +74,7 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
     let api: kube::Api<EndpointSlice> =
         kube::Api::namespaced(client, &config.gateway_service_namespace);
     let watch_config = watch::watch_config(&config.gateway_service_name);
-    tokio::spawn(watch::run(api, watch_config, store.clone()));
+    let watch_handle = tokio::spawn(watch::run(api, watch_config, store.clone()));
 
     // Key resolution (deliverable 3). Resolver wiring is built only for the
     // canonical-tenant key source.
@@ -108,7 +110,28 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(config.listen_http).await?;
     tracing::info!(addr = %config.listen_http, "ravel-ingest-router listening");
-    axum::serve(listener, proxy::build_app(state)).await?;
+
+    // The watcher normally never returns (kube_runtime::watcher turns errors
+    // into stream items and retries with backoff internally, per watch::run's
+    // own doc comment). If its task does return or panic, the process must not
+    // keep serving on an endpoint snapshot that will never update again: a
+    // silently-dead watcher would route tenant ingest to an increasingly stale
+    // (and, after enough pod churn, wrong) set of addresses while /readyz kept
+    // reporting healthy. Race it against the HTTP server and exit on either.
+    tokio::select! {
+        result = axum::serve(listener, proxy::build_app(state)) => {
+            result?;
+        }
+        watch_result = watch_handle => {
+            match watch_result {
+                Ok(()) => anyhow::bail!("endpointslice watcher task ended unexpectedly"),
+                Err(join_error) => {
+                    return Err(anyhow::Error::from(join_error))
+                        .context("endpointslice watcher task panicked");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
