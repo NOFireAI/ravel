@@ -5,9 +5,10 @@
 # spec, so no mode is baked in here. ravel-cli ships in the same image for
 # one-shot maintain and inspection use.
 #
-# This Dockerfile has two final runtime targets: `server` (ravel-server plus
-# ravel-cli) and `operator` (the Kubernetes operator). Stages are named so
-# `--target server` or `--target operator` builds only that one image.
+# This Dockerfile has three final runtime targets: `server` (ravel-server plus
+# ravel-cli), `operator` (the Kubernetes operator), and `ingest-router` (the
+# ingest fan-out router). Stages are named so `--target server`,
+# `--target operator`, or `--target ingest-router` builds only that one image.
 
 # ---- Builder ----------------------------------------------------------------
 # Pinned to the workspace toolchain (rust-toolchain.toml channel = 1.97.1) so
@@ -45,7 +46,8 @@ COPY . .
 ENV CARGO_BUILD_JOBS=2
 RUN cargo build --release --locked -p ravel-server --features sql \
     && cargo build --release --locked -p ravel-cli \
-    && cargo build --release --locked -p ravel-operator
+    && cargo build --release --locked -p ravel-operator \
+    && cargo build --release --locked -p ravel-ingest-router
 
 # ---- Runtime: server image --------------------------------------------------
 # distroless/cc: glibc (no untested musl), ships ca-certificates for
@@ -86,3 +88,18 @@ COPY --from=builder /app/target/release/ravel-operator /usr/local/bin/ravel-oper
 # CustomResourceDefinition and exits, which is how deploy/k8s/operator/crd.yaml
 # is regenerated.
 ENTRYPOINT ["/usr/local/bin/ravel-operator"]
+
+# ---- Runtime: ingest-router image -------------------------------------------
+# The ingest fan-out router (ADR-0080): same distroless/cc:nonroot base and the
+# same CARGO_BUILD_JOBS=2 builder stage as the server and operator images, so it
+# inherits the OOM fix without a second build configuration.
+# `--target ingest-router` builds only this image.
+FROM gcr.io/distroless/cc-debian12:nonroot AS ingest-router
+
+COPY --from=builder /app/target/release/ravel-ingest-router /usr/local/bin/ravel-ingest-router
+
+# The router watches EndpointSlices via the ambient Kubernetes environment
+# (in-cluster service account or kubeconfig) and reverse-proxies ingest traffic
+# to gateway pods; every listen address and flag is supplied by the operator
+# from the CRD, so no default CMD is baked in.
+ENTRYPOINT ["/usr/local/bin/ravel-ingest-router"]
