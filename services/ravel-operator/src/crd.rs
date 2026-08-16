@@ -98,6 +98,16 @@ pub struct RavelClusterSpec {
     /// only by the maintain tier, so these render onto the maintain Deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionSpec>,
+
+    /// Per-tenant shard-count overrides (#147, ADR-0076 decision 2): the
+    /// primary operator-facing cost control, wired to the already-shipped
+    /// ADR-0052 online-resharding mechanism. Distinct from the immutable,
+    /// cluster-wide `shards` field above: this drives a durable
+    /// `append_generation` call per named tenant, never a Deployment
+    /// `--shards` flag, and does not relax `shards`'s own CEL immutability
+    /// rule (see [`ravel_cluster_crd`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_overrides: Option<ShardOverridesSpec>,
 }
 
 /// Reference to a Secret in the same namespace as the `RavelCluster`.
@@ -453,6 +463,44 @@ pub struct RetentionSpec {
     pub tenants: BTreeMap<String, String>,
 }
 
+/// Per-tenant shard-count overrides (#147, ADR-0076 decision 2), patterned on
+/// [`RetentionSpec`]'s per-tenant map.
+///
+/// Costs an operator takes on by lowering a tenant's count are documented in
+/// `docs/guides/shard-overrides.md` (single-actor throughput ceiling,
+/// shard-0 concentration at one shard, coarser ADR-0065 maintenance units),
+/// not just discovered after the fact.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ShardOverridesSpec {
+    /// Per-tenant shard-count targets: tenant name to desired shard count.
+    /// Applied independently to every ingested signal (metrics, logs, spans).
+    /// A tenant absent here keeps whatever count its provisioning record (or,
+    /// absent one, the cluster's day-one `spec.shards`) already has.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenants: BTreeMap<String, u32>,
+
+    /// Hours of lead time before the new count activates, passed to
+    /// `append_generation` as `activation_hour = now_hour + leadHours`.
+    /// Enforced to be at least [`MIN_RESHARD_LEAD_HOURS`] -- the same bound
+    /// `ravel-cli provision reshard` enforces (`services/ravel-cli/src/
+    /// provision.rs`) -- rejected outright rather than silently clamped up,
+    /// since a shorter lead could let a live writer route past the
+    /// activation on a view it had not yet refreshed.
+    #[serde(default = "default_reshard_lead_hours")]
+    pub lead_hours: u32,
+}
+
+/// Minimum lead hours accepted for a `shardOverrides` reshard, mirroring
+/// `ravel-cli provision reshard`'s own `MIN_LEAD_HOURS`
+/// (`services/ravel-cli/src/provision.rs`): `ceil(C) + 1` with the router's
+/// default 60s refresh interval `C` (ADR-0052 section 3).
+pub const MIN_RESHARD_LEAD_HOURS: u32 = 2;
+
+fn default_reshard_lead_hours() -> u32 {
+    MIN_RESHARD_LEAD_HOURS
+}
+
 /// Container resource requests and limits, mapping onto the Kubernetes
 /// `ResourceRequirements` shape (`cpu`/`memory` quantity strings).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
@@ -560,8 +608,15 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
 }
 
 /// Immutability message surfaced to a user who tries to change `shards`.
-const SHARDS_IMMUTABLE_MESSAGE: &str =
-    "shards is immutable after creation; resharding is out of scope (ADR-0034)";
+///
+/// `shards` itself stays immutable: it renders into every tier's `--shards`
+/// flag (ADR-0034 decision 2), and editing it directly would desync that
+/// must-match invariant across the gateway/query/maintain Deployments. This is
+/// not a claim that resharding at large is out of scope -- ADR-0052 shipped
+/// online resharding, and `spec.shardOverrides` (#147, ADR-0076 decision 2)
+/// reaches it through a distinct field this CEL rule does not touch.
+const SHARDS_IMMUTABLE_MESSAGE: &str = "shards is immutable after creation; use \
+    spec.shardOverrides for per-tenant resharding (ADR-0052)";
 
 /// Attach the `self == oldSelf` CEL transition rule to the `shards` property of
 /// every stored version's schema.
@@ -1050,6 +1105,55 @@ mod tests {
                 serde_json::Value::String(text.to_string())
             );
         }
+    }
+
+    #[test]
+    fn shard_overrides_is_optional_and_lead_hours_defaults_to_the_minimum() {
+        // #147, ADR-0076 decision 2. Absent by default, like retention: an
+        // existing RavelCluster that never heard of shardOverrides
+        // deserializes with None and the reconcile step (controller.rs) does
+        // nothing. Declaring an empty tenants map still surfaces
+        // leadHours == MIN_RESHARD_LEAD_HOURS.
+        let crd = ravel_cluster_crd();
+        let spec_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        assert!(
+            spec_props.contains_key("shardOverrides"),
+            "spec must expose shardOverrides in its schema"
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.shard_overrides, None);
+
+        let mut with_overrides = base;
+        with_overrides["shardOverrides"] = serde_json::json!({
+            "tenants": { "tenant-a": 1 }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(with_overrides).expect("deserialize");
+        let overrides = spec.shard_overrides.expect("shardOverrides present");
+        assert_eq!(overrides.tenants.get("tenant-a"), Some(&1));
+        assert_eq!(
+            overrides.lead_hours, MIN_RESHARD_LEAD_HOURS,
+            "omitting leadHours must default to the minimum, not zero"
+        );
     }
 
     #[test]

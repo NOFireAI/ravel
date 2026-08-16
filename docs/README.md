@@ -58,6 +58,11 @@ Start here to run Ravel, ingest into it, or query it.
   the throughput ceiling it costs, how to size the subset, and what a rolling
   restart or replica loss does. Read this to cut object-storage request cost
   without touching latency or any format.
+- [guides/shard-overrides.md](guides/shard-overrides.md): lowering one
+  tenant's shard count via `spec.shardOverrides` (ADR-0076 decision 2,
+  ADR-0052's online resharding) -- the request-cost savings, the throughput
+  ceiling and shard-0 concentration it costs, and coarser ADR-0065
+  maintenance units. Read this to cut per-tenant object-storage request cost.
 - [guides/disaster-recovery.md](guides/disaster-recovery.md): recovering a
   deployment from object storage alone -- what state is reconstructable, the
   commit-record and catalog rebuild path, and the operator steps. Read this

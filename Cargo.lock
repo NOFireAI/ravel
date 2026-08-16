@@ -4561,6 +4561,7 @@ dependencies = [
  "ravel-catalog",
  "ravel-object-store",
  "ravel-tracing-export",
+ "ravel-types",
  "rustls",
  "schemars",
  "serde",

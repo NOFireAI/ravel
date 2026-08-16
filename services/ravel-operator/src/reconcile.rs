@@ -1081,6 +1081,7 @@ mod tests {
                 default: Some("30d".to_string()),
                 tenants: BTreeMap::from([("acme".to_string(), "7d".to_string())]),
             }),
+            shard_overrides: None,
         }
     }
 
