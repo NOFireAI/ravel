@@ -1,0 +1,47 @@
+# OpenTelemetry Collector config for the container-first quickstart
+# (ADR-0081 decision 3). Scrapes host metrics and exports them to ravel-server
+# over OTLP/HTTP, authenticating with the demo bearer token.
+#
+# SECURITY: `demo-token` is a fixed development credential, matching the
+# `--tenant-token demo-token=demo-tenant` ravel-server runs with in
+# deploy/docker-compose/ravel.yml. It is not a secret and is not for any
+# network-reachable deployment.
+extensions:
+  # Injects `Authorization: Bearer demo-token` on the exporter's requests, the
+  # same tenant credential ravel-server maps to `demo-tenant`.
+  bearertokenauth:
+    scheme: Bearer
+    token: demo-token
+
+receivers:
+  # Only scrapers that read /proc work in a container with no host mounts:
+  # cpu (/proc/stat), load (/proc/loadavg), memory (/proc/meminfo), and
+  # network (/proc/net/dev). disk/filesystem are omitted deliberately; they
+  # need host device mounts the quickstart does not grant.
+  hostmetrics:
+    collection_interval: 10s
+    scrapers:
+      cpu:
+      load:
+      memory:
+      network:
+
+processors:
+  batch:
+
+exporters:
+  # OTLP/HTTP posts to ravel-server's /v1/metrics (the exporter appends the
+  # signal path to this base). Protobuf encoding, which is what
+  # ExportMetricsServiceRequest::decode expects.
+  otlphttp:
+    endpoint: http://ravel-server:4318
+    auth:
+      authenticator: bearertokenauth
+
+service:
+  extensions: [bearertokenauth]
+  pipelines:
+    metrics:
+      receivers: [hostmetrics]
+      processors: [batch]
+      exporters: [otlphttp]

@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test test-python doc-drift build minio minio-down demo kind-up kind-demo kind-down bench audit difftest
+.PHONY: check fmt clippy test test-python doc-drift build minio minio-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest
 
 check: fmt clippy test
 
@@ -37,6 +37,16 @@ minio-down:
 
 demo: build
 	./scripts/demo.sh
+
+# Container-first quickstart (ADR-0081): the whole stack from published images
+# -- MinIO, ravel-server, an OpenTelemetry Collector, and Grafana -- with no
+# cargo build. Override the pinned server image with RAVEL_IMAGE. This is the
+# documented first run; `demo` above stays the from-source contributor path.
+quickstart:
+	docker compose -f deploy/docker-compose/ravel.yml up -d
+
+quickstart-down:
+	docker compose -f deploy/docker-compose/ravel.yml down
 
 # The same ingest/query round trip on a real local Kubernetes cluster, driven
 # by the operator (ADR-0034 decision 6; docs/guides/kubernetes.md). No `build`
