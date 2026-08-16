@@ -27,6 +27,7 @@ expect_used = "warn"
 # wildcards. allow-wildcard-paths is not usable here because these
 # crates are not marked publish = false, so it does not exempt them.
 ravel-types = { path = "crates/ravel-types", version = "0.9.2" }
+ravel-tenant-resolve = { path = "crates/ravel-tenant-resolve", version = "0.9.2" }
 ravel-proto = { path = "crates/ravel-proto", version = "0.9.2" }
 ravel-codec = { path = "crates/ravel-codec", version = "0.9.2" }
 ravel-object-store = { path = "crates/ravel-object-store", version = "0.9.2" }
