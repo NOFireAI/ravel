@@ -83,7 +83,11 @@ impl IdleTenantEvictor for ravel_ingest::IngestRouter {
 
 impl IdleTenantEvictor for ravel_ingest::LogIngestRouter {
     fn evict_idle(&self, now_ns: i64, ttl_ns: i64) -> usize {
+        // The log router owns two re-derivable per-tenant caches: the generation
+        // views (ADR-0052) and the durable-override indexed-field cache
+        // (ADR-0079). Sweep both under the one sweep, summing the evictions.
         self.evict_idle_generation_views(now_ns, ttl_ns)
+            + self.evict_idle_indexed_field_cache(now_ns, ttl_ns)
     }
     fn label(&self) -> &'static str {
         "generation-views-logs"

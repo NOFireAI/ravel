@@ -21,6 +21,7 @@ use crate::budget::{IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
+use crate::indexed_fields::IndexedFieldsOverlay;
 use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
 use crate::log_shard::{LogShardActor, LogShardMsg, est_record_bytes};
@@ -80,6 +81,11 @@ pub struct LogIngestRouter {
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<dyn Clock>,
     metrics: Arc<LogIngestMetrics>,
+    /// The durable-override indexed-field overlay (ADR-0079), shared by `Arc`
+    /// with every shard's flush context (via the [`GenerationSwitch`] factory).
+    /// The router holds its own clone only so the idle-tenant sweep can evict its
+    /// per-tenant cache (ADR-0069 decision 2) alongside the generation views.
+    indexed_fields: Arc<IndexedFieldsOverlay>,
     config: IngestConfig,
     /// Process-wide ingest buffer byte budget (ADR-0069 decision 1), shared by
     /// `Arc` with the metrics and span routers. Defaults to `Unlimited`;
@@ -97,18 +103,25 @@ impl LogIngestRouter {
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self::new_with_indexed_fields(config, store, clock, Arc::new(NoIndexedFields))
+        Self::new_with_indexed_fields(
+            config,
+            store,
+            clock,
+            Arc::new(IndexedFieldsOverlay::new(Arc::new(NoIndexedFields))),
+        )
     }
 
     /// Like [`Self::new`], but every shard resolves each tenant's POSTINGS
     /// indexed-field list through `indexed_fields` at flush time (ADR-0049
-    /// decision 3). This is the production constructor; the server
-    /// passes its per-tenant `IndexedFieldConfig` here.
+    /// decision 3, ADR-0079). This is the production constructor; the server
+    /// wraps its CLI-derived `IndexedFieldConfig` in an [`IndexedFieldsOverlay`]
+    /// (so a durable `TenantConfig.indexed_fields` override is read without a
+    /// restart) and passes it here.
     pub fn new_with_indexed_fields(
         config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<dyn Clock>,
-        indexed_fields: Arc<dyn LogIndexedFields>,
+        indexed_fields: Arc<IndexedFieldsOverlay>,
     ) -> Self {
         let metrics = Arc::new(LogIngestMetrics::default());
         // Production OS-entropy source for writer ids and PUT-retry jitter
@@ -159,6 +172,7 @@ impl LogIngestRouter {
             store,
             clock,
             metrics,
+            indexed_fields,
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
         }
@@ -236,6 +250,15 @@ impl LogIngestRouter {
     /// tenant's next log write.
     pub fn evict_idle_generation_views(&self, now_ns: i64, ttl_ns: i64) -> usize {
         self.switch.evict_idle(now_ns, ttl_ns)
+    }
+
+    /// Evict every idle entry from the durable-override indexed-field cache
+    /// (ADR-0079, wired into the same ADR-0069 decision 2 idle-tenant sweep as
+    /// [`Self::evict_idle_generation_views`]). Returns the number of entries
+    /// dropped; an evicted entry re-derives from `TenantConfig` on the tenant's
+    /// next flush.
+    pub fn evict_idle_indexed_field_cache(&self, now_ns: i64, ttl_ns: i64) -> usize {
+        self.indexed_fields.evict_idle(now_ns, ttl_ns)
     }
 
     /// Groups `records` by `shard_for_log`, sends one `LogShardMsg::Write` per

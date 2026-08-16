@@ -102,6 +102,16 @@ pub struct LogIngestMetrics {
     /// rather than fleet-wide-outed; the log-pipeline counterpart of
     /// `IngestMetrics::grace_extended_stale_flushes`.
     grace_extended_stale_flushes: AtomicU64,
+    /// Flushes whose per-tenant indexed-field list resolved from a stale cached
+    /// value or a failed-re-read/validation fallback rather than a fresh durable
+    /// `TenantConfig` read this tick (ADR-0079 deliverable 6). Degraded, not
+    /// failed: the flush still indexes on the last-known-good or CLI-only list.
+    /// A sustained rise means a tenant's durable override is unreadable or
+    /// malformed and its override is silently not applying -- the exact
+    /// silent-gap class ADR-0079 exists to close, so it must be visible. Mirrors
+    /// `grace_extended_stale_flushes` (a snapshot-only counter, read via
+    /// [`LogIngestMetrics::snapshot`]).
+    indexed_fields_stale_fallbacks: AtomicU64,
     /// Objects flushed carrying a non-empty POSTINGS section (ADR-0049). The denominator for average section bytes per indexed object; an
     /// object whose resolved indexed-field list produced no section is not
     /// counted here.
@@ -154,6 +164,7 @@ pub struct LogIngestMetricsSnapshot {
     pub shard_deaths: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    pub indexed_fields_stale_fallbacks: u64,
     pub postings_objects: u64,
     pub postings_bytes_total: u64,
     pub postings_indexed_fields_total: u64,
@@ -268,6 +279,15 @@ impl LogIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush resolved its indexed-field list from a stale cached value or a
+    /// failed-re-read/validation fallback rather than a fresh durable read
+    /// (ADR-0079 deliverable 6). Called from `run_flush` on the overlay's
+    /// fallback arm, mirroring [`Self::record_grace_extended_stale_flush`].
+    pub(crate) fn record_indexed_fields_stale_fallback(&self) {
+        self.indexed_fields_stale_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Fold one flushed object's write-side POSTINGS counters
     /// ([`ravel_logseg::writer::WriteStats`]) into the cumulative totals
     /// (ADR-0049). An object with no POSTINGS section
@@ -305,6 +325,9 @@ impl LogIngestMetrics {
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            indexed_fields_stale_fallbacks: self
+                .indexed_fields_stale_fallbacks
+                .load(Ordering::Relaxed),
             postings_objects: self.postings_objects.load(Ordering::Relaxed),
             postings_bytes_total: self.postings_bytes_total.load(Ordering::Relaxed),
             postings_indexed_fields_total: self
@@ -395,6 +418,13 @@ mod tests {
             LogIngestMetrics::record_shard_death,
             LogIngestMetricsSnapshot {
                 shard_deaths: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_indexed_fields_stale_fallback,
+            LogIngestMetricsSnapshot {
+                indexed_fields_stale_fallbacks: 1,
                 ..Default::default()
             },
         );
