@@ -51,6 +51,22 @@ pub enum RenderError {
          is not set; set routerImage to the ravel-ingest-router container image"
     )]
     RouterImageMissing,
+
+    /// `key.source: canonicalTenant` is selected but no resolver is configured.
+    /// `ravel-ingest-router`'s own CLI refuses to start with `--key-source
+    /// canonical-tenant` unless at least one resolver flag is set (a
+    /// `--tenant-token`, `--oidc-issuer`/`--oidc-jwks-url`, `--mtls-enabled`, or
+    /// `--dev-insecure-tenant-header`). The only resolver surface this CRD
+    /// exposes today is `tenantTokensSecretRef`, which renders the
+    /// `--tenant-token` flags; with it absent the rendered command line would
+    /// crashloop the router at startup, so the operator renders no router
+    /// objects and surfaces this instead (mirrors [`Self::RouterImageMissing`]).
+    #[error(
+        "gateway.ingestAffinity.key.source is canonicalTenant but no resolver is configured; \
+         set tenantTokensSecretRef so the router renders at least one --tenant-token resolver \
+         (canonical-tenant cannot start with no resolver)"
+    )]
+    CanonicalTenantResolverMissing,
 }
 
 /// HTTP listener port (OTLP/HTTP, query API, and the `/healthz` `/readyz`
@@ -1107,6 +1123,13 @@ fn router_args(
         child_name(instance, "gateway"),
         "--gateway-service-namespace".to_string(),
         namespace.to_string(),
+        // Pin the gateway port explicitly. The gateway Service exposes two named
+        // ports (`http`/4318, `grpc`/4317); an unset `--gateway-port-name` uses
+        // the endpoint's first port, which is not guaranteed to be `http`. The
+        // router only ever proxies HTTP today (see desired_gateway_routes: the
+        // GRPCRoute still targets the gateway Service directly), so pin `http`.
+        "--gateway-port-name".to_string(),
+        "http".to_string(),
         "--subset-size".to_string(),
         affinity.subset_size.to_string(),
         "--key-source".to_string(),
@@ -1159,6 +1182,16 @@ pub fn desired_router_deployment(
     let Some(image) = affinity.router_image.as_ref() else {
         return Err(RenderError::RouterImageMissing);
     };
+    // canonical-tenant needs at least one resolver or the router's own CLI
+    // crashloops at startup. tenantTokensSecretRef is the only resolver surface
+    // this CRD exposes today, so its absence under canonical-tenant is a
+    // render-time rejection, not a rendered Deployment (see
+    // RenderError::CanonicalTenantResolverMissing).
+    if affinity.key.source == AffinityKeySource::CanonicalTenant
+        && spec.tenant_tokens_secret_ref.is_none()
+    {
+        return Err(RenderError::CanonicalTenantResolverMissing);
+    }
     let args = router_args(affinity, instance, namespace, spec, ctx);
     let env = if affinity.key.source == AffinityKeySource::CanonicalTenant {
         tenant_token_env(spec, ctx)
@@ -1450,25 +1483,28 @@ pub fn desired_gateway_routes(
     else {
         return (None, None);
     };
-    // Backend-aware backendRef (ADR-0080 decision 3, deliverable 4). Under
-    // `backend: ravelNative` the routes point at the router's Service so ingest
-    // traffic is subset-pinned; for every other CR (affinity absent, disabled,
-    // or ingressNginx) they keep targeting the gateway Service exactly as
-    // before -- zero behavior change. The router listens HTTP-only on
-    // ROUTER_HTTP_PORT today; the GRPCRoute still targets the router by name (so
-    // gRPC traffic does not silently bypass affinity by hitting the gateway
-    // directly), but at the router's HTTP port until #184 adds the router's gRPC
-    // listener and a dedicated port -- a documented follow-up.
-    let (http_backend, http_port, grpc_backend, grpc_port) = match ravel_native_affinity(spec) {
-        Some(_) => {
-            let router = child_name(instance, ROUTER_COMPONENT);
-            (router.clone(), ROUTER_HTTP_PORT, router, ROUTER_HTTP_PORT)
-        }
-        None => {
-            let gateway = child_name(instance, "gateway");
-            (gateway.clone(), HTTP_PORT, gateway, GRPC_PORT)
-        }
+    let gateway = child_name(instance, "gateway");
+    // HTTPRoute backendRef (ADR-0080 decision 3, deliverable 4): under
+    // `backend: ravelNative` the HTTP route points at the router's Service so
+    // OTLP/HTTP ingest is subset-pinned; for every other CR (affinity absent,
+    // disabled, or ingressNginx) it keeps targeting the gateway Service exactly
+    // as before -- zero behavior change.
+    let (http_backend, http_port) = match ravel_native_affinity(spec) {
+        Some(_) => (child_name(instance, ROUTER_COMPONENT), ROUTER_HTTP_PORT),
+        None => (gateway.clone(), HTTP_PORT),
     };
+    // GRPCRoute backendRef ALWAYS targets the gateway Service, regardless of
+    // backend. The router deliberately renders an HTTP-only Deployment today
+    // (one container port, no --listen-grpc): #184 has since added a
+    // --listen-grpc flag, but ravel-ingest-router's EndpointStore holds a single
+    // `port_name` per snapshot, shared by the HTTP and gRPC listeners in the
+    // same process, so one router Deployment cannot proxy HTTP to the gateway's
+    // `http` port and gRPC to its `grpc` port at once. Wiring gRPC through the
+    // router (two Deployments pinned to different --gateway-port-name, or a
+    // per-listener port surface in ravel-ingest-router) is a follow-up, not a
+    // gap here; until then the GRPCRoute must keep hitting the gateway Service
+    // directly so gRPC ingest keeps working exactly as it does on main.
+    let (grpc_backend, grpc_port) = (gateway, GRPC_PORT);
     let httproute = gateway_route(
         instance,
         GATEWAY_HTTPROUTE_COMPONENT,
@@ -1521,6 +1557,18 @@ pub struct DesiredObjects {
     pub router_role: Option<Role>,
     /// The router's namespaced RoleBinding.
     pub router_role_binding: Option<RoleBinding>,
+    /// A render error from the router path (a missing `routerImage`, or
+    /// `canonicalTenant` with no resolver), or `None` when the router rendered
+    /// cleanly or was not requested.
+    ///
+    /// Captured here rather than propagated out of [`desired_objects`] so a
+    /// misconfigured router degrades ONLY the router: when this is `Some`, every
+    /// `router_*` field above is `None` (render nothing for the router), the
+    /// controller records a `Degraded` condition, and every other tier
+    /// (gateway/query/maintain) still reconciles. Propagating it instead would
+    /// abort the whole reconcile (ADR-0080 decision 3; crd.rs documents "renders
+    /// no router objects" when misconfigured, i.e. everything else still runs).
+    pub router_render_error: Option<RenderError>,
     /// The query Deployment.
     pub query_deployment: Deployment,
     /// The query Service.
@@ -1532,26 +1580,52 @@ pub struct DesiredObjects {
 
 /// Render every Kubernetes object a `RavelCluster` reconcile applies.
 ///
-/// Fallible because the ravel-native router cannot be rendered without a
-/// `routerImage` (ADR-0080 decision 3, deliverable 1): a misconfigured CR yields
-/// [`RenderError::RouterImageMissing`], which the controller turns into a
-/// `Degraded` status rather than applying a broken Deployment.
+/// Returns `Result` for forward compatibility with a render error that must
+/// fail the whole reconcile, but is infallible today: the one render error that
+/// currently exists (the ravel-native router's, ADR-0080 decision 3) is
+/// captured in [`DesiredObjects::router_render_error`] rather than propagated,
+/// so a misconfigured router degrades only the router and every other tier
+/// still reconciles. The controller turns a captured router error into a
+/// `Degraded` condition rather than applying a broken Deployment.
 pub fn desired_objects(
     spec: &RavelClusterSpec,
     instance: &str,
     namespace: &str,
     ctx: &RenderCtx,
 ) -> Result<DesiredObjects, RenderError> {
+    // Capture the router render result instead of `?`-propagating it: a router
+    // misconfiguration must not abort the gateway/query/maintain tiers below.
+    // On error, render none of the router objects (all `None`) and surface the
+    // error for the controller to degrade the router alone.
+    let (
+        router_deployment,
+        router_service,
+        router_service_account,
+        router_role,
+        router_role_binding,
+        router_render_error,
+    ) = match desired_router_deployment(spec, instance, namespace, ctx) {
+        Ok(deployment) => (
+            deployment,
+            desired_router_service(spec, instance),
+            desired_router_service_account(spec, instance),
+            desired_router_role(spec, instance),
+            desired_router_role_binding(spec, instance, namespace),
+            None,
+        ),
+        Err(err) => (None, None, None, None, None, Some(err)),
+    };
     Ok(DesiredObjects {
         gateway_deployment: desired_gateway_deployment(spec, instance, ctx),
         gateway_service: desired_gateway_service(spec, instance),
         gateway_ingresses: desired_gateway_ingresses(spec, instance),
         gateway_routes: desired_gateway_routes(spec, instance),
-        router_deployment: desired_router_deployment(spec, instance, namespace, ctx)?,
-        router_service: desired_router_service(spec, instance),
-        router_service_account: desired_router_service_account(spec, instance),
-        router_role: desired_router_role(spec, instance),
-        router_role_binding: desired_router_role_binding(spec, instance, namespace),
+        router_deployment,
+        router_service,
+        router_service_account,
+        router_role,
+        router_role_binding,
+        router_render_error,
         query_deployment: desired_query_deployment(spec, instance, ctx),
         query_service: desired_query_service(spec, instance),
         maintain_deployment: desired_maintain_deployment(spec, instance, ctx),
@@ -3267,7 +3341,17 @@ mod tests {
         // #184's crate) becomes a caught test failure here instead of a
         // crashlooping pod. The args are pinned as a full ordered vector, not a
         // contains-check.
-        let spec = ravel_native_spec(3, AffinityKeySource::CanonicalTenant);
+        //
+        // canonical-tenant needs a resolver, so this fixture carries a
+        // tenantTokensSecretRef (a valid, non-crashing config): the router
+        // renders --tenant-token resolver flags, and the frozen vector pins them
+        // too. The render-time rejection of canonical-tenant WITHOUT a resolver
+        // is proven separately in
+        // `canonical_tenant_without_resolver_is_a_typed_error_not_a_panic`.
+        let mut spec = ravel_native_spec(3, AffinityKeySource::CanonicalTenant);
+        spec.tenant_tokens_secret_ref = Some(LocalSecretRef {
+            name: "ravel-tokens".to_string(),
+        });
         let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
         let deployment = objects
             .router_deployment
@@ -3280,12 +3364,20 @@ mod tests {
                 "prod-gateway",
                 "--gateway-service-namespace",
                 "default",
+                "--gateway-port-name",
+                "http",
                 "--subset-size",
                 "3",
                 "--key-source",
                 "canonical-tenant",
                 "--listen-http",
                 "0.0.0.0:8080",
+                // canonical-tenant with a resolver renders the --tenant-token
+                // flags, one per tenant in ctx() order.
+                "--tenant-token",
+                "$(RAVEL_TENANT_TOKEN_0)=acme",
+                "--tenant-token",
+                "$(RAVEL_TENANT_TOKEN_1)=globex",
             ]
         );
 
@@ -3454,26 +3546,130 @@ mod tests {
             desired_router_deployment(&spec, "prod", "default", &ctx()),
             Err(RenderError::RouterImageMissing)
         );
-        // DesiredObjects holds DynamicObjects (no PartialEq), so match the Err
-        // arm rather than comparing the whole Result.
-        assert!(matches!(
-            desired_objects(&spec, "prod", "default", &ctx()),
-            Err(RenderError::RouterImageMissing)
-        ));
+        // desired_objects captures the router error rather than propagating it
+        // (Fix 5): it returns Ok, the router objects are None, and the error is
+        // surfaced in router_render_error for the controller to degrade the
+        // router alone.
+        let objects =
+            desired_objects(&spec, "prod", "default", &ctx()).expect("render never aborts");
+        assert_eq!(
+            objects.router_render_error,
+            Some(RenderError::RouterImageMissing)
+        );
+        assert!(objects.router_deployment.is_none());
+    }
+
+    #[test]
+    fn canonical_tenant_without_resolver_is_a_typed_error_not_a_panic() {
+        // Fix 1 (B1): canonical-tenant with no resolver would render a command
+        // line the router's own CLI rejects at startup (a guaranteed crashloop).
+        // tenantTokensSecretRef is the only resolver surface this CRD exposes
+        // today; absent it, the operator renders no router objects and surfaces a
+        // typed error, never a panic and never a crash-looping Deployment.
+        let spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+        assert!(spec.tenant_tokens_secret_ref.is_none());
+        assert_eq!(
+            desired_router_deployment(&spec, "prod", "default", &ctx()),
+            Err(RenderError::CanonicalTenantResolverMissing)
+        );
+        // Captured, not propagated (Fix 5): every other tier still renders.
+        let objects =
+            desired_objects(&spec, "prod", "default", &ctx()).expect("render never aborts");
+        assert_eq!(
+            objects.router_render_error,
+            Some(RenderError::CanonicalTenantResolverMissing)
+        );
+        assert!(objects.router_deployment.is_none());
+        assert!(objects.router_service.is_none());
+        assert!(objects.router_service_account.is_none());
+        assert!(objects.router_role.is_none());
+        assert!(objects.router_role_binding.is_none());
+
+        // Happy path: the same config WITH a resolver renders a router
+        // Deployment cleanly.
+        let mut ok = spec.clone();
+        ok.tenant_tokens_secret_ref = Some(LocalSecretRef {
+            name: "ravel-tokens".to_string(),
+        });
+        assert!(
+            desired_router_deployment(&ok, "prod", "default", &ctx())
+                .expect("render")
+                .is_some(),
+            "canonical-tenant with a resolver must render a router Deployment"
+        );
+    }
+
+    #[test]
+    fn router_render_failure_still_renders_every_other_tier() {
+        // Fix 5 (non-blocking): a router render error must degrade ONLY the
+        // router, never abort the whole reconcile. desired_objects returns the
+        // gateway/query/maintain tiers as usual for BOTH router render errors,
+        // with zero router objects and the error captured for the controller to
+        // turn into a Degraded condition (see degraded_reason tests in
+        // controller.rs). Proving it at the render layer is the testable proof:
+        // the controller applies exactly desired_objects' contents (no live API
+        // server in this crate's tests, see the module doc).
+        let router_image_missing = {
+            let mut s = base_spec();
+            s.gateway.ingest_affinity = Some(IngestAffinitySpec {
+                backend: AffinityBackend::RavelNative,
+                router_image: None,
+                ..IngestAffinitySpec::default()
+            });
+            s
+        };
+        let canonical_no_resolver = {
+            let mut s = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+            s.tenant_tokens_secret_ref = None;
+            s
+        };
+        for spec in [router_image_missing, canonical_no_resolver] {
+            let objects =
+                desired_objects(&spec, "prod", "default", &ctx()).expect("render never aborts");
+            assert!(
+                objects.router_render_error.is_some(),
+                "the router error is captured, not propagated"
+            );
+            assert!(objects.router_deployment.is_none());
+            assert!(objects.router_service.is_none());
+            assert!(objects.router_service_account.is_none());
+            assert!(objects.router_role.is_none());
+            assert!(objects.router_role_binding.is_none());
+            // Every other tier still renders.
+            assert_eq!(
+                objects.gateway_deployment.metadata.name.as_deref(),
+                Some("prod-gateway"),
+                "gateway still renders when the router render fails"
+            );
+            assert_eq!(
+                objects.query_deployment.metadata.name.as_deref(),
+                Some("prod-query"),
+                "query still renders when the router render fails"
+            );
+            assert!(
+                objects.maintain_deployment.is_some(),
+                "maintain still renders when the router render fails"
+            );
+        }
     }
 
     #[test]
     fn gateway_route_backend_ref_targets_router_service_under_ravel_native() {
-        // ADR-0080 decision 3, deliverable 4. Exposure + ravelNative affinity:
-        // both routes point at the router Service. The same exposure under the
-        // default ingressNginx backend still targets the gateway Service
-        // (regression guard on Wave 2 behavior).
+        // ADR-0080 decision 3, deliverable 4, as corrected by Fix 3 (B3). Under
+        // exposure + ravelNative affinity, ONLY the HTTPRoute switches to the
+        // router Service; the GRPCRoute keeps targeting the gateway Service,
+        // because the router serves HTTP only today (single port_name per
+        // process) and switching gRPC to it would break gRPC ingest that works
+        // now. The same exposure under the default ingressNginx backend still
+        // targets the gateway Service for both (regression guard on Wave 2
+        // behavior).
         let router_gw = GatewayReference {
             name: "public-gw".to_string(),
             namespace: None,
         };
 
-        // ravelNative: backendRefs -> router Service, on the router's HTTP port.
+        // ravelNative: HTTPRoute -> router Service on the router's HTTP port;
+        // GRPCRoute -> STILL the gateway Service on the gateway's gRPC port.
         let mut spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
         spec.gateway.exposure = exposure_with(router_gw.clone(), Vec::new(), true).exposure;
         let (http, grpc) = desired_gateway_routes(&spec, "prod");
@@ -3489,9 +3685,14 @@ mod tests {
         );
         assert_eq!(
             route_spec(&grpc)["rules"][0]["backendRefs"][0]["name"],
-            serde_json::json!("prod-ingest-router"),
-            "GRPCRoute must also target the router by name so gRPC does not \
-             silently bypass affinity by hitting the gateway"
+            serde_json::json!("prod-gateway"),
+            "GRPCRoute must keep targeting the gateway Service: the router serves \
+             HTTP only today, so routing gRPC through it would break gRPC ingest"
+        );
+        assert_eq!(
+            route_spec(&grpc)["rules"][0]["backendRefs"][0]["port"],
+            serde_json::json!(GRPC_PORT),
+            "GRPCRoute must keep the gateway's gRPC port, exactly as on main"
         );
 
         // Default ingressNginx backend + same exposure: still the gateway
@@ -3521,8 +3722,10 @@ mod tests {
         let sweep = possible_router_object_names("prod");
         assert_eq!(sweep, vec!["prod-ingest-router".to_string()]);
 
-        // Active: every router object carries the swept name.
-        let spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+        // Active: every router object carries the swept name. Key source is
+        // authorization-header (needs no resolver) since this test is about
+        // object naming and the sweep, not the key source.
+        let spec = ravel_native_spec(2, AffinityKeySource::AuthorizationHeader);
         let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
         assert_eq!(
             objects
@@ -3543,8 +3746,9 @@ mod tests {
         // Switched back to ingressNginx: nothing rendered under that name, so
         // the sweep (which iterates `possible_router_object_names` and deletes
         // whatever the render omitted) removes every router-owned object. The
-        // key source is reset to a legacy-valid one too, since canonicalTenant +
-        // ingressNginx is a CEL-rejected combination that cannot reach reconcile.
+        // key source stays authorization-header, a legacy-valid source (a
+        // canonicalTenant + ingressNginx combination is CEL-rejected and cannot
+        // reach reconcile).
         let mut switched = spec.clone();
         if let Some(a) = switched.gateway.ingest_affinity.as_mut() {
             a.backend = AffinityBackend::IngressNginx;
