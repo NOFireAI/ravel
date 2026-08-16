@@ -18,12 +18,18 @@
 //! override (`--indexed-field-tenant acme=`).
 //!
 //! Where this list reaches the writer: [`crate::start`] builds one
-//! [`IndexedFieldConfig`] and hands it to the log ingest router, which resolves
-//! `fields_for(tenant_hash)` at flush time and passes the result to
-//! `RlogWriter::with_indexed_fields`. An operator changes the list by editing
-//! `--indexed-field-default` / `--indexed-field-tenant` and restarting, the
-//! same restart-to-change contract every other per-tenant flag has
-//! (`--retention-tenant`, `--tenant-token`).
+//! [`IndexedFieldConfig`] as the CLI-derived base/default, then wraps it in
+//! `ravel_ingest::IndexedFieldsOverlay` (ADR-0079) before handing it to the
+//! log ingest router. The overlay resolves each flush's field list from a
+//! per-tenant cache-aside read of the durable `TenantConfig.indexed_fields`
+//! override, falling back to this base's own `fields_for(tenant_hash)` when
+//! no durable override exists, and passes the result to
+//! `RlogWriter::with_indexed_fields`. Changing the CLI-derived base/default
+//! still requires editing `--indexed-field-default` / `--indexed-field-tenant`
+//! and restarting, the same restart-to-change contract every other
+//! CLI-only per-tenant flag has (`--retention-tenant`, `--tenant-token`);
+//! the durable per-tenant override, once a write path for it exists, is the
+//! no-restart path ADR-0066 decision 6 originally promised.
 
 use std::collections::{HashMap, HashSet};
 
