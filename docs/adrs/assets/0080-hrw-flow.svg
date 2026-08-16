@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 380" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
+    </marker>
+  </defs>
+  <rect width="1020" height="380" fill="#fdfcf8"/>
+  <text x="24" y="34" font-size="20" fill="#1b2230">ravel-affinity: rendezvous (HRW) subset selection</text>
+
+  <!-- tenant key -->
+  <path d="M 30 90 Q 27 87 33 87 L 190 85 Q 197 86 196 93 L 197 148 Q 196 154 190 153 L 34 155 Q 28 154 29 148 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="45" y="112" fill="#31536b">canonical tenant ID</text>
+  <text x="45" y="132" font-size="12" fill="#5b6472">(or legacy key source)</text>
+
+  <!-- ready replicas -->
+  <path d="M 30 230 Q 27 227 33 227 L 190 225 Q 197 226 196 233 L 197 300 Q 196 306 190 305 L 34 307 Q 28 306 29 300 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="45" y="252" fill="#4c6b45">Ready gateway replicas</text>
+  <text x="45" y="272" font-size="12" fill="#5b6472">EndpointSlice watch</text>
+  <text x="45" y="290" font-size="12" fill="#5b6472">keyed by pod UID</text>
+
+  <!-- scoring -->
+  <path d="M 260 150 Q 256 146 264 146 L 440 144 Q 449 145 448 153 L 450 230 Q 449 238 441 237 L 264 239 Q 257 238 258 230 Z" fill="#fff" stroke="#0e7c86" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="278" y="178" fill="#0e7c86">blake3(tenant, replica)</text>
+  <text x="278" y="200" font-size="12" fill="#5b6472">one score per Ready</text>
+  <text x="278" y="218" font-size="12" fill="#5b6472">replica, every instance</text>
+
+  <!-- rank -->
+  <path d="M 500 150 Q 496 146 504 146 L 660 144 Q 668 145 667 153 L 669 230 Q 668 238 660 237 L 504 239 Q 497 238 498 230 Z" fill="#fff" stroke="#0e7c86" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="518" y="178" fill="#0e7c86">rank()</text>
+  <text x="518" y="200" font-size="12" fill="#5b6472">sort by score, full</text>
+  <text x="518" y="218" font-size="12" fill="#5b6472">order, ties by replica id</text>
+
+  <!-- subset top S -->
+  <path d="M 720 150 Q 716 146 724 146 L 860 144 Q 868 145 867 153 L 869 230 Q 868 238 860 237 L 724 239 Q 717 238 718 230 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="736" y="178" fill="#31536b">subset(S)</text>
+  <text x="736" y="200" font-size="12" fill="#5b6472">top S of rank(),</text>
+  <text x="736" y="218" font-size="12" fill="#5b6472">order-independent</text>
+
+  <!-- pick + proxy -->
+  <path d="M 720 260 Q 716 256 724 256 L 950 254 Q 959 255 958 263 L 960 340 Q 959 348 951 347 L 724 349 Q 717 348 718 340 Z" fill="#f5f3ee" stroke="#5b6472" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="738" y="288" fill="#3a3f47">pick one member</text>
+  <text x="738" y="308" font-size="12" fill="#5b6472">round-robin, skip not-Ready,</text>
+  <text x="738" y="326" font-size="12" fill="#5b6472">fall to rank S+1 if needed</text>
+  <text x="738" y="342" font-size="12" fill="#5b6472">-&gt; proxy HTTP/gRPC to pod</text>
+
+  <!-- arrows -->
+  <path d="M 197 130 Q 230 160 258 185" fill="none" stroke="#31536b" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 197 265 Q 230 230 258 200" fill="none" stroke="#4c6b45" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 450 190 Q 475 190 498 190" fill="none" stroke="#0e7c86" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 669 190 Q 695 190 718 190" fill="none" stroke="#0e7c86" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+  <path d="M 800 239 Q 810 248 815 254" fill="none" stroke="#31536b" stroke-width="1.8" marker-end="url(#arr)" stroke-linecap="round"/>
+
+  <text x="30" y="368" font-size="12" fill="#5b6472">Same Ready set -&gt; same result on every routing instance. Adding/removing one replica moves only tenants whose rank crosses position S.</text>
+</svg>

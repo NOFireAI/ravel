@@ -274,36 +274,9 @@ independently testable:
    whichever objects the previous mode created instead of leaving them
    orphaned.
 
-```mermaid
-flowchart TB
-    subgraph CR["RavelCluster spec.gateway"]
-        exposure["exposure.gatewayAPI\n(hostnames, gateway ref)"]
-        affinity["ingestAffinity\n(enabled, subsetSize, key, backend)"]
-    end
+![Exposure and affinity, decoupled: the CR's exposure.gatewayAPI and ingestAffinity fields feed independent rendering paths — standard HTTPRoute/GRPCRoute to a user-provided Gateway, versus legacy Ingress (deprecated) or the new ravel-ingest-router, both of which dial gateway pods directly rather than through the Service VIP.](assets/0080-architecture.svg)
 
-    exposure --> HR["HTTPRoute"]
-    exposure --> GR["GRPCRoute"]
-    HR --> GW["Gateway\n(Envoy Gateway / NGF / Cilium / Istio / managed)"]
-    GR --> GW
-
-    affinity -- "backend: ingressNginx (legacy, deprecated)" --> ING["Ingress x2\n(upstream-hash-by-subset annotations)"]
-    affinity -- "backend: ravelNative" --> RTR["ravel-ingest-router\n(watches EndpointSlices,\nravel-affinity HRW subset)"]
-
-    GW -.->|"backendRef, when ravelNative\n(CEL rule forbids gatewayAPI\nexposure + legacy backend together)"| RTR
-    GW -->|"backendRef, when affinity off"| GWSVC["gateway Service"]
-    GWSVC --> PODS["gateway pod endpoints"]
-    ING -->|"service-upstream: false —\nbalances endpoints directly,\nbypassing the Service VIP"| PODS
-    RTR -->|"dials the chosen pod's\nEndpointSlice address directly\n(never the Service VIP)"| PODS
-```
-
-```mermaid
-flowchart LR
-    T["canonical tenant ID\n(or legacy key source)"] --> H["blake3(tenant_key, replica_id)\nper Ready replica"]
-    R["Ready gateway replicas\n(EndpointSlice watch)"] --> H
-    H --> TOPK["sort by score,\ntake top S"]
-    TOPK --> PICK["pick one member\nfor this request"]
-    PICK --> FWD["proxy HTTP/gRPC"]
-```
+![ravel-affinity's rendezvous (HRW) subset selection: a canonical tenant ID and the Ready replica set both feed a per-pair blake3 score; rank() produces the full deterministic order, subset() takes the top S, and the router picks one member, falling back through the rank order if a subset member isn't Ready.](assets/0080-hrw-flow.svg)
 
 ## Rejected alternatives
 
