@@ -16,6 +16,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::{DeleteParams, Patch, PatchParams};
+use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
 use kube_runtime::watcher;
@@ -32,7 +33,8 @@ use crate::crd::{
 };
 use crate::reconcile::{
     DEPLOYMENT_KEY_SECRET_KEY, RenderCtx, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
-    desired_objects, possible_ingest_ingress_names,
+    desired_objects, grpcroute_api_resource, httproute_api_resource, possible_gateway_route_names,
+    possible_ingest_ingress_names,
 };
 
 /// Server-side-apply field manager name.
@@ -816,6 +818,24 @@ where
     Ok(applied)
 }
 
+/// Server-side-apply a [`DynamicObject`], used for the Gateway API routes
+/// (ADR-0080 decision 2) whose CRD the operator does not own and so cannot model
+/// as a typed [`Resource<DynamicType = ()>`] the generic [`apply`] requires.
+///
+/// The object already carries its `apiVersion`/`kind` in `types` (set by
+/// `DynamicObject::new` from the [`crate::reconcile::httproute_api_resource`] /
+/// [`crate::reconcile::grpcroute_api_resource`] `ApiResource`), so the applied
+/// document is self-describing, as server-side apply requires.
+async fn apply_dynamic(
+    api: &Api<DynamicObject>,
+    name: &str,
+    obj: &DynamicObject,
+) -> Result<(), Error> {
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    api.patch(name, &params, &Patch::Apply(obj)).await?;
+    Ok(())
+}
+
 /// Reconcile one `RavelCluster` to its desired Deployments and Services.
 ///
 /// Wraps [`reconcile_inner`] so that any failure before the success-path status
@@ -986,6 +1006,47 @@ async fn reconcile_inner(
         // Ignore not-found: the Ingress may never have existed, which is the
         // steady state for every cluster that never enables affinity.
         if let Err(err) = ingresses.delete(&name, &DeleteParams::default()).await
+            && !is_not_found(&err)
+        {
+            return Err(err.into());
+        }
+    }
+
+    // Gateway API exposure (ADR-0080 decision 2): apply the HTTPRoute/GRPCRoute
+    // the spec asks for, then delete every route name it does not, mirroring the
+    // Ingress apply-then-sweep above. Separate Api<DynamicObject> clients per
+    // kind because HTTPRoute and GRPCRoute are distinct resource kinds whose CRD
+    // the operator does not own (rendered as DynamicObjects, k8s-openapi does
+    // not vendor the gateway.networking.k8s.io group).
+    let httproutes: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &httproute_api_resource());
+    let grpcroutes: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &grpcroute_api_resource());
+    let (desired_httproute, desired_grpcroute) = desired.gateway_routes;
+    let mut desired_route_names: BTreeSet<String> = BTreeSet::new();
+    for (route, api) in [
+        (desired_httproute, &httproutes),
+        (desired_grpcroute, &grpcroutes),
+    ] {
+        let Some(mut route) = route else { continue };
+        let name = route.name_any();
+        route.metadata.namespace = Some(namespace.to_string());
+        route.metadata.owner_references = owner.clone();
+        apply_dynamic(api, &name, &route).await?;
+        desired_route_names.insert(name);
+    }
+    // possible_gateway_route_names returns [httproute, grpcroute] in a fixed
+    // order, so delete index 0 via the HTTPRoute Api and index 1 via the
+    // GRPCRoute Api. Ignore not-found: a route may never have existed, which is
+    // the steady state for every cluster that never sets exposure.
+    for (name, api) in possible_gateway_route_names(instance)
+        .into_iter()
+        .zip([&httproutes, &grpcroutes])
+    {
+        if desired_route_names.contains(&name) {
+            continue;
+        }
+        if let Err(err) = api.delete(&name, &DeleteParams::default()).await
             && !is_not_found(&err)
         {
             return Err(err.into());

@@ -25,9 +25,10 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 
 use crate::crd::{
-    AffinityKeySource, IngestAffinitySpec, LocalSecretRef, RavelClusterSpec,
+    AffinityKeySource, GatewayReference, IngestAffinitySpec, LocalSecretRef, RavelClusterSpec,
     ResourceRequirementsSpec,
 };
 
@@ -990,6 +991,146 @@ pub fn desired_gateway_ingresses(spec: &RavelClusterSpec, instance: &str) -> Vec
     ingresses
 }
 
+/// Gateway API group for the exposure routes (ADR-0080 decision 2).
+///
+/// `k8s-openapi` does not vendor this CRD group and there is no `gateway-api`
+/// crate in the workspace, so the operator renders `HTTPRoute`/`GRPCRoute` as
+/// [`DynamicObject`]s built from a [`GroupVersionKind`] rather than typed
+/// structs, the standard `kube` approach for a resource kind whose CRD the
+/// operator does not own.
+pub const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
+
+/// Gateway API version the operator targets for the exposure routes.
+pub const GATEWAY_API_VERSION: &str = "v1";
+
+/// Component suffix of the exposure HTTPRoute: `<cluster>-gateway-route`.
+const GATEWAY_HTTPROUTE_COMPONENT: &str = "gateway-route";
+
+/// Component suffix of the exposure GRPCRoute: `<cluster>-gateway-route-grpc`.
+const GATEWAY_GRPCROUTE_COMPONENT: &str = "gateway-route-grpc";
+
+/// The [`ApiResource`] for the exposure `HTTPRoute` kind, with the plural given
+/// explicitly rather than guessed.
+pub fn httproute_api_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk(GATEWAY_API_GROUP, GATEWAY_API_VERSION, "HTTPRoute"),
+        "httproutes",
+    )
+}
+
+/// The [`ApiResource`] for the exposure `GRPCRoute` kind, with the plural given
+/// explicitly rather than guessed.
+pub fn grpcroute_api_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk(GATEWAY_API_GROUP, GATEWAY_API_VERSION, "GRPCRoute"),
+        "grpcroutes",
+    )
+}
+
+/// Every Gateway API route name the exposure render can produce for `instance`,
+/// in a fixed order, whether or not the current spec asks for them.
+///
+/// The controller applies the ones [`desired_gateway_routes`] returns and
+/// deletes every other name in this list, so removing `exposure` (or turning
+/// `grpc` off) converges back to the exposure-absent state instead of leaving an
+/// orphaned route attached to the Gateway.
+pub fn possible_gateway_route_names(instance: &str) -> Vec<String> {
+    vec![
+        child_name(instance, GATEWAY_HTTPROUTE_COMPONENT),
+        child_name(instance, GATEWAY_GRPCROUTE_COMPONENT),
+    ]
+}
+
+/// One Gateway API route ([`DynamicObject`]) attached to `gateway_ref`, backing
+/// onto the gateway Service's `port`.
+///
+/// `parentRefs` carries the referenced `Gateway`'s name, and its namespace only
+/// when explicitly set: an omitted `parentRefs` namespace resolves, per Gateway
+/// API, to the route's own namespace, which the controller renders into the
+/// `RavelCluster`'s namespace -- exactly the "defaults to the CR's own
+/// namespace" contract, without this pure function needing to know the
+/// namespace. `backendRefs` always points at the gateway Service directly (ADR-
+/// 0080 decision 2); pointing it at the ravel-native router's Service under
+/// `backend: RavelNative` is a later task (#158), not anticipated here.
+fn gateway_route(
+    instance: &str,
+    component: &str,
+    api_resource: &ApiResource,
+    port: i32,
+    gateway_ref: &GatewayReference,
+    hostnames: &[String],
+) -> DynamicObject {
+    let mut parent_ref = serde_json::json!({ "name": gateway_ref.name });
+    if let Some(namespace) = gateway_ref.namespace.as_ref() {
+        parent_ref["namespace"] = serde_json::Value::String(namespace.clone());
+    }
+    let mut route_spec = serde_json::json!({
+        "parentRefs": [parent_ref],
+        "rules": [{
+            "backendRefs": [{
+                // The gateway Service, by numeric port: Gateway API backendRefs
+                // reference a port number, not the named port an Ingress uses.
+                "name": child_name(instance, "gateway"),
+                "port": port,
+            }],
+        }],
+    });
+    // Empty hostnames renders no `hostnames`, which matches every hostname the
+    // parent Gateway's listeners accept -- the route-level analogue of the
+    // host-less Ingress rule.
+    if !hostnames.is_empty() {
+        route_spec["hostnames"] = serde_json::json!(hostnames);
+    }
+    let mut route = DynamicObject::new(&child_name(instance, component), api_resource)
+        .data(serde_json::json!({ "spec": route_spec }));
+    // The gateway component labels, matching the Ingress objects, so the
+    // controller's managed-by-scoped watch sees these objects.
+    route.metadata.labels = Some(labels(instance, "gateway"));
+    route
+}
+
+/// The Gateway API exposure routes (ADR-0080 decision 2): `(HTTPRoute, GRPCRoute)`.
+///
+/// Returns `(None, None)` when `gateway.exposure.gatewayApi` is absent, exactly
+/// mirroring [`desired_gateway_ingresses`]'s affinity-absent-renders-nothing
+/// contract. When present, the HTTPRoute is always rendered and the GRPCRoute is
+/// rendered only when `grpc` is true. Exposure is independent of affinity: this
+/// renders whether affinity is absent, disabled, or enabled on
+/// `backend: RavelNative` (the CEL rule rejects the one forbidden combination,
+/// enabled `backend: ingressNginx`, at admission).
+pub fn desired_gateway_routes(
+    spec: &RavelClusterSpec,
+    instance: &str,
+) -> (Option<DynamicObject>, Option<DynamicObject>) {
+    let Some(gateway_api) = spec
+        .gateway
+        .exposure
+        .as_ref()
+        .and_then(|exposure| exposure.gateway_api.as_ref())
+    else {
+        return (None, None);
+    };
+    let httproute = gateway_route(
+        instance,
+        GATEWAY_HTTPROUTE_COMPONENT,
+        &httproute_api_resource(),
+        HTTP_PORT,
+        &gateway_api.gateway_ref,
+        &gateway_api.hostnames,
+    );
+    let grpcroute = gateway_api.grpc.then(|| {
+        gateway_route(
+            instance,
+            GATEWAY_GRPCROUTE_COMPONENT,
+            &grpcroute_api_resource(),
+            GRPC_PORT,
+            &gateway_api.gateway_ref,
+            &gateway_api.hostnames,
+        )
+    });
+    (Some(httproute), grpcroute)
+}
+
 /// Everything one `RavelCluster` reconcile applies, rendered in one place.
 ///
 /// [`crate::controller`] builds this and applies exactly its contents, so a
@@ -1003,6 +1144,10 @@ pub struct DesiredObjects {
     pub gateway_service: Service,
     /// The ingest-affinity Ingress objects; empty when affinity is off.
     pub gateway_ingresses: Vec<Ingress>,
+    /// The Gateway API exposure routes `(HTTPRoute, GRPCRoute)` (ADR-0080
+    /// decision 2); each `None` when exposure is off or, for the GRPCRoute, when
+    /// `grpc` is false.
+    pub gateway_routes: (Option<DynamicObject>, Option<DynamicObject>),
     /// The query Deployment.
     pub query_deployment: Deployment,
     /// The query Service.
@@ -1018,6 +1163,7 @@ pub fn desired_objects(spec: &RavelClusterSpec, instance: &str, ctx: &RenderCtx)
         gateway_deployment: desired_gateway_deployment(spec, instance, ctx),
         gateway_service: desired_gateway_service(spec, instance),
         gateway_ingresses: desired_gateway_ingresses(spec, instance),
+        gateway_routes: desired_gateway_routes(spec, instance),
         query_deployment: desired_query_deployment(spec, instance, ctx),
         query_service: desired_query_service(spec, instance),
         maintain_deployment: desired_maintain_deployment(spec, instance, ctx),
@@ -1029,8 +1175,10 @@ pub fn desired_objects(spec: &RavelClusterSpec, instance: &str, ctx: &RenderCtx)
 mod tests {
     use super::*;
     use crate::crd::{
-        AffinityKeySpec, DEFAULT_AFFINITY_SUBSET_SIZE, FoldSpec, GatewaySpec, IngestAffinitySpec,
-        LocalSecretRef, MaintainSpec, QuerySpec, RetentionSpec, S3Spec, StorageSpec,
+        AffinityBackend, AffinityKeySpec, DEFAULT_AFFINITY_SUBSET_SIZE, FoldSpec,
+        GatewayApiExposureSpec, GatewayExposureSpec, GatewayReference, GatewaySpec,
+        IngestAffinitySpec, LocalSecretRef, MaintainSpec, QuerySpec, RetentionSpec, S3Spec,
+        StorageSpec,
     };
     use std::collections::BTreeMap;
 
@@ -1064,6 +1212,7 @@ mod tests {
                     interval_secs: Some(120),
                 }),
                 ingest_affinity: None,
+                exposure: None,
             },
             query: QuerySpec {
                 replicas: 2,
@@ -2512,6 +2661,195 @@ mod tests {
             checksum_of(&mb),
             checksum_of(&ma),
             "maintain must roll when the deployment key rotates"
+        );
+    }
+
+    /// The `spec` body of a rendered Gateway API route.
+    fn route_spec(route: &DynamicObject) -> serde_json::Value {
+        route
+            .data
+            .get("spec")
+            .expect("route must carry a spec")
+            .clone()
+    }
+
+    /// A rendered route's `kind` from its `TypeMeta`.
+    fn route_kind(route: &DynamicObject) -> String {
+        route.types.as_ref().expect("route types").kind.clone()
+    }
+
+    /// An exposure spec pointing at a `Gateway`, for the render tests.
+    fn exposure_with(
+        gateway_ref: GatewayReference,
+        hostnames: Vec<String>,
+        grpc: bool,
+    ) -> GatewaySpec {
+        GatewaySpec {
+            exposure: Some(GatewayExposureSpec {
+                gateway_api: Some(GatewayApiExposureSpec {
+                    gateway_ref,
+                    hostnames,
+                    grpc,
+                }),
+            }),
+            ..GatewaySpec::default()
+        }
+    }
+
+    #[test]
+    fn exposure_gateway_api_renders_httproute_and_grpcroute_independent_of_affinity() {
+        // ADR-0080 decision 2, the acceptance test. Asserted through
+        // `desired_objects`, which is the exact render the controller applies.
+        //
+        // Case 1: exposure with affinity absent (plain routing, no pinning),
+        // grpc default true, one hostname, gatewayRef namespace omitted.
+        let mut spec = base_spec();
+        spec.gateway = exposure_with(
+            GatewayReference {
+                name: "public-gw".to_string(),
+                namespace: None,
+            },
+            vec!["ingest.example.com".to_string()],
+            true,
+        );
+        let objects = desired_objects(&spec, "prod", &ctx());
+        let (http, grpc) = objects.gateway_routes;
+        let http = http.expect("HTTPRoute always rendered when exposure is set");
+        let grpc = grpc.expect("GRPCRoute rendered when grpc is true");
+
+        // Kinds, versions, and names.
+        assert_eq!(route_kind(&http), "HTTPRoute");
+        assert_eq!(route_kind(&grpc), "GRPCRoute");
+        for route in [&http, &grpc] {
+            assert_eq!(
+                route.types.as_ref().expect("types").api_version,
+                "gateway.networking.k8s.io/v1"
+            );
+            assert_eq!(
+                route.metadata.labels.as_ref().expect("labels")["app.kubernetes.io/component"],
+                "gateway"
+            );
+        }
+        assert_eq!(http.metadata.name.as_deref(), Some("prod-gateway-route"));
+        assert_eq!(
+            grpc.metadata.name.as_deref(),
+            Some("prod-gateway-route-grpc")
+        );
+
+        // parentRefs name only (namespace omitted -> Gateway API defaults it to
+        // the route's own namespace, i.e. the CR's namespace).
+        let http_spec = route_spec(&http);
+        assert_eq!(
+            http_spec["parentRefs"][0]["name"],
+            serde_json::json!("public-gw")
+        );
+        assert!(
+            http_spec["parentRefs"][0].get("namespace").is_none(),
+            "omitted gatewayRef namespace must not render a parentRef namespace"
+        );
+
+        // backendRefs point at the gateway Service, HTTP route on 4318, gRPC on
+        // 4317.
+        assert_eq!(
+            http_spec["rules"][0]["backendRefs"][0]["name"],
+            serde_json::json!("prod-gateway")
+        );
+        assert_eq!(
+            http_spec["rules"][0]["backendRefs"][0]["port"],
+            serde_json::json!(HTTP_PORT)
+        );
+        assert_eq!(
+            route_spec(&grpc)["rules"][0]["backendRefs"][0]["port"],
+            serde_json::json!(GRPC_PORT)
+        );
+        assert_eq!(
+            route_spec(&grpc)["rules"][0]["backendRefs"][0]["name"],
+            serde_json::json!("prod-gateway")
+        );
+
+        // Hostnames carried on both route kinds.
+        assert_eq!(
+            http_spec["hostnames"],
+            serde_json::json!(["ingest.example.com"])
+        );
+        assert_eq!(
+            route_spec(&grpc)["hostnames"],
+            serde_json::json!(["ingest.example.com"])
+        );
+
+        // Case 2: grpc: false renders only the HTTPRoute.
+        let mut spec = base_spec();
+        spec.gateway = exposure_with(
+            GatewayReference {
+                name: "public-gw".to_string(),
+                namespace: None,
+            },
+            Vec::new(),
+            false,
+        );
+        let (http, grpc) = desired_gateway_routes(&spec, "prod");
+        assert!(
+            http.is_some(),
+            "HTTPRoute still rendered when grpc is false"
+        );
+        assert!(grpc.is_none(), "no GRPCRoute when grpc is false");
+        // Empty hostnames renders no `hostnames` key.
+        assert!(
+            route_spec(&http.expect("HTTPRoute"))
+                .get("hostnames")
+                .is_none(),
+            "empty hostnames must not render a hostnames key"
+        );
+
+        // Case 3: exposure combined with affinity enabled on backend
+        // ravelNative (allowed by the CEL rule) still renders both routes,
+        // independent of affinity, with an explicit gatewayRef namespace.
+        let mut spec = base_spec();
+        spec.gateway = GatewaySpec {
+            ingest_affinity: Some(IngestAffinitySpec {
+                backend: AffinityBackend::RavelNative,
+                ..IngestAffinitySpec::default()
+            }),
+            ..exposure_with(
+                GatewayReference {
+                    name: "public-gw".to_string(),
+                    namespace: Some("gw-ns".to_string()),
+                },
+                Vec::new(),
+                true,
+            )
+        };
+        let (http, grpc) = desired_gateway_routes(&spec, "prod");
+        let http = http.expect("HTTPRoute rendered alongside ravelNative affinity");
+        assert!(
+            grpc.is_some(),
+            "GRPCRoute rendered alongside ravelNative affinity"
+        );
+        // The gateway also still renders its affinity nothing here (ravelNative
+        // renders no Ingress), and the route parentRefs carry the explicit
+        // namespace.
+        assert_eq!(
+            route_spec(&http)["parentRefs"][0]["namespace"],
+            serde_json::json!("gw-ns")
+        );
+
+        // Case 4: removing exposure renders nothing, and the delete-sweep names
+        // both route kinds so the controller can remove an existing pair.
+        let mut spec = base_spec();
+        spec.gateway = GatewaySpec::default();
+        assert_eq!(
+            desired_gateway_routes(&spec, "prod"),
+            (None, None),
+            "exposure absent renders no routes"
+        );
+        let sweep = possible_gateway_route_names("prod");
+        assert_eq!(
+            sweep,
+            vec![
+                "prod-gateway-route".to_string(),
+                "prod-gateway-route-grpc".to_string()
+            ],
+            "the delete-sweep must name both route kinds so both are removed"
         );
     }
 }
