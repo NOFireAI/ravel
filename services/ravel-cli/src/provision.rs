@@ -68,8 +68,11 @@ pub async fn adopt(
             Ok(ProvisioningCheck::Written) => {
                 println!("{sig}: adopted (wrote provisioning record with shard_count={shards})");
             }
-            Ok(ProvisioningCheck::Matched) => {
-                println!("{sig}: already provisioned; recorded shard_count matches {shards}");
+            Ok(ProvisioningCheck::RecordPresent) => {
+                println!(
+                    "{sig}: already provisioned; a durable record exists (ADR-0082: its \
+                     recorded shard_count is authoritative and need not equal --shards={shards})"
+                );
             }
             Ok(ProvisioningCheck::FreshNoData) => {
                 println!(

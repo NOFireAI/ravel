@@ -1041,16 +1041,16 @@ pub(crate) async fn run_tick_with_clock(
     let mut total = MaintainReport::default();
     for signal in MAINTAINED_SIGNALS {
         // Durable shard_count validation before maintaining this (tenant,
-        // signal) (ADR-0050 section 5, EC5). A statically-known tenant's
-        // mismatch already refused startup; a dynamically-discovered tenant's
-        // mismatch here means this maintain process is configured for a
-        // different shard_count than the tenant's data was written under.
-        // Maintaining over `0..shard_count` would compact or sweep only a
-        // subset of shards, so skip this (tenant, signal)'s pass entirely and
-        // log loudly, rather than silently maintaining a truncated shard range
-        // or crashing the whole maintain loop for one tenant. Pre-ADR data with
-        // all shard indices in range is adopted here (the ADR names the
-        // maintenance touch as an adopter).
+        // signal) (ADR-0050 section 5, EC5; loosened by ADR-0082). A present,
+        // decodable record is accepted regardless of whether its gen-0
+        // shard_count agrees with this process's configured value: maintenance
+        // below already scans the union of every generation's range
+        // (`scan_shards`), not `0..shard_count`, so a disagreement here is drift
+        // (logged and counted, never fatal). Only an unreadable record, or
+        // pre-ADR data a lower value would hide, fails and is skipped this
+        // tick rather than crashing the whole maintain loop for one tenant.
+        // Pre-ADR data with all shard indices in range is adopted here (the ADR
+        // names the maintenance touch as an adopter).
         if let Err(err) = ravel_catalog::validate_or_adopt(
             store,
             tenant,
@@ -1061,16 +1061,16 @@ pub(crate) async fn run_tick_with_clock(
         )
         .await
         {
-            // Count a hard mismatch caught here too, so an alert keyed on
+            // Count a hard failure caught here too, so an alert keyed on
             // `ravel_provisioning_shard_count_mismatch_total` fires for a
-            // maintain-only mismatch, not just an ingest-path one.
+            // maintain-only failure, not just an ingest-path one.
             crate::provisioning::note_provisioning_failure(&err);
             tracing::error!(
                 tenant = %tenant.to_hex(),
                 signal = ?signal,
                 error = %err,
                 "maintenance: shard_count provisioning check failed; skipping this \
-                 (tenant, signal) this tick rather than maintaining a truncated shard range"
+                 (tenant, signal) this tick rather than maintaining under an untrustworthy record"
             );
             continue;
         }

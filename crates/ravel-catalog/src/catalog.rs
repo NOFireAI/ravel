@@ -198,25 +198,29 @@ impl Catalog {
         })
     }
 
-    /// Enable durable `shard_count` enforcement on the resolve path (ADR-0050
-    /// section 5). With it on, the first resolve for each (tenant, signal)
-    /// validates this catalog's configured `shard_count` against the
-    /// `t/<tenant_hash>/<sig>/prov` record; a disagreement is a hard
-    /// [`CatalogError`], never a silent resolve over a subset of shards. Absent
-    /// or fresh records pass through (a query never writes a record). Off by
-    /// default so only the process that opts in (the server's `build_catalog`)
-    /// pays the one GET per (tenant, signal); every existing direct-construction
-    /// caller is unchanged.
+    /// Enable durable `shard_count` validation on the resolve path (ADR-0050
+    /// section 5; loosened by ADR-0082). With it on, the first resolve for each
+    /// (tenant, signal) validates that its `t/<tenant_hash>/<sig>/prov` record
+    /// is present and decodable; a present record is accepted regardless of
+    /// whether its gen-0 `shard_count` agrees with this catalog's configured
+    /// value -- routing comes entirely from the record's own generation
+    /// history, so a disagreement is never a silent resolve over a subset of
+    /// shards, and never a hard [`CatalogError`] either. Only an unreadable
+    /// record still fails closed. Absent or fresh records pass through (a query
+    /// never writes a record). Off by default so only the process that opts in
+    /// (the server's `build_catalog`) pays the one GET per (tenant, signal);
+    /// every existing direct-construction caller is unchanged.
     pub fn with_provisioning_enforcement(mut self) -> Self {
         self.enforce_provisioning = true;
         self
     }
 
-    /// Validate the configured `shard_count` for one (tenant, signal) against
-    /// its provisioning record, once per pair (ADR-0050 section 5). A no-op
-    /// when enforcement is off or the pair was already checked. Read-only:
-    /// [`crate::AbsentPolicy::CheckOnly`] never writes, so a query-only node
-    /// with write-restricted credentials still resolves.
+    /// Validate that one (tenant, signal)'s provisioning record is present and
+    /// decodable, once per pair (ADR-0050 section 5; loosened by ADR-0082: no
+    /// longer checked for agreement with this catalog's configured
+    /// `shard_count`). A no-op when enforcement is off or the pair was already
+    /// checked. Read-only: [`crate::AbsentPolicy::CheckOnly`] never writes, so
+    /// a query-only node with write-restricted credentials still resolves.
     async fn enforce_provisioning_once(
         &self,
         tenant: &TenantHash,
@@ -241,11 +245,12 @@ impl Catalog {
             crate::provisioning::AbsentPolicy::CheckOnly,
         )
         .await?;
-        // Only a `Matched` result is safe to cache forever: the record is
-        // immutable, so a match stays a match. `FreshNoData` means "no record
-        // exists yet, nothing to validate against" -- caching it would skip the
-        // real check once a later, higher-shard_count process writes the record
-        // and lands data across shards this process would then silently omit
+        // Only a `RecordPresent` result is safe to cache forever: the record is
+        // immutable, so present-and-decodable stays present-and-decodable.
+        // `FreshNoData` means "no record exists yet, nothing to validate
+        // against" -- caching it would skip the real check once a later
+        // process writes the record, and the routing that record's own
+        // generation history then drives would go unchecked for readability
         // (records are immutable; a stale cache hit never re-checks). Re-check
         // on the next resolve until the record actually appears; that is one
         // extra GET per resolve until first ingest, which is self-limiting.
@@ -848,16 +853,20 @@ impl Catalog {
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
     ) -> Result<(Snapshot, SegmentOrigins), CatalogError> {
-        // Durable shard_count enforcement on the read path (ADR-0050 section 5): fail before the `0..shard_count` listing loop below if this
-        // catalog's configured shard_count disagrees with the (tenant, signal)'s
-        // provisioning record, so a lower value never silently drops the shards
-        // it omits. A no-op unless enforcement was opted into.
+        // Durable shard_count validation on the read path (ADR-0050 section 5;
+        // loosened by ADR-0082): fail before the shard-fanout listing below if
+        // this (tenant, signal)'s provisioning record is unreadable. A present,
+        // decodable record is accepted regardless of what its gen-0
+        // shard_count says -- the listing loop below already fans out over the
+        // generation-history-derived range (`read_scan_generations`), not this
+        // catalog's configured shard_count, so a disagreement can never cause
+        // a silently dropped shard. A no-op unless enforcement was opted into.
         self.enforce_provisioning_once(tenant, signal).await?;
 
         // The generation history for the per-hour scan rule (ADR-0052 section
         // 4), read fresh (see `read_scan_generations`). A corrupt or misfiled
         // record fails the resolve here as a hard `CatalogError`, exactly as
-        // `enforce_provisioning_once` above fails on a scalar mismatch: a
+        // `enforce_provisioning_once` above fails on an unreadable record: a
         // malformed generation history must never be read as "assume
         // generation 0" and silently under-scan.
         //
@@ -2958,13 +2967,15 @@ mod tests {
             .expect("seed provisioning record");
     }
 
-    /// With provisioning enforcement on (as `build_catalog` sets it), a resolve
-    /// for a (tenant, signal) whose record disagrees with the configured
-    /// shard_count fails with a typed error before the `0..shard_count` listing
-    /// loop, so a lower shard_count never serves a truncated shard range
-    /// (ADR-0050 section 5, S1-E6 query-path guard).
+    /// ADR-0082: with provisioning enforcement on (as `build_catalog` sets
+    /// it), a resolve for a (tenant, signal) whose record's gen-0 shard_count
+    /// disagrees with the catalog's configured value no longer fails -- the
+    /// record is present and decodable, which is now the whole check, and
+    /// routing still comes from the generation history (a single implicit
+    /// generation at the record's own count here), not the catalog's
+    /// configured value.
     #[tokio::test]
-    async fn resolve_enforces_provisioning_record_mismatch() {
+    async fn resolve_accepts_disagreeing_provisioning_record() {
         let store = Arc::new(MemoryStore::new());
         let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
         publish_segment(&store, 0, 1, 500_000, now, now - 1_000, now).await;
@@ -2979,14 +2990,10 @@ mod tests {
             start_ns: now - 1_000,
             end_ns: now,
         };
-        let err = catalog
+        catalog
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
-            .expect_err("a lower configured shard_count must fail the resolve");
-        assert!(
-            matches!(err, CatalogError::Provisioning(_)),
-            "expected a provisioning failure, got: {err}"
-        );
+            .expect("a disagreeing but decodable record must not fail the resolve (ADR-0082)");
     }
 
     /// Enforcement is opt-in: a catalog built without
@@ -3204,11 +3211,14 @@ mod tests {
     }
 
     /// Regression: a `FreshNoData` result (no record yet) must not be
-    /// cached as validated. A query-only catalog resolves an empty-record tenant
-    /// (passes as fresh), then a real record appears written under a higher
-    /// shard_count; the next resolve must re-check and surface the mismatch, not
-    /// serve a truncated shard range from a stale "already validated" cache
-    /// entry (records are immutable, so a wrongly-cached miss never re-checks).
+    /// cached as validated. A query-only catalog resolves an empty-record
+    /// tenant (passes as fresh), then a record appears -- but a corrupt,
+    /// undecodable one; the next resolve must re-check and surface the decode
+    /// failure, not silently resolve from a stale "already validated" cache
+    /// entry (records are immutable, so a wrongly-cached miss never
+    /// re-checks). ADR-0082 removed the scalar-equality check this regression
+    /// originally proved via, but a corrupt record is still fatal, so it
+    /// remains an observable proxy for "did the re-check actually run".
     #[tokio::test]
     async fn resolve_rechecks_after_fresh_no_data_until_record_appears() {
         let store = Arc::new(MemoryStore::new());
@@ -3230,16 +3240,22 @@ mod tests {
             .expect("a fresh (no-record) tenant resolves cleanly");
         assert_eq!(snapshot.segments.len(), 1, "first resolve returns the data");
 
-        // A separate higher-shard_count process now writes the real record and
-        // (conceptually) lands data across shards 0..4. If the earlier
-        // `FreshNoData` had been cached as validated, this resolve would skip the
-        // check and silently serve only shards 0..2.
-        seed_provisioning_record(&store, 4).await;
+        // A separate process now writes a corrupt, undecodable record. If the
+        // earlier `FreshNoData` had been cached as validated, this resolve
+        // would skip the check entirely and resolve cleanly regardless.
+        store
+            .put(
+                &crate::provisioning::provisioning_key(&tenant(), Signal::Metrics),
+                vec![0xFF, 0xFF, 0xFF, 0x07].into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt record");
 
         let err = catalog
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
-            .expect_err("once the real record appears the resolve must re-check and refuse");
+            .expect_err("once a corrupt record appears the resolve must re-check and refuse");
         assert!(
             matches!(err, CatalogError::Provisioning(_)),
             "expected a provisioning failure from the re-check, got: {err}"

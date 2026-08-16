@@ -248,40 +248,41 @@ Default alert rule:
 |---|---|---|
 | Isolation breach | `increase(ravel_catalog_isolation_breach_total[5m]) > 0` | Every increment already failed a query with a hard error; there is no sustained-condition or dilution case to wait out, unlike the mass-orphan breaker below. Any nonzero increase is a cross-tenant key-layout or hashing bug an operator needs to see immediately, not a rate to threshold. |
 
-## Durable shard count (ADR-0050 section 5)
+## Durable shard count (ADR-0050 section 5; ADR-0082)
 
-`--shards` is immutable per (tenant, signal): once a tenant's data for a
-signal is written across N shards, resolution iterates `0..N`, so serving
-that tenant with a lower `--shards` would silently omit every series in the
-missing shards. To make that a loud failure instead of silent data loss, the
-first write for a (tenant, signal) records `--shards` in a durable
-provisioning record at `t/<tenant_hash>/<signal>/prov`, and every later
-ingest, query, and maintenance touch validates the configured value against
-it.
+The first write for a (tenant, signal) records the configured `shard_count`
+in a durable provisioning record at `t/<tenant_hash>/<signal>/prov`, plus the
+append-only shard-generation history a reshard extends (ADR-0052). Routing
+and resolution come entirely from that record's own generation history, never
+from the live `--shards` config default, so `--shards` is really only "the
+value used to provision a brand-new tenant" -- an already-provisioned
+tenant's true shard range lives in its record regardless of what `--shards`
+is set to on any later restart.
 
-**A startup refusal from a shard_count mismatch** means this process was
-configured with a different `--shards` than a statically-known tenant's data
-was written under. The error names the tenant, signal, expected (recorded),
-and actual (configured) values. It is not transient and does not clear on
-restart: the object storage records the true shard count, and the fix is to
-set `--shards` back to the recorded value (never lower it below what a tenant
-already used). Lowering `--shards` for a tenant that has data in higher
-shards is a data-hiding operation and is refused by construction.
+Every later ingest, query, and maintenance touch still validates the record
+before trusting it, but (ADR-0082) that validation checks presence and
+decodability, not agreement with `--shards`: a present, decodable record is
+accepted even when its recorded `shard_count` differs from the configured
+value, so lowering (or raising) the fleet-wide `--shards` default no longer
+breaks startup, ingest, or queries for a tenant already provisioned at a
+different count. Only an unreadable record (corrupt, or a future format
+version this process cannot understand), or pre-ADR data a configured value
+would provably hide, still fails closed.
 
 A brand-new tenant with no prior writes has no record yet, so a fresh
 deployment (including an operator-managed cluster that starts with zero data
 and configured tenant tokens) starts normally; the record is created on the
-tenant's first write. Only a tenant whose record already disagrees, or whose
-pre-ADR data a lower value would hide, refuses.
+tenant's first write.
 
-For a **dynamically-resolved tenant** (OIDC/mTLS), a mismatch is not known
+For a **dynamically-resolved tenant** (OIDC/mTLS), a hard failure is not known
 until a request arrives: that one request fails with a typed error and
 `ravel_provisioning_shard_count_mismatch_total` increments; the process is
-never taken down for a single tenant's mismatch. Alert on any increase:
+never taken down for a single tenant's failure. Alert on any increase:
 
 | Condition | Query | Why |
 |---|---|---|
-| shard_count mismatch | `increase(ravel_provisioning_shard_count_mismatch_total[5m]) > 0` | A dynamic tenant's provisioning check failed: either a real shard_count disagreement against the durable record (that one request fails, per above), or an unreadable record (corrupt or a future format version) caught on the maintain per-tenant loop, which skips that tenant's tick rather than failing a request. Either way, a nonzero increase means a config-vs-data problem an operator must reconcile, not a rate to threshold. |
+| shard_count provisioning failure | `increase(ravel_provisioning_shard_count_mismatch_total[5m]) > 0` | A dynamic tenant's provisioning check failed on an unrecoverable condition: pre-ADR data the configured `--shards` would hide (that one request fails, per above), or an unreadable record (corrupt or a future format version) caught here or on the maintain per-tenant loop, which skips that tenant's tick rather than failing a request. This no longer fires for a present record merely disagreeing with `--shards` (ADR-0082); a nonzero increase means a genuinely unrecoverable condition, not a rate to threshold. |
+| shard_count drift (informational) | `increase(ravel_provisioning_shard_count_drift_total[5m]) > 0` | A present, decodable record's recorded `shard_count` disagrees with this process's configured `--shards` default. Never fatal -- the record wins and routing is unaffected -- but a sustained increase can indicate a fleet-wide `--shards` default that has drifted away from what operators intend for a specific tenant; investigate at your own pace, don't page on it. |
 
 **Adopting pre-ADR data.** A (tenant, signal) that already had data before
 this record existed is adopted the first time a server ingests or maintains

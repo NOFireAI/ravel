@@ -168,12 +168,27 @@ when it adopted a pre-ADR-0050 bucket that held `t/` data but no `sys/tenancy`
 marker. A nonzero value is the visible signal that the one-time migration
 happened.
 
-### Provisioning (`ravel_provisioning_shard_count_mismatch_total`)
+### Provisioning (`ravel_provisioning_shard_count_mismatch_total`, `ravel_provisioning_shard_count_drift_total`)
 
-Labels: `mode`. Counts dynamic-tenant provisioning checks that failed: a
-`shard_count` disagreement, an unreadable record, or a maintain-loop check
-catching either (ADR-0050 section 5). The operations guide gives its alert
-rule.
+Labels: `mode` on both.
+
+`ravel_provisioning_shard_count_mismatch_total` counts dynamic-tenant
+provisioning checks that failed on an unrecoverable condition: pre-ADR data a
+configured `shard_count` would hide, an unreadable record, or a maintain-loop
+check catching either (ADR-0050 section 5). Since ADR-0082, a present,
+decodable record merely disagreeing with the configured `shard_count` no
+longer counts here -- routing comes from the record's own generation history,
+not the live config default, so that disagreement is not a failure.
+
+`ravel_provisioning_shard_count_drift_total` counts that disagreement instead
+(ADR-0082): a present, decodable record whose recorded `shard_count` differs
+from the caller's live config default. Never fatal and never blocks the
+touch; it is read from `ravel_catalog::shard_count_drift_count`, the single
+choke point (`validate_record`) every consumer routes through, so it covers
+ingest, static startup, catalog resolve, the maintain loop, and `ravel-cli
+provision adopt` uniformly.
+
+The operations guide gives both metrics' alert rules.
 
 ### Store reachability (`ravel_store_*`)
 

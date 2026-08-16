@@ -108,12 +108,14 @@ pub fn build_catalog(
         byte_cache_max_bytes,
         ..CatalogConfig::default()
     };
-    // Durable shard_count enforcement on the read path (ADR-0050 section 5,
-    // EC5): the first resolve for each (tenant, signal) validates this
-    // catalog's configured shard_count against the tenant's provisioning
-    // record, so a query never silently resolves over a subset of shards. The
-    // check is read-only (it never writes a record), so a query-only node with
-    // write-restricted credentials is unaffected.
+    // Durable shard_count validation on the read path (ADR-0050 section 5,
+    // EC5; loosened by ADR-0082): the first resolve for each (tenant, signal)
+    // validates that the tenant's provisioning record is present and
+    // decodable, not that it agrees with this catalog's configured
+    // shard_count -- routing comes entirely from the record's own generation
+    // history, so a lower configured shard_count never truncates a query's
+    // results. The check is read-only (it never writes a record), so a
+    // query-only node with write-restricted credentials is unaffected.
     let catalog = Catalog::new(store, catalog_config)
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?
         .with_provisioning_enforcement();

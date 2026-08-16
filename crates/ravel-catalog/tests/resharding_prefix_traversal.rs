@@ -48,9 +48,11 @@ fn tenant() -> TenantHash {
 }
 
 /// Enforcement-enabled catalog forced onto the prefix scan (crossover 0), with
-/// an unbounded runtime ceiling. `gen0_count` is generation 0's count, which
-/// the enforced provisioning check validates the configured `shard_count`
-/// against.
+/// an unbounded runtime ceiling. `gen0_count` is generation 0's count; the
+/// caller sets `CatalogConfig.shard_count` to it by convention (ADR-0082
+/// no longer requires the two to agree -- the enforced check only requires
+/// the record to be present and decodable, and routing comes from the
+/// generation history regardless of this catalog's configured value).
 fn prefix_enforcing(store: Arc<dyn ObjectStoreBackend>, gen0_count: u32) -> Catalog {
     Catalog::new(
         store,
@@ -117,15 +119,15 @@ async fn seed_two_generations(
 /// (hour 0), generation 1 at `gen1_count` activating at `gen1_activation`,
 /// generation 2 at `gen2_count` activating at `gen2_activation`.
 ///
-/// Enforcement pins the configured `shard_count` to generation 0's count
-/// (`validate_or_adopt`'s check), so a two-generation decrease can never expose
-/// a static-`shard_count` bug: whichever count generation 0 has, it *is* the
-/// enforced config, and if generation 0 is the larger of the two counts the
-/// old static bound already covered the retiring generation by coincidence. A
-/// middle generation wider than generation 0 is the only shape that exposes
-/// it: `gen0_count < gen1_count`, `gen2_count <= gen0_count`, so the enforced
-/// config (`gen0_count`) is narrower than the retiring generation 1's count
-/// and the bug is real, not accidentally masked.
+/// These helpers set `CatalogConfig.shard_count` to generation 0's count by
+/// convention (see `prefix_enforcing`), so a two-generation decrease alone can
+/// never expose a static-`shard_count` bug: whichever count generation 0 has
+/// is also the configured value, and if generation 0 is the larger of the two
+/// counts the old static bound already covered the retiring generation by
+/// coincidence. A middle generation wider than generation 0 is the only shape
+/// that exposes it: `gen0_count < gen1_count`, `gen2_count <= gen0_count`, so
+/// the configured value (`gen0_count`) is narrower than the retiring
+/// generation 1's count and the bug is real, not accidentally masked.
 async fn seed_three_generations(
     store: &dyn ObjectStoreBackend,
     gen0_count: u32,

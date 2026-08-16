@@ -1,18 +1,24 @@
-//! Durable `shard_count` acceptance test (ADR-0050 section 5, EC5).
-//! Ingest across four shards through a real in-process server (which
-//! writes the provisioning record with shard_count=4), then simulate a restart
-//! configured for two shards and assert the process refuses to start with a
-//! typed error naming the record, and that no query path serves the truncated
-//! shard range.
+//! Durable `shard_count` acceptance test (ADR-0050 section 5, EC5; loosened by
+//! ADR-0082). Ingest across four shards through a real in-process server
+//! (which writes the provisioning record with shard_count=4), then simulate a
+//! restart configured for two shards and assert the process STARTS (ADR-0082:
+//! a present, decodable record is accepted regardless of what its gen-0
+//! shard_count says), and that a query at the new, lower configured
+//! shard_count still serves the COMPLETE original 4-shard data -- routing
+//! comes entirely from the record's own generation history, never from the
+//! live config default, so a lowered fleet-wide default never truncates a
+//! tenant already provisioned at a higher count.
 //!
-//! The startup refusal itself lives in `main.rs`
+//! The startup path itself lives in `main.rs`
 //! (`ravel_server::provisioning::validate_static_provisioning`, called before
 //! any listener binds), not in `ravel_server::start`, so the "restart"
 //! phase calls that exact function the binary calls, against the same store the
-//! first process wrote. The query-path guard is exercised through a real
-//! `Catalog` built the way `build_catalog` builds it (with provisioning
-//! enforcement), so a lower-shard_count query fails rather than resolving over
-//! `0..2`.
+//! first process wrote. The query-path routing-correctness claim is exercised
+//! by actually restarting a real server (`ravel_server::start`, which wires
+//! its catalog through `query::build_catalog` with provisioning enforcement
+//! on) and querying it over HTTP, so a lower-shard_count query still resolves
+//! every series, including ones that hashed to shard indices at or above the
+//! new, lower configured value.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -30,11 +36,10 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
-use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
-use ravel_types::{Signal, TenantId, TimeRange};
+use ravel_types::{Signal, TenantId};
 
 const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
@@ -145,15 +150,41 @@ async fn start_server(
     .expect("server starts")
 }
 
-/// Ingest 4 shards, restart at 2, assert the restart refuses with a
-/// typed error naming the record, and that no query serves the truncated range.
+/// A PromQL selector matching every series `export_request` writes, so a query
+/// result count directly proves how many of the 12 series a resolve served --
+/// the routing-correctness observable this test hinges on.
+const ALL_SERIES_QUERY: &str = "{__name__=~\"cpu_usage_.*\"}";
+
+async fn query_result_count(client: &reqwest::Client, base: &str) -> usize {
+    let resp = client
+        .get(format!("{base}/api/v1/query"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[("query", ALL_SERIES_QUERY)])
+        .send()
+        .await
+        .expect("query request succeeds");
+    assert_eq!(resp.status(), 200, "query should succeed");
+    let body: serde_json::Value = resp.json().await.expect("query response is JSON");
+    assert_eq!(body["status"], "success", "query body: {body}");
+    body["data"]["result"]
+        .as_array()
+        .expect("result is an array")
+        .len()
+}
+
+/// Ingest across 4 shards, restart at 2, assert the restart STARTS (ADR-0082:
+/// a present, decodable record is accepted regardless of what its gen-0
+/// shard_count says), and that a query against the restarted, lower-configured
+/// server still serves the complete original 4-shard data -- routing comes
+/// entirely from the record's own generation history, never truncating to the
+/// new, lower configured value.
 #[tokio::test]
-async fn startup_fails_on_shard_count_mismatch() {
+async fn restart_at_lower_shard_count_serves_complete_data() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
     // Phase 1: ingest across 4 shards through the real HTTP handler. This writes
     // the provisioning record with shard_count=4 (on the first write) and lands
-    // segment data.
+    // segment data across however many of those 4 shards the 12 series hash to.
     let running = start_server(store.clone(), INGEST_SHARDS).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
@@ -175,82 +206,48 @@ async fn startup_fails_on_shard_count_mismatch() {
         .await
         .expect("provisioning record exists after first ingest");
 
-    // A query at the correct shard_count=4 serves the data (the record does not
-    // break normal operation).
-    let query_ok = client
-        .get(format!("{base}/api/v1/query"))
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .query(&[("query", "cpu_usage_0")])
-        .send()
-        .await
-        .expect("query at 4 shards succeeds");
+    // A query at the correct shard_count=4 serves all 12 series.
+    let before_restart = query_result_count(&client, &base).await;
     assert_eq!(
-        query_ok.status(),
-        200,
-        "query at the correct shard_count works"
+        before_restart, 12,
+        "all 12 series must be visible at the shard_count the data was written under"
     );
 
     running.shutdown().await.expect("graceful shutdown");
 
     // Phase 2: simulate a restart configured for 2 shards. This is exactly what
     // `main.rs` runs before binding any listener: the static tenant ("acme",
-    // from `--tenant-token`) is validated against its record and the process
-    // refuses to start on a mismatch.
+    // from `--tenant-token`) is validated against its record. ADR-0082: a
+    // present, decodable record no longer refuses startup on disagreement, so
+    // this now succeeds instead of erroring.
     let static_tenants = vec![TenantId::new(TENANT).hash()];
-    let err = ravel_server::provisioning::validate_static_provisioning(
+    ravel_server::provisioning::validate_static_provisioning(
         store.as_ref(),
         &static_tenants,
         RESTART_SHARDS,
         now_ns(),
     )
     .await
-    .expect_err("restart configured for 2 shards must refuse to start");
-    // A typed FieldMismatch-style error naming the record and the values.
-    assert!(
-        matches!(
-            err,
-            ravel_catalog::ProvisioningError::ShardCountMismatch { .. }
-        ),
-        "expected a typed shard_count mismatch, got: {err}"
-    );
-    let msg = err.to_string();
-    assert!(msg.contains("/prov"), "error names the record key: {msg}");
-    assert!(msg.contains("shard_count"), "error names the field: {msg}");
-    assert!(
-        msg.contains(&RESTART_SHARDS.to_string()) && msg.contains(&INGEST_SHARDS.to_string()),
-        "error names expected (2) and actual (4): {msg}"
+    .expect(
+        "a disagreeing but decodable record must not refuse startup (ADR-0082); \
+         the process starts and routing still comes from the generation history",
     );
 
-    // Phase 3: prove the query path never serves the truncated shard range. A
-    // catalog built for 2 shards (the way `build_catalog` builds it, with
-    // provisioning enforcement) fails the resolve on the record mismatch rather
-    // than iterating `0..2` and dropping shards 2 and 3.
-    let catalog = Catalog::new(
-        store.clone(),
-        CatalogConfig {
-            shard_count: RESTART_SHARDS,
-            ..CatalogConfig::default()
-        },
-    )
-    .expect("catalog builds")
-    .with_provisioning_enforcement();
-    let resolve_err = catalog
-        .resolve(
-            &TenantId::new(TENANT).hash(),
-            Signal::Metrics,
-            TimeRange {
-                start_ns: 0,
-                end_ns: now_ns(),
-            },
-            &[],
-            now_ns(),
-        )
-        .await
-        .expect_err("a query at shard_count=2 must fail, never serve a truncated shard range");
-    assert!(
-        matches!(resolve_err, ravel_catalog::CatalogError::Provisioning(_)),
-        "expected a provisioning failure on resolve, got: {resolve_err}"
+    // Phase 3: actually restart a server against the same store at the lower
+    // shard_count, and prove the query path never serves a truncated shard
+    // range. `build_catalog` turns on provisioning enforcement exactly as the
+    // real binary does, so this exercises the same enforced resolve path a
+    // production restart would.
+    let restarted = start_server(store.clone(), RESTART_SHARDS).await;
+    let restarted_base = format!("http://{}", restarted.http_addr);
+    let after_restart = query_result_count(&client, &restarted_base).await;
+    assert_eq!(
+        after_restart, 12,
+        "a restart at a lower configured shard_count must still serve every series: \
+         routing comes from the record's own generation history, not the live config default"
     );
+
+    restarted.shutdown().await.expect("graceful shutdown");
 }
 
 /// The fresh-deployment guarantee at the server layer: a

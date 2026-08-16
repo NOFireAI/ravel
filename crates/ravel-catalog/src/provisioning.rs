@@ -1,24 +1,39 @@
-//! Durable, startup-checked `shard_count` (ADR-0050 section 5).
+//! Durable, startup-checked `shard_count` (ADR-0050 section 5; validation
+//! semantics loosened by ADR-0082).
 //!
 //! Each (tenant, signal) carries an immutable provisioning record at
-//! `t/<tenant_hash>/<sig>/prov` recording the `shard_count` its data was
-//! written under. `shard_count` lives only in process config otherwise, and
-//! resolution iterates `0..shard_count` (catalog.rs), so a process configured
-//! with a lower value than the data was written under silently omits every
-//! series in the missing shards. This record turns that silent truncation into
-//! a loud refusal: every ingest, catalog, and maintain touch validates the
-//! configured value against the record before acting.
+//! `t/<tenant_hash>/<sig>/prov` recording the `shard_count` its data was first
+//! written under, plus the append-only shard-generation history a reshard
+//! extends (ADR-0052 section 1). `shard_count` lives only in process config
+//! for a (tenant, signal) with no record yet; an already-provisioned (tenant,
+//! signal) routes and scans entirely off its own generation history
+//! (`active_shard_count`, `scan_count`), never off the live config default.
 //!
-//! This module is the one shared implementation the three consumers named in
-//! ADR-0050 section 5 call: ingest-router first write, catalog first resolve,
-//! and the maintain per-tenant loop. [`validate_or_adopt`] handles all three
-//! ADR scenarios (no record + no data; no record + pre-ADR data; record
-//! present) so no consumer reimplements the decision.
+//! [`validate_record`] therefore gates on record *presence and decodability*,
+//! not on the record's generation-0 scalar equalling the live `--shards`
+//! config value (ADR-0082): a lowered fleet-wide default no longer breaks
+//! ingest, startup, or queries for a tenant already provisioned at a higher
+//! count. A record that cannot be trusted at all -- a future format version,
+//! a misfiled tenant/signal, or a corrupt generation history -- still fails
+//! closed exactly as before; only the scalar-equality refusal is gone. A
+//! disagreement between the live default and a record's gen-0 count is logged
+//! and counted ([`shard_count_drift_count`]) but never blocks the touch.
 //!
-//! Scope note: `shard_count` is immutable per (tenant, signal) in this
-//! decision. Resharding (a shard-epoch map) is deferred to its own ADR (epic
-//! EK); nothing here changes a recorded value, only refuses when config and
-//! record disagree.
+//! This module is the one shared implementation the four consumers named in
+//! ADR-0082 call: ingest-router first write, static-tenant startup, catalog
+//! first resolve, and the maintain per-tenant loop. [`validate_or_adopt`]
+//! handles all three absence/adoption scenarios (no record + no data; no
+//! record + pre-ADR data; record present) so no consumer reimplements the
+//! decision.
+//!
+//! Scope note: a record's generation-0 scalar is immutable per (tenant,
+//! signal); a reshard (ADR-0052) only appends a later generation, never
+//! rewrites generation 0. [`ProvisioningError::AdoptionWouldHideData`] is
+//! untouched by ADR-0082: a tenant with pre-ADR data and no record still
+//! refuses adoption when a configured value would hide an observed shard
+//! index.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
@@ -97,21 +112,6 @@ pub enum ProvisioningError {
         field: &'static str,
         expected: String,
         actual: String,
-    },
-    /// The record exists and its `shard_count` disagrees with the configured
-    /// value. This is the S1-E6 refusal (ADR-0050 section 5): a `FieldMismatch`
-    /// naming the record, tenant, signal, expected, and actual.
-    #[error(
-        "provisioning record {key:?} for tenant {tenant_hash} signal {signal} records \
-         shard_count {actual}, but this process is configured for {expected}: refusing to resolve \
-         over a subset of shards (ADR-0050 section 5, S1-E6)"
-    )]
-    ShardCountMismatch {
-        key: String,
-        tenant_hash: String,
-        signal: &'static str,
-        expected: u32,
-        actual: u32,
     },
     /// Pre-ADR data has a shard index at or above the configured count, so the
     /// configured value is provably hiding data. Adoption writes nothing and
@@ -755,8 +755,14 @@ impl ProvisioningError {
 /// is a [`ProvisioningError`], never a variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisioningCheck {
-    /// A record was present and its `shard_count` matched the configured value.
-    Matched,
+    /// A record was present and decoded successfully. Its generation-0
+    /// `shard_count` may or may not equal the caller's live config value --
+    /// ADR-0082 no longer requires them to agree, only that the record exists,
+    /// is not misfiled, and its generation history is structurally sound.
+    /// Routing already comes entirely from the record's own generation
+    /// history, so a disagreement here is observability only
+    /// ([`shard_count_drift_count`]), never a refusal.
+    RecordPresent,
     /// No record and no shard data: a fresh (tenant, signal). Nothing was
     /// written (the caller passed [`AbsentPolicy::AdoptIfData`]); the record is
     /// created on the tenant's first actual write. This is the fresh-tenant,
@@ -817,10 +823,33 @@ async fn read_record(
     }
 }
 
-/// Validate a decoded record against the (tenant, signal) it was read under and
-/// the configured `shard_count`. A version, tenant_hash, or signal disagreement
-/// is a corrupt/misfiled record; a `shard_count` disagreement is the S1-E6
-/// mismatch.
+/// Count of provisioning touches where a present, decodable record's
+/// generation-0 `shard_count` differs from the caller's live config default.
+/// ADR-0082 made this non-fatal (the record wins, routing is unaffected), but
+/// still worth surfacing to an operator: rendered at `/metrics` as
+/// `ravel_provisioning_shard_count_drift_total`, distinct from the
+/// corruption-only `ravel_provisioning_shard_count_mismatch_total`.
+/// Process-global with a single source and no labels, incremented from the
+/// one shared choke point ([`validate_record`]) every consumer routes
+/// through, so ingest, static startup, catalog resolve, the maintain loop, and
+/// `ravel-cli provision adopt` are all covered without each call site
+/// duplicating the comparison.
+static SHARD_COUNT_DRIFTS: AtomicU64 = AtomicU64::new(0);
+
+/// The drift count for a `/metrics` renderer (or any other consumer) to read.
+pub fn shard_count_drift_count() -> u64 {
+    SHARD_COUNT_DRIFTS.load(Ordering::Relaxed)
+}
+
+/// Validate a decoded record against the (tenant, signal) it was read under. A
+/// version, tenant_hash, or signal disagreement is a corrupt/misfiled record,
+/// and the generation history must be structurally sound -- both fail closed
+/// exactly as before. Since ADR-0082, the record's generation-0 `shard_count`
+/// is no longer required to equal the caller's live `shard_count` config
+/// value: a record that exists and decodes is valid regardless, because
+/// routing already comes entirely from its own generation history. A
+/// disagreement is logged and counted ([`shard_count_drift_count`]) rather
+/// than refused.
 fn validate_record(
     record: &sysproto::ProvisioningRecord,
     key: &str,
@@ -850,22 +879,27 @@ fn validate_record(
             actual: format!("{}", record.signal),
         });
     }
-    if record.shard_count != shard_count {
-        return Err(ProvisioningError::ShardCountMismatch {
-            key: key.to_string(),
-            tenant_hash: tenant_hash.to_hex(),
-            signal: signal.key_prefix(),
-            expected: shard_count,
-            actual: record.shard_count,
-        });
-    }
-    // The scalar `shard_count` is generation 0's count and the configured value
-    // still equals it (a reshard never touches gen 0). But the append-only
-    // generation history (ADR-0052 section 1) must also be structurally sound on
-    // every touch: a corrupt history could route or scan over the wrong shard
-    // set. Validate it here so any consumer fails closed, exactly as it does on
-    // a `shard_count` disagreement.
+    // The append-only generation history (ADR-0052 section 1) must be
+    // structurally sound on every touch, independent of whether its gen-0
+    // count agrees with the live config: a corrupt history could route or scan
+    // over the wrong shard set. Validate it here so any consumer fails closed.
     read_generations(record, key)?;
+
+    // ADR-0082: an existing, decodable record is valid regardless of its
+    // gen-0 count relative to the live `--shards` default -- this is
+    // observability only, never a refusal.
+    if record.shard_count != shard_count {
+        SHARD_COUNT_DRIFTS.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            key,
+            tenant_hash = %tenant_hash.to_hex(),
+            signal = signal.key_prefix(),
+            live_shard_count = shard_count,
+            record_shard_count = record.shard_count,
+            "provisioning record's shard_count differs from the live --shards default; \
+             accepted (ADR-0082), routing uses the record's own generation history"
+        );
+    }
     Ok(())
 }
 
@@ -937,9 +971,12 @@ fn build_record(
 }
 
 /// Write the record with `CreateIfAbsent`. A racing loser (`AlreadyExists`)
-/// re-reads the winner's record and validates the configured value against it,
-/// so a race can never let an incompatible `shard_count` through (ADR-0050
-/// section 5, mirroring the `sys/tenancy` write_marker race handling).
+/// re-reads the winner's record and validates it exists, is not misfiled, and
+/// decodes (ADR-0050 section 5, mirroring the `sys/tenancy` write_marker race
+/// handling). Since ADR-0082, a loser configured for a different `shard_count`
+/// than the winner accepts the winner's record rather than erroring: the
+/// winner's write already pinned generation 0, and future routing uses the
+/// record's own generation history, not either writer's live config.
 async fn write_record_race_safe(
     store: &dyn ObjectStoreBackend,
     key: &str,
@@ -968,7 +1005,7 @@ async fn write_record_race_safe(
                 ProvisioningError::store(key, StoreError::NotFound)
             })?;
             validate_record(&winner, key, tenant_hash, signal, shard_count)?;
-            Ok(ProvisioningCheck::Matched)
+            Ok(ProvisioningCheck::RecordPresent)
         }
         Err(err) => Err(ProvisioningError::store(key, err)),
     }
@@ -976,7 +1013,8 @@ async fn write_record_race_safe(
 
 /// Validate the configured `shard_count` for one (tenant, signal) against its
 /// durable provisioning record, adopting or creating the record as ADR-0050
-/// section 5 prescribes. The single shared entry point for all consumers.
+/// section 5 prescribes and ADR-0082 refines. The single shared entry point
+/// for all consumers.
 ///
 /// Three scenarios, kept distinct:
 /// 1. No record, no shard data: fresh. With [`AbsentPolicy::CreateFromConfig`],
@@ -990,10 +1028,15 @@ async fn write_record_race_safe(
 ///    [`ProvisioningCheck::FreshNoData`]). If every observed shard index is
 ///    `< shard_count`, write the record from config. If any is `>= shard_count`,
 ///    the configured value hides data:
-///    [`ProvisioningError::AdoptionWouldHideData`], writing nothing.
-/// 3. Record present: compare `shard_count`. Equal is
-///    [`ProvisioningCheck::Matched`]; unequal is
-///    [`ProvisioningError::ShardCountMismatch`]. Identical under every policy.
+///    [`ProvisioningError::AdoptionWouldHideData`], writing nothing (ADR-0082
+///    leaves this refusal untouched).
+/// 3. Record present and decodable: [`ProvisioningCheck::RecordPresent`],
+///    regardless of whether its gen-0 `shard_count` equals the caller's live
+///    config value (ADR-0082) -- a disagreement is logged and counted
+///    ([`shard_count_drift_count`]) but never refused. A record that is
+///    misfiled, a future format version, or has a corrupt generation history
+///    still fails closed with the same typed errors as before. Identical
+///    under every policy.
 pub async fn validate_or_adopt(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -1006,7 +1049,7 @@ pub async fn validate_or_adopt(
 
     if let Some(record) = read_record(store, &key).await? {
         validate_record(&record, &key, tenant_hash, signal, shard_count)?;
-        return Ok(ProvisioningCheck::Matched);
+        return Ok(ProvisioningCheck::RecordPresent);
     }
 
     // No record. The read path never writes and never needs to list: pass
@@ -1634,14 +1677,20 @@ mod tests {
         )
         .await
         .expect("matching record");
-        assert_eq!(out, ProvisioningCheck::Matched);
+        assert_eq!(out, ProvisioningCheck::RecordPresent);
     }
 
+    /// ADR-0082: a present, decodable record is accepted regardless of
+    /// whether its gen-0 `shard_count` agrees with the caller's live config
+    /// value -- this used to be a hard `ShardCountMismatch` refusal; now the
+    /// record wins and the disagreement is only observed via the drift
+    /// counter, never blocking.
     #[tokio::test]
-    async fn record_present_and_disagreeing_is_shard_count_mismatch() {
+    async fn record_present_and_disagreeing_is_accepted() {
         let store = mem();
         seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
-        let err = validate_or_adopt(
+        let before = shard_count_drift_count();
+        let out = validate_or_adopt(
             store.as_ref(),
             &tenant(),
             Signal::Metrics,
@@ -1650,16 +1699,12 @@ mod tests {
             AbsentPolicy::AdoptIfData,
         )
         .await
-        .expect_err("a lower configured shard_count must refuse");
-        match err {
-            ProvisioningError::ShardCountMismatch {
-                expected, actual, ..
-            } => {
-                assert_eq!(expected, 2);
-                assert_eq!(actual, 4);
-            }
-            other => panic!("wrong error: {other}"),
-        }
+        .expect("a disagreeing but decodable record must be accepted (ADR-0082)");
+        assert_eq!(out, ProvisioningCheck::RecordPresent);
+        assert!(
+            shard_count_drift_count() > before,
+            "the drift counter must have incremented for the disagreement"
+        );
     }
 
     #[tokio::test]
@@ -1842,7 +1887,7 @@ mod tests {
         )
         .await
         .expect("race loser re-reads and validates against the winner");
-        assert_eq!(out, ProvisioningCheck::Matched);
+        assert_eq!(out, ProvisioningCheck::RecordPresent);
         assert_eq!(
             store.fault_count(Op::Get, ravel_object_store::fault::FaultKind::NotFoundBlip),
             1,
@@ -1851,10 +1896,12 @@ mod tests {
     }
 
     /// Same race, but the loser's configured shard_count disagrees with the
-    /// winner's record: the re-read surfaces the mismatch rather than silently
-    /// accepting either value.
+    /// winner's record. ADR-0082: record-wins semantics apply here exactly as
+    /// everywhere else -- the re-read accepts the winner's record rather than
+    /// erroring, and the disagreement only shows up as a drift-counter
+    /// increment.
     #[tokio::test]
-    async fn create_if_absent_race_loser_surfaces_mismatch() {
+    async fn create_if_absent_race_loser_accepts_winner_despite_disagreement() {
         let inner = MemoryStore::new();
         let th = tenant();
         seed_record(&inner, &th, Signal::Metrics, 4).await;
@@ -1865,7 +1912,8 @@ mod tests {
         );
         let store = FaultStore::new(inner, plan);
 
-        let err = validate_or_adopt(
+        let before = shard_count_drift_count();
+        let out = validate_or_adopt(
             &store,
             &th,
             Signal::Metrics,
@@ -1874,8 +1922,12 @@ mod tests {
             AbsentPolicy::CreateFromConfig,
         )
         .await
-        .expect_err("a race loser configured for a different shard_count must refuse");
-        assert!(matches!(err, ProvisioningError::ShardCountMismatch { .. }));
+        .expect("a race loser configured differently from the winner accepts the winner's record");
+        assert_eq!(out, ProvisioningCheck::RecordPresent);
+        assert!(
+            shard_count_drift_count() > before,
+            "the disagreement must still be counted as drift"
+        );
         assert_eq!(
             store.fault_count(Op::Get, ravel_object_store::fault::FaultKind::NotFoundBlip),
             1

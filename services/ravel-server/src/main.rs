@@ -157,17 +157,18 @@ async fn main() -> anyhow::Result<()> {
         ravel_server::config::merge_fold_tenants(tenant_tokens.values(), &maintain_tenants);
 
     // Durable shard_count validation for statically-known tenants (ADR-0050
-    // section 5, EC5). The static set is exactly `fold_tenants`, the union of
-    // `--tenant-token` and `--maintain-tenant` (already hashed under the pinned
-    // scheme). Each (tenant, signal) whose durable provisioning record
-    // disagrees with `--shards` refuses startup here, before any listener
-    // binds, so a lower shard_count on restart is a failed deploy rather than a
-    // silent resolve over a subset of shards. A brand-new tenant with no prior
-    // writes and no record passes through cleanly (nothing to validate yet), so
-    // a fresh, operator-managed cluster with configured tenants and zero data
-    // starts normally; only a present, disagreeing record, or pre-ADR data a
-    // lower value would hide, refuses. An OIDC/mTLS deployment with no static
-    // tenants validates nothing here and checks each tenant at first touch.
+    // section 5, EC5; loosened by ADR-0082). The static set is exactly
+    // `fold_tenants`, the union of `--tenant-token` and `--maintain-tenant`
+    // (already hashed under the pinned scheme). A present, decodable
+    // provisioning record is accepted here regardless of whether its recorded
+    // `shard_count` agrees with `--shards`: routing comes entirely from the
+    // record's own generation history, so a lower `--shards` on restart no
+    // longer fails the deploy. A brand-new tenant with no prior writes and no
+    // record passes through cleanly too (nothing to validate yet), so a fresh,
+    // operator-managed cluster with configured tenants and zero data starts
+    // normally. Only an unreadable record, or pre-ADR data a lower value would
+    // hide, refuses startup. An OIDC/mTLS deployment with no static tenants
+    // validates nothing here and checks each tenant at first touch.
     ravel_server::provisioning::validate_static_provisioning(
         store.as_ref(),
         &fold_tenants,

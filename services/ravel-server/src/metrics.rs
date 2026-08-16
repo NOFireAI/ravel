@@ -1118,22 +1118,26 @@ fn render_query_postings_family(out: &mut String, mode: Mode, blocks: (u64, u64,
 }
 
 /// Dynamic-tenant `shard_count` provisioning failures (ADR-0050 section 5,
-/// EC5): a dynamically-resolved tenant's durable provisioning check failed,
-/// either a real disagreement against this process's configured `--shards`
-/// (failing that single first-touch request), an unreadable record (corrupt
-/// or a future format version, also a hard failure), or the same class of
-/// failure caught on the maintain per-tenant loop instead (which skips that
-/// tenant's tick rather than failing a request). A static tenant's mismatch
-/// refuses startup instead and never reaches this counter. A nonzero value
-/// means at least one dynamic tenant's provisioning record could not be
-/// validated as expected; the operations guide pages on any increase.
+/// EC5; loosened by ADR-0082): a dynamically-resolved tenant's durable
+/// provisioning check failed -- pre-ADR data this process's configured
+/// `--shards` would hide (failing that single first-touch request), an
+/// unreadable record (corrupt or a future format version, also a hard
+/// failure), or the same class of failure caught on the maintain per-tenant
+/// loop instead (which skips that tenant's tick rather than failing a
+/// request). ADR-0082 removed the scalar-equality disagreement from this
+/// count entirely: a present, decodable record disagreeing with config is no
+/// longer a failure here, only drift ([`ravel_provisioning_shard_count_drift_total`],
+/// rendered by [`render_provisioning_drift_family`]). A static tenant's hard
+/// failure refuses startup instead and never reaches this counter. A nonzero
+/// value means at least one dynamic tenant's provisioning record could not be
+/// validated at all; the operations guide pages on any increase.
 /// Process-global atomic read from [`crate::provisioning`], single source,
 /// no labels.
 fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatches: u64) {
     write_header(
         out,
         "ravel_provisioning_shard_count_mismatch_total",
-        "Dynamic-tenant provisioning checks that failed: a shard_count disagreement, an unreadable record, or a maintain-loop check catching either (ADR-0050 section 5).",
+        "Dynamic-tenant provisioning checks that failed: pre-ADR data a configured shard_count would hide, an unreadable record, or a maintain-loop check catching either (ADR-0050 section 5). Does not count a present record's shard_count merely disagreeing with config (ADR-0082); see ravel_provisioning_shard_count_drift_total for that.",
         "counter",
     );
     write_sample(
@@ -1141,6 +1145,31 @@ fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatch
         "ravel_provisioning_shard_count_mismatch_total",
         &[Label::Mode(mode)],
         shard_count_mismatches,
+    );
+}
+
+/// `shard_count` drift observability (ADR-0082): a present, decodable
+/// provisioning record whose generation-0 `shard_count` disagrees with the
+/// caller's live config default. Never fatal -- the record wins and routing is
+/// unaffected -- but still worth surfacing, since a fleet-wide default that
+/// silently drifted away from what a tenant was actually provisioned at may
+/// indicate a misconfiguration worth investigating. Process-global atomic read
+/// from [`ravel_catalog::shard_count_drift_count`], single source, no labels,
+/// covering every consumer that routes through `validate_record` (ingest,
+/// static startup, catalog resolve, the maintain loop, and `ravel-cli
+/// provision adopt`).
+fn render_provisioning_drift_family(out: &mut String, mode: Mode, shard_count_drifts: u64) {
+    write_header(
+        out,
+        "ravel_provisioning_shard_count_drift_total",
+        "A present, decodable provisioning record's shard_count disagreeing with the caller's live config default (ADR-0082). Non-fatal: the record wins, routing is unaffected.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_provisioning_shard_count_drift_total",
+        &[Label::Mode(mode)],
+        shard_count_drifts,
     );
 }
 
@@ -2634,6 +2663,7 @@ pub fn render(
         mode,
         crate::provisioning::shard_count_mismatch_count(),
     );
+    render_provisioning_drift_family(&mut out, mode, ravel_catalog::shard_count_drift_count());
     render_store_probe_family(
         &mut out,
         mode,
