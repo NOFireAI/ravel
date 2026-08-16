@@ -81,3 +81,5 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0076](0076-reducing-s3-request-cost.md) | Reducing S3 request cost without weakening durability | Accepted |
 | [0077](0077-dr-posture-and-chaos-evidence.md) | Operator-owned DR via replicated-bucket controls, a rehearsed restore, and a process-kill evidence lane | Accepted |
 | [0078](0078-fold-retention-frontier-deployment-default.md) | Fold retention-frontier reconcile honors the deployment-wide retention default | Accepted |
+| [0079](0079-indexed-fields-durable-override-cache.md) | Indexed-fields durable override cache: cache-aside overlay over TenantConfig.indexed_fields | Accepted |
+| [0080](0080-gateway-api-ingest-affinity.md) | Gateway API exposure and Ravel-native subset affinity | Claimed |
