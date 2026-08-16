@@ -21,11 +21,15 @@ use kube_runtime::controller::{Action, Controller};
 use kube_runtime::watcher;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::s3::{S3Config, S3Store};
+use ravel_types::{Signal, TenantHash, TenantHashScheme, TenantId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 
-use crate::crd::{Condition, LocalSecretRef, RavelCluster, RavelClusterSpec, RavelClusterStatus};
+use crate::crd::{
+    Condition, LocalSecretRef, MIN_RESHARD_LEAD_HOURS, RavelCluster, RavelClusterSpec,
+    RavelClusterStatus, ShardOverridesSpec,
+};
 use crate::reconcile::{
     DEPLOYMENT_KEY_SECRET_KEY, RenderCtx, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
     desired_objects, possible_ingest_ingress_names,
@@ -387,8 +391,10 @@ async fn resolve_s3_credentials(
     ))
 }
 
-/// Build the S3 backend `sys/auth` reconciliation reads and writes, from
-/// `spec.storage.s3` plus its credential Secret. Mirrors `ravel-server`'s
+/// Build the S3 backend a reconcile step needs its own store handle for --
+/// `sys/auth` reconciliation and the `shardOverrides` reshard step both use
+/// this -- from `spec.storage.s3` plus its credential Secret. Mirrors
+/// `ravel-server`'s
 /// `build_store` S3 branch: `force_path_style: true` (path-style addressing,
 /// what MinIO/most S3-compatible endpoints expect), `allow_http:
 /// endpoint.is_some()` (only a custom endpoint may be plain HTTP; real AWS S3
@@ -584,8 +590,196 @@ async fn reconcile_sys_auth_best_effort(
     }
 }
 
-/// Current Unix time in nanoseconds, for `sys/auth` CAS-record timestamps.
-/// Direct `SystemTime::now()` use is acceptable here: this is the binary/
+/// The signals a `shardOverrides` entry reshards independently (#147,
+/// ADR-0076 decision 2): ADR-0052 resharding is per `(tenant, signal)`, each
+/// with its own provisioning record and generation history.
+const RESHARDED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+
+/// Nanoseconds per unix hour, the unit `activation_hour` counts in
+/// (`services/ravel-cli/src/provision.rs` uses the same constant).
+const RESHARD_NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// Bounded retry budget for an `append_generation` `ReshardCasConflict`:
+/// another writer (another operator replica's own reconcile cycle, or a
+/// concurrent `ravel-cli provision reshard`) appended its own generation
+/// between this attempt's read and write. `append_generation` re-reads the
+/// record fresh on every call, so retrying here is a fresh read-modify-write,
+/// not a blind replay of a stale one -- the same shape as [`retry_cas`]
+/// above, but a separate constant/loop since it retries a different error
+/// type (`ravel_catalog::ProvisioningError`, not `AuthTokenMapError`).
+/// `ravel-cli provision reshard` itself has no retry loop (it is a
+/// one-shot, human-invoked command); the operator adds one because its
+/// reconcile is periodic and unattended, so a transient conflict should
+/// self-heal within one cycle rather than wait for the next resync.
+const RESHARD_CAS_ATTEMPTS: u32 = 3;
+
+/// Errors from attempting one `(tenant, signal)` reshard via
+/// [`reshard_tenant_signal`].
+#[derive(Debug, thiserror::Error)]
+enum ShardOverrideError {
+    /// Mirrors `ravel-cli provision reshard`'s own refusal
+    /// (`services/ravel-cli/src/provision.rs`): a lead shorter than
+    /// [`MIN_RESHARD_LEAD_HOURS`] could let a live writer route past the
+    /// activation on a view it had not yet refreshed. Rejected outright, not
+    /// clamped up to the minimum.
+    #[error("shardOverrides.leadHours {lead_hours} is below the minimum {MIN_RESHARD_LEAD_HOURS}")]
+    LeadHoursTooShort {
+        /// The rejected lead-hours value.
+        lead_hours: u32,
+    },
+
+    /// One of `append_generation`'s own fail-closed preconditions (no
+    /// existing record, an out-of-range or no-op target count, an
+    /// activation that already landed in the past) or a CAS conflict that
+    /// survived [`RESHARD_CAS_ATTEMPTS`].
+    #[error("append_generation failed: {0}")]
+    Provisioning(#[from] ravel_catalog::ProvisioningError),
+}
+
+/// Resolve a `(cluster, tenant)`'s tenant hash directly from the cluster's own
+/// deployment key, rather than through `ravel_types`'s global
+/// `install_tenant_hash_scheme` singleton: this operator process may
+/// reconcile several `RavelCluster`s concurrently, each with its own
+/// (possibly absent) deployment key, and the ambient global scheme cannot
+/// represent more than one at a time.
+fn tenant_hash_for(tenant: &str, deployment_key: Option<&[u8; 32]>) -> TenantHash {
+    let id = TenantId::new(tenant);
+    match deployment_key {
+        Some(key) => TenantHashScheme::v2_from_deployment_key(key).hash(&id),
+        None => TenantHashScheme::V1Unkeyed.hash(&id),
+    }
+}
+
+/// Reshard one `(tenant, signal)` to `target_shard_count`, enforcing exactly
+/// the fail-closed preconditions `ravel-cli provision reshard` enforces
+/// (`services/ravel-cli/src/provision.rs`): a lead below
+/// [`MIN_RESHARD_LEAD_HOURS`] is refused before any store access; existing
+/// record, shard-count range, and same-count (no-op) are enforced by
+/// [`ravel_catalog::append_generation`] itself, which this calls directly
+/// rather than reimplementing. A `ReshardCasConflict` is retried up to
+/// [`RESHARD_CAS_ATTEMPTS`] times.
+async fn reshard_tenant_signal(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    target_shard_count: u32,
+    lead_hours: u32,
+    now_ns: i64,
+) -> Result<ravel_catalog::ReshardOutcome, ShardOverrideError> {
+    if lead_hours < MIN_RESHARD_LEAD_HOURS {
+        return Err(ShardOverrideError::LeadHoursTooShort { lead_hours });
+    }
+    let now_hour = u32::try_from(now_ns.div_euclid(RESHARD_NS_PER_HOUR).max(0)).unwrap_or(u32::MAX);
+    let activation_hour = now_hour.saturating_add(lead_hours);
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match ravel_catalog::append_generation(
+            store,
+            tenant_hash,
+            signal,
+            target_shard_count,
+            activation_hour,
+            now_ns,
+        )
+        .await
+        {
+            Err(ravel_catalog::ProvisioningError::ReshardCasConflict { .. })
+                if attempt < RESHARD_CAS_ATTEMPTS =>
+            {
+                continue;
+            }
+            other => return other.map_err(ShardOverrideError::from),
+        }
+    }
+}
+
+/// Converge every tenant named in `overrides` toward its target shard count
+/// (#147, ADR-0076 decision 2), one independent `append_generation` attempt
+/// per `(tenant, signal)` in [`RESHARDED_SIGNALS`].
+///
+/// "Current" is read as the LAST recorded generation's shard count, never the
+/// instantaneous count active at this hour: a reshard already appended (whose
+/// activation is still in the future) already matches the target, and
+/// comparing against the instantaneous active count would re-append a new
+/// generation every reconcile cycle until the activation hour finally
+/// arrived. A signal with no provisioning record yet compares against the
+/// cluster's day-one default (`spec.shards`, what every tenant is pinned to
+/// before its first write); when the override differs, the attempt is still
+/// made and surfaces `append_generation`'s own `NoRecordToReshard` refusal,
+/// rather than silently skipping a real difference.
+///
+/// Every failure (a too-short lead, a not-yet-provisioned tenant, an
+/// out-of-range or no-op target, a CAS conflict that survived its retry
+/// budget) is logged and skipped, never propagated: a misconfigured override
+/// for one tenant or signal must not block Deployment/Service reconciliation
+/// for the rest of the cluster, or the same tenant's other signals.
+async fn reconcile_shard_overrides(
+    spec: &RavelClusterSpec,
+    overrides: &ShardOverridesSpec,
+    deployment_key: Option<&[u8; 32]>,
+    store: &dyn ObjectStoreBackend,
+    now_ns: i64,
+) {
+    for (tenant, &target) in &overrides.tenants {
+        let tenant_hash = tenant_hash_for(tenant, deployment_key);
+        for signal in RESHARDED_SIGNALS {
+            let current =
+                match ravel_catalog::read_generations_from_store(store, &tenant_hash, signal).await
+                {
+                    Ok(Some(generations)) => {
+                        generations.last().map_or(spec.shards, |g| g.shard_count)
+                    }
+                    Ok(None) => spec.shards,
+                    Err(err) => {
+                        warn!(
+                            %tenant,
+                            signal = signal.key_prefix(),
+                            %err,
+                            "shardOverrides reconcile: failed to read the current shard-generation \
+                             history; skipping this tenant/signal this cycle"
+                        );
+                        continue;
+                    }
+                };
+            if current == target {
+                continue;
+            }
+            match reshard_tenant_signal(
+                store,
+                &tenant_hash,
+                signal,
+                target,
+                overrides.lead_hours,
+                now_ns,
+            )
+            .await
+            {
+                Ok(outcome) => info!(
+                    %tenant,
+                    signal = signal.key_prefix(),
+                    from = current,
+                    to = target,
+                    generation = outcome.generation,
+                    "shardOverrides reconcile: appended a new shard generation"
+                ),
+                Err(err) => warn!(
+                    %tenant,
+                    signal = signal.key_prefix(),
+                    from = current,
+                    to = target,
+                    %err,
+                    "shardOverrides reconcile: reshard attempt refused"
+                ),
+            }
+        }
+    }
+}
+
+/// Current Unix time in nanoseconds, for `sys/auth` and `shardOverrides`
+/// CAS-record timestamps. Direct `SystemTime::now()` use is acceptable here:
+/// this is the binary/
 /// wiring layer (analogous to `ravel-cli`'s own `now_ns()`), not the injected-
 /// clock-only "library logic" the testing-patterns rule governs.
 fn now_ns() -> i64 {
@@ -694,6 +888,24 @@ async fn reconcile_inner(
         reconcile_sys_auth_best_effort(
             &deployment_key,
             &token_secret.token_values,
+            &store,
+            now_ns(),
+        )
+        .await;
+    }
+
+    // Converge shardOverrides to the ADR-0052 resharding mechanism (#147,
+    // ADR-0076 decision 2), whenever the spec names at least one tenant.
+    // Best-effort per (tenant, signal): see reconcile_shard_overrides's doc
+    // comment for why a misconfigured override cannot block reconciliation.
+    if let Some(shard_overrides) = obj.spec.shard_overrides.as_ref()
+        && !shard_overrides.tenants.is_empty()
+    {
+        let store = build_auth_store(client, namespace, &obj.spec).await?;
+        reconcile_shard_overrides(
+            &obj.spec,
+            shard_overrides,
+            deployment_key_secret.key.as_ref(),
             &store,
             now_ns(),
         )
@@ -1510,5 +1722,293 @@ mod tests {
 
         assert_eq!(secret_value(&secret, "key"), Some(b"from-data".to_vec()));
         assert_eq!(secret_value(&secret, "missing"), None);
+    }
+
+    /// #147 (ADR-0076 decision 2 / ADR-0052): `reconcile_shard_overrides` is
+    /// the exact function `reconcile_inner` calls when `spec.shardOverrides`
+    /// names at least one tenant, so testing it directly here exercises the
+    /// real controller entry point rather than a test-only stand-in
+    /// (mirroring how `reconcile_sys_auth`, not a mocked `reconcile_inner`,
+    /// is the unit under test above -- a full `kube::Client` is out of scope
+    /// to mock either way).
+    mod shard_overrides {
+        use ravel_catalog::AbsentPolicy;
+
+        use super::*;
+
+        fn test_spec(shards: u32) -> RavelClusterSpec {
+            RavelClusterSpec {
+                image: "ravel:dev".to_string(),
+                image_pull_policy: None,
+                shards,
+                storage: crate::crd::StorageSpec {
+                    s3: crate::crd::S3Spec {
+                        bucket: "b".to_string(),
+                        region: "us-east-1".to_string(),
+                        endpoint: None,
+                        credentials_secret_ref: LocalSecretRef {
+                            name: "creds".to_string(),
+                        },
+                    },
+                },
+                tenant_tokens_secret_ref: None,
+                deployment_key_secret_ref: None,
+                gateway: Default::default(),
+                query: Default::default(),
+                maintain: Default::default(),
+                retention: None,
+                shard_overrides: None,
+            }
+        }
+
+        fn overrides(tenants: &[(&str, u32)], lead_hours: u32) -> ShardOverridesSpec {
+            ShardOverridesSpec {
+                tenants: tenants
+                    .iter()
+                    .map(|(name, count)| (name.to_string(), *count))
+                    .collect(),
+                lead_hours,
+            }
+        }
+
+        async fn seed_record(store: &dyn ObjectStoreBackend, tenant: &str, shard_count: u32) {
+            let hash = tenant_hash_for(tenant, None);
+            ravel_catalog::validate_or_adopt(
+                store,
+                &hash,
+                Signal::Metrics,
+                shard_count,
+                1_000,
+                AbsentPolicy::CreateFromConfig,
+            )
+            .await
+            .expect("seed generation-0 record");
+        }
+
+        async fn last_shard_count(store: &dyn ObjectStoreBackend, tenant: &str) -> Option<u32> {
+            let hash = tenant_hash_for(tenant, None);
+            ravel_catalog::read_generations_from_store(store, &hash, Signal::Metrics)
+                .await
+                .expect("read succeeds")
+                .and_then(|gens| gens.last().map(|g| g.shard_count))
+        }
+
+        #[tokio::test]
+        async fn appends_a_generation_when_the_target_differs_from_the_last_generation() {
+            let store = memory_store();
+            seed_record(&store, "acme", 4).await;
+
+            let spec = test_spec(4);
+            let ovr = overrides(&[("acme", 1)], MIN_RESHARD_LEAD_HOURS);
+            reconcile_shard_overrides(&spec, &ovr, None, &store, 10 * RESHARD_NS_PER_HOUR).await;
+
+            assert_eq!(
+                last_shard_count(&store, "acme").await,
+                Some(1),
+                "the reconcile step must drive a real append_generation call"
+            );
+        }
+
+        #[tokio::test]
+        async fn is_a_no_op_when_the_target_already_matches_the_last_generation() {
+            let store = memory_store();
+            seed_record(&store, "acme", 4).await;
+
+            let spec = test_spec(4);
+            let ovr = overrides(&[("acme", 4)], MIN_RESHARD_LEAD_HOURS);
+            reconcile_shard_overrides(&spec, &ovr, None, &store, 10 * RESHARD_NS_PER_HOUR).await;
+
+            let hash = tenant_hash_for("acme", None);
+            let generations =
+                ravel_catalog::read_generations_from_store(&store, &hash, Signal::Metrics)
+                    .await
+                    .expect("read succeeds")
+                    .expect("record exists");
+            assert_eq!(
+                generations.len(),
+                1,
+                "an already-converged tenant must not append a redundant generation"
+            );
+        }
+
+        /// One tenant with no provisioning record must not block a sibling
+        /// tenant's reshard: best-effort per (tenant, signal), matching
+        /// `reconcile_sys_auth`'s per-tenant-collision property.
+        #[tokio::test]
+        async fn one_unprovisioned_tenant_does_not_block_another_tenants_reshard() {
+            let store = memory_store();
+            seed_record(&store, "acme", 4).await;
+            // "globex" never had a provisioning record written.
+
+            let spec = test_spec(4);
+            let ovr = overrides(&[("acme", 1), ("globex", 2)], MIN_RESHARD_LEAD_HOURS);
+            reconcile_shard_overrides(&spec, &ovr, None, &store, 10 * RESHARD_NS_PER_HOUR).await;
+
+            assert_eq!(last_shard_count(&store, "acme").await, Some(1));
+            assert_eq!(
+                last_shard_count(&store, "globex").await,
+                None,
+                "globex has no record to reshard and must stay untouched"
+            );
+        }
+
+        #[tokio::test]
+        async fn reshard_tenant_signal_rejects_lead_hours_below_the_minimum_before_any_store_access()
+         {
+            let store = memory_store();
+            // No record seeded at all: the lead-hours check must fire before
+            // reshard_tenant_signal ever reaches the store.
+            let hash = tenant_hash_for("acme", None);
+
+            let err = reshard_tenant_signal(
+                &store,
+                &hash,
+                Signal::Metrics,
+                8,
+                MIN_RESHARD_LEAD_HOURS - 1,
+                10 * RESHARD_NS_PER_HOUR,
+            )
+            .await
+            .expect_err("a lead below the minimum must be rejected, not clamped up");
+            assert!(
+                matches!(err, ShardOverrideError::LeadHoursTooShort { lead_hours: 1 }),
+                "err: {err}"
+            );
+            assert_eq!(
+                last_shard_count(&store, "acme").await,
+                None,
+                "the rejection must happen before any store access"
+            );
+        }
+
+        #[tokio::test]
+        async fn reshard_tenant_signal_rejects_when_no_provisioning_record_exists() {
+            let store = memory_store();
+            let hash = tenant_hash_for("acme", None);
+
+            let err = reshard_tenant_signal(
+                &store,
+                &hash,
+                Signal::Metrics,
+                8,
+                MIN_RESHARD_LEAD_HOURS,
+                10 * RESHARD_NS_PER_HOUR,
+            )
+            .await
+            .expect_err("resharding a tenant with no provisioning record must be refused");
+            assert!(
+                matches!(
+                    err,
+                    ShardOverrideError::Provisioning(
+                        ravel_catalog::ProvisioningError::NoRecordToReshard { .. }
+                    )
+                ),
+                "err: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn reshard_tenant_signal_rejects_a_same_count_target_without_clamping() {
+            let store = memory_store();
+            seed_record(&store, "acme", 4).await;
+            let hash = tenant_hash_for("acme", None);
+
+            let err = reshard_tenant_signal(
+                &store,
+                &hash,
+                Signal::Metrics,
+                4,
+                MIN_RESHARD_LEAD_HOURS,
+                10 * RESHARD_NS_PER_HOUR,
+            )
+            .await
+            .expect_err("a same-count target is a no-op and must be refused, not silently ok");
+            assert!(
+                matches!(
+                    err,
+                    ShardOverrideError::Provisioning(
+                        ravel_catalog::ProvisioningError::ReshardSameCount { shard_count: 4 }
+                    )
+                ),
+                "err: {err}"
+            );
+            assert_eq!(
+                last_shard_count(&store, "acme").await,
+                Some(4),
+                "no new generation must have been appended"
+            );
+        }
+
+        #[tokio::test]
+        async fn reshard_tenant_signal_rejects_an_out_of_range_count() {
+            let store = memory_store();
+            seed_record(&store, "acme", 4).await;
+            let hash = tenant_hash_for("acme", None);
+
+            let err = reshard_tenant_signal(
+                &store,
+                &hash,
+                Signal::Metrics,
+                0,
+                MIN_RESHARD_LEAD_HOURS,
+                10 * RESHARD_NS_PER_HOUR,
+            )
+            .await
+            .expect_err("shard count 0 is out of range and must be refused");
+            assert!(
+                matches!(
+                    err,
+                    ShardOverrideError::Provisioning(
+                        ravel_catalog::ProvisioningError::ReshardCountOutOfRange { shard_count: 0 }
+                    )
+                ),
+                "err: {err}"
+            );
+        }
+
+        /// A transient CAS conflict on the first `append_generation` write
+        /// must be absorbed by `reshard_tenant_signal`'s own retry loop (the
+        /// operator's, not `ravel-cli provision reshard`'s -- that CLI
+        /// command has no retry loop of its own).
+        #[tokio::test]
+        async fn reshard_tenant_signal_retries_a_transient_cas_conflict() {
+            use ravel_object_store::fault::{
+                FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+            };
+
+            let base = memory_store();
+            seed_record(&base, "acme", 4).await;
+            let hash = tenant_hash_for("acme", None);
+
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite)
+                    .with_key_contains("prov")
+                    .with_occurrence(Occurrence::Nth(1)),
+            );
+            let store = FaultStore::new(base, plan);
+
+            let outcome = reshard_tenant_signal(
+                &store,
+                &hash,
+                Signal::Metrics,
+                8,
+                MIN_RESHARD_LEAD_HOURS,
+                10 * RESHARD_NS_PER_HOUR,
+            )
+            .await
+            .expect("the retry must absorb one transient CAS conflict");
+            assert_eq!(outcome.generation, 1);
+
+            assert_eq!(
+                store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+                1,
+                "the injected conflict must actually have fired"
+            );
+            assert_eq!(
+                last_shard_count(&store, "acme").await,
+                Some(8),
+                "the retried attempt must have succeeded"
+            );
+        }
     }
 }
