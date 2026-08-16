@@ -37,16 +37,37 @@ py_module="$here/check_readme_commands.py"
 # The compose stack from ADR-0081 binds loopback; #175 wires the real values.
 RAVEL_HTTP_BASE=${RAVEL_HTTP_BASE:-http://127.0.0.1:4318}
 RAVEL_TENANT_TOKEN=${RAVEL_TENANT_TOKEN:-demo-token}
-RAVEL_HEALTH_PATH=${RAVEL_HEALTH_PATH:-/health}
-# Query the readiness poll uses to decide the stack has data. It must be an
-# outcome both the collector and telemetrygen produce (ADR-0081 D5); the
-# default is a shape-only instant query whose result set is non-empty once any
-# series exists.
-RAVEL_READY_QUERY_URL=${RAVEL_READY_QUERY_URL:-$RAVEL_HTTP_BASE/api/v1/query?query=up}
+# Liveness route. ravel-server registers /healthz, /readyz, /-/healthy, and
+# /-/ready (services/ravel-server/src/health.rs); /healthz returns 200 as soon
+# as the axum server can route, which is what the readiness wait needs. There is
+# no /health route, so it is not a usable default.
+RAVEL_HEALTH_PATH=${RAVEL_HEALTH_PATH:-/healthz}
+# Query the readiness poll uses to decide the stack has data. It must return a
+# non-empty result set for an outcome both the collector and telemetrygen
+# produce (ADR-0081 D5). There is NO usable default: ravel-server has no scrape
+# loop and never synthesizes a `up` series, the collector's hostmetrics receiver
+# emits `system_*`, and telemetrygen emits `gen*`, so no single series name is
+# non-empty across both generators. The caller (#175's CI job, wiring the real
+# compose stack) MUST supply this explicitly; an empty value is a hard error
+# when the readiness poll runs, never a silent skip.
+RAVEL_READY_QUERY_URL=${RAVEL_READY_QUERY_URL:-}
 
 # Readiness timeout is a NAMED CONSTANT, never a fixed sleep (ADR-0081 D5).
 READINESS_TIMEOUT_SECONDS=${RAVEL_READINESS_TIMEOUT_SECONDS:-120}
 READINESS_POLL_SECONDS=${RAVEL_READINESS_POLL_SECONDS:-2}
+# Per-request bounds (ADR-0081 D5: a bounded poll, not just a bounded loop). A
+# server that accepts a connection and never responds must not hang a single
+# request past these, so the overall READINESS_TIMEOUT_SECONDS budget stays the
+# real ceiling. These apply to every curl this script issues, including the ones
+# that run marked README blocks: a hung server otherwise hangs the whole CI job,
+# not just the readiness phase. Timing out is a failure, never a pass.
+CONNECT_TIMEOUT_SECONDS=${RAVEL_CONNECT_TIMEOUT_SECONDS:-5}
+REQUEST_TIMEOUT_SECONDS=${RAVEL_REQUEST_TIMEOUT_SECONDS:-10}
+
+# Real curl path and the on-PATH shim dir that fronts it while a marked block
+# runs. Resolved once, before any shim is on PATH. See setup_curl_shim.
+REAL_CURL=$(command -v curl || true)
+CURL_SHIM_DIR=""
 
 # --- Readiness ------------------------------------------------------------
 # Poll health, then poll a first query until it returns a non-empty result,
@@ -56,11 +77,20 @@ wait_for_ready() {
   local health_url="$RAVEL_HTTP_BASE$RAVEL_HEALTH_PATH"
   local deadline=$(( $(date +%s) + READINESS_TIMEOUT_SECONDS ))
 
+  if [[ -z $RAVEL_READY_QUERY_URL ]]; then
+    echo "readiness: RAVEL_READY_QUERY_URL is unset; it has no working default" \
+         "(no series is non-empty across both the collector and telemetrygen)." \
+         "Set it to a query the running stack answers non-empty." >&2
+    return 1
+  fi
+
   echo "readiness: waiting for health at $health_url"
   while true; do
     local http_code=000
     local curl_rc=0
-    http_code=$(curl -s -o /dev/null -w '%{http_code}' "$health_url") || curl_rc=$?
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+      --connect-timeout "$CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$REQUEST_TIMEOUT_SECONDS" "$health_url") || curl_rc=$?
     if [[ $curl_rc -eq 0 && $http_code == "200" ]]; then
       break
     fi
@@ -74,7 +104,9 @@ wait_for_ready() {
   echo "readiness: waiting for first non-empty query at $RAVEL_READY_QUERY_URL"
   while true; do
     local body=""
-    body=$(curl -s -H "Authorization: Bearer $RAVEL_TENANT_TOKEN" "$RAVEL_READY_QUERY_URL") || body=""
+    body=$(curl -s -H "Authorization: Bearer $RAVEL_TENANT_TOKEN" \
+      --connect-timeout "$CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$REQUEST_TIMEOUT_SECONDS" "$RAVEL_READY_QUERY_URL") || body=""
     local eval_rc=0
     printf '%s' "$body" | python3 "$py_module" evaluate 'nonempty:.data.result' \
       --exit 0 --http 200 >/dev/null 2>&1 || eval_rc=$?
@@ -91,12 +123,60 @@ wait_for_ready() {
   echo "readiness: stack healthy and first query non-empty"
 }
 
+# --- The curl shim --------------------------------------------------------
+# Capturing the HTTP status must be OUT OF BAND: it may never be recoverable
+# from the response body (the body is produced by the very thing being gated, so
+# any status parsed out of it is forgeable), and appending flags to the tail of
+# an arbitrary command string is unsafe (a trailing `#`, `;`, or `|` in a README
+# line detaches them). Instead we front the real curl with a shim on PATH while
+# a marked block runs. The block command is executed verbatim; when it invokes
+# `curl` the shim receives the arguments as real argv, injects the timeouts and
+# a `%{http_code}` write-out, sends the body to its own stdout, and writes the
+# status to RAVEL_STATUS_FILE. Because the injected options are argv inside the
+# shim rather than text appended to the command string, they survive a trailing
+# `#` (the shim never sees it), a `;` (the shell runs `curl ...` as its own
+# simple command, which resolves to the shim), and a `|` (curl is one stage of
+# the pipeline; the shim still runs and still writes the status file). A 000
+# code (connection refused, or a --max-time timeout with no response) is written
+# as-is, so a timeout fails a `status=` assertion rather than passing it.
+setup_curl_shim() {
+  [[ -n $CURL_SHIM_DIR ]] && return 0
+  if [[ -z $REAL_CURL ]]; then
+    echo "curl not found on PATH" >&2
+    return 1
+  fi
+  CURL_SHIM_DIR=$(mktemp -d)
+  cat >"$CURL_SHIM_DIR/curl" <<'SHIM'
+#!/usr/bin/env bash
+# On-PATH shim for scripts/check-readme-commands.sh. Injects request timeouts
+# and captures the HTTP status out of band into RAVEL_STATUS_FILE.
+set -uo pipefail
+body=$(mktemp)
+code=$("$RAVEL_REAL_CURL" \
+  --silent \
+  --connect-timeout "$RAVEL_CURL_CONNECT_TIMEOUT_SECONDS" \
+  --max-time "$RAVEL_CURL_MAX_TIME_SECONDS" \
+  --output "$body" \
+  --write-out '%{http_code}' \
+  "$@")
+rc=$?
+printf '%s' "$code" >"$RAVEL_STATUS_FILE"
+cat "$body"
+rm -f "$body"
+exit "$rc"
+SHIM
+  chmod +x "$CURL_SHIM_DIR/curl"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$CURL_SHIM_DIR'" EXIT
+}
+
 # --- Running one command --------------------------------------------------
 # Runs `cmd`, writes its stdout to `body_file`, and prints two space-separated
 # tokens on one line: the captured HTTP status (or "none") and the command's
-# own exit code. For a curl command it appends a write-out directive so the
-# HTTP status is captured even when curl exits 0 on a 4xx/5xx; the sentinel
-# line is stripped from the body before evaluation.
+# own exit code. A curl command runs with the shim on PATH so the HTTP status is
+# captured out of band even when curl exits 0 on a 4xx/5xx. If the status cannot
+# be determined, "none" is reported and a `status=` assertion fails on it, never
+# passes.
 run_one_command() {
   local cmd=$1
   local body_file=$2
@@ -104,14 +184,22 @@ run_one_command() {
   local captured="none"
 
   if [[ $cmd == curl* ]]; then
-    bash -c "$cmd --silent --write-out '\nRAVEL_HTTP_STATUS=%{http_code}'" \
-      >"$body_file" 2>/dev/null || run_code=$?
-    local line
-    line=$(sed -n 's/^RAVEL_HTTP_STATUS=//p' "$body_file")
-    [[ -n $line ]] && captured=$line
-    local cleaned
-    cleaned=$(sed '/^RAVEL_HTTP_STATUS=/d' "$body_file")
-    printf '%s' "$cleaned" >"$body_file"
+    setup_curl_shim
+    local status_file
+    status_file=$(mktemp)
+    : >"$status_file"
+    PATH="$CURL_SHIM_DIR:$PATH" \
+      RAVEL_REAL_CURL="$REAL_CURL" \
+      RAVEL_STATUS_FILE="$status_file" \
+      RAVEL_CURL_CONNECT_TIMEOUT_SECONDS="$CONNECT_TIMEOUT_SECONDS" \
+      RAVEL_CURL_MAX_TIME_SECONDS="$REQUEST_TIMEOUT_SECONDS" \
+      bash -c "$cmd" >"$body_file" 2>/dev/null || run_code=$?
+    local code_read
+    code_read=$(cat "$status_file")
+    rm -f "$status_file"
+    if [[ -n $code_read ]]; then
+      captured=$code_read
+    fi
   else
     bash -c "$cmd" >"$body_file" 2>/dev/null || run_code=$?
   fi
@@ -123,6 +211,21 @@ run_blocks() {
   local md=$1
   local found=0
   local line_no exp_raw cmd_b64
+
+  # Extract to a file and capture the extractor's exit code before looping.
+  # `done < <(python3 ... )` would discard it: a producer that exits non-zero
+  # would leave the loop at rc 0 (a fail-open channel, the exact shape CLAUDE.md
+  # warns about). Unreachable from markdown today (a MarkerError emits zero
+  # records, so found=0 already fails), but closed here regardless.
+  local rec_file
+  rec_file=$(mktemp)
+  local extract_rc=0
+  python3 "$py_module" extract "$md" >"$rec_file" || extract_rc=$?
+  if [[ $extract_rc -ne 0 ]]; then
+    rm -f "$rec_file"
+    echo "extractor failed for $md (rc=$extract_rc)" >&2
+    return "$extract_rc"
+  fi
 
   while IFS= read -r -d '' line_no \
      && IFS= read -r -d '' exp_raw \
@@ -153,7 +256,8 @@ run_blocks() {
       return 1
     fi
     echo "PASS: ${md}:${line_no}"
-  done < <(python3 "$py_module" extract "$md")
+  done <"$rec_file"
+  rm -f "$rec_file"
 
   if [[ $found -eq 0 ]]; then
     echo "no marked (ravel:run) blocks found in $md" >&2
