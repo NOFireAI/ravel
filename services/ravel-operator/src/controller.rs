@@ -25,7 +25,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 
-use crate::crd::{Condition, LocalSecretRef, RavelCluster, RavelClusterSpec, RavelClusterStatus};
+use crate::crd::{
+    AffinityBackend, Condition, LocalSecretRef, RavelCluster, RavelClusterSpec, RavelClusterStatus,
+};
 use crate::reconcile::{
     DEPLOYMENT_KEY_SECRET_KEY, RenderCtx, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
     desired_objects, possible_ingest_ingress_names,
@@ -635,7 +637,22 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
     let instance = obj.name_any();
     let client = &ctx.client;
 
-    match reconcile_inner(&obj, client, &namespace, &instance).await {
+    // Conditions this pass owns beyond `Available`/`Degraded`, computed once
+    // here because either status writer may be the one that runs, and each
+    // PATCHes the whole `conditions` array (RFC 7386 merge patch replaces it
+    // wholesale). Computing them at one call site only would mean the other
+    // writer silently drops them.
+    let extra_conditions = spec_conditions(&obj.spec, obj.metadata.generation);
+
+    match reconcile_inner(
+        &obj,
+        client,
+        &namespace,
+        &instance,
+        extra_conditions.clone(),
+    )
+    .await
+    {
         Ok(action) => Ok(action),
         Err(err) => {
             let (reason, message) = degraded_reason(&err);
@@ -648,6 +665,7 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                 obj.metadata.generation,
                 &reason,
                 &message,
+                extra_conditions,
             )
             .await
             {
@@ -666,6 +684,7 @@ async fn reconcile_inner(
     client: &Client,
     namespace: &str,
     instance: &str,
+    extra_conditions: Vec<Condition>,
 ) -> Result<Action, Error> {
     let token_secret = resolve_token_secret(
         client,
@@ -804,6 +823,7 @@ async fn reconcile_inner(
         ready_replicas(&gateway_applied),
         ready_replicas(&query_applied),
         maintain_ready,
+        extra_conditions,
     )
     .await?;
 
@@ -852,21 +872,51 @@ fn condition(
     }
 }
 
-/// Write the status subresource: observed generation, per-mode ready replicas,
-/// and an `Available` condition derived from whether the gateway and query
-/// tiers report ready replicas.
-#[allow(clippy::too_many_arguments)]
-async fn write_status(
-    client: &Client,
-    namespace: &str,
-    instance: &str,
+/// Conditions derived from the spec alone, independent of whether this pass
+/// succeeds or fails (ADR-0080 decision 1).
+///
+/// Today that is exactly one: `IngestAffinityBackendDeprecated`, set while
+/// ingest affinity is enabled on the legacy ingress-nginx backend, whether that
+/// backend was chosen explicitly or came from the schema default. Absent,
+/// disabled, or `ravelNative` affinity produces no condition at all, so the
+/// deprecation notice disappears the moment a cluster migrates.
+///
+/// The reconcile pass hands the result to whichever status writer runs; there
+/// is deliberately no read-modify-write against live status, which would race
+/// a concurrent writer.
+fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) -> Vec<Condition> {
+    let legacy_backend = spec
+        .gateway
+        .ingest_affinity
+        .as_ref()
+        .is_some_and(|a| a.enabled && matches!(a.backend, AffinityBackend::IngressNginx));
+    if !legacy_backend {
+        return Vec::new();
+    }
+    vec![condition(
+        "IngestAffinityBackendDeprecated",
+        true,
+        observed_generation,
+        "IngressNginxRetired",
+        "ingestAffinity is using the ingress-nginx backend, which is \
+         retired upstream; migrate to backend: ravelNative or an \
+         equivalent Gateway API exposure (see docs/guides/ingest-affinity.md)",
+    )]
+}
+
+/// Build the success-path status: observed generation, per-mode ready replicas,
+/// an `Available` condition derived from whether the gateway and query tiers
+/// report ready replicas, and whatever spec-derived conditions this pass
+/// computed. Pure, so the condition set is testable without a cluster.
+fn build_status(
     observed_generation: Option<i64>,
     gateway_ready: Option<i32>,
     query_ready: Option<i32>,
     maintain_ready: Option<i32>,
-) -> Result<(), Error> {
+    extra_conditions: Vec<Condition>,
+) -> RavelClusterStatus {
     let available = gateway_ready.unwrap_or(0) > 0 && query_ready.unwrap_or(0) > 0;
-    let condition = if available {
+    let available_condition = if available {
         condition(
             "Available",
             true,
@@ -883,13 +933,61 @@ async fn write_status(
             "waiting for gateway and query tiers to become ready",
         )
     };
-    let status = RavelClusterStatus {
+    let mut conditions = vec![available_condition];
+    conditions.extend(extra_conditions);
+    RavelClusterStatus {
         observed_generation,
         gateway_ready_replicas: gateway_ready,
         query_ready_replicas: query_ready,
         maintain_ready_replicas: maintain_ready,
-        conditions: vec![condition],
-    };
+        conditions,
+    }
+}
+
+/// Build the failure-path status. Pure counterpart of [`build_status`].
+fn build_degraded_status(
+    observed_generation: Option<i64>,
+    reason: &str,
+    message: &str,
+    extra_conditions: Vec<Condition>,
+) -> RavelClusterStatus {
+    let mut conditions = vec![
+        condition("Degraded", true, observed_generation, reason, message),
+        condition("Available", false, observed_generation, reason, message),
+    ];
+    conditions.extend(extra_conditions);
+    RavelClusterStatus {
+        observed_generation,
+        gateway_ready_replicas: None,
+        query_ready_replicas: None,
+        maintain_ready_replicas: None,
+        conditions,
+    }
+}
+
+/// Write the status subresource: observed generation, per-mode ready replicas,
+/// and an `Available` condition derived from whether the gateway and query
+/// tiers report ready replicas. `extra_conditions` are the spec-derived
+/// conditions this reconcile pass computed (see [`spec_conditions`]); they are
+/// appended because the PATCH replaces the whole `conditions` array.
+#[allow(clippy::too_many_arguments)]
+async fn write_status(
+    client: &Client,
+    namespace: &str,
+    instance: &str,
+    observed_generation: Option<i64>,
+    gateway_ready: Option<i32>,
+    query_ready: Option<i32>,
+    maintain_ready: Option<i32>,
+    extra_conditions: Vec<Condition>,
+) -> Result<(), Error> {
+    let status = build_status(
+        observed_generation,
+        gateway_ready,
+        query_ready,
+        maintain_ready,
+        extra_conditions,
+    );
     patch_status(client, namespace, instance, &status).await
 }
 
@@ -897,7 +995,9 @@ async fn write_status(
 /// status write (finding 3), so the failure is visible on `.status` rather than
 /// only in operator logs. Also flips `Available` to `False` with the same
 /// reason so a `kubectl wait --for=condition=Available` fails fast with an
-/// explanation instead of silently timing out.
+/// explanation instead of silently timing out. `extra_conditions` carries the
+/// same spec-derived conditions the success path appends, so a failing
+/// reconcile does not drop them.
 async fn write_degraded_status(
     client: &Client,
     namespace: &str,
@@ -905,17 +1005,9 @@ async fn write_degraded_status(
     observed_generation: Option<i64>,
     reason: &str,
     message: &str,
+    extra_conditions: Vec<Condition>,
 ) -> Result<(), Error> {
-    let status = RavelClusterStatus {
-        observed_generation,
-        gateway_ready_replicas: None,
-        query_ready_replicas: None,
-        maintain_ready_replicas: None,
-        conditions: vec![
-            condition("Degraded", true, observed_generation, reason, message),
-            condition("Available", false, observed_generation, reason, message),
-        ],
-    };
+    let status = build_degraded_status(observed_generation, reason, message, extra_conditions);
     patch_status(client, namespace, instance, &status).await
 }
 
@@ -1033,6 +1125,9 @@ pub async fn run() -> Result<(), Error> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::crd::{
+        GatewaySpec, IngestAffinitySpec, MaintainSpec, QuerySpec, S3Spec, StorageSpec,
+    };
 
     #[test]
     fn rfc3339_formats_known_instants() {
@@ -1050,6 +1145,144 @@ mod tests {
         let (reason, message) = degraded_reason(&err);
         assert_eq!(reason, "SecretNotFound");
         assert!(message.contains("ravel-tokens"), "message names the Secret");
+    }
+
+    /// A minimal spec whose only interesting field is `gateway.ingestAffinity`.
+    fn spec_with_affinity(affinity: Option<IngestAffinitySpec>) -> RavelClusterSpec {
+        RavelClusterSpec {
+            image: "registry.example/ravel:v1".to_string(),
+            image_pull_policy: None,
+            shards: 4,
+            storage: StorageSpec {
+                s3: S3Spec {
+                    bucket: "ravel-data".to_string(),
+                    region: "eu-west-1".to_string(),
+                    endpoint: None,
+                    credentials_secret_ref: LocalSecretRef {
+                        name: "ravel-s3".to_string(),
+                    },
+                },
+            },
+            tenant_tokens_secret_ref: None,
+            deployment_key_secret_ref: None,
+            gateway: GatewaySpec {
+                ingest_affinity: affinity,
+                ..GatewaySpec::default()
+            },
+            query: QuerySpec::default(),
+            maintain: MaintainSpec::default(),
+            retention: None,
+        }
+    }
+
+    /// Condition `type`s in order, which is what the assertions below are
+    /// really about: a condition present at all, and no other one dropped.
+    fn condition_types(conditions: &[Condition]) -> Vec<&str> {
+        conditions.iter().map(|c| c.r#type.as_str()).collect()
+    }
+
+    fn find<'a>(conditions: &'a [Condition], condition_type: &str) -> &'a Condition {
+        conditions
+            .iter()
+            .find(|c| c.r#type == condition_type)
+            .expect("condition present")
+    }
+
+    /// The legacy-backend deprecation condition rides alongside `Available` on
+    /// the success path and alongside both `Degraded` and `Available` on the
+    /// failure path. Both status writers PATCH the whole `conditions` array, so
+    /// the failure-path assertion is the one that catches a regression where
+    /// only the success path learned about the new condition.
+    #[test]
+    fn legacy_backend_condition_appears_without_dropping_available_or_degraded() {
+        let spec = spec_with_affinity(Some(IngestAffinitySpec::default()));
+        let extra = spec_conditions(&spec, Some(7));
+        assert_eq!(
+            condition_types(&extra),
+            vec!["IngestAffinityBackendDeprecated"]
+        );
+
+        let ok = build_status(Some(7), Some(3), Some(2), Some(1), extra.clone());
+        assert_eq!(
+            condition_types(&ok.conditions),
+            vec!["Available", "IngestAffinityBackendDeprecated"]
+        );
+        assert_eq!(find(&ok.conditions, "Available").status, "True");
+
+        let deprecated = find(&ok.conditions, "IngestAffinityBackendDeprecated");
+        assert_eq!(deprecated.status, "True");
+        assert_eq!(deprecated.reason, "IngressNginxRetired");
+        assert_eq!(deprecated.observed_generation, Some(7));
+        assert!(
+            deprecated.message.contains("backend: ravelNative"),
+            "message names the migration target: {}",
+            deprecated.message
+        );
+
+        let degraded = build_degraded_status(Some(7), "SecretNotFound", "no such Secret", extra);
+        assert_eq!(
+            condition_types(&degraded.conditions),
+            vec!["Degraded", "Available", "IngestAffinityBackendDeprecated"]
+        );
+        assert_eq!(find(&degraded.conditions, "Degraded").status, "True");
+        assert_eq!(find(&degraded.conditions, "Available").status, "False");
+    }
+
+    /// An existing CR, whose serialized spec predates the `backend` field
+    /// entirely, still gets the deprecation condition: the field defaults to
+    /// `ingressNginx`, which is exactly the backend that CR is running.
+    #[test]
+    fn legacy_backend_condition_appears_for_a_cr_that_never_set_backend() {
+        let affinity: IngestAffinitySpec = serde_json::from_value(serde_json::json!({
+            "ingressClassName": "nginx",
+            "hosts": ["ingest.example.com"],
+        }))
+        .expect("legacy ingestAffinity JSON deserializes");
+        assert_eq!(affinity.backend, AffinityBackend::IngressNginx);
+
+        let spec = spec_with_affinity(Some(affinity));
+        assert_eq!(
+            condition_types(&spec_conditions(&spec, Some(1))),
+            vec!["IngestAffinityBackendDeprecated"]
+        );
+    }
+
+    /// No deprecation condition when there is no legacy backend in play, and
+    /// the rest of the status is unchanged in each case: `Available` alone on
+    /// success, `Degraded` + `Available` on failure, exactly as before this
+    /// condition existed.
+    #[test]
+    fn no_legacy_backend_condition_when_affinity_is_native_disabled_or_absent() {
+        let native = spec_with_affinity(Some(IngestAffinitySpec {
+            backend: AffinityBackend::RavelNative,
+            ..IngestAffinitySpec::default()
+        }));
+        let disabled = spec_with_affinity(Some(IngestAffinitySpec {
+            enabled: false,
+            ..IngestAffinitySpec::default()
+        }));
+        let disabled_native = spec_with_affinity(Some(IngestAffinitySpec {
+            enabled: false,
+            backend: AffinityBackend::RavelNative,
+            ..IngestAffinitySpec::default()
+        }));
+        let absent = spec_with_affinity(None);
+
+        for spec in [&native, &disabled, &disabled_native, &absent] {
+            let extra = spec_conditions(spec, Some(2));
+            assert!(
+                extra.is_empty(),
+                "no spec-derived condition, got {:?}",
+                condition_types(&extra)
+            );
+            let ok = build_status(Some(2), Some(1), Some(1), None, extra.clone());
+            assert_eq!(condition_types(&ok.conditions), vec!["Available"]);
+            let degraded = build_degraded_status(Some(2), "ReconcileError", "boom", extra);
+            assert_eq!(
+                condition_types(&degraded.conditions),
+                vec!["Degraded", "Available"]
+            );
+        }
     }
 
     #[test]
