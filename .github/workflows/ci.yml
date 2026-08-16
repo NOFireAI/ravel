@@ -1410,6 +1410,17 @@ jobs:
       - name: Run the read-your-write walkthrough
         if: steps.filter.outputs.run == 'true'
         run: demo/walkthrough.sh
+      # The kill-and-recover demo (ADR-0081 D9): ingest under strict ack,
+      # SIGKILL ravel-server, replace it with a fresh container, read the
+      # pre-kill write back by its own commit token. Runs LAST of the assertion
+      # steps because it deliberately destroys and recreates the server
+      # container; the steps above expect the container they started. It is
+      # assertive on its own and fails the job by itself. This attachment is
+      # what makes the script trustworthy: the fleet executors that write it
+      # cannot run docker, so without a job step it would merge unproven.
+      - name: Run the kill-and-recover demo
+        if: steps.filter.outputs.run == 'true'
+        run: demo/kill-and-recover.sh
       # Always capture logs on failure: a CI failure nobody can diagnose is a job
       # that gets disabled (ADR-0081 D6).
       - name: Dump compose logs on failure
