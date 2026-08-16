@@ -249,6 +249,51 @@ should have been marked is a reviewable omission rather than a silent one.
 not prove the data survives a process kill, which is Ravel's actual claim. The
 dashboard is the hook; the kill script is the evidence.
 
+## Amendments
+
+Four things this ADR got wrong or left unsaid, found while implementing it.
+Recorded here rather than silently patched into the decisions above, so the
+gap between what was designed and what shipped stays visible.
+
+**A1. Decision 2's argument vector is incomplete: the stack needs a store
+qualification step.** `ravel-server --store s3` refuses to start without a
+`sys/qualification` object, and there is no bootstrap-and-continue path. As
+written, decision 1's service list produces a quickstart that never starts. The
+compose stack therefore runs `ravel-cli store qualify` as a one-shot ordered
+between bucket creation and the server, gated with
+`service_completed_successfully`. The command is idempotent, which is what makes
+it safe against the reused `minio-data/` decision 1 requires tolerating.
+
+**A2. Decision 2's argument vector is also missing the tenant-hash scheme.**
+A fresh bucket with no `--tenant-hash-*` flag fails startup with
+`FreshBucketNeedsKey` (`services/ravel-server/src/tenancy.rs`). CI always starts
+from an empty `minio-data/`, so the stack would never have come up there. The
+compose service passes `--tenant-hash-unkeyed`: correct for a throwaway
+development stack, since it needs no key file and an existing unkeyed marker
+from a previous run resolves cleanly. A deployment that matters wants the keyed
+scheme, and the quickstart docs must not read as a template for one.
+
+**A3. Decision 9 says "restarts it from empty" without saying how, and the
+obvious reading is wrong.** `docker compose start` preserves the container's
+writable layer, which would weaken the demonstration to the point of
+meaninglessness. The script kills with SIGKILL, then `rm`s and `up`s so the
+container is *replaced*, and asserts the container id actually changed. The
+`ravel-server` service mounts no volumes, so a replaced container is genuinely a
+fresh filesystem, which is what makes the assertion sound.
+
+**A4. Decision 5's "an outcome both generators produce" is not satisfiable by
+any series name.** `hostmetrics` emits `system_*` and telemetrygen emits `gen*`,
+and `ravel-server` has no scrape loop, so it never synthesizes an `up` series
+either. `RAVEL_READY_QUERY_URL` consequently has no default at all: an empty
+value is a hard error when the readiness poll runs, and each caller supplies the
+query for the generator it actually runs. A marked block may still assert only
+shapes both generators produce, which is what decision 5 was reaching for.
+
+One thing outside this ADR that A2 exposes: `scripts/demo.sh` passes no
+tenant-hash flag either, so the from-source demo only works because a previous
+run left an unkeyed marker behind. On a genuinely fresh `minio-data/` it fails
+the same way. Reported, not fixed here.
+
 ## Consequences
 
 - Time to first useful behaviour drops from tens of minutes to one image pull.
