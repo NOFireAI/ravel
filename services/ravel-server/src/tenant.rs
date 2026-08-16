@@ -4,11 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::HeaderMap;
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_query::http::{
-    AuthError, DevHeaderTenantResolver, MtlsResolver, OidcJwksCache, OidcResolver,
-    StaticBearerTokenResolver, TenantResolver,
+    DevHeaderTenantResolver, MtlsResolver, OidcJwksCache, OidcResolver, StaticBearerTokenResolver,
+    TenantResolver,
 };
 use ravel_types::TenantId;
 use tokio::sync::oneshot;
@@ -16,27 +15,11 @@ use tokio::task::JoinHandle;
 
 use crate::config::AuthResolverSettings;
 
-/// Tries each resolver in order, returning the first successful match.
-pub struct FallbackResolver {
-    resolvers: Vec<Arc<dyn TenantResolver>>,
-}
-
-impl FallbackResolver {
-    pub fn new(resolvers: Vec<Arc<dyn TenantResolver>>) -> Self {
-        FallbackResolver { resolvers }
-    }
-}
-
-impl TenantResolver for FallbackResolver {
-    fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError> {
-        for resolver in &self.resolvers {
-            if let Ok(tenant) = resolver.resolve(headers) {
-                return Ok(tenant);
-            }
-        }
-        Err(AuthError)
-    }
-}
+// `FallbackResolver` moved to the shared `ravel-tenant-resolve` crate (ADR-0080
+// decision 3). Re-exported here so `ravel_server::tenant::FallbackResolver`
+// keeps resolving for the wiring in `crate::lib` and the real-authn e2e test,
+// unchanged.
+pub use ravel_tenant_resolve::FallbackResolver;
 
 pub fn build_resolver(
     tokens: HashMap<String, TenantId>,

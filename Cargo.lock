@@ -4670,13 +4670,11 @@ version = "0.9.2"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.23.0",
  "blake3",
  "bytes",
  "criterion",
  "futures",
  "humantime",
- "jsonwebtoken",
  "promql-parser",
  "proptest",
  "prost",
@@ -4691,8 +4689,8 @@ dependencies = [
  "ravel-promql",
  "ravel-proto",
  "ravel-segment",
+ "ravel-tenant-resolve",
  "ravel-types",
- "reqwest 0.13.4",
  "serde",
  "serde_json",
  "thiserror",
@@ -4798,6 +4796,7 @@ dependencies = [
  "ravel-rspan",
  "ravel-segment",
  "ravel-sql",
+ "ravel-tenant-resolve",
  "ravel-tracing-export",
  "ravel-types",
  "reqwest 0.13.4",
@@ -4872,6 +4871,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "ravel-tenant-resolve"
+version = "0.9.2"
+dependencies = [
+ "axum",
+ "base64 0.23.0",
+ "blake3",
+ "jsonwebtoken",
+ "ravel-types",
+ "reqwest 0.13.4",
+ "serde_json",
+ "thiserror",
  "uuid",
 ]
 

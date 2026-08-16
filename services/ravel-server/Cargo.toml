@@ -22,6 +22,11 @@ ravel-logseg = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-remote-write = { workspace = true }
 ravel-query = { workspace = true }
+# Shared tenant-resolution primitives (ADR-0080 decision 3): FallbackResolver is
+# re-exported from `crate::tenant`, and the concrete resolvers reach the wiring
+# via ravel-query's `http` re-export. One resolver implementation, shared with
+# the future ravel-ingest-router.
+ravel-tenant-resolve = { workspace = true }
 ravel-promql = { workspace = true }
 # The exemplars endpoint (ADR-0047 decision 4) reads the RSEG
 # EXEMPLARS section back out of the segments a query already matched, using
