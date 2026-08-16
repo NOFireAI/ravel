@@ -6,6 +6,7 @@
 //! are persistent contracts: changing them requires a new version domain
 //! string, never an in-place edit.
 
+// Fleet dispatch smoke test: 2026-08-16.
 pub mod accounting;
 pub mod exemplar;
 pub mod logstream;
