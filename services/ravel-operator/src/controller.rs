@@ -920,7 +920,7 @@ async fn reconcile_inner(
     client: &Client,
     namespace: &str,
     instance: &str,
-    extra_conditions: Vec<Condition>,
+    mut extra_conditions: Vec<Condition>,
 ) -> Result<Action, Error> {
     let token_secret = resolve_token_secret(
         client,
@@ -1090,6 +1090,22 @@ async fn reconcile_inner(
     let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
     let roles: Api<Role> = Api::namespaced(client.clone(), namespace);
     let role_bindings: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
+    // A router RENDER error (a missing routerImage, or canonicalTenant with no
+    // resolver) degrades ONLY the router: record a Degraded condition and render
+    // none of its objects, but let every other tier below still reconcile.
+    // `desired_objects` already captured the error here rather than aborting the
+    // whole reconcile, so all `router_*` fields are None and the apply blocks
+    // below are no-ops; the sweep then removes any stale router objects.
+    if let Some(err) = desired.router_render_error {
+        let (reason, message) = degraded_reason(&Error::Render(err));
+        extra_conditions.push(condition(
+            "Degraded",
+            true,
+            obj.metadata.generation,
+            &reason,
+            &message,
+        ));
+    }
     let mut desired_router_names: BTreeSet<String> = BTreeSet::new();
     if let Some(mut sa) = desired.router_service_account {
         let name = sa.name_any();
@@ -1403,6 +1419,10 @@ fn degraded_reason(err: &Error) -> (String, String) {
         Error::Render(RenderError::RouterImageMissing) => {
             ("RouterImageMissing".to_string(), err.to_string())
         }
+        Error::Render(RenderError::CanonicalTenantResolverMissing) => (
+            "CanonicalTenantResolverMissing".to_string(),
+            err.to_string(),
+        ),
         other => ("ReconcileError".to_string(), other.to_string()),
     }
 }
@@ -1506,6 +1526,21 @@ mod tests {
         let (reason, message) = degraded_reason(&err);
         assert_eq!(reason, "SecretNotFound");
         assert!(message.contains("ravel-tokens"), "message names the Secret");
+    }
+
+    #[test]
+    fn degraded_reason_maps_router_render_errors() {
+        // A router render error degrades only the router (Fix 5), with a reason
+        // string naming the exact misconfiguration so `kubectl describe` shows
+        // what to fix. Both render-error variants map to their own reason.
+        let (reason, message) = degraded_reason(&Error::Render(RenderError::RouterImageMissing));
+        assert_eq!(reason, "RouterImageMissing");
+        assert!(!message.is_empty(), "message carries the error text");
+
+        let (reason, message) =
+            degraded_reason(&Error::Render(RenderError::CanonicalTenantResolverMissing));
+        assert_eq!(reason, "CanonicalTenantResolverMissing");
+        assert!(!message.is_empty(), "message carries the error text");
     }
 
     /// A minimal spec whose only interesting field is `gateway.ingestAffinity`.

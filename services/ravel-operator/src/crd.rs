@@ -483,6 +483,13 @@ pub enum AffinityKeySource {
     /// no way to run the tenant-resolution chain, so this key source combined
     /// with `backend: ingressNginx` is rejected at admission by a CEL rule on
     /// the `ingestAffinity` object (see [`ravel_cluster_crd`]).
+    ///
+    /// Requires a resolver: `ravel-ingest-router` refuses to start under
+    /// `canonical-tenant` unless at least one resolver is configured. The only
+    /// resolver surface this CRD exposes today is `tenantTokensSecretRef`;
+    /// selecting `canonicalTenant` without it makes the operator surface a
+    /// `Degraded` condition (reason `CanonicalTenantResolverMissing`) and render
+    /// no router objects, rather than a Deployment that would crashloop.
     CanonicalTenant,
 }
 
