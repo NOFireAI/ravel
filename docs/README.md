@@ -63,6 +63,11 @@ Start here to run Ravel, ingest into it, or query it.
   ADR-0052's online resharding) -- the request-cost savings, the throughput
   ceiling and shard-0 concentration it costs, and coarser ADR-0065
   maintenance units. Read this to cut per-tenant object-storage request cost.
+- [guides/cost-model.md](guides/cost-model.md): the PUTs/day formula
+  (ADR-0076) and how tenant count, signal mix, shard count, replica
+  affinity, and flush cadence each move it, with a measured before/after of
+  the flush-cadence default change. Read this to predict the S3 request
+  bill before deploying.
 - [guides/disaster-recovery.md](guides/disaster-recovery.md): recovering a
   deployment from object storage alone -- what state is reconstructable, the
   commit-record and catalog rebuild path, and the operator steps. Read this

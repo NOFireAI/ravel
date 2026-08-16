@@ -1431,7 +1431,7 @@ no special shutdown sequence:
   memory. If you kill the process, you lose that buffer. In strict mode,
   nothing in that buffer was ever acknowledged, so no acknowledged write is
   lost. In buffered mode, the acknowledged-but-unflushed window (bounded by
-  `max_flush_delay`, 500ms default) is lost, by design.
+  `max_flush_delay`, 2s default, ADR-0076 decision 4) is lost, by design.
   ([docs/consistency-model.md](../consistency-model.md))
 - **Gateway and query processes** hold no durable state at all. They read
   and write the object store, and otherwise hold only in-flight request

@@ -62,7 +62,8 @@ Every write has a mode. The default is strict:
 - **Buffered**: the call returns as soon as Ravel validates the request and
   enqueues it into its shard's in-memory buffer, before any flush. This is
   lower latency but not durable. A crash between the ack and the next flush
-  loses that buffered window, bounded by `max_flush_delay` (500ms default).
+  loses that buffered window, bounded by `max_flush_delay` (2s default,
+  ADR-0076 decision 4).
   Ravel issues no commit token, because there is nothing yet to point one at.
 
 To use buffered mode for one request, send `x-ravel-ingest-mode: buffered` on
