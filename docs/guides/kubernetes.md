@@ -194,7 +194,7 @@ A minimal example is in
 | `spec.gateway.ingestAffinity.tlsSecretName` | string | — | Legacy `ingressNginx` only. Renders `spec.tls`. Effectively required for OTLP/gRPC, which needs HTTP/2. |
 | `spec.gateway.ingestAffinity.grpc` | boolean | `true` | Legacy `ingressNginx` only. Also render the OTLP/gRPC Ingress. |
 | `spec.gateway.ingestAffinity.annotations` | map | `{}` | Legacy `ingressNginx` only. Extra Ingress annotations, merged before the affinity annotations. `nginx.ingress.kubernetes.io/proxy-body-size` belongs here: the ingress-nginx default of `1m` rejects larger OTLP/HTTP exports. |
-| `spec.gateway.exposure.gatewayAPI` | object | — | Gateway API exposure (ADR-0080 decision 2), independent of `ingestAffinity`. Renders `HTTPRoute`/`GRPCRoute` onto an existing `Gateway` instead of Ingress objects. Fields `gatewayRef.name`/`gatewayRef.namespace`, `hostnames`, `grpc` (default true). See [ingest-affinity.md](ingest-affinity.md). |
+| `spec.gateway.exposure.gatewayApi` | object | — | Gateway API exposure (ADR-0080 decision 2), independent of `ingestAffinity`. Renders `HTTPRoute`/`GRPCRoute` onto an existing `Gateway` instead of Ingress objects. Fields `gatewayRef.name`/`gatewayRef.namespace`, `hostnames`, `grpc` (default true). See [ingest-affinity.md](ingest-affinity.md). |
 | `spec.query.replicas` | integer | `1` | |
 | `spec.query.resources` | object | — | |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
@@ -271,8 +271,8 @@ For a `RavelCluster` named `dev`:
 | `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
 | `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
 | `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative` (ADR-0080). See [ingest-affinity.md](ingest-affinity.md). |
-| `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayAPI` (ADR-0080), independent of the backend. |
-| `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayAPI.grpc` is `false`. |
+| `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi` (ADR-0080), independent of the backend. |
+| `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
 
 Maintain is pinned to one replica with `Recreate` to avoid rolling-update
 overlap. This is not an at-most-one guarantee, and correctness does not need
@@ -331,7 +331,7 @@ cluster.
 - The operator does not expose the query Service outside the cluster. It renders
   ingest exposure only when you ask for it: `gateway.ingestAffinity` on
   `backend: ingressNginx` renders an ingest Ingress, `backend: ravelNative`
-  renders the subset router, and `gateway.exposure.gatewayAPI` renders
+  renders the subset router, and `gateway.exposure.gatewayApi` renders
   `HTTPRoute`/`GRPCRoute` onto a `Gateway` you provide (all in
   [ingest-affinity.md](ingest-affinity.md)). Otherwise add an Ingress or a
   `LoadBalancer` Service yourself. Either way put TLS in front of it: tenant

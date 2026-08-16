@@ -76,7 +76,7 @@ all. Name them separately:
   ingress-nginx's `upstream-hash-by-subset` annotation family. It works and is
   unchanged, but ingress-nginx is retiring upstream, so it is **deprecated**
   (ADR-0080 decision 1).
-- **(c) Gateway API exposure (`gateway.exposure.gatewayAPI`).** A separate,
+- **(c) Gateway API exposure (`gateway.exposure.gatewayApi`).** A separate,
   affinity-independent field that renders standard `HTTPRoute`/`GRPCRoute`
   objects onto a `Gateway` you already run. It is *exposure*, not affinity: by
   itself it pins nothing. ADR-0080 decision 2.
@@ -241,9 +241,10 @@ routes on something other than what you configured.
 
 #### Current limitation: HTTP-only, no gRPC through the router
 
-**The router proxies HTTP only today.** Its Deployment renders a single HTTP
-container port (8080) and no gRPC listener. When `backend: ravelNative` is
-combined with Gateway API exposure (c):
+**The operator-rendered router Deployment is HTTP-only today.** It renders a
+single HTTP container port (8080) and no `--listen-grpc` flag, even though the
+router binary itself has a gRPC listener (added in #184). When
+`backend: ravelNative` is combined with Gateway API exposure (c):
 
 - the rendered **HTTPRoute** points at the router's Service (subset-pinned), but
 - the rendered **GRPCRoute** continues to target the **gateway Service
@@ -263,7 +264,7 @@ migrating: `ravelNative` will pin your OTLP/HTTP traffic but not yet your gRPC.
 
 ### (c) Gateway API exposure
 
-`gateway.exposure.gatewayAPI` is a separate, independent field from
+`gateway.exposure.gatewayApi` is a separate, independent field from
 `ingestAffinity` (ADR-0080 decision 2): it renders standard
 `gateway.networking.k8s.io` `HTTPRoute` and `GRPCRoute` objects attached to an
 existing `Gateway`, instead of the ingress-nginx-specific `Ingress` objects. It
@@ -275,7 +276,7 @@ cloud implementation) — Ravel does not couple its CRD to one.
 spec:
   gateway:
     exposure:
-      gatewayAPI:
+      gatewayApi:
         gatewayRef:
           name: public-gateway
           # namespace: defaults to this RavelCluster's own namespace
@@ -301,7 +302,7 @@ subset-of-`S`). Its relationship with the two affinity backends:
 TLS is not rendered by the operator here: Gateway API exposure terminates TLS at
 the referenced `Gateway`'s own listener, which you configure directly
 (`tls.certificateRefs`) — there is no `tlsSecretName` equivalent under
-`exposure.gatewayAPI`, unlike the legacy `ingestAffinity.tlsSecretName`.
+`exposure.gatewayApi`, unlike the legacy `ingestAffinity.tlsSecretName`.
 
 Requires Gateway API **v1.1 or newer** in the cluster: `GRPCRoute` only reached
 the stable `v1` API version in Gateway API v1.1 (it was `v1alpha2` in v1.0), and
@@ -335,7 +336,7 @@ Two combinations are rejected by the API server at admission (CEL
 with a clear message rather than degrading silently at runtime:
 
 1. **Gateway API exposure with an enabled legacy backend.** Setting
-   `gateway.exposure.gatewayAPI` while `ingestAffinity` is enabled on
+   `gateway.exposure.gatewayApi` while `ingestAffinity` is enabled on
    `backend: ingressNginx` is rejected:
 
    > `gateway.exposure.gatewayApi cannot be combined with an enabled
@@ -381,6 +382,12 @@ Only the router degrades: the gateway, query, and maintain tiers still reconcile
 normally. Fix the field named in the condition message and the router renders on
 the next reconcile.
 
+If Gateway API exposure is also configured, a degraded router pass does not
+strand the HTTPRoute either: the operator computes the router's render outcome
+before rendering routes, so the HTTPRoute falls back to targeting the gateway
+Service directly whenever the router will not exist that pass, rather than
+pointing at a router Service the same reconcile just swept away.
+
 ## Migrating from `ingressNginx` to `ravelNative`
 
 `backend: ingressNginx` → `backend: ravelNative` is the ADR-0080 migration path.
@@ -417,7 +424,7 @@ toggle.** It has behavior differences you must plan for:
 
 A workable sequence: set `routerImage` and (if using it) confirm the
 tenant-tokens Secret is populated; apply `backend: ravelNative`; if you also
-want Gateway API exposure, add `exposure.gatewayAPI` in the same or a following
+want Gateway API exposure, add `exposure.gatewayApi` in the same or a following
 apply and move your `Gateway` listener's TLS across; watch the flush/PUT rate
 settle (see [Verifying it works](#verifying-it-works)); then decommission the
 old ingress-nginx `Ingress` for this cluster once traffic has moved.
@@ -455,7 +462,7 @@ spec:
       routerImage: ghcr.io/nofireai/ravel-ingest-router:latest
       # subsetSize, key default as above
     exposure:
-      gatewayAPI:
+      gatewayApi:
         gatewayRef:
           name: public-gateway
         hostnames: [ingest.example.com]
@@ -476,10 +483,10 @@ spec:
 | `ingressClassName` | string | — | **Legacy `ingressNginx` only.** Omit to use the cluster's default IngressClass. |
 | `hosts` | list | `[]` | **Legacy `ingressNginx` only.** Empty renders one host-less rule matching any host that reaches the controller. |
 | `tlsSecretName` | string | — | **Legacy `ingressNginx` only.** Renders `spec.tls`. Effectively required, see below. No Gateway API equivalent. |
-| `grpc` | boolean | `true` | **Legacy `ingressNginx` only.** Also render an Ingress for OTLP/gRPC on port 4317. (Gateway API exposure has its own `exposure.gatewayAPI.grpc`.) |
+| `grpc` | boolean | `true` | **Legacy `ingressNginx` only.** Also render an Ingress for OTLP/gRPC on port 4317. (Gateway API exposure has its own `exposure.gatewayApi.grpc`.) |
 | `annotations` | map | `{}` | **Legacy `ingressNginx` only.** Merged onto both Ingress objects, *before* the affinity annotations, which therefore always win. |
 
-`spec.gateway.exposure.gatewayAPI` (independent of `ingestAffinity`):
+`spec.gateway.exposure.gatewayApi` (independent of `ingestAffinity`):
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -505,12 +512,12 @@ Under `backend: ravelNative` (enabled, `routerImage` set): the five
 [The managed objects and their RBAC](#the-managed-objects-and-their-rbac). No
 `Ingress` is rendered.
 
-Under `gateway.exposure.gatewayAPI` (independent of backend):
+Under `gateway.exposure.gatewayApi` (independent of backend):
 
 | Object | Kind | Notes |
 |---|---|---|
 | `prod-gateway-route` | HTTPRoute | Attached to `gatewayRef`. Backs onto the router's Service under `ravelNative`, otherwise the gateway Service. |
-| `prod-gateway-route-grpc` | GRPCRoute | Attached to `gatewayRef`. **Always** backs onto the gateway Service directly (see the HTTP-only limitation). Absent when `exposure.gatewayAPI.grpc: false`. |
+| `prod-gateway-route-grpc` | GRPCRoute | Attached to `gatewayRef`. **Always** backs onto the gateway Service directly (see the HTTP-only limitation). Absent when `exposure.gatewayApi.grpc: false`. |
 
 Every object is owned by the `RavelCluster` and deleted with it. All are also
 deleted when `enabled` becomes `false` or the mode changes, so switching modes
@@ -751,5 +758,3 @@ you can do it without losing the rest of the configuration.
   reference.
 - [ingest.md](ingest.md) — the OTLP endpoints and how tenancy is authenticated.
 - [observability.md](observability.md) — the metrics to watch the saving on.
-</content>
-</invoke>
