@@ -388,25 +388,24 @@ pub struct Cli {
     #[arg(long = "max-ingest-buffer-bytes", default_value_t = 512 * 1024 * 1024)]
     pub max_ingest_buffer_bytes: u64,
 
-    /// Per-shard bound on concurrently in-flight flushes for the metrics
-    /// ingest pipeline (ADR-0067 decision 2). Each shard's flush
-    /// runs in a spawned task the shard actor no longer waits on; this caps
-    /// how many such tasks a single shard may have outstanding at once, so
-    /// pipelining trades bounded extra memory (buffers held by in-flight
+    /// Per-shard bound on concurrently in-flight flushes, for all three
+    /// ingest pipelines (metrics, logs, spans -- ADR-0067 decision 2,
+    /// extended to logs and spans by ADR-0076 decision 3). Each shard's
+    /// flush runs in a spawned task the shard actor no longer waits on; this
+    /// caps how many such tasks a single shard may have outstanding at once,
+    /// so pipelining trades bounded extra memory (buffers held by in-flight
     /// flushes) for overlapped PUT latency instead of unbounded fan-out.
     /// Matches [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own
     /// default of 1 (today's non-pipelined behavior). `0` is rejected by
     /// [`Cli::validate`]: it would deadlock every flush, since a shard could
-    /// never acquire a permit to run one. Applies only to the metrics ingest
-    /// pipeline; log and span shard actors are unaffected (they keep their
-    /// existing inline flush).
+    /// never acquire a permit to run one.
     #[arg(long = "max-inflight-flushes", default_value_t = 1)]
     pub max_inflight_flushes: u32,
 
     /// Enables the adaptive flush-delay corridor for the metrics ingest
     /// pipeline (ADR-0067 decision 3): instead of always
     /// flushing a tenant's buffer on the fixed `--max-flush-delay` age, the
-    /// age threshold adapts within `[500ms floor, ceiling]`, where the
+    /// age threshold adapts within `[max_flush_delay, ceiling]`, where the
     /// ceiling derives from the shard's observed PUT p99 RTT and the
     /// strict-write visibility budget. Off by default
     /// (matches [`ravel_ingest::IngestConfig::adaptive_flush_delay`]'s own
@@ -415,6 +414,50 @@ pub struct Cli {
     /// log and span shard actors are unaffected.
     #[arg(long = "adaptive-flush-delay")]
     pub adaptive_flush_delay: bool,
+
+    /// Fast-tier flush age threshold, shared by all three ingest pipelines
+    /// (ADR-0076 decision 4), as a humantime duration (e.g. `2s`). Applied
+    /// to a tenant's buffer once it has a strict-mode waiter or already
+    /// holds at least `--min-flush-bytes`; also the floor (and, off
+    /// adaptive delay, the whole corridor) of the metrics pipeline's
+    /// strict-mode visibility budget. Moves as a set with
+    /// `--max-flush-delay-idle` and `--min-flush-bytes`: [`Cli::validate`]
+    /// rejects setting only one or two of the three, since raising this one
+    /// alone while leaving the byte threshold at its old, smaller value
+    /// would not actually slow the fast tier down for a buffered tenant
+    /// that crosses it sooner. Omitted, along with the other two, defaults
+    /// to [`ravel_ingest::IngestConfig::default().max_flush_delay`] (2s). A
+    /// zero or unparseable duration fails startup.
+    #[arg(long = "max-flush-delay", value_name = "DURATION")]
+    pub max_flush_delay: Option<String>,
+
+    /// Idle-tier flush age threshold, shared by all three ingest pipelines
+    /// (ADR-0076 decision 4), as a humantime duration (e.g. `40s`). Applied
+    /// instead of `--max-flush-delay` to a tenant's buffer with no
+    /// strict-mode waiter and fewer than `--min-flush-bytes` buffered, so a
+    /// low-volume buffered-mode tenant is not flushed on the fast cadence
+    /// regardless of how little data it holds. Moves as a set with
+    /// `--max-flush-delay` and `--min-flush-bytes`; see `--max-flush-delay`
+    /// for the partial-override rejection. Omitted, along with the other
+    /// two, defaults to
+    /// [`ravel_ingest::IngestConfig::default().max_flush_delay_idle`] (40s).
+    /// A zero or unparseable duration fails startup.
+    #[arg(long = "max-flush-delay-idle", value_name = "DURATION")]
+    pub max_flush_delay_idle: Option<String>,
+
+    /// Byte threshold, shared by all three ingest pipelines (ADR-0076
+    /// decision 4), at or above which a tenant's buffer is never treated as
+    /// idle for the age trigger even with no strict-mode waiter: it is
+    /// already worth the PUT cost `--max-flush-delay` pays for. Moves as a
+    /// set with `--max-flush-delay` and `--max-flush-delay-idle`; see
+    /// `--max-flush-delay` for the partial-override rejection. Omitted,
+    /// along with the other two, defaults to
+    /// [`ravel_ingest::IngestConfig::default().min_flush_bytes`] (256 KiB).
+    /// `0` fails startup: every buffer would count as at-or-above it, which
+    /// is not "idle detection", it is "idle detection disabled" spelled as
+    /// a size.
+    #[arg(long = "min-flush-bytes", value_name = "BYTES")]
+    pub min_flush_bytes: Option<u64>,
 
     /// The at-rest scrub period `P` (ADR-0059 decision 1), as a humantime
     /// duration (e.g. `7d`). The content-tier scrubber rotates through the
@@ -754,6 +797,49 @@ pub struct Cli {
 /// recently fetched segment/log byte ranges across a handful of concurrent
 /// queries, small enough that a dev process does not need tuning to pick it.
 pub const DEFAULT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The resolved ADR-0076 decision 4 flush-cadence knobs
+/// (`--max-flush-delay`, `--max-flush-delay-idle`, `--min-flush-bytes`), all
+/// three either at their `IngestConfig` defaults or all three overridden
+/// together ([`Cli::resolve_flush_cadence`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushCadence {
+    pub max_flush_delay: Duration,
+    pub max_flush_delay_idle: Duration,
+    pub min_flush_bytes: usize,
+}
+
+/// Upper bound on `--max-flush-delay` derived from the read-side scan-slack
+/// arithmetic `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` encodes (ADR-0076
+/// decision 4): `FLUSH_BOUND_SLACK_HOURS` is `ceil(max_flush_delay +
+/// max_flush_lifetime)` at the defaults it was last derived against, and
+/// governs how long the read side keeps scanning a retiring shard-count
+/// generation after an activation (docs/catalog-and-mvcc.md). Raising
+/// `--max-flush-delay` past what keeps that sum under
+/// `FLUSH_BOUND_SLACK_HOURS` hours would silently shrink the straggler
+/// window below what a flush can actually take, without `S`
+/// (`ravel_catalog::DEFAULT_SCAN_SLACK_HOURS`) ever being told to grow to
+/// compensate -- a straggler flush pinned under a retiring generation could
+/// then land outside the window the read side still scans, an invisibility
+/// hazard. `ravel_ingest::IngestConfig::max_flush_lifetime` is not itself an
+/// operator-facing flag in this ADR's scope, so [`Cli::validate`] uses its
+/// compiled-in default (1h) as the fixed half of the sum.
+pub const FLUSH_BOUND_SLACK_HOURS_NS: i64 =
+    ravel_catalog::FLUSH_BOUND_SLACK_HOURS as i64 * 3_600_000_000_000;
+
+/// Upper bound on `--max-flush-delay` (and, in strict mode, the
+/// `strict_visibility_budget_ns` that follows it) derived from client-side
+/// export timeouts rather than from `FLUSH_BOUND_SLACK_HOURS_NS` (ADR-0076
+/// decision 4). OTLP collector and SDK exporter timeout defaults sit in the
+/// 5-10 s range; this uses the SMALLEST of that range (5 s) as the client
+/// budget a strict ack must fit inside before the client's own export
+/// timeout could fire, then subtracts an assumed 2 s PUT p99 tail (the data-
+/// object PUT plus the commit-record PUT, the same two round trips
+/// `visibility_ceiling_ns` accounts for) as headroom: 5s - 2s = 3s. A flush
+/// delay above this ceiling risks the client timing out and retrying before
+/// the strict ack returns, which produces duplicate logs/spans and more
+/// requests, not fewer -- the opposite of this ADR's goal.
+pub const MAX_STRICT_VISIBILITY_BUDGET_NS: i64 = 3_000_000_000;
 
 /// Validated OIDC settings, present only when `--oidc-issuer`/`--oidc-jwks-url`
 /// are configured.
@@ -1192,24 +1278,81 @@ impl Cli {
         }
     }
 
+    /// Resolve the three ADR-0076 decision 4 flush-cadence knobs
+    /// (`--max-flush-delay`, `--max-flush-delay-idle`, `--min-flush-bytes`),
+    /// which move as a set. All three omitted resolves to
+    /// [`ravel_ingest::IngestConfig::default()`]'s own values; any other
+    /// count set (one or two of three) is rejected, since raising one alone
+    /// leaves the other two at their old cadence, defeating the point of
+    /// moving them together. Each individually-set value is further
+    /// rejected if it parses to zero (a zero delay or byte threshold has no
+    /// sensible "idle" meaning). This is the single source [`Self::validate`]
+    /// and every `IngestConfig`-construction call site in `start` both call,
+    /// so the value validated is the value enforced.
+    pub fn resolve_flush_cadence(&self) -> anyhow::Result<FlushCadence> {
+        let (max_flush_delay, max_flush_delay_idle, min_flush_bytes) = match (
+            self.max_flush_delay.as_deref(),
+            self.max_flush_delay_idle.as_deref(),
+            self.min_flush_bytes,
+        ) {
+            (None, None, None) => {
+                let default = ravel_ingest::IngestConfig::default();
+                return Ok(FlushCadence {
+                    max_flush_delay: default.max_flush_delay,
+                    max_flush_delay_idle: default.max_flush_delay_idle,
+                    min_flush_bytes: default.min_flush_bytes,
+                });
+            }
+            (Some(delay), Some(idle), Some(bytes)) => (delay, idle, bytes),
+            _ => anyhow::bail!(
+                "--max-flush-delay, --max-flush-delay-idle, and --min-flush-bytes must be set \
+                 together or not at all (ADR-0076 decision 4): they move as a set, and \
+                 overriding only some of them would leave the rest at their old cadence, \
+                 defeating the point of raising the ones you did set."
+            ),
+        };
+        let max_flush_delay = humantime::parse_duration(max_flush_delay)
+            .map_err(|e| anyhow::anyhow!("invalid --max-flush-delay: {e}"))?;
+        if max_flush_delay.is_zero() {
+            anyhow::bail!("--max-flush-delay must be a positive duration");
+        }
+        let max_flush_delay_idle = humantime::parse_duration(max_flush_delay_idle)
+            .map_err(|e| anyhow::anyhow!("invalid --max-flush-delay-idle: {e}"))?;
+        if max_flush_delay_idle.is_zero() {
+            anyhow::bail!("--max-flush-delay-idle must be a positive duration");
+        }
+        if min_flush_bytes == 0 {
+            anyhow::bail!(
+                "--min-flush-bytes '0' disables idle detection entirely (every buffer is at or \
+                 above zero bytes); set a positive byte count"
+            );
+        }
+        Ok(FlushCadence {
+            max_flush_delay,
+            max_flush_delay_idle,
+            min_flush_bytes: min_flush_bytes as usize,
+        })
+    }
+
     /// Resolve the per-query S3 request budget (ADR-0075). An explicit
     /// `--max-s3-requests` is used verbatim; otherwise the budget is DERIVED
-    /// from `--shards` and the ingest pipeline's flush cadence
-    /// (`ravel_ingest::IngestConfig::default().max_flush_delay`, the value the
-    /// server's own metrics ingest pipeline runs with, since `start` builds
-    /// `IngestConfig` with `..IngestConfig::default()`). This is the one place
+    /// from `--shards` and the ingest pipeline's actually-configured flush
+    /// cadence ([`Self::resolve_flush_cadence`], the value the server's own
+    /// ingest pipelines run with -- not `IngestConfig::default()`, so an
+    /// operator who raises `--max-flush-delay` gets a budget derived from
+    /// what they configured, not the shipped default). This is the one place
     /// the derivation is wired into the real startup path: `main.rs` calls it
     /// to fill [`crate::ServerConfig::max_s3_requests`], which `start` threads
     /// into the process-wide `EngineConfig` both query surfaces share. A `0`
     /// override is rejected by [`Self::validate`], not here.
-    pub fn resolve_max_s3_requests(&self) -> ravel_query::RequestLimit {
-        match self.max_s3_requests {
+    pub fn resolve_max_s3_requests(&self) -> anyhow::Result<ravel_query::RequestLimit> {
+        Ok(match self.max_s3_requests {
             Some(n) => ravel_query::RequestLimit::Bounded(n),
             None => ravel_query::RequestLimit::Bounded(ravel_query::derive_max_s3_requests(
                 self.shards,
-                ravel_ingest::IngestConfig::default().max_flush_delay,
+                self.resolve_flush_cadence()?.max_flush_delay,
             )),
-        }
+        })
     }
 
     /// Parse `--max-inflight-ingest-requests` into an
@@ -1547,6 +1690,41 @@ impl Cli {
             anyhow::bail!(
                 "--max-s3-requests '0' would reject every query; omit the flag to derive the \
                  budget from --shards and the flush cadence, or set a positive count"
+            );
+        }
+
+        // ADR-0076 decision 4: parsed and range-checked here so a malformed
+        // or partially-overridden flush cadence fails startup, not the first
+        // flush.
+        let flush_cadence = self.resolve_flush_cadence()?;
+
+        let flush_bound_ns = flush_cadence.max_flush_delay.as_nanos() as i64
+            + ravel_ingest::IngestConfig::default()
+                .max_flush_lifetime
+                .as_nanos() as i64;
+        if flush_bound_ns > FLUSH_BOUND_SLACK_HOURS_NS {
+            anyhow::bail!(
+                "--max-flush-delay {:?} plus the ingest pipeline's max_flush_lifetime ({:?}) \
+                 exceeds FLUSH_BOUND_SLACK_HOURS ({} h): the read-side scan slack \
+                 ravel_catalog::FLUSH_BOUND_SLACK_HOURS encodes would no longer cover a \
+                 straggler flush pinned under a retiring shard-count generation, an \
+                 invisibility hazard. Lower --max-flush-delay, or revisit \
+                 FLUSH_BOUND_SLACK_HOURS in ravel-catalog in lockstep (ADR-0076 decision 4).",
+                flush_cadence.max_flush_delay,
+                ravel_ingest::IngestConfig::default().max_flush_lifetime,
+                ravel_catalog::FLUSH_BOUND_SLACK_HOURS,
+            );
+        }
+
+        if flush_cadence.max_flush_delay.as_nanos() as i64 > MAX_STRICT_VISIBILITY_BUDGET_NS {
+            anyhow::bail!(
+                "--max-flush-delay {:?} exceeds MAX_STRICT_VISIBILITY_BUDGET_NS ({}s): in strict \
+                 mode a client waits for the flush delay plus two PUT round trips before its ack \
+                 returns, and a value this high risks the OTLP client's own export timeout \
+                 firing first, producing retries and duplicate logs/spans instead of the fewer \
+                 requests this ADR is for. Lower --max-flush-delay.",
+                flush_cadence.max_flush_delay,
+                MAX_STRICT_VISIBILITY_BUDGET_NS as f64 / 1e9,
             );
         }
 
@@ -2786,18 +2964,19 @@ mod tests {
         let flush = ravel_ingest::IngestConfig::default().max_flush_delay;
         let expected = ravel_query::derive_max_s3_requests(cli.shards, flush);
         assert_eq!(
-            cli.resolve_max_s3_requests(),
+            cli.resolve_max_s3_requests()
+                .expect("defaults resolve a bounded budget"),
             RequestLimit::Bounded(expected)
         );
-        let open_hour_cost = 4 * (3_600_000u64 / 500);
-        assert_eq!(open_hour_cost, 28_800);
+        let open_hour_cost = 4 * (3_600_000u64 / 2_000);
+        assert_eq!(open_hour_cost, 7_200);
         assert!(
             !RequestLimit::Bounded(expected).is_exceeded_by(open_hour_cost),
             "the derived budget {expected} must admit the 4-shard open hour ({open_hour_cost})"
         );
         assert!(
-            RequestLimit::Bounded(25_000).is_exceeded_by(open_hour_cost),
-            "sanity: the old flat 25,000 default rejected the 4-shard open hour"
+            RequestLimit::Bounded(1_000).is_exceeded_by(open_hour_cost),
+            "sanity: an overly tight 1,000 budget rejects the 4-shard open hour"
         );
         // And the derived cap must still bound a runaway query (three GETs per
         // recent segment across shards).
@@ -2806,7 +2985,11 @@ mod tests {
         // Explicit override: used verbatim, the derivation does not apply.
         let cli = Cli::try_parse_from(["ravel-server", "--max-s3-requests", "999"])
             .expect("explicit flag parses");
-        assert_eq!(cli.resolve_max_s3_requests(), RequestLimit::Bounded(999));
+        assert_eq!(
+            cli.resolve_max_s3_requests()
+                .expect("explicit override resolves"),
+            RequestLimit::Bounded(999)
+        );
 
         // Zero is rejected at validation, never silently used as a budget that
         // rejects every query.
@@ -2816,6 +2999,173 @@ mod tests {
             cli.validate().is_err(),
             "--max-s3-requests 0 must fail startup"
         );
+
+        // The call site must derive from the actually-configured flush
+        // cadence, not `IngestConfig::default()`: a non-default
+        // --max-flush-delay must change the derived budget.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "1s",
+            "--max-flush-delay-idle",
+            "20s",
+            "--min-flush-bytes",
+            "131072",
+        ])
+        .expect("flush-cadence override parses");
+        let configured_flush = std::time::Duration::from_secs(1);
+        let expected_for_override =
+            ravel_query::derive_max_s3_requests(cli.shards, configured_flush);
+        assert_ne!(
+            expected_for_override, expected,
+            "guard: the override must actually change the derived budget vs. the default flush delay"
+        );
+        assert_eq!(
+            cli.resolve_max_s3_requests()
+                .expect("configured flush cadence resolves"),
+            RequestLimit::Bounded(expected_for_override),
+            "derive_max_s3_requests call site must use the configured --max-flush-delay, not IngestConfig::default()"
+        );
+    }
+
+    /// ADR-0076 decision 4: the three flush-cadence knobs move as a set.
+    /// Setting only one or two of `--max-flush-delay`,
+    /// `--max-flush-delay-idle`, `--min-flush-bytes` must be rejected,
+    /// since raising one alone leaves the others at their old cadence.
+    #[test]
+    fn flush_cadence_partial_set_is_rejected() {
+        let one = Cli::try_parse_from(["ravel-server", "--max-flush-delay", "1s"])
+            .expect("flag parses at the CLI layer");
+        let err = one
+            .resolve_flush_cadence()
+            .expect_err("setting only --max-flush-delay must be rejected");
+        assert!(
+            err.to_string().contains("together or not at all"),
+            "expected the move-as-a-set message, got: {err}"
+        );
+
+        let two = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "1s",
+            "--max-flush-delay-idle",
+            "20s",
+        ])
+        .expect("flags parse at the CLI layer");
+        let err = two
+            .resolve_flush_cadence()
+            .expect_err("setting only two of three must be rejected");
+        assert!(
+            err.to_string().contains("together or not at all"),
+            "expected the move-as-a-set message, got: {err}"
+        );
+
+        let three = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "1s",
+            "--max-flush-delay-idle",
+            "20s",
+            "--min-flush-bytes",
+            "131072",
+        ])
+        .expect("flags parse at the CLI layer");
+        three
+            .resolve_flush_cadence()
+            .expect("all three set together must be accepted");
+
+        let none = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        none.resolve_flush_cadence()
+            .expect("all three omitted must fall back to IngestConfig::default()");
+    }
+
+    /// ADR-0076 decision 4: a `--max-flush-delay` that, combined with the
+    /// ingest pipeline's fixed `max_flush_lifetime`, exceeds
+    /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` must fail startup, not
+    /// silently under-cover a straggler flush pinned under a retiring
+    /// shard-count generation.
+    ///
+    /// Proof this test can fail: with the `flush_bound_ns >
+    /// FLUSH_BOUND_SLACK_HOURS_NS` check at src/config.rs:1714 disabled
+    /// (guarded with `if false &&`), `cli.validate()` still returned `Err`
+    /// -- 3601s also trips the separate MAX_STRICT_VISIBILITY_BUDGET_NS
+    /// check below it -- but the message assertion caught the missing
+    /// check specifically: the panic was "expected a FLUSH_BOUND_SLACK_HOURS
+    /// error, got: --max-flush-delay 3601s exceeds
+    /// MAX_STRICT_VISIBILITY_BUDGET_NS (3s): ...". Restoring the check made
+    /// it pass again.
+    #[test]
+    fn flush_delay_exceeding_flush_bound_slack_hours_is_rejected_at_startup() {
+        // FLUSH_BOUND_SLACK_HOURS is 2h = 7200s; max_flush_lifetime defaults
+        // to 3600s, so 3601s of --max-flush-delay pushes the sum to 7201s,
+        // one second over the ceiling.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "3601s",
+            "--max-flush-delay-idle",
+            "2h",
+            "--min-flush-bytes",
+            "131072",
+        ])
+        .expect("flags parse at the CLI layer");
+        let err = cli.validate().expect_err(
+            "startup must reject --max-flush-delay 3601s: exceeds FLUSH_BOUND_SLACK_HOURS",
+        );
+        assert!(
+            err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
+            "expected a FLUSH_BOUND_SLACK_HOURS error, got: {err}"
+        );
+    }
+
+    /// ADR-0076 decision 4: a `--max-flush-delay` exceeding
+    /// `MAX_STRICT_VISIBILITY_BUDGET_NS` (the smallest OTLP client timeout
+    /// minus an assumed PUT p99 tail) must fail startup, since it risks the
+    /// client's own export timeout firing before the strict ack returns.
+    ///
+    /// Proof this test can fail: with the max-flush-delay-exceeds-budget
+    /// check at src/config.rs:1728 disabled (guarded with `if false &&`),
+    /// this test failed with "startup must reject --max-flush-delay 4s:
+    /// exceeds MAX_STRICT_VISIBILITY_BUDGET_NS" because `cli.validate()`
+    /// returned `Ok(())` instead of erroring. Restoring the check made it
+    /// pass again.
+    #[test]
+    fn flush_delay_exceeding_max_strict_visibility_budget_is_rejected_at_startup() {
+        // MAX_STRICT_VISIBILITY_BUDGET_NS is 3s; 4s clears
+        // FLUSH_BOUND_SLACK_HOURS (4s + 3600s well under 7200s) but must
+        // still be refused by the visibility-budget ceiling.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "4s",
+            "--max-flush-delay-idle",
+            "40s",
+            "--min-flush-bytes",
+            "262144",
+        ])
+        .expect("flags parse at the CLI layer");
+        let err = cli.validate().expect_err(
+            "startup must reject --max-flush-delay 4s: exceeds MAX_STRICT_VISIBILITY_BUDGET_NS",
+        );
+        assert!(
+            err.to_string().contains("MAX_STRICT_VISIBILITY_BUDGET_NS"),
+            "expected a MAX_STRICT_VISIBILITY_BUDGET_NS error, got: {err}"
+        );
+    }
+
+    /// The shipped default (2s, ADR-0076 decision 4) must pass both new
+    /// startup validations: it is well under both FLUSH_BOUND_SLACK_HOURS
+    /// (2s + 3600s = 3602s, under the 7200s ceiling) and
+    /// MAX_STRICT_VISIBILITY_BUDGET_NS (2s, under the 3s ceiling).
+    #[test]
+    fn shipped_default_flush_delay_passes_both_startup_validations() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let flush_cadence = cli
+            .resolve_flush_cadence()
+            .expect("all three omitted resolves to IngestConfig::default()");
+        assert_eq!(flush_cadence.max_flush_delay, Duration::from_secs(2));
+        cli.validate()
+            .expect("shipped default --max-flush-delay (2s) must pass startup validation");
     }
 
     #[test]

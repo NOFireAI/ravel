@@ -177,9 +177,9 @@ Loop over `select!`:
   (ADR-0005 fail-loud rule).
 - flush tick (interval default 200 ms): flush if `oldest_ns` older than an
   age threshold, and buffer non-empty. The threshold is `max_flush_delay`
-  (default 500 ms) when the buffer has a strict-mode waiter or already holds
-  at least `min_flush_bytes` (default 64 KiB); otherwise the buffer is idle
-  and the threshold is `max_flush_delay_idle` (default 10 s) instead
+  (default 2 s) when the buffer has a strict-mode waiter or already holds
+  at least `min_flush_bytes` (default 256 KiB); otherwise the buffer is idle
+  and the threshold is `max_flush_delay_idle` (default 40 s) instead
   (ADR-0051 section 7). Strict-mode ack latency is unaffected, since a
   strict write always leaves a waiter in the buffer for its whole flush
   window; only a low-volume buffered-mode tenant's PUT cadence changes.
@@ -278,9 +278,10 @@ flush task, and the same shutdown join. Only the adaptive flush delay
 or already past `min_flush_bytes`, with a per-(shard, tenant) threshold
 clamped into a corridor `[max_flush_delay, ceiling]`:
 
-- **Floor**: `max_flush_delay` (500 ms default), unchanged from today.
-- **Ceiling**: the strict-mode visibility budget (1 s, the same budget
-  docs/consistency-model.md's strict-mode ack contract names) minus two
+- **Floor**: `max_flush_delay` (2 s default), unchanged from today.
+- **Ceiling**: the strict-mode visibility budget (`IngestConfig::strict_visibility_budget_ns`,
+  2 s default, following `max_flush_delay` -- ADR-0076 decision 4; the same
+  budget docs/consistency-model.md's strict-mode ack contract names) minus two
   PUT round trips at their observed p99 (data object, then commit
   record) minus one retry's base backoff as headroom, floored at
   `max_flush_delay` so the corridor never inverts. With no PUT RTT
@@ -603,9 +604,9 @@ carries max token per shard).
 | shard_count | 4 (dev), scale with cores |
 | channel depth | 256 msgs |
 | target_bytes | 8 MiB |
-| max_flush_delay | 500 ms |
-| max_flush_delay_idle | 10 s |
-| min_flush_bytes | 64 KiB |
+| max_flush_delay | 2 s (`--max-flush-delay`) |
+| max_flush_delay_idle | 40 s (`--max-flush-delay-idle`) |
+| min_flush_bytes | 256 KiB (`--min-flush-bytes`) |
 | put retry budget | 4 attempts, 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |

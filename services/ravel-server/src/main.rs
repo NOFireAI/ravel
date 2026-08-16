@@ -384,6 +384,10 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to resolve --remote-cluster settings")?;
     ravel_server::warn_plaintext_federation(&remote_clusters);
 
+    let flush_cadence = cli
+        .resolve_flush_cadence()
+        .context("failed to resolve flush-cadence flags")?;
+
     let config = ServerConfig {
         mode: cli.mode,
         listen_http: cli.listen_http,
@@ -391,6 +395,9 @@ async fn main() -> anyhow::Result<()> {
         shard_count: cli.shards,
         max_inflight_flushes: cli.max_inflight_flushes,
         adaptive_flush_delay: cli.adaptive_flush_delay,
+        max_flush_delay: flush_cadence.max_flush_delay,
+        max_flush_delay_idle: flush_cadence.max_flush_delay_idle,
+        min_flush_bytes: flush_cadence.min_flush_bytes,
         tenant_resolver: resolver_bundle.resolver,
         mtls_listener,
         fold_tenants,
@@ -432,7 +439,9 @@ async fn main() -> anyhow::Result<()> {
         query_concurrency_limit: cli
             .parse_query_concurrency_limit()
             .context("failed to parse --max-concurrent-queries")?,
-        max_s3_requests: cli.resolve_max_s3_requests(),
+        max_s3_requests: cli
+            .resolve_max_s3_requests()
+            .context("failed to resolve --max-s3-requests")?,
         scrub_period: cli
             .parse_scrub_period()
             .context("failed to parse --scrub-period")?,
