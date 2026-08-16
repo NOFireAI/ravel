@@ -83,4 +83,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0078](0078-fold-retention-frontier-deployment-default.md) | Fold retention-frontier reconcile honors the deployment-wide retention default | Accepted |
 | [0079](0079-indexed-fields-durable-override-cache.md) | Indexed-fields durable override cache: cache-aside overlay over TenantConfig.indexed_fields | Accepted |
 | [0080](0080-gateway-api-ingest-affinity.md) | Gateway API exposure and Ravel-native subset affinity: additive backend enum deprecating ingress-nginx, exposure/affinity split, HRW subset selection via a new ravel-affinity crate and ravel-ingest-router service | Accepted |
-| [0081](0081-container-first-quickstart.md) | Container-first quickstart: a published-image `docker compose` path as the documented first run, with README command blocks executed in CI | Claimed |
+| [0081](0081-container-first-quickstart.md) | Container-first quickstart: a published-image `docker compose` path as the documented first run, with README command blocks executed in CI | Accepted |

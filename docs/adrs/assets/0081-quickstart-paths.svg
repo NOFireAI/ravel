@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 430" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
+    </marker>
+  </defs>
+  <rect width="1020" height="430" fill="#fdfcf8"/>
+  <text x="24" y="34" font-size="20" fill="#1b2230">Two paths from a clone to first data</text>
+
+  <!-- clone -->
+  <path d="M 30 150 Q 27 147 33 147 L 150 145 Q 157 146 156 153 L 157 218 Q 156 224 150 223 L 34 225 Q 28 224 29 218 Z" fill="#f5f3ee" stroke="#5b6472" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="46" y="176" fill="#3a3f47">git clone</text>
+  <text x="46" y="198" font-size="12" fill="#5b6472">the only step</text>
+  <text x="46" y="214" font-size="12" fill="#5b6472">both paths share</text>
+
+  <line x1="158" y1="170" x2="228" y2="118" stroke="#a04040" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="158" y1="205" x2="228" y2="300" stroke="#31536b" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- TODAY: from source -->
+  <text x="234" y="72" font-size="13" fill="#a04040">documented today</text>
+
+  <path d="M 232 84 Q 228 80 236 80 L 430 78 Q 439 79 438 87 L 440 154 Q 439 162 431 161 L 236 163 Q 229 162 230 154 Z" fill="#f9eeee" stroke="#a04040" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="250" y="110" fill="#a04040">install Rust 1.97.1</text>
+  <text x="250" y="132" font-size="12" fill="#5b6472">a toolchain the reader has</text>
+  <text x="250" y="150" font-size="12" fill="#5b6472">no other reason to want</text>
+
+  <line x1="442" y1="120" x2="490" y2="120" stroke="#a04040" stroke-width="2" marker-end="url(#arr)"/>
+
+  <path d="M 494 84 Q 490 80 498 80 L 730 78 Q 739 79 738 87 L 740 154 Q 739 162 731 161 L 498 163 Q 491 162 492 154 Z" fill="#f9eeee" stroke="#a04040" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="512" y="110" fill="#a04040">cargo build --workspace --release</text>
+  <text x="512" y="132" font-size="12" fill="#5b6472">26 crates + 3 services, including</text>
+  <text x="512" y="150" font-size="12" fill="#5b6472">sim / difftest / bench, none of them run</text>
+
+  <line x1="742" y1="120" x2="790" y2="120" stroke="#a04040" stroke-width="2" marker-end="url(#arr)"/>
+
+  <path d="M 794 84 Q 790 80 798 80 L 976 78 Q 985 79 984 87 L 986 154 Q 985 162 977 161 L 798 163 Q 791 162 792 154 Z" fill="#fff" stroke="#a04040" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="812" y="108" font-size="19" fill="#a04040">57 minutes</text>
+  <text x="812" y="130" font-size="12" fill="#5b6472">measured, cold, 2 jobs</text>
+  <text x="812" y="148" font-size="12" fill="#5b6472">(Dockerfile.prebuilt:7-9)</text>
+
+  <!-- NEW: container first -->
+  <text x="234" y="258" font-size="13" fill="#31536b">container-first</text>
+
+  <path d="M 232 270 Q 228 266 236 266 L 430 264 Q 439 265 438 273 L 440 340 Q 439 348 431 347 L 236 349 Q 229 348 230 340 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="250" y="296" fill="#31536b">docker compose up -d</text>
+  <text x="250" y="318" font-size="12" fill="#5b6472">MinIO + ravel-server + collector</text>
+  <text x="250" y="336" font-size="12" fill="#5b6472">+ Grafana, one command</text>
+
+  <line x1="442" y1="306" x2="490" y2="306" stroke="#31536b" stroke-width="2" marker-end="url(#arr)"/>
+
+  <path d="M 494 270 Q 490 266 498 266 L 730 264 Q 739 265 738 273 L 740 340 Q 739 348 731 347 L 498 349 Q 491 348 492 340 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="512" y="296" fill="#4c6b45">pull ghcr.io/nofireai/ravel-server</text>
+  <text x="512" y="318" font-size="12" fill="#5b6472">already built, already signed,</text>
+  <text x="512" y="336" font-size="12" fill="#5b6472">already carries --features sql</text>
+
+  <line x1="742" y1="306" x2="790" y2="306" stroke="#31536b" stroke-width="2" marker-end="url(#arr)"/>
+
+  <path d="M 794 270 Q 790 266 798 266 L 976 264 Q 985 265 984 273 L 986 340 Q 985 348 977 347 L 798 349 Q 791 348 792 340 Z" fill="#fff" stroke="#31536b" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="812" y="294" font-size="19" fill="#31536b">one image pull</text>
+  <text x="812" y="316" font-size="12" fill="#5b6472">live telemetry in Grafana,</text>
+  <text x="812" y="334" font-size="12" fill="#5b6472">no toolchain on the machine</text>
+
+  <text x="232" y="392" font-size="13" fill="#5b6472">The from-source path is not deleted. It stays as the contributor path in guides/development.md,</text>
+  <text x="232" y="412" font-size="13" fill="#5b6472">where compiling Ravel is the point. It stops being the first thing a stranger is told to do.</text>
+</svg>
