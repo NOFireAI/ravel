@@ -373,8 +373,8 @@ fn visibility_ceiling_ns(
 
 /// The adaptive age threshold for one (shard, tenant): the tenant's observed
 /// inter-arrival gap, clamped into `[floor_ns, ceiling_ns]`. A bursty tenant
-/// (small gap) clamps up to `floor_ns` -- today's fixed 500 ms behavior,
-/// unchanged; a trickle tenant (large gap) clamps down to `ceiling_ns`
+/// (small gap) clamps up to `floor_ns` -- the fixed `max_flush_delay`
+/// behavior, unchanged; a trickle tenant (large gap) clamps down to `ceiling_ns`
 /// instead of waiting indefinitely for a full `target_bytes` batch.
 fn adaptive_age_threshold_ns(avg_gap_ns: i64, floor_ns: i64, ceiling_ns: i64) -> i64 {
     avg_gap_ns.clamp(floor_ns, ceiling_ns)
@@ -1023,8 +1023,8 @@ impl ShardActor {
     /// section 7). Strict-mode ack latency is unaffected: a strict
     /// write always leaves `waiters` non-empty for its whole flush window.
     ///
-    /// The fast clock itself is either the fixed `max_flush_delay` (today's
-    /// 500 ms, and always the value used when `adaptive_flush_delay` is
+    /// The fast clock itself is either the fixed `max_flush_delay` (2 s
+    /// default, and always the value used when `adaptive_flush_delay` is
     /// off) or, with adaptive delay on, a per-tenant threshold within
     /// `[max_flush_delay, ceiling]` derived from this tenant's observed
     /// arrival rate and this shard's observed PUT RTT (ADR-0067 decision 3).
@@ -1238,7 +1238,7 @@ impl ShardActor {
 
 #[cfg(test)]
 mod adaptive_delay_tests {
-    use super::{adaptive_age_threshold_ns, visibility_ceiling_ns};
+    use super::{IngestConfig, adaptive_age_threshold_ns, visibility_ceiling_ns};
 
     const FLOOR_NS: i64 = 500_000_000;
     const RETRY_HEADROOM_NS: i64 = 100_000_000;
@@ -1340,5 +1340,36 @@ mod adaptive_delay_tests {
             ceiling_ns,
             "the corridor must cap a large observed gap at the ceiling, not pass it through"
         );
+    }
+
+    /// Regression for the checkpoint-review bug: `IngestConfig::default()`
+    /// once set `strict_visibility_budget_ns` exactly equal to
+    /// `max_flush_delay`, so `visibility_ceiling_ns`'s subtraction always
+    /// left the ceiling at the floor regardless of RTT, making
+    /// `FlushTrigger::AgeAdaptive` permanently unreachable. Built on
+    /// `IngestConfig::default()` directly (not a hand-assembled config the
+    /// real server can never build), across a range of plausible observed
+    /// RTTs, so a regression in the real default is what this test would
+    /// catch.
+    #[test]
+    fn default_config_visibility_ceiling_clears_the_floor() {
+        let cfg = IngestConfig::default();
+        let floor_ns = cfg.max_flush_delay.as_nanos() as i64;
+        let retry_headroom_ns = cfg.put_retry_base_delay.as_nanos() as i64;
+        for rtt_p99_ns in [0i64, 10_000_000, 50_000_000] {
+            let ceiling_ns = visibility_ceiling_ns(
+                floor_ns,
+                Some(rtt_p99_ns),
+                retry_headroom_ns,
+                cfg.strict_visibility_budget_ns,
+            );
+            assert!(
+                ceiling_ns > floor_ns,
+                "IngestConfig::default()'s visibility_ceiling_ns must clear max_flush_delay's \
+                 floor ({floor_ns}ns) at rtt_p99_ns={rtt_p99_ns}, got {ceiling_ns}ns -- a \
+                 strict_visibility_budget_ns equal to max_flush_delay collapses the corridor \
+                 unconditionally"
+            );
+        }
     }
 }

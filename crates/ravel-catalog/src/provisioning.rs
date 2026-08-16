@@ -342,8 +342,11 @@ impl std::fmt::Display for FloorDefect {
 pub const MAX_SHARD_COUNT: u32 = 10_000;
 
 /// The flush-timing component of the read-side scan slack `S`, in ingest
-/// hours: `ceil(max_flush_delay + max_flush_lifetime)` with today's ingest
-/// defaults (`max_flush_delay` 500ms + `max_flush_lifetime` 3600s) = 2. Held
+/// hours: `ceil(max_flush_delay_idle + max_flush_lifetime)` with today's
+/// ingest defaults (`max_flush_delay_idle` 40s + `max_flush_lifetime` 3600s)
+/// = 2. `max_flush_delay_idle`, not `max_flush_delay`, is the real worst-case
+/// buffer age before a forced flush (ADR-0076 decision 4): a buffer with no
+/// strict waiter can age all the way to the idle ceiling. Held
 /// separately from [`TOLERATED_CLOCK_SKEW_HOURS`] so the two components of the
 /// ADR-0052 section 3 formula (below) are each named and independently
 /// reviewable, rather than folded into one unexplained literal.
