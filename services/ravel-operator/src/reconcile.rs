@@ -1194,9 +1194,11 @@ pub fn desired_router_deployment(
     // `tenant_token_args`, which emits one `--tenant-token` per
     // `ctx.tenant_names`, and `tenant_names` is the tenant-tokens Secret's live
     // keys (see controller.rs). The Secret ref can be SET on the spec while the
-    // Secret is absent or has zero keys this cycle (a normal, already-anticipated
-    // live state that controller.rs just warns on and continues) -- in which case
-    // no `--tenant-token` renders and the router crashloops just the same. If no
+    // Secret itself resolves to zero keys this cycle -- a reachable live state
+    // distinct from the Secret being absent entirely (an absent Secret is a hard
+    // `Error::SecretNotFound` that aborts the reconcile before this function is
+    // ever called; a present-but-empty Secret is not). In the zero-keys case no
+    // `--tenant-token` renders and the router crashloops just the same. If no
     // resolver flags would actually render, reject at render time (see
     // RenderError::CanonicalTenantResolverMissing) rather than ship a
     // guaranteed-crashlooping Deployment.
@@ -3637,12 +3639,15 @@ mod tests {
     fn canonical_tenant_with_secret_ref_but_no_live_tenants_is_a_typed_error() {
         // F1: the resolver guard must check the ACTUAL rendered resolver flags,
         // not `tenant_tokens_secret_ref.is_none()`. A Secret ref SET on the spec
-        // while the Secret is absent or has zero keys this cycle is a normal live
-        // state (controller.rs derives ctx.tenant_names from the Secret's live
-        // keys and just warns on empty). In that case `tenant_token_args` renders
-        // zero `--tenant-token` flags and the router's own CLI still crashloops at
-        // startup -- the exact case the spec-field guard missed. The render must
-        // reject it, not ship a crashlooping Deployment.
+        // while the Secret resolves to zero live keys this cycle is a reachable
+        // state distinct from the Secret being absent entirely (controller.rs
+        // derives ctx.tenant_names from the Secret's live keys; an absent Secret
+        // is a hard error that aborts the reconcile before rendering is ever
+        // reached, a present-but-empty one is not). In the zero-keys case
+        // `tenant_token_args` renders zero `--tenant-token` flags and the
+        // router's own CLI still crashloops at startup -- the exact case the
+        // spec-field guard missed. The render must reject it, not ship a
+        // crashlooping Deployment.
         let mut spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
         spec.tenant_tokens_secret_ref = Some(LocalSecretRef {
             name: "ravel-tokens".to_string(),
@@ -3864,6 +3869,57 @@ mod tests {
                 "fallback uses the gateway's HTTP port, not the router's"
             );
         }
+    }
+
+    #[test]
+    fn httproute_targets_router_service_through_desired_objects_when_router_renders() {
+        // The positive half of the F2 wiring: `gateway_route_backend_ref_
+        // targets_router_service_under_ravel_native` above passes
+        // `router_available` as a literal `true` straight to
+        // `desired_gateway_routes`, so it only proves that function's own
+        // internal branch -- it does not prove `desired_objects` ever computes
+        // `router_available = true` on a genuinely successful router render. A
+        // mutation to `desired_objects` that always passed `false` through (permanently
+        // disabling the ADR-0080 decision 3 / deliverable 4 switch) would leave
+        // that test green. Go through `desired_objects`, the render the
+        // controller actually calls, so this wiring is what's under test.
+        let mut spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+        spec.tenant_tokens_secret_ref = Some(LocalSecretRef {
+            name: "ravel-tokens".to_string(),
+        });
+        spec.gateway.exposure = exposure_with(
+            GatewayReference {
+                name: "public-gw".to_string(),
+                namespace: None,
+            },
+            Vec::new(),
+            true,
+        )
+        .exposure;
+
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
+        assert!(
+            objects.router_render_error.is_none(),
+            "precondition: the router renders cleanly this pass"
+        );
+        assert!(
+            objects.router_service.is_some(),
+            "precondition: a router Service will exist after this pass"
+        );
+
+        let (http, _grpc) = objects.gateway_routes;
+        let http = http.expect("HTTPRoute");
+        assert_eq!(
+            route_spec(&http)["rules"][0]["backendRefs"][0]["name"],
+            serde_json::json!("prod-ingest-router"),
+            "on a clean router render, desired_objects must switch the HTTPRoute \
+             to the router Service -- this is the deliverable, not just \
+             desired_gateway_routes's own internal branch"
+        );
+        assert_eq!(
+            route_spec(&http)["rules"][0]["backendRefs"][0]["port"],
+            serde_json::json!(ROUTER_HTTP_PORT)
+        );
     }
 
     #[test]
