@@ -56,6 +56,29 @@ docker compose -f deploy/docker-compose/ravel.yml down
 The [getting started guide](docs/guides/getting-started.md) walks the same path
 with expected output.
 
+### Kill the server, keep the data
+
+Every Ravel process is disposable because the object store holds everything
+durable. [demo/kill-and-recover.sh](demo/kill-and-recover.sh) demonstrates that
+against the running stack rather than asserting it in prose:
+
+```sh
+demo/kill-and-recover.sh
+```
+
+It ingests one export under strict acknowledgement and captures the
+`x-ravel-commit-token` the response carries, `SIGKILL`s the `ravel-server`
+container (`docker compose kill`, so the process gets no chance to shut down
+cleanly or flush anything on its way out), deletes that container, starts a
+fresh one with an empty filesystem, and reads the pre-kill sample back by
+passing the captured token as `min_commit_token`. Nothing crosses the kill
+except what is in MinIO.
+
+The script asserts every step itself and exits non-zero if the sample is absent
+or the commit token comes back unsatisfiable, so a passing run is evidence and
+not a demonstration you have to watch closely. CI runs it against a live stack
+on every change to the quickstart.
+
 ### Capabilities and the from-source path
 
 The quickstart's SQL surface exists because the published image carries
