@@ -89,6 +89,15 @@
                             "description": "Extra annotations merged onto both rendered Ingress objects, for an\ningress controller other than ingress-nginx or for tuning\n(`nginx.ingress.kubernetes.io/proxy-body-size` is the common one: the\ningress-nginx default of 1m rejects larger OTLP/HTTP payloads).\n\nThe affinity annotations the operator computes are applied AFTER this\nmap, so an entry here can never silently disable the affinity it is\nmeant to configure.",
                             "type": "object"
                           },
+                          "backend": {
+                            "default": "ingressNginx",
+                            "description": "Which implementation carries out the pinning (ADR-0080 decision 1).\nDefaults to [`AffinityBackend::IngressNginx`], so a CR written before\nthis field existed keeps the backend it already runs, with the same\n`subsetSize` and `key` semantics.\n\n`ingressNginx` is deprecated: ingress-nginx is retiring upstream, and a\ncluster using it gets an `IngestAffinityBackendDeprecated` condition on\nits `RavelCluster` status.",
+                            "enum": [
+                              "ingressNginx",
+                              "ravelNative"
+                            ],
+                            "type": "string"
+                          },
                           "enabled": {
                             "default": true,
                             "description": "Whether affinity is active. Defaults to true, so declaring the block is\nenough. Set it to false to turn affinity off during an incident without\ndeleting the rest of the configuration; the Ingress objects are then\nremoved and rendering returns to the affinity-absent baseline.",

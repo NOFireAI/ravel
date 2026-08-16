@@ -225,6 +225,17 @@ pub struct IngestAffinitySpec {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Which implementation carries out the pinning (ADR-0080 decision 1).
+    /// Defaults to [`AffinityBackend::IngressNginx`], so a CR written before
+    /// this field existed keeps the backend it already runs, with the same
+    /// `subsetSize` and `key` semantics.
+    ///
+    /// `ingressNginx` is deprecated: ingress-nginx is retiring upstream, and a
+    /// cluster using it gets an `IngestAffinityBackendDeprecated` condition on
+    /// its `RavelCluster` status.
+    #[serde(default)]
+    pub backend: AffinityBackend,
+
     /// How many replicas a tenant's traffic is pinned to. Defaults to
     /// [`DEFAULT_AFFINITY_SUBSET_SIZE`] (two), not one, so a single replica
     /// loss does not concentrate a tenant on one process.
@@ -288,6 +299,7 @@ impl Default for IngestAffinitySpec {
     fn default() -> Self {
         Self {
             enabled: default_true(),
+            backend: AffinityBackend::default(),
             subset_size: default_subset_size(),
             key: AffinityKeySpec::default(),
             ingress_class_name: None,
@@ -297,6 +309,27 @@ impl Default for IngestAffinitySpec {
             annotations: BTreeMap::new(),
         }
     }
+}
+
+/// Which implementation carries out subset pinning (ADR-0080 decision 1).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AffinityBackend {
+    /// Render ingress-nginx `Ingress` objects carrying the
+    /// `upstream-hash-by-subset` annotation family. The default, so an existing
+    /// CR that never set `backend` keeps running exactly what it runs today.
+    ///
+    /// Deprecated: ingress-nginx is retiring upstream. A cluster on this
+    /// backend gets an `IngestAffinityBackendDeprecated` condition on its
+    /// status; migrate to [`AffinityBackend::RavelNative`] or to an equivalent
+    /// Gateway API exposure (`docs/guides/ingest-affinity.md`).
+    #[default]
+    IngressNginx,
+
+    /// Ravel's own subset router: deterministic rendezvous-hash selection over
+    /// the gateway's live endpoints, independent of which ingress or Gateway
+    /// implementation terminates the connection.
+    RavelNative,
 }
 
 /// Which piece of authentication material the load balancer hashes to identify
@@ -1086,6 +1119,78 @@ mod tests {
             rules[0].message.as_deref(),
             Some(AFFINITY_HEADER_NAME_MESSAGE)
         );
+    }
+
+    #[test]
+    fn affinity_backend_defaults_to_ingress_nginx_for_an_existing_cr() {
+        // ADR-0080 decision 1: `backend` is additive. A CR serialized before
+        // the field existed must deserialize onto the backend it already runs,
+        // with subsetSize and key semantics untouched -- an upgrade that
+        // silently moved either would be a behavior change.
+        let affinity: IngestAffinitySpec = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "subsetSize": 3,
+            "key": { "source": "header", "headerName": "x-tenant" },
+            "ingressClassName": "nginx",
+            "hosts": ["ingest.example.com"],
+            "tlsSecretName": "ingest-tls",
+            "grpc": true,
+        }))
+        .expect("legacy ingestAffinity JSON deserializes");
+        assert_eq!(affinity.backend, AffinityBackend::IngressNginx);
+        assert_eq!(affinity.subset_size, 3);
+        assert_eq!(affinity.key.source, AffinityKeySource::Header);
+        assert_eq!(affinity.key.header_name.as_deref(), Some("x-tenant"));
+
+        assert_eq!(
+            IngestAffinitySpec::default().backend,
+            AffinityBackend::IngressNginx
+        );
+
+        // The schema exposes the field, so a CR can opt into the new backend.
+        let affinity_props = ravel_cluster_crd().spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .properties
+            .clone()
+            .expect("affinity props");
+        assert!(
+            affinity_props.contains_key("backend"),
+            "ingestAffinity must expose backend in its schema"
+        );
+    }
+
+    #[test]
+    fn affinity_backends_serialize_as_documented_camel_case() {
+        // Public CRD enum values, quoted in the guide and in manifests.
+        for (backend, text) in [
+            (AffinityBackend::IngressNginx, "ingressNginx"),
+            (AffinityBackend::RavelNative, "ravelNative"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(backend).expect("serialize"),
+                serde_json::Value::String(text.to_string())
+            );
+        }
     }
 
     #[test]
