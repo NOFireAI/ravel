@@ -30,7 +30,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_query::{EngineConfig, QueryEngine};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
-use ravel_server::alert_sink::AlertSink;
+use ravel_server::alert_sink::{AlertSink, Credential};
 use ravel_server::alerting::{
     ALERT_SHARD, AlertEvalConfig, AlertEvaluator, AlertQueryEngines, parse_rules,
 };
@@ -286,6 +286,10 @@ async fn seeded_store_spanning(last_ns: i64) -> Arc<dyn ObjectStoreBackend> {
 /// Everything the in-process sink server saw, plus the status it answers with.
 struct Capture {
     received: Mutex<Vec<(String, Json)>>,
+    /// The `Authorization` header of each call, aligned by index with
+    /// `received`. `None` when the request carried no such header, which is
+    /// what an unauthenticated sink must produce.
+    authorizations: Mutex<Vec<Option<String>>>,
     status: AtomicU16,
 }
 
@@ -293,6 +297,7 @@ impl Capture {
     fn new(status: StatusCode) -> Arc<Capture> {
         Arc::new(Capture {
             received: Mutex::new(Vec::new()),
+            authorizations: Mutex::new(Vec::new()),
             status: AtomicU16::new(status.as_u16()),
         })
     }
@@ -304,19 +309,35 @@ impl Capture {
     fn calls(&self) -> Vec<(String, Json)> {
         self.received.lock().expect("capture lock").clone()
     }
+
+    /// The `Authorization` header seen on each call, in call order.
+    fn authorizations(&self) -> Vec<Option<String>> {
+        self.authorizations.lock().expect("capture lock").clone()
+    }
 }
 
 async fn sink_handler(
     State(capture): State<Arc<Capture>>,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> StatusCode {
     let json: Json = serde_json::from_slice(&body).expect("a sink body must be JSON");
+    let authorization = headers.get(axum::http::header::AUTHORIZATION).map(|v| {
+        v.to_str()
+            .expect("authorization is valid ascii")
+            .to_string()
+    });
     capture
         .received
         .lock()
         .expect("capture lock")
         .push((uri.path().to_string(), json));
+    capture
+        .authorizations
+        .lock()
+        .expect("capture lock")
+        .push(authorization);
     StatusCode::from_u16(capture.status.load(Ordering::SeqCst)).expect("valid status")
 }
 
@@ -608,6 +629,89 @@ async fn the_alertmanager_sink_posts_the_api_v2_alerts_payload() {
         resolved["endsAt"].is_string(),
         "a resolved alert carries endsAt"
     );
+
+    server.stop().await;
+}
+
+/// ADR-0083, proven end to end through the real evaluator: a webhook sink
+/// carrying a bearer credential attaches `Authorization: Bearer <token>` to the
+/// POST, and the header is observed on the bytes that actually crossed the
+/// socket. The unauthenticated sink alongside it sends no such header, so the
+/// header is attached because the credential is present, not unconditionally.
+#[tokio::test]
+async fn authenticated_sink_posts_bearer_header() {
+    let server = SinkServer::start(StatusCode::OK).await;
+    let store = seeded_store().await;
+    let auth_url = format!("{}/authed", server.base_url());
+    let plain_url = format!("{}/plain", server.base_url());
+    let mut evaluator = evaluator(
+        Arc::clone(&store),
+        TestClock::at(NOW_NS),
+        vec![threshold_rule(None)],
+        vec![
+            AlertSink::webhook(auth_url).with_credential(Credential::Bearer("s3cr3t-token".into())),
+            AlertSink::webhook(plain_url),
+        ],
+    );
+
+    let report = evaluator.run_tick().await;
+    assert_eq!(report.records_written, 1);
+    // One transition, delivered to every sink: the count is per notification,
+    // not per sink, so it is 1 even though two POSTs cross the socket below.
+    assert_eq!(report.notifications_delivered, 1);
+    assert_eq!(report.notifications_failed, 0);
+
+    // Pair each call with the Authorization header it carried.
+    let calls = server.capture.calls();
+    let auths = server.capture.authorizations();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(auths.len(), calls.len());
+    let by_path: HashMap<&str, &Option<String>> = calls
+        .iter()
+        .zip(auths.iter())
+        .map(|((path, _), auth)| (path.as_str(), auth))
+        .collect();
+
+    assert_eq!(
+        by_path["/authed"],
+        &Some("Bearer s3cr3t-token".to_string()),
+        "the credentialed sink attaches the bearer header"
+    );
+    assert_eq!(
+        by_path["/plain"], &None,
+        "the unauthenticated sink sends no Authorization header"
+    );
+
+    server.stop().await;
+}
+
+/// ADR-0083 Basic path: a sink with an HTTP Basic credential attaches
+/// `Authorization: Basic base64(user:pass)`, the exact encoding Alertmanager
+/// receivers expect.
+#[tokio::test]
+async fn authenticated_sink_posts_basic_header() {
+    use base64::Engine;
+
+    let server = SinkServer::start(StatusCode::OK).await;
+    let store = seeded_store().await;
+    let url = format!("{}/hook", server.base_url());
+    let mut evaluator = evaluator(
+        Arc::clone(&store),
+        TestClock::at(NOW_NS),
+        vec![threshold_rule(None)],
+        vec![AlertSink::webhook(url).with_credential(Credential::Basic {
+            user: "alice".into(),
+            pass: "hunter2".into(),
+        })],
+    );
+
+    assert_eq!(evaluator.run_tick().await.notifications_delivered, 1);
+
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("alice:hunter2")
+    );
+    assert_eq!(server.capture.authorizations(), vec![Some(expected)]);
 
     server.stop().await;
 }
