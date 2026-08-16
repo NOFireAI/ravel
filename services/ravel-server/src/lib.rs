@@ -621,11 +621,15 @@ pub async fn start(
     // `l` keyspace (docs/ingest.md "Log pipeline"). It exists in exactly the
     // modes that serve ingest, so the two options are always Some together.
     let log_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
-        // The per-tenant POSTINGS indexed-field resolver reaches
-        // the writer here: the router hands it to every shard, which resolves
-        // `fields_for(tenant_hash)` at flush time.
-        let indexed_fields: Arc<dyn ravel_ingest::LogIndexedFields> =
+        // The per-tenant POSTINGS indexed-field resolver reaches the writer here:
+        // the router hands it to every shard, which resolves the list at flush
+        // time. The CLI-derived `IndexedFieldConfig` is the base; wrapping it in
+        // an `IndexedFieldsOverlay` (ADR-0079) makes a durable
+        // `TenantConfig.indexed_fields` override apply per tenant without a
+        // restart, read cache-aside off the flush path.
+        let indexed_fields_base: Arc<dyn ravel_ingest::LogIndexedFields> =
             Arc::new(config.indexed_fields.clone());
+        let indexed_fields = Arc::new(ravel_ingest::IndexedFieldsOverlay::new(indexed_fields_base));
         Some(Arc::new(
             LogIngestRouter::new_with_indexed_fields(
                 IngestConfig {

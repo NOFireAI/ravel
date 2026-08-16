@@ -13,6 +13,7 @@ mod config;
 mod error;
 mod generation;
 mod idempotency;
+mod indexed_fields;
 mod lifecycle;
 mod log_error;
 mod log_metrics;
@@ -46,6 +47,7 @@ pub use idempotency::{
     MarkerError, MarkerWriteError, WriteOutcome, decode_marker, keyhash32, marker_key, read_marker,
     write_marker,
 };
+pub use indexed_fields::{DEFAULT_INDEXED_FIELDS_REREAD_BACKOFF_NS, IndexedFieldsOverlay};
 pub use lifecycle::{
     DEFAULT_HARD_STALENESS_MULTIPLE, DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS, StalenessGate,
     overlay_admission_limits, refresh_tenant_limits_once,
