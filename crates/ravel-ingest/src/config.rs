@@ -34,6 +34,19 @@ pub const SPAN_SEGMENT_FORMAT_VERSION: u16 = ravel_rspan::footer::VERSION;
 /// Nanoseconds per hour, the unit `ingest_hour_bucket` counts in.
 pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
+/// Reserve `strict_visibility_budget_ns` must exceed `max_flush_delay` by
+/// (ADR-0076 decision 4): two PUT round trips (data object, then commit
+/// record) plus one retry's base backoff, with margin. `visibility_ceiling_ns`
+/// subtracts those same costs from the budget to get the adaptive corridor's
+/// cap; setting the budget equal to `max_flush_delay` (as the pre-fix default
+/// and the `ravel-server` call site both did) leaves nothing for that
+/// subtraction to work with, so the ceiling collapses to the floor
+/// unconditionally and `FlushTrigger::AgeAdaptive` becomes unreachable. This
+/// preserves the same absolute corridor width the original hard-coded values
+/// had (1s budget over a 500ms floor = 500ms of headroom before RTT/retry
+/// subtraction).
+pub const STRICT_VISIBILITY_RESERVE_NS: i64 = 500_000_000;
+
 /// Receiver-clock plausibility floor: 2020-01-01T00:00:00Z in nanoseconds
 /// (ADR-0051 amendment). No host legitimately
 /// runs Ravel with a clock reading before the system existed, so a reading
@@ -185,17 +198,18 @@ pub struct IngestConfig {
 
 impl Default for IngestConfig {
     fn default() -> Self {
+        // ADR-0076 decision 4: the three flush-cadence knobs move as a
+        // set, scaled 4x together (500ms/10s/64KiB -> 2s/40s/256KiB). At
+        // the ~9.6 KB/s buffer fill rate the ADR measures, 256KiB is
+        // reached in ~27s, comfortably under the new 40s idle ceiling,
+        // so buffered-mode tenants keep the same "size trigger fires
+        // before the idle timer" property they had before the bump.
+        let max_flush_delay = Duration::from_secs(2);
         IngestConfig {
             shard_count: 4,
             channel_depth: 256,
             target_bytes: 8 * 1024 * 1024,
-            // ADR-0076 decision 4: the three flush-cadence knobs move as a
-            // set, scaled 4x together (500ms/10s/64KiB -> 2s/40s/256KiB). At
-            // the ~9.6 KB/s buffer fill rate the ADR measures, 256KiB is
-            // reached in ~27s, comfortably under the new 40s idle ceiling,
-            // so buffered-mode tenants keep the same "size trigger fires
-            // before the idle timer" property they had before the bump.
-            max_flush_delay: Duration::from_secs(2),
+            max_flush_delay,
             flush_tick: Duration::from_millis(200),
             max_flush_delay_idle: Duration::from_secs(40),
             min_flush_bytes: 256 * 1024,
@@ -206,7 +220,12 @@ impl Default for IngestConfig {
             exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
             max_inflight_flushes: 1,
             adaptive_flush_delay: false,
-            strict_visibility_budget_ns: 2_000_000_000,
+            // Must exceed max_flush_delay by STRICT_VISIBILITY_RESERVE_NS, not
+            // equal it: equal leaves visibility_ceiling_ns's subtraction with
+            // no headroom, collapsing the adaptive corridor to the floor
+            // unconditionally.
+            strict_visibility_budget_ns: max_flush_delay.as_nanos() as i64
+                + STRICT_VISIBILITY_RESERVE_NS,
         }
     }
 }
@@ -239,9 +258,13 @@ mod tests {
         // behavior bit for bit; the flip to 3 is a later measured decision.
         assert_eq!(cfg.max_inflight_flushes, 1);
         assert!(!cfg.adaptive_flush_delay);
-        // ADR-0076 decision 4: must follow the new max_flush_delay default
-        // (2s), not the old hard-coded 1s STRICT_VISIBILITY_BUDGET_NS.
-        assert_eq!(cfg.strict_visibility_budget_ns, 2_000_000_000);
+        // ADR-0076 decision 4: must exceed the max_flush_delay default (2s)
+        // by STRICT_VISIBILITY_RESERVE_NS, not equal it -- equal collapses
+        // the adaptive corridor to the floor unconditionally.
+        assert_eq!(
+            cfg.strict_visibility_budget_ns,
+            cfg.max_flush_delay.as_nanos() as i64 + STRICT_VISIBILITY_RESERVE_NS
+        );
     }
 
     #[test]

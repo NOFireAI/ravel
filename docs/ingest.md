@@ -280,17 +280,20 @@ clamped into a corridor `[max_flush_delay, ceiling]`:
 
 - **Floor**: `max_flush_delay` (2 s default), unchanged from today.
 - **Ceiling**: the strict-mode visibility budget (`IngestConfig::strict_visibility_budget_ns`,
-  2 s default, following `max_flush_delay` -- ADR-0076 decision 4; the same
-  budget docs/consistency-model.md's strict-mode ack contract names) minus two
+  2.5 s default -- `max_flush_delay` plus `STRICT_VISIBILITY_RESERVE_NS` (500 ms),
+  following `max_flush_delay` -- ADR-0076 decision 4; the same budget
+  docs/consistency-model.md's strict-mode ack contract names) minus two
   PUT round trips at their observed p99 (data object, then commit
   record) minus one retry's base backoff as headroom, floored at
-  `max_flush_delay` so the corridor never inverts. With no PUT RTT
-  observed yet, the ceiling collapses to the floor: adapting upward
-  would be a guess the budget cannot back, so a tenant sees today's
-  fixed 500 ms from its very first flush, not just after warm-up. RTT is
-  sampled from both PUTs of every flush (from spawned tasks, concurrently
-  with the actor and with each other), kept as a bounded p99 estimate
-  (last 64 samples) per shard.
+  `max_flush_delay` so the corridor never inverts. The reserve keeps the
+  corridor's width non-zero: a budget set exactly equal to `max_flush_delay`
+  would leave the subtraction nothing to work with, collapsing the ceiling to
+  the floor unconditionally. With no PUT RTT observed yet, the ceiling still
+  collapses to the floor: adapting upward would be a guess the budget cannot
+  back, so a tenant sees the fixed `max_flush_delay` from its very first
+  flush, not just after warm-up. RTT is sampled from both PUTs of every flush
+  (from spawned tasks, concurrently with the actor and with each other), kept
+  as a bounded p99 estimate (last 64 samples) per shard.
 - **Threshold**: the tenant's own observed inter-arrival gap, clamped
   into `[floor, ceiling]`. A bursty tenant (small gap) clamps up to the
   floor -- today's behavior, unchanged. A trickle tenant (large gap)
