@@ -1071,10 +1071,16 @@ const DEFAULT_ROUTER_REPLICAS: i32 = 2;
 /// The ingest-affinity spec when the ravel-native router should be rendered:
 /// affinity present, `enabled`, and `backend: ravelNative`. `None` otherwise.
 ///
-/// Every router renderer and the Gateway-API backendRef switch
-/// ([`desired_gateway_routes`]) share this one gate, so they cannot disagree
-/// about when the router exists: a route can only point at a router Service the
-/// renderers also produce.
+/// Every router renderer shares this one gate, so they cannot disagree about
+/// which objects the router set contains. The Gateway-API backendRef switch
+/// ([`desired_gateway_routes`]) needs a STRICTER condition than this, though:
+/// affinity being `ravelNative` is necessary but not sufficient for the router's
+/// Service to exist after a reconcile pass, because the router's own render can
+/// fail this pass (missing `routerImage`, or a canonical-tenant resolver that
+/// resolves to zero tenants). So the route switch keys off the router's actual
+/// render outcome (`router_available`, threaded from [`desired_objects`]), not
+/// this gate alone -- otherwise a route could point at a router Service the same
+/// pass deletes.
 fn ravel_native_affinity(spec: &RavelClusterSpec) -> Option<&IngestAffinitySpec> {
     let affinity = spec.gateway.ingest_affinity.as_ref()?;
     (affinity.enabled && matches!(affinity.backend, AffinityBackend::RavelNative))
@@ -1183,12 +1189,19 @@ pub fn desired_router_deployment(
         return Err(RenderError::RouterImageMissing);
     };
     // canonical-tenant needs at least one resolver or the router's own CLI
-    // crashloops at startup. tenantTokensSecretRef is the only resolver surface
-    // this CRD exposes today, so its absence under canonical-tenant is a
-    // render-time rejection, not a rendered Deployment (see
-    // RenderError::CanonicalTenantResolverMissing).
+    // crashloops at startup. Gate on the ACTUAL rendered resolver flags, not on
+    // `tenant_tokens_secret_ref.is_none()`: the flags come from
+    // `tenant_token_args`, which emits one `--tenant-token` per
+    // `ctx.tenant_names`, and `tenant_names` is the tenant-tokens Secret's live
+    // keys (see controller.rs). The Secret ref can be SET on the spec while the
+    // Secret is absent or has zero keys this cycle (a normal, already-anticipated
+    // live state that controller.rs just warns on and continues) -- in which case
+    // no `--tenant-token` renders and the router crashloops just the same. If no
+    // resolver flags would actually render, reject at render time (see
+    // RenderError::CanonicalTenantResolverMissing) rather than ship a
+    // guaranteed-crashlooping Deployment.
     if affinity.key.source == AffinityKeySource::CanonicalTenant
-        && spec.tenant_tokens_secret_ref.is_none()
+        && tenant_token_args(spec, ctx).is_empty()
     {
         return Err(RenderError::CanonicalTenantResolverMissing);
     }
@@ -1474,6 +1487,7 @@ fn gateway_route(
 pub fn desired_gateway_routes(
     spec: &RavelClusterSpec,
     instance: &str,
+    router_available: bool,
 ) -> (Option<DynamicObject>, Option<DynamicObject>) {
     let Some(gateway_api) = spec
         .gateway
@@ -1484,14 +1498,24 @@ pub fn desired_gateway_routes(
         return (None, None);
     };
     let gateway = child_name(instance, "gateway");
-    // HTTPRoute backendRef (ADR-0080 decision 3, deliverable 4): under
-    // `backend: ravelNative` the HTTP route points at the router's Service so
-    // OTLP/HTTP ingest is subset-pinned; for every other CR (affinity absent,
-    // disabled, or ingressNginx) it keeps targeting the gateway Service exactly
-    // as before -- zero behavior change.
-    let (http_backend, http_port) = match ravel_native_affinity(spec) {
-        Some(_) => (child_name(instance, ROUTER_COMPONENT), ROUTER_HTTP_PORT),
-        None => (gateway.clone(), HTTP_PORT),
+    // HTTPRoute backendRef (ADR-0080 decision 3, deliverable 4): point the HTTP
+    // route at the router's Service ONLY when the router's Service will actually
+    // exist after this reconcile pass -- `router_available` is threaded in from
+    // `desired_objects`, which computes it from the router's own render outcome
+    // this pass. A static `ravel_native_affinity(spec).is_some()` check is NOT
+    // enough: on a router render error (RouterImageMissing, or F1's
+    // CanonicalTenantResolverMissing from a transiently-empty token Secret) the
+    // controller applies routes BEFORE the router block and its delete-sweep
+    // removes every router-owned object that did not render this pass. Pointing
+    // the HTTPRoute at the router Service in that pass would apply a route at a
+    // Service the same pass then deletes -- an ingest outage that does not
+    // self-heal. So for every other case (affinity absent/disabled, ingressNginx,
+    // OR a router that will not be present this pass) fall back to the gateway
+    // Service exactly as before -- zero behavior change on the healthy paths.
+    let (http_backend, http_port) = if router_available {
+        (child_name(instance, ROUTER_COMPONENT), ROUTER_HTTP_PORT)
+    } else {
+        (gateway.clone(), HTTP_PORT)
     };
     // GRPCRoute backendRef ALWAYS targets the gateway Service, regardless of
     // backend. The router deliberately renders an HTTP-only Deployment today
@@ -1615,11 +1639,18 @@ pub fn desired_objects(
         ),
         Err(err) => (None, None, None, None, None, Some(err)),
     };
+    // The HTTPRoute may only point at the router's Service when that Service will
+    // actually exist after this pass. `router_service.is_some()` is exactly that:
+    // it is `Some` only under `backend: ravelNative` AND a clean router render
+    // (the error branch above set it to `None`), so it flips to `false` on any
+    // router render error this pass. See `desired_gateway_routes` for why a static
+    // spec check would strand the route at a deleted Service.
+    let router_available = router_service.is_some();
     Ok(DesiredObjects {
         gateway_deployment: desired_gateway_deployment(spec, instance, ctx),
         gateway_service: desired_gateway_service(spec, instance),
         gateway_ingresses: desired_gateway_ingresses(spec, instance),
-        gateway_routes: desired_gateway_routes(spec, instance),
+        gateway_routes: desired_gateway_routes(spec, instance, router_available),
         router_deployment,
         router_service,
         router_service_account,
@@ -3250,7 +3281,8 @@ mod tests {
             Vec::new(),
             false,
         );
-        let (http, grpc) = desired_gateway_routes(&spec, "prod");
+        // Affinity absent: router not present, HTTPRoute stays on the gateway.
+        let (http, grpc) = desired_gateway_routes(&spec, "prod", false);
         assert!(
             http.is_some(),
             "HTTPRoute still rendered when grpc is false"
@@ -3282,7 +3314,9 @@ mod tests {
                 true,
             )
         };
-        let (http, grpc) = desired_gateway_routes(&spec, "prod");
+        // Routes render independent of affinity; router_available is irrelevant
+        // to this assertion (it checks parentRefs, not the backendRef).
+        let (http, grpc) = desired_gateway_routes(&spec, "prod", false);
         let http = http.expect("HTTPRoute rendered alongside ravelNative affinity");
         assert!(
             grpc.is_some(),
@@ -3301,7 +3335,7 @@ mod tests {
         let mut spec = base_spec();
         spec.gateway = GatewaySpec::default();
         assert_eq!(
-            desired_gateway_routes(&spec, "prod"),
+            desired_gateway_routes(&spec, "prod", false),
             (None, None),
             "exposure absent renders no routes"
         );
@@ -3600,6 +3634,51 @@ mod tests {
     }
 
     #[test]
+    fn canonical_tenant_with_secret_ref_but_no_live_tenants_is_a_typed_error() {
+        // F1: the resolver guard must check the ACTUAL rendered resolver flags,
+        // not `tenant_tokens_secret_ref.is_none()`. A Secret ref SET on the spec
+        // while the Secret is absent or has zero keys this cycle is a normal live
+        // state (controller.rs derives ctx.tenant_names from the Secret's live
+        // keys and just warns on empty). In that case `tenant_token_args` renders
+        // zero `--tenant-token` flags and the router's own CLI still crashloops at
+        // startup -- the exact case the spec-field guard missed. The render must
+        // reject it, not ship a crashlooping Deployment.
+        let mut spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+        spec.tenant_tokens_secret_ref = Some(LocalSecretRef {
+            name: "ravel-tokens".to_string(),
+        });
+        // The Secret resolves to zero tenants this cycle.
+        let empty_ctx = RenderCtx {
+            tenant_names: Vec::new(),
+            ..ctx()
+        };
+        assert_eq!(
+            desired_router_deployment(&spec, "prod", "default", &empty_ctx),
+            Err(RenderError::CanonicalTenantResolverMissing),
+            "a set secret_ref that resolves to zero live tenants must still be a \
+             typed resolver-missing error, not a crashlooping Deployment"
+        );
+        // And it is captured (not propagated) by desired_objects, exactly like the
+        // secret-ref-absent case: router objects None, error surfaced.
+        let objects =
+            desired_objects(&spec, "prod", "default", &empty_ctx).expect("render never aborts");
+        assert_eq!(
+            objects.router_render_error,
+            Some(RenderError::CanonicalTenantResolverMissing)
+        );
+        assert!(objects.router_deployment.is_none());
+
+        // Sanity: the same spec with a non-empty live tenant set (the existing
+        // fixture shape) still renders cleanly -- the guard did not over-reject.
+        assert!(
+            desired_router_deployment(&spec, "prod", "default", &ctx())
+                .expect("render")
+                .is_some(),
+            "non-empty tenant_names must still render a router Deployment"
+        );
+    }
+
+    #[test]
     fn router_render_failure_still_renders_every_other_tier() {
         // Fix 5 (non-blocking): a router render error must degrade ONLY the
         // router, never abort the whole reconcile. desired_objects returns the
@@ -3672,7 +3751,9 @@ mod tests {
         // GRPCRoute -> STILL the gateway Service on the gateway's gRPC port.
         let mut spec = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
         spec.gateway.exposure = exposure_with(router_gw.clone(), Vec::new(), true).exposure;
-        let (http, grpc) = desired_gateway_routes(&spec, "prod");
+        // Router renders cleanly here (router_available = true): the HTTPRoute
+        // switches to the router Service.
+        let (http, grpc) = desired_gateway_routes(&spec, "prod", true);
         let http = http.expect("HTTPRoute");
         let grpc = grpc.expect("GRPCRoute");
         assert_eq!(
@@ -3699,7 +3780,8 @@ mod tests {
         // Service on 4318/4317, exactly as before.
         let mut spec = base_spec();
         spec.gateway = exposure_with(router_gw, Vec::new(), true);
-        let (http, grpc) = desired_gateway_routes(&spec, "prod");
+        // ingressNginx backend: no router, HTTPRoute stays on the gateway Service.
+        let (http, grpc) = desired_gateway_routes(&spec, "prod", false);
         assert_eq!(
             route_spec(&http.expect("HTTPRoute"))["rules"][0]["backendRefs"][0]["name"],
             serde_json::json!("prod-gateway")
@@ -3708,6 +3790,80 @@ mod tests {
             route_spec(&grpc.expect("GRPCRoute"))["rules"][0]["backendRefs"][0]["name"],
             serde_json::json!("prod-gateway")
         );
+    }
+
+    #[test]
+    fn httproute_falls_back_to_gateway_service_on_router_render_error() {
+        // F2: on ANY router render error the same reconcile pass would apply the
+        // router's objects as no-ops and the delete-sweep removes the router's
+        // Service, yet a static `backend: ravelNative` check would still point the
+        // HTTPRoute at that (now-deleted) Service -- an ingest outage that does not
+        // self-heal. The route renderer must instead fall back to the gateway
+        // Service whenever the router will not be present this pass. Asserted
+        // through `desired_objects`, the exact render the controller applies, so
+        // the router-outcome-to-route wiring is what is under test.
+        for spec in [
+            // CanonicalTenantResolverMissing (F1's path): ravelNative + canonical,
+            // no tenant-tokens Secret ref.
+            {
+                let mut s = ravel_native_spec(2, AffinityKeySource::CanonicalTenant);
+                s.tenant_tokens_secret_ref = None;
+                s.gateway.exposure = exposure_with(
+                    GatewayReference {
+                        name: "public-gw".to_string(),
+                        namespace: None,
+                    },
+                    Vec::new(),
+                    true,
+                )
+                .exposure;
+                s
+            },
+            // RouterImageMissing: ravelNative with routerImage unset.
+            {
+                let mut s = base_spec();
+                s.gateway.ingest_affinity = Some(IngestAffinitySpec {
+                    backend: AffinityBackend::RavelNative,
+                    router_image: None,
+                    ..IngestAffinitySpec::default()
+                });
+                s.gateway.exposure = exposure_with(
+                    GatewayReference {
+                        name: "public-gw".to_string(),
+                        namespace: None,
+                    },
+                    Vec::new(),
+                    true,
+                )
+                .exposure;
+                s
+            },
+        ] {
+            let objects =
+                desired_objects(&spec, "prod", "default", &ctx()).expect("render never aborts");
+            assert!(
+                objects.router_render_error.is_some(),
+                "precondition: the router render failed this pass"
+            );
+            assert!(
+                objects.router_service.is_none(),
+                "precondition: no router Service will exist after this pass"
+            );
+            let (http, _grpc) = objects.gateway_routes;
+            let http = http.expect("HTTPRoute still rendered");
+            assert_eq!(
+                route_spec(&http)["rules"][0]["backendRefs"][0]["name"],
+                serde_json::json!("prod-gateway"),
+                "on a router render error the HTTPRoute must fall back to the \
+                 gateway Service, never point at the router Service the same pass \
+                 deletes"
+            );
+            assert_eq!(
+                route_spec(&http)["rules"][0]["backendRefs"][0]["port"],
+                serde_json::json!(HTTP_PORT),
+                "fallback uses the gateway's HTTP port, not the router's"
+            );
+        }
     }
 
     #[test]
