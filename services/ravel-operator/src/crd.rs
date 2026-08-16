@@ -306,6 +306,23 @@ pub struct IngestAffinitySpec {
     #[serde(default)]
     pub backend: AffinityBackend,
 
+    /// Container image for the `ravel-ingest-router` Deployment rendered under
+    /// [`AffinityBackend::RavelNative`] (ADR-0080 decision 3).
+    ///
+    /// The router is a DIFFERENT binary from `spec.image` (which is
+    /// `ravel-server`), so its image cannot be derived from `spec.image` and is
+    /// named explicitly here. Deriving it by string-manipulating `spec.image`
+    /// would be fragile: an image reference host can carry a port
+    /// (`localhost:5000/ravel-server:v1`), so any split-on-`:` guess breaks.
+    ///
+    /// Required when `backend: ravelNative`: the operator surfaces a `Degraded`
+    /// status condition (reason `RouterImageMissing`) and renders no router
+    /// objects when it is absent, rather than a Deployment with an empty
+    /// `image:` that would never schedule. Has no effect under
+    /// `backend: ingressNginx`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_image: Option<String>,
+
     /// How many replicas a tenant's traffic is pinned to. Defaults to
     /// [`DEFAULT_AFFINITY_SUBSET_SIZE`] (two), not one, so a single replica
     /// loss does not concentrate a tenant on one process.
@@ -384,6 +401,7 @@ impl Default for IngestAffinitySpec {
         Self {
             enabled: default_true(),
             backend: AffinityBackend::default(),
+            router_image: None,
             subset_size: default_subset_size(),
             key: AffinityKeySpec::default(),
             ingress_class_name: None,
@@ -456,6 +474,16 @@ pub enum AffinityKeySource {
     /// authentication configured; the variable is empty otherwise, which
     /// collapses every tenant onto one subset.
     MtlsSubject,
+
+    /// Hash the canonical `TenantId` resolved by the `ravel-tenant-resolve`
+    /// auth chain (ADR-0080 decision 3), immune to bearer-token rotation unlike
+    /// hashing the raw `Authorization` header.
+    ///
+    /// Only meaningful under [`AffinityBackend::RavelNative`]: ingress-nginx has
+    /// no way to run the tenant-resolution chain, so this key source combined
+    /// with `backend: ingressNginx` is rejected at admission by a CEL rule on
+    /// the `ingestAffinity` object (see [`ravel_cluster_crd`]).
+    CanonicalTenant,
 }
 
 /// Catalog fold tuning (`--disable-fold`, `--fold-interval-secs`).
@@ -722,6 +750,7 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     inject_minimum_bounds(&mut crd);
     inject_ingest_affinity_constraints(&mut crd);
     inject_gateway_exposure_affinity_guard(&mut crd);
+    inject_canonical_tenant_backend_guard(&mut crd);
     crd
 }
 
@@ -952,6 +981,75 @@ fn inject_gateway_exposure_affinity_guard(crd: &mut CustomResourceDefinition) {
         };
         // Append rather than replace: leave room for a future rule on `gateway`
         // without silently dropping this one.
+        let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
+        rules.push(rule.clone());
+        gateway.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// Message surfaced to a user who selects the `canonicalTenant` key source on
+/// the legacy `ingressNginx` backend (ADR-0080 decision 3).
+const CANONICAL_TENANT_BACKEND_MESSAGE: &str = "gateway.ingestAffinity.key.source \
+    canonicalTenant requires backend: ravelNative -- ingress-nginx cannot run the \
+    ravel-tenant-resolve auth chain that canonical-tenant hashing needs";
+
+/// The CEL rule rejecting the `canonicalTenant` key source under
+/// `backend: ingressNginx` (ADR-0080 decision 3), kept as a constant so the
+/// injected rule and the logic unit test cannot drift.
+///
+/// It is attached at the `gateway` object level (so `self` is the gateway
+/// struct), following the exact shape of the exposure guard rather than nesting
+/// inside `ingestAffinity`: that keeps `ingestAffinity`'s own rule set to just
+/// its `headerName` rule. It passes (no rejection) unless BOTH
+/// `ingestAffinity.key.source` is `canonicalTenant` and `ingestAffinity.backend`
+/// is `ingressNginx`. The disjunction reads as "the combination is fine if any
+/// precondition of the bad case is absent". `backend` is materialized to
+/// `ingressNginx` by the schema default before CEL evaluates, so a manifest that
+/// sets `key.source: canonicalTenant` while omitting `backend` is still rejected
+/// (the omitted default IS `ingressNginx`); the `has()` guards are a defensive
+/// belt against a missing serde default, matching the other injectors.
+const CANONICAL_TENANT_BACKEND_RULE: &str = "!has(self.ingestAffinity) || \
+    !has(self.ingestAffinity.key) || !has(self.ingestAffinity.key.source) || \
+    self.ingestAffinity.key.source != 'canonicalTenant' || \
+    !has(self.ingestAffinity.backend) || self.ingestAffinity.backend != 'ingressNginx'";
+
+/// Attach the canonical-tenant-versus-legacy-backend guard (ADR-0080
+/// decision 3) to the `gateway` property.
+///
+/// Attached at the `gateway` level and APPENDED (not replaced), the exact shape
+/// of [`inject_gateway_exposure_affinity_guard`], so the exposure guard already
+/// on `gateway` is preserved and `ingestAffinity`'s own rule set stays at just
+/// its `headerName` rule. Injected post-hoc for the same reason the other
+/// injectors are, and every step bails out rather than panicking if the schema
+/// shape is not what it expects.
+fn inject_canonical_tenant_backend_guard(crd: &mut CustomResourceDefinition) {
+    let rule = ValidationRule {
+        rule: CANONICAL_TENANT_BACKEND_RULE.to_string(),
+        message: Some(CANONICAL_TENANT_BACKEND_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(gateway) = spec_props.get_mut("gateway") else {
+            continue;
+        };
+        // Append rather than replace: the exposure guard is already on `gateway`
+        // and dropping it would silently re-admit the exposure+ingressNginx
+        // combination.
         let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
         rules.push(rule.clone());
         gateway.x_kubernetes_validations = Some(rules);
@@ -1360,12 +1458,162 @@ mod tests {
             ),
             (AffinityKeySource::Header, "header"),
             (AffinityKeySource::MtlsSubject, "mtlsSubject"),
+            (AffinityKeySource::CanonicalTenant, "canonicalTenant"),
         ] {
             assert_eq!(
                 serde_json::to_value(source).expect("serialize"),
                 serde_json::Value::String(text.to_string())
             );
         }
+    }
+
+    /// Rust mirror of [`CANONICAL_TENANT_BACKEND_RULE`]: returns whether the
+    /// combination is ADMITTED (the CEL rule evaluates true). `backend` is
+    /// always materialized when the affinity block is present (serde/schema
+    /// default `ingressNginx`), so it is modeled as always present. The exact
+    /// rule string is pinned separately in
+    /// [`canonical_tenant_key_source_rejected_with_ingress_nginx_backend`], so a
+    /// change to the real rule that diverges from this model is caught there.
+    fn canonical_tenant_cel_admits(key_source: &str, backend: &str) -> bool {
+        key_source != "canonicalTenant" || backend != "ingressNginx"
+    }
+
+    #[test]
+    fn canonical_tenant_key_source_rejected_with_ingress_nginx_backend() {
+        // ADR-0080 decision 3. Test venue: schema assertion plus a plain-Rust
+        // logic mirror, the same venue #156/T2 established for this repo's CEL
+        // rules (no envtest exists here; x-kubernetes-validations runs in the
+        // API server, which a reconcile unit test cannot reach).
+
+        // The one rejected combination:
+        assert!(
+            !canonical_tenant_cel_admits("canonicalTenant", "ingressNginx"),
+            "canonicalTenant + ingressNginx must be rejected"
+        );
+
+        // Every allowed combination named in the deliverable:
+        assert!(
+            canonical_tenant_cel_admits("canonicalTenant", "ravelNative"),
+            "canonicalTenant + ravelNative is allowed"
+        );
+        for backend in ["ingressNginx", "ravelNative"] {
+            for source in ["authorizationHeader", "header", "mtlsSubject"] {
+                assert!(
+                    canonical_tenant_cel_admits(source, backend),
+                    "{source} + {backend} is allowed"
+                );
+            }
+        }
+
+        // The schema carries the exact rule and message on the `gateway`
+        // property (the same shape as the exposure guard), appended alongside it
+        // rather than nested inside ingestAffinity.
+        let gateway = ravel_cluster_crd().spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .clone();
+        let rules = gateway
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("gateway must carry CEL rules");
+        let guard = rules
+            .iter()
+            .find(|r| r.rule == CANONICAL_TENANT_BACKEND_RULE)
+            .expect("gateway must carry the exact canonical-tenant/backend rule");
+        assert_eq!(
+            guard.message.as_deref(),
+            Some(CANONICAL_TENANT_BACKEND_MESSAGE)
+        );
+        // The exposure guard already on `gateway` is not dropped by appending.
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.rule == GATEWAY_EXPOSURE_AFFINITY_RULE),
+            "appending the canonical-tenant rule must not drop the exposure guard"
+        );
+        // ingestAffinity still carries only its own headerName rule (the
+        // canonical-tenant rule lives on gateway, not here).
+        let affinity_rules = gateway
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .x_kubernetes_validations
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            affinity_rules
+                .iter()
+                .all(|r| r.rule != CANONICAL_TENANT_BACKEND_RULE),
+            "the canonical-tenant rule must live on `gateway`, not on `ingestAffinity`"
+        );
+    }
+
+    #[test]
+    fn router_image_is_optional_and_defaults_to_none() {
+        // ADR-0080 decision 3, deliverable 1. A sibling of `backend`, optional
+        // and skipped when None so an existing CR is byte-identical.
+        assert_eq!(IngestAffinitySpec::default().router_image, None);
+
+        let affinity: IngestAffinitySpec = serde_json::from_value(serde_json::json!({
+            "backend": "ravelNative",
+            "routerImage": "registry.example/ravel-ingest-router:v1"
+        }))
+        .expect("deserialize");
+        assert_eq!(
+            affinity.router_image.as_deref(),
+            Some("registry.example/ravel-ingest-router:v1")
+        );
+
+        // Omitted routerImage deserializes to None, and the schema exposes it.
+        let affinity: IngestAffinitySpec =
+            serde_json::from_value(serde_json::json!({ "backend": "ravelNative" }))
+                .expect("deserialize");
+        assert_eq!(affinity.router_image, None);
+        let affinity_props = ravel_cluster_crd().spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props")
+            .get("gateway")
+            .expect("gateway prop")
+            .properties
+            .as_ref()
+            .expect("gateway props")
+            .get("ingestAffinity")
+            .expect("ingestAffinity prop")
+            .properties
+            .clone()
+            .expect("affinity props");
+        assert!(
+            affinity_props.contains_key("routerImage"),
+            "ingestAffinity must expose routerImage in its schema"
+        );
     }
 
     #[test]

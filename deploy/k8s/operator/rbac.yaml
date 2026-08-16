@@ -13,6 +13,12 @@
 #   - RavelCluster (and its status subresource): watch the spec, write status.
 #   - Secrets: get only. The operator reads the credentials and tenant-token
 #     Secrets to resolve tenant names; it never lists, writes, or watches them.
+#   - ServiceAccounts, Roles, and RoleBindings: the same lifecycle, for the
+#     ravel-native ingest router's own ServiceAccount and its namespaced,
+#     least-privilege Role/RoleBinding (ADR-0080 decision 3). The operator's own
+#     identity needs these verbs to create those objects for the router; delete
+#     is what lets backend: ravelNative be switched away without leaving the
+#     router's RBAC orphaned.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -42,6 +48,12 @@ rules:
     verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes", "grpcroutes"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
     verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
   - apiGroups: ["ravel.nofire.ai"]
     resources: ["ravelclusters"]
