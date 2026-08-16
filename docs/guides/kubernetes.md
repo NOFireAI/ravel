@@ -167,7 +167,9 @@ A minimal example is in
 |---|---|---|---|
 | `spec.image` | string | required | Server image for all three tiers. |
 | `spec.imagePullPolicy` | string | — | Standard Kubernetes values. |
-| `spec.shards` | integer | required | Feeds `--shards` to the gateway, query, and maintain from one field, so nothing can break the must-match invariant. **Immutable after creation** through a CEL rule; resharding is out of scope. |
+| `spec.shards` | integer | required | Feeds `--shards` to the gateway, query, and maintain from one field, so nothing can break the must-match invariant. **Immutable after creation** through a CEL rule; use `spec.shardOverrides` for per-tenant resharding. |
+| `spec.shardOverrides.leadHours` | integer | `2` | Minimum hours of lead time an override needs before its shard count takes effect (ADR-0052 activation-hour semantics). Rejected below the mechanism's own floor. |
+| `spec.shardOverrides.tenants` | map | — | Per-tenant target shard count, tenant name to integer. A target that differs from the tenant's current active shard count drives a durable `append_generation` reshard (ADR-0052); a target equal to the current count is a no-op. Lowering a tenant's shard count is the primary operator-facing cost control from ADR-0076 decision 2 -- see the documented costs (single-actor throughput ceiling, shard-0 concentration, coarser ADR-0065 maintenance units) in [shard-overrides.md](shard-overrides.md). |
 | `spec.storage.s3.bucket` | string | required | |
 | `spec.storage.s3.region` | string | `us-east-1` | |
 | `spec.storage.s3.endpoint` | string | — | Omit for real AWS S3. Path-style addressing is always used. |
