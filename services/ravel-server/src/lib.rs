@@ -622,7 +622,12 @@ pub async fn start(
                     // ADR-0076 decision 4: follows the actually-configured
                     // max_flush_delay, not just its default, so the adaptive
                     // corridor never contradicts the operator's chosen budget.
-                    strict_visibility_budget_ns: config.max_flush_delay.as_nanos() as i64,
+                    // Must exceed max_flush_delay by the same reserve
+                    // IngestConfig::default() uses -- setting it equal (as
+                    // this call site once did) collapses the adaptive
+                    // corridor to the floor unconditionally.
+                    strict_visibility_budget_ns: config.max_flush_delay.as_nanos() as i64
+                        + ravel_ingest::STRICT_VISIBILITY_RESERVE_NS,
                     ..IngestConfig::default()
                 },
                 store.clone(),

@@ -38,7 +38,8 @@ pub use budget::{IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge, Inge
 pub use clock::{Clock, SystemClock};
 pub use config::{
     IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MIN_PLAUSIBLE_INGEST_CLOCK_NS,
-    SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION, plausible_ingest_clock,
+    SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION, STRICT_VISIBILITY_RESERVE_NS,
+    plausible_ingest_clock,
 };
 pub use error::WriteError;
 pub use generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed};

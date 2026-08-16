@@ -809,15 +809,19 @@ pub struct FlushCadence {
     pub min_flush_bytes: usize,
 }
 
-/// Upper bound on `--max-flush-delay` derived from the read-side scan-slack
-/// arithmetic `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` encodes (ADR-0076
-/// decision 4): `FLUSH_BOUND_SLACK_HOURS` is `ceil(max_flush_delay +
+/// Upper bound on `--max-flush-delay-idle` derived from the read-side
+/// scan-slack arithmetic `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` encodes
+/// (ADR-0076 decision 4): `FLUSH_BOUND_SLACK_HOURS` is `ceil(max_flush_delay +
 /// max_flush_lifetime)` at the defaults it was last derived against, and
 /// governs how long the read side keeps scanning a retiring shard-count
-/// generation after an activation (docs/catalog-and-mvcc.md). Raising
-/// `--max-flush-delay` past what keeps that sum under
-/// `FLUSH_BOUND_SLACK_HOURS` hours would silently shrink the straggler
-/// window below what a flush can actually take, without `S`
+/// generation after an activation (docs/catalog-and-mvcc.md). The real
+/// worst-case buffer age before a forced flush is `max_flush_delay_idle` (the
+/// ceiling for a buffer with no strict waiter), not `max_flush_delay` (the
+/// fast-tier floor); [`Cli::validate`]'s tier-ordering check guarantees
+/// `max_flush_delay_idle >= max_flush_delay`, so it is always the correct
+/// bound to use here. Raising `--max-flush-delay-idle` past what keeps that
+/// sum under `FLUSH_BOUND_SLACK_HOURS` hours would silently shrink the
+/// straggler window below what a flush can actually take, without `S`
 /// (`ravel_catalog::DEFAULT_SCAN_SLACK_HOURS`) ever being told to grow to
 /// compensate -- a straggler flush pinned under a retiring generation could
 /// then land outside the window the read side still scans, an invisibility
@@ -1698,33 +1702,78 @@ impl Cli {
         // flush.
         let flush_cadence = self.resolve_flush_cadence()?;
 
-        let flush_bound_ns = flush_cadence.max_flush_delay.as_nanos() as i64
+        // ADR-0076 decision 4: the idle tier (no strict waiter, below
+        // min_flush_bytes) must never flush faster than the fast tier (a
+        // strict waiter present, or already at min_flush_bytes) -- strict
+        // acks are supposed to be the fast path. Equal is fine (both tiers
+        // then share one threshold); only a strictly smaller idle ceiling
+        // inverts the design.
+        if flush_cadence.max_flush_delay_idle < flush_cadence.max_flush_delay {
+            anyhow::bail!(
+                "--max-flush-delay-idle {:?} is less than --max-flush-delay {:?}: the idle/no- \
+                 waiter tier would flush faster than the strict/waiter-present tier, inverting \
+                 ADR-0076 decision 4's design where strict acks are the fast path. Raise \
+                 --max-flush-delay-idle to at least --max-flush-delay.",
+                flush_cadence.max_flush_delay_idle,
+                flush_cadence.max_flush_delay,
+            );
+        }
+
+        // Bug3's check above makes max_flush_delay_idle the validated
+        // larger-or-equal worst-case bound: a buffer with no strict waiter is
+        // the one that can age all the way to max_flush_delay_idle before a
+        // forced flush, so that (not max_flush_delay, the fast-tier floor) is
+        // the real worst-case age FLUSH_BOUND_SLACK_HOURS must cover.
+        let flush_bound_ns = flush_cadence.max_flush_delay_idle.as_nanos() as i64
             + ravel_ingest::IngestConfig::default()
                 .max_flush_lifetime
                 .as_nanos() as i64;
         if flush_bound_ns > FLUSH_BOUND_SLACK_HOURS_NS {
             anyhow::bail!(
-                "--max-flush-delay {:?} plus the ingest pipeline's max_flush_lifetime ({:?}) \
+                "--max-flush-delay-idle {:?} plus the ingest pipeline's max_flush_lifetime ({:?}) \
                  exceeds FLUSH_BOUND_SLACK_HOURS ({} h): the read-side scan slack \
                  ravel_catalog::FLUSH_BOUND_SLACK_HOURS encodes would no longer cover a \
                  straggler flush pinned under a retiring shard-count generation, an \
-                 invisibility hazard. Lower --max-flush-delay, or revisit \
+                 invisibility hazard. Lower --max-flush-delay-idle, or revisit \
                  FLUSH_BOUND_SLACK_HOURS in ravel-catalog in lockstep (ADR-0076 decision 4).",
-                flush_cadence.max_flush_delay,
+                flush_cadence.max_flush_delay_idle,
                 ravel_ingest::IngestConfig::default().max_flush_lifetime,
                 ravel_catalog::FLUSH_BOUND_SLACK_HOURS,
             );
         }
 
-        if flush_cadence.max_flush_delay.as_nanos() as i64 > MAX_STRICT_VISIBILITY_BUDGET_NS {
+        let strict_visibility_budget_ns = flush_cadence.max_flush_delay.as_nanos() as i64
+            + ravel_ingest::STRICT_VISIBILITY_RESERVE_NS;
+        if strict_visibility_budget_ns >= MAX_STRICT_VISIBILITY_BUDGET_NS {
             anyhow::bail!(
-                "--max-flush-delay {:?} exceeds MAX_STRICT_VISIBILITY_BUDGET_NS ({}s): in strict \
-                 mode a client waits for the flush delay plus two PUT round trips before its ack \
-                 returns, and a value this high risks the OTLP client's own export timeout \
-                 firing first, producing retries and duplicate logs/spans instead of the fewer \
-                 requests this ADR is for. Lower --max-flush-delay.",
+                "--max-flush-delay {:?} derives a strict_visibility_budget_ns of {:?}ns, which \
+                 meets or exceeds MAX_STRICT_VISIBILITY_BUDGET_NS ({}s): in strict mode a client \
+                 waits for that budget plus two PUT round trips before its ack returns, and a \
+                 value this high risks the OTLP client's own export timeout firing first, \
+                 producing retries and duplicate logs/spans instead of the fewer requests this \
+                 ADR is for. Lower --max-flush-delay.",
                 flush_cadence.max_flush_delay,
+                strict_visibility_budget_ns,
                 MAX_STRICT_VISIBILITY_BUDGET_NS as f64 / 1e9,
+            );
+        }
+
+        // `target_bytes` (8 MiB default, ADR-0076's size-trigger that never
+        // fires at realistic loads) is not itself an operator-facing flag in
+        // this ADR's scope, so compare against its compiled-in default, the
+        // same pattern the FLUSH_BOUND_SLACK_HOURS check above uses for
+        // max_flush_lifetime. A `min_flush_bytes` at or above it makes the
+        // idle-tier byte-priority trigger unreachable, defeating its
+        // purpose.
+        let target_bytes = ravel_ingest::IngestConfig::default().target_bytes;
+        if flush_cadence.min_flush_bytes >= target_bytes {
+            anyhow::bail!(
+                "--min-flush-bytes {} meets or exceeds the ingest pipeline's target_bytes ({}): \
+                 a buffer would always hit target_bytes' own size trigger before it could ever \
+                 be treated as idle, making the min_flush_bytes byte-priority trigger \
+                 unreachable. Lower --min-flush-bytes below target_bytes.",
+                flush_cadence.min_flush_bytes,
+                target_bytes,
             );
         }
 
@@ -3079,38 +3128,32 @@ mod tests {
             .expect("all three omitted must fall back to IngestConfig::default()");
     }
 
-    /// ADR-0076 decision 4: a `--max-flush-delay` that, combined with the
-    /// ingest pipeline's fixed `max_flush_lifetime`, exceeds
+    /// ADR-0076 decision 4: a `--max-flush-delay-idle` that, combined with
+    /// the ingest pipeline's fixed `max_flush_lifetime`, exceeds
     /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` must fail startup, not
     /// silently under-cover a straggler flush pinned under a retiring
-    /// shard-count generation.
-    ///
-    /// Proof this test can fail: with the `flush_bound_ns >
-    /// FLUSH_BOUND_SLACK_HOURS_NS` check at src/config.rs:1714 disabled
-    /// (guarded with `if false &&`), `cli.validate()` still returned `Err`
-    /// -- 3601s also trips the separate MAX_STRICT_VISIBILITY_BUDGET_NS
-    /// check below it -- but the message assertion caught the missing
-    /// check specifically: the panic was "expected a FLUSH_BOUND_SLACK_HOURS
-    /// error, got: --max-flush-delay 3601s exceeds
-    /// MAX_STRICT_VISIBILITY_BUDGET_NS (3s): ...". Restoring the check made
-    /// it pass again.
+    /// shard-count generation. The bound is computed from
+    /// `max_flush_delay_idle` (the real worst-case buffer age), not
+    /// `max_flush_delay` (the fast-tier floor) -- Bug 4's fix.
     #[test]
     fn flush_delay_exceeding_flush_bound_slack_hours_is_rejected_at_startup() {
         // FLUSH_BOUND_SLACK_HOURS is 2h = 7200s; max_flush_lifetime defaults
-        // to 3600s, so 3601s of --max-flush-delay pushes the sum to 7201s,
-        // one second over the ceiling.
+        // to 3600s, so an idle ceiling of 3601s pushes the sum to 7201s, one
+        // second over the ceiling. --max-flush-delay stays small so this
+        // exercises the idle-based bound, not the (still-present) delay-based
+        // strict-visibility-budget check below.
         let cli = Cli::try_parse_from([
             "ravel-server",
             "--max-flush-delay",
-            "3601s",
+            "1s",
             "--max-flush-delay-idle",
-            "2h",
+            "3601s",
             "--min-flush-bytes",
             "131072",
         ])
         .expect("flags parse at the CLI layer");
         let err = cli.validate().expect_err(
-            "startup must reject --max-flush-delay 3601s: exceeds FLUSH_BOUND_SLACK_HOURS",
+            "startup must reject --max-flush-delay-idle 3601s: exceeds FLUSH_BOUND_SLACK_HOURS",
         );
         assert!(
             err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
@@ -3118,22 +3161,93 @@ mod tests {
         );
     }
 
-    /// ADR-0076 decision 4: a `--max-flush-delay` exceeding
-    /// `MAX_STRICT_VISIBILITY_BUDGET_NS` (the smallest OTLP client timeout
-    /// minus an assumed PUT p99 tail) must fail startup, since it risks the
-    /// client's own export timeout firing before the strict ack returns.
-    ///
-    /// Proof this test can fail: with the max-flush-delay-exceeds-budget
-    /// check at src/config.rs:1728 disabled (guarded with `if false &&`),
-    /// this test failed with "startup must reject --max-flush-delay 4s:
-    /// exceeds MAX_STRICT_VISIBILITY_BUDGET_NS" because `cli.validate()`
-    /// returned `Ok(())` instead of erroring. Restoring the check made it
-    /// pass again.
+    /// Bug 4 regression: before the fix, `flush_bound_ns` was computed from
+    /// `max_flush_delay` alone, so a `--max-flush-delay-idle` of 5h (a real
+    /// operator-facing flag with no upper bound of its own) passed every
+    /// existing check -- an invisibility hazard for a decrease-reshard
+    /// straggler. `--max-flush-delay` here is small enough (1s) that only the
+    /// idle knob can trip the bound, so this exercises the fixed line, not
+    /// the pre-existing `max_flush_delay`-only path.
+    #[test]
+    fn flush_delay_idle_exceeding_flush_bound_slack_hours_is_rejected_at_startup() {
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "1s",
+            "--max-flush-delay-idle",
+            "5h",
+            "--min-flush-bytes",
+            "131072",
+        ])
+        .expect("flags parse at the CLI layer");
+        let err = cli.validate().expect_err(
+            "startup must reject --max-flush-delay-idle 5h: exceeds FLUSH_BOUND_SLACK_HOURS",
+        );
+        assert!(
+            err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
+            "expected a FLUSH_BOUND_SLACK_HOURS error, got: {err}"
+        );
+    }
+
+    /// Bug 3 regression: the idle tier must never flush faster than the
+    /// strict/waiter-present tier, since strict acks are supposed to be the
+    /// fast path. `max_flush_delay_idle < max_flush_delay` must fail startup.
+    #[test]
+    fn flush_delay_idle_below_flush_delay_is_rejected_at_startup() {
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "3s",
+            "--max-flush-delay-idle",
+            "1s",
+            "--min-flush-bytes",
+            "262144",
+        ])
+        .expect("flags parse at the CLI layer");
+        let err = cli
+            .validate()
+            .expect_err("startup must reject --max-flush-delay-idle 1s < --max-flush-delay 3s");
+        assert!(
+            err.to_string().contains("--max-flush-delay-idle")
+                && err.to_string().contains("less than"),
+            "expected the tier-inversion error, got: {err}"
+        );
+    }
+
+    /// Boundary case for Bug 3's fix: `max_flush_delay_idle ==
+    /// max_flush_delay` is the inclusive edge and must be accepted, not
+    /// rejected.
+    #[test]
+    fn flush_delay_idle_equal_to_flush_delay_is_accepted_at_startup() {
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "2s",
+            "--max-flush-delay-idle",
+            "2s",
+            "--min-flush-bytes",
+            "262144",
+        ])
+        .expect("flags parse at the CLI layer");
+        cli.validate().expect(
+            "--max-flush-delay-idle == --max-flush-delay must be accepted (inclusive boundary)",
+        );
+    }
+
+    /// ADR-0076 decision 4: a `--max-flush-delay` whose DERIVED
+    /// `strict_visibility_budget_ns` (`max_flush_delay +
+    /// STRICT_VISIBILITY_RESERVE_NS`) meets or exceeds
+    /// `MAX_STRICT_VISIBILITY_BUDGET_NS` must fail startup, since it risks
+    /// the client's own export timeout firing before the strict ack returns.
+    /// `>=` matters here (Bug 1+2's fix), not `>`: a derived budget exactly
+    /// equal to the ceiling is "5s smallest OTLP client timeout minus 2s
+    /// assumed PUT tail", not "well clear of" it.
     #[test]
     fn flush_delay_exceeding_max_strict_visibility_budget_is_rejected_at_startup() {
-        // MAX_STRICT_VISIBILITY_BUDGET_NS is 3s; 4s clears
-        // FLUSH_BOUND_SLACK_HOURS (4s + 3600s well under 7200s) but must
-        // still be refused by the visibility-budget ceiling.
+        // MAX_STRICT_VISIBILITY_BUDGET_NS is 3s; derived budget = 4s + 0.5s
+        // reserve = 4.5s. 4s alone clears FLUSH_BOUND_SLACK_HOURS (4s + 3600s
+        // well under 7200s) but the derived budget must still be refused by
+        // the visibility-budget ceiling.
         let cli = Cli::try_parse_from([
             "ravel-server",
             "--max-flush-delay",
@@ -3145,7 +3259,8 @@ mod tests {
         ])
         .expect("flags parse at the CLI layer");
         let err = cli.validate().expect_err(
-            "startup must reject --max-flush-delay 4s: exceeds MAX_STRICT_VISIBILITY_BUDGET_NS",
+            "startup must reject --max-flush-delay 4s: derived budget exceeds \
+             MAX_STRICT_VISIBILITY_BUDGET_NS",
         );
         assert!(
             err.to_string().contains("MAX_STRICT_VISIBILITY_BUDGET_NS"),
@@ -3153,10 +3268,11 @@ mod tests {
         );
     }
 
-    /// The shipped default (2s, ADR-0076 decision 4) must pass both new
-    /// startup validations: it is well under both FLUSH_BOUND_SLACK_HOURS
-    /// (2s + 3600s = 3602s, under the 7200s ceiling) and
-    /// MAX_STRICT_VISIBILITY_BUDGET_NS (2s, under the 3s ceiling).
+    /// The shipped default (2s max_flush_delay, 40s max_flush_delay_idle,
+    /// ADR-0076 decision 4) must pass all startup validations: the idle-based
+    /// FLUSH_BOUND_SLACK_HOURS check (40s + 3600s = 3640s, under the 7200s
+    /// ceiling) and the derived strict_visibility_budget_ns check (2s + 0.5s
+    /// reserve = 2.5s, under the 3s MAX_STRICT_VISIBILITY_BUDGET_NS ceiling).
     #[test]
     fn shipped_default_flush_delay_passes_both_startup_validations() {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
@@ -3166,6 +3282,32 @@ mod tests {
         assert_eq!(flush_cadence.max_flush_delay, Duration::from_secs(2));
         cli.validate()
             .expect("shipped default --max-flush-delay (2s) must pass startup validation");
+    }
+
+    /// `--min-flush-bytes` at or above `target_bytes` (8 MiB default) makes
+    /// the idle-tier byte-priority trigger unreachable: a buffer would always
+    /// hit `target_bytes`' own size trigger first. Must be rejected at
+    /// startup.
+    #[test]
+    fn min_flush_bytes_at_or_above_target_bytes_is_rejected_at_startup() {
+        let target_bytes = ravel_ingest::IngestConfig::default().target_bytes;
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "2s",
+            "--max-flush-delay-idle",
+            "40s",
+            "--min-flush-bytes",
+            &target_bytes.to_string(),
+        ])
+        .expect("flags parse at the CLI layer");
+        let err = cli
+            .validate()
+            .expect_err("startup must reject --min-flush-bytes == target_bytes");
+        assert!(
+            err.to_string().contains("target_bytes"),
+            "expected a target_bytes error, got: {err}"
+        );
     }
 
     #[test]
