@@ -978,6 +978,20 @@ impl std::fmt::Debug for RemoteClusterConfig {
     }
 }
 
+/// Convert a `Duration` to nanoseconds as `i64`, saturating to `i64::MAX`
+/// instead of the truncating wraparound a plain `as i64` cast on
+/// `Duration::as_nanos()` (a `u128`) performs when the value exceeds
+/// `i64::MAX` nanoseconds (about 292 years). An operator-supplied
+/// `--max-flush-delay`/`--max-flush-delay-idle` has no upper bound at the
+/// parse layer (humantime accepts `"1000y"`), so every fail-closed
+/// comparison against these durations in [`Cli::validate`] must use this
+/// instead of a bare cast: a wraparound can silently produce a small or
+/// negative `i64` that passes a "must be below this bound" check the
+/// duration was actually meant to fail.
+pub(crate) fn duration_nanos_saturating(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
+}
+
 /// Parse a `true`/`false` value from a `--remote-cluster` boolean field,
 /// erroring with the spec and key in context rather than a bare parse failure.
 fn parse_bool_field(spec: &str, key: &str, value: &str) -> anyhow::Result<bool> {
@@ -1724,10 +1738,10 @@ impl Cli {
         // the one that can age all the way to max_flush_delay_idle before a
         // forced flush, so that (not max_flush_delay, the fast-tier floor) is
         // the real worst-case age FLUSH_BOUND_SLACK_HOURS must cover.
-        let flush_bound_ns = flush_cadence.max_flush_delay_idle.as_nanos() as i64
-            + ravel_ingest::IngestConfig::default()
-                .max_flush_lifetime
-                .as_nanos() as i64;
+        let flush_bound_ns = duration_nanos_saturating(flush_cadence.max_flush_delay_idle)
+            .saturating_add(duration_nanos_saturating(
+                ravel_ingest::IngestConfig::default().max_flush_lifetime,
+            ));
         if flush_bound_ns > FLUSH_BOUND_SLACK_HOURS_NS {
             anyhow::bail!(
                 "--max-flush-delay-idle {:?} plus the ingest pipeline's max_flush_lifetime ({:?}) \
@@ -1742,8 +1756,8 @@ impl Cli {
             );
         }
 
-        let strict_visibility_budget_ns = flush_cadence.max_flush_delay.as_nanos() as i64
-            + ravel_ingest::STRICT_VISIBILITY_RESERVE_NS;
+        let strict_visibility_budget_ns = duration_nanos_saturating(flush_cadence.max_flush_delay)
+            .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS);
         if strict_visibility_budget_ns >= MAX_STRICT_VISIBILITY_BUDGET_NS {
             anyhow::bail!(
                 "--max-flush-delay {:?} derives a strict_visibility_budget_ns of {:?}ns, which \
@@ -3186,6 +3200,67 @@ mod tests {
         assert!(
             err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
             "expected a FLUSH_BOUND_SLACK_HOURS error, got: {err}"
+        );
+    }
+
+    /// Overflow regression, found during re-review of Bug 4's fix: a plain
+    /// `Duration::as_nanos() as i64` cast truncates rather than saturates
+    /// when the value exceeds `i64::MAX` nanoseconds (~292 years).
+    /// `--max-flush-delay-idle` has no upper bound at the parse layer
+    /// (humantime accepts `"1000y"`), so an absurd value wraps to an
+    /// arbitrary (possibly small or negative) `i64` and can silently pass
+    /// the `FLUSH_BOUND_SLACK_HOURS` check the duration was meant to fail --
+    /// the exact invisibility hazard Bug 4's fix exists to prevent, reopened
+    /// by the cast it introduced. `--max-flush-delay` stays small so this
+    /// exercises only the idle-based bound.
+    #[test]
+    fn flush_delay_idle_overflowing_i64_nanos_is_rejected_at_startup() {
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "1s",
+            "--max-flush-delay-idle",
+            "1000y",
+            "--min-flush-bytes",
+            "262144",
+        ])
+        .expect("flags parse at the CLI layer: humantime accepts absurd durations");
+        let err = cli.validate().expect_err(
+            "startup must reject --max-flush-delay-idle 1000y: a naive `as i64` cast \
+             overflows and wraps, silently passing FLUSH_BOUND_SLACK_HOURS",
+        );
+        assert!(
+            err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
+            "expected a FLUSH_BOUND_SLACK_HOURS error, got: {err}"
+        );
+    }
+
+    /// Same overflow class as above, on the other cast this fix touches:
+    /// `--max-flush-delay` itself feeds `strict_visibility_budget_ns`'s
+    /// derivation. `--max-flush-delay-idle` is set to the same absurd value
+    /// so Bug 3's tier-ordering check (idle must be >= delay) does not
+    /// intercept this case before it reaches the visibility-budget check.
+    #[test]
+    fn flush_delay_overflowing_i64_nanos_is_rejected_at_startup() {
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--max-flush-delay",
+            "1000y",
+            "--max-flush-delay-idle",
+            "1000y",
+            "--min-flush-bytes",
+            "262144",
+        ])
+        .expect("flags parse at the CLI layer: humantime accepts absurd durations");
+        let err = cli.validate().expect_err(
+            "startup must reject --max-flush-delay 1000y: an overflowing derived budget \
+             must not silently pass either bound",
+        );
+        assert!(
+            err.to_string().contains("FLUSH_BOUND_SLACK_HOURS")
+                || err.to_string().contains("MAX_STRICT_VISIBILITY_BUDGET_NS"),
+            "expected a FLUSH_BOUND_SLACK_HOURS or MAX_STRICT_VISIBILITY_BUDGET_NS error, got: \
+             {err}"
         );
     }
 
