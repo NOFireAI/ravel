@@ -116,6 +116,9 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
     let config = ServerConfig {
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
+        max_flush_delay: std::time::Duration::from_secs(2),
+        max_flush_delay_idle: std::time::Duration::from_secs(40),
+        min_flush_bytes: 256 * 1024,
         mode: Mode::All,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
         listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),

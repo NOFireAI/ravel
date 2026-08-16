@@ -345,24 +345,27 @@ impl RttTracker {
     }
 }
 
-/// Strict-mode visibility p99 budget the adaptive ceiling is derived from
-/// (ADR-0067 decision 3, docs/consistency-model.md's strict-mode ack
-/// contract), never a free-standing constant chosen for this feature alone.
-const STRICT_VISIBILITY_BUDGET_NS: i64 = 1_000_000_000;
-
-/// Corridor ceiling for the adaptive age trigger: the strict visibility
-/// budget minus two PUT round trips (data object, then commit record) at
+/// Corridor ceiling for the adaptive age trigger: `budget_ns` (the caller's
+/// `IngestConfig::strict_visibility_budget_ns`, ADR-0067 decision 3 /
+/// ADR-0076 decision 4, docs/consistency-model.md's strict-mode ack
+/// contract -- never a free-standing constant chosen for this feature
+/// alone) minus two PUT round trips (data object, then commit record) at
 /// their observed p99, minus one retry's base backoff as headroom, floored
 /// at `floor_ns` so the corridor never inverts. `None` RTT (no observations
 /// yet) collapses the ceiling to `floor_ns`: with nothing measured,
 /// adapting upward would be a guess the budget cannot back, and a bursty
 /// tenant must keep today's behavior from the first flush, not just after
 /// warm-up.
-fn visibility_ceiling_ns(floor_ns: i64, rtt_p99_ns: Option<i64>, retry_headroom_ns: i64) -> i64 {
+fn visibility_ceiling_ns(
+    floor_ns: i64,
+    rtt_p99_ns: Option<i64>,
+    retry_headroom_ns: i64,
+    budget_ns: i64,
+) -> i64 {
     let Some(rtt_p99_ns) = rtt_p99_ns else {
         return floor_ns;
     };
-    let ceiling = STRICT_VISIBILITY_BUDGET_NS
+    let ceiling = budget_ns
         .saturating_sub(2 * rtt_p99_ns)
         .saturating_sub(retry_headroom_ns);
     ceiling.max(floor_ns)
@@ -1042,7 +1045,12 @@ impl ShardActor {
             return (floor_ns, FlushTrigger::Age);
         }
         let retry_headroom_ns = self.config.put_retry_base_delay.as_nanos() as i64;
-        let ceiling_ns = visibility_ceiling_ns(floor_ns, self.rtt.p99_ns(), retry_headroom_ns);
+        let ceiling_ns = visibility_ceiling_ns(
+            floor_ns,
+            self.rtt.p99_ns(),
+            retry_headroom_ns,
+            self.config.strict_visibility_budget_ns,
+        );
         let threshold_ns = adaptive_age_threshold_ns(buf.avg_gap_ns, floor_ns, ceiling_ns);
         let trigger = if threshold_ns > floor_ns {
             FlushTrigger::AgeAdaptive
@@ -1230,10 +1238,14 @@ impl ShardActor {
 
 #[cfg(test)]
 mod adaptive_delay_tests {
-    use super::{STRICT_VISIBILITY_BUDGET_NS, adaptive_age_threshold_ns, visibility_ceiling_ns};
+    use super::{adaptive_age_threshold_ns, visibility_ceiling_ns};
 
     const FLOOR_NS: i64 = 500_000_000;
     const RETRY_HEADROOM_NS: i64 = 100_000_000;
+    // Mirrors `IngestConfig::default().strict_visibility_budget_ns`
+    // (ADR-0076 decision 4); not read from `IngestConfig` directly since
+    // these tests exercise the pure corridor functions in isolation.
+    const BUDGET_NS: i64 = 2_000_000_000;
 
     /// ADR-0067 decision 3's corridor, `[max_flush_delay, ceiling]`, exercised
     /// directly against the two pure functions it is built from rather than
@@ -1256,17 +1268,18 @@ mod adaptive_delay_tests {
         // trickle tenant gets today's fixed-delay behavior until at least
         // one PUT has been timed.
         assert_eq!(
-            visibility_ceiling_ns(FLOOR_NS, None, RETRY_HEADROOM_NS),
+            visibility_ceiling_ns(FLOOR_NS, None, RETRY_HEADROOM_NS, BUDGET_NS),
             FLOOR_NS
         );
 
-        // A cheap, fast backend leaves most of the 1s strict-visibility
+        // A cheap, fast backend leaves most of the 2s strict-visibility
         // budget spare, so the ceiling sits well above the floor.
         let cheap_rtt_ns = 50_000_000; // 50ms
-        let ceiling_cheap = visibility_ceiling_ns(FLOOR_NS, Some(cheap_rtt_ns), RETRY_HEADROOM_NS);
+        let ceiling_cheap =
+            visibility_ceiling_ns(FLOOR_NS, Some(cheap_rtt_ns), RETRY_HEADROOM_NS, BUDGET_NS);
         assert_eq!(
             ceiling_cheap,
-            STRICT_VISIBILITY_BUDGET_NS - 2 * cheap_rtt_ns - RETRY_HEADROOM_NS
+            BUDGET_NS - 2 * cheap_rtt_ns - RETRY_HEADROOM_NS
         );
         assert!(ceiling_cheap > FLOOR_NS);
 
@@ -1274,7 +1287,7 @@ mod adaptive_delay_tests {
         // into the budget, so the ceiling shrinks monotonically.
         let pricier_rtt_ns = 200_000_000; // 200ms
         let ceiling_pricier =
-            visibility_ceiling_ns(FLOOR_NS, Some(pricier_rtt_ns), RETRY_HEADROOM_NS);
+            visibility_ceiling_ns(FLOOR_NS, Some(pricier_rtt_ns), RETRY_HEADROOM_NS, BUDGET_NS);
         assert!(
             ceiling_pricier < ceiling_cheap,
             "a slower observed backend must narrow the corridor, not widen it"
@@ -1283,9 +1296,14 @@ mod adaptive_delay_tests {
         // A backend slow enough that 2*rtt plus retry headroom would eat the
         // whole budget (or overshoot it) must never invert the corridor: the
         // ceiling is floored at floor_ns, exactly like the None case.
-        let very_slow_rtt_ns = 600_000_000; // 600ms: 2*rtt alone exceeds the 1s budget
+        let very_slow_rtt_ns = 1_100_000_000; // 1.1s: 2*rtt alone exceeds the 2s budget
         assert_eq!(
-            visibility_ceiling_ns(FLOOR_NS, Some(very_slow_rtt_ns), RETRY_HEADROOM_NS),
+            visibility_ceiling_ns(
+                FLOOR_NS,
+                Some(very_slow_rtt_ns),
+                RETRY_HEADROOM_NS,
+                BUDGET_NS
+            ),
             FLOOR_NS,
             "a corridor that inverted (ceiling < floor) would make an already-slow \
              backend flush even less often; the floor must win"
