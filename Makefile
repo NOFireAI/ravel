@@ -17,7 +17,7 @@ test:
 # environment beyond the interpreter. Run from scripts/ so the tests'
 # `from process_metrics import ...` resolves without a package layout.
 test-python:
-	cd scripts && python3 -m unittest test_process_metrics -v
+	cd scripts && python3 -m unittest discover -p 'test_*.py' -v
 
 # Derived counts in docs/query-engine.md's generated conformance block
 # (ADR-0053 decision 6). No build, so it is cheap enough to run before a
