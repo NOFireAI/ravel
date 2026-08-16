@@ -185,6 +185,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
             AdmissionLimits::default(),
         )),
         metrics_tenant_labels: false,
+        metrics_tenant_allowlist: Arc::new(HashSet::new()),
         query_accounting,
         ingest_concurrency: crate::ingest_concurrency::IngestConcurrencyController::shared(
             crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
