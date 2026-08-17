@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 610" font-family="'Segoe Print','Bradley Hand','Comic Sans MS',cursive" font-size="15">
+  <defs>
+    <marker id="a84" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1.5 Q 6 4 8.5 5 Q 6 6 1 8.5" fill="none" stroke="#444" stroke-width="1.6" stroke-linecap="round"/>
+    </marker>
+  </defs>
+  <rect width="1040" height="610" fill="#fdfcf8"/>
+  <text x="24" y="34" font-size="20" fill="#1b2230">A gzip OTLP body against each admission layer</text>
+  <text x="24" y="54" font-size="12" fill="#5b6472">Every cap bounds an allocation before it happens. Nothing reaches a shard buffer without passing all of them.</text>
+
+  <!-- client -->
+  <path d="M 28 110 Q 25 107 31 107 L 172 105 Q 179 106 178 113 L 179 168 Q 178 174 172 173 L 32 175 Q 26 174 27 168 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="44" y="132" fill="#31536b">OTel Collector</text>
+  <text x="44" y="152" font-size="12" fill="#5b6472">gzip by default,</text>
+  <text x="44" y="168" font-size="12" fill="#5b6472">Content-Encoding: gzip</text>
+
+  <line x1="180" y1="140" x2="228" y2="140" stroke="#383e46" stroke-width="2" marker-end="url(#a84)"/>
+
+  <!-- layer 1 compressed cap -->
+  <path d="M 232 100 Q 228 96 236 96 L 428 94 Q 437 95 436 103 L 438 178 Q 437 186 429 185 L 236 187 Q 229 186 230 178 Z" fill="#fff" stroke="#8a5a10" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="250" y="124" fill="#8a5a10">Layer 1a: compressed cap</text>
+  <text x="250" y="146" font-size="12" fill="#5b6472">DefaultBodyLimit 16 MiB,</text>
+  <text x="250" y="163" font-size="12" fill="#5b6472">unchanged. Bounds what</text>
+  <text x="250" y="180" font-size="12" fill="#5b6472">the server buffers. 413.</text>
+
+  <line x1="440" y1="140" x2="488" y2="140" stroke="#383e46" stroke-width="2" marker-end="url(#a84)"/>
+
+  <!-- capped decompression -->
+  <path d="M 492 100 Q 488 96 496 96 L 706 94 Q 715 95 714 103 L 716 178 Q 715 186 707 185 L 496 187 Q 489 186 490 178 Z" fill="#f9eeee" stroke="#a04040" stroke-width="2.6" stroke-linecap="round"/>
+  <text x="510" y="124" fill="#a04040">Layer 1b: capped decompress</text>
+  <text x="510" y="146" font-size="12" fill="#5b6472">NEW. take(cap + 1), 64 MiB.</text>
+  <text x="510" y="163" font-size="12" fill="#5b6472">Refused WHILE expanding,</text>
+  <text x="510" y="180" font-size="12" fill="#5b6472">never after. 413.</text>
+
+  <line x1="718" y1="140" x2="766" y2="140" stroke="#383e46" stroke-width="2" marker-end="url(#a84)"/>
+
+  <!-- byte rate -->
+  <path d="M 770 100 Q 766 96 774 96 L 996 94 Q 1005 95 1004 103 L 1006 178 Q 1005 186 997 185 L 774 187 Q 767 186 768 178 Z" fill="#eaf1ea" stroke="#4c6b45" stroke-width="2.6" stroke-linecap="round"/>
+  <text x="788" y="124" fill="#4c6b45">Layer 2: ingest byte rate</text>
+  <text x="788" y="146" font-size="12" fill="#5b6472">MOVED. Charged on the</text>
+  <text x="788" y="163" font-size="12" fill="#5b6472">DECOMPRESSED size, so a</text>
+  <text x="788" y="180" font-size="12" fill="#5b6472">ratio cannot buy allowance. 429.</text>
+
+  <line x1="888" y1="189" x2="888" y2="243" stroke="#383e46" stroke-width="2" marker-end="url(#a84)"/>
+
+  <!-- shard buffer -->
+  <path d="M 770 246 Q 766 242 774 242 L 996 240 Q 1005 241 1004 249 L 1006 306 Q 1005 314 997 313 L 774 315 Q 767 314 768 306 Z" fill="#dde1e7" stroke="#454b54" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="788" y="272" fill="#3a3f47">decode, then shard buffer</text>
+  <text x="788" y="294" font-size="12" fill="#5b6472">the allocation Layer 2 protects</text>
+
+  <!-- identity path -->
+  <path d="M 28 300 Q 25 297 31 297 L 172 295 Q 179 296 178 303 L 179 358 Q 178 364 172 363 L 32 365 Q 26 364 27 358 Z" fill="#eef3f7" stroke="#31536b" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="44" y="322" fill="#31536b">uncompressed client</text>
+  <text x="44" y="342" font-size="12" fill="#5b6472">no Content-Encoding,</text>
+  <text x="44" y="358" font-size="12" fill="#5b6472">or identity</text>
+
+  <path d="M 232 300 Q 228 296 236 296 L 706 294 Q 715 295 714 303 L 716 358 Q 715 366 707 365 L 236 367 Q 229 366 230 358 Z" fill="#f5f3ee" stroke="#5b6472" stroke-width="2.2" stroke-linecap="round" stroke-dasharray="7,4"/>
+  <text x="250" y="324" fill="#3a3f47">unchanged path: no decompression, byte rate charged where it is today</text>
+  <text x="250" y="348" font-size="12" fill="#5b6472">Byte for byte identical to current behavior. No new allocation, no new branch cost.</text>
+
+  <line x1="180" y1="330" x2="228" y2="330" stroke="#383e46" stroke-width="2" marker-end="url(#a84)"/>
+  <line x1="718" y1="330" x2="766" y2="330" stroke="#383e46" stroke-width="2" marker-end="url(#a84)"/>
+
+  <!-- rejected encoding -->
+  <path d="M 232 396 Q 228 392 236 392 L 706 390 Q 715 391 714 399 L 716 452 Q 715 460 707 459 L 236 461 Q 229 460 230 452 Z" fill="#f9eeee" stroke="#a04040" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="250" y="420" fill="#a04040">any other Content-Encoding: 415, naming what is supported</text>
+  <text x="250" y="444" font-size="12" fill="#5b6472">Never treated as identity. That would hand prost a compressed body and produce the</text>
+  <text x="250" y="460" font-size="12" fill="#5b6472">same misleading "invalid OTLP payload" 400 this decision exists to remove.</text>
+
+  <text x="28" y="506" font-size="13" fill="#5b6472">gRPC: tonic checks max_decoding_message_size against the COMPRESSED frame, then limits the inflate to the same</text>
+  <text x="28" y="526" font-size="13" fill="#5b6472">value, so both halves are bounded at 16 MiB (not 64) and the refuse-while-expanding property already holds there.</text>
+  <text x="28" y="546" font-size="13" fill="#a04040">gRPC Layer 2 counts COMPRESSED frame bytes today (WireByteCountLayer). A compressed frame must charge the</text>
+  <text x="28" y="566" font-size="13" fill="#a04040">decoded size instead, or the split this decision removes from HTTP reappears between the two transports.</text>
+  <text x="28" y="588" font-size="13" fill="#8a5a10">Remote Write keeps charging compressed bytes. That inconsistency is recorded, not hidden, and is its own decision.</text>
+</svg>

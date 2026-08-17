@@ -86,4 +86,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0081](0081-container-first-quickstart.md) | Container-first quickstart: a published-image `docker compose` path as the documented first run, with README command blocks executed in CI | Accepted |
 | [0082](0082-provisioning-shard-count-drift-tolerance.md) | Provisioning shard-count drift tolerance for an evolving default | Accepted |
 | [0083](0083-alert-sink-auth.md) | Alert sink delivery supports optional credentials | Accepted |
-| [0084](0084-otlp-gzip-ingest.md) | Accept gzip-compressed OTLP ingest on HTTP and gRPC, with a decompressed-size cap and an explicit decision on which bytes the ingest byte-rate charges | Claimed |
+| [0084](0084-otlp-gzip-ingest.md) | Accept gzip-compressed OTLP ingest on HTTP and gRPC, with a decompressed-size cap and an explicit decision on which bytes the ingest byte-rate charges | Accepted |
