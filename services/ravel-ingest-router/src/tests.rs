@@ -778,3 +778,72 @@ async fn grpc_unready_subset_member_falls_through_to_next_ranked_replica() {
         "the next-ranked Ready replica received the gRPC request over the fallthrough path"
     );
 }
+
+// --- background-task supervision (#187) --------------------------------------
+
+// Deliverable 1: the JWKS refresh task's JoinHandle is genuinely held and wired
+// into the `run()` `select!` via `join_optional_jwks`, not dropped. Driving the
+// full `run()` path would need a live Kubernetes API server (`kube::Client::
+// try_default`), which is not available in this crate's cluster-free test
+// harness, so these prove the `select!` arm's semantics directly at the
+// `join_optional_jwks` boundary the arm awaits: an absent task never fires, and
+// a present task's end or panic is observable (which is exactly what tears the
+// process down in `run()`).
+
+#[tokio::test]
+async fn jwks_arm_parks_forever_when_oidc_is_not_configured() {
+    // `None` means OIDC was never configured: the arm must never resolve, so an
+    // HTTP-only (or non-OIDC) router is not torn down for a task that was never
+    // spawned. A ready future racing against it must always win.
+    tokio::select! {
+        _ = crate::join_optional_jwks(None) => {
+            panic!("the JWKS arm must park forever when no refresh task was spawned");
+        }
+        _ = std::future::ready(()) => {}
+    }
+}
+
+#[tokio::test]
+async fn jwks_arm_fires_when_the_refresh_task_ends() {
+    // A refresh task that returns (should never happen: the loop is infinite)
+    // resolves the arm with `Ok`, which `run()` turns into a fatal bail.
+    let handle = tokio::spawn(async {});
+    let result = crate::join_optional_jwks(Some(handle)).await;
+    assert!(
+        result.is_ok(),
+        "a JWKS task that ended must resolve the select! arm (fatal in run())"
+    );
+}
+
+#[tokio::test]
+async fn jwks_arm_fires_when_the_refresh_task_panics() {
+    // A panicking refresh task resolves the arm with a JoinError carrying the
+    // panic, which `run()` turns into a fatal error rather than silently serving
+    // a frozen JWKS cache forever.
+    let handle = tokio::spawn(async { panic!("simulated JWKS refresh panic") });
+    let result = crate::join_optional_jwks(Some(handle)).await;
+    let err = result.expect_err("a panicking JWKS task must resolve the arm with an error");
+    assert!(err.is_panic(), "the JoinError must carry the task's panic");
+}
+
+// Deliverable 2: a panic inside the round-robin sweep is caught and logged
+// (`tracing::error!`) instead of silently terminating the sweep task. The sweep
+// is memory-bound only, so it is not raced in the fatal `select!`; instead
+// `run_sweep_guarded` swallows the panic so the loop keeps running.
+
+#[test]
+fn sweep_guard_catches_a_panic_and_does_not_propagate() {
+    // If the guard did not catch the panic, this test would itself unwind and
+    // fail. Reaching the assertion proves the panic was contained.
+    let evicted = crate::run_sweep_guarded(|| panic!("simulated sweep panic"));
+    assert_eq!(
+        evicted, 0,
+        "a panicked sweep reports zero evictions, not a crash"
+    );
+
+    // And the loop can keep sweeping afterward: a subsequent normal sweep runs
+    // and returns its real count, proving the guard is log-and-continue, not
+    // log-and-die.
+    let evicted = crate::run_sweep_guarded(|| 3);
+    assert_eq!(evicted, 3, "a normal sweep after a panicked one still runs");
+}
