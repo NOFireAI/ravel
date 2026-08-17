@@ -125,6 +125,17 @@ services:
     image: otel/opentelemetry-collector-contrib:latest
     depends_on: [ravel-server]
     command: ["--config=/etc/otel/collector-config.yaml"]
+    # The collector's own metrics, for answering "is it delivering?" without
+    # guessing from an empty dashboard (#209). Read the delivery counters with:
+    #   curl -s localhost:18888/metrics | grep otelcol_exporter
+    # A non-zero `send_failed` means Ravel is refusing the exports.
+    #
+    # Published on 18888 rather than the collector's own 8888: that port is the
+    # collector default and is contended on a developer machine, and a
+    # quickstart that fails on `docker compose up` with "port is already
+    # allocated" is a bad first command. The container side stays 8888.
+    ports:
+      - "127.0.0.1:18888:8888"
     volumes:
       - ../otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
 

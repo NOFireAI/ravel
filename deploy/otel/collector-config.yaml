@@ -50,3 +50,22 @@ service:
       receivers: [hostmetrics]
       processors: [batch]
       exporters: [otlphttp]
+  # The collector's own delivery counters, on a Prometheus endpoint.
+  #
+  # This exists so that "is the collector actually delivering?" is a question
+  # with a numeric answer. It is the assertion CI needs (#209) and the first
+  # thing to read when the Grafana dashboard is empty: a non-zero
+  # `otelcol_exporter_send_failed_metric_points` says the collector is running
+  # and Ravel is refusing its exports, which is a different fault from the
+  # collector not scraping at all.
+  #
+  # The address must be 0.0.0.0, not the default localhost. localhost binds the
+  # container's own loopback, which no port mapping can reach.
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
