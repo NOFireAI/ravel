@@ -86,7 +86,10 @@ tokio = { workspace = true }
 # come from these features. They are additive over `channel` and inert for a
 # plaintext (`tls=off`) remote and for the intra-cluster coordinator, which
 # stays plaintext `http://`.
-tonic = { workspace = true, features = ["channel", "tls-ring", "tls-native-roots"] }
+# `gzip` links tonic's server-side gzip decoder so the OTLP services can
+# `.accept_compressed(CompressionEncoding::Gzip)` (ADR-0084 decision 2); the
+# OpenTelemetry Collector and Grafana Alloy send gzip by default.
+tonic = { workspace = true, features = ["channel", "tls-ring", "tls-native-roots", "gzip"] }
 tonic-prost = { workspace = true }
 # rustls 0.23 links a process-level default crypto provider that must be
 # installed before the first TLS endpoint is built. This binary transitively
@@ -127,6 +130,12 @@ tracing-subscriber = { workspace = true }
 # are unchanged.
 ravel-tracing-export = { workspace = true }
 bytes = { workspace = true }
+# gzip decompression for OTLP HTTP ingest (ADR-0084). A genuinely new external
+# dependency: the workspace's existing zstd/snap/lz4 codecs cannot decode gzip,
+# and the OpenTelemetry Collector and Grafana Alloy send gzip by default. Used
+# for its `MultiGzDecoder`, which decodes concatenated multi-member streams
+# under one capped reader.
+flate2 = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 # The alert evaluator hashes the RLOG object it writes to build the commit

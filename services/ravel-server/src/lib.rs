@@ -22,6 +22,7 @@ pub mod gc_config;
 pub mod health;
 pub mod idle_tenant_state;
 pub mod ingest;
+pub mod ingest_byte_metrics;
 pub mod ingest_concurrency;
 pub mod lifecycle_refresh;
 pub mod logs_ingest;
@@ -512,6 +513,7 @@ fn gateway_state(
     recovery: &Option<Arc<tenancy::RecoveryManifestWriter>>,
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
+    ingest_byte_metrics: &Arc<ingest_byte_metrics::IngestByteMetrics>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -543,6 +545,7 @@ fn gateway_state(
         },
         admission: admission.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
+        ingest_byte_metrics: ingest_byte_metrics.clone(),
     })
 }
 
@@ -800,6 +803,12 @@ pub async fn start(
     let ingest_concurrency =
         ingest_concurrency::IngestConcurrencyController::shared(config.ingest_concurrency_limit);
 
+    // Per-tenant wire (compressed) request-body byte counter (ADR-0084 decision
+    // 5): one shared instance per process, threaded into every `GatewayState`
+    // (public and mTLS listeners) and read at scrape time by `/metrics`, so the
+    // wire-bytes family sums the same tenants the admission family does.
+    let ingest_byte_metrics = Arc::new(ingest_byte_metrics::IngestByteMetrics::new());
+
     // Per-query cost aggregator (ADR-0044 section 4): one per
     // process, shared with every query handler below and read at scrape time by
     // the `/metrics` route. Its per-tenant allowlist is the tenants an operator
@@ -854,6 +863,7 @@ pub async fn start(
             &recovery,
             &provisioning_writer,
             &ingest_concurrency,
+            &ingest_byte_metrics,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -877,6 +887,7 @@ pub async fn start(
                 &recovery,
                 &provisioning_writer,
                 &ingest_concurrency,
+                &ingest_byte_metrics,
             );
             let mtls_rw_state = remote_write_state(
                 router,
@@ -1041,6 +1052,7 @@ pub async fn start(
         ingest_buffer_budget: ingest_buffer_budget.clone(),
         distrib: distrib_metrics.clone(),
         durable_auth: durable_auth.clone(),
+        ingest_byte_metrics: ingest_byte_metrics.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 
@@ -1358,6 +1370,7 @@ pub async fn start(
             &recovery,
             &provisioning_writer,
             &ingest_concurrency,
+            &ingest_byte_metrics,
         )),
         _ => None,
     };
@@ -1365,17 +1378,27 @@ pub async fn start(
     // 2): the cap is on the wire message, before OTLP protobuf decode, on
     // every service equally regardless of transport.
     const MAX_DECODED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+    // Accept gzip-compressed request messages (ADR-0084 decision 2). Not
+    // `send_compressed`: response bodies are tiny partial-success records, so
+    // compressing them only costs CPU. `max_decoding_message_size` is left at
+    // 16 MiB deliberately: tonic 0.14 checks that cap against the compressed
+    // frame length AND limits the decompression output to the same value, so a
+    // compressed gRPC message's decompressed ceiling is 16 MiB by design (the
+    // asymmetry against HTTP's 64 MiB is recorded in the ADR's consequences).
     let metrics_service = otlp_grpc_state.as_ref().map(|state| {
         MetricsServiceServer::new(otlp_grpc::GrpcMetricsService::new(state.clone()))
             .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
     });
     let logs_service = otlp_grpc_state.as_ref().map(|state| {
         LogsServiceServer::new(otlp_grpc_logs::GrpcLogsService::new(state.clone()))
             .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
     });
     let traces_service = otlp_grpc_state.as_ref().map(|state| {
         TraceServiceServer::new(otlp_grpc_traces::GrpcTraceService::new(state.clone()))
             .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
     });
 
     // OTAP metrics ride the same gRPC listener and share the same

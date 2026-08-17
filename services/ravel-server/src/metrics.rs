@@ -1847,6 +1847,14 @@ fn render_cache_family(
 pub struct AdmissionCountersSnapshot {
     pub usage: Vec<TenantUsage>,
     pub tenant_labels: bool,
+    /// Per-tenant wire (compressed) request-body bytes (ADR-0084 decision 5),
+    /// rendered as `ravel_ingest_wire_bytes_total` alongside this family's
+    /// charged-bytes counter. Sourced from
+    /// [`crate::ingest_byte_metrics::IngestByteMetrics`], not the admission
+    /// `usage_snapshot`: the byte-rate bucket charges the decompressed size for
+    /// a compressed request, so the wire quantity has no home in that snapshot.
+    /// Folded by the same `tenant_labels` gate as `usage`.
+    pub wire_bytes: Vec<crate::ingest_byte_metrics::TenantWireBytes>,
 }
 
 /// The counters this family sums per rendered series. Split out so the fold
@@ -1976,7 +1984,11 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
     write_header(
         out,
         "ravel_admission_admitted_bytes_total",
-        "Wire body bytes admitted past the ingest byte-rate layer, by tenant and signal.",
+        "Bytes charged against the ingest byte-rate layer for admitted requests, by tenant and \
+         signal. For a gzip-compressed OTLP request this is the decompressed size (ADR-0084 \
+         decision 4); for an uncompressed request it equals the wire size. Compare with \
+         ravel_ingest_wire_bytes_total to distinguish a tenant that increased telemetry from one \
+         that turned compression off.",
         "counter",
     );
     for ((hash, signal), acc) in &ordered {
@@ -1985,6 +1997,48 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
             "ravel_admission_admitted_bytes_total",
             &labels(mode, *hash, *signal),
             acc.bytes_admitted,
+        );
+    }
+
+    // Wire (compressed) request-body bytes per tenant/signal (ADR-0084 decision
+    // 5), sourced from `IngestByteMetrics`, not the admission usage snapshot.
+    // Folded by the same `tenant_labels` gate as the counters above so its
+    // cardinality is bounded identically. Its ratio to
+    // `ravel_admission_admitted_bytes_total` is a tenant's effective
+    // compression factor.
+    let mut wire_rows: std::collections::HashMap<(Option<TenantHash>, Signal), u64> =
+        std::collections::HashMap::new();
+    for row in &snapshot.wire_bytes {
+        let key = (
+            snapshot.tenant_labels.then_some(row.tenant_hash),
+            row.signal,
+        );
+        let acc = wire_rows.entry(key).or_default();
+        *acc = acc.saturating_add(row.wire_bytes_total);
+    }
+    let mut wire_ordered: Vec<((Option<TenantHash>, Signal), u64)> =
+        wire_rows.into_iter().collect();
+    wire_ordered.sort_by(|(a_key, _), (b_key, _)| {
+        tenant_label(a_key.0)
+            .value()
+            .cmp(&tenant_label(b_key.0).value())
+            .then_with(|| signal_name(a_key.1).cmp(signal_name(b_key.1)))
+    });
+    write_header(
+        out,
+        "ravel_ingest_wire_bytes_total",
+        "Wire (on-the-wire, compressed when the client compressed) OTLP request body bytes \
+         admitted, by tenant and signal (ADR-0084 decision 5). Divide \
+         ravel_admission_admitted_bytes_total by this to read a tenant's effective compression \
+         factor.",
+        "counter",
+    );
+    for ((hash, signal), wire_bytes) in &wire_ordered {
+        write_sample(
+            out,
+            "ravel_ingest_wire_bytes_total",
+            &labels(mode, *hash, *signal),
+            *wire_bytes,
         );
     }
 
@@ -2772,6 +2826,12 @@ pub struct MetricsState {
     /// (`Mode::All`/`Gateway`/`Query`); `None` otherwise leaves the whole
     /// `ravel_durable_auth_*` family off the exposition.
     pub durable_auth: Option<Arc<crate::lifecycle_refresh::DurableAuthState>>,
+    /// Per-tenant wire (compressed) request-body bytes (ADR-0084 decision 5),
+    /// rendered alongside the admission family's charged (decompressed) bytes so
+    /// the two together distinguish a tenant that increased telemetry from one
+    /// that turned compression off. Always present; empty until an OTLP request
+    /// is admitted. Folded by the same `--metrics-tenant-labels` gate.
+    pub ingest_byte_metrics: Arc<crate::ingest_byte_metrics::IngestByteMetrics>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -2873,6 +2933,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     let admission_snapshot = AdmissionCountersSnapshot {
         usage: state.admission.usage_snapshot(),
         tenant_labels: state.metrics_tenant_labels,
+        wire_bytes: state.ingest_byte_metrics.snapshot(),
     };
 
     // Per-query cost rows, read at scrape time like every other family (a
@@ -4432,6 +4493,7 @@ mod tests {
         let snapshot = AdmissionCountersSnapshot {
             usage,
             tenant_labels: false,
+            wire_bytes: Vec::new(),
         };
         let body = render(
             Mode::Gateway,
@@ -4505,6 +4567,7 @@ mod tests {
         let snapshot = AdmissionCountersSnapshot {
             usage: vec![byte_rate, series_rate, series_cap],
             tenant_labels: true,
+            wire_bytes: Vec::new(),
         };
         let body = render(
             Mode::Gateway,
@@ -4576,6 +4639,7 @@ mod tests {
         let snapshot = AdmissionCountersSnapshot {
             usage: vec![row],
             tenant_labels: true,
+            wire_bytes: Vec::new(),
         };
         let hash = ravel_types::TenantId::new("skewed").hash().to_hex();
         let body = render(
