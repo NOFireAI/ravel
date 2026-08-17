@@ -91,14 +91,35 @@ struct Slot {
     last_used_ns: i64,
 }
 
+/// Number of entries sampled per eviction to approximate least-recently-used
+/// without scanning the whole map. The map's keys are blake3 hashes, so a
+/// HashMap iteration prefix is an unbiased sample uncorrelated with recency;
+/// the oldest of the sample is a good-enough eviction victim (Redis-style
+/// sampled LRU). Small so a single eviction is O(1), not O(n).
+const EVICTION_SAMPLE_SIZE: usize = 8;
+
+/// Hard cap on the number of entries a single `make_room` call may evict.
+/// Bounds the per-`tick` (per-request) eviction work to O(1). In steady state
+/// the map sits exactly at `max_entries`, so a new-key insertion evicts one
+/// entry and this cap is never approached; it only bites when the map is
+/// genuinely over the cap (e.g. after a burst under lock contention), letting
+/// the map converge back toward `max_entries` over successive calls (each
+/// over-cap call nets `1 - MAX_EVICTIONS_PER_CALL` entries) without any single
+/// call paying the full O(n) drain.
+const MAX_EVICTIONS_PER_CALL: usize = 8;
+
 /// Bounded per-tenant round-robin offsets (ADR-0069 idle-eviction shape).
 ///
 /// Keyed by a blake3 hash of the tenant key (never the raw bytes). Bounded two
 /// ways so client-controlled key churn (a rotating bearer token under
 /// `authorization-header`) cannot grow it without limit: entries idle past
-/// `idle_ttl_ns` are swept, and a hard `max_entries` cap evicts the
-/// least-recently-used entry on overflow. A dropped entry only restarts that
-/// tenant's rotation at offset 0, so eviction is never correctness-bearing.
+/// `idle_ttl_ns` are swept by the background task, and a hard `max_entries` cap
+/// evicts an approximately-least-recently-used entry on overflow. Overflow
+/// eviction is amortized and bounded (see [`RoundRobin::make_room`]): it never
+/// scans the whole map on the request path, so sustained new-key churn once the
+/// cap is reached cannot turn the memory bound into a per-request CPU cliff. A
+/// dropped entry only restarts that tenant's rotation at offset 0, so eviction
+/// is never correctness-bearing.
 pub(crate) struct RoundRobin {
     slots: Mutex<HashMap<[u8; 32], Slot>>,
     max_entries: usize,
@@ -119,7 +140,7 @@ impl RoundRobin {
     pub(crate) fn tick(&self, key_hash: [u8; 32], now_ns: i64) -> u64 {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if !slots.contains_key(&key_hash) {
-            self.make_room(&mut slots, now_ns);
+            self.make_room(&mut slots);
         }
         let slot = slots.entry(key_hash).or_insert(Slot {
             counter: 0,
@@ -146,22 +167,37 @@ impl RoundRobin {
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Ensure there is room for one more entry: first sweep idle entries, then,
-    /// if still at the cap, evict the single least-recently-used entry.
-    fn make_room(&self, slots: &mut HashMap<[u8; 32], Slot>, now_ns: i64) {
-        if slots.len() < self.max_entries {
-            return;
-        }
-        slots.retain(|_, slot| now_ns.saturating_sub(slot.last_used_ns) < self.idle_ttl_ns);
-        while slots.len() >= self.max_entries {
-            let Some(oldest) = slots
+    /// Make room for one more entry when the map is at or over `max_entries`.
+    ///
+    /// Eviction is amortized and bounded: this never scans the whole map. While
+    /// the map is at or over the cap it removes up to [`MAX_EVICTIONS_PER_CALL`]
+    /// approximately-least-recently-used entries, each chosen as the oldest of a
+    /// bounded [`EVICTION_SAMPLE_SIZE`] sample (a HashMap iteration prefix, which
+    /// for blake3-hashed keys is an unbiased sample uncorrelated with recency).
+    /// The loop condition still gates on the cap, so in steady state (map at the
+    /// cap) a single new-key insertion evicts exactly one entry; the batch only
+    /// does more work when the map is genuinely over the cap, so it converges
+    /// back toward `max_entries` without any single call paying the O(n) cost.
+    ///
+    /// The idle-TTL `retain` sweep is deliberately NOT run here: it is an O(n)
+    /// scan, and running it on the request path once the cap is reached (under
+    /// the held lock, on every `tick` from a churning client) is exactly the CPU
+    /// cliff this strategy replaces. `spawn_round_robin_sweep` in `lib.rs` runs
+    /// [`RoundRobin::evict_idle`] on a timer off the request path for that.
+    fn make_room(&self, slots: &mut HashMap<[u8; 32], Slot>) {
+        for _ in 0..MAX_EVICTIONS_PER_CALL {
+            if slots.len() < self.max_entries {
+                return;
+            }
+            let Some(victim) = slots
                 .iter()
+                .take(EVICTION_SAMPLE_SIZE)
                 .min_by_key(|(_, slot)| slot.last_used_ns)
                 .map(|(k, _)| *k)
             else {
-                break;
+                return;
             };
-            slots.remove(&oldest);
+            slots.remove(&victim);
         }
     }
 }
@@ -282,6 +318,98 @@ mod tests {
         assert!(
             rr.len() <= 4,
             "map must stay bounded by max_entries, got {}",
+            rr.len()
+        );
+    }
+
+    /// A distinct 32-byte key derived from `i`, mimicking a rotating token hash.
+    fn key_of(i: u64) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&i.to_le_bytes());
+        key
+    }
+
+    #[test]
+    fn eviction_under_cap_pressure_does_not_scan_the_whole_map() {
+        // Force the map WELL over the cap directly (the public API keeps it at
+        // the cap, so we cannot reach an over-cap state through `tick` alone).
+        // A single `tick` must then evict only a bounded batch, not drain the
+        // whole overflow back to the cap in one O(n) pass the way the old
+        // full-scan `while` loop did.
+        let cap = 10;
+        let rr = RoundRobin::new(cap, i64::MAX);
+        {
+            let mut slots = rr.slots.lock().expect("lock");
+            for i in 0..100u64 {
+                slots.insert(
+                    key_of(i),
+                    Slot {
+                        counter: 0,
+                        last_used_ns: i as i64,
+                    },
+                );
+            }
+        }
+        assert_eq!(rr.len(), 100, "precondition: map forced over the cap");
+
+        // One request for a new key.
+        rr.tick(key_of(1000), 1000);
+
+        let len = rr.len();
+        // Bounded work: at most MAX_EVICTIONS_PER_CALL removed, plus the one
+        // insert, so the map barely moved rather than collapsing toward the cap.
+        assert!(
+            len >= 100 - MAX_EVICTIONS_PER_CALL,
+            "a single tick evicted more than the per-call bound: {len}"
+        );
+        // It did do *some* eviction (proving the batch fired, not that it grew
+        // unbounded), and it did NOT shrink to 1 (the old full-scan tell).
+        assert!(
+            len < 100,
+            "eviction must make progress each call, got {len}"
+        );
+        assert!(
+            len > 1,
+            "a single call must not drain the whole map, got {len}"
+        );
+    }
+
+    #[test]
+    fn round_robin_converges_toward_cap_under_sustained_pressure() {
+        // Start well over the cap, then hammer with distinct new keys. Bounded
+        // per-call eviction must still drive the map back down toward the cap
+        // over many calls (each over-cap call nets 1 insert minus up to
+        // MAX_EVICTIONS_PER_CALL evictions), not merely keep each call cheap.
+        let cap = 10;
+        let rr = RoundRobin::new(cap, i64::MAX);
+        {
+            let mut slots = rr.slots.lock().expect("lock");
+            for i in 0..500u64 {
+                slots.insert(
+                    key_of(i),
+                    Slot {
+                        counter: 0,
+                        last_used_ns: i as i64,
+                    },
+                );
+            }
+        }
+        assert_eq!(rr.len(), 500, "precondition: map forced far over the cap");
+
+        for i in 0..500u64 {
+            rr.tick(key_of(1_000 + i), (1_000 + i) as i64);
+        }
+
+        // Converged: each new-key `tick` at the cap evicts one and inserts one,
+        // so the steady state is exactly the cap, never above it.
+        assert!(
+            rr.len() <= cap,
+            "map did not converge back toward the cap, got {}",
+            rr.len()
+        );
+        assert!(
+            rr.len() >= cap - MAX_EVICTIONS_PER_CALL,
+            "map shrank below the expected steady state, got {}",
             rr.len()
         );
     }
