@@ -376,3 +376,197 @@ symlink pointing outside the repository.
   on them.
 - The next publish changes every moving tag's digest, as every publish
   always has.
+
+## Amendment: multi-architecture publishing
+
+The original ADR deferred multi-arch rather than rejecting it, on two
+conditions that have both changed. It said nothing in the deploy targets
+required arm64, and it said cross-building arm64 on an amd64 runner
+re-introduces the QEMU-versus-rustc SIGSEGV this ADR exists to route
+around, so the work needed native arm64-hosted runners and a manifest
+list, as a larger independently reviewable change.
+
+That change is this amendment.
+
+### Context
+
+ADR-0081 made `docker compose -f deploy/docker-compose/ravel.yml up -d`
+the first command in the README, pulling `ghcr.io/nofireai/ravel-server`.
+An amd64-only image turned the project's front door into an immediate
+failure on Apple Silicon:
+
+```
+Error response from daemon: no matching manifest for linux/arm64/v8
+in the manifest list entries: no match for platform in manifest: not found
+```
+
+CI never saw it. `ubuntu-latest` is amd64, so the `quickstart` job was
+genuinely green, and three checkpoint reviews read the compose file and the
+workflow with no reason to question the image's platform list. It surfaced
+the first time the stack ran on a machine that was not a GitHub runner.
+
+The compose file now pins `platform: linux/amd64` on the services that use
+the published image, so Docker runs it under emulation on arm64 and the
+quickstart works. That is a usability floor, not a fix. Emulated ingest is
+slower than native and is not the performance story a first-time reader
+should measure, which is exactly what a quickstart invites them to do.
+
+The deferral's second condition is also satisfied: GitHub now offers
+arm64-hosted runners, free for public repositories, and this repository is
+public.
+
+### Decision 12: build each platform on its native runner (amends decision 3)
+
+The publish matrix gains a platform dimension. `linux/amd64` builds on
+`ubuntu-latest` and `linux/arm64` on `ubuntu-24.04-arm`. Neither build invokes
+QEMU.
+
+GitHub's arm64-hosted runners are generally available and free for public
+repositories, which this one is, and releases publish from the public mirror.
+The label is `ubuntu-24.04-arm` or `ubuntu-22.04-arm`; there is no
+`ubuntu-latest-arm`, so the version is part of the label and pinning it is not
+optional.
+
+This is not a performance preference. The original ADR records that
+QEMU-emulated rustc SIGSEGVs on this workspace, which is why the publish
+job exists on a native runner at all. Emulating the arm64 half would
+reintroduce the exact failure the whole ADR routes around, so a native
+runner is a correctness requirement here, not an optimization.
+
+The runner label must be confirmed by a real run before this is relied on.
+No local gate compiles a workflow file, and a label that does not exist
+fails at job start rather than at review.
+
+### Decision 13: push by digest, then assemble a manifest list
+
+Each platform build pushes by digest and no tag, using
+`outputs: type=image,push-by-digest=true,name-canonical=true`. A per-target
+merge job then assembles the two digests into one manifest list with
+`docker buildx imagetools create`, and that index carries the tags decision
+3 defines.
+
+The per-platform digests reach the merge job as uploaded artifacts, one file
+per build, not as job outputs. A matrix's job outputs collapse to a single
+last-writer-wins value, so a two-platform matrix would silently publish an
+index containing whichever build finished last.
+
+### Decision 14: cosign signs the assembled index, not a per-platform digest (amends decision 7)
+
+This is the part of the amendment most able to fail silently, so it is
+called out as its own decision.
+
+Decision 7 signs `steps.build.outputs.digest`, which today is the index the
+single build produced. After decision 13 that same expression is a
+*per-platform* digest. Left unchanged, the workflow would sign two manifests
+nobody pulls by digest and leave the published, tagged index unsigned, while
+every log line still reads as a successful signature.
+
+The signing step therefore moves into the merge job and signs the digest
+`imagetools create` reports for the assembled index. The signing identity is
+unchanged, so the `cosign verify` invocation documented in README.md stays
+correct as written.
+
+The publish must fail if the signed digest is not the digest the tags
+resolve to. A verification step re-resolves the tag and compares, so a
+future refactor that reintroduces the wrong-digest bug is caught by the
+workflow rather than by a user.
+
+That comparison resolves the run's **immutable** identity tag: `X.Y.Z` on a
+tag push, `manual-<short-sha>` on a dispatch. Never `latest`, `X`, or `X.Y`.
+Those move, so a concurrent publish can re-point one between the merge and the
+check, which fails a correct release or, worse, passes against an index this
+run did not produce.
+
+The digest check has a blind spot worth naming, because it is the failure this
+decision would otherwise invite. It proves the thing that was signed is the
+thing the tag resolves to. It cannot prove the index was assembled from the
+right inputs: a cross-target artifact mix-up, a server index built from an
+operator platform digest, yields a consistently wrong index that passes the
+equality check. Three cheap guards close it:
+
+- Artifact names are scoped per target and per platform. `upload-artifact` v4
+  rejects duplicate names, so a collision fails the run instead of silently
+  overwriting a digest.
+- The verification asserts, via `imagetools inspect`, that the assembled index
+  carries exactly the `linux/amd64` and `linux/arm64` platform entries and no
+  others.
+- A `cosign verify` against the just-published identity tag runs before the job
+  ends. It is one command and it closes the loop: the published artifact
+  verifies under the same invocation README.md tells a user to run.
+
+### Decision 15: SBOM and provenance stay attached to what ships (amends decision 8)
+
+Decision 8 attaches an SBOM and max-mode provenance. With per-platform
+builds these attach per platform, and the merge must carry them into the
+assembled index rather than dropping them.
+
+Whether `imagetools create` preserves the attestation manifests is a
+property of the tooling, not of this decision, so the rollout verifies it
+against the published index rather than assuming it: after the first
+`workflow_dispatch` publish, `docker buildx imagetools inspect --raw` must
+show both platform manifests and their attestation manifests. If they do not
+survive the merge, the fix is to attach at merge time; publishing an index
+whose attestations silently vanished would defeat decision 8 while appearing
+to satisfy it.
+
+### Decision 16: the compose platform pins come out
+
+`deploy/docker-compose/ravel.yml` pins `platform: linux/amd64` on the
+`qualify` and `ravel-server` services. Those pins exist only because the
+image was amd64-only, and they force emulation on an arm64 host even once a
+native image is available.
+
+They are removed once a multi-arch image is published and verified on arm64,
+and not before. Removing them against an amd64-only image restores the
+original failure, so the ordering matters: publish first, verify, then unpin.
+
+"Verified" means the bar #197's own mitigation met, not merely a successful
+pull. A pull proves the manifest exists; it does not prove the native binary
+runs. The bar is the stack up natively on an arm64 host, `/healthz` returning
+200, and `demo/kill-and-recover.sh` passing.
+
+The same change removes the documentation that describes the limitation:
+README.md states the amd64-only scope in two places (the capability list and
+the container-images section), and the two compose services carry comments
+explaining the pins and pointing at #197. A pin removed while the prose still
+says amd64-only leaves a reader with contradictory instructions.
+
+### Decision 17: `id-token: write` moves to the merge job
+
+Decision 7's consequence recorded `id-token: write` on the publish job, for
+Fulcio to bind the signature to the workflow identity. Signing now happens in
+the merge job, so that permission moves there, alongside `packages: write`.
+The per-platform build jobs keep `packages: write` to push by digest and drop
+`id-token` entirely: they no longer sign anything, and a build job holding a
+signing-capable token is exactly the least-privilege drift the first amendment
+set out to avoid.
+
+![Two native builds push by digest, one merge job assembles the manifest list, and cosign signs that assembled index rather than either per-platform digest.](assets/0037-multiarch-publish.svg)
+
+### Consequences (multi-arch amendment)
+
+- The quickstart works natively on Apple Silicon. This is the point.
+- Publish cost roughly doubles: six full workspace compiles per release
+  instead of three, since each target's build recompiles the builder stage.
+  That waste predates this amendment and is not addressed here; halving it
+  by building the workspace once and deriving all three runtime images
+  belongs in its own change.
+- arm64 build time is unmeasured. The publish job carries no explicit
+  timeout today and inherits the six-hour default, so the first run's real
+  duration must be recorded and an explicit timeout set from it.
+- More moving parts between build and signature: two builds, an artifact
+  hop, a merge, then signing. Decision 14's digest check exists because that
+  chain has more places to sign the wrong thing than the single-build
+  version did.
+- Anyone pinning by digest keeps working unchanged. The digest of an index
+  is stable; consumers pinning the old amd64-only index continue to resolve
+  it.
+- Publish wall-clock becomes the slower of the two platform builds plus the
+  merge, rather than the amd64 build alone. Worth knowing when a release looks
+  slow: the arm64 leg is likely the long pole and its duration is unmeasured.
+- README.md changes in the same commit that publishes multi-arch, in both
+  places it currently states the amd64-only scope. The `cosign verify`
+  invocation it documents is unaffected: the signing identity does not change,
+  only which digest is signed.
+- No frozen format changes, no crate changes, no runtime behavior change.
+  This amendment is CI configuration, a compose file, and documentation.
