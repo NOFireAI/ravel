@@ -349,8 +349,8 @@ pub struct IngestAffinitySpec {
     /// cluster's default IngressClass apply.
     ///
     /// Legacy `backend: ingressNginx` only. Has no effect under
-    /// `backend: ravelNative`, and no effect on `gateway.exposure.gatewayAPI`
-    /// routing (Gateway API attachment goes through `exposure.gatewayAPI
+    /// `backend: ravelNative`, and no effect on `gateway.exposure.gatewayApi`
+    /// routing (Gateway API attachment goes through `exposure.gatewayApi
     /// .gatewayRef` instead, ADR-0080 decision 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_class_name: Option<String>,
@@ -358,7 +358,7 @@ pub struct IngestAffinitySpec {
     /// Hostnames the ingest Ingress answers on. Empty renders a single
     /// host-less rule, which matches any host reaching the controller.
     ///
-    /// Legacy `backend: ingressNginx` only. `gateway.exposure.gatewayAPI
+    /// Legacy `backend: ingressNginx` only. `gateway.exposure.gatewayApi
     /// .hostnames` is the equivalent field for Gateway API exposure; the two
     /// are independent and neither reads the other.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1826,7 +1826,7 @@ mod tests {
         // schema defaulting (which the API server applies before CEL runs) to
         // materialize `backend: ingressNginx` and `enabled: true` first. If
         // either default is ever removed, the rejected combination
-        // (exposure.gatewayAPI + an omitted-affinity-config CR) silently
+        // (exposure.gatewayApi + an omitted-affinity-config CR) silently
         // starts being admitted instead -- exactly the silent degrade this
         // rule exists to forbid -- with every other test here still green.
         // Pin both defaults so that regression fails loudly.
