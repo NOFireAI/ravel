@@ -134,6 +134,28 @@ caps it would have been 1.4-2.2 GiB. Operators who need a higher per-tenant
 active-series ceiling can still set it explicitly in `[tenants.<id>]`
 (or `unlimited`), sized against this same formula.
 
+### Transient gzip decompression memory (ADR-0084)
+
+Accepting gzip on OTLP HTTP adds a second, transient, memory demand that
+ADR-0069's ingest buffer budget does not account for. A gzip request is
+decompressed into a fresh buffer bounded by the 64 MiB HTTP decompressed cap,
+held only while the request holds an ingest concurrency permit
+(`--max-inflight-ingest-requests`, default 1024). Worst-case peak decompression
+memory is therefore:
+
+```
+max_inflight_ingest_requests × 64 MiB
+```
+
+At the default 1024 permits that is a 64 GiB worst case, far past what the
+small hosts this project targets have. On such a host, size
+`--max-inflight-ingest-requests` down so this product fits the headroom you
+have alongside the ingest buffer budget and the active-identity memory above;
+the three are additive and none is bounded by the others. gRPC's transient
+decompression is bounded at 16 MiB per in-flight request by
+`max_decoding_message_size`, so the same arithmetic with a 16 MiB factor
+applies to the gRPC side.
+
 ## `ravel-cli` flags
 
 Every subcommand shares the same store flags as `ravel-server`

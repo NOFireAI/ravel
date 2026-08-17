@@ -25,6 +25,87 @@ underneath. Traces are also ingested, over the same two transports: `POST
 /v1/traces` over HTTP and `opentelemetry.proto.collector.trace.v1.TraceService/Export`
 over gRPC. No transport accepts profiles yet.
 
+## Compressed requests (ADR-0084)
+
+Ravel accepts gzip-compressed OTLP bodies on both transports. A stock
+OpenTelemetry Collector and a stock Grafana Alloy both default to gzip, so no
+client configuration is needed.
+
+### OTLP HTTP
+
+`POST /v1/metrics`, `/v1/logs`, and `/v1/traces` dispatch on `Content-Encoding`:
+
+- `gzip`, or its RFC 9110 alias `x-gzip`, is decompressed and then decoded.
+  The comparison is case-insensitive: `GZIP`, `gzip`, and `X-Gzip` are the same
+  coding.
+- An absent header, an empty value, or `identity` is the body as-is, byte for
+  byte the pre-ADR-0084 path. An uncompressed client sees no change.
+- Any other single coding (`deflate`, `br`, ...), and any multi-coding list
+  (`gzip, gzip`, `deflate, gzip`), is rejected with `415 Unsupported Media
+  Type`. Ravel chains no decoders and never guesses at one member of a list.
+  The 415 body names what is supported.
+
+Two independent size caps bound a gzip request:
+
+- The **compressed** body is capped at 16 MiB by the existing wire body limit
+  (`DefaultBodyLimit`). This is the same Layer 1 cap that bounds an
+  uncompressed body.
+- The **decompressed** body is capped at 64 MiB, returning `413 Payload Too
+  Large`. The cap is enforced *while* the body is inflated, not after: the
+  decoder is read through `take(cap + 1)`, so a decompression bomb is refused
+  as it expands rather than after 64 MiB has been allocated.
+
+The two caps are independent, exactly as they are for Remote Write. A 16 MiB
+compressed body that would inflate past 64 MiB is a 413; a body over 16 MiB
+compressed never reaches the decompressor.
+
+A gzip body is decoded as a whole stream with multi-member semantics: a
+concatenated multi-member gzip stream (legal gzip that ordinary tooling
+produces) is decoded in full, under the single 64 MiB cap across all members.
+Trailing bytes after a well-formed stream ends are `400 Bad Request`, never
+silently truncated: silent truncation would be data loss on an acknowledged
+write.
+
+### OTLP gRPC
+
+The three gRPC services accept gzip via tonic's `accept_compressed`. Here the
+decompressed size is bounded at **16 MiB**, not HTTP's 64 MiB. tonic applies
+`max_decoding_message_size` to both the compressed frame and the decompressed
+output (checking the framed length first, then limiting the inflate buffer to
+the same value), so the one 16 MiB knob caps both halves. Raising it to match
+HTTP would also raise the ceiling on uncompressed gRPC messages, which is a
+separate change; ADR-0084 accepts the asymmetry. A batch that inflates to
+40 MiB is accepted over HTTP and rejected over gRPC with `resource_exhausted`.
+
+Ravel does not compress responses (`send_compressed` is off): OTLP export
+responses are small partial-success records, so compressing them buys nothing.
+
+### Byte-rate charging differs by path
+
+The per-tenant ingest byte rate (Layer 2) is charged on **different bases** by
+path, and an operator sizing limits must know it:
+
+| Path | Charged quantity |
+|---|---|
+| OTLP HTTP / gRPC | Decompressed size |
+| Prometheus Remote Write | Compressed size |
+
+OTLP charges the decompressed size (ADR-0084 decision 4) so that two tenants
+sending identical telemetry are charged identically regardless of a client-side
+compression setting. Remote Write still charges the compressed body length;
+ADR-0084 deliberately leaves that alone, and the inconsistency is recorded
+there rather than papered over. The practical effect: a gzip OTLP client's
+effective byte-rate allowance drops relative to an uncompressed client of the
+same nominal rate, because it is now charged for what it actually sent rather
+than what it put on the wire.
+
+To keep rejection cheap for an already-over-rate tenant, the gzip path does a
+compressed-size pre-check first: the compressed length is a strict lower bound
+on the decompressed length, so if even the compressed size exceeds the tenant's
+available tokens the request is rejected `429 Too Many Requests` before
+anything is decompressed and without consuming tokens. Only if the pre-check
+passes is the body inflated and the real charge made on the decompressed size.
+
 ## Authentication
 
 Every request must resolve to a tenant. If it does not, Ravel rejects it with

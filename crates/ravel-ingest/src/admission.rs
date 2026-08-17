@@ -1360,4 +1360,144 @@ mod tests {
             .expect("a logs usage row exists after a clock rejection");
         assert_eq!(logs_row.requests_rejected_clock_total, 1);
     }
+
+    /// ADR-0084 decision 4: `TokenBucket::peek` and an immediately following
+    /// `try_take` at the SAME `now_ns` must agree on whether `amount` is
+    /// available. This is the correctness contract the gzip pre-check relies on:
+    /// a peek that says "would fit" must be followed by a take that does fit
+    /// (and vice versa), or the gzip path would 429 a request the charge would
+    /// have admitted, or admit one the charge then rejects.
+    ///
+    /// Non-vacuity: change `peek`'s `self.refill(now_ns)` to a no-op (drop the
+    /// line) and the "drained then refilled, amount exactly the refilled
+    /// balance" case fails: peek sees 0 tokens and reports unavailable while the
+    /// refilling `try_take` accepts. Change `peek`'s `self.tokens >= amount` to
+    /// `>` and the same exact-balance case fails the other way.
+    #[test]
+    fn peek_and_take_agree_at_same_instant() {
+        // Peek then take on ONE bucket at the same instant, exactly as the
+        // gzip path calls peek_byte_rate then check_byte_rate. peek takes no
+        // tokens, so the following take at the same `now_ns` sees the same
+        // balance; their Ok/Err verdict must match.
+        fn assert_agree(mut bucket: TokenBucket, amount: u64, now_ns: i64) {
+            let peeked = bucket.peek(amount, now_ns).is_ok();
+            let taken = bucket.try_take(amount, now_ns).is_ok();
+            assert_eq!(
+                peeked, taken,
+                "peek/try_take disagree for amount={amount} at now={now_ns}"
+            );
+        }
+
+        // Fresh bucket: burst 100, rate 100/s, full at t=0.
+        let fresh = TokenBucket::new(100, 100, 0);
+        assert_agree(fresh, 0, 0); // trivially available
+        assert_agree(fresh, 100, 0); // exactly the full burst: available
+        assert_agree(fresh, 101, 0); // one past burst: unavailable
+
+        // Drained, then refilled by exactly 50 tokens after 0.5s at 100/s. The
+        // exact-balance amount (50) is the discriminating case: it catches both
+        // a peek that fails to refill and a peek using `>` instead of `>=`.
+        let mut drained = TokenBucket::new(100, 100, 0);
+        drained.try_take(100, 0).expect("drain the fresh burst");
+        assert_agree(drained, 50, 500_000_000); // exactly the refilled balance
+        assert_agree(drained, 51, 500_000_000); // one past it: unavailable
+        assert_agree(drained, 0, 500_000_000);
+    }
+
+    /// ADR-0084 decision 4: a `peek` that fails reports the same `retry_after`
+    /// wait a `try_take` would, so the gzip pre-check's 429 `Retry-After` is the
+    /// value the tenant would really wait. Neither consumes on failure, so the
+    /// take at the same instant sees the identical deficit.
+    #[test]
+    fn peek_failure_reports_same_retry_after_as_try_take() {
+        let mut bucket = TokenBucket::new(100, 100, 0);
+        bucket.try_take(100, 0).expect("drain the burst");
+        // 100 short at 100/s is a 1s wait; assert peek and take agree on it
+        // exactly rather than hard-coding the arithmetic.
+        let peek_err = bucket.peek(100, 0).expect_err("empty bucket, peek fails");
+        let take_err = bucket
+            .try_take(100, 0)
+            .expect_err("empty bucket, take fails");
+        assert_eq!(
+            peek_err, take_err,
+            "peek and try_take must report the same retry_after"
+        );
+        assert!(peek_err > 0);
+    }
+
+    /// ADR-0084 decision 4: the `rate_per_sec == 0` branch behaves identically
+    /// in `peek` and `try_take`. A zero-rate bucket never refills, so an amount
+    /// over the current balance is unsatisfiable and both report `i64::MAX`.
+    #[test]
+    fn peek_and_take_agree_when_rate_is_zero() {
+        // rate 0, burst 10, full at t=0.
+        let mut within = TokenBucket::new(0, 10, 0);
+        assert!(within.peek(10, 0).is_ok());
+        assert!(within.try_take(10, 0).is_ok(), "within burst is available");
+
+        let mut over = TokenBucket::new(0, 10, 1_000_000_000);
+        // Elapsed time credits nothing at rate 0, so 20 stays unsatisfiable.
+        let peek_err = over
+            .peek(20, 2_000_000_000)
+            .expect_err("rate 0, over burst");
+        let take_err = over
+            .try_take(20, 2_000_000_000)
+            .expect_err("rate 0, over burst");
+        assert_eq!(peek_err, i64::MAX, "rate 0 reports an unbounded wait");
+        assert_eq!(
+            peek_err, take_err,
+            "the rate==0 branch must match in peek and try_take"
+        );
+    }
+
+    /// ADR-0084 decision 4: a request that PASSES the compressed-size pre-check
+    /// (`peek_byte_rate`) and then FAILS the real charge (`check_byte_rate` on
+    /// the larger decompressed size) is counted as exactly one byte-rate
+    /// rejection, not two. The pre-check consumes nothing and, on success,
+    /// records nothing; only the failing charge increments the counter.
+    ///
+    /// Non-vacuity: make `peek_byte_rate`'s success arm increment
+    /// `requests_rejected_byte_rate_total` (or count on the pass path at all)
+    /// and this reads 2.
+    #[test]
+    fn peek_pass_then_charge_fail_counts_one_rejection() {
+        let clock = TestClock::new(0);
+        let controller = AdmissionController::new(clock.clone(), AdmissionLimits::default());
+        let tenant = TenantId::new("acme");
+        controller.set_tenant_limits(
+            tenant.clone(),
+            AdmissionLimits {
+                ingest_byte_rate: RateLimit::Bounded {
+                    per_sec: 1,
+                    burst: 100,
+                },
+                ..tight_limits(u64::MAX)
+            },
+        );
+
+        // Pre-check on a small compressed size (50 <= 100): passes, no charge,
+        // no counter.
+        controller
+            .peek_byte_rate(&tenant, Signal::Metrics, 50, clock.now())
+            .expect("the compressed-size pre-check passes");
+        // Real charge on the larger decompressed size (200 > 100): rejected.
+        let rejection = controller
+            .check_byte_rate(&tenant, Signal::Metrics, 200, clock.now())
+            .expect_err("the decompressed charge exceeds the burst");
+        assert_eq!(rejection.reason, RequestRejectionReason::ByteRate);
+
+        let snapshot = controller.usage_snapshot();
+        let row = snapshot
+            .iter()
+            .find(|row| row.tenant_hash == tenant.hash() && row.signal == Signal::Metrics)
+            .expect("a metrics usage row after the rejection");
+        assert_eq!(
+            row.requests_rejected_byte_rate_total, 1,
+            "a peek-pass then charge-fail is exactly one rejection, not two"
+        );
+        assert_eq!(
+            row.bytes_admitted_total, 0,
+            "nothing is admitted when the charge is rejected"
+        );
+    }
 }

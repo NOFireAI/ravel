@@ -257,12 +257,24 @@ gives its alert rules.
 |---|---|
 | `ravel_admission_active_series` | Gauge. Active series (metrics) or streams (logs) tracked for the active cap, by tenant and signal. |
 | `ravel_admission_admitted_total` | Requests admitted past the ingest byte-rate layer, by tenant and signal. |
-| `ravel_admission_admitted_bytes_total` | Wire body bytes admitted past the ingest byte-rate layer, by tenant and signal. |
+| `ravel_admission_admitted_bytes_total` | Charged (decompressed) bytes admitted past the ingest byte-rate layer, by tenant and signal. For a gzip OTLP request this is the decompressed size (ADR-0084 decision 4); for an uncompressed request it equals the wire size. |
+| `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal (ADR-0084 decision 5). |
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
 
 The `reason` label carries `byte_rate`, `series_rate`, or `series_cap`. The
 active-streams count for logs renders under `ravel_admission_active_series`
 with `signal="logs"`, not under a separate metric name.
+
+`ravel_ingest_wire_bytes_total` is emitted from the ingest byte-metrics tracker
+rather than the admission snapshot, so its name carries the `ravel_ingest_`
+prefix, but it folds tenants by the same allowlist and is read alongside the
+admission counters. The ratio
+`ravel_admission_admitted_bytes_total / ravel_ingest_wire_bytes_total` is the
+tenant's effective compression factor. It distinguishes two situations a raw
+admitted-bytes rise cannot: a tenant that genuinely grew its telemetry (the
+ratio holds roughly steady) from one that turned client-side compression off
+(admitted bytes flat, wire bytes jump, ratio falls toward 1). The two need
+different responses, so read the ratio, not either counter alone.
 
 ### Per-query cost (`ravel_query_*`)
 
