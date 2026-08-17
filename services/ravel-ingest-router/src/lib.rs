@@ -86,13 +86,18 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
     let watch_handle = tokio::spawn(watch::run(api, watch_config, store.clone()));
 
     // Key resolution (deliverable 3). Resolver wiring is built only for the
-    // canonical-tenant key source.
+    // canonical-tenant key source. When OIDC is configured the JWKS refresh task
+    // is spawned and its JoinHandle kept (never dropped): a dead refresh task
+    // silently stops picking up key rotation, so it joins the watcher race below
+    // and tears the process down if it ends or panics. `None` when OIDC is not
+    // configured, so its `select!` arm parks forever and never fires.
+    let mut jwks_handle: Option<tokio::task::JoinHandle<()>> = None;
     let key_resolver = match config.key {
         KeyConfig::Header(name) => key::KeyResolver::Header(name),
         KeyConfig::CanonicalTenant(settings) => {
             let built = auth::build(&settings)?;
             if let Some(refresh) = built.oidc_refresh {
-                auth::spawn_jwks_refresh(refresh);
+                jwks_handle = Some(auth::spawn_jwks_refresh(refresh));
             }
             key::KeyResolver::Canonical(built.resolver)
         }
@@ -152,7 +157,11 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
     // (and, after enough pod churn, wrong) set of addresses while /readyz kept
     // reporting healthy. Race it against BOTH listeners and exit on any arm, so a
     // dead watcher tears the whole process down regardless of which listener(s)
-    // are active.
+    // are active. The JWKS refresh task (when OIDC is configured) joins the same
+    // race: fail-closed resolution means a dead refresh task degrades silently
+    // (rotated-key requests eventually 401 with no signal), so treat its exit or
+    // panic as fatal too. When OIDC is off the arm parks forever and never fires,
+    // so an HTTP-only router is not torn down for a task that was never spawned.
     tokio::select! {
         result = axum::serve(listener, proxy::build_app(state)) => {
             result?;
@@ -169,8 +178,30 @@ pub async fn run(config: RouterConfig) -> anyhow::Result<()> {
                 }
             }
         }
+        jwks_result = join_optional_jwks(jwks_handle) => {
+            match jwks_result {
+                Ok(()) => anyhow::bail!("JWKS refresh task ended unexpectedly"),
+                Err(join_error) => {
+                    return Err(anyhow::Error::from(join_error))
+                        .context("JWKS refresh task panicked");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Await the JWKS refresh task's JoinHandle when OIDC is configured, or park
+/// forever when it is not, so this can be a `tokio::select!` arm whether or not
+/// the refresh task was spawned. When `None`, it never resolves, so the process
+/// is never torn down for a JWKS refresh task that was never enabled.
+async fn join_optional_jwks(
+    handle: Option<tokio::task::JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    match handle {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Serve the gRPC listener when one is bound, or park forever when it is not, so
@@ -190,16 +221,46 @@ async fn serve_optional_grpc(
 /// Periodically evict idle round-robin entries. A swept entry restarts at
 /// offset 0 on the tenant's next request, so this only bounds memory and never
 /// affects correctness.
+///
+/// Unlike the watcher and JWKS refresh tasks, a dead sweep task is not fatal:
+/// the round-robin map's own hard cap in [`select`] still bounds it, so a
+/// stopped sweep only slows eviction. Racing it in the `select!` above would
+/// make a purely cosmetic degradation kill the whole router, the wrong tradeoff.
+/// Instead each sweep runs under [`run_sweep_guarded`], which catches a panic in
+/// `evict_idle` and logs it loudly so the loop keeps running and the failure is
+/// visible in logs rather than silently terminating the task.
 fn spawn_round_robin_sweep(state: Arc<router::RouterState>, interval: std::time::Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // consume the immediate first tick
         loop {
             ticker.tick().await;
-            let evicted = state.round_robin.evict_idle(state.clock.now_ns());
+            let now_ns = state.clock.now_ns();
+            run_sweep_guarded(|| state.round_robin.evict_idle(now_ns));
+        }
+    });
+}
+
+/// Run one round-robin sweep under a panic guard. `evict_idle` is synchronous
+/// (no `.await` inside), so a plain [`std::panic::catch_unwind`] suffices: a
+/// panic is caught and logged with `tracing::error!` and the caller's loop
+/// continues, rather than the panic unwinding the whole sweep task and letting
+/// it vanish silently. Returns the number of entries the sweep evicted, or `0`
+/// if the sweep panicked.
+fn run_sweep_guarded<F>(sweep: F) -> usize
+where
+    F: FnOnce() -> usize,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(sweep)) {
+        Ok(evicted) => {
             if evicted > 0 {
                 tracing::debug!(evicted, "swept idle round-robin entries");
             }
+            evicted
         }
-    });
+        Err(_) => {
+            tracing::error!("round-robin sweep panicked; continuing sweep loop");
+            0
+        }
+    }
 }

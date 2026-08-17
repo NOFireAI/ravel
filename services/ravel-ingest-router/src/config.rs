@@ -40,7 +40,13 @@ pub enum KeySource {
 }
 
 /// Ravel-native subset-affinity ingest router (ADR-0080 decision 3).
-#[derive(Debug, Parser)]
+///
+/// `Debug` is implemented by hand rather than derived: `tenant_tokens` holds
+/// raw bearer tokens (`--tenant-token TOKEN=TENANT`), and a derived `Debug`
+/// would dump them verbatim into any `tracing::debug!(?cli)` at startup. The
+/// manual impl redacts that field and prints every other flag normally, the
+/// same no-leak discipline [`crate::key::TenantKey`]'s own `Debug` follows.
+#[derive(Parser)]
 #[command(
     name = "ravel-ingest-router",
     about = "Ravel-native subset-affinity ingest router (ADR-0080)"
@@ -146,6 +152,43 @@ pub struct Cli {
     pub mtls_header: Option<String>,
 }
 
+impl std::fmt::Debug for Cli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cli")
+            .field("gateway_service_name", &self.gateway_service_name)
+            .field("gateway_service_namespace", &self.gateway_service_namespace)
+            .field("gateway_port_name", &self.gateway_port_name)
+            .field("subset_size", &self.subset_size)
+            .field("key_source", &self.key_source)
+            .field("key_header_name", &self.key_header_name)
+            .field("listen_http", &self.listen_http)
+            .field("listen_grpc", &self.listen_grpc)
+            .field("round_robin_max_entries", &self.round_robin_max_entries)
+            .field("round_robin_idle_ttl", &self.round_robin_idle_ttl)
+            // Never print the raw bearer tokens: this is the load-bearing
+            // no-leak property (each entry is a `TOKEN=TENANT` string).
+            .field(
+                "tenant_tokens",
+                &format_args!("[redacted {} entries]", self.tenant_tokens.len()),
+            )
+            .field(
+                "dev_insecure_tenant_header",
+                &self.dev_insecure_tenant_header,
+            )
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("oidc_jwks_url", &self.oidc_jwks_url)
+            .field("oidc_audiences", &self.oidc_audiences)
+            .field("oidc_tenant_claim", &self.oidc_tenant_claim)
+            .field(
+                "oidc_jwks_refresh_interval_secs",
+                &self.oidc_jwks_refresh_interval_secs,
+            )
+            .field("mtls_enabled", &self.mtls_enabled)
+            .field("mtls_header", &self.mtls_header)
+            .finish()
+    }
+}
+
 /// Validated OIDC settings, present only when both `--oidc-issuer` and
 /// `--oidc-jwks-url` are configured.
 #[derive(Debug, Clone)]
@@ -159,13 +202,33 @@ pub struct OidcSettings {
 
 /// The canonical-tenant resolver chain configuration, built only under
 /// `--key-source canonical-tenant`.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` is manual (not derived) so `tokens` -- the raw bearer tokens paired
+/// with their tenant -- is redacted rather than printed. This is also what
+/// keeps [`KeyConfig`] and [`RouterConfig`], which embed this type, safe to
+/// `Debug`-format.
+#[derive(Clone, Default)]
 pub struct CanonicalAuthSettings {
     pub tokens: Vec<(String, String)>,
     pub dev_header: bool,
     pub oidc: Option<OidcSettings>,
     /// The trusted client-cert header, `Some` only when `--mtls-enabled`.
     pub mtls_header: Option<String>,
+}
+
+impl std::fmt::Debug for CanonicalAuthSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonicalAuthSettings")
+            // Never print the raw bearer tokens (or their tenant mappings).
+            .field(
+                "tokens",
+                &format_args!("[redacted {} entries]", self.tokens.len()),
+            )
+            .field("dev_header", &self.dev_header)
+            .field("oidc", &self.oidc)
+            .field("mtls_header", &self.mtls_header)
+            .finish()
+    }
 }
 
 /// How the router derives the routing key: either raw header bytes, or the
@@ -180,7 +243,12 @@ pub enum KeyConfig {
 }
 
 /// The fully-validated runtime configuration.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is manual (not derived) so a `tracing::debug!(?config)` at startup
+/// cannot leak secrets. The only secret-bearing field is `key`, whose
+/// [`CanonicalAuthSettings`] already redacts its tokens; every other field is
+/// non-secret and printed normally.
+#[derive(Clone)]
 pub struct RouterConfig {
     pub gateway_service_name: String,
     pub gateway_service_namespace: String,
@@ -191,6 +259,23 @@ pub struct RouterConfig {
     pub listen_grpc: Option<SocketAddr>,
     pub round_robin_max_entries: usize,
     pub round_robin_idle_ttl: Duration,
+}
+
+impl std::fmt::Debug for RouterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouterConfig")
+            .field("gateway_service_name", &self.gateway_service_name)
+            .field("gateway_service_namespace", &self.gateway_service_namespace)
+            .field("gateway_port_name", &self.gateway_port_name)
+            .field("subset_size", &self.subset_size)
+            // `key`'s own Debug (via CanonicalAuthSettings) redacts any tokens.
+            .field("key", &self.key)
+            .field("listen_http", &self.listen_http)
+            .field("listen_grpc", &self.listen_grpc)
+            .field("round_robin_max_entries", &self.round_robin_max_entries)
+            .field("round_robin_idle_ttl", &self.round_robin_idle_ttl)
+            .finish()
+    }
 }
 
 impl Cli {
@@ -552,6 +637,49 @@ mod tests {
         assert_eq!(
             config.listen_grpc,
             Some("0.0.0.0:4317".parse().expect("addr"))
+        );
+    }
+
+    #[test]
+    fn debug_redacts_tenant_token_across_config_types() {
+        // A `tracing::debug!(?cli)` / `?config` at startup must never dump a raw
+        // bearer token. Prove the token bytes appear in none of the three types'
+        // Debug output. (Against `#[derive(Debug)]` this fails: the derive prints
+        // `tenant_tokens: ["super-...=acme"]` verbatim.)
+        const SECRET: &str = "super-secret-bearer-token-value";
+        let token_arg = format!("{SECRET}=acme");
+
+        let cli = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--tenant-token",
+            token_arg.as_str(),
+        ]);
+        let rendered = format!("{cli:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "Cli Debug leaked the raw token: {rendered}"
+        );
+
+        let config = cli
+            .into_config()
+            .expect("canonical-tenant with a token is valid");
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "RouterConfig Debug leaked the raw token: {rendered}"
+        );
+
+        let settings = CanonicalAuthSettings {
+            tokens: vec![(SECRET.to_string(), "acme".to_string())],
+            dev_header: false,
+            oidc: None,
+            mtls_header: None,
+        };
+        let rendered = format!("{settings:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "CanonicalAuthSettings Debug leaked the raw token: {rendered}"
         );
     }
 
