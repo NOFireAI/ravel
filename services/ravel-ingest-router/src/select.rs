@@ -4,7 +4,7 @@
 //! subset size, and a round-robin offset, so it is unit-testable with no watcher
 //! and no HTTP server. [`RoundRobin`] holds the bounded per-tenant offset state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
@@ -91,13 +91,6 @@ struct Slot {
     last_used_ns: i64,
 }
 
-/// Number of entries sampled per eviction to approximate least-recently-used
-/// without scanning the whole map. The map's keys are blake3 hashes, so a
-/// HashMap iteration prefix is an unbiased sample uncorrelated with recency;
-/// the oldest of the sample is a good-enough eviction victim (Redis-style
-/// sampled LRU). Small so a single eviction is O(1), not O(n).
-const EVICTION_SAMPLE_SIZE: usize = 8;
-
 /// Hard cap on the number of entries a single `make_room` call may evict.
 /// Bounds the per-`tick` (per-request) eviction work to O(1). In steady state
 /// the map sits exactly at `max_entries`, so a new-key insertion evicts one
@@ -108,20 +101,54 @@ const EVICTION_SAMPLE_SIZE: usize = 8;
 /// call paying the full O(n) drain.
 const MAX_EVICTIONS_PER_CALL: usize = 8;
 
+/// Hard cap on the number of *stale* FIFO entries a single `make_room` call may
+/// discard: keys popped off the insertion-order queue that are no longer in the
+/// map because the background idle sweep removed them independently. Without
+/// this bound, a large burst of idle-sweep removals between two `tick` calls
+/// could make one `tick` walk an arbitrarily long run of stale queue entries,
+/// which is the same unbounded-per-call work the FIFO is here to remove. On
+/// exhausting this budget `make_room` gives up for the call and leaves the map
+/// transiently over the cap; the next call (or the next sweep) continues.
+const MAX_STALE_DISCARDS_PER_CALL: usize = 32;
+
+/// The `RoundRobin` mutable state: the offset map plus its insertion-order FIFO.
+///
+/// Both live under one mutex because every mutation touches both and they must
+/// not diverge across a lock boundary.
+struct State {
+    slots: HashMap<[u8; 32], Slot>,
+    /// Keys in the order they were inserted into `slots`, oldest at the front.
+    /// A key is pushed only when it is newly inserted, never on a repeat `tick`
+    /// of a key already present, so a hot key cannot accumulate duplicate
+    /// entries and grow this queue without bound. Entries can go stale when the
+    /// background idle sweep removes a key from `slots`; `make_room` discards
+    /// those on pop (within [`MAX_STALE_DISCARDS_PER_CALL`]) and
+    /// [`RoundRobin::evict_idle`] prunes them in bulk off the request path.
+    order: VecDeque<[u8; 32]>,
+}
+
 /// Bounded per-tenant round-robin offsets (ADR-0069 idle-eviction shape).
 ///
 /// Keyed by a blake3 hash of the tenant key (never the raw bytes). Bounded two
 /// ways so client-controlled key churn (a rotating bearer token under
 /// `authorization-header`) cannot grow it without limit: entries idle past
 /// `idle_ttl_ns` are swept by the background task, and a hard `max_entries` cap
-/// evicts an approximately-least-recently-used entry on overflow. Overflow
-/// eviction is amortized and bounded (see [`RoundRobin::make_room`]): it never
-/// scans the whole map on the request path, so sustained new-key churn once the
-/// cap is reached cannot turn the memory bound into a per-request CPU cliff. A
-/// dropped entry only restarts that tenant's rotation at offset 0, so eviction
-/// is never correctness-bearing.
+/// evicts the oldest-inserted entry on overflow. Overflow eviction is amortized
+/// and bounded (see [`RoundRobin::make_room`]): its cost per call depends on
+/// neither `max_entries` nor the map's occupancy pattern, so sustained new-key
+/// churn once the cap is reached cannot turn the memory bound into a
+/// per-request CPU cliff.
+///
+/// Overflow eviction order is insertion-order FIFO, not use-recency LRU: a
+/// frequently used ("hot") key inserted early is still evicted once
+/// `max_entries` newer keys have churned past it. That is an accepted trade for
+/// a genuinely constant per-call bound, because a dropped entry only restarts
+/// that tenant's rotation at offset 0, so eviction is never
+/// correctness-bearing. It is also strictly better than an eviction order
+/// biased by the hash table's internal bucket layout, which can never evict a
+/// hot key at all while repeatedly re-scanning the same region of the table.
 pub(crate) struct RoundRobin {
-    slots: Mutex<HashMap<[u8; 32], Slot>>,
+    state: Mutex<State>,
     max_entries: usize,
     idle_ttl_ns: i64,
 }
@@ -129,7 +156,10 @@ pub(crate) struct RoundRobin {
 impl RoundRobin {
     pub(crate) fn new(max_entries: usize, idle_ttl_ns: i64) -> Self {
         RoundRobin {
-            slots: Mutex::new(HashMap::new()),
+            state: Mutex::new(State {
+                slots: HashMap::new(),
+                order: VecDeque::new(),
+            }),
             max_entries: max_entries.max(1),
             idle_ttl_ns: idle_ttl_ns.max(1),
         }
@@ -138,11 +168,14 @@ impl RoundRobin {
     /// Return this tenant's current round-robin offset, then advance it. Records
     /// `now_ns` as the entry's last use for idle eviction.
     pub(crate) fn tick(&self, key_hash: [u8; 32], now_ns: i64) -> u64 {
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if !slots.contains_key(&key_hash) {
-            self.make_room(&mut slots);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.slots.contains_key(&key_hash) {
+            self.make_room(&mut state);
+            // Newly inserted below, so it joins the back of the FIFO exactly
+            // once. Repeat ticks of a present key skip this branch entirely.
+            state.order.push_back(key_hash);
         }
-        let slot = slots.entry(key_hash).or_insert(Slot {
+        let slot = state.slots.entry(key_hash).or_insert(Slot {
             counter: 0,
             last_used_ns: now_ns,
         });
@@ -154,50 +187,77 @@ impl RoundRobin {
 
     /// Evict entries idle longer than the TTL. Returns the number removed.
     /// Driven by the background sweep and by unit tests.
+    ///
+    /// This is an O(n) scan, which is fine: `spawn_round_robin_sweep` in
+    /// `lib.rs` runs it on a timer, off the request path. It also prunes the
+    /// insertion-order FIFO of the keys it just removed, so the FIFO cannot
+    /// accumulate stale entries indefinitely when the map churns below the cap
+    /// (where `make_room` never runs and so never discards them on pop).
     pub(crate) fn evict_idle(&self, now_ns: i64) -> usize {
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let State { slots, order } = &mut *state;
         let before = slots.len();
         slots.retain(|_, slot| now_ns.saturating_sub(slot.last_used_ns) < self.idle_ttl_ns);
-        before - slots.len()
+        let removed = before - slots.len();
+        if removed > 0 {
+            order.retain(|key| slots.contains_key(key));
+        }
+        removed
     }
 
     /// Current entry count (tests).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.slots.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .slots
+            .len()
     }
 
     /// Make room for one more entry when the map is at or over `max_entries`.
     ///
-    /// Eviction is amortized and bounded: this never scans the whole map. While
-    /// the map is at or over the cap it removes up to [`MAX_EVICTIONS_PER_CALL`]
-    /// approximately-least-recently-used entries, each chosen as the oldest of a
-    /// bounded [`EVICTION_SAMPLE_SIZE`] sample (a HashMap iteration prefix, which
-    /// for blake3-hashed keys is an unbiased sample uncorrelated with recency).
-    /// The loop condition still gates on the cap, so in steady state (map at the
-    /// cap) a single new-key insertion evicts exactly one entry; the batch only
-    /// does more work when the map is genuinely over the cap, so it converges
-    /// back toward `max_entries` without any single call paying the O(n) cost.
+    /// Eviction pops the oldest-inserted key off the front of the
+    /// insertion-order FIFO and removes it from the map. The FIFO is maintained
+    /// independently of the hash table's internal layout, so the per-call cost
+    /// is a constant number of `VecDeque::pop_front` plus `HashMap::remove`
+    /// operations, independent of `max_entries` and of which buckets happen to
+    /// be occupied. Nothing here iterates the map.
+    ///
+    /// Two independent budgets bound the call: at most
+    /// [`MAX_EVICTIONS_PER_CALL`] actual removals, and at most
+    /// [`MAX_STALE_DISCARDS_PER_CALL`] popped keys that were already gone from
+    /// the map (removed by the background idle sweep). Exhausting either budget
+    /// ends the call with the map possibly still over the cap; the cap is a
+    /// steady-state bound, not an every-instant invariant, and the next `tick`
+    /// or sweep continues the work.
     ///
     /// The idle-TTL `retain` sweep is deliberately NOT run here: it is an O(n)
     /// scan, and running it on the request path once the cap is reached (under
     /// the held lock, on every `tick` from a churning client) is exactly the CPU
-    /// cliff this strategy replaces. `spawn_round_robin_sweep` in `lib.rs` runs
-    /// [`RoundRobin::evict_idle`] on a timer off the request path for that.
-    fn make_room(&self, slots: &mut HashMap<[u8; 32], Slot>) {
-        for _ in 0..MAX_EVICTIONS_PER_CALL {
-            if slots.len() < self.max_entries {
+    /// cliff this strategy replaces.
+    fn make_room(&self, state: &mut State) {
+        let mut stale = 0usize;
+        let mut evicted = 0usize;
+        while evicted < MAX_EVICTIONS_PER_CALL {
+            if state.slots.len() < self.max_entries {
                 return;
             }
-            let Some(victim) = slots
-                .iter()
-                .take(EVICTION_SAMPLE_SIZE)
-                .min_by_key(|(_, slot)| slot.last_used_ns)
-                .map(|(k, _)| *k)
-            else {
+            let Some(victim) = state.order.pop_front() else {
+                // FIFO empty with the map at the cap: nothing to evict by
+                // insertion order. Cannot happen while the two stay in sync,
+                // and returning keeps the call bounded if they ever do not.
                 return;
             };
-            slots.remove(&victim);
+            if state.slots.remove(&victim).is_some() {
+                evicted += 1;
+            } else {
+                // Stale front entry: the idle sweep already removed this key.
+                stale += 1;
+                if stale >= MAX_STALE_DISCARDS_PER_CALL {
+                    return;
+                }
+            }
         }
     }
 }
@@ -329,27 +389,151 @@ mod tests {
         key
     }
 
+    /// Force the map (and its FIFO) over the cap directly. The public API keeps
+    /// the map at the cap, so an over-cap state is not reachable through `tick`
+    /// alone. Keys `0..n` are inserted in order, oldest first.
+    fn force_over_cap(rr: &RoundRobin, n: u64) {
+        let mut state = rr.state.lock().expect("lock");
+        for i in 0..n {
+            state.slots.insert(
+                key_of(i),
+                Slot {
+                    counter: 0,
+                    last_used_ns: i as i64,
+                },
+            );
+            state.order.push_back(key_of(i));
+        }
+    }
+
+    /// Per-call `tick` cost under sustained churn at a given cap, in nanoseconds
+    /// per call: churn `churn` distinct new keys to reach steady state, then time
+    /// `measure` further distinct-key calls and return the mean.
+    fn steady_state_ns_per_tick(cap: usize, churn: u64, measure: u64) -> f64 {
+        let rr = RoundRobin::new(cap, i64::MAX);
+        for i in 0..churn {
+            rr.tick(key_of(i), i as i64);
+        }
+        let start = std::time::Instant::now();
+        for i in churn..(churn + measure) {
+            rr.tick(key_of(i), i as i64);
+        }
+        start.elapsed().as_nanos() as f64 / measure as f64
+    }
+
     #[test]
-    fn eviction_under_cap_pressure_does_not_scan_the_whole_map() {
-        // Force the map WELL over the cap directly (the public API keeps it at
-        // the cap, so we cannot reach an over-cap state through `tick` alone).
-        // A single `tick` must then evict only a bounded batch, not drain the
-        // whole overflow back to the cap in one O(n) pass the way the old
-        // full-scan `while` loop did.
+    fn surviving_entries_are_recent_under_sustained_cap_pressure() {
+        // The property the sampled-LRU predecessor violated. It sampled a fixed
+        // prefix of `HashMap::iter()`, which always starts at the same low
+        // bucket, so it evicted from one region of the table forever: entries in
+        // higher buckets survived indefinitely regardless of age (the review
+        // measured 1016/1024 residents last used more than `cap` ticks earlier,
+        // with the very first key ever inserted still resident after 100k
+        // ticks), and walking the hollowed-out prefix made each call O(n).
+        //
+        // Under insertion-order FIFO with every `tick` using a fresh key, the
+        // residents are exactly the last `cap` keys inserted, so every resident
+        // must have `last_used_ns >= ticks - cap`. The assertion allows 2x that
+        // slack to stay robust against the bounded-batch behaviour, and is still
+        // ~100x tighter than what the predecessor produced.
+        let cap = 1024usize;
+        let ticks = 100_000u64;
+        let rr = RoundRobin::new(cap, i64::MAX);
+        for i in 0..ticks {
+            rr.tick(key_of(i), i as i64);
+        }
+
+        let state = rr.state.lock().expect("lock");
+        assert_eq!(state.slots.len(), cap, "steady state sits at the cap");
+        assert!(
+            !state.slots.contains_key(&key_of(0)),
+            "the first key ever inserted must not survive 100k ticks of churn"
+        );
+        let floor = ticks as i64 - 2 * cap as i64;
+        let oldest = state
+            .slots
+            .values()
+            .map(|slot| slot.last_used_ns)
+            .min()
+            .expect("non-empty");
+        assert!(
+            oldest >= floor,
+            "a resident entry is far older than the eviction order allows: \
+             last_used_ns {oldest} < floor {floor}"
+        );
+        // The FIFO tracks the map, so it cannot grow unboundedly either.
+        assert!(
+            state.order.len() <= cap + MAX_EVICTIONS_PER_CALL,
+            "insertion-order FIFO drifted from the map: {} entries",
+            state.order.len()
+        );
+    }
+
+    #[test]
+    fn per_tick_cost_is_independent_of_max_entries() {
+        // The bound the predecessor failed: its per-call cost grew with the
+        // hollowed-out bucket prefix, measured at ~3,700-6,800ns per `tick` at
+        // cap=100,000 versus a few tens of ns at cap=100. FIFO eviction pops one
+        // deque entry and removes one map entry regardless of cap.
+        //
+        // Both caps are churned to several multiples of capacity first, then a
+        // batch of single calls is timed. Best-of-3 trials filters scheduler
+        // noise. The threshold is deliberately loose (3x plus a 200ns additive
+        // floor, so a sub-100ns baseline cannot make ordinary jitter fail the
+        // test) because the point is to catch an O(n) blowup - three orders of
+        // magnitude in the review's numbers - not to police cache-miss-scale
+        // differences between a 100-entry and a 100,000-entry table.
+        let trials = 3;
+        let small = (0..trials)
+            .map(|_| steady_state_ns_per_tick(100, 10_000, 5_000))
+            .fold(f64::INFINITY, f64::min);
+        let big = (0..trials)
+            .map(|_| steady_state_ns_per_tick(100_000, 300_000, 5_000))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            big <= small * 3.0 + 200.0,
+            "per-tick cost scales with max_entries: {small:.0}ns at cap=100 vs \
+             {big:.0}ns at cap=100_000"
+        );
+    }
+
+    #[test]
+    fn a_hot_key_is_still_evicted_under_sustained_churn() {
+        // FIFO evicts by insertion order, not by use recency, so a hot key IS
+        // evicted once `cap` newer keys have churned past it - and its rotation
+        // restarts at offset 0. That is the accepted trade documented on
+        // `RoundRobin`: eviction is never correctness-bearing. The predecessor's
+        // bucket-biased sampling never evicted an always-active early key at all
+        // (the review measured 0 restarts over 8 x 50,000 requests), so it was
+        // not approximating any eviction policy.
+        let cap = 64usize;
+        let rounds = 10_000u64;
+        let rr = RoundRobin::new(cap, i64::MAX);
+        let hot = [0xABu8; 32];
+        let mut restarts = 0usize;
+        for i in 0..rounds {
+            // The hot tenant keeps requesting throughout.
+            if rr.tick(hot, i as i64) == 0 && i > 0 {
+                restarts += 1;
+            }
+            // A churning client rotates its token every request.
+            rr.tick(key_of(i), i as i64);
+        }
+        // Roughly one restart per `cap` new keys inserted; assert only that the
+        // hot key is not starved from eviction forever.
+        assert!(
+            restarts > 0,
+            "a hot key was never evicted under {rounds} rounds of churn at cap {cap}"
+        );
+    }
+
+    #[test]
+    fn over_cap_tick_evicts_only_a_bounded_batch() {
+        // A single `tick` must evict only a bounded batch, not drain the whole
+        // overflow back to the cap in one O(n) pass.
         let cap = 10;
         let rr = RoundRobin::new(cap, i64::MAX);
-        {
-            let mut slots = rr.slots.lock().expect("lock");
-            for i in 0..100u64 {
-                slots.insert(
-                    key_of(i),
-                    Slot {
-                        counter: 0,
-                        last_used_ns: i as i64,
-                    },
-                );
-            }
-        }
+        force_over_cap(&rr, 100);
         assert_eq!(rr.len(), 100, "precondition: map forced over the cap");
 
         // One request for a new key.
@@ -372,6 +556,85 @@ mod tests {
             len > 1,
             "a single call must not drain the whole map, got {len}"
         );
+        // The oldest-inserted keys are the ones that went.
+        let state = rr.state.lock().expect("lock");
+        assert!(
+            !state.slots.contains_key(&key_of(0)),
+            "FIFO must evict from the front (oldest insert) first"
+        );
+        assert!(
+            state.slots.contains_key(&key_of(99)),
+            "FIFO must not evict the newest insert"
+        );
+    }
+
+    #[test]
+    fn stale_fifo_entries_are_discarded_within_a_bounded_budget() {
+        // The background idle sweep can remove keys from the map, leaving their
+        // FIFO entries stale. `make_room` discards stale front entries on pop,
+        // but only up to MAX_STALE_DISCARDS_PER_CALL of them, so one `tick`
+        // cannot be made to walk an unbounded run of them.
+        let cap = 16usize;
+        let rr = RoundRobin::new(cap, i64::MAX);
+        {
+            let mut state = rr.state.lock().expect("lock");
+            // A long run of stale front entries: in the FIFO, absent from the map.
+            for i in 0..10_000u64 {
+                state.order.push_back(key_of(i));
+            }
+            // Then `cap` live entries behind them.
+            for i in 10_000..(10_000 + cap as u64) {
+                state.slots.insert(
+                    key_of(i),
+                    Slot {
+                        counter: 0,
+                        last_used_ns: i as i64,
+                    },
+                );
+                state.order.push_back(key_of(i));
+            }
+        }
+
+        rr.tick(key_of(999_999), 999_999);
+
+        let state = rr.state.lock().expect("lock");
+        // Exactly the stale budget was discarded, and the call gave up rather
+        // than walking to the live entries, so nothing live was evicted.
+        assert_eq!(
+            state.order.len(),
+            10_000 + cap + 1 - MAX_STALE_DISCARDS_PER_CALL,
+            "stale discards were not bounded by MAX_STALE_DISCARDS_PER_CALL"
+        );
+        assert_eq!(
+            state.slots.len(),
+            cap + 1,
+            "map may sit transiently over the cap when the stale budget is spent"
+        );
+    }
+
+    #[test]
+    fn idle_sweep_prunes_the_insertion_order_fifo() {
+        // Below the cap `make_room` never runs, so nothing would ever discard
+        // stale FIFO entries on pop. The sweep prunes them instead, off the
+        // request path, so repeated sweep-and-reinsert churn cannot grow the
+        // FIFO without bound.
+        let ttl = 100;
+        let rr = RoundRobin::new(100_000, ttl);
+        for round in 0..50i64 {
+            let base = round * 1_000;
+            for k in 0..10u64 {
+                rr.tick(key_of(k), base);
+            }
+            // Every key is now idle past the TTL and swept away.
+            assert_eq!(rr.evict_idle(base + ttl), 10);
+            assert_eq!(rr.len(), 0);
+        }
+        let state = rr.state.lock().expect("lock");
+        assert!(
+            state.order.is_empty(),
+            "FIFO grew across sweep-and-reinsert rounds: {} entries",
+            state.order.len()
+        );
     }
 
     #[test]
@@ -382,18 +645,7 @@ mod tests {
         // MAX_EVICTIONS_PER_CALL evictions), not merely keep each call cheap.
         let cap = 10;
         let rr = RoundRobin::new(cap, i64::MAX);
-        {
-            let mut slots = rr.slots.lock().expect("lock");
-            for i in 0..500u64 {
-                slots.insert(
-                    key_of(i),
-                    Slot {
-                        counter: 0,
-                        last_used_ns: i as i64,
-                    },
-                );
-            }
-        }
+        force_over_cap(&rr, 500);
         assert_eq!(rr.len(), 500, "precondition: map forced far over the cap");
 
         for i in 0..500u64 {
