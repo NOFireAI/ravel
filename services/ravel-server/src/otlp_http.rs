@@ -21,7 +21,7 @@ use ravel_ingest::{
     AdmissionController, LogWriteError, RequestRejection, SpanWriteError, WriteError, WriteMode,
 };
 use ravel_query::http::TenantResolver;
-use ravel_types::Signal;
+use ravel_types::{Signal, TenantId};
 
 use crate::ingest::{IngestRequestError, IngestState};
 use crate::ingest_concurrency::IngestConcurrencyController;
@@ -49,8 +49,213 @@ pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// Layer 1 (ADR-0051 section 2): the wire-body cap on every OTLP HTTP
-/// endpoint, ahead of protobuf decode.
+/// endpoint, ahead of protobuf decode. This bounds the *compressed* body when a
+/// client sends gzip; the decompressed size is bounded independently by
+/// [`MAX_DECOMPRESSED_OTLP_BODY_BYTES`], exactly as Remote Write pairs its two
+/// caps (ADR-0084 decision 3).
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cap on the decompressed size of a gzip OTLP body (ADR-0084 decision 3),
+/// matching Remote Write's post-Snappy cap. Enforced *while* expanding, not
+/// after, by reading the decoder through `take(cap + 1)`: a decompression bomb
+/// is refused as it is being inflated rather than after Ravel has already
+/// allocated it (the same discipline as `ravel-otap`'s `decompress_capped`).
+const MAX_DECOMPRESSED_OTLP_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The `Content-Encoding` a request declared, after RFC 9110 parsing. Only the
+/// codings Ravel actually decodes are named; everything else is
+/// [`ContentCoding::Unsupported`] and answered with 415 rather than being
+/// guessed at, so an unknown coding never reaches prost as a compressed body
+/// and produces the misleading `invalid OTLP payload` 400 ADR-0084 exists to
+/// remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentCoding {
+    /// Absent header, empty value, or the literal `identity`: the body is the
+    /// payload as-is.
+    Identity,
+    /// `gzip` or its RFC 9110 alias `x-gzip`, compared case-insensitively.
+    Gzip,
+    /// Any other single coding, or any multi-coding list (`gzip, gzip`,
+    /// `deflate, gzip`): Ravel does not chain decoders, so this is a 415.
+    Unsupported,
+}
+
+/// Parses `Content-Encoding` per RFC 9110: case-insensitive, `x-gzip` an alias
+/// for `gzip`, a single coding only. A comma-separated list is unsupported
+/// because Ravel implements no chained decoding and guessing at one member
+/// would be a silent approximation.
+fn parse_content_encoding(headers: &HeaderMap) -> ContentCoding {
+    let Some(value) = headers.get(header::CONTENT_ENCODING) else {
+        return ContentCoding::Identity;
+    };
+    let Ok(value) = value.to_str() else {
+        return ContentCoding::Unsupported;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return ContentCoding::Identity;
+    }
+    // A list is always unsupported, even `gzip, gzip`: no chained decoding.
+    if trimmed.contains(',') {
+        return ContentCoding::Unsupported;
+    }
+    let coding = trimmed.to_ascii_lowercase();
+    match coding.as_str() {
+        "identity" => ContentCoding::Identity,
+        "gzip" | "x-gzip" => ContentCoding::Gzip,
+        _ => ContentCoding::Unsupported,
+    }
+}
+
+/// Why a gzip body could not be turned into OTLP bytes.
+#[derive(Debug)]
+enum GzipDecodeError {
+    /// The decompressed stream exceeded [`MAX_DECOMPRESSED_OTLP_BODY_BYTES`]:
+    /// HTTP 413. Detected while expanding, before the full expansion is
+    /// allocated.
+    TooLarge,
+    /// The bytes were not a well-formed gzip stream, or carried trailing bytes
+    /// after a well-formed stream ended: HTTP 400. Truncating silently is not
+    /// an option at any size.
+    Invalid(String),
+}
+
+/// Decompresses a gzip `body` under a single hard cap across all members,
+/// copying `ravel-otap`'s `decompress_capped` discipline: the decoder is read
+/// through `take(cap + 1)` so the output buffer can never grow past `cap + 1`
+/// before the check runs, which refuses a bomb as it inflates rather than after
+/// the allocation the attack targets has already happened.
+///
+/// Uses [`MultiGzDecoder`], not `GzDecoder`: a concatenated multi-member stream
+/// is legal gzip that ordinary tooling produces, and a plain `GzDecoder` would
+/// decode member one, acknowledge it, and silently drop the rest. Trailing
+/// bytes after the final member surface as [`GzipDecodeError::Invalid`] (400).
+fn decompress_gzip_capped(body: &[u8], cap: usize) -> Result<Vec<u8>, GzipDecodeError> {
+    use std::io::Read;
+
+    use flate2::read::MultiGzDecoder;
+
+    let cap_u64 = cap as u64;
+    let mut limited = MultiGzDecoder::new(body).take(cap_u64 + 1);
+    let mut out = Vec::new();
+    limited
+        .read_to_end(&mut out)
+        .map_err(|err| GzipDecodeError::Invalid(err.to_string()))?;
+    if out.len() as u64 > cap_u64 {
+        return Err(GzipDecodeError::TooLarge);
+    }
+    Ok(out)
+}
+
+/// HTTP 415 for an unsupported `Content-Encoding`, naming what is supported so
+/// the gap is legible rather than a mystery (ADR-0084 decision 1).
+fn unsupported_encoding_response() -> Response {
+    (
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported Content-Encoding; this endpoint accepts only an absent or identity encoding, \
+         or a single gzip (x-gzip) coding",
+    )
+        .into_response()
+}
+
+/// Applies the layer-2 byte-rate charge and returns the OTLP protobuf bytes to
+/// decode, dispatching on `Content-Encoding` (ADR-0084 decisions 1, 3, 4).
+///
+/// - Identity: the current path byte for byte. `check_byte_rate` charges the
+///   wire body length exactly as before, and the returned `Bytes` is the input
+///   with no copy.
+/// - gzip/x-gzip: the compressed length is pre-checked against the tenant's
+///   available tokens without consuming any (`peek_byte_rate`); if even that
+///   lower bound is over rate the request is rejected 429 before anything is
+///   inflated. Otherwise the body is decompressed under the 64 MiB cap and the
+///   real charge is made on the decompressed size.
+/// - anything else: 415.
+///
+/// The wire (compressed) length is recorded per tenant on the admitted path so
+/// `/metrics` can report it alongside the charged (decompressed) size.
+fn admit_and_decode_body(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    tenant: &TenantId,
+    signal: Signal,
+    body: Bytes,
+) -> Result<Bytes, Box<Response>> {
+    match parse_content_encoding(headers) {
+        ContentCoding::Unsupported => Err(Box::new(unsupported_encoding_response())),
+        ContentCoding::Identity => {
+            let wire_len = body.len() as u64;
+            // Layer 2 (ADR-0051 section 2): byte rate on the wire body, before
+            // decode, unchanged from today for an uncompressed client.
+            if let Err(rejection) =
+                state
+                    .admission
+                    .check_byte_rate(tenant, signal, wire_len, now_ns())
+            {
+                return Err(Box::new(admission_rejection_response(rejection)));
+            }
+            state
+                .ingest_byte_metrics
+                .record_wire_bytes(tenant, signal, wire_len);
+            Ok(body)
+        }
+        ContentCoding::Gzip => {
+            let wire_len = body.len() as u64;
+            // Compressed-size pre-check (ADR-0084 decision 4): the compressed
+            // length is a strict lower bound on the decompressed length, so if
+            // even it exceeds the available tokens the request is rejected 429
+            // without inflating anything and without consuming tokens. This
+            // keeps an already-over-rate tenant from billing the gateway up to
+            // 64 MiB of inflate per rejected request.
+            if let Err(rejection) =
+                state
+                    .admission
+                    .peek_byte_rate(tenant, signal, wire_len, now_ns())
+            {
+                return Err(Box::new(admission_rejection_response(rejection)));
+            }
+            let decompressed = match decompress_gzip_capped(&body, MAX_DECOMPRESSED_OTLP_BODY_BYTES)
+            {
+                Ok(bytes) => bytes,
+                Err(GzipDecodeError::TooLarge) => {
+                    return Err(Box::new(
+                        (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            format!(
+                                "decompressed OTLP body exceeds {} bytes",
+                                MAX_DECOMPRESSED_OTLP_BODY_BYTES
+                            ),
+                        )
+                            .into_response(),
+                    ));
+                }
+                Err(GzipDecodeError::Invalid(detail)) => {
+                    return Err(Box::new(
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid gzip body: {detail}"),
+                        )
+                            .into_response(),
+                    ));
+                }
+            };
+            let decompressed_len = decompressed.len() as u64;
+            // The real charge: the decompressed size (ADR-0084 decision 4), so
+            // a compressing tenant and an uncompressing one sending the same
+            // telemetry are charged the same.
+            if let Err(rejection) =
+                state
+                    .admission
+                    .check_byte_rate(tenant, signal, decompressed_len, now_ns())
+            {
+                return Err(Box::new(admission_rejection_response(rejection)));
+            }
+            state
+                .ingest_byte_metrics
+                .record_wire_bytes(tenant, signal, wire_len);
+            Ok(Bytes::from(decompressed))
+        }
+    }
+}
 
 pub struct GatewayState {
     pub tenant_resolver: Arc<dyn TenantResolver>,
@@ -63,8 +268,17 @@ pub struct GatewayState {
     /// the `s` keyspace, its own router and its own limits (ADR-0041).
     pub traces_ingest: SpanIngestState,
     /// Tenant admission (ADR-0051): shared by all three signals for the
-    /// layer-2 byte-rate check, done here on wire bytes before decode.
+    /// layer-2 byte-rate check. On the identity path this is done on wire bytes
+    /// before decode as before; on the gzip path (ADR-0084) it is done on the
+    /// decompressed size after decompression, behind a compressed-size
+    /// pre-check.
     pub admission: Arc<AdmissionController>,
+    /// Per-tenant wire (compressed) request-body byte counter (ADR-0084
+    /// decision 5). Shared with the gRPC ingest services and the `/metrics`
+    /// renderer, so an operator can compare wire bytes against the charged
+    /// (decompressed) bytes admission reports and tell a tenant that increased
+    /// telemetry from one that turned compression off.
+    pub ingest_byte_metrics: Arc<crate::ingest_byte_metrics::IngestByteMetrics>,
     /// The process-wide in-flight ingest-request ceiling, shared
     /// with every OTLP HTTP/gRPC service and Remote Write on this listener
     /// and the mTLS listener. Checked first in every handler below, ahead of
@@ -257,15 +471,13 @@ async fn export_metrics(
 
     let mode = write_mode_from_headers(&headers);
 
-    // Layer 2 (ADR-0051 section 2): byte rate on the wire body, before
-    // decode, whole-request rejection with no tokens consumed.
-    if let Err(rejection) =
-        state
-            .admission
-            .check_byte_rate(&tenant, Signal::Metrics, body.len() as u64, now_ns())
-    {
-        return admission_rejection_response(rejection);
-    }
+    // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
+    // byte rate and return the OTLP protobuf bytes, decompressing first when
+    // the client sent gzip. Identity is unchanged from before.
+    let body = match admit_and_decode_body(&state, &headers, &tenant, Signal::Metrics, body) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
 
     let request = match ExportMetricsServiceRequest::decode(body.as_ref()) {
         Ok(request) => request,
@@ -324,15 +536,13 @@ async fn export_logs(
 
     let mode = write_mode_from_headers(&headers);
 
-    // Layer 2 (ADR-0051 section 2): byte rate on the wire body, before
-    // decode, whole-request rejection with no tokens consumed.
-    if let Err(rejection) =
-        state
-            .admission
-            .check_byte_rate(&tenant, Signal::Logs, body.len() as u64, now_ns())
-    {
-        return admission_rejection_response(rejection);
-    }
+    // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
+    // byte rate and return the OTLP protobuf bytes, decompressing first when
+    // the client sent gzip. Identity is unchanged from before.
+    let body = match admit_and_decode_body(&state, &headers, &tenant, Signal::Logs, body) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
 
     let request = match ExportLogsServiceRequest::decode(body.as_ref()) {
         Ok(request) => request,
@@ -400,16 +610,13 @@ async fn export_traces(
 
     let mode = write_mode_from_headers(&headers);
 
-    // Layer 2 (ADR-0051 section 2): byte rate applies uniformly to every
-    // signal including spans, even though spans get no layer-4 admission
-    // (ADR-0051 excludes spans from series/stream admission).
-    if let Err(rejection) =
-        state
-            .admission
-            .check_byte_rate(&tenant, Signal::Spans, body.len() as u64, now_ns())
-    {
-        return admission_rejection_response(rejection);
-    }
+    // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): byte rate
+    // applies uniformly to every signal including spans (even though spans get
+    // no layer-4 admission), charged after decompression on the gzip path.
+    let body = match admit_and_decode_body(&state, &headers, &tenant, Signal::Spans, body) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
 
     let request = match ExportTraceServiceRequest::decode(body.as_ref()) {
         Ok(request) => request,
@@ -453,5 +660,392 @@ async fn export_traces(
         Err(err @ SpanIngestRequestError::Write(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::io::Write as _;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+    use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    };
+    use ravel_ingest::{
+        AdmissionController, AdmissionLimits, IngestConfig, IngestRouter, LogIngestRouter,
+        RateLimit, SpanIngestRouter, SystemClock,
+    };
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_otlp::{IngestLimits, LogIngestLimits, SpanIngestLimits};
+    use ravel_query::http::AuthError;
+
+    use super::*;
+    use crate::ingest_byte_metrics::IngestByteMetrics;
+    use crate::ingest_concurrency::{IngestConcurrencyController, IngestConcurrencyLimit};
+
+    const TENANT: &str = "acme";
+
+    /// Resolves every request to the same fixed tenant, so a handler test can
+    /// find that tenant's admission usage row without threading a token.
+    struct FixedTenantResolver(TenantId);
+
+    impl TenantResolver for FixedTenantResolver {
+        fn resolve(&self, _headers: &HeaderMap) -> Result<TenantId, AuthError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A `GatewayState` over `MemoryStore`, whose admission controller carries
+    /// `limits` as its per-tenant defaults (so the fixed tenant gets them). The
+    /// metrics, log, and span routers are all real, so a handler runs the full
+    /// ingest path and returns the same status a client would see.
+    fn state_with_limits(limits: AdmissionLimits) -> Arc<GatewayState> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let metrics_router = Arc::new(IngestRouter::new(
+            IngestConfig::default(),
+            store.clone(),
+            Signal::Metrics,
+            Arc::new(SystemClock),
+        ));
+        let log_router = Arc::new(LogIngestRouter::new(
+            IngestConfig::default(),
+            store.clone(),
+            Arc::new(SystemClock),
+        ));
+        let span_router = Arc::new(SpanIngestRouter::new(
+            IngestConfig::default(),
+            store.clone(),
+            Arc::new(SystemClock),
+        ));
+        let admission = Arc::new(AdmissionController::new(Arc::new(SystemClock), limits));
+        Arc::new(GatewayState {
+            tenant_resolver: Arc::new(FixedTenantResolver(TenantId::new(TENANT))),
+            ingest: crate::ingest::IngestState {
+                router: metrics_router,
+                limits: IngestLimits::default(),
+                ack_deadline: std::time::Duration::from_secs(5),
+                admission: admission.clone(),
+                recovery: None,
+                provisioning: None,
+            },
+            logs_ingest: crate::logs_ingest::LogIngestState {
+                router: log_router,
+                limits: LogIngestLimits::default(),
+                ack_deadline: std::time::Duration::from_secs(5),
+                admission: admission.clone(),
+                store: store.clone(),
+                recovery: None,
+                provisioning: None,
+            },
+            traces_ingest: crate::traces_ingest::SpanIngestState {
+                router: span_router,
+                limits: SpanIngestLimits::default(),
+                ack_deadline: std::time::Duration::from_secs(5),
+                admission: admission.clone(),
+                store: store.clone(),
+                recovery: None,
+                provisioning: None,
+            },
+            admission,
+            ingest_concurrency: IngestConcurrencyController::shared(
+                IngestConcurrencyLimit::Unlimited,
+            ),
+            ingest_byte_metrics: Arc::new(IngestByteMetrics::new()),
+        })
+    }
+
+    /// A metrics export that compresses well: `points` copies of one gauge data
+    /// point, so the decompressed protobuf is many times the gzip size. The
+    /// distinction matters for the charging tests, which assert the byte rate is
+    /// charged the decompressed length, not the compressed one.
+    fn compressible_request(points: usize) -> ExportMetricsServiceRequest {
+        let data_points = (0..points)
+            .map(|_| NumberDataPoint {
+                time_unix_nano: now_ns() as u64,
+                value: Some(NumberValue::AsDouble(1.0)),
+                ..Default::default()
+            })
+            .collect();
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests_total".to_string(),
+                        data: Some(MetricData::Gauge(Gauge { data_points })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// One-member gzip of `data`.
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+
+    /// The fixed tenant's metrics admission usage row, or `None` if untouched.
+    fn metrics_usage(state: &GatewayState) -> Option<ravel_ingest::TenantUsage> {
+        let want = TenantId::new(TENANT).hash();
+        state
+            .admission
+            .usage_snapshot()
+            .into_iter()
+            .find(|row| row.tenant_hash == want && row.signal == Signal::Metrics)
+    }
+
+    fn gzip_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        headers
+    }
+
+    /// ADR-0084 decision 1/4: a gzip body is decoded and ingested (200), and the
+    /// byte rate is charged the DECOMPRESSED length, not the compressed one.
+    ///
+    /// Non-vacuity: the request is chosen so `compressed_len` is far below
+    /// `decompressed_len`, and the test asserts the charge equals the latter and
+    /// differs from the former. Change `admit_and_decode_body`'s gzip
+    /// `check_byte_rate(decompressed_len)` to charge `wire_len` and this fails.
+    #[tokio::test]
+    async fn gzip_body_is_accepted_and_charged_decompressed() {
+        let state = state_with_limits(AdmissionLimits::default());
+        let encoded = compressible_request(2000).encode_to_vec();
+        let compressed = gzip(&encoded);
+        assert!(
+            compressed.len() < encoded.len(),
+            "fixture must compress: compressed={} decompressed={}",
+            compressed.len(),
+            encoded.len()
+        );
+
+        let response = export_metrics(
+            State(state.clone()),
+            gzip_headers(),
+            Bytes::from(compressed.clone()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "gzip body must be accepted"
+        );
+
+        let usage = metrics_usage(&state).expect("a metrics usage row after admitting the request");
+        assert_eq!(
+            usage.bytes_admitted_total,
+            encoded.len() as u64,
+            "the byte rate must charge the decompressed length"
+        );
+        assert_ne!(
+            usage.bytes_admitted_total,
+            compressed.len() as u64,
+            "the charge must not be the compressed length"
+        );
+
+        // The wire (compressed) size is recorded separately for /metrics.
+        let wire = state.ingest_byte_metrics.snapshot();
+        let row = wire
+            .iter()
+            .find(|r| r.tenant_hash == TenantId::new(TENANT).hash() && r.signal == Signal::Metrics)
+            .expect("a wire-bytes row");
+        assert_eq!(row.wire_bytes_total, compressed.len() as u64);
+    }
+
+    /// ADR-0084 decision 3: a body inflating past 64 MiB is rejected 413 while
+    /// expanding, without the process allocating the full expansion (the decoder
+    /// is read through `take(cap + 1)`, so at most 64 MiB + 1 is ever buffered).
+    ///
+    /// Non-vacuity: revert `decompress_gzip_capped`'s `if out.len() as u64 >
+    /// cap_u64 { return Err(TooLarge) }` and the oversized body flows on to
+    /// prost as a truncated buffer, turning the 413 into a 400.
+    #[tokio::test]
+    async fn gzip_bomb_over_cap_is_rejected_413() {
+        let state = state_with_limits(AdmissionLimits::default());
+        // Zeros compress ~1000:1, so this is a small body that inflates past the
+        // 64 MiB cap. It need not be valid OTLP: the cap trips before decode.
+        let bomb_plain = vec![0u8; MAX_DECOMPRESSED_OTLP_BODY_BYTES + 1024];
+        let compressed = gzip(&bomb_plain);
+        assert!(
+            compressed.len() < 1024 * 1024,
+            "the compressed bomb must stay small: {}",
+            compressed.len()
+        );
+
+        let response = export_metrics(State(state), gzip_headers(), Bytes::from(compressed)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an over-cap decompression must be 413"
+        );
+    }
+
+    /// ADR-0084 decision 1: a concatenated multi-member gzip stream ingests ALL
+    /// members. The fixture splits one encoded request across two members, so a
+    /// decoder that stops after member one (`GzDecoder`) yields a truncated,
+    /// undecodable protobuf.
+    ///
+    /// Non-vacuity: swap `decompress_gzip_capped`'s `MultiGzDecoder` for
+    /// `GzDecoder` and only the first half decompresses, so prost sees a
+    /// truncated message and the handler returns 400 instead of 200.
+    #[tokio::test]
+    async fn gzip_multi_member_stream_ingests_all_members() {
+        let state = state_with_limits(AdmissionLimits::default());
+        let encoded = compressible_request(500).encode_to_vec();
+        let mid = encoded.len() / 2;
+        assert!(mid > 0 && mid < encoded.len(), "need a real two-way split");
+        // Two independently-framed gzip members, concatenated. Each is a
+        // complete gzip stream; MultiGzDecoder decodes both and yields the full
+        // `encoded`, GzDecoder would yield only the first half.
+        let mut two_member = gzip(&encoded[..mid]);
+        two_member.extend_from_slice(&gzip(&encoded[mid..]));
+
+        // Sanity: our own capped decoder reconstructs the whole thing.
+        let round_trip =
+            decompress_gzip_capped(&two_member, MAX_DECOMPRESSED_OTLP_BODY_BYTES).expect("decodes");
+        assert_eq!(round_trip, encoded, "both members must decompress");
+
+        let response = export_metrics(
+            State(state.clone()),
+            gzip_headers(),
+            Bytes::from(two_member),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "both members must ingest as one request"
+        );
+        let usage = metrics_usage(&state).expect("a metrics usage row");
+        assert_eq!(
+            usage.bytes_admitted_total,
+            encoded.len() as u64,
+            "the charge covers the whole decompressed stream, not one member"
+        );
+    }
+
+    /// ADR-0084 decision 1: trailing bytes after a well-formed gzip stream are a
+    /// 400, never silently truncated.
+    #[tokio::test]
+    async fn gzip_trailing_garbage_is_rejected_400() {
+        let state = state_with_limits(AdmissionLimits::default());
+        let encoded = compressible_request(10).encode_to_vec();
+        let mut body = gzip(&encoded);
+        body.extend_from_slice(b"trailing junk not a gzip header");
+
+        let response = export_metrics(State(state), gzip_headers(), Bytes::from(body)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "trailing bytes after the stream must be 400"
+        );
+    }
+
+    /// ADR-0084 decision 1: an unsupported single coding, and any multi-coding
+    /// list, are 415 (never treated as identity, which would hand prost a
+    /// compressed body and produce the misleading 400 this ADR removes).
+    #[tokio::test]
+    async fn unsupported_content_encoding_is_415() {
+        for value in ["deflate", "br", "gzip, gzip", "deflate, gzip"] {
+            let state = state_with_limits(AdmissionLimits::default());
+            let encoded = compressible_request(10).encode_to_vec();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            let response = export_metrics(State(state), headers, Bytes::from(gzip(&encoded))).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Content-Encoding {value:?} must be 415"
+            );
+        }
+    }
+
+    /// ADR-0084 decision 1/4: the identity path is byte-for-byte unchanged. An
+    /// uncompressed body (absent Content-Encoding) is charged its wire length,
+    /// exactly as today, and `x-gzip` is honored as a gzip alias.
+    #[tokio::test]
+    async fn identity_path_charge_is_wire_length() {
+        let state = state_with_limits(AdmissionLimits::default());
+        let encoded = compressible_request(50).encode_to_vec();
+
+        let response = export_metrics(
+            State(state.clone()),
+            HeaderMap::new(),
+            Bytes::from(encoded.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let usage = metrics_usage(&state).expect("a metrics usage row");
+        assert_eq!(
+            usage.bytes_admitted_total,
+            encoded.len() as u64,
+            "identity charge must equal the wire body length, as before this change"
+        );
+    }
+
+    /// ADR-0084 decision 1: `x-gzip` is an accepted alias for `gzip`.
+    #[tokio::test]
+    async fn x_gzip_alias_is_accepted() {
+        let state = state_with_limits(AdmissionLimits::default());
+        let encoded = compressible_request(50).encode_to_vec();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("X-Gzip"));
+        let response = export_metrics(State(state), headers, Bytes::from(gzip(&encoded))).await;
+        assert_eq!(response.status(), StatusCode::OK, "x-gzip must be accepted");
+    }
+
+    /// ADR-0084 decision 4: an already-over-rate tenant sending a compressed body
+    /// is rejected 429 by the compressed-size pre-check, WITHOUT the decompressor
+    /// running.
+    ///
+    /// The body is deliberately not valid gzip. If the pre-check runs first (as
+    /// it must), the request is 429 and the bytes are never fed to the decoder;
+    /// if decompression ran before the check, the invalid body would surface as
+    /// a 400. Asserting 429 therefore proves the decompressor did not run.
+    ///
+    /// Non-vacuity: delete the `peek_byte_rate` pre-check in
+    /// `admit_and_decode_body`'s gzip arm and this returns 400 (the invalid body
+    /// reaches the decoder).
+    #[tokio::test]
+    async fn over_rate_compressed_body_pre_check_rejects_429_without_decompressing() {
+        // A tight byte-rate bucket: burst 16 bytes, so any real body is over.
+        let limits = AdmissionLimits {
+            ingest_byte_rate: RateLimit::Bounded {
+                per_sec: 1,
+                burst: 16,
+            },
+            ..AdmissionLimits::default()
+        };
+        let state = state_with_limits(limits);
+        // Not a gzip stream at all, and larger than the 16-byte burst.
+        let not_gzip = Bytes::from(vec![0x42u8; 1024]);
+
+        let response = export_metrics(State(state.clone()), gzip_headers(), not_gzip).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the compressed-size pre-check must reject before decompressing"
+        );
+        let usage = metrics_usage(&state).expect("a metrics usage row after the rejection");
+        assert_eq!(
+            usage.requests_rejected_byte_rate_total, 1,
+            "the pre-check rejection is counted as a byte-rate rejection"
+        );
+        assert_eq!(
+            usage.bytes_admitted_total, 0,
+            "nothing is admitted and no tokens are consumed on the pre-check rejection"
+        );
     }
 }

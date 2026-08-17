@@ -204,6 +204,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         ),
         distrib: None,
         durable_auth: None,
+        ingest_byte_metrics: std::sync::Arc::new(
+            ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
+        ),
     });
 
     Surfaces {
@@ -602,6 +605,9 @@ mod flight {
                 ),
             distrib: None,
             durable_auth: None,
+            ingest_byte_metrics: std::sync::Arc::new(
+                ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
+            ),
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![

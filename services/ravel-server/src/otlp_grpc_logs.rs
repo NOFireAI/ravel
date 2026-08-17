@@ -53,17 +53,22 @@ impl LogsService for GrpcLogsService {
             .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
         let mode = write_mode_from_headers(&headers);
 
-        // Layer 2 (ADR-0051 section 2): byte rate on wire bytes, counted by
-        // `WireByteCountLayer` as tonic's decoder reads them off the request
-        // body, before this request reaches `handle_export_logs`.
-        let request_bytes = wire_request_bytes(&request)?;
-        if let Err(rejection) =
-            self.state
-                .admission
-                .check_byte_rate(&tenant, Signal::Logs, request_bytes, now_ns())
-        {
+        // Layer 2 (ADR-0051 section 2): byte rate counted by
+        // `WireByteCountLayer` as tonic's decoder reads the request body. A
+        // gzip-compressed frame is charged its decoded message size, not the
+        // compressed wire length (ADR-0084 decision 4).
+        let charge = wire_request_bytes(&request)?;
+        if let Err(rejection) = self.state.admission.check_byte_rate(
+            &tenant,
+            Signal::Logs,
+            charge.charge_bytes,
+            now_ns(),
+        ) {
             return Err(admission_rejection_status(rejection));
         }
+        self.state
+            .ingest_byte_metrics
+            .record_wire_bytes(&tenant, Signal::Logs, charge.wire_bytes);
 
         let idempotency_key = idempotency_key_from_headers(&headers);
 

@@ -8,9 +8,16 @@
 //! for a [`CountingBody`] that parses gRPC's length-delimited message
 //! framing directly off the wire bytes as tonic's decoder reads them, and
 //! places the resulting [`WireByteCounter`] in the request's extensions
-//! before the inner service (and eventually the handler) runs. This also
-//! aligns the charged quantity with the HTTP ingest path, which has always
-//! charged wire body bytes.
+//! before the inner service (and eventually the handler) runs.
+//!
+//! Since ADR-0084 the charged quantity aligns with the HTTP ingest path on the
+//! *decompressed* size, not the wire size. An uncompressed frame is charged its
+//! wire bytes exactly as before; a frame whose 1-byte compression flag is set
+//! is charged the decoded message's size instead (via [`wire_request_bytes`]'s
+//! `encoded_len` of the decoded protobuf), so a tenant that gzips its gRPC
+//! export and one that does not are charged the same for identical telemetry.
+//! The parser already reads that flag per frame, so the basis is available
+//! where the charge is made.
 //!
 //! Parsing frames at the body level rather than reading a single running
 //! total matters for a streaming call (OTAP): the underlying transport can
@@ -40,53 +47,112 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use parking_lot::Mutex;
+use prost::Message;
 use tonic::body::Body as TonicBody;
 use tonic::{Request, Status};
 use tower::{Layer, Service};
+
+/// One completed gRPC message frame's admission accounting: whether its 1-byte
+/// compression flag was set, and its total wire length (the 5-byte gRPC frame
+/// header plus payload). For a compressed frame the wire length is the
+/// *compressed* size, which is not what the byte rate charges (ADR-0084
+/// decision 4); the flag is what lets [`wire_request_bytes`] switch the charge
+/// to the decoded message size instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameCharge {
+    compressed: bool,
+    wire_bytes: u64,
+}
 
 /// Shared, cloneable handle to the completed gRPC message frames read off one
 /// request's (or stream's) body so far, in arrival order. Placed in the
 /// request's extensions by [`WireByteCountLayer`]; read back by the handler
 /// via [`wire_request_bytes`] or [`wire_byte_counter`].
 #[derive(Clone)]
-pub struct WireByteCounter(Arc<Mutex<VecDeque<u64>>>);
+pub struct WireByteCounter(Arc<Mutex<VecDeque<FrameCharge>>>);
 
 impl WireByteCounter {
     fn new() -> Self {
         WireByteCounter(Arc::new(Mutex::new(VecDeque::new())))
     }
 
-    fn push_message(&self, total_bytes: u64) {
-        self.0.lock().push_back(total_bytes);
+    fn push_message(&self, compressed: bool, total_bytes: u64) {
+        self.0.lock().push_back(FrameCharge {
+            compressed,
+            wire_bytes: total_bytes,
+        });
+    }
+
+    /// Pops the next completed frame's accounting, in the order frames
+    /// completed on the wire. `None` if no complete frame has been counted yet.
+    fn pop_frame(&self) -> Option<FrameCharge> {
+        self.0.lock().pop_front()
     }
 
     /// Pops the next completed message's total wire length (its 5-byte gRPC
-    /// frame header plus payload), in the order frames completed on the
-    /// wire. `None` if no complete frame has been counted yet.
+    /// frame header plus payload), in the order frames completed on the wire.
+    /// `None` if no complete frame has been counted yet. Used by the streaming
+    /// (OTAP) path, which does not enable `accept_compressed` and so never sees
+    /// a compressed frame; the unary OTLP path uses [`wire_request_bytes`],
+    /// which honors the compression flag.
     pub fn pop_message_bytes(&self) -> Option<u64> {
-        self.0.lock().pop_front()
+        self.pop_frame().map(|frame| frame.wire_bytes)
     }
 }
 
-/// Reads the wire-byte count for a unary gRPC request's one message, charged
-/// by [`WireByteCountLayer`]. `Err` if the layer was never installed on the
-/// listener this request arrived on (a wiring bug, not something a client
-/// can trigger), or if, contrary to the gRPC wire format's guarantee of
-/// exactly one message frame per unary call, no complete frame was counted.
-pub fn wire_request_bytes<T>(request: &Request<T>) -> Result<u64, Status> {
+/// The admission accounting for a unary gRPC request's one message
+/// (ADR-0084 decision 4/5): what to charge the byte rate, and the wire size the
+/// tenant actually sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestCharge {
+    /// Bytes to charge the byte-rate bucket: the decoded message size for a
+    /// compressed frame, the wire length otherwise. Equal to `wire_bytes` for
+    /// an uncompressed frame.
+    pub charge_bytes: u64,
+    /// The frame's total wire length (the compressed size when the frame's
+    /// compression flag was set), recorded per tenant for
+    /// `ravel_ingest_wire_bytes_total`.
+    pub wire_bytes: u64,
+}
+
+/// The byte-rate accounting for a unary gRPC request's one message, from the
+/// frame [`WireByteCountLayer`] counted (ADR-0084 decisions 4, 5).
+///
+/// For an uncompressed frame the charge is the wire length exactly as before.
+/// For a frame whose compression flag is set, the wire length is the
+/// *compressed* size, which would charge a compressing tenant less than an
+/// uncompressing one for identical telemetry; so the charge is the decoded
+/// message's size (`request.get_ref().encoded_len()`) instead. Tonic has
+/// already decoded the message by the time the handler runs, so the decoded
+/// value is in hand with no re-decode.
+///
+/// `Err` if the layer was never installed on the listener this request arrived
+/// on (a wiring bug, not something a client can trigger), or if, contrary to
+/// the gRPC wire format's guarantee of exactly one message frame per unary
+/// call, no complete frame was counted.
+pub fn wire_request_bytes<T: Message>(request: &Request<T>) -> Result<RequestCharge, Status> {
     let counter = wire_byte_counter(request)?;
-    let bytes = counter.pop_message_bytes();
+    let frame = counter.pop_frame();
     // Tonic already decoded this request's one message before calling the
     // handler, which means `CountingBody` -- sitting underneath that same
     // decode, watching the same bytes -- must already have a completed frame
     // queued. A `None` here would mean the two disagree about how many bytes
     // make up this message.
     debug_assert!(
-        bytes.is_some(),
+        frame.is_some(),
         "unary gRPC request decoded but WireByteCountLayer counted no complete message frame"
     );
-    bytes.ok_or_else(|| {
+    let frame = frame.ok_or_else(|| {
         Status::internal("ingest admission: wire-byte count unavailable for this request")
+    })?;
+    let charge_bytes = if frame.compressed {
+        request.get_ref().encoded_len() as u64
+    } else {
+        frame.wire_bytes
+    };
+    Ok(RequestCharge {
+        charge_bytes,
+        wire_bytes: frame.wire_bytes,
     })
 }
 
@@ -164,8 +230,15 @@ struct FrameParser {
 }
 
 enum FrameState {
-    Header { buf: [u8; 5], filled: u8 },
-    Payload { remaining: u32, total: u64 },
+    Header {
+        buf: [u8; 5],
+        filled: u8,
+    },
+    Payload {
+        remaining: u32,
+        total: u64,
+        compressed: bool,
+    },
 }
 
 impl FrameParser {
@@ -198,15 +271,26 @@ impl FrameParser {
                     if usize::from(*filled) < 5 {
                         return;
                     }
+                    // Byte 0 is the gRPC compression flag: nonzero means the
+                    // payload is compressed with the call's Message-Encoding
+                    // (ADR-0084 decision 4 charges such a frame its decoded
+                    // size, not this wire length). Bytes 1..5 are the payload
+                    // length, big-endian.
+                    let compressed = buf[0] != 0;
                     let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
                     self.state = FrameState::Payload {
                         remaining: len,
                         total: 5 + u64::from(len),
+                        compressed,
                     };
                 }
-                FrameState::Payload { remaining, total } => {
+                FrameState::Payload {
+                    remaining,
+                    total,
+                    compressed,
+                } => {
                     if *remaining == 0 {
-                        counter.push_message(*total);
+                        counter.push_message(*compressed, *total);
                         self.state = FrameState::Header {
                             buf: [0; 5],
                             filled: 0,
@@ -260,5 +344,133 @@ impl Body for CountingBody {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+    use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+    use opentelemetry_proto::tonic::metrics::v1::{Gauge, Metric, NumberDataPoint, ScopeMetrics};
+    use opentelemetry_proto::tonic::{
+        collector::metrics::v1::ExportMetricsServiceRequest, metrics::v1::ResourceMetrics,
+    };
+
+    use super::*;
+
+    /// Builds one gRPC length-prefixed frame: a 1-byte compression flag, a
+    /// 4-byte big-endian payload length, then `payload`.
+    fn frame(compressed: bool, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(if compressed { 1 } else { 0 });
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The frame parser reads the 1-byte compression flag per frame, so a
+    /// compressed frame's completed accounting carries `compressed = true` and
+    /// an uncompressed one `false`, each with the full wire length.
+    #[test]
+    fn frame_parser_reports_compression_flag_per_frame() {
+        let counter = WireByteCounter::new();
+        let mut parser = FrameParser::new();
+        parser.feed(&frame(true, &[0xaa; 7]), &counter);
+        parser.feed(&frame(false, &[0xbb; 3]), &counter);
+
+        assert_eq!(
+            counter.pop_frame(),
+            Some(FrameCharge {
+                compressed: true,
+                wire_bytes: 5 + 7,
+            })
+        );
+        assert_eq!(
+            counter.pop_frame(),
+            Some(FrameCharge {
+                compressed: false,
+                wire_bytes: 5 + 3,
+            })
+        );
+        assert_eq!(counter.pop_frame(), None);
+    }
+
+    fn sample_request() -> ExportMetricsServiceRequest {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests_total".to_string(),
+                        data: Some(MetricData::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1,
+                                value: Some(NumberValue::AsDouble(1.0)),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// ADR-0084 decision 4: a compressed gRPC frame is charged the DECODED
+    /// message size, not its (compressed) wire length, so a tenant that gzips
+    /// its gRPC export and one that does not are charged the same for identical
+    /// telemetry.
+    ///
+    /// Non-vacuity: replace `wire_request_bytes`'s `if frame.compressed {
+    /// encoded_len } else { wire }` with an unconditional `frame.wire_bytes`,
+    /// and this test sees the (deliberately different) wire length instead of
+    /// the decoded size and fails. The frame here has its compression flag SET;
+    /// a test that left it clear would pass against the unmodified layer.
+    #[test]
+    fn compressed_frame_is_charged_decoded_size_not_wire_size() {
+        let message = sample_request();
+        let decoded_len = message.encoded_len() as u64;
+
+        // A wire length deliberately unequal to the decoded size, standing in
+        // for the compressed frame's on-the-wire size.
+        let wire_len = decoded_len + 4096;
+        let counter = WireByteCounter::new();
+        counter.push_message(true, wire_len);
+
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(counter);
+
+        let charge = wire_request_bytes(&request).expect("charge available");
+        assert_eq!(
+            charge.charge_bytes, decoded_len,
+            "a compressed frame charges the decoded message size"
+        );
+        assert_ne!(
+            charge.charge_bytes, wire_len,
+            "a compressed frame must not charge the compressed wire length"
+        );
+        assert_eq!(
+            charge.wire_bytes, wire_len,
+            "the wire length is still reported for /metrics"
+        );
+    }
+
+    /// An uncompressed frame is charged its wire length exactly as before this
+    /// change, so nothing shifts for a client that does not compress.
+    #[test]
+    fn uncompressed_frame_is_charged_wire_size() {
+        let message = sample_request();
+        let wire_len = message.encoded_len() as u64 + 5;
+        let counter = WireByteCounter::new();
+        counter.push_message(false, wire_len);
+
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(counter);
+
+        let charge = wire_request_bytes(&request).expect("charge available");
+        assert_eq!(charge.charge_bytes, wire_len);
+        assert_eq!(charge.wire_bytes, wire_len);
     }
 }
