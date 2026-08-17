@@ -158,7 +158,7 @@ independently testable:
    the silent degradation the epic's non-goals forbid, so it is rejected
    at admission rather than left as a footgun: a CEL validation rule (the
    same mechanism already guarding `headerName`, `crd.yaml:155-156`)
-   rejects a CR that sets `exposure.gatewayAPI` while
+   rejects a CR that sets `exposure.gatewayApi` while
    `ingestAffinity.enabled && backend == IngressNginx`. The rule spans two
    sibling fields (`exposure` and `ingestAffinity`) rather than validating
    one struct against its own fields as the `headerName` precedent does,
@@ -278,7 +278,7 @@ independently testable:
    whichever objects the previous mode created instead of leaving them
    orphaned.
 
-![Exposure and affinity, decoupled: the CR's exposure.gatewayAPI and ingestAffinity fields feed independent rendering paths — standard HTTPRoute/GRPCRoute to a user-provided Gateway, versus legacy Ingress (deprecated) or the new ravel-ingest-router, both of which dial gateway pods directly rather than through the Service VIP.](assets/0080-architecture.svg)
+![Exposure and affinity, decoupled: the CR's exposure.gatewayApi and ingestAffinity fields feed independent rendering paths — standard HTTPRoute/GRPCRoute to a user-provided Gateway, versus legacy Ingress (deprecated) or the new ravel-ingest-router, both of which dial gateway pods directly rather than through the Service VIP.](assets/0080-architecture.svg)
 
 ![ravel-affinity's rendezvous (HRW) subset selection: a canonical tenant ID and the Ready replica set both feed a per-pair blake3 score; rank() produces the full deterministic order, subset() takes the top S, and the router picks one member, falling back through the rank order if a subset member isn't Ready.](assets/0080-hrw-flow.svg)
 
@@ -357,7 +357,7 @@ or the CRD version bumped.
   lines 98-104 and adding the legacy/Gateway-API/Ravel-native/S=1-vs-S>1
   distinctions the epic requires; it is not deferred to a later phase.
 - Existing ingress-nginx users see no behavior change until they opt into
-  `backend: RavelNative` or add `exposure.gatewayAPI` themselves; they gain
+  `backend: RavelNative` or add `exposure.gatewayApi` themselves; they gain
   only the new `IngestAffinityBackendDeprecated` condition on their
   `RavelCluster` status.
 - Phase 5 (removal criteria and version boundary for the ingress-nginx
@@ -382,7 +382,7 @@ or the CRD version bumped.
   `ravel-affinity` gets property tests for determinism (same inputs, same
   output), ordering-independence (shuffled replica input, same result),
   and bounded reassignment on single add/remove (only tenants whose rank
-  crosses position `S` move); the CEL rejection of `exposure.gatewayAPI` +
+  crosses position `S` move); the CEL rejection of `exposure.gatewayApi` +
   legacy `backend` is proven by an envtest against the real API server (or
   a direct CEL-expression evaluation over the generated schema), since
   `x-kubernetes-validations` runs at admission and no reconcile-loop unit

@@ -19,7 +19,7 @@
 
   <!-- exposure box -->
   <path d="M 55 100 Q 52 97 58 97 L 300 95 Q 307 96 306 103 L 307 168 Q 306 174 300 173 L 59 175 Q 54 174 55 168 Z" fill="#eaf5f3" stroke="#0e7c86" stroke-width="2.2" stroke-linecap="round"/>
-  <text x="70" y="124" fill="#0e7c86">exposure.gatewayAPI</text>
+  <text x="70" y="124" fill="#0e7c86">exposure.gatewayApi</text>
   <text x="70" y="146" font-size="12" fill="#5b6472">hostnames, gatewayRef</text>
   <text x="70" y="163" font-size="12" fill="#5b6472">independent of affinity</text>
 
@@ -29,7 +29,7 @@
   <text x="346" y="146" font-size="12" fill="#5b6472">enabled, subsetSize, key</text>
   <text x="346" y="166" font-size="12" fill="#5b6472">backend: ingressNginx (default)</text>
   <text x="346" y="184" font-size="12" fill="#5b6472">        | ravelNative</text>
-  <text x="346" y="207" font-size="11" fill="#b3423a">CEL: gatewayAPI + legacy backend forbidden</text>
+  <text x="346" y="207" font-size="11" fill="#b3423a">CEL: gatewayApi + legacy backend forbidden</text>
 
   <!-- HTTPRoute / GRPCRoute -->
   <path d="M 70 300 Q 67 297 73 297 L 210 296 Q 217 297 216 303 L 217 348 Q 216 354 210 353 L 74 355 Q 68 354 69 348 Z" fill="#fff" stroke="#0e7c86" stroke-width="2" stroke-linecap="round"/>
