@@ -37,6 +37,11 @@ exporters:
     endpoint: http://ravel-server:4318
     auth:
       authenticator: bearertokenauth
+    # The exporter defaults to gzip. Ravel's OTLP HTTP ingest does not decode
+    # compressed bodies yet (#115), and rejects them with HTTP 400 "invalid
+    # OTLP payload". Without this, every export the collector sends is dropped
+    # and the quickstart's Grafana dashboard stays empty.
+    compression: none
 
 service:
   extensions: [bearertokenauth]
