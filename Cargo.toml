@@ -108,6 +108,7 @@ crc32c = "0.6"
 zstd = "0.13"
 lz4_flex = "0.14"
 snap = "1.1"
+flate2 = "1"
 
 # query
 promql-parser = "0.10"

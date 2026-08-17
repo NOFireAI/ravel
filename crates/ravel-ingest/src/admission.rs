@@ -225,6 +225,25 @@ impl TokenBucket {
             Err(i64::try_from(retry_after_ns).unwrap_or(i64::MAX))
         }
     }
+
+    /// Whether `amount` tokens are currently available, taking none. Refills
+    /// first (crediting elapsed time) exactly as [`Self::try_take`], so a peek
+    /// and an immediately following take at the same `now_ns` agree; on
+    /// insufficient tokens the error carries the same wait `try_take` reports.
+    fn peek(&mut self, amount: u64, now_ns: i64) -> Result<(), i64> {
+        self.refill(now_ns);
+        if self.tokens >= amount {
+            Ok(())
+        } else if self.rate_per_sec == 0 {
+            Err(i64::MAX)
+        } else {
+            let deficit = (amount - self.tokens) as u128;
+            let retry_after_ns = deficit
+                .saturating_mul(1_000_000_000)
+                .div_ceil(self.rate_per_sec as u128);
+            Err(i64::try_from(retry_after_ns).unwrap_or(i64::MAX))
+        }
+    }
 }
 
 /// Exact active-identity tracker over two rotating one-hour epochs
@@ -581,6 +600,42 @@ impl AdmissionController {
                         usage.bytes_admitted_total += request_bytes;
                         Ok(())
                     }
+                    Err(retry_after_ns) => {
+                        usage.requests_rejected_byte_rate_total += 1;
+                        Err(RequestRejection {
+                            reason: RequestRejectionReason::ByteRate,
+                            retry_after_ns,
+                        })
+                    }
+                },
+            }
+        })
+    }
+
+    /// Non-consuming pre-check of `request_bytes` against the tenant's ingest
+    /// byte-rate bucket, for the OTLP gzip path (ADR-0084 decision 4). The
+    /// compressed body length is a strict lower bound on the decompressed
+    /// length, so if even the compressed size exceeds the available tokens the
+    /// gateway rejects 429 before inflating anything; the real charge is then
+    /// made on the decompressed size via [`Self::check_byte_rate`].
+    ///
+    /// Unlike [`Self::check_byte_rate`] this takes no tokens and increments no
+    /// admitted counter on success; on rejection it records the same
+    /// `requests_rejected_byte_rate_total` a consuming rejection would, so a
+    /// pre-check 429 is attributed identically in `/metrics`.
+    pub fn peek_byte_rate(
+        &self,
+        tenant: &TenantId,
+        signal: Signal,
+        request_bytes: u64,
+        now_ns: i64,
+    ) -> Result<(), RequestRejection> {
+        self.with_tenant(tenant, now_ns, |state| {
+            let usage = state.usage.entry(signal).or_default();
+            match &mut state.byte_rate {
+                None => Ok(()),
+                Some(bucket) => match bucket.peek(request_bytes, now_ns) {
+                    Ok(()) => Ok(()),
                     Err(retry_after_ns) => {
                         usage.requests_rejected_byte_rate_total += 1;
                         Err(RequestRejection {

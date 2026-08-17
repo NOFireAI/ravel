@@ -195,6 +195,9 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         ),
         distrib: None,
         durable_auth: None,
+        ingest_byte_metrics: std::sync::Arc::new(
+            crate::ingest_byte_metrics::IngestByteMetrics::new(),
+        ),
     });
 
     Harness {

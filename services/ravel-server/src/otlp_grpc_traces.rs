@@ -56,16 +56,21 @@ impl TraceService for GrpcTraceService {
         // Layer 2 (ADR-0051 section 2): byte rate applies uniformly to every
         // signal including spans, even though spans get no layer-4 admission
         // (ADR-0051 excludes spans from series/stream admission). Counted by
-        // `WireByteCountLayer` on wire bytes, not the decoded message's
-        // encoded length.
-        let request_bytes = wire_request_bytes(&request)?;
-        if let Err(rejection) =
-            self.state
-                .admission
-                .check_byte_rate(&tenant, Signal::Spans, request_bytes, now_ns())
-        {
+        // `WireByteCountLayer` off the request body; a gzip-compressed frame is
+        // charged its decoded message size, not the compressed wire length
+        // (ADR-0084 decision 4).
+        let charge = wire_request_bytes(&request)?;
+        if let Err(rejection) = self.state.admission.check_byte_rate(
+            &tenant,
+            Signal::Spans,
+            charge.charge_bytes,
+            now_ns(),
+        ) {
             return Err(admission_rejection_status(rejection));
         }
+        self.state
+            .ingest_byte_metrics
+            .record_wire_bytes(&tenant, Signal::Spans, charge.wire_bytes);
 
         let idempotency_key = idempotency_key_from_headers(&headers);
 
