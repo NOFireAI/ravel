@@ -1326,7 +1326,7 @@ jobs:
           fi
           merge_base=$(git merge-base "$base" "${{ github.sha }}")
           changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
-          filter='^README\.md$|^deploy/docker-compose/|^deploy/otel/|^deploy/grafana/|^demo/|^scripts/check-readme-commands\.sh$|^scripts/check_readme_commands\.py$|^Dockerfile\.prebuilt$|^services/ravel-server/'
+          filter='^README\.md$|^deploy/docker-compose/|^deploy/otel/|^deploy/grafana/|^demo/|^scripts/check-readme-commands\.sh$|^scripts/check_readme_commands\.py$|^scripts/check-collector-delivery\.sh$|^Dockerfile\.prebuilt$|^services/ravel-server/'
           if echo "$changed" | grep -qE "$filter"; then
             echo "::notice::quickstart-relevant path changed, running the job"
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -1400,6 +1400,16 @@ jobs:
             --otlp-header 'Authorization="Bearer demo-token"' \
             --metric-type Gauge \
             --metrics 500
+      # Assert the collector is actually delivering, from its own counters
+      # (#209). telemetrygen supplies the series the README assertions query, so
+      # without this step a total collector failure is invisible to this job:
+      # that is exactly how a gzip rejection (#115) kept the quickstart's
+      # Grafana dashboard empty while CI stayed green. Runs BEFORE the README
+      # blocks so a delivery fault is reported as a delivery fault rather than
+      # as a confusing query failure downstream.
+      - name: Assert the collector is delivering to Ravel
+        if: steps.filter.outputs.run == 'true'
+        run: scripts/check-collector-delivery.sh
       # Waits for readiness (health, then a non-empty `gen` query), then runs
       # every marked README block and asserts its declared outcome.
       - name: Assert the README's marked command blocks
