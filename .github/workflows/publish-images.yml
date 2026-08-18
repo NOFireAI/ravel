@@ -120,17 +120,26 @@ jobs:
           echo "::error::timed out after $((max_attempts * interval))s waiting for a successful ci.yml run for $SHA (decision 9, fail closed)"
           exit 1
 
-  # ADR-0037 multi-arch amendment, decisions 12-15 and 17. Each (target,
-  # platform) pair builds on its own NATIVE runner and pushes by digest with no
-  # tag. Decision 12: QEMU-emulated rustc SIGSEGVs on this workspace, so
+  # ADR-0037 multi-arch amendment, decisions 12-15 and 17, as amended by
+  # ADR-0086 decision 9. The matrix is now ONE dimension, platform: each
+  # platform job builds on its own NATIVE runner and runs the three target
+  # builds sequentially on that runner, pushing each by digest with no tag.
+  # Decision 12: QEMU-emulated rustc SIGSEGVs on this workspace, so
   # cross-building the arm64 half on an amd64 runner would reintroduce the exact
   # failure this whole ADR routes around. A native runner per platform is a
   # correctness requirement, not a speed preference; there is deliberately no
   # QEMU setup step and no multi-platform `platforms:` list that would make one
   # runner build both.
+  #
+  # ADR-0086 decision 9: the three per-target builds share one builder stage,
+  # so the second and third invocations hit the first's LOCAL layer cache and
+  # the workspace compiles once per platform instead of three times. That local
+  # reuse is the whole point of collapsing the matrix, and it is why the target
+  # builds run sequentially in one job rather than in three parallel jobs that
+  # could never share a layer cache.
   build:
     needs: gate
-    timeout-minutes: 60
+    timeout-minutes: 90
     # Decision 17: a build job no longer signs anything, so it holds
     # packages: write to push by digest and DROPS id-token entirely. A build
     # job carrying a signing-capable token is exactly the least-privilege drift
@@ -142,7 +151,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [server, operator, ingest-router]
         platform: [linux/amd64, linux/arm64]
         # Decision 12: pair each platform with its native runner label so
         # runs-on resolves from the matrix. The label carries its Ubuntu
@@ -181,55 +189,138 @@ jobs:
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      # No cache-from/cache-to: type=gha. The builder stage's single
-      # COPY-then-build layer changes on every commit (ADR-0037 decision 4),
-      # so a GHA cache export here could never hit and would only spend the
-      # 10 GB per-repo budget shared with sccache/rust-cache in ci.yml.
+      # The three target builds below share the builder stage. No
+      # cache-from/cache-to: type=gha on any of them: the builder stage's single
+      # COPY-then-build layer changes on every commit (ADR-0037 decision 4), so
+      # a GHA cache export could never hit and would only spend the 10 GB
+      # per-repo budget shared with sccache/rust-cache in ci.yml. The reuse that
+      # matters here is buildx's LOCAL layer cache on this one runner: the
+      # server build compiles the workspace, and the operator and ingest-router
+      # builds that follow reuse that builder layer instead of recompiling.
       #
       # Decision 13: push by digest and NO tag. `push-by-digest=true` publishes
       # the single-platform manifest under its content digest with no tag ref;
       # the tags decision 3 defines are applied later, by the merge job, onto
       # the assembled manifest list. `name` is the target's canonical image
       # reference so the digest is pushed into the right repository.
-      - name: Build and push by digest
-        id: build
+      #
+      # Decision 15: SBOM and max-mode provenance stay on each PLATFORM build
+      # (not the merge). They attach per platform here and the merge's
+      # imagetools create carries the attestation manifests into the assembled
+      # index.
+      - name: Build and push ravel-server by digest
+        id: build-server
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
-          target: ${{ matrix.target }}
+          target: server
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-${{ matrix.target }},push-by-digest=true,name-canonical=true,push=true
-          # Decision 15: SBOM and max-mode provenance stay on each PLATFORM
-          # build (not the merge). They attach per platform here and the merge's
-          # imagetools create carries the attestation manifests into the
-          # assembled index.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-server,push-by-digest=true,name-canonical=true,push=true
           sbom: true
           provenance: mode=max
 
-      # Decision 13: the per-platform digest reaches the merge job as an
+      - name: Build and push ravel-operator by digest
+        id: build-operator
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          target: operator
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-operator,push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
+
+      - name: Build and push ravel-ingest-router by digest
+        id: build-ingest-router
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          target: ingest-router
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-ingest-router,push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
+
+      # Decision 13: each per-platform digest reaches the merge job as an
       # uploaded artifact, NOT as a job output. A matrix's job outputs collapse
-      # to a single last-writer-wins value, so a two-platform matrix routed
-      # through outputs would silently publish an index containing whichever
-      # build finished last. The digest travels as the artifact's filename (an
-      # empty marker file named by the digest's hex), so the merge job can
-      # reconstruct `<image>@sha256:<digest>` for each platform.
-      - name: Export digest
+      # to a single last-writer-wins value, so routing them through outputs
+      # would silently publish an index containing whichever build finished
+      # last. The digest travels as the artifact's filename (an empty marker
+      # file named by the digest's hex), one per-target directory so the three
+      # globs below never collide, so the merge job can reconstruct
+      # `<image>@sha256:<digest>` for each platform.
+      - name: Export digests
+        env:
+          SERVER_DIGEST: ${{ steps.build-server.outputs.digest }}
+          OPERATOR_DIGEST: ${{ steps.build-operator.outputs.digest }}
+          INGEST_ROUTER_DIGEST: ${{ steps.build-ingest-router.outputs.digest }}
         run: |
           set -euo pipefail
-          mkdir -p "${{ runner.temp }}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          for pair in "server:$SERVER_DIGEST" "operator:$OPERATOR_DIGEST" \
+                      "ingest-router:$INGEST_ROUTER_DIGEST"; do
+            target="${pair%%:*}"
+            digest="${pair#*:}"
+            mkdir -p "${{ runner.temp }}/digests/$target"
+            touch "${{ runner.temp }}/digests/$target/${digest#sha256:}"
+          done
 
       # Decision 14: the artifact name is scoped per target AND per platform
-      # (digest-server-linux-amd64). upload-artifact v4 rejects a duplicate
+      # (digest-server-linux-amd64), byte-identical to what the per-target merge
+      # jobs' `pattern: digest-<target>-*` expects, so collapsing the build
+      # matrix needs no change there. upload-artifact v4 rejects a duplicate
       # name, so a cross-target or cross-platform mix-up fails the run instead
       # of silently overwriting a digest and yielding a wrong index that still
       # passes the digest-equality check downstream.
-      - name: Upload digest
+      - name: Upload ravel-server digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: digest-${{ matrix.target }}-${{ env.PLATFORM_PAIR }}
-          path: ${{ runner.temp }}/digests/*
+          name: digest-server-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/server/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload ravel-operator digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-operator-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/operator/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload ravel-ingest-router digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-ingest-router-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/ingest-router/*
+          if-no-files-found: error
+          retention-days: 1
+
+      # ADR-0086 decision 3: export the non-runtime debug-symbols stage and
+      # upload the separated .debug files for task #248's release job to attach
+      # next to the stripped binaries. This build reuses the same builder layer
+      # the three image builds already compiled on this runner, so it recompiles
+      # nothing; type=local writes the stage's files to a directory.
+      #
+      # One builder stage produces all four binaries, so the debug-symbols stage
+      # carries all four .debug files and there is exactly ONE export per
+      # platform, not one per target. The artifact name is therefore
+      # debug-symbols-<platform> (per-platform-unique, so upload-artifact v4's
+      # duplicate-name guard still fails a cross-platform mix-up); a per-target
+      # name cannot fit a single export that holds four files across three
+      # targets (server alone carries ravel-server.debug and ravel-cli.debug).
+      - name: Export debug symbols
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          target: debug-symbols
+          platforms: ${{ matrix.platform }}
+          outputs: type=local,dest=${{ runner.temp }}/debug
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: debug-symbols-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/debug/*.debug
           if-no-files-found: error
           retention-days: 1
 
