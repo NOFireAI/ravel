@@ -4,6 +4,22 @@ All notable changes to Ravel are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Ravel aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5]
+
+Documentation only. No code changed since 0.9.4, so the binaries and images
+this release publishes are rebuilt from the same source.
+
+### Added
+
+- An interactive architecture explorer in the documentation.
+- A release badge in README.md, pointing at the latest release.
+
+### Changed
+
+- ADR-0086 records that its required-checks decision has been applied:
+  `supply-chain`, `docker-build`, `fuzz`, `object-store-contract`,
+  `promql-difftest` and `actionlint` now gate merges to `main`.
+
 ## [0.9.4]
 
 ### Added
