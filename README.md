@@ -56,8 +56,6 @@ Not there yet:
 
 - No downsampled tier. A wide-range query reads every raw hour ([#118](https://github.com/NOFireAI/ravel/issues/118)).
 - Flight SQL runs ad-hoc statements. Prepared statements return `unimplemented`.
-- Published images are `linux/amd64` only. On arm64 the quickstart runs them
-  under emulation ([#197](https://github.com/NOFireAI/ravel/issues/197)).
 
 The [SQL conformance table](docs/sql-conformance.md) and the PromQL conformance
 table in the [query engine spec](docs/query-engine.md) classify every construct
@@ -185,10 +183,10 @@ See the [Kubernetes guide](docs/guides/kubernetes.md).
 
 `ravel-server` and `ravel-operator` publish to the GitHub Container Registry on
 every `vX.Y.Z` release tag, built from the root `Dockerfile`
-(see [ADR-0037](docs/adrs/0037-container-image-ci-registry.md)). Only
-`linux/amd64` is published today ([#197](https://github.com/NOFireAI/ravel/issues/197)).
+(see [ADR-0037](docs/adrs/0037-container-image-ci-registry.md)). Both
+`linux/amd64` and `linux/arm64` are published.
 Each published object is an OCI image index that carries an SBOM and full build
-provenance. The quickstart pins `ghcr.io/nofireai/ravel-server:0.9.2`. Override
+provenance. The quickstart pins `ghcr.io/nofireai/ravel-server:0.9.3`. Override
 it with `RAVEL_IMAGE`.
 
 ```sh

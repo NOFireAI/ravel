@@ -26,7 +26,7 @@ This brings up, all from published images:
 - MinIO on `127.0.0.1:9000` (S3 API) and `127.0.0.1:9001` (console), plus a
   one-shot that creates the `ravel-dev` bucket and a one-shot that qualifies the
   store (ADR-0050 section 6) so `ravel-server` will start against it.
-- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.9.2` (override the pin
+- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.9.3` (override the pin
   with the `RAVEL_IMAGE` environment variable), listening on `127.0.0.1:4318`
   (HTTP/OTLP) and `127.0.0.1:4317` (gRPC/OTLP), with the tenant token
   `demo-token` mapped to tenant `demo-tenant`.

@@ -50,16 +50,7 @@ services:
   # already-qualified bucket it reports the existing record and exits 0, so this
   # tolerates a populated `minio-data/` across runs.
   qualify:
-    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.9.2}
-    # The published image is linux/amd64 only (ADR-0037). Without this, `docker
-    # compose up` on an Apple Silicon Mac fails with "no matching manifest for
-    # linux/arm64/v8" before anything starts, which is an opaque way to greet a
-    # reader running the first command in the README. Pinning the platform makes
-    # Docker run the amd64 image under emulation there; it is a no-op on an
-    # amd64 host, including CI. Emulated ingest is slower than native and is not
-    # the performance story Ravel wants a first-time reader to measure, so this
-    # is a usability floor, not the fix: publishing multi-arch images is #197.
-    platform: linux/amd64
+    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.9.3}
     depends_on:
       createbucket:
         condition: service_completed_successfully
@@ -81,9 +72,7 @@ services:
   # container boundary forbids, so the demo authenticates with a real bearer
   # token against a real tenant map, exactly as a deployment does.
   ravel-server:
-    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.9.2}
-    # linux/amd64 only; see the note on the qualify service above; tracked in #197.
-    platform: linux/amd64
+    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.9.3}
     depends_on:
       qualify:
         condition: service_completed_successfully
