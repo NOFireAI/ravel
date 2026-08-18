@@ -64,10 +64,10 @@ flowchart LR
   T["push tag vX.Y.Z"] --> G["gate<br/>CI green for SHA<br/>version == tag"]
   G --> B["build (per PLATFORM)<br/>3 targets on one runner<br/>shared builder layer<br/>push by digest"]
   B -.->|"digest-target-platform"| M
-  B -.->|"debug-target-platform"| R
+  B -.->|"debug-symbols-platform"| R
   M["merge (per target)<br/>imagetools create<br/>cosign sign index"] --> R["release<br/>contents+id-token only"]
   R --> E["cosign verify tag<br/>resolve platform digest<br/>docker create + cp"]
-  E --> A["upload binaries UNMODIFIED<br/>plus .debug artifacts"]
+  E --> A["upload binaries UNMODIFIED<br/>plus one symbols tar.gz per platform"]
   A --> C["SHA256SUMS<br/>cosign sign-blob"]
   C --> P["gh release create<br/>notes + assets"]
   style R fill:#2d6a9f,color:#fff
@@ -191,7 +191,7 @@ flowchart TD
   O1 --> O2["objcopy --strip-debug<br/>--add-gnu-debuglink=bin.debug"]
   O2 --> RT["runtime images<br/>stripped + debuglink"]
   O1 --> DS["FROM scratch AS debug-symbols"]
-  DS --> AR["workflow artifact<br/>debug-target-platform"]
+  DS --> AR["workflow artifact<br/>debug-symbols-platform"]
   RT --> REG["GHCR signed index"]
   REG --> EX["release job extracts<br/>UNMODIFIED"]
   AR --> UP["release assets"]
