@@ -41,6 +41,11 @@ delete the entire stateful tier. Ravel's job is to make that a good trade.
 Also live:
 
 - A Prometheus-compatible HTTP API, so existing Grafana dashboards work.
+  `/api/v1/metadata` returns real per-metric type, help, and unit for metrics
+  ingested after ADR-0085, and OTLP metric names get the standard
+  Prometheus-style unit and `_total` suffixes at ingest (a monotonic `foo` with
+  `unit: "By"` lands as `foo_bytes_total`), so the same metric matches whether
+  it arrives over OTLP or through a collector's Prometheus exporter.
 - Exemplars that link a metric sample to its trace.
 - Alerting that stores every rule transition as immutable, queryable data.
 - An analytics endpoint for change point detection and summary statistics.
