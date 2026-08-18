@@ -63,7 +63,7 @@ futures = { workspace = true, optional = true }
 # ravel-sql is an internal path crate not yet listed in the workspace
 # `[workspace.dependencies]`, so it is named by path here; every other dep
 # below reuses a workspace pin.
-ravel-sql = { path = "../ravel-sql", version = "0.9.3", optional = true, features = ["flight-sql"] }
+ravel-sql = { path = "../ravel-sql", version = "0.9.4", optional = true, features = ["flight-sql"] }
 arrow-flight = { workspace = true, optional = true }
 
 [features]

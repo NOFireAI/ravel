@@ -4,6 +4,32 @@ All notable changes to Ravel are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Ravel aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4]
+
+### Added
+
+- GitHub Releases are published for every `vX.Y.Z` tag, carrying per-architecture
+  binaries for `ravel-server`, `ravel-cli`, `ravel-operator` and
+  `ravel-ingest-router`, separated debug symbols, a `SHA256SUMS` file, and a
+  keyless cosign signature over it. The binaries are extracted from the
+  published images rather than rebuilt, so each is byte-identical to the one
+  inside the signed image.
+- CI lints workflow files with actionlint and shellcheck, and fails if
+  shellcheck is not genuinely available rather than silently checking less.
+- CI fails when a path dependency's version drifts from
+  `[workspace.package] version`.
+
+### Changed
+
+- Container images are roughly a quarter of their previous size. The builder
+  now separates debug info with `objcopy` and ships stripped binaries carrying
+  a `.gnu_debuglink`, so the `ravel-server` image drops from 923 MB to 209 MB.
+  Symbols are published with each release. `[profile.release] debug = 1` is
+  unchanged.
+- A release compiles the workspace twice instead of six times. The publish
+  matrix is now one job per platform, building all three image targets against
+  a shared builder layer.
+
 ## [0.9.3]
 
 ### Added
