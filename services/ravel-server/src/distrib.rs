@@ -172,6 +172,22 @@ pub struct FragmentMetrics {
     slice_fetch_micros_buckets: [AtomicU64; LATENCY_BUCKET_COUNT],
     /// Sum of per-slice fetch latencies, in nanoseconds, for the `_sum` series.
     slice_fetch_nanos_total: AtomicU64,
+    /// Dead-endpoint quarantine events (ADR-0071 amendment, decision 3): a
+    /// fragment endpoint whose dispatch was classified re-dispatchable
+    /// (transport loss or an `Unavailable` summary) was recorded in the
+    /// coordinator's quarantine map. Counted once per marking dispatch, so a
+    /// re-mark after a readmitted-but-still-dead endpoint fails again counts
+    /// again.
+    quarantine_marks_total: AtomicU64,
+    /// Quarantine readmit events (ADR-0071 amendment, decision 3): a
+    /// quarantined endpoint published a strictly newer heartbeat stamp than the
+    /// one recorded at mark time, so its entry was cleared and it is ranked
+    /// again on this dispatch. The worker's own heartbeat is the half-open
+    /// probe.
+    quarantine_readmits_total: AtomicU64,
+    /// Endpoints currently held in the coordinator's quarantine map (gauge).
+    /// Kept in step with the map's length after every mark, readmit, and prune.
+    quarantine_current: AtomicU64,
 }
 
 impl Default for FragmentMetrics {
@@ -187,6 +203,9 @@ impl Default for FragmentMetrics {
             slices_fallback_total: AtomicU64::new(0),
             slice_fetch_micros_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             slice_fetch_nanos_total: AtomicU64::new(0),
+            quarantine_marks_total: AtomicU64::new(0),
+            quarantine_readmits_total: AtomicU64::new(0),
+            quarantine_current: AtomicU64::new(0),
         }
     }
 }
@@ -238,6 +257,25 @@ impl FragmentMetrics {
 
     fn record_slice_fallback(&self) {
         self.slices_fallback_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one dead-endpoint quarantine mark (ADR-0071 amendment, decision
+    /// 3): a marking dispatch just recorded an endpoint into the quarantine map.
+    fn record_quarantine_mark(&self) {
+        self.quarantine_marks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one quarantine readmit (ADR-0071 amendment, decision 3): a
+    /// strictly newer heartbeat stamp cleared an endpoint's quarantine entry.
+    fn record_quarantine_readmit(&self) {
+        self.quarantine_readmits_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publish the current quarantine-map size as the gauge, called by the
+    /// coordinator under its map lock after every mark, readmit, and prune.
+    fn set_quarantine_current(&self, current: u64) {
+        self.quarantine_current.store(current, Ordering::Relaxed);
     }
 
     /// Record one completed slice fetch's latency into the histogram.
@@ -297,6 +335,21 @@ impl FragmentMetrics {
 
     pub fn slice_fetch_nanos_total(&self) -> u64 {
         self.slice_fetch_nanos_total.load(Ordering::Relaxed)
+    }
+
+    /// Total dead-endpoint quarantine marks (ADR-0071 amendment, decision 3).
+    pub fn quarantine_marks_total(&self) -> u64 {
+        self.quarantine_marks_total.load(Ordering::Relaxed)
+    }
+
+    /// Total quarantine readmits (ADR-0071 amendment, decision 3).
+    pub fn quarantine_readmits_total(&self) -> u64 {
+        self.quarantine_readmits_total.load(Ordering::Relaxed)
+    }
+
+    /// Endpoints currently quarantined (gauge; ADR-0071 amendment, decision 3).
+    pub fn quarantine_current(&self) -> u64 {
+        self.quarantine_current.load(Ordering::Relaxed)
     }
 }
 
@@ -996,6 +1049,17 @@ pub struct RoutingSliceFetcher {
     /// Cached `tonic` channels, keyed by endpoint (a channel is cheap to clone
     /// but expensive to reconnect).
     channels: Mutex<HashMap<String, Channel>>,
+    /// Dead-endpoint quarantine (ADR-0071 amendment, decision 3): a map from a
+    /// fragment endpoint to the worker's `started_unix_ns` heartbeat stamp as
+    /// seen in the live view at the moment its dispatch was classified
+    /// re-dispatchable. Coordinator-local soft state, in memory only, no durable
+    /// backing. `ranked_owners` drops a candidate that is present here and whose
+    /// current live-view stamp is no newer than the recorded one, so the
+    /// coordinator stops re-paying `REMOTE_CONNECT_TIMEOUT` to a dead worker for
+    /// the up-to-4-heartbeat-interval window it stays ranked after death. A
+    /// strictly newer stamp (the worker's own next heartbeat, the half-open
+    /// probe) readmits it; an endpoint absent from the live view is pruned.
+    quarantine: Mutex<HashMap<String, i64>>,
     /// The client TLS configuration for dialing a remote worker's dedicated
     /// fragment listener (ADR-0071 amendment decision 1). `Some` when this
     /// process runs a `--fragment-listener` (workers advertise that TLS address
@@ -1021,6 +1085,7 @@ impl RoutingSliceFetcher {
             fragment_keys,
             local,
             channels: Mutex::new(HashMap::new()),
+            quarantine: Mutex::new(HashMap::new()),
             // Plaintext dial by default (the pre-amendment layout). A coordinator
             // running a dedicated fragment listener enables TLS via
             // `with_client_tls`.
@@ -1068,6 +1133,73 @@ impl RoutingSliceFetcher {
         Some(codec::mint_capability(key, &claims))
     }
 
+    /// The `started_unix_ns` heartbeat stamp `endpoint` currently carries in the
+    /// live view, or `None` if it is absent (aged out or never seen). Used at
+    /// mark time to record the stamp a later heartbeat must strictly exceed to
+    /// readmit the endpoint (ADR-0071 amendment, decision 3).
+    fn live_stamp(&self, endpoint: &str) -> Option<i64> {
+        let live = Arc::clone(&self.live_workers.read());
+        live.iter()
+            .find(|record| record.fragment_endpoint == endpoint)
+            .map(|record| record.started_unix_ns)
+    }
+
+    /// Record `endpoint` into the quarantine map at its current live-view stamp
+    /// (ADR-0071 amendment, decision 3, Mark). Called at the point `dispatch`
+    /// classifies a remote attempt as [`Attempt::Retry`]; it invents no new
+    /// failure detection, it reuses that classification. An endpoint already
+    /// absent from the live view is never ranked again, so there is nothing to
+    /// quarantine and the mark is skipped.
+    fn mark_quarantine(&self, endpoint: &str) {
+        let Some(stamp) = self.live_stamp(endpoint) else {
+            return;
+        };
+        let mut quarantine = self.quarantine.lock();
+        quarantine.insert(endpoint.to_string(), stamp);
+        self.metrics.set_quarantine_current(quarantine.len() as u64);
+        self.metrics.record_quarantine_mark();
+    }
+
+    /// Whether a quarantined `endpoint` at its current live-view `stamp` must be
+    /// skipped by `ranked_owners` (ADR-0071 amendment, decision 3, Skip and
+    /// Readmit). It is skipped while its stamp is no newer than the one recorded
+    /// at mark time. A strictly newer stamp is first-hand evidence of life (only
+    /// the worker writes its own record), so it clears the entry, counts a
+    /// readmit, and the endpoint is ranked again. An endpoint not in the map is
+    /// never skipped.
+    fn quarantine_skips(&self, endpoint: &str, stamp: i64) -> bool {
+        let mut quarantine = self.quarantine.lock();
+        match quarantine.get(endpoint).copied() {
+            Some(marked) if stamp > marked => {
+                quarantine.remove(endpoint);
+                self.metrics.set_quarantine_current(quarantine.len() as u64);
+                self.metrics.record_quarantine_readmit();
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Drop quarantine entries whose endpoint is absent from `live` (ADR-0071
+    /// amendment, decision 3, Prune). Such endpoints are never ranked anyway, so
+    /// this only bounds the map by the historical worker-set size; it is not a
+    /// readmit and is not counted as one.
+    fn prune_quarantine(&self, live: &[QueryWorkerRecord]) {
+        let mut quarantine = self.quarantine.lock();
+        if quarantine.is_empty() {
+            return;
+        }
+        let before = quarantine.len();
+        quarantine.retain(|endpoint, _| {
+            live.iter()
+                .any(|record| &record.fragment_endpoint == endpoint)
+        });
+        if quarantine.len() != before {
+            self.metrics.set_quarantine_current(quarantine.len() as u64);
+        }
+    }
+
     /// Rendezvous-rank the live worker set for a slice, top owner first.
     ///
     /// Only workers whose `protocol_version` equals the coordinator's are
@@ -1086,6 +1218,10 @@ impl RoutingSliceFetcher {
             return Vec::new();
         };
         let live = Arc::clone(&self.live_workers.read());
+        // Opportunistic prune: drop quarantine entries for endpoints no longer
+        // in the live view, bounding the map by the historical worker set
+        // (ADR-0071 amendment, decision 3, Prune).
+        self.prune_quarantine(&live);
         // Version-matched records with a parseable process id, paired with the
         // id so ranking and endpoint lookup share one filtered view.
         let candidates: Vec<(Uuid, &QueryWorkerRecord)> = live
@@ -1107,7 +1243,15 @@ impl RoutingSliceFetcher {
             if Some(owner) == self_id {
                 ranked.push(Owner::SelfLocal);
             } else if let Some((_, record)) = candidates.iter().find(|(id, _)| *id == owner) {
-                ranked.push(Owner::Remote(record.fragment_endpoint.clone()));
+                // Skip a quarantined dead endpoint whose heartbeat stamp has not
+                // advanced past the one recorded at its failure, so routing falls
+                // through to the next rendezvous owner or SelfLocal without
+                // re-paying its connect timeout (ADR-0071 amendment, decision 3,
+                // Skip). A strictly newer stamp readmits it inside
+                // `quarantine_skips`.
+                if !self.quarantine_skips(&record.fragment_endpoint, record.started_unix_ns) {
+                    ranked.push(Owner::Remote(record.fragment_endpoint.clone()));
+                }
             }
             ids.retain(|id| *id != owner);
         }
@@ -1275,7 +1419,11 @@ impl RoutingSliceFetcher {
                 self.metrics.record_slice_remote();
                 return (*result, primary, false);
             }
-            Attempt::Retry => {}
+            // The primary failed re-dispatchably: quarantine it at its current
+            // live-view stamp so later queries route past it without re-paying
+            // the connect timeout (ADR-0071 amendment, decision 3, Mark). This
+            // reuses the existing classification, adding no new failure signal.
+            Attempt::Retry => self.mark_quarantine(&primary),
         }
 
         // The primary was lost or Unavailable. Re-dispatch EXACTLY once to the
@@ -1289,9 +1437,14 @@ impl RoutingSliceFetcher {
             && *next != primary
         {
             self.metrics.record_slice_redispatched();
-            if let Attempt::Keep(result) = self.try_remote(next, &request).await {
-                self.metrics.record_slice_remote();
-                return (*result, next.clone(), false);
+            match self.try_remote(next, &request).await {
+                Attempt::Keep(result) => {
+                    self.metrics.record_slice_remote();
+                    return (*result, next.clone(), false);
+                }
+                // The re-dispatch target also failed re-dispatchably: quarantine
+                // it too, so a subsequent query skips both corpses.
+                Attempt::Retry => self.mark_quarantine(next),
             }
         }
 
@@ -2140,6 +2293,230 @@ mod tests {
             metrics.slices_local_total(),
             local_before + 1,
             "the slice now runs locally"
+        );
+    }
+
+    /// Dead-endpoint quarantine (ADR-0071 amendment, decision 3), driven end to
+    /// end through the production routing path (`fetch` -> `ranked_owners` ->
+    /// `dispatch`), not through a unit call on the map:
+    ///
+    /// 1. The first query to a slice that rendezvous-maps to an unreachable
+    ///    endpoint dispatches, fails at transport, falls back local, and marks
+    ///    the endpoint quarantined at its live-view stamp.
+    /// 2. The second query to the same slice routes local with ZERO dial to that
+    ///    endpoint (asserted as the absence of a remote attempt / fallback, the
+    ///    whole point of the feature), because `ranked_owners` skips the
+    ///    quarantined endpoint.
+    /// 3. A strictly newer heartbeat stamp readmits the endpoint: the next query
+    ///    ranks it again and dials it (falling back once more, since it is still
+    ///    unreachable in this test).
+    /// 4. The mark/readmit metrics move exactly as those steps imply.
+    ///
+    /// To watch step 2 fail against the pre-change behavior, flip
+    /// `quarantine_skips`'s `Some(_) => true` arm to `Some(_) => false`: the
+    /// endpoint is then never skipped, so the second query re-dials and pays the
+    /// connect timeout again (`slices_fallback_total` increments, no local run),
+    /// and the step-2 assertions below fail.
+    #[tokio::test]
+    async fn quarantine_skips_dead_endpoint_then_readmits_on_fresh_stamp() {
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = test_service(metrics.clone());
+        let self_id = uuid::Uuid::from_u128(1);
+        let other_id = uuid::Uuid::from_u128(2);
+        let dead_endpoint = "192.0.2.1:9";
+        let self_cell = Arc::new(OnceLock::new());
+        self_cell.set(self_id).expect("set self id");
+        // Self plus one unreachable remote worker, both version-matched. The
+        // remote's fragment endpoint is a reserved-for-docs TEST-NET address that
+        // never accepts a connection, so any slice mapped to it fails at
+        // transport (bounded by REMOTE_CONNECT_TIMEOUT).
+        let self_record = QueryWorkerRecord {
+            process_id: self_id.to_string(),
+            fragment_endpoint: "127.0.0.1:1".to_string(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        };
+        let live: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>> = Arc::new(RwLock::new(Arc::new(vec![
+            self_record.clone(),
+            QueryWorkerRecord {
+                process_id: other_id.to_string(),
+                fragment_endpoint: dead_endpoint.to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 0,
+            },
+        ])));
+        let fetcher = RoutingSliceFetcher::new(
+            self_cell,
+            live.clone(),
+            test_keys(),
+            service,
+            metrics.clone(),
+        );
+
+        // Step 1: find a tenant whose unit maps to the dead remote (proven by a
+        // transport fallback) and, in the same query, quarantine it. We break on
+        // the first fallback, so exactly one endpoint is marked.
+        let mut mapped_to_dead: Option<[u8; 16]> = None;
+        for i in 0..256u128 {
+            let tenant = uuid::Uuid::from_u128(i).into_bytes();
+            let before = metrics.slices_fallback_total();
+            fetcher
+                .fetch(pinned_request(tenant, &[0]))
+                .await
+                .expect("fetch resolves via local fallback");
+            if metrics.slices_fallback_total() > before {
+                mapped_to_dead = Some(tenant);
+                break;
+            }
+        }
+        let tenant = mapped_to_dead.expect("some unit maps to the dead remote worker");
+        assert_eq!(
+            metrics.quarantine_marks_total(),
+            1,
+            "the failed dispatch marked exactly one endpoint"
+        );
+        assert_eq!(
+            metrics.quarantine_current(),
+            1,
+            "one endpoint is currently quarantined"
+        );
+        assert_eq!(metrics.quarantine_readmits_total(), 0);
+
+        // Step 2: a second query to the SAME slice must route local with no dial
+        // to the dead endpoint. Absence of a dial is the property under test, so
+        // assert no remote attempt and no fallback occurred, only a local run.
+        let fallback_before = metrics.slices_fallback_total();
+        let remote_before = metrics.slices_remote_total();
+        let local_before = metrics.slices_local_total();
+        fetcher
+            .fetch(pinned_request(tenant, &[0]))
+            .await
+            .expect("second query resolves");
+        assert_eq!(
+            metrics.slices_fallback_total(),
+            fallback_before,
+            "the quarantined endpoint is not dialed, so no fallback is paid"
+        );
+        assert_eq!(
+            metrics.slices_remote_total(),
+            remote_before,
+            "no remote attempt is made to the quarantined endpoint"
+        );
+        assert_eq!(
+            metrics.slices_local_total(),
+            local_before + 1,
+            "the slice routes local instead"
+        );
+        assert_eq!(
+            metrics.quarantine_marks_total(),
+            1,
+            "no re-mark: the skip happens before any dispatch"
+        );
+        assert_eq!(metrics.quarantine_readmits_total(), 0);
+
+        // Step 3: advance the live view with a strictly newer started_unix_ns for
+        // the dead endpoint. The next query readmits and ranks it again, so it is
+        // dialed once more (and falls back, since it is still unreachable here).
+        *live.write() = Arc::new(vec![
+            self_record,
+            QueryWorkerRecord {
+                process_id: other_id.to_string(),
+                fragment_endpoint: dead_endpoint.to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 1_000,
+            },
+        ]);
+        let fallback_before = metrics.slices_fallback_total();
+        fetcher
+            .fetch(pinned_request(tenant, &[0]))
+            .await
+            .expect("query after readmission resolves");
+        assert_eq!(
+            metrics.quarantine_readmits_total(),
+            1,
+            "the strictly newer heartbeat stamp readmitted the endpoint"
+        );
+        assert_eq!(
+            metrics.slices_fallback_total(),
+            fallback_before + 1,
+            "the readmitted endpoint is ranked again and dialed (then falls back)"
+        );
+        assert_eq!(
+            metrics.quarantine_marks_total(),
+            2,
+            "still unreachable, so the readmitted endpoint is re-quarantined"
+        );
+        assert_eq!(
+            metrics.quarantine_current(),
+            1,
+            "re-quarantined at the newer stamp"
+        );
+    }
+
+    /// Prune (ADR-0071 amendment, decision 3): a quarantined endpoint that
+    /// leaves the live view entirely is dropped from the map opportunistically
+    /// on the next ranking pass, bounding the map by the historical worker set.
+    /// Such an endpoint is never ranked anyway, so this is not counted as a
+    /// readmit.
+    #[tokio::test]
+    async fn quarantine_prunes_endpoint_absent_from_live_view() {
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = test_service(metrics.clone());
+        let self_id = uuid::Uuid::from_u128(1);
+        let other_id = uuid::Uuid::from_u128(2);
+        let dead_endpoint = "192.0.2.1:9";
+        let self_cell = Arc::new(OnceLock::new());
+        self_cell.set(self_id).expect("set self id");
+        let self_record = QueryWorkerRecord {
+            process_id: self_id.to_string(),
+            fragment_endpoint: "127.0.0.1:1".to_string(),
+            protocol_version: codec::PROTOCOL_VERSION,
+            started_unix_ns: 0,
+        };
+        let live: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>> = Arc::new(RwLock::new(Arc::new(vec![
+            self_record.clone(),
+            QueryWorkerRecord {
+                process_id: other_id.to_string(),
+                fragment_endpoint: dead_endpoint.to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 0,
+            },
+        ])));
+        let fetcher = RoutingSliceFetcher::new(
+            self_cell,
+            live.clone(),
+            test_keys(),
+            service,
+            metrics.clone(),
+        );
+
+        // Quarantine the dead endpoint (a query whose unit maps to it falls back).
+        for i in 0..256u128 {
+            let tenant = uuid::Uuid::from_u128(i).into_bytes();
+            let before = metrics.slices_fallback_total();
+            fetcher
+                .fetch(pinned_request(tenant, &[0]))
+                .await
+                .expect("fetch");
+            if metrics.slices_fallback_total() > before {
+                break;
+            }
+        }
+        assert_eq!(metrics.quarantine_current(), 1, "endpoint quarantined");
+
+        // The worker leaves the live set entirely (aged out). The next ranking
+        // pass prunes its stale quarantine entry, and no readmit is counted.
+        *live.write() = Arc::new(vec![self_record]);
+        let _ = fetcher.ranked_owners(&pinned_request([0u8; 16], &[0]));
+        assert_eq!(
+            metrics.quarantine_current(),
+            0,
+            "the absent endpoint's quarantine entry is pruned"
+        );
+        assert_eq!(
+            metrics.quarantine_readmits_total(),
+            0,
+            "a prune is not a readmit"
         );
     }
 
