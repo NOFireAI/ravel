@@ -181,8 +181,9 @@ See the [Kubernetes guide](docs/guides/kubernetes.md).
 
 ## Container images
 
-`ravel-server` and `ravel-operator` publish to the GitHub Container Registry on
-every `vX.Y.Z` release tag, built from the root `Dockerfile`
+`ravel-server`, `ravel-operator`, and `ravel-ingest-router` publish to the
+GitHub Container Registry on every `vX.Y.Z` release tag, built from the root
+`Dockerfile`
 (see [ADR-0037](docs/adrs/0037-container-image-ci-registry.md)). Both
 `linux/amd64` and `linux/arm64` are published.
 Each published object is an OCI image index that carries an SBOM and full build
@@ -192,6 +193,7 @@ it with `RAVEL_IMAGE`.
 ```sh
 docker pull ghcr.io/nofireai/ravel-server:latest
 docker pull ghcr.io/nofireai/ravel-operator:latest
+docker pull ghcr.io/nofireai/ravel-ingest-router:latest
 ```
 
 `X.Y.Z` is write-once. A bad release is superseded by a new patch release, never
@@ -204,8 +206,8 @@ an immutable reference.
 Every published index digest is signed with
 [cosign](https://github.com/sigstore/cosign) in keyless mode. The signing
 certificate binds the signature to the release workflow's identity, so you can
-verify a pull without a pre-shared key. Releases are cut from the public mirror
-`NOFireAI/ravel`, so that is the identity in the certificate:
+verify a pull without a pre-shared key. Releases are cut from this repository,
+so that is the identity in the certificate:
 
 ```sh
 cosign verify \
