@@ -167,8 +167,9 @@ async fn federated_series_under_request_budget_succeeds() {
         result.is_ok(),
         "an under-budget federated query must not be rejected: {result:?}"
     );
+    let (series, _coverage) = result.expect("checked is_ok above");
     assert!(
-        result.expect("checked is_ok above").is_empty(),
+        series.is_empty(),
         "the remote and the empty local tenant both report zero series"
     );
 }

@@ -476,7 +476,7 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
 
     let run_query = || async {
         let start = std::time::Instant::now();
-        let value = engine
+        let (value, _coverage) = engine
             .instant(
                 tenant_hash,
                 &w.query,

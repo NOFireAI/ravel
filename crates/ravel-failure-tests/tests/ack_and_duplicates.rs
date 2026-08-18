@@ -110,19 +110,18 @@ async fn ack_lost_after_commit_then_client_retry_dedups_to_one_value() {
     )
     .expect("catalog");
     let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
-    let result = expect_vector(
-        engine
-            .instant(
-                tid.hash(),
-                "requests_total",
-                event_ts / 1_000_000,
-                &[],
-                clock.now(),
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("query"),
-    );
+    let (value, _coverage) = engine
+        .instant(
+            tid.hash(),
+            "requests_total",
+            event_ts / 1_000_000,
+            &[],
+            clock.now(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("query");
+    let result = expect_vector(value);
     assert_eq!(
         result.len(),
         1,
@@ -224,19 +223,18 @@ async fn duplicate_otlp_delivery_normalized_twice_does_not_double_count() {
     )
     .expect("catalog");
     let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
-    let result = expect_vector(
-        engine
-            .instant(
-                tid.hash(),
-                "otlp_gauge",
-                event_ts / 1_000_000,
-                &[],
-                clock.now(),
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("query"),
-    );
+    let (value, _coverage) = engine
+        .instant(
+            tid.hash(),
+            "otlp_gauge",
+            event_ts / 1_000_000,
+            &[],
+            clock.now(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("query");
+    let result = expect_vector(value);
     assert_eq!(result.len(), 1, "one series, not two, despite two ingests");
     assert_eq!(result[0].value, 7.0);
 }

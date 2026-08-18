@@ -838,7 +838,7 @@ impl AlertEvaluator {
     async fn run_query(&self, rule: &Rule, now_ns: i64) -> anyhow::Result<QueryResultSummary> {
         match &rule.query {
             RuleQuery::Promql(text) => {
-                let value = self
+                let (value, coverage) = self
                     .engines
                     .promql
                     .instant(
@@ -850,6 +850,28 @@ impl AlertEvaluator {
                         self.query_deadline,
                     )
                     .await?;
+                // A rule refuses to evaluate over partial federated coverage
+                // (ADR-0071 "partial results are consent-gated and
+                // envelope-visible" amendment, decision 5; "federation TLS by
+                // default, engine-direct caller honesty" amendment, decision 2).
+                // Returning an error here takes the existing per-rule failure
+                // path in `run_tick`: the failure is logged, `rules_failed` is
+                // incremented, prior alert state is kept unchanged, no transition
+                // record is written, and the next tick retries. Evaluating anyway
+                // could produce a false resolve when the firing series lived on
+                // the remote that just went unreachable, which is confident
+                // silence during an outage. Only rules whose query federates
+                // across a `skip_unavailable` remote can reach this path;
+                // intra-cluster execution never returns partial coverage. The
+                // skipped clusters are operator-facing names only, redacted
+                // exactly as the response warnings are.
+                if coverage.is_partial() {
+                    anyhow::bail!(
+                        "query evaluated over partial federated coverage; skipped cluster(s): \
+                         {}; refusing to evaluate the rule, prior state kept and retried next tick",
+                        coverage.skipped().join(", ")
+                    );
+                }
                 promql_summary(value)
             }
             RuleQuery::Sql(text) => self.run_sql(text, now_ns).await,
@@ -2115,5 +2137,183 @@ mod tick_tests {
             report.repeats_queued, 1,
             "at the 60s default cadence a repeat is due"
         );
+    }
+
+    /// An address bound then immediately released: a connection to it is refused,
+    /// so a federated remote pointed here is unavailable at query time. Mirrors
+    /// `tests/federation_handler_warnings.rs`'s helper.
+    async fn dead_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead");
+        let addr = listener.local_addr().expect("dead local addr");
+        drop(listener);
+        addr.to_string()
+    }
+
+    /// An evaluator whose PromQL engine federates across one unavailable remote
+    /// with `skip_unavailable = true`, dialed by the production
+    /// `FederationSliceFetcher` exactly as `--remote-cluster` wires it. Every
+    /// rule query over it resolves to partial coverage.
+    async fn federated_evaluator(
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+    ) -> AlertEvaluator {
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let remote = crate::config::RemoteClusterConfig {
+            name: "eu-west".to_string(),
+            endpoint: dead_endpoint().await,
+            credential: "operator-cred".to_string(),
+            tls: false,
+            tls_ca_file: None,
+            skip_unavailable: true,
+            soft_timeout: Duration::from_secs(3),
+        };
+        let fetcher = crate::distrib::FederationSliceFetcher::connect(&remote)
+            .expect("federation client connects lazily");
+        let federation =
+            ravel_query::distrib::Federation::new(vec![ravel_query::distrib::RemoteCluster {
+                name: "eu-west".to_string(),
+                fetcher: Arc::new(fetcher),
+                skip_unavailable: true,
+                soft_timeout: Duration::from_secs(3),
+            }]);
+        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default())
+            .with_federation(Arc::new(federation));
+        let config = AlertEvalConfig {
+            enabled: true,
+            ..AlertEvalConfig::default()
+        };
+        AlertEvaluator::new(
+            store,
+            AlertQueryEngines {
+                promql: Arc::new(engine),
+                #[cfg(feature = "sql")]
+                sql: None,
+            },
+            clock,
+            TenantId::new(TENANT).hash(),
+            vec![threshold_rule()],
+            &config,
+        )
+        .expect("build federated evaluator")
+    }
+
+    /// A real alert-evaluator tick over a rule whose PromQL query federates
+    /// across a `skip_unavailable` remote that is unavailable must refuse to
+    /// evaluate the rule (ADR-0071 "partial results are consent-gated and
+    /// envelope-visible" amendment, decision 5): it takes the per-rule failure
+    /// path, so no transition record is written, `rules_failed` increments, and
+    /// the prior alert state (firing or resolved) is frozen for the next tick to
+    /// retry. Driven end to end through `run_tick`, not `run_query` in isolation,
+    /// so it proves the refusal is reachable from the production alerting loop.
+    ///
+    /// Flip-line proof (prove-the-test): delete the `if coverage.is_partial()`
+    /// refusal block in `run_query` (i.e. let `run_query` ignore coverage as the
+    /// pre-change code did). The firing block then sees `rules_failed == 0`
+    /// (the rule evaluates normally, condition still met, no transition), and the
+    /// resolved block writes a false re-fire transition record from partial data
+    /// (`records_written == 1`), so both `rules_failed`/`records_written`
+    /// assertions fail.
+    #[tokio::test]
+    async fn partial_coverage_freezes_rule_state() {
+        let tenant = TenantId::new(TENANT).hash();
+
+        // --- A firing rule stays firing under partial coverage ---
+        {
+            let store = seeded_store().await;
+            let clock = TestClock::at(NOW_NS);
+
+            // Seed a durable Firing record with a healthy (non-federated)
+            // evaluator: the seeded sample is 1.0, above the 0.9 threshold, so the
+            // first tick fires.
+            let mut healthy = evaluator(Arc::clone(&store), Arc::clone(&clock));
+            assert_eq!(healthy.run_tick().await.records_written, 1, "onset fires");
+            let before = read_alert_records(store.as_ref(), tenant).await;
+            assert_eq!(before.len(), 1);
+            assert_eq!(before[0].state, AlertState::Firing);
+
+            // Clear the seeding replica's lease so the fresh federated replica can
+            // acquire it and actually evaluate (a lease held by a live peer would
+            // otherwise skip evaluation, masking the behavior under test).
+            store
+                .delete(&alert_lease_key(&tenant))
+                .await
+                .expect("clear the seeding replica's lease");
+
+            // A federated tick at the same instant: coverage is partial, so the
+            // rule refuses to evaluate. Prior firing state is frozen.
+            let mut fed = federated_evaluator(Arc::clone(&store), Arc::clone(&clock)).await;
+            let report = fed.run_tick().await;
+            assert_eq!(
+                report.rules_failed, 1,
+                "partial coverage is a failed evaluation"
+            );
+            assert_eq!(
+                report.records_written, 0,
+                "no transition record is written from partial data"
+            );
+
+            let after = read_alert_records(store.as_ref(), tenant).await;
+            assert_eq!(after.len(), 1, "no new transition record written");
+            assert_eq!(
+                after.last().expect("record").state,
+                AlertState::Firing,
+                "the prior firing state is unchanged after the partial-coverage tick"
+            );
+        }
+
+        // --- A resolved rule stays resolved: no false re-fire under partial
+        // coverage (the confident-silence-in-reverse the ADR argues against) ---
+        {
+            let store = seeded_store().await;
+            let clock = TestClock::at(NOW_NS);
+            let mut healthy = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+            // Fire, then clear the condition by stepping the clock behind the only
+            // sample so the instant vector empties, producing a durable Resolved
+            // record as the folded latest.
+            assert_eq!(healthy.run_tick().await.records_written, 1, "onset fires");
+            clock.set(NOW_NS - 100 * NS_PER_SEC);
+            assert_eq!(
+                healthy.run_tick().await.records_written,
+                1,
+                "the cleared condition resolves"
+            );
+            clock.set(NOW_NS);
+            let before = read_alert_records(store.as_ref(), tenant).await;
+            let before_len = before.len();
+            assert_eq!(
+                before.last().expect("record").state,
+                AlertState::Resolved,
+                "prior state is resolved before the federated tick"
+            );
+
+            store
+                .delete(&alert_lease_key(&tenant))
+                .await
+                .expect("clear the seeding replica's lease");
+
+            // At NOW the sample is visible again and the condition is met: a
+            // complete query would re-fire (Resolved -> Firing, a durable
+            // transition record). Partial coverage must freeze the resolved state
+            // instead.
+            let mut fed = federated_evaluator(Arc::clone(&store), Arc::clone(&clock)).await;
+            let report = fed.run_tick().await;
+            assert_eq!(report.rules_failed, 1);
+            assert_eq!(
+                report.records_written, 0,
+                "no re-fire transition is written from partial data"
+            );
+
+            let after = read_alert_records(store.as_ref(), tenant).await;
+            assert_eq!(after.len(), before_len, "no transition record written");
+            assert_eq!(
+                after.last().expect("record").state,
+                AlertState::Resolved,
+                "the prior resolved state is unchanged; no false re-fire"
+            );
+        }
     }
 }

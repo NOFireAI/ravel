@@ -57,8 +57,8 @@ async fn within_segment_duplicate_and_out_of_order_timestamps_resolve_correctly(
     let cat = catalog(Arc::clone(&store), 1);
     let eng = engine(store, cat);
 
-    let at_ts = expect_vector(
-        eng.instant(
+    let (value_at_ts, _coverage) = eng
+        .instant(
             tid.hash(),
             "ordering_metric",
             ts / 1_000_000,
@@ -67,16 +67,16 @@ async fn within_segment_duplicate_and_out_of_order_timestamps_resolve_correctly(
             Duration::from_secs(5),
         )
         .await
-        .expect("query at ts"),
-    );
+        .expect("query at ts");
+    let at_ts = expect_vector(value_at_ts);
     assert_eq!(at_ts.len(), 1);
     assert_eq!(
         at_ts[0].value, 9.0,
         "later-in-page sample must win the duplicate timestamp"
     );
 
-    let at_later_ts = expect_vector(
-        eng.instant(
+    let (value_at_later_ts, _coverage) = eng
+        .instant(
             tid.hash(),
             "ordering_metric",
             later_ts / 1_000_000,
@@ -85,8 +85,8 @@ async fn within_segment_duplicate_and_out_of_order_timestamps_resolve_correctly(
             Duration::from_secs(5),
         )
         .await
-        .expect("query at later_ts"),
-    );
+        .expect("query at later_ts");
+    let at_later_ts = expect_vector(value_at_later_ts);
     assert_eq!(at_later_ts.len(), 1);
     assert_eq!(
         at_later_ts[0].value, 3.0,
@@ -140,8 +140,8 @@ async fn cross_segment_duplicate_timestamp_later_commit_wins_regardless_of_publi
 
     let cat = catalog(Arc::clone(&store), 1);
     let eng = engine(store, cat);
-    let result = expect_vector(
-        eng.instant(
+    let (value, _coverage) = eng
+        .instant(
             tid.hash(),
             "race_metric",
             ts / 1_000_000,
@@ -150,8 +150,8 @@ async fn cross_segment_duplicate_timestamp_later_commit_wins_regardless_of_publi
             Duration::from_secs(5),
         )
         .await
-        .expect("query"),
-    );
+        .expect("query");
+    let result = expect_vector(value);
     assert_eq!(result.len(), 1);
     assert_eq!(
         result[0].value, 2.0,

@@ -367,6 +367,19 @@ impl QueryEngine {
         &self.config
     }
 
+    /// Evaluates an instant query and returns its [`Value`] paired with the
+    /// query's [`Coverage`] (ADR-0071 "partial results are consent-gated and
+    /// envelope-visible" amendment, decision 4). The value can no longer be had
+    /// without its coverage: `Coverage` is `#[must_use]`, so a caller that wants
+    /// to ignore partial federated coverage must write that decision down where
+    /// review can see it, instead of silently mistaking a partial answer for a
+    /// complete one. The alert evaluator relies on exactly this to refuse to
+    /// evaluate a rule over partial coverage.
+    ///
+    /// Coverage is derived via [`Coverage::from_stats`] from the same
+    /// [`QueryStats`] [`Self::instant_with_stats`] already produces; this adds
+    /// no new tracking. The stats-carrying sibling remains the source for the
+    /// wire rendering.
     pub async fn instant(
         &self,
         tenant_hash: TenantHash,
@@ -375,16 +388,18 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         deadline: Duration,
-    ) -> Result<Value, QueryError> {
-        let (value, _stats) = self
+    ) -> Result<(Value, Coverage), QueryError> {
+        let (value, stats) = self
             .instant_with_stats(tenant_hash, query, t_ms, min_tokens, now_ns, deadline)
             .await?;
-        Ok(value)
+        Ok((value, Coverage::from_stats(&stats)))
     }
 
-    /// Same as [`Self::instant`], additionally returning this query's
-    /// segment counters. Additive: `instant`
-    /// keeps its original signature and behavior unchanged, mirroring the
+    /// Same as [`Self::instant`], but returns the full [`QueryStats`] rather than
+    /// the [`Coverage`] projected from it. This is the source the HTTP query
+    /// handlers render onto the wire (both the `partial` flag and the segment
+    /// counters); [`Self::instant`] keeps only the coverage signal callers that
+    /// do not render stats actually need. Mirrors the
     /// `Catalog::resolve`/`resolve_pruned` split.
     pub async fn instant_with_stats(
         &self,
@@ -447,6 +462,11 @@ impl QueryEngine {
         Ok((value, annotations, stats))
     }
 
+    /// Evaluates a range query and returns its [`Value`] paired with the query's
+    /// [`Coverage`] (ADR-0071 amendment decision 4). Like [`Self::instant`], the
+    /// value cannot be had without its `#[must_use]` coverage; coverage is
+    /// derived via [`Coverage::from_stats`] from the same [`QueryStats`]
+    /// [`Self::range_with_stats`] produces.
     #[allow(clippy::too_many_arguments)]
     pub async fn range(
         &self,
@@ -458,8 +478,8 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         deadline: Duration,
-    ) -> Result<Value, QueryError> {
-        let (value, _stats) = self
+    ) -> Result<(Value, Coverage), QueryError> {
+        let (value, stats) = self
             .range_with_stats(
                 tenant_hash,
                 query,
@@ -471,12 +491,12 @@ impl QueryEngine {
                 deadline,
             )
             .await?;
-        Ok(value)
+        Ok((value, Coverage::from_stats(&stats)))
     }
 
-    /// Same as [`Self::range`], additionally returning this query's segment
-    /// counters. Additive: `range` keeps its
-    /// original signature and behavior unchanged, mirroring the
+    /// Same as [`Self::range`], but returns the full [`QueryStats`] rather than
+    /// the [`Coverage`] projected from it, for the wire rendering. [`Self::range`]
+    /// keeps only the coverage signal; this keeps every counter. Mirrors the
     /// `Catalog::resolve`/`resolve_pruned` split.
     #[allow(clippy::too_many_arguments)]
     pub async fn range_with_stats(
@@ -579,7 +599,11 @@ impl QueryEngine {
     }
 
     /// Resolves the series (labels only, no samples) matching `matchers` in
-    /// `window`, for the labels/label-values/series HTTP endpoints.
+    /// `window`, for the labels/label-values/series HTTP endpoints, and returns
+    /// them paired with the query's [`Coverage`] (ADR-0071 amendment decision
+    /// 4). Like [`Self::instant`], the series cannot be had without their
+    /// `#[must_use]` coverage; coverage is derived via [`Coverage::from_stats`]
+    /// from the same [`QueryStats`] [`Self::resolve_series_with_stats`] produces.
     pub async fn resolve_series(
         &self,
         tenant_hash: TenantHash,
@@ -588,17 +612,17 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         deadline: Duration,
-    ) -> Result<Vec<(SeriesId, LabelSet)>, QueryError> {
-        let (series, _stats) = self
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, Coverage), QueryError> {
+        let (series, stats) = self
             .resolve_series_with_stats(tenant_hash, matchers, window, min_tokens, now_ns, deadline)
             .await?;
-        Ok(series)
+        Ok((series, Coverage::from_stats(&stats)))
     }
 
-    /// Same as [`Self::resolve_series`], additionally returning this query's
-    /// segment counters. Additive:
-    /// `resolve_series` keeps its original signature and behavior unchanged,
-    /// mirroring the `Catalog::resolve`/`resolve_pruned` split.
+    /// Same as [`Self::resolve_series`], but returns the full [`QueryStats`]
+    /// rather than the [`Coverage`] projected from it, for the wire rendering.
+    /// [`Self::resolve_series`] keeps only the coverage signal. Mirrors the
+    /// `Catalog::resolve`/`resolve_pruned` split.
     pub async fn resolve_series_with_stats(
         &self,
         tenant_hash: TenantHash,
@@ -4531,5 +4555,189 @@ mod prefetch_tests {
              not trip a budget set at that exact real cost: {:?}",
             result.err()
         );
+    }
+
+    /// A federated remote whose fetch always fails at transport. Paired with
+    /// `skip_unavailable = true` it produces exactly one skipped cluster, so a
+    /// query over it resolves to `Coverage::Partial` (ADR-0071).
+    struct UnavailableFetcher;
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for UnavailableFetcher {
+        async fn fetch(
+            &self,
+            _request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            Err(crate::distrib::client::DistribError::Transport(
+                "connection refused dialing eu-west".to_string(),
+            ))
+        }
+    }
+
+    /// An engine whose single federated remote is always unavailable but opted
+    /// into `skip_unavailable`, so every federated query returns partial
+    /// coverage naming that one cluster.
+    fn engine_with_unavailable_remote(store: Arc<MemoryStore>) -> QueryEngine {
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        let federation = crate::distrib::Federation::new(vec![crate::distrib::RemoteCluster {
+            name: "eu-west".to_string(),
+            fetcher: Arc::new(UnavailableFetcher),
+            skip_unavailable: true,
+            soft_timeout: Duration::from_secs(5),
+        }]);
+        QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default())
+            .with_federation(Arc::new(federation))
+    }
+
+    /// The bare `instant`/`range`/`resolve_series` wrappers must return exactly
+    /// the `Coverage` their `_with_stats` sibling computes from the same
+    /// `QueryStats` for the same inputs (ADR-0071 amendment decision 4). The
+    /// bare wrappers derive coverage via `Coverage::from_stats`, so this pins
+    /// that they add no divergent tracking. Both the `Complete` case (no
+    /// federation) and the `Partial` case (a skipped `skip_unavailable` remote)
+    /// are exercised so a regression in either branch of `from_stats` is caught.
+    #[tokio::test]
+    async fn bare_wrappers_return_the_same_coverage_as_with_stats() {
+        const T_MS: i64 = BASE_NS / 1_000_000;
+        let window = TimeRange {
+            start_ns: BASE_NS - NS_PER_MIN * 10,
+            end_ns: BASE_NS + NS_PER_MIN,
+        };
+        let matchers = [name_matcher("up")];
+        let deadline = Duration::from_secs(5);
+
+        // Complete: a fully cluster-local engine over one real segment. Every
+        // wrapper's coverage must be `Complete` and must equal what the
+        // stats-carrying sibling reports.
+        {
+            let store = Arc::new(MemoryStore::new());
+            let tenant_hash = TenantId::new("acme").hash();
+            publish_metric(&store, tenant_hash, 1, "up", BASE_NS - NS_PER_MIN, 1.0).await;
+            let eng = engine(Arc::clone(&store));
+
+            let (_v, coverage) = eng
+                .instant(tenant_hash, "up", T_MS, &[], BASE_NS, deadline)
+                .await
+                .expect("instant");
+            let (_v, stats) = eng
+                .instant_with_stats(tenant_hash, "up", T_MS, &[], BASE_NS, deadline)
+                .await
+                .expect("instant_with_stats");
+            assert_eq!(coverage, Coverage::Complete);
+            assert_eq!(coverage, Coverage::from_stats(&stats));
+
+            let (_v, coverage) = eng
+                .range(
+                    tenant_hash,
+                    "up",
+                    T_MS - 60_000,
+                    T_MS,
+                    60_000,
+                    &[],
+                    BASE_NS,
+                    deadline,
+                )
+                .await
+                .expect("range");
+            let (_v, stats) = eng
+                .range_with_stats(
+                    tenant_hash,
+                    "up",
+                    T_MS - 60_000,
+                    T_MS,
+                    60_000,
+                    &[],
+                    BASE_NS,
+                    deadline,
+                )
+                .await
+                .expect("range_with_stats");
+            assert_eq!(coverage, Coverage::Complete);
+            assert_eq!(coverage, Coverage::from_stats(&stats));
+
+            let (_s, coverage) = eng
+                .resolve_series(tenant_hash, &matchers, window, &[], BASE_NS, deadline)
+                .await
+                .expect("resolve_series");
+            let (_s, stats) = eng
+                .resolve_series_with_stats(tenant_hash, &matchers, window, &[], BASE_NS, deadline)
+                .await
+                .expect("resolve_series_with_stats");
+            assert_eq!(coverage, Coverage::Complete);
+            assert_eq!(coverage, Coverage::from_stats(&stats));
+        }
+
+        // Partial: an engine whose one federated remote is skipped. Every
+        // wrapper's coverage must be `Partial` naming that cluster and must
+        // equal what the stats-carrying sibling reports.
+        {
+            let store = Arc::new(MemoryStore::new());
+            let tenant_hash = TenantId::new("acme").hash();
+            publish_metric(&store, tenant_hash, 1, "up", BASE_NS - NS_PER_MIN, 1.0).await;
+            let eng = engine_with_unavailable_remote(Arc::clone(&store));
+
+            let (_v, coverage) = eng
+                .instant(tenant_hash, "up", T_MS, &[], BASE_NS, deadline)
+                .await
+                .expect("instant");
+            let (_v, stats) = eng
+                .instant_with_stats(tenant_hash, "up", T_MS, &[], BASE_NS, deadline)
+                .await
+                .expect("instant_with_stats");
+            assert!(
+                coverage.is_partial(),
+                "a skipped remote is partial coverage"
+            );
+            assert_eq!(coverage.skipped().len(), 1, "one skipped cluster");
+            assert!(
+                coverage.skipped()[0].contains("eu-west"),
+                "the skipped-cluster warning names the operator-facing cluster: {:?}",
+                coverage.skipped()
+            );
+            assert_eq!(coverage, Coverage::from_stats(&stats));
+
+            let (_v, coverage) = eng
+                .range(
+                    tenant_hash,
+                    "up",
+                    T_MS - 60_000,
+                    T_MS,
+                    60_000,
+                    &[],
+                    BASE_NS,
+                    deadline,
+                )
+                .await
+                .expect("range");
+            let (_v, stats) = eng
+                .range_with_stats(
+                    tenant_hash,
+                    "up",
+                    T_MS - 60_000,
+                    T_MS,
+                    60_000,
+                    &[],
+                    BASE_NS,
+                    deadline,
+                )
+                .await
+                .expect("range_with_stats");
+            assert!(coverage.is_partial());
+            assert_eq!(coverage, Coverage::from_stats(&stats));
+
+            let (_s, coverage) = eng
+                .resolve_series(tenant_hash, &matchers, window, &[], BASE_NS, deadline)
+                .await
+                .expect("resolve_series");
+            let (_s, stats) = eng
+                .resolve_series_with_stats(tenant_hash, &matchers, window, &[], BASE_NS, deadline)
+                .await
+                .expect("resolve_series_with_stats");
+            assert!(coverage.is_partial());
+            assert_eq!(coverage, Coverage::from_stats(&stats));
+        }
     }
 }

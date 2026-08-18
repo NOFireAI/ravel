@@ -239,7 +239,7 @@ pub async fn run(config: &QueryLatencyConfig) -> Report {
     let mut instant_matched_series = 0usize;
     for i in 0..config.instant_query_count {
         let start = Instant::now();
-        let value = engine
+        let (value, _coverage) = engine
             .instant(
                 tenant_hash,
                 &config.query,
@@ -263,7 +263,7 @@ pub async fn run(config: &QueryLatencyConfig) -> Report {
     let mut range_matched_series = 0usize;
     for i in 0..config.range_query_count {
         let start = Instant::now();
-        let value = engine
+        let (value, _coverage) = engine
             .range(
                 tenant_hash,
                 &config.query,

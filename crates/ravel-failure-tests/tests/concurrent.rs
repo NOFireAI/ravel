@@ -135,20 +135,19 @@ async fn query_batch_sample_count(
     let start = batch_start_ns(batch);
     let end = start + (SAMPLES_PER_BATCH - 1) * NS_PER_SEC;
     let query = format!("concurrent_metric{{batch=\"{batch}\"}}");
-    let result = expect_matrix(
-        engine
-            .range(
-                tid.hash(),
-                &query,
-                start / 1_000_000,
-                end / 1_000_000,
-                NS_PER_SEC / 1_000_000,
-                &[],
-                BASE_NS,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("range query must not error"),
-    );
+    let (value, _coverage) = engine
+        .range(
+            tid.hash(),
+            &query,
+            start / 1_000_000,
+            end / 1_000_000,
+            NS_PER_SEC / 1_000_000,
+            &[],
+            BASE_NS,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("range query must not error");
+    let result = expect_matrix(value);
     result.first().map_or(0, |(_, samples)| samples.len())
 }

@@ -101,8 +101,8 @@ async fn value_of(
 ) -> Option<f64> {
     let cat = catalog(Arc::clone(store), 2);
     let eng = engine(Arc::clone(store), cat);
-    let vector = expect_vector(
-        eng.instant(
+    let (value, _coverage) = eng
+        .instant(
             tenant_hash,
             metric,
             ts / 1_000_000,
@@ -111,8 +111,8 @@ async fn value_of(
             Duration::from_secs(5),
         )
         .await
-        .expect("query"),
-    );
+        .expect("query");
+    let vector = expect_vector(value);
     match vector.len() {
         0 => None,
         _ => Some(vector[0].value),

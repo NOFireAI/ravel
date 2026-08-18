@@ -96,19 +96,18 @@ async fn folder_down_for_hours_never_loses_data_only_widens_listing() {
 
     let before = engine(Arc::clone(&store), catalog(Arc::clone(&store), 1));
     for (hour, ts) in hours.iter().zip(&timestamps) {
-        let result = expect_vector(
-            before
-                .instant(
-                    tid.hash(),
-                    "folder_down_metric",
-                    ts / 1_000_000,
-                    &[],
-                    now_ns,
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect("query with no folder ever run must still succeed via listing"),
-        );
+        let (value, _coverage) = before
+            .instant(
+                tid.hash(),
+                "folder_down_metric",
+                ts / 1_000_000,
+                &[],
+                now_ns,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query with no folder ever run must still succeed via listing");
+        let result = expect_vector(value);
         assert_eq!(
             result.len(),
             1,
@@ -132,19 +131,18 @@ async fn folder_down_for_hours_never_loses_data_only_widens_listing() {
 
     let after = engine(Arc::clone(&store), catalog(Arc::clone(&store), 1));
     for (hour, ts) in hours.iter().zip(&timestamps) {
-        let result = expect_vector(
-            after
-                .instant(
-                    tid.hash(),
-                    "folder_down_metric",
-                    ts / 1_000_000,
-                    &[],
-                    now_ns,
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect("query after the folder catches up must still succeed"),
-        );
+        let (value, _coverage) = after
+            .instant(
+                tid.hash(),
+                "folder_down_metric",
+                ts / 1_000_000,
+                &[],
+                now_ns,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query after the folder catches up must still succeed");
+        let result = expect_vector(value);
         assert_eq!(
             result.len(),
             1,
@@ -206,8 +204,8 @@ async fn corrupt_head_falls_back_to_listing_never_to_an_error() {
         .expect("overwrite HEAD with garbage");
 
     let eng = engine(Arc::clone(&store), catalog(Arc::clone(&store), 1));
-    let result = expect_vector(
-        eng.instant(
+    let (value, _coverage) = eng
+        .instant(
             tid.hash(),
             "corrupt_head_metric",
             ts / 1_000_000,
@@ -216,8 +214,8 @@ async fn corrupt_head_falls_back_to_listing_never_to_an_error() {
             Duration::from_secs(5),
         )
         .await
-        .expect("a corrupt HEAD must degrade to listing, not fail the query"),
-    );
+        .expect("a corrupt HEAD must degrade to listing, not fail the query");
+    let result = expect_vector(value);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].value, 42.0);
 }
@@ -272,8 +270,8 @@ async fn missing_snapshot_part_falls_back_to_listing_after_one_head_reread() {
         .expect("delete the part, simulating a GC race");
 
     let eng = engine(Arc::clone(&store), catalog(Arc::clone(&store), 1));
-    let result = expect_vector(
-        eng.instant(
+    let (value, _coverage) = eng
+        .instant(
             tid.hash(),
             "missing_part_metric",
             ts / 1_000_000,
@@ -282,8 +280,8 @@ async fn missing_snapshot_part_falls_back_to_listing_after_one_head_reread() {
             Duration::from_secs(5),
         )
         .await
-        .expect("a missing snapshot part must degrade to listing, not fail the query"),
-    );
+        .expect("a missing snapshot part must degrade to listing, not fail the query");
+    let result = expect_vector(value);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].value, 7.0);
 }
@@ -339,8 +337,8 @@ async fn concurrent_folders_race_head_cas_without_losing_or_duplicating_data() {
     result_b.expect("folder b's fold");
 
     let eng = engine(Arc::clone(&store), catalog(Arc::clone(&store), 1));
-    let result = expect_vector(
-        eng.instant(
+    let (value, _coverage) = eng
+        .instant(
             tid.hash(),
             "cas_race_metric",
             ts / 1_000_000,
@@ -349,8 +347,8 @@ async fn concurrent_folders_race_head_cas_without_losing_or_duplicating_data() {
             Duration::from_secs(5),
         )
         .await
-        .expect("query after a CAS race"),
-    );
+        .expect("query after a CAS race");
+    let result = expect_vector(value);
     assert_eq!(
         result.len(),
         1,
@@ -407,8 +405,8 @@ async fn stale_head_cache_widens_listing_but_never_misses_new_data() {
     // One engine, queried twice: its internal Catalog's head_cache entry
     // from the first query stays warm for the second.
     let eng = engine(Arc::clone(&store), catalog(Arc::clone(&store), 1));
-    let first = expect_vector(
-        eng.instant(
+    let (value_first, _coverage) = eng
+        .instant(
             tid.hash(),
             "stale_cache_metric",
             ts_a / 1_000_000,
@@ -417,8 +415,8 @@ async fn stale_head_cache_widens_listing_but_never_misses_new_data() {
             Duration::from_secs(5),
         )
         .await
-        .expect("first query populates the head_cache"),
-    );
+        .expect("first query populates the head_cache");
+    let first = expect_vector(value_first);
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].value, 1.0);
 
@@ -466,8 +464,8 @@ async fn stale_head_cache_widens_listing_but_never_misses_new_data() {
     // watermark_hour = hour_a + 1. now_1 is already past hour_b's end,
     // so hour_b sits inside the ordinary listing suffix above that stale
     // watermark and must still be found.
-    let second = expect_vector(
-        eng.instant(
+    let (value_second, _coverage) = eng
+        .instant(
             tid.hash(),
             "stale_cache_metric",
             ts_b / 1_000_000,
@@ -476,8 +474,8 @@ async fn stale_head_cache_widens_listing_but_never_misses_new_data() {
             Duration::from_secs(5),
         )
         .await
-        .expect("second query, head_cache still warm"),
-    );
+        .expect("second query, head_cache still warm");
+    let second = expect_vector(value_second);
     assert_eq!(
         second.len(),
         1,
@@ -554,8 +552,8 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
     .await;
 
     let eng = engine(Arc::clone(&store), catalog(Arc::clone(&store), 1));
-    let without_token = expect_vector(
-        eng.instant(
+    let (value_without_token, _coverage) = eng
+        .instant(
             tid.hash(),
             "clock_skew_metric",
             late_ts / 1_000_000,
@@ -564,8 +562,8 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
             Duration::from_secs(5),
         )
         .await
-        .expect("query without the late writer's token"),
-    );
+        .expect("query without the late writer's token");
+    let without_token = expect_vector(value_without_token);
     // on_time_ts and late_ts are 1s apart, well inside PromQL's default 5m
     // lookback, so a masked late sample does not show up as an empty
     // vector: `pick_sample` falls through to the on-time sample instead.
@@ -583,8 +581,8 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
          may satisfy it"
     );
 
-    let with_token = expect_vector(
-        eng.instant(
+    let (value_with_token, _coverage) = eng
+        .instant(
             tid.hash(),
             "clock_skew_metric",
             late_ts / 1_000_000,
@@ -593,8 +591,8 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
             Duration::from_secs(5),
         )
         .await
-        .expect("query with the late writer's own token"),
-    );
+        .expect("query with the late writer's own token");
+    let with_token = expect_vector(value_with_token);
     assert_eq!(
         with_token.len(),
         1,
@@ -621,19 +619,18 @@ async fn commit_in_wrongly_sealed_bucket_is_invisible_until_head_rebuild_repairs
         .await
         .expect("rebuild fold after HEAD deletion");
 
-    let repaired = expect_vector(
-        engine(Arc::clone(&store), catalog(Arc::clone(&store), 1))
-            .instant(
-                tid.hash(),
-                "clock_skew_metric",
-                late_ts / 1_000_000,
-                &[],
-                now_1,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("query after the rebuild repair"),
-    );
+    let (value_repaired, _coverage) = engine(Arc::clone(&store), catalog(Arc::clone(&store), 1))
+        .instant(
+            tid.hash(),
+            "clock_skew_metric",
+            late_ts / 1_000_000,
+            &[],
+            now_1,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("query after the rebuild repair");
+    let repaired = expect_vector(value_repaired);
     assert_eq!(
         repaired.len(),
         1,
