@@ -178,6 +178,7 @@ async fn promql_with_federation(store: Arc<dyn ObjectStoreBackend>, tenant: &Ten
         ),
         None,
         Some(federation),
+        None,
     );
     promql_router(app_state)
 }

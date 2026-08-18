@@ -136,6 +136,7 @@ pub fn build_app_state(
     query_admission: Arc<QueryAdmissionController>,
     distributed: Option<Arc<ravel_query::distrib::Distributed>>,
     federation: Option<Arc<ravel_query::distrib::Federation>>,
+    metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
 ) -> AppState {
     let mut engine = QueryEngine::new(catalog, store, engine_config);
     if let Some(cache) = cache {
@@ -158,9 +159,17 @@ pub fn build_app_state(
     // `/metrics` covers PromQL read traffic too. The shared query
     // concurrency controller (ADR-0061 decision 2) gates every handler before
     // it resolves or fetches.
-    AppState::new(Arc::new(engine), tenant_resolver)
+    // ADR-0085 decision 1 read path: attach the per-process metric metadata
+    // cache that backs `/api/v1/metadata`. `None` in a mode that serves no
+    // Prometheus-shaped query routes; when absent the endpoint keeps its
+    // pre-ADR behavior byte-for-byte (a `200` with an empty `data` object).
+    let state = AppState::new(Arc::new(engine), tenant_resolver)
         .with_cost_recorder(query_accounting)
-        .with_query_admission(query_admission)
+        .with_query_admission(query_admission);
+    match metadata_cache {
+        Some(cache) => state.with_metadata_cache(cache),
+        None => state,
+    }
 }
 
 /// Default per-tenant SQL memory ceiling: 1 GiB across a tenant's concurrent
@@ -281,6 +290,7 @@ mod catalog_cache_tests {
                 std::collections::HashSet::new(),
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
             None,
             None,
         );

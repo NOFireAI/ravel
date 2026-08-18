@@ -385,6 +385,7 @@ fn build_metrics_app(
         ),
         None,
         None,
+        None,
     );
     ravel_query::http::router(state)
 }
