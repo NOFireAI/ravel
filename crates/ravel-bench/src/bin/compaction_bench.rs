@@ -491,8 +491,10 @@ async fn measure_query(
     let query_wall = query_start.elapsed();
     let (qg, ql, _) = q_counters.snapshot();
     let query_status = match result {
-        Ok(ravel_promql::Value::Vector(v)) => format!("OK ({} series matched)", v.len()),
-        Ok(other) => format!("OK (non-vector: {other:?})"),
+        Ok((ravel_promql::Value::Vector(v), _coverage)) => {
+            format!("OK ({} series matched)", v.len())
+        }
+        Ok((other, _coverage)) => format!("OK (non-vector: {other:?})"),
         Err(e) => format!("FAILS: {e}"),
     };
     QueryMeasure {
@@ -652,10 +654,11 @@ async fn query_value(
 ) -> ravel_promql::Value {
     let catalog = Arc::new(build_catalog(Arc::clone(&raw), 1));
     let engine = QueryEngine::new(catalog, raw, EngineConfig::default());
-    engine
+    let (value, _coverage) = engine
         .instant(tenant_hash, query, t_ms, &[], now, Duration::from_secs(30))
         .await
-        .expect("query")
+        .expect("query");
+    value
 }
 
 /// Bit-exact comparison of two instant-vector results (value bits and labels),

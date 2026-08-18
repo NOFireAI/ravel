@@ -28,12 +28,14 @@ use ravel_ingest::Clock;
 use ravel_logseg::{Predicate, RlogConfig, RlogReader};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
+use ravel_query::distrib::{Federation, RemoteCluster};
 use ravel_query::{EngineConfig, QueryEngine};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::alert_sink::{AlertSink, Credential};
 use ravel_server::alerting::{
     ALERT_SHARD, AlertEvalConfig, AlertEvaluator, AlertQueryEngines, parse_rules,
 };
+use ravel_server::config::RemoteClusterConfig;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use serde_json::Value as Json;
 use tokio::sync::oneshot;
@@ -1387,4 +1389,251 @@ async fn a_rule_removed_from_config_never_repeats() {
     );
 
     server.stop().await;
+}
+
+// --- Partial federated coverage freezes a rule (ADR-0071 amendment) --------
+
+/// An address that was bound then immediately released: a connection to it is
+/// refused, so a remote pointed here is unavailable at evaluation time. Same
+/// device `federation_e2e.rs` uses for its dead-cluster cases.
+async fn dead_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind dead");
+    let addr = listener.local_addr().expect("dead local addr");
+    drop(listener);
+    addr.to_string()
+}
+
+/// An evaluator whose PromQL engine federates to one `skip_unavailable = true`
+/// remote that is down, dialed by the production `FederationSliceFetcher`. Every
+/// rule query it runs therefore completes with partial coverage: the fan-out
+/// skips the dead cluster, warns, and marks the stats partial.
+///
+/// Identical to [`evaluator`] in every other respect, and over the same store,
+/// so a test can seed durable alert state with a healthy evaluator and then
+/// evaluate the next tick under partial coverage.
+async fn evaluator_with_dead_remote(
+    store: Arc<dyn ObjectStoreBackend>,
+    clock: TestClock,
+    rules: Vec<Rule>,
+) -> AlertEvaluator {
+    let endpoint = dead_endpoint().await;
+    let cluster_config = RemoteClusterConfig {
+        name: "west".to_string(),
+        endpoint: endpoint.clone(),
+        credential: "operator-cred".to_string(),
+        tls: false,
+        tls_ca_file: None,
+        skip_unavailable: true,
+        soft_timeout: Duration::from_secs(2),
+    };
+    let fetcher = ravel_server::distrib::FederationSliceFetcher::connect(&cluster_config)
+        .expect("federation client connects lazily");
+    let federation = Federation::new(vec![RemoteCluster {
+        name: "west".to_string(),
+        fetcher: Arc::new(fetcher),
+        skip_unavailable: true,
+        soft_timeout: Duration::from_secs(2),
+    }]);
+
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default())
+        .with_federation(Arc::new(federation));
+    let config = AlertEvalConfig {
+        enabled: true,
+        ..AlertEvalConfig::default()
+    };
+    AlertEvaluator::new(
+        store,
+        AlertQueryEngines {
+            promql: Arc::new(engine),
+            #[cfg(feature = "sql")]
+            sql: None,
+        },
+        Arc::new(clock),
+        TenantId::new(TENANT).hash(),
+        rules,
+        &config,
+    )
+    .expect("build evaluator")
+}
+
+/// ADR-0071 "partial results are consent-gated and envelope-visible" amendment,
+/// decision 5: a rule whose query federates across a down `skip_unavailable`
+/// remote is a FAILED evaluation, not a decided one. The tick must count
+/// `rules_failed`, write no transition record, and leave the prior alert state
+/// exactly as it was, so the next tick retries against (hopefully) full
+/// coverage.
+///
+/// Both prior states are seeded, and in each the local-only answer is the
+/// OPPOSITE of the prior state, so an evaluator that ignores coverage really
+/// does transition:
+///
+/// - prior `Firing`, local data stale at the partial tick: ignoring coverage
+///   resolves the alert on data that was never read.
+/// - prior `Resolved`, local data fresh and above threshold at the partial
+///   tick: ignoring coverage fires it.
+///
+/// Flip-line proof (prove-the-test): in
+/// `services/ravel-server/src/alerting.rs::run_query`, delete the
+/// `if let Coverage::Partial { skipped } = coverage { anyhow::bail!(...) }`
+/// block (equivalently, bind the wrapper's second element to `_coverage` and
+/// carry on, which is exactly the pre-change behavior). Both halves then fail
+/// on `records_written`/`rules_failed`, and the read-back history grows a
+/// transition record decided from an incomplete answer.
+#[tokio::test]
+async fn partial_coverage_freezes_rule_state() {
+    let tenant = TenantId::new(TENANT).hash();
+
+    // --- Prior state Firing -------------------------------------------------
+    {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        {
+            let mut healthy = evaluator(
+                Arc::clone(&store),
+                clock.clone(),
+                vec![threshold_rule(None)],
+                Vec::new(),
+            );
+            assert_eq!(healthy.run_tick().await.records_written, 1, "fires");
+        }
+        let before = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].state, AlertState::Firing);
+
+        // Ten minutes on, the only local sample is outside PromQL's 5-minute
+        // lookback, so the local-only instant vector is empty and the threshold
+        // can no longer be met: an evaluator that ignored coverage would write a
+        // Resolved record here.
+        clock.advance(Duration::from_secs(600));
+        let mut degraded = evaluator_with_dead_remote(
+            Arc::clone(&store),
+            clock.clone(),
+            vec![threshold_rule(None)],
+        )
+        .await;
+        let report = degraded.run_tick().await;
+
+        assert!(
+            !report.lease_not_held && !report.lease_unavailable,
+            "the degraded evaluator must actually reach rule evaluation, or every \
+             assertion below is vacuous: {report:?}"
+        );
+        assert_eq!(
+            report.rules_failed, 1,
+            "partial coverage must take the per-rule failure path"
+        );
+        assert_eq!(
+            report.rules_evaluated, 0,
+            "a rule that could not be evaluated is not counted as evaluated"
+        );
+        assert_eq!(
+            report.records_written, 0,
+            "no transition record may be written from partial data"
+        );
+        assert!(!report.history_unavailable, "history read fine");
+
+        let after = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "the alerts keyspace must be byte-for-byte unchanged: {after:?}"
+        );
+        assert_eq!(
+            after[0].state,
+            AlertState::Firing,
+            "prior Firing state must survive the partial tick untouched"
+        );
+        assert_eq!(after[0].ts_ns, before[0].ts_ns);
+        assert_eq!(after[0].alert_id, before[0].alert_id);
+        assert_eq!(
+            alert_object_count(store.as_ref(), tenant).await,
+            1,
+            "not even an uncommitted orphan object may be written"
+        );
+    }
+
+    // --- Prior state Resolved -----------------------------------------------
+    {
+        // Two samples in one segment: the first fires the first tick, the second
+        // is above threshold again once the clock reaches it. Between them the
+        // series goes stale, which is what resolves the alert.
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new(TENANT);
+        publish_metric(
+            store.as_ref(),
+            &tenant_id,
+            &[
+                (NOW_NS - 30 * NS_PER_SEC, 1.0),
+                (NOW_NS + 870 * NS_PER_SEC, 1.0),
+            ],
+        )
+        .await;
+
+        let clock = TestClock::at(NOW_NS);
+        {
+            let mut healthy = evaluator(
+                Arc::clone(&store),
+                clock.clone(),
+                vec![threshold_rule(None)],
+                Vec::new(),
+            );
+            assert_eq!(healthy.run_tick().await.records_written, 1, "fires");
+            // Ten minutes on: the first sample is outside the lookback window and
+            // the second is still in the future, so the alert resolves.
+            clock.advance(Duration::from_secs(600));
+            assert_eq!(healthy.run_tick().await.records_written, 1, "resolves");
+        }
+        let before = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[1].state, AlertState::Resolved);
+
+        // Five minutes more brings the second sample inside the lookback window,
+        // so the local-only answer is above threshold: an evaluator that ignored
+        // coverage would fire the alert again here. Five and not one, because the
+        // healthy evaluator above holds the tenant alert lease for three
+        // evaluation intervals (180s at the default): a shorter gap would leave
+        // the degraded evaluator locked out and skipping rules for a reason that
+        // has nothing to do with coverage, making every assertion below vacuous.
+        clock.advance(Duration::from_secs(300));
+        let mut degraded = evaluator_with_dead_remote(
+            Arc::clone(&store),
+            clock.clone(),
+            vec![threshold_rule(None)],
+        )
+        .await;
+        let report = degraded.run_tick().await;
+
+        assert!(
+            !report.lease_not_held && !report.lease_unavailable,
+            "the degraded evaluator must actually reach rule evaluation, or every \
+             assertion below is vacuous: {report:?}"
+        );
+        assert_eq!(
+            report.rules_failed, 1,
+            "partial coverage must take the per-rule failure path"
+        );
+        assert_eq!(report.rules_evaluated, 0);
+        assert_eq!(
+            report.records_written, 0,
+            "no transition record may be written from partial data"
+        );
+
+        let after = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(
+            after.len(),
+            2,
+            "the alerts keyspace must be unchanged: {after:?}"
+        );
+        assert_eq!(
+            after[1].state,
+            AlertState::Resolved,
+            "prior Resolved state must survive the partial tick untouched"
+        );
+        assert_eq!(after[1].ts_ns, before[1].ts_ns);
+        assert_eq!(alert_object_count(store.as_ref(), tenant).await, 2);
+    }
 }

@@ -194,7 +194,15 @@ pub fn engine(store: Arc<dyn ObjectStoreBackend>, catalog: Catalog) -> QueryEngi
 /// Unwraps an instant-query result this suite expects to be a plain
 /// instant vector (every query here is a bare selector, never a
 /// scalar/string literal), panicking with the actual variant otherwise.
-pub fn expect_vector(value: ravel_promql::Value) -> ravel_promql::InstantVector {
+///
+/// Takes the `(Value, Coverage)` pair `QueryEngine::instant` returns
+/// (ADR-0071 amendment decision 4) and drops the coverage here, in one
+/// place, rather than at each of this suite's call sites: every query in
+/// this suite is single-cluster, so its coverage is always
+/// `Coverage::Complete`.
+pub fn expect_vector(
+    (value, _coverage): (ravel_promql::Value, ravel_query::Coverage),
+) -> ravel_promql::InstantVector {
     match value {
         ravel_promql::Value::Vector(v) => v,
         other => panic!("expected instant vector, got {other:?}"),
@@ -202,8 +210,11 @@ pub fn expect_vector(value: ravel_promql::Value) -> ravel_promql::InstantVector 
 }
 
 /// Unwraps a range-query result this suite expects to be a plain range
-/// matrix, panicking with the actual variant otherwise.
-pub fn expect_matrix(value: ravel_promql::Value) -> ravel_promql::RangeMatrix {
+/// matrix, panicking with the actual variant otherwise. Drops the coverage
+/// for the same reason [`expect_vector`] does.
+pub fn expect_matrix(
+    (value, _coverage): (ravel_promql::Value, ravel_query::Coverage),
+) -> ravel_promql::RangeMatrix {
     match value {
         ravel_promql::Value::Matrix(m) => m,
         other => panic!("expected range matrix, got {other:?}"),

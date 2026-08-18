@@ -300,7 +300,7 @@ async fn run_reader(
         latencies_ns.push(start.elapsed().as_nanos() as u64);
         queries_run += 1;
         match result {
-            Ok(Value::Vector(v)) if !v.is_empty() => non_empty_results += 1,
+            Ok((Value::Vector(v), _coverage)) if !v.is_empty() => non_empty_results += 1,
             Ok(_) => {}
             Err(err) => eprintln!("reader {reader_id}: query error: {err}"),
         }
@@ -325,7 +325,7 @@ async fn run_reader(
     latencies_ns.push(start.elapsed().as_nanos() as u64);
     queries_run += 1;
     match result {
-        Ok(Value::Vector(v)) if !v.is_empty() => non_empty_results += 1,
+        Ok((Value::Vector(v), _coverage)) if !v.is_empty() => non_empty_results += 1,
         Ok(_) => {}
         Err(err) => eprintln!("reader {reader_id}: final query error: {err}"),
     }
@@ -458,7 +458,7 @@ pub async fn run(config: &ConcurrentConfig) -> Report {
     let query_now_ns = clock.now_ns();
 
     let cold_start = Instant::now();
-    let cold_value = cold_engine
+    let (cold_value, _cold_coverage) = cold_engine
         .instant(
             tenant_hash,
             &config.query,
@@ -476,7 +476,7 @@ pub async fn run(config: &ConcurrentConfig) -> Report {
     };
 
     let warm_start = Instant::now();
-    let warm_value = cold_engine
+    let (warm_value, _warm_coverage) = cold_engine
         .instant(
             tenant_hash,
             &config.query,
