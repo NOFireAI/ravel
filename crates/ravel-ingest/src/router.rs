@@ -158,6 +158,15 @@ impl IngestRouter {
         &self.metrics
     }
 
+    /// The counter registry as a shared handle, for a process-level component
+    /// that outlives a borrow and must count into the same registry the
+    /// `/metrics` snapshot reads: the metric metadata sink
+    /// ([`crate::MetadataSink`], ADR-0085 decision 1) is spawned as its own task
+    /// and holds this rather than a second, invisible `IngestMetrics`.
+    pub fn metrics_handle(&self) -> Arc<IngestMetrics> {
+        self.metrics.clone()
+    }
+
     /// Resolve the tenant's active shard-actor set for a write at `now_ns`,
     /// re-reading the provisioning record when the cached view is older than the
     /// refresh interval `C` (ADR-0052 section 3). When the re-read cannot

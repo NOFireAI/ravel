@@ -150,6 +150,7 @@ fn build_process(store: Arc<dyn ObjectStoreBackend>) -> (Arc<AdmissionController
         admission: admission.clone(),
         recovery: None,
         provisioning: None,
+        metadata_sink: None,
     };
     (admission, state)
 }

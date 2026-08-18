@@ -732,6 +732,7 @@ mod tests {
                 admission: admission.clone(),
                 recovery: None,
                 provisioning: None,
+                metadata_sink: None,
             },
             logs_ingest: crate::logs_ingest::LogIngestState {
                 router: log_router,

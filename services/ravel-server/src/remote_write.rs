@@ -145,6 +145,11 @@ pub struct RemoteWriteState {
     /// `SystemTime::now()`; tests supply a fixed sub-floor clock to exercise
     /// the receiver-clock plausibility floor deterministically.
     pub clock: Arc<dyn Clock>,
+    /// The one-per-process metric metadata sink (ADR-0085 decision 1), the same
+    /// `Arc` the OTLP and OTAP surfaces hold. RW1 and RW2 both decode
+    /// `(family, type, help, unit)` already; this is where the decoded tuples
+    /// stop being discarded. `None` captures nothing.
+    pub metadata_sink: Option<Arc<ravel_ingest::MetadataSink>>,
 }
 
 pub fn router(state: Arc<RemoteWriteState>) -> Router {
@@ -354,6 +359,17 @@ async fn remote_write(
             return (StatusCode::BAD_REQUEST, message).into_response();
         }
     };
+
+    // Metric metadata (ADR-0085 decision 1), captured before `resolved` is
+    // consumed by normalization. Cloned rather than moved out: the decoded
+    // metadata is part of the request `normalize_resolved` accounts for
+    // (`metadata_dropped` below), so taking it would change what this surface
+    // reports. `observe` is synchronous, does no I/O, and cannot fail, so the
+    // 2xx this handler eventually returns depends only on the data write.
+    let metadata = resolved.metadata.clone();
+    if let Some(sink) = &state.metadata_sink {
+        sink.observe(&tenant, tenant.hash(), metadata);
+    }
 
     // Strict mode only: a Remote Write 2xx must mean durable, so the
     // buffered-mode header override is never consulted on this surface.
@@ -565,6 +581,7 @@ mod tests {
                 IngestConcurrencyLimit::Unlimited,
             ),
             clock,
+            metadata_sink: None,
         })
     }
 

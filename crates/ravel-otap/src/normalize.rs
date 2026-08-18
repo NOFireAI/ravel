@@ -67,7 +67,7 @@
 //! counted as dropped by [`push_exp_histogram_exemplar_drops`], which also
 //! records the attachment rule waiting for them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -76,8 +76,10 @@ use arrow::array::{
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::UInt8Type;
-use ravel_otlp::metadata::MetricKind as PromMetricKind;
-use ravel_otlp::normalize::{MetricsNormalizeResult, NormalizedExemplar, prometheus_family_name};
+use ravel_otlp::metadata::{MetricKind as PromMetricKind, MetricMetadata};
+use ravel_otlp::normalize::{
+    MetricsNormalizeResult, NormalizedExemplar, map_unit, prometheus_family_name,
+};
 use ravel_otlp::promcompat::format_float;
 use ravel_otlp::{IngestLimits, NormalizeOutput, NormalizedPoint, Rejection};
 use ravel_types::{
@@ -477,6 +479,57 @@ pub fn normalize_decoded_with_exemplars(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> MetricsNormalizeResult {
+    normalize_impl(tenant, batch, limits, ingest_ts_ns, exemplar_cap, false).0
+}
+
+/// Normalize exactly like [`normalize_decoded_with_exemplars`], and additionally
+/// surface one [`MetricMetadata`] per metric family that produced at least one
+/// point (ADR-0085 Decision 1). The returned [`MetricsNormalizeResult`] is what
+/// [`normalize_decoded_with_exemplars`] returns for the same input, unchanged;
+/// the metadata is the only addition.
+///
+/// This mirrors `ravel_otlp::normalize::normalize_metrics_with_metadata` field
+/// for field, since the two surfaces must store the same tuple for the same
+/// logical metric:
+///
+/// - `family_name` is the Decision 2 suffixed name (unit word and `_total`
+///   applied) *before* the classic histogram/summary explosion appends
+///   `_bucket`/`_sum`/`_count`, i.e. exactly the decision name the exploded
+///   series are derived from.
+/// - `kind` comes from the METRICS `metric_type` column and the `is_monotonic`
+///   flag, the OTAP equivalent of OTLP's `data` oneof: a monotonic Sum is a
+///   Counter, a non-monotonic Sum and a Gauge are both Gauge.
+/// - `help` is the METRICS `description` column, empty when the producer omits
+///   it (OTLP's `Metric.description`).
+/// - `unit` is the mapped Prometheus word (`bytes`, `seconds`), the raw unit
+///   when it maps to nothing, or empty, matching the word the name was suffixed
+///   with.
+///
+/// Metadata is deduplicated by `family_name`, first write wins. A metric whose
+/// every point was rejected contributes nothing: metadata describes families
+/// Ravel actually stored points for.
+pub fn normalize_decoded_with_metadata(
+    tenant: &TenantId,
+    batch: &DecodedBatch,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+    normalize_impl(tenant, batch, limits, ingest_ts_ns, exemplar_cap, true)
+}
+
+/// Shared body of the two exemplar-carrying entry points. `collect_metadata` is
+/// true only for [`normalize_decoded_with_metadata`]; the points, exemplars, and
+/// rejections it produces do not depend on it, so the older entry points are
+/// behaviorally unchanged.
+fn normalize_impl(
+    tenant: &TenantId,
+    batch: &DecodedBatch,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+    collect_metadata: bool,
+) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
     let total_points = count_total_points(batch);
     if total_points > limits.max_data_points_per_request {
         // No payload past the count is decoded, so no exemplar is even read
@@ -489,21 +542,27 @@ pub fn normalize_decoded_with_exemplars(
         // The difference is structural, not an oversight, and the differential
         // gate compares rejection classes at the shared admission layer rather
         // than at this return for exactly that reason.
-        return MetricsNormalizeResult {
-            output: NormalizeOutput {
-                points: Vec::new(),
-                // OTAP carries only scalar metric points; native-histogram
-                // admission is the OTLP/Remote Write surface's concern, so this
-                // vector is always empty here (ravel_otlp::NormalizeOutput
-                // gained it for those surfaces).
-                histogram_points: Vec::new(),
-                rejected: vec![Rejection::TooManyDataPoints {
-                    count: total_points,
-                    max: limits.max_data_points_per_request,
-                }],
+        return (
+            MetricsNormalizeResult {
+                output: NormalizeOutput {
+                    points: Vec::new(),
+                    // OTAP carries only scalar metric points; native-histogram
+                    // admission is the OTLP/Remote Write surface's concern, so
+                    // this vector is always empty here
+                    // (ravel_otlp::NormalizeOutput gained it for those
+                    // surfaces).
+                    histogram_points: Vec::new(),
+                    rejected: vec![Rejection::TooManyDataPoints {
+                        count: total_points,
+                        max: limits.max_data_points_per_request,
+                    }],
+                },
+                exemplars: Vec::new(),
             },
-            exemplars: Vec::new(),
-        };
+            // A whole-request rejection stored no point, so it describes no
+            // family: no metadata, exactly as OTLP's own early return.
+            Vec::new(),
+        );
     }
 
     let mut rejected = Vec::new();
@@ -565,6 +624,12 @@ pub fn normalize_decoded_with_exemplars(
             count: unknown_metric_count,
         });
     }
+
+    // Which metric ids actually contributed a point. Read only by the metadata
+    // build below (a family whose every point was rejected describes nothing),
+    // and one bool write per admitted point regardless, so the metadata-free
+    // entry points pay nothing measurable for it.
+    let mut produced = vec![false; dense_size];
 
     let attr_order = sort_attrs_by_parent(&flat_attrs);
     let mut points = Vec::with_capacity(flat_dp.len());
@@ -674,6 +739,9 @@ pub fn normalize_decoded_with_exemplars(
                     },
                     is_monotonic_sum: decision.is_sum && decision.is_monotonic,
                 });
+                if let Some(slot) = produced.get_mut(dp.parent_id as usize) {
+                    *slot = true;
+                }
                 // A number data point has no buckets, so its exemplars attach
                 // to the point's own series: there is no `le` bound to resolve
                 // This is the same rule `ravel_otlp::build_point`
@@ -722,6 +790,11 @@ pub fn normalize_decoded_with_exemplars(
             memo,
         ) {
             Ok((mut new_points, informational)) => {
+                if !new_points.is_empty()
+                    && let Some(slot) = produced.get_mut(dp.parent_id as usize)
+                {
+                    *slot = true;
+                }
                 points.append(&mut new_points);
                 rejected.extend(informational);
             }
@@ -753,21 +826,205 @@ pub fn normalize_decoded_with_exemplars(
             ingest_ts_ns,
             memo,
         ) {
-            Ok(mut new_points) => points.append(&mut new_points),
+            Ok(mut new_points) => {
+                if !new_points.is_empty()
+                    && let Some(slot) = produced.get_mut(dp.parent_id as usize)
+                {
+                    *slot = true;
+                }
+                points.append(&mut new_points);
+            }
             Err(rejection) => rejected.push(rejection),
         }
     }
 
-    MetricsNormalizeResult {
-        output: NormalizeOutput {
-            points,
-            // Always empty: OTAP admits only scalar points (see the early
-            // return above).
-            histogram_points: Vec::new(),
-            rejected,
+    let metadata = if collect_metadata {
+        build_metadata(
+            &root,
+            &metric_decision,
+            &hist_decision,
+            &summary_decision,
+            &produced,
+        )
+    } else {
+        Vec::new()
+    };
+
+    (
+        MetricsNormalizeResult {
+            output: NormalizeOutput {
+                points,
+                // Always empty: OTAP admits only scalar points (see the early
+                // return above).
+                histogram_points: Vec::new(),
+                rejected,
+            },
+            exemplars,
         },
-        exemplars,
+        metadata,
+    )
+}
+
+/// One [`MetricMetadata`] per metric id that contributed a point, in metric-id
+/// order, deduplicated by `family_name` with the first occurrence winning
+/// (`ravel_otlp`'s `MetadataCollector` rule). The family name is the decision's
+/// already-suffixed name, so it agrees with the series the points carry.
+fn build_metadata(
+    root: &[Option<RootEntry>],
+    metric_decision: &[Option<MetricDecision>],
+    hist_decision: &[Option<HistogramDecision>],
+    summary_decision: &[Option<SummaryDecision>],
+    produced: &[bool],
+) -> Vec<MetricMetadata> {
+    let mut out: Vec<MetricMetadata> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (id, contributed) in produced.iter().enumerate() {
+        if !contributed {
+            continue;
+        }
+        let Some(entry) = root.get(id).and_then(|e| e.as_ref()) else {
+            continue;
+        };
+        // Exactly one of the three decision tables holds this id: the tables
+        // are built from the same `metric_type` column, and a row whose type
+        // disagrees with its data-point table was classed unknown and produced
+        // no point.
+        let family_name = metric_decision
+            .get(id)
+            .and_then(|d| d.as_ref())
+            .map(|d| d.name.as_str())
+            .or_else(|| {
+                hist_decision
+                    .get(id)
+                    .and_then(|d| d.as_ref())
+                    .map(|d| d.name.as_str())
+            })
+            .or_else(|| {
+                summary_decision
+                    .get(id)
+                    .and_then(|d| d.as_ref())
+                    .map(|d| d.name.as_str())
+            });
+        let Some(family_name) = family_name else {
+            continue;
+        };
+        if !seen.insert(family_name) {
+            continue;
+        }
+        let kind = metadata_kind(&entry.kind);
+        out.push(MetricMetadata {
+            family_name: family_name.to_string(),
+            kind,
+            help: entry.description.clone(),
+            unit: metadata_unit_word(&entry.unit, kind),
+        });
     }
+    out
+}
+
+/// The Prometheus kind a METRICS root row implies, the OTAP twin of
+/// `ravel_otlp`'s `metric_kind_of` over the `data` oneof: a monotonic Sum is a
+/// Counter, a non-monotonic Sum and a Gauge are both Gauge. An `Unsupported`
+/// row never reaches here (it produces no point and so no metadata), and
+/// [`PromMetricKind::Unknown`] is the honest answer if one ever did.
+fn metadata_kind(kind: &RootKind) -> PromMetricKind {
+    match kind {
+        RootKind::Gauge => PromMetricKind::Gauge,
+        RootKind::Sum {
+            is_monotonic: true, ..
+        } => PromMetricKind::Counter,
+        RootKind::Sum { .. } => PromMetricKind::Gauge,
+        RootKind::Histogram { .. } => PromMetricKind::Histogram,
+        RootKind::Summary => PromMetricKind::Summary,
+        RootKind::Unsupported => PromMetricKind::Unknown,
+    }
+}
+
+/// The unit word stored in a metadata tuple: the mapped Prometheus word when the
+/// unit maps (so it agrees with the suffix [`prometheus_family_name`] put on the
+/// name), otherwise the raw unit with annotations stripped, otherwise empty
+/// (ADR-0085 Decision 1/2).
+///
+/// This mirrors `ravel_otlp::normalize`'s private `metadata_unit_word` /
+/// `unit_suffix` pair, the same way this module already mirrors that crate's
+/// private sanitization helpers: the mapped-word table itself is reused through
+/// the pub `map_unit`, and only the compound (`a/b`) and annotation handling is
+/// restated. Exporting `metadata_unit_word` from `ravel-otlp` would let both
+/// paths share one function; that is a `ravel-otlp` change, outside this task's
+/// scope, and is flagged rather than made here.
+fn metadata_unit_word(unit: &str, kind: PromMetricKind) -> String {
+    match metadata_unit_suffix(unit, kind) {
+        Some(word) => word,
+        // Unmapped: carry the raw unit through as free text. This is a metadata
+        // field, not a metric name, so metric-name sanitizing does not apply.
+        None => strip_unit_annotations(unit).trim().to_string(),
+    }
+}
+
+/// The mapped unit suffix (without a leading `_`), or `None` when the unit adds
+/// no suffix (empty, unrecognized simple unit, or `1` on a non-gauge).
+fn metadata_unit_suffix(unit: &str, kind: PromMetricKind) -> Option<String> {
+    let stripped = strip_unit_annotations(unit);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "1" {
+        return match kind {
+            PromMetricKind::Gauge => Some("ratio".to_string()),
+            _ => None,
+        };
+    }
+    if let Some((num_raw, den_raw)) = trimmed.split_once('/') {
+        let num = num_raw.trim();
+        let den = den_raw.trim();
+        let num_mapped =
+            (!num.is_empty()).then(|| map_unit(num).unwrap_or_else(|| num.to_string()));
+        let den_mapped =
+            (!den.is_empty()).then(|| map_per_unit(den).unwrap_or_else(|| den.to_string()));
+        match (num_mapped, den_mapped) {
+            (Some(n), Some(d)) => Some(format!("{n}_per_{d}")),
+            (Some(n), None) => Some(n),
+            (None, Some(d)) => Some(format!("per_{d}")),
+            (None, None) => None,
+        }
+    } else {
+        map_unit(trimmed)
+    }
+}
+
+/// Strip every `{...}` annotation from a unit, at any nesting, tolerating
+/// unbalanced braces (a unit string is attacker-influenced and must never
+/// panic). Mirrors `ravel_otlp::normalize`'s private `strip_annotations`.
+fn strip_unit_annotations(unit: &str) -> String {
+    let mut out = String::with_capacity(unit.len());
+    let mut depth: usize = 0;
+    for c in unit.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A per-unit denominator through the Collector's `perUnitMapper` table, where
+/// `m` is `minute` rather than `meters`. Mirrors `ravel_otlp::normalize`'s
+/// private `map_per_unit`.
+fn map_per_unit(unit: &str) -> Option<String> {
+    let mapped = match unit {
+        "s" => "second",
+        "m" => "minute",
+        "h" => "hour",
+        "d" => "day",
+        "w" => "week",
+        "mo" => "month",
+        "y" => "year",
+        _ => return None,
+    };
+    Some(mapped.to_string())
 }
 
 fn payloads_of(batch: &DecodedBatch, ty: ArrowPayloadType) -> Vec<&RecordBatch> {
@@ -861,6 +1118,13 @@ struct RootEntry {
     /// [`prometheus_family_name`] when building each decision's suffixed name
     /// (ADR-0085 Decision 2), mirroring `ravel_otlp::normalize_metric`.
     unit: String,
+    /// The metric's help text (METRICS.description column), empty when the
+    /// column is absent or null. OTAP's counterpart to OTLP's
+    /// `Metric.description`, and the `help` field of the metadata tuple
+    /// [`normalize_decoded_with_metadata`] surfaces (ADR-0085 Decision 1). It
+    /// has no effect on points, names, or rejections, so a producer that omits
+    /// the column normalizes exactly as before with an empty help.
+    description: String,
 }
 
 enum RootKind {
@@ -1094,12 +1358,19 @@ fn build_root_table(
         let temporality_col = column_as::<Int32Array>(rb, "aggregation_temporality");
         let monotonic_col = column_as::<BooleanArray>(rb, "is_monotonic");
         let unit_col = rb.column_by_name("unit");
+        // Optional like `unit`: a producer that omits the column (this crate's
+        // own test encoder among them) yields an empty help rather than a
+        // decode failure.
+        let description_col = rb.column_by_name("description");
 
         for (i, &id) in ids.iter().enumerate() {
             let Some(name) = name_at(name_col, i) else {
                 continue;
             };
             let unit = unit_col.and_then(|c| name_at(c, i)).unwrap_or_default();
+            let description = description_col
+                .and_then(|c| name_at(c, i))
+                .unwrap_or_default();
             let kind = match types.value(i) {
                 METRIC_TYPE_GAUGE => RootKind::Gauge,
                 METRIC_TYPE_SUM => {
@@ -1120,7 +1391,12 @@ fn build_root_table(
                 _ => RootKind::Unsupported,
             };
             if (id as usize) < entries.len() {
-                entries[id as usize] = Some(RootEntry { name, kind, unit });
+                entries[id as usize] = Some(RootEntry {
+                    name,
+                    kind,
+                    unit,
+                    description,
+                });
             }
         }
     }
@@ -2403,4 +2679,159 @@ fn explode_summary_point(
     )?);
 
     Ok(series)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The unit word this module stores must be the same word
+    /// `ravel_otlp::normalize`'s private `metadata_unit_word` stores, since the
+    /// two surfaces write the same durable record. Pinned against the exact
+    /// table that crate's own tests pin (mapped word, dimensionless ratio,
+    /// unmapped raw passthrough, annotation-only collapse, compound form), so a
+    /// future divergence in either mirror fails here.
+    #[test]
+    fn metadata_unit_word_mirrors_the_otlp_mapping() {
+        assert_eq!(metadata_unit_word("By", PromMetricKind::Counter), "bytes");
+        assert_eq!(
+            metadata_unit_word("s", PromMetricKind::Histogram),
+            "seconds"
+        );
+        assert_eq!(metadata_unit_word("", PromMetricKind::Gauge), "");
+        // Dimensionless `1` is `ratio` on a gauge and nothing on any other kind,
+        // where "nothing" still carries the raw unit as free text.
+        assert_eq!(metadata_unit_word("1", PromMetricKind::Gauge), "ratio");
+        assert_eq!(metadata_unit_word("1", PromMetricKind::Counter), "1");
+        // Unmapped units pass through raw, never metric-name sanitized.
+        assert_eq!(
+            metadata_unit_word("furlong", PromMetricKind::Gauge),
+            "furlong"
+        );
+        assert_eq!(metadata_unit_word("2h", PromMetricKind::Gauge), "2h");
+        // Annotations are stripped; an annotation-only unit is empty.
+        assert_eq!(metadata_unit_word("{request}", PromMetricKind::Gauge), "");
+        assert_eq!(
+            metadata_unit_word("{packet}/s", PromMetricKind::Gauge),
+            "per_second"
+        );
+        // Compound form, each side mapped independently. `m` is `minute` in the
+        // denominator, not `meters`.
+        assert_eq!(
+            metadata_unit_word("By/s", PromMetricKind::Gauge),
+            "bytes_per_second"
+        );
+        assert_eq!(
+            metadata_unit_word("By/m", PromMetricKind::Gauge),
+            "bytes_per_minute"
+        );
+        // An unrecognized side passes through rather than being dropped.
+        assert_eq!(
+            metadata_unit_word("furlong/fortnight", PromMetricKind::Gauge),
+            "furlong_per_fortnight"
+        );
+    }
+
+    /// The METRICS `metric_type`/`is_monotonic` pair maps to the same Prometheus
+    /// kind OTLP's `data` oneof does.
+    #[test]
+    fn metadata_kind_follows_the_otlp_oneof_rule() {
+        assert_eq!(metadata_kind(&RootKind::Gauge), PromMetricKind::Gauge);
+        assert_eq!(
+            metadata_kind(&RootKind::Sum {
+                temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+                is_monotonic: true,
+            }),
+            PromMetricKind::Counter
+        );
+        assert_eq!(
+            metadata_kind(&RootKind::Sum {
+                temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+                is_monotonic: false,
+            }),
+            PromMetricKind::Gauge
+        );
+        assert_eq!(
+            metadata_kind(&RootKind::Histogram {
+                temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+            }),
+            PromMetricKind::Histogram
+        );
+        assert_eq!(metadata_kind(&RootKind::Summary), PromMetricKind::Summary);
+        assert_eq!(
+            metadata_kind(&RootKind::Unsupported),
+            PromMetricKind::Unknown
+        );
+    }
+
+    /// Deduplication by family name, first occurrence winning, and "no point, no
+    /// metadata".
+    #[test]
+    fn build_metadata_dedups_by_family_and_skips_unproduced() {
+        let root = vec![
+            Some(RootEntry {
+                name: "requests".to_string(),
+                kind: RootKind::Sum {
+                    temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+                    is_monotonic: true,
+                },
+                unit: "By".to_string(),
+                description: "first help".to_string(),
+            }),
+            Some(RootEntry {
+                name: "requests".to_string(),
+                kind: RootKind::Sum {
+                    temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+                    is_monotonic: true,
+                },
+                unit: "By".to_string(),
+                description: "second help".to_string(),
+            }),
+            Some(RootEntry {
+                name: "silent".to_string(),
+                kind: RootKind::Gauge,
+                unit: String::new(),
+                description: "never stored".to_string(),
+            }),
+        ];
+        let decisions = vec![
+            Some(MetricDecision {
+                name: "requests_bytes_total".to_string(),
+                is_sum: true,
+                is_monotonic: true,
+            }),
+            Some(MetricDecision {
+                name: "requests_bytes_total".to_string(),
+                is_sum: true,
+                is_monotonic: true,
+            }),
+            Some(MetricDecision {
+                name: "silent".to_string(),
+                is_sum: false,
+                is_monotonic: false,
+            }),
+        ];
+        let empty_hist: Vec<Option<HistogramDecision>> = vec![None, None, None];
+        let empty_summary: Vec<Option<SummaryDecision>> = vec![None, None, None];
+
+        let metadata = build_metadata(
+            &root,
+            &decisions,
+            &empty_hist,
+            &empty_summary,
+            // The third metric produced no admitted point.
+            &[true, true, false],
+        );
+
+        assert_eq!(
+            metadata,
+            vec![MetricMetadata {
+                family_name: "requests_bytes_total".to_string(),
+                kind: PromMetricKind::Counter,
+                help: "first help".to_string(),
+                unit: "bytes".to_string(),
+            }]
+        );
+    }
 }

@@ -25,11 +25,11 @@ use std::sync::Arc;
 
 use futures::Stream;
 use ravel_ingest::{IngestPoint, WriteMode, plausible_ingest_clock};
-use ravel_otap::normalize::normalize_decoded;
+use ravel_otap::normalize::normalize_decoded_with_metadata;
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
 use ravel_otap::stream::{DecodeError, DecodedBatch, StreamConfig, StreamState};
-use ravel_types::{CommitToken, SeriesId, Signal, TenantId};
+use ravel_types::{CommitToken, ExemplarCap, SeriesId, Signal, TenantId};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::ingest::{IngestRequestError, IngestState};
@@ -335,7 +335,28 @@ async fn write_batch(
     .await
     .map_err(|e| IngestRequestError::Provisioning(e.to_string()))?;
 
-    let normalized = normalize_decoded(tenant, decoded, &ingest.limits, ingest_ts_ns);
+    // OTAP mirrors OTLP's normalize point-for-point, metadata included: the same
+    // `(family, type, help, unit)` tuple, from the METRICS table's
+    // `metric_type`/`description`/`unit` columns (ADR-0085 decision 1). The
+    // exemplar-carrying inner call is unchanged, so this stays the
+    // `normalize_decoded` wrapper's behavior plus the metadata.
+    //
+    // The request-scoped `ExemplarCap` and the discarded `result.exemplars` are
+    // what the `normalize_decoded` wrapper this call site used to call built
+    // internally: nothing on this path stores exemplars (it writes through
+    // `write_values`, not `write_values_with_exemplars`), and the wrapper's
+    // drop-count rejection went into a `rejected` vector this function does not
+    // read either. So points, series, and the ack are byte-for-byte what they
+    // were; the metadata tuple is the only addition.
+    let mut cap = ExemplarCap::new(ingest.limits.exemplar_cap_window_ns);
+    let (result, metadata) =
+        normalize_decoded_with_metadata(tenant, decoded, &ingest.limits, ingest_ts_ns, &mut cap);
+    let normalized = result.output;
+    // Synchronous, no I/O, off the acknowledgement path: see the twin call in
+    // `crate::ingest::handle_export`.
+    if let Some(sink) = &ingest.metadata_sink {
+        sink.observe(tenant, tenant.hash(), metadata);
+    }
     let mut points: Vec<IngestPoint> =
         Vec::with_capacity(normalized.points.len() + normalized.histogram_points.len());
     points.extend(normalized.points.into_iter().map(IngestPoint::from));
@@ -449,6 +470,7 @@ mod tests {
             )),
             recovery: None,
             provisioning: None,
+            metadata_sink: None,
         }
     }
 

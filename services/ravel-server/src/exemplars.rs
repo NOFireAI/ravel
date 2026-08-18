@@ -2038,6 +2038,7 @@ mod tests {
             )),
             recovery: None,
             provisioning: None,
+            metadata_sink: None,
         };
 
         // A classic histogram data point (le bounds [0.5]) carrying one
