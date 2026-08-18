@@ -9,10 +9,11 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use ravel_ingest::{
-    AdmissionController, IngestExemplar, IngestPoint, IngestRouter, RequestRejection, WriteError,
-    WriteMode, plausible_ingest_clock,
+    AdmissionController, IngestExemplar, IngestPoint, IngestRouter, MetadataSink, RequestRejection,
+    WriteError, WriteMode, plausible_ingest_clock,
 };
-use ravel_otlp::{IngestLimits, Rejection, normalize_metrics_with_exemplars};
+use ravel_otlp::normalize::normalize_metrics_with_metadata;
+use ravel_otlp::{IngestLimits, Rejection};
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
 
 pub struct IngestState {
@@ -33,6 +34,11 @@ pub struct IngestState {
     /// write and fails the request on a `shard_count` mismatch. `Some` in the
     /// ingest modes; `None` (e.g. a unit test) is a no-op.
     pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
+    /// The one-per-process metric metadata sink (ADR-0085 decision 1). Every
+    /// ingest surface shares this one `Arc`; `handle_export` hands it what
+    /// normalization decoded, synchronously and off the acknowledgement path.
+    /// `None` in a unit test or a mode that captures no metadata.
+    pub metadata_sink: Option<Arc<MetadataSink>>,
 }
 
 pub struct IngestOutcome {
@@ -151,8 +157,17 @@ pub async fn handle_export(
     // `shard.rs`'s per-flush cap comment already rejected building one layer
     // lower).
     let mut cap = ExemplarCap::new(state.limits.exemplar_cap_window_ns);
-    let result =
-        normalize_metrics_with_exemplars(&tenant, request, &state.limits, ingest_ts_ns, &mut cap);
+    let (result, metadata) =
+        normalize_metrics_with_metadata(&tenant, request, &state.limits, ingest_ts_ns, &mut cap);
+    // Capture this request's `(family, type, help, unit)` tuples (ADR-0085
+    // decision 1). Synchronous, no I/O, infallible: it only compares
+    // fingerprints and stores the changed ones for the background flush window,
+    // so it is deliberately called here, right after normalization, rather than
+    // anywhere near the write's await. A point is acked on its data write and is
+    // never blocked on or failed by the metadata record.
+    if let Some(sink) = &state.metadata_sink {
+        sink.observe(&tenant, tenant.hash(), metadata);
+    }
     let exemplars: Vec<IngestExemplar> = result
         .exemplars
         .into_iter()
@@ -316,7 +331,39 @@ mod tests {
             )),
             recovery: None,
             provisioning: None,
+            metadata_sink: None,
         }
+    }
+
+    /// An ingest state whose metric metadata sink writes to the same store the
+    /// router does, plus that store and sink, so a test can drive the real
+    /// `handle_export` and then flush the window it armed.
+    fn state_with_metadata_sink() -> (IngestState, Arc<dyn ObjectStoreBackend>, Arc<MetadataSink>) {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router = Arc::new(IngestRouter::new(
+            IngestConfig::default(),
+            store.clone(),
+            Signal::Metrics,
+            Arc::new(SystemClock),
+        ));
+        let sink = Arc::new(MetadataSink::new(
+            store.clone(),
+            ravel_ingest::MetadataSinkConfig::default(),
+            router.metrics_handle(),
+        ));
+        let state = IngestState {
+            router,
+            limits: IngestLimits::default(),
+            ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            recovery: None,
+            provisioning: None,
+            metadata_sink: Some(sink.clone()),
+        };
+        (state, store, sink)
     }
 
     fn empty_request() -> ExportMetricsServiceRequest {
@@ -428,6 +475,74 @@ mod tests {
         );
     }
 
+    /// The OTLP surface must hand every ingested family's `(type, help, unit)`
+    /// to the process metadata sink (ADR-0085 decision 1), keyed by the family
+    /// name after the Decision 2 suffix pass. Drives the real `handle_export`,
+    /// then flushes the window it armed and reads the durable record back: this
+    /// is the wiring, not the sink's own behavior (unit-tested in
+    /// `ravel-ingest`), that it proves.
+    #[tokio::test]
+    async fn handle_export_observes_metric_metadata_for_the_flush_window() {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric::Data as MetricData,
+        };
+
+        let (state, store, sink) = state_with_metadata_sink();
+        let tenant = TenantId::new("acme");
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "http_request_size".to_string(),
+                        description: "size of each request".to_string(),
+                        unit: "By".to_string(),
+                        data: Some(MetricData::Sum(Sum {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: BASE_TS_NS as u64,
+                                value: Some(NumberValue::AsDouble(1.0)),
+                                ..Default::default()
+                            }],
+                            aggregation_temporality: 2,
+                            is_monotonic: true,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        handle_export(
+            &state,
+            tenant.clone(),
+            WriteMode::Buffered,
+            request,
+            BASE_TS_NS,
+        )
+        .await
+        .expect("buffered write succeeds");
+
+        let summary = sink.flush_once(BASE_TS_NS).await;
+        assert_eq!(summary.tenants_flushed, 1);
+        assert_eq!(summary.gets, 1);
+        assert_eq!(summary.puts, 1);
+
+        let entries = ravel_catalog::read_metrics_meta(store.as_ref(), &tenant.hash())
+            .await
+            .expect("read metadata record")
+            .expect("record written by the flush")
+            .0;
+        assert_eq!(entries.len(), 1);
+        // Suffixed name (unit word, then `_total` for a monotonic Sum), the
+        // mapped unit word, and the OTLP description as help.
+        assert_eq!(entries[0].family_name, "http_request_size_bytes_total");
+        assert_eq!(entries[0].kind, ravel_catalog::MetricKind::Counter);
+        assert_eq!(entries[0].help, "size of each request");
+        assert_eq!(entries[0].unit, "bytes");
+    }
+
     #[tokio::test]
     async fn handle_export_reports_no_partial_success_when_nothing_rejected() {
         let state = state();
@@ -476,6 +591,7 @@ mod tests {
             )),
             recovery: Some(writer),
             provisioning: None,
+            metadata_sink: None,
         };
 
         let tenant = TenantId::new("acme");

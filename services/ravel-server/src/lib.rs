@@ -27,6 +27,7 @@ pub mod ingest_concurrency;
 pub mod lifecycle_refresh;
 pub mod logs_ingest;
 pub mod maintain;
+pub mod metadata_sink_task;
 pub mod metrics;
 #[cfg(feature = "otap")]
 pub mod otap_grpc;
@@ -421,6 +422,7 @@ pub struct Running {
     scrub_task: scrub::ScrubTask,
     lifecycle_refresh_task: lifecycle_refresh::LifecycleRefreshTask,
     idle_tenant_state_task: idle_tenant_state::IdleTenantStateTask,
+    metadata_sink_task: metadata_sink_task::MetadataSinkTask,
 }
 
 impl Running {
@@ -497,6 +499,9 @@ impl Running {
         self.scrub_task.shutdown().await;
         self.lifecycle_refresh_task.shutdown().await;
         self.idle_tenant_state_task.shutdown().await;
+        // Last: its final flush writes whatever the in-progress window
+        // observed, and it must not race the ingest surfaces that feed it.
+        self.metadata_sink_task.shutdown().await;
 
         Ok(())
     }
@@ -514,6 +519,7 @@ fn gateway_state(
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
     ingest_byte_metrics: &Arc<ingest_byte_metrics::IngestByteMetrics>,
+    metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -524,6 +530,7 @@ fn gateway_state(
             admission: admission.clone(),
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
+            metadata_sink: metadata_sink.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
@@ -549,6 +556,7 @@ fn gateway_state(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn remote_write_state(
     ingest_router: &Arc<IngestRouter>,
     tenant_resolver: Arc<dyn TenantResolver>,
@@ -556,6 +564,7 @@ fn remote_write_state(
     recovery: &Option<Arc<tenancy::RecoveryManifestWriter>>,
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
+    metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -568,6 +577,7 @@ fn remote_write_state(
         provisioning: provisioning.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
         clock: Arc::new(SystemClock),
+        metadata_sink: metadata_sink.clone(),
     })
 }
 
@@ -644,6 +654,24 @@ pub async fn start(
     } else {
         None
     };
+
+    // The one metric metadata sink for this process (ADR-0085 decision 1). One
+    // sink, not one per protocol, so the OTLP, OTAP, RW1, and RW2 surfaces
+    // sharing this `Arc` can never race each other on `t/<tenant_hash>/m/meta`.
+    // It counts into the metrics router's own `IngestMetrics`, so its GET/PUT/
+    // drop counters land in the snapshot an operator already scrapes, and it
+    // writes through the foreground store handle the router writes data objects
+    // through. Built only in the ingest-serving modes: a query-only process
+    // captures no metadata and spawns no flush loop. Defaults are used
+    // throughout (30 s window, 20k entries per tenant, 5 CAS retries); no CLI
+    // knob is added, so retuning it is a code change for now.
+    let metadata_sink = ingest_router.as_ref().map(|router| {
+        Arc::new(ravel_ingest::MetadataSink::new(
+            store.clone(),
+            ravel_ingest::MetadataSinkConfig::default(),
+            router.metrics_handle(),
+        ))
+    });
 
     // The log pipeline is a parallel router, not a mode of the metrics one:
     // same shard count, same store, same clock, but RLOG objects under the
@@ -864,6 +892,7 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &ingest_byte_metrics,
+            &metadata_sink,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -873,6 +902,7 @@ pub async fn start(
             &recovery,
             &provisioning_writer,
             &ingest_concurrency,
+            &metadata_sink,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -888,6 +918,7 @@ pub async fn start(
                 &provisioning_writer,
                 &ingest_concurrency,
                 &ingest_byte_metrics,
+                &metadata_sink,
             );
             let mtls_rw_state = remote_write_state(
                 router,
@@ -896,6 +927,7 @@ pub async fn start(
                 &recovery,
                 &provisioning_writer,
                 &ingest_concurrency,
+                &metadata_sink,
             );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
@@ -1371,6 +1403,7 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &ingest_byte_metrics,
+            &metadata_sink,
         )),
         _ => None,
     };
@@ -1774,6 +1807,12 @@ pub async fn start(
         lifecycle_refresh::spawn(durable_auth.clone(), store.clone(), limits, interval)
     };
 
+    // The metric metadata flush loop (ADR-0085 decision 1), supervised exactly
+    // like the lifecycle refresh loop above: one task per process, joined on
+    // shutdown after a final flush, and never able to fail an ingest request
+    // (every metadata failure is counted and logged inside the sink).
+    let metadata_sink_task = metadata_sink_task::spawn(metadata_sink.clone());
+
     // Idle-tenant state eviction sweep (ADR-0069 decision 2): one
     // task per process that evicts re-derivable per-tenant state idle past
     // `--idle-tenant-state-ttl`. The evictor set is built from whatever
@@ -1828,5 +1867,6 @@ pub async fn start(
         scrub_task,
         lifecycle_refresh_task,
         idle_tenant_state_task,
+        metadata_sink_task,
     })
 }

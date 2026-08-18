@@ -151,6 +151,30 @@ pub struct IngestMetrics {
     /// struct (see the module docs' "no per-shard dimension" note); read it
     /// via [`IngestMetrics::in_flight_flushes_by_shard`].
     in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Metadata-record GETs issued by the metric metadata sink's flush window
+    /// (ADR-0085 decision 1). The ADR budgets one GET per tenant per window
+    /// with a non-empty pending set, so this is the counter an operator checks
+    /// that budget against. Exported as
+    /// `ingest_metadata_flush_gets_total`.
+    metadata_flush_gets: AtomicU64,
+    /// Metadata-record CAS PUTs *attempted* by the sink's flush window
+    /// (ADR-0085 decision 1), including an attempt that lost its CAS and was
+    /// retried, so `puts - conflicts` is the number that landed. The ADR
+    /// budgets at most one PUT per tenant per window in the conflict-free
+    /// case. Exported as `ingest_metadata_flush_puts_total`.
+    metadata_flush_puts: AtomicU64,
+    /// Flush windows whose metadata update was dropped: a CAS that still
+    /// conflicted after `max_cas_retries`, or any other read/write failure
+    /// against the record. Never fatal to an ingest request (the flush is off
+    /// the acknowledgement path entirely) and never silent, which is what this
+    /// counter is for. Exported as `ingest_metadata_flush_dropped_total`.
+    metadata_flush_dropped: AtomicU64,
+    /// Metric family names not added to a tenant's metadata record because it
+    /// was already at the per-tenant entry cap (ADR-0085 decision 1). The
+    /// points themselves are still ingested and queryable; only the metadata
+    /// entry is dropped. Exported as
+    /// `ingest_metadata_entries_dropped_total`.
+    metadata_entries_dropped: AtomicU64,
     /// Bounded-cardinality per-tenant PUT attribution (ADR-0076 decision 2).
     /// Unlike every flat counter above it carries a per-tenant dimension, so
     /// it is kept bounded by a top-K cap rather than exposed as an unbounded
@@ -181,6 +205,15 @@ pub struct IngestMetricsSnapshot {
     pub exemplars_dropped_total: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    /// `ingest_metadata_flush_gets_total` (ADR-0085 decision 1).
+    pub metadata_flush_gets_total: u64,
+    /// `ingest_metadata_flush_puts_total` (ADR-0085 decision 1). Counts PUT
+    /// attempts, so a CAS-conflicted attempt is included.
+    pub metadata_flush_puts_total: u64,
+    /// `ingest_metadata_flush_dropped_total` (ADR-0085 decision 1).
+    pub metadata_flush_dropped_total: u64,
+    /// `ingest_metadata_entries_dropped_total` (ADR-0085 decision 1).
+    pub metadata_entries_dropped_total: u64,
     /// Sum across shards of [`IngestMetrics::in_flight_flushes_by_shard`] at
     /// snapshot time. The per-shard breakdown does not fit this struct's flat
     /// Copy shape; call `in_flight_flushes_by_shard` directly for that.
@@ -308,6 +341,30 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One metadata-record GET issued by a flush window (ADR-0085 decision 1).
+    pub(crate) fn record_metadata_flush_get(&self) {
+        self.metadata_flush_gets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One metadata-record CAS PUT attempted by a flush window. Counted per
+    /// attempt, so a conflicted-and-retried write counts more than once.
+    pub(crate) fn record_metadata_flush_put(&self) {
+        self.metadata_flush_puts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush window's metadata update dropped (CAS retries exhausted, or a
+    /// read/write failure against the record). Visible, never fatal.
+    pub(crate) fn record_metadata_flush_dropped(&self) {
+        self.metadata_flush_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` new family names not stored because the tenant's record was
+    /// already at the per-tenant entry cap. The points stay ingested.
+    pub(crate) fn record_metadata_entries_dropped(&self, count: u64) {
+        self.metadata_entries_dropped
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> IngestMetricsSnapshot {
         IngestMetricsSnapshot {
             flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
@@ -327,6 +384,10 @@ impl IngestMetrics {
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            metadata_flush_gets_total: self.metadata_flush_gets.load(Ordering::Relaxed),
+            metadata_flush_puts_total: self.metadata_flush_puts.load(Ordering::Relaxed),
+            metadata_flush_dropped_total: self.metadata_flush_dropped.load(Ordering::Relaxed),
+            metadata_entries_dropped_total: self.metadata_entries_dropped.load(Ordering::Relaxed),
             in_flight_flushes_total: self
                 .in_flight_flushes_by_shard()
                 .into_iter()
