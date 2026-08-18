@@ -220,6 +220,7 @@ endpoints):
 | `op` | object | The analytic to apply (tagged; see below). |
 | `timeout` | number, optional | Wall deadline in seconds; clamped to the server maximum, can only lower it. |
 | `min_commit_token` | array of string, optional | Read-your-write commit tokens. |
+| `allow_partial` | bool, optional | Consent to a partial federated answer; default `false`. See "Partial federated coverage" below. |
 
 `start`, `end`, and `step` accept the identical syntax `/api/v1/query_range`
 accepts. A JSON number is accepted wherever a bare-seconds string would be, so
@@ -256,7 +257,9 @@ the evaluated matrix:
        "result": { ... op result ... }}
     ]
   },
-  "stats": { "accounting": { ... }, "estimate": { ... } }
+  "stats": { "accounting": { ... }, "estimate": { ... } },
+  "partial": false,
+  "warnings": []
 }
 ```
 
@@ -268,6 +271,23 @@ serde). Fields are snake_case.
 on object storage, and the pre-execution upper envelope of that spend
 (ADR-0044). docs/guides/operations.md, section "Per-query cost accounting",
 gives the field list.
+
+`partial` and `warnings` sit beside `data` too, on every response, complete
+or not. `partial` is `true` only when the query federated across a remote
+that `skip_unavailable` let it skip; `warnings` names which one. See
+"Partial federated coverage" below.
+
+### Partial federated coverage
+
+A federated query (ADR-0071) can skip an unreachable remote when that
+remote's `skip_unavailable` opt-in is set. By default the analytics
+endpoint refuses to hand back an answer built on incomplete coverage: it
+fails with a `503`/`unavailable` naming the degraded cluster, and names
+`allow_partial` as the remedy in the message itself. Setting
+`allow_partial: true` in the request body opts in; the response is then a
+normal `200` with `partial: true` and `warnings` naming the skipped
+cluster(s). This mirrors the consent gate `/api/v1/query` and
+`/api/v1/query_range` apply to the same situation.
 
 `change_point` result:
 
@@ -349,6 +369,7 @@ mappings:
 | `AnalyticsError::EmptySeries` | 422 | `execution` |
 | Query deadline exceeded | 504 | `timeout` |
 | Transient storage fault, unsatisfiable commit token | 503 | `unavailable` |
+| Partial federated coverage without `allow_partial: true` | 503 | `unavailable` |
 | Permanent data corruption | 500 | `internal` |
 
 `AnalyticsError` messages carry only the caller's own parameters (a
