@@ -383,6 +383,48 @@ the owner's explicit go-ahead, never folded into an auto-merged pull request,
 because a rule change that lands automatically can silently loosen the very
 gate it is meant to tighten.
 
+## Amendment: decision 11 applied
+
+Decision 11 recorded the evidence and left the setting alone, because branch
+protection is a repository setting and a rule change that lands through an
+auto-merged pull request could silently loosen the gate it is meant to tighten.
+The owner applied it by hand on 2026-08-18. The required-status-check list on
+`main`'s `protect-main` ruleset goes from seven contexts to thirteen:
+
+    added: supply-chain, docker-build, fuzz, object-store-contract,
+           promql-difftest, actionlint
+
+`actionlint` was not in decision 11's original list because it did not exist
+when that decision was written. This epic added it, and it caught a real defect
+on its first pull request, so it belongs in the set for the same reason as the
+others.
+
+The risk checked before applying, rather than assumed: a required check that is
+*skipped* must not deadlock a pull request. It does not here. `check`, `sql`,
+`flight-sql` and `features` were already required, all four reported `skipping`
+on the docs-only #244, and that pull request merged. The `docs_only`
+short-circuit therefore keeps working with the larger set.
+
+Two checks are deliberately still not required:
+
+- `quickstart`, because ADR-0081's consequences hold it advisory until its
+  warm-cache budget is observed. Promoting it here would overturn a standing
+  decision as a side effect of a different one.
+- `coverage`, because it runs only on pushes to `main`, never on pull requests.
+  Requiring it would block every pull request forever, waiting for a check that
+  never reports.
+
+That second exclusion leaves a real gap open, and it is recorded rather than
+hidden. `coverage` cannot block a pull request, yet its outcome fully determines
+the `ci.yml` run conclusion that ADR-0037 decision 9's release gate reads. A
+coverage timeout therefore vetoes a publish while being unable to veto a merge,
+which is the wrong way round. It nearly did so during this epic's rollout: a
+cold-cache coverage run hit its forty-minute timeout, the run concluded
+`cancelled`, and the release gate would have refused the tag. Fixing it means
+either having the gate consult required-job outcomes rather than the run
+conclusion, or stopping `coverage` from setting that conclusion. Neither
+belongs in this epic.
+
 ## Rejected alternatives
 
 - **Publish macOS binaries.** Rejected for now. There is no tested macOS
