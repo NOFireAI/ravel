@@ -70,7 +70,7 @@ t/<tenant_hash>/metrics/meta   metric-name -> {type, help, unit} map
                                 (CAS whole-record replace, additive)
 ```
 
-Body: a small JSON object, `{format_version, entries: {"<metric_name>":
+Body: a small JSON object, `{format_version, entries: {"<metric_family_name>":
 {"type": "counter"|"gauge"|"histogram"|"summary"|"unknown", "help": "...",
 "unit": "..."}}}`. One entry per metric name per tenant (not per series):
 Prometheus metadata is keyed by name, and Ravel has no per-target scrape
@@ -79,37 +79,68 @@ so a single latest-write-wins record per name is the exact match for
 Ravel's ingest model, not an approximation of a richer thing Ravel doesn't
 have.
 
+The map key is the *family* name, defined per path so all three agree on
+what a lookup at query time matches: for OTLP it is the name after the
+suffix pass in Decision 2 (final unit + `_total` suffix applied, but before
+the classic histogram/summary explosion that appends `_bucket`/`_sum`/
+`_count`) — the metadata describes the family the exploded series belong to,
+not any one exploded series. For RW1 it is `metric_family_name` as already
+parsed. For RW2, per-series names that already carry a structural
+`_bucket`/`_sum`/`_count`/`_total` suffix are stripped back to the family
+name before use as the map key (mirroring the same structural-suffix set
+OTLP's explosion produces), so a classic histogram doesn't fragment into
+multiple spurious metadata entries.
+
 Each ingest path (OTLP, RW1, RW2) keeps decoding type/help/unit exactly as it
 already does — RW1/RW2 already parse it and only need to stop discarding it;
 OTLP needs `Metric.description` and `Metric.unit` read alongside `Metric.name`
 (the type is already known from the `data` oneof match). Each ingest process
-keeps an in-memory `HashSet<(tenant, metric_name)>` of names it has already
-flushed with unchanged metadata, purely as a fast local skip — it is never
-trusted on its own. On a name not in that local set (new to this process, or
-a fresh process after restart), the process reads the current
-`t/<tenant_hash>/metrics/meta` body, computes the merged result, and compares
-the merge against what it just read: if the merge is a no-op (the entry is
-already present with identical type/help/unit — the common case right after a
-restart, when every name looks "new" locally but the durable record already
-has it), it skips the CAS write entirely and just adds the name to its local
-set. Only a genuine new-or-changed entry triggers the CAS write, retried
-against the freshly-read body on conflict. This bounds a rolling restart of N
-ingest processes to zero rewrites once the durable record already reflects
-current metadata, and bounds steady-state ingest — the overwhelming majority
-of points, which are existing series with unchanged metadata — to zero
-CAS traffic, the same debounced-write shape already used for
-`sys/maintain/workers/<process_id>`.
+keeps an in-memory `HashMap<(tenant, metric_family_name), fingerprint>` where
+`fingerprint` hashes the last-flushed `(type, help, unit)` tuple — keyed on
+content, not just name, so a help/unit change during the process's lifetime
+is detected locally instead of being masked by "we've seen this name before."
+This local map is purely a fast skip — it is never trusted on its own. On a
+name whose current fingerprint differs from the local map (new name, changed
+metadata, or a fresh process after restart where nothing is in the local map
+yet), the process reads the current `t/<tenant_hash>/metrics/meta` body and
+field-wise merges the new tuple into the existing entry for that name — an
+absent/empty incoming field never overwrites a populated existing field, so
+RW1 supplying help without unit and OTLP later supplying unit without help
+compose instead of one clobbering the other. It compares the merged record
+against what it just read: if merging is a no-op (every field already
+matches, the common case right after a restart, when every name looks new
+locally but the durable record already reflects it), it skips the CAS write
+and just updates the local fingerprint. Only a genuine new-or-changed field
+triggers the CAS write, retried against the freshly-read body on conflict up
+to a bounded retry count (default 5, jittered backoff); on exhaustion the
+update is dropped and an `ingest_metadata_flush_dropped_total` counter is
+incremented and a warning logged — visible, not silent, and never fatal to
+the ingest request. This flush is asynchronous and off the ingest
+acknowledgement path entirely: the point being ingested is acked based on
+the data write succeeding, never blocked on or failed by the metadata CAS,
+so a contended or degraded metadata key cannot turn into an ingest
+availability regression. This bounds a rolling restart of N ingest processes
+to zero rewrites once the durable record already reflects current metadata,
+and bounds steady-state ingest — the overwhelming majority of points, which
+are existing series with unchanged metadata — to zero CAS traffic, the same
+debounced-write shape already used for `sys/maintain/workers/<process_id>`.
 
 Expected metric-name cardinality per tenant is orders of magnitude below
 series cardinality (typically low thousands, not millions — name count grows
 with distinct metric definitions, not label combinations), so the
-whole-record CAS-replace body stays small in the common case. This ADR does
-not add an enforced cap: past a few thousand entries the JSON record's size
-becomes a visible, loggable cost (ingest logs a warning with the current
-entry count on every CAS write past a configurable threshold, default
-10,000), not a silent one, consistent with the "no silent caps" guidance —
-splitting the key by shard or metric-name prefix is deferred until real
-tenant data shows the threshold matters.
+whole-record CAS-replace body stays small in the common case. The
+pathological case — a client minting unbounded distinct metric names (IDs
+embedded in names) — turns this shared key into a per-tenant write-amplification
+target with no expiry, since metadata is additive-only by default. This ADR
+therefore adds a hard per-tenant entry cap (default 20,000, configurable):
+once a durable record is at the cap, a new name is not added (the point is
+still ingested and queryable, only its metadata entry is dropped), and an
+`ingest_metadata_entries_dropped_total` counter is incremented — a visible
+drop, not a silent one. Remediation for a record that needs pruning (stale
+names from a since-fixed bad client) doesn't need a delete grant: it is the
+same CAS-write path with a smaller merged body, evicting entries whose
+last-updated timestamp (carried per entry) is oldest, which stays within the
+established "no role holds delete, only overwrite in place" pattern below.
 
 Grants: the ingest role (OTLP, RW1, RW2 ingest processes) holds read + CAS
 write on `t/<tenant_hash>/metrics/meta`, the same role that already writes
@@ -146,12 +177,18 @@ counter suffix, then the structural suffixes ADR-0016 already applies):
    mapped unit as a `_<unit>` suffix if the name doesn't already end with
    it: `s` -> `seconds`, `By` -> `bytes`, `ms`/`us`/`ns` -> `milliseconds`/
    `microseconds`/`nanoseconds`, and so on through the documented table.
-   `1` (dimensionless ratio) maps to no suffix. Any `{annotation}` bracketed
-   portion of the unit (e.g. `{packet}`) is stripped before lookup,
-   regardless of position. A compound unit `a/b` maps each side through the
-   table independently and joins as `_<a>_per_<b>` (`By/s` ->
-   `_bytes_per_second`). An unrecognized unit string is left unmapped (no
-   suffix appended) rather than guessed.
+   `1` (dimensionless ratio) maps to `_ratio` on Gauge metrics specifically
+   (matching the collector/spec convention, which ties the ratio suffix to
+   gauge semantics) and to no suffix on other types. Any `{annotation}`
+   bracketed portion of the unit (e.g. `{packet}`) is stripped before
+   lookup, regardless of position; if stripping empties one side of a
+   compound unit entirely (`{packet}/s` leaves an empty numerator and `s`
+   denominator), the suffix uses only the remaining side's mapped form
+   (`_per_second`), not a `_per_` with an empty component. A compound unit
+   `a/b` with both sides present maps each side through the table
+   independently and joins as `_<a>_per_<b>` (`By/s` -> `_bytes_per_second`).
+   An unrecognized unit string is left unmapped (no suffix appended) rather
+   than guessed.
 3. If the metric is a monotonic Sum (`is_monotonic_sum`) and the
    (now unit-suffixed) name does not already end in `_total`, append
    `_total`. This order matches real output: `process_cpu_seconds_total`,
