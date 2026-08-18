@@ -12,6 +12,7 @@ mod covering_postings;
 mod error;
 mod fold;
 mod key_epoch;
+mod metrics_meta;
 mod provisioning;
 mod seal_divergence;
 mod snapshot;
@@ -44,6 +45,11 @@ pub use fold::{FoldReport, PostingsBuildError, Transaction, fetch_segment_names}
 pub use key_epoch::{
     EpochDefect, KEY_EPOCH_FORMAT_VERSION, KeyEpoch, KeyEpochError, KeyEpochOutcome, enc_key,
     epoch_for_write, read_epochs, read_epochs_checked, read_epochs_from_store, record_key_epoch,
+};
+pub use metrics_meta::{
+    DEFAULT_METRICS_META_ENTRY_CAP, MAX_METRICS_META_DECOMPRESSED_BYTES,
+    METRICS_META_FORMAT_VERSION, MergeOutcome, MetricKind, MetricMetadataEntry, MetricsMetaDefect,
+    MetricsMetaError, merge_entries, metrics_meta_key, read_metrics_meta, write_metrics_meta,
 };
 pub use provisioning::{
     AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, FLUSH_BOUND_SLACK_HOURS, FloorDefect,

@@ -493,3 +493,84 @@ message AuthTokenMap {
   repeated TokenHashEntry entries = 3;
   sfixed64 updated_unix_ns = 4;  // informational; when the map was last swapped
 }
+
+// The type of a metric family, as captured at ingest from whichever protocol
+// carried the point (ADR-0085 decision 1). Mirrors the Prometheus metadata
+// `type` field the `/api/v1/metadata` response reports, which is the vocabulary
+// every existing Prometheus API client already understands; OTLP/OTAP derive it
+// from the `data` oneof, Remote-Write v1/v2 carry it explicitly.
+enum MetricMetadataType {
+  METRIC_METADATA_TYPE_UNSPECIFIED = 0;  // never written; an entry carrying it is corrupt
+  METRIC_METADATA_TYPE_COUNTER = 1;
+  METRIC_METADATA_TYPE_GAUGE = 2;
+  METRIC_METADATA_TYPE_HISTOGRAM = 3;
+  METRIC_METADATA_TYPE_SUMMARY = 4;
+  // The protocol carried a point but named no type. A real, written value,
+  // unlike UNSPECIFIED: it is what a merge treats as "no opinion", so it never
+  // overwrites a known type already in the record.
+  METRIC_METADATA_TYPE_UNKNOWN = 5;
+}
+
+// One metric family's captured metadata (ADR-0085 decision 1). Keyed by the
+// family name, not by series and not by ingest process: Prometheus metadata
+// semantics are per metric name, and Ravel has no per-target scrape concept
+// that would make several type/help/unit tuples per name meaningful, so a
+// single latest-write-wins entry per name is the exact match for Ravel's
+// ingest model.
+message MetricMetadataEntry {
+  // The metric family name, as defined per ingest path in ADR-0085 decision 1:
+  // for OTLP/OTAP the name after the unit/`_total` suffix pass but before the
+  // classic histogram/summary explosion, for RW1 `metric_family_name` as
+  // parsed, for RW2 the per-series name with any structural
+  // `_bucket`/`_sum`/`_count`/`_total` suffix stripped back off.
+  string family_name = 1;
+  MetricMetadataType type = 2;
+  // Help text and unit as the protocol supplied them. Either may be empty: a
+  // protocol that carries one but not the other is normal (RW1 often supplies
+  // help without unit), and an empty incoming field never overwrites a
+  // populated stored one on merge, so the two compose instead of clobbering.
+  // For OTLP/OTAP `unit` holds the mapped Prometheus word (`bytes`,
+  // `seconds`), matching the suffix on the name, not the raw UCUM string.
+  string help = 3;
+  string unit = 4;
+  // When this entry's fields last actually changed, informational and the
+  // eviction order for a record pruned back under the entry cap. Stamped only
+  // on a genuine change, so an unchanged entry keeps its original timestamp
+  // and two processes computing the same merge produce identical bytes.
+  sfixed64 updated_unix_ns = 5;
+}
+
+// The durable per-tenant metric metadata record at `t/<tenant_hash>/m/meta`
+// (ADR-0085 decision 1). Under the metrics signal prefix `m/` like every other
+// metrics-scoped record (`m/l0`, `m/c`), never a new top-level prefix.
+//
+// Written by the one metadata sink per ingest process, read by
+// `/api/v1/metadata` on the query side. Body is this message, zstd-compressed
+// on the wire.
+//
+// Mutation shape: whole-record CAS-replace, the TenantConfigRecord/`sys/gc`
+// shape and for the same reason. The entry set is mutable current state whose
+// latest value is the only one that matters, and pruning it back under the
+// per-tenant entry cap -- dropping the oldest `updated_unix_ns` entries --
+// is a shrinking write an append-only history cannot express. The loser of a
+// concurrent write re-reads and merges rather than overwriting the winner.
+//
+// Its own top-level message, sharing no field number with the records above.
+// Field numbers are frozen from the moment this ships; only additive changes
+// are allowed, exactly like every other message in this file.
+message MetricMetadataRecord {
+  // Format floor: the minimum reader version that understands this record. A
+  // reader that only knows a lower version refuses rather than misreading a
+  // future layout, matching every other durable record's version guard. = 1.
+  uint32 format_version = 1;
+  // One entry per metric family name. Decode enforces: every family_name is
+  // non-empty, no family_name repeats (a duplicate would make a
+  // `/api/v1/metadata` lookup ambiguous), and every type is a real value
+  // rather than the UNSPECIFIED sentinel. Any violation is a typed decode
+  // error (fail closed).
+  repeated MetricMetadataEntry entries = 2;
+  // 16 bytes; the `t/<tenant_hash>/` prefix owner. Carried so a record
+  // misfiled under another tenant's key is refused rather than served as this
+  // tenant's metadata, the TenantConfigRecord misfile guard.
+  bytes tenant_hash = 3;
+}
