@@ -198,6 +198,7 @@ fn promql_app(
         QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
         None,
         None,
+        None,
     );
     ravel_query::http::router(state)
 }

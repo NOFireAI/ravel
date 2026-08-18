@@ -191,6 +191,27 @@ Two behaviors are worth knowing about, both intentional:
   one named `_foo` both sanitize to `_foo` and become the same series. This
   is a documented consequence of the sanitization rule, not a bug.
 
+## Metric metadata and OTLP name suffixing
+
+Ravel captures each metric's type, help, and unit at ingest time and serves it
+back through [`GET /api/v1/metadata`](query.md#get-apiv1statusbuildinfo-and-get-apiv1metadata).
+Every path supplies it: OTLP reads `Metric.description` (help) and `Metric.unit`
+alongside the name and infers the type from the data shape; Remote Write v1 and
+v2 stop discarding the `MetricMetadata`/per-series metadata they already parse.
+Capture is best-effort and off the acknowledgement path, so a point is acked on
+its data write and never waits on or fails from the metadata record.
+
+OTLP metric names also get the standard OpenTelemetry-to-Prometheus suffixes a
+Prometheus exporter would add, so the same metric ingested over OTLP or scraped
+through a collector lands under one series name. The unit is mapped and appended
+(`s` becomes `_seconds`, `By` becomes `_bytes`), then a monotonic `Sum` gets
+`_total`: a monotonic counter named `foo` with `unit: "By"` ingests as
+`foo_bytes_total`. This is an ingest-time transform on the name string only; it
+does not touch series identity or any stored format. It is a one-time,
+intentional naming change for dashboards built directly against pre-ADR-0085
+OTLP names. See [ADR-0085](../adrs/0085-metric-metadata-and-otlp-suffixing.md)
+for the full unit table and the metadata record format.
+
 ## Job and instance labels
 
 If the resource has `service.name`, its points get a `job` label. The value is

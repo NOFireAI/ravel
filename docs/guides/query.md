@@ -132,9 +132,18 @@ save. They take no parameters.
 `version` is Ravel's own version, not a Prometheus one. `revision` is the
 build's git SHA when the build exported `RAVEL_GIT_SHA`, empty otherwise.
 
-`/api/v1/metadata` always returns `{"status": "success", "data": {}}`: Ravel
-captures no OTLP metric type, help, or unit metadata today, so there is
-nothing truthful to report.
+`/api/v1/metadata` returns real per-metric type, help, and unit for any metric
+ingested after ADR-0085 shipped, in Prometheus' documented shape (`data` maps
+each family name to a length-1 array of `{type, help, unit}`). It resolves the
+requesting tenant from the same bearer credential the other query routes use and
+serves that tenant's metadata from a per-process, per-tenant cache (one object
+read per tenant per refresh horizon, never a read per request). The optional
+`metric` and `limit` query parameters filter to one family and cap the number of
+names, matching Prometheus. Metadata is best-effort: a metric ingested before
+ADR-0085, or over a path that sent no type/help/unit, has no entry, and a request
+that carries no resolvable tenant still gets `{"status": "success", "data": {}}`
+(this endpoint never returns `401`). See [ADR-0085](../adrs/0085-metric-metadata-and-otlp-suffixing.md)
+for the record format and the OTLP name suffixing that decides the family names.
 
 ## PromQL support
 

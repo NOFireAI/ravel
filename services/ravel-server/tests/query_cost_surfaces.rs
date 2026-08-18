@@ -172,6 +172,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         ),
         None,
         None,
+        None,
     );
     let promql = promql_router(app_state);
 

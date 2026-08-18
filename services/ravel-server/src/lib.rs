@@ -410,6 +410,14 @@ pub struct Running {
     fragment_shutdown: Option<oneshot::Sender<()>>,
     fragment_task: Option<JoinHandle<anyhow::Result<()>>>,
     ingest_router: Option<Arc<IngestRouter>>,
+    /// The process's one metric metadata sink (ADR-0085 decision 1), `Some`
+    /// exactly in the ingest-serving modes that built it. Public by design as a
+    /// test seam: an end-to-end test drives the durable flush deterministically
+    /// with `metadata_sink.flush_once(now_ns)` rather than waiting on the real
+    /// debounce window, following the repo's time-injection testing pattern.
+    /// The supervised background flush loop still owns the production cadence
+    /// (`metadata_sink_task`); this handle shares the same `Arc`.
+    pub metadata_sink: Option<Arc<ravel_ingest::MetadataSink>>,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
     span_ingest_router: Option<Arc<SpanIngestRouter>>,
     fold_tasks: fold::FoldTasks,
@@ -672,6 +680,28 @@ pub async fn start(
             router.metrics_handle(),
         ))
     });
+
+    // The read side of the same record (ADR-0085 decision 1 read path): one
+    // per-process, per-tenant, on-demand cache over `t/<tenant_hash>/m/meta`,
+    // reading through the same `store` handle. Unlike `metadata_sink` (an
+    // ingest-only concern) this is a query-side concern, so it is built in
+    // exactly the modes that mount the Prometheus-shaped query routes below
+    // (`Mode::All`/`Mode::Query`) and threaded into `build_app_state`; a
+    // gateway- or maintain-only process serves no `/api/v1/metadata` and builds
+    // none. Defaults throughout (60 s refresh horizon, 256 tenants, LRU); no CLI
+    // knob is added. `SystemClock` here matches the injected-clock rule the
+    // cache follows for its horizon and idle-eviction decisions.
+    let metadata_cache = if matches!(config.mode, Mode::All | Mode::Query) {
+        Some(Arc::new(ravel_query::http::MetadataCache::new(
+            store.clone(),
+            ravel_query::http::MetadataCacheConfig::default(),
+            // The cache's horizon/idle clock is `ravel_cache::Clock`, not the
+            // ingest `Clock` this file's `SystemClock` implements.
+            Arc::new(ravel_cache::SystemClock),
+        )))
+    } else {
+        None
+    };
 
     // The log pipeline is a parallel router, not a mode of the metrics one:
     // same shard count, same store, same clock, but RLOG objects under the
@@ -1168,6 +1198,7 @@ pub async fn start(
             query_admission.clone(),
             distributed.clone(),
             federation,
+            metadata_cache.clone(),
         );
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
@@ -1277,10 +1308,16 @@ pub async fn start(
         )?;
 
         if let Some(mtls) = &config.mtls_listener {
-            let mtls_app_state =
+            let mut mtls_app_state =
                 ravel_query::http::AppState::new(app_state.engine.clone(), mtls.resolver.clone())
                     .with_cost_recorder(query_accounting.clone())
                     .with_query_admission(query_admission.clone());
+            // Same read-side metadata cache the primary listener serves from
+            // (ADR-0085 decision 1): the mTLS `/api/v1/metadata` must serve the
+            // same per-tenant record, not fall back to the empty object.
+            if let Some(cache) = &metadata_cache {
+                mtls_app_state = mtls_app_state.with_metadata_cache(cache.clone());
+            }
             mtls_router = mtls_router.merge(ravel_query::http::router(mtls_app_state));
         }
         http_router = http_router.merge(ravel_query::http::router(app_state));
@@ -1855,6 +1892,7 @@ pub async fn start(
         fragment_shutdown,
         fragment_task,
         ingest_router,
+        metadata_sink,
         log_ingest_router,
         span_ingest_router,
         fold_tasks,
