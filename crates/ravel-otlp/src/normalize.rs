@@ -1631,13 +1631,11 @@ fn metadata_unit_word(unit: &str, kind: MetricKind) -> String {
     if let Some(word) = unit_suffix(unit, kind) {
         return word;
     }
-    let stripped = strip_annotations(unit);
-    let trimmed = stripped.trim();
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        sanitize_metric_name(trimmed)
-    }
+    // Unmapped: carry the raw unit through as free text. This is a metadata
+    // field, not a metric name, so metric-name sanitizing rules do not apply
+    // (they would turn `1` into `_` and `2h` into `_h`, neither of which is
+    // the word an OpenMetrics `# UNIT` line would carry).
+    strip_annotations(unit).trim().to_string()
 }
 
 /// The Prometheus [`MetricKind`] and monotonic-Sum flag a metric's `data`
@@ -4527,13 +4525,25 @@ mod tests {
     }
 
     #[test]
-    fn metadata_unit_is_mapped_or_raw_sanitized_or_empty() {
+    fn metadata_unit_is_mapped_or_raw_or_empty_never_name_sanitized() {
         let (_names, metadata) = suffixed(gauge_u("foo", "furlong"));
         assert_eq!(metadata[0].unit, "furlong");
         let (_names, metadata) = suffixed(gauge_u("bar", ""));
         assert_eq!(metadata[0].unit, "");
         let (_names, metadata) = suffixed(gauge_u("baz", "By"));
         assert_eq!(metadata[0].unit, "bytes");
+        // A monotonic Sum with unit `1` gets no `_ratio` (Gauge-only), so the
+        // unit is unmapped for it; the metadata field must carry the raw `1`,
+        // not the metric-name-sanitized `_`. Same for a unit like `2h`: free
+        // text, not an identifier.
+        let (names, metadata) = suffixed(mono_sum_u("qux", "1"));
+        assert_eq!(names, vec!["qux_total".to_string()]);
+        assert_eq!(metadata[0].unit, "1");
+        let (_names, metadata) = suffixed(gauge_u("quux", "2h"));
+        assert_eq!(metadata[0].unit, "2h");
+        // Annotations are still stripped from the raw carry-through.
+        let (_names, metadata) = suffixed(gauge_u("corge", "{request}"));
+        assert_eq!(metadata[0].unit, "");
     }
 
     #[test]
