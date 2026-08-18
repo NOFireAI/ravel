@@ -157,9 +157,22 @@ The within-segment GET/byte model is the `selective_read_accounting` bench.
   never a Prometheus version string. `revision` carries the build's git SHA
   when the build environment exported `RAVEL_GIT_SHA`, otherwise it is empty,
   as are `branch`, `buildUser`, `buildDate`, and `goVersion`.
-- `GET /api/v1/metadata`: always `{"status":"success","data":{}}`. Ravel
-  captures no OTLP metric type/help/unit metadata, and an empty object is a
-  valid Prometheus response; inventing entries would not be.
+- `GET /api/v1/metadata`: per-tenant metric type/help/unit metadata (ADR-0085
+  decision 1), served from a per-process, per-tenant, on-demand cache over the
+  catalog record at `t/<tenant_hash>/m/meta`, never a per-request object-store
+  read. The tenant is resolved from the same bearer credential `/api/v1/labels`
+  uses; a request with no resolvable tenant keeps the pre-ADR
+  `{"status":"success","data":{}}` (the endpoint never `401`s). Response shape
+  is Prometheus' own: `data` maps each family name to a length-1 array of
+  `{type, help, unit}`, with `type` one of `counter`/`gauge`/`histogram`/
+  `summary`/`unknown` and names in deterministic sorted order. The optional
+  `metric=<name>` param filters to one family (an unknown name yields an empty
+  object, still `200`) and `limit=<n>` caps the number of names. The cache fills
+  on the first request for a tenant (one GET), serves within a 60 s refresh
+  horizon from memory, and past the horizon serves the cached record
+  immediately while one background refresh GET runs (stale-while-revalidate);
+  cost is one GET per (queried tenant, horizon, query process). When no cache is
+  attached the endpoint returns the empty object exactly as before.
 - All accept `min_commit_token`. Errors use the Prometheus JSON error
   envelope (`status:"error"`, `errorType`, `error`) with correct HTTP codes
   (400 bad_data, 422 unprocessable for unsupported constructs, 503
