@@ -50,34 +50,52 @@ postings.rs`), is a frozen, versioned wire format (`RNP1`, CRC-validated,
 sealed into the catalog snapshot by the commit protocol) and the wrong fit
 for data that changes independently of committed series data — this ADR uses
 a new, additive, module-owned key instead, following the precedent already
-documented for `t/<tenant_hash>/config` and `admission/query/<process_id>.
-snapshot` in `docs/catalog-and-mvcc.md:16-61`: small JSON, non-frozen,
-internal contract of the module that owns it. Checked against the
-format-change skill: the frozen "object key layout" contract covers the
-data/commit/snapshot key *shapes* the commit and catalog protocols depend on,
-and that doc already documents the carve-out this ADR follows — an additive,
-single-purpose, module-owned key needs no version bump or dual-reader
-window, the same way `config` and `admission/query/*` didn't.
+documented for `t/<tenant_hash>/config`, `enc`, and `<signal>/prov` in
+`docs/catalog-and-mvcc.md:16-61`: a small versioned record, single-writer
+per key, whose body is the internal contract of the module that owns it.
+Checked against the format-change skill: the frozen "object key layout"
+contract covers the data/commit/snapshot key *shapes* the commit and
+catalog protocols depend on, and that doc already documents the carve-out
+this ADR follows — an additive, single-purpose, module-owned key needs no
+version bump or dual-reader window, the same way `config` and `prov`
+didn't. The record's prost message is an additive addition to
+`proto/sys/v1`, allowed under the frozen-proto rule and the same move
+ADR-0066 made for `TenantConfigRecord`.
 
 ## Decision
 
 ### 1. Metric metadata capture and store
 
-Add a new per-tenant catalog key:
+Add a new per-tenant, per-signal catalog key, under the metrics signal
+prefix `m/` like every other metrics-scoped record (`m/l0`, `m/c`,
+`<signal>/prov`), not a new top-level prefix:
 
 ```
-t/<tenant_hash>/metrics/meta   metric-name -> {type, help, unit} map
-                                (CAS whole-record replace, additive)
+t/<tenant_hash>/m/meta   metric-family-name -> {type, help, unit} record
+                          (CAS whole-record replace, additive)
 ```
 
-Body: a small JSON object, `{format_version, entries: {"<metric_family_name>":
-{"type": "counter"|"gauge"|"histogram"|"summary"|"unknown", "help": "...",
-"unit": "..."}}}`. One entry per metric name per tenant (not per series):
-Prometheus metadata is keyed by name, and Ravel has no per-target scrape
-concept that would make multiple type/help/unit tuples per name meaningful,
-so a single latest-write-wins record per name is the exact match for
-Ravel's ingest model, not an approximation of a richer thing Ravel doesn't
-have.
+Body: a prost message `MetricMetadataRecord` in `ravel_proto::sys::v1`
+(`format_version`, repeated `entries {family_name, type, help, unit,
+updated_unix_ns}`), zstd-compressed on the wire. This follows the precedent
+the other durable `t/<tenant_hash>/` records set (`config`, `enc`, `prov`
+are all versioned prost with a `format_version` guard;
+`crates/ravel-catalog` carries no serde dependency at all), not the JSON
+shape of `admission/query/*`, which is a root-level, per-process, ephemeral
+key with a different lifecycle. Adding a new message is an additive
+change under the frozen-proto rule (the same thing ADR-0066 did for
+`TenantConfigRecord`); its field numbers freeze once shipped. Sizing,
+honestly: about 2,000 families with typical help strings is roughly 250 KB
+of prost and roughly 50 KB after zstd. Bytes are not what drives Ravel's
+S3 bill (request count is; see `docs/guides/cost-model.md`), so the
+compression buys read latency and egress, not dollars, and it costs one
+already-present workspace dependency.
+
+One entry per metric family name per tenant (not per series): Prometheus
+metadata is keyed by name, and Ravel has no per-target scrape concept that
+would make multiple type/help/unit tuples per name meaningful, so a single
+latest-write-wins record per name is the exact match for Ravel's ingest
+model, not an approximation of a richer thing Ravel doesn't have.
 
 The map key is the *family* name, defined per path so all three agree on
 what a lookup at query time matches: for OTLP it is the name after the
@@ -91,39 +109,61 @@ name before use as the map key (mirroring the same structural-suffix set
 OTLP's explosion produces), so a classic histogram doesn't fragment into
 multiple spurious metadata entries.
 
-Each ingest path (OTLP, RW1, RW2) keeps decoding type/help/unit exactly as it
-already does — RW1/RW2 already parse it and only need to stop discarding it;
-OTLP needs `Metric.description` and `Metric.unit` read alongside `Metric.name`
-(the type is already known from the `data` oneof match). Each ingest process
-keeps an in-memory `HashMap<(tenant, metric_family_name), fingerprint>` where
-`fingerprint` hashes the last-flushed `(type, help, unit)` tuple — keyed on
-content, not just name, so a help/unit change during the process's lifetime
-is detected locally instead of being masked by "we've seen this name before."
-This local map is purely a fast skip — it is never trusted on its own. On a
-name whose current fingerprint differs from the local map (new name, changed
-metadata, or a fresh process after restart where nothing is in the local map
-yet), the process reads the current `t/<tenant_hash>/metrics/meta` body and
-field-wise merges the new tuple into the existing entry for that name — an
-absent/empty incoming field never overwrites a populated existing field, so
-RW1 supplying help without unit and OTLP later supplying unit without help
-compose instead of one clobbering the other. It compares the merged record
-against what it just read: if merging is a no-op (every field already
+Each ingest path (OTLP, OTAP, RW1, RW2) keeps decoding type/help/unit
+exactly as it already does — RW1/RW2 already parse it and only need to stop
+discarding it; OTLP needs `Metric.description` and `Metric.unit` read
+alongside `Metric.name` (the type is already known from the `data` oneof
+match); OTAP mirrors OTLP's normalize point-for-point (its own module doc
+says so, and `crates/ravel-otap/tests/differential.rs` enforces it), so it
+picks up the same capture. The decoder crates (`ravel-otlp`, `ravel-otap`,
+`ravel-remote-write`) are synchronous and store-agnostic by design; they
+surface a protocol-neutral `(family_name, type, help, unit)` tuple and
+nothing else. The one **metadata sink** per process lives in `ravel-ingest`
+(the crate that already owns the object-store client and the per-process
+ingest pipeline all four surfaces funnel through via `IngestRouter`); its
+flush task is spawned and supervised from `ravel-server` next to the
+existing lifecycle refresh loop. One sink per process, not one per
+protocol, so a single process never races itself on the key.
+
+The sink keeps an in-memory `HashMap<(tenant, family_name), fingerprint>`
+where `fingerprint` hashes the last-flushed `(type, help, unit)` tuple —
+keyed on content, not just name, so a help/unit change during the process's
+lifetime is detected locally instead of being masked by "we've seen this
+name before." This local map is purely a fast skip — it is never trusted on
+its own. Names whose current fingerprint differs from the local map (new
+name, changed metadata, or a fresh process after restart where the map is
+empty) are not flushed one at a time: they accumulate in a per-tenant
+pending set, and once per **debounce window** (default 30 s, configurable)
+the sink does, per tenant with a non-empty pending set, exactly **one GET**
+of `t/<tenant_hash>/m/meta` and **at most one CAS PUT**. It field-wise
+merges every pending tuple into the record it just read — an absent/empty
+incoming field never overwrites a populated existing field, so RW1
+supplying help without unit and OTLP later supplying unit without help
+compose instead of one clobbering the other — and compares the merged
+record against what it read. If the merge is a no-op (every field already
 matches, the common case right after a restart, when every name looks new
-locally but the durable record already reflects it), it skips the CAS write
-and just updates the local fingerprint. Only a genuine new-or-changed field
-triggers the CAS write, retried against the freshly-read body on conflict up
-to a bounded retry count (default 5, jittered backoff); on exhaustion the
-update is dropped and an `ingest_metadata_flush_dropped_total` counter is
-incremented and a warning logged — visible, not silent, and never fatal to
-the ingest request. This flush is asynchronous and off the ingest
-acknowledgement path entirely: the point being ingested is acked based on
-the data write succeeding, never blocked on or failed by the metadata CAS,
-so a contended or degraded metadata key cannot turn into an ingest
-availability regression. This bounds a rolling restart of N ingest processes
-to zero rewrites once the durable record already reflects current metadata,
-and bounds steady-state ingest — the overwhelming majority of points, which
-are existing series with unchanged metadata — to zero CAS traffic, the same
-debounced-write shape already used for `sys/maintain/workers/<process_id>`.
+locally but the durable record already reflects it), it skips the PUT and
+just updates the local fingerprints. Only a genuine new-or-changed field
+triggers the CAS PUT, retried against a freshly read body on conflict up to
+a bounded retry count (default 5, jittered backoff); on exhaustion the
+window's update is dropped, an `ingest_metadata_flush_dropped_total`
+counter is incremented and a warning logged — visible, not silent, and
+never fatal to any ingest request. The first record for a tenant is written
+with `CreateIfAbsent` (the `config`/`prov` first-write precedent), never
+CAS against a version that does not exist.
+
+The request-count consequences, stated so they can be checked: steady-state
+ingest (existing series, unchanged metadata) costs zero requests. A cold
+start of R ingest replicas over T active tenants costs R x T GETs total and
+zero PUTs when nothing changed. A new deployment introducing thousands of
+new families at once costs at most two requests (one GET, one PUT) per
+replica per tenant per window, however many names arrive; the second
+window's GET sees the winner's merge and skips. Batching bounds the request
+count; the entry cap below bounds the record size; they are separate
+protections and both are needed. This flush is asynchronous and off the
+ingest acknowledgement path entirely: a point is acked on its data write,
+never blocked on or failed by the metadata CAS, so a contended or degraded
+metadata key cannot become an ingest availability regression.
 
 Expected metric-name cardinality per tenant is orders of magnitude below
 series cardinality (typically low thousands, not millions — name count grows
@@ -142,22 +182,52 @@ same CAS-write path with a smaller merged body, evicting entries whose
 last-updated timestamp (carried per entry) is oldest, which stays within the
 established "no role holds delete, only overwrite in place" pattern below.
 
-Grants: the ingest role (OTLP, RW1, RW2 ingest processes) holds read + CAS
-write on `t/<tenant_hash>/metrics/meta`, the same role that already writes
-`t/<tenant_hash>/<signal>/idem/*` and the data/commit keys for that tenant.
-The query role holds read-only. No role holds delete: like the `config` and
-`admission`/`maintain` keys this prefix is never swept, only overwritten in
-place.
+Grants: the ingest role (the process hosting the OTLP, OTAP, RW1, RW2
+surfaces) holds read + CAS write on `t/<tenant_hash>/m/meta`, the same role
+that already writes `t/<tenant_hash>/<signal>/idem/*` and the data/commit
+keys for that tenant. The query role holds read-only. No role holds delete:
+like the `config` and `admission`/`maintain` keys this prefix is never
+swept, only overwritten in place.
 
-`ravel-query`'s `/api/v1/metadata` handler (`compat.rs:76-82`) gets
-`AppState` access (the router that mounts `compat.rs` currently merges it in
-stateless — this changes) and, on request, reads
-`t/<tenant_hash>/metrics/meta`, projecting the single-entry-per-name body into
-Prometheus's documented response shape (`data: {"<name>": [{"type", "help",
-"unit"}]}` — an array of length 0 or 1 in Ravel's case, matching the wire
-contract every existing Prometheus API client already expects). Missing key
-or missing entry for a name returns an empty result for that name, not an
-error: this metadata is best-effort and its absence is not a fault.
+**Read path.** `ravel-query`'s `/api/v1/metadata` handler (`compat.rs:76-82`)
+gets `AppState` access (the router that mounts `compat.rs` currently merges
+it in stateless — this changes) and serves from a per-process, per-tenant
+**metadata cache**, never from a per-request object-store read. Grafana
+calls this endpoint on every dashboard load and datasource probe; an
+uncached design would turn every one of those into an S3 round trip that is
+both user-visible latency (tens of milliseconds per call, on the dashboard
+critical path) and a request-count line item the read-side budget
+(ADR-0075) never accounted for. The cache is filled **on demand**: a tenant
+nobody asks about costs zero requests. On first request for a tenant the
+handler GETs `t/<tenant_hash>/m/meta` once, decompresses and decodes it,
+and keeps the parsed record. Later requests within the refresh horizon
+(default 60 s, the same bounded-staleness horizon `config` and the
+lifecycle gate use) are served from memory; a request past the horizon is
+still served from the cached record immediately while one background
+refresh GET runs (stale-while-revalidate), so no client ever waits on S3
+for metadata after the first call. Cost is therefore one GET per (queried
+tenant, horizon, query process), independent of request rate. The
+object-store contract has `head` but no conditional GET, and S3 bills HEAD
+and GET identically, so a HEAD-then-GET dance saves nothing; the refresh
+is a plain GET. Memory: a record at the 20,000-entry cap is on the order of
+3 MB parsed; entries are per-tenant and evicted after a small number of
+idle horizons, so the process holds records only for tenants it recently
+answered for, and a bound on the cached tenant count (default 256, LRU)
+keeps a many-tenant deployment predictable.
+
+The handler projects the single-entry-per-name record into Prometheus's
+documented response shape (`data: {"<name>": [{"type", "help", "unit"}]}`
+— an array of length 0 or 1 in Ravel's case, matching the wire contract
+every existing Prometheus API client already expects). Missing key or
+missing entry for a name returns an empty result for that name, not an
+error: this metadata is best-effort and its absence is not a fault. The
+endpoint is unauthenticated today because it has nothing tenant-specific
+to say. Metadata is per-tenant, so a request that carries a resolvable
+tenant credential (the same bearer resolution `/api/v1/labels` uses) gets
+that tenant's record; a request with no resolvable tenant keeps today's
+behavior exactly — `200` with an empty object — rather than turning a
+previously always-succeeding probe into a `401`. Additive for every
+existing caller.
 
 ### 2. OTLP name suffixing
 
@@ -197,6 +267,16 @@ counter suffix, then the structural suffixes ADR-0016 already applies):
    as a safety pass (the unit table's output is chosen to already be
    identifier-safe, but this catches any future table entry that isn't).
 
+The same pass lands in `crates/ravel-otap/src/normalize.rs`, which mirrors
+`ravel_otlp::normalize` point-for-point by its own module doc and is held
+to that by the OTAP/OTLP differential proptest
+(`crates/ravel-otap/tests/differential.rs`); an OTLP-only change would fail
+that test, and OTAP is a real, feature-gated production surface. The unit
+string written into the metadata record for an OTLP/OTAP metric is the
+mapped Prometheus word (`bytes`, `seconds`), the same word an OpenMetrics
+`# UNIT` line would carry, so the metadata `unit` field agrees with the
+suffix on the name rather than repeating the raw UCUM `By`.
+
 This is an ingest-time-only change: it does not touch `SeriesId::compute`,
 ADR-0005's canonical byte layout, or any RSEG/commit/catalog format.
 Historical data already written under pre-suffix names is untouched — data
@@ -219,6 +299,37 @@ OTLP-ingested series names before this ships; see Consequences.
   without any new series being written) and doesn't share that immutability
   or sealing lifecycle. Coupling them would force a format-change ADR and
   version bump for a concern that has nothing to do with series data commit.
+- **One object per metric family (`t/<hash>/m/meta/<name_hash>`).**
+  Rejected on the read path: serving `/api/v1/metadata` would need a LIST
+  plus one GET per family, thousands of requests per cache fill against a
+  bill that request count dominates. Whole-record CAS makes the read one
+  GET.
+- **One object per ingest process (`t/<hash>/m/meta/<process_id>`,
+  plain Overwrite, no CAS).** Rejected: it trades away CAS conflicts (which
+  batching already makes rare and bounded) for a read path that must LIST
+  and GET every replica's record and merge them per request, plus a sweep
+  for dead processes. Worse on both request count and read latency.
+- **Carry metadata in the catalog snapshot fold, so `/api/v1/metadata`
+  reads the same cached snapshot bytes `/api/v1/labels` does.** Rejected:
+  the fold is driven by commit records, which carry no metadata and are
+  frozen, and the snapshot part format (`RNP1`/`.csnap`) is frozen too.
+  Reaching it would be a format-change ADR against two frozen contracts for
+  a record that changes on its own lifecycle.
+- **Fold the record into `t/<hash>/config` to save a key.** Rejected:
+  `config` is operator-written from the control plane under CAS; adding an
+  ingest-side writer to the same object makes two unrelated writers
+  contend, and a lost race on a limits change is a much worse failure than
+  a delayed help string.
+- **JSON body, citing the `admission/query/*` snapshot precedent.**
+  Rejected on second look: that key is root-level, per-process, and
+  ephemeral. Every durable tenant-scoped record in `ravel-catalog` is
+  versioned prost with a `format_version` guard and the crate carries no
+  serde dependency; the metadata record has the durable, tenant-scoped
+  lifecycle, so it takes that shape.
+- **Per-request object-store read on `/api/v1/metadata`.** Rejected: an S3
+  round trip on every dashboard load and datasource probe is user-visible
+  latency and an unbudgeted request stream. The on-demand horizon cache
+  serves the same data at one GET per (queried tenant, horizon, process).
 - **In-memory-only cache, no durable store.** Rejected: goes empty on every
   process restart and diverges between concurrent query-serving processes,
   which reads as flapping/inconsistent metadata to a Grafana user hitting
@@ -256,32 +367,42 @@ OTLP-ingested series names before this ships; see Consequences.
   matching Prometheus-exporter naming, called out here rather than
   discovered silently. Historical data under the old name is untouched.
 - `docs/catalog-and-mvcc.md`'s key layout table gains the
-  `t/<tenant_hash>/metrics/meta` row (Decision 1 pattern, matching the
+  `t/<tenant_hash>/m/meta` row (Decision 1 pattern, matching the
   existing `config`/`admission`/`maintain` entries).
 - `docs/query-engine.md`'s `/api/v1/metadata` entry updates from "always
   empty" to the real behavior.
 
 ```mermaid
 flowchart LR
-    subgraph Ingest
-        OTLP[OTLP metric point] --> Norm[normalize_metric]
-        RW1[Remote-Write v1] --> Meta1[metadata already parsed]
-        RW2[Remote-Write v2] --> Meta2[metadata already parsed]
-        Norm -->|"1. unit suffix<br/>2. _total if monotonic<br/>3. re-sanitize"| SuffixedName[suffixed name]
+    subgraph Decoders["decoders (sync, store-agnostic)"]
+        OTLP[OTLP / OTAP metric] --> Norm[normalize_metric]
+        RW1[Remote-Write v1] --> Meta1[metadata tuple]
+        RW2[Remote-Write v2] --> Meta2[metadata tuple]
+        Norm -->|"1. unit suffix<br/>2. _total if monotonic<br/>3. re-sanitize"| SuffixedName[suffixed family name]
         SuffixedName --> SeriesId[SeriesId::compute]
         SeriesId --> DataObj[(immutable data object)]
     end
-    subgraph MetadataCapture
-        Norm -->|"name, type, help, unit"| Cache{"changed vs<br/>durable record?"}
-        Meta1 --> Cache
-        Meta2 --> Cache
-        Cache -->|yes| CAS[read-modify-write CAS]
-        Cache -->|no| Skip[no write]
-        CAS --> MetaKey[(t/tenant/metrics/meta)]
+    subgraph Sink["ravel-ingest metadata sink (one per process, off ack path)"]
+        Norm -->|"family, type, help, unit"| FP{"fingerprint<br/>changed?"}
+        Meta1 --> FP
+        Meta2 --> FP
+        FP -->|no| Skip[nothing]
+        FP -->|yes| Pending[per-tenant pending set]
+        Pending -->|"every 30s window"| Get["1 GET"]
+        Get --> Merge{"field-wise merge<br/>is a no-op?"}
+        Merge -->|yes| Skip2[no PUT]
+        Merge -->|no| Put["<=1 CAS PUT<br/>(CreateIfAbsent first time)"]
+        Put --> MetaKey[("t/tenant/m/meta<br/>prost + zstd")]
+        Get --> MetaKey
     end
-    subgraph Query
-        API["/api/v1/metadata"] --> Read[read MetaKey]
-        Read --> MetaKey
-        Read --> Resp[Prometheus-shaped response]
+    subgraph Query["ravel-query (per process)"]
+        API["/api/v1/metadata"] --> Cache{"tenant record<br/>cached?"}
+        Cache -->|"hit, fresh"| Resp[Prometheus-shaped response]
+        Cache -->|"hit, past horizon"| Resp
+        Cache -->|"hit, past horizon"| Refresh["background GET"]
+        Cache -->|miss| Fill["GET, decode, cache"]
+        Fill --> Resp
+        Refresh --> MetaKey
+        Fill --> MetaKey
     end
 ```
