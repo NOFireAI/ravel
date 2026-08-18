@@ -203,6 +203,15 @@ pub enum MetricsMetaError {
          accepts: refusing rather than allocate an unbounded body"
     )]
     DecompressedTooLarge { key: String, cap: usize },
+    #[error(
+        "metadata record {key:?} would encode to {size} bytes, past the {cap}-byte ceiling readers \
+         accept: refusing to write a record no reader could open"
+    )]
+    RecordTooLarge {
+        key: String,
+        size: usize,
+        cap: usize,
+    },
     #[error("metadata record {key:?} could not be decoded: {source}")]
     Decode {
         key: String,
@@ -463,6 +472,17 @@ fn encode_body(
     key: &str,
 ) -> Result<Vec<u8>, MetricsMetaError> {
     let raw = build_record(tenant_hash, entries).encode_to_vec();
+    // The reader refuses any body that decompresses past
+    // MAX_METRICS_META_DECOMPRESSED_BYTES. A writer that accepted more would
+    // persist a durable object no reader can ever open again, so the same
+    // bound is enforced here, on the pre-compression size, before any PUT.
+    if raw.len() > MAX_METRICS_META_DECOMPRESSED_BYTES {
+        return Err(MetricsMetaError::RecordTooLarge {
+            key: key.to_string(),
+            size: raw.len(),
+            cap: MAX_METRICS_META_DECOMPRESSED_BYTES,
+        });
+    }
     zstd::bulk::compress(&raw, ZSTD_LEVEL).map_err(|e| MetricsMetaError::Compress {
         key: key.to_string(),
         message: e.to_string(),
@@ -664,6 +684,64 @@ mod tests {
             metrics_meta_key(&tenant()),
             format!("t/{}/m/meta", tenant().to_hex()),
             "the key sits under the tenant's metrics signal prefix, not a new top-level one"
+        );
+    }
+
+    /// The writer enforces the reader's decompressed-size ceiling on the raw
+    /// (pre-compression) body, so a record that would be unreadable is refused
+    /// before any PUT instead of being persisted as a durable object no reader
+    /// can open. Help text is length-unbounded at every ingest surface, so a
+    /// single oversized entry is enough to cross the bound.
+    #[tokio::test]
+    async fn write_refuses_a_record_the_reader_could_not_open() {
+        let store = mem();
+        let key = metrics_meta_key(&tenant());
+        let huge_help = "h".repeat(MAX_METRICS_META_DECOMPRESSED_BYTES + 1);
+        let entries = vec![entry("big", MetricKind::Gauge, &huge_help, "", 1)];
+        let err = write_metrics_meta(store.as_ref(), &tenant(), &entries, None)
+            .await
+            .expect_err("a record past the read ceiling must be refused");
+        assert!(
+            matches!(
+                &err,
+                MetricsMetaError::RecordTooLarge { key: k, cap, .. }
+                    if k == &key && *cap == MAX_METRICS_META_DECOMPRESSED_BYTES
+            ),
+            "expected RecordTooLarge, got {err:?}"
+        );
+        assert!(
+            read_metrics_meta(store.as_ref(), &tenant())
+                .await
+                .expect("read")
+                .is_none(),
+            "nothing may be persisted when the write is refused"
+        );
+        // A comfortably-sized record with the same shape still writes and reads.
+        let ok = vec![entry("small", MetricKind::Gauge, "h", "", 1)];
+        write_metrics_meta(store.as_ref(), &tenant(), &ok, None)
+            .await
+            .expect("small record writes");
+    }
+
+    /// The decode side of the same bound: a body whose zstd frame inflates past
+    /// the ceiling is refused with a typed error, not allocated. Built with the
+    /// raw prost bytes of an over-cap record compressed directly, bypassing the
+    /// writer's own guard, so this exercises the reader's guard in isolation.
+    #[test]
+    fn decode_refuses_a_body_that_inflates_past_the_ceiling() {
+        let key = metrics_meta_key(&tenant());
+        let huge_help = "h".repeat(MAX_METRICS_META_DECOMPRESSED_BYTES + 1);
+        let entries = vec![entry("big", MetricKind::Gauge, &huge_help, "", 1)];
+        let raw = build_record(&tenant(), &entries).encode_to_vec();
+        assert!(raw.len() > MAX_METRICS_META_DECOMPRESSED_BYTES);
+        let body = zstd::bulk::compress(&raw, ZSTD_LEVEL).expect("compress");
+        // Highly compressible: the frame is small, the inflation is not.
+        assert!(body.len() < MAX_METRICS_META_DECOMPRESSED_BYTES / 64);
+        let err = decode_body(&body, &key, &tenant()).expect_err("must refuse");
+        assert!(
+            matches!(&err, MetricsMetaError::DecompressedTooLarge { key: k, cap }
+                if k == &key && *cap == MAX_METRICS_META_DECOMPRESSED_BYTES),
+            "expected DecompressedTooLarge, got {err:?}"
         );
     }
 
