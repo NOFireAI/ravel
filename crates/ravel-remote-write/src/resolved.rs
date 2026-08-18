@@ -8,6 +8,7 @@
 //! (length, uniqueness, presence of `__name__`) rather than mutating names,
 //! per ADR-0015's no-sanitization rule.
 
+use ravel_otlp::metadata::MetricMetadata;
 use ravel_types::Label;
 
 /// One sample as carried on the wire: milliseconds since epoch, not yet
@@ -112,10 +113,14 @@ pub struct ResolvedSeries {
 
 /// A resolved `WriteRequest`, version-blind.
 ///
-/// `metadata_count` is a whole-request tally: RW1's `MetricMetadata` list
-/// has no per-series correlation (unlike RW2's per-`TimeSeries` `metadata`
-/// field), so it is dropped with one request-level counter rather than
-/// distributed across series.
+/// `metadata` carries the per-metric-family `(family_name, type, help, unit)`
+/// tuples the request supplied (ADR-0085 Decision 1), surfaced rather than
+/// discarded. RW1 fills one entry per `MetricMetadata` (its list is
+/// request-level, `family_name` is `metric_family_name`); RW2 fills one entry
+/// per series carrying metadata, keyed by the series' `__name__` stripped of a
+/// structural `_bucket`/`_sum`/`_count`/`_total` suffix and deduplicated by
+/// family name (first write wins). A caller that only needs the old
+/// request-level count reads `metadata.len()`.
 ///
 /// `created_timestamps_count` tallies non-zero `start_timestamp` fields
 /// (RW2's `Sample.start_timestamp` and `Histogram.start_timestamp`; RW1's
@@ -133,7 +138,7 @@ pub struct ResolvedSeries {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedRequest {
     pub series: Vec<ResolvedSeries>,
-    pub metadata_count: usize,
+    pub metadata: Vec<MetricMetadata>,
     pub created_timestamps_count: usize,
     pub exemplars_dropped: usize,
 }

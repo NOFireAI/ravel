@@ -20,6 +20,7 @@
 pub mod limits;
 pub mod logs_limits;
 pub mod logs_normalize;
+pub mod metadata;
 pub mod normalize;
 pub mod promcompat;
 pub mod traces_limits;
@@ -28,9 +29,10 @@ pub mod traces_normalize;
 pub use limits::{IngestLimits, Rejection};
 pub use logs_limits::{LogIngestLimits, LogRejection};
 pub use logs_normalize::{LogNormalizeOutput, NormalizedLogRecord, normalize_logs};
+pub use metadata::{MetricKind, MetricMetadata};
 pub use normalize::{
     MetricsNormalizeResult, NormalizeOutput, NormalizedHistogramPoint, NormalizedPoint,
-    normalize_metrics, normalize_metrics_with_exemplars,
+    normalize_metrics, normalize_metrics_with_exemplars, normalize_metrics_with_metadata,
 };
 pub use traces_limits::{SpanIngestLimits, SpanRejection};
 pub use traces_normalize::{NormalizedSpan, SpanNormalizeOutput, normalize_traces};

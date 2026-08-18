@@ -71,6 +71,7 @@ use ravel_types::{
 };
 
 use crate::limits::{IngestLimits, Rejection};
+use crate::metadata::{MetricKind, MetricMetadata};
 use crate::promcompat::format_float;
 
 /// Prometheus stale marker: a NaN with this exact bit pattern (upstream
@@ -208,6 +209,54 @@ pub fn normalize_metrics_with_exemplars(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> MetricsNormalizeResult {
+    normalize_impl(tenant, req, limits, ingest_ts_ns, exemplar_cap, None)
+}
+
+/// Decode and normalize gauge and sum data points exactly like
+/// [`normalize_metrics_with_exemplars`], and additionally surface one
+/// [`MetricMetadata`] per metric family that produced at least one point
+/// (ADR-0085 Decision 1). The returned [`MetricsNormalizeResult`] is
+/// byte-for-byte what [`normalize_metrics_with_exemplars`] returns for the same
+/// input, including the now-suffixed series names (Decision 2); the metadata is
+/// the only addition. `family_name` is the suffixed name before the classic
+/// histogram/summary explosion; metadata is deduplicated by `family_name`,
+/// first write wins.
+///
+/// The metric metadata store that consumes this is ticket #235; it has no
+/// production consumer yet. The suffix pass, in contrast, is reachable the
+/// moment this ships: every OTLP metric ingested through the existing
+/// `ravel-server` call sites gets its new Prometheus name.
+pub fn normalize_metrics_with_metadata(
+    tenant: &TenantId,
+    req: ExportMetricsServiceRequest,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+    let mut collector = MetadataCollector::default();
+    let result = normalize_impl(
+        tenant,
+        req,
+        limits,
+        ingest_ts_ns,
+        exemplar_cap,
+        Some(&mut collector),
+    );
+    (result, collector.entries)
+}
+
+/// Shared body of the two exemplar-carrying entry points. `metadata_out` is
+/// `Some` only for [`normalize_metrics_with_metadata`]; when `None`, the suffix
+/// pass still runs (names are unconditional) but no metadata is collected, so
+/// the older entry points stay behaviorally identical apart from the names.
+fn normalize_impl(
+    tenant: &TenantId,
+    req: ExportMetricsServiceRequest,
+    limits: &IngestLimits,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+    mut metadata_out: Option<&mut MetadataCollector>,
+) -> MetricsNormalizeResult {
     let total_points = count_data_points(&req);
     if total_points > limits.max_data_points_per_request {
         let mut rejected = vec![Rejection::TooManyDataPoints {
@@ -256,6 +305,7 @@ pub fn normalize_metrics_with_exemplars(
             &mut histogram_points,
             &mut exemplars,
             &mut rejected,
+            metadata_out.as_deref_mut(),
         );
     }
 
@@ -330,6 +380,7 @@ fn normalize_resource(
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
     exemplars: &mut Vec<NormalizedExemplar>,
     rejected: &mut Vec<Rejection>,
+    mut metadata_out: Option<&mut MetadataCollector>,
 ) {
     let resource_point_count = resource_metrics_point_count(rm);
     if resource_point_count == 0 {
@@ -370,6 +421,7 @@ fn normalize_resource(
                 histogram_points,
                 exemplars,
                 rejected,
+                metadata_out.as_deref_mut(),
             );
         }
     }
@@ -387,6 +439,7 @@ fn normalize_metric(
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
     exemplars: &mut Vec<NormalizedExemplar>,
     rejected: &mut Vec<Rejection>,
+    metadata_out: Option<&mut MetadataCollector>,
 ) {
     let point_count = metric_data_point_count(metric);
     if point_count == 0 {
@@ -407,6 +460,17 @@ fn normalize_metric(
         rejected.push(Rejection::EmptyMetricName { count: point_count });
         return;
     }
+
+    // Apply the ADR-0085 Decision 2 suffix pass to the sanitized base name
+    // before it reaches any `SeriesId::compute` call and before the classic
+    // histogram/summary explosion. `point_count > 0` guarantees `data` is set.
+    let Some(data) = metric.data.as_ref() else {
+        return;
+    };
+    let (kind, is_monotonic_sum) = metric_kind_of(data);
+    let name = prometheus_family_name(&name, &metric.unit, kind, is_monotonic_sum);
+    let points_before = points.len();
+    let hist_before = histogram_points.len();
 
     match &metric.data {
         Some(MetricData::Gauge(gauge)) => {
@@ -530,6 +594,21 @@ fn normalize_metric(
             }
         }
         None => {}
+    }
+
+    // One metadata tuple per metric family that produced at least one point.
+    // `family_name` is the suffixed name above, before the explosion that
+    // appends `_bucket`/`_sum`/`_count`, so it names the family the exploded
+    // series belong to (ADR-0085 Decision 1).
+    if let Some(collector) = metadata_out
+        && (points.len() > points_before || histogram_points.len() > hist_before)
+    {
+        collector.record(MetricMetadata {
+            family_name: name.clone(),
+            kind,
+            help: metric.description.clone(),
+            unit: metadata_unit_word(&metric.unit, kind),
+        });
     }
 }
 
@@ -1392,6 +1471,208 @@ fn any_value_to_label_value(value: Option<&AnyValue>) -> Result<String, Rejectio
         | Some(AnyValueVariant::KvlistValue(_))
         | Some(AnyValueVariant::BytesValue(_))
         | Some(AnyValueVariant::StringValueStrindex(_)) => Err(Rejection::ComplexAttributeValue),
+    }
+}
+
+/// Apply the OTLP-to-Prometheus name suffixes (ADR-0085 Decision 2) to a
+/// metric name that has already been through [`sanitize_metric_name`].
+///
+/// Order, matching the OpenTelemetry Collector's `prometheusexporter`
+/// translator: the mapped unit suffix (appended only when the name does not
+/// already end with it), then `_total` for a monotonic Sum (appended only when
+/// the name does not already end with it), then a final re-sanitize so any
+/// character the unit table introduced is still a valid metric-name character.
+///
+/// `kind` selects the dimensionless-ratio behavior (`unit == "1"` becomes
+/// `_ratio` on a `Gauge` only) and is redundant with `is_monotonic_sum` for
+/// the `_total` decision (`is_monotonic_sum` is `true` exactly when
+/// `kind == Counter`); both are taken so a caller need not derive one from the
+/// other. Pure and total: no allocation beyond the returned `String`, and it
+/// never fails.
+pub fn prometheus_family_name(
+    sanitized: &str,
+    unit: &str,
+    kind: MetricKind,
+    is_monotonic_sum: bool,
+) -> String {
+    let mut name = sanitized.to_string();
+    if let Some(suffix) = unit_suffix(unit, kind) {
+        let with_sep = format!("_{suffix}");
+        if !name.ends_with(&with_sep) {
+            name.push_str(&with_sep);
+        }
+    }
+    if is_monotonic_sum && !name.ends_with("_total") {
+        name.push_str("_total");
+    }
+    sanitize_metric_name(&name)
+}
+
+/// Map a whole (non-compound) UCUM unit through the OpenTelemetry Collector's
+/// `unitMapper` table (ADR-0085 Decision 2), returning the Prometheus word or
+/// `None` for an empty or unrecognized unit. The dimensionless `1` is not in
+/// this table: its `_ratio` mapping is gauge-specific and lives in
+/// [`unit_suffix`], since this mapper has no metric kind.
+pub fn map_unit(unit: &str) -> Option<String> {
+    let mapped = match unit {
+        // time
+        "d" => "days",
+        "h" => "hours",
+        "min" => "minutes",
+        "s" => "seconds",
+        "ms" => "milliseconds",
+        "us" => "microseconds",
+        "ns" => "nanoseconds",
+        // bytes
+        "By" => "bytes",
+        "KiBy" => "kibibytes",
+        "MiBy" => "mebibytes",
+        "GiBy" => "gibibytes",
+        "TiBy" => "tibibytes",
+        "KBy" => "kilobytes",
+        "MBy" => "megabytes",
+        "GBy" => "gigabytes",
+        "TBy" => "terabytes",
+        // SI
+        "m" => "meters",
+        "V" => "volts",
+        "A" => "amperes",
+        "J" => "joules",
+        "W" => "watts",
+        "g" => "grams",
+        // misc
+        "Cel" => "celsius",
+        "Hz" => "hertz",
+        "%" => "percent",
+        _ => return None,
+    };
+    Some(mapped.to_string())
+}
+
+/// Map a per-unit denominator through the Collector's `perUnitMapper` table
+/// (ADR-0085 Decision 2). Unlike [`map_unit`], `m` here is `minute`, not
+/// `meters`. An unrecognized denominator returns `None`; callers pass it
+/// through sanitized rather than dropping it.
+fn map_per_unit(unit: &str) -> Option<String> {
+    let mapped = match unit {
+        "s" => "second",
+        "m" => "minute",
+        "h" => "hour",
+        "d" => "day",
+        "w" => "week",
+        "mo" => "month",
+        "y" => "year",
+        _ => return None,
+    };
+    Some(mapped.to_string())
+}
+
+/// Strip every `{...}` annotation from a unit, anywhere it appears and at any
+/// nesting (ADR-0085 Decision 2: `{packet}/s` becomes `/s`). Unbalanced braces
+/// are tolerated rather than treated as an error, since a unit string is
+/// attacker-influenced input and must never panic here.
+fn strip_annotations(unit: &str) -> String {
+    let mut out = String::with_capacity(unit.len());
+    let mut depth: usize = 0;
+    for c in unit.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Compute the mapped unit suffix (without a leading `_`) for a unit string,
+/// or `None` when it should add no suffix (empty, an unrecognized simple unit,
+/// or `1` on a non-gauge). Handles the `a/b` compound form (each side mapped
+/// independently, joined as `<a>_per_<b>`) and the annotation-only-side
+/// collapse (`{packet}/s` yields `per_second`) from ADR-0085 Decision 2.
+fn unit_suffix(unit: &str, kind: MetricKind) -> Option<String> {
+    let stripped = strip_annotations(unit);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Dimensionless ratio: `_ratio` on a gauge, nothing on any other kind.
+    if trimmed == "1" {
+        return match kind {
+            MetricKind::Gauge => Some("ratio".to_string()),
+            _ => None,
+        };
+    }
+    if let Some((num_raw, den_raw)) = trimmed.split_once('/') {
+        let num = num_raw.trim();
+        let den = den_raw.trim();
+        // An empty side (its content was entirely an annotation) contributes
+        // nothing; an unrecognized side passes through sanitized rather than
+        // being guessed or dropped.
+        let num_mapped =
+            (!num.is_empty()).then(|| map_unit(num).unwrap_or_else(|| num.to_string()));
+        let den_mapped =
+            (!den.is_empty()).then(|| map_per_unit(den).unwrap_or_else(|| den.to_string()));
+        match (num_mapped, den_mapped) {
+            (Some(n), Some(d)) => Some(format!("{n}_per_{d}")),
+            (Some(n), None) => Some(n),
+            (None, Some(d)) => Some(format!("per_{d}")),
+            (None, None) => None,
+        }
+    } else {
+        map_unit(trimmed)
+    }
+}
+
+/// The unit word stored in a metric's [`MetricMetadata`]: the mapped Prometheus
+/// word when the unit maps (agreeing with the name suffix), otherwise the raw
+/// unit sanitized as a metric name, otherwise empty (ADR-0085 Decision 1/2).
+fn metadata_unit_word(unit: &str, kind: MetricKind) -> String {
+    if let Some(word) = unit_suffix(unit, kind) {
+        return word;
+    }
+    let stripped = strip_annotations(unit);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        sanitize_metric_name(trimmed)
+    }
+}
+
+/// The Prometheus [`MetricKind`] and monotonic-Sum flag a metric's `data`
+/// oneof implies (ADR-0085 Decision 1): a monotonic `Sum` is a `Counter`, a
+/// non-monotonic `Sum` and a `Gauge` are both `Gauge`, `Histogram` and
+/// `ExponentialHistogram` are `Histogram`, and `Summary` is `Summary`. `None`
+/// data carries no points and is handled before this is called.
+fn metric_kind_of(data: &MetricData) -> (MetricKind, bool) {
+    match data {
+        MetricData::Gauge(_) => (MetricKind::Gauge, false),
+        MetricData::Sum(s) if s.is_monotonic => (MetricKind::Counter, true),
+        MetricData::Sum(_) => (MetricKind::Gauge, false),
+        MetricData::Histogram(_) | MetricData::ExponentialHistogram(_) => {
+            (MetricKind::Histogram, false)
+        }
+        MetricData::Summary(_) => (MetricKind::Summary, false),
+    }
+}
+
+/// Accumulates one [`MetricMetadata`] per metric family that produced at least
+/// one point, deduplicated by `family_name` with the first write winning
+/// (ADR-0085 Decision 1). Threaded through normalization only by the
+/// [`normalize_metrics_with_metadata`] entry point; the exemplar-only entry
+/// points pass `None` and never allocate it.
+#[derive(Default)]
+struct MetadataCollector {
+    entries: Vec<MetricMetadata>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl MetadataCollector {
+    fn record(&mut self, meta: MetricMetadata) {
+        if self.seen.insert(meta.family_name.clone()) {
+            self.entries.push(meta);
+        }
     }
 }
 
@@ -4070,5 +4351,262 @@ mod tests {
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points[0].sample.value, 5.0);
+    }
+
+    // --- ADR-0085 Decision 2: OTLP-to-Prometheus name suffixing, and
+    // Decision 1: per-metric metadata surfaced from normalize ---
+
+    fn cap() -> ExemplarCap {
+        ExemplarCap::new(IngestLimits::default().exemplar_cap_window_ns)
+    }
+
+    fn gauge_u(name: &str, unit: &str) -> Metric {
+        Metric {
+            name: name.to_string(),
+            unit: unit.to_string(),
+            data: Some(MetricData::Gauge(Gauge {
+                data_points: vec![number_point(vec![], 1_000_000, NumberValue::AsDouble(1.0))],
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn mono_sum_u(name: &str, unit: &str) -> Metric {
+        Metric {
+            name: name.to_string(),
+            unit: unit.to_string(),
+            data: Some(MetricData::Sum(Sum {
+                data_points: vec![number_point(vec![], 1_000_000, NumberValue::AsDouble(1.0))],
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                is_monotonic: true,
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Normalize a one-metric request with metadata, returning the distinct
+    /// `__name__` values its points carry (sorted) and the metadata list.
+    fn suffixed(metric: Metric) -> (Vec<String>, Vec<MetricMetadata>) {
+        let rm = resource_metrics(vec![], vec![metric]);
+        let mut c = cap();
+        let (result, metadata) = normalize_metrics_with_metadata(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut c,
+        );
+        assert!(
+            result.output.rejected.is_empty(),
+            "{:?}",
+            result.output.rejected
+        );
+        let mut names: Vec<String> = result
+            .output
+            .points
+            .iter()
+            .map(|p| {
+                p.labels
+                    .get(METRIC_NAME_LABEL)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        (names, metadata)
+    }
+
+    #[test]
+    fn monotonic_sum_with_unit_gets_unit_then_total_suffix() {
+        let mut metric = mono_sum_u("foo", "By");
+        metric.description = "bytes processed".to_string();
+        let (names, metadata) = suffixed(metric);
+        assert_eq!(names, vec!["foo_bytes_total".to_string()]);
+        assert_eq!(
+            metadata,
+            vec![MetricMetadata {
+                family_name: "foo_bytes_total".to_string(),
+                kind: MetricKind::Counter,
+                help: "bytes processed".to_string(),
+                unit: "bytes".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn name_suffix_cases() {
+        use MetricKind::{Counter, Gauge};
+        assert_eq!(
+            prometheus_family_name("foo", "1", Gauge, false),
+            "foo_ratio"
+        );
+        assert_eq!(
+            prometheus_family_name("foo", "1", Counter, true),
+            "foo_total"
+        );
+        assert_eq!(
+            prometheus_family_name("foo", "By/s", Gauge, false),
+            "foo_bytes_per_second"
+        );
+        assert_eq!(
+            prometheus_family_name("foo", "{packet}/s", Gauge, false),
+            "foo_per_second"
+        );
+        assert_eq!(
+            prometheus_family_name("foo", "furlong", Gauge, false),
+            "foo"
+        );
+        assert_eq!(
+            prometheus_family_name("foo_total", "", Counter, true),
+            "foo_total"
+        );
+        assert_eq!(
+            prometheus_family_name("foo_bytes", "By", Gauge, false),
+            "foo_bytes"
+        );
+        assert_eq!(
+            prometheus_family_name("foo", "ms", Gauge, false),
+            "foo_milliseconds"
+        );
+        // A passthrough compound side with characters needing sanitizing
+        // survives the final re-sanitize: `a.b/c` -> `foo_a_b_per_c`.
+        assert_eq!(
+            prometheus_family_name("foo", "a.b/c", Gauge, false),
+            "foo_a_b_per_c"
+        );
+    }
+
+    #[test]
+    fn unit_table_is_complete() {
+        let table = [
+            ("d", "days"),
+            ("h", "hours"),
+            ("min", "minutes"),
+            ("s", "seconds"),
+            ("ms", "milliseconds"),
+            ("us", "microseconds"),
+            ("ns", "nanoseconds"),
+            ("By", "bytes"),
+            ("KiBy", "kibibytes"),
+            ("MiBy", "mebibytes"),
+            ("GiBy", "gibibytes"),
+            ("TiBy", "tibibytes"),
+            ("KBy", "kilobytes"),
+            ("MBy", "megabytes"),
+            ("GBy", "gigabytes"),
+            ("TBy", "terabytes"),
+            ("m", "meters"),
+            ("V", "volts"),
+            ("A", "amperes"),
+            ("J", "joules"),
+            ("W", "watts"),
+            ("g", "grams"),
+            ("Cel", "celsius"),
+            ("Hz", "hertz"),
+            ("%", "percent"),
+        ];
+        for (unit, word) in table {
+            assert_eq!(map_unit(unit).as_deref(), Some(word), "map_unit({unit})");
+            assert_eq!(
+                prometheus_family_name("foo", unit, MetricKind::Gauge, false),
+                format!("foo_{word}"),
+                "family({unit})"
+            );
+        }
+        assert_eq!(map_unit("furlong"), None);
+        assert_eq!(map_unit(""), None);
+    }
+
+    #[test]
+    fn gauge_ratio_end_to_end() {
+        let (names, metadata) = suffixed(gauge_u("cpu", "1"));
+        assert_eq!(names, vec!["cpu_ratio".to_string()]);
+        assert_eq!(metadata[0].unit, "ratio");
+        assert_eq!(metadata[0].kind, MetricKind::Gauge);
+    }
+
+    #[test]
+    fn metadata_unit_is_mapped_or_raw_sanitized_or_empty() {
+        let (_names, metadata) = suffixed(gauge_u("foo", "furlong"));
+        assert_eq!(metadata[0].unit, "furlong");
+        let (_names, metadata) = suffixed(gauge_u("bar", ""));
+        assert_eq!(metadata[0].unit, "");
+        let (_names, metadata) = suffixed(gauge_u("baz", "By"));
+        assert_eq!(metadata[0].unit, "bytes");
+    }
+
+    #[test]
+    fn classic_histogram_unit_suffix_before_structural() {
+        let hp = histogram_point(
+            vec![],
+            1_000_000,
+            3,
+            Some(6.0),
+            vec![1.0, 2.0],
+            vec![1, 1, 1],
+        );
+        let metric = Metric {
+            name: "foo".to_string(),
+            unit: "s".to_string(),
+            data: Some(MetricData::Histogram(Histogram {
+                data_points: vec![hp],
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            })),
+            ..Default::default()
+        };
+        let (names, metadata) = suffixed(metric);
+        assert!(
+            names.contains(&"foo_seconds_bucket".to_string()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"foo_seconds_sum".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"foo_seconds_count".to_string()),
+            "{names:?}"
+        );
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].family_name, "foo_seconds");
+        assert_eq!(metadata[0].kind, MetricKind::Histogram);
+    }
+
+    #[test]
+    fn metadata_deduplicated_by_family_first_wins() {
+        let mut a = gauge_u("foo", "");
+        a.description = "first".to_string();
+        let mut b = gauge_u("foo", "");
+        b.description = "second".to_string();
+        let rm = resource_metrics(vec![], vec![a, b]);
+        let mut c = cap();
+        let (_r, metadata) = normalize_metrics_with_metadata(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut c,
+        );
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].help, "first");
+    }
+
+    #[test]
+    fn metadata_absent_when_no_points_produced() {
+        let m = sum_metric(
+            "requests",
+            vec![number_point(vec![], 1_000_000, NumberValue::AsDouble(1.0))],
+            AggregationTemporality::Delta,
+            true,
+        );
+        let rm = resource_metrics(vec![], vec![m]);
+        let mut c = cap();
+        let (r, metadata) = normalize_metrics_with_metadata(
+            &tenant(),
+            request(vec![rm]),
+            &IngestLimits::default(),
+            1_000_000,
+            &mut c,
+        );
+        assert!(r.output.points.is_empty());
+        assert!(metadata.is_empty());
     }
 }
