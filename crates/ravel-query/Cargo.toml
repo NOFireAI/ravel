@@ -81,7 +81,7 @@ ravel-cache = { workspace = true }
 # proof (tests/differential_compaction.rs) drives P4's real compactor to
 # produce write_v4 L1 parts. ravel-maintain does not depend on ravel-query,
 # so this is acyclic.
-ravel-maintain = { path = "../ravel-maintain", version = "0.9.3" }
+ravel-maintain = { path = "../ravel-maintain", version = "0.9.4" }
 proptest = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

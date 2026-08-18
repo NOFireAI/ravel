@@ -187,7 +187,7 @@ GitHub Container Registry on every `vX.Y.Z` release tag, built from the root
 (see [ADR-0037](docs/adrs/0037-container-image-ci-registry.md)). Both
 `linux/amd64` and `linux/arm64` are published.
 Each published object is an OCI image index that carries an SBOM and full build
-provenance. The quickstart pins `ghcr.io/nofireai/ravel-server:0.9.3`. Override
+provenance. The quickstart pins `ghcr.io/nofireai/ravel-server:0.9.4`. Override
 it with `RAVEL_IMAGE`.
 
 ```sh
