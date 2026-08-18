@@ -130,6 +130,7 @@ jobs:
   # runner build both.
   build:
     needs: gate
+    timeout-minutes: 60
     # Decision 17: a build job no longer signs anything, so it holds
     # packages: write to push by digest and DROPS id-token entirely. A build
     # job carrying a signing-capable token is exactly the least-privilege drift
@@ -237,6 +238,7 @@ jobs:
   # list, applies the tags, signs the assembled index, and verifies the result.
   merge:
     needs: [gate, build]
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     # Decision 17: signing moved here, so id-token: write lives here alongside
     # packages: write. The build jobs dropped id-token; this is the only job
