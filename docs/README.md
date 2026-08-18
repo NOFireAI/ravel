@@ -90,6 +90,11 @@ code, not only to use it.
 
 - [architecture.md](architecture.md): end-to-end system diagram and crate
   dependency graph. Start here for the implementer's view.
+- [explorer/](explorer/index.html): the interactive map. An isometric city
+  of the crates and services, the flows that cross them (ingest to commit,
+  PromQL and SQL reads, maintenance, alerting, boot), and live per-crate
+  counts and dependencies. Open the file in a browser; regenerate the numbers
+  with `make archmap`.
 - [ingest.md](ingest.md): the ingest pipeline's internal structure (gateway,
   shard actors, flush) and sizing defaults.
 - [query-engine.md](query-engine.md): the query engine's internal structure

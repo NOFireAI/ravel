@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test test-python doc-drift build minio minio-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest
+.PHONY: check fmt clippy test test-python doc-drift build minio minio-down demo quickstart quickstart-down kind-up kind-demo kind-down bench audit difftest archmap
 
 check: fmt clippy test
 
@@ -23,6 +23,11 @@ test-python:
 # (ADR-0053 decision 6). No build, so it is cheap enough to run before a
 # commit; the full regeneration lives in ravel-promql-difftest's
 # conformance_table test.
+# Regenerate docs/explorer/stats.js (per-crate counts and the dependency
+# graph the explorer page aggregates); commit it with any docs/explorer change.
+archmap:
+	python3 scripts/archmap/gen_stats.py
+
 doc-drift:
 	./scripts/check-doc-drift.sh
 
