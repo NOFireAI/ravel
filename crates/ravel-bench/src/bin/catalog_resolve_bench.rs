@@ -499,7 +499,7 @@ async fn run_gate_scenario(raw_store: Arc<dyn ObjectStoreBackend>, args: &Args) 
         EngineConfig::default(),
     );
     let query_start = Instant::now();
-    let value = engine
+    let (value, _coverage) = engine
         .instant(
             tenant_hash,
             query,

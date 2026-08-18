@@ -1386,7 +1386,7 @@ async fn probe_all_series(
     let mut record_count = 0usize;
     for series in series_list {
         let selector = series_selector(series);
-        let value = engine
+        let (value, _coverage) = engine
             .range(
                 tenant_hash,
                 &selector,
@@ -1475,7 +1475,7 @@ async fn check_visible(
         let Some(expected) = expected_sample(series) else {
             continue;
         };
-        let value = engine
+        let (value, _coverage) = engine
             .instant(
                 *tenant_hash,
                 &expected.query,
@@ -1547,9 +1547,10 @@ async fn run_query(
 ) -> Result<Value, QueryError> {
     match query {
         QuerySpec::Instant { query, t_ms } => {
-            engine
+            let (value, _coverage) = engine
                 .instant(tenant_hash, query, *t_ms, &[], now_ns, deadline)
-                .await
+                .await?;
+            Ok(value)
         }
         QuerySpec::Range {
             query,
@@ -1557,7 +1558,7 @@ async fn run_query(
             end_ms,
             step_ms,
         } => {
-            engine
+            let (value, _coverage) = engine
                 .range(
                     tenant_hash,
                     query,
@@ -1568,7 +1569,8 @@ async fn run_query(
                     now_ns,
                     deadline,
                 )
-                .await
+                .await?;
+            Ok(value)
         }
     }
 }

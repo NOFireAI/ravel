@@ -295,7 +295,7 @@ async fn queried_user_ids(
     token: &CommitToken,
     ts_ns: i64,
 ) -> Vec<String> {
-    let value = engine
+    let (value, _coverage) = engine
         .instant(
             tenant_hash,
             METRIC,
@@ -333,7 +333,7 @@ async fn range_user_ids(
     tenant_hash: TenantHash,
     token: &CommitToken,
 ) -> Vec<String> {
-    let value = engine
+    let (value, _coverage) = engine
         .range(
             tenant_hash,
             METRIC,
@@ -372,7 +372,7 @@ async fn enumerated_user_ids(
     tenant_hash: TenantHash,
     token: &CommitToken,
 ) -> Vec<String> {
-    let series = engine
+    let (series, _coverage) = engine
         .resolve_series(
             tenant_hash,
             &[LabelMatcher::equal(METRIC_NAME_LABEL, METRIC)],

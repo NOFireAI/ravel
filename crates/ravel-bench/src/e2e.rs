@@ -472,7 +472,7 @@ pub async fn run(config: &E2eConfig) -> Report {
     let mut query_matched_series = 0usize;
     for i in 0..config.query_count {
         let start = std::time::Instant::now();
-        let value = engine
+        let (value, _coverage) = engine
             .instant(
                 tenant_hash,
                 &config.query,

@@ -68,7 +68,7 @@ use ravel_ingest::{Clock, LOG_SEGMENT_FORMAT_VERSION};
 use ravel_logseg::{ObjectIdentity, Predicate, RlogConfig, RlogReader};
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
 use ravel_promql::Value as PromqlValue;
-use ravel_query::QueryEngine;
+use ravel_query::{Coverage, QueryEngine};
 use ravel_types::{Signal, TenantHash, TenantId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -835,10 +835,21 @@ impl AlertEvaluator {
 
     /// Run a rule's query and summarize the result into the shape its condition
     /// tests.
+    ///
+    /// Partial federated coverage is a failed evaluation, not a usable answer
+    /// (ADR-0071 "partial results are consent-gated and envelope-visible"
+    /// amendment, decision 5). A rule evaluated over a result that omits a
+    /// skipped remote's data can fire, or worse resolve, on data that was never
+    /// read. Returning an error here puts the rule on the existing per-rule
+    /// failure path in [`Self::run_tick`]: it is logged, counted in
+    /// `rules_failed`, the prior alert state is left exactly as it was, no
+    /// transition record is written, and the next tick retries. A per-rule
+    /// opt-in to evaluate on partial coverage is deliberately not offered here;
+    /// the amendment leaves that to the alerting surface's own work.
     async fn run_query(&self, rule: &Rule, now_ns: i64) -> anyhow::Result<QueryResultSummary> {
         match &rule.query {
             RuleQuery::Promql(text) => {
-                let value = self
+                let (value, coverage) = self
                     .engines
                     .promql
                     .instant(
@@ -850,6 +861,13 @@ impl AlertEvaluator {
                         self.query_deadline,
                     )
                     .await?;
+                if let Coverage::Partial { skipped } = coverage {
+                    anyhow::bail!(
+                        "alert rule query ran over partial federated coverage (degraded \
+                         clusters: {}); refusing to evaluate the rule on an incomplete result",
+                        skipped.join(", ")
+                    );
+                }
                 promql_summary(value)
             }
             RuleQuery::Sql(text) => self.run_sql(text, now_ns).await,

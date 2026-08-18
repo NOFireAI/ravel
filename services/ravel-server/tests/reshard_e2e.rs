@@ -273,10 +273,11 @@ async fn instant(
     min_tokens: &[CommitToken],
     now_ns: i64,
 ) -> Value {
-    engine
+    let (value, _coverage) = engine
         .instant(tenant_hash(), query, t_ms, min_tokens, now_ns, ACK)
         .await
-        .expect("instant query succeeds")
+        .expect("instant query succeeds");
+    value
 }
 
 /// A range query over `[start_ms, end_ms]` at `step_ms`. Used for the
@@ -292,7 +293,7 @@ async fn range(
     step_ms: i64,
     now_ns: i64,
 ) -> Value {
-    engine
+    let (value, _coverage) = engine
         .range(
             tenant_hash(),
             query,
@@ -304,7 +305,8 @@ async fn range(
             ACK,
         )
         .await
-        .expect("range query succeeds")
+        .expect("range query succeeds");
+    value
 }
 
 /// `(metric_name, value)` pairs of an instant vector; exact `f64` values.

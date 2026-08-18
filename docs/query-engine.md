@@ -489,6 +489,30 @@ warning (the remote returned a data kind this build cannot federate yet),
 and without `skip_unavailable` it fails with that same typed reason rather
 than a generic transport error.
 
+#### The engine API cannot hand a caller a value without its coverage
+
+Warnings in a response envelope only help a caller that reads an envelope,
+so the engine API carries the same signal in its types (ADR-0071 "partial
+results are consent-gated and envelope-visible" amendment, decision 4). The
+bare convenience wrappers `QueryEngine::{instant, range, resolve_series}`
+return their value paired with a `#[must_use] Coverage`
+(`Complete | Partial { skipped }`), derived by `Coverage::from_stats` from
+the same `QueryStats` their `_with_stats` sibling returns. Nothing new is
+tracked; the wrappers simply cannot drop what the fan-out already recorded.
+A caller that does not care must bind the coverage to a name, which puts the
+decision to ignore it where review can see it. The `_with_stats` and
+`_with_stats_annotated` variants are unchanged and remain the source for the
+wire rendering.
+
+The alert evaluator (`services/ravel-server/src/alerting.rs`, `run_query`)
+is the caller this matters most for, and it treats `Coverage::Partial` as a
+failed evaluation (amendment decision 5): the rule is logged, counted in the
+tick's `rules_failed`, its prior alert state is left untouched, no transition
+record is written, and the next tick retries. A rule can therefore never fire
+or resolve on data a skipped cluster never returned. There is deliberately no
+per-rule opt-in to evaluate on partial coverage; that policy belongs with the
+alerting surface's own work.
+
 ### Cross-cluster duplicate tie-break limitation
 
 The merge resolves a duplicate `(series_id, ts)` under the total order in
