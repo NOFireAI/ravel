@@ -34,6 +34,14 @@
 //! raise it, and the optional `min_commit_token` array carries read-your-write
 //! tokens, both exactly as the range endpoint treats them.
 //!
+//! The optional `allow_partial` (bool, default `false`) is the consent gate for
+//! partial federated coverage (ADR-0071, "partial results are consent-gated and
+//! envelope-visible" amendment, section 2). Absent or `false`, a request whose
+//! evaluation skipped a federated remote is refused with a 503 rather than
+//! answered from an incomplete read; `true` accepts the partial answer, which
+//! the response envelope then states. It is a body field, not a query-string
+//! parameter, because this endpoint's whole request contract is the JSON body.
+//!
 //! `op` is a tagged object selecting one analytic:
 //!
 //! - `{"type": "change_point", "downsample": <bool, default false>}`
@@ -57,9 +65,17 @@
 //!                   "score": 42.1, "downsampled": false,
 //!                   "original_points": 120, "nan_excluded": 0}}
 //!     ]
-//!   }
+//!   },
+//!   "partial": false,
+//!   "warnings": []
 //! }
 //! ```
+//!
+//! `partial` and `warnings` are the ADR-0071 coverage surface: `partial` is
+//! always present and is `true` exactly when the evaluation skipped a federated
+//! remote (which requires `allow_partial: true`, see above), and `warnings`
+//! carries the fan-out's already-redacted per-cluster warnings, empty on a
+//! complete answer.
 //!
 //! The op result is serialized through the server-local serde structs at the
 //! bottom of this module; `ravel-analytics` carries no serde derive (ADR-0028
@@ -70,7 +86,9 @@
 //! Evaluator errors keep the exact status mapping `/api/v1/query_range` uses,
 //! including the redaction of storage-layer faults that would otherwise
 //! leak an object key or tenant hash. `ravel-analytics` errors and the
-//! per-call series cap map to 422. The full table is in docs/analytics.md.
+//! per-call series cap map to 422. Partial coverage without `allow_partial`
+//! maps to 503 `unavailable`, the same typed shape the HTTP query endpoints
+//! use. The full table is in docs/analytics.md.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -89,7 +107,7 @@ use ravel_ingest::Clock;
 use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_promql::Value;
 use ravel_query::http::{QueryErrorResponse, TenantResolver};
-use ravel_query::{QueryEngine, QueryError};
+use ravel_query::{Coverage, QueryEngine, QueryError};
 use ravel_types::{CommitToken, LabelSet, Sample, TenantHash};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -163,6 +181,14 @@ struct AnalyticsBody {
     /// them.
     #[serde(default)]
     min_commit_token: Vec<String>,
+    /// Consent to a partial federated answer (ADR-0071 amendment, section 2).
+    /// `serde(default)`, so an absent field means `false`: a client that never
+    /// asked for partial coverage gets a 503 refusal instead of an incomplete
+    /// answer that looks complete. Mirrors the `allow_partial` query-string
+    /// parameter the HTTP query endpoints take, carried in the body because
+    /// this endpoint's request contract is the body.
+    #[serde(default)]
+    allow_partial: bool,
 }
 
 /// The tagged analytic selector. `rename_all = "snake_case"` makes the tag
@@ -288,6 +314,16 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
     .await?;
     let (value, stats) = eval.map_err(ApiError::from_query)?;
 
+    // Consent gate (ADR-0071 "partial results are consent-gated and
+    // envelope-visible" amendment, section 2): the evaluation ran and was
+    // audited, but a partial answer the client did not opt into is refused with
+    // the typed 503 the HTTP query endpoints use, before any op runs and before
+    // any body is built. Coverage is knowable only now, and it is derived from
+    // the stats the engine already produced rather than newly tracked
+    // (amendment decision 4).
+    let coverage = Coverage::from_stats(&stats);
+    gate_partial(&coverage, body.allow_partial)?;
+
     // Fold this query's actual cost and its pre-execution estimate into the
     // process-global aggregator for `/metrics` (ADR-0044 section 4) and record
     // the final counts on the span.
@@ -345,9 +381,32 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
             // Beside `data`, the "stats object beside data" shape
             // `/api/v1/query_exemplars` uses (ADR-0044).
             "stats": stats_json,
+            // The coverage of the answer, stated on the envelope where a naive
+            // consumer cannot miss it (ADR-0071 amendment, section 2): `partial`
+            // is always present, and `warnings` carries the federation
+            // fan-out's already-redacted per-cluster warnings (empty on a
+            // complete answer). Reaching here with `partial: true` means the
+            // request opted in through `allow_partial`.
+            "partial": coverage.is_partial(),
+            "warnings": stats.warnings,
         })),
     )
         .into_response())
+}
+
+/// The consent gate, the analytics mirror of `gate_partial` in
+/// `crates/ravel-query/src/http/handlers.rs` (ADR-0071 amendment, section 2).
+/// Partial coverage the client did not opt into fails with the same typed shape
+/// the HTTP query endpoints use, HTTP 503 with `errorType: "unavailable"`, so a
+/// consumer that never asked for a partial answer fails safe instead of
+/// silently accepting one. Complete coverage, or partial coverage with
+/// `allow_partial: true`, passes and the response is a 200 whose top-level
+/// `partial` field states the coverage.
+fn gate_partial(coverage: &Coverage, allow_partial: bool) -> Result<(), ApiError> {
+    if coverage.is_partial() && !allow_partial {
+        return Err(ApiError::partial_refusal(coverage.skipped()));
+    }
+    Ok(())
 }
 
 /// Apply the selected op to every series, converting each crate result into
@@ -546,6 +605,31 @@ impl ApiError {
             error_type: "execution",
             message: format!(
                 "analytics call matched {count} series, exceeding the limit of {MAX_SERIES}"
+            ),
+        }
+    }
+
+    /// Partial coverage without `allow_partial` (ADR-0071 amendment, section
+    /// 2). The status, the `errorType` tag, and the message shape are the ones
+    /// `ApiError::Unavailable` and `partial_refusal_message` produce on the HTTP
+    /// query endpoints (`crates/ravel-query/src/http/error.rs`,
+    /// `handlers.rs`), reproduced here because both are private to that crate;
+    /// the wording is kept identical so one refusal contract covers every read
+    /// surface. `skipped` names the degraded clusters, already redacted at the
+    /// federation seam to operator-facing cluster names, and the remedy
+    /// (`allow_partial`) is named in the failure itself.
+    fn partial_refusal(skipped: &[String]) -> Self {
+        let clusters = if skipped.is_empty() {
+            "one or more federated clusters were skipped".to_string()
+        } else {
+            skipped.join("; ")
+        };
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "unavailable",
+            message: format!(
+                "partial results: coverage is incomplete ({clusters}); \
+                 set allow_partial=true to receive partial results"
             ),
         }
     }
@@ -847,5 +931,33 @@ mod tests {
         let unavailable = ApiError::from_query(QueryError::SnapshotInvalidated);
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.message, ravel_query::http::MSG_UNAVAILABLE);
+    }
+
+    /// The consent gate's decision table (ADR-0071 amendment, section 2). The
+    /// end-to-end behavior is pinned through the real handler in
+    /// `tests/analytics_endpoint.rs`; this pins the branch table itself,
+    /// including the empty-`skipped` fallback a partial flag with no per-cluster
+    /// warning would take.
+    #[test]
+    fn the_consent_gate_refuses_only_unconsented_partial_coverage() {
+        let partial = Coverage::Partial {
+            skipped: vec!["remote cluster west unavailable".to_string()],
+        };
+        gate_partial(&Coverage::Complete, false).expect("complete coverage passes");
+        gate_partial(&Coverage::Complete, true).expect("complete coverage passes opted in");
+        gate_partial(&partial, true).expect("opted-in partial coverage passes");
+
+        let err = gate_partial(&partial, false).expect_err("unconsented partial is refused");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.error_type, "unavailable");
+        assert!(err.message.contains("west"), "{}", err.message);
+        assert!(err.message.contains("allow_partial"), "{}", err.message);
+
+        let bare = ApiError::partial_refusal(&[]);
+        assert!(
+            bare.message.contains("one or more federated clusters"),
+            "{}",
+            bare.message
+        );
     }
 }
