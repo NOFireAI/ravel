@@ -18,6 +18,7 @@ t/<tenant_hash>/<signal>/del/<request_id>.done                          erasure 
 t/<tenant_hash>/<signal>/prov                                           shard_count provisioning record (write-once, additive; ADR-0050 §5)
 t/<tenant_hash>/enc                                                     per-tenant KMS key-epoch record (CAS append-only, additive; ADR-0062 §1b)
 t/<tenant_hash>/config                                                  per-tenant lifecycle/limits/retention config (CAS whole-record replace, additive; ADR-0066 §6)
+t/<tenant_hash>/m/meta                                                  per-tenant metric family metadata record (CAS whole-record replace, additive; ADR-0085 §1)
 t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempotency marker (logs/spans; additive)
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
@@ -192,6 +193,33 @@ deployment defaults (`read_config` returns `Ok(None)`). This record is durable
 control state only; the bounded-staleness refresh loop that reads it on a
 horizon and re-invokes the admission controller's `set_tenant_limits` is a
 separate concern.
+
+`t/<tenant_hash>/m/meta` (ADR-0085 §1) is the durable per-tenant metric
+metadata record: one entry per metric **family name** (never per series)
+holding the `{type, help, unit}` tuple captured at ingest, plus a
+`format_version` floor and the owning `tenant_hash`
+(proto/ravel/sys.proto `MetricMetadataRecord`/`MetricMetadataEntry`, zstd
+compressed on the wire). It sits under the metrics signal prefix `m/` beside
+`m/l0` and `m/c` rather than at a new top-level prefix. Like
+`t/<tenant_hash>/config` it is mutated by **whole-record CAS-replace**
+(`ravel_catalog::write_metrics_meta`, with `CreateIfAbsent` on the first write
+for a tenant): the entry set is mutable current state, and pruning it back
+under the per-tenant entry cap by evicting the oldest entries is a shrinking
+write an append-only history cannot express. A concurrent write is a typed
+conflict whose loser re-reads and field-wise re-merges onto the winner's body
+(`ravel_catalog::merge_entries`) rather than overwriting it; an absent incoming
+`help`/`unit`, or a `type` of `unknown`, never overwrites a populated stored
+value, so two ingest paths that each carry part of the tuple compose instead of
+clobbering. A tenant with no `m/meta` record has had nothing captured yet,
+which is not an error (`read_metrics_meta` returns `Ok(None)`) and reads as an
+empty `/api/v1/metadata` response. Grants: the **ingest role** (the process
+hosting the OTLP, OTAP, RW1, and RW2 surfaces, the same role that already
+writes that tenant's `<signal>/idem/*` and data/commit keys) holds read and CAS
+write on this key; the **query role** holds read-only, since it only serves the
+record through `/api/v1/metadata`; and **no role holds delete**. Like `config`
+and the `admission`/`maintain` keys, this key is never swept, only overwritten
+in place, so remediation of a record polluted by a bad client is the same CAS
+write with a smaller merged body, not a deletion.
 
 `sys/auth` (ADR-0066 §6) is the durable, deployment-wide bearer-token
 map replacing the startup-frozen `--tenant-token` allowlist: a bucket-root
