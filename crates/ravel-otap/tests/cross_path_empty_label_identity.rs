@@ -111,7 +111,7 @@ fn rw_series_id(mut labels: Vec<Label>) -> SeriesId {
             histograms: vec![],
             exemplars: vec![],
         }],
-        metadata_count: 0,
+        metadata: vec![],
         created_timestamps_count: 0,
         exemplars_dropped: 0,
     };

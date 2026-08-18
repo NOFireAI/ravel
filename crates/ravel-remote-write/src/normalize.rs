@@ -290,7 +290,7 @@ pub fn normalize_with_exemplars(
                 histograms_written: 0,
                 histograms_dropped: 0,
                 exemplars_dropped,
-                metadata_dropped: resolved.metadata_count,
+                metadata_dropped: resolved.metadata.len(),
                 created_timestamps_dropped: resolved.created_timestamps_count,
             },
             exemplars: Vec::new(),
@@ -330,7 +330,7 @@ pub fn normalize_with_exemplars(
             histograms_written: counts.written,
             histograms_dropped: counts.dropped,
             exemplars_dropped,
-            metadata_dropped: resolved.metadata_count,
+            metadata_dropped: resolved.metadata.len(),
             created_timestamps_dropped: resolved.created_timestamps_count,
         },
         exemplars,
@@ -1046,7 +1046,7 @@ mod tests {
     fn request(series: Vec<ResolvedSeries>) -> ResolvedRequest {
         ResolvedRequest {
             series,
-            metadata_count: 0,
+            metadata: vec![],
             created_timestamps_count: 0,
             exemplars_dropped: 0,
         }
@@ -2157,11 +2157,21 @@ mod tests {
 
     #[test]
     fn metadata_dropped_is_request_level_tally() {
+        use ravel_otlp::metadata::{MetricKind, MetricMetadata};
         let mut req = request(vec![series(
             vec![label("__name__", "up")],
             vec![sample(1_000, 1.0)],
         )]);
-        req.metadata_count = 5;
+        // `metadata_dropped` is the resolved metadata list length now that the
+        // tuple is surfaced rather than tallied (ADR-0085 Decision 1).
+        req.metadata = (0..5)
+            .map(|i| MetricMetadata {
+                family_name: format!("m{i}"),
+                kind: MetricKind::Unknown,
+                help: String::new(),
+                unit: String::new(),
+            })
+            .collect();
         let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
         assert_eq!(out.metadata_dropped, 5);
     }

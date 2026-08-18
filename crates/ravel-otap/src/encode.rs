@@ -253,6 +253,10 @@ fn root_schema() -> Schema {
         ),
         Field::new("aggregation_temporality", DataType::Int32, true),
         Field::new("is_monotonic", DataType::Boolean, true),
+        // The metric's UCUM unit (otap-spec.md's METRICS.unit). Nullable and
+        // empty for a metric that carries none; the normalizer maps it to the
+        // Prometheus name suffix (ADR-0085 Decision 2).
+        Field::new("unit", DataType::Utf8, true),
     ])
 }
 
@@ -710,7 +714,60 @@ impl MetricsStreamEncoder {
         histograms: &[HistogramMetricRow],
         summaries: &[SummaryMetricRow],
     ) -> Result<BatchArrowRecords, EncodeError> {
+        self.encode_ext_inner(batch_id, metrics, &[], histograms, &[], summaries, &[])
+    }
+
+    /// Encode gauge/sum `metrics` with a parallel `metric_units` slice
+    /// (`metric_units[i]` is the UCUM unit of `metrics[i]`, or `""` past the
+    /// slice's end). Additive over [`Self::encode_batch`] so existing callers
+    /// need not change; used by the differential gate to exercise the ADR-0085
+    /// name-suffix pass across the OTLP and OTAP paths.
+    pub fn encode_batch_units(
+        &mut self,
+        batch_id: i64,
+        metrics: &[MetricRow],
+        metric_units: &[&str],
+    ) -> Result<BatchArrowRecords, EncodeError> {
+        self.encode_ext_inner(batch_id, metrics, metric_units, &[], &[], &[], &[])
+    }
+
+    /// Encode gauge/sum, histogram, and summary metrics with their parallel
+    /// unit slices. Additive over [`Self::encode_batch_ext`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_batch_ext_units(
+        &mut self,
+        batch_id: i64,
+        metrics: &[MetricRow],
+        metric_units: &[&str],
+        histograms: &[HistogramMetricRow],
+        histogram_units: &[&str],
+        summaries: &[SummaryMetricRow],
+        summary_units: &[&str],
+    ) -> Result<BatchArrowRecords, EncodeError> {
+        self.encode_ext_inner(
+            batch_id,
+            metrics,
+            metric_units,
+            histograms,
+            histogram_units,
+            summaries,
+            summary_units,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_ext_inner(
+        &mut self,
+        batch_id: i64,
+        metrics: &[MetricRow],
+        metric_units: &[&str],
+        histograms: &[HistogramMetricRow],
+        histogram_units: &[&str],
+        summaries: &[SummaryMetricRow],
+        summary_units: &[&str],
+    ) -> Result<BatchArrowRecords, EncodeError> {
         let mut root_ids = Vec::new();
+        let mut root_units: Vec<String> = Vec::new();
         let mut root_types = Vec::new();
         let mut root_names = Vec::new();
         let mut root_temporalities: Vec<Option<i32>> = Vec::new();
@@ -724,11 +781,12 @@ impl MetricsStreamEncoder {
         let mut attr_builder = AttrColumnBuilder::default();
         let mut number_exemplar_builder = ExemplarColumnBuilder::default();
 
-        for metric in metrics {
+        for (mi, metric) in metrics.iter().enumerate() {
             let metric_id = self.next_metric_id;
             self.next_metric_id = self.next_metric_id.wrapping_add(1);
             root_ids.push(metric_id);
             root_names.push(metric.name.clone());
+            root_units.push(metric_units.get(mi).copied().unwrap_or("").to_string());
             match metric.kind {
                 MetricKind::Gauge => {
                     root_types.push(METRIC_TYPE_GAUGE);
@@ -782,12 +840,13 @@ impl MetricsStreamEncoder {
         let mut hist_attr_builder = AttrColumnBuilder::default();
         let mut hist_exemplar_builder = ExemplarColumnBuilder::default();
 
-        for metric in histograms {
+        for (mi, metric) in histograms.iter().enumerate() {
             let metric_id = self.next_metric_id;
             self.next_metric_id = self.next_metric_id.wrapping_add(1);
             root_ids.push(metric_id);
             root_types.push(METRIC_TYPE_HISTOGRAM);
             root_names.push(metric.name.clone());
+            root_units.push(histogram_units.get(mi).copied().unwrap_or("").to_string());
             root_temporalities.push(Some(metric.temporality));
             root_monotonic.push(None);
 
@@ -827,12 +886,13 @@ impl MetricsStreamEncoder {
         let mut summary_dp_flags = Vec::new();
         let mut summary_attr_builder = AttrColumnBuilder::default();
 
-        for metric in summaries {
+        for (mi, metric) in summaries.iter().enumerate() {
             let metric_id = self.next_metric_id;
             self.next_metric_id = self.next_metric_id.wrapping_add(1);
             root_ids.push(metric_id);
             root_types.push(METRIC_TYPE_SUMMARY);
             root_names.push(metric.name.clone());
+            root_units.push(summary_units.get(mi).copied().unwrap_or("").to_string());
             root_temporalities.push(None);
             root_monotonic.push(None);
 
@@ -869,6 +929,7 @@ impl MetricsStreamEncoder {
                 Arc::new(name_builder.finish()),
                 Arc::new(Int32Array::from(root_temporalities)),
                 Arc::new(BooleanArray::from(root_monotonic)),
+                Arc::new(StringArray::from_iter_values(root_units.iter())),
             ],
         )?;
 
