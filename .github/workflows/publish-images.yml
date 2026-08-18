@@ -887,15 +887,15 @@ jobs:
           set -euo pipefail
           export GH_HOST="${GH_HOST#https://}"
           export GH_HOST="${GH_HOST#http://}"
-          mapfile -t assets < <(find "$ASSETS" -maxdepth 1 -type f | sort)
+          mapfile -t asset_files < <(find "$ASSETS" -maxdepth 1 -type f | sort)
           # 10 checksummed assets plus SHA256SUMS and its .sig and .pem.
-          if [[ "${#assets[@]}" -ne 13 ]]; then
-            echo "::error::expected 13 release assets, found ${#assets[@]}"
-            printf '%s\n' "${assets[@]}"
+          if [[ "${#asset_files[@]}" -ne 13 ]]; then
+            echo "::error::expected 13 release assets, found ${#asset_files[@]}"
+            printf '%s\n' "${asset_files[@]}"
             exit 1
           fi
           gh release create "$TAG" \
             --verify-tag \
             --title "$TAG" \
             --notes-file "$NOTES" \
-            "${assets[@]}"
+            "${asset_files[@]}"
