@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -791,4 +792,262 @@ async fn analytics_submits_one_audit_event_per_executed_query() {
         audit_attr(event, "query.tenant"),
         Some(tenant.hash().to_hex().as_str())
     );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0071 partial-coverage consent gate ("partial results are consent-gated
+// and envelope-visible" amendment, section 2: the analytics endpoint bypasses
+// the HTTP query endpoints' gate, so it carries its own).
+// ---------------------------------------------------------------------------
+
+/// The degraded cluster the gate tests federate to. It must appear in both the
+/// refusal message and the opted-in response's `warnings`.
+const DEAD_CLUSTER: &str = "west";
+const GATE_OPERATOR_CRED: &str = "operator-west-credential";
+
+/// An address bound then immediately released: a connection to it is refused,
+/// so a remote pointed here is unavailable at query time (the same technique
+/// `federation_handler_warnings.rs` uses).
+async fn dead_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind dead");
+    let addr = listener.local_addr().expect("dead local addr");
+    drop(listener);
+    addr.to_string()
+}
+
+/// A `Federation` over one unavailable remote cluster that opted into
+/// `skip_unavailable`, dialed by the production `FederationSliceFetcher`
+/// exactly as `--remote-cluster` wires it. The fan-out skips it and records a
+/// partial-coverage warning naming the cluster, which is the only way this
+/// endpoint can observe partial coverage at all (intra-cluster execution never
+/// returns partial results).
+fn dead_federation(name: &str, endpoint: &str) -> ravel_query::distrib::Federation {
+    use ravel_query::distrib::{Federation, RemoteCluster};
+    use ravel_server::config::RemoteClusterConfig;
+
+    let config = RemoteClusterConfig {
+        name: name.to_string(),
+        endpoint: endpoint.to_string(),
+        credential: GATE_OPERATOR_CRED.to_string(),
+        tls: false,
+        tls_ca_file: None,
+        skip_unavailable: true,
+        soft_timeout: Duration::from_secs(3),
+    };
+    let fetcher = ravel_server::distrib::FederationSliceFetcher::connect(&config)
+        .expect("federation client connects lazily");
+    Federation::new(vec![RemoteCluster {
+        name: name.to_string(),
+        fetcher: Arc::new(fetcher),
+        skip_unavailable: true,
+        soft_timeout: Duration::from_secs(3),
+    }])
+}
+
+/// The analytics router over a local store holding `samples`, with a federation
+/// attached over one dead, skippable remote, so every evaluation this router
+/// runs has partial coverage.
+async fn federated_app(metric: &str, samples: &[(i64, f64)]) -> Router {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish(
+        store.as_ref(),
+        &tenant,
+        0,
+        vec![one_series(&tenant, metric, samples)],
+    )
+    .await;
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let federation = Arc::new(dead_federation(DEAD_CLUSTER, &dead_endpoint().await));
+    let engine =
+        QueryEngine::new(catalog, store, EngineConfig::default()).with_federation(federation);
+    router(AnalyticsState {
+        engine: Arc::new(engine),
+        tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens(&[(
+            "acme-token",
+            "acme",
+        )]))),
+        clock: Arc::new(FixedClock),
+        query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
+        audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+    })
+}
+
+/// A `summary` request over the whole ingested window. `allow_partial` is
+/// omitted entirely when `allow_partial` is `None`, which is the "client never
+/// asked" case the gate must refuse.
+fn gate_body(metric: &str, end_sec: f64, allow_partial: Option<bool>) -> String {
+    let mut body = serde_json::json!({
+        "query": metric,
+        "start": 0.0,
+        "end": end_sec,
+        "step": "10s",
+        "op": {"type": "summary", "percentiles": [0.5]},
+    });
+    if let Some(allow) = allow_partial {
+        body["allow_partial"] = serde_json::json!(allow);
+    }
+    body.to_string()
+}
+
+/// Samples for the gate tests: a plain 10-second grid, enough points for
+/// `summary` to be meaningful and few enough to keep the run cheap.
+fn gate_samples() -> (Vec<(i64, f64)>, f64) {
+    let values: Vec<f64> = (0..12).map(|i| 10.0 + i as f64).collect();
+    grid_samples(10 * NS_PER_SEC, &values)
+}
+
+/// Acceptance 1: partial coverage with no `allow_partial` in the body is
+/// refused with the typed 503 the HTTP query endpoints use, and the refusal
+/// names both the degraded cluster and the remedy.
+///
+/// Flip-line proof (prove-the-test evidence): delete the
+/// `gate_partial(&coverage, body.allow_partial)?;` line in
+/// `services/ravel-server/src/analytics.rs::run` (the line right after
+/// `let coverage = Coverage::from_stats(&stats);`). Without it the request is a
+/// 200 carrying an answer that silently omits the skipped cluster's data, and
+/// the `SERVICE_UNAVAILABLE` assertion below fails. Verified failing against
+/// the pre-change handler, which had no gate at all.
+#[tokio::test]
+async fn partial_coverage_without_consent_is_refused() {
+    let (samples, end_sec) = gate_samples();
+    let app = federated_app("gate_metric", &samples).await;
+
+    let (status, value) =
+        post_json(&app, "acme-token", gate_body("gate_metric", end_sec, None)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "partial coverage the client did not opt into must be refused: {value}"
+    );
+    assert_eq!(value["status"], "error", "{value}");
+    assert_eq!(value["errorType"], "unavailable", "{value}");
+    let message = value["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal must carry an error message: {value}"));
+    assert!(
+        message.contains(DEAD_CLUSTER),
+        "the refusal must name the degraded cluster: {message:?}"
+    );
+    assert!(
+        message.contains("allow_partial"),
+        "the refusal must name the remedy: {message:?}"
+    );
+}
+
+/// Acceptance 2: the same partial evaluation with `allow_partial: true` is a
+/// 200 whose envelope states the coverage: top-level `partial` is `true` and
+/// top-level `warnings` names the skipped cluster.
+///
+/// Flip-line proof: delete the `"partial": coverage.is_partial(),` and
+/// `"warnings": stats.warnings,` entries from the `json!` response envelope in
+/// `services/ravel-server/src/analytics.rs::run`. Both assertions below then
+/// fail (the fields read as JSON null), while the request still returns 200 --
+/// exactly the "a partial answer is indistinguishable from a complete one"
+/// defect this pins. Verified failing against the pre-change handler, whose
+/// envelope carried only `status`/`data`/`stats`.
+#[tokio::test]
+async fn partial_coverage_with_consent_is_reported_on_the_envelope() {
+    let (samples, end_sec) = gate_samples();
+    let app = federated_app("gate_metric", &samples).await;
+
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        gate_body("gate_metric", end_sec, Some(true)),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "opted-in partial must succeed: {value}"
+    );
+    assert_eq!(
+        value["partial"],
+        serde_json::json!(true),
+        "the envelope's top-level partial field must state the coverage: {value}"
+    );
+    let warnings = value["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the envelope must carry a warnings array: {value}"));
+    assert!(
+        !warnings.is_empty(),
+        "a skipped remote must produce at least one warning: {value}"
+    );
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .map(|s| s.contains(DEAD_CLUSTER))
+            .unwrap_or(false)),
+        "the skipped cluster must be named in the warnings: {warnings:?}"
+    );
+    // The op still ran over the coverage that was available.
+    assert_eq!(value["data"]["resultType"], "analytics", "{value}");
+    assert!(
+        value["data"]["result"].as_array().is_some(),
+        "the partial answer still carries its result array: {value}"
+    );
+}
+
+/// Acceptance 3: complete coverage is a 200 with `partial: false` and no
+/// warnings, with or without the opt-in, and the rest of the envelope is
+/// unchanged (`data` and `stats` still present and shaped as before).
+#[tokio::test]
+async fn complete_coverage_reports_not_partial_either_way() {
+    let (samples, end_sec) = gate_samples();
+
+    for allow_partial in [None, Some(false), Some(true)] {
+        let app = single_series_app("gate_metric", &samples).await;
+        let (status, value) = post_json(
+            &app,
+            "acme-token",
+            gate_body("gate_metric", end_sec, allow_partial),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{allow_partial:?}: {value}");
+        assert_eq!(
+            value["partial"],
+            serde_json::json!(false),
+            "complete coverage must report partial=false ({allow_partial:?}): {value}"
+        );
+        assert_eq!(
+            value["warnings"],
+            serde_json::json!([]),
+            "complete coverage carries no warnings ({allow_partial:?}): {value}"
+        );
+
+        // The pre-existing envelope, unchanged: status, the analytics data
+        // block with one entry per series, and the accounting stats block.
+        assert_eq!(value["status"], "success", "{value}");
+        assert_eq!(value["data"]["resultType"], "analytics", "{value}");
+        let result = value["data"]["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("data.result must be an array: {value}"));
+        assert_eq!(
+            result.len(),
+            1,
+            "one entry for the one ingested series: {value}"
+        );
+        assert_eq!(result[0]["metric"]["__name__"], "gate_metric", "{value}");
+        assert!(
+            result[0]["result"]["median"].is_f64(),
+            "the summary op result is unchanged: {value}"
+        );
+        assert!(
+            value["stats"]["accounting"].is_object(),
+            "the stats block still carries accounting: {value}"
+        );
+        assert!(
+            value["stats"]["estimate"].is_object(),
+            "the stats block still carries the estimate: {value}"
+        );
+    }
 }
