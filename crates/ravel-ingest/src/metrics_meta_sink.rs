@@ -38,13 +38,16 @@
 //! is always read and merged before any write, so a fresh process with an empty
 //! map converges to zero PUTs rather than rewriting what is already stored.
 //!
-//! Its memory grows with the number of distinct metric family names a process
-//! sees over its lifetime, per tenant. That growth is the same vector the
-//! record-side per-tenant entry cap
-//! ([`MetadataSinkConfig::entry_cap`]) bounds durably; ADR-0085 puts the cap on
-//! the record, and a family whose entry was dropped over cap is not re-armed
-//! every window (its fingerprint is committed like any other), so a hostile
-//! name-minting client costs one bounded local map and no extra requests.
+//! Both maps are bounded, not just the durable record: a family name that
+//! would grow one tenant's tracked set past `MetadataSinkConfig::entry_cap`
+//! (the same cap the durable record enforces) is never fingerprinted or
+//! queued, and a tenant beyond `MetadataSinkConfig::max_tracked_tenants` has
+//! its least-recently-touched, no-pending-work sibling evicted to make room.
+//! A hostile client minting unbounded distinct family names or tenant
+//! identities therefore cannot grow this process's memory without bound; the
+//! cost is at most one extra GET per window for the tenant whose local state
+//! was capped or evicted, never lost data (the durable record is unaffected,
+//! and it enforces its own cap independently via `merge_entries`).
 //!
 //! # Failure handling
 //!
@@ -88,6 +91,15 @@ pub const DEFAULT_MAX_CAS_RETRIES: u32 = 5;
 /// inside one debounce window.
 const CAS_BACKOFF_BASE: Duration = Duration::from_millis(50);
 
+/// Default cap on the number of distinct tenants [`MetadataSink`]'s local
+/// fingerprint map tracks at once. Chosen generously above any deployment's
+/// real tenant count (this is a memory-safety backstop, not an operational
+/// limit); a tenant beyond the cap is not refused, its least-recently-touched
+/// sibling with no pending flush is evicted from the local map instead, which
+/// only costs that sibling one extra GET on its next observed metric (the
+/// durable record already has what the local map forgot).
+pub const DEFAULT_MAX_TRACKED_TENANTS: usize = 4096;
+
 /// Tuning for [`MetadataSink`]. Every default is the ADR-0085 decision 1 value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataSinkConfig {
@@ -97,8 +109,17 @@ pub struct MetadataSinkConfig {
     /// Per-tenant durable entry cap. A *new* family name arriving when the
     /// record is already at the cap is dropped and counted
     /// (`ingest_metadata_entries_dropped_total`); its points are still ingested
-    /// and queryable.
+    /// and queryable. Also the bound on the local fingerprint/pending maps'
+    /// per-tenant size (see [`SinkState::fingerprints`]): a client cannot make
+    /// this process track more distinct families for one tenant, in memory,
+    /// than could ever be durably stored for it.
     pub entry_cap: usize,
+    /// Cap on the number of distinct tenants tracked in the local fingerprint
+    /// map at once (see [`DEFAULT_MAX_TRACKED_TENANTS`]). Bounds this
+    /// process's total metadata-sink memory to roughly
+    /// `max_tracked_tenants * entry_cap` entries regardless of how many
+    /// distinct tenants or metric names a client mints.
+    pub max_tracked_tenants: usize,
     /// How many times a CAS PUT is retried against a freshly read body after a
     /// conflict. The initial attempt is not a retry, so a window issues at most
     /// `max_cas_retries + 1` PUTs.
@@ -114,6 +135,7 @@ impl Default for MetadataSinkConfig {
         MetadataSinkConfig {
             window: DEFAULT_METADATA_FLUSH_WINDOW,
             entry_cap: DEFAULT_METRICS_META_ENTRY_CAP,
+            max_tracked_tenants: DEFAULT_MAX_TRACKED_TENANTS,
             max_cas_retries: DEFAULT_MAX_CAS_RETRIES,
             disabled: false,
         }
@@ -186,10 +208,27 @@ struct SinkState {
     /// Last-flushed fingerprint per (tenant, family name). Nested rather than
     /// keyed by a `(TenantHash, String)` tuple so the request-path lookup in
     /// `observe` borrows the name instead of cloning it into a key.
+    ///
+    /// Bounded per tenant at `MetadataSinkConfig::entry_cap`: a family name
+    /// that would grow a tenant's tracked set past the cap is never
+    /// fingerprinted or queued (see `observe`), so this map cannot grow past
+    /// `entry_cap` distinct families per known tenant regardless of how many
+    /// distinct names a client sends. Bounded in tenant count at
+    /// `MetadataSinkConfig::max_tracked_tenants` (see `evict_tenant_if_full`):
+    /// a hostile or misconfigured client cannot make this process's memory
+    /// grow without bound just by minting metric names or tenants.
     fingerprints: HashMap<TenantHash, HashMap<String, u64>>,
     /// Names whose fingerprint differs from `fingerprints`, awaiting the next
-    /// flush window. Ordered so a flush is deterministic.
+    /// flush window. Ordered so a flush is deterministic. Same per-tenant cap
+    /// as `fingerprints` (the two together, not each separately, bound one
+    /// tenant's tracked family count).
     pending: BTreeMap<TenantHash, PendingTenant>,
+    /// Last `touch_seq` a tenant was observed at, for `evict_tenant_if_full`'s
+    /// least-recently-touched eviction when `max_tracked_tenants` is reached.
+    /// A logical clock (not wall time) so eviction order is deterministic
+    /// under test without a clock dependency.
+    tenant_touch: HashMap<TenantHash, u64>,
+    touch_seq: u64,
 }
 
 /// The one-per-process metric metadata sink. Share it by `Arc`: every ingest
@@ -287,18 +326,52 @@ impl MetadataSink {
             // degradation on its next tick.
             return;
         };
+        // Touch this tenant (for LRU eviction below) and, if it is one this
+        // process has never tracked, make room under `max_tracked_tenants`
+        // before adding anything for it. A tenant with pending work is never
+        // evicted, so this can never evict the tenant it is about to serve.
+        state.touch_seq = state.touch_seq.wrapping_add(1);
+        let seq = state.touch_seq;
+        state.tenant_touch.insert(tenant_hash, seq);
+        if !state.fingerprints.contains_key(&tenant_hash)
+            && !state.pending.contains_key(&tenant_hash)
+        {
+            evict_tenant_if_full(&mut state, tenant_hash, self.config.max_tracked_tenants);
+        }
         for meta in metadata {
             if meta.family_name.is_empty() {
                 continue;
             }
             let fingerprint = fingerprint_of(&meta);
-            let unchanged = state
+            let existing_fingerprint = state
                 .fingerprints
                 .get(&tenant_hash)
                 .and_then(|names| names.get(meta.family_name.as_str()))
-                .is_some_and(|stored| *stored == fingerprint);
-            if unchanged {
+                .copied();
+            if existing_fingerprint == Some(fingerprint) {
                 continue;
+            }
+            let already_pending = state
+                .pending
+                .get(&tenant_hash)
+                .is_some_and(|p| p.entries.contains_key(meta.family_name.as_str()));
+            // A name absent from both maps would grow this tenant's tracked
+            // set by one slot. Refuse it past `entry_cap` so the local maps
+            // cannot outgrow what the durable record could ever hold for this
+            // tenant, however many distinct names a client sends -- the same
+            // counter the flush-time durable-record cap uses, since both are
+            // "this family name did not get a metadata entry because the
+            // tenant is already at its cap."
+            if existing_fingerprint.is_none() && !already_pending {
+                let known = state.fingerprints.get(&tenant_hash).map_or(0, HashMap::len)
+                    + state
+                        .pending
+                        .get(&tenant_hash)
+                        .map_or(0, |p| p.entries.len());
+                if known >= self.config.entry_cap {
+                    self.metrics.record_metadata_entries_dropped(1);
+                    continue;
+                }
             }
             let pending = state
                 .pending
@@ -525,6 +598,41 @@ impl MetadataSink {
             "metric metadata flush failed; dropping this window's metadata update (ingest \
              unaffected, re-armed on the next changed tuple)"
         );
+    }
+}
+
+/// If `state.fingerprints` already tracks `max_tracked_tenants` distinct
+/// tenants, evict the least-recently-touched one that has no pending flush,
+/// to make room for `incoming` (never itself a candidate). A tenant with
+/// pending data is never evicted, so an evicted tenant's local state is
+/// simply forgotten -- exactly what a process restart already does to every
+/// tenant, and self-healing the same way: its next observed metric costs one
+/// extra GET, not lost data (the durable record is unaffected).
+///
+/// A linear scan, same as `MetadataCache::evict_if_full` in `ravel-query`:
+/// this only runs when a genuinely new tenant is seen with the map already
+/// at capacity, not on every `observe` call, and `max_tracked_tenants` is a
+/// memory-safety backstop sized in the low thousands, not a per-request cost.
+fn evict_tenant_if_full(state: &mut SinkState, incoming: TenantHash, max_tracked_tenants: usize) {
+    let max = max_tracked_tenants.max(1);
+    while state.fingerprints.len() >= max {
+        let victim = state
+            .fingerprints
+            .keys()
+            .filter(|hash| **hash != incoming && !state.pending.contains_key(*hash))
+            .min_by_key(|hash| state.tenant_touch.get(*hash).copied().unwrap_or(0))
+            .copied();
+        match victim {
+            Some(hash) => {
+                state.fingerprints.remove(&hash);
+                state.tenant_touch.remove(&hash);
+            }
+            // Every tracked tenant has pending work: nothing is safe to
+            // evict this call. The map temporarily exceeds
+            // `max_tracked_tenants`; the next flush drains pending sets and
+            // the next `observe` after that will find room.
+            None => break,
+        }
     }
 }
 
@@ -970,7 +1078,14 @@ mod tests {
 
         let entries = stored(store.as_ref(), &tenant).await;
         assert_eq!(entries.len(), 3);
-        assert_eq!(summary.dropped_over_cap, 2);
+        // `observe` itself refuses a name that would grow this tenant's
+        // tracked set past `entry_cap` (the local-map memory bound), so the
+        // two over-cap names never reach `pending` and `merge_entries` never
+        // sees them at flush time: `dropped_over_cap` is the *merge's* own
+        // count, and it is 0 here. The counter still fires from `observe`'s
+        // own drop path, which is what the durable outcome (3 stored, 2
+        // dropped) actually depends on.
+        assert_eq!(summary.dropped_over_cap, 0);
         assert_eq!(metrics.snapshot().metadata_entries_dropped_total, 2);
 
         // An existing name's help still updates at the cap: shrinking or
@@ -990,6 +1105,108 @@ mod tests {
             .find(|e| e.family_name == existing)
             .expect("existing family still stored");
         assert_eq!(updated.help, "revised help");
+    }
+
+    /// The memory-safety regression this exists to prevent: a single burst of
+    /// far more distinct family names than `entry_cap` must not make the
+    /// local maps grow past it before a flush ever runs. Proven indirectly
+    /// (the fields are private): if `observe` queued every name instead of
+    /// capping locally, `flush_once` would still do one GET/PUT (the flush
+    /// loop is always one-per-tenant), but `merge_entries` would report a
+    /// dropped_over_cap of `10_000 - cap`, not 0, because the flush-time
+    /// cap would be doing all the work `observe` should have already done.
+    #[tokio::test]
+    async fn observe_bounds_a_huge_burst_before_any_flush_runs() {
+        let store = counting_store();
+        let metrics = Arc::new(IngestMetrics::default());
+        let config = MetadataSinkConfig {
+            entry_cap: 5,
+            ..MetadataSinkConfig::default()
+        };
+        let sink = Arc::new(
+            MetadataSink::new(store.clone(), config, metrics.clone())
+                .with_clock(Arc::new(InstantClock))
+                .with_rng(Arc::new(NoJitter)),
+        );
+        let tenant = TenantId::new("tenant-a");
+
+        sink.observe(&tenant, tenant.hash(), families("burst", 10_000));
+        let summary = sink.flush_once(NOW).await;
+
+        assert_eq!(summary.gets, 1);
+        assert_eq!(summary.puts, 1);
+        assert_eq!(
+            summary.dropped_over_cap, 0,
+            "observe already refused the over-cap names; merge_entries never saw them"
+        );
+        assert_eq!(stored(store.as_ref(), &tenant).await.len(), 5);
+        assert_eq!(metrics.snapshot().metadata_entries_dropped_total, 9_995);
+    }
+
+    /// `max_tracked_tenants` bounds the number of distinct tenants the local
+    /// fingerprint map holds. A tenant evicted to make room is not lost data:
+    /// its durable record is untouched, and re-observing an unchanged metric
+    /// for it costs one extra GET (the map "forgot" it, exactly what a
+    /// process restart already does), never an extra PUT.
+    #[tokio::test]
+    async fn max_tracked_tenants_evicts_the_idle_tenant_and_self_heals() {
+        let store = counting_store();
+        let metrics = Arc::new(IngestMetrics::default());
+        let config = MetadataSinkConfig {
+            max_tracked_tenants: 2,
+            ..MetadataSinkConfig::default()
+        };
+        let sink = Arc::new(
+            MetadataSink::new(store.clone(), config, metrics.clone())
+                .with_clock(Arc::new(InstantClock))
+                .with_rng(Arc::new(NoJitter)),
+        );
+        let tenant_a = TenantId::new("tenant-a");
+        let tenant_b = TenantId::new("tenant-b");
+        let tenant_c = TenantId::new("tenant-c");
+
+        // A and B each get one metric, and are flushed (so neither has
+        // pending work and both are eviction-eligible). A is touched first,
+        // so it is the least-recently-touched of the two once C arrives.
+        sink.observe(&tenant_a, tenant_a.hash(), [meta("m", "help", "bytes")]);
+        sink.flush_once(NOW).await;
+        sink.observe(&tenant_b, tenant_b.hash(), [meta("m", "help", "bytes")]);
+        sink.flush_once(NOW).await;
+
+        // A third tenant, with the map already at max_tracked_tenants,
+        // evicts A (not B, which was touched more recently).
+        sink.observe(&tenant_c, tenant_c.hash(), [meta("m", "help", "bytes")]);
+        let summary = sink.flush_once(NOW).await;
+        assert_eq!(summary.tenants_flushed, 1, "only C had pending work");
+
+        // B, never evicted, is still a pure local hit: no GET, no PUT.
+        let gets_before = gets(store.as_ref());
+        let puts_before = puts(store.as_ref());
+        sink.observe(&tenant_b, tenant_b.hash(), [meta("m", "help", "bytes")]);
+        let summary = sink.flush_once(NOW).await;
+        assert_eq!(summary.tenants_flushed, 0, "B is still tracked locally");
+        assert_eq!(gets(store.as_ref()), gets_before);
+        assert_eq!(puts(store.as_ref()), puts_before);
+
+        // Re-observing A's already-durable, unchanged metric looks "new"
+        // locally (A was evicted), so it flushes: one more GET, but the merge
+        // is a no-op against the durable record, so zero more PUTs. This
+        // insert itself evicts whichever of {B, C} is now least-recently
+        // touched (B, touched before C arrived) -- LRU eviction keeps
+        // running exactly the same way once the map is back at capacity;
+        // this call only asserts A's own self-healing GET-not-PUT, not B's
+        // fate afterward.
+        let gets_before = gets(store.as_ref());
+        let puts_before = puts(store.as_ref());
+        sink.observe(&tenant_a, tenant_a.hash(), [meta("m", "help", "bytes")]);
+        let summary = sink.flush_once(NOW).await;
+        assert_eq!(summary.tenants_flushed, 1);
+        assert_eq!(gets(store.as_ref()), gets_before + 1);
+        assert_eq!(
+            puts(store.as_ref()),
+            puts_before,
+            "the durable record already had A's unchanged entry; eviction cost a GET, not a PUT"
+        );
     }
 
     /// `observe` is synchronous (this test is not `async` and never awaits it)

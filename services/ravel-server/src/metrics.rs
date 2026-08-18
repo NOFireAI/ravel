@@ -567,6 +567,25 @@ pub struct IngestPipelineSnapshot {
     /// log pipeline; `None` for metrics and spans, which build no POSTINGS
     /// section, so the postings family renders no sample for them.
     pub postings: Option<PostingsCounters>,
+    /// Metric metadata sink counters (ADR-0085 decision 1). `Some` only for
+    /// the metrics pipeline: the sink and its record are metrics-only
+    /// concepts, so logs and spans render no sample for this family, the
+    /// same structural-absence convention `collisions` and `postings` use.
+    pub metadata_sink: Option<MetadataSinkCounters>,
+}
+
+/// Metric metadata sink counters (ADR-0085 decision 1), mirroring
+/// [`ravel_ingest::IngestMetricsSnapshot`]'s four `metadata_*` fields. A
+/// separate struct rather than four more flat fields on
+/// [`IngestPipelineSnapshot`] because they are always present or always
+/// absent together (one sink, one set of counters), which `Option<Self>`
+/// says once instead of four times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MetadataSinkCounters {
+    pub flush_gets_total: u64,
+    pub flush_puts_total: u64,
+    pub flush_dropped_total: u64,
+    pub entries_dropped_total: u64,
 }
 
 /// The log pipeline's write-side POSTINGS counters, cumulative over flushed
@@ -601,6 +620,12 @@ impl IngestPipelineSnapshot {
             shard_deaths: snapshot.shard_deaths,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
+            metadata_sink: Some(MetadataSinkCounters {
+                flush_gets_total: snapshot.metadata_flush_gets_total,
+                flush_puts_total: snapshot.metadata_flush_puts_total,
+                flush_dropped_total: snapshot.metadata_flush_dropped_total,
+                entries_dropped_total: snapshot.metadata_entries_dropped_total,
+            }),
         }
     }
 
@@ -627,6 +652,7 @@ impl IngestPipelineSnapshot {
                 distinct_values_total: snapshot.postings_distinct_values_total,
                 capped_fields_total: snapshot.postings_capped_fields_total,
             }),
+            metadata_sink: None,
         }
     }
 
@@ -647,6 +673,7 @@ impl IngestPipelineSnapshot {
             shard_deaths: snapshot.shard_deaths,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
+            metadata_sink: None,
         }
     }
 }
@@ -856,6 +883,83 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             &labels(mode, pipeline.signal),
             pipeline.stale_provisioning_flushes,
         );
+    }
+
+    // Metric metadata sink counters (ADR-0085 decision 1): only the metrics
+    // pipeline builds this record, so `metadata_sink` is `Some` only there
+    // (same structural-absence convention as `collisions` above), and the
+    // family is empty in a logs- or spans-only process.
+    let with_metadata_sink: Vec<_> = pipelines
+        .iter()
+        .filter_map(|pipeline| pipeline.metadata_sink.map(|counters| (pipeline, counters)))
+        .collect();
+    if !with_metadata_sink.is_empty() {
+        write_header(
+            out,
+            "ravel_ingest_metadata_flush_gets_total",
+            "Metric metadata record GETs issued by the flush window (ADR-0085 decision 1), by \
+             signal.",
+            "counter",
+        );
+        for (pipeline, counters) in &with_metadata_sink {
+            write_sample(
+                out,
+                "ravel_ingest_metadata_flush_gets_total",
+                &labels(mode, pipeline.signal),
+                counters.flush_gets_total,
+            );
+        }
+
+        write_header(
+            out,
+            "ravel_ingest_metadata_flush_puts_total",
+            "Metric metadata record CAS PUTs attempted by the flush window (ADR-0085 decision \
+             1), by signal. Counts attempts, so a conflicted-and-retried write counts more than \
+             once.",
+            "counter",
+        );
+        for (pipeline, counters) in &with_metadata_sink {
+            write_sample(
+                out,
+                "ravel_ingest_metadata_flush_puts_total",
+                &labels(mode, pipeline.signal),
+                counters.flush_puts_total,
+            );
+        }
+
+        write_header(
+            out,
+            "ravel_ingest_metadata_flush_dropped_total",
+            "Flush windows whose metric metadata update was dropped: CAS retries exhausted, or \
+             a read/write failure against the record (ADR-0085 decision 1), by signal. Never \
+             fatal to an ingest request.",
+            "counter",
+        );
+        for (pipeline, counters) in &with_metadata_sink {
+            write_sample(
+                out,
+                "ravel_ingest_metadata_flush_dropped_total",
+                &labels(mode, pipeline.signal),
+                counters.flush_dropped_total,
+            );
+        }
+
+        write_header(
+            out,
+            "ravel_ingest_metadata_entries_dropped_total",
+            "Metric family names not stored in a tenant's metadata record because it was \
+             already at the per-tenant entry cap (ADR-0085 decision 1), by signal. The points \
+             themselves are still ingested and queryable.",
+            "counter",
+        );
+        for (pipeline, counters) in &with_metadata_sink {
+            write_sample(
+                out,
+                "ravel_ingest_metadata_entries_dropped_total",
+                &labels(mode, pipeline.signal),
+                counters.entries_dropped_total,
+            );
+        }
     }
 }
 
@@ -3489,6 +3593,74 @@ mod tests {
                 "+Inf bucket must equal _count for series {series}"
             );
         }
+    }
+
+    /// The four metric metadata sink counters (ADR-0085 decision 1) render
+    /// for the metrics pipeline, carrying the driven values, and render
+    /// nothing for logs/spans pipelines -- `metadata_sink` is a
+    /// metrics-only concept, the same structural-absence convention
+    /// `collisions` and `postings` use, checked here so a future edit
+    /// cannot silently stop exporting them the way this family started out
+    /// (ADR-0085's own doc comments claimed "Exported as ..." for a build
+    /// that rendered nothing).
+    #[test]
+    fn metadata_sink_counters_render_for_metrics_only() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                metadata_flush_gets_total: 7,
+                metadata_flush_puts_total: 3,
+                metadata_flush_dropped_total: 1,
+                metadata_entries_dropped_total: 42,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+        );
+
+        assert!(body.contains(
+            "ravel_ingest_metadata_flush_gets_total{mode=\"gateway\",signal=\"metrics\"} 7"
+        ));
+        assert!(body.contains(
+            "ravel_ingest_metadata_flush_puts_total{mode=\"gateway\",signal=\"metrics\"} 3"
+        ));
+        assert!(body.contains(
+            "ravel_ingest_metadata_flush_dropped_total{mode=\"gateway\",signal=\"metrics\"} 1"
+        ));
+        assert!(body.contains(
+            "ravel_ingest_metadata_entries_dropped_total{mode=\"gateway\",signal=\"metrics\"} 42"
+        ));
+        assert!(
+            !body.contains(
+                "ravel_ingest_metadata_flush_gets_total{mode=\"gateway\",signal=\"logs\""
+            ),
+            "logs pipeline must render no metadata_sink sample"
+        );
+        assert!(
+            !body.contains(
+                "ravel_ingest_metadata_flush_gets_total{mode=\"gateway\",signal=\"spans\""
+            ),
+            "spans pipeline must render no metadata_sink sample"
+        );
     }
 
     #[test]
