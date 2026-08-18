@@ -24,8 +24,15 @@ Facts this ADR is built on, measured against the live registry and current
   profiling"*. Removing it would silently revoke that ADR's premise.
 - The cost of that setting on the shipped artifact is large and unmeasured
   until now. Extracted from `ghcr.io/nofireai/ravel-server:0.9.3` (arm64):
-  `ravel-server` is **659 MB**; stripped it is **81.5 MB**; stripped and
-  gzipped, **30.7 MB**. The published image is **923 MB**.
+  `ravel-server` is **659 MB**, and the published image is **923 MB**. A full
+  `strip` takes the binary to 81.5 MB, and 30.7 MB gzipped.
+
+  What this ADR actually does is `--strip-debug`, not a full `strip`, which
+  keeps `.symtab`. Measured on a real build of the resulting Dockerfile:
+  `ravel-server` is **107 MB** and the server image is **208 MB**. The extra
+  25 MB over a full strip is the symbol table, and it is deliberate: a
+  backtrace from a deployed binary still resolves function names with no
+  `.debug` file present at all, and the separated file adds line numbers on top.
 - The Dockerfile has three runtime targets (`server`, `operator`,
   `ingest-router`) and a single builder stage that produces all four binaries;
   every runtime target already copies from that one stage. The six full
@@ -138,9 +145,28 @@ images receive the stripped binaries, which carry a `.gnu_debuglink` section. A
 dedicated non-runtime stage (`FROM scratch AS debug-symbols`) receives the
 `.debug` files; each per-platform build job exports that stage with
 `--output type=local` and uploads the result as a workflow artifact named
-`debug-<target>-<platform>`, following the same per-target-and-per-platform
-naming rule ADR-0037 decision 14 requires of the digest artifacts. The release
-job downloads those and uploads each as `<name>-<os>-<arch>.debug`.
+`debug-symbols-<platform>`.
+
+Two details of that naming were wrong in this ADR's first draft and are
+corrected here, because each would have shipped something that looks right and
+is useless:
+
+- The artifact is scoped **per platform, not per target**. One builder stage
+  produces all four binaries, so there is exactly one export per platform
+  carrying all four `.debug` files, and the `server` target alone owns two of
+  them (`ravel-server.debug` and `ravel-cli.debug`). A per-target name cannot
+  describe that. Nothing is lost: the per-target scoping ADR-0037 decision 14
+  requires exists so a `server` merge can never ingest an `operator` digest,
+  and debug symbols never reach the merge job. Per-platform naming still gives
+  `upload-artifact` v4's duplicate-name guard its cross-platform protection.
+- The release job publishes **one archive per platform**
+  (`ravel-debug-symbols-<os>-<arch>.tar.gz`), not individually renamed `.debug`
+  files. `--add-gnu-debuglink` records a *basename*: the binary points at
+  `ravel-server.debug`, so an asset renamed to `ravel-server-linux-amd64.debug`
+  would never auto-resolve, and the "no manual `symbol-file` step" property
+  this decision exists to provide would be silently gone while every step still
+  exited 0. Archiving preserves the basename through extraction, and keeps one
+  asset per platform, matching the single-export reality above.
 
 Doing the split here rather than in the release job is forced by two things,
 either of which alone would decide it:
@@ -181,9 +207,9 @@ for 81.5 MB of actual code is a hostile default. Stripping without publishing
 symbols was also rejected: it would revoke exactly what ADR-0036 set the
 profile flag to buy.
 
-This decision is also what shrinks the published images, from 923 MB toward the
-size their stripped contents occupy. That is a direct consequence of the same
-`objcopy` step, not a separate change.
+This decision is also what shrinks the published images: measured on a real
+build, the server image goes from 923 MB to 208 MB. That is a direct
+consequence of the same `objcopy` step, not a separate change.
 
 ## Decision 4: assets carry checksums, and the checksum file is signed
 

@@ -49,6 +49,24 @@ RUN cargo build --release --locked -p ravel-server --features sql \
     && cargo build --release --locked -p ravel-operator \
     && cargo build --release --locked -p ravel-ingest-router
 
+# Split debug info out of each binary (ADR-0086 decision 3). The four cargo
+# invocations above stay four and stay separate: this workspace is
+# resolver = "3", so collapsing them into one -p ... -p ... --features
+# ravel-server/sql would unify the DataFusion feature tree into the other three
+# binaries and silently change what ships. [profile.release] debug = 1 also
+# stays (ADR-0036 depends on it for line-level profiling); rather than dropping
+# symbols to shrink the artifact, we separate them here and strip the shipped
+# copy. Order matters: extract the .debug copy FIRST, then strip and link, or
+# --add-gnu-debuglink would point at contents already discarded.
+# --add-gnu-debuglink is required, not decoration: it lets gdb resolve symbols
+# from a downloaded .debug file by name, with no manual symbol-file step.
+RUN set -eux; \
+    cd target/release; \
+    for bin in ravel-server ravel-cli ravel-operator ravel-ingest-router; do \
+        objcopy --only-keep-debug "$bin" "$bin.debug"; \
+        objcopy --strip-debug --add-gnu-debuglink="$bin.debug" "$bin"; \
+    done
+
 # ---- Runtime: server image --------------------------------------------------
 # distroless/cc: glibc (no untested musl), ships ca-certificates for
 # object_store's TLS path against real AWS S3, and carries no shell or package
@@ -103,3 +121,17 @@ COPY --from=builder /app/target/release/ravel-ingest-router /usr/local/bin/ravel
 # to gateway pods; every listen address and flag is supplied by the operator
 # from the CRD, so no default CMD is baked in.
 ENTRYPOINT ["/usr/local/bin/ravel-ingest-router"]
+
+# ---- Debug symbols (non-runtime) --------------------------------------------
+# ADR-0086 decision 3. A scratch stage carrying ONLY the four separated .debug
+# files produced by the objcopy step in the builder, nothing runnable. The
+# publish workflow exports this stage with `--output type=local` and uploads
+# the result as workflow artifacts; task #248's release job attaches them next
+# to the stripped binaries so downloaded symbols resolve by name. This is never
+# a runtime target and no image is published from it.
+FROM scratch AS debug-symbols
+
+COPY --from=builder /app/target/release/ravel-server.debug /
+COPY --from=builder /app/target/release/ravel-cli.debug /
+COPY --from=builder /app/target/release/ravel-operator.debug /
+COPY --from=builder /app/target/release/ravel-ingest-router.debug /
