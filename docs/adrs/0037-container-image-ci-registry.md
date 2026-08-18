@@ -570,3 +570,34 @@ set out to avoid.
   only which digest is signed.
 - No frozen format changes, no crate changes, no runtime behavior change.
   This amendment is CI configuration, a compose file, and documentation.
+
+## Amendment: repository topology
+
+The two amendments above reason throughout about releases publishing from a
+public mirror. Decision 7 grounds keyless signing in "the mirror is the
+repository strangers can actually read", decision 9 rejects the implicit CI
+gate because the tagged commit "lives on the mirror's rewritten history", and
+several of the supporting facts describe `v0.9.0` existing only on the mirror.
+That reasoning was written when this repository was the private `store` and a
+separate public mirror, `NOFireAI/ravel`, carried the releases.
+
+That topology no longer holds. `origin` is now `NOFireAI/ravel` directly: this
+repository is the public one, and there is no separate mirror. There is no
+rewritten downstream history, and release tags live here rather than only on a
+mirror.
+
+Read the mirror-era passages in the sections above historically. They record
+why the decisions were made and remain load-bearing for that: the
+keyless-signing rationale and the explicit-gate rationale both turn on the
+mirror having been the only public, CI-running copy at the time. Collapsing the
+mirror into this repository does not weaken either decision. Keyless signing is
+still the right fit for a public repository that keeps no long-lived
+credentials, and an explicit CI gate on the publishing side is still stronger
+than trusting temporal ordering between independently triggered workflows.
+
+The `cosign verify` identity is unaffected. Decision 7 binds the signature to
+the mirror's workflow path,
+`https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml`, which
+is now this repository's own. The identity string does not change, so the
+invocation documented in README.md stays correct as written and consumers
+verifying released images need do nothing.

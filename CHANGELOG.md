@@ -4,6 +4,84 @@ All notable changes to Ravel are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Ravel aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3]
+
+### Added
+
+- `ravel-ingest-router`, a Ravel-native ingest router that steers OTLP over
+  HTTP and gRPC (HTTP/2) to a stable subset of ingest replicas, published as
+  its own container image.
+- gzip-compressed OTLP ingest over HTTP.
+- Exemplars carried end to end over the OTLP HTTP ingest path.
+- An optional `Authorization` credential on alert-sink delivery.
+- Operator support for Gateway API ingress exposure and a Ravel-native
+  ingest-affinity backend, per-tenant shard overrides, and an
+  operator-settable flush cadence.
+- Durable per-tenant indexed-field overrides applied at ingest, and a
+  per-tenant PUT attribution metric family.
+- Multi-architecture container images: `linux/amd64` and `linux/arm64` are
+  each built on a native runner and the merged index is signed.
+- A container-first quickstart whose marked README command blocks are
+  asserted against a live stack in CI.
+
+### Fixed
+
+- Bump `h2` to 0.4.16 for RUSTSEC-2026-0258.
+- `ravel-ingest-router` supervises its background tasks and redacts secrets
+  from `Debug` output.
+
+## [0.9.2]
+
+### Added
+
+- RSPAN v4 span segment format: per-key typed attribute columns replace the
+  single opaque per-row attribute blob, and span events, including the
+  exception stack traces they carry, are promoted into scan-queryable nested
+  columns.
+
+### Fixed
+
+- Set the workspace version to the real release version so the image-publish
+  version-tag gate passes; `0.9.0` and `0.9.1` had shipped from a `0.1.0`
+  placeholder.
+
+## [0.9.1]
+
+### Added
+
+- Selective subject erasure across metrics, logs, and traces: `ravel-cli
+  erase submit` and `erase status`, resolver-side exclusion of erased
+  subjects, and a segment-rewrite pass that removes their data from stored
+  objects.
+- A `spans` SQL table alongside `samples` and `logs`, over both HTTP and
+  Flight SQL, with service name, duration, and status-code predicate
+  pushdown.
+- OIDC and mTLS tenant resolvers, the latter served on a dedicated listener,
+  for authenticating tenants without static bearer tokens.
+- Per-tenant query cost governance: bytes-scanned and S3-request budgets
+  enforced during scans, with per-query cost accounting exported on
+  `/metrics`.
+- Online resharding through a generation-versioned shard count, with
+  maintenance work leased across workers.
+- Query-path OTLP trace export, enabled with `--otlp-trace-endpoint`.
+- A local read-cache tier over RAM and disk in front of object-store reads.
+- Signed and attested release images: every published index is cosign-signed
+  in keyless mode and carries an SBOM and build provenance, and a tag publish
+  is gated on a passing CI run for the tagged commit.
+
+### Changed
+
+- Cross-cluster federation defaults to TLS and warns on plaintext.
+- Ingest flushes are pipelined with an adaptive flush delay, and process-wide
+  ingest memory is bounded with idle-tenant eviction.
+
+### Security
+
+- Constant-time bearer-token lookup and a decode panic guard on the OTAP
+  ingest path.
+- Require an OIDC audience, and bump `jsonwebtoken` to 10.4 for
+  CVE-2026-25537.
+
 ## [0.9.0]
 
 First public release. Ravel is an OpenTelemetry-native observability database
