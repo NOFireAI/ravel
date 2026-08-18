@@ -173,8 +173,78 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Check derived-doc drift (docs/query-engine.md)
         run: scripts/check-doc-drift.sh
+      - name: Check workspace version drift (ADR-0086 D8)
+        run: scripts/check-workspace-versions.sh
       - name: Python script unit tests
         run: make test-python
+
+  # Lint the workflow files themselves (ADR-0086 decision 7). actionlint is
+  # cheap and uses no cargo toolchain, so like doc-scripts it runs on every
+  # trigger rather than gating on `changes`.
+  #
+  # The whole point of this job is that shellcheck is GENUINELY available to
+  # actionlint. actionlint runs shellcheck over every `run:` script, but when
+  # the shellcheck binary is absent it silently skips those checks and still
+  # exits 0: a linter whose sub-checker is missing reports clean identically to
+  # one that ran everything. During epic #218 an executor hit exactly this,
+  # reporting a file clean that a shellcheck-enabled actionlint flagged twice
+  # (SC2046, SC2129). So this job installs a pinned shellcheck itself and then
+  # asserts it is on PATH before running actionlint; if that install or
+  # assertion fails, the job fails rather than linting less. Relying on the
+  # runner image's preinstalled shellcheck is exactly the silent-drift risk the
+  # ADR names, so both binaries are installed here at pinned, checksum-verified
+  # versions.
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Pinned versions and their published sha256 sums (exact-version pinning,
+      # the download equivalent of the commit-SHA pins the `uses:` steps carry).
+      ACTIONLINT_VERSION: 1.7.7
+      ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+      SHELLCHECK_VERSION: v0.10.0
+      SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned shellcheck and actionlint
+        run: |
+          bin_dir="${RUNNER_TEMP}/lint-bin"
+          mkdir -p "$bin_dir"
+
+          # Verify the shellcheck archive's sha256 before extracting, then
+          # place the binary on PATH for the assert and lint steps below.
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$bin_dir/shellcheck"
+
+          # actionlint: same verify-then-extract shape.
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          mv actionlint "$bin_dir/actionlint"
+
+          echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Assert shellcheck is available
+        run: |
+          # actionlint exits 0 when shellcheck is missing, silently linting
+          # less (ADR-0086 D7). Fail the job here instead, so a missing
+          # sub-checker can never be mistaken for a clean run. This resolves
+          # on the same PATH actionlint uses in the next step.
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::error::shellcheck not on PATH; actionlint would skip its shell checks and still pass (ADR-0086 D7)"
+            exit 1
+          fi
+          shellcheck --version
+      - name: Lint workflow files
+        run: |
+          # No path args: actionlint discovers every workflow under
+          # .github/workflows/ on its own, so a new workflow is covered
+          # automatically. -shellcheck=shellcheck names the binary asserted
+          # present above explicitly rather than relying on the default lookup.
+          actionlint -color -shellcheck=shellcheck
 
   # First-stage fail-fast gate (ADR-0053 D3). Runs fmt and the two clippy
   # configurations the workspace has (default features, plus ravel-server's
@@ -536,7 +606,7 @@ jobs:
             minio/minio:latest server /data
       - name: Wait for MinIO to be live
         run: |
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -fsS http://localhost:9000/minio/health/live; then
               echo "MinIO is live"
               exit 0
@@ -604,7 +674,7 @@ jobs:
           # floci reports per-service readiness, so wait on S3 specifically
           # rather than on the process being up: the container answers on
           # 4566 before every handler is running.
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -fsS http://localhost:4566/_floci/health | grep -q '"s3":"running"'; then
               echo "floci S3 is live"
               exit 0
@@ -709,7 +779,7 @@ jobs:
             minio/minio:latest server /data
       - name: Wait for MinIO to be live
         run: |
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl -fsS http://localhost:9000/minio/health/live; then
               echo "MinIO is live"
               exit 0
@@ -1374,7 +1444,7 @@ jobs:
       - name: Wait for ravel-server readiness
         if: steps.filter.outputs.run == 'true'
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -fsS "${RAVEL_HTTP_BASE}/readyz" >/dev/null 2>&1; then
               echo "ravel-server ready"
               exit 0

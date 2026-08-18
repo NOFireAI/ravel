@@ -131,7 +131,7 @@ jobs:
       # comes up. A fixed sleep would race image-pull and startup time.
       - name: Wait for ravel-server readiness
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -fsS "${RAVEL_HTTP_BASE}/readyz" >/dev/null 2>&1; then
               echo "ravel-server ready"
               exit 0
