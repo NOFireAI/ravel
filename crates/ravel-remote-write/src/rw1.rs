@@ -6,6 +6,7 @@
 //! typed, non-retryable [`Rw1DecodeError`].
 
 use prost::Message;
+use ravel_otlp::metadata::{MetricKind, MetricMetadata};
 use ravel_types::Label;
 
 use crate::proto::prometheus::histogram::{Count, ZeroCount};
@@ -40,14 +41,39 @@ pub fn decode_write_request(
 }
 
 fn resolve(req: WriteRequest) -> ResolvedRequest {
+    // RW1's `MetricMetadata` list is request-level with no per-series
+    // correlation, so one resolved tuple per entry, in order (ADR-0085
+    // Decision 1). `family_name` is `metric_family_name`; help/unit are already
+    // in the Prometheus model, carried through verbatim.
+    let metadata = req.metadata.iter().map(rw1_metadata).collect();
     ResolvedRequest {
         series: req.timeseries.into_iter().map(resolve_series).collect(),
-        metadata_count: req.metadata.len(),
+        metadata,
         // prometheus.Sample carries no start_timestamp field on the wire.
         created_timestamps_count: 0,
         // RW1 resolves no symbol table and charges no resolved-label budget, so
         // no exemplar is ever dropped at decode time.
         exemplars_dropped: 0,
+    }
+}
+
+/// Map one RW1 `prometheus.MetricMetadata` to the protocol-neutral tuple.
+/// `GAUGEHISTOGRAM`, `INFO`, `STATESET`, and `UNKNOWN` have no canonical Ravel
+/// kind and map to [`MetricKind::Unknown`] rather than being guessed.
+fn rw1_metadata(m: &crate::proto::prometheus::MetricMetadata) -> MetricMetadata {
+    use crate::proto::prometheus::metric_metadata::MetricType;
+    let kind = match MetricType::try_from(m.r#type) {
+        Ok(MetricType::Counter) => MetricKind::Counter,
+        Ok(MetricType::Gauge) => MetricKind::Gauge,
+        Ok(MetricType::Histogram) => MetricKind::Histogram,
+        Ok(MetricType::Summary) => MetricKind::Summary,
+        _ => MetricKind::Unknown,
+    };
+    MetricMetadata {
+        family_name: m.metric_family_name.clone(),
+        kind,
+        help: m.help.clone(),
+        unit: m.unit.clone(),
     }
 }
 
@@ -299,15 +325,16 @@ mod tests {
     }
 
     #[test]
-    fn metadata_is_a_request_level_tally() {
+    fn metadata_list_surfaces_with_kinds_mapped() {
         use crate::proto::prometheus::metric_metadata::MetricType;
+        use ravel_otlp::metadata::MetricKind;
         let mut req = write_request(vec![]);
         req.metadata = vec![
             MetricMetadata {
                 r#type: MetricType::Counter as i32,
                 metric_family_name: "a".to_string(),
-                help: String::new(),
-                unit: String::new(),
+                help: "help a".to_string(),
+                unit: "bytes".to_string(),
             },
             MetricMetadata {
                 r#type: MetricType::Gauge as i32,
@@ -315,11 +342,24 @@ mod tests {
                 help: String::new(),
                 unit: String::new(),
             },
+            // GAUGEHISTOGRAM has no canonical Ravel kind: Unknown, not guessed.
+            MetricMetadata {
+                r#type: MetricType::Gaugehistogram as i32,
+                metric_family_name: "c".to_string(),
+                help: String::new(),
+                unit: String::new(),
+            },
         ];
         let body = compress(&req.encode_to_vec());
 
         let resolved = decode_write_request(&body, 1_000_000).expect("decode");
-        assert_eq!(resolved.metadata_count, 2);
+        assert_eq!(resolved.metadata.len(), 3);
+        assert_eq!(resolved.metadata[0].family_name, "a");
+        assert_eq!(resolved.metadata[0].kind, MetricKind::Counter);
+        assert_eq!(resolved.metadata[0].help, "help a");
+        assert_eq!(resolved.metadata[0].unit, "bytes");
+        assert_eq!(resolved.metadata[1].kind, MetricKind::Gauge);
+        assert_eq!(resolved.metadata[2].kind, MetricKind::Unknown);
     }
 
     #[test]
@@ -328,7 +368,7 @@ mod tests {
         let body = compress(&req.encode_to_vec());
         let resolved = decode_write_request(&body, 1_000_000).expect("decode");
         assert!(resolved.series.is_empty());
-        assert_eq!(resolved.metadata_count, 0);
+        assert!(resolved.metadata.is_empty());
     }
 
     #[test]

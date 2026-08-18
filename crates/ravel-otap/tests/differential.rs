@@ -83,6 +83,7 @@ enum WorkloadKind {
 #[derive(Debug, Clone)]
 struct WorkloadMetric {
     name: String,
+    unit: String,
     kind: WorkloadKind,
     points: Vec<WorkloadPoint>,
 }
@@ -166,6 +167,25 @@ fn point_strategy() -> impl Strategy<Value = WorkloadPoint> {
         })
 }
 
+/// A spread of units that exercise the ADR-0085 Decision 2 pass on both
+/// paths: mapped simple units (`By`, `s`, `ms`), the gauge-only ratio (`1`),
+/// compound and annotation forms (`By/s`, `{packet}/s`), an unknown unit
+/// (`furlong`, no suffix), and empty (no suffix). Both paths apply the same
+/// `prometheus_family_name`, so any divergence in how each feeds it a unit or
+/// monotonic flag shows up as a different series-name set.
+fn unit_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(String::new()),
+        Just("By".to_string()),
+        Just("s".to_string()),
+        Just("ms".to_string()),
+        Just("1".to_string()),
+        Just("By/s".to_string()),
+        Just("{packet}/s".to_string()),
+        Just("furlong".to_string()),
+    ]
+}
+
 fn metric_kind_strategy() -> impl Strategy<Value = WorkloadKind> {
     prop_oneof![
         Just(WorkloadKind::Gauge),
@@ -181,10 +201,16 @@ fn metric_kind_strategy() -> impl Strategy<Value = WorkloadKind> {
 fn metric_strategy() -> impl Strategy<Value = WorkloadMetric> {
     (
         metric_name_strategy(),
+        unit_strategy(),
         metric_kind_strategy(),
         prop::collection::vec(point_strategy(), 1..=6),
     )
-        .prop_map(|(name, kind, points)| WorkloadMetric { name, kind, points })
+        .prop_map(|(name, unit, kind, points)| WorkloadMetric {
+            name,
+            unit,
+            kind,
+            points,
+        })
 }
 
 fn workload_strategy() -> impl Strategy<Value = Vec<WorkloadMetric>> {
@@ -223,6 +249,7 @@ fn build_otlp_request(workload: &[WorkloadMetric]) -> ExportMetricsServiceReques
             match &m.kind {
                 WorkloadKind::Gauge => Metric {
                     name: m.name.clone(),
+                    unit: m.unit.clone(),
                     data: Some(MetricData::Gauge(Gauge { data_points })),
                     ..Default::default()
                 },
@@ -231,6 +258,7 @@ fn build_otlp_request(workload: &[WorkloadMetric]) -> ExportMetricsServiceReques
                     is_monotonic,
                 } => Metric {
                     name: m.name.clone(),
+                    unit: m.unit.clone(),
                     data: Some(MetricData::Sum(Sum {
                         data_points,
                         aggregation_temporality: *temporality,
@@ -302,8 +330,9 @@ fn build_otap_batch(
             }
         })
         .collect();
+    let units: Vec<&str> = workload.iter().map(|m| m.unit.as_str()).collect();
     encoder
-        .encode_batch(batch_id, &metrics)
+        .encode_batch_units(batch_id, &metrics, &units)
         .expect("encode workload")
 }
 
@@ -384,6 +413,7 @@ fn future_skew_boundary_agrees() {
     };
     assert_paths_agree(&[WorkloadMetric {
         name: "widgets".to_string(),
+        unit: String::new(),
         kind: WorkloadKind::Gauge,
         points: vec![at_bound, past_bound],
     }]);
@@ -406,6 +436,7 @@ fn too_old_boundary_agrees() {
     };
     assert_paths_agree(&[WorkloadMetric {
         name: "widgets".to_string(),
+        unit: String::new(),
         kind: WorkloadKind::Gauge,
         points: vec![at_bound, past_bound],
     }]);
@@ -432,6 +463,7 @@ fn duplicate_label_names_after_sanitization_agree() {
     };
     assert_paths_agree(&[WorkloadMetric {
         name: "requests".to_string(),
+        unit: String::new(),
         kind: WorkloadKind::Gauge,
         points: vec![point],
     }]);
@@ -453,6 +485,7 @@ fn number_stale_marker_agrees() {
     };
     assert_paths_agree(&[WorkloadMetric {
         name: "requests".to_string(),
+        unit: String::new(),
         kind: WorkloadKind::Gauge,
         points: vec![point],
     }]);

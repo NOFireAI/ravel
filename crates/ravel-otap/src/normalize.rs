@@ -3,7 +3,11 @@
 //!
 //! This mirrors `ravel_otlp::normalize::normalize_metrics` point-for-point:
 //! same admission limits (`ravel_otlp::IngestLimits`), same sanitization,
-//! same [`Rejection`] classes, same `is_monotonic_sum` semantics. The
+//! same [`Rejection`] classes, same `is_monotonic_sum` semantics, and the same
+//! ADR-0085 Decision 2 name-suffix pass, applied through the pub
+//! `ravel_otlp::normalize::prometheus_family_name` (called directly, like
+//! `format_float`, rather than re-implemented) so the METRICS `unit` column
+//! and monotonic flag drive the same `foo_bytes_total` name on both paths. The
 //! differential gate (tests/differential.rs) asserts the two paths produce
 //! identical `SeriesId` sets, identical `(series, ts, value)` samples, and
 //! identical rejection classes for the same logical input. Where
@@ -72,7 +76,8 @@ use arrow::array::{
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::UInt8Type;
-use ravel_otlp::normalize::{MetricsNormalizeResult, NormalizedExemplar};
+use ravel_otlp::metadata::MetricKind as PromMetricKind;
+use ravel_otlp::normalize::{MetricsNormalizeResult, NormalizedExemplar, prometheus_family_name};
 use ravel_otlp::promcompat::format_float;
 use ravel_otlp::{IngestLimits, NormalizeOutput, NormalizedPoint, Rejection};
 use ravel_types::{
@@ -852,6 +857,10 @@ fn push_exp_histogram_exemplar_drops(batch: &DecodedBatch, rejected: &mut Vec<Re
 struct RootEntry {
     name: String,
     kind: RootKind,
+    /// The metric's UCUM unit (METRICS.unit column), empty when absent. Fed to
+    /// [`prometheus_family_name`] when building each decision's suffixed name
+    /// (ADR-0085 Decision 2), mirroring `ravel_otlp::normalize_metric`.
+    unit: String,
 }
 
 enum RootKind {
@@ -1084,11 +1093,13 @@ fn build_root_table(
         };
         let temporality_col = column_as::<Int32Array>(rb, "aggregation_temporality");
         let monotonic_col = column_as::<BooleanArray>(rb, "is_monotonic");
+        let unit_col = rb.column_by_name("unit");
 
         for (i, &id) in ids.iter().enumerate() {
             let Some(name) = name_at(name_col, i) else {
                 continue;
             };
+            let unit = unit_col.and_then(|c| name_at(c, i)).unwrap_or_default();
             let kind = match types.value(i) {
                 METRIC_TYPE_GAUGE => RootKind::Gauge,
                 METRIC_TYPE_SUM => {
@@ -1109,7 +1120,7 @@ fn build_root_table(
                 _ => RootKind::Unsupported,
             };
             if (id as usize) < entries.len() {
-                entries[id as usize] = Some(RootEntry { name, kind });
+                entries[id as usize] = Some(RootEntry { name, kind, unit });
             }
         }
     }
@@ -1256,6 +1267,12 @@ fn build_metric_decisions(
                 RootKind::Unsupported => unknown_count += count,
                 RootKind::Gauge => {
                     if let Some(name) = process_metric_name(&entry.name, limits, count, rejected) {
+                        let name = prometheus_family_name(
+                            &name,
+                            &entry.unit,
+                            PromMetricKind::Gauge,
+                            false,
+                        );
                         decisions[id] = Some(MetricDecision {
                             name,
                             is_sum: false,
@@ -1282,6 +1299,12 @@ fn build_metric_decisions(
                         rejected.push(Rejection::UnsupportedTemporality { count });
                         continue;
                     }
+                    let kind = if *is_monotonic {
+                        PromMetricKind::Counter
+                    } else {
+                        PromMetricKind::Gauge
+                    };
+                    let name = prometheus_family_name(&name, &entry.unit, kind, *is_monotonic);
                     decisions[id] = Some(MetricDecision {
                         name,
                         is_sum: true,
@@ -1834,6 +1857,12 @@ fn build_histogram_decisions(
                         rejected.push(Rejection::UnsupportedTemporality { count });
                         continue;
                     }
+                    let name = prometheus_family_name(
+                        &name,
+                        &entry.unit,
+                        PromMetricKind::Histogram,
+                        false,
+                    );
                     decisions[id] = Some(HistogramDecision { name });
                 }
                 _ => unknown_count += count,
@@ -1874,6 +1903,12 @@ fn build_summary_decisions(
             Some(entry) => match &entry.kind {
                 RootKind::Summary => {
                     if let Some(name) = process_metric_name(&entry.name, limits, count, rejected) {
+                        let name = prometheus_family_name(
+                            &name,
+                            &entry.unit,
+                            PromMetricKind::Summary,
+                            false,
+                        );
                         decisions[id] = Some(SummaryDecision { name });
                     }
                 }

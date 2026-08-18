@@ -15,8 +15,11 @@
 //! typed, non-retryable [`Rw2DecodeError`]; this module never panics on
 //! malformed input.
 
+use std::collections::HashSet;
+
 use prost::Message;
-use ravel_types::Label;
+use ravel_otlp::metadata::{MetricKind, MetricMetadata};
+use ravel_types::{Label, METRIC_NAME_LABEL};
 
 use crate::proto::write_v2::histogram::{Count, ZeroCount};
 use crate::proto::write_v2::{
@@ -136,7 +139,8 @@ pub fn decode_request(
 fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest, Rw2DecodeError> {
     let symbols = req.symbols;
     let mut series = Vec::with_capacity(req.timeseries.len());
-    let mut metadata_count = 0usize;
+    let mut metadata: Vec<MetricMetadata> = Vec::new();
+    let mut metadata_seen: HashSet<String> = HashSet::new();
     let mut created_timestamps_count = 0usize;
     let mut exemplars_dropped = 0usize;
     let mut resolved_label_bytes = 0usize;
@@ -151,7 +155,8 @@ fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest
             series_index,
             ts,
             &symbols,
-            &mut metadata_count,
+            &mut metadata,
+            &mut metadata_seen,
             &mut created_timestamps_count,
             &mut exemplars_dropped,
             &mut resolved_label_bytes,
@@ -161,10 +166,42 @@ fn resolve(req: Request, resolved_label_budget: usize) -> Result<ResolvedRequest
     }
     Ok(ResolvedRequest {
         series,
-        metadata_count,
+        metadata,
         created_timestamps_count,
         exemplars_dropped,
     })
+}
+
+/// Map one RW2 `io.prometheus.write.v2.Metadata` type to the protocol-neutral
+/// kind. Types with no canonical Ravel kind (`GAUGEHISTOGRAM`, `INFO`,
+/// `STATESET`, `UNSPECIFIED`) map to [`MetricKind::Unknown`].
+fn rw2_kind(ty: i32) -> MetricKind {
+    use crate::proto::write_v2::metadata::MetricType;
+    match MetricType::try_from(ty) {
+        Ok(MetricType::Counter) => MetricKind::Counter,
+        Ok(MetricType::Gauge) => MetricKind::Gauge,
+        Ok(MetricType::Histogram) => MetricKind::Histogram,
+        Ok(MetricType::Summary) => MetricKind::Summary,
+        _ => MetricKind::Unknown,
+    }
+}
+
+/// Strip one structural suffix from an RW2 series `__name__` to recover the
+/// metric family name (ADR-0085 Decision 1): `_bucket`/`_sum`/`_count` always,
+/// and `_total` only when the metric type is `Counter` (so a gauge legitimately
+/// named `foo_total` keeps its name). At most one suffix is removed.
+fn strip_structural_suffix(name: &str, kind: MetricKind) -> &str {
+    for suffix in ["_bucket", "_sum", "_count"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    if matches!(kind, MetricKind::Counter)
+        && let Some(stripped) = name.strip_suffix("_total")
+    {
+        return stripped;
+    }
+    name
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,7 +209,8 @@ fn resolve_series(
     series_index: usize,
     ts: ProtoTimeSeriesV2,
     symbols: &[String],
-    metadata_count: &mut usize,
+    metadata: &mut Vec<MetricMetadata>,
+    metadata_seen: &mut HashSet<String>,
     created_timestamps_count: &mut usize,
     exemplars_dropped: &mut usize,
     resolved_label_bytes: &mut usize,
@@ -226,7 +264,29 @@ fn resolve_series(
                 symbols_len: symbols.len(),
             });
         }
-        *metadata_count += 1;
+        // One tuple per metric family, keyed by the series `__name__` stripped
+        // of a structural suffix and deduplicated first-wins, so a classic
+        // histogram's `_bucket`/`_sum`/`_count` series collapse to one entry
+        // (ADR-0085 Decision 1). A series carrying metadata but no `__name__`
+        // has no family to key on and is skipped. help_ref/unit_ref are already
+        // range-checked above, so indexing `symbols` is in bounds.
+        let kind = rw2_kind(meta.r#type);
+        if let Some(name) = labels
+            .iter()
+            .find(|l| l.name == METRIC_NAME_LABEL)
+            .map(|l| l.value.as_str())
+            .filter(|v| !v.is_empty())
+        {
+            let family = strip_structural_suffix(name, kind).to_string();
+            if metadata_seen.insert(family.clone()) {
+                metadata.push(MetricMetadata {
+                    family_name: family,
+                    kind,
+                    help: symbols[meta.help_ref as usize].clone(),
+                    unit: symbols[meta.unit_ref as usize].clone(),
+                });
+            }
+        }
     }
 
     let mut samples = Vec::with_capacity(ts.samples.len());
@@ -633,7 +693,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_help_and_unit_refs_are_a_per_series_tally() {
+    fn metadata_surfaces_as_a_family_tuple() {
+        use ravel_otlp::metadata::MetricKind;
         let syms = symbols(&["__name__", "up", "help text", "seconds"]);
         let req = request(
             syms,
@@ -651,7 +712,76 @@ mod tests {
         );
 
         let resolved = decode(&req).expect("decode");
-        assert_eq!(resolved.metadata_count, 1);
+        assert_eq!(resolved.metadata.len(), 1);
+        assert_eq!(resolved.metadata[0].family_name, "up");
+        // Type 0 is METRIC_TYPE_UNSPECIFIED: no canonical kind, not guessed.
+        assert_eq!(resolved.metadata[0].kind, MetricKind::Unknown);
+        assert_eq!(resolved.metadata[0].help, "help text");
+        assert_eq!(resolved.metadata[0].unit, "seconds");
+    }
+
+    #[test]
+    fn metadata_tuples_use_family_name_stripped_of_structural_suffixes() {
+        use crate::proto::write_v2::metadata::MetricType;
+        use ravel_otlp::metadata::MetricKind;
+        // 0="",1="__name__",2..6=series names,7="help text",8="s"
+        let syms = symbols(&[
+            "__name__",
+            "foo_bucket",
+            "foo_sum",
+            "foo_count",
+            "bar_total",
+            "baz_total",
+            "help text",
+            "s",
+        ]);
+        let hist_meta = |name_ref: u32| ProtoTimeSeriesV2 {
+            labels_refs: vec![1, name_ref],
+            samples: vec![],
+            histograms: vec![],
+            exemplars: vec![],
+            metadata: Some(ProtoMetadataV2 {
+                r#type: MetricType::Histogram as i32,
+                help_ref: 7,
+                unit_ref: 8,
+            }),
+        };
+        let typed = |name_ref: u32, ty: MetricType| ProtoTimeSeriesV2 {
+            labels_refs: vec![1, name_ref],
+            samples: vec![],
+            histograms: vec![],
+            exemplars: vec![],
+            metadata: Some(ProtoMetadataV2 {
+                r#type: ty as i32,
+                help_ref: 7,
+                unit_ref: 8,
+            }),
+        };
+        let req = request(
+            syms,
+            vec![
+                hist_meta(2),                  // foo_bucket -> foo
+                hist_meta(3),                  // foo_sum    -> foo (deduped)
+                hist_meta(4),                  // foo_count  -> foo (deduped)
+                typed(5, MetricType::Counter), // bar_total -> bar
+                typed(6, MetricType::Gauge),   // baz_total stays (not a counter)
+            ],
+        );
+
+        let resolved = decode(&req).expect("decode");
+        let families: Vec<(&str, MetricKind)> = resolved
+            .metadata
+            .iter()
+            .map(|m| (m.family_name.as_str(), m.kind))
+            .collect();
+        assert_eq!(
+            families,
+            vec![
+                ("foo", MetricKind::Histogram),
+                ("bar", MetricKind::Counter),
+                ("baz_total", MetricKind::Gauge),
+            ]
+        );
     }
 
     #[test]
@@ -684,7 +814,7 @@ mod tests {
         let req = request(symbols(&[]), vec![]);
         let resolved = decode(&req).expect("decode");
         assert!(resolved.series.is_empty());
-        assert_eq!(resolved.metadata_count, 0);
+        assert!(resolved.metadata.is_empty());
         assert_eq!(resolved.created_timestamps_count, 0);
     }
 
