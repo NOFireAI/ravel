@@ -257,8 +257,15 @@ counter suffix, then the structural suffixes ADR-0016 already applies):
    (`_per_second`), not a `_per_` with an empty component. A compound unit
    `a/b` with both sides present maps each side through the table
    independently and joins as `_<a>_per_<b>` (`By/s` -> `_bytes_per_second`).
-   An unrecognized unit string is left unmapped (no suffix appended) rather
-   than guessed.
+   An unrecognized *whole* unit string is left unmapped (no suffix
+   appended) rather than guessed. Inside a compound unit, a side the table
+   does not know is passed through sanitized (`furlong/s` ->
+   `_furlong_per_second`), matching what the collector's translator does
+   with an unknown side; the two rules are deliberately different because
+   the compound form has already declared its shape, so the unknown side is
+   a name to carry, not a guess to make. In the metadata record, an
+   unmapped unit is stored as the raw unit string with annotations
+   stripped (`1`, `2h`), never passed through metric-name sanitizing.
 3. If the metric is a monotonic Sum (`is_monotonic_sum`) and the
    (now unit-suffixed) name does not already end in `_total`, append
    `_total`. This order matches real output: `process_cpu_seconds_total`,
