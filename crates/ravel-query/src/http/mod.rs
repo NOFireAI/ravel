@@ -6,6 +6,7 @@ mod compat;
 mod error;
 mod handlers;
 mod json;
+mod metadata_cache;
 mod params;
 pub mod tenant;
 
@@ -17,6 +18,9 @@ use ravel_maintain::{NoopQueryAuditSink, QueryAuditSink};
 use ravel_types::accounting::{NoopQueryCostRecorder, QueryCostRecorder};
 
 pub use error::{MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, QueryErrorResponse};
+pub use metadata_cache::{
+    MetadataCache, MetadataCacheConfig, MetadataCacheCounters, MetadataSnapshot,
+};
 pub use tenant::{
     AuthError, DevHeaderTenantResolver, MtlsResolver, OidcError, OidcJwksCache, OidcResolver,
     StaticBearerTokenResolver, TenantResolver,
@@ -65,6 +69,15 @@ pub struct AppState {
     /// as before this seam existed; a deployment attaches the one shared
     /// pipeline with [`AppState::with_audit_sink`].
     pub audit_sink: Arc<dyn QueryAuditSink>,
+    /// The per-process, per-tenant metric metadata cache backing
+    /// `/api/v1/metadata` (ADR-0085 decision 1 read path). Defaults to `None` in
+    /// [`AppState::new`]: when it is absent the endpoint keeps its pre-ADR
+    /// behavior exactly (a `200` with an empty `data` object), so every existing
+    /// caller and `ravel-server`'s [`AppState::new`] call site are unaffected. A
+    /// deployment attaches a cache built from its object store with
+    /// [`AppState::with_metadata_cache`], at which point the endpoint serves that
+    /// process's cached view of each queried tenant's metadata.
+    pub metadata_cache: Option<Arc<MetadataCache>>,
 }
 
 impl AppState {
@@ -77,6 +90,7 @@ impl AppState {
             cost_recorder: Arc::new(NoopQueryCostRecorder),
             query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
             audit_sink: Arc::new(NoopQueryAuditSink),
+            metadata_cache: None,
         }
     }
 
@@ -106,6 +120,19 @@ impl AppState {
         self.audit_sink = audit_sink;
         self
     }
+
+    /// Attach the per-process metric metadata cache that backs
+    /// `/api/v1/metadata` (ADR-0085 decision 1). Returns `self` so it chains off
+    /// [`AppState::new`]. Without this the endpoint serves the pre-ADR empty
+    /// object; with it, a request carrying a resolvable tenant credential gets
+    /// that tenant's cached metadata, and a request with no resolvable tenant
+    /// still gets the empty object (the endpoint never `401`s, ADR-0085 read
+    /// path). A deployment builds the cache from the same object store the query
+    /// engine reads and passes it here.
+    pub fn with_metadata_cache(mut self, metadata_cache: Arc<MetadataCache>) -> Self {
+        self.metadata_cache = Some(metadata_cache);
+        self
+    }
 }
 
 /// Builds the Prometheus-compatible query API router. The caller is
@@ -113,6 +140,12 @@ impl AppState {
 /// compression, timeouts), and nesting this under whatever path prefix
 /// their service uses.
 pub fn router(state: AppState) -> Router {
+    // The compatibility routes are now stateful: `/api/v1/metadata` reads
+    // `AppState` to reach the metadata cache and the tenant resolver (ADR-0085
+    // read path). `buildinfo` still ignores state. Build the compat router with
+    // its own clone of `state`, merged so every service mounting this router
+    // serves them without extra wiring of its own.
+    let compat = compat::router(state.clone());
     Router::new()
         .route("/api/v1/query", get(handlers::query).post(handlers::query))
         .route(
@@ -126,8 +159,5 @@ pub fn router(state: AppState) -> Router {
             get(handlers::series).post(handlers::series),
         )
         .with_state(state)
-        // Stateless Prometheus compatibility routes (buildinfo, metadata).
-        // Merged here so every service mounting this router serves them
-        // without any extra wiring of its own.
-        .merge(compat::router())
+        .merge(compat)
 }

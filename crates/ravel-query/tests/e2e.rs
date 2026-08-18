@@ -1933,3 +1933,139 @@ async fn series_endpoint_folds_cost_into_recorder() {
         "the /series resolve fetched from the store, so recorded s3 requests must be > 0"
     );
 }
+
+/// Counts GETs so the metadata read path can prove the ADR's one-GET budget
+/// through the real router (the second call is served from the cache).
+struct MetaCountingStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    gets: std::sync::atomic::AtomicU64,
+}
+
+impl MetaCountingStore {
+    fn new(inner: Arc<dyn ObjectStoreBackend>) -> Arc<Self> {
+        Arc::new(MetaCountingStore {
+            inner,
+            gets: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    fn get_count(&self) -> u64 {
+        self.gets.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for MetaCountingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(key, range).await
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// A seeded metric metadata record is served through the real `Router` for the
+/// tenant the bearer resolves to, in Prometheus' shape, and the second request
+/// is served from the per-process cache with no additional store read
+/// (ADR-0085 decision 1 read path).
+#[tokio::test]
+async fn metadata_returns_record_for_tenant_via_real_router() {
+    use ravel_cache::SystemClock;
+    use ravel_catalog::{MetricKind, MetricMetadataEntry, write_metrics_meta};
+    use ravel_query::http::{MetadataCache, MetadataCacheConfig};
+
+    let mem: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let store = MetaCountingStore::new(mem);
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+
+    // CreateIfAbsent seeding does no GET, so a later handler GET is countable.
+    write_metrics_meta(
+        store.as_ref(),
+        &th,
+        &[
+            MetricMetadataEntry {
+                family_name: "http_requests_total".to_string(),
+                kind: MetricKind::Counter,
+                help: "total requests".to_string(),
+                unit: "".to_string(),
+                updated_unix_ns: 1,
+            },
+            MetricMetadataEntry {
+                family_name: "mem_resident_bytes".to_string(),
+                kind: MetricKind::Gauge,
+                help: "resident memory".to_string(),
+                unit: "bytes".to_string(),
+                updated_unix_ns: 1,
+            },
+        ],
+        None,
+    )
+    .await
+    .expect("seed record");
+    let base = store.get_count();
+
+    let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog =
+        Arc::new(Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog"));
+    let engine = Arc::new(QueryEngine::new(
+        catalog,
+        backend.clone(),
+        EngineConfig::default(),
+    ));
+    let cache = Arc::new(MetadataCache::new(
+        backend,
+        MetadataCacheConfig::default(),
+        Arc::new(SystemClock),
+    ));
+    let mut tokens = HashMap::new();
+    tokens.insert("secret-a".to_string(), tid);
+    let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tokens)))
+        .with_metadata_cache(cache);
+    let app = router(state);
+
+    let (status, json) = call(&app, "/api/v1/metadata", Some("secret-a")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["status"], "success");
+    assert_eq!(json["data"]["http_requests_total"][0]["type"], "counter");
+    assert_eq!(
+        json["data"]["http_requests_total"][0]["help"],
+        "total requests"
+    );
+    assert_eq!(json["data"]["mem_resident_bytes"][0]["type"], "gauge");
+    assert_eq!(json["data"]["mem_resident_bytes"][0]["unit"], "bytes");
+    assert_eq!(
+        store.get_count() - base,
+        1,
+        "the first request does one GET"
+    );
+
+    let (status, json) = call(&app, "/api/v1/metadata", Some("secret-a")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["data"]["http_requests_total"][0]["type"], "counter");
+    assert_eq!(
+        store.get_count() - base,
+        1,
+        "the second request is served from the cache with no store read"
+    );
+}
