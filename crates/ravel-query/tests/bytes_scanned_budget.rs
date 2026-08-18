@@ -324,7 +324,7 @@ async fn empty_matching_labels_query_still_trips_budget() {
 
     // Unlimited: proves the query really does match zero series.
     let (engine, gets, tokens, tenant_hash) = setup(ByteLimit::Unlimited).await;
-    let series = engine
+    let (series, _coverage) = engine
         .resolve_series(
             tenant_hash,
             &matchers,
