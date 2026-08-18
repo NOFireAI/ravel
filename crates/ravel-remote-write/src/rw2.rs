@@ -278,7 +278,10 @@ fn resolve_series(
             .filter(|v| !v.is_empty())
         {
             let family = strip_structural_suffix(name, kind).to_string();
-            if metadata_seen.insert(family.clone()) {
+            // A series literally named `_bucket`/`_sum`/`_count` (or `_total`
+            // on a Counter) strips to nothing; an empty family name is not a
+            // metadata entry (the catalog writer refuses it), so skip it.
+            if !family.is_empty() && metadata_seen.insert(family.clone()) {
                 metadata.push(MetricMetadata {
                     family_name: family,
                     kind,
@@ -781,6 +784,42 @@ mod tests {
                 ("bar", MetricKind::Counter),
                 ("baz_total", MetricKind::Gauge),
             ]
+        );
+    }
+
+    #[test]
+    fn series_that_strips_to_an_empty_family_name_yields_no_metadata_entry() {
+        use crate::proto::write_v2::metadata::MetricType;
+        // 0="",1="__name__",2="_bucket",3="_total",4="help",5="s"
+        let syms = symbols(&["__name__", "_bucket", "_total", "help", "s"]);
+        let typed = |name_ref: u32, ty: MetricType| ProtoTimeSeriesV2 {
+            labels_refs: vec![1, name_ref],
+            samples: vec![],
+            histograms: vec![],
+            exemplars: vec![],
+            metadata: Some(ProtoMetadataV2 {
+                r#type: ty as i32,
+                help_ref: 4,
+                unit_ref: 5,
+            }),
+        };
+        let req = request(
+            syms,
+            vec![
+                typed(2, MetricType::Histogram), // "_bucket" -> "" -> dropped
+                typed(3, MetricType::Counter),   // "_total"  -> "" -> dropped
+            ],
+        );
+        let resolved = decode(&req).expect("decode");
+        assert!(
+            resolved.metadata.is_empty(),
+            "an empty family name must not become a metadata entry: {:?}",
+            resolved.metadata
+        );
+        assert_eq!(
+            resolved.series.len(),
+            2,
+            "the series themselves still decode"
         );
     }
 

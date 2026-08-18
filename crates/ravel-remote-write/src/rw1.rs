@@ -45,7 +45,15 @@ fn resolve(req: WriteRequest) -> ResolvedRequest {
     // correlation, so one resolved tuple per entry, in order (ADR-0085
     // Decision 1). `family_name` is `metric_family_name`; help/unit are already
     // in the Prometheus model, carried through verbatim.
-    let metadata = req.metadata.iter().map(rw1_metadata).collect();
+    // An entry with an empty `metric_family_name` (legal on the wire) has no
+    // family to attach to and the catalog writer refuses empty names, so it is
+    // dropped here rather than poisoning a later flush.
+    let metadata = req
+        .metadata
+        .iter()
+        .filter(|m| !m.metric_family_name.is_empty())
+        .map(rw1_metadata)
+        .collect();
     ResolvedRequest {
         series: req.timeseries.into_iter().map(resolve_series).collect(),
         metadata,
@@ -360,6 +368,30 @@ mod tests {
         assert_eq!(resolved.metadata[0].unit, "bytes");
         assert_eq!(resolved.metadata[1].kind, MetricKind::Gauge);
         assert_eq!(resolved.metadata[2].kind, MetricKind::Unknown);
+    }
+
+    #[test]
+    fn metadata_with_empty_family_name_is_dropped_not_surfaced() {
+        use crate::proto::prometheus::metric_metadata::MetricType;
+        let mut req = write_request(vec![]);
+        req.metadata = vec![
+            MetricMetadata {
+                r#type: MetricType::Counter as i32,
+                metric_family_name: String::new(),
+                help: "orphan".to_string(),
+                unit: String::new(),
+            },
+            MetricMetadata {
+                r#type: MetricType::Gauge as i32,
+                metric_family_name: "kept".to_string(),
+                help: String::new(),
+                unit: String::new(),
+            },
+        ];
+        let body = compress(&req.encode_to_vec());
+        let resolved = decode_write_request(&body, 1_000_000).expect("decode");
+        assert_eq!(resolved.metadata.len(), 1);
+        assert_eq!(resolved.metadata[0].family_name, "kept");
     }
 
     #[test]
