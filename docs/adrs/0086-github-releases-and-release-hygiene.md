@@ -27,9 +27,13 @@ Facts this ADR is built on, measured against the live registry and current
   `ravel-server` is **659 MB**; stripped it is **81.5 MB**; stripped and
   gzipped, **30.7 MB**. The published image is **923 MB**.
 - The Dockerfile has three runtime targets (`server`, `operator`,
-  `ingest-router`) and one builder stage, and the builder recompiles the whole
-  workspace once per target. With two platforms that is six full workspace
-  compiles per release; measured on the `v0.9.3` run, 23 to 31 minutes each.
+  `ingest-router`) and a single builder stage that produces all four binaries;
+  every runtime target already copies from that one stage. The six full
+  workspace compiles per release come from the publish workflow's
+  `target x platform` matrix, which is six independent jobs on six runners with
+  `type=gha` caching deliberately off (ADR-0037 decision 4), so no job can
+  reuse another's builder layer. Measured on the `v0.9.3` run: 23 to 31 minutes
+  each.
 - All four shippable binaries already exist inside those images: `server`
   carries `ravel-server` and `ravel-cli`, `operator` carries `ravel-operator`,
   `ingest-router` carries `ravel-ingest-router`.
@@ -51,22 +55,33 @@ Facts this ADR is built on, measured against the live registry and current
 ```mermaid
 flowchart LR
   T["push tag vX.Y.Z"] --> G["gate<br/>CI green for SHA<br/>version == tag"]
-  G --> B["build<br/>3 targets x 2 platforms<br/>push by digest"]
-  B --> M["merge (per target)<br/>imagetools create<br/>cosign sign index"]
-  M --> R["release (new)"]
-  R --> E["extract binaries<br/>by platform digest"]
-  E --> S["strip -> asset<br/>symbols -> .debug asset"]
-  S --> C["SHA256SUMS<br/>cosign sign-blob"]
+  G --> B["build (per PLATFORM)<br/>3 targets on one runner<br/>shared builder layer<br/>push by digest"]
+  B -.->|"digest-target-platform"| M
+  B -.->|"debug-target-platform"| R
+  M["merge (per target)<br/>imagetools create<br/>cosign sign index"] --> R["release<br/>contents+id-token only"]
+  R --> E["cosign verify tag<br/>resolve platform digest<br/>docker create + cp"]
+  E --> A["upload binaries UNMODIFIED<br/>plus .debug artifacts"]
+  A --> C["SHA256SUMS<br/>cosign sign-blob"]
   C --> P["gh release create<br/>notes + assets"]
   style R fill:#2d6a9f,color:#fff
   style P fill:#2d6a9f,color:#fff
 ```
+
 
 ## Decision 1: the Release is a job in `publish-images.yml`, gated on the merge jobs
 
 A new `release` job `needs:` all three per-target `merge` jobs and runs once
 per tag push. It does not run on `workflow_dispatch`: a `manual-<sha>` publish
 is a test artifact and must never create a public Release.
+
+The release job's permissions are exactly `contents: write` and
+`id-token: write`. It holds no `packages` permission: the images it extracts
+from are public and are pulled anonymously. It also carries
+`if: github.event_name == 'push'` alongside its `needs:`, so a dispatch run
+skips it rather than failing it. Stating this here is not pedantry: the
+obvious implementation copies the merge job's permission block and adds
+`contents: write`, producing a job holding all three and quietly undoing the
+least-privilege split ADR-0037 decision 17 established.
 
 This is deliberately not a separate workflow. GitHub Actions has no
 cross-workflow `needs:` (ADR-0037 decision 9 records this), so a separate
@@ -77,36 +92,98 @@ and verified" a structural precondition rather than a hope.
 
 ## Decision 2: release binaries are extracted from the published images, never rebuilt
 
-The `release` job pulls each platform's image **by its digest** and extracts
-the binaries with `docker create` plus `docker cp`.
+The `release` job extracts the binaries from each published image with
+`docker create` plus `docker cp`, and uploads them **unmodified**. Every
+transformation (stripping, symbol separation) happens in the builder stage
+under decision 3, so the file a user downloads is byte-identical to the file
+inside the signed, attested image they can pull. That property is the reason
+for this decision and it only holds because nothing is modified here.
 
-Rebuilding the binaries with a separate `cargo build` matrix was rejected: it
-would add four more full workspace compiles to a release that already runs six,
-and it would produce binaries that are not the binaries in the image. Extraction
-gives a property a rebuild cannot: the file a user downloads is byte-identical
-to the one inside the signed, attested image they can pull.
+Rebuilding the binaries with a separate `cargo build` matrix was rejected. Not
+primarily for cost (it would be two more workspace compiles, one per platform,
+not four), but because it would produce binaries that are not the binaries in
+the image: a second artifact, built from the same source but never exercised by
+the quickstart, the kind lanes, or anything else that tests what actually
+ships.
 
-Extraction resolves the **platform-specific digest** from the index, never the
-tag with `--platform`. This is the same trap as ADR-0037 decision 14: pulling
-`0.9.3 --platform linux/arm64` on an amd64 runner can silently resolve a
-manifest other than the one that was signed. The digest is read from the index
-the merge job assembled.
+Digest resolution is specified, because the obvious shortcut is a trap this
+pipeline already documented. The release job resolves each target's
+platform-specific digests from the registry by inspecting the run's immutable
+identity tag (`docker buildx imagetools inspect --raw`, selecting the runnable
+platform entries), the same maneuver the merge job's platform check uses. It
+does **not** read them from `needs.merge.outputs`: the merge job is a
+three-target matrix and a matrix's job outputs collapse last-writer-wins, which
+is exactly what ADR-0037 decision 13 routed around with artifacts. It does not
+pull a tag with `--platform` either (ADR-0037 decision 14).
 
-## Decision 3: binaries ship stripped, with debug symbols as separate assets
+Before extracting, the job runs the README's own `cosign verify` invocation
+against each identity tag, so "extracted from the signed image" is checked
+rather than assumed.
+
+The job extracts an explicit expected inventory and fails if any path is
+absent: `server` provides `ravel-server` and `ravel-cli`, `operator` provides
+`ravel-operator`, `ingest-router` provides `ravel-ingest-router`. A future
+Dockerfile change that drops or renames a binary then fails the release loudly,
+instead of publishing a Release with an asset silently missing.
+
+## Decision 3: debug info is split in the builder, not after extraction
 
 `[profile.release] debug = 1` stays exactly as it is. ADR-0036 depends on it,
 and a 659 MB `ravel-server` is what that setting costs.
 
-The `release` job strips each extracted binary before uploading it, and uploads
-the separated debug info as its own asset (`<name>-<os>-<arch>.debug`). Both
-are listed in the checksums file.
+The split happens in the builder stage, before anything is copied into a
+runtime image. For each binary: `objcopy --only-keep-debug <bin> <bin>.debug`,
+then `objcopy --strip-debug --add-gnu-debuglink=<bin>.debug <bin>`. The runtime
+images receive the stripped binaries, which carry a `.gnu_debuglink` section. A
+dedicated non-runtime stage (`FROM scratch AS debug-symbols`) receives the
+`.debug` files; each per-platform build job exports that stage with
+`--output type=local` and uploads the result as a workflow artifact named
+`debug-<target>-<platform>`, following the same per-target-and-per-platform
+naming rule ADR-0037 decision 14 requires of the digest artifacts. The release
+job downloads those and uploads each as `<name>-<os>-<arch>.debug`.
 
-Stripping without publishing symbols was rejected: a stack trace from a
-deployed binary would stop being symbolizable, which trades away exactly what
-ADR-0036 set that profile flag to buy. Publishing the unstripped binary was
-also rejected: a 659 MB download, 120 MB gzipped, for a program that is 81.5 MB
-of actual code is a hostile default, and the people who need symbols are a
-small minority of the people who need the binary.
+Doing the split here rather than in the release job is forced by two things,
+either of which alone would decide it:
+
+- **It is the only ordering that is self-consistent.** If the images ship
+  stripped and the release job tries to separate symbols afterwards, there is
+  nothing left to separate: `objcopy --only-keep-debug` on an
+  already-stripped binary yields an empty, useless `.debug` file while every
+  step exits 0. And if the release job strips instead, then what it uploads is
+  by construction not what is in the image, and decision 2's byte-identity
+  property is false.
+- **The release job cannot do it anyway.** It is a single job on a single
+  architecture, and GNU `objcopy` on an amd64 runner will not correctly process
+  an aarch64 ELF. The builder runs natively per platform (ADR-0037 decision
+  12), so it is the only place where a native toolchain already matches the
+  binary. If any object manipulation is ever added back to the release job, it
+  must use `llvm-objcopy`, which is target-agnostic.
+
+```mermaid
+flowchart TD
+  CB["cargo build --release<br/>debug = 1 retained"] --> O1["objcopy --only-keep-debug<br/>bin -> bin.debug"]
+  O1 --> O2["objcopy --strip-debug<br/>--add-gnu-debuglink=bin.debug"]
+  O2 --> RT["runtime images<br/>stripped + debuglink"]
+  O1 --> DS["FROM scratch AS debug-symbols"]
+  DS --> AR["workflow artifact<br/>debug-target-platform"]
+  RT --> REG["GHCR signed index"]
+  REG --> EX["release job extracts<br/>UNMODIFIED"]
+  AR --> UP["release assets"]
+  EX --> UP
+```
+
+`--add-gnu-debuglink` is not decoration. Without it a downloaded `.debug` file
+requires the user to know to run `symbol-file` by hand; with it, gdb and
+friends resolve symbols by name automatically.
+
+Shipping unstripped binaries was rejected: a 659 MB download, 120 MB gzipped,
+for 81.5 MB of actual code is a hostile default. Stripping without publishing
+symbols was also rejected: it would revoke exactly what ADR-0036 set the
+profile flag to buy.
+
+This decision is also what shrinks the published images, from 923 MB toward the
+size their stripped contents occupy. That is a direct consequence of the same
+`objcopy` step, not a separate change.
 
 ## Decision 4: assets carry checksums, and the checksum file is signed
 
@@ -131,8 +208,16 @@ releases. Requiring a changelog section to release was rejected for the same
 reason: it makes the release fail closed on a documentation lapse, and a
 release blocked on prose is a release that gets cut by hand instead.
 
+The job reads `CHANGELOG.md` from the **tagged tree**, so a section only reaches
+a Release if it was committed before the tag was cut. That has a consequence
+worth stating plainly rather than discovering later: the backfilled `0.9.1`
+through `0.9.3` entries land on `main` after those tags already exist, so they
+will never appear in any automated release's notes. They are for readers of the
+file, not for the releases page.
+
 Backfilling `CHANGELOG.md` entries for `0.9.1`, `0.9.2` and `0.9.3` **is in
-scope** for this epic. The changelog is a normative document under CLAUDE.md's
+scope** for this epic. It is reconstruction, not invention: the tags exist and
+the merged pull requests in each range are recoverable from history. The changelog is a normative document under CLAUDE.md's
 doc-currency rule, and it is three releases stale.
 
 ## Decision 6: the README carries a release badge, and names all three images
@@ -141,9 +226,22 @@ A `shields.io` release badge joins the existing badge row, linking to
 `/releases/latest`.
 
 The badge renders "no releases" until a Release exists, so ordering matters:
-the badge lands only after the first Release is created. Because `v0.9.3` is
-already tagged and published, the rollout backfills a Release for it rather
-than waiting for `v0.9.4`.
+the badge lands only after the first Release is created.
+
+The first Release is `v0.9.4`, cut once this epic lands. Backfilling one for
+the already-published `v0.9.3` was considered and rejected. Every automated
+path to it is closed by this ADR's own rules: the tag is already pushed so no
+push trigger fires again, re-pushing it violates the write-once policy, the
+original run executed a workflow file that had no release job, and decision 1
+forbids a dispatch run from creating a Release. That leaves a manual
+`cosign sign-blob`, which would carry a human's Fulcio identity rather than the
+workflow identity the README documents, making the very first Release users
+see the one that does not match the verification story. And `v0.9.3`'s images
+predate decision 3, so they hold unstripped binaries with no debuglink: its
+assets would be structurally unlike every release after it.
+
+Cutting `v0.9.4` costs one tag push and produces a Release that is honest about
+its own provenance. The epic's own changes are its changelog entry.
 
 The same change fixes a stale claim next to it: the "Container images" section
 names `ravel-server` and `ravel-operator` and its `docker pull` block lists
@@ -172,36 +270,72 @@ satisfied by a `0.9.3` path crate, so it is invisible until a **minor** bump
 makes those requirements fail to resolve. The failure lands on whoever cuts
 `0.10.0`, far from the change that caused it.
 
-## Decision 9: the Dockerfile builds the workspace once per platform
+## Decision 9: the publish matrix collapses to one dimension, so the workspace compiles once per platform
 
-The builder stage is restructured so all four binaries are produced by one
-`cargo build` invocation, and the three runtime targets copy from that single
-stage. The same change strips the binaries copied into the runtime images.
+The six full workspace compiles do **not** come from the Dockerfile. The
+builder is already a single stage that produces all four binaries, and all
+three runtime targets already copy from it. They come from the workflow: the
+build matrix is `target × platform`, which is six independent jobs on six
+runners, and ADR-0037 decision 4 deliberately disabled `type=gha` caching, so
+no job can reuse another's builder layer.
 
-ADR-0037's multi-arch amendment named this and deferred it: *"Publish cost
-roughly doubles: six full workspace compiles per release instead of three...
-halving it by building the workspace once and deriving all three runtime
-images belongs in its own change."* This is that change, and it now also
-carries the image-size fix, because both are edits to the same file and
-splitting them across tasks would produce two divergent rewrites of one
-Dockerfile.
+The fix is therefore in the workflow, not the Dockerfile. The build matrix
+collapses to a single dimension, `platform: [linux/amd64, linux/arm64]`. Each
+platform job runs three `docker/build-push-action` invocations, one per target,
+sequentially on the same runner. The second and third hit the first's local
+layer cache for the shared builder stage, so the workspace compiles once per
+platform rather than three times. Each invocation keeps `sbom: true` and
+`provenance: mode=max` (ADR-0037 decision 15 unchanged) and pushes by digest,
+and the job uploads three digest artifacts named `digest-<target>-<platform>`
+exactly as decision 14 requires, so the per-target merge jobs need no change at
+all. Build-job permissions are unchanged: `packages: write`, no `id-token`.
 
-Expected effect: six full workspace compiles become two, and the server image
-drops from 923 MB toward the ~100 MB its stripped contents occupy.
+The builder's four sequential `cargo build` invocations stay four. Collapsing
+them into one `cargo build -p ... -p ... --features ravel-server/sql` was
+considered and rejected: this workspace is `resolver = "3"`, and feature
+resolution still unifies features of shared dependencies across every package
+selected in a single invocation. Enabling `ravel-server/sql` pulls the
+DataFusion tree into that unified graph, and whatever features it turns on for
+dependencies shared with `ravel-cli`, `ravel-operator` and
+`ravel-ingest-router` would then compile into those binaries too. The change is
+usually additive and harmless, but it is unverified, it silently alters what
+ships, and it buys almost nothing: the four invocations already share one
+target directory inside one stage. Collapsing them trades a real correctness
+question for a negligible saving.
 
-This is the highest-risk decision here. It rewrites the build of the image the
-README's first command pulls, so it re-verifies natively on arm64 against the
-same bar ADR-0037 decision 16 set: the stack up, `/healthz` returning 200, and
-`demo/kill-and-recover.sh` passing.
+Expected effect: six full workspace compiles become two. Measured against the
+`v0.9.3` run's 23 to 31 minutes per compile, that is the dominant cost of a
+release.
 
-## Decision 10: ADR-0037's "public mirror" premise is corrected in place
+ADR-0037's multi-arch amendment named this and deferred it: *"halving it by
+building the workspace once and deriving all three runtime images belongs in
+its own change."* This is that change. Its premise was slightly off, in that it
+implied the waste was in the image build; it is in the job matrix.
+
+This is the highest-risk decision here. It restructures the workflow that
+publishes the image the README's first command pulls, so it re-verifies
+natively on arm64 against the bar ADR-0037 decision 16 set: the stack up,
+`/healthz` returning 200, and `demo/kill-and-recover.sh` passing.
+
+## Decision 10: ADR-0037's stale topology gets a dated amendment, not a silent edit
 
 ADR-0037's amendments reason about releases publishing from a public mirror,
 written when this repository was the private `store` and a separate public
 mirror existed. `origin` is now `NOFireAI/ravel` directly and there is no
-mirror. The prose is corrected where it describes topology; no decision
-changes, and the `cosign verify` identity is unaffected because it already
+mirror.
+
+A short dated "Amendment: repository topology" section is appended to ADR-0037
+stating that, noting that mirror-era reasoning should be read historically, and
+confirming the `cosign verify` identity is unaffected because it already
 resolves to this repository's workflow path.
+
+Correcting the prose in place was rejected. That reasoning is load-bearing
+history: decision 7 argues keyless signing is right partly because *"the mirror
+is the repository strangers can actually read"*, and decision 9 rejects the
+implicit CI gate specifically because the mirror rewrote history. Editing the
+topology out from under those arguments leaves them reading as non sequiturs
+and hides that the topology ever changed. Dated amendment sections are this
+ADR's own established convention, twice over.
 
 ## Decision 11: the required-checks list is proposed here, not changed here
 
@@ -241,6 +375,19 @@ gate it is meant to tighten.
 - **A separate `release.yml` workflow.** Rejected under decision 1: no
   cross-workflow `needs:`.
 - **Removing `debug = 1`.** Rejected under decision 3: ADR-0036 depends on it.
+- **Collapsing the builder's four `cargo build` invocations into one.**
+  Rejected under decision 9: `resolver = "3"` unifies shared-dependency
+  features across a combined package selection, so it would silently change
+  what three of the four binaries are compiled with, to save almost nothing.
+- **Stripping in the release job instead of the builder.** Rejected under
+  decision 3: it contradicts decision 2's byte-identity property, and a single
+  release job cannot correctly `objcopy` a foreign-architecture ELF anyway.
+- **Backfilling a Release for `v0.9.3`.** Rejected under decision 6: no
+  automated path to it exists that this ADR's own rules permit, and the manual
+  one would sign under an identity the README does not document.
+- **Editing ADR-0037's mirror prose in place.** Rejected under decision 10: it
+  erases load-bearing history and leaves two decisions' rationales reading as
+  non sequiturs.
 
 ## Consequences
 
@@ -252,8 +399,8 @@ gate it is meant to tighten.
   far more from decision 9. Net expected: substantially faster.
 - `SHA256SUMS` covers stripped binaries. A user who downloads the `.debug`
   asset verifies it from the same file.
-- The badge is broken-looking until the first Release exists, which is why the
-  rollout backfills `v0.9.3` before the badge lands.
+- The badge is broken-looking until the first Release exists, which is why it
+  lands together with the `v0.9.4` cut rather than before it.
 - Decision 11 leaves a known gap open until someone with repository admin
   applies it. That is deliberate and is recorded rather than silently carried.
 - No frozen format changes, no crate logic changes. This is CI configuration, a
