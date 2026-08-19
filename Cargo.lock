@@ -4739,6 +4739,7 @@ dependencies = [
  "ravel-object-store",
  "ravel-promql",
  "ravel-proto",
+ "ravel-rspan",
  "ravel-segment",
  "ravel-tenant-resolve",
  "ravel-types",

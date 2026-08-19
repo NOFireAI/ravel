@@ -45,12 +45,13 @@ use ravel_types::logstream::canonical_attr_bytes;
 use ravel_types::{SeriesId, Signal, TenantHash};
 
 use crate::config::{ByteLimit, EngineConfig};
-use crate::distrib::client::{DistribError, SliceFetcher, SliceLogResponse};
+use crate::distrib::client::{DistribError, SliceFetcher, SliceLogResponse, SliceSpanResponse};
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
 use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
+use crate::span_fetcher::SpanRow;
 
 pub use partition::{DISTRIBUTE_MIN_SEGMENTS, DISTRIBUTE_MIN_STORE_BYTES};
 
@@ -491,6 +492,158 @@ impl Distributed {
 
         Ok(Some(merge_log_records(per_slice)))
     }
+
+    /// Partitions the snapshot, dispatches one Spans slice request per slice, and
+    /// merges the decoded spans into the single cross-segment total order a local
+    /// multi-segment read produces (#285). The span sibling of
+    /// [`fetch_logs`](Self::fetch_logs).
+    ///
+    /// Returns:
+    /// - `Ok(Some(spans))` when every slice succeeded: the coordinator-ordered
+    ///   span set (no dedup -- see [`merge_spans`]), the same multiset a local
+    ///   `SpanSegmentFetcher` read over the same segments produces, merged under
+    ///   the same total order.
+    /// - `Ok(None)` for whole-query local fallback: a worker reported
+    ///   `Unsupported` (version skew, a worker with no span fetcher wired,
+    ///   matcher pushdown, or a resolve-scope slice).
+    /// - `Err(QueryError::Fetch(Store { NotFound }))` for a `SnapshotInvalidated`
+    ///   slice, so the engine re-resolves and re-dispatches once.
+    /// - `Err(..)` for a terminal slice failure or a re-enforced budget overrun.
+    ///
+    /// This machinery is correct and tested, but no caller in the engine or SQL
+    /// layer dispatches a `Signal::Spans` distributed fetch yet
+    /// (`fetch_samples_and_histograms_maybe_distributed` only ever passes
+    /// `Signal::Metrics`, and the SQL span scan is single-process); wiring a real
+    /// span caller is a later task's scope.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_spans(
+        &self,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        snapshot: &Snapshot,
+        matchers: &[LabelMatcher],
+        erasure: &[ErasurePredicate],
+        accounting: &QueryAccounting,
+        config: &EngineConfig,
+        deadline_unix_ns: i64,
+    ) -> Result<Option<Vec<SpanRow>>, QueryError> {
+        let slices = partition_snapshot(snapshot, self.thresholds.max_parallel_slices);
+        if slices.is_empty() {
+            // An empty snapshot merges to an empty span set identically whether
+            // local or distributed.
+            return Ok(Some(Vec::new()));
+        }
+
+        let encoded_matchers = codec::encode_matchers(matchers);
+        let encoded_erasure = codec::encode_erasure(erasure);
+        let budgets = encode_budgets(config);
+        let tenant_bytes = tenant_hash.0.to_vec();
+        let signal_disc = codec::signal_to_u32(signal);
+        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
+
+        let concurrency = self.thresholds.max_parallel_slices.max(1);
+        let mut stream = stream::iter(slices)
+            .map(|slice| {
+                let (window_start_ns, window_end_ns) = slice_event_window(&slice.segments);
+                let request = pb::FetchRequest {
+                    protocol_version: codec::PROTOCOL_VERSION,
+                    query_id: query_id.to_vec(),
+                    tenant_hash: tenant_bytes.clone(),
+                    signal: signal_disc,
+                    scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+                        segments: slice
+                            .segments
+                            .iter()
+                            .map(codec::encode_segment_identity)
+                            .collect(),
+                    })),
+                    matchers: encoded_matchers.clone(),
+                    window_start_ns,
+                    window_end_ns,
+                    budgets: Some(budgets),
+                    deadline_unix_ns,
+                    erasure: encoded_erasure.clone(),
+                    trace_context: String::new(),
+                    fragment_capability: Vec::new(),
+                };
+                let fetcher = Arc::clone(&self.fetcher);
+                async move { fetcher.fetch_spans(request).await }
+            })
+            .buffer_unordered(concurrency);
+
+        // Collect each slice's spans into a flat per-slice pool, folding its
+        // accounting into the query's aggregate and re-enforcing the
+        // bytes-scanned budget over the running total, exactly as the logs path
+        // does. Precedence on soft outcomes matches `fetch`: a later hard error
+        // dominates an invalidation, which dominates an Unsupported fallback.
+        let mut per_slice: Vec<Vec<SpanRow>> = Vec::new();
+        let mut running = QueryAccountingSnapshot::default();
+        let mut invalidated = false;
+        let mut unsupported = false;
+
+        while let Some(result) = stream.next().await {
+            let response = result.map_err(distrib_error)?;
+            match response.status {
+                pb::status::Code::Ok => {
+                    fold_span_slice(accounting, &mut running, &response);
+                    if let Some(err) =
+                        bytes_scanned_exceeded(running.total_s3_bytes(), config.max_bytes_scanned)
+                    {
+                        return Err(err);
+                    }
+                    per_slice.push(response.spans);
+                }
+                pb::status::Code::SnapshotInvalidated => invalidated = true,
+                pb::status::Code::Unsupported => {
+                    fold_span_slice(accounting, &mut running, &response);
+                    unsupported = true;
+                }
+                pb::status::Code::BudgetExceeded => {
+                    fold_span_slice(accounting, &mut running, &response);
+                    return Err(bytes_scanned_exceeded(
+                        running.total_s3_bytes(),
+                        config.max_bytes_scanned,
+                    )
+                    .unwrap_or_else(|| QueryError::Distrib {
+                        reason: format!("slice tripped its budget: {}", response.status_message),
+                    }));
+                }
+                pb::status::Code::Corrupt => {
+                    return Err(QueryError::Distrib {
+                        reason: format!(
+                            "slice reported a corrupt segment: {}",
+                            response.status_message
+                        ),
+                    });
+                }
+                pb::status::Code::Unavailable => {
+                    return Err(QueryError::Distrib {
+                        reason: format!(
+                            "slice unavailable after re-dispatch and local execution: {}",
+                            response.status_message
+                        ),
+                    });
+                }
+                other => {
+                    return Err(QueryError::Distrib {
+                        reason: format!("slice returned {other:?}: {}", response.status_message),
+                    });
+                }
+            }
+        }
+
+        if invalidated {
+            return Err(QueryError::Fetch(FetchError::Store {
+                key: "distributed-slice".to_string(),
+                source: ravel_object_store::StoreError::NotFound,
+            }));
+        }
+        if unsupported {
+            return Ok(None);
+        }
+
+        Ok(Some(merge_spans(per_slice)))
+    }
 }
 
 /// Folds one OK/Unsupported slice's reported cost into both the query's live
@@ -522,6 +675,19 @@ fn fold_log_slice(
     live: &QueryAccounting,
     running: &mut QueryAccountingSnapshot,
     response: &SliceLogResponse,
+) {
+    live.merge_snapshot(&response.accounting);
+    *running = running.saturating_merge(&response.accounting);
+}
+
+/// Folds one Spans slice's accounting into the query's live handle and the
+/// coordinator's running snapshot (the basis for the incremental bytes-scanned
+/// check). The span sibling of [`fold_log_slice`]; a span slice carries no
+/// `FetchStats` page counters (a metric-path concept), so there is none to sum.
+fn fold_span_slice(
+    live: &QueryAccounting,
+    running: &mut QueryAccountingSnapshot,
+    response: &SliceSpanResponse,
 ) {
     live.merge_snapshot(&response.accounting);
     *running = running.saturating_merge(&response.accounting);
@@ -631,6 +797,109 @@ pub(crate) fn log_record_order_key(record: &LogRecord) -> LogOrderKey {
         record.span_id,
         record.flags,
         attrs_key,
+    )
+}
+
+/// The stated cross-segment total order for spans (no dedup: see below), and the
+/// coordinator merge that reproduces it (#285, ADR-0071 amendment decision 4).
+///
+/// # The invariant this reproduces
+///
+/// A distributed Spans fetch must equal, as a multiset under one defined total
+/// order, reading every pinned RSPAN segment locally with `SpanSegmentFetcher`
+/// and combining the spans under that order. RSPAN sorts records by
+/// `(trace_id, start_ts)` within one object, but across objects there is no
+/// global order on disk, and ADR-0052 online resharding routes one trace's
+/// spans to different shard indices across generations, so a trace's segments
+/// can land in different slices. Within a single shard generation a trace's
+/// spans land on one shard (`shard_for_span`,
+/// `one_trace_lands_in_exactly_one_shard`), but `SpanIngestRouter` carries the
+/// same `GenerationSwitch` the log streams do, so a trace whose spans were
+/// written on both sides of a reshard activation straddles shards. The merge is
+/// therefore defined purely on span identity and this total order, never on
+/// slice or shard arrival order (mirroring `merge_log_records` and the metrics
+/// lane's `merge_soa_runs`, both order-independent over the flat pool).
+///
+/// The **total order** over spans is ascending, lexicographic, over the whole
+/// span content in a fixed field sequence:
+///
+/// `(trace_id, span_id, start_ts_ns, end_ts_ns, parent_span_id, name,
+///   status_code, status_message, service_name, attrs)`
+///
+/// where `attrs` is the record's merged `(key, value)` map compared as a
+/// `Vec<(String, String)>` (RSPAN canonicalizes it to ascending key order on
+/// write, so two reads of the same object compare equal). Every field
+/// participates, so the key is a total order: two spans with an equal key are
+/// byte-identical.
+///
+/// **No dedup.** An equal key here (two byte-identical spans) is NOT collapsed.
+/// `docs/consistency-model.md` ("logs and spans") and ADR-0051 section 5 are
+/// explicit that spans have no query-time dedup: a retry after a lost ack
+/// produces byte-identical spans that are legitimately duplicate user data and
+/// must stay visible, not silently dropped. The total order above still matters
+/// for merge determinism (a stable sort under a total key gives the same output
+/// regardless of slice arrival order), it just never doubles as an identity for
+/// collapsing spans.
+///
+/// The naive alternative -- concatenating each slice's spans in slice arrival
+/// order -- is wrong precisely when one trace's spans straddle two slices: it
+/// emits one slice's spans before another's, an order the local read never
+/// produces. The `sort_by` below is the line that fixes it; replacing this merge
+/// with a slice-order concatenation fails the reshard-straddling differential
+/// test.
+///
+/// The merge is order-independent over the flat pool: sorting the flattened
+/// multiset of spans is a pure function of that multiset, so the per-slice
+/// grouping (which differs from the local per-segment grouping) never changes
+/// the result -- exactly the property the differential test exercises.
+pub(crate) fn merge_spans(per_slice: Vec<Vec<SpanRow>>) -> Vec<SpanRow> {
+    let mut keyed: Vec<(SpanOrderKey, SpanRow)> = per_slice
+        .into_iter()
+        .flatten()
+        .map(|row| (span_order_key(&row), row))
+        .collect();
+    // A stable sort on the precomputed full-content key. Equal-key spans are
+    // byte-identical, but they are NOT collapsed: the consistency model
+    // (docs/consistency-model.md, "logs and spans") forbids query-time dedup for
+    // spans, because a retry after a lost ack produces byte-identical spans that
+    // are legitimately duplicate USER DATA and must stay visible. Every span in
+    // the pool is returned.
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.into_iter().map(|(_, row)| row).collect()
+}
+
+/// The total-order key for one span (see [`merge_spans`]). A tuple so `Ord`
+/// derives structurally; span attribute values are plain strings, so the merged
+/// `attrs` map is compared directly as a `Vec<(String, String)>` (no canonical
+/// byte encoding needed, unlike the typed log attribute values). `service_name`
+/// and `status_message` are `Option<String>`, so `None` orders before `Some`,
+/// keeping them distinct from an empty string.
+type SpanOrderKey = (
+    [u8; 16],
+    [u8; 8],
+    i64,
+    i64,
+    Option<[u8; 8]>,
+    String,
+    u8,
+    Option<String>,
+    Option<String>,
+    Vec<(String, String)>,
+);
+
+pub(crate) fn span_order_key(row: &SpanRow) -> SpanOrderKey {
+    let record = &row.record;
+    (
+        record.trace_id,
+        record.span_id,
+        record.start_ts_ns,
+        record.end_ts_ns,
+        record.parent_span_id,
+        record.name.clone(),
+        record.status_code.to_u8(),
+        record.status_message.clone(),
+        row.service_name.clone(),
+        record.attrs.clone(),
     )
 }
 
