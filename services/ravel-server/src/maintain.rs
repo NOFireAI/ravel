@@ -15,7 +15,10 @@
 //! [`scan_and_maintain_with_memo`] (retention-before-compaction over every
 //! sealed bucket), [`ravel_maintain::sweep_shard`] (the three per-shard GC
 //! rules), [`ravel_maintain::sweep_idempotency_markers`] (the fourth GC
-//! rule, run once per signal instead of per shard), and the ADR-0064
+//! rule, run once per signal instead of per shard),
+//! [`ravel_maintain::sweep_unreferenced_catalog_objects`] (the fifth GC rule,
+//! reclaiming catalog snapshot/index objects no HEAD names, also once per
+//! signal), and the ADR-0064
 //! selective-erasure trio -- [`ravel_maintain::erasure_rewrite_bucket`] per
 //! bucket, the request-completion `.done` write, and
 //! [`ravel_maintain::sweep_erasure_requests`] -- once per tenant per tick.
@@ -86,7 +89,8 @@ use ravel_maintain::{
     LeaseCheck, LegalHoldCheck, MaintainError, PendingErasureRequest, QUERY_AUDIT_SHARD,
     RetentionConfig, WorkerSet, erasure_rewrite_bucket, pending_erasure_requests,
     read_all_memo_snapshots, scan_and_compact, sweep_audit_retention, sweep_erasure_requests,
-    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned, write_memo_snapshot,
+    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned, sweep_unreferenced_catalog_objects,
+    write_memo_snapshot,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
 use ravel_proto::commit::v1::{ErasureCompletion, ErasureDeferralCause, ErasureRequest};
@@ -889,7 +893,9 @@ pub async fn run_discovery_cycle(
 /// for [`Signal::Logs`] and [`Signal::Spans`] only -- markers don't exist for
 /// [`Signal::Metrics`] (ADR-0051 §5) and the marker sweep already covers every
 /// shard of a signal in one LIST, so it does not belong in the per-shard
-/// loop -- and finally the ADR-0064 selective-erasure pass
+/// loop -- then the unreferenced-catalog-object sweep (via
+/// [`sweep_unreferenced_catalog_objects`]) once per signal for every signal,
+/// and finally the ADR-0064 selective-erasure pass
 /// ([`run_erasure_pass`]) for every signal. Every scan/sweep error is logged
 /// and retried next tick; nothing here affects query correctness. Split out
 /// from [`run_discovery_cycle`] so a test can drive a single deterministic
@@ -1341,6 +1347,45 @@ pub(crate) async fn run_tick_with_clock(
                         "maintenance: idempotency marker sweep pass failed; retried next tick"
                     );
                 }
+            }
+        }
+
+        // Unreferenced catalog snapshot and index objects (ADR-0064 §5 GC rule
+        // 5, issue #121). Every fold, and the frontier-reconcile path in
+        // `ravel_catalog::fold`, publishes a new HEAD that supersedes the prior
+        // snapshot/index objects; those superseded objects are named by no HEAD
+        // afterward and are reclaimed by nothing else. This is the only
+        // production driver of `sweep_unreferenced_catalog_objects`; without
+        // this call the already-tested rule never runs outside tests and the
+        // objects accumulate forever.
+        //
+        // Per (tenant, signal), not per shard: catalog objects carry no shard
+        // dimension, so it runs once per signal here, outside the per-shard
+        // loop above, exactly like the idempotency-marker sweep. Gated on
+        // ownership of shard 0 of this (tenant, signal) pair (ADR-0065 decision
+        // 2) so replicas do not double-pay it. Unlike the marker sweep it runs
+        // for EVERY signal: catalog objects exist for metrics, logs, and spans
+        // alike, and the sweep's own HEAD anchor (an absent HEAD sweeps
+        // nothing) is what makes it safe on a signal that has never folded.
+        // Logged like the other per-signal sweeps, not folded into
+        // `MaintainReport`'s summed fields.
+        if worker.owns_unit(live_set, tenant, signal, 0) {
+            match sweep_unreferenced_catalog_objects(store, clock, compactor, &hold, tenant, signal)
+                .await
+            {
+                Ok(outcome) => tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    deleted = outcome.deleted,
+                    kept = outcome.kept,
+                    "maintenance: unreferenced catalog object sweep pass complete"
+                ),
+                Err(err) => tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    error = %err,
+                    "maintenance: unreferenced catalog object sweep pass failed; retried next tick"
+                ),
             }
         }
 
@@ -2484,6 +2529,124 @@ mod tests {
                 "a Metrics marker must never be touched: the sweep is not called for that signal"
             );
         }
+    }
+
+    /// A real tick drives the unreferenced-catalog-object sweep (ADR-0064 §5
+    /// GC rule 5, issue #121): an old catalog snapshot object that the live
+    /// HEAD no longer names is reclaimed, while the object the HEAD still names
+    /// survives. This is the reachability proof that
+    /// `run_tick_with_clock` actually calls `sweep_unreferenced_catalog_objects`
+    /// on the per-(tenant, signal) tick.
+    ///
+    /// Deliberately run on `Signal::Metrics`, which produces no idempotency
+    /// markers: the sweep call must NOT be gated on the `matches!(signal,
+    /// Logs | Spans)` predicate the marker sweep above uses, so exercising it
+    /// on Metrics is what makes the two naive-wrong states fail here. If the
+    /// `sweep_unreferenced_catalog_objects` call were removed, or copied under
+    /// the marker sweep's logs/spans gate (so it never fires for Metrics), the
+    /// superseded object would survive and the
+    /// `store.get(&superseded_key, ...).await.is_err()` assertion below would
+    /// fail; the surviving-referenced-object assertion additionally proves the
+    /// sweep is the real HEAD-anchored rule, not a blanket delete.
+    #[tokio::test]
+    async fn run_tick_sweeps_unreferenced_catalog_objects() {
+        use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef};
+
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let signal = Signal::Metrics;
+
+        // Catalog key layout (docs/catalog-and-mvcc.md), reconstructed from the
+        // same pieces `ravel_maintain`'s sweep builds them from: no public
+        // builder is exported.
+        let snap_prefix = format!(
+            "t/{}/catalog/{}/snap/",
+            tenant.to_hex(),
+            signal.key_prefix()
+        );
+        let head_key = format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix());
+        let referenced_key = format!("{snap_prefix}20260101T00.aaaa.csnap");
+        let superseded_key = format!("{snap_prefix}20251231T00.cccc.csnap");
+
+        // Both objects seeded at the store's default clock (0), so both are far
+        // older than the protection horizon once "now" is advanced below.
+        for key in [&referenced_key, &superseded_key] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from_static(b"catalog-object"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed catalog object");
+        }
+
+        // A HEAD that names only `referenced_key`, so `superseded_key` is
+        // unreferenced and eligible once past the horizon.
+        let head = SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 100,
+            parts: vec![SnapshotPartRef {
+                key: referenced_key.clone(),
+                blake3: vec![1u8; 32],
+                size: 1,
+                entry_count: 1,
+                watermark_hour: 100,
+                min_hour: 0,
+            }],
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        store
+            .put(
+                &head_key,
+                bytes::Bytes::from(ravel_catalog::encode_head(&head).expect("valid HEAD encodes")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        // "now" two horizons out: the store clock-0 objects are both old, so the
+        // sweep's age gate does not spare the unreferenced one.
+        let clock =
+            ravel_maintain::FixedClock::new(compactor.protection_horizon_ns.saturating_mul(2));
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(
+            store.get(&superseded_key, GetRange::Full).await.is_err(),
+            "an old catalog object no HEAD names must be swept by a real Metrics tick; \
+             it survives if the sweep call is missing or gated on logs/spans"
+        );
+        assert!(
+            store.get(&referenced_key, GetRange::Full).await.is_ok(),
+            "the object the live HEAD still names must survive the sweep"
+        );
     }
 
     // --- ADR-0064 selective erasure, driven through `run_tick` ---
