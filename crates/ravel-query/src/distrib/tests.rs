@@ -2317,13 +2317,23 @@ fn span_id_seq(spans: &[SpanRow]) -> Vec<([u8; 16], [u8; 8])> {
 ///
 /// Span identities are laid out so slice-order concatenation is observably NOT
 /// the correct total order `(trace_id, span_id, ...)`:
-/// - seg_a (shard 0), sorted on disk by (trace_id, start): TA/S2 (start 20),
+/// - seg_a (shard 0), sorted on disk by (trace_id, start): TA/S2 (start 10),
 ///   TB/S1 (start 15).
-/// - seg_b (shard 1): TA/S1 (start 10), TB/S2 (start 25).
+/// - seg_b (shard 1): TA/S1 (start 20), TB/S2 (start 25).
 ///
 /// The correct merge order is TA/S1, TA/S2, TB/S1, TB/S2; slice-order concat
 /// (seg_a then seg_b) is TA/S2, TB/S1, TA/S1, TB/S2 -- different, so the merge's
 /// `sort_by` line is under test.
+///
+/// Crucially, trace TA's span_id order DISAGREES with its start_ts order: S1 < S2
+/// by span_id, but S1 starts at 20 while S2 starts at 10, so by start_ts S2 comes
+/// first. This is what makes the corpus discriminate the key's field sequence: a
+/// key that put `start_ts_ns` ahead of `span_id`, or dropped `span_id` entirely
+/// and ordered TA by `start_ts` alone, would emit TA/S2 before TA/S1 and fail the
+/// `correct_ids == [TA/S1, TA/S2, ...]` assertion. Under the old geometry (S1
+/// start 10, S2 start 20) span_id and start_ts order agreed for both traces, so
+/// swapping those two key fields, or truncating the key to `(trace_id,
+/// start_ts)`, left every distrib test green.
 ///
 /// Per-span `user_id`: the two TA spans carry u1, the two TB spans carry u2.
 /// Erasing u1 therefore removes both TA spans, which straddle the two slices.
@@ -2337,8 +2347,8 @@ async fn split_trace_corpus(store: &MemoryStore) -> Vec<SegmentRef> {
             span_record(
                 TA,
                 S2,
-                20,
-                21,
+                10,
+                11,
                 &[("service.name", "alpha"), ("user_id", "u1")],
             ),
             span_record(
@@ -2360,8 +2370,8 @@ async fn split_trace_corpus(store: &MemoryStore) -> Vec<SegmentRef> {
             span_record(
                 TA,
                 S1,
-                10,
-                11,
+                20,
+                21,
                 &[("service.name", "alpha"), ("user_id", "u1")],
             ),
             span_record(
@@ -2558,7 +2568,7 @@ fn spans_worker_applies_erasure_across_straddling_slices() {
             };
 
             // Erase every span carrying user_id=u1. Both TA spans carry u1, at
-            // ts 10 (slice 1) and ts 20 (slice 0), so the erased trace straddles
+            // ts 10 (slice 0) and ts 20 (slice 1), so the erased trace straddles
             // slices at cap 2.
             let erasure = vec![ErasurePredicate::windowless(vec![(
                 "user_id".to_string(),
@@ -2661,5 +2671,72 @@ fn spans_worker_without_span_fetcher_signals_local_fallback() {
             "a worker with no span fetcher signals whole-query local fallback (Ok(None))"
         );
         server.abort();
+    });
+}
+
+/// Direct discrimination test for every field of the documented span total order
+/// `(trace_id, span_id, start_ts_ns, end_ts_ns, parent_span_id, name,
+/// status_code, status_message, service_name, attrs)`. For each of the ten
+/// fields, two `SpanRow`s are built identical in every OTHER field and differing
+/// only in that one, and `span_order_key` must map them to different keys.
+///
+/// This is the field-level complement to the corpus geometry in
+/// `split_trace_corpus`: it covers the seven fields the corpus can never reach
+/// (end_ts_ns, parent_span_id, name, status_code, status_message, service_name,
+/// attrs) and, unlike the corpus, does not decay if a later edit reshuffles the
+/// corpus. Dropping any field from `span_order_key` -- in particular truncating
+/// it to `(trace_id, start_ts_ns)` -- collapses that field's pair to an equal key
+/// and fails the matching assertion below.
+#[test]
+fn span_order_key_discriminates_every_field() {
+    // A canonical base row; each case clones it and perturbs exactly one field.
+    let base = SpanRow {
+        record: ravel_rspan::SpanRecord {
+            trace_id: TA,
+            span_id: S1,
+            parent_span_id: Some([3u8; 8]),
+            name: "op".to_string(),
+            start_ts_ns: 10,
+            end_ts_ns: 11,
+            status_code: ravel_rspan::StatusCode::Unset,
+            status_message: Some("msg".to_string()),
+            attrs: vec![("k".to_string(), "v".to_string())],
+        },
+        service_name: Some("alpha".to_string()),
+    };
+
+    // Assert that perturbing exactly the named field (all others equal to `base`)
+    // moves the key: proof that field participates and has not been dropped.
+    let check = |field: &str, mutate: &dyn Fn(&mut SpanRow)| {
+        let mut other = base.clone();
+        mutate(&mut other);
+        assert_ne!(
+            span_order_key(&base),
+            span_order_key(&other),
+            "span_order_key must distinguish spans differing only in {field}; \
+             if it does not, that field has been dropped from the key"
+        );
+    };
+
+    // One case per documented key field, in the key's field order.
+    check("trace_id", &|r| r.record.trace_id = TB);
+    check("span_id", &|r| r.record.span_id = S2);
+    check("start_ts_ns", &|r| r.record.start_ts_ns = 20);
+    check("end_ts_ns", &|r| r.record.end_ts_ns = 99);
+    check("parent_span_id", &|r| {
+        r.record.parent_span_id = Some([7u8; 8])
+    });
+    check("name", &|r| r.record.name = "other".to_string());
+    check("status_code", &|r| {
+        r.record.status_code = ravel_rspan::StatusCode::Error
+    });
+    check("status_message", &|r| {
+        r.record.status_message = Some("boom".to_string())
+    });
+    check("service_name", &|r| {
+        r.service_name = Some("beta".to_string())
+    });
+    check("attrs", &|r| {
+        r.record.attrs = vec![("k".to_string(), "w".to_string())]
     });
 }
