@@ -118,6 +118,8 @@ Small PRs with a clear purpose are easier to review than large mixed changes.
 
 Review is part of the contribution process. Maintainers may ask for a different approach, additional tests, a smaller scope, or an ADR before a change can be merged.
 
+Ravel also runs CodeRabbit, but only when a maintainer asks it to. Automated review is not triggered by opening a pull request, by a label, or by a comment, and `@coderabbitai` commands do nothing here. A maintainer dispatches a review of one revision, and CodeRabbit posts a single comment review that neither approves nor blocks. Treat its findings as one more opinion to answer, not as a gate. See [ADR-0090](docs/adrs/0090-maintainer-gated-coderabbit-reviews.md).
+
 ## Licensing
 
 Ravel is licensed under the Apache License 2.0.
