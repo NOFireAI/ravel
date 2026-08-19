@@ -18,6 +18,17 @@ ignore = [
   # acceptable to ignore. No fixed bincode 1.x exists; revisit when
   # promql-parser drops the lrpar bincode dependency.
   "RUSTSEC-2025-0141",
+  # RUSTSEC-2024-0436: paste 1.0.15 is unmaintained (repo archived). It
+  # enters only through parquet (services/ravel-cli's bulk-import loader,
+  # ADR-0089), which uses it purely as a proc-macro for compile-time
+  # identifier concatenation. paste has no runtime API surface at all: it
+  # expands entirely during macro invocation and contributes nothing to
+  # the compiled binary or its runtime behavior, so "unmaintained" has no
+  # runtime security implication here, unlike a crate that ships code
+  # that executes. No safe upgrade exists (the advisory's own suggested
+  # forks, pastey and with_builtin_macros, are not drop-in and parquet
+  # does not depend on either); revisit if parquet drops paste upstream.
+  "RUSTSEC-2024-0436",
 ]
 
 [licenses]
