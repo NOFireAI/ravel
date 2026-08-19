@@ -1,4 +1,4 @@
-# Code owners for the trusted CodeRabbit control plane (ADR-0090).
+# Code owners for the trusted CodeRabbit control plane (ADR-0091).
 #
 # Everything listed here decides who can cause a CodeRabbit API call, what
 # policy that call runs under, and what CodeRabbit is allowed to do to this
@@ -12,13 +12,20 @@
 # docs/guides/coderabbit-runbook.md. Until that is applied, treat these paths as
 # unprotected.
 #
-# Listed individually because NOFireAI/ravel has no maintainer team yet. Every
-# login below holds `admin` on this repository. Replace the list with
-# `@NOFireAI/ravel-maintainers` once that team exists and carries `maintain` or
-# `admin`; a team is reconciled in one place, a list drifts.
+# @NOFireAI/ravel-maintainers holds `maintain` on this repository. It is
+# currently a one-person team, so every change to a path below needs that one
+# person. That is a deliberate narrow gate on the CodeRabbit control plane, not
+# an accident, but it is also a bus factor of one: add members as the set of
+# people who should own these paths grows.
+#
+# The team is NOT the required reviewer on the `coderabbit-oss` environment, and
+# should not become it while it has one member: `prevent_self_review` would then
+# leave nobody able to approve a review that person started. The environment
+# keeps a list of individual maintainers for that reason.
 
-/.github/workflows/coderabbit-maintainer-review.yml @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
-/.github/coderabbit/                                @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
-/.coderabbit.yaml                                   @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
-/scripts/coderabbit-maintainer-review.sh            @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
-/.github/CODEOWNERS                                 @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
+/.github/workflows/coderabbit-maintainer-review.yml @NOFireAI/ravel-maintainers
+/.github/coderabbit/                                @NOFireAI/ravel-maintainers
+/.coderabbit.yaml                                   @NOFireAI/ravel-maintainers
+/scripts/coderabbit-maintainer-review.sh            @NOFireAI/ravel-maintainers
+/scripts/coderabbit-acceptance-tests.sh             @NOFireAI/ravel-maintainers
+/.github/CODEOWNERS                                 @NOFireAI/ravel-maintainers
