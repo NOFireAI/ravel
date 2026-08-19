@@ -346,10 +346,10 @@ impl Distributed {
     /// log sibling of [`fetch`](Self::fetch).
     ///
     /// Returns:
-    /// - `Ok(Some(records))` when every slice succeeded: the coordinator-ordered,
-    ///   deduped record set, bit-identical to a local `LogSegmentFetcher` read
-    ///   over the same segments merged under the same rule (see
-    ///   [`merge_log_records`]).
+    /// - `Ok(Some(records))` when every slice succeeded: the coordinator-ordered
+    ///   record set (no dedup -- see [`merge_log_records`]), bit-identical to a
+    ///   local `LogSegmentFetcher` read over the same segments merged under the
+    ///   same rule.
     /// - `Ok(None)` for whole-query local fallback: a worker reported
     ///   `Unsupported` (version skew, a worker with no log fetcher wired, matcher
     ///   pushdown, or a resolve-scope slice).
@@ -527,8 +527,9 @@ fn fold_log_slice(
     *running = running.saturating_merge(&response.accounting);
 }
 
-/// The stated cross-segment total order and dedup rule for RLOG records, and the
-/// coordinator merge that reproduces it (#284, ADR-0071 amendment decision 4).
+/// The stated cross-segment total order for RLOG records (no dedup: see below),
+/// and the coordinator merge that reproduces it (#284, ADR-0071 amendment
+/// decision 4).
 ///
 /// # The invariant this reproduces
 ///
@@ -554,13 +555,14 @@ fn fold_log_slice(
 /// field participates, so the key is a total order: two records with an equal
 /// key are byte-identical.
 ///
-/// The **dedup / tie-break rule**: records with an equal key are exact
-/// duplicates (identical in every field, e.g. one record copied verbatim into
-/// two overlapping segments), and the merge keeps one. This is the log analog of
-/// the metrics `(series_id, ts)` dedup: the identity is the full record because
-/// an RLOG record carries no separate id, and the tie-break is total because the
-/// key already orders every field. Distinct records never share a key, so dedup
-/// can never drop a genuine record.
+/// **No dedup.** Unlike the metrics `(series_id, ts)` dedup, an equal key here
+/// (two byte-identical records) is NOT collapsed. `docs/consistency-model.md`
+/// ("logs and spans") and ADR-0051 section 5 are explicit that logs/alerts/audit
+/// have no query-time dedup: a retry after a lost ack produces byte-identical
+/// rows that are legitimately duplicate user data and must stay visible, not
+/// silently dropped. The total order above still matters for merge determinism
+/// (a stable sort under a total key gives the same output regardless of slice
+/// arrival order), it just never doubles as an identity for collapsing records.
 ///
 /// The naive alternative -- concatenating each slice's records in slice arrival
 /// order -- is wrong precisely when one stream's segments straddle two slices:
