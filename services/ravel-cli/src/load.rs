@@ -270,9 +270,22 @@ impl LoadReport {
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     /// Setup failed before any record was written (mapping, provisioning, file
-    /// open, Parquet schema, missing column). Nothing is durable.
+    /// open, Parquet reader construction). Nothing is durable. Not used once
+    /// the batch loop starts — a failure there uses `BatchFailed` instead,
+    /// since earlier batches in the same run may already be durable.
     #[error("{0}")]
     Setup(String),
+    /// A batch failed to decode, or its columns failed to resolve against the
+    /// mapping, once the loop has already started (a later Parquet batch may
+    /// have a schema/type Parquet itself allows but the mapping cannot
+    /// handle). Distinct from `Setup`: earlier batches in the same run may
+    /// already be durable, and this variant reports them rather than
+    /// silently losing them.
+    #[error("{reason}")]
+    BatchFailed {
+        reason: String,
+        durable: Vec<CommitToken>,
+    },
     /// A row failed a kept admission check (future skew, length cap, or the
     /// loader per-record attribute cap). Fail-fast: the run stops at the first
     /// bad row. Any tokens listed are batches durable before this row.
@@ -293,11 +306,14 @@ pub enum LoadError {
 
 impl LoadError {
     /// The commit tokens already durable when this error occurred (empty for a
-    /// setup error).
+    /// setup error, since `Setup` never occurs once any batch could have
+    /// flushed).
     pub fn durable_tokens(&self) -> &[CommitToken] {
         match self {
             LoadError::Setup(_) => &[],
-            LoadError::RowRejected { durable, .. } | LoadError::Flush { durable, .. } => durable,
+            LoadError::BatchFailed { durable, .. }
+            | LoadError::RowRejected { durable, .. }
+            | LoadError::Flush { durable, .. } => durable,
         }
     }
 }
@@ -381,11 +397,17 @@ pub async fn load(
     let mut row_base: u64 = 0;
 
     for batch in reader {
-        let batch =
-            batch.map_err(|e| LoadError::Setup(format!("failed to read Parquet batch: {e}")))?;
+        let batch = batch.map_err(|e| LoadError::BatchFailed {
+            reason: format!("failed to read Parquet batch: {e}"),
+            durable: report.tokens.clone(),
+        })?;
         // Resolve column indices once per batch (schema is stable across
         // batches, but re-resolving keeps this self-contained and cheap).
-        let cols = ColumnIndex::resolve(&batch, mapping).map_err(LoadError::Setup)?;
+        let cols =
+            ColumnIndex::resolve(&batch, mapping).map_err(|reason| LoadError::BatchFailed {
+                reason,
+                durable: report.tokens.clone(),
+            })?;
 
         let mut records = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
@@ -1068,5 +1090,34 @@ type = "i64"
         let err = parse_mapping("ts_column = \"t\"\nts_unit = \"nanos\"\nbogus = 1\n")
             .expect_err("deny_unknown_fields rejects a typo");
         assert!(matches!(err, LoadError::Setup(_)));
+    }
+
+    // A batch that fails mid-loop (a later Parquet batch fails to decode, or
+    // its columns fail to resolve against the mapping) must report whatever
+    // was durable before it, not the empty slice `Setup` reports. Before this
+    // fix, both in-loop failure sites used `LoadError::Setup`, so a load that
+    // durably flushed earlier batches and then hit this error told the
+    // operator "nothing landed" while `report.tokens` already held commit
+    // tokens for those earlier batches -- confirmed by temporarily reverting
+    // this test's expectation to `&[]` and observing it match `Setup`'s
+    // behavior, which is the exact silent-loss shape the fix removes.
+    #[test]
+    fn batch_failed_reports_durable_tokens_not_empty() {
+        let durable = vec![CommitToken {
+            shard: 0,
+            writer_id: uuid::Uuid::nil(),
+            epoch: 0,
+            seq: 1,
+            ingest_hour_bucket: 0,
+        }];
+        let err = LoadError::BatchFailed {
+            reason: "failed to read Parquet batch: corrupt page".into(),
+            durable: durable.clone(),
+        };
+        assert_eq!(err.durable_tokens(), durable.as_slice());
+        assert_ne!(
+            err.durable_tokens(),
+            LoadError::Setup("x".into()).durable_tokens()
+        );
     }
 }
