@@ -294,10 +294,10 @@ jobs:
           fi
           policy_names=$(jq -r '[.branch_policies[] | select(.type == "branch") | .name] | sort | join(",")' policies.json)
           policy_count=$(jq -r '.branch_policies | length' policies.json)
-          [ "$policy_names" = "$TRUSTED_BASE_BRANCH" ] && [ "$policy_count" = "1" ] || {
+          if [ "$policy_names" != "$TRUSTED_BASE_BRANCH" ] || [ "$policy_count" != "1" ]; then
             echo "::error::coderabbit-oss deployment branches are '${policy_names}' (${policy_count} entries), expected only ${TRUSTED_BASE_BRANCH}"
             fail=1
-          }
+          fi
 
           [ "$fail" = "0" ] || exit 1
           echo "coderabbit-oss: ${reviewers} required reviewer(s), self-review prevented, ${TRUSTED_BASE_BRANCH} only" >> "$GITHUB_STEP_SUMMARY"
