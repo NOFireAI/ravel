@@ -985,6 +985,125 @@ fn worker_rejects_non_metrics_and_unknown_signals() {
     });
 }
 
+/// #283: `run_slice_inner` dispatches on the signal via a real per-signal match
+/// arm reached AFTER decoding tenant/matchers/erasure, not the former
+/// pre-decode blanket rejection. Logs and Spans route to their own branch (a
+/// stub returning a distinct "not yet implemented" Unsupported until #284/#285
+/// fill it in); Profiles stays rejected exactly as every non-Metrics signal was
+/// before #283.
+///
+/// Two facts here would each FAIL against the old blanket-rejection code:
+///  1. Logs/Spans now carry the distinct "not yet implemented" message; the old
+///     code produced "not distributed yet; only Metrics" for every non-Metrics
+///     signal, so it never distinguished the stubbed family from Profiles.
+///  2. A Logs request with a malformed `tenant_hash` now returns `BadData`
+///     (tenant decode runs before the signal dispatch); the old code returned
+///     `Unsupported` because the signal check preceded any decode.
+#[test]
+fn run_slice_inner_dispatches_on_signal_not_blanket_rejects() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let seg = write_segment(
+            &store,
+            0,
+            0,
+            100,
+            &[SeriesDesc {
+                metric: "m0".to_string(),
+                samples: vec![(NS, 1.0f64.to_bits())],
+            }],
+        )
+        .await;
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), vec![seg.clone()]).await;
+
+        let request = |signal: u32, tenant: Vec<u8>| pb::FetchRequest {
+            protocol_version: crate::distrib::codec::PROTOCOL_VERSION,
+            query_id: Vec::new(),
+            tenant_hash: tenant,
+            signal,
+            scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+                segments: vec![crate::distrib::codec::encode_segment_identity(&seg)],
+            })),
+            matchers: Vec::new(),
+            window_start_ns: 0,
+            window_end_ns: 0,
+            budgets: None,
+            deadline_unix_ns: 0,
+            erasure: Vec::new(),
+            trace_context: String::new(),
+            fragment_capability: Vec::new(),
+        };
+
+        // Logs and Spans reach the new stub branch: Unsupported, but with the
+        // distinct "not yet implemented" message the old code never produced.
+        for signal in [Signal::Logs, Signal::Spans] {
+            let resp = SliceFetcher::fetch(
+                &fetcher,
+                request(
+                    crate::distrib::codec::signal_to_u32(signal),
+                    TENANT.0.to_vec(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("worker responds to a {signal:?} request: {e:?}"));
+            assert_eq!(
+                resp.status,
+                pb::status::Code::Unsupported,
+                "{signal:?} stub is still Unsupported so the coordinator falls back to local"
+            );
+            assert!(
+                resp.status_message.contains("not yet implemented"),
+                "{signal:?} must reach the new per-signal stub branch (distinct message), \
+                 got {:?}",
+                resp.status_message
+            );
+        }
+
+        // Structural proof the signal check now runs AFTER decoding: a Logs
+        // request with a malformed tenant hash is BadData (decode failed), not
+        // the Unsupported the pre-decode blanket check would have returned.
+        let bad_tenant = SliceFetcher::fetch(
+            &fetcher,
+            request(
+                crate::distrib::codec::signal_to_u32(Signal::Logs),
+                vec![0u8; 3],
+            ),
+        )
+        .await
+        .expect("worker responds to a malformed-tenant logs request");
+        assert_eq!(
+            bad_tenant.status,
+            pb::status::Code::BadData,
+            "tenant decode runs before the signal dispatch, so a bad tenant is BadData"
+        );
+
+        // Profiles stays on the reject arm, exactly as before #283: Unsupported,
+        // and specifically NOT the stubbed-family "not yet implemented" message.
+        let profiles = SliceFetcher::fetch(
+            &fetcher,
+            request(
+                crate::distrib::codec::signal_to_u32(Signal::Profiles),
+                TENANT.0.to_vec(),
+            ),
+        )
+        .await
+        .expect("worker responds to a profiles request");
+        assert_eq!(
+            profiles.status,
+            pb::status::Code::Unsupported,
+            "Profiles keeps returning Unsupported like every non-Metrics signal did"
+        );
+        assert!(
+            !profiles.status_message.contains("not yet implemented"),
+            "Profiles must take the reject arm, not the stubbed-family branch, got {:?}",
+            profiles.status_message
+        );
+
+        server.abort();
+    });
+}
+
 /// A [`SliceFetcher`] double whose reported spend is keyed on the slice's
 /// shard, with the overflow-sized report delayed so it always completes (and
 /// folds) second -- the one completion order a wrapping fold is blind to.

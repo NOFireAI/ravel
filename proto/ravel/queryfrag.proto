@@ -135,6 +135,8 @@ message FetchResponse {
     SeriesFrame series = 1;
     HistogramFrame hist = 2;
     Summary summary = 3;
+    LogRecordFrame log_record = 4;
+    SpanFrame span = 5;
   }
 }
 
@@ -180,6 +182,36 @@ message HistogramRun {
   // Opaque encoded histogram span payload for this run. Grammar deferred to a
   // later ticket; treated as an opaque blob by this contract.
   bytes span_payload = 5;
+}
+
+// One log-record frame for a slice of the RLOG family (Logs, Alerts, Audit),
+// carrying the worker's per-record merged attribute view so the coordinator
+// orders and dedups records without re-deriving attribute merging (ADR-0071
+// "log and span distributed fan-out" amendment). Additive oneof member: no
+// protocol_version bump, because skew is governed by the signal gate, not the
+// version field (an old worker returns Unsupported for signal=Logs, which the
+// coordinator maps to whole-query local fallback, so this frame can never
+// reach an old coordinator). The record payload grammar is deferred to the log
+// distribution ticket (#284); the field is reserved here as opaque bytes with
+// its number frozen, so adding the grammar is a decode-side change, not a wire
+// change, exactly as HistogramRun.span_payload reserves the histogram grammar.
+message LogRecordFrame {
+  // Opaque encoded per-record merged view for this slice. Grammar deferred to
+  // #284; treated as an opaque blob by this contract.
+  bytes record_payload = 1;
+}
+
+// One span frame for a slice of the Spans signal, carrying the worker's
+// per-span merged view so the coordinator orders and dedups spans keyed on
+// (trace_id, span_id) without re-deriving attribute merging (ADR-0071 "log and
+// span distributed fan-out" amendment). Additive oneof member with the same
+// no-version-bump rationale as LogRecordFrame. The span payload grammar is
+// deferred to the span distribution ticket (#285); the field is reserved here
+// as opaque bytes with its number frozen.
+message SpanFrame {
+  // Opaque encoded per-span merged view for this slice. Grammar deferred to
+  // #285; treated as an opaque blob by this contract.
+  bytes span_payload = 1;
 }
 
 // The terminal frame of a slice: the worker's accounting snapshot, the counts

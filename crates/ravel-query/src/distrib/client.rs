@@ -46,6 +46,18 @@ pub enum DistribError {
         "remote returned native-histogram data this build cannot decode across the slice boundary"
     )]
     HistogramUnsupported,
+    /// The remote streamed a per-signal record frame (a log record or a span)
+    /// for a signal this coordinator's metrics fetch path cannot consume.
+    /// Unreachable from a real query today: the metrics coordinator only ever
+    /// dispatches `Signal::Metrics`, and the log/span coordinators that would
+    /// receive these frames are built by #284/#285. The `frame` oneof is
+    /// exhaustive, so the metrics decoder must still name the variants; like
+    /// [`HistogramUnsupported`](Self::HistogramUnsupported) this is a
+    /// well-formed frame this build does not consume, not corruption.
+    #[error(
+        "remote returned a {0} frame this metrics coordinator cannot decode across the slice boundary"
+    )]
+    FrameSignalUnsupported(&'static str),
 }
 
 /// One slice's fully-decoded response, in the same in-memory shapes the local
@@ -145,6 +157,12 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
             }
             Some(pb::fetch_response::Frame::Hist(_)) => {
                 return Err(DistribError::HistogramUnsupported);
+            }
+            Some(pb::fetch_response::Frame::LogRecord(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("log-record"));
+            }
+            Some(pb::fetch_response::Frame::Span(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("span"));
             }
             Some(pb::fetch_response::Frame::Summary(s)) => {
                 if summary.is_some() {
