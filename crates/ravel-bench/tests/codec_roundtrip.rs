@@ -11,7 +11,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use proptest::prelude::*;
-use ravel_bench::codecs::{ByteSplitZstd, Chimp128, RawF64, ValueCodec};
+use ravel_bench::codecs::{Alp, ByteSplitZstd, Chimp128, GcdDeltaFor, RawF64, ValueCodec};
 
 fn bits(values: &[f64]) -> Vec<u64> {
     values.iter().map(|v| v.to_bits()).collect()
@@ -32,6 +32,8 @@ fn assert_roundtrip<C: ValueCodec>(codec: &C, values: &[f64]) {
 }
 
 fn assert_roundtrip_all(values: &[f64]) {
+    assert_roundtrip(&Alp, values);
+    assert_roundtrip(&GcdDeltaFor, values);
     assert_roundtrip(&Chimp128, values);
     assert_roundtrip(&ByteSplitZstd, values);
     assert_roundtrip(&RawF64, values);
@@ -88,9 +90,55 @@ proptest! {
 
     #[test]
     fn arbitrary_bitpatterns_roundtrip(values in proptest::collection::vec(any_f64(), 0..600)) {
+        assert_roundtrip(&Alp, &values);
+        assert_roundtrip(&GcdDeltaFor, &values);
         assert_roundtrip(&Chimp128, &values);
         assert_roundtrip(&ByteSplitZstd, &values);
         assert_roundtrip(&RawF64, &values);
+    }
+
+    // Integer- and fixed-decimal streams are the paths ALP and GCD-FOR model
+    // (rather than fall back on), so they exercise the exponent-recovery,
+    // exception, and GCD-reduction logic that random bit patterns skip. All
+    // must still round-trip bit-exactly.
+    #[test]
+    fn decimal_streams_roundtrip(
+        ints in proptest::collection::vec(-1_000_000i64..1_000_000, 1..300),
+        places in 0i32..4,
+    ) {
+        let scale = 10f64.powi(places);
+        let values: Vec<f64> = ints.iter().map(|&i| (i as f64) / scale).collect();
+        assert_roundtrip(&Alp, &values);
+        assert_roundtrip(&GcdDeltaFor, &values);
+        assert_roundtrip(&Chimp128, &values);
+        assert_roundtrip(&ByteSplitZstd, &values);
+        assert_roundtrip(&RawF64, &values);
+    }
+
+    // A decimal stream salted with occasional special values (NaN, -0.0, inf):
+    // the model fits most, and the special values must survive as ALP
+    // exceptions / GCD-FOR raw-fallback, bit-for-bit.
+    #[test]
+    fn decimal_with_exceptions_roundtrip(
+        ints in proptest::collection::vec(-100_000i64..100_000, 2..200),
+        specials in proptest::collection::vec(
+            prop_oneof![
+                Just(f64::NAN),
+                Just(-0.0f64),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                Just(f64::from_bits(1)),
+            ],
+            0..8,
+        ),
+    ) {
+        let mut values: Vec<f64> = ints.iter().map(|&i| (i as f64) / 100.0).collect();
+        for (k, s) in specials.into_iter().enumerate() {
+            let idx = k % values.len();
+            values[idx] = s;
+        }
+        assert_roundtrip(&Alp, &values);
+        assert_roundtrip(&GcdDeltaFor, &values);
     }
 
     // Streams built from a tiny alphabet of close values exercise Chimp's
@@ -104,6 +152,8 @@ proptest! {
             .iter()
             .map(|&s| f64::from_bits(base ^ u64::from(s)))
             .collect();
+        assert_roundtrip(&Alp, &values);
+        assert_roundtrip(&GcdDeltaFor, &values);
         assert_roundtrip(&Chimp128, &values);
         assert_roundtrip(&ByteSplitZstd, &values);
         assert_roundtrip(&RawF64, &values);
@@ -116,6 +166,8 @@ proptest! {
         bytes in proptest::collection::vec(any::<u8>(), 0..2048),
         count in 0usize..800,
     ) {
+        let _ = Alp.decode(&bytes, count);
+        let _ = GcdDeltaFor.decode(&bytes, count);
         let _ = Chimp128.decode(&bytes, count);
         let _ = ByteSplitZstd.decode(&bytes, count);
         let _ = RawF64.decode(&bytes, count);
@@ -129,11 +181,13 @@ proptest! {
         values in proptest::collection::vec(any_f64(), 2..200),
         cut in 1usize..40,
     ) {
-        for codec_kind in 0..3u8 {
+        for codec_kind in 0..5u8 {
             let encoded = match codec_kind {
                 0 => Chimp128.encode(&values),
                 1 => ByteSplitZstd.encode(&values),
-                _ => RawF64.encode(&values),
+                2 => RawF64.encode(&values),
+                3 => Alp.encode(&values),
+                _ => GcdDeltaFor.encode(&values),
             };
             if cut >= encoded.len() {
                 continue;
@@ -142,7 +196,9 @@ proptest! {
             let decoded = match codec_kind {
                 0 => Chimp128.decode(truncated, values.len()),
                 1 => ByteSplitZstd.decode(truncated, values.len()),
-                _ => RawF64.decode(truncated, values.len()),
+                2 => RawF64.decode(truncated, values.len()),
+                3 => Alp.decode(truncated, values.len()),
+                _ => GcdDeltaFor.decode(truncated, values.len()),
             };
             // RawF64 loses exactly `cut` bytes so the length can never match.
             if codec_kind == 2 {

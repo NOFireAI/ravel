@@ -14,9 +14,17 @@
 //! `cargo test -- --nocapture` output can be diffed across runs.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_raw};
 use ravel_bench::section_accounting::shape_many_small;
-use ravel_bench::segment_support::{SERIES_IDX, SERIES_META, SERIES_META_CHUNKS, build_segment_v5};
-use ravel_segment::{ReaderLimits, open_from_full};
+use ravel_bench::segment_support::{
+    LABEL_DICT, SERIES_IDS, SERIES_IDX, SERIES_META, SERIES_META_CHUNKS, TS_PAGES, VAL_PAGES,
+    bench_bounds, bench_identity, bench_meta, build_segment_v5,
+};
+use ravel_segment::{
+    ReaderLimits, RunInputV4, SegmentWriter, SeriesInputV4, SeriesValues, WrittenSegment,
+    encode_run_v4, open_from_full,
+};
+use ravel_types::{LabelSet, Sample, SeriesId};
 
 /// 10k `many_small` series, 20k total samples: >= the 4096 sparse-emission
 /// threshold, a fraction of the 100k report's runtime.
@@ -89,6 +97,205 @@ fn v5_measurements_are_deterministic() {
             v5.bytes.len() as u64,
             section_len(&v5.bytes, SERIES_IDX),
             section_len(&v5.bytes, SERIES_META_CHUNKS),
+        )
+    };
+    assert_eq!(measure(), measure());
+}
+
+// --- run-fragmentation byte gate (issue #312, ADR-0092) -----------------
+//
+// The gate above builds one run of two samples per series, so it measures the
+// per-series identity floor and cannot see run fragmentation. This gate builds
+// the SAME sample data two ways through `SegmentWriter::write_v5` and pins that
+// the fragmented layout costs materially more per sample than the merged one,
+// which is the whole premise of ADR-0092's run-merging L1.
+
+/// Fragmentation fixture: 500 series, 240 samples each, 15 s spacing,
+/// millisecond-resolution timestamps with +/-200 ms jitter. 500 series is
+/// below the 4096 sparse-emission threshold, so both layouts emit a plain
+/// SERIES_META (not SERIES_META_CHUNKS), matching ADR-0092's measured table.
+const FRAG_SERIES: usize = 500;
+const FRAG_SAMPLES_PER_SERIES: usize = 240;
+const FRAG_INTERVAL_NS: i64 = 15_000_000_000;
+const FRAG_JITTER_NS: i64 = 200_000_000;
+const MS_NS: i64 = 1_000_000;
+
+/// A flush is modelled 2 s apart (ADR-0076 `max_flush_delay`), so the
+/// fragmented layout's per-run provenance columns carry realistic distinct
+/// values rather than an all-zero column that would understate its cost.
+const FRAG_FLUSH_SPACING_NS: i64 = 2_000_000_000;
+
+/// One deterministic workload: 500 series x 240 samples, timestamps snapped to
+/// millisecond resolution and sorted ascending. Fixed seed, no wall-clock
+/// time. Both layouts consume this identical data, so the comparison is
+/// apples-to-apples.
+fn fragmentation_workload() -> Vec<(SeriesId, LabelSet, Vec<Sample>)> {
+    let config = WorkloadConfig {
+        series_count: FRAG_SERIES,
+        samples_per_series: FRAG_SAMPLES_PER_SERIES,
+        interval_ns: FRAG_INTERVAL_NS,
+        jitter_ns: FRAG_JITTER_NS,
+        cardinality: CardinalityProfile::many_small(FRAG_SERIES),
+        ..Default::default()
+    };
+    let mut raw = generate_raw(&config).expect("generate fragmentation workload");
+    for (_, _, samples) in &mut raw {
+        for s in samples.iter_mut() {
+            // Snap to millisecond resolution.
+            s.ts_ns = (s.ts_ns / MS_NS) * MS_NS;
+        }
+        samples.sort_by_key(|s| s.ts_ns);
+    }
+    raw
+}
+
+/// Merged layout: one run of N samples per series (one L0 flush's worth,
+/// carrying one provenance triple).
+fn build_merged(raw: &[(SeriesId, LabelSet, Vec<Sample>)]) -> WrittenSegment {
+    let inputs: Vec<SeriesInputV4> = raw
+        .iter()
+        .map(|(series_id, labels, samples)| {
+            let run = encode_run_v4(
+                series_id,
+                1_700_000_000_000_000_000,
+                0,
+                0,
+                &SeriesValues::Scalar(samples.clone()),
+            )
+            .expect("encode merged run");
+            SeriesInputV4 {
+                series_id: *series_id,
+                labels: labels.clone(),
+                runs: vec![run],
+            }
+        })
+        .collect();
+    SegmentWriter::write_v5(inputs, bench_identity(), bench_bounds(), bench_meta())
+        .expect("write merged v5")
+}
+
+/// Fragmented layout: N runs of one sample per series, each modelling a
+/// separate L0 flush with its own provenance. Every one-sample value page
+/// falls back to raw f64 and every one-sample timestamp page is an absolute
+/// varint, exactly the regime ADR-0092 measures.
+fn build_fragmented(raw: &[(SeriesId, LabelSet, Vec<Sample>)]) -> WrittenSegment {
+    let inputs: Vec<SeriesInputV4> = raw
+        .iter()
+        .map(|(series_id, labels, samples)| {
+            let runs: Vec<RunInputV4> = samples
+                .iter()
+                .enumerate()
+                .map(|(k, sample)| {
+                    encode_run_v4(
+                        series_id,
+                        1_700_000_000_000_000_000 + k as i64 * FRAG_FLUSH_SPACING_NS,
+                        0,
+                        k as u64,
+                        &SeriesValues::Scalar(vec![*sample]),
+                    )
+                    .expect("encode fragmented run")
+                })
+                .collect();
+            SeriesInputV4 {
+                series_id: *series_id,
+                labels: labels.clone(),
+                runs,
+            }
+        })
+        .collect();
+    SegmentWriter::write_v5(inputs, bench_identity(), bench_bounds(), bench_meta())
+        .expect("write fragmented v5")
+}
+
+/// The five per-section byte-per-sample figures ADR-0092 reports, plus the
+/// object total.
+struct SectionSplit {
+    label_dict: f64,
+    series_ids: f64,
+    series_meta: f64,
+    ts_pages: f64,
+    val_pages: f64,
+    total: f64,
+}
+
+fn section_split(seg: &WrittenSegment, total_samples: usize) -> SectionSplit {
+    let n = total_samples as f64;
+    let per = |kind: u32| section_len(&seg.bytes, kind) as f64 / n;
+    // At 500 series the layout is non-sparse: SERIES_META (kind 6) carries the
+    // run-major columns; SERIES_META_CHUNKS (kind 9) is absent (len 0).
+    let series_meta = per(SERIES_META) + per(SERIES_META_CHUNKS);
+    SectionSplit {
+        label_dict: per(LABEL_DICT),
+        series_ids: per(SERIES_IDS),
+        series_meta,
+        ts_pages: per(TS_PAGES),
+        val_pages: per(VAL_PAGES),
+        total: seg.bytes.len() as f64 / n,
+    }
+}
+
+fn print_split(name: &str, s: &SectionSplit) {
+    println!(
+        "[fragmentation {name}] total={:.2} B/sample  \
+         LABEL_DICT={:.2} SERIES_IDS={:.2} SERIES_META={:.2} TS_PAGES={:.2} VAL_PAGES={:.2}",
+        s.total, s.label_dict, s.series_ids, s.series_meta, s.ts_pages, s.val_pages,
+    );
+}
+
+/// Pinned lower bound on `fragmented_total / merged_total`. Measured on this
+/// tree the ratio is about 3.0 (see the printed splits); ADR-0092's own table
+/// reports 3.68 for the same workload built through the full production writer
+/// with real per-run provenance. This gate pins a conservative 2.5x with
+/// margin so it flags a regression in the fragmentation penalty without being
+/// brittle to codec-level byte wobble.
+const FRAG_RATIO_MIN: f64 = 2.5;
+
+#[test]
+fn fragmented_multi_run_shape_costs_more_than_merged() {
+    let raw = fragmentation_workload();
+    let total_samples: usize = raw.iter().map(|(_, _, s)| s.len()).sum();
+    assert_eq!(total_samples, FRAG_SERIES * FRAG_SAMPLES_PER_SERIES);
+
+    let merged = build_merged(&raw);
+    let fragmented = build_fragmented(&raw);
+
+    let merged_split = section_split(&merged, total_samples);
+    let fragmented_split = section_split(&fragmented, total_samples);
+
+    // Both splits printed on success so the numbers can be diffed across runs.
+    print_split("merged", &merged_split);
+    print_split("fragmented", &fragmented_split);
+
+    // Sanity: at 500 series both layouts are non-sparse (plain SERIES_META,
+    // no chunked catalog).
+    assert_eq!(
+        section_len(&merged.bytes, SERIES_META_CHUNKS),
+        0,
+        "500 series is below the sparse threshold: no SERIES_META_CHUNKS"
+    );
+
+    let ratio = fragmented_split.total / merged_split.total;
+    println!(
+        "[fragmentation] fragmented/merged total ratio = {ratio:.3} (gate >= {FRAG_RATIO_MIN})"
+    );
+
+    assert!(
+        ratio >= FRAG_RATIO_MIN,
+        "fragmented layout ({:.2} B/sample) must exceed merged ({:.2} B/sample) by >= {FRAG_RATIO_MIN}x, got {ratio:.3}x",
+        fragmented_split.total,
+        merged_split.total,
+    );
+}
+
+/// Determinism: the fixed-seed workload -> both writers yields byte-identical
+/// object sizes on a second run, so the pinned ratio never wobbles.
+#[test]
+fn fragmentation_measurements_are_deterministic() {
+    let measure = || {
+        let raw = fragmentation_workload();
+        (
+            build_merged(&raw).bytes.len(),
+            build_fragmented(&raw).bytes.len(),
         )
     };
     assert_eq!(measure(), measure());

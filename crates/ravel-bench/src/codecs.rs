@@ -5,8 +5,22 @@
 //! is measured through its public segment API in the bin, not reimplemented
 //! here.
 //!
-//! Two challengers plus a raw baseline:
+//! Four challengers plus a raw baseline:
 //!
+//! - [`Alp`]: Adaptive Lossless floating-Point compression (Afroozeh,
+//!   Kuffo, Boncz, "ALP: Adaptive Lossless floating-Point Compression",
+//!   SIGMOD 2024). Recover a decimal exponent `e` so each value becomes the
+//!   integer `round(v * 10^e)`, compress those integers through
+//!   `encode_i64` (the same integer path RSEG v7 uses for its
+//!   provenance columns, ADR-0092), and store any value the model does not
+//!   reproduce bit-exactly as a raw `f64` exception. Clean fallback: a value
+//!   that overflows the integer domain, is non-finite, or is `-0.0` becomes an
+//!   exception rather than corrupting the stream.
+//! - [`GcdDeltaFor`]: recover the same decimal exponent (all values must fit,
+//!   else a whole-page raw fallback), delta the resulting integers, divide the
+//!   deltas by their greatest common divisor, then frame-of-reference
+//!   bit-pack the reduced deltas. Targets integer-valued counters and
+//!   fixed-precision decimal gauges, where the deltas share a large GCD.
 //! - [`Chimp128`]: the 128-previous-values variant of the Chimp codec
 //!   (Liakos, Papakonstantinopoulou, Kotidis, "Chimp: Efficient Lossless
 //!   Floating Point Compression for Time Series Databases", VLDB 2022). Each
@@ -23,6 +37,8 @@
 //! denormals survive exactly (asserted by `tests/codec_roundtrip.rs`).
 //! Decoders treat their input as untrusted: corrupt or truncated bytes return
 //! a typed [`CodecError`], never a panic.
+
+use ravel_codec::encoding::{Enc, decode_i64, encode_i64};
 
 /// Typed decode failure. Encoding never fails, so only decoders return this.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -451,6 +467,398 @@ impl ValueCodec for RawF64 {
     }
 }
 
+// --- shared integer-model helpers (ALP, GCD-FOR) ------------------------
+
+/// Largest decimal exponent either integer-model codec will try. `10^18`
+/// still fits an `i64` (max `~9.22e18`), and larger exponents only lose
+/// precision, so a decimal that needs more than 18 places is not modelled and
+/// falls back (per value for ALP, per page for GCD-FOR).
+const MAX_DECIMAL_EXP: usize = 18;
+
+/// `10^0 ..= 10^18` as exact `f64` (every one is representable: `10^22` is the
+/// last exactly-representable power of ten in `f64`).
+const POW10: [f64; MAX_DECIMAL_EXP + 1] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18,
+];
+
+/// The i64 digit `v` maps to under exponent `e`, or `None` when the model does
+/// not reproduce `v` bit-exactly: non-finite, out of the i64 domain after
+/// scaling, or a round-trip that changes any bit (notably `-0.0`, whose sign
+/// the integer path drops).
+fn digit_for(v: f64, e: usize) -> Option<i64> {
+    let scaled = v * POW10[e];
+    // 2^63 as f64; `as i64` saturates but we reject the whole range to stay
+    // inside the exactly-invertible domain.
+    if !scaled.is_finite() || scaled.abs() >= 9_223_372_036_854_775_808.0 {
+        return None;
+    }
+    let digit = scaled.round() as i64;
+    // The decoder computes exactly this; accept only when it is bit-identical.
+    if ((digit as f64) / POW10[e]).to_bits() == v.to_bits() {
+        Some(digit)
+    } else {
+        None
+    }
+}
+
+/// Exponent in `0..=MAX_DECIMAL_EXP` that fits the most values bit-exactly,
+/// ties broken toward the smaller exponent (fewer significant digits, smaller
+/// integers). Returns the exponent and how many values it fits.
+fn best_exponent(values: &[f64]) -> (usize, usize) {
+    let mut best = (0usize, 0usize);
+    for e in 0..=MAX_DECIMAL_EXP {
+        let fits = values
+            .iter()
+            .filter(|&&v| digit_for(v, e).is_some())
+            .count();
+        if fits > best.1 {
+            best = (e, fits);
+            if fits == values.len() {
+                break;
+            }
+        }
+    }
+    best
+}
+
+fn gcd_u64(a: u64, b: u64) -> u64 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+// --- self-contained LEB128 varints + zigzag (no dependency on ravel_codec's
+// crate-private varint module) -------------------------------------------
+
+fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn put_ivarint(out: &mut Vec<u8>, v: i64) {
+    put_uvarint(out, ((v << 1) ^ (v >> 63)) as u64);
+}
+
+fn get_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64, CodecError> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*pos).ok_or(CodecError::Truncated)?;
+        *pos += 1;
+        if shift >= 64 {
+            return Err(CodecError::Corrupt);
+        }
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+}
+
+fn get_ivarint(bytes: &[u8], pos: &mut usize) -> Result<i64, CodecError> {
+    let u = get_uvarint(bytes, pos)?;
+    Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
+}
+
+// --- frame-of-reference bit-packing over i64 (LSB-first) ----------------
+
+/// FOR-packs `values`: zigzag-varint min, then a `bit_width` byte, then each
+/// `(value - min)` LSB-packed at that width. Width 0 (all equal) writes no
+/// packed bytes.
+fn for_pack(out: &mut Vec<u8>, values: &[i64]) {
+    let min = values.iter().copied().min().unwrap_or(0);
+    let max_offset = values
+        .iter()
+        .map(|&v| (v as u64).wrapping_sub(min as u64))
+        .max()
+        .unwrap_or(0);
+    let bit_width = if max_offset == 0 {
+        0
+    } else {
+        64 - max_offset.leading_zeros()
+    };
+    put_ivarint(out, min);
+    out.push(bit_width as u8);
+    if bit_width == 0 {
+        return;
+    }
+    let mask = if bit_width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bit_width) - 1
+    };
+    let mut acc: u128 = 0;
+    let mut nbits: u32 = 0;
+    for &v in values {
+        let off = (v as u64).wrapping_sub(min as u64);
+        acc |= u128::from(off & mask) << nbits;
+        nbits += bit_width;
+        while nbits >= 8 {
+            out.push((acc & 0xff) as u8);
+            acc >>= 8;
+            nbits -= 8;
+        }
+    }
+    if nbits > 0 {
+        out.push((acc & 0xff) as u8);
+    }
+}
+
+/// Inverse of [`for_pack`] for exactly `count` values, reading from `bytes` at
+/// `pos`. A `bit_width > 64` or a packed region shorter than `count * width`
+/// bits is a typed error, never a panic.
+fn for_unpack(bytes: &[u8], pos: &mut usize, count: usize) -> Result<Vec<i64>, CodecError> {
+    let min = get_ivarint(bytes, pos)?;
+    let bit_width = u32::from(*bytes.get(*pos).ok_or(CodecError::Truncated)?);
+    *pos += 1;
+    if bit_width > 64 {
+        return Err(CodecError::Corrupt);
+    }
+    if bit_width == 0 {
+        return Ok(vec![min; count]);
+    }
+    let need_bits = (count as u64)
+        .checked_mul(u64::from(bit_width))
+        .ok_or(CodecError::Overflow)?;
+    let need = usize::try_from(need_bits.div_ceil(8)).map_err(|_| CodecError::Overflow)?;
+    let region = bytes.get(*pos..*pos + need).ok_or(CodecError::Truncated)?;
+    *pos += need;
+    let mask = if bit_width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bit_width) - 1
+    };
+    let mut out = Vec::with_capacity(count.min(1 << 16));
+    let mut acc: u128 = 0;
+    let mut nbits: u32 = 0;
+    let mut byte_idx = 0usize;
+    for _ in 0..count {
+        while nbits < bit_width {
+            acc |= u128::from(region[byte_idx]) << nbits;
+            byte_idx += 1;
+            nbits += 8;
+        }
+        let off = (acc as u64) & mask;
+        acc >>= bit_width;
+        nbits -= bit_width;
+        out.push((min as u64).wrapping_add(off) as i64);
+    }
+    Ok(out)
+}
+
+// --- ALP -----------------------------------------------------------------
+
+/// ALP codec (see module docs). Stateless handle.
+pub struct Alp;
+
+impl ValueCodec for Alp {
+    fn name(&self) -> &'static str {
+        "alp"
+    }
+
+    fn encode(&self, values: &[f64]) -> Vec<u8> {
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let (e, _fits) = best_exponent(values);
+        // Digits for fit positions; a placeholder 0 for exceptions, so the
+        // integer stream stays length `count` and the exceptions overwrite it.
+        let mut digits = Vec::with_capacity(values.len());
+        let mut exceptions: Vec<(usize, u64)> = Vec::new();
+        for (i, &v) in values.iter().enumerate() {
+            match digit_for(v, e) {
+                Some(d) => digits.push(d),
+                None => {
+                    digits.push(0);
+                    exceptions.push((i, v.to_bits()));
+                }
+            }
+        }
+        let (enc, int_bytes) = encode_i64(&digits);
+        let mut out = Vec::new();
+        out.push(e as u8);
+        out.push(enc.to_u8());
+        put_uvarint(&mut out, int_bytes.len() as u64);
+        out.extend_from_slice(&int_bytes);
+        put_uvarint(&mut out, exceptions.len() as u64);
+        for (idx, bits) in &exceptions {
+            put_uvarint(&mut out, *idx as u64);
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+        out
+    }
+
+    fn decode(&self, bytes: &[u8], count: usize) -> Result<Vec<f64>, CodecError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut pos = 0usize;
+        let e = usize::from(*bytes.get(pos).ok_or(CodecError::Truncated)?);
+        pos += 1;
+        if e > MAX_DECIMAL_EXP {
+            return Err(CodecError::Corrupt);
+        }
+        let enc_tag = *bytes.get(pos).ok_or(CodecError::Truncated)?;
+        pos += 1;
+        let enc = Enc::from_u8(enc_tag).map_err(|_| CodecError::Corrupt)?;
+        let int_len =
+            usize::try_from(get_uvarint(bytes, &mut pos)?).map_err(|_| CodecError::Overflow)?;
+        let int_end = pos.checked_add(int_len).ok_or(CodecError::Truncated)?;
+        let int_bytes = bytes.get(pos..int_end).ok_or(CodecError::Truncated)?;
+        pos += int_len;
+        let digits = decode_i64(enc, int_bytes, count).map_err(|_| CodecError::Corrupt)?;
+        if digits.len() != count {
+            return Err(CodecError::Corrupt);
+        }
+        let mut out: Vec<f64> = digits.iter().map(|&d| (d as f64) / POW10[e]).collect();
+        let n_exc =
+            usize::try_from(get_uvarint(bytes, &mut pos)?).map_err(|_| CodecError::Overflow)?;
+        for _ in 0..n_exc {
+            let idx =
+                usize::try_from(get_uvarint(bytes, &mut pos)?).map_err(|_| CodecError::Overflow)?;
+            let raw_end = pos.checked_add(8).ok_or(CodecError::Truncated)?;
+            let raw = bytes.get(pos..raw_end).ok_or(CodecError::Truncated)?;
+            pos += 8;
+            let arr: [u8; 8] = raw.try_into().map_err(|_| CodecError::Truncated)?;
+            *out.get_mut(idx).ok_or(CodecError::Corrupt)? = f64::from_bits(u64::from_le_bytes(arr));
+        }
+        Ok(out)
+    }
+}
+
+// --- GCD-of-deltas + frame-of-reference ---------------------------------
+
+/// GCD-of-deltas then FOR bit-packing (see module docs). Stateless handle.
+pub struct GcdDeltaFor;
+
+/// Model marker byte written first: whole-page raw fallback vs the integer
+/// model.
+const GDF_RAW: u8 = 0;
+const GDF_MODEL: u8 = 1;
+
+impl GcdDeltaFor {
+    /// Digits under the smallest exponent that fits *every* value, or `None`
+    /// when no exponent does (then the page falls back to raw f64).
+    fn model_digits(values: &[f64]) -> Option<(usize, Vec<i64>)> {
+        for e in 0..=MAX_DECIMAL_EXP {
+            let mut digits = Vec::with_capacity(values.len());
+            let mut all = true;
+            for &v in values {
+                match digit_for(v, e) {
+                    Some(d) => digits.push(d),
+                    None => {
+                        all = false;
+                        break;
+                    }
+                }
+            }
+            if all {
+                return Some((e, digits));
+            }
+        }
+        None
+    }
+}
+
+impl ValueCodec for GcdDeltaFor {
+    fn name(&self) -> &'static str {
+        "gcd_delta_for"
+    }
+
+    fn encode(&self, values: &[f64]) -> Vec<u8> {
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let modelled = GcdDeltaFor::model_digits(values).and_then(|(e, digits)| {
+            // Deltas of the digit stream; a checked_sub failure (astronomical
+            // spread) drops to raw.
+            let mut deltas = Vec::with_capacity(digits.len().saturating_sub(1));
+            for w in digits.windows(2) {
+                deltas.push(w[1].checked_sub(w[0])?);
+            }
+            let g = deltas
+                .iter()
+                .fold(0u64, |acc, &d| gcd_u64(acc, d.unsigned_abs()));
+            let g = g.max(1);
+            let reduced: Vec<i64> = deltas.iter().map(|&d| d / g as i64).collect();
+            let mut out = vec![GDF_MODEL, e as u8];
+            put_ivarint(&mut out, digits[0]);
+            put_uvarint(&mut out, g);
+            for_pack(&mut out, &reduced);
+            Some(out)
+        });
+        modelled.unwrap_or_else(|| {
+            let mut out = Vec::with_capacity(values.len() * 8 + 1);
+            out.push(GDF_RAW);
+            for v in values {
+                out.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            out
+        })
+    }
+
+    fn decode(&self, bytes: &[u8], count: usize) -> Result<Vec<f64>, CodecError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let (&marker, body) = bytes.split_first().ok_or(CodecError::Truncated)?;
+        match marker {
+            GDF_RAW => {
+                let expected = count.checked_mul(8).ok_or(CodecError::Overflow)?;
+                if body.len() != expected {
+                    return Err(CodecError::LengthMismatch {
+                        expected,
+                        actual: body.len(),
+                        count,
+                    });
+                }
+                let mut out = Vec::with_capacity(count);
+                for chunk in body.chunks_exact(8) {
+                    let arr: [u8; 8] = chunk.try_into().map_err(|_| CodecError::Truncated)?;
+                    out.push(f64::from_bits(u64::from_le_bytes(arr)));
+                }
+                Ok(out)
+            }
+            GDF_MODEL => {
+                let mut pos = 0usize;
+                let e = usize::from(*body.get(pos).ok_or(CodecError::Truncated)?);
+                pos += 1;
+                if e > MAX_DECIMAL_EXP {
+                    return Err(CodecError::Corrupt);
+                }
+                let first = get_ivarint(body, &mut pos)?;
+                let g = get_uvarint(body, &mut pos)?;
+                if g == 0 {
+                    return Err(CodecError::Corrupt);
+                }
+                let reduced = for_unpack(body, &mut pos, count - 1)?;
+                let g = g as i64;
+                let mut digits = Vec::with_capacity(count);
+                digits.push(first);
+                let mut acc = first;
+                for r in reduced {
+                    let step = r.checked_mul(g).ok_or(CodecError::Corrupt)?;
+                    acc = acc.checked_add(step).ok_or(CodecError::Corrupt)?;
+                    digits.push(acc);
+                }
+                Ok(digits.iter().map(|&d| (d as f64) / POW10[e]).collect())
+            }
+            _ => Err(CodecError::Corrupt),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -492,6 +900,8 @@ mod tests {
     #[test]
     fn all_codecs_roundtrip_special_values() {
         let values = special_values();
+        roundtrip(&Alp, &values);
+        roundtrip(&GcdDeltaFor, &values);
         roundtrip(&Chimp128, &values);
         roundtrip(&ByteSplitZstd, &values);
         roundtrip(&RawF64, &values);
@@ -500,10 +910,50 @@ mod tests {
     #[test]
     fn empty_and_single_roundtrip() {
         for values in [vec![], vec![7.25], vec![f64::NAN]] {
+            roundtrip(&Alp, &values);
+            roundtrip(&GcdDeltaFor, &values);
             roundtrip(&Chimp128, &values);
             roundtrip(&ByteSplitZstd, &values);
             roundtrip(&RawF64, &values);
         }
+    }
+
+    #[test]
+    fn integer_and_decimal_streams_roundtrip() {
+        // Integer counter, 2-dp and 3-dp decimals: the paths the two integer
+        // codecs model rather than fall back on.
+        let counter: Vec<f64> = (0..200).map(|i| (i * 3) as f64).collect();
+        let dec2: Vec<f64> = (0..200).map(|i| (i as f64) * 0.01 + 3.57).collect();
+        let dec3: Vec<f64> = (0..200).map(|i| (i as f64) * 0.001 - 2.501).collect();
+        for values in [&counter, &dec2, &dec3] {
+            roundtrip(&Alp, values);
+            roundtrip(&GcdDeltaFor, values);
+        }
+    }
+
+    #[test]
+    fn alp_negative_zero_is_an_exception() {
+        // -0.0 * 10^e rounds to integer 0, which decodes to +0.0; ALP must
+        // route it through the exception list to preserve the sign bit.
+        let values = vec![1.0, -0.0, 2.0, -0.0, 3.0];
+        let encoded = Alp.encode(&values);
+        let decoded = Alp.decode(&encoded, values.len()).expect("decode");
+        assert_eq!(bits(&decoded), bits(&values));
+        assert!(decoded[1].is_sign_negative());
+    }
+
+    #[test]
+    fn gcd_delta_for_reduces_regular_counter() {
+        // A counter stepping by a constant 250 has all deltas == 250; the GCD
+        // is 250, reduced deltas are all 1, and the model beats raw f64.
+        let values: Vec<f64> = (0..240).map(|i| (i * 250) as f64).collect();
+        let encoded = GcdDeltaFor.encode(&values);
+        assert!(
+            encoded.len() < values.len() * 8,
+            "gcd_delta_for must beat raw on a constant-stride counter"
+        );
+        let decoded = GcdDeltaFor.decode(&encoded, values.len()).expect("decode");
+        assert_eq!(bits(&decoded), bits(&values));
     }
 
     #[test]
@@ -526,6 +976,8 @@ mod tests {
             Chimp128.encode(&values),
             ByteSplitZstd.encode(&values),
             RawF64.encode(&values),
+            Alp.encode(&values),
+            GcdDeltaFor.encode(&values),
         ]
         .into_iter()
         .enumerate()
@@ -536,7 +988,9 @@ mod tests {
                 let _ = match which {
                     0 => Chimp128.decode(truncated, values.len()),
                     1 => ByteSplitZstd.decode(truncated, values.len()),
-                    _ => RawF64.decode(truncated, values.len()),
+                    2 => RawF64.decode(truncated, values.len()),
+                    3 => Alp.decode(truncated, values.len()),
+                    _ => GcdDeltaFor.decode(truncated, values.len()),
                 };
                 // No panic is the assertion; result may be Ok or Err.
             }
