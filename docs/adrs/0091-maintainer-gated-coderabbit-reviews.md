@@ -509,10 +509,22 @@ Reviews stop being automatic. A maintainer dispatches the workflow, approves the
 environment, and gets one review of one revision. That is slower than the App,
 and it is the cost of the property.
 
-The workflow is inert until an administrator creates the `coderabbit-oss`
-environment and its secret. A dispatch before then fails at the environment
-gate. This is the intended shipping state: nothing can spend the allowance until
-someone with the authority to decide that has acted.
+The workflow cannot spend anything until an administrator creates the
+`coderabbit-oss` environment, protects it, and adds its secret. It is worth
+being precise about which of those is load-bearing, because an earlier draft of
+this ADR got it wrong: GitHub creates an environment the first time a workflow
+names one, with no protection rules and no secrets. So a dispatch before setup
+does not fail at a missing environment, it silently creates an unprotected one,
+and the run then fails on the missing key. The failure mode that leaves behind
+is an administrator adding the key to that auto-created environment and getting
+no reviewer gate and no branch restriction, with everything looking configured.
+
+The `authorize` job therefore verifies the environment's protection rules in
+band, on every run, and fails closed: required reviewers present, self-review
+prevented, a custom deployment branch policy naming exactly `main` and nothing
+else. Setup is asserted rather than assumed. Verified on 2026-08-19 that the
+default `GITHUB_TOKEN` with `contents: read` can read both the environments and
+the deployment-branch-policies endpoints on this repository.
 
 Three questions cannot be answered from a terminal and are named as runbook
 preconditions rather than assumed: whether the CodeRabbit organization backing

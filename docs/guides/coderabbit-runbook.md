@@ -10,10 +10,22 @@ Everything here was verified against CodeRabbit's and GitHub's documentation,
 the GitHub API for `NOFireAI/ravel`, and the CodeRabbit CLI binary, on
 **2026-08-19**.
 
-Read this first: **the integration is inert until step 3 is done.** No
-`coderabbit-oss` environment exists, so the review job cannot start and no
-credential exists to spend. That is deliberate. Do not create the environment
-until steps 1 and 2 pass.
+Read this first: **the integration cannot spend anything until the
+`coderabbit-oss` environment is protected and carries a secret.**
+
+Be precise about why, because the obvious reading is wrong. GitHub creates an
+environment the first time a workflow names one, with no protection rules and no
+secrets: "Running a workflow that references an environment that does not exist
+will create an environment with the referenced name." So a run before setup does
+not stop at a missing environment. It creates an unprotected one and then fails
+on the missing key.
+
+The trap that leaves is an administrator finding `coderabbit-oss` already there
+and simply adding the secret to it, which yields no reviewer gate and no branch
+restriction while looking configured. The `authorize` job closes it by checking
+the protection rules on every run and failing closed. **If you ever see
+`coderabbit-oss` with no required reviewers, it was auto-created. Protect it
+before adding anything to it.**
 
 ---
 
@@ -136,23 +148,51 @@ residual risk, or remove it. CodeRabbit's finest-grained chat control is
 13 `write` collaborators who are not maintainers, so that boundary is not a
 maintainer-only boundary here.
 
-## Step 3: create the protected environment
+## Step 3: create and protect the environment
 
 Only after step 1 passes.
 
-1. Repository settings, Environments, **New environment**, named exactly
-   `coderabbit-oss`.
-2. **Required reviewers**: add only current `maintain` or `admin` holders. Use
-   the reconciliation command in "Who can change what".
-3. **Prevent self-review**: on. A maintainer who dispatches the workflow must
-   not be able to approve their own deployment.
-4. **Deployment branches and tags**: *Selected branches and tags*, one rule,
-   exactly `main`. No wildcard, no tag rule.
-5. **Custom deployment protection rules**: none. Do not enable a third-party
-   protection app here.
-6. Add the secret **`CODERABBIT_API_KEY`** as an *environment* secret of
-   `coderabbit-oss`. Not a repository secret, not an organization secret, not a
-   variable.
+**Done on 2026-08-19**, with this state, which the `authorize` job now asserts
+on every run:
+
+- Required reviewers: `ananos`, `spirosoik`, `alextoulps`, `safts`,
+  `stylianosrigas`, `asapranidis`
+- Prevent self-review: on
+- Deployment branches: *Selected*, one rule, exactly `main`
+- Custom deployment protection rules: none
+- Secret: **not set**. Adding `CODERABBIT_API_KEY` is the remaining step, and it
+  waits on step 1.
+
+Two things to know about that reviewer list.
+
+GitHub caps required reviewers at **six**, and this repository has seven admins,
+so one had to be left out. It is `pmoust`, on the reasoning that they are the
+integration's primary operator and `prevent_self_review` already excludes them
+from approving their own dispatches, which makes their reviewer slot the one
+least often usable. Swap it with one API call if that is wrong.
+
+The cap is why a `@NOFireAI/ravel-maintainers` team is the better end state: a
+team counts as one reviewer entry, so the cap stops binding, and it also
+replaces the seven hardcoded logins in `.github/CODEOWNERS`. Reconcile the list
+against roles whenever they change.
+
+To recreate this from scratch:
+
+```sh
+gh api --method PUT repos/NOFireAI/ravel/environments/coderabbit-oss --input - <<'JSON'
+{"wait_timer":0,"prevent_self_review":true,
+ "reviewers":[{"type":"User","id":678645},{"type":"User","id":812075},
+              {"type":"User","id":4415924},{"type":"User","id":14074326},
+              {"type":"User","id":14320113},{"type":"User","id":149146140}],
+ "deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}
+JSON
+gh api --method POST repos/NOFireAI/ravel/environments/coderabbit-oss/deployment-branch-policies \
+  -f name=main -f type=branch
+```
+
+Then add the secret **`CODERABBIT_API_KEY`** as an *environment* secret of
+`coderabbit-oss`. Not a repository secret, not an organization secret, not a
+variable.
 
 Verify:
 
@@ -328,7 +368,8 @@ identities available for the `write` cases.
 | 19 | Rate limit does not fall through to paid usage | Exhaust the hourly CLI allowance, then dispatch | Job summary: "CodeRabbit declined this review". No retry, no credit, exit success. Confirm the CodeRabbit usage page shows no credit spend | I + M |
 | 20 | Oversized PR does not trigger on-demand billing or partitioned reviews | Dispatch against a PR exceeding the plan's per-review file limit | One call, one declining message, no split, no matrix, no credit spend. Confirm on the CodeRabbit usage page | I + M |
 | 21 | Key absent from logs, outputs, caches, artifacts | Read the full run log; check `gh run view <id> --log` for the key; confirm no `upload-artifact` and no cache step exists | The key appears nowhere. It is referenced by exactly one step, passed as an argument to one process, and the runner state is scrubbed afterwards | I |
-| 22 | Non-`main` ref cannot reach the environment | Push a branch carrying a modified copy of the workflow and dispatch it on that ref | Rejected twice over: the "Assert trusted control plane" step fails on the ref, and the environment's deployment branch policy admits only `main` | I + M |
+| 22 | Non-`main` ref cannot reach the environment | Push a branch carrying a modified copy of the workflow and dispatch it on that ref | Rejected three times over: "Assert trusted control plane" fails on the ref, the in-band guard requires the deployment branch policy to name exactly `main`, and GitHub itself refuses the deployment | I |
+| 24 | An unprotected environment is refused | Remove the required reviewers from `coderabbit-oss` (or let a run auto-create a fresh one), then dispatch | "Verify the protected environment is actually protected" fails before the environment is requested. Covered offline by `scripts/coderabbit-acceptance-tests.sh` section E3, which exercises the shipped guard against a rules-less environment, self-review left on, an any-protected-branch policy, a wildcard branch, an extra branch, and an unreadable environment | I |
 | 23 | Disabling stops all activity without touching Ravel CI | Follow [Rollback](#rollback) on a scratch schedule and observe | No CodeRabbit review can be produced. `ci`, `publish-images`, `bench-s3`, `k8s-nightly`, `sim-nightly`, and `quickstart-published` are untouched: no file of theirs changes and no required check is removed | I |
 
 Cases 1 to 5, 7, 8, 12, 16, and 18, and the policy and cost-control assertions
@@ -537,6 +578,14 @@ never the decision: MEMBER and COLLABORATOR are both far wider than maintainer.
 A determined abuser is answered by revoking their access; there is no
 workflow-level fix, because GitHub does not expose the trigger permission this
 design would want.
+
+**Every comment in the repository now produces a workflow run record.**
+`issue_comment` has no body or path filter at the trigger level, so GitHub
+queues a run for each comment on every issue and pull request, and the
+pre-filter skips the jobs. A skipped job allocates no runner and consumes no
+minutes, so the cost is Actions-tab noise rather than money. Filter with
+`gh run list --workflow coderabbit-maintainer-review.yml --json conclusion` and
+ignore the `skipped` ones.
 
 **The acknowledgement job holds `issues: write`.** That scope can comment on
 issues, not only react to them. It is confined to a job that runs after
