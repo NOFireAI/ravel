@@ -200,6 +200,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                 self.run_slice_logs(
                     request.scope,
                     request.budgets,
+                    tenant_hash,
                     matchers,
                     erasure,
                     request.window_start_ns,
@@ -377,12 +378,15 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     /// this slice's segments produces the exact per-record view `RlogReader`
     /// produces locally, and applies erasure identically per segment, whether or
     /// not a stream's segments straddle two slices. The coordinator (see
-    /// [`crate::distrib::merge_log_records`]) re-orders and dedups; this path
-    /// never assumes a stream maps to one slice.
+    /// [`crate::distrib::merge_log_records`]) re-orders under a total order but
+    /// never dedups (logs have no query-time dedup); this path never assumes a
+    /// stream maps to one slice.
+    #[allow(clippy::too_many_arguments)]
     async fn run_slice_logs(
         &self,
         scope: Option<pb::fetch_request::Scope>,
         budgets: Option<pb::Budgets>,
+        tenant_hash: TenantHash,
         matchers: Vec<ravel_promql::LabelMatcher>,
         erasure: Vec<crate::erasure::ErasurePredicate>,
         window_start_ns: i64,
@@ -448,7 +452,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         let stats = FetchStats::default();
         for seg in &segments {
             let out = log_fetcher
-                .fetch_accounted(seg, &query, &accounting)
+                .fetch_accounted_with_tenant(seg, tenant_hash, &query, &accounting)
                 .await
                 .map_err(map_log_fetch_error)?;
             if let Some(output) = out {

@@ -579,11 +579,14 @@ pub(crate) fn merge_log_records(per_slice: Vec<Vec<LogRecord>>) -> Vec<LogRecord
         .flatten()
         .map(|record| (log_record_order_key(&record), record))
         .collect();
-    // A stable sort on the precomputed full-content key; equal-key records are
-    // byte-identical, so which of a duplicate run survives `dedup_by` is
-    // immaterial.
+    // A stable sort on the precomputed full-content key. Equal-key records are
+    // byte-identical, but they are NOT collapsed: the consistency model
+    // (docs/consistency-model.md, "logs and spans") forbids query-time dedup
+    // for logs/alerts/audit, because a retry after a lost ack produces
+    // byte-identical rows that are legitimately duplicate USER DATA and must
+    // stay visible. Every record in the pool is returned; only the metric path
+    // (dedup by (series_id, ts), where duplicates are harmless) dedups.
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    keyed.dedup_by(|a, b| a.0 == b.0);
     keyed.into_iter().map(|(_, record)| record).collect()
 }
 
@@ -604,7 +607,7 @@ type LogOrderKey = (
     Vec<u8>,
 );
 
-fn log_record_order_key(record: &LogRecord) -> LogOrderKey {
+pub(crate) fn log_record_order_key(record: &LogRecord) -> LogOrderKey {
     // Encode each attribute pair with the frozen canonical grammar and
     // concatenate in the record's own order. Each single-entry encoding is
     // self-delimiting (leading count 1, then `len(key) key encode_value`), so
