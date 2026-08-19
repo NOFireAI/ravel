@@ -103,6 +103,32 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         (Category::Clause, "LIMIT") => Some(Expect::Rows(1)),
         (Category::TableDispatch, "samples -> Signal::Metrics") => Some(Expect::Rows(count)),
         (Category::TableDispatch, "logs -> Signal::Logs") => Some(Expect::Rows(LOG_RECORD_COUNT)),
+        // ADR-0090 decision 8: analytical clause/operator shapes over the
+        // metrics dataset. Every expected value is re-derived directly from the
+        // four fixture samples (1, 2, -1, 3), not from any implementation path.
+        // Four distinct values, so `count(DISTINCT value)` is 4.
+        (Category::Clause, "count(DISTINCT)") => Some(Expect::Scalar(4.0)),
+        // Four values ordered, skip the first: three rows.
+        (Category::Clause, "OFFSET") => Some(Expect::Rows(3)),
+        // Both series carry two samples, so `HAVING count >= 2` keeps both.
+        (Category::Clause, "HAVING") => Some(Expect::Rows(2)),
+        // One group per series.
+        (Category::Clause, "GROUP BY ordinal") => Some(Expect::Rows(2)),
+        // One CASE result per sample.
+        (Category::Clause, "CASE") => Some(Expect::Rows(count)),
+        // Two of the four values are in (1, 2).
+        (Category::Clause, "IN list") => Some(Expect::Rows(2)),
+        // A one-row scalar rewrite ('ab' -> 'ba' via the backreference).
+        (Category::Clause, "REGEXP_REPLACE backreference") => Some(Expect::Rows(1)),
+        // One extracted minute per sample.
+        (Category::Clause, "date_part(minute)") => Some(Expect::Rows(count)),
+        // One truncated timestamp per sample.
+        (Category::Clause, "DATE_TRUNC") => Some(Expect::Rows(count)),
+        // ADR-0090: typed queries over the declared `i64` column `dur`, whose
+        // fixture values are 10, 20, 30 (see `publish_logs`). Two rows have
+        // `dur >= 20`; the sum is 60.
+        (Category::Clause, "declared i64 typed comparison") => Some(Expect::Rows(2)),
+        (Category::Clause, "declared i64 typed aggregate") => Some(Expect::Scalar(60.0)),
         _ => None,
     }
 }
@@ -223,7 +249,9 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
                 trace_id: None,
                 span_id: None,
                 flags: 0,
-                attrs: Vec::new(),
+                // A declared `i64` attribute for the ADR-0090 typed-column
+                // conformance rows: dur = 10, 20, 30 across the three records.
+                attrs: vec![("dur".to_string(), AttrValue::I64((i as i64 + 1) * 10))],
             })
             .expect("push log record");
     }
@@ -277,7 +305,30 @@ async fn conformance_fixture() -> Fixture {
     )
     .await;
     publish_logs(store.as_ref(), &tenant).await;
-    fixture
+    // Install a declared `i64` attribute column `dur` (ADR-0090) so the
+    // typed-column conformance rows resolve a widened `logs` schema and project
+    // `dur` as a native `Int64` column. `StaticDeclaredColumns` keeps the
+    // fixture self-contained (no dependency on ravel-server's real overlay).
+    let Fixture {
+        store,
+        catalog,
+        fetcher,
+        executor,
+        data_keys,
+    } = fixture;
+    let executor = executor.with_declared_column_source(Arc::new(
+        ravel_sql::StaticDeclaredColumns::new(vec![ravel_sql::DeclaredColumn::new(
+            "dur",
+            ravel_sql::DeclaredType::I64,
+        )]),
+    ));
+    Fixture {
+        store,
+        catalog,
+        fetcher,
+        executor,
+        data_keys,
+    }
 }
 
 /// Runs one supported construct's example and checks the result against a

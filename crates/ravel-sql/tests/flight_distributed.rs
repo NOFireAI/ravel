@@ -290,6 +290,7 @@ fn endpoints_for(snapshot: &Snapshot) -> Vec<WorkerSlice> {
                 slice_index: k as u32,
                 slice_count: count,
                 pending_erasure: Vec::new(),
+                declared_columns: Vec::new(),
             },
         })
         .collect()
@@ -919,6 +920,7 @@ fn slice_template(tenant: TenantHash, statement: &str, snapshot: &Snapshot) -> F
         slice_index: 0,
         slice_count: 1,
         pending_erasure: ravel_query::erasure::snapshot_pending_erasure_predicates(snapshot),
+        declared_columns: Vec::new(),
     }
 }
 
@@ -1002,7 +1004,8 @@ async fn multi_endpoint_tickets_partition_pinned_snapshot() {
     body.extend_from_slice(&0u32.to_le_bytes()); // slice_count
     body.extend_from_slice(&0u32.to_le_bytes()); // token_count
     body.extend_from_slice(&0u32.to_le_bytes()); // seg_count
-    body.extend_from_slice(&0u32.to_le_bytes()); // erasure_count, padding to v5's MIN_ENCODED_LEN
+    body.extend_from_slice(&0u32.to_le_bytes()); // erasure_count
+    body.extend_from_slice(&0u32.to_le_bytes()); // declared_count, padding to v6's MIN_ENCODED_LEN
     body.extend_from_slice(&0u32.to_le_bytes()); // stmt_len
     let tag = blake3::keyed_hash(key, &body);
     body.extend_from_slice(tag.as_bytes());

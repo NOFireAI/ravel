@@ -102,6 +102,11 @@
 //!         value          N   matcher value (UTF-8)
 //!     window_start_ns    8   i64
 //!     window_end_ns      8   i64
+//! declared_count 4  u32   (declared typed attribute columns, ADR-0090)
+//!   per column:
+//!     key_len        4   u32
+//!     key            N   attribute key (UTF-8)
+//!     type_tag       1   1=Str 2=I64 3=Bool 4=Bytes
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
 //! mac          32   keyed BLAKE3-256 over every preceding byte
@@ -206,6 +211,21 @@
 //! distributed `FetchRequest` (`ravel-query/src/distrib/mod.rs`); this codec
 //! stays hand-rolled rather than reusing that proto message, consistent with
 //! this codec avoiding prost by design.
+//!
+//! Version 6 (ADR-0090) carries the tenant's declared typed attribute columns
+//! ([`FlightTicket::declared_columns`]). The `logs` table's declared schema is
+//! resolved once at `GetFlightInfo` from a `DeclaredColumnSource` whose real
+//! implementation is a cache-aside overlay, so its result is not a pure
+//! function of `(tenant, now_ns)`: a refresh between `GetFlightInfo` and
+//! `DoGet` could otherwise make `DoGet` plan against a different declared
+//! schema than the one the `FlightInfo` advertised, and the streamed batch
+//! schema would disagree with it. Pinning the resolved list here makes `DoGet`
+//! plan against exactly the schema `GetFlightInfo` advertised, for the same
+//! reason the segment set and the pending-erasure set are pinned. A v5 (or
+//! earlier) ticket is rejected with [`FlightTicketError::UnsupportedVersion`],
+//! never reinterpreted under the v6 layout. Consistent with every earlier
+//! extension, this is a version bump on an ephemeral MAC'd blob, not a `.proto`
+//! schema change and not an ADR of its own.
 
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
@@ -213,13 +233,15 @@ use ravel_query::erasure::ErasurePredicate;
 use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
+use crate::declared::{DeclaredColumn, DeclaredType};
+
 /// Maximum accepted SQL statement length, in bytes. 64 KiB. Longer
 /// statements are rejected at [`FlightTicket::encode`] time and refused at
 /// [`FlightTicket::decode`] time.
 pub const MAX_STATEMENT_LEN: usize = 64 * 1024;
 
 const MAGIC: [u8; 4] = *b"RFT1";
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 
 /// Length in bytes of the trailing keyed-MAC tag ([`mac`]).
 const MAC_LEN: usize = 32;
@@ -269,8 +291,9 @@ pub fn derive_ticket_key(shared_secret: &[u8]) -> TicketKey {
 
 /// Smallest possible encoded ticket: the fixed header (including the
 /// `slice_index`/`slice_count` pair) plus the trailing MAC, with zero tokens,
-/// zero segments, zero pending-erasure predicates, and an empty statement.
-const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + MAC_LEN;
+/// zero segments, zero pending-erasure predicates, zero declared columns, and
+/// an empty statement.
+const MIN_ENCODED_LEN: usize = 4 + 1 + 16 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + MAC_LEN;
 
 /// One pinned segment inside a [`FlightTicket`]: the wire mirror of a
 /// resolved [`SegmentRef`].
@@ -407,6 +430,16 @@ pub struct FlightTicket {
     /// excludes exactly what `GetFlightInfo`'s resolve saw pending, never a
     /// re-resolution and never an empty set.
     pub pending_erasure: Vec<ErasurePredicate>,
+    /// The tenant's declared typed attribute columns resolved at
+    /// `GetFlightInfo` (ADR-0090 decision 2). Pinned into the ticket so `DoGet`
+    /// plans the `logs` table against the exact same declared schema
+    /// `GetFlightInfo` advertised, never a re-resolution: the real
+    /// `DeclaredColumnSource` is a cache-aside overlay whose result is not a
+    /// pure function of `(tenant, now_ns)`, so a concurrent refresh between the
+    /// two RPCs could otherwise stream a batch schema that disagrees with the
+    /// advertised `FlightInfo` schema. Empty for a metrics/spans query or a
+    /// tenant with no declared columns.
+    pub declared_columns: Vec<DeclaredColumn>,
 }
 
 impl FlightTicket {
@@ -466,6 +499,12 @@ impl FlightTicket {
             }
             buf.extend_from_slice(&predicate.window_start_ns().to_le_bytes());
             buf.extend_from_slice(&predicate.window_end_ns().to_le_bytes());
+        }
+
+        write_u32(&mut buf, u32_len(self.declared_columns.len())?);
+        for column in &self.declared_columns {
+            write_len_prefixed(&mut buf, column.key.as_bytes())?;
+            buf.push(declared_type_tag(column.ty));
         }
 
         write_len_prefixed(&mut buf, self.statement.as_bytes())?;
@@ -575,6 +614,15 @@ impl FlightTicket {
             ));
         }
 
+        let declared_count = cur.read_u32()?;
+        let mut declared_columns = Vec::new();
+        for _ in 0..declared_count {
+            let key = cur.read_len_prefixed()?;
+            let key = std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
+            let ty = declared_type_from_tag(cur.read_u8()?)?;
+            declared_columns.push(DeclaredColumn::new(key.to_owned(), ty));
+        }
+
         let stmt_len = cur.read_u32()? as usize;
         if stmt_len > MAX_STATEMENT_LEN {
             return Err(FlightTicketError::StatementTooLong {
@@ -600,6 +648,7 @@ impl FlightTicket {
             slice_index,
             slice_count,
             pending_erasure,
+            declared_columns,
         })
     }
 
@@ -697,6 +746,10 @@ pub enum FlightTicketError {
     /// A segment's level tag byte was neither L0 (0) nor L1 (1).
     #[error("ticket contains an invalid segment level tag {0}")]
     InvalidSegmentLevel(u8),
+    /// A declared column's type tag byte was not one of the four declarable
+    /// types (ADR-0090).
+    #[error("ticket contains an invalid declared column type tag {0}")]
+    InvalidDeclaredType(u8),
     /// Bytes remained after the last field was read.
     #[error("ticket has trailing bytes")]
     TrailingBytes,
@@ -758,6 +811,29 @@ fn write_segment_level(buf: &mut Vec<u8>, level: &SegmentLevel) {
             buf.extend_from_slice(input_set_hash);
             buf.extend_from_slice(&part_index.to_le_bytes());
         }
+    }
+}
+
+/// Wire tag for a [`DeclaredType`] (ADR-0090). A single byte, its own small
+/// enumeration distinct from `ravel_logseg`'s `FieldType` byte so a change to
+/// either surfaces as a compile error here rather than a silently different
+/// pin. `f64`/`List`/`Map` have no declared type, so only these four exist.
+fn declared_type_tag(ty: DeclaredType) -> u8 {
+    match ty {
+        DeclaredType::Str => 1,
+        DeclaredType::I64 => 2,
+        DeclaredType::Bool => 3,
+        DeclaredType::Bytes => 4,
+    }
+}
+
+fn declared_type_from_tag(tag: u8) -> Result<DeclaredType, FlightTicketError> {
+    match tag {
+        1 => Ok(DeclaredType::Str),
+        2 => Ok(DeclaredType::I64),
+        3 => Ok(DeclaredType::Bool),
+        4 => Ok(DeclaredType::Bytes),
+        other => Err(FlightTicketError::InvalidDeclaredType(other)),
     }
 }
 
@@ -872,6 +948,7 @@ mod tests {
             slice_index: 0,
             slice_count: 1,
             pending_erasure: Vec::new(),
+            declared_columns: Vec::new(),
         };
         let encoded = ticket.encode(&a).expect("encode");
         assert!(FlightTicket::decode(&encoded, &b).is_ok());
@@ -938,6 +1015,14 @@ mod tests {
             pending_erasure: vec![
                 ErasurePredicate::windowless(vec![("__name__".to_owned(), "erase_me".to_owned())]),
                 ErasurePredicate::new(vec![("region".to_owned(), "us-east".to_owned())], 100, 200),
+            ],
+            // One declared column of each type, so the round-trip and
+            // single-flip tests exercise every DeclaredType wire tag.
+            declared_columns: vec![
+                DeclaredColumn::new("http.status_code", DeclaredType::I64),
+                DeclaredColumn::new("k8s.namespace.name", DeclaredType::Str),
+                DeclaredColumn::new("ok", DeclaredType::Bool),
+                DeclaredColumn::new("payload", DeclaredType::Bytes),
             ],
         }
     }
@@ -1025,7 +1110,8 @@ mod tests {
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
         write_u32(&mut body, 0);
-        write_u32(&mut body, 0); // erasure_count, so this clears MIN_ENCODED_LEN
+        write_u32(&mut body, 0); // erasure_count
+        write_u32(&mut body, 0); // declared_count, so this clears MIN_ENCODED_LEN
         // A valid MAC under the real key: the version check, not the MAC,
         // must be what rejects this.
         let tag = mac(&key, &body);
@@ -1059,6 +1145,7 @@ mod tests {
         write_u32(&mut body, 0); // tokens
         write_u32(&mut body, 0); // segments
         write_u32(&mut body, 0); // erasure_count
+        write_u32(&mut body, 0); // declared_count
         write_u32(&mut body, 0); // stmt_len
         let tag = mac(&key, &body);
         body.extend_from_slice(&tag);
@@ -1087,13 +1174,44 @@ mod tests {
         write_u32(&mut body, 0); // slice_count
         write_u32(&mut body, 0); // tokens
         write_u32(&mut body, 0); // segments
-        write_u32(&mut body, 0); // erasure_count, padding to v5's MIN_ENCODED_LEN
+        write_u32(&mut body, 0); // erasure_count
+        write_u32(&mut body, 0); // declared_count, padding to v6's MIN_ENCODED_LEN
         write_u32(&mut body, 0); // stmt_len
         let tag = mac(&key, &body);
         body.extend_from_slice(&tag);
         assert_eq!(
             FlightTicket::decode(&body, &key),
             Err(FlightTicketError::UnsupportedVersion(4))
+        );
+    }
+
+    /// v5 (the predecessor of this ticket's `declared_columns` field, ADR-0090)
+    /// is rejected the same way v3 and v4 are: a v5-shaped envelope carrying a
+    /// valid MAC under this process's key still fails on the version byte, never
+    /// reinterpreted under the v6 layout -- which would otherwise silently read
+    /// v5's `stmt_len` as `declared_count` and desync every field after it
+    /// instead of refusing outright.
+    #[test]
+    fn a_v5_envelope_is_rejected_as_unsupported_version() {
+        let key = test_key();
+        let mut body = Vec::new();
+        body.extend_from_slice(&MAGIC);
+        body.push(5); // the predecessor version, before declared_columns
+        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0i64.to_le_bytes());
+        write_u32(&mut body, 0); // slice_index
+        write_u32(&mut body, 0); // slice_count
+        write_u32(&mut body, 0); // tokens
+        write_u32(&mut body, 0); // segments
+        write_u32(&mut body, 0); // erasure_count
+        write_u32(&mut body, 0); // declared_count, padding to v6's MIN_ENCODED_LEN
+        write_u32(&mut body, 0); // stmt_len
+        let tag = mac(&key, &body);
+        body.extend_from_slice(&tag);
+        assert_eq!(
+            FlightTicket::decode(&body, &key),
+            Err(FlightTicketError::UnsupportedVersion(5))
         );
     }
 
@@ -1147,6 +1265,7 @@ mod tests {
             slice_index: 0,
             slice_count: 1,
             pending_erasure: vec![],
+            declared_columns: vec![],
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(bytes.len(), MIN_ENCODED_LEN);
@@ -1189,6 +1308,17 @@ mod tests {
                         i as i64,
                         i as i64 + 1,
                     )
+                })
+                .collect(),
+            declared_columns: (0..8)
+                .map(|i| {
+                    let ty = match i % 4 {
+                        0 => DeclaredType::Str,
+                        1 => DeclaredType::I64,
+                        2 => DeclaredType::Bool,
+                        _ => DeclaredType::Bytes,
+                    };
+                    DeclaredColumn::new(format!("declared.{i}"), ty)
                 })
                 .collect(),
         };
@@ -1235,6 +1365,7 @@ mod tests {
         write_u32(&mut body, 0); // tokens
         write_u32(&mut body, 0); // segments
         write_u32(&mut body, 0); // erasure_count
+        write_u32(&mut body, 0); // declared_count
         write_u32(&mut body, (MAX_STATEMENT_LEN + 1) as u32); // stmt_len
         // No stmt bytes follow, but the length check fires before the read.
         let tag = mac(&key, &body);
@@ -1346,6 +1477,7 @@ mod tests {
             slice_index: 0,
             slice_count: 1,
             pending_erasure: vec![],
+            declared_columns: vec![],
         };
         let mut bytes = ticket.encode(&key).expect("encode");
         // The level tag sits right after the per-segment fixed fields and the
@@ -1466,6 +1598,19 @@ mod tests {
             })
     }
 
+    fn declared_type_strategy() -> impl Strategy<Value = DeclaredType> {
+        prop_oneof![
+            Just(DeclaredType::Str),
+            Just(DeclaredType::I64),
+            Just(DeclaredType::Bool),
+            Just(DeclaredType::Bytes),
+        ]
+    }
+
+    fn declared_column_strategy() -> impl Strategy<Value = DeclaredColumn> {
+        (".{0,32}", declared_type_strategy()).prop_map(|(key, ty)| DeclaredColumn::new(key, ty))
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -1484,6 +1629,7 @@ mod tests {
             slice_index in any::<u32>(),
             slice_count in any::<u32>(),
             pending_erasure in prop::collection::vec(erasure_predicate_strategy(), 0..8),
+            declared_columns in prop::collection::vec(declared_column_strategy(), 0..8),
         ) {
             let ticket = FlightTicket {
                 tenant: TenantHash(tenant),
@@ -1495,6 +1641,7 @@ mod tests {
                 slice_index,
                 slice_count,
                 pending_erasure,
+                declared_columns,
             };
             let key = test_key();
             let bytes = ticket.encode(&key).expect("encode");
