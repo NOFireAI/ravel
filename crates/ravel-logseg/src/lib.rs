@@ -13,6 +13,7 @@
 //! panicking.
 
 pub mod block;
+pub mod columns;
 pub mod error;
 pub mod field_dir;
 pub mod footer;
@@ -31,10 +32,11 @@ pub mod writer;
 // Cargo.toml need to change.
 pub use ravel_codec::{bloom, bloom_section, encoding, tokenizer};
 
+pub use columns::ColumnSelection;
 pub use error::LogSegError;
 pub use footer::{SuffixOutcome, open_from_suffix};
 pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockSpan};
-pub use reader::{RlogReader, ScanStats, decode_section, read_section};
+pub use reader::{BlockScan, RlogReader, ScanStats, decode_section, read_section};
 pub use record::{FieldSel, LogRecord, Predicate, stream_attrs_bytes};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
 

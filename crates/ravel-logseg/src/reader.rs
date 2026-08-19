@@ -10,8 +10,9 @@
 
 use ravel_types::logstream::AttrValue;
 
-use crate::block::{ColumnPlan, DecodedBlock, read_block};
+use crate::block::{ColumnPlan, DecodedBlock, read_block_columns};
 use crate::bloom_section::BloomSection;
+use crate::columns::ColumnSelection;
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
 use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open};
@@ -45,6 +46,14 @@ pub struct ScanStats {
     /// be parsed and postings pruning was skipped for that arm (the scan
     /// still returns correct results via bloom + exact scan).
     pub postings_degraded: bool,
+    /// Block pages this scan decompressed and decoded. Grows as blocks are
+    /// decoded, so a partially-drained [`BlockScan`] reports what it has read
+    /// so far, not what it will read.
+    pub pages_decoded: u64,
+    /// Block pages this scan skipped because the [`ColumnSelection`] excluded
+    /// their column. Zero for an all-columns scan; the observable proof that
+    /// column projection reached the page level (ADR-0087 decision 3).
+    pub pages_skipped: u64,
 }
 
 /// An opened RLOG object ready to scan.
@@ -92,6 +101,15 @@ impl<'a> RlogReader<'a> {
         column_plans(&self.field_dir)
     }
 
+    /// This object's FIELD_DIR. Test-only: production resolution of a
+    /// [`ColumnSelection`] happens inside [`RlogReader::scan_blocks`], which
+    /// reaches the directory directly; `columns.rs`'s unit tests need a real
+    /// writer-produced FIELD_DIR to resolve against.
+    #[cfg(test)]
+    pub(crate) fn field_dir(&self) -> &FieldDir {
+        &self.field_dir
+    }
+
     /// Scans the object for records matching `pred`, evaluated exactly per row.
     ///
     /// Equivalent to [`RlogReader::scan_pruned`] with an empty prune channel.
@@ -133,6 +151,38 @@ impl<'a> RlogReader<'a> {
         content: &Predicate,
         prune: &[Predicate],
     ) -> Result<(Vec<LogRecord>, ScanStats), LogSegError> {
+        let mut cursor = self.scan_blocks(content, prune, &ColumnSelection::all())?;
+        let mut out = Vec::new();
+        while let Some(rows) = cursor.next_block(self.bytes)? {
+            out.extend(rows);
+        }
+        Ok((out, cursor.stats()))
+    }
+
+    /// The block-at-a-time form of [`RlogReader::scan_pruned`], plus column
+    /// projection (ADR-0087).
+    ///
+    /// Pruning is identical: the same skip-index, POSTINGS, and bloom steps run
+    /// here, once, and the returned [`BlockScan`] names exactly the surviving
+    /// blocks. What differs is that nothing is decoded yet. The caller drives
+    /// [`BlockScan::next_block`] one block at a time and can release each
+    /// block's records before asking for the next, so peak resident decoded
+    /// memory is one block rather than one object.
+    ///
+    /// `columns` narrows what each block decodes.
+    /// [`ColumnSelection::all`] reproduces `scan_pruned` exactly, which is how
+    /// `scan_pruned` itself is implemented; a narrower selection leaves the
+    /// unselected columns undecoded, so the rebuilt records carry a *partial*
+    /// view (an unselected fixed column reads as its zero value, an unselected
+    /// attribute is simply absent from `attrs`). A caller that narrows the
+    /// selection is responsible for having included every column it, or
+    /// anything downstream of it, reads.
+    pub fn scan_blocks(
+        &self,
+        content: &Predicate,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+    ) -> Result<BlockScan, LogSegError> {
         let mut stats = ScanStats {
             blocks_total: self.skip.l0.len() as u32,
             ..ScanStats::default()
@@ -159,7 +209,7 @@ impl<'a> RlogReader<'a> {
             }
         }
         if ts_min > ts_max {
-            return Ok((Vec::new(), stats));
+            return Ok(self.empty_scan(stats));
         }
 
         // Stream filter: intersect every StreamIn arm's resolved refs.
@@ -179,7 +229,7 @@ impl<'a> RlogReader<'a> {
             }
         }
         if stream_refs.as_ref().is_some_and(|r| r.is_empty()) {
-            return Ok((Vec::new(), stats));
+            return Ok(self.empty_scan(stats));
         }
 
         // Skip-index pruning.
@@ -261,21 +311,51 @@ impl<'a> RlogReader<'a> {
         }
         stats.blocks_after_bloom = survivors.len() as u32;
 
-        // Read, verify, decode, and re-evaluate the survivors exactly.
-        let plans = self.plans();
-        let mut out = Vec::new();
+        // Locate the survivors. Nothing is read or decoded here: the caller
+        // drives the decode one block at a time through `BlockScan::next_block`.
+        let mut blocks = Vec::with_capacity(survivors.len());
         for &b in &survivors {
-            let entry = &self.skip.l0[b];
-            let block_bytes = self.block_bytes(entry.block_offset, entry.block_len)?;
-            let decoded = read_block(block_bytes, entry.block_crc32c, &plans, DEFAULT_MAX_UNCOMP)?;
-            for row in 0..decoded.record_count() {
-                if self.eval(content, &decoded, row)? {
-                    out.push(self.rebuild_record(&decoded, row)?);
-                }
-            }
+            let entry =
+                self.skip.l0.get(b).ok_or_else(|| {
+                    LogSegError::Corrupted("skip block index out of range".into())
+                })?;
+            let start = self
+                .blocks_offset
+                .checked_add(entry.block_offset)
+                .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
+            blocks.push(BlockLoc {
+                start,
+                len: entry.block_len,
+                crc32c: entry.block_crc32c,
+            });
         }
-        stats.blocks_scanned = survivors.len() as u32;
-        Ok((out, stats))
+
+        Ok(BlockScan {
+            stream_dir: self.stream_dir.clone(),
+            field_dir: self.field_dir.clone(),
+            plans: self.plans(),
+            columns: columns.resolve(&self.field_dir),
+            content: content.clone(),
+            blocks,
+            next: 0,
+            stats,
+        })
+    }
+
+    /// A cursor over zero surviving blocks, for the two pre-decode short
+    /// circuits (an empty ts range, an empty resolved stream set). Draining it
+    /// yields nothing, which is what those paths returned before.
+    fn empty_scan(&self, stats: ScanStats) -> BlockScan {
+        BlockScan {
+            stream_dir: self.stream_dir.clone(),
+            field_dir: self.field_dir.clone(),
+            plans: Vec::new(),
+            columns: None,
+            content: Predicate::And(Vec::new()),
+            blocks: Vec::new(),
+            next: 0,
+            stats,
+        }
     }
 
     /// The bloom-eligible arms: HasWord on any field, and Equals on a short
@@ -467,145 +547,236 @@ impl<'a> RlogReader<'a> {
             .get(start..end)
             .ok_or_else(|| LogSegError::Corrupted("section out of bounds".into()))
     }
+}
 
-    /// Slice of one block's stored bytes (offset is relative to BLOCKS).
-    fn block_bytes(&self, block_offset: u64, block_len: u64) -> Result<&'a [u8], LogSegError> {
-        let abs = self
-            .blocks_offset
-            .checked_add(block_offset)
-            .ok_or_else(|| LogSegError::Corrupted("block offset overflow".into()))?;
-        let start = usize::try_from(abs)
+/// The absolute extent and checksum of one surviving block, copied out of the
+/// skip index so a [`BlockScan`] can locate it without borrowing the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockLoc {
+    start: u64,
+    len: u64,
+    crc32c: u32,
+}
+
+/// A pruned scan that has not decoded anything yet: the surviving block list,
+/// the directories needed to rebuild records, and the resolved column filter.
+///
+/// [`RlogReader::scan_pruned`] is this type drained in a loop. The point of
+/// exposing it is that a caller can drain it *incrementally* and drop each
+/// block's records before asking for the next, which is what bounds the SQL
+/// logs scan's peak memory to one block rather than one partition (ADR-0087).
+///
+/// It owns everything it needs (the two directories are cloned out of the
+/// reader), so it does not borrow the object bytes. The bytes are supplied per
+/// call instead, which lets the caller hold them however it likes -- an owned
+/// `Bytes` from a cache hit, say -- without a self-referential struct.
+pub struct BlockScan {
+    stream_dir: StreamDir,
+    field_dir: FieldDir,
+    plans: Vec<ColumnPlan>,
+    /// `None` decodes every column (see [`ColumnSelection::resolve`]).
+    columns: Option<std::collections::HashSet<u32>>,
+    /// The exact per-row filter, re-evaluated against every decoded row.
+    content: Predicate,
+    blocks: Vec<BlockLoc>,
+    next: usize,
+    stats: ScanStats,
+}
+
+impl BlockScan {
+    /// Pruning counters. `blocks_total`/`blocks_after_*` are final from
+    /// construction; `blocks_scanned`, `pages_decoded`, and `pages_skipped`
+    /// grow as blocks are drained, so read this after the last
+    /// [`Self::next_block`] to get the whole scan's figures.
+    pub fn stats(&self) -> ScanStats {
+        self.stats
+    }
+
+    /// Surviving blocks not yet decoded.
+    pub fn remaining_blocks(&self) -> usize {
+        self.blocks.len().saturating_sub(self.next)
+    }
+
+    /// Decode the next surviving block and return the rows of it that match the
+    /// exact filter, or `None` once every surviving block has been decoded.
+    ///
+    /// `object_bytes` MUST be the whole RLOG object the [`RlogReader`] this
+    /// cursor came from was opened on: block extents are absolute offsets into
+    /// it. A block whose extent falls outside the buffer is a typed
+    /// `Corrupted` error, never a panic.
+    ///
+    /// Returning `Some(vec![])` is normal and distinct from `None`: a block can
+    /// survive pruning and still have no row matching the exact filter. Only
+    /// `None` means the scan is finished.
+    pub fn next_block(
+        &mut self,
+        object_bytes: &[u8],
+    ) -> Result<Option<Vec<LogRecord>>, LogSegError> {
+        let Some(loc) = self.blocks.get(self.next).copied() else {
+            return Ok(None);
+        };
+        self.next += 1;
+        let start = usize::try_from(loc.start)
             .map_err(|_| LogSegError::Corrupted("block offset range".into()))?;
-        let len = usize::try_from(block_len)
+        let len = usize::try_from(loc.len)
             .map_err(|_| LogSegError::Corrupted("block len range".into()))?;
         let end = start
             .checked_add(len)
             .ok_or_else(|| LogSegError::Corrupted("block range overflow".into()))?;
-        self.bytes
+        let block_bytes = object_bytes
             .get(start..end)
-            .ok_or_else(|| LogSegError::Corrupted("block out of bounds".into()))
+            .ok_or_else(|| LogSegError::Corrupted("block out of bounds".into()))?;
+        let decoded = read_block_columns(
+            block_bytes,
+            loc.crc32c,
+            &self.plans,
+            DEFAULT_MAX_UNCOMP,
+            self.columns.as_ref(),
+        )?;
+        self.stats.blocks_scanned += 1;
+        self.stats.pages_decoded += decoded.pages_decoded() as u64;
+        self.stats.pages_skipped += decoded.pages_skipped() as u64;
+
+        let strict = self.columns.is_none();
+        let mut out = Vec::new();
+        for row in 0..decoded.record_count() {
+            if eval(
+                &self.stream_dir,
+                &self.field_dir,
+                &self.content,
+                &decoded,
+                row,
+            )? {
+                out.push(rebuild_record_projected(
+                    &self.stream_dir,
+                    &self.field_dir,
+                    &decoded,
+                    row,
+                    strict,
+                )?);
+            }
+        }
+        Ok(Some(out))
     }
+}
 
-    // --- exact evaluation ---------------------------------------------------
+// --- exact evaluation -------------------------------------------------------
 
-    fn eval(
-        &self,
-        pred: &Predicate,
-        block: &DecodedBlock,
-        row: usize,
-    ) -> Result<bool, LogSegError> {
-        Ok(match pred {
-            Predicate::And(v) => {
-                for p in v {
-                    if !self.eval(p, block, row)? {
-                        return Ok(false);
-                    }
-                }
-                true
-            }
-            Predicate::TsRange { min_ns, max_ns } => {
-                let ts = i64_at(block, COL_TS, row)?;
-                ts >= *min_ns && ts <= *max_ns
-            }
-            Predicate::StreamIn(ids) => {
-                let r = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
-                    .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-                match self.stream_dir.stream_id(r) {
-                    Some(sid) => ids.contains(sid),
-                    None => false,
+/// Evaluate the exact filter against one decoded row.
+///
+/// Free rather than a [`RlogReader`] method because [`BlockScan`] evaluates the
+/// same predicate without holding a reader: both need only the two directories.
+fn eval(
+    stream_dir: &StreamDir,
+    field_dir: &FieldDir,
+    pred: &Predicate,
+    block: &DecodedBlock,
+    row: usize,
+) -> Result<bool, LogSegError> {
+    Ok(match pred {
+        Predicate::And(v) => {
+            for p in v {
+                if !eval(stream_dir, field_dir, p, block, row)? {
+                    return Ok(false);
                 }
             }
-            Predicate::HasWord { field, word } => {
-                let value = self.field_text(field, block, row)?;
-                match value {
-                    Some(bytes) => phrase_match(&bytes, word),
-                    None => false,
-                }
+            true
+        }
+        Predicate::TsRange { min_ns, max_ns } => {
+            let ts = i64_at(block, COL_TS, row)?;
+            ts >= *min_ns && ts <= *max_ns
+        }
+        Predicate::StreamIn(ids) => {
+            let r = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            match stream_dir.stream_id(r) {
+                Some(sid) => ids.contains(sid),
+                None => false,
             }
-            Predicate::Equals { field, value } => self.equals(field, value, block, row)?,
-        })
-    }
+        }
+        Predicate::HasWord { field, word } => {
+            let value = field_text(field_dir, field, block, row)?;
+            match value {
+                Some(bytes) => phrase_match(&bytes, word),
+                None => false,
+            }
+        }
+        Predicate::Equals { field, value } => equals(field_dir, field, value, block, row)?,
+    })
+}
 
-    /// The tokenizable text of a field for a row, if present.
-    fn field_text(
-        &self,
-        field: &FieldSel,
-        block: &DecodedBlock,
-        row: usize,
-    ) -> Result<Option<Vec<u8>>, LogSegError> {
-        Ok(match field {
-            FieldSel::Body => str_at(block, COL_BODY, row),
-            FieldSel::SeverityText => str_at(block, COL_SEVERITY_TEXT, row),
-            FieldSel::Attr(name) => {
-                match self.field_dir.column(name, FieldType::Str) {
-                    Some(e) => str_at(block, e.column_id, row),
-                    // Fall back to an overflow attr of type Str.
-                    None => self.overflow_attr(block, row, name)?.and_then(|v| match v {
-                        AttrValue::Str(s) => Some(s.into_bytes()),
-                        _ => None,
-                    }),
-                }
+/// The tokenizable text of a field for a row, if present.
+fn field_text(
+    field_dir: &FieldDir,
+    field: &FieldSel,
+    block: &DecodedBlock,
+    row: usize,
+) -> Result<Option<Vec<u8>>, LogSegError> {
+    Ok(match field {
+        FieldSel::Body => str_at(block, COL_BODY, row),
+        FieldSel::SeverityText => str_at(block, COL_SEVERITY_TEXT, row),
+        FieldSel::Attr(name) => {
+            match field_dir.column(name, FieldType::Str) {
+                Some(e) => str_at(block, e.column_id, row),
+                // Fall back to an overflow attr of type Str.
+                None => overflow_attr(block, row, name)?.and_then(|v| match v {
+                    AttrValue::Str(s) => Some(s.into_bytes()),
+                    _ => None,
+                }),
             }
-        })
-    }
+        }
+    })
+}
 
-    fn equals(
-        &self,
-        field: &FieldSel,
-        value: &AttrValue,
-        block: &DecodedBlock,
-        row: usize,
-    ) -> Result<bool, LogSegError> {
-        match field {
-            FieldSel::Body | FieldSel::SeverityText => {
-                let col = if matches!(field, FieldSel::Body) {
-                    COL_BODY
-                } else {
-                    COL_SEVERITY_TEXT
-                };
-                let stored = str_at(block, col, row);
-                Ok(match (value, stored) {
-                    (AttrValue::Str(s), Some(b)) => s.as_bytes() == b.as_slice(),
-                    _ => false,
-                })
-            }
-            FieldSel::Attr(name) => {
-                let (ty, _) = resolve_value(value);
-                if let Some(entry) = self.field_dir.column(name, ty) {
-                    Ok(attr_equals(block, entry.column_id, ty, value, row))
-                } else {
-                    // Overflow: compare against the decoded attrs_raw value.
-                    Ok(self
-                        .overflow_attr(block, row, name)?
-                        .as_ref()
-                        .is_some_and(|v| attr_value_eq(v, value)))
-                }
+fn equals(
+    field_dir: &FieldDir,
+    field: &FieldSel,
+    value: &AttrValue,
+    block: &DecodedBlock,
+    row: usize,
+) -> Result<bool, LogSegError> {
+    match field {
+        FieldSel::Body | FieldSel::SeverityText => {
+            let col = if matches!(field, FieldSel::Body) {
+                COL_BODY
+            } else {
+                COL_SEVERITY_TEXT
+            };
+            let stored = str_at(block, col, row);
+            Ok(match (value, stored) {
+                (AttrValue::Str(s), Some(b)) => s.as_bytes() == b.as_slice(),
+                _ => false,
+            })
+        }
+        FieldSel::Attr(name) => {
+            let (ty, _) = resolve_value(value);
+            if let Some(entry) = field_dir.column(name, ty) {
+                Ok(attr_equals(block, entry.column_id, ty, value, row))
+            } else {
+                // Overflow: compare against the decoded attrs_raw value.
+                Ok(overflow_attr(block, row, name)?
+                    .as_ref()
+                    .is_some_and(|v| attr_value_eq(v, value)))
             }
         }
     }
+}
 
-    /// Looks up an attribute by name in a row's decoded `attrs_raw`, if any.
-    fn overflow_attr(
-        &self,
-        block: &DecodedBlock,
-        row: usize,
-        name: &str,
-    ) -> Result<Option<AttrValue>, LogSegError> {
-        let raw = match block.str_col(crate::record::COL_ATTRS_RAW) {
-            Some(col) => match col.get(row).and_then(|v| v.as_ref()) {
-                Some(bytes) => bytes.clone(),
-                None => return Ok(None),
-            },
+/// Looks up an attribute by name in a row's decoded `attrs_raw`, if any.
+fn overflow_attr(
+    block: &DecodedBlock,
+    row: usize,
+    name: &str,
+) -> Result<Option<AttrValue>, LogSegError> {
+    let raw = match block.str_col(crate::record::COL_ATTRS_RAW) {
+        Some(col) => match col.get(row).and_then(|v| v.as_ref()) {
+            Some(bytes) => bytes.clone(),
             None => return Ok(None),
-        };
-        let attrs = decode_canonical_attrs(&raw)?;
-        Ok(attrs.into_iter().find(|(k, _)| k == name).map(|(_, v)| v))
-    }
-
-    /// Rebuilds a full [`LogRecord`] from a decoded row.
-    fn rebuild_record(&self, block: &DecodedBlock, row: usize) -> Result<LogRecord, LogSegError> {
-        rebuild_record(&self.stream_dir, &self.field_dir, block, row)
-    }
+        },
+        None => return Ok(None),
+    };
+    let attrs = decode_canonical_attrs(&raw)?;
+    Ok(attrs.into_iter().find(|(k, _)| k == name).map(|(_, v)| v))
 }
 
 /// The column plans for every dynamic column, for block decode. Shared by the
@@ -632,6 +803,30 @@ pub(crate) fn rebuild_record(
     field_dir: &FieldDir,
     block: &DecodedBlock,
     row: usize,
+) -> Result<LogRecord, LogSegError> {
+    rebuild_record_projected(stream_dir, field_dir, block, row, true)
+}
+
+/// [`rebuild_record`] over a possibly column-projected block.
+///
+/// `strict` is the all-columns contract: every fixed numeric column must be
+/// present, and its absence is a `Corrupted` error, because for an unprojected
+/// decode absence really does mean the block is malformed. Under a projection
+/// (`strict == false`) an undecoded fixed numeric column is expected, so it
+/// reads as `0` rather than erroring -- the caller asked not to decode it and
+/// must not read the field. `ts` and `stream_ref` are exempt: a
+/// [`ColumnSelection`](crate::ColumnSelection) always keeps them, so their
+/// absence is a real corruption under either mode and still errors.
+///
+/// String and fixed-width columns need no mode: they are `Option` at the block
+/// level already, so an undecoded one reads as empty/`None` exactly as an
+/// absent one does.
+pub(crate) fn rebuild_record_projected(
+    stream_dir: &StreamDir,
+    field_dir: &FieldDir,
+    block: &DecodedBlock,
+    row: usize,
+    strict: bool,
 ) -> Result<LogRecord, LogSegError> {
     let sref = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
         .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
@@ -677,15 +872,31 @@ pub(crate) fn rebuild_record(
         stream_id,
         stream_attrs,
         ts_ns: i64_at(block, COL_TS, row)?,
-        observed_ts_ns: i64_at(block, COL_OBSERVED_TS, row)?,
-        severity_num: i64_at(block, COL_SEVERITY_NUM, row)? as u8,
+        observed_ts_ns: i64_projected(block, COL_OBSERVED_TS, row, strict)?,
+        severity_num: i64_projected(block, COL_SEVERITY_NUM, row, strict)? as u8,
         severity_text,
         body,
         trace_id,
         span_id,
-        flags: i64_at(block, COL_FLAGS, row)? as u32,
+        flags: i64_projected(block, COL_FLAGS, row, strict)? as u32,
         attrs,
     })
+}
+
+/// A fixed numeric column's value, or `0` when the column was projected away.
+/// Under `strict` (an all-columns decode) an absent column is corruption and
+/// errors, exactly as before column projection existed.
+fn i64_projected(
+    block: &DecodedBlock,
+    col: u32,
+    row: usize,
+    strict: bool,
+) -> Result<i64, LogSegError> {
+    match block.i64_col(col) {
+        Some(_) => i64_at(block, col, row),
+        None if strict => i64_at(block, col, row),
+        None => Ok(0),
+    }
 }
 
 fn section(footer: &LogFooter, k: u32) -> Result<&SectionDesc, LogSegError> {

@@ -40,8 +40,8 @@ use ravel_catalog::SegmentRef;
 use ravel_logseg::footer::{self, kind};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
-    AttrValue, LogRecord, LogSegError, LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats,
-    read_section,
+    AttrValue, BlockScan, ColumnSelection, LogRecord, LogSegError, LogStreamId, Predicate,
+    RlogConfig, RlogReader, ScanStats, read_section,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
@@ -189,6 +189,78 @@ impl LogQuery {
 pub struct LogFetchOutput {
     pub records: Vec<LogRecord>,
     pub stats: ScanStats,
+}
+
+/// A fetched, pruned, not-yet-decoded scan over one segment (ADR-0087).
+///
+/// This is the streaming counterpart of [`LogFetchOutput`]: the object's bytes
+/// are resident and its blocks are pruned, but no block has been decoded. The
+/// caller pulls one block at a time with [`next_block`](Self::next_block) and
+/// can drop each block's records before asking for the next, so peak decoded
+/// memory is one block rather than one segment.
+///
+/// Everything else is identical to [`LogSegmentFetcher::fetch`]: the same
+/// combined predicate is the exact per-row filter, the same prune channel drives
+/// POSTINGS, and the same selective-erasure exclusion
+/// ([`crate::erasure::retain_log_records`]) is applied to each block's rows
+/// after fetch and after cache. Draining this to exhaustion yields exactly the
+/// records `fetch` would return, in the same order, which is how `fetch` is
+/// implemented.
+pub struct LogSegmentScan {
+    /// The whole object. Block extents are absolute offsets into it.
+    bytes: Bytes,
+    scan: BlockScan,
+    erasure: Vec<ErasurePredicate>,
+    /// The log path's `decode` span, entered around each block decode and
+    /// completed with the block counters when the scan runs out.
+    span: tracing::Span,
+    /// The object key, for error attribution.
+    key: String,
+    /// Set once [`next_block`](Self::next_block) has reported exhaustion, so
+    /// the span's counters are recorded exactly once.
+    finished: bool,
+}
+
+impl LogSegmentScan {
+    /// The reader's pruning counters. `blocks_scanned`, `pages_decoded`, and
+    /// `pages_skipped` grow as blocks are drained; read this after the last
+    /// [`next_block`](Self::next_block) for the whole segment's figures.
+    pub fn stats(&self) -> ScanStats {
+        self.scan.stats()
+    }
+
+    /// Surviving blocks not yet decoded.
+    pub fn remaining_blocks(&self) -> usize {
+        self.scan.remaining_blocks()
+    }
+
+    /// Decode the next surviving block and return its matching, unerased rows,
+    /// or `None` once every surviving block has been decoded.
+    ///
+    /// `Some(vec![])` is normal and distinct from `None`: a block can survive
+    /// pruning and hold no row that matches the exact filter, or have every
+    /// matching row erased. Only `None` ends the scan.
+    pub fn next_block(&mut self) -> Result<Option<Vec<LogRecord>>, LogFetchError> {
+        let span = self.span.clone();
+        let decoded = span
+            .in_scope(|| self.scan.next_block(&self.bytes))
+            .map_err(|source| corrupt(&self.key, source))?;
+        let Some(mut records) = decoded else {
+            if !self.finished {
+                self.finished = true;
+                let stats = self.scan.stats();
+                self.span.record("blocks_scanned", stats.blocks_scanned);
+                self.span.record("blocks_total", stats.blocks_total);
+            }
+            return Ok(None);
+        };
+        // Selective-erasure exclusion (ADR-0064 decision 2), per block rather
+        // than per segment. Filtering a block's rows and filtering the
+        // concatenation of every block's rows give the same survivors: the
+        // predicate is per record and carries no cross-record state.
+        crate::erasure::retain_log_records(&mut records, &self.erasure);
+        Ok(Some(records))
+    }
 }
 
 /// Errors fetching and decoding one RLOG segment. Every variant is a hard
@@ -452,17 +524,84 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        let Some(bytes) = self
+            .tenant_bytes(seg_ref, tenant_hash, query, accounting)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.decode_spanned(&seg_ref.data_object_key, &bytes, query)
+    }
+
+    /// Streaming counterpart of
+    /// [`fetch_accounted_with_tenant`](Self::fetch_accounted_with_tenant)
+    /// (ADR-0087 decisions 2 and 3): the same GET, the same cache, the same
+    /// pruning, but the object's blocks are returned as a [`LogSegmentScan`]
+    /// the caller drains one block at a time instead of one
+    /// already-fully-decoded `Vec<LogRecord>`.
+    ///
+    /// `columns` narrows what each block decodes. `ColumnSelection::all()`
+    /// makes this exactly `fetch_accounted_with_tenant` in slow motion; a
+    /// narrower selection leaves unselected columns undecoded, so the yielded
+    /// records carry a partial view and the caller must have included every
+    /// column it (or anything downstream of it, including its selective-erasure
+    /// exclusion) reads.
+    ///
+    /// The whole object is still fetched with one [`GetRange::Full`] GET: this
+    /// bounds *decoded* memory, not raw bytes. A ranged block read is
+    /// [`ravel_logseg::RlogRangeReader`]'s territory and out of scope here
+    /// (ADR-0087 decision 3).
+    pub async fn scan_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        let Some(bytes) = self
+            .tenant_bytes(seg_ref, tenant_hash, query, accounting)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let key = &seg_ref.data_object_key;
+        let span = decode_span();
+        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns))?;
+        Ok(Some(LogSegmentScan {
+            bytes,
+            scan,
+            erasure: query.erasure.clone(),
+            span,
+            key: key.to_string(),
+            finished: false,
+        }))
+    }
+
+    /// The byte-fetch half of the tenant-aware funnel: the ts-range pre-check,
+    /// then the object's bytes from the read cache or a whole-object GET, with
+    /// the `page_fetch` span and the accounting both entry points share.
+    /// `Ok(None)` means the catalog summary proved the object irrelevant and no
+    /// GET was issued.
+    async fn tenant_bytes(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<Bytes>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
         }
         let key = &seg_ref.data_object_key;
 
         // Same two phases as `fetch_accounted`, spanned on the path production
-        // log/alerts/audit traffic actually takes (ADR-0044 decision 5): the whole-object GET (`page_fetch`), then the STREAM_DIR
-        // resolve + `RlogReader` scan in `scan_bytes` (`decode`). Duplicated
-        // rather than shared with `fetch_accounted` because the byte-fetch
-        // differs -- this one is cache-aware and may serve a hit with no store
-        // GET at all -- while only the `scan_bytes` tail is common. The
+        // log/alerts/audit traffic actually takes (ADR-0044 decision 5): the
+        // whole-object GET (`page_fetch`) here, then the STREAM_DIR resolve +
+        // `RlogReader` prune and decode (`decode`) in whichever of the two
+        // callers this feeds. Duplicated rather than shared with
+        // `fetch_accounted` because the byte-fetch differs -- this one is
+        // cache-aware and may serve a hit with no store GET at all. The
         // recorded `s3_requests`/`s3_bytes` reflect this call's own store GETs:
         // one on the uncached or cache-miss path, zero on a cache hit (the
         // served bytes are cache, not S3).
@@ -489,7 +628,7 @@ impl LogSegmentFetcher {
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
-            return self.decode_spanned(key, &got.data, query);
+            return Ok(Some(got.data));
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
@@ -546,7 +685,7 @@ impl LogSegmentFetcher {
             fetch_span.record("s3_bytes", bytes.len() as u64);
             bytes
         };
-        self.decode_spanned(key, &bytes, query)
+        Ok(Some(bytes))
     }
 
     /// Runs [`scan_bytes`](Self::scan_bytes) inside the log path's `decode`
@@ -562,7 +701,7 @@ impl LogSegmentFetcher {
     /// bytes, and decompression happens per block inside
     /// [`RlogReader::scan_pruned`] (`read_block`) where the total is never
     /// summed. Surfacing one would need a new `ScanStats` field and a structural
-    /// change to `ravel-logseg`, out of scope for a fix confined to this crate.
+    /// change to `ravel-logseg`, out of scope for that fix.
     ///
     /// `blocks_scanned`/`blocks_total` are instead a real, already-computed
     /// pruning-effectiveness signal -- how much of the object's block index the
@@ -577,12 +716,7 @@ impl LogSegmentFetcher {
         bytes: &Bytes,
         query: &LogQuery,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
-        let span = tracing::debug_span!(
-            "decode",
-            signal = "logs",
-            blocks_scanned = tracing::field::Empty,
-            blocks_total = tracing::field::Empty,
-        );
+        let span = decode_span();
         let out = span.in_scope(|| self.scan_bytes(key, bytes, query))?;
         if let Some(output) = &out {
             span.record("blocks_scanned", output.stats.blocks_scanned);
@@ -591,20 +725,54 @@ impl LogSegmentFetcher {
         Ok(out)
     }
 
-    /// Shared tail of both fetch entry points: resolve stream-attribute
-    /// equalities against STREAM_DIR (over-approximating, see
-    /// [`matching_streams`](Self::matching_streams)), build the combined exact
-    /// predicate, and scan it with `query.prune` as the prune-only channel.
-    /// Identical regardless of whether `bytes` came from the store or the cache
-    /// -- `RlogReader::scan_pruned`'s block-level skip-index and bloom
-    /// verification run unconditionally either way, so a corrupt cache entry
-    /// fails exactly like a corrupt store read.
+    /// Shared tail of both fetch entry points: open the pruned scan and drain
+    /// every block of it. This is [`LogSegmentScan`] collected eagerly, so the
+    /// two paths cannot drift: same predicate, same prune channel, same
+    /// per-record erasure exclusion, same order.
     fn scan_bytes(
         &self,
         key: &str,
         bytes: &Bytes,
         query: &LogQuery,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
+        let mut scan = self.open_scan(key, bytes, query, &ColumnSelection::all())?;
+        let mut records = Vec::new();
+        loop {
+            let block = scan.next_block(bytes).map_err(|s| corrupt(key, s))?;
+            let Some(mut rows) = block else { break };
+            // Selective-erasure exclusion (ADR-0064 decision 2): drop every
+            // row a pending erasure predicate matches. Applied here, on the
+            // decoded records, so it excludes rows identically whether `bytes`
+            // came from the store or from a cache hit -- the whole point of
+            // filtering after fetch and after cache. A no-op when
+            // `query.erasure` is empty.
+            crate::erasure::retain_log_records(&mut rows, &query.erasure);
+            records.extend(rows);
+        }
+        Ok(Some(LogFetchOutput {
+            records,
+            stats: scan.stats(),
+        }))
+    }
+
+    /// Resolve stream-attribute equalities against STREAM_DIR
+    /// (over-approximating, see [`matching_streams`](Self::matching_streams)),
+    /// build the combined exact predicate, and open the pruned scan with
+    /// `query.prune` as the prune-only channel.
+    ///
+    /// Identical regardless of whether `bytes` came from the store or the cache
+    /// -- the reader's block-level skip-index and bloom verification run
+    /// unconditionally either way, so a corrupt cache entry fails exactly like
+    /// a corrupt store read.
+    ///
+    /// [`matching_streams`]: Self::matching_streams
+    fn open_scan(
+        &self,
+        key: &str,
+        bytes: &Bytes,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+    ) -> Result<BlockScan, LogFetchError> {
         let stream_ids = if query.stream_attrs.is_empty() {
             None
         } else {
@@ -634,16 +802,9 @@ impl LogSegmentFetcher {
         // drop resource/scope-only matches (docs/adrs/0049-rlog-postings.md
         // amendment 2026-08-03). An empty channel makes this identical to
         // `scan`.
-        let (mut records, stats) = reader
-            .scan_pruned(&pred, &query.prune)
-            .map_err(|source| corrupt(key, source))?;
-        // Selective-erasure exclusion (ADR-0064 decision 2): drop every
-        // row a pending erasure predicate matches. Applied here, on the decoded
-        // records, so it excludes rows identically whether `bytes` came from
-        // the store or from a cache hit -- the whole point of filtering after
-        // fetch and after cache. A no-op when `query.erasure` is empty.
-        crate::erasure::retain_log_records(&mut records, &query.erasure);
-        Ok(Some(LogFetchOutput { records, stats }))
+        reader
+            .scan_blocks(&pred, &query.prune, columns)
+            .map_err(|source| corrupt(key, source))
     }
 
     /// Decodes the STREAM_DIR section of an object from its own public section
@@ -688,6 +849,17 @@ fn blob_contains(blob: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     blob.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The log path's `decode` phase span, shared by the collecting and the
+/// streaming funnel so both report the same fields (docs/guides/tracing.md).
+fn decode_span() -> tracing::Span {
+    tracing::debug_span!(
+        "decode",
+        signal = "logs",
+        blocks_scanned = tracing::field::Empty,
+        blocks_total = tracing::field::Empty,
+    )
 }
 
 fn corrupt(key: &str, source: LogSegError) -> LogFetchError {

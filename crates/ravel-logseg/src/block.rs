@@ -8,7 +8,7 @@
 //! SKIP_IDX level-0 entry, not inline; [`read_block`] verifies it before
 //! decoding anything.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::encoding::{
     Enc, decode_bitmap, decode_f64, decode_fixed, decode_i64, decode_strings, encode_bitmap,
@@ -386,6 +386,13 @@ fn row_column(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
 
 /// A decoded block: per-column, per-row values. Every column vector has length
 /// `record_count`; `None` marks a row where the column has no value.
+///
+/// A block decoded through [`read_block_columns`] with a column filter holds
+/// only the filtered columns. A column the filter excluded is indistinguishable
+/// from a column the block never carried: its accessor returns `None`. Callers
+/// that project must therefore know which columns they asked for; nothing here
+/// can tell them apart, by design (an absent page and a skipped page decode to
+/// the same nothing).
 pub struct DecodedBlock {
     record_count: usize,
     i64_cols: HashMap<u32, Vec<Option<i64>>>,
@@ -393,11 +400,26 @@ pub struct DecodedBlock {
     bool_cols: HashMap<u32, Vec<Option<bool>>>,
     str_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
     fixed_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
+    pages_decoded: usize,
+    pages_skipped: usize,
 }
 
 impl DecodedBlock {
     pub fn record_count(&self) -> usize {
         self.record_count
+    }
+
+    /// Pages this decode decompressed and decoded (value pages and presence
+    /// bitmaps alike).
+    pub fn pages_decoded(&self) -> usize {
+        self.pages_decoded
+    }
+
+    /// Pages this decode skipped because the column filter excluded them. Zero
+    /// for an all-columns decode. This is the observable proof that column
+    /// projection reached the page level rather than being applied after decode.
+    pub fn pages_skipped(&self) -> usize {
+        self.pages_skipped
     }
     pub fn i64_col(&self, column_id: u32) -> Option<&[Option<i64>]> {
         self.i64_cols.get(&column_id).map(Vec::as_slice)
@@ -446,6 +468,17 @@ fn column_kind(column_id: u32, plans: &[ColumnPlan]) -> Result<ColKind, LogSegEr
     })
 }
 
+/// The decoded bytes of a page that the column filter kept. Only ever called
+/// for a page whose column was grouped, i.e. one the filter kept, so a `None`
+/// here would be an internal inconsistency rather than bad input; it is still
+/// reported as a typed error rather than unwrapped.
+fn page(pages: &[Option<Vec<u8>>], idx: usize) -> Result<&[u8], LogSegError> {
+    pages
+        .get(idx)
+        .and_then(|p| p.as_deref())
+        .ok_or_else(|| LogSegError::Corrupted("page not decoded".into()))
+}
+
 /// Scatters `present`-length-`record_count` values into a per-row vector.
 /// `values` holds only the present entries, in row order.
 fn scatter<T: Clone>(present: &[bool], values: Vec<T>) -> Result<Vec<Option<T>>, LogSegError> {
@@ -469,12 +502,42 @@ fn scatter<T: Clone>(present: &[bool], values: Vec<T>) -> Result<Vec<Option<T>>,
     Ok(out)
 }
 
-/// Decodes a block, verifying its crc32c first.
+/// Decodes every column of a block, verifying its crc32c first.
+///
+/// This is the all-columns case, and it is what
+/// [`crate::ranged::RlogRangeReader`] (the compaction merge's reader) and
+/// [`crate::RlogReader::scan_pruned`] use: identical decoded output to before
+/// column projection existed. Use [`read_block_columns`] to decode a subset.
 pub fn read_block(
     bytes: &[u8],
     expected_crc: u32,
     plans: &[ColumnPlan],
     max_uncomp: u64,
+) -> Result<DecodedBlock, LogSegError> {
+    read_block_columns(bytes, expected_crc, plans, max_uncomp, None)
+}
+
+/// Decodes a block, verifying its crc32c first, decompressing and decoding only
+/// the pages of the columns `columns` names (ADR-0087 decision 3).
+///
+/// `columns == None` is the all-columns case ([`read_block`]). Otherwise every
+/// page whose `column_id` is not in the set is walked past without a
+/// `read_page` call, so its stored bytes are never decompressed and its values
+/// are never materialized; the resulting [`DecodedBlock`] reports that column as
+/// absent. Both a column's presence bitmap page and its value page are governed
+/// by the same decision, so a projected column is never left half-decoded.
+///
+/// The block's crc32c covers the whole block and is verified in full regardless
+/// of the filter: projection changes what is decoded, never what is checked.
+/// Every page descriptor is still parsed and every page's stored extent is still
+/// walked, so a truncated or over-long block is rejected exactly as it is
+/// without a filter.
+pub fn read_block_columns(
+    bytes: &[u8],
+    expected_crc: u32,
+    plans: &[ColumnPlan],
+    max_uncomp: u64,
+    columns: Option<&HashSet<u32>>,
 ) -> Result<DecodedBlock, LogSegError> {
     if crc32c::crc32c(bytes) != expected_crc {
         return Err(LogSegError::Corrupted("block crc mismatch".into()));
@@ -521,8 +584,19 @@ pub fn read_block(
         });
     }
 
-    // Slice each page's stored bytes and decompress to encoded bytes.
-    let mut page_bytes: Vec<Vec<u8>> = Vec::with_capacity(descs.len());
+    // Whether a column's pages are decoded at all. `None` selects everything.
+    let wanted = |cid: u32| match columns {
+        None => true,
+        Some(set) => set.contains(&cid),
+    };
+
+    // Slice each page's stored bytes and decompress to encoded bytes. A page
+    // belonging to an unwanted column is walked past: its extent is still
+    // validated (so truncation is still caught) but `read_page` is not called,
+    // so its bytes are never decompressed.
+    let mut page_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(descs.len());
+    let mut pages_decoded = 0usize;
+    let mut pages_skipped = 0usize;
     for d in &descs {
         let len = usize::try_from(d.len)
             .map_err(|_| LogSegError::Corrupted("page len out of range".into()))?;
@@ -532,7 +606,13 @@ pub fn read_block(
         let stored = bytes
             .get(pos..end)
             .ok_or_else(|| LogSegError::Corrupted("page range out of bounds".into()))?;
-        page_bytes.push(read_page(stored, d, max_uncomp)?);
+        if wanted(d.column_id) {
+            page_bytes.push(Some(read_page(stored, d, max_uncomp)?));
+            pages_decoded += 1;
+        } else {
+            page_bytes.push(None);
+            pages_skipped += 1;
+        }
         pos = end;
     }
     if pos != bytes.len() {
@@ -541,10 +621,14 @@ pub fn read_block(
         ));
     }
 
-    // Group descriptor indices by column id, preserving order.
+    // Group descriptor indices by column id, preserving order. Unwanted columns
+    // are not grouped at all, so nothing below ever looks at their pages.
     let mut order: Vec<u32> = Vec::new();
     let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, d) in descs.iter().enumerate() {
+        if !wanted(d.column_id) {
+            continue;
+        }
         groups.entry(d.column_id).or_insert_with(|| {
             order.push(d.column_id);
             Vec::new()
@@ -561,6 +645,8 @@ pub fn read_block(
         bool_cols: HashMap::new(),
         str_cols: HashMap::new(),
         fixed_cols: HashMap::new(),
+        pages_decoded,
+        pages_skipped,
     };
 
     for column_id in order {
@@ -571,7 +657,7 @@ pub fn read_block(
                 if descs[*p].enc != Enc::Bitmap {
                     return Err(LogSegError::Corrupted("presence page not a bitmap".into()));
                 }
-                (decode_bitmap(&page_bytes[*p], record_count)?, *v)
+                (decode_bitmap(page(&page_bytes, *p)?, record_count)?, *v)
             }
             _ => {
                 return Err(LogSegError::Corrupted(format!(
@@ -582,7 +668,7 @@ pub fn read_block(
         };
         let present_count = present.iter().filter(|&&b| b).count();
         let enc = descs[value_idx].enc;
-        let encoded = &page_bytes[value_idx];
+        let encoded = page(&page_bytes, value_idx)?;
         match column_kind(column_id, plans)? {
             ColKind::I64 => {
                 let vals = decode_i64(enc, encoded, present_count)?;
@@ -753,6 +839,88 @@ mod tests {
         assert_eq!(f64::from_bits(s11.min_bits), -3.0);
         assert_eq!(f64::from_bits(s11.max_bits), 1.5);
         assert_eq!(s11.null_count, 7);
+    }
+
+    /// A column filter decodes only the named columns' pages, leaves every
+    /// other column absent, and reports how many pages it walked past. The
+    /// values it does decode are identical to the all-columns decode's, so
+    /// projection changes cost, never content.
+    #[test]
+    fn column_filter_decodes_only_the_named_columns() {
+        let plans: Vec<ColumnPlan> = (10..30)
+            .map(|column_id| ColumnPlan {
+                column_id,
+                ty: FieldType::Str,
+            })
+            .collect();
+        let mut rows = Vec::new();
+        for i in 0..64i64 {
+            let mut r = row(0, 1000 + i);
+            for p in &plans {
+                r.columns.push((
+                    p.column_id,
+                    ColumnValue::Str(format!("c{}r{i}", p.column_id).into_bytes()),
+                ));
+            }
+            rows.push(r);
+        }
+        let out = write_block(&rows, &plans, 3).expect("write");
+
+        let all = read_block(&out.bytes, out.crc32c, &plans, 1 << 30).expect("read all");
+        assert_eq!(all.pages_skipped(), 0, "no filter skips nothing");
+
+        let keep: HashSet<u32> = HashSet::from([COL_TS, COL_STREAM_REF, 11, 17]);
+        let projected =
+            read_block_columns(&out.bytes, out.crc32c, &plans, 1 << 30, Some(&keep)).expect("read");
+
+        assert_eq!(projected.record_count(), 64);
+        // Exactly the four requested columns decoded, one page each (every
+        // column here is present in every row, so no presence bitmaps).
+        assert_eq!(projected.pages_decoded(), 4);
+        assert_eq!(
+            projected.pages_decoded() + projected.pages_skipped(),
+            all.pages_decoded(),
+            "every page is either decoded or skipped, none invented"
+        );
+        assert!(
+            projected.pages_skipped() >= 18,
+            "the 18 unreferenced dynamic columns must be skipped, got {}",
+            projected.pages_skipped()
+        );
+
+        // Kept columns decode identically to the unfiltered decode.
+        assert_eq!(projected.i64_col(COL_TS), all.i64_col(COL_TS));
+        assert_eq!(projected.str_col(11), all.str_col(11));
+        assert_eq!(projected.str_col(17), all.str_col(17));
+        // Excluded columns are absent, including fixed ones.
+        assert!(projected.str_col(12).is_none());
+        assert!(projected.str_col(COL_BODY).is_none());
+        assert!(all.str_col(COL_BODY).is_some());
+    }
+
+    /// A filter never weakens the integrity checks: the block crc still covers
+    /// the whole block, so a corrupted byte inside a *skipped* column's page is
+    /// still caught.
+    #[test]
+    fn column_filter_still_verifies_the_whole_block_crc() {
+        let plans = vec![ColumnPlan {
+            column_id: 10,
+            ty: FieldType::Str,
+        }];
+        let mut rows = vec![row(0, 1), row(0, 2)];
+        for r in &mut rows {
+            r.columns.push((10, ColumnValue::Str(b"payload".to_vec())));
+        }
+        let out = write_block(&rows, &plans, 3).expect("write");
+        let keep: HashSet<u32> = HashSet::from([COL_TS, COL_STREAM_REF]);
+        // Corrupt the tail, which belongs to a column the filter skips.
+        let mut bad = out.bytes.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert!(matches!(
+            read_block_columns(&bad, out.crc32c, &plans, 1 << 30, Some(&keep)),
+            Err(LogSegError::Corrupted(_))
+        ));
     }
 
     #[test]
