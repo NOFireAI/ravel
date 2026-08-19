@@ -133,19 +133,16 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         codec::check_protocol_version(request.protocol_version)
             .map_err(|e| (pb::status::Code::Unsupported, e.to_string()))?;
 
-        // Signal validation. An unknown discriminant is malformed (BadData); a
-        // known non-metrics signal is simply not distributed yet, so hand it to
-        // the coordinator's local fallback (Unsupported) rather than return a
-        // wrong or partial result. `signal_from_u32` is otherwise only exercised
-        // by codec round-trip tests; this is its production caller.
+        // Decode the signal discriminant, then the signal-agnostic request
+        // shape (tenant, matchers, erasure), and only then dispatch on the
+        // signal. An unknown discriminant is malformed (BadData);
+        // `signal_from_u32` is otherwise only exercised by codec round-trip
+        // tests, this is its production caller. The per-signal dispatch is a
+        // real match arm reached AFTER this decode (not the former pre-decode
+        // blanket rejection), so a signal's own fetch path can build on the
+        // decoded request rather than re-parsing it (#283).
         let signal = codec::signal_from_u32(request.signal)
             .map_err(|e| (pb::status::Code::BadData, e.to_string()))?;
-        if signal != Signal::Metrics {
-            return Err((
-                pb::status::Code::Unsupported,
-                format!("signal {signal:?} is not distributed yet; only Metrics"),
-            ));
-        }
 
         let tenant_hash =
             decode_tenant_hash(&request.tenant_hash).map_err(|m| (pb::status::Code::BadData, m))?;
@@ -154,7 +151,57 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             .map_err(|e| (pb::status::Code::BadData, e.to_string()))?;
         let erasure = codec::decode_erasure(request.erasure);
 
-        let identities = match request.scope {
+        match signal {
+            // Metrics keeps its exact path: resolve the pinned scope, fetch,
+            // and encode scalar series. Unchanged from before #283.
+            Signal::Metrics => {
+                self.run_slice_metrics(
+                    request.scope,
+                    request.budgets,
+                    tenant_hash,
+                    matchers,
+                    erasure,
+                )
+                .await
+            }
+            // The RLOG family (Logs, Alerts, Audit) and Spans now reach a real
+            // per-signal branch after decoding, proving the signal check is a
+            // dispatch and not a pre-decode reject. Their fetch-and-encode
+            // paths land in #284 (logs) and #285 (spans); until then the branch
+            // returns a distinct "not yet implemented" Unsupported, so the
+            // coordinator still silently falls back to fully local execution
+            // (ADR-0071 failure semantics). This is deliberately NOT reachable
+            // from a real query yet: no caller dispatches a non-Metrics
+            // distributed fetch until #284/#285 build the coordinators.
+            Signal::Logs | Signal::Alerts | Signal::Audit | Signal::Spans => Err((
+                pb::status::Code::Unsupported,
+                format!("distributed fetch for signal {signal:?} is not yet implemented"),
+            )),
+            // Profiles has no distributed fetch path planned in this lane, so it
+            // stays rejected exactly as every non-Metrics signal was before
+            // #283: Unsupported, whole-query local fallback.
+            Signal::Profiles => Err((
+                pb::status::Code::Unsupported,
+                format!("signal {signal:?} is not distributed"),
+            )),
+        }
+    }
+
+    /// The Metrics slice path: resolve the pinned scope to refs, fetch each
+    /// segment's scalar (and histogram) series, enforce the per-slice
+    /// bytes-scanned budget, apply erasure, and stream scalar frames ending in
+    /// a terminal summary. Extracted from `run_slice_inner` unchanged so the
+    /// per-signal dispatch there can call it as one arm; Metrics behavior is
+    /// bit-for-bit what it was before #283.
+    async fn run_slice_metrics(
+        &self,
+        scope: Option<pb::fetch_request::Scope>,
+        budgets: Option<pb::Budgets>,
+        tenant_hash: TenantHash,
+        matchers: Vec<ravel_promql::LabelMatcher>,
+        erasure: Vec<crate::erasure::ErasurePredicate>,
+    ) -> Result<Vec<pb::FetchResponse>, (pb::status::Code, String)> {
+        let identities = match scope {
             Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments,
             // Cross-cluster resolve scope is future work; fall back to local.
             Some(pb::fetch_request::Scope::Resolve(_)) | None => {
@@ -184,7 +231,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // Per-slice bytes-scanned budget, enforced per completed segment
         // exactly as the local path does (ADR-0061 decision 1): `0` is the wire
         // sentinel for "no cap" (a real fetch never scans zero bytes).
-        let byte_limit = match request.budgets.as_ref().map(|b| b.max_bytes_scanned) {
+        let byte_limit = match budgets.as_ref().map(|b| b.max_bytes_scanned) {
             Some(0) | None => ByteLimit::Unlimited,
             Some(max) => ByteLimit::Bounded(max),
         };
