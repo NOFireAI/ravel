@@ -238,6 +238,53 @@ An `ORDER BY` or a high-cardinality `GROUP BY` over a large result is what
 genuinely accumulates. Exceeding the ceiling is an HTTP 422 `execution` error
 naming the pool, never a truncated result.
 
+### Operator-configurable budgets (server flags)
+
+Four of these budgets are process-wide server flags (ADR-0088). Each default is
+exactly the compiled-in value, so a server started with none of the flags
+behaves byte-for-byte as before they existed. All four are process-wide, not
+per-tenant.
+
+| Flag | Reaches | Default |
+|---|---|---|
+| `--fetch-concurrency <N>` | `EngineConfig::fetch_concurrency` | 8 |
+| `--max-segments <N>` | `EngineConfig::max_segments` | 1024 |
+| `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | 256 MiB |
+| `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | 1 GiB |
+
+`--fetch-concurrency` is a single knob with three coupled effects, **not**
+decoupled by this change: it governs the PromQL/analytics per-query segment
+fetch fan-out, the SQL scan partition count (`target_partitions` in
+`crates/ravel-sql/src/session.rs`), and object-store GET concurrency (ADR-0087).
+Raising it widens all three together; size it against the host's cores and the
+store's request budget.
+
+`--max-segments` caps how many segments a single query fans out over. Only the
+narrow recent set (`SegmentOrigin::Recent`, roughly the last couple of hours) is
+exempt; everything older, including compacted L0/L1 objects, counts toward the
+cap. A wide scan over a tenant with many sealed objects hits it directly, so
+raise this flag for such a workload.
+
+`--sql-max-query-bytes` bounds a single SQL query's DataFusion memory pool;
+`--sql-tenant-max-bytes` bounds the memory one tenant may hold across its
+concurrent SQL queries (the multi-tenant isolation ceiling, defaulting to four
+times the per-query pool). Both apply only in a build with the `sql` feature.
+Per-tenant SQL budgets are **not** configurable in the `--limits-file`: its
+per-tenant query overrides have no per-tenant `EngineConfig` lookup at query
+time today and are inert (ADR-0088), so these ceilings are process-wide flags
+until that gap closes.
+
+`max_bytes_scanned` is **not** a flag. It stays a `--limits-file` entry
+(`query_defaults.max_bytes_scanned`, default Unlimited); see
+[admission-limits.md](admission-limits.md). `--max-s3-requests` (ADR-0075)
+remains a flag; omitted, it is derived from `--shards` and the flush cadence.
+
+`--gc-max-query-duration` sets the engine's enforced wall-clock deadline. It
+must be **`<=`** the tenant's durable `sys/gc.max_query_duration` (default 1h).
+A value above it is **rejected at startup** (a hard error), not clamped: raise
+`sys/gc.max_query_duration` first (`ravel-cli gc-config set`) if you need a
+longer engine deadline.
+
 The catalog-list budget is checked before any object-store request is made,
 not after. The catalog lists one prefix per (shard, ingest hour) from the
 window's start to the current hour, so a query whose `start` reaches far back

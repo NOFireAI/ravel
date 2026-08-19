@@ -220,6 +220,7 @@ async fn publish_segment(store: &dyn ObjectStoreBackend, metric: &str, samples: 
 
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
+        query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),

@@ -298,6 +298,16 @@ impl SqlExecutor {
         &self.config
     }
 
+    /// The per-tenant memory ceiling each tenant's accountant enforces across
+    /// that tenant's concurrent queries (the `max_tenant_bytes` passed to
+    /// [`SqlExecutor::new`]). Distinct from the per-query ceiling in
+    /// `config().max_query_bytes`. Exposed so a caller wiring the server's
+    /// `--sql-tenant-max-bytes` flag can assert the configured ceiling actually
+    /// reached the executor rather than a compiled-in default.
+    pub fn max_tenant_bytes(&self) -> usize {
+        self.max_tenant_bytes
+    }
+
     /// Lock the tenant map, recovering a poisoned guard. A poisoned lock means
     /// another thread panicked while holding it; the map is a plain HashMap of
     /// Arc counters with no torn-state hazard, so recovering is safe and
