@@ -1298,7 +1298,7 @@ flowchart TB
         P --> S2[Slice 2: shard 1,3]
         S1 --> F1[FetchRequest\nsignal=Logs, erasure, budgets]
         S2 --> F2[FetchRequest\nsignal=Logs, erasure, budgets]
-        M[Coordinator merge:\nk-way merge + dedup on record identity\nsame total order as the local read] 
+        M[Coordinator merge:\nk-way merge on record identity, NO dedup for logs/spans\nsame total order as the local read] 
     end
     subgraph Worker1[Worker A]
         F1 --> W1[run_slice_inner\ndispatch on signal]
@@ -1380,9 +1380,9 @@ frame variants are never on the wire toward one.
 | ID | crates | predicted files | deps | risk |
 |---|---|---|---|---|
 | T1 | ravel-query | distrib/service.rs, distrib/mod.rs, proto/ravel/queryfrag.proto | - | medium |
-| T2 | ravel-query, ravel-logseg | distrib/service.rs (RLOG-family fetch path over LogSegmentFetcher), distrib/mod.rs (log merge: stated total order + dedup rule) | T1 | high (merge correctness) |
+| T2 | ravel-query, ravel-logseg | distrib/service.rs (RLOG-family fetch path over LogSegmentFetcher), distrib/mod.rs (log merge: stated total order, NO dedup -- docs/consistency-model.md forbids query-time dedup for logs/alerts/audit) | T1 | high (merge correctness) |
 | T3 | ravel-query, ravel-rspan, ravel-sql | promote a span fetch surface from ravel-sql/src/spans_fetcher.rs into ravel-query, distrib/service.rs (span fetch path), span merge | T1 | high (merge correctness + fetcher promotion) |
 | T4 | ravel-query | distrib/tests.rs (differential tests per signal incl. a reshard-straddled stream/trace split across slices; erasure property test; old-worker/new-coordinator skew test) | T2, T3 | medium |
 | T5 | ravel-query | federation.rs (per-signal federation test, incl. old-remote Unsupported under skip_unavailable) | T2, T3 | low |
-| T6 | ravel-sql | SQL-lane per-signal distributed scan: slice tickets + DistributedScanExec for logs/alerts/audit/spans, per-signal dedup/merge execs, flight_distributed.rs coverage | T1, ADR-0087 landed | high (same merge-correctness class as T2/T3) |
+| T6 | ravel-sql | SQL-lane per-signal distributed scan: slice tickets + DistributedScanExec for logs/alerts/audit/spans, per-signal merge execs (dedup for metrics only -- NOT for logs/alerts/audit/spans, see T2/T3), flight_distributed.rs coverage | T1, ADR-0087 landed | high (same merge-correctness class as T2/T3) |
 | T7 | docs | docs/query-engine.md, docs/adrs/0071-distributed-read-fanout.md currency | T4, T5, T6 | low |
