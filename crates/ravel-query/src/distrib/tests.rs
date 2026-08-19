@@ -18,7 +18,11 @@
 use std::sync::Arc;
 
 use proptest::prelude::*;
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::SeriesData;
@@ -41,7 +45,7 @@ use crate::distrib::Distributed;
 use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, SliceResponse};
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
 use crate::distrib::{
-    merge_log_records, service::SeriesFetchService, service::SnapshotSegmentResolver,
+    log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver,
 };
 use crate::engine::merge_soa_runs;
 use crate::erasure::ErasurePredicate;
@@ -176,7 +180,18 @@ async fn spawn_worker(
     // so one worker serves Metrics and Logs/Alerts/Audit slices.
     let log_store: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
     let log_fetcher = LogSegmentFetcher::new(log_store);
-    let fetcher = SegmentFetcher::new(store);
+    let metrics_store: Arc<dyn ObjectStoreBackend> = store as Arc<dyn ObjectStoreBackend>;
+    spawn_worker_with_log_fetcher(metrics_store, log_fetcher, segments).await
+}
+
+/// `spawn_worker` with an explicitly built (possibly cache-wired) log fetcher, so
+/// a test can prove the worker's log path is cache-aware.
+async fn spawn_worker_with_log_fetcher(
+    metrics_store: Arc<dyn ObjectStoreBackend>,
+    log_fetcher: LogSegmentFetcher,
+    segments: Vec<SegmentRef>,
+) -> (RemoteSliceFetcher, JoinHandle<()>) {
+    let fetcher = SegmentFetcher::new(metrics_store);
     let resolver = Arc::new(SnapshotSegmentResolver::new(segments));
     let service = SeriesFetchService::new(fetcher, resolver)
         .with_log_fetcher(log_fetcher)
@@ -1393,15 +1408,18 @@ fn histogram_slice_falls_back_with_spend_folded() {
 
 // --- RLOG-family distributed fan-out (#284) --------------------------------
 //
-// The centerpiece is `assert_log_distributed_matches_local`: over a real
-// loopback worker, a distributed Logs/Alerts/Audit fetch merged by the
-// coordinator is bit-identical to a local `LogSegmentFetcher` read over the same
-// segments, merged under the same stated total order (`merge_log_records`),
-// including a corpus where one stream's segments straddle two slices (a
-// reshard-activation window). Both paths feed the same order-independent merge,
-// so the test proves the codec preserves every record and the partition is total
-// -- and, on the split corpus, that the coordinator ORDERS rather than
-// concatenates in slice order.
+// The centerpiece is `run_log_differential`: over a real loopback worker, a
+// distributed Logs/Alerts/Audit fetch merged by the coordinator equals, as a
+// multiset under the stated total order, a raw local `LogSegmentFetcher` read
+// over the same segments -- concatenated directly, NOT through
+// `merge_log_records`, so the reference is independent of the function under
+// test and the differential can actually catch a merge regression. This
+// includes a corpus where one stream's segments straddle two slices (a
+// reshard-activation window). The test proves the codec preserves every record
+// and the partition is total -- and, on the split corpus, that the coordinator
+// ORDERS rather than concatenates in slice order. Duplicate-record preservation
+// (no query-time dedup for logs) is pinned separately by
+// `logs_coordinator_preserves_duplicate_records_across_slices`.
 
 /// Resource attributes and the derived stream identity/blob for a named
 /// service. Records sharing a service name share one `LogStreamId`, so a corpus
@@ -1515,9 +1533,13 @@ fn whole_window(segments: &[SegmentRef]) -> (i64, i64) {
 }
 
 /// The local reference for logs: read every segment with `LogSegmentFetcher`
-/// over the whole-snapshot window (a superset of each segment), then merge under
-/// the stated total order. This is exactly what a local multi-segment read
-/// produces.
+/// over the whole-snapshot window (a superset of each segment) and concatenate
+/// the per-segment records directly, with NO merge or dedup. This is exactly the
+/// multiset of records a local multi-segment read observes, and it is
+/// deliberately independent of `merge_log_records` (the function under test) so
+/// the differential compares distributed output against a reference the function
+/// cannot influence. Callers compare via [`sorted_by_order_key`] as a multiset
+/// (duplicates preserved on both sides).
 async fn local_log_records(
     store: Arc<MemoryStore>,
     segments: &[SegmentRef],
@@ -1526,12 +1548,21 @@ async fn local_log_records(
     let fetcher = LogSegmentFetcher::new(store);
     let (min, max) = whole_window(segments);
     let query = LogQuery::new(min, max).with_erasure(erasure.to_vec());
-    let mut per_segment = Vec::with_capacity(segments.len());
+    let mut all = Vec::new();
     for seg in segments {
         let out = fetcher.fetch(seg, &query).await.expect("local log fetch");
-        per_segment.push(out.map(|o| o.records).unwrap_or_default());
+        all.extend(out.map(|o| o.records).unwrap_or_default());
     }
-    merge_log_records(per_segment)
+    all
+}
+
+/// Stable-sort a record multiset under the production total-order key, preserving
+/// duplicates. Applying this to both sides of a differential turns an
+/// order-sensitive `Vec` equality into a multiset equality under the stated
+/// order, without ever calling `merge_log_records`.
+fn sorted_by_order_key(mut records: Vec<LogRecord>) -> Vec<LogRecord> {
+    records.sort_by_key(log_record_order_key);
+    records
 }
 
 /// The distributed reference for logs: dispatch `signal` over a real loopback
@@ -1641,7 +1672,8 @@ async fn run_log_differential(signal: Signal) {
     )
     .await;
     assert_eq!(
-        one_slice, local,
+        sorted_by_order_key(one_slice),
+        sorted_by_order_key(local.clone()),
         "{signal:?}: single-slice distributed must equal local"
     );
 
@@ -1676,7 +1708,8 @@ async fn run_log_differential(signal: Signal) {
     )
     .await;
     assert_eq!(
-        two_slice, local,
+        sorted_by_order_key(two_slice.clone()),
+        sorted_by_order_key(local),
         "{signal:?}: two-slice distributed must equal local even when a stream straddles slices"
     );
 
@@ -1729,18 +1762,21 @@ fn audit_distributed_matches_local_including_reshard_straddle() {
     rt.block_on(run_log_differential(Signal::Audit));
 }
 
-/// A record present verbatim in two overlapping segments that land in two
-/// different slices is collapsed to one by the coordinator's record-identity
-/// dedup, matching a local read merged under the same rule. Pins the dedup /
-/// tie-break half of the stated invariant (the ordering half is pinned by
-/// `run_log_differential`).
+/// Two byte-identical records split across two segments/slices must BOTH survive
+/// the coordinator's merge. Per docs/consistency-model.md ("logs and spans"),
+/// logs/alerts/audit have NO query-time dedup: a retry after a lost ack produces
+/// byte-identical rows that are legitimately duplicate user data and must stay
+/// visible, so collapsing them is silent data loss. This is the focused
+/// minimal-repro for the dedup bug that shipped in #284 (`merge_log_records`
+/// applied the metric-path `(series_id, ts)` dedup where it is forbidden).
 #[test]
-fn logs_coordinator_dedups_identical_record_across_slices() {
+fn logs_coordinator_preserves_duplicate_records_across_slices() {
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async {
         let store = Arc::new(MemoryStore::new());
         // The SAME record (same stream, ts, body, attrs) written into two
-        // segments under two shards -> two slices at cap 2.
+        // segments under two shards -> two slices at cap 2. A raw local read of
+        // the two segments returns TWO records; the distributed merge must too.
         let dup = log_record("gamma", 50, "dup", &[("k", "v")]);
         let seg_a = write_log_segment(&store, 0, 0, 100, std::slice::from_ref(&dup)).await;
         let seg_b = write_log_segment(&store, 1, 1, 100, std::slice::from_ref(&dup)).await;
@@ -1751,8 +1787,13 @@ fn logs_coordinator_dedups_identical_record_across_slices() {
             pending_erasure: Vec::new(),
         };
 
+        // Reference: a raw local read of both segments, independent of the merge.
         let local = local_log_records(Arc::clone(&store), &segments, &[]).await;
-        assert_eq!(local.len(), 1, "local merge collapses the identical record");
+        assert_eq!(
+            local.len(),
+            2,
+            "a raw local read of the two segments returns both duplicate records"
+        );
 
         let distributed = distributed_log_records(
             Arc::clone(&store),
@@ -1764,10 +1805,112 @@ fn logs_coordinator_dedups_identical_record_across_slices() {
         )
         .await;
         assert_eq!(
-            distributed, local,
-            "the coordinator dedups the cross-slice duplicate to one record"
+            distributed.len(),
+            2,
+            "the coordinator must preserve both cross-slice duplicate records, not collapse them"
         );
-        assert_eq!(distributed.len(), 1);
+        assert_eq!(
+            sorted_by_order_key(distributed),
+            sorted_by_order_key(local),
+            "the distributed result is the same multiset as the raw local read"
+        );
+    });
+}
+
+/// The worker's log fetch path is cache-aware: it goes through
+/// [`LogSegmentFetcher::fetch_accounted_with_tenant`] (ADR-0046's read cache),
+/// not the cache-blind `fetch_accounted`. Proven by wiring a cache into the
+/// worker's fetcher over a `FaultStore` that fails the SECOND store GET of the
+/// segment object. The first distributed fetch is a cache miss (one real GET,
+/// which populates the cache); the second must be served from the cache with no
+/// further GET, so the scripted second-GET fault never fires. With the
+/// cache-blind funnel the second fetch would GET again, trip the fault, and the
+/// coordinator would silently fall back to local -- exactly the wiring gap this
+/// fixes.
+#[test]
+fn logs_worker_serves_repeat_reads_from_the_read_cache() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        // Write the segment, then wrap a snapshot of that store in a FaultStore.
+        let seed = MemoryStore::new();
+        let records = [
+            log_record("gamma", 10, "one", &[("k", "v")]),
+            log_record("gamma", 20, "two", &[("k", "v")]),
+        ];
+        let seg = write_log_segment(&seed, 0, 0, 100, &records).await;
+        let segments = vec![seg];
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // Fail the SECOND GET of any object; the first (cache-miss) GET passes
+        // through and populates the cache.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent(
+                    "second GET must not happen: cache should serve it".into(),
+                ),
+            )
+            .with_occurrence(Occurrence::Nth(2)),
+        );
+        let fault_store = Arc::new(FaultStore::new(seed, plan));
+        let cache: Arc<Cache<crate::fetcher::CacheFetchError>> = Arc::new(Cache::new(
+            CacheLimits::new(16 * 1024 * 1024, 100, 16 * 1024 * 1024),
+        ));
+        let log_store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>;
+        let log_fetcher = LogSegmentFetcher::new(log_store).with_cache(cache);
+
+        // Metrics path is unused for a Logs signal; give it an empty store.
+        let metrics_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let (fetcher, server) =
+            spawn_worker_with_log_fetcher(metrics_store, log_fetcher, segments).await;
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+
+        let fetch = || async {
+            distributed
+                .fetch_logs(
+                    TENANT,
+                    Signal::Logs,
+                    &snapshot,
+                    &[],
+                    &[],
+                    &QueryAccounting::new(),
+                    &EngineConfig::default(),
+                    i64::MAX,
+                )
+                .await
+                .expect("distributed log fetch")
+                .expect("distributed produced a result (not a fallback)")
+        };
+
+        // Miss: one real GET populates the cache.
+        let first = fetch().await;
+        assert_eq!(first.len(), 2, "cache-miss fetch returns both records");
+
+        // Hit: served from the cache, so the scripted second GET never happens.
+        let second = fetch().await;
+        server.abort();
+        assert_eq!(
+            sorted_by_order_key(second),
+            sorted_by_order_key(first),
+            "cache-hit fetch returns the same records as the miss"
+        );
+        assert_eq!(
+            fault_store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "the second fetch must be served from the read cache, issuing no store GET"
+        );
     });
 }
 
@@ -1816,7 +1959,8 @@ fn logs_worker_applies_erasure_across_straddling_slices() {
             )
             .await;
             assert_eq!(
-                distributed, local,
+                sorted_by_order_key(distributed.clone()),
+                sorted_by_order_key(local),
                 "cap {cap}: distributed erasure must equal local erasure over the same segments"
             );
             // The erasure genuinely removed the u1 rows (not a vacuous no-op),
@@ -1862,7 +2006,11 @@ fn logs_resource_only_erasure_key_is_a_consistent_no_op() {
 
         let baseline = local_log_records(Arc::clone(&store), &segments, &[]).await;
         let local = local_log_records(Arc::clone(&store), &segments, &erasure).await;
-        assert_eq!(local, baseline, "resource-only key erases nothing locally");
+        assert_eq!(
+            sorted_by_order_key(local),
+            sorted_by_order_key(baseline.clone()),
+            "resource-only key erases nothing locally"
+        );
 
         let distributed = distributed_log_records(
             Arc::clone(&store),
@@ -1874,7 +2022,8 @@ fn logs_resource_only_erasure_key_is_a_consistent_no_op() {
         )
         .await;
         assert_eq!(
-            distributed, baseline,
+            sorted_by_order_key(distributed),
+            sorted_by_order_key(baseline),
             "resource-only key erases nothing distributed either (consistent no-op)"
         );
     });
