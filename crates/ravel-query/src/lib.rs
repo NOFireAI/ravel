@@ -13,6 +13,7 @@ pub mod http;
 mod log_fetcher;
 mod query_admission;
 mod segment_admission;
+pub mod span_fetcher;
 
 pub use config::{
     ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_MAX_SAMPLES,
@@ -32,3 +33,4 @@ pub use query_admission::{
     query_admission_snapshot_key, reconcile_query_admission_once,
 };
 pub use segment_admission::{SegmentAdmission, admit, request_budget_exceeded};
+pub use span_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};

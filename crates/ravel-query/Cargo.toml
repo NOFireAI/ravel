@@ -15,6 +15,14 @@ ravel-types = { workspace = true }
 ravel-tenant-resolve = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-logseg = { workspace = true }
+# RSPAN span segment reader/record types for the distributed Spans fetch path
+# (#285). The span fetcher promoted from ravel-sql
+# (`crate::span_fetcher::SpanSegmentFetcher`) reads RSPAN objects through
+# `RspanReader`/`SpanRecord`/`SpanQuery`, exactly as the `spans` SQL table does.
+# ravel-rspan is a low-level format crate that does not depend on ravel-query,
+# so this edge is acyclic; it mirrors the existing ravel-logseg dependency the
+# log fetch path uses.
+ravel-rspan = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-promql = { workspace = true }
 # ADR-0071 distributed read fan-out: the frozen queryfrag wire
