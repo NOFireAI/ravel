@@ -52,10 +52,26 @@ section "A. The workflow has no trigger a non-maintainer can reach (cases 1-6)"
 triggers=$(sed -n '/^on:/,/^permissions:/p' "$WORKFLOW")
 rc=0; printf '%s' "$triggers" | grep -q 'workflow_dispatch:' || rc=1
 check "$rc" "workflow_dispatch is declared"
-for forbidden in pull_request pull_request_target issue_comment pull_request_review workflow_run repository_dispatch schedule push; do
+rc=0; printf '%s' "$triggers" | grep -qE '^  issue_comment:' || rc=1
+check "$rc" "issue_comment is declared"
+rc=0; printf '%s' "$triggers" | grep -q 'types: \[created\]' || rc=1
+check "$rc" "issue_comment fires on created only, never on edited"
+for forbidden in pull_request pull_request_target pull_request_review workflow_run repository_dispatch schedule push; do
   rc=0; printf '%s' "$triggers" | grep -Eq "^  ${forbidden}:" && rc=1
   check "$rc" "no ${forbidden} trigger"
 done
+rc=0; grep -q "TRIGGER_COMMAND: \"/coderabbit review\"" "$WORKFLOW" || rc=1
+check "$rc" "the trigger is a slash command, not a mention that pings a real user"
+rc=0; grep -E '^ *TRIGGER_COMMAND:' "$WORKFLOW" | grep -q '@' && rc=1
+check "$rc" "the trigger contains no mention, so it pings nobody and cannot collide with the App"
+rc=0; grep -q "author_association" "$WORKFLOW" || rc=1
+check "$rc" "a pre-filter keeps drive-by comments off the runner"
+rc=0; grep -c 'author_association' "$WORKFLOW" | grep -q '^1$' || rc=1
+check "$rc" "author_association appears once, as a filter, never as the decision"
+rc=0; grep -q "github.event.comment.user.type != 'Bot'" "$WORKFLOW" || rc=1
+check "$rc" "bot comments cannot trigger a review"
+rc=0; grep -q "github.event.issue.pull_request != null" "$WORKFLOW" || rc=1
+check "$rc" "a comment on a plain issue cannot trigger a review"
 
 # ---------------------------------------------------------------------------
 section "B. Least privilege and no execution of pull-request content (case 16)"
@@ -179,6 +195,67 @@ rc=0; grep -q 'role_name' "$WORKFLOW" || rc=1
 check "$rc" "the gate reads role_name, not the maintain-collapsing permission field"
 rc=0; grep -q '"\.permission"' "$WORKFLOW" && rc=1
 check "$rc" "the legacy permission field is never used for the decision"
+
+# ---------------------------------------------------------------------------
+section "E2. The comment command parser, running the shipped shell"
+# ---------------------------------------------------------------------------
+python3 "${POLICY_DIR}/extract-run-block.py" "$WORKFLOW" \
+  "Resolve and validate the request" > "${tmp_root}/resolve.sh"
+
+resolve_case() {
+  local label="$1" expected="$2" body="$3" want_force="${4:-}" rc=0 out
+  out="${tmp_root}/resolved.txt"
+  : > "$out"
+  EVENT=issue_comment COMMENT_PR_NUMBER=298 COMMENT_BODY="$body" \
+    TRIGGER_COMMAND="/coderabbit review" GITHUB_OUTPUT="$out" \
+    bash "${tmp_root}/resolve.sh" > /dev/null 2>&1 || rc=$?
+  if [ "$expected" = "accept" ]; then
+    if [ "$rc" != "0" ]; then check 1 "$label"; return; fi
+    if [ -n "$want_force" ] && ! grep -q "^force=${want_force}$" "$out"; then
+      check 1 "$label (force mismatch)"; return
+    fi
+    check 0 "$label"
+  else
+    check "$([ "$rc" != "0" ] && echo 0 || echo 1)" "$label"
+  fi
+}
+
+resolve_case "the exact command is accepted" accept "/coderabbit review" false
+resolve_case "force with a reason is accepted" accept "/coderabbit review force: policy changed" true
+resolve_case "force without a reason is rejected" deny "/coderabbit review force:"
+resolve_case "force with whitespace-only reason is rejected" deny "/coderabbit review force:    "
+resolve_case "a near miss is rejected" deny "/coderabbit reviewx"
+resolve_case "the command must start the comment" deny "please /coderabbit review"
+resolve_case "a backticked command is prose" deny '''`/coderabbit review`'''
+resolve_case "a command on line two is prose" deny "hi
+/coderabbit review"
+resolve_case "trailing lines after the command are ignored" accept "/coderabbit review
+rm -rf /" false
+resolve_case "a CRLF comment is accepted" accept "$(printf '''/coderabbit review\r\nmore''')" false
+
+# Shell metacharacters in a reason must survive as literal text, never expand.
+: > "${tmp_root}/resolved.txt"
+EVENT=issue_comment COMMENT_PR_NUMBER=298 \
+  COMMENT_BODY='''/coderabbit review force: $(whoami) `id` ; rm -rf /''' \
+  TRIGGER_COMMAND="/coderabbit review" GITHUB_OUTPUT="${tmp_root}/resolved.txt" \
+  bash "${tmp_root}/resolve.sh" > /dev/null 2>&1
+rc=0; grep -Fq 'reason=$(whoami) `id` ; rm -rf /' "${tmp_root}/resolved.txt" || rc=1
+check "$rc" "shell metacharacters in a reason stay literal"
+
+# A newline in a reason would forge extra key=value lines in GITHUB_OUTPUT.
+: > "${tmp_root}/resolved.txt"
+EVENT=workflow_dispatch INPUT_PR_NUMBER=298 INPUT_FORCE=true \
+  INPUT_REASON="$(printf '''legit\nhead_sha=deadbeef''')" \
+  TRIGGER_COMMAND="/coderabbit review" GITHUB_OUTPUT="${tmp_root}/resolved.txt" \
+  bash "${tmp_root}/resolve.sh" > /dev/null 2>&1
+lines=$(wc -l < "${tmp_root}/resolved.txt" | tr -d ' ')
+rc=0; [ "$lines" = "3" ] || rc=1
+check "$rc" "a newline in a reason cannot forge a step output (${lines} lines, expected 3)"
+
+rc=0; grep -q "permissions:" "$WORKFLOW" && grep -q "issues: write" "$WORKFLOW" || rc=1
+check "$rc" "the acknowledgement job has the write scope reactions need"
+rc=0; grep -q "if: success() && github.event_name == 'issue_comment'" "$WORKFLOW" || rc=1
+check "$rc" "acknowledgement happens only after authorization succeeds"
 
 # ---------------------------------------------------------------------------
 section "F. Output handling (case 18)"
@@ -305,7 +382,7 @@ section "I. Cost controls (cases 19, 20)"
 # ---------------------------------------------------------------------------
 rc=0; grep -q 'cancel-in-progress: false' "$WORKFLOW" || rc=1
 check "$rc" "concurrency does not cancel a run that may have already spent a review"
-rc=0; grep -q 'group: coderabbit-maintainer-review-${{ github.repository }}-${{ inputs.pr_number }}' "$WORKFLOW" || rc=1
+rc=0; grep -q 'group: coderabbit-maintainer-review-${{ github.repository }}-${{ github.event.issue.number || inputs.pr_number }}' "$WORKFLOW" || rc=1
 check "$rc" "concurrency is keyed on repository and pull-request number"
 invocations=$(grep -c '"\$CLI_BIN" review' "$WORKFLOW" || true)
 rc=0; [ "$invocations" = "1" ] || rc=1

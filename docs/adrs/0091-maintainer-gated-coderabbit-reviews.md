@@ -190,11 +190,11 @@ that.
 ## Decision 2: reviews come from a manually dispatched, maintainer-gated workflow
 
 `.github/workflows/coderabbit-maintainer-review.yml` is the only supported way
-to obtain a CodeRabbit review of a Ravel pull request. Its only trigger is
-`workflow_dispatch`. It carries none of `pull_request`, `pull_request_target`,
-`issue_comment`, `pull_request_review`, `workflow_run`, `repository_dispatch`,
-`schedule`, or `push`, because each of those is a way for a non-maintainer to
-start a review.
+to obtain a CodeRabbit review of a Ravel pull request. It triggers on
+`workflow_dispatch` and, per the amendment below, on `issue_comment`. It carries
+none of `pull_request`, `pull_request_target`, `pull_request_review`,
+`workflow_run`, `repository_dispatch`, `schedule`, or `push`, because each of
+those starts a review with no human intent behind it.
 
 It is layered, and the layers are independent:
 
@@ -398,6 +398,63 @@ runbook's manual evidence steps, so a green run is never read as a complete one.
 It is not wired into `ci.yml`, because this change has no business editing a
 workflow that is not its own.
 
+## Amendment: a maintainer may also start a review by comment
+
+The original decision allowed only `workflow_dispatch`. Dispatching from the
+Actions tab or the `gh` CLI is a context switch away from the pull request being
+reviewed, which is where the decision to review it is actually made. The
+workflow now also triggers on `issue_comment`, and a maintainer starts a review
+by commenting on the pull request:
+
+```text
+/coderabbit review
+/coderabbit review force: <audit reason>
+```
+
+**The comment is not the authorization.** It is a request. Authorization is the
+same `role_name` check as before, and the credential sits behind the same
+protected environment. What the comment changes is who can cause a workflow
+*run*, not who can cause a CodeRabbit *call*.
+
+Three properties make this safe to add.
+
+`issue_comment` always runs the copy of the workflow on the default branch, with
+`GITHUB_REF` set to the default branch. So a pull request cannot alter the
+control plane by commenting on itself, the existing `refs/heads/main` assertion
+still holds, and the environment's main-only deployment branch policy still
+admits the run. The assertion is kept rather than relaxed: if GitHub ever
+changed that, the feature would stop working instead of starting to trust a
+pull request.
+
+The command grammar is fixed and matched against the first line only. A command
+quoted further down a comment is prose, so one person's paste cannot act on
+another person's behalf. The comment body never becomes part of a command: it
+arrives as an environment variable, is matched against a literal, and the only
+value extracted from it is the audit reason, which is stripped of every control
+character before it crosses a step boundary. Stripping newlines specifically
+matters: without it, a reason could forge additional `key=value` lines in
+`GITHUB_OUTPUT`.
+
+Nothing answers a non-maintainer. An authorised command gets a reaction on the
+comment, from a small job holding `issues: write` and nothing else, which runs
+only after authorization succeeded. An unauthorised one gets silence and a
+failed run that only people with repository access can see. Replying would turn
+this into an amplifier for anyone who can type.
+
+The cost, stated plainly: anyone who can comment, which on a public repository
+is anyone, can now cause a workflow run to start and fail. A pre-filter on the
+job (the comment is on a pull request, the author is not a bot, the body starts
+with the command, and the author association is at least COLLABORATOR) keeps
+ordinary drive-by comments off the runner entirely. That filter is an extra
+condition, never an alternative to the permission check: MEMBER and COLLABORATOR
+are both far wider than maintainer, and `role_name` is what decides. Runner
+minutes on public repositories are free, so the residual exposure is noise in
+the Actions tab, and a determined abuser is answered by revoking their access.
+
+The trigger is a slash command rather than a mention on purpose.
+`@coderabbit` is a real and unrelated GitHub user who would be notified on every
+invocation, and `@coderabbitai` is the vendor App's handle.
+
 ## Rejected alternatives
 
 **Native App reviews as the authorization mechanism.** Rejected on the evidence
@@ -416,8 +473,10 @@ description. None of these is an authorization decision.
 Rejected: MEMBER, COLLABORATOR, and CONTRIBUTOR are explicitly not maintainers,
 and a CODEOWNER need not hold `maintain`.
 
-**An `@coderabbitai` comment command as the trigger.** Rejected: anyone who can
-comment can issue it.
+**An `@coderabbitai` comment command as the trigger.** Rejected: it is the
+vendor App's own handle, so the App and this workflow would both act on one
+comment, and the App's own handling of it is not maintainer-gated. See the
+amendment for the trigger that was adopted instead.
 
 **The legacy `permission` field from the collaborator-permission endpoint.**
 Rejected: it reports a `maintain` user as `write`, so it cannot express this

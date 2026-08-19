@@ -219,25 +219,63 @@ Both must be satisfied. Until they are, `.github/CODEOWNERS` only *requests*
 review of the trusted paths and does not require it, and acceptance tests 14 and
 15 fail.
 
-## Step 6: first run
+## Step 6: starting a review
+
+Two ways in, one gate. Both verify that the actor holds `maintain` or `admin`,
+and both then wait for the environment approval.
+
+**By comment, on the pull request itself:**
+
+```text
+/coderabbit review
+```
+
+The command must be the first line of the comment. A quoted command further
+down is prose and does nothing. An authorised command gets a reaction on the
+comment within a few seconds: 👀 means a review is starting, 👍 means this head
+SHA was already reviewed under this policy and nothing was spent.
+
+A comment from a non-maintainer gets no reaction and no reply. The run fails at
+the permission check, and only people with repository access see it in the
+Actions tab. That silence is deliberate: replying would let anyone who can
+comment make this integration speak.
+
+Note the trigger is a slash command, not a mention. `@coderabbit` is a real,
+unrelated GitHub user, and `@coderabbitai` is the vendor App's own handle.
+
+**By dispatch, from the Actions tab or the CLI:**
 
 ```sh
 gh workflow run coderabbit-maintainer-review.yml \
   --ref main -f pr_number=<n>
 ```
 
-The run pauses at the environment gate for a maintainer approval, then posts one
-`COMMENT` review carrying the head SHA, the trusted policy hash, and the CLI
-version.
+Either way, the run pauses at the environment gate for a maintainer approval,
+then posts one `COMMENT` review carrying the head SHA, the trusted policy hash,
+and the CLI version.
 
-To repeat a review of a head SHA that was already reviewed:
+To repeat a review of a head SHA that was already reviewed, an audit reason is
+required and is published in the review:
+
+```text
+/coderabbit review force: policy changed, re-checking the durability findings
+```
 
 ```sh
 gh workflow run coderabbit-maintainer-review.yml \
   --ref main -f pr_number=<n> -f force=true -f reason="<why>"
 ```
 
-`force` without a reason is rejected, and the reason is published in the review.
+### Verify once, on the first comment-triggered run
+
+The comment trigger depends on GitHub running `issue_comment` workflows from the
+default branch, with `GITHUB_REF` set to it. That is documented behaviour and it
+is what makes a pull request unable to alter the control plane by commenting on
+itself, but it cannot be tested before this workflow is on `main`. On the first
+comment-triggered run, open the `authorize` job's "Assert trusted control plane"
+step and confirm it passed. If it failed on the ref, the comment trigger is
+inoperative and the workflow has failed closed rather than trusting a pull
+request; report it and use `workflow_dispatch` until it is understood.
 
 ---
 
@@ -272,7 +310,9 @@ identities available for the `write` cases.
 | 3 | `write` user cannot invoke | Same, as a `write` user (`nofire-bot`) | Dispatch is accepted by GitHub, then the `authorize` job fails at "Verify actor holds maintain or admin" with `role 'write'`. No environment requested, no secret reachable, no CodeRabbit call | I |
 | 4 | Organization member without `maintain` | Same, as an organization member holding `write` or less | As 1 to 3. Membership is never consulted | I |
 | 5 | Outside collaborator cannot invoke | Same, as an outside collaborator with `write` | As 3 | I |
-| 6 | External fork author cannot invoke via any surface | From a fork: open a PR; add labels; write `@coderabbitai review` in the description, in a comment, in a commit message; push again | No workflow run starts. No CodeRabbit call. The workflow has no `pull_request`, `pull_request_target`, `issue_comment`, `pull_request_review`, `workflow_run`, `repository_dispatch`, `schedule`, or `push` trigger. With the App removed or its org settings applied, the comment produces nothing | I + M |
+| 6 | External fork author cannot invoke via any surface | From a fork: open a PR; add labels; write `@coderabbitai review` and `/coderabbit review` in the description, in a comment, in a commit message; push again | No CodeRabbit call, no reaction, no reply. A `/coderabbit review` comment from a non-maintainer either never starts a runner (pre-filter) or fails at the permission check. The workflow has no `pull_request`, `pull_request_target`, `pull_request_review`, `workflow_run`, `repository_dispatch`, `schedule`, or `push` trigger. With the App removed or its org settings applied, `@coderabbitai` produces nothing | I + M |
+| 6b | A `/coderabbit review` comment from a `write` user is rejected | Comment the command as `nofire-bot` or another `write` collaborator | The `authorize` job fails at "Verify actor holds maintain or admin". No reaction, no reply, no environment requested, no CodeRabbit call | I |
+| 6c | The command grammar cannot be smuggled | Comment `please /coderabbit review`; a backticked `` `/coderabbit review` ``; the command on line two; `/coderabbit review force:` with no reason | Every one is rejected. Covered by `scripts/coderabbit-acceptance-tests.sh` section E2 | I |
 | 7 | `maintain` user can review | Dispatch as a `maintain` holder against an open PR targeting `main` | `authorize` passes with `role_name=maintain`, environment approval requested, one `COMMENT` review published | I |
 | 8 | `admin` can review | Same, as an `admin` | As 7, with `role_name=admin` | I |
 | 9 | Wrong base branch rejected | Dispatch against a PR whose base is not `main` | "Validate the pull request" fails: `base branch is '<x>', expected main` | I |
@@ -485,12 +525,24 @@ code.
 exception auto-capture. Diagnostics about a review, including error text, may
 leave the runner. No Ravel secret is in scope, but this is not a hermetic tool.
 
-**GitHub's `workflow_dispatch` permission is `write`.** A `write` user can
-always start a run. They are stopped by the `role_name` check and by the
-environment, and a rejected run costs a few seconds of a hosted runner. It is
-not free, and a determined `write` user could dispatch repeatedly. If that ever
-happens, revoke their access; there is no workflow-level fix, because GitHub
-does not expose the trigger permission this design would want.
+**Anyone can cause a run to start.** `workflow_dispatch` comes with `write`, and
+the comment trigger widens that further: on a public repository anyone can
+comment. Neither widens who can cause a CodeRabbit call, because both reach the
+`role_name` check and the protected environment, and a rejected run costs a few
+seconds of a hosted runner, which is free on public repositories. The pre-filter
+on the `authorize` job (comment is on a pull request, author is not a bot, body
+starts with the command, author association is at least COLLABORATOR) keeps
+ordinary drive-by comments off the runner entirely. It is an extra condition and
+never the decision: MEMBER and COLLABORATOR are both far wider than maintainer.
+A determined abuser is answered by revoking their access; there is no
+workflow-level fix, because GitHub does not expose the trigger permission this
+design would want.
+
+**The acknowledgement job holds `issues: write`.** That scope can comment on
+issues, not only react to them. It is confined to a job that runs after
+authorization succeeded, touches no pull-request content, and does exactly one
+thing. Watch it in review: widening what that job does is how a reaction becomes
+a reply, and a reply is an amplifier for anyone who can type.
 
 **Ruleset and environment settings are not code.** Nothing in this repository
 can assert that `require_code_owner_review` is true or that the environment

@@ -6,10 +6,24 @@
 # entire policy from `main`, and it never executes anything from the pull
 # request under review.
 #
+# Two ways in, one gate. A maintainer either dispatches it by hand, or comments
+# `/coderabbit review` on a pull request. Both funnel through the same
+# authorization job, and neither the comment nor the dispatch is the
+# authorization: the effective repository permission of the actor is.
+#
 # Deliberately absent triggers: pull_request, pull_request_target,
-# issue_comment, pull_request_review, workflow_run, repository_dispatch,
-# schedule, push. Each of them would hand a non-maintainer a way to start a
-# review, which is exactly the property this workflow exists to deny.
+# pull_request_review, workflow_run, repository_dispatch, schedule, push. Each
+# of them would start a review with no human intent behind it at all.
+#
+# `issue_comment` is present, and it widens who can cause a workflow RUN from
+# `write` (who may dispatch) to anyone who can comment, which on a public
+# repository is anyone. It does not widen who can cause a CodeRabbit CALL: an
+# unauthorised comment reaches the `role_name` check, fails, and stops before
+# the environment is requested or a credential exists. `issue_comment` also
+# always runs the copy of this file on the default branch, so a pull request
+# cannot alter the control plane by commenting on itself. A cheap pre-filter on
+# the job keeps drive-by comments from starting a runner at all; it is a noise
+# filter, and it is never the decision.
 #
 # The workflow is inert until an administrator creates the `coderabbit-oss`
 # environment and its `CODERABBIT_API_KEY` secret. Without them the review job
@@ -34,6 +48,10 @@ on:
         required: false
         default: ""
         type: string
+  issue_comment:
+    # `created` only. On `edited`, an old comment could be rewritten into a
+    # command and re-trigger, and the edit history is a poor audit record.
+    types: [created]
 
 # Deny by default. Each job re-grants the minimum it needs.
 permissions: {}
@@ -42,10 +60,15 @@ permissions: {}
 # run that has already called CodeRabbit would spend the allowance and post
 # nothing.
 concurrency:
-  group: coderabbit-maintainer-review-${{ github.repository }}-${{ inputs.pr_number }}
+  group: coderabbit-maintainer-review-${{ github.repository }}-${{ github.event.issue.number || inputs.pr_number }}
   cancel-in-progress: false
 
 env:
+  # A slash command, not a mention. `@coderabbit` is a real and unrelated GitHub
+  # user who would be notified on every invocation, and `@coderabbitai` is the
+  # vendor App's own handle, which would make both the App and this workflow act
+  # on one comment.
+  TRIGGER_COMMAND: "/coderabbit review"
   TRUSTED_REPOSITORY: NOFireAI/ravel
   TRUSTED_BASE_BRANCH: main
   TRUSTED_WORKFLOW_REF: refs/heads/main
@@ -55,12 +78,26 @@ jobs:
   # rejected here, before the protected environment is ever requested.
   authorize:
     name: authorize and validate
+    # Noise filter, not authorization. It keeps an ordinary comment, a bot
+    # comment, and a comment on a plain issue from starting a runner. Author
+    # association appears here and NOWHERE else: it is an extra AND on top of
+    # the real check, never a substitute for it. MEMBER and COLLABORATOR are far
+    # wider than maintainer, and the `role_name` step below is what decides.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request != null &&
+       github.event.comment.user.type != 'Bot' &&
+       startsWith(github.event.comment.body, '/coderabbit review') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
     outputs:
+      pr_number: ${{ steps.req.outputs.pr_number }}
+      force: ${{ steps.req.outputs.force }}
+      reason: ${{ steps.req.outputs.reason }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       base_sha: ${{ steps.pr.outputs.base_sha }}
       actor_role: ${{ steps.actor.outputs.role_name }}
@@ -78,39 +115,89 @@ jobs:
           umask 077
           fail=0
           [ "$ACTUAL_REPOSITORY" = "$TRUSTED_REPOSITORY" ] || { echo "::error::repository is $ACTUAL_REPOSITORY, expected $TRUSTED_REPOSITORY"; fail=1; }
-          [ "$ACTUAL_EVENT" = "workflow_dispatch" ] || { echo "::error::event is $ACTUAL_EVENT, expected workflow_dispatch"; fail=1; }
+          case "$ACTUAL_EVENT" in
+            workflow_dispatch|issue_comment) ;;
+            *) echo "::error::event is $ACTUAL_EVENT, expected workflow_dispatch or issue_comment"; fail=1 ;;
+          esac
+          # Both events run the copy of this workflow on the default branch, so
+          # this holds for either. GitHub sets GITHUB_REF to the default branch
+          # for issue_comment; if that ever changes, this fails closed and the
+          # feature stops working rather than starting to trust a pull request.
           [ "$ACTUAL_REF" = "$TRUSTED_WORKFLOW_REF" ] || { echo "::error::workflow ref is $ACTUAL_REF, expected $TRUSTED_WORKFLOW_REF"; fail=1; }
           [ "$fail" = "0" ] || exit 1
 
-      - name: Validate dispatch inputs
+      # One request shape out of two event shapes. Everything downstream reads
+      # these outputs and never touches an event payload again.
+      - name: Resolve and validate the request
+        id: req
         env:
-          PR_NUMBER: ${{ inputs.pr_number }}
-          FORCE: ${{ inputs.force }}
-          REASON: ${{ inputs.reason }}
+          EVENT: ${{ github.event_name }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_FORCE: ${{ inputs.force }}
+          INPUT_REASON: ${{ inputs.reason }}
+          COMMENT_PR_NUMBER: ${{ github.event.issue.number }}
+          # Untrusted text. It is read as data here, matched against a fixed
+          # grammar, and never interpolated into a command.
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -Eeuo pipefail
           umask 077
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            pr_number="$INPUT_PR_NUMBER"
+            force="$INPUT_FORCE"
+            reason="$INPUT_REASON"
+          else
+            pr_number="$COMMENT_PR_NUMBER"
+            # Only the first line is a command. A quoted command further down a
+            # comment is prose, and treating it as a command would let one
+            # person's paste act on another person's behalf.
+            first_line=${COMMENT_BODY%%$'\n'*}
+            first_line=${first_line%$'\r'}
+            if [ "$first_line" = "$TRIGGER_COMMAND" ]; then
+              force=false
+              reason=""
+            elif [[ "$first_line" =~ ^"$TRIGGER_COMMAND"[[:space:]]+force:[[:space:]]*(.+)$ ]]; then
+              force=true
+              reason="${BASH_REMATCH[1]}"
+            else
+              echo "::error::comment must be exactly '$TRIGGER_COMMAND' or '$TRIGGER_COMMAND force: <reason>'"
+              exit 1
+            fi
+          fi
+
           # A positive integer with no leading zero, bounded so it cannot be a
           # path, a flag, or a denial-of-service length.
-          case "$PR_NUMBER" in
+          case "$pr_number" in
             [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9]) ;;
-            *) echo "::error::pr_number must be a positive integer of at most 6 digits"; exit 1 ;;
+            *) echo "::error::pull-request number must be a positive integer of at most 6 digits"; exit 1 ;;
           esac
-          case "$FORCE" in
+          case "$force" in
             true|false) ;;
             *) echo "::error::force must be true or false"; exit 1 ;;
           esac
-          if [ "$FORCE" = "true" ]; then
-            trimmed=$(printf '%s' "$REASON" | tr -d '[:space:]')
+          if [ "$force" = "true" ]; then
+            trimmed=$(printf '%s' "$reason" | tr -d '[:space:]')
             if [ -z "$trimmed" ]; then
-              echo "::error::reason is required when force is true"
+              echo "::error::an audit reason is required to repeat a review"
               exit 1
             fi
-            if [ "${#REASON}" -gt 500 ]; then
+            if [ "${#reason}" -gt 500 ]; then
               echo "::error::reason must be at most 500 characters"
               exit 1
             fi
           fi
+          # Every control character out, newlines included, before this crosses
+          # a step boundary: a newline in a reason would let the value forge
+          # further `key=value` lines in GITHUB_OUTPUT. The renderer sanitises
+          # again before any of it reaches a review body.
+          reason=$(printf '%s' "$reason" | tr -d '\000-\037\177')
+
+          {
+            echo "pr_number=$pr_number"
+            echo "force=$force"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
 
       # Effective repository permission, from GitHub, for the actor GitHub says
       # dispatched this run. `role_name` is the granular field: the legacy
@@ -197,7 +284,7 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_NUMBER: ${{ steps.req.outputs.pr_number }}
         run: |
           set -Eeuo pipefail
           umask 077
@@ -242,8 +329,8 @@ jobs:
         id: dedupe
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          FORCE: ${{ inputs.force }}
+          PR_NUMBER: ${{ steps.req.outputs.pr_number }}
+          FORCE: ${{ steps.req.outputs.force }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           CONFIG_HASH: ${{ steps.policy.outputs.config_hash }}
           CLI_VERSION: ${{ steps.policy.outputs.cli_version }}
@@ -276,6 +363,42 @@ jobs:
             echo "review_needed=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # Tells the maintainer the command was heard, without giving anyone else a
+  # way to make this workflow speak. It runs only after authorization succeeded,
+  # so an unauthorised comment gets no reaction and no reply: silence, and a
+  # failed run that only maintainers can see. `issues: write` lives here and
+  # nowhere else, and this job never touches pull-request content.
+  ack:
+    name: acknowledge the command
+    needs: authorize
+    if: success() && github.event_name == 'issue_comment'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: React to the triggering comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REVIEW_NEEDED: ${{ needs.authorize.outputs.review_needed }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          case "$COMMENT_ID" in
+            ''|*[!0-9]*) echo "::error::comment id has an unexpected shape"; exit 1 ;;
+          esac
+          # eyes: accepted, review starting. +1: this head SHA was already
+          # reviewed under this policy, so nothing was spent.
+          if [ "$REVIEW_NEEDED" = "true" ]; then
+            reaction="eyes"
+          else
+            reaction="+1"
+          fi
+          gh api --method POST -H "Accept: application/vnd.github+json" \
+            "repos/${TRUSTED_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" \
+            -f "content=${reaction}" > /dev/null
+
   review:
     name: review
     needs: authorize
@@ -290,7 +413,7 @@ jobs:
       contents: read
       pull-requests: write
     env:
-      PR_NUMBER: ${{ inputs.pr_number }}
+      PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
       HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
       BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
       CONFIG_HASH: ${{ needs.authorize.outputs.config_hash }}
@@ -511,7 +634,7 @@ jobs:
           FINDINGS: ${{ steps.run.outputs.findings }}
           MERGE_BASE: ${{ steps.fetch.outputs.merge_base }}
           ACTOR: ${{ github.actor }}
-          REASON: ${{ inputs.reason }}
+          REASON: ${{ needs.authorize.outputs.reason }}
           CLI_RC: ${{ steps.run.outputs.rc }}
         run: |
           set -Eeuo pipefail
