@@ -226,6 +226,18 @@ truncation ([crates/ravel-query/src/config.rs](../../crates/ravel-query/src/conf
 seconds) lowers the deadline per request. It cannot raise it above the
 server's configured default.
 
+SQL queries carry one more bound, a per-query byte ceiling on the DataFusion
+memory pool (256 MiB by default). It bounds the memory the query *holds at one
+instant* -- what a scan currently has decoded, plus the batch it is handing
+downstream, plus whatever aggregate state the operators above it accumulate --
+not the number of bytes the query has produced over its lifetime. A full-table
+scan over `logs` therefore does not exhaust it merely by being large: the logs
+scan streams one block at a time and releases each block before decoding the
+next (ADR-0087), so its own contribution tracks block size and partition count.
+An `ORDER BY` or a high-cardinality `GROUP BY` over a large result is what
+genuinely accumulates. Exceeding the ceiling is an HTTP 422 `execution` error
+naming the pool, never a truncated result.
+
 The catalog-list budget is checked before any object-store request is made,
 not after. The catalog lists one prefix per (shard, ingest hour) from the
 window's start to the current hour, so a query whose `start` reaches far back

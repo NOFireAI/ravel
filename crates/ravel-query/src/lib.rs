@@ -25,7 +25,7 @@ pub use fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, SegmentFetcher,
 };
 pub use log_fetcher::{
-    LogFetchError, LogFetchOutput, LogQuery, LogSegmentFetcher, StreamAttrEquals,
+    LogFetchError, LogFetchOutput, LogQuery, LogSegmentFetcher, LogSegmentScan, StreamAttrEquals,
 };
 pub use query_admission::{
     QueryAdmissionController, QueryConcurrencyLimit, QueryPermit, QueryRejected,

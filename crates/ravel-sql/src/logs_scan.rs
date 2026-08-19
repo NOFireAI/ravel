@@ -3,21 +3,46 @@
 //!
 //! Partitions the snapshot's segments round-robin into
 //! `N = min(target_partitions, segment_count)` partitions. Each partition
-//! fetches its segments through [`LogSegmentFetcher::fetch`] (one
-//! [`LogQuery`] per segment: the extracted ts range, stream-attribute
-//! equalities, and content predicates), decodes the returned
-//! [`ravel_logseg::LogRecord`]s into Arrow arrays matching
-//! [`crate::logs_schema::logs_schema`], and emits them sorted by `ts`
-//! ascending. That per-partition ordering is declared through
-//! `PlanProperties` so a later merge stage can honor it with a
-//! `SortPreservingMergeExec`.
+//! opens its segments one at a time through
+//! [`LogSegmentFetcher::scan_accounted_with_tenant`] (one [`LogQuery`] per
+//! segment: the extracted ts range, stream-attribute equalities, and content
+//! predicates), decodes **one block at a time**, and turns each block's
+//! [`ravel_logseg::LogRecord`]s into Arrow arrays matching this scan's
+//! projection of [`crate::logs_schema::logs_schema`].
 //!
-//! `RlogReader::scan` (inside `fetch`) already emits a segment's records
-//! grouped by `(stream_ref, ts)`, not globally by `ts`, and a partition draws
-//! from several segments, so this stage sorts each partition's collected
-//! records by `ts` before emitting. Declaring `ts` ascending is therefore
-//! truthful for the stream this stage produces; nothing declares a global
-//! cross-partition order (that is a merge's job, not the leaf's).
+//! # Streaming, and why no ordering is declared (ADR-0087)
+//!
+//! This stage declares **no** output ordering. It used to declare `ts`
+//! ascending per partition, and earned that by collecting the whole partition
+//! and sorting it before emitting anything -- which made peak memory
+//! proportional to the partition, i.e. to the table. `RlogReader` itself only
+//! emits a segment's records grouped by `(stream_ref, ts)`, not globally by
+//! `ts`, and a partition draws from several segments, so a block-at-a-time
+//! scan cannot truthfully claim a global per-partition `ts` order.
+//!
+//! Declaring one anyway would be silently wrong, not merely optimistic:
+//! DataFusion trusts a leaf's declared ordering and would skip the sort an
+//! `ORDER BY ts` needs. So the guarantee is gone, and an `ORDER BY ts` gets an
+//! explicit `SortExec` that DataFusion inserts above this leaf. Nothing here
+//! sorts, buffers a partition, or otherwise reintroduces the bound this
+//! removes.
+//!
+//! Memory is reserved against the query's DataFusion pool for what the scan
+//! *currently holds* -- the decoded block being drained plus the batch just
+//! handed downstream -- and released as each goes away, so the pool bounds
+//! concurrently-held scan memory rather than cumulative bytes emitted.
+//!
+//! # Column projection
+//!
+//! The scan's output schema *is* the projection DataFusion asked for; there is
+//! no `ProjectionExec` above it dropping columns the scan already paid to
+//! produce. The projected columns, plus every field a pushed content predicate
+//! names, plus every attribute key a pending erasure predicate names, are
+//! resolved into a [`ColumnSelection`] that the reader uses to decode only
+//! those columns' pages ([`resolve_columns`]). Any reference to the SQL `attrs`
+//! map column resolves to every dynamic column plus `attrs_raw`, because the
+//! map's contract is that every key is present; per-key `attrs['k']`
+//! projection is out of scope (ADR-0087 decision 3).
 //!
 //! # Correctness: the merged `attrs` column plus DataFusion's residual
 //!
@@ -62,6 +87,7 @@
 //! the key to the record's value, which wins). The merged column and the
 //! residual are the whole correctness story.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -72,14 +98,12 @@ use datafusion::arrow::array::{
     ArrayRef, FixedSizeBinaryBuilder, MapBuilder, StringArray, StringBuilder,
     TimestampNanosecondArray, UInt8Array, UInt32Array,
 };
-use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::physical_expr::expressions::col;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -90,21 +114,144 @@ use datafusion::physical_plan::{
 };
 use futures::Stream;
 use ravel_catalog::SegmentRef;
-use ravel_logseg::{LogRecord, Predicate, ScanStats};
+use ravel_logseg::{ColumnSelection, FieldSel, LogRecord, Predicate, ScanStats};
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_query::{LogQuery, LogSegmentFetcher, LogSegmentScan};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::logstream::AttrValue;
 
 use crate::error::SqlError;
-use crate::logs_schema::{SPAN_ID_WIDTH, TRACE_ID_WIDTH, logs_schema};
+use crate::logs_schema::{
+    LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS, LOG_COL_SEVERITY_NUM,
+    LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS, SPAN_ID_WIDTH,
+    TRACE_ID_WIDTH, logs_schema,
+};
 use crate::rlog_attrs::{attr_value_to_string, merged_attrs, retain_unerased};
 
 /// Rows accumulated into one output batch before it is emitted.
+///
+/// A block usually decodes to fewer rows than this (RLOG's default block target
+/// is 8192 records, and predicate evaluation only removes rows), so one block
+/// normally becomes one batch. This bounds the other direction: a block written
+/// with a larger target is still emitted in pieces of at most this many rows, so
+/// one batch's Arrow footprint stays bounded whatever the writer chose.
 const BATCH_ROWS: usize = 8192;
 
-/// Log segment scan producing per-partition ts-ascending batches over the
-/// public `logs` schema.
+/// Rough resident size of a decoded record in row form, for the memory
+/// reservation.
+///
+/// Deliberately an estimate, not an exact figure: the point is that the pool
+/// sees a charge proportional to what the scan actually holds, which nothing
+/// charged at all before (ADR-0087 context). It counts the struct itself, the
+/// owned string and blob payloads, and the attribute vector's spine and
+/// contents. It does not chase `AttrValue::List`/`Map` recursively past their
+/// direct children, so a deeply nested attribute is undercounted; the fixed
+/// per-record and per-attribute terms dominate at the cardinalities this
+/// bound exists for.
+fn records_memory(records: &[LogRecord]) -> usize {
+    let mut total = std::mem::size_of_val(records);
+    for r in records {
+        total += r.stream_attrs.len() + r.severity_text.len() + r.body.len();
+        total += r.attrs.len() * std::mem::size_of::<(String, AttrValue)>();
+        for (k, v) in &r.attrs {
+            total += k.len() + attr_value_memory(v);
+        }
+    }
+    total
+}
+
+fn attr_value_memory(v: &AttrValue) -> usize {
+    match v {
+        AttrValue::Str(s) => s.len(),
+        AttrValue::Bytes(b) => b.len(),
+        AttrValue::I64(_) | AttrValue::F64(_) | AttrValue::Bool(_) => 0,
+        AttrValue::List(items) => items.len() * std::mem::size_of::<AttrValue>(),
+        AttrValue::Map(entries) => entries.len() * std::mem::size_of::<(String, AttrValue)>(),
+    }
+}
+
+/// The block columns one query needs decoded (ADR-0087 decision 3).
+///
+/// Four contributors, and every one of them is load-bearing:
+///
+/// - the **projected schema columns**, which are what the query's output and
+///   DataFusion's residual `FilterExec` above this leaf read (the projection
+///   DataFusion hands `TableProvider::scan` already includes the columns its
+///   residual filters need, which is why the residual is safe over a projected
+///   scan);
+/// - the **`ts`/`stream_ref` fixed columns**, added unconditionally by
+///   [`ColumnSelection`] because every rebuilt record and every exact
+///   ts re-check needs them;
+/// - every field a **pushed content predicate** names, because
+///   `RlogReader` evaluates those exactly per row and a column it cannot see
+///   reads as absent, i.e. as not matching, i.e. as dropped rows;
+/// - every attribute key a **pending erasure predicate** names, at record level
+///   for the fetcher's own filter and at merged resource/scope/record level for
+///   [`retain_unerased`] here (ADR-0064). A key the selection omits makes an
+///   erased row reappear.
+///
+/// The prune-only channel contributes nothing: its arms drive POSTINGS block
+/// pruning and are never evaluated per row, so no page has to be decoded for
+/// them.
+///
+/// Resource and scope attributes cost nothing to keep: they live in STREAM_DIR,
+/// reached through `stream_ref`, not in a block column. So an erasure subject
+/// named only at resource level is matched under any selection.
+fn resolve_columns(
+    projection: &[usize],
+    content: &[Predicate],
+    erasure: &[ErasurePredicate],
+) -> ColumnSelection {
+    let mut sel = ColumnSelection::fixed_only();
+    for &i in projection {
+        sel = match i {
+            // `ts` is always decoded; naming it changes nothing.
+            LOG_COL_TS => sel,
+            LOG_COL_OBSERVED_TS => sel.with_observed_ts(),
+            LOG_COL_SEVERITY_NUM => sel.with_severity_num(),
+            LOG_COL_SEVERITY_TEXT => sel.with_severity_text(),
+            LOG_COL_BODY => sel.with_body(),
+            LOG_COL_TRACE_ID => sel.with_trace_id(),
+            LOG_COL_SPAN_ID => sel.with_span_id(),
+            LOG_COL_FLAGS => sel.with_flags(),
+            // The merged `attrs` map exposes every key, so referencing it at
+            // all means every dynamic column plus the overflow.
+            LOG_COL_ATTRS => sel.with_all_attrs(),
+            // Not reachable: `LogsScanExec::new` validates every index against
+            // the schema before building the projected schema. Fail open (decode
+            // everything) rather than silently under-decode if that ever
+            // changes.
+            _ => ColumnSelection::all(),
+        };
+    }
+    for p in content {
+        sel = content_columns(p, sel);
+    }
+    for p in erasure {
+        for (key, _) in p.matchers() {
+            sel = sel.with_attr(key);
+        }
+    }
+    sel
+}
+
+/// Add every column an exact content predicate reads. `TsRange` and `StreamIn`
+/// need only the two always-decoded fixed columns.
+fn content_columns(pred: &Predicate, sel: ColumnSelection) -> ColumnSelection {
+    match pred {
+        Predicate::And(arms) => arms.iter().fold(sel, |acc, a| content_columns(a, acc)),
+        Predicate::TsRange { .. } | Predicate::StreamIn(_) => sel,
+        Predicate::HasWord { field, .. } | Predicate::Equals { field, .. } => match field {
+            FieldSel::Body => sel.with_body(),
+            FieldSel::SeverityText => sel.with_severity_text(),
+            FieldSel::Attr(name) => sel.with_attr(name.clone()),
+        },
+    }
+}
+
+/// Log segment scan producing block-at-a-time batches over a projection of the
+/// public `logs` schema. Declares no ordering (ADR-0087 decision 1).
 pub struct LogsScanExec {
     tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
@@ -128,6 +275,13 @@ pub struct LogsScanExec {
     /// (`retain_log_records`) engages; empty when the snapshot has no pending
     /// erasure, which is a no-op there.
     erasure: Arc<Vec<ErasurePredicate>>,
+    /// Indices into [`logs_schema`] this scan emits, in output order. Always
+    /// concrete: a `None` projection from DataFusion becomes every index.
+    projection: Arc<Vec<usize>>,
+    /// The block columns the reader must decode, resolved once from
+    /// `projection`, `content`, and `erasure` (see [`resolve_columns`]).
+    columns: ColumnSelection,
+    /// This scan's output schema: `logs_schema()` projected by `projection`.
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
@@ -150,6 +304,14 @@ struct BlockMetrics {
     total: Count,
     scanned: Count,
     pruned_by_postings: Count,
+    /// Column pages this partition decompressed and decoded.
+    pages_decoded: Count,
+    /// Column pages this partition walked past because the resolved
+    /// [`ColumnSelection`] excluded them. This is the externally visible proof
+    /// that column projection reached the page level rather than being a
+    /// post-decode filter: a query that touches two of a hundred attributes
+    /// leaves this large and `pages_decoded` small.
+    pages_skipped: Count,
 }
 
 impl BlockMetrics {
@@ -159,6 +321,8 @@ impl BlockMetrics {
             scanned: MetricBuilder::new(metrics).counter("blocks_scanned", partition),
             pruned_by_postings: MetricBuilder::new(metrics)
                 .counter("blocks_pruned_by_postings", partition),
+            pages_decoded: MetricBuilder::new(metrics).counter("pages_decoded", partition),
+            pages_skipped: MetricBuilder::new(metrics).counter("pages_skipped", partition),
         }
     }
 
@@ -175,6 +339,8 @@ impl BlockMetrics {
                 .blocks_after_skip
                 .saturating_sub(stats.blocks_after_postings) as usize,
         );
+        self.pages_decoded.add(stats.pages_decoded as usize);
+        self.pages_skipped.add(stats.pages_skipped as usize);
     }
 }
 
@@ -202,6 +368,7 @@ impl LogsScanExec {
         content: Arc<Vec<Predicate>>,
         prune: Arc<Vec<Predicate>>,
         erasure: Arc<Vec<ErasurePredicate>>,
+        projection: Option<&Vec<usize>>,
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
@@ -209,8 +376,24 @@ impl LogsScanExec {
         for (i, seg) in segments.iter().enumerate() {
             partitions[i % n].push(seg.clone());
         }
-        let schema = logs_schema();
-        let properties = Arc::new(Self::compute_properties(&schema, n)?);
+        let full = logs_schema();
+        // A `None` projection means every column, in schema order. Resolving it
+        // here rather than carrying an `Option` keeps one code path for the
+        // schema, the batch builder, and the column-set resolution.
+        let projection: Vec<usize> = match projection {
+            Some(p) => p.clone(),
+            None => (0..full.fields().len()).collect(),
+        };
+        for &i in &projection {
+            if i >= full.fields().len() {
+                return Err(DataFusionError::Internal(format!(
+                    "logs scan projection index {i} out of range"
+                )));
+            }
+        }
+        let columns = resolve_columns(&projection, &content, &erasure);
+        let schema: SchemaRef = Arc::new(full.project(&projection)?);
+        let properties = Arc::new(Self::compute_properties(&schema, n));
         Ok(LogsScanExec {
             tenant_hash,
             fetcher,
@@ -220,6 +403,8 @@ impl LogsScanExec {
             content,
             prune,
             erasure,
+            projection: Arc::new(projection),
+            columns,
             schema,
             properties,
             accounting,
@@ -227,21 +412,18 @@ impl LogsScanExec {
         })
     }
 
-    fn compute_properties(schema: &SchemaRef, n: usize) -> DFResult<PlanProperties> {
-        let asc = SortOptions {
-            descending: false,
-            nulls_first: false,
-        };
-        let sort_expr = PhysicalSortExpr::new(col("ts", schema)?, asc);
-        let ordering = LexOrdering::new(vec![sort_expr])
-            .ok_or_else(|| DataFusionError::Internal("empty logs scan ordering".into()))?;
-        let eq = EquivalenceProperties::new_with_orderings(Arc::clone(schema), vec![ordering]);
-        Ok(PlanProperties::new(
+    /// No output ordering (ADR-0087 decision 1). A block-streaming scan emits a
+    /// partition's blocks in stored order, which is `(stream_ref, ts)` within a
+    /// block and segment order across a partition, so no `ts` ordering holds.
+    /// Downstream operators that need one get an explicit sort.
+    fn compute_properties(schema: &SchemaRef, n: usize) -> PlanProperties {
+        let eq = EquivalenceProperties::new(Arc::clone(schema));
+        PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(n),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        ))
+        )
     }
 }
 
@@ -259,10 +441,16 @@ impl DisplayAs for LogsScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "LogsScanExec: partitions={}, content={}, prune={}",
+            "LogsScanExec: partitions={}, content={}, prune={}, projection=[{}]",
             self.partitions.len(),
             self.content.len(),
-            self.prune.len()
+            self.prune.len(),
+            self.schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
 }
@@ -296,111 +484,170 @@ impl ExecutionPlan for LogsScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let segs = self.partitions.get(partition).cloned().unwrap_or_default();
-        let fetcher = self.fetcher.clone();
-        let tenant_hash = self.tenant_hash;
-        let content = Arc::clone(&self.content);
-        let prune = Arc::clone(&self.prune);
-        let erasure = Arc::clone(&self.erasure);
-        let schema = Arc::clone(&self.schema);
-        let blocks = BlockMetrics::new(&self.metrics, partition);
+        let segments: VecDeque<SegmentRef> = self
+            .partitions
+            .get(partition)
+            .cloned()
+            .unwrap_or_default()
+            .into();
+
+        let mut query =
+            LogQuery::new(self.ts_min, self.ts_max).with_erasure((*self.erasure).clone());
+        for c in self.content.iter() {
+            query = query.with_content(c.clone());
+        }
+        // The prune channel, kept out of `content` on purpose: the reader
+        // evaluates a content arm exactly per row against per-record attributes
+        // only, which would drop a resource/scope-only match the merged
+        // residual must keep.
+        for p in self.prune.iter() {
+            query = query.with_prune(p.clone());
+        }
 
         let reservation = MemoryConsumer::new(format!("LogsScanExec[{partition}]"))
             .register(context.memory_pool());
 
-        let fut = Box::pin(prepare_partition(
-            fetcher,
-            tenant_hash,
-            segs,
-            self.ts_min,
-            self.ts_max,
-            content,
-            prune,
-            erasure,
-            self.accounting.clone(),
-            blocks,
-        ));
         Ok(Box::pin(LogScanStream {
-            schema,
+            schema: Arc::clone(&self.schema),
+            projection: Arc::clone(&self.projection),
+            ctx: Arc::new(PartitionCtx {
+                fetcher: self.fetcher.clone(),
+                tenant_hash: self.tenant_hash,
+                query,
+                columns: self.columns.clone(),
+                accounting: self.accounting.clone(),
+            }),
+            erasure: Arc::clone(&self.erasure),
+            blocks: BlockMetrics::new(&self.metrics, partition),
+            segments,
             reservation,
-            state: LogScanState::Fetching(fut),
+            held: 0,
+            emitted: 0,
+            pending: Vec::new(),
+            pos: 0,
+            state: LogScanState::NextSegment,
         }))
     }
 }
 
-/// Fetch every segment in this partition and return its records sorted by `ts`
-/// ascending. The ts range and content predicates prune the fetch and the
-/// attribute equalities in `prune` drive POSTINGS block pruning inside the
-/// reader; neither filters attributes, which is DataFusion's residual over
-/// [`build_batch`]'s merged `attrs` column (see the module doc). Every fetched
-/// record is emitted.
-#[allow(clippy::too_many_arguments)]
-async fn prepare_partition(
+/// Everything one partition's fetches need, shared by every per-segment open
+/// future so each can be `'static` without cloning the query per segment.
+struct PartitionCtx {
     fetcher: LogSegmentFetcher,
     tenant_hash: TenantHash,
-    segs: Vec<SegmentRef>,
-    ts_min: i64,
-    ts_max: i64,
-    content: Arc<Vec<Predicate>>,
-    prune: Arc<Vec<Predicate>>,
-    erasure: Arc<Vec<ErasurePredicate>>,
+    query: LogQuery,
+    columns: ColumnSelection,
     accounting: QueryAccounting,
-    blocks: BlockMetrics,
-) -> DFResult<Vec<LogRecord>> {
-    let mut query = LogQuery::new(ts_min, ts_max).with_erasure((*erasure).clone());
-    for c in content.iter() {
-        query = query.with_content(c.clone());
-    }
-    // The prune channel, kept out of `content` on purpose: the reader evaluates
-    // a content arm exactly per row against per-record attributes only, which
-    // would drop a resource/scope-only match the merged residual must keep.
-    for p in prune.iter() {
-        query = query.with_prune(p.clone());
-    }
-
-    let mut out: Vec<LogRecord> = Vec::new();
-    for seg in &segs {
-        let Some(output) = fetcher
-            .fetch_accounted_with_tenant(seg, tenant_hash, &query, &accounting)
-            .await
-            .map_err(SqlError::from)?
-        else {
-            continue;
-        };
-        blocks.record(&output.stats);
-        // Emit every fetched record: stream-attribute equalities are not pushed
-        // (a stream-level prune is unsound against the merged `attrs` column),
-        // so nothing here narrows below what DataFusion's residual keeps.
-        out.extend(output.records);
-    }
-    // Scan-layer selective-erasure exclusion (ADR-0064). This is the
-    // authoritative exclusion because it sees the same merged `attrs` view the
-    // surface returns (resource + scope + record), so a subject named only in a
-    // resource/scope attribute is dropped; the fetcher-level filter matches
-    // per-record attributes alone and cannot see it.
-    retain_unerased(&mut out, &erasure)?;
-    // Stable sort so records with equal ts keep the reader's emission order.
-    out.sort_by_key(|r| r.ts_ns);
-    Ok(out)
 }
 
-type PrepareFuture = Pin<Box<dyn Future<Output = DFResult<Vec<LogRecord>>> + Send>>;
+type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> + Send>>;
+
+/// Fetch one segment's bytes and open its pruned, column-projected scan.
+/// `Ok(None)` means the catalog summary proved the segment irrelevant, with no
+/// GET issued.
+fn open_segment(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
+    Box::pin(async move {
+        let scan = ctx
+            .fetcher
+            .scan_accounted_with_tenant(
+                &seg,
+                ctx.tenant_hash,
+                &ctx.query,
+                &ctx.columns,
+                &ctx.accounting,
+            )
+            .await
+            .map_err(SqlError::from)?;
+        Ok(scan)
+    })
+}
 
 enum LogScanState {
-    Fetching(PrepareFuture),
-    Emitting { records: Vec<LogRecord>, pos: usize },
+    /// Advance to the next segment of this partition, or finish.
+    NextSegment,
+    /// Awaiting one segment's GET and prune.
+    Opening(OpenFuture),
+    /// Draining one segment's surviving blocks, one at a time.
+    Draining(Box<LogSegmentScan>),
     Done,
 }
 
-/// Per-partition record-batch stream: awaits the fetch, then emits ts-ascending
-/// bounded batches, growing the memory reservation by each batch's measured
-/// size so a byte-budget overrun surfaces as the pool's `ResourcesExhausted`.
-/// The reservation lives on the stream (not the state) so it is the same one
+/// Per-partition record-batch stream (ADR-0087 decisions 1 and 2).
+///
+/// Holds at most one segment's decoded block plus the batch built from it, and
+/// charges the query's memory pool for exactly that: `held` is the reservation
+/// covering `pending`, `emitted` the reservation covering the batch handed
+/// downstream on the previous poll. Both are released as their data goes away,
+/// so the reservation tracks live resident memory rather than cumulative output
+/// and a pool overrun surfaces as `ResourcesExhausted` at the moment the scan
+/// genuinely holds too much.
+///
+/// The reservation lives on the stream (not on the state) so it is the same one
 /// for the partition's lifetime and frees exactly once on drop.
 struct LogScanStream {
     schema: SchemaRef,
+    /// Indices into [`logs_schema`] to emit, in output order.
+    projection: Arc<Vec<usize>>,
+    ctx: Arc<PartitionCtx>,
+    erasure: Arc<Vec<ErasurePredicate>>,
+    blocks: BlockMetrics,
+    segments: VecDeque<SegmentRef>,
     reservation: MemoryReservation,
+    /// Reservation bytes currently covering `pending`.
+    held: usize,
+    /// Reservation bytes currently covering the batch emitted last poll.
+    emitted: usize,
+    /// The block being drained into batches.
+    pending: Vec<LogRecord>,
+    pos: usize,
     state: LogScanState,
+}
+
+impl LogScanStream {
+    /// Build the next batch out of `pending`, moving the reservation with it:
+    /// the previous batch's charge is released (it is downstream's now), the new
+    /// batch's charge is taken before it is handed over.
+    fn emit_next_batch(&mut self) -> DFResult<RecordBatch> {
+        self.reservation.shrink(std::mem::take(&mut self.emitted));
+        let end = (self.pos + BATCH_ROWS).min(self.pending.len());
+        let batch = build_batch(
+            &self.pending[self.pos..end],
+            Arc::clone(&self.schema),
+            &self.projection,
+        )?;
+        self.pos = end;
+        let bytes = batch.get_array_memory_size();
+        self.reservation.try_grow(bytes)?;
+        self.emitted = bytes;
+        Ok(batch)
+    }
+
+    /// Take ownership of one decoded block, charging the pool for it before it
+    /// is held. An empty block (every row filtered out) charges nothing and
+    /// leaves the stream to ask for the next one.
+    fn hold_block(&mut self, records: Vec<LogRecord>) -> DFResult<()> {
+        let bytes = records_memory(&records);
+        self.reservation.try_grow(bytes)?;
+        self.held = bytes;
+        self.pending = records;
+        self.pos = 0;
+        Ok(())
+    }
+
+    /// Drop the drained block and release its charge.
+    fn release_block(&mut self) {
+        self.reservation.shrink(std::mem::take(&mut self.held));
+        self.pending = Vec::new();
+        self.pos = 0;
+    }
+
+    /// Abandon the stream on error, releasing everything the scan still holds.
+    fn fail(&mut self, e: DataFusionError) -> Poll<Option<DFResult<RecordBatch>>> {
+        self.state = LogScanState::Done;
+        self.release_block();
+        self.reservation.shrink(std::mem::take(&mut self.emitted));
+        Poll::Ready(Some(Err(e)))
+    }
 }
 
 impl Stream for LogScanStream {
@@ -409,36 +656,77 @@ impl Stream for LogScanStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
+            // Anything buffered from the current block goes out first.
+            if this.pos < this.pending.len() {
+                return match this.emit_next_batch() {
+                    Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                    Err(e) => this.fail(e),
+                };
+            }
+            // The block is drained: release it before decoding another, so the
+            // reservation never covers two blocks at once.
+            if this.held > 0 {
+                this.release_block();
+            }
+
             match &mut this.state {
-                LogScanState::Fetching(fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(records)) => {
-                        this.state = LogScanState::Emitting { records, pos: 0 };
+                LogScanState::NextSegment => match this.segments.pop_front() {
+                    Some(seg) => {
+                        this.state =
+                            LogScanState::Opening(open_segment(Arc::clone(&this.ctx), seg));
                     }
-                    Poll::Ready(Err(e)) => {
+                    None => {
                         this.state = LogScanState::Done;
-                        return Poll::Ready(Some(Err(e)));
                     }
+                },
+                LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(Some(scan))) => {
+                        this.state = LogScanState::Draining(Box::new(scan));
+                    }
+                    // The segment's ts span could not satisfy the query: no GET
+                    // was issued and there is nothing to drain.
+                    Poll::Ready(Ok(None)) => this.state = LogScanState::NextSegment,
+                    Poll::Ready(Err(e)) => return this.fail(e),
                     Poll::Pending => return Poll::Pending,
                 },
-                LogScanState::Emitting { records, pos } => {
-                    if *pos >= records.len() {
-                        this.state = LogScanState::Done;
-                        return Poll::Ready(None);
-                    }
-                    let end = (*pos + BATCH_ROWS).min(records.len());
-                    let batch = match build_batch(&records[*pos..end], Arc::clone(&this.schema)) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            this.state = LogScanState::Done;
-                            return Poll::Ready(Some(Err(e)));
+                LogScanState::Draining(scan) => {
+                    let decoded = scan.next_block().map_err(SqlError::from);
+                    match decoded {
+                        Ok(Some(mut records)) => {
+                            // Scan-layer selective-erasure exclusion (ADR-0064).
+                            // This is the authoritative exclusion because it
+                            // sees the same merged `attrs` view the surface
+                            // returns (resource + scope + record), so a subject
+                            // named only in a resource/scope attribute is
+                            // dropped; the fetcher-level filter matches
+                            // per-record attributes alone and cannot see it.
+                            if let Err(e) = retain_unerased(&mut records, &this.erasure) {
+                                return this.fail(e);
+                            }
+                            // Every surviving record is emitted:
+                            // stream-attribute equalities are not pushed (a
+                            // stream-level prune is unsound against the merged
+                            // `attrs` column), so nothing here narrows below
+                            // what DataFusion's residual keeps.
+                            //
+                            // An empty `records` here is normal, not the end of
+                            // the segment: a block can survive pruning and hold
+                            // no row matching the exact filter, or have every
+                            // matching row erased. The loop just asks for the
+                            // next block.
+                            if let Err(e) = this.hold_block(records) {
+                                return this.fail(e);
+                            }
                         }
-                    };
-                    *pos = end;
-                    if let Err(e) = this.reservation.try_grow(batch.get_array_memory_size()) {
-                        this.state = LogScanState::Done;
-                        return Poll::Ready(Some(Err(e)));
+                        // Only `None` ends the segment. Its counters are final
+                        // now, so publish them before moving on.
+                        Ok(None) => {
+                            let stats = scan.stats();
+                            this.blocks.record(&stats);
+                            this.state = LogScanState::NextSegment;
+                        }
+                        Err(e) => return this.fail(e.into()),
                     }
-                    return Poll::Ready(Some(Ok(batch)));
                 }
                 LogScanState::Done => return Poll::Ready(None),
             }
@@ -452,75 +740,103 @@ impl RecordBatchStream for LogScanStream {
     }
 }
 
-/// Decode a slice of records into one `logs`-schema [`RecordBatch`].
-fn build_batch(records: &[LogRecord], schema: SchemaRef) -> DFResult<RecordBatch> {
-    let ts = TimestampNanosecondArray::from(records.iter().map(|r| r.ts_ns).collect::<Vec<_>>());
-    let observed_ts = TimestampNanosecondArray::from(
-        records.iter().map(|r| r.observed_ts_ns).collect::<Vec<_>>(),
-    );
-    let severity_num = UInt8Array::from(records.iter().map(|r| r.severity_num).collect::<Vec<_>>());
-    let severity_text = StringArray::from(
-        records
-            .iter()
-            .map(|r| r.severity_text.as_str())
-            .collect::<Vec<_>>(),
-    );
-    let body = StringArray::from(records.iter().map(|r| r.body.as_str()).collect::<Vec<_>>());
-
-    let mut trace = FixedSizeBinaryBuilder::with_capacity(records.len(), TRACE_ID_WIDTH);
-    for r in records {
-        match &r.trace_id {
-            Some(id) => trace
-                .append_value(id)
-                .map_err(|e| SqlError::Internal(format!("trace_id array build: {e}")))?,
-            None => trace.append_null(),
-        }
+/// Decode a slice of records into one [`RecordBatch`] over `schema`, which is
+/// `logs_schema()` projected by `projection`.
+///
+/// Only the projected columns are built. A column the query did not ask for is
+/// never materialized here, which is the second half of the projection story:
+/// the reader does not decode its pages ([`resolve_columns`]) and this does not
+/// allocate an Arrow array for it. `attrs` is the expensive one to skip -- at a
+/// hundred attributes a row it dominated the batch's footprint even for
+/// `COUNT(*)`, which projects nothing at all.
+fn build_batch(
+    records: &[LogRecord],
+    schema: SchemaRef,
+    projection: &[usize],
+) -> DFResult<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
+    for &i in projection {
+        let array: ArrayRef = match i {
+            LOG_COL_TS => Arc::new(TimestampNanosecondArray::from(
+                records.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            )),
+            LOG_COL_OBSERVED_TS => Arc::new(TimestampNanosecondArray::from(
+                records.iter().map(|r| r.observed_ts_ns).collect::<Vec<_>>(),
+            )),
+            LOG_COL_SEVERITY_NUM => Arc::new(UInt8Array::from(
+                records.iter().map(|r| r.severity_num).collect::<Vec<_>>(),
+            )),
+            LOG_COL_SEVERITY_TEXT => Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|r| r.severity_text.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            LOG_COL_BODY => Arc::new(StringArray::from(
+                records.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            )),
+            LOG_COL_TRACE_ID => {
+                let mut trace =
+                    FixedSizeBinaryBuilder::with_capacity(records.len(), TRACE_ID_WIDTH);
+                for r in records {
+                    match &r.trace_id {
+                        Some(id) => trace.append_value(id).map_err(|e| {
+                            SqlError::Internal(format!("trace_id array build: {e}"))
+                        })?,
+                        None => trace.append_null(),
+                    }
+                }
+                Arc::new(trace.finish())
+            }
+            LOG_COL_SPAN_ID => {
+                let mut span = FixedSizeBinaryBuilder::with_capacity(records.len(), SPAN_ID_WIDTH);
+                for r in records {
+                    match &r.span_id {
+                        Some(id) => span
+                            .append_value(id)
+                            .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?,
+                        None => span.append_null(),
+                    }
+                }
+                Arc::new(span.finish())
+            }
+            LOG_COL_FLAGS => Arc::new(UInt32Array::from(
+                records.iter().map(|r| r.flags).collect::<Vec<_>>(),
+            )),
+            // `attrs` map: each record's stream-identity (resource + scope)
+            // attributes merged with its dynamic per-record attributes, values
+            // rendered to text. DataFusion's mandatory `Inexact` residual
+            // re-applies `attrs['k'] = 'v'` against this column, and that
+            // residual is the sole exactness mechanism, so the column must carry
+            // the fully merged view. Populating it from `r.attrs` alone silently
+            // dropped every record whose matched attribute was a genuine
+            // resource attribute (ADR-0033 amendment). See `merged_attrs`.
+            LOG_COL_ATTRS => {
+                let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+                for r in records {
+                    for (k, v) in merged_attrs(r)? {
+                        attrs.keys().append_value(&k);
+                        attrs.values().append_value(attr_value_to_string(&v));
+                    }
+                    attrs
+                        .append(true)
+                        .map_err(|e| SqlError::Internal(format!("attrs map build: {e}")))?;
+                }
+                Arc::new(attrs.finish())
+            }
+            other => {
+                return Err(DataFusionError::Internal(format!(
+                    "logs scan projection index {other} out of range"
+                )));
+            }
+        };
+        columns.push(array);
     }
-    let trace = trace.finish();
-
-    let mut span = FixedSizeBinaryBuilder::with_capacity(records.len(), SPAN_ID_WIDTH);
-    for r in records {
-        match &r.span_id {
-            Some(id) => span
-                .append_value(id)
-                .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?,
-            None => span.append_null(),
-        }
-    }
-    let span = span.finish();
-
-    let flags = UInt32Array::from(records.iter().map(|r| r.flags).collect::<Vec<_>>());
-
-    // `attrs` map: each record's stream-identity (resource + scope) attributes
-    // merged with its dynamic per-record attributes, values rendered to text.
-    // DataFusion's mandatory `Inexact` residual re-applies `attrs['k'] = 'v'`
-    // against this column, and that residual is the sole exactness mechanism, so
-    // the column must carry the fully merged view. Populating it from `r.attrs`
-    // alone silently dropped every record whose matched attribute was a genuine
-    // resource attribute (ADR-0033 amendment). See `merged_attrs`.
-    let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-    for r in records {
-        for (k, v) in merged_attrs(r)? {
-            attrs.keys().append_value(&k);
-            attrs.values().append_value(attr_value_to_string(&v));
-        }
-        attrs
-            .append(true)
-            .map_err(|e| SqlError::Internal(format!("attrs map build: {e}")))?;
-    }
-    let attrs = attrs.finish();
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(ts),
-        Arc::new(observed_ts),
-        Arc::new(severity_num),
-        Arc::new(severity_text),
-        Arc::new(body),
-        Arc::new(trace),
-        Arc::new(span),
-        Arc::new(flags),
-        Arc::new(attrs),
-    ];
     debug_assert_eq!(schema.fields().len(), columns.len());
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+    // The row count is carried explicitly: an empty projection (what a bare
+    // `COUNT(*)` asks for, and the cheapest case this change exists to make
+    // work) has no column to infer it from, and inferring zero rows there would
+    // silently lose every row.
+    let options = RecordBatchOptions::new().with_row_count(Some(records.len()));
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(DataFusionError::from)
 }

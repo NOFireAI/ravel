@@ -28,9 +28,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
@@ -80,11 +78,11 @@ impl LogsTableProvider {
         }
     }
 
-    /// Build the scan over every segment in the snapshot with no pushdown.
-    /// Exposed (like the metrics provider's `plan`) so tests can execute the
-    /// scan without a SQL front-end.
+    /// Build the scan over every segment in the snapshot with no pushdown and
+    /// no projection (every column). Exposed (like the metrics provider's
+    /// `plan`) so tests can execute the scan without a SQL front-end.
     pub fn plan(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(target_partitions, &LogsPushdown::default())
+        self.build_scan(target_partitions, &LogsPushdown::default(), None)
     }
 
     /// Build the scan for a set of filters, extracting the pushdown from them.
@@ -94,7 +92,7 @@ impl LogsTableProvider {
         target_partitions: usize,
         filters: &[Expr],
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(target_partitions, &extract_logs(filters))
+        self.build_scan(target_partitions, &extract_logs(filters), None)
     }
 
     /// Admission (the sealed-segment cap) is decided exactly once, at
@@ -109,6 +107,7 @@ impl LogsTableProvider {
         &self,
         target_partitions: usize,
         pushdown: &LogsPushdown,
+        projection: Option<&Vec<usize>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
         let scan = LogsScanExec::new(
@@ -121,6 +120,7 @@ impl LogsTableProvider {
             Arc::new(pushdown.content.clone()),
             Arc::new(pushdown.prune.clone()),
             Arc::clone(&self.erasure),
+            projection,
             self.accounting.clone(),
         )?;
         Ok(Arc::new(scan))
@@ -179,26 +179,19 @@ impl TableProvider for LogsTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let target_partitions = state.config().target_partitions();
         let pushdown = extract_logs(filters);
-        let plan = self.build_scan(target_partitions, &pushdown)?;
-
-        // Projection pushdown: column selection only. When a column is not
-        // projected DataFusion still receives every column from the scan and
-        // this ProjectionExec drops the rest; the fetch reads the whole object
-        // regardless (RLOG's reader has no per-column page toggle at this
-        // layer), matching the metrics provider's stance.
-        match projection {
-            Some(proj) => {
-                let exprs = proj
-                    .iter()
-                    .map(|&i| {
-                        let name = self.schema.field(i).name();
-                        Ok((col(name, &self.schema)?, name.to_string()))
-                    })
-                    .collect::<DFResult<Vec<_>>>()?;
-                Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
-            }
-            None => Ok(plan),
-        }
+        // Projection pushdown reaches the reader (ADR-0087 decision 3): the
+        // scan's output schema *is* the projection, and the resolved column set
+        // stops the RLOG reader decoding the pages of columns nothing reads.
+        // There is no `ProjectionExec` above the scan any more; one would have
+        // dropped columns the scan had already paid to decode and materialize.
+        //
+        // The projection DataFusion hands us already contains every column its
+        // residual `FilterExec` above this scan will read: pushdown is
+        // `Inexact`, so the optimizer keeps the filters' columns in the scan's
+        // projection. `LogsScanExec` separately adds the columns its own pushed
+        // content predicates and pending erasure predicates need, which are not
+        // visible in the projection at all.
+        self.build_scan(target_partitions, &pushdown, projection)
     }
 }
 

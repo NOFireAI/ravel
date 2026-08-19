@@ -996,6 +996,52 @@ never drop a true result):
   `attrs['k'] IN (...)` stays unextracted, because an `IN` list is a
   disjunction the intersecting prune channel cannot represent soundly.
 
+### Scan execution: streaming and column projection (ADR-0087)
+
+`LogsScanExec` streams. A partition opens its segments one at a time, decodes
+one RLOG block, emits that block's rows as a batch, and releases the block
+before decoding the next. Peak memory is therefore a function of block size and
+partition count, not of table size. Before ADR-0087 the scan collected a whole
+partition's records in row form, sorted them, and only then emitted batches, so
+a full-table scan's peak memory grew with the table.
+
+Two consequences an operator and a plan reader both see:
+
+- **The scan declares no output ordering.** It used to declare `ts` ascending
+  per partition, which it earned by sorting the collected partition.
+  `RlogReader` emits a segment's records grouped by `(stream_ref, ts)`, not
+  globally by `ts`, and a partition spans several segments, so a
+  block-at-a-time scan cannot truthfully claim that order. `ORDER BY ts` still
+  returns correctly sorted results; the ordering now comes from a `SortExec`
+  DataFusion inserts above the scan, visible in `EXPLAIN`. Any downstream
+  operator that relied on a sort-preserving merge over logs-scan partitions
+  gets that explicit sort instead.
+- **Projection reaches the reader.** The scan's output schema *is* DataFusion's
+  requested projection; there is no `ProjectionExec` above it discarding
+  columns the scan already decoded. The decoded column set is the projected
+  columns, plus `ts`/`stream_ref` (always), plus every field a pushed content
+  predicate names, plus every attribute key a pending erasure predicate names
+  (ADR-0064). `read_block` decompresses and decodes only those columns' pages.
+  Because `attrs` is one merged map column, a query referencing `attrs` at all
+  -- `SELECT *` included -- resolves to every dynamic column plus the
+  `attrs_raw` overflow; per-key `attrs['k']` projection is not implemented.
+  Skip-index, POSTINGS, and bloom pruning are unchanged: they read stored
+  statistics, not decoded pages.
+
+`LogsScanExec` publishes `pages_decoded` and `pages_skipped` per partition
+alongside its block counters, so `EXPLAIN ANALYZE` shows how much of each block
+the projection avoided touching.
+
+The per-query DataFusion memory pool now bounds concurrently-held scan memory:
+the reservation grows when a decoded block and the batch built from it are held
+and shrinks as each is released. It is not a cumulative-output budget, and
+raising it does not change how much a full-table scan holds at one instant.
+
+Whole-object GET is unchanged: this bounds decoded memory, not the raw bytes an
+object fetch brings into RAM. Per-block ranged reads are
+`RlogRangeReader`'s territory (used by compaction) and are not on the SQL read
+path.
+
 Both gaps ADR-0033 recorded are now closed. Both were deliberate, not
 oversights.
 

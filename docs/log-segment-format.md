@@ -265,6 +265,17 @@ its SKIP_IDX level-0 entry, not inline) covers the complete block bytes
 (header and all pages); the reader verifies it before decoding anything
 in the block.
 
+A reader may decode a *subset* of a block's columns. The page header names each
+page's `column_id` and stored length, so a reader walks past a page it does not
+want without decompressing it (`read_block_columns`, ADR-0087); the SQL logs
+scan uses this to decode only the columns a query references. This is a read
+choice, not a format variant: the crc32c is still verified over the complete
+block bytes, every page descriptor is still parsed, and every page's stored
+extent is still walked, so a truncated or over-long block is rejected exactly
+as it is under a whole-block decode. A skipped column is indistinguishable from
+an absent one in the decoded result, so a reader that projects is responsible
+for having asked for every column it goes on to read.
+
 ```
    one row block, columnar:
 

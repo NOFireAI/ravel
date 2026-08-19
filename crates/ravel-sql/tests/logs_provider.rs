@@ -578,3 +578,367 @@ async fn residual_recheck_keeps_resource_only_stream_attr_match() {
          and exclude ts=2 (non-matching stream); got {got:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0087: streaming, column-projecting scan
+// ---------------------------------------------------------------------------
+
+/// A `SessionContext` built through the real production path
+/// (`ravel_sql::build_session`), the same one `/api/v1/sql` and Flight SQL use,
+/// with `provider` registered as `logs`.
+fn logs_session(
+    provider: LogsTableProvider,
+) -> datafusion::error::Result<datafusion::prelude::SessionContext> {
+    let config = ravel_sql::SqlConfig::default();
+    let tenant = ravel_sql::TenantMemoryAccountant::new(1 << 30);
+    let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
+    ravel_sql::build_session(
+        &config,
+        pool,
+        ravel_sql::SessionTable::Logs(Arc::new(provider)),
+    )
+}
+
+/// The `LogsScanExec` leaf of a physical plan. The plan above it is whatever
+/// the optimizer built, so the leaf is found by walking rather than by shape.
+fn find_by_name(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    name: &str,
+) -> Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    if plan.name() == name {
+        return Some(Arc::clone(plan));
+    }
+    plan.children().iter().find_map(|c| find_by_name(c, name))
+}
+
+/// Two streams whose records interleave in time, written to two objects, so
+/// neither the reader's `(stream_ref, ts)` grouping within an object nor the
+/// segment order across the partition is `ts` ascending. This is what makes the
+/// `ORDER BY ts` assertion below non-vacuous.
+fn interleaved_objects() -> (Vec<LogRecord>, Vec<LogRecord>) {
+    // Object A: "api" at even ts 0..40, "worker" at odd ts 1..41. The writer
+    // sorts by (stream_ref, ts), so A emits all of one stream then all of the
+    // other: not ts ascending.
+    let a: Vec<LogRecord> = (0..20)
+        .flat_map(|i| {
+            [
+                record("api", i * 2, &format!("api {}", i * 2)),
+                record("worker", i * 2 + 1, &format!("worker {}", i * 2 + 1)),
+            ]
+        })
+        .collect();
+    // Object B covers a ts band that *precedes* part of A, so concatenating the
+    // partition's segments in order is not ts ascending either.
+    let b: Vec<LogRecord> = (0..20)
+        .map(|i| record("db", i * 2 + 100, &format!("db {}", i * 2 + 100)))
+        .collect();
+    (a, b)
+}
+
+/// ADR-0087 decision 1's must-not-regress case: the leaf declares no ordering,
+/// and `ORDER BY ts` is nonetheless exactly sorted because DataFusion inserts a
+/// sort above it.
+///
+/// Three things are asserted together, and all three are needed. The rows are
+/// exactly the reference multiset (nothing lost or duplicated); the emitted
+/// sequence is `ts` ascending (the ordering itself); and the plan contains a
+/// `SortExec` above the `LogsScanExec` while the leaf's own
+/// `PlanProperties` declare no output ordering (the ordering comes from the
+/// inserted sort, not from a leaf claim).
+///
+/// Against a naive streaming implementation that keeps the old
+/// `EquivalenceProperties::new_with_orderings(... ts asc ...)` in
+/// `LogsScanExec::compute_properties` and simply drops the partition sort,
+/// DataFusion trusts the leaf, inserts no `SortExec`, and the ts-ascending
+/// assertion fails on the very first out-of-order pair.
+#[tokio::test]
+async fn order_by_ts_is_sorted_by_an_inserted_sort_not_by_a_leaf_claim() {
+    let store = MemoryStore::new();
+    let (obj_a, obj_b) = interleaved_objects();
+    let ref_a = write_object(&store, "logs/order-a.rlog", &obj_a).await;
+    let ref_b = write_object(&store, "logs/order-b.rlog", &obj_b).await;
+    let snapshot = Snapshot {
+        segments: vec![ref_a, ref_b],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        LogSegmentFetcher::new(backend),
+        QueryAccounting::new(),
+    );
+
+    // The leaf itself declares nothing. Read it off the unsorted plan so this
+    // is a statement about `LogsScanExec`, not about whatever the optimizer
+    // wrapped it in.
+    let bare = provider.plan(4).expect("plan");
+    assert!(
+        bare.properties().output_ordering().is_none(),
+        "the logs scan must declare no output ordering (ADR-0087 decision 1)"
+    );
+
+    let ctx = logs_session(provider).expect("session");
+
+    // Unordered: prove the scan really does emit out of ts order, so the
+    // ordered assertion below is not satisfied by accident.
+    let unordered = ctx
+        .sql("SELECT ts, body FROM logs")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+    let emitted = ts_sequence(&unordered);
+    assert!(
+        emitted.windows(2).any(|w| w[0] > w[1]),
+        "fixture must not already be ts-ascending out of the scan, else the \
+         ORDER BY assertion proves nothing"
+    );
+
+    let plan = ctx
+        .sql("SELECT ts, body FROM logs ORDER BY ts")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    assert!(
+        find_by_name(&plan, "SortExec").is_some(),
+        "ORDER BY ts must be answered by a sort operator above the scan"
+    );
+    assert!(
+        find_by_name(&plan, "LogsScanExec").is_some(),
+        "the plan must still be over the logs scan"
+    );
+
+    let ordered = collect_plan(plan).await;
+    let got = ts_sequence(&ordered);
+    let mut want = emitted;
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "ORDER BY ts must return every scanned row exactly once, ts ascending"
+    );
+    assert!(
+        got.windows(2).all(|w| w[0] <= w[1]),
+        "ORDER BY ts output must be ascending"
+    );
+}
+
+/// The `ts` values of `batches`, in emission order (column 0 of `SELECT ts, ...`).
+fn ts_sequence(batches: &[RecordBatch]) -> Vec<i64> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("ts col");
+        for i in 0..batch.num_rows() {
+            out.push(ts.value(i));
+        }
+    }
+    out
+}
+
+/// Number of dynamic attribute columns each record in the projection fixture
+/// carries. Comfortably over the "100+ attributes" the ADR's motivating case
+/// describes.
+const WIDE_ATTRS: usize = 120;
+
+/// One record carrying `WIDE_ATTRS` dynamic attributes. `a007` and `a042` vary
+/// per record (so an erasure predicate can name one specific row); the rest are
+/// constant, which changes nothing about how many *columns* exist.
+fn wide_record(ts: i64) -> LogRecord {
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let attrs: Vec<(String, AttrValue)> = (0..WIDE_ATTRS)
+        .map(|i| {
+            let key = format!("a{i:03}");
+            let value = match i {
+                7 => format!("r{ts}"),
+                42 => format!("s{ts}"),
+                _ => format!("v{i}"),
+            };
+            (key, AttrValue::Str(value))
+        })
+        .collect();
+    record_with_resource_and_attrs(&resource, ts, &format!("body {ts}"), &attrs)
+}
+
+/// Sum a named `LogsScanExec` metric over the executed plan.
+fn scan_metric(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, name: &str) -> usize {
+    find_by_name(plan, "LogsScanExec")
+        .expect("a LogsScanExec leaf")
+        .metrics()
+        .expect("the scan publishes metrics")
+        .sum_by_name(name)
+        .map(|v| v.as_usize())
+        .unwrap_or_else(|| panic!("metric {name} missing"))
+}
+
+/// ADR-0087 decision 3: a query that references two of a hundred-and-twenty
+/// attributes decodes exactly those two columns' pages and walks past the rest.
+///
+/// The two referenced attributes here are named by *pending erasure
+/// predicates*, not by the projection. That is deliberate and it is the only
+/// shape the ADR leaves room for: the SQL surface exposes attributes as one
+/// merged `attrs` Map column, so any query naming `attrs` at all resolves to
+/// every dynamic column (per-key `attrs['k']` projection is explicitly out of
+/// scope). Erasure predicates name individual attribute keys, so they exercise
+/// the per-key resolution path that does exist -- and they are the case where
+/// getting the column set wrong is a correctness bug, not just a performance
+/// one: an erasure key the reader never decodes makes the erased row reappear.
+///
+/// Both halves are asserted: the page counts (projection reached the page
+/// level) and the rows (the two erasures still bite, so the columns that *were*
+/// decoded are the right ones).
+#[tokio::test]
+async fn column_projection_decodes_only_the_referenced_attribute_pages() {
+    let store = MemoryStore::new();
+    let records: Vec<LogRecord> = (0..12).map(wide_record).collect();
+    let seg = write_object(&store, "logs/wide.rlog", &records).await;
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    // Two pending erasure requests, each naming one attribute key: `a007` on
+    // the ts=3 row and `a042` on the ts=5 row.
+    let erasure = |key: &str, value: &str| ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: key.to_string(),
+            value: value.to_string(),
+        }],
+        ..Default::default()
+    };
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: vec![erasure("a007", "r3"), erasure("a042", "s5")],
+    };
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        LogSegmentFetcher::new(backend),
+        QueryAccounting::new(),
+    );
+    let ctx = logs_session(provider).expect("session");
+
+    let plan = ctx
+        .sql("SELECT ts, body FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let batches = collect_plan(Arc::clone(&plan)).await;
+
+    // Rows: everything except the two erased ones. This proves the two decoded
+    // attribute columns are genuinely the erasure keys' columns -- had the
+    // projection dropped them, the erasure would have found nothing to match
+    // and both rows would be back.
+    let got: BTreeSet<i64> = ts_sequence(&batches).into_iter().collect();
+    let want: BTreeSet<i64> = (0..12).filter(|ts| *ts != 3 && *ts != 5).collect();
+    assert_eq!(
+        got, want,
+        "the two erasure predicates must still exclude their rows"
+    );
+
+    let blocks = scan_metric(&plan, "blocks_scanned");
+    let decoded = scan_metric(&plan, "pages_decoded");
+    let skipped = scan_metric(&plan, "pages_skipped");
+    assert!(blocks > 0, "the fixture must actually decode blocks");
+
+    // Per block: `ts`, `stream_ref` (always), `body` (projected), and the two
+    // erasure-named attribute columns. Nothing else. `attrs_raw` is in the
+    // resolved set but occupies no page here (no record overflowed), and an
+    // absent column costs no page either way.
+    assert_eq!(
+        decoded,
+        5 * blocks,
+        "expected 5 pages per block (ts, stream_ref, body, a007, a042), got \
+         {decoded} over {blocks} blocks"
+    );
+    // Everything else in the block: the remaining 118 dynamic columns plus the
+    // four unprojected always-present fixed columns (observed_ts, severity_num,
+    // flags, severity_text).
+    assert_eq!(
+        skipped,
+        (WIDE_ATTRS - 2 + 4) * blocks,
+        "every unreferenced column's pages must be skipped, got {skipped} over \
+         {blocks} blocks"
+    );
+    assert!(
+        skipped > 20 * decoded,
+        "the whole point: {skipped} pages skipped vs {decoded} decoded"
+    );
+}
+
+/// The counterpart to the test above: a query that *does* reference `attrs`
+/// gets every dynamic column, because the merged map's contract is that every
+/// key is present (ADR-0087 decision 3, per-key projection out of scope).
+/// Without this, "we skipped pages" could be true while `SELECT *` silently
+/// returned a truncated map.
+#[tokio::test]
+async fn referencing_attrs_decodes_every_dynamic_column() {
+    let store = MemoryStore::new();
+    let records: Vec<LogRecord> = (0..6).map(wide_record).collect();
+    let seg = write_object(&store, "logs/wide-attrs.rlog", &records).await;
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        LogSegmentFetcher::new(backend),
+        QueryAccounting::new(),
+    );
+    let ctx = logs_session(provider).expect("session");
+
+    let plan = ctx
+        .sql("SELECT ts, attrs FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let batches = collect_plan(Arc::clone(&plan)).await;
+
+    // Every record's map carries all WIDE_ATTRS dynamic keys plus the one
+    // resource attribute.
+    let mut rows = 0usize;
+    for batch in &batches {
+        let map = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("attrs map col");
+        for i in 0..batch.num_rows() {
+            let entries = map.value(i);
+            let entries = entries
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("map entries");
+            assert_eq!(
+                entries.len(),
+                WIDE_ATTRS + 1,
+                "a query referencing attrs must see every dynamic key plus the \
+                 resource attribute"
+            );
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 6);
+
+    let blocks = scan_metric(&plan, "blocks_scanned");
+    let skipped = scan_metric(&plan, "pages_skipped");
+    // Only the five unprojected fixed columns (observed_ts, severity_num,
+    // flags, severity_text, body) are skipped; every dynamic column is decoded.
+    assert_eq!(
+        skipped,
+        5 * blocks,
+        "referencing attrs must skip only the unprojected fixed columns"
+    );
+}
