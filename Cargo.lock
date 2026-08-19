@@ -4375,6 +4375,7 @@ name = "ravel-cli"
 version = "0.9.5"
 dependencies = [
  "anyhow",
+ "arrow 59.1.0",
  "async-trait",
  "blake3",
  "bytes",
@@ -4382,6 +4383,7 @@ dependencies = [
  "crc32c",
  "hex",
  "humantime",
+ "parquet",
  "prost",
  "ravel-catalog",
  "ravel-commit",
@@ -4389,15 +4391,19 @@ dependencies = [
  "ravel-logseg",
  "ravel-maintain",
  "ravel-object-store",
+ "ravel-otlp",
  "ravel-proto",
+ "ravel-query",
  "ravel-rspan",
  "ravel-segment",
+ "ravel-sql",
  "ravel-types",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "uuid",
 ]
 

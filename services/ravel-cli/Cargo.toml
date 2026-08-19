@@ -16,6 +16,12 @@ ravel-commit = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-maintain = { workspace = true }
 ravel-ingest = { workspace = true }
+# `load --parquet` reuses `NormalizedLogRecord` and the `logs_limits` constants
+# (max_future_skew_ns, the length caps) rather than reimplementing the record
+# shape or re-deriving the bounds (ADR-0089). New dependency of ravel-cli;
+# already a workspace pin (ravel-otap/ravel-bench use it), adds no new external
+# crate.
+ravel-otlp = { workspace = true }
 prost = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
@@ -36,8 +42,36 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+# Parquet reader for `load --parquet` (ADR-0089). Not in the workspace
+# `[workspace.dependencies]`; pinned directly here at the same major (59) as the
+# workspace `arrow` pin, following crates/ravel-bench/Cargo.toml's pattern, and
+# deliberately NOT added to the root Cargo.toml (ADR-0011 isolates the arrow
+# family from the ingest-critical path; ravel-cli is operator tooling). This is
+# a genuinely new external dependency for ravel-cli, flagged per CLAUDE.md.
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
+# arrow's array/datatypes/record_batch surface, to read Parquet row batches.
+# Reuses the workspace pin (major 59, matching `parquet` above).
+arrow = { workspace = true }
+# TOML parser (serde) for the `--mapping` file. Already in the dependency tree
+# (Cargo.lock carries toml 1.x transitively); pinned directly here. Flagged as
+# a new direct dependency of ravel-cli per CLAUDE.md.
+toml = "1"
 
 [dev-dependencies]
+# Writing small Parquet fixtures in the loader tests uses the same parquet/arrow
+# reader deps declared above; ArrowWriter comes from the `parquet` dep.
+# Query loaded logs back through the real ravel-sql logs path in the
+# reachability test (ADR-0089). ravel-sql is a path-only crate not listed in the
+# workspace `[workspace.dependencies]`, so it is named by path here, exactly as
+# crates/ravel-bench/Cargo.toml names it. The in-process `SqlExecutor` +
+# `LogsTableProvider` logs path is in ravel-sql's default build (the
+# `flight-sql` feature only gates the Flight transport), so no feature is
+# needed here.
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.9.5" }
+# The reachability test builds a SqlExecutor's segment fetchers from ravel-query
+# (SegmentFetcher/LogSegmentFetcher/SpanSegmentFetcher); ravel-catalog is
+# already a normal dependency. Workspace pin, test construction only.
+ravel-query = { workspace = true }
 # Implementing a small `ObjectStoreBackend` test wrapper (hide one key from
 # LIST) needs the same async-trait the trait itself uses. Already a workspace
 # pin; adds no new external crate.

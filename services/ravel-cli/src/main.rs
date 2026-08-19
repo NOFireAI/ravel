@@ -86,7 +86,8 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Maintain { .. }
         | Command::Hold { .. }
         | Command::Erase { .. }
-        | Command::Provision { .. } => true,
+        | Command::Provision { .. }
+        | Command::Load { .. } => true,
         // `commit reconstruct` computes a `t/<tenant_hash>/` prefix from its
         // `--tenant`, so it needs the bucket's scheme resolved first; the
         // other `commit` variants take an explicit key/path and do not.
@@ -182,6 +183,37 @@ enum Command {
     Tenant {
         #[command(subcommand)]
         command: TenantCommand,
+    },
+    /// Bulk-import a Parquet file into the logs signal (ADR-0089).
+    ///
+    /// Writes directly to the log ingest router in-process. NOTE: the
+    /// per-tenant AdmissionController (active-stream cap, stream-creation rate,
+    /// byte rate) that guards the HTTP ingest path is BYPASSED by construction
+    /// on this path. The future-skew and length caps are enforced identically
+    /// to OTLP; the past-event-time lag check is deliberately NOT enforced, so
+    /// historical timestamps are admitted (they bucket by load time, so query
+    /// with a window that reaches now). A per-record attribute cap of 1024
+    /// applies (relaxed from OTLP's 128). A row that fails a kept check is
+    /// rejected fail-fast: the run stops at the first bad row and exits
+    /// nonzero. There is NO resumability or deduplication: re-running after a
+    /// failure re-ingests the whole file from the start, and retention is
+    /// measured from load time, not the records' event times.
+    Load {
+        /// Path to the source Parquet file.
+        #[arg(long, value_name = "FILE")]
+        parquet: std::path::PathBuf,
+        /// Target tenant id (hashed under the bucket's pinned scheme).
+        #[arg(long)]
+        tenant: String,
+        /// Path to the `--mapping` TOML (source columns to record fields).
+        #[arg(long, value_name = "TOML")]
+        mapping: std::path::PathBuf,
+        /// Configured shard count. Validated against (or, for a fresh signal,
+        /// written to) the durable provisioning record, exactly as the server
+        /// does at first touch; the router resolves the active generation from
+        /// that record. Defaults to the server's default of 4.
+        #[arg(long, default_value_t = 4)]
+        shards: u32,
     },
 }
 
@@ -1046,6 +1078,22 @@ async fn main() -> anyhow::Result<()> {
                 tenant_token::list(store::build_store(&cli.store)?, &deployment_key_file).await?;
             print!("{report}");
             Ok(())
+        }
+        Command::Load {
+            parquet,
+            tenant,
+            mapping,
+            shards,
+        } => {
+            ravel_cli::load::run(
+                store::build_store(&cli.store)?,
+                &parquet,
+                &tenant,
+                &mapping,
+                shards,
+                now_ns()?,
+            )
+            .await
         }
     }
 }

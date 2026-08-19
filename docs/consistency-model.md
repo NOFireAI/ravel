@@ -258,6 +258,17 @@ ingestion.
   (docs/catalog-and-mvcc.md, "Config discipline"). Lowering the admission lag
   is always safe. Raising the admission lag alone admits records the listing
   window then fails to discover on any non-token query.
+- Bulk-import exception (ADR-0089): `ravel-cli load --parquet` relaxes the
+  *past-event-time lag* admission bound for offline bulk loads without
+  violating the paired-bound rule above, because it does not touch the listing
+  side. A bulk-loaded record buckets by the flush-open wall clock, not its
+  event time, so it lands in today's ingest-hour bucket regardless of how old
+  the event is; the listing window's future bound (`now + max_future_skew`)
+  still reaches that bucket, so a query with a normal `start`/`end` window
+  (compared against event-range overlap) discovers it. Future skew stays
+  enforced on this path for exactly the reason above -- a far-future event
+  would bucket by today's wall clock but never be reached by any later query's
+  listing window. See docs/guides/ingest.md "Bulk import".
 
 ## Online resharding (ADR-0052)
 
