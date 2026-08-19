@@ -45,7 +45,7 @@ use crate::distrib::Distributed;
 use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, SliceResponse};
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
 use crate::distrib::{
-    log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver,
+    log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver, span_cmp,
     span_order_key,
 };
 use crate::engine::merge_soa_runs;
@@ -2887,4 +2887,67 @@ fn span_order_key_respects_field_precedence() {
             r.record.attrs = vec![("k".to_string(), "a".to_string())];
         },
     );
+}
+
+/// `merge_spans` sorts with the allocation-free [`span_cmp`] comparator rather
+/// than building an owned [`span_order_key`] tuple per span (#307). The two are
+/// separate definitions of the same total order and could silently drift, so
+/// this pins them together: over a matrix of rows built to differ in each key
+/// field (at least one differing pair per field, plus every cross pair),
+/// `span_cmp(a, b)` must equal `span_order_key(a).cmp(&span_order_key(b))` for
+/// every ordered pair -- including the reflexive `Equal` pairs. If a later edit
+/// reordered `span_cmp`'s `then_with` chain, dropped a field, or flipped a
+/// comparison relative to the key tuple, some pair would disagree and this fails.
+#[test]
+fn span_cmp_agrees_with_span_order_key() {
+    let base = SpanRow {
+        record: ravel_rspan::SpanRecord {
+            trace_id: TA,
+            span_id: S1,
+            parent_span_id: Some([3u8; 8]),
+            name: "op".to_string(),
+            start_ts_ns: 10,
+            end_ts_ns: 11,
+            status_code: ravel_rspan::StatusCode::Unset,
+            status_message: Some("msg".to_string()),
+            attrs: vec![("k".to_string(), "v".to_string())],
+        },
+        service_name: Some("alpha".to_string()),
+    };
+
+    let mutate = |m: &dyn Fn(&mut SpanRow)| {
+        let mut r = base.clone();
+        m(&mut r);
+        r
+    };
+    // The base plus one row differing in exactly each key field: every field
+    // therefore appears in at least one differing pair (base vs its mutant), and
+    // the full cartesian product below also exercises multi-field differences.
+    let rows = vec![
+        base.clone(),
+        mutate(&|r| r.record.trace_id = TB),
+        mutate(&|r| r.record.span_id = S2),
+        mutate(&|r| r.record.start_ts_ns = 20),
+        mutate(&|r| r.record.end_ts_ns = 99),
+        mutate(&|r| r.record.parent_span_id = Some([7u8; 8])),
+        mutate(&|r| r.record.parent_span_id = None),
+        mutate(&|r| r.record.name = "other".to_string()),
+        mutate(&|r| r.record.status_code = ravel_rspan::StatusCode::Error),
+        mutate(&|r| r.record.status_message = Some("boom".to_string())),
+        mutate(&|r| r.record.status_message = None),
+        mutate(&|r| r.service_name = Some("beta".to_string())),
+        mutate(&|r| r.service_name = None),
+        mutate(&|r| r.record.attrs = vec![("k".to_string(), "w".to_string())]),
+    ];
+
+    for (i, a) in rows.iter().enumerate() {
+        for (j, b) in rows.iter().enumerate() {
+            assert_eq!(
+                span_cmp(a, b),
+                span_order_key(a).cmp(&span_order_key(b)),
+                "span_cmp and span_order_key disagree on rows ({i}, {j}); \
+                 the comparator has drifted from the key tuple"
+            );
+        }
+    }
 }

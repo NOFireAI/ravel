@@ -853,19 +853,45 @@ pub(crate) fn log_record_order_key(record: &LogRecord) -> LogOrderKey {
 /// grouping (which differs from the local per-segment grouping) never changes
 /// the result -- exactly the property the differential test exercises.
 pub(crate) fn merge_spans(per_slice: Vec<Vec<SpanRow>>) -> Vec<SpanRow> {
-    let mut keyed: Vec<(SpanOrderKey, SpanRow)> = per_slice
-        .into_iter()
-        .flatten()
-        .map(|row| (span_order_key(&row), row))
-        .collect();
-    // A stable sort on the precomputed full-content key. Equal-key spans are
-    // byte-identical, but they are NOT collapsed: the consistency model
-    // (docs/consistency-model.md, "logs and spans") forbids query-time dedup for
-    // spans, because a retry after a lost ack produces byte-identical spans that
-    // are legitimately duplicate USER DATA and must stay visible. Every span in
-    // the pool is returned.
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    keyed.into_iter().map(|(_, row)| row).collect()
+    let mut spans: Vec<SpanRow> = per_slice.into_iter().flatten().collect();
+    // A stable sort under the full-content total-order comparator. Equal-key
+    // spans are byte-identical, but they are NOT collapsed: the consistency
+    // model (docs/consistency-model.md, "logs and spans") forbids query-time
+    // dedup for spans, because a retry after a lost ack produces byte-identical
+    // spans that are legitimately duplicate USER DATA and must stay visible.
+    // Every span in the pool is returned. `span_cmp` compares borrowed fields in
+    // place, so unlike an owned `SpanOrderKey` per span it clones nothing.
+    spans.sort_by(span_cmp);
+    spans
+}
+
+/// The total order over spans (see [`merge_spans`]): a `sort_by` comparator over
+/// borrowed fields, in the exact field sequence
+/// `(trace_id, span_id, start_ts_ns, end_ts_ns, parent_span_id, name,
+/// status_code, status_message, service_name, attrs)`. It compares the same
+/// fields, in the same order, as the [`span_order_key`] tuple (whose `Ord`
+/// derives structurally), but without allocating an owned key per span: no
+/// clones of `name`, `status_message`, `service_name`, or `attrs`. Span
+/// attribute values are plain strings, so `attrs` compares directly as a
+/// `Vec<(String, String)>` (no canonical byte encoding, unlike the typed log
+/// attribute values). `service_name` and `status_message` are `Option<String>`,
+/// so `None` orders before `Some`, keeping them distinct from an empty string.
+/// `span_cmp_agrees_with_span_order_key` pins the two definitions together so
+/// they cannot silently drift.
+pub(crate) fn span_cmp(a: &SpanRow, b: &SpanRow) -> std::cmp::Ordering {
+    let ra = &a.record;
+    let rb = &b.record;
+    ra.trace_id
+        .cmp(&rb.trace_id)
+        .then_with(|| ra.span_id.cmp(&rb.span_id))
+        .then_with(|| ra.start_ts_ns.cmp(&rb.start_ts_ns))
+        .then_with(|| ra.end_ts_ns.cmp(&rb.end_ts_ns))
+        .then_with(|| ra.parent_span_id.cmp(&rb.parent_span_id))
+        .then_with(|| ra.name.cmp(&rb.name))
+        .then_with(|| ra.status_code.to_u8().cmp(&rb.status_code.to_u8()))
+        .then_with(|| ra.status_message.cmp(&rb.status_message))
+        .then_with(|| a.service_name.cmp(&b.service_name))
+        .then_with(|| ra.attrs.cmp(&rb.attrs))
 }
 
 /// The total-order key for one span (see [`merge_spans`]). A tuple so `Ord`
@@ -874,6 +900,12 @@ pub(crate) fn merge_spans(per_slice: Vec<Vec<SpanRow>>) -> Vec<SpanRow> {
 /// byte encoding needed, unlike the typed log attribute values). `service_name`
 /// and `status_message` are `Option<String>`, so `None` orders before `Some`,
 /// keeping them distinct from an empty string.
+///
+/// The production merge no longer builds this owned key ([`merge_spans`] sorts
+/// with the allocation-free [`span_cmp`]); it stays as the reference definition
+/// of the span total order that the coordinator tests assert against directly,
+/// so it is compiled only under `cfg(test)`.
+#[cfg(test)]
 type SpanOrderKey = (
     [u8; 16],
     [u8; 8],
@@ -887,6 +919,7 @@ type SpanOrderKey = (
     Vec<(String, String)>,
 );
 
+#[cfg(test)]
 pub(crate) fn span_order_key(row: &SpanRow) -> SpanOrderKey {
     let record = &row.record;
     (

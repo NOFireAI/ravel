@@ -224,11 +224,19 @@ impl RemoteSliceFetcher {
     pub fn new(channel: Channel) -> Self {
         RemoteSliceFetcher { channel }
     }
-}
 
-#[async_trait::async_trait]
-impl SliceFetcher for RemoteSliceFetcher {
-    async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+    /// Dispatches one slice request and drains the worker's response stream into
+    /// a flat `Vec` of frames. The signal-agnostic transport half shared by
+    /// [`fetch`](SliceFetcher::fetch),
+    /// [`fetch_logs`](SliceFetcher::fetch_logs), and
+    /// [`fetch_spans`](SliceFetcher::fetch_spans): each of those calls this, then
+    /// applies its own per-signal decode to the frames. Any transport failure (the
+    /// call itself or a mid-stream `message()`) is mapped to
+    /// [`DistribError::Transport`]; framing/decode is the caller's concern.
+    async fn collect_frames(
+        &self,
+        request: pb::FetchRequest,
+    ) -> Result<Vec<pb::FetchResponse>, DistribError> {
         let mut client = SeriesFetchClient::new(self.channel.clone());
         let response = client
             .fetch(request)
@@ -243,6 +251,14 @@ impl SliceFetcher for RemoteSliceFetcher {
         {
             frames.push(frame);
         }
+        Ok(frames)
+    }
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for RemoteSliceFetcher {
+    async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        let frames = self.collect_frames(request).await?;
         decode_slice_frames(frames)
     }
 
@@ -250,20 +266,7 @@ impl SliceFetcher for RemoteSliceFetcher {
         &self,
         request: pb::FetchRequest,
     ) -> Result<SliceLogResponse, DistribError> {
-        let mut client = SeriesFetchClient::new(self.channel.clone());
-        let response = client
-            .fetch(request)
-            .await
-            .map_err(|s| DistribError::Transport(s.to_string()))?;
-        let mut stream = response.into_inner();
-        let mut frames = Vec::new();
-        while let Some(frame) = stream
-            .message()
-            .await
-            .map_err(|s| DistribError::Transport(s.to_string()))?
-        {
-            frames.push(frame);
-        }
+        let frames = self.collect_frames(request).await?;
         decode_log_slice_frames(frames)
     }
 
@@ -271,20 +274,7 @@ impl SliceFetcher for RemoteSliceFetcher {
         &self,
         request: pb::FetchRequest,
     ) -> Result<SliceSpanResponse, DistribError> {
-        let mut client = SeriesFetchClient::new(self.channel.clone());
-        let response = client
-            .fetch(request)
-            .await
-            .map_err(|s| DistribError::Transport(s.to_string()))?;
-        let mut stream = response.into_inner();
-        let mut frames = Vec::new();
-        while let Some(frame) = stream
-            .message()
-            .await
-            .map_err(|s| DistribError::Transport(s.to_string()))?
-        {
-            frames.push(frame);
-        }
+        let frames = self.collect_frames(request).await?;
         decode_span_slice_frames(frames)
     }
 }
@@ -662,6 +652,175 @@ mod tests {
         assert!(matches!(
             decode_slice_frames(vec![bad_code]),
             Err(DistribError::Codec(CodecError::UnknownStatusCode(-1)))
+        ));
+    }
+
+    // --- decode_span_slice_frames (#307) -----------------------------------
+    //
+    // The span decoder mirrors `decode_slice_frames`' terminal paths (missing
+    // summary, duplicate summary, empty frame, missing status, unknown status)
+    // and adds its own: a series, histogram, or log-record frame in a span
+    // stream is rejected as `FrameSignalUnsupported`, never silently skipped.
+
+    /// A well-formed span frame (root span, `Unset` status, no attributes). Its
+    /// contents never reach a reject arm, so only the shape matters.
+    fn span_frame() -> pb::FetchResponse {
+        pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Span(pb::SpanFrame {
+                trace_id: vec![0xAAu8; 16],
+                span_id: vec![1u8; 8],
+                parent_span_id: Vec::new(),
+                name: "op".to_string(),
+                start_ts_ns: 10,
+                end_ts_ns: 11,
+                status_code: 0,
+                status_message: None,
+                attrs: Vec::new(),
+                service_name: None,
+            })),
+        }
+    }
+
+    /// The happy path: a span frame plus one terminal summary decodes to a
+    /// `SliceSpanResponse` carrying the decoded span and the summary fields.
+    #[test]
+    fn span_then_summary_decodes() {
+        let response =
+            decode_span_slice_frames(vec![span_frame(), summary_frame(pb::status::Code::Ok)])
+                .expect("valid span frame sequence decodes");
+        assert_eq!(response.spans.len(), 1);
+        assert_eq!(response.spans[0].record.trace_id, [0xAAu8; 16]);
+        assert_eq!(response.status, pb::status::Code::Ok);
+        // The summary's `series_returned` field is reused as the span count.
+        assert_eq!(response.spans_returned, 1);
+        assert_eq!(response.stats.raw_f64_pages, 5);
+        assert_eq!(response.accounting.s3_requests(AccountedOp::Get), 3);
+    }
+
+    /// A span stream that never sent its mandatory terminal summary is
+    /// `NoSummary`.
+    #[test]
+    fn span_missing_summary_is_typed_error() {
+        assert!(matches!(
+            decode_span_slice_frames(vec![span_frame()]),
+            Err(DistribError::NoSummary)
+        ));
+    }
+
+    /// Two summary frames violate the exactly-one-summary rule.
+    #[test]
+    fn span_duplicate_summary_is_typed_error() {
+        assert!(matches!(
+            decode_span_slice_frames(vec![
+                summary_frame(pb::status::Code::Ok),
+                summary_frame(pb::status::Code::Ok),
+            ]),
+            Err(DistribError::MultipleSummaries)
+        ));
+    }
+
+    /// A frame carrying no `frame` oneof variant is `EmptyFrame`.
+    #[test]
+    fn span_empty_frame_is_typed_error() {
+        assert!(matches!(
+            decode_span_slice_frames(vec![pb::FetchResponse { frame: None }]),
+            Err(DistribError::EmptyFrame)
+        ));
+    }
+
+    /// A summary that carries no status is a typed `MissingStatus` codec error.
+    #[test]
+    fn span_summary_without_status_is_typed_error() {
+        let no_status = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                accounting: None,
+                series_returned: 0,
+                samples_returned: 0,
+                status: None,
+                raw_f64_pages: 0,
+                raw_f64_bytes: 0,
+            })),
+        };
+        assert!(matches!(
+            decode_span_slice_frames(vec![no_status]),
+            Err(DistribError::Codec(CodecError::MissingStatus))
+        ));
+    }
+
+    /// A summary naming a status code discriminant this build does not model is a
+    /// typed error, never a silent success.
+    #[test]
+    fn span_unknown_status_code_is_typed_error() {
+        let bad_code = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                accounting: None,
+                series_returned: 0,
+                samples_returned: 0,
+                status: Some(pb::Status {
+                    code: -1,
+                    message: String::new(),
+                }),
+                raw_f64_pages: 0,
+                raw_f64_bytes: 0,
+            })),
+        };
+        assert!(matches!(
+            decode_span_slice_frames(vec![bad_code]),
+            Err(DistribError::Codec(CodecError::UnknownStatusCode(-1)))
+        ));
+    }
+
+    /// A series frame in a span stream is rejected as `FrameSignalUnsupported`,
+    /// never decoded as a span and never skipped. If the explicit
+    /// `Frame::Series(_)` reject arm in `decode_span_slice_frames` were relaxed
+    /// to a permissive wildcard (`_ => continue`), the frame would be dropped and
+    /// the trailing summary would decode to an empty `Ok` response, so this
+    /// `expect_err`-style match would fail.
+    #[test]
+    fn span_decoder_rejects_series_frame_as_unsupported() {
+        let soa = series_soa();
+        assert!(matches!(
+            decode_span_slice_frames(vec![
+                series_frame(&soa),
+                summary_frame(pb::status::Code::Ok),
+            ]),
+            Err(DistribError::FrameSignalUnsupported("series"))
+        ));
+    }
+
+    /// A native-histogram frame in a span stream is rejected as
+    /// `FrameSignalUnsupported`. As with the series case, relaxing the explicit
+    /// `Frame::Hist(_)` reject arm to a wildcard would drop the frame and decode
+    /// to an empty `Ok`, failing this assertion.
+    #[test]
+    fn span_decoder_rejects_histogram_frame_as_unsupported() {
+        let hist = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Hist(pb::HistogramFrame {
+                series_id: vec![0u8; 16],
+                labels: Vec::new(),
+                runs: Vec::new(),
+            })),
+        };
+        assert!(matches!(
+            decode_span_slice_frames(vec![hist, summary_frame(pb::status::Code::Ok)]),
+            Err(DistribError::FrameSignalUnsupported("histogram"))
+        ));
+    }
+
+    /// A log-record frame in a span stream is rejected as
+    /// `FrameSignalUnsupported`. Relaxing the explicit `Frame::LogRecord(_)`
+    /// reject arm to a wildcard would drop the frame and decode to an empty `Ok`,
+    /// failing this assertion.
+    #[test]
+    fn span_decoder_rejects_log_record_frame_as_unsupported() {
+        let log = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::LogRecord(
+                pb::LogRecordFrame::default(),
+            )),
+        };
+        assert!(matches!(
+            decode_span_slice_frames(vec![log, summary_frame(pb::status::Code::Ok)]),
+            Err(DistribError::FrameSignalUnsupported("log-record"))
         ));
     }
 }
