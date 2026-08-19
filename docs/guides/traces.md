@@ -13,7 +13,7 @@ durable copy. Records in a segment sort by `(trace_id, start_ts)`, so all spans
 of one trace occupy a contiguous run of blocks. Each object carries a skip
 index that holds, per block, the block's `trace_id` range, its time interval
 (`start_ts` minimum and `end_ts` maximum), its `duration_ns` range, and a
-one-byte `status_mask`. RSPAN v3 objects also carry a BLOOM section with a
+one-byte `status_mask`. RSPAN v4 objects also carry a BLOOM section with a
 per-block bloom filter over the tokens of `service.name` and span `name`, plus a
 block-local `service_name` column. The reader uses these structures to skip
 blocks that cannot match a query.
@@ -25,19 +25,22 @@ format; read this guide to query it.
 ## Why one trace is a bounded read
 
 Ingest routes each span to a shard by its `trace_id`. The router hashes the
-`trace_id` with BLAKE3 and picks the shard from the hash. A `trace_id` alone
-picks the shard, so all spans of one trace land on the same shard, and within
-that shard's objects they sort together into a contiguous block run. A lookup by
-`trace_id` is therefore a bounded scan of one shard, not a fan-out across every
-shard. The skip index prunes it further: it drops every block whose `trace_id`
-range excludes the target, so the reader decodes only the blocks that can hold
-the trace.
+`trace_id` with BLAKE3 and picks the shard from the hash, so all spans of one
+trace land on the same shard, and within that shard's objects they sort
+together into a contiguous block run.
 
-One caveat applies. ADR-0052 online resharding can move a tenant to a new shard
-count while spans are still arriving. A trace whose spans straddle a reshard
-activation can split across two shards. This is rare and is covered in depth in
-the resharding documentation; a trace-by-id query still returns every stored
-span, it just reads two shards instead of one.
+The query-time catalog listing does not yet exploit this routing: a
+`trace_id =` query still lists and opens every shard's segments in the
+matched time window, the same as any other query. What is bounded is the
+per-object decode: the skip index drops every block whose `trace_id` range
+excludes the target, so the reader decodes only the blocks that can hold the
+trace, on whichever shard(s) it lists. Shard-level pruning by `trace_id` is a
+later capability, not a current one.
+
+One caveat applies regardless. ADR-0052 online resharding can move a tenant
+to a new shard count while spans are still arriving. A trace whose spans
+straddle a reshard activation can split across two shards; a trace-by-id
+query still returns every stored span from wherever it landed.
 
 ## The `spans` table
 
@@ -96,7 +99,7 @@ These predicates prune at the skip-index level:
   block whose `status_mask` clears every requested bit. A `status_code = 2`
   query skips every block with no Error span.
 
-These predicates prune at the bloom level (RSPAN v3):
+These predicates prune at the bloom level (RSPAN v4):
 
 - `service_name = <literal>` probes the block's `service.name` bloom. The
   reader skips a block whose bloom proves the token absent. A bloom never proves
@@ -180,8 +183,8 @@ in two ways:
   window query returns the spans in the window, not the whole trace.
 
 To read a whole trace regardless of window, query by `trace_id` and widen or
-drop the time bounds. A trace missing its root span is reported as incomplete on
-the result; Ravel never waits for it.
+drop the time bounds. Ravel does not flag a result as incomplete; it returns
+exactly the spans in view and never waits for a missing root or sibling.
 
 ## What Ravel does not store
 
