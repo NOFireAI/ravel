@@ -731,12 +731,15 @@ pub fn encode_segment_identity(seg: &SegmentRef) -> pb::SegmentIdentity {
         part_index,
         content_hash: seg.content_hash.to_vec(),
         object_size: seg.object_size,
-        // The single readable/writable RSEG version (ADR-0027). `SegmentRef`
-        // carries no per-segment format version, so every current segment is a
-        // VERSION_V6 object; shipping the real constant rather than a
-        // meaningless hardcoded 0 gives the reconstruct-and-verify path the
-        // version to check the fetched footer against.
-        segment_format_version: u32::from(ravel_segment::VERSION_V6),
+        // The version every current segment is written at, read from the
+        // reader's supported-version window rather than from a version
+        // constant: `SegmentRef` carries no per-segment format version, so the
+        // identity names the version this build writes, and that value must
+        // follow a version bump instead of being restamped by hand (ADR-0092
+        // decision 7). Shipping the real version rather than a meaningless
+        // hardcoded 0 gives the reconstruct-and-verify path the version to
+        // check the fetched footer against.
+        segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
     }
 }
 
@@ -1088,7 +1091,7 @@ mod tests {
         assert_eq!(identity.part_index, 4);
         assert_eq!(
             identity.segment_format_version,
-            u32::from(ravel_segment::VERSION_V6),
+            u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
             "the shipped identity names the real RSEG version, not a hardcoded 0"
         );
         assert_eq!(identity_content_hash(&identity).expect("hash"), [5u8; 32]);
@@ -1098,6 +1101,47 @@ mod tests {
         assert_eq!(
             identity_content_hash(&bad),
             Err(CodecError::BadContentHash { got: 31 })
+        );
+    }
+
+    /// The stamped `segment_format_version` must be the version this build
+    /// writes, derived from the reader's supported-version window, not a
+    /// hand-maintained copy of a version constant (ADR-0092 decision 7).
+    ///
+    /// The assertion names no version literal, so it keeps holding when the
+    /// RSEG version moves: at a bump, a site that stamped the old constant
+    /// would ship a fragment identity naming a version no object carries,
+    /// silently, since the field is a plain `uint32` on the wire.
+    #[test]
+    fn segment_identity_version_follows_supported_versions() {
+        use ravel_catalog::SegmentLevel;
+        use uuid::Uuid;
+        let seg = SegmentRef {
+            data_object_key: "k".to_string(),
+            object_size: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            ingest_hour_bucket: 1,
+            sample_count: 0,
+            series_count: 0,
+            shard: 0,
+            content_hash: [1u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        };
+        let stamped = encode_segment_identity(&seg).segment_format_version;
+        assert_eq!(
+            stamped,
+            u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            "the fragment identity must stamp the version this build writes"
+        );
+        let as_u16 = u16::try_from(stamped).expect("a trailer version fits in u16");
+        assert!(
+            ravel_segment::SUPPORTED_VERSIONS.contains(as_u16),
+            "the stamped version must be one this build's reader accepts"
         );
     }
 

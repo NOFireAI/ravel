@@ -17,7 +17,7 @@ use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
-    ExemplarInput, FooterOutcome, ReaderLimits, VERSION_V6, ValueKind, decode_catalog_v4,
+    ExemplarInput, FooterLocation, FooterOutcome, ReaderLimits, ValueKind, decode_catalog_v4,
     decode_catalog_v5, decode_exemplars_section, open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::{LabelSet, SeriesId, Signal};
@@ -31,6 +31,8 @@ use crate::error::{MaintainError, Result};
 const LABEL_DICT: u32 = 1;
 const SERIES_IDS: u32 = 5;
 const SERIES_META: u32 = 6;
+const SERIES_IDX: u32 = 8;
+const SERIES_META_CHUNKS: u32 = 9;
 const EXEMPLARS: u32 = 10;
 
 /// Domain-separated prefix for the `input_set_hash` preimage. Fixes the
@@ -254,12 +256,12 @@ pub struct InputCatalog {
 /// every run's provenance from the input's commit record.
 ///
 /// Footer is located by a suffix probe (one GET, growing to a second GET only
-/// if the probe missed the footer). The catalog sections are then read: a
-/// sparse v5 object (series_count at or above the threshold) needs the whole
-/// object for the sparse decode, but an object below the threshold needs only
-/// its three catalog sections, fetched by range. Either shape occurs at L0: a
-/// busy shard flushes 4096+ series in one object, so the sparse branch is a
-/// routine L0 input, not just a compacted output.
+/// if the probe missed the footer). The catalog sections are then read: an
+/// object carrying the sparse catalog pair needs the whole object for the
+/// sparse decode, but an object carrying the whole-section SERIES_META needs
+/// only its three catalog sections, fetched by range. Either shape occurs at
+/// L0: a busy shard flushes 4096+ series in one object, so the sparse branch
+/// is a routine L0 input, not just a compacted output.
 pub async fn load_input_catalog(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -320,8 +322,7 @@ pub async fn load_catalog_from_object(
     };
     let footer = &loc.footer;
 
-    let sparse =
-        loc.version == VERSION_V6 && footer.series_count >= ravel_segment::V5_SPARSE_THRESHOLD;
+    let sparse = catalog_is_sparse(&loc)?;
     let entries = if sparse {
         // Sparse decode needs the whole object. An L0 flush of 4096+ series is
         // ordinary (a busy shard reaches it in one flush), so this branch is a
@@ -387,6 +388,37 @@ pub async fn load_catalog_from_object(
         series,
         exemplars,
     })
+}
+
+/// Whether an object carries the sparse catalog (SERIES_IDX kind 8 +
+/// SERIES_META_CHUNKS kind 9) rather than the whole-section SERIES_META
+/// (kind 6), decided by which sections the footer lists.
+///
+/// Presence, not the trailer version and not the series count, is the reader
+/// contract: docs/segment-format.md's "Sparse catalog" section states that the
+/// sparse-emission threshold is a writer-side constant and that "presence is
+/// signalled by the sections themselves". Selecting on the version instead
+/// would silently route every object written at some later version to the
+/// whole-catalog branch, where it would look for a section the object does not
+/// carry (ADR-0092 decision 7). The whole [`FooterLocation`] is taken rather
+/// than just its footer so that `version` is visibly in scope and visibly
+/// unused: this decision does not depend on it.
+///
+/// Fails closed on half a pair. The format doc makes "one half of the sparse
+/// pair without the other" Corrupted, so it is reported as
+/// [`ravel_segment::SegmentError::SparseSectionsIncomplete`], never resolved
+/// to one branch or the other. `validate_sections` already rejects that shape
+/// at open time; the check is repeated here so this branch never depends on a
+/// caller having run it.
+fn catalog_is_sparse(loc: &FooterLocation) -> Result<bool> {
+    let has = |kind: u32| loc.footer.sections.iter().any(|s| s.kind == kind);
+    match (has(SERIES_IDX), has(SERIES_META_CHUNKS)) {
+        (true, true) => Ok(true),
+        (false, false) => Ok(false),
+        _ => Err(MaintainError::Segment(
+            ravel_segment::SegmentError::SparseSectionsIncomplete,
+        )),
+    }
 }
 
 /// Decode one input's EXEMPLARS section (kind 10, ADR-0047) and resolve each
@@ -469,4 +501,174 @@ async fn get_section(
         )
         .await?;
     Ok(got.data)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    //! Catalog-form selection (ADR-0092 decision 7): which of the two catalog
+    //! bodies an input carries is read off the footer's section list, not off
+    //! the trailer version and not off the series count.
+
+    use ravel_segment::{
+        IngestBounds, SUPPORTED_VERSIONS, SegmentError, SegmentIdentity, SegmentWriter, SeriesInput,
+    };
+    use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
+
+    use super::*;
+
+    const TENANT: &str = "acme";
+
+    /// A real object above the sparse-emission threshold, written by the
+    /// production writer, so its footer carries the SERIES_IDX +
+    /// SERIES_META_CHUNKS pair exactly as a busy shard's L0 flush would.
+    fn sparse_object() -> Vec<u8> {
+        let tenant = TenantId::new(TENANT);
+        let n = ravel_segment::V5_SPARSE_THRESHOLD as usize;
+        let mut series = Vec::with_capacity(n);
+        for i in 0..n {
+            let metric = format!("m{i:05}");
+            let labels = LabelSet::new(vec![Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: metric.clone(),
+            }])
+            .expect("valid labels");
+            series.push(SeriesInput {
+                series_id: SeriesId::compute(&tenant, &metric, &labels).expect("series id"),
+                labels,
+                samples: vec![Sample {
+                    ts_ns: i as i64 + 1,
+                    value: i as f64,
+                }],
+            });
+        }
+        let identity = SegmentIdentity {
+            tenant_hash: tenant.hash().0,
+            shard: 3,
+            writer_id: uuid::Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 1,
+            max_ingest_ts_ns: 1,
+        };
+        SegmentWriter::write(series, identity, bounds)
+            .expect("write sparse object")
+            .bytes
+            .to_vec()
+    }
+
+    fn has_section(loc: &FooterLocation, kind: u32) -> bool {
+        loc.footer.sections.iter().any(|s| s.kind == kind)
+    }
+
+    /// Rewrites the trailer's version field in place and recomputes
+    /// `footer_crc32c` over the changed bytes, so the object is well formed at
+    /// every other layer and only its version differs.
+    fn set_trailer_version(bytes: &mut [u8], loc: &FooterLocation, version: u16) {
+        let trailer = loc.trailer_offset as usize;
+        let footer_bytes = &bytes[loc.footer_offset as usize..trailer];
+        let footer_len = (trailer - loc.footer_offset as usize) as u32;
+        let signal = bytes[trailer + 10];
+        let reserved = bytes[trailer + 11];
+        let magic = [
+            bytes[trailer + 12],
+            bytes[trailer + 13],
+            bytes[trailer + 14],
+            bytes[trailer + 15],
+        ];
+        let mut crc = crc32c::crc32c(footer_bytes);
+        crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+        crc = crc32c::crc32c_append(crc, &version.to_le_bytes());
+        crc = crc32c::crc32c_append(crc, &[signal, reserved]);
+        crc = crc32c::crc32c_append(crc, &magic);
+        bytes[trailer + 4..trailer + 8].copy_from_slice(&crc.to_le_bytes());
+        bytes[trailer + 8..trailer + 10].copy_from_slice(&version.to_le_bytes());
+    }
+
+    /// An object carrying the sparse pair takes the sparse decode branch
+    /// whatever its trailer version says. A version-keyed selection would send
+    /// a future object down the whole-catalog branch, which then looks for a
+    /// kind-6 SERIES_META the object does not carry.
+    ///
+    /// The full reader path cannot be driven with such an object: `parse_footer`
+    /// rejects any version outside `SUPPORTED_VERSIONS` before the branch is
+    /// reached, which the middle of this test asserts. So the branch selection
+    /// is driven directly, on the footer decoded from the retrailered bytes.
+    #[test]
+    fn sparse_branch_selected_by_section_presence_not_version() {
+        let mut bytes = sparse_object();
+        let loc = ravel_segment::open_from_full(&bytes, ReaderLimits::default())
+            .expect("open the sparse object");
+        assert!(
+            has_section(&loc, SERIES_IDX) && has_section(&loc, SERIES_META_CHUNKS),
+            "the writer must have emitted the sparse pair"
+        );
+        assert!(
+            !has_section(&loc, SERIES_META),
+            "the sparse pair replaces the whole-section catalog"
+        );
+        assert!(
+            catalog_is_sparse(&loc).expect("classify the untampered object"),
+            "an object carrying the sparse pair is on the sparse branch"
+        );
+
+        // A trailer version other than the one this build writes.
+        let other = SUPPORTED_VERSIONS.newest() + 1;
+        set_trailer_version(&mut bytes, &loc, other);
+
+        // The reader gate rejects it before the branch is reached, so the
+        // branch is exercised directly below rather than through a load.
+        let opened = ravel_segment::parse_footer(bytes.len() as u64, &bytes);
+        assert!(
+            matches!(opened, Err(SegmentError::UnsupportedVersion(v)) if v == other),
+            "expected the version gate to reject the retrailered object, got {opened:?}"
+        );
+
+        // The retrailer changed no footer byte, so the section list the branch
+        // reads is the object's own.
+        let footer: ravel_segment::Footer =
+            prost::Message::decode(&bytes[loc.footer_offset as usize..loc.trailer_offset as usize])
+                .expect("decode the retrailered object's footer");
+        assert_eq!(footer, loc.footer);
+        let future = FooterLocation {
+            footer,
+            version: other,
+            ..loc
+        };
+        assert!(
+            catalog_is_sparse(&future).expect("classify the retrailered object"),
+            "section presence, not the trailer version, selects the sparse branch"
+        );
+    }
+
+    /// Half a sparse pair stays Corrupted (docs/segment-format.md validation:
+    /// "one half of the sparse pair without the other"), never silently
+    /// resolved to either branch.
+    #[test]
+    fn half_a_sparse_pair_is_corrupted() {
+        let bytes = sparse_object();
+        let loc = ravel_segment::open_from_full(&bytes, ReaderLimits::default())
+            .expect("open the sparse object");
+
+        for dropped in [SERIES_IDX, SERIES_META_CHUNKS] {
+            let mut half = loc.clone();
+            half.footer.sections.retain(|s| s.kind != dropped);
+            assert!(
+                has_section(&half, SERIES_IDX) != has_section(&half, SERIES_META_CHUNKS),
+                "the fixture must carry exactly one half of the pair"
+            );
+            let got = catalog_is_sparse(&half);
+            assert!(
+                matches!(
+                    got,
+                    Err(MaintainError::Segment(
+                        SegmentError::SparseSectionsIncomplete
+                    ))
+                ),
+                "dropping section kind {dropped} must fail closed, got {got:?}"
+            );
+        }
+    }
 }
