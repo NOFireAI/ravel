@@ -48,6 +48,23 @@ The seven `admin` holders on `NOFireAI/ravel` today are `ananos`,
 `gh api repos/NOFireAI/ravel/collaborators --jq '.[] | select(.role_name == "admin" or .role_name == "maintain") | .login'`
 whenever CODEOWNERS or the environment reviewer list is touched.
 
+`@NOFireAI/ravel-maintainers` was created on 2026-08-19, holds `maintain` on
+this repository, and owns the trusted paths in `.github/CODEOWNERS`. It has one
+member, `pmoust`. Two consequences follow, and both are deliberate.
+
+Every change to the CodeRabbit control plane needs that one person's approval
+once step 5 is applied. That is a narrow gate on exactly the right paths, and a
+bus factor of one. Add members when the set of people who should own these paths
+grows; that is a one-line change and needs no code.
+
+The team is **not** a required reviewer on the `coderabbit-oss` environment, and
+must not become the only one while it has a single member. `prevent_self_review`
+would then leave nobody able to approve a review that person started, and every
+run would hang at the environment gate. The environment keeps individual
+reviewers for that reason. If the team grows past two members, moving the
+environment to the team is the better shape: it makes the six-reviewer cap stop
+binding and reconciles the list in one place.
+
 ---
 
 ## Step 1: verify the plan, before anything else
@@ -171,10 +188,11 @@ integration's primary operator and `prevent_self_review` already excludes them
 from approving their own dispatches, which makes their reviewer slot the one
 least often usable. Swap it with one API call if that is wrong.
 
-The cap is why a `@NOFireAI/ravel-maintainers` team is the better end state: a
-team counts as one reviewer entry, so the cap stops binding, and it also
-replaces the seven hardcoded logins in `.github/CODEOWNERS`. Reconcile the list
-against roles whenever they change.
+The cap is why a team is the better end state for the reviewer list: a team
+counts as one entry, so the cap stops binding. `@NOFireAI/ravel-maintainers`
+now exists and has replaced the hardcoded logins in `.github/CODEOWNERS`, but it
+has one member, so it is deliberately not the environment's reviewer yet. See
+"Who can change what" for why that ordering matters.
 
 To recreate this from scratch:
 
