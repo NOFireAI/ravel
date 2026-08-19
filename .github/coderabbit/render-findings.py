@@ -266,7 +266,7 @@ def render(args: argparse.Namespace, findings: list[dict], notes: list[str]) -> 
 
     parts.append(
         "---\nProduced by `.github/workflows/coderabbit-maintainer-review.yml` "
-        "under the policy in `.github/coderabbit/` on `main` (ADR-0090). "
+        "under the policy in `.github/coderabbit/` on `main` (ADR-0091). "
         "Read-only: this integration cannot push commits, open issues, or reply."
     )
 
