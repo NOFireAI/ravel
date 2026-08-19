@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
 #
-# Trusted CodeRabbit policy for NOFireAI/ravel (ADR-0090).
+# Trusted CodeRabbit policy for NOFireAI/ravel (ADR-0091).
 #
 # This file is loaded ONLY from a checkout of the trusted `main` branch, copied
 # to a directory outside the pull-request worktree, and passed to the CLI by

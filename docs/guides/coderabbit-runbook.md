@@ -2,7 +2,7 @@
 
 How to turn on, verify, operate, rotate, and remove Ravel's CodeRabbit
 integration. The design and its evidence are in
-[ADR-0090](../adrs/0090-maintainer-gated-coderabbit-reviews.md); this document
+[ADR-0091](../adrs/0091-maintainer-gated-coderabbit-reviews.md); this document
 is the operational half, and it covers the controls that cannot be expressed as
 files in this repository.
 
@@ -77,7 +77,7 @@ answer is the local fallback.
 The App is installed on this organization with repository selection `selected`,
 and it has been reviewing Ravel pull requests on its defaults.
 
-**Preferred: remove `NOFireAI/ravel` from the installation.** ADR-0090 does not
+**Preferred: remove `NOFireAI/ravel` from the installation.** ADR-0091 does not
 use the App for anything, and an uninstalled App has no attack surface to
 harden. Organization settings, Installed GitHub Apps, CodeRabbit, Configure,
 deselect `ravel`.
@@ -167,7 +167,7 @@ gh api orgs/NOFireAI/actions/secrets --jq '.secrets[].name'          # must NOT 
 ## Step 4: workflow execution actor rules
 
 GitHub has no setting that limits `workflow_dispatch` to `maintain` and above.
-Dispatch comes with `write`. This is why ADR-0090 does not rely on GitHub's
+Dispatch comes with `write`. This is why ADR-0091 does not rely on GitHub's
 trigger permissions at all, and instead verifies `role_name` at runtime and puts
 the credential behind the environment.
 
@@ -375,7 +375,7 @@ what it claims, and none of them touches Ravel's other workflows.
    `.github/workflows/coderabbit-maintainer-review.yml`, `.github/coderabbit/`,
    `.coderabbit.yaml`, `scripts/coderabbit-maintainer-review.sh`, and the
    CodeRabbit entries in `.github/CODEOWNERS`, in one pull request. Mark
-   ADR-0090 superseded rather than deleting it.
+   ADR-0091 superseded rather than deleting it.
 5. **Remove the environment.**
    `gh api --method DELETE repos/NOFireAI/ravel/environments/coderabbit-oss`.
 
@@ -416,7 +416,7 @@ non-maintainer to consume: the allowance spent is your own.
 
 ## Upgrading the pinned CLI
 
-ADR-0090's Decision 4 depends on one property of the pinned build: a non-empty
+ADR-0091's Decision 4 depends on one property of the pinned build: a non-empty
 `--config` list replaces the CLI's discovery list rather than adding to it, and
 an absolute path is used verbatim. A version bump can change that silently,
 because the vendor's own help text describes the flag as additive.

@@ -1,4 +1,4 @@
-# Maintainer-gated CodeRabbit review (ADR-0090).
+# Maintainer-gated CodeRabbit review (ADR-0091).
 #
 # The only supported way to obtain a CodeRabbit review of a Ravel pull request.
 # It is dispatched by hand, it proves the dispatching actor holds `maintain` or
@@ -499,7 +499,7 @@ jobs:
             echo
             echo "The Open Source plan limit for this hour was reached, or the pull request exceeds the plan's per-review file limit."
             echo
-            echo "No retry was attempted, no credit was spent, and the pull request was not split into several reviews. Ravel's CodeRabbit integration has no paid fallback by design (ADR-0090)."
+            echo "No retry was attempted, no credit was spent, and the pull request was not split into several reviews. Ravel's CodeRabbit integration has no paid fallback by design (ADR-0091)."
             echo
             echo "Dispatch this workflow again later for head \`${HEAD_SHA}\`."
           } >> "$GITHUB_STEP_SUMMARY"
