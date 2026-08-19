@@ -10,6 +10,7 @@ pub mod erase;
 pub mod gc_config;
 pub mod hold;
 pub mod idem;
+pub mod load;
 pub mod maintain;
 pub mod provision;
 pub mod qualify;
