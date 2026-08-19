@@ -172,11 +172,13 @@ pub const ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes directly t
 
 /// CLI entry point for `ravel-cli load --parquet`: read the mapping and Parquet
 /// file paths, run the load, and print a summary on success or the error plus
-/// the already-durable commit tokens on failure.
+/// the known-durable commit tokens on failure.
 ///
 /// Returns `Err` (nonzero exit) for any failure. On a flush failure or a
 /// rejected row, the durable commit tokens are printed rather than swallowed
-/// (ADR-0089): a failure mid-file is a genuine partial load.
+/// (ADR-0089): a failure mid-file is a genuine partial load. See
+/// [`print_durable_tokens`] for the one case (a flush failure) where the
+/// printed list is a lower bound rather than exact.
 pub async fn run(
     store: Arc<dyn ObjectStoreBackend>,
     parquet_path: &Path,
@@ -208,8 +210,7 @@ pub async fn run(
             Ok(())
         }
         Err(err) => {
-            let durable = err.durable_tokens();
-            print_durable_tokens(durable);
+            print_durable_tokens(&err);
             Err(anyhow::Error::new(err))
         }
     }
@@ -230,16 +231,38 @@ fn print_summary(report: &LoadReport) {
     println!("  elapsed          : {secs:.3}s");
 }
 
-/// Print the commit tokens durable before a failure, one per line, so an
-/// operator can see exactly what landed (ADR-0089 deliverable 7).
-fn print_durable_tokens(tokens: &[CommitToken]) {
+/// Print the commit tokens known durable before a failure, one per line, so
+/// an operator can see what landed (ADR-0089 deliverable 7). On
+/// [`LoadError::Flush`] this is a lower bound, not an exact account: the
+/// listed tokens are batches completed *before* the failing one, and do not
+/// include a shard that may have committed within the failing batch itself
+/// while a sibling shard's ack failed (see that variant's doc). Every other
+/// variant's tokens are exact -- the failing row or batch never reached
+/// `LogIngestRouter::write`.
+fn print_durable_tokens(err: &LoadError) {
+    let tokens = err.durable_tokens();
+    let is_flush = matches!(err, LoadError::Flush { .. });
     if tokens.is_empty() {
-        println!("no commit tokens were durable before the failure (nothing landed)");
+        if is_flush {
+            println!(
+                "no commit tokens were durable from a completed batch before the failure \
+                 (earlier batches, if any, all landed; the failing batch's own shards may or \
+                 may not have -- ravel-ingest does not report partial-shard success on error)"
+            );
+        } else {
+            println!("no commit tokens were durable before the failure (nothing landed)");
+        }
         return;
     }
+    let suffix = if is_flush {
+        " (this list may undercount: a shard within the failing batch itself may also have \
+          committed, but ravel-ingest does not report that on error)"
+    } else {
+        ""
+    };
     println!(
         "{} commit token(s)/segment(s) were durable before the failure (a partial load; \
-         re-running re-ingests the whole file, there is no dedup):",
+         re-running re-ingests the whole file, there is no dedup){suffix}:",
         tokens.len()
     );
     for token in tokens {
@@ -296,7 +319,14 @@ pub enum LoadError {
         durable: Vec<CommitToken>,
     },
     /// A flush (object-store PUT) failed. The tokens are what was durable
-    /// before the failure; the failed batch and everything after it are not.
+    /// from *earlier* batches. `LogIngestRouter::write` shards the failing
+    /// batch and waits for every shard's ack, but on the first shard error it
+    /// returns before collecting tokens from shards that acked successfully
+    /// in that same call (`LogWriteError` carries no partial-success data),
+    /// so a shard's records from the failing batch can be durable and still
+    /// go unreported here. Narrowing that gap needs `ravel-ingest` to return
+    /// per-shard outcomes on error; tracked as a follow-up, not fixed by this
+    /// type.
     #[error("flush failed: {cause}")]
     Flush {
         durable: Vec<CommitToken>,
@@ -332,8 +362,12 @@ impl LoadError {
 ///
 /// Fail-fast on the first row that fails a kept admission check. A run that
 /// returns `Ok` has every row durable; a run that returns `Err` reports the
-/// tokens already durable (a partial load — re-running re-ingests the whole
-/// file, there is no resumability or dedup in this version).
+/// tokens durable from batches that completed before the failure (a partial
+/// load — re-running re-ingests the whole file, there is no resumability or
+/// dedup in this version). On a [`LoadError::Flush`], the reported tokens can
+/// undercount: a shard within the failing batch may have committed while a
+/// sibling shard's ack failed, and that shard's token is not recoverable from
+/// the current `LogIngestRouter::write` error (see the variant's doc).
 #[allow(clippy::too_many_arguments)]
 pub async fn load(
     store: Arc<dyn ObjectStoreBackend>,

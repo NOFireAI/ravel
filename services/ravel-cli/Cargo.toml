@@ -48,7 +48,14 @@ bytes = { workspace = true }
 # deliberately NOT added to the root Cargo.toml (ADR-0011 isolates the arrow
 # family from the ingest-critical path; ravel-cli is operator tooling). This is
 # a genuinely new external dependency for ravel-cli, flagged per CLAUDE.md.
-parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
+parquet = { version = "59", default-features = false, features = [
+    "arrow",
+    "snap",
+    "zstd",
+    "brotli",
+    "flate2-zlib-rs",
+    "lz4",
+] }
 # arrow's array/datatypes/record_batch surface, to read Parquet row batches.
 # Reuses the workspace pin (major 59, matching `parquet` above).
 arrow = { workspace = true }
