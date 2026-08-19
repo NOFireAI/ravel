@@ -49,4 +49,8 @@ pub enum QueryError {
     Federation { cluster: String, reason: String },
     #[error("decoded segment run is not ascending by timestamp: {prev} was followed by {next}")]
     NonMonotonicSamples { prev: i64, next: i64 },
+    #[error(
+        "run carries {priorities} per-sample dedup priorities but {samples} samples; the column must be parallel to the samples"
+    )]
+    PrioritySampleCountMismatch { priorities: usize, samples: usize },
 }

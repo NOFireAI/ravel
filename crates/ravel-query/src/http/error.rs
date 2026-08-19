@@ -128,7 +128,13 @@ impl From<QueryError> for ApiError {
             // outage from the client's view; its `reason` may name an internal
             // cluster, so it is redacted to the same retryable 503.
             | QueryError::Federation { .. }
-            | QueryError::NonMonotonicSamples { .. } => {
+            | QueryError::NonMonotonicSamples { .. }
+            // A run whose per-sample dedup priority column is not parallel to
+            // its samples is the same class as a non-ascending run: the decoded
+            // object contradicts the format's invariants, so it is reported as
+            // a server-side fault with a fixed message rather than echoing
+            // internal column lengths.
+            | QueryError::PrioritySampleCountMismatch { .. } => {
                 ApiError::Unavailable(MSG_UNAVAILABLE.to_string())
             }
         }
