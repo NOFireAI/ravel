@@ -378,6 +378,54 @@ pub struct Cli {
     #[arg(long = "max-s3-requests", value_name = "COUNT")]
     pub max_s3_requests: Option<u64>,
 
+    /// Per-query ceiling, in bytes, on the SQL DataFusion memory pool
+    /// (ADR-0088), threaded into `ravel_sql::SqlConfig::max_query_bytes`.
+    /// Governs a single SQL query's intermediate `RecordBatch` footprint; a
+    /// query whose pool grow would exceed it aborts rather than growing without
+    /// bound. Process-wide, not per-tenant (per-tenant SQL budgets wait on the
+    /// limits-file's per-tenant enforcement gap, ADR-0088). Omitted defaults to
+    /// [`DEFAULT_SQL_MAX_QUERY_BYTES`] (256 MiB, today's compiled-in value), so
+    /// behavior is byte-identical when unset. Meaningful only in a build with
+    /// the `sql` feature (the SQL query surface); inert otherwise.
+    #[arg(long = "sql-max-query-bytes", value_name = "BYTES", default_value_t = DEFAULT_SQL_MAX_QUERY_BYTES)]
+    pub sql_max_query_bytes: usize,
+
+    /// Per-tenant ceiling, in bytes, on the SQL memory a single tenant may hold
+    /// across its concurrent queries (ADR-0088), threaded into the
+    /// `SqlExecutor`'s per-tenant accountant. The multi-tenant isolation bound:
+    /// one tenant's wide scans cannot starve another tenant's query pool. Sits
+    /// above `--sql-max-query-bytes` (the per-query ceiling); defaults to four
+    /// times it. Process-wide, not itself per-tenant-overridable (ADR-0088).
+    /// Omitted defaults to [`DEFAULT_SQL_TENANT_MAX_BYTES`] (1 GiB, today's
+    /// compiled-in value), so behavior is byte-identical when unset. Meaningful
+    /// only in a build with the `sql` feature; inert otherwise.
+    #[arg(long = "sql-tenant-max-bytes", value_name = "BYTES", default_value_t = DEFAULT_SQL_TENANT_MAX_BYTES)]
+    pub sql_tenant_max_bytes: usize,
+
+    /// Bound on concurrent in-flight segment fetches per query (ADR-0088),
+    /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is a
+    /// single knob with three coupled effects, NOT decoupled by this change: it
+    /// governs the PromQL/analytics per-query segment fetch fan-out, the SQL
+    /// scan partition count (`target_partitions` in
+    /// `crates/ravel-sql/src/session.rs`), and S3 GET concurrency (ADR-0087).
+    /// Raising it widens all three together; sizing it is a memory-vs-latency
+    /// trade against the host's cores and the store's request budget. Omitted
+    /// defaults to [`ravel_query::DEFAULT_FETCH_CONCURRENCY`] (8, today's
+    /// compiled-in value), so behavior is byte-identical when unset.
+    #[arg(long = "fetch-concurrency", value_name = "N", default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
+    pub fetch_concurrency: usize,
+
+    /// Cap on the number of segments a single query may fan out over (ADR-0088),
+    /// threaded into `ravel_query::EngineConfig::max_segments`. A wide scan over
+    /// a tenant with many sealed-below-watermark L0/L1 objects hits this cap
+    /// directly (only the narrow `SegmentOrigin::Recent` set, roughly the last
+    /// couple of hours, is exempt); this flag is what lets an operator raise it
+    /// for such a workload. Omitted defaults to
+    /// [`ravel_query::DEFAULT_MAX_SEGMENTS`] (1024, today's compiled-in value),
+    /// so behavior is byte-identical when unset.
+    #[arg(long = "max-segments", value_name = "N", default_value_t = ravel_query::DEFAULT_MAX_SEGMENTS)]
+    pub max_segments: usize,
+
     /// The process-wide in-flight ingest-request ceiling: the
     /// maximum number of OTLP metrics/logs/traces and Remote Write requests
     /// this process admits at once, across every listener (public and mTLS)
@@ -807,6 +855,72 @@ pub struct Cli {
     /// calibration; not a frozen value (decision 2).
     #[arg(long, default_value_t = 8)]
     pub store_bg_permits: usize,
+}
+
+/// Default `--sql-max-query-bytes`: the per-query SQL memory-pool ceiling
+/// (256 MiB), today's compiled-in `ravel_sql::config::DEFAULT_MAX_QUERY_BYTES`.
+/// Mirrored here (ravel-sql is an optional dependency, so this crate cannot
+/// name that constant in feature-independent code) and pinned equal to it by
+/// `sql_budget_defaults_match_compiled_in_constants`.
+pub const DEFAULT_SQL_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default `--sql-tenant-max-bytes`: the per-tenant SQL memory ceiling (1 GiB),
+/// today's compiled-in `crate::query::DEFAULT_MAX_TENANT_BYTES` (which is
+/// defined as this constant when the `sql` feature is on). Four times the
+/// per-query default.
+pub const DEFAULT_SQL_TENANT_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// The four ADR-0088 operator-configurable query budgets, resolved from
+/// `--fetch-concurrency`, `--max-segments`, `--sql-max-query-bytes`, and
+/// `--sql-tenant-max-bytes`. `main` builds this from the CLI
+/// ([`Cli::query_budgets`]) into [`crate::ServerConfig::query_budgets`], and
+/// [`crate::start`] folds `fetch_concurrency`/`max_segments` into the one
+/// process-wide `EngineConfig` both query surfaces share and passes the two SQL
+/// ceilings to `build_sql_state`. Every field's [`Default`] is exactly today's
+/// compiled-in value, so a server built with none of the four flags carries a
+/// budget bit-for-bit identical to before they existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudgets {
+    /// Per-query segment fetch concurrency, also the SQL scan partition count
+    /// and S3 GET concurrency (ADR-0087; not decoupled). Reaches
+    /// `EngineConfig::fetch_concurrency`.
+    pub fetch_concurrency: usize,
+    /// Per-query segment fan-out cap. Reaches `EngineConfig::max_segments`.
+    pub max_segments: usize,
+    /// Per-query SQL memory-pool ceiling. Reaches `SqlConfig::max_query_bytes`.
+    pub sql_max_query_bytes: usize,
+    /// Per-tenant SQL memory ceiling. Reaches the `SqlExecutor`'s per-tenant
+    /// accountant (`max_tenant_bytes`).
+    pub sql_tenant_max_bytes: usize,
+}
+
+impl Default for QueryBudgets {
+    fn default() -> Self {
+        QueryBudgets {
+            fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
+            sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
+            sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
+        }
+    }
+}
+
+impl QueryBudgets {
+    /// Fold the two `EngineConfig`-bound budgets (`fetch_concurrency`,
+    /// `max_segments`) onto a base `EngineConfig` that already carries the
+    /// separately-resolved deadline, bytes-scanned budget, and S3 request
+    /// budget. [`crate::start`] calls this so the one process-wide engine both
+    /// query surfaces share enforces the operator's `--fetch-concurrency` /
+    /// `--max-segments`, not `EngineConfig::default()`'s compiled-in 8 / 1024.
+    /// The single wiring point, so a reachability test that drives it proves the
+    /// running engine carries the flag values.
+    pub fn apply_to_engine(&self, base: ravel_query::EngineConfig) -> ravel_query::EngineConfig {
+        ravel_query::EngineConfig {
+            fetch_concurrency: self.fetch_concurrency,
+            max_segments: self.max_segments,
+            ..base
+        }
+    }
 }
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of
@@ -1407,6 +1521,22 @@ impl Cli {
                 self.resolve_flush_cadence()?.max_flush_delay,
             )),
         })
+    }
+
+    /// The four ADR-0088 query budgets sourced directly from the CLI flags.
+    /// `main` threads this into [`crate::ServerConfig::query_budgets`], and
+    /// [`crate::start`] folds it into the process-wide `EngineConfig` and the
+    /// SQL executor, so a flag set here is the value the query/SQL execution
+    /// path enforces. Infallible: clap has already parsed each flag to its
+    /// typed field (an unset flag is its compiled-in default), and none of the
+    /// four has a rejected value the way `--max-s3-requests 0` does.
+    pub fn query_budgets(&self) -> QueryBudgets {
+        QueryBudgets {
+            fetch_concurrency: self.fetch_concurrency,
+            max_segments: self.max_segments,
+            sql_max_query_bytes: self.sql_max_query_bytes,
+            sql_tenant_max_bytes: self.sql_tenant_max_bytes,
+        }
     }
 
     /// Parse `--max-inflight-ingest-requests` into an
@@ -3346,6 +3476,153 @@ mod tests {
             RequestLimit::Bounded(expected_for_override),
             "derive_max_s3_requests call site must use the configured --max-flush-delay, not IngestConfig::default()"
         );
+    }
+
+    /// ADR-0088 reachability: `--fetch-concurrency` must reach the
+    /// `EngineConfig` the running engine enforces, not stop at a parsed field.
+    /// Traced through the exact wiring `start` uses:
+    /// `Cli::query_budgets` -> `QueryBudgets::apply_to_engine` -> the process-wide
+    /// `EngineConfig`. Drives clap so a green result proves a running binary's
+    /// engine carries the flag value.
+    #[test]
+    fn fetch_concurrency_is_reachable_from_cli() {
+        use ravel_query::EngineConfig;
+
+        // Sanity: the value under test differs from the compiled-in default, so
+        // the assertion cannot pass by the flag being ignored.
+        assert_ne!(16, ravel_query::DEFAULT_FETCH_CONCURRENCY);
+
+        let cli = Cli::try_parse_from(["ravel-server", "--fetch-concurrency", "16"])
+            .expect("flag parses");
+        let engine = cli.query_budgets().apply_to_engine(EngineConfig::default());
+        assert_eq!(
+            engine.fetch_concurrency, 16,
+            "the running engine's fetch_concurrency must be the configured flag, \
+             not EngineConfig::default()'s 8"
+        );
+
+        // Default path: unset flag leaves the engine's value byte-identical.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.query_budgets()
+                .apply_to_engine(EngineConfig::default())
+                .fetch_concurrency,
+            EngineConfig::default().fetch_concurrency,
+        );
+    }
+
+    /// ADR-0088 reachability: `--max-segments` must reach the `EngineConfig` the
+    /// running engine enforces. Same wiring trace as
+    /// [`fetch_concurrency_is_reachable_from_cli`].
+    #[test]
+    fn max_segments_is_reachable_from_cli() {
+        use ravel_query::EngineConfig;
+
+        assert_ne!(4096, ravel_query::DEFAULT_MAX_SEGMENTS);
+
+        let cli =
+            Cli::try_parse_from(["ravel-server", "--max-segments", "4096"]).expect("flag parses");
+        let engine = cli.query_budgets().apply_to_engine(EngineConfig::default());
+        assert_eq!(
+            engine.max_segments, 4096,
+            "the running engine's max_segments must be the configured flag, \
+             not EngineConfig::default()'s 1024"
+        );
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.query_budgets()
+                .apply_to_engine(EngineConfig::default())
+                .max_segments,
+            EngineConfig::default().max_segments,
+        );
+    }
+
+    /// ADR-0088 default-unchanged guard: a server built with none of the four
+    /// new flags carries budgets bit-for-bit identical to the compiled-in
+    /// values the engine used before the flags existed. Pins each default to its
+    /// source constant so a future edit to any default fails loudly here.
+    #[test]
+    fn query_budget_defaults_match_compiled_in_constants() {
+        use ravel_query::EngineConfig;
+
+        let budgets = Cli::try_parse_from(["ravel-server"])
+            .expect("defaults parse")
+            .query_budgets();
+        assert_eq!(budgets, QueryBudgets::default());
+        assert_eq!(
+            budgets.fetch_concurrency,
+            EngineConfig::default().fetch_concurrency
+        );
+        assert_eq!(budgets.max_segments, EngineConfig::default().max_segments);
+        assert_eq!(budgets.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
+        assert_eq!(budgets.sql_tenant_max_bytes, DEFAULT_SQL_TENANT_MAX_BYTES);
+        // The two EngineConfig-bound defaults leave a base config untouched.
+        assert_eq!(
+            budgets.apply_to_engine(EngineConfig::default()),
+            EngineConfig::default(),
+            "unset --fetch-concurrency/--max-segments must not perturb the engine config"
+        );
+    }
+
+    /// ADR-0088 pins the two SQL byte defaults equal to the compiled-in
+    /// constants they mirror, so the CLI default and the ravel-sql / server
+    /// constant are one value. `sql`-gated because `DEFAULT_MAX_TENANT_BYTES`
+    /// is.
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sql_budget_defaults_match_compiled_in_constants() {
+        assert_eq!(
+            DEFAULT_SQL_MAX_QUERY_BYTES,
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            "the --sql-max-query-bytes default must equal ravel-sql's compiled-in per-query pool"
+        );
+        assert_eq!(
+            DEFAULT_SQL_TENANT_MAX_BYTES,
+            crate::query::DEFAULT_MAX_TENANT_BYTES,
+            "the --sql-tenant-max-bytes default must equal the compiled-in per-tenant ceiling"
+        );
+    }
+
+    /// ADR-0088 documents that `--gc-max-query-duration` must be `<=` the
+    /// tenant's durable `sys/gc.max_query_duration` (default 1h). This exercises
+    /// the actual validation path `main` runs (`resolve_gc_runtime` ->
+    /// `gc_config::validate_query` -> `ravel_maintain::validate_query_deadline`)
+    /// and pins its behavior: a deadline ABOVE the stored value is REJECTED (a
+    /// hard startup error), never clamped. Written against what the code does,
+    /// not an assumption.
+    #[test]
+    fn gc_max_query_duration_above_sys_gc_is_rejected() {
+        // Stored GC config with the default 1h max_query_duration.
+        let stored = ravel_maintain::GcConfigValues::maintain_defaults();
+
+        // A deadline above 1h: resolve it the way main does, then run the real
+        // query-mode validation. It must be an error, and the enforced deadline
+        // is the same value that was validated (not silently reduced).
+        let cli = Cli::try_parse_from(["ravel-server", "--gc-max-query-duration", "2h"])
+            .expect("flag parses");
+        let runtime = cli.resolve_gc_runtime().expect("resolves");
+        assert_eq!(runtime.query_deadline, Duration::from_secs(2 * 3600));
+        let err = crate::gc_config::validate_query(&stored, runtime.query_deadline)
+            .expect_err("a deadline above sys/gc.max_query_duration must be rejected, not clamped");
+        // The error names the query-deadline-exceeds-horizon condition; assert on
+        // the message so a future refactor that swaps reject for clamp fails here.
+        assert!(
+            err.to_string().to_lowercase().contains("deadline")
+                || err.to_string().to_lowercase().contains("horizon")
+                || err.to_string().to_lowercase().contains("query"),
+            "unexpected error shape: {err}"
+        );
+
+        // A deadline AT the stored ceiling (exactly 1h) passes: the bound is
+        // `<=`, so the boundary is admitted, and the resolved value is used
+        // verbatim.
+        let cli = Cli::try_parse_from(["ravel-server", "--gc-max-query-duration", "1h"])
+            .expect("flag parses");
+        let runtime = cli.resolve_gc_runtime().expect("resolves");
+        assert_eq!(runtime.query_deadline, Duration::from_secs(3600));
+        crate::gc_config::validate_query(&stored, runtime.query_deadline)
+            .expect("a deadline equal to sys/gc.max_query_duration must pass");
     }
 
     /// ADR-0076 decision 4: the three flush-cadence knobs move as a set.

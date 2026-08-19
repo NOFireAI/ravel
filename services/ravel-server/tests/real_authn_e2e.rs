@@ -56,6 +56,7 @@ async fn start_with_mtls(
 ) -> ravel_server::Running {
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),

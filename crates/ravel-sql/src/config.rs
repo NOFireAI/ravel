@@ -22,8 +22,11 @@ use ravel_types::accounting::QueryAccounting;
 
 use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 
-/// Default per-query RecordBatch byte budget: 256 MiB. A placeholder pending
-/// measurement; documented as such so it is not mistaken for a tuned value.
+/// Default per-query RecordBatch byte budget: 256 MiB. This is the shipped
+/// default, not a guess awaiting a number: an operator overrides it per process
+/// with `--sql-max-query-bytes` (ADR-0088). Changing the compiled-in default
+/// itself is a separate, measurement-backed follow-up; this value stays exactly
+/// as it was so behavior is unchanged when the flag is unset.
 pub const DEFAULT_MAX_QUERY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Per-query ravel-sql configuration: the shared engine budgets plus the

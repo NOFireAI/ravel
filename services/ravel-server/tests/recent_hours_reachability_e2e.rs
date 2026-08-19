@@ -217,6 +217,8 @@ fn sql_app(
         build_resolver(tokens, false),
         None,
         engine_config,
+        ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
+        ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),

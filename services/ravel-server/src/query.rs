@@ -173,11 +173,22 @@ pub fn build_app_state(
 }
 
 /// Default per-tenant SQL memory ceiling: 1 GiB across a tenant's concurrent
-/// queries, four times the per-query default in `ravel_sql::SqlConfig`. A
-/// placeholder pending measurement rather than a tuned value; documented as
-/// such so it is not mistaken for one.
+/// queries, four times the per-query default in `ravel_sql::SqlConfig`. This is
+/// the shipped default an operator overrides per process with
+/// `--sql-tenant-max-bytes` (ADR-0088), not a guess awaiting a number; changing
+/// the compiled-in value itself is a separate measurement-backed follow-up.
+/// Defined as [`crate::config::DEFAULT_SQL_TENANT_MAX_BYTES`] so the flag's
+/// default and this ceiling are one constant.
 #[cfg(feature = "sql")]
-pub const DEFAULT_MAX_TENANT_BYTES: usize = 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_TENANT_BYTES: usize = crate::config::DEFAULT_SQL_TENANT_MAX_BYTES;
+
+/// Re-export of the per-query SQL memory-pool default so callers of
+/// [`build_sql_state`] (including external test crates that do not depend on
+/// `ravel-sql` directly) can name the compiled-in default without threading the
+/// dependency. Equals `ravel_sql::DEFAULT_MAX_QUERY_BYTES` and
+/// [`crate::config::DEFAULT_SQL_MAX_QUERY_BYTES`].
+#[cfg(feature = "sql")]
+pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 
 /// Build the state for `POST /api/v1/sql`.
 ///
@@ -192,13 +203,25 @@ pub const DEFAULT_MAX_TENANT_BYTES: usize = 1024 * 1024 * 1024;
 /// must enforce the deadline `main` validated against `sys/gc`, not an
 /// independent `EngineConfig::default()` (without this, PromQL is wired to
 /// the validated deadline but SQL/Flight SQL would not be).
+///
+/// `max_query_bytes` (the per-query DataFusion memory-pool ceiling) and
+/// `max_tenant_bytes` (the per-tenant ceiling across a tenant's concurrent
+/// queries) are the ADR-0088 operator-configurable SQL budgets, resolved from
+/// `--sql-max-query-bytes` / `--sql-tenant-max-bytes` (defaulting to
+/// [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`] and [`DEFAULT_MAX_TENANT_BYTES`]).
+/// Threading them here rather than taking `SqlConfig::default()` is what makes an
+/// operator's override the value the executor's pool and per-tenant accountant
+/// actually enforce.
 #[cfg(feature = "sql")]
+#[allow(clippy::too_many_arguments)]
 pub fn build_sql_state(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<Arc<Cache<CacheFetchError>>>,
     engine_config: EngineConfig,
+    max_query_bytes: usize,
+    max_tenant_bytes: usize,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
 ) -> anyhow::Result<crate::sql::SqlState> {
@@ -207,7 +230,7 @@ pub fn build_sql_state(
 
     let config = SqlConfig {
         engine: engine_config,
-        ..SqlConfig::default()
+        max_query_bytes,
     };
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone());
@@ -232,7 +255,7 @@ pub fn build_sql_state(
         logs_fetcher,
         span_fetcher,
         config,
-        DEFAULT_MAX_TENANT_BYTES,
+        max_tenant_bytes,
     );
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
@@ -420,6 +443,8 @@ mod tests {
             tenant_resolver,
             None,
             non_default,
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            DEFAULT_MAX_TENANT_BYTES,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
@@ -461,6 +486,8 @@ mod tests {
             Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             None,
             engine_config,
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            DEFAULT_MAX_TENANT_BYTES,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
@@ -472,5 +499,90 @@ mod tests {
             ByteLimit::Bounded(4096),
             "the SQL executor must enforce the configured byte budget, not the default Unlimited"
         );
+    }
+
+    /// Build a minimal `SqlState` the way `start` does, sourcing the two SQL
+    /// budgets from a parsed CLI's `query_budgets()` so the test traces the same
+    /// wiring the running server uses (`Cli::query_budgets` -> `build_sql_state`
+    /// args -> `SqlConfig`/`SqlExecutor`).
+    fn sql_state_from_cli(argv: &[&str]) -> crate::sql::SqlState {
+        use clap::Parser;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store.clone(),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+        )
+        .expect("catalog");
+        let budgets = crate::Cli::try_parse_from(argv)
+            .expect("flags parse")
+            .query_budgets();
+        build_sql_state(
+            catalog,
+            store,
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            None,
+            EngineConfig::default(),
+            budgets.sql_max_query_bytes,
+            budgets.sql_tenant_max_bytes,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+        )
+        .expect("sql state builds")
+    }
+
+    /// ADR-0088 reachability: `--sql-max-query-bytes` must reach the value the
+    /// SQL executor's per-query DataFusion memory pool is built from
+    /// (`SqlConfig::max_query_bytes`), not stop at a parsed field. Traced from
+    /// the CLI through `query_budgets()` and `build_sql_state` to
+    /// `executor.config()`.
+    #[test]
+    fn sql_max_query_bytes_is_reachable_from_cli() {
+        let non_default = 7 * 1024 * 1024;
+        assert_ne!(non_default, ravel_sql::DEFAULT_MAX_QUERY_BYTES);
+        let state = sql_state_from_cli(&[
+            "ravel-server",
+            "--sql-max-query-bytes",
+            &non_default.to_string(),
+        ]);
+        assert_eq!(
+            state.executor.config().max_query_bytes,
+            non_default,
+            "the SQL executor's per-query pool ceiling must be the configured flag, not the default"
+        );
+
+        // Unset: byte-identical to the compiled-in per-query default.
+        let state = sql_state_from_cli(&["ravel-server"]);
+        assert_eq!(
+            state.executor.config().max_query_bytes,
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+        );
+    }
+
+    /// ADR-0088 reachability: `--sql-tenant-max-bytes` must reach the per-tenant
+    /// ceiling the executor's per-tenant accountant enforces
+    /// (`SqlExecutor::max_tenant_bytes`), not stop at a parsed field.
+    #[test]
+    fn sql_tenant_max_bytes_is_reachable_from_cli() {
+        let non_default = 3 * 1024 * 1024 * 1024;
+        assert_ne!(non_default, DEFAULT_MAX_TENANT_BYTES);
+        let state = sql_state_from_cli(&[
+            "ravel-server",
+            "--sql-tenant-max-bytes",
+            &non_default.to_string(),
+        ]);
+        assert_eq!(
+            state.executor.max_tenant_bytes(),
+            non_default,
+            "the SQL executor's per-tenant ceiling must be the configured flag, not the default"
+        );
+
+        // Unset: byte-identical to the compiled-in per-tenant default.
+        let state = sql_state_from_cli(&["ravel-server"]);
+        assert_eq!(state.executor.max_tenant_bytes(), DEFAULT_MAX_TENANT_BYTES);
     }
 }

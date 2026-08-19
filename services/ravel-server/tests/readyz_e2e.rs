@@ -104,6 +104,7 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
     tokens.insert("testtoken".to_string(), TenantId::new("acme"));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let config = ServerConfig {
+        query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),
