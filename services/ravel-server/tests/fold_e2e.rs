@@ -341,6 +341,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
 
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
     let config = ServerConfig {
+        query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),
@@ -482,6 +483,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
 
     let config = ServerConfig {
+        query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),

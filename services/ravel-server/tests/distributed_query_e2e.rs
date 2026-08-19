@@ -243,6 +243,7 @@ async fn start_server_with_query_cap(
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let config = ServerConfig {
+        query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),

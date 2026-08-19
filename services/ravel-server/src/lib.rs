@@ -80,7 +80,7 @@ use tokio::task::JoinHandle;
 
 pub use alerting::AlertEvalConfig;
 pub use config::limits::{LimitsConfig, QueryLimits};
-pub use config::{Cli, Mode, StoreKind};
+pub use config::{Cli, Mode, QueryBudgets, StoreKind};
 pub use fold::FoldTaskConfig;
 pub use maintain::MaintenanceTaskConfig;
 /// Re-exported so callers building a [`ServerConfig`] can name the ingest
@@ -309,6 +309,18 @@ pub struct ServerConfig {
     /// enforced budget. Distinct from the flat default an
     /// `EngineConfig::default()` would carry, which knows no shard count.
     pub max_s3_requests: ravel_query::RequestLimit,
+    /// The four ADR-0088 operator-configurable query budgets, from
+    /// `--fetch-concurrency`, `--max-segments`, `--sql-max-query-bytes`, and
+    /// `--sql-tenant-max-bytes` (`main` fills this via
+    /// [`crate::config::Cli::query_budgets`]). [`start`] folds
+    /// `fetch_concurrency`/`max_segments` into the one process-wide
+    /// `EngineConfig` both query surfaces share (PromQL/HTTP and SQL/HTTP), and
+    /// passes `sql_max_query_bytes`/`sql_tenant_max_bytes` to
+    /// [`query::build_sql_state`] so the SQL executor's per-query pool and
+    /// per-tenant accountant enforce the configured ceilings. Every field's
+    /// default equals today's compiled-in value, so an unset deployment is
+    /// byte-identical to before these flags existed.
+    pub query_budgets: crate::config::QueryBudgets,
     /// The at-rest scrub period `P` (ADR-0059 decision 1), from `--scrub-period`
     /// (default 7 days). [`start`] spawns one scrub task per process at a
     /// cadence derived from this, only in [`Mode::Maintain`] (the one mode that
@@ -1157,17 +1169,25 @@ pub async fn start(
         // SQL/HTTP paths alike (both `build_app_state` and `build_sql_state`
         // below take this same value). Every other engine limit stays at its
         // default.
-        let engine_config = ravel_query::EngineConfig {
-            deadline: config.query_deadline,
-            max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
-            // The shard-aware S3 request budget (ADR-0075), resolved in `main`
-            // from `--max-s3-requests` (verbatim) or derived from `--shards`
-            // and the flush cadence. Threaded here so the running binary uses
-            // the derived value, not `EngineConfig::default()`'s
-            // no-deployment-context fallback.
-            max_s3_requests: config.max_s3_requests,
-            ..ravel_query::EngineConfig::default()
-        };
+        // ADR-0088: fold `--fetch-concurrency` / `--max-segments` onto the base
+        // engine config via `QueryBudgets::apply_to_engine` (the single wiring
+        // point start and the reachability tests share). Without it the engine
+        // would keep `EngineConfig::default()`'s compiled-in 8 / 1024.
+        // `fetch_concurrency` is the same knob that sets the SQL scan partition
+        // count and S3 GET concurrency (ADR-0087).
+        let engine_config = config
+            .query_budgets
+            .apply_to_engine(ravel_query::EngineConfig {
+                deadline: config.query_deadline,
+                max_bytes_scanned: config.limits.query_defaults.max_bytes_scanned,
+                // The shard-aware S3 request budget (ADR-0075), resolved in `main`
+                // from `--max-s3-requests` (verbatim) or derived from `--shards`
+                // and the flush cadence. Threaded here so the running binary uses
+                // the derived value, not `EngineConfig::default()`'s
+                // no-deployment-context fallback.
+                max_s3_requests: config.max_s3_requests,
+                ..ravel_query::EngineConfig::default()
+            });
         // ADR-0071 cross-cluster federation: build one gRPC
         // federation client per configured remote and install a `Federation` on
         // the engine. `None` when no `--remote-cluster` is set, leaving the
@@ -1218,6 +1238,13 @@ pub async fn start(
                 config.tenant_resolver.clone(),
                 cache.clone(),
                 engine_config,
+                // ADR-0088: the per-query SQL pool ceiling and the per-tenant
+                // SQL ceiling, from `--sql-max-query-bytes` /
+                // `--sql-tenant-max-bytes`. Without threading these,
+                // `build_sql_state` would fall back to `SqlConfig::default()`'s
+                // 256 MiB and the compiled-in 1 GiB tenant ceiling.
+                config.query_budgets.sql_max_query_bytes,
+                config.query_budgets.sql_tenant_max_bytes,
                 query_accounting.clone(),
                 query_admission.clone(),
             )?;

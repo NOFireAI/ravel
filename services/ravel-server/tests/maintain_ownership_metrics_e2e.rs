@@ -49,6 +49,7 @@ const SHARD_COUNT: u32 = 8;
 /// under test.
 fn maintain_config(tenant: &TenantId) -> ServerConfig {
     ServerConfig {
+        query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),

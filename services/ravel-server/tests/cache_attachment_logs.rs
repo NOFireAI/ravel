@@ -205,6 +205,8 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache.clone()),
         ravel_query::EngineConfig::default(),
+        ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
+        ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
