@@ -48,6 +48,7 @@ mod avg;
 mod config;
 pub mod conformance;
 mod cost;
+mod declared;
 mod dedup;
 #[cfg(feature = "flight-sql")]
 pub mod distributed;
@@ -94,6 +95,7 @@ pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
 pub use config::{DEFAULT_MAX_QUERY_BYTES, SqlConfig};
+pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
 #[cfg(feature = "flight-sql")]
 pub use distributed::{
     DistributedFlightConfig, DistributedScanExec, FlightWorkerSliceClient, StaticWorkerEndpoints,

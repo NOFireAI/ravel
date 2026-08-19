@@ -251,6 +251,84 @@ pub fn registry() -> Vec<Construct> {
         });
     }
 
+    // The analytical clause/operator shapes typed-column queries need (ADR-0090
+    // decision 8). None are blocked by `validate.rs` (it rejects statement
+    // kinds, not clause shapes); each is registered SupportedAndCovered with a
+    // hand-declared differential-oracle expectation (tests/conformance.rs),
+    // re-derived directly from the fixture input, exactly like the base clause
+    // rows above.
+    let extended_clauses = [
+        (
+            "count(DISTINCT)",
+            "SELECT count(DISTINCT value) FROM samples",
+        ),
+        (
+            "OFFSET",
+            "SELECT value FROM samples ORDER BY value OFFSET 1",
+        ),
+        (
+            "HAVING",
+            "SELECT series_id, count(value) FROM samples \
+             GROUP BY series_id HAVING count(value) >= 2",
+        ),
+        (
+            "GROUP BY ordinal",
+            "SELECT series_id, count(value) FROM samples GROUP BY 1 ORDER BY series_id",
+        ),
+        (
+            "CASE",
+            "SELECT CASE WHEN value > 0 THEN 1 ELSE 0 END FROM samples",
+        ),
+        ("IN list", "SELECT value FROM samples WHERE value IN (1, 2)"),
+        (
+            "REGEXP_REPLACE backreference",
+            "SELECT regexp_replace('ab', '(a)(b)', '\\2\\1') FROM samples LIMIT 1",
+        ),
+        // The minute component of a timestamp. The `EXTRACT(minute FROM ts)`
+        // sugar is not planner-wired in this crate's DataFusion `sql` feature
+        // (no `ExprPlanner` for it, the same seam that leaves `attrs['k']` SQL
+        // text unplannable); the equivalent `date_part` scalar function is, so
+        // the minute-extraction capability is covered through that spelling.
+        (
+            "date_part(minute)",
+            "SELECT date_part('minute', ts) FROM samples",
+        ),
+        ("DATE_TRUNC", "SELECT date_trunc('hour', ts) FROM samples"),
+    ];
+    for (name, example) in extended_clauses {
+        out.push(Construct {
+            category: Category::Clause,
+            name: name.to_string(),
+            example: example.to_string(),
+            classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
+            rationale: "analytical clause/operator over typed columns (ADR-0090 decision 8)",
+        });
+    }
+
+    // Typed comparison and aggregate over a declared `i64` attribute column on
+    // the `logs` table (ADR-0090 decisions 1 and 8): a real typed `>=` and a
+    // real `SUM` over an `Int64` column, neither expressible over the
+    // stringified `attrs` map. Verified against the conformance fixture's
+    // declared `dur` column (tests/conformance.rs), whose expected values are
+    // re-derived from the fixture's known `dur` inputs, not from this task's
+    // own `merged_attrs`/`find_attr`.
+    let typed_columns = [
+        (
+            "declared i64 typed comparison",
+            "SELECT ts FROM logs WHERE dur >= 20",
+        ),
+        ("declared i64 typed aggregate", "SELECT sum(dur) FROM logs"),
+    ];
+    for (name, example) in typed_columns {
+        out.push(Construct {
+            category: Category::Clause,
+            name: name.to_string(),
+            example: example.to_string(),
+            classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
+            rationale: "typed predicate/aggregate over a declared column (ADR-0090)",
+        });
+    }
+
     // --- Write / DDL statements ------------------------------------------
     // The read-only single-statement gate refuses every non-`SELECT` statement
     // DataFusion's front end parses, with a typed error before any planning

@@ -95,8 +95,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, MapBuilder, StringArray, StringBuilder,
-    TimestampNanosecondArray, UInt8Array, UInt32Array,
+    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Int64Builder, MapBuilder,
+    StringArray, StringBuilder, TimestampNanosecondArray, UInt8Array, UInt32Array,
 };
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -121,13 +121,15 @@ use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
 
+use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::error::SqlError;
 use crate::logs_schema::{
-    LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS, LOG_COL_SEVERITY_NUM,
-    LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS, SPAN_ID_WIDTH,
-    TRACE_ID_WIDTH, logs_schema,
+    FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
+    LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
+    SPAN_ID_WIDTH, TRACE_ID_WIDTH,
 };
-use crate::rlog_attrs::{attr_value_to_string, merged_attrs, retain_unerased};
+use crate::rlog_attrs::{attr_value_to_string, find_attr, merged_attrs, retain_unerased};
+use ravel_logseg::record::canonical_value_bytes;
 
 /// Rows accumulated into one output batch before it is emitted.
 ///
@@ -171,9 +173,10 @@ fn attr_value_memory(v: &AttrValue) -> usize {
     }
 }
 
-/// The block columns one query needs decoded (ADR-0087 decision 3).
+/// The block columns one query needs decoded (ADR-0087 decision 3, extended by
+/// ADR-0090 decision 4).
 ///
-/// Four contributors, and every one of them is load-bearing:
+/// Five contributors, and every one of them is load-bearing:
 ///
 /// - the **projected schema columns**, which are what the query's output and
 ///   DataFusion's residual `FilterExec` above this leaf read (the projection
@@ -190,6 +193,15 @@ fn attr_value_memory(v: &AttrValue) -> usize {
 ///   for the fetcher's own filter and at merged resource/scope/record level for
 ///   [`retain_unerased`] here (ADR-0064). A key the selection omits makes an
 ///   erased row reappear.
+/// - every **declared typed attribute column** the projection names (ADR-0090
+///   decision 4). A declared column occupies a schema index at or above
+///   [`FIRST_DECLARED_COL`]; DataFusion already folds a residual-filter column
+///   into the projection it hands the scan, so a declared column named only in
+///   a `WHERE` clause is still decoded. This adds the declared key to the
+///   selection exactly like the content- and erasure-predicate contributors do;
+///   declared-column predicates are NOT extracted into the prune or
+///   content-predicate channels in this ADR (a typed comparison is a residual
+///   filter above the scan; typed-predicate pushdown is #278).
 ///
 /// The prune-only channel contributes nothing: its arms drive POSTINGS block
 /// pruning and are never evaluated per row, so no page has to be decoded for
@@ -202,6 +214,7 @@ fn resolve_columns(
     projection: &[usize],
     content: &[Predicate],
     erasure: &[ErasurePredicate],
+    declared: &[DeclaredColumn],
 ) -> ColumnSelection {
     let mut sel = ColumnSelection::fixed_only();
     for &i in projection {
@@ -218,11 +231,20 @@ fn resolve_columns(
             // The merged `attrs` map exposes every key, so referencing it at
             // all means every dynamic column plus the overflow.
             LOG_COL_ATTRS => sel.with_all_attrs(),
-            // Not reachable: `LogsScanExec::new` validates every index against
-            // the schema before building the projected schema. Fail open (decode
-            // everything) rather than silently under-decode if that ever
-            // changes.
-            _ => ColumnSelection::all(),
+            // A declared typed attribute column (index >= FIRST_DECLARED_COL):
+            // decode exactly that key's dynamic column, the same per-key path
+            // an erasure predicate uses. `i` here is never a fixed index
+            // (0..=8 are matched above), so the subtraction cannot underflow;
+            // `declared.get` fails open (decode everything) only if the index
+            // is somehow past the declared set, which `LogsScanExec::new`'s
+            // projection validation already rules out.
+            other => match other
+                .checked_sub(FIRST_DECLARED_COL)
+                .and_then(|k| declared.get(k))
+            {
+                Some(dc) => sel.with_attr(dc.key.clone()),
+                None => ColumnSelection::all(),
+            },
         };
     }
     for p in content {
@@ -275,13 +297,20 @@ pub struct LogsScanExec {
     /// (`retain_log_records`) engages; empty when the snapshot has no pending
     /// erasure, which is a no-op there.
     erasure: Arc<Vec<ErasurePredicate>>,
-    /// Indices into [`logs_schema`] this scan emits, in output order. Always
-    /// concrete: a `None` projection from DataFusion becomes every index.
+    /// Indices into the resolved full schema this scan emits, in output order.
+    /// Always concrete: a `None` projection from DataFusion becomes every index.
     projection: Arc<Vec<usize>>,
     /// The block columns the reader must decode, resolved once from
-    /// `projection`, `content`, and `erasure` (see [`resolve_columns`]).
+    /// `projection`, `content`, `erasure`, and `declared` (see
+    /// [`resolve_columns`]).
     columns: ColumnSelection,
-    /// This scan's output schema: `logs_schema()` projected by `projection`.
+    /// The tenant's declared typed attribute columns (ADR-0090), in schema-
+    /// append order. Index `k` here is schema index `FIRST_DECLARED_COL + k`.
+    /// Empty for a zero-declaration query, which is byte-identical to the
+    /// pre-ADR-0090 scan.
+    declared: Arc<Vec<DeclaredColumn>>,
+    /// This scan's output schema: the resolved full schema
+    /// (`logs_schema_with_declared(&declared)`) projected by `projection`.
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
@@ -357,6 +386,15 @@ impl LogsScanExec {
     // `tenant_hash` widened this past clippy\'s 7-argument
     // threshold; the codebase allows it at the equivalent sites
     // (scan.rs, ravel-query\'s fetcher.rs).
+    /// `full_schema` is the resolved full `logs` schema this scan projects, i.e.
+    /// `logs_schema_with_declared(&declared)` for the tenant's `declared`
+    /// columns (ADR-0090 decision 3). It is passed in rather than built here so
+    /// the provider resolves it once and the projection, batch builder, and
+    /// column-set resolution all agree with the schema the planner saw.
+    /// `declared` is the same tenant's declared columns in schema-append order,
+    /// so [`build_batch`] and [`resolve_columns`] can map a projected declared
+    /// index back to its key and type. Both are empty/base for a
+    /// zero-declaration query.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tenant_hash: TenantHash,
@@ -370,13 +408,15 @@ impl LogsScanExec {
         erasure: Arc<Vec<ErasurePredicate>>,
         projection: Option<&Vec<usize>>,
         accounting: QueryAccounting,
+        full_schema: SchemaRef,
+        declared: Arc<Vec<DeclaredColumn>>,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
         for (i, seg) in segments.iter().enumerate() {
             partitions[i % n].push(seg.clone());
         }
-        let full = logs_schema();
+        let full = full_schema;
         // A `None` projection means every column, in schema order. Resolving it
         // here rather than carrying an `Option` keeps one code path for the
         // schema, the batch builder, and the column-set resolution.
@@ -391,7 +431,7 @@ impl LogsScanExec {
                 )));
             }
         }
-        let columns = resolve_columns(&projection, &content, &erasure);
+        let columns = resolve_columns(&projection, &content, &erasure, &declared);
         let schema: SchemaRef = Arc::new(full.project(&projection)?);
         let properties = Arc::new(Self::compute_properties(&schema, n));
         Ok(LogsScanExec {
@@ -405,6 +445,7 @@ impl LogsScanExec {
             erasure,
             projection: Arc::new(projection),
             columns,
+            declared,
             schema,
             properties,
             accounting,
@@ -510,6 +551,7 @@ impl ExecutionPlan for LogsScanExec {
         Ok(Box::pin(LogScanStream {
             schema: Arc::clone(&self.schema),
             projection: Arc::clone(&self.projection),
+            declared: Arc::clone(&self.declared),
             ctx: Arc::new(PartitionCtx {
                 fetcher: self.fetcher.clone(),
                 tenant_hash: self.tenant_hash,
@@ -586,8 +628,11 @@ enum LogScanState {
 /// for the partition's lifetime and frees exactly once on drop.
 struct LogScanStream {
     schema: SchemaRef,
-    /// Indices into [`logs_schema`] to emit, in output order.
+    /// Indices into the resolved full schema to emit, in output order.
     projection: Arc<Vec<usize>>,
+    /// The tenant's declared typed attribute columns (ADR-0090), consulted by
+    /// [`build_batch`] for a projected declared index.
+    declared: Arc<Vec<DeclaredColumn>>,
     ctx: Arc<PartitionCtx>,
     erasure: Arc<Vec<ErasurePredicate>>,
     blocks: BlockMetrics,
@@ -614,6 +659,7 @@ impl LogScanStream {
             &self.pending[self.pos..end],
             Arc::clone(&self.schema),
             &self.projection,
+            &self.declared,
         )?;
         self.pos = end;
         let bytes = batch.get_array_memory_size();
@@ -741,7 +787,7 @@ impl RecordBatchStream for LogScanStream {
 }
 
 /// Decode a slice of records into one [`RecordBatch`] over `schema`, which is
-/// `logs_schema()` projected by `projection`.
+/// `logs_schema_with_declared(&declared)` projected by `projection`.
 ///
 /// Only the projected columns are built. A column the query did not ask for is
 /// never materialized here, which is the second half of the projection story:
@@ -749,11 +795,38 @@ impl RecordBatchStream for LogScanStream {
 /// allocate an Arrow array for it. `attrs` is the expensive one to skip -- at a
 /// hundred attributes a row it dominated the batch's footprint even for
 /// `COUNT(*)`, which projects nothing at all.
+///
+/// The merged attribute view ([`merged_attrs`]) is computed **once per record**
+/// (ADR-0090 decision 5) into `merged`, shared by the `attrs` map arm and every
+/// declared-column arm, rather than decoded again per declared column. A
+/// declared column (schema index >= [`FIRST_DECLARED_COL`]) is built as a
+/// native typed Arrow array from that precomputed view via [`find_attr`]:
+/// NULL for an absent key or a variant that does not match the declared type,
+/// never a cast (ADR-0090 decision 7), with the one `bytes` normalization of a
+/// `List`/`Map` value through [`canonical_value_bytes`].
 fn build_batch(
     records: &[LogRecord],
     schema: SchemaRef,
     projection: &[usize],
+    declared: &[DeclaredColumn],
 ) -> DFResult<RecordBatch> {
+    // Precompute the merged attribute view once per record when any projected
+    // column needs it -- the `attrs` map or any declared typed column. Hoisted
+    // out of the per-column loop so a query projecting `attrs` and several
+    // declared columns decodes each record's stream_attrs blob exactly once.
+    let needs_merged = projection
+        .iter()
+        .any(|&i| i == LOG_COL_ATTRS || i >= FIRST_DECLARED_COL);
+    let merged: Vec<Vec<(String, AttrValue)>> = if needs_merged {
+        let mut v = Vec::with_capacity(records.len());
+        for r in records {
+            v.push(merged_attrs(r)?);
+        }
+        v
+    } else {
+        Vec::new()
+    };
+
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
     for &i in projection {
         let array: ArrayRef = match i {
@@ -813,10 +886,10 @@ fn build_batch(
             // resource attribute (ADR-0033 amendment). See `merged_attrs`.
             LOG_COL_ATTRS => {
                 let mut attrs = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-                for r in records {
-                    for (k, v) in merged_attrs(r)? {
-                        attrs.keys().append_value(&k);
-                        attrs.values().append_value(attr_value_to_string(&v));
+                for row in &merged {
+                    for (k, v) in row {
+                        attrs.keys().append_value(k);
+                        attrs.values().append_value(attr_value_to_string(v));
                     }
                     attrs
                         .append(true)
@@ -824,11 +897,23 @@ fn build_batch(
                 }
                 Arc::new(attrs.finish())
             }
-            other => {
-                return Err(DataFusionError::Internal(format!(
-                    "logs scan projection index {other} out of range"
-                )));
-            }
+            // A declared typed attribute column (ADR-0090 decisions 5-7):
+            // index >= FIRST_DECLARED_COL selects `declared[i - FIRST_DECLARED_COL]`.
+            // The declared key is still present in the `attrs` map arm above
+            // (decision 6, keys stay in the map); this arm additionally
+            // materializes it as a native typed column from the same merged
+            // view.
+            other => match other
+                .checked_sub(FIRST_DECLARED_COL)
+                .and_then(|k| declared.get(k))
+            {
+                Some(dc) => declared_column_array(dc, &merged),
+                None => {
+                    return Err(DataFusionError::Internal(format!(
+                        "logs scan projection index {other} out of range"
+                    )));
+                }
+            },
         };
         columns.push(array);
     }
@@ -839,4 +924,70 @@ fn build_batch(
     // silently lose every row.
     let options = RecordBatchOptions::new().with_row_count(Some(records.len()));
     RecordBatch::try_new_with_options(schema, columns, &options).map_err(DataFusionError::from)
+}
+
+/// Build one declared typed attribute column as a native Arrow array from the
+/// per-record precomputed merged views (ADR-0090 decisions 5-7).
+///
+/// For each record, the key is looked up via [`find_attr`] against that record's
+/// merged view. A value whose [`AttrValue`] variant matches the declared type is
+/// appended natively; every other case -- an absent key, or a present value of a
+/// different variant -- appends NULL, never a cast and never an error. The one
+/// exception is a `Bytes`-declared column: a `List`/`Map` value is first
+/// normalized to its canonical encoding via [`canonical_value_bytes`] (the same
+/// function the write path uses in `ravel_logseg::record::resolve_value`), so a
+/// value that fit the object's dynamic-column budget and was stored as a `Bytes`
+/// column reads identically to the same logical value that overflowed into
+/// `attrs_raw` and decoded back as `List`/`Map`.
+fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>]) -> ArrayRef {
+    match dc.ty {
+        DeclaredType::Str => {
+            let mut b = StringBuilder::new();
+            for row in merged {
+                match find_attr(row, &dc.key) {
+                    Some(AttrValue::Str(s)) => b.append_value(s),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::I64 => {
+            let mut b = Int64Builder::new();
+            for row in merged {
+                match find_attr(row, &dc.key) {
+                    Some(AttrValue::I64(v)) => b.append_value(*v),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::Bool => {
+            let mut b = BooleanBuilder::new();
+            for row in merged {
+                match find_attr(row, &dc.key) {
+                    Some(AttrValue::Bool(v)) => b.append_value(*v),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::Bytes => {
+            let mut b = BinaryBuilder::new();
+            for row in merged {
+                match find_attr(row, &dc.key) {
+                    Some(AttrValue::Bytes(bytes)) => b.append_value(bytes),
+                    // A record-level `List`/`Map` value that fit the dynamic-
+                    // column budget was canonicalized into a `Bytes` column at
+                    // write time; one that overflowed decodes back as
+                    // `List`/`Map`. Canonicalize the latter here so both storage
+                    // locations produce the identical `bytes` value (decision 7).
+                    Some(v @ (AttrValue::List(_) | AttrValue::Map(_))) => {
+                        b.append_value(canonical_value_bytes(v))
+                    }
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+    }
 }
