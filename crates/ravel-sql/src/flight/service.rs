@@ -341,6 +341,14 @@ impl FlightSqlService for RavelFlightSqlService {
             .iter()
             .map(SegmentPin::from_segment_ref)
             .collect();
+        // Resolve the tenant's declared typed attribute columns once, here at
+        // the plan entry point (ADR-0090 decision 2), with the same `now_ns`
+        // that bounded the resolve above. The resolved list is both threaded
+        // into `plan_pinned` (so the advertised FlightInfo schema carries the
+        // declared columns) and pinned into the ticket below, so the paired
+        // `DoGet` plans against exactly this schema even if a concurrent cache
+        // refresh changes what a re-resolution would return.
+        let declared = self.executor.resolve_declared_columns(tenant, now_ns).await;
         // Carried into the ticket below so `DoGet` excludes exactly what this
         // resolve saw pending (ADR-0064 decision 3): `snapshot` is
         // moved into `plan_pinned` just below, so this must be derived first.
@@ -353,7 +361,7 @@ impl FlightSqlService for RavelFlightSqlService {
         // segments.
         let planned = self
             .executor
-            .plan_pinned(tenant, snapshot, &query.query, &accounting)
+            .plan_pinned(tenant, snapshot, &query.query, &accounting, &declared)
             .await
             .map_err(|err| status_from_sql(&err, tenant))?;
         let schema = planned.schema();
@@ -404,6 +412,7 @@ impl FlightSqlService for RavelFlightSqlService {
             slice_index: 0,
             slice_count: 1,
             pending_erasure,
+            declared_columns: declared,
         };
         let info = info.with_endpoint(
             FlightEndpoint::new().with_ticket(self.encode_statement_ticket(tenant, ticket)?),

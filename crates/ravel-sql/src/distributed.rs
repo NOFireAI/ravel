@@ -635,6 +635,11 @@ pub fn plan_distributed_slices(
                     // only way its slice excludes what the coordinator saw
                     // pending (ADR-0064 decision 3).
                     pending_erasure: template.pending_erasure.clone(),
+                    // A slice fetch serves the raw internal-schema samples scan
+                    // (metrics only, no statement planning), so declared typed
+                    // attribute columns never apply; copied from the template
+                    // (empty for a metrics query) for uniformity, ADR-0090.
+                    declared_columns: template.declared_columns.clone(),
                 };
                 WorkerSlice { location, ticket }
             })

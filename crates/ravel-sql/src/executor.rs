@@ -90,6 +90,7 @@ use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange}
 
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
+use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_source};
 use crate::error::SqlError;
 use crate::logs_provider::LogsTableProvider;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
@@ -143,6 +144,11 @@ pub(crate) type DistributedScan = (
 /// distributed machinery.
 #[derive(Default)]
 struct PlanExtras {
+    /// The tenant's declared typed attribute columns (ADR-0090), resolved once
+    /// per plan at the entry point and threaded down here. Empty for a
+    /// zero-declaration query, and irrelevant to a metrics- or spans-target
+    /// query (only the `logs` provider consumes it).
+    declared: Vec<DeclaredColumn>,
     /// The coordinator-side distributed samples scan to install for this query,
     /// or `None` to run the samples scan locally.
     #[cfg(feature = "flight-sql")]
@@ -261,6 +267,15 @@ pub struct SqlExecutor {
     /// process-local byte-counter state, rebuilt on the tenant's next query, so
     /// dropping an idle one with no outstanding reservations changes no result.
     tenants: Mutex<HashMap<TenantHash, TenantAccountantEntry>>,
+    /// The source of each tenant's declared typed attribute columns for the
+    /// `logs` table (ADR-0090 decision 2). Resolved once per plan at the entry
+    /// point (`run` for HTTP, Flight's `get_flight_info`) and threaded down as a
+    /// plain parameter; the planning functions never call this themselves.
+    /// [`SqlExecutor::new`] defaults it to an empty
+    /// [`crate::StaticDeclaredColumns`] so the constructor and every existing
+    /// call site stay source-compatible; a caller installs the real cache-aside
+    /// overlay (#302) with [`Self::with_declared_column_source`].
+    declared_source: Arc<dyn DeclaredColumnSource>,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -291,7 +306,32 @@ impl SqlExecutor {
             config,
             max_tenant_bytes,
             tenants: Mutex::new(HashMap::new()),
+            declared_source: default_declared_source(),
         }
+    }
+
+    /// Install the source of per-tenant declared typed attribute columns for the
+    /// `logs` table (ADR-0090 decision 2), replacing the empty default this
+    /// executor was built with. This is the seam the server's real cache-aside,
+    /// `TenantConfig`-backed overlay (#302) attaches through, without changing
+    /// [`Self::new`]'s signature or any existing call site.
+    pub fn with_declared_column_source(mut self, source: Arc<dyn DeclaredColumnSource>) -> Self {
+        self.declared_source = source;
+        self
+    }
+
+    /// Resolve the declared typed attribute columns for `tenant` as of
+    /// `now_ns` (ADR-0090 decision 2). This is the one call into the injected
+    /// [`DeclaredColumnSource`]; it happens exactly once per plan, at the entry
+    /// point that carries both the tenant and the query's injected clock
+    /// (`SqlExecutor::run` for HTTP, Flight's `get_flight_info`), and the
+    /// resolved list is threaded down as a plain parameter thereafter.
+    pub async fn resolve_declared_columns(
+        &self,
+        tenant: TenantHash,
+        now_ns: i64,
+    ) -> Vec<DeclaredColumn> {
+        self.declared_source.declared_columns(tenant, now_ns).await
     }
 
     pub fn config(&self) -> &SqlConfig {
@@ -402,6 +442,16 @@ impl SqlExecutor {
     async fn run(&self, tenant_hash: TenantHash, req: &SqlRequest) -> Result<SqlOutcome, SqlError> {
         let mut stats = SqlStats::default();
 
+        // Resolve the tenant's declared typed attribute columns once for the
+        // whole request (ADR-0090 decision 2), before the retry loop, so the
+        // same declared schema is used across the original attempt and the one
+        // retry the consistency model allows -- never re-resolved per attempt
+        // with a source that might have refreshed in between. `req.now_ns` is
+        // the request's injected clock reading, the same one that bounds the
+        // resolve window, so the declared schema and the snapshot are pinned to
+        // one instant together.
+        let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
+
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
         // (ADR-0044): a discarded first attempt's counts must never bleed
@@ -413,8 +463,9 @@ impl SqlExecutor {
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
 
-            let (result, emitted, blocks) =
-                self.attempt(tenant_hash, req, snapshot, &accounting).await;
+            let (result, emitted, blocks) = self
+                .attempt(tenant_hash, req, snapshot, &accounting, &declared)
+                .await;
             stats.batches_emitted += emitted;
 
             match result {
@@ -492,13 +543,21 @@ impl SqlExecutor {
         snapshot: Snapshot,
         sql: &str,
         accounting: &QueryAccounting,
+        declared: &[DeclaredColumn],
     ) -> Result<PinnedQuery, SqlError> {
         self.plan_pinned_with(
             tenant_hash,
             snapshot,
             sql,
             accounting,
-            PlanExtras::default(),
+            PlanExtras {
+                declared: declared.to_vec(),
+                // Explicit per-field so this compiles clean whether or not the
+                // `flight-sql` feature adds `distributed`; a `..default()` would
+                // be a needless update on the single-field local build.
+                #[cfg(feature = "flight-sql")]
+                distributed: None,
+            },
         )
         .await
     }
@@ -521,13 +580,17 @@ impl SqlExecutor {
         sql: &str,
         accounting: &QueryAccounting,
         distributed: Option<DistributedScan>,
+        declared: &[DeclaredColumn],
     ) -> Result<PinnedQuery, SqlError> {
         self.plan_pinned_with(
             tenant_hash,
             snapshot,
             sql,
             accounting,
-            PlanExtras { distributed },
+            PlanExtras {
+                declared: declared.to_vec(),
+                distributed,
+            },
         )
         .await
     }
@@ -544,10 +607,6 @@ impl SqlExecutor {
         accounting: &QueryAccounting,
         extras: PlanExtras,
     ) -> Result<PinnedQuery, SqlError> {
-        // With `flight-sql` off, `PlanExtras` has no fields and the distributed
-        // install below is compiled out; keep `extras` from reading unused.
-        #[cfg(not(feature = "flight-sql"))]
-        let _ = extras;
         let (pool, breach) = self
             .config
             .query_pool(self.tenant_budget(tenant_hash), accounting.clone());
@@ -573,12 +632,19 @@ impl SqlExecutor {
                 }
                 SessionTable::Metrics(Arc::new(provider))
             }
-            TargetSignal::Logs => SessionTable::Logs(Arc::new(LogsTableProvider::new(
-                snapshot,
-                tenant_hash,
-                self.log_fetcher.clone(),
-                accounting.clone(),
-            ))),
+            // The declared typed attribute columns (ADR-0090) resolved once per
+            // plan are installed on the logs provider here; they widen the
+            // table's schema and are consumed only by this provider. A metrics-
+            // or spans-target query leaves `extras.declared` unused.
+            TargetSignal::Logs => SessionTable::Logs(Arc::new(
+                LogsTableProvider::new(
+                    snapshot,
+                    tenant_hash,
+                    self.log_fetcher.clone(),
+                    accounting.clone(),
+                )
+                .with_declared_columns(extras.declared),
+            )),
             // The spans provider drives `SpanSegmentFetcher::fetch_accounted`
             // for every scanned segment: `accounting` is cloned in so each
             // span GET is recorded against this query, and the fetch is
@@ -848,9 +914,10 @@ impl SqlExecutor {
         req: &SqlRequest,
         snapshot: Snapshot,
         accounting: &QueryAccounting,
+        declared: &[DeclaredColumn],
     ) -> (Result<QueryOutput, SqlError>, usize, BlockCounts) {
         let planned = match self
-            .plan_pinned(tenant_hash, snapshot, &req.sql, accounting)
+            .plan_pinned(tenant_hash, snapshot, &req.sql, accounting, declared)
             .await
         {
             Ok(planned) => planned,

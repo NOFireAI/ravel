@@ -54,10 +54,10 @@ and stays conformant.
 
 ## Score
 
-- Supported and covered: 13
+- Supported and covered: 24
 - Intentionally rejected: 55
 - Unclassified / broken: 0
-- **Conformance: 68 / 68 = 100.0%**
+- **Conformance: 79 / 79 = 100.0%**
 
 ## Conformance table
 
@@ -108,11 +108,22 @@ and stays conformant.
 | Aggregate | `var_population` | `SELECT var_population(value) FROM samples` | Intentionally rejected | `ValidationError::ExcludedAggregate` | outside the six-aggregate allowlist (ADR-0022 decision 2) |
 | Aggregate | `var_samp` | `SELECT var_samp(value) FROM samples` | Intentionally rejected | `ValidationError::ExcludedAggregate` | outside the six-aggregate allowlist (ADR-0022 decision 2) |
 | Aggregate | `var_sample` | `SELECT var_sample(value) FROM samples` | Intentionally rejected | `ValidationError::ExcludedAggregate` | outside the six-aggregate allowlist (ADR-0022 decision 2) |
+| Clause / operator | `CASE` | `SELECT CASE WHEN value > 0 THEN 1 ELSE 0 END FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `DATE_TRUNC` | `SELECT date_trunc('hour', ts) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `Filter (WHERE)` | `SELECT ts, value FROM samples WHERE value > 0 ORDER BY series_id, ts` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
 | Clause / operator | `GROUP BY` | `SELECT series_id, count(value) FROM samples GROUP BY series_id ORDER BY series_id` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
+| Clause / operator | `GROUP BY ordinal` | `SELECT series_id, count(value) FROM samples GROUP BY 1 ORDER BY series_id` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `HAVING` | `SELECT series_id, count(value) FROM samples GROUP BY series_id HAVING count(value) >= 2` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `IN list` | `SELECT value FROM samples WHERE value IN (1, 2)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `LIMIT` | `SELECT ts, value FROM samples ORDER BY series_id, ts LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
+| Clause / operator | `OFFSET` | `SELECT value FROM samples ORDER BY value OFFSET 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `ORDER BY` | `SELECT ts, value FROM samples ORDER BY ts` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
 | Clause / operator | `Projection` | `SELECT ts, value FROM samples ORDER BY series_id, ts` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
+| Clause / operator | `REGEXP_REPLACE backreference` | `SELECT regexp_replace('ab', '(a)(b)', '\2\1') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `count(DISTINCT)` | `SELECT count(DISTINCT value) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `date_part(minute)` | `SELECT date_part('minute', ts) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `declared i64 typed aggregate` | `SELECT sum(dur) FROM logs` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a declared column (ADR-0090) |
+| Clause / operator | `declared i64 typed comparison` | `SELECT ts FROM logs WHERE dur >= 20` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a declared column (ADR-0090) |
 | Write / DDL statement | `ALTER TABLE` | `ALTER TABLE samples ADD COLUMN x INT` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `COPY` | `COPY (SELECT 1) TO 's3://evil/out.parquet'` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `CREATE EXTERNAL TABLE` | `CREATE EXTERNAL TABLE t (a INT) STORED AS PARQUET LOCATION '/tmp/x'` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |

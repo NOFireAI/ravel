@@ -35,9 +35,10 @@ use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
+use crate::declared::DeclaredColumn;
 use crate::logs_pushdown::{LogsPushdown, extract_logs};
 use crate::logs_scan::LogsScanExec;
-use crate::logs_schema::logs_schema;
+use crate::logs_schema::{logs_schema, logs_schema_with_declared};
 
 /// The `logs` table provider for one tenant over one pinned `Signal::Logs`
 /// snapshot.
@@ -54,6 +55,13 @@ pub struct LogsTableProvider {
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `LogsScanExec` the provider builds.
     erasure: Arc<Vec<ErasurePredicate>>,
+    /// The tenant's declared typed attribute columns (ADR-0090), in schema-
+    /// append order. Resolved once per plan by `SqlExecutor` and installed with
+    /// [`LogsTableProvider::with_declared_columns`]; empty for a
+    /// zero-declaration query, which reproduces the pre-ADR-0090 provider
+    /// exactly. The provider's advertised [`Self::schema`] and every
+    /// `LogsScanExec` it builds are derived from this list.
+    declared: Arc<Vec<DeclaredColumn>>,
 }
 
 impl LogsTableProvider {
@@ -75,7 +83,23 @@ impl LogsTableProvider {
             schema: logs_schema(),
             accounting,
             erasure,
+            declared: Arc::new(Vec::new()),
         }
+    }
+
+    /// Install the tenant's declared typed attribute columns (ADR-0090), which
+    /// the caller (`SqlExecutor`) resolved once per plan and threaded down. The
+    /// provider's advertised schema becomes
+    /// `logs_schema_with_declared(&declared)` and every scan it builds carries
+    /// the list, so a declared column projects as a native typed Arrow column.
+    ///
+    /// A builder method rather than a `new` parameter so `LogsTableProvider::new`
+    /// stays source-compatible with existing callers and tests: the
+    /// zero-declaration default is exactly the base `logs` schema.
+    pub fn with_declared_columns(mut self, declared: Vec<DeclaredColumn>) -> Self {
+        self.schema = logs_schema_with_declared(&declared);
+        self.declared = Arc::new(declared);
+        self
     }
 
     /// Build the scan over every segment in the snapshot with no pushdown and
@@ -122,6 +146,8 @@ impl LogsTableProvider {
             Arc::clone(&self.erasure),
             projection,
             self.accounting.clone(),
+            Arc::clone(&self.schema),
+            Arc::clone(&self.declared),
         )?;
         Ok(Arc::new(scan))
     }

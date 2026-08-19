@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
+use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::schema::label_map_type;
 
 pub const LOG_COL_TS: usize = 0;
@@ -42,6 +43,12 @@ pub const LOG_COL_TRACE_ID: usize = 5;
 pub const LOG_COL_SPAN_ID: usize = 6;
 pub const LOG_COL_FLAGS: usize = 7;
 pub const LOG_COL_ATTRS: usize = 8;
+
+/// The first schema index a declared typed attribute column occupies (ADR-0090
+/// decision 3). Declared columns are appended after `attrs` (index
+/// [`LOG_COL_ATTRS`]), so the first one is index 9 and the `k`-th declared
+/// column in list order is index `FIRST_DECLARED_COL + k`.
+pub const FIRST_DECLARED_COL: usize = LOG_COL_ATTRS + 1;
 
 /// Byte width of a trace id (`ravel_logseg::record::TRACE_ID_WIDTH`).
 pub const TRACE_ID_WIDTH: i32 = 16;
@@ -71,9 +78,40 @@ fn logs_fields() -> Vec<Field> {
     ]
 }
 
-/// The public `logs` table schema.
+/// The public `logs` table schema: the zero-declaration base (ADR-0090
+/// decision 3). Unchanged by this ADR, so every existing caller and the public
+/// re-export in `lib.rs` see exactly the nine fixed fields.
 pub fn logs_schema() -> SchemaRef {
     Arc::new(Schema::new(logs_fields()))
+}
+
+/// The Arrow type a declared column of `ty` is projected as (ADR-0090
+/// decision 3). Every declared column is nullable: a row whose value is absent
+/// or whose decoded variant does not match the declared type reads NULL, never
+/// a cast (ADR-0090 decision 7).
+fn declared_arrow_type(ty: DeclaredType) -> DataType {
+    match ty {
+        DeclaredType::Str => DataType::Utf8,
+        DeclaredType::I64 => DataType::Int64,
+        DeclaredType::Bool => DataType::Boolean,
+        DeclaredType::Bytes => DataType::Binary,
+    }
+}
+
+/// The `logs` table schema for a tenant with `declared` typed attribute columns
+/// (ADR-0090 decision 3). The nine fixed fields of [`logs_schema`] are followed
+/// by one nullable Arrow field per declared column, appended in `declared`'s
+/// order (index [`FIRST_DECLARED_COL`] onward) and never re-sorted, so a
+/// tenant's schema does not reorder between one plan and the next.
+///
+/// With an empty `declared` this is exactly [`logs_schema`]: the zero-
+/// declaration base path is provably unchanged.
+pub fn logs_schema_with_declared(declared: &[DeclaredColumn]) -> SchemaRef {
+    let mut fields = logs_fields();
+    for dc in declared {
+        fields.push(Field::new(dc.key.clone(), declared_arrow_type(dc.ty), true));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
@@ -107,5 +145,62 @@ mod tests {
         assert_eq!(s.field(LOG_COL_FLAGS).data_type(), &DataType::UInt32);
         assert_eq!(s.field(LOG_COL_ATTRS).name(), "attrs");
         assert_eq!(s.field(LOG_COL_ATTRS).data_type(), &label_map_type());
+    }
+
+    /// ADR-0090 decision 3: the zero-declaration path is provably unchanged.
+    /// `logs_schema_with_declared(&[])` is the same `Schema` shape as the
+    /// unchanged `logs_schema()`, so a tenant with no declared columns gets
+    /// byte-for-byte the base schema this task did not touch.
+    #[test]
+    fn empty_declared_schema_equals_the_base_schema() {
+        let base = logs_schema();
+        let with_none = logs_schema_with_declared(&[]);
+        assert_eq!(base.fields().len(), 9);
+        assert_eq!(
+            base.as_ref(),
+            with_none.as_ref(),
+            "zero declared columns must reproduce the base logs schema exactly"
+        );
+    }
+
+    /// Declared columns are appended after `attrs` in declaration order, each
+    /// nullable, mapped to the Arrow type its logical type declares (ADR-0090
+    /// decision 3), and the order is preserved verbatim (never re-sorted).
+    #[test]
+    fn declared_columns_append_in_order_after_attrs() {
+        let declared = vec![
+            DeclaredColumn::new("z.last", DeclaredType::Str),
+            DeclaredColumn::new("duration_ms", DeclaredType::I64),
+            DeclaredColumn::new("ok", DeclaredType::Bool),
+            DeclaredColumn::new("payload", DeclaredType::Bytes),
+        ];
+        let s = logs_schema_with_declared(&declared);
+        assert_eq!(s.fields().len(), 9 + declared.len());
+        // The first nine are still the fixed columns, ending at `attrs`.
+        assert_eq!(s.field(LOG_COL_ATTRS).name(), "attrs");
+        // Declared columns follow, in list order, each nullable.
+        assert_eq!(s.field(FIRST_DECLARED_COL).name(), "z.last");
+        assert_eq!(s.field(FIRST_DECLARED_COL).data_type(), &DataType::Utf8);
+        assert_eq!(s.field(FIRST_DECLARED_COL + 1).name(), "duration_ms");
+        assert_eq!(
+            s.field(FIRST_DECLARED_COL + 1).data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(s.field(FIRST_DECLARED_COL + 2).name(), "ok");
+        assert_eq!(
+            s.field(FIRST_DECLARED_COL + 2).data_type(),
+            &DataType::Boolean
+        );
+        assert_eq!(s.field(FIRST_DECLARED_COL + 3).name(), "payload");
+        assert_eq!(
+            s.field(FIRST_DECLARED_COL + 3).data_type(),
+            &DataType::Binary
+        );
+        for i in FIRST_DECLARED_COL..s.fields().len() {
+            assert!(
+                s.field(i).is_nullable(),
+                "declared column {i} must be nullable"
+            );
+        }
     }
 }
