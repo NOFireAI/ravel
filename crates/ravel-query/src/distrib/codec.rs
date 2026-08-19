@@ -25,6 +25,9 @@ use ravel_proto::queryfrag::v1 as pb;
 use ravel_types::accounting::{AccountedOp, QueryAccountingSnapshot};
 use ravel_types::{Label, LabelSet, SeriesId, Signal};
 
+use ravel_logseg::LogRecord;
+use ravel_types::logstream::{AttrValue, LogStreamId};
+
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::FetchedSeriesSoa;
 
@@ -185,6 +188,16 @@ pub enum CodecError {
     UnknownSegmentLevel(u32),
     #[error("fragment capability is {got} bytes, expected {CAPABILITY_LEN}")]
     BadCapabilityLength { got: usize },
+    #[error("log stream id is {got} bytes, expected 16")]
+    BadStreamId { got: usize },
+    #[error("log trace id is {got} bytes, expected 16 (or 0 for absent)")]
+    BadTraceId { got: usize },
+    #[error("log span id is {got} bytes, expected 8 (or 0 for absent)")]
+    BadSpanId { got: usize },
+    #[error("log severity number {got} does not fit in a u8")]
+    SeverityOutOfRange { got: u32 },
+    #[error("log attribute carried no value")]
+    MissingAttrValue,
 }
 
 /// Rejects any protocol version this build does not speak. `Ok(())` only for
@@ -333,6 +346,156 @@ fn decode_labels(labels: Vec<pb::Label>) -> Result<LabelSet, CodecError> {
         })
         .collect();
     LabelSet::new(pairs).map_err(|e| CodecError::InvalidLabels(e.to_string()))
+}
+
+// ---- LogRecordFrame <-> ravel_logseg::LogRecord ---------------------------
+
+/// Encodes one decoded RLOG record as a `LogRecordFrame`, field for field. The
+/// worker produces the record through the same `LogSegmentFetcher`/`RlogReader`
+/// funnel the local path uses, so the shipped per-segment merged view (the
+/// verbatim `stream_attrs` resource+scope blob plus the per-record `attrs`) is
+/// byte-identical to what a local read produces; the coordinator never
+/// re-derives attribute merging. `f64` attribute values cross as raw bit
+/// patterns, never proto doubles, so NaN payloads and `-0.0` survive the wire,
+/// the same discipline the scalar path applies to sample values.
+pub fn encode_log_record(record: &LogRecord) -> pb::LogRecordFrame {
+    pb::LogRecordFrame {
+        stream_id: record.stream_id.0.to_vec(),
+        stream_attrs: record.stream_attrs.clone(),
+        ts_ns: record.ts_ns,
+        observed_ts_ns: record.observed_ts_ns,
+        severity_num: u32::from(record.severity_num),
+        severity_text: record.severity_text.clone(),
+        body: record.body.clone(),
+        // An absent id is the empty byte string; a present one is its fixed
+        // width. A real all-zero id is still its full 16/8 bytes, so it is
+        // distinguishable from absent (which is zero bytes).
+        trace_id: record.trace_id.map(|t| t.to_vec()).unwrap_or_default(),
+        span_id: record.span_id.map(|s| s.to_vec()).unwrap_or_default(),
+        flags: record.flags,
+        attrs: record.attrs.iter().map(encode_log_attr).collect(),
+    }
+}
+
+/// Inverse of [`encode_log_record`]. Every malformation (a mis-sized stream,
+/// trace, or span id, a severity past `u8`, or an attribute with no value) is a
+/// typed [`CodecError`], never a panic or a silently truncated record.
+pub fn decode_log_record(frame: pb::LogRecordFrame) -> Result<LogRecord, CodecError> {
+    let stream_id = decode_log_stream_id(&frame.stream_id)?;
+    let trace_id = decode_trace_id(&frame.trace_id)?;
+    let span_id = decode_span_id(&frame.span_id)?;
+    let severity_num =
+        u8::try_from(frame.severity_num).map_err(|_| CodecError::SeverityOutOfRange {
+            got: frame.severity_num,
+        })?;
+    let attrs = frame
+        .attrs
+        .into_iter()
+        .map(decode_log_attr)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(LogRecord {
+        stream_id,
+        stream_attrs: frame.stream_attrs,
+        ts_ns: frame.ts_ns,
+        observed_ts_ns: frame.observed_ts_ns,
+        severity_num,
+        severity_text: frame.severity_text,
+        body: frame.body,
+        trace_id,
+        span_id,
+        flags: frame.flags,
+        attrs,
+    })
+}
+
+fn encode_log_attr(attr: &(String, AttrValue)) -> pb::LogAttr {
+    pb::LogAttr {
+        key: attr.0.clone(),
+        value: Some(encode_attr_value(&attr.1)),
+    }
+}
+
+fn decode_log_attr(attr: pb::LogAttr) -> Result<(String, AttrValue), CodecError> {
+    let value = attr.value.ok_or(CodecError::MissingAttrValue)?;
+    Ok((attr.key, decode_attr_value(value)?))
+}
+
+/// Encodes one attribute value, recursing through lists and maps. `f64` is
+/// carried as `to_bits` (proto `fixed64`), never a double, so every bit
+/// pattern (NaN payloads, `-0.0`) round-trips exactly.
+fn encode_attr_value(value: &AttrValue) -> pb::LogAttrValue {
+    use pb::log_attr_value::Value;
+    let inner = match value {
+        AttrValue::Str(s) => Value::Str(s.clone()),
+        AttrValue::I64(v) => Value::Int(*v),
+        AttrValue::F64(f) => Value::DoubleBits(f.to_bits()),
+        AttrValue::Bool(b) => Value::Boolean(*b),
+        AttrValue::Bytes(b) => Value::BytesVal(b.clone()),
+        AttrValue::List(items) => Value::List(pb::LogAttrList {
+            items: items.iter().map(encode_attr_value).collect(),
+        }),
+        AttrValue::Map(entries) => Value::Map(pb::LogAttrMap {
+            entries: entries.iter().map(encode_log_attr).collect(),
+        }),
+    };
+    pb::LogAttrValue { value: Some(inner) }
+}
+
+/// Inverse of [`encode_attr_value`]. An attribute value with no oneof variant
+/// set is [`CodecError::MissingAttrValue`], never a silent default.
+fn decode_attr_value(value: pb::LogAttrValue) -> Result<AttrValue, CodecError> {
+    use pb::log_attr_value::Value;
+    let inner = value.value.ok_or(CodecError::MissingAttrValue)?;
+    Ok(match inner {
+        Value::Str(s) => AttrValue::Str(s),
+        Value::Int(v) => AttrValue::I64(v),
+        Value::DoubleBits(b) => AttrValue::F64(f64::from_bits(b)),
+        Value::Boolean(b) => AttrValue::Bool(b),
+        Value::BytesVal(b) => AttrValue::Bytes(b),
+        Value::List(l) => AttrValue::List(
+            l.items
+                .into_iter()
+                .map(decode_attr_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Value::Map(m) => AttrValue::Map(
+            m.entries
+                .into_iter()
+                .map(decode_log_attr)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    })
+}
+
+fn decode_log_stream_id(bytes: &[u8]) -> Result<LogStreamId, CodecError> {
+    let arr: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| CodecError::BadStreamId { got: bytes.len() })?;
+    Ok(LogStreamId(arr))
+}
+
+/// Decodes an optional trace id: an empty byte string is `None`, a 16-byte
+/// string is `Some`, and any other length is a typed error.
+fn decode_trace_id(bytes: &[u8]) -> Result<Option<[u8; 16]>, CodecError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let arr: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| CodecError::BadTraceId { got: bytes.len() })?;
+    Ok(Some(arr))
+}
+
+/// Decodes an optional span id: an empty byte string is `None`, an 8-byte
+/// string is `Some`, and any other length is a typed error.
+fn decode_span_id(bytes: &[u8]) -> Result<Option<[u8; 8]>, CodecError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| CodecError::BadSpanId { got: bytes.len() })?;
+    Ok(Some(arr))
 }
 
 // ---- LabelMatcher <-> pb::LabelMatcher ------------------------------------
@@ -915,6 +1078,176 @@ mod tests {
             decode_status_code(-1),
             Err(CodecError::UnknownStatusCode(-1))
         );
+    }
+
+    /// A full RLOG record with every attribute-value kind (including a nested
+    /// list and map), a NaN-payload `f64` attribute, and present trace/span ids
+    /// round-trips byte-for-byte. The `f64` crosses as its bit pattern, so the
+    /// NaN payload survives -- the same discipline the scalar path applies.
+    #[test]
+    fn log_record_round_trips_including_nested_and_nan_attrs() {
+        let nan = f64::from_bits(0x7ff8_0000_dead_beef);
+        let record = LogRecord {
+            stream_id: LogStreamId([3u8; 16]),
+            stream_attrs: vec![1, 2, 3, 4, 5],
+            ts_ns: -42,
+            observed_ts_ns: i64::MAX,
+            severity_num: 17,
+            severity_text: "WARN".to_string(),
+            body: "something happened".to_string(),
+            trace_id: Some([9u8; 16]),
+            span_id: Some([7u8; 8]),
+            flags: 0xdead_beef,
+            attrs: vec![
+                ("s".to_string(), AttrValue::Str("v".to_string())),
+                ("i".to_string(), AttrValue::I64(-7)),
+                ("f".to_string(), AttrValue::F64(nan)),
+                ("b".to_string(), AttrValue::Bool(true)),
+                ("raw".to_string(), AttrValue::Bytes(vec![0, 255, 1])),
+                (
+                    "list".to_string(),
+                    AttrValue::List(vec![AttrValue::I64(1), AttrValue::Str("x".to_string())]),
+                ),
+                (
+                    "map".to_string(),
+                    AttrValue::Map(vec![("k".to_string(), AttrValue::F64(-0.0))]),
+                ),
+            ],
+        };
+        let decoded = decode_log_record(encode_log_record(&record)).expect("decode");
+        assert_eq!(decoded.stream_id, record.stream_id);
+        assert_eq!(decoded.stream_attrs, record.stream_attrs);
+        assert_eq!(decoded.ts_ns, record.ts_ns);
+        assert_eq!(decoded.observed_ts_ns, record.observed_ts_ns);
+        assert_eq!(decoded.severity_num, record.severity_num);
+        assert_eq!(decoded.severity_text, record.severity_text);
+        assert_eq!(decoded.body, record.body);
+        assert_eq!(decoded.trace_id, record.trace_id);
+        assert_eq!(decoded.span_id, record.span_id);
+        assert_eq!(decoded.flags, record.flags);
+        // Structural equality would treat NaN != NaN, so check the f64 attr by
+        // bit pattern explicitly, then the rest structurally.
+        let got_f = decoded
+            .attrs
+            .iter()
+            .find(|(k, _)| k == "f")
+            .expect("f attr");
+        let want_f = record.attrs.iter().find(|(k, _)| k == "f").expect("f attr");
+        match (&got_f.1, &want_f.1) {
+            (AttrValue::F64(a), AttrValue::F64(b)) => assert_eq!(a.to_bits(), b.to_bits()),
+            _ => panic!("f attr is not F64"),
+        }
+        // The map's -0.0 likewise survives by bit pattern.
+        match &decoded
+            .attrs
+            .iter()
+            .find(|(k, _)| k == "map")
+            .expect("map")
+            .1
+        {
+            AttrValue::Map(entries) => match &entries[0].1 {
+                AttrValue::F64(v) => assert_eq!(v.to_bits(), (-0.0f64).to_bits()),
+                _ => panic!("map value not F64"),
+            },
+            _ => panic!("map attr not a Map"),
+        }
+    }
+
+    /// An absent trace/span id is the empty byte string; a present one is its
+    /// fixed width. A record with neither round-trips to `None`, and a present
+    /// all-zero id (16/8 bytes) round-trips to `Some`, distinct from absent.
+    #[test]
+    fn log_record_optional_ids_round_trip() {
+        let none = LogRecord {
+            stream_id: LogStreamId([0u8; 16]),
+            stream_attrs: Vec::new(),
+            ts_ns: 0,
+            observed_ts_ns: 0,
+            severity_num: 0,
+            severity_text: String::new(),
+            body: String::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        };
+        let decoded = decode_log_record(encode_log_record(&none)).expect("decode");
+        assert_eq!(decoded.trace_id, None);
+        assert_eq!(decoded.span_id, None);
+
+        let zero_ids = LogRecord {
+            trace_id: Some([0u8; 16]),
+            span_id: Some([0u8; 8]),
+            ..none
+        };
+        let decoded = decode_log_record(encode_log_record(&zero_ids)).expect("decode");
+        assert_eq!(decoded.trace_id, Some([0u8; 16]));
+        assert_eq!(decoded.span_id, Some([0u8; 8]));
+    }
+
+    #[test]
+    fn log_record_bad_lengths_and_missing_value_are_typed_errors() {
+        let base = pb::LogRecordFrame {
+            stream_id: vec![0u8; 16],
+            stream_attrs: Vec::new(),
+            ts_ns: 0,
+            observed_ts_ns: 0,
+            severity_num: 0,
+            severity_text: String::new(),
+            body: String::new(),
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
+            flags: 0,
+            attrs: Vec::new(),
+        };
+
+        let bad_stream = pb::LogRecordFrame {
+            stream_id: vec![0u8; 15],
+            ..base.clone()
+        };
+        assert!(matches!(
+            decode_log_record(bad_stream),
+            Err(CodecError::BadStreamId { got: 15 })
+        ));
+
+        let bad_trace = pb::LogRecordFrame {
+            trace_id: vec![0u8; 8],
+            ..base.clone()
+        };
+        assert!(matches!(
+            decode_log_record(bad_trace),
+            Err(CodecError::BadTraceId { got: 8 })
+        ));
+
+        let bad_span = pb::LogRecordFrame {
+            span_id: vec![0u8; 7],
+            ..base.clone()
+        };
+        assert!(matches!(
+            decode_log_record(bad_span),
+            Err(CodecError::BadSpanId { got: 7 })
+        ));
+
+        let bad_sev = pb::LogRecordFrame {
+            severity_num: 256,
+            ..base.clone()
+        };
+        assert!(matches!(
+            decode_log_record(bad_sev),
+            Err(CodecError::SeverityOutOfRange { got: 256 })
+        ));
+
+        let missing_value = pb::LogRecordFrame {
+            attrs: vec![pb::LogAttr {
+                key: "k".to_string(),
+                value: None,
+            }],
+            ..base
+        };
+        assert!(matches!(
+            decode_log_record(missing_value),
+            Err(CodecError::MissingAttrValue)
+        ));
     }
 
     #[test]

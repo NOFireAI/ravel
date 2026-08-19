@@ -191,14 +191,68 @@ message HistogramRun {
 // protocol_version bump, because skew is governed by the signal gate, not the
 // version field (an old worker returns Unsupported for signal=Logs, which the
 // coordinator maps to whole-query local fallback, so this frame can never
-// reach an old coordinator). The record payload grammar is deferred to the log
-// distribution ticket (#284); the field is reserved here as opaque bytes with
-// its number frozen, so adding the grammar is a decode-side change, not a wire
-// change, exactly as HistogramRun.span_payload reserves the histogram grammar.
+// reach an old coordinator).
+//
+// #284 defines the concrete grammar below. It carries one decoded
+// `ravel_logseg::LogRecord` field-for-field: the stream identity plus its
+// verbatim canonical resource+scope blob (`stream_attrs`, the STREAM_DIR bytes
+// every segment carrying the stream embeds -- this is what makes the
+// per-segment merged attribute view self-contained, so a worker ships exactly
+// what `RlogReader` produces locally and the coordinator never re-derives
+// attribute merging), the record's timestamps and content columns, and its
+// per-record attributes. That whole content is also the record's identity for
+// coordinator-side dedup: two frames are the same logical record iff every
+// field matches. Field 1 was a deferred opaque `bytes record_payload`
+// placeholder in #283; its number is retired (reserved) rather than reused
+// with a new type, per this file's frozen-field-number discipline. Every
+// field below is additive.
 message LogRecordFrame {
-  // Opaque encoded per-record merged view for this slice. Grammar deferred to
-  // #284; treated as an opaque blob by this contract.
-  bytes record_payload = 1;
+  reserved 1;                   // was the deferred opaque `bytes record_payload`
+
+  bytes stream_id = 2;          // 16 bytes; ravel_types LogStreamId
+  bytes stream_attrs = 3;       // canonical resource+scope blob, verbatim
+  sint64 ts_ns = 4;             // event time
+  sint64 observed_ts_ns = 5;    // observed (ingest) time
+  uint32 severity_num = 6;      // 0..=255 (u8 widened; a larger value is BadData)
+  string severity_text = 7;
+  string body = 8;
+  bytes trace_id = 9;           // 16 bytes when present, empty = absent
+  bytes span_id = 10;           // 8 bytes when present, empty = absent
+  uint32 flags = 11;
+  repeated LogAttr attrs = 12;  // per-record attributes, order preserved
+}
+
+// One per-record attribute: a key and its typed value. Mirrors one entry of
+// `ravel_logseg::LogRecord::attrs` (a `(String, AttrValue)` pair).
+message LogAttr {
+  string key = 1;
+  LogAttrValue value = 2;
+}
+
+// One OTLP attribute value, mirroring `ravel_types::logstream::AttrValue`
+// variant for variant. `f64` crosses as its raw `to_bits` pattern (fixed64),
+// never a proto double, so NaN payloads and -0.0 survive byte-for-byte, the
+// same bit-exactness the scalar `Run.value_bits` path guarantees.
+message LogAttrValue {
+  oneof value {
+    string str = 1;
+    sint64 int = 2;
+    fixed64 double_bits = 3;    // f64::to_bits
+    bool boolean = 4;
+    bytes bytes_val = 5;
+    LogAttrList list = 6;
+    LogAttrMap map = 7;
+  }
+}
+
+// A list attribute value (`AttrValue::List`).
+message LogAttrList {
+  repeated LogAttrValue items = 1;
+}
+
+// A map attribute value (`AttrValue::Map`): an ordered set of nested entries.
+message LogAttrMap {
+  repeated LogAttr entries = 1;
 }
 
 // One span frame for a slice of the Spans signal, carrying the worker's

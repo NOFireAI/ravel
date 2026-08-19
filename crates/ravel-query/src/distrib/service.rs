@@ -42,6 +42,7 @@ use crate::distrib::codec;
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use crate::engine::bytes_scanned_exceeded;
 use crate::fetcher::{FetchError, FetchStats, SegmentFetcher};
+use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
 
 /// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
 /// worker fetches. The production resolver reconstructs the
@@ -86,12 +87,35 @@ impl SegmentResolver for SnapshotSegmentResolver {
 /// turn shipped identities into refs.
 pub struct SeriesFetchService<R: SegmentResolver + 'static> {
     fetcher: SegmentFetcher,
+    /// The RLOG-family fetcher (Logs, Alerts, Audit), wired via
+    /// [`with_log_fetcher`](Self::with_log_fetcher). `None` (the default) means
+    /// this worker cannot serve a distributed log fetch: a Logs/Alerts/Audit
+    /// slice returns `Unsupported` so the coordinator falls back to local
+    /// execution. Kept optional so the crate-internal `new` constructor (and the
+    /// out-of-crate coordinator wiring that calls it) is unchanged; a worker that
+    /// wants to serve logs opts in with the builder.
+    log_fetcher: Option<LogSegmentFetcher>,
     resolver: Arc<R>,
 }
 
 impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     pub fn new(fetcher: SegmentFetcher, resolver: Arc<R>) -> Self {
-        SeriesFetchService { fetcher, resolver }
+        SeriesFetchService {
+            fetcher,
+            log_fetcher: None,
+            resolver,
+        }
+    }
+
+    /// Wires the RLOG-family fetch path (#284) onto this worker. Built over the
+    /// same object store the metrics [`SegmentFetcher`] reads, so a Logs,
+    /// Alerts, or Audit slice fetches the same pinned segments the resolver
+    /// maps. Without this, those signals return `Unsupported` and the
+    /// coordinator runs the query locally.
+    #[must_use]
+    pub fn with_log_fetcher(mut self, log_fetcher: LogSegmentFetcher) -> Self {
+        self.log_fetcher = Some(log_fetcher);
+        self
     }
 
     /// Wraps this service in the generated gRPC server, ready to add to a
@@ -164,16 +188,31 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                 )
                 .await
             }
-            // The RLOG family (Logs, Alerts, Audit) and Spans now reach a real
-            // per-signal branch after decoding, proving the signal check is a
-            // dispatch and not a pre-decode reject. Their fetch-and-encode
-            // paths land in #284 (logs) and #285 (spans); until then the branch
-            // returns a distinct "not yet implemented" Unsupported, so the
-            // coordinator still silently falls back to fully local execution
-            // (ADR-0071 failure semantics). This is deliberately NOT reachable
-            // from a real query yet: no caller dispatches a non-Metrics
-            // distributed fetch until #284/#285 build the coordinators.
-            Signal::Logs | Signal::Alerts | Signal::Audit | Signal::Spans => Err((
+            // The RLOG family (Logs, Alerts, Audit) fetches through the same
+            // `LogSegmentFetcher`/`RlogReader` funnel the local logs/alerts/audit
+            // paths use (#284). All three signals share one fetch path: they are
+            // the same RLOG object family, distinguished only by the object-key
+            // prefix the coordinator resolved, which the worker never re-derives
+            // (it fetches the pinned segments the resolver maps). A worker with
+            // no log fetcher wired returns Unsupported inside `run_slice_logs`,
+            // so the coordinator falls back to local.
+            Signal::Logs | Signal::Alerts | Signal::Audit => {
+                self.run_slice_logs(
+                    request.scope,
+                    request.budgets,
+                    matchers,
+                    erasure,
+                    request.window_start_ns,
+                    request.window_end_ns,
+                )
+                .await
+            }
+            // Spans reach a real per-signal branch after decoding but their
+            // fetch-and-encode path lands in #285; until then the branch returns
+            // a distinct "not yet implemented" Unsupported, so the coordinator
+            // still silently falls back to fully local execution (ADR-0071
+            // failure semantics).
+            Signal::Spans => Err((
                 pb::status::Code::Unsupported,
                 format!("distributed fetch for signal {signal:?} is not yet implemented"),
             )),
@@ -324,6 +363,137 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         ));
         Ok(frames)
     }
+
+    /// The RLOG-family slice path (Logs, Alerts, Audit): resolve the pinned
+    /// scope to refs, fetch each segment through the production
+    /// [`LogSegmentFetcher`] funnel (so the per-segment merged attribute view
+    /// and the erasure exclusion are byte-identical to a local read), enforce
+    /// the per-slice bytes-scanned budget, and stream one `LogRecordFrame` per
+    /// decoded record ending in a terminal summary.
+    ///
+    /// Correctness under ADR-0052 resharding rests on segment self-containment,
+    /// not slice atomicity: every RLOG segment embeds the resource+scope
+    /// `stream_attrs` blob for the streams it carries, so a worker reading only
+    /// this slice's segments produces the exact per-record view `RlogReader`
+    /// produces locally, and applies erasure identically per segment, whether or
+    /// not a stream's segments straddle two slices. The coordinator (see
+    /// [`crate::distrib::merge_log_records`]) re-orders and dedups; this path
+    /// never assumes a stream maps to one slice.
+    async fn run_slice_logs(
+        &self,
+        scope: Option<pb::fetch_request::Scope>,
+        budgets: Option<pb::Budgets>,
+        matchers: Vec<ravel_promql::LabelMatcher>,
+        erasure: Vec<crate::erasure::ErasurePredicate>,
+        window_start_ns: i64,
+        window_end_ns: i64,
+    ) -> Result<Vec<pb::FetchResponse>, (pb::status::Code, String)> {
+        let Some(log_fetcher) = self.log_fetcher.as_ref() else {
+            return Err((
+                pb::status::Code::Unsupported,
+                "distributed log fetch is not configured on this worker".to_string(),
+            ));
+        };
+
+        // Matcher pushdown for logs has no defined `LogQuery` mapping in this
+        // lane yet (that is the SQL lane / engine log-fetch wiring, out of
+        // #284's scope). Ignoring matchers would under-filter, so fail closed to
+        // the coordinator's local fallback rather than return a wrong result.
+        if !matchers.is_empty() {
+            return Err((
+                pb::status::Code::Unsupported,
+                "distributed log fetch does not support matcher pushdown yet".to_string(),
+            ));
+        }
+
+        let identities = match scope {
+            Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments,
+            Some(pb::fetch_request::Scope::Resolve(_)) | None => {
+                return Err((
+                    pb::status::Code::Unsupported,
+                    "resolve-scope slices are not supported yet".to_string(),
+                ));
+            }
+        };
+
+        let mut segments = Vec::with_capacity(identities.len());
+        for identity in &identities {
+            match self.resolver.resolve(identity) {
+                Some(seg) => segments.push(seg),
+                None => {
+                    return Err((
+                        pb::status::Code::SnapshotInvalidated,
+                        "pinned segment not found on worker".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let byte_limit = match budgets.as_ref().map(|b| b.max_bytes_scanned) {
+            Some(0) | None => ByteLimit::Unlimited,
+            Some(max) => ByteLimit::Bounded(max),
+        };
+
+        // The slice's event-time window is the ts range for the fetch. The
+        // coordinator sets it to the envelope of this slice's pinned segments, a
+        // superset of every one of them, so the `TsRange` filter drops no record
+        // a local read (over the whole-snapshot window) would keep. Erasure is
+        // threaded through the same funnel, applied per segment after decode.
+        let query = LogQuery::new(window_start_ns, window_end_ns).with_erasure(erasure);
+
+        let accounting = QueryAccounting::new();
+        let mut records: Vec<ravel_logseg::LogRecord> = Vec::new();
+        // Logs carry no raw-f64 page counters (a metric-path concept), so
+        // `FetchStats` stays zero, exactly what a local log read reports.
+        let stats = FetchStats::default();
+        for seg in &segments {
+            let out = log_fetcher
+                .fetch_accounted(seg, &query, &accounting)
+                .await
+                .map_err(map_log_fetch_error)?;
+            if let Some(output) = out {
+                records.extend(output.records);
+            }
+            // Per-segment bytes-scanned short-circuit, matching the metric path
+            // and the local per-segment check. The terminal summary carries the
+            // spend so far so the coordinator folds this slice's real cost
+            // before failing the query.
+            if let Some(err) =
+                bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), byte_limit)
+            {
+                return Ok(vec![summary_frame(
+                    &accounting.snapshot(),
+                    0,
+                    0,
+                    pb::status::Code::BudgetExceeded,
+                    err.to_string(),
+                    &stats,
+                )]);
+            }
+        }
+
+        let records_returned = records.len() as u64;
+        let mut frames = Vec::with_capacity(records.len() + 1);
+        for record in &records {
+            frames.push(pb::FetchResponse {
+                frame: Some(pb::fetch_response::Frame::LogRecord(
+                    codec::encode_log_record(record),
+                )),
+            });
+        }
+        // The record count rides the summary's `series_returned` field (reused
+        // per signal); `decode_log_slice_frames` reads it back as
+        // `records_returned`.
+        frames.push(summary_frame(
+            &accounting.snapshot(),
+            records_returned,
+            0,
+            pb::status::Code::Ok,
+            String::new(),
+            &stats,
+        ));
+        Ok(frames)
+    }
 }
 
 /// The stream type the generated trait requires: a boxed stream of already-
@@ -388,5 +558,20 @@ fn map_fetch_error(err: FetchError) -> (pb::status::Code, String) {
         FetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         FetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         FetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
+    }
+}
+
+/// Maps an RLOG fetch-path error to the worker's typed status, mirroring
+/// [`map_fetch_error`]: a vanished object is a snapshot invalidation
+/// (retryable), a transient store error is unavailable, and a corrupt object is
+/// terminal.
+fn map_log_fetch_error(err: LogFetchError) -> (pb::status::Code, String) {
+    match err {
+        LogFetchError::Store {
+            source: ravel_object_store::StoreError::NotFound,
+            ..
+        } => (pb::status::Code::SnapshotInvalidated, err.to_string()),
+        LogFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
+        LogFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
     }
 }
