@@ -258,6 +258,71 @@ rc=0; grep -q "if: success() && github.event_name == 'issue_comment'" "$WORKFLOW
 check "$rc" "acknowledgement happens only after authorization succeeds"
 
 # ---------------------------------------------------------------------------
+section "E3. The environment-protection guard, running the shipped shell"
+# ---------------------------------------------------------------------------
+# GitHub creates an environment the first time a workflow names one, with no
+# protection rules and no secrets, so the guard has to assert the rules rather
+# than assume setup happened.
+python3 "${POLICY_DIR}/extract-run-block.py" "$WORKFLOW" \
+  "Verify the protected environment is actually protected" > "${tmp_root}/envguard.sh"
+
+env_bin="${tmp_root}/envbin"
+mkdir -p "$env_bin"
+cat > "${env_bin}/gh" <<'MOCK'
+#!/usr/bin/env bash
+target=""
+for a in "$@"; do case "$a" in repos/*) target="$a";; esac; done
+case "$target" in
+  */deployment-branch-policies) cat "${MOCK_POLICIES:?}" ;;
+  */environments/coderabbit-oss) if [ "${MOCK_ENV_MISSING:-0}" = "1" ]; then exit 1; fi; cat "${MOCK_ENV:?}" ;;
+esac
+MOCK
+chmod +x "${env_bin}/gh"
+
+good_env="${tmp_root}/env-good.json"
+cat > "$good_env" <<'JSON'
+{"protection_rules":[{"type":"required_reviewers","prevent_self_review":true,
+ "reviewers":[{"reviewer":{"login":"a"}},{"reviewer":{"login":"b"}}]},{"type":"branch_policy"}],
+ "deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}
+JSON
+good_pol="${tmp_root}/pol-good.json"
+echo '{"total_count":1,"branch_policies":[{"name":"main","type":"branch"}]}' > "$good_pol"
+
+env_case() {
+  local label="$1" expected="$2" envfile="$3" polfile="$4" missing="${5:-0}" rc=0
+  MOCK_ENV="$envfile" MOCK_POLICIES="$polfile" MOCK_ENV_MISSING="$missing" \
+    PATH="${env_bin}:${PATH}" TRUSTED_REPOSITORY="NOFireAI/ravel" \
+    TRUSTED_BASE_BRANCH="main" GITHUB_STEP_SUMMARY="${tmp_root}/sum.txt" \
+    bash "${tmp_root}/envguard.sh" > /dev/null 2>&1 || rc=$?
+  if [ "$expected" = "accept" ]; then
+    check "$([ "$rc" = "0" ] && echo 0 || echo 1)" "$label"
+  else
+    check "$([ "$rc" != "0" ] && echo 0 || echo 1)" "$label"
+  fi
+}
+
+env_case "a fully protected environment passes" accept "$good_env" "$good_pol"
+env_case "a missing or unreadable environment fails closed" deny "$good_env" "$good_pol" 1
+
+printf '%s' '{"protection_rules":[{"type":"branch_policy"}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' > "${tmp_root}/env-noreviewers.json"
+env_case "an auto-created environment with no rules is rejected" deny "${tmp_root}/env-noreviewers.json" "$good_pol"
+
+printf '%s' '{"protection_rules":[{"type":"required_reviewers","prevent_self_review":false,"reviewers":[{"reviewer":{"login":"a"}}]},{"type":"branch_policy"}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' > "${tmp_root}/env-selfreview.json"
+env_case "self-review left enabled is rejected" deny "${tmp_root}/env-selfreview.json" "$good_pol"
+
+printf '%s' '{"protection_rules":[{"type":"required_reviewers","prevent_self_review":true,"reviewers":[{"reviewer":{"login":"a"}}]}],"deployment_branch_policy":{"protected_branches":true,"custom_branch_policies":false}}' > "${tmp_root}/env-anyprotected.json"
+env_case "any-protected-branch policy is rejected" deny "${tmp_root}/env-anyprotected.json" "$good_pol"
+
+echo '{"total_count":2,"branch_policies":[{"name":"main","type":"branch"},{"name":"release/*","type":"branch"}]}' > "${tmp_root}/pol-extra.json"
+env_case "an extra deployment branch is rejected" deny "$good_env" "${tmp_root}/pol-extra.json"
+
+echo '{"total_count":1,"branch_policies":[{"name":"*","type":"branch"}]}' > "${tmp_root}/pol-wildcard.json"
+env_case "a wildcard deployment branch is rejected" deny "$good_env" "${tmp_root}/pol-wildcard.json"
+
+echo '{"total_count":0,"branch_policies":[]}' > "${tmp_root}/pol-empty.json"
+env_case "no deployment branch policy is rejected" deny "$good_env" "${tmp_root}/pol-empty.json"
+
+# ---------------------------------------------------------------------------
 section "F. Output handling (case 18)"
 # ---------------------------------------------------------------------------
 hostile="${tmp_root}/hostile.jsonl"

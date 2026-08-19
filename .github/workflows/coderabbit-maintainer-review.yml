@@ -25,9 +25,12 @@
 # the job keeps drive-by comments from starting a runner at all; it is a noise
 # filter, and it is never the decision.
 #
-# The workflow is inert until an administrator creates the `coderabbit-oss`
-# environment and its `CODERABBIT_API_KEY` secret. Without them the review job
-# cannot start. See docs/guides/coderabbit-runbook.md.
+# The `coderabbit-oss` environment must exist AND be protected before this can
+# spend anything. Note that referencing an environment that does not exist makes
+# GitHub create it, with no protection rules and no secrets, so the environment
+# existing proves nothing on its own. The `authorize` job therefore checks its
+# protection rules in band and fails closed, rather than trusting that setup
+# happened. See docs/guides/coderabbit-runbook.md.
 
 name: coderabbit-maintainer-review
 
@@ -249,6 +252,55 @@ jobs:
           fi
           echo "role_name=$actor_role" >> "$GITHUB_OUTPUT"
           echo "$ACTOR is $actor_role; triggered by $TRIGGERING_ACTOR" >> "$GITHUB_STEP_SUMMARY"
+
+      # GitHub creates an environment the first time a workflow names one, with
+      # no protection rules and no secrets. So "the environment exists" is not
+      # evidence that anyone configured it, and an administrator who later adds
+      # the key to that auto-created environment gets no reviewer gate and no
+      # branch restriction while everything looks set up. This asserts the rules
+      # are really there, every run, before the environment is requested.
+      #
+      # Verified on 2026-08-19 that the default GITHUB_TOKEN with
+      # `contents: read` can read both endpoints on this repository.
+      - name: Verify the protected environment is actually protected
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          code=0
+          gh api "repos/${TRUSTED_REPOSITORY}/environments/coderabbit-oss" > env.json || code=$?
+          if [ "$code" != "0" ]; then
+            echo "::error::the coderabbit-oss environment could not be read; create and protect it per docs/guides/coderabbit-runbook.md"
+            exit 1
+          fi
+
+          fail=0
+          reviewers=$(jq '[.protection_rules[] | select(.type == "required_reviewers") | .reviewers // []] | flatten | length' env.json)
+          [ "$reviewers" -gt 0 ] || { echo "::error::coderabbit-oss has no required reviewers"; fail=1; }
+
+          self_review=$(jq -r '[.protection_rules[] | select(.type == "required_reviewers") | .prevent_self_review] | first // false' env.json)
+          [ "$self_review" = "true" ] || { echo "::error::coderabbit-oss does not prevent self-review"; fail=1; }
+
+          custom=$(jq -r '.deployment_branch_policy.custom_branch_policies // false' env.json)
+          protected_only=$(jq -r '.deployment_branch_policy.protected_branches // false' env.json)
+          [ "$custom" = "true" ] || { echo "::error::coderabbit-oss has no custom deployment branch policy"; fail=1; }
+          [ "$protected_only" = "false" ] || { echo "::error::coderabbit-oss admits every protected branch, not only ${TRUSTED_BASE_BRANCH}"; fail=1; }
+
+          gh api "repos/${TRUSTED_REPOSITORY}/environments/coderabbit-oss/deployment-branch-policies" > policies.json || code=$?
+          if [ "$code" != "0" ]; then
+            echo "::error::the coderabbit-oss deployment branch policies could not be read; failing closed"
+            exit 1
+          fi
+          policy_names=$(jq -r '[.branch_policies[] | select(.type == "branch") | .name] | sort | join(",")' policies.json)
+          policy_count=$(jq -r '.branch_policies | length' policies.json)
+          [ "$policy_names" = "$TRUSTED_BASE_BRANCH" ] && [ "$policy_count" = "1" ] || {
+            echo "::error::coderabbit-oss deployment branches are '${policy_names}' (${policy_count} entries), expected only ${TRUSTED_BASE_BRANCH}"
+            fail=1
+          }
+
+          [ "$fail" = "0" ] || exit 1
+          echo "coderabbit-oss: ${reviewers} required reviewer(s), self-review prevented, ${TRUSTED_BASE_BRANCH} only" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check out trusted policy from main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
