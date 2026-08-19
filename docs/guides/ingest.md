@@ -378,3 +378,114 @@ Malformed `trace_id`/`span_id` byte lengths normalize to absent; Ravel does
 not pad or truncate them. Padding would fabricate an id that never existed.
 A record with neither `time_unix_nano` nor `observed_time_unix_nano` set
 (legal OTLP) takes the server's ingest timestamp for both.
+
+## Bulk import (`ravel-cli load --parquet`, ADR-0089)
+
+OTLP is the only *networked* way to write logs. For loading an existing
+structured dataset offline (a Parquet export, an archive migration, a
+historical backfill), `ravel-cli load` imports a Parquet file into the logs
+signal:
+
+```sh
+ravel-cli load --parquet events.parquet --tenant acme --mapping map.toml --shards 4
+```
+
+The loader is an in-process caller of the same `LogIngestRouter` OTLP uses --
+the same shard actors, flush cadence, and commit protocol, not a parallel write
+path. It builds the router against the target tenant's provisioned shard count
+(validated against, or written to, the durable provisioning record exactly as
+the server does at first touch) and writes with strict acknowledgement, awaiting
+every write before it exits, so a run that returns success has no
+buffered-but-unflushed data.
+
+### The `--mapping` TOML
+
+The mapping declares how source Parquet columns become record fields. Resource
+attributes determine stream identity (ADR-0029) and are declared separately from
+record attributes, which never enter identity:
+
+```toml
+ts_column = "timestamp"
+ts_unit   = "millis"        # seconds | millis | micros | nanos
+
+body_column            = "message"   # optional
+severity_number_column = "sev_num"   # optional (integer column)
+severity_text_column   = "level"     # optional (string column)
+trace_id_column        = "trace_id"  # optional (16-byte binary or 32-hex string)
+span_id_column         = "span_id"   # optional (8-byte binary or 16-hex string)
+
+# Resource attributes: part of stream identity.
+[[resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+# Record attributes: typed values in the record's `attrs`, never stream identity.
+[[attribute]]
+key = "http.status_code"
+column = "status"
+type = "i64"                # str | i64 | f64 | bool | bytes
+```
+
+### Which admission rules this path keeps, relaxes, and bypasses
+
+- **Future skew: kept.** The loader enforces the same `max_future_skew_ns`
+  bound OTLP does. Relaxing it would let a record bucket by today's wall clock
+  while every later query lists from `query_range.start - max_ingest_lag`, which
+  does not reach today's bucket, so the record would be permanently
+  undiscoverable.
+- **Length caps (attribute key length, attribute value length, body length):
+  kept**, re-implemented identically to `ravel-otlp`'s `logs_limits.rs`. These
+  bound field sizes regardless of who is sending; the offline/trusted framing
+  does not change that.
+- **Past-event-time lag: relaxed (not enforced).** A backfill or migration needs
+  its real event times, and rewriting them would corrupt the source semantics
+  this path exists to preserve. This is sound because a record buckets by the
+  *flush-open wall clock* (`checked_ingest_hour_bucket`), not by its event time,
+  so an old-event record still lands in today's ingest-hour bucket. Its
+  *discoverability* then depends on the query's listing window reaching that
+  bucket: a caller querying with a normal `start`/`end` window already does,
+  since that window is compared against event-range overlap and the listing
+  upper bound is `now + max_future_skew` (which reaches today's bucket). See
+  `docs/consistency-model.md` "Late and skewed data" for the paired
+  admission/discoverability bound this relies on. **Query bulk-loaded data with
+  a window that reaches now, not just the records' event times.**
+- **Per-record attribute cap: relaxed** from OTLP's 128 to a loader-specific
+  1024. Bulk import is an operator-initiated, offline action over a file the
+  operator already controls -- a different threat model than a networked sender.
+  This 1024 cap is a *per-record* axis and is unrelated to the RLOG object's
+  1000-distinct-`(name, type)` dynamic-column budget: past that per-object
+  budget, extra columns fold into the object's `attrs_raw` overflow column
+  rather than being rejected, exactly as they do for OTLP-ingested data. A row
+  over the 1024 cap is rejected; a row within it whose columns push the object
+  past 1000 distinct columns is not -- its overflow columns fold into
+  `attrs_raw`.
+- **Per-tenant `AdmissionController` (active-stream cap, stream-creation rate,
+  byte rate): bypassed by construction.** This control lives in the server's
+  HTTP layer, above the router the loader calls directly. The loader does not go
+  through it, and there is no equivalent concept for a single offline bulk load.
+  Bulk-loaded volume is therefore not evidence the admission controller's limits
+  were exercised. The CLI prints this warning before every run.
+
+### Failure, retention, and performance
+
+A row that fails a kept check (future skew, a length cap, or the 1024 attribute
+cap) is rejected **fail-fast**: the run stops at the first bad row, prints a
+per-row error, and exits non-zero. Batches durable before that row stay durable.
+
+A failed flush (an object-store PUT failure) exits non-zero and prints the
+commit tokens already durable before the failure. A failure mid-file is a
+genuine **partial load, not a rollback**. There is **no resumability or
+deduplication**: re-running after any failure re-ingests the whole file from the
+start.
+
+Retention and GC key on ingest-hour buckets, which the loader derives from
+*load* time. A bulk-loaded record with an old event timestamp is therefore
+retained for the full retention window measured from when it was loaded, not
+from the data's real age.
+
+An RLOG object spanning a wide event-time range overlaps every later query's
+event range at resolve time, so unsorted input makes every subsequent query over
+the affected stream fetch the bulk-loaded objects regardless of the query's
+window. Sort input by event time before load where the mapping allows it. This
+is a performance recommendation, not a correctness requirement.
