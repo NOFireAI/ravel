@@ -177,8 +177,10 @@ retention, and indexed-field config off process flags and into durable state.
 A tenant-scoped object (not per-signal, since these apply across every signal)
 holding `tenant_hash`, a `format_version` floor, a `lifecycle_state`
 (`active` / `suspended` / `offboarding`), optional admission-limit and
-retention overrides, an optional indexed-field set, and `created`/`updated`
-timestamps (proto/ravel/sys.proto `TenantConfigRecord`). Defaults still come
+retention overrides, an optional indexed-field set, an optional declared
+typed-attribute-column set (ADR-0090; `str`/`i64`/`bool`/`bytes` only in v1),
+and `created`/`updated` timestamps (proto/ravel/sys.proto
+`TenantConfigRecord`). Defaults still come
 from flags/limits-file at startup; a field present here overrides the default
 for this tenant, an absent one leaves the default in place. Unlike the
 append-only `prov`/`enc` histories, it is mutated by **whole-record
