@@ -1,0 +1,137 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# CodeRabbit GitHub App policy for NOFireAI/ravel.
+#
+# THIS FILE IS NOT A SECURITY CONTROL. CodeRabbit's own documentation states
+# that "the configuration present in the feature branch under review will be
+# automatically detected and used by CodeRabbit for that review", so any pull
+# request, including one from a fork, ships its own copy of this file and that
+# copy is what governs the review of that pull request. A contributor can
+# re-enable here anything this file turns off.
+#
+# The controls that actually hold are, in order:
+#
+#   1. CodeRabbit organization settings, applied in the CodeRabbit dashboard by
+#      an organization owner and, where the plan supports global overrides,
+#      marked as overriding repository configuration. These are the only App
+#      controls a pull request cannot edit. See
+#      docs/guides/coderabbit-runbook.md.
+#   2. Not installing the App on this repository at all, which is the posture
+#      ADR-0090 prefers if OSS entitlement does not require the installation.
+#   3. .github/workflows/coderabbit-maintainer-review.yml, which is the only
+#      supported way to obtain a CodeRabbit review of a Ravel pull request. It
+#      is dispatched by hand, it verifies the actor holds `maintain` or `admin`
+#      on this repository, and it reads its policy from `main`, never from the
+#      pull request.
+#
+# This file exists so that the App's defaults, which are permissive (automatic
+# review on, autofix on, fix-ci on, unit-test generation on, chat auto-reply on,
+# non-organization-member chat on), are not what runs when someone forgets. It
+# closes the honest-mistake case. It does not close the adversarial one.
+#
+# Keep it consistent with .github/coderabbit/trusted-config.yaml, which is the
+# policy the workflow actually enforces.
+
+language: en-US
+early_access: false
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: false
+  review_status: false
+  commit_status: false
+  fail_commit_status: false
+  poem: false
+  in_progress_fortune: false
+  sequence_diagrams: false
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  abort_on_close: true
+
+  auto_review:
+    enabled: false
+    auto_incremental_review: false
+    drafts: false
+    base_branches: []
+    labels: []
+    ignore_title_keywords: []
+    ignore_usernames: []
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+    custom: []
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+    custom_checks: []
+
+  post_merge_actions: []
+
+chat:
+  auto_reply: false
+  allow_non_org_members: false
+  art: false
+  integrations:
+    jira:
+      usage: disabled
+    linear:
+      usage: disabled
+
+knowledge_base:
+  opt_out: true
+  web_search:
+    enabled: false
+  code_guidelines:
+    enabled: false
+    filePatterns: []
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  jira:
+    usage: disabled
+  linear:
+    usage: disabled
+  pull_requests:
+    scope: local
+  mcp:
+    usage: disabled
+    disabled_servers: []
+  automatic_repository_linking: false
+  linked_repositories: []
+
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: false
+    auto_planning:
+      enabled: false
+      labels: []
+  labeling:
+    labeling_instructions: []
+    auto_apply_labels: false

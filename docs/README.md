@@ -82,6 +82,11 @@ Start here to run Ravel, ingest into it, or query it.
   loop (`cargo check` while you edit, the full gate list before you commit) and
   how CI shares build work across jobs with sccache and nextest. Read this
   to change Ravel's code.
+- [guides/coderabbit-runbook.md](guides/coderabbit-runbook.md): enabling,
+  verifying, operating, rotating, and removing the maintainer-gated CodeRabbit
+  integration (ADR-0090), including the controls that live in GitHub and
+  CodeRabbit administration rather than in this repository. Read this before
+  touching anything CodeRabbit-related.
 
 ## Specs
 

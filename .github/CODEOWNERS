@@ -1,0 +1,24 @@
+# Code owners for the trusted CodeRabbit control plane (ADR-0090).
+#
+# Everything listed here decides who can cause a CodeRabbit API call, what
+# policy that call runs under, and what CodeRabbit is allowed to do to this
+# repository. A user with `write` can open a pull request against any of these
+# paths, so CODEOWNERS is what makes a maintainer approval necessary before such
+# a change can merge.
+#
+# CODEOWNERS alone requests a review; it does not require one. It only becomes a
+# control once the `protect-main` ruleset sets `require_code_owner_review: true`
+# and a non-zero approval count. See "Branch and ruleset protection" in
+# docs/guides/coderabbit-runbook.md. Until that is applied, treat these paths as
+# unprotected.
+#
+# Listed individually because NOFireAI/ravel has no maintainer team yet. Every
+# login below holds `admin` on this repository. Replace the list with
+# `@NOFireAI/ravel-maintainers` once that team exists and carries `maintain` or
+# `admin`; a team is reconciled in one place, a list drifts.
+
+/.github/workflows/coderabbit-maintainer-review.yml @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
+/.github/coderabbit/                                @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
+/.coderabbit.yaml                                   @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
+/scripts/coderabbit-maintainer-review.sh            @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
+/.github/CODEOWNERS                                 @ananos @spirosoik @pmoust @alextoulps @safts @stylianosrigas @asapranidis
