@@ -260,7 +260,11 @@ pub fn registry() -> Vec<Construct> {
     let extended_clauses = [
         (
             "count(DISTINCT)",
-            "SELECT count(DISTINCT value) FROM samples",
+            // `value` has no duplicates in the fixture, so a plain `count`
+            // would be indistinguishable from a `count(DISTINCT)` over it;
+            // `series_id` does (2 rows per series), so DISTINCT actually has
+            // something to collapse.
+            "SELECT count(DISTINCT series_id) FROM samples",
         ),
         (
             "OFFSET",
@@ -268,8 +272,12 @@ pub fn registry() -> Vec<Construct> {
         ),
         (
             "HAVING",
+            // Both series carry exactly 2 samples, so a threshold of `>= 2`
+            // can't be told apart from no HAVING clause at all (both give 2
+            // rows). `> 2` excludes every group, so a working filter yields 0
+            // rows against the ungated 2.
             "SELECT series_id, count(value) FROM samples \
-             GROUP BY series_id HAVING count(value) >= 2",
+             GROUP BY series_id HAVING count(value) > 2",
         ),
         (
             "GROUP BY ordinal",

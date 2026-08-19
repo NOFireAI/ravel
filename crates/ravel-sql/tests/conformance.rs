@@ -77,6 +77,11 @@ enum Expect {
     /// Exactly this many rows, each of which must carry a value in every
     /// column (no all-null padding row standing in for data).
     Rows(usize),
+    /// One row, one column, carrying exactly this string. Row-count-only
+    /// checks can't tell a construct that transformed its input correctly
+    /// from one that passed it through unchanged or applied a different
+    /// (still successful, still one-row) transform.
+    Str(&'static str),
 }
 
 /// The declared result for one supported construct, or `None` when the
@@ -106,12 +111,14 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         // ADR-0090 decision 8: analytical clause/operator shapes over the
         // metrics dataset. Every expected value is re-derived directly from the
         // four fixture samples (1, 2, -1, 3), not from any implementation path.
-        // Four distinct values, so `count(DISTINCT value)` is 4.
-        (Category::Clause, "count(DISTINCT)") => Some(Expect::Scalar(4.0)),
+        // Two series ("a", "b"), so `count(DISTINCT series_id)` is 2 -- a
+        // plain `count(series_id)` would be 4, so DISTINCT is load-bearing.
+        (Category::Clause, "count(DISTINCT)") => Some(Expect::Scalar(2.0)),
         // Four values ordered, skip the first: three rows.
         (Category::Clause, "OFFSET") => Some(Expect::Rows(3)),
-        // Both series carry two samples, so `HAVING count >= 2` keeps both.
-        (Category::Clause, "HAVING") => Some(Expect::Rows(2)),
+        // Both series carry exactly 2 samples, so `HAVING count(value) > 2`
+        // excludes both: 0 rows, versus 2 without the filter.
+        (Category::Clause, "HAVING") => Some(Expect::Rows(0)),
         // One group per series.
         (Category::Clause, "GROUP BY ordinal") => Some(Expect::Rows(2)),
         // One CASE result per sample.
@@ -119,7 +126,7 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         // Two of the four values are in (1, 2).
         (Category::Clause, "IN list") => Some(Expect::Rows(2)),
         // A one-row scalar rewrite ('ab' -> 'ba' via the backreference).
-        (Category::Clause, "REGEXP_REPLACE backreference") => Some(Expect::Rows(1)),
+        (Category::Clause, "REGEXP_REPLACE backreference") => Some(Expect::Str("ba")),
         // One extracted minute per sample.
         (Category::Clause, "date_part(minute)") => Some(Expect::Rows(count)),
         // One truncated timestamp per sample.
@@ -168,7 +175,40 @@ fn check_output(expect: Expect, output: &QueryOutput) -> Result<(), String> {
             }
             Ok(())
         }
+        Expect::Str(want) => {
+            if output.num_rows() != 1 {
+                return Err(format!(
+                    "expected 1 row carrying {want:?}, got {} rows",
+                    output.num_rows()
+                ));
+            }
+            let got = single_str(output)?;
+            if got != want {
+                return Err(format!("expected {want:?}, got {got:?}"));
+            }
+            Ok(())
+        }
     }
+}
+
+/// The single string cell of a one-row, one-column result.
+fn single_str(output: &QueryOutput) -> Result<String, String> {
+    use datafusion::arrow::array::StringArray;
+
+    let batch = output
+        .batches()
+        .iter()
+        .find(|b| b.num_rows() == 1)
+        .ok_or_else(|| "no single-row batch in the result".to_string())?;
+    if batch.num_columns() != 1 {
+        return Err(format!("expected 1 column, got {}", batch.num_columns()));
+    }
+    let column = batch.column(0);
+    let strings = column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| format!("result column has type {}, not Utf8", column.data_type()))?;
+    Ok(strings.value(0).to_string())
 }
 
 /// The single numeric cell of a one-row, one-column result, as an `f64`.
