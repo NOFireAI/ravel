@@ -358,6 +358,43 @@ message IndexedFieldConfig {
   repeated string fields = 1;  // attribute keys promoted to indexed columns
 }
 
+// The logical type an operator declares for a promoted logs attribute column
+// (ADR-0090 decision 1). Exactly four declarable types in v1: str/i64/bool/
+// bytes. f64, date, and timestamp are deliberately deferred by ADR-0090
+// (f64 gated on #277's fold-order decision; date/timestamp on a lifting rule),
+// so they are absent here on purpose, not by omission. UNSPECIFIED is the
+// proto3 zero default that is never written; a stored column carrying it is
+// corrupt and refused on decode (fail closed), the same discipline
+// TenantLifecycleState/Signal apply to their own enums.
+enum TypedAttrColumnType {
+  TYPED_ATTR_COLUMN_TYPE_UNSPECIFIED = 0;  // never written; a column carrying it is corrupt
+  TYPED_ATTR_COLUMN_TYPE_STR = 1;
+  TYPED_ATTR_COLUMN_TYPE_I64 = 2;
+  TYPED_ATTR_COLUMN_TYPE_BOOL = 3;
+  TYPED_ATTR_COLUMN_TYPE_BYTES = 4;
+}
+
+// One operator-declared typed attribute column (ADR-0090 decision 1): an
+// attribute key promoted to a native typed logs SQL column, paired with the
+// logical type it is read as. The SQL column name is the key verbatim, never
+// mangled.
+message TypedAttrColumn {
+  string key = 1;                 // the attribute key; the SQL column name, verbatim
+  TypedAttrColumnType type = 2;   // the declared logical type
+}
+
+// The set of attribute keys promoted to native typed logs SQL columns for one
+// tenant (ADR-0090 decision 1), carried as an optional sub-message of
+// TenantConfigRecord so its three states are distinct, exactly like
+// IndexedFieldConfig: absent sub-message means "no override, use the deployment
+// default"; a present sub-message with an empty `columns` list means "override
+// to no declared columns"; a present non-empty list is the explicit ordered
+// declaration. Declaration order is stable and never re-sorted (ADR-0090
+// decision 3).
+message TypedAttrColumnConfig {
+  repeated TypedAttrColumn columns = 1;
+}
+
 // The durable, per-tenant configuration record at `t/<tenant_hash>/config`
 // (ADR-0066 decision 6, epic EM). Moves per-tenant lifecycle state, admission
 // limits, retention, and indexed-field config off process flags and into a
@@ -405,6 +442,14 @@ message TenantConfigRecord {
   IndexedFieldConfig indexed_fields = 9;
   sfixed64 created_unix_ns = 10;      // informational; when the record was first written
   sfixed64 updated_unix_ns = 11;      // informational; when it was last swapped
+  // Per-tenant declared typed logs SQL columns (ADR-0090 decision 1); absent
+  // leaves the deployment default (see TypedAttrColumnConfig for the
+  // present-but-empty vs absent distinction). Additive field: a reader that
+  // skips this unknown field reads every earlier field exactly as before, and a
+  // reader that understands it sees an absent sub-message on every pre-ADR-0090
+  // record, identical to "no override". No format_version bump (ADR-0090
+  // Consequences).
+  TypedAttrColumnConfig typed_attr_columns = 12;
 }
 
 // One entry of the durable `sys/auth` token map (ADR-0066 decision 6, epic EM):
