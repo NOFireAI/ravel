@@ -2740,3 +2740,151 @@ fn span_order_key_discriminates_every_field() {
         r.record.attrs = vec![("k".to_string(), "w".to_string())]
     });
 }
+
+/// Field-precedence complement to [`span_order_key_discriminates_every_field`].
+/// That test only proves each field participates in the key; it passes even if
+/// two adjacent fields were swapped in `SpanOrderKey`'s declared order, because
+/// a single-field mutation can't observe field *position*, only presence.
+///
+/// For every adjacent pair `(early, late)` in the documented order
+/// `(trace_id, span_id, start_ts_ns, end_ts_ns, parent_span_id, name,
+/// status_code, status_message, service_name, attrs)`, this builds two rows
+/// identical everywhere except `early` and `late`, deliberately set so `early`
+/// alone must decide the order: row "lo" has the smaller `early` value but the
+/// LARGER `late` value; row "hi" has the larger `early` value but the smaller
+/// `late` value. `span_order_key(lo) < span_order_key(hi)` only holds if
+/// `early` is compared, and compared before `late`. Swapping the pair's
+/// declared order (or dropping `early` from the key) would let `late` decide
+/// instead, flipping the comparison and failing the assertion.
+#[test]
+fn span_order_key_respects_field_precedence() {
+    let base = SpanRow {
+        record: ravel_rspan::SpanRecord {
+            trace_id: TA,
+            span_id: S1,
+            parent_span_id: Some([3u8; 8]),
+            name: "op".to_string(),
+            start_ts_ns: 10,
+            end_ts_ns: 11,
+            status_code: ravel_rspan::StatusCode::Unset,
+            status_message: Some("msg".to_string()),
+            attrs: vec![("k".to_string(), "v".to_string())],
+        },
+        service_name: Some("alpha".to_string()),
+    };
+
+    // (pair name, set `early`+`late` low on `lo` / high on `hi`, set `late`+`early`
+    // reversed -- high on `lo` / low on `hi` -- on the SAME row).
+    let pair_check = |pair: &str, lo_mut: &dyn Fn(&mut SpanRow), hi_mut: &dyn Fn(&mut SpanRow)| {
+        let mut lo = base.clone();
+        lo_mut(&mut lo);
+        let mut hi = base.clone();
+        hi_mut(&mut hi);
+        assert!(
+            span_order_key(&lo) < span_order_key(&hi),
+            "in the ({pair}) pair, the earlier field must decide the order even \
+             when the later field disagrees; if it does not, the fields are \
+             either out of order or one has been dropped from the key"
+        );
+    };
+
+    pair_check(
+        "trace_id, span_id",
+        &|r| {
+            r.record.trace_id = TA;
+            r.record.span_id = S2;
+        },
+        &|r| {
+            r.record.trace_id = TB;
+            r.record.span_id = S1;
+        },
+    );
+    pair_check(
+        "span_id, start_ts_ns",
+        &|r| {
+            r.record.span_id = S1;
+            r.record.start_ts_ns = 20;
+        },
+        &|r| {
+            r.record.span_id = S2;
+            r.record.start_ts_ns = 10;
+        },
+    );
+    pair_check(
+        "start_ts_ns, end_ts_ns",
+        &|r| {
+            r.record.start_ts_ns = 10;
+            r.record.end_ts_ns = 99;
+        },
+        &|r| {
+            r.record.start_ts_ns = 20;
+            r.record.end_ts_ns = 11;
+        },
+    );
+    pair_check(
+        "end_ts_ns, parent_span_id",
+        &|r| {
+            r.record.end_ts_ns = 10;
+            r.record.parent_span_id = Some([7u8; 8]);
+        },
+        &|r| {
+            r.record.end_ts_ns = 20;
+            r.record.parent_span_id = Some([3u8; 8]);
+        },
+    );
+    pair_check(
+        "parent_span_id, name",
+        &|r| {
+            r.record.parent_span_id = Some([3u8; 8]);
+            r.record.name = "z".to_string();
+        },
+        &|r| {
+            r.record.parent_span_id = Some([7u8; 8]);
+            r.record.name = "a".to_string();
+        },
+    );
+    pair_check(
+        "name, status_code",
+        &|r| {
+            r.record.name = "op".to_string();
+            r.record.status_code = ravel_rspan::StatusCode::Error;
+        },
+        &|r| {
+            r.record.name = "other".to_string();
+            r.record.status_code = ravel_rspan::StatusCode::Unset;
+        },
+    );
+    pair_check(
+        "status_code, status_message",
+        &|r| {
+            r.record.status_code = ravel_rspan::StatusCode::Unset;
+            r.record.status_message = Some("z".to_string());
+        },
+        &|r| {
+            r.record.status_code = ravel_rspan::StatusCode::Error;
+            r.record.status_message = Some("a".to_string());
+        },
+    );
+    pair_check(
+        "status_message, service_name",
+        &|r| {
+            r.record.status_message = Some("boom".to_string());
+            r.service_name = Some("zeta".to_string());
+        },
+        &|r| {
+            r.record.status_message = Some("msg".to_string());
+            r.service_name = Some("alpha".to_string());
+        },
+    );
+    pair_check(
+        "service_name, attrs",
+        &|r| {
+            r.service_name = Some("alpha".to_string());
+            r.record.attrs = vec![("k".to_string(), "z".to_string())];
+        },
+        &|r| {
+            r.service_name = Some("beta".to_string());
+            r.record.attrs = vec![("k".to_string(), "a".to_string())];
+        },
+    );
+}

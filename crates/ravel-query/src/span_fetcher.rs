@@ -22,9 +22,9 @@
 //! for a caller to assemble a bloom-backed scan itself -- [`RspanReader::bloom`]
 //! and [`RspanReader::skip_index`], `candidate_blocks_with_bloom`,
 //! [`ravel_rspan::block::read_block`], and
-//! [`ravel_rspan::block::DecodedBlock::service_name`] -- and since this stays
-//! scoped to `ravel-sql`, this fetcher assembles that scan here on top of the
-//! public format surface rather than adding a bloom-aware `scan` to the reader.
+//! [`ravel_rspan::block::DecodedBlock::service_name`] -- so this fetcher
+//! assembles that scan here on top of the public format surface rather than
+//! adding a bloom-aware `scan` to the reader.
 //! The block-slicing bounds check mirrors the reader's own: a
 //! `(block_offset, block_len)` decoded from SKIP_IDX is checked against the
 //! BLOCKS section's own length, never merely the whole object, so a corrupt
