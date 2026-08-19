@@ -18,6 +18,11 @@ Start here to run Ravel, ingest into it, or query it.
 - [guides/query.md](guides/query.md): the five `/api/v1` endpoints, the
   supported PromQL subset, query budgets, and HTTP status codes. Read this
   to read data back out.
+- [guides/traces.md](guides/traces.md): querying spans over the `spans` SQL
+  table (ADR-0045) -- how Ravel stores spans, why a trace-by-id lookup is a
+  bounded scan of one shard, the table schema, which predicates prune at the
+  skip-index and bloom levels, worked queries, and what an incomplete trace is.
+  Read this to investigate traces.
 - [guides/distributed-query.md](guides/distributed-query.md): distributed read
   fan-out and cross-cluster federation (ADR-0071) for operators -- the cost gate
   and its two thresholds, `--distributed-query` and the fragment token file, the
