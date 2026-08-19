@@ -1787,6 +1787,17 @@ fn logs_coordinator_preserves_duplicate_records_across_slices() {
             pending_erasure: Vec::new(),
         };
 
+        // Confirm the two duplicate records genuinely land in two different
+        // slices, not the easy single-slice case where any merge would trivially
+        // preserve both.
+        let slices = partition_snapshot(&snapshot, 2);
+        assert_eq!(
+            slices.len(),
+            2,
+            "the two segments must partition into two slices for this to be a
+             cross-slice duplicate, not a within-slice one"
+        );
+
         // Reference: a raw local read of both segments, independent of the merge.
         let local = local_log_records(Arc::clone(&store), &segments, &[]).await;
         assert_eq!(
@@ -1824,9 +1835,10 @@ fn logs_coordinator_preserves_duplicate_records_across_slices() {
 /// segment object. The first distributed fetch is a cache miss (one real GET,
 /// which populates the cache); the second must be served from the cache with no
 /// further GET, so the scripted second-GET fault never fires. With the
-/// cache-blind funnel the second fetch would GET again, trip the fault, and the
-/// coordinator would silently fall back to local -- exactly the wiring gap this
-/// fixes.
+/// cache-blind funnel the second fetch would GET again and trip the fault; the
+/// worker then returns a hard error for that slice rather than silently
+/// substituting stale or partial data, and the coordinator surfaces it as a
+/// `QueryError::Distrib` -- exactly the wiring gap this fixes.
 #[test]
 fn logs_worker_serves_repeat_reads_from_the_read_cache() {
     let rt = Runtime::new().expect("runtime");

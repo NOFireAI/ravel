@@ -91,7 +91,8 @@ pub struct SliceResponse {
 /// One RLOG-family slice's fully-decoded response (Logs, Alerts, Audit). The
 /// log sibling of [`SliceResponse`]: `records` carries the worker's decoded
 /// per-segment merged view, post-erasure, in the worker's local scan order (the
-/// coordinator re-orders and dedups them, so this order is not load-bearing).
+/// coordinator re-orders them under the stated total order and does not dedup,
+/// so this arrival order is not load-bearing).
 /// Only meaningful when `status` is `Ok`.
 #[derive(Debug)]
 pub struct SliceLogResponse {
