@@ -1116,6 +1116,95 @@ oversights.
    `blocks_pruned_by_postings=0` and reads everything, which is the widen-only
    fallback, not a failure.
 
+## SQL over spans (the `spans` table, ADR-0045)
+
+`POST /api/v1/sql` serves a third table alongside `samples` and `logs`:
+`spans` (`Signal::Spans`). It follows the same one-signal-per-query rule the
+logs table established. `SqlExecutor` decides the target table from the `FROM`
+clause before planning, resolves a snapshot for that one signal, and registers
+exactly the one table in the per-query `SessionContext`. A query naming two real
+tables is rejected before any catalog listing (HTTP 400). A CTE named `spans` is
+a query-local name, not a base-table reference.
+
+The operator-facing walkthrough, with worked queries, is
+[docs/guides/traces.md](guides/traces.md). This section is the reference: the
+exact schema, the exact pushdown, and which predicate prunes where.
+
+Schema (fixed columns plus one map, `crates/ravel-sql/src/spans_schema.rs`):
+
+- `trace_id` — `FixedSizeBinary(16)`, non-null; `span_id` —
+  `FixedSizeBinary(8)`, non-null.
+- `parent_span_id` — `FixedSizeBinary(8)`, nullable (NULL on a root span, never
+  zero-filled).
+- `name` — `Utf8`, non-null (the span/operation name).
+- `start_ts`, `end_ts` — `Timestamp(Nanosecond, None)`, non-null.
+- `status_code` — `UInt8`, non-null: the stored OTLP byte, `0=Unset`, `1=Ok`,
+  `2=Error`. A `UInt8` for the same reason `logs.severity_num` is one: a tiny
+  fixed enum a plain integer round-trips exactly. Map it to text in SQL when a
+  caller wants the string.
+- `status_message` — `Utf8`, nullable.
+- `attrs` — `Map(Utf8, Utf8)`: the span's already-merged resource, scope, and
+  span attributes. RSPAN stores that merged map directly, so unlike `logs`
+  there is no separate stream-identity blob to fold in at scan time.
+- `service_name` — `Utf8`, nullable: populated from `attrs["service.name"]`
+  (NULL when the span has no such attribute). RSPAN v3 stores it as a
+  block-local dictionary column (ADR-0054); the scan exposes it as a plain
+  column so `WHERE service_name = '...'` is pushdown-eligible.
+- `duration_ns` — `Int64`, non-null: **computed** `end_ts - start_ts`, never a
+  stored column (ADR-0045 decision 5, rejected alternative 3). Both endpoints
+  are already stored, so materializing the difference per row would add bytes to
+  answer a question the block bounds answer for free. It is exposed as a SQL
+  column so `WHERE duration_ns > 5e8` is expressible, and the pushdown maps it
+  onto each block's stored duration bounds.
+
+Supported predicates (all pushdown is widen-only; `supports_filters_pushdown`
+returns `Inexact` for every filter, so DataFusion always re-applies the original
+predicate above the scan, and pruning can only ever widen the fetch, never drop
+a true result). Six shapes are recognized; every other predicate contributes no
+prune and is evaluated as a residual only:
+
+- `trace_id = <literal>` — the RSPAN fast path (ADR-0041). The literal is a
+  16-byte binary or a 32-character hex string. It compiles to a
+  `SpanQuery::trace` lookup, and the skip index drops every block whose
+  `[min_trace_id, max_trace_id]` range excludes the target: a bounded
+  single-trace scan instead of a full window scan.
+- `start_ts` / `end_ts` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and
+  `BETWEEN`) — both columns fold into one inclusive `[ts_min, ts_max]` window
+  the reader prunes blocks against by time-interval overlap. Folding both
+  endpoints into one window is a widen, never a narrow, because `end_ts >=
+  start_ts` on every record.
+- `duration_ns` range comparisons — fold into a `[lo, hi]` window exactly as
+  the ts window folds, pruned against each block's `min/max_duration_ns` (RSPAN
+  v2 skip-index fields). Strict `>`/`<` use `checked_add`/`checked_sub`.
+- `status_code = <literal>`, `status_code IN (...)`, and a same-axis `OR` of
+  `status_code` equalities — map to the skip index's status bits and prune
+  against each block's one-byte `status_mask` (RSPAN v2). `status_code = 2`
+  skips every block with no Error span. Multiple sibling equalities
+  AND-intersect; a same-axis `OR`/`IN` unions.
+- `service_name = <literal>` — a per-block `service.name` bloom probe (RSPAN
+  v3, ADR-0054). A block whose bloom proves the token absent is skipped before
+  decode.
+- `name = <literal>` — the span-name sibling of `service_name`, the other field
+  the v3 per-block bloom is built over.
+
+Prune site by predicate: `trace_id`, `start_ts`/`end_ts`, `duration_ns`, and
+`status_code` prune at the **skip index** (exact min/max ranges and the status
+mask). `service_name` and `name` prune at the **bloom** (a false-positive-only
+membership test, so a negative excludes a block and a positive changes nothing,
+under the widen-only rule ADR-0013 established). Everything else, including
+`attrs['k'] = 'v'` and any predicate on `span_id`, `parent_span_id`, or
+`status_message`, prunes nothing and is evaluated exactly as a DataFusion
+residual. Span attribute pruning (postings, analogous to RLOG's) is a later,
+undecided epic, not a current capability.
+
+Conjunctive shape: the pruning predicates must be top-level `AND` conjuncts. A
+disjunction inside a conjunct's subtree drops that whole conjunct from pruning
+(refusing is always widen-safe: the residual re-applies it). The exception is a
+**same-axis** `OR`/`IN` on `status_code` or `duration_ns`, pushed as the union
+of its disjuncts; a **cross-axis** disjunction (`status_code = 2 OR duration_ns
+> 5e8`) is refused. `trace_id` is a single-point lookup with no range primitive
+to union, so a `trace_id` disjunction is refused too.
+
 ## Caching note
 
 ADR-0046 added a content-addressed RAM read-cache tier (`ravel-cache`,

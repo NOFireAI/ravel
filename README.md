@@ -170,7 +170,9 @@ All query endpoints live under `/api/v1` on the HTTP listener, which binds
 `127.0.0.1:4318` by default. They need `Authorization: Bearer <token>`, the same
 as ingest. The [query guide](docs/guides/query.md) and the
 [distributed query guide](docs/guides/distributed-query.md) cover PromQL, SQL,
-Flight SQL, exemplars, alerting, and analytics.
+Flight SQL, exemplars, alerting, and analytics. The
+[traces guide](docs/guides/traces.md) covers querying spans over the `spans`
+SQL table.
 
 ## Kubernetes
 
