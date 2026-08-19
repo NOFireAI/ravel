@@ -390,6 +390,7 @@ fn soa_bits_eq(a: &FetchedSeriesSoa, b: &FetchedSeriesSoa) -> bool {
             .iter()
             .zip(b.values.iter())
             .all(|(x, y)| f64_bits_eq(*x, *y))
+        && a.per_sample_priorities == b.per_sample_priorities
 }
 
 fn hist_series_bits_eq(a: &FetchedHistogramSeries, b: &FetchedHistogramSeries) -> bool {
@@ -404,6 +405,7 @@ fn hist_series_bits_eq(a: &FetchedHistogramSeries, b: &FetchedHistogramSeries) -
             .iter()
             .zip(b.values.iter())
             .all(|(x, y)| hist_value_bits_eq(x, y))
+        && a.per_sample_priorities == b.per_sample_priorities
 }
 
 #[allow(clippy::type_complexity)]

@@ -262,6 +262,15 @@ pub fn signal_from_u32(raw: u32) -> Result<Signal, CodecError> {
 /// it maps to exactly one [`pb::Run`]; the labels are written once. Timestamps
 /// become zig-zag deltas (delta-from-zero for the first), values become raw
 /// bit patterns.
+///
+/// `pb::Run` carries run-wide provenance only, which is exactly what every
+/// object in existence holds, so this mapping is total for every run the
+/// fetcher emits today. It cannot express a run-merged run's per-sample dedup
+/// priority column ([`FetchedSeriesSoa::per_sample_priorities`]): adding four
+/// per-sample columns to the frozen `ravel.queryfrag.v1` messages is a wire
+/// contract change, so whatever makes a worker able to produce such a run
+/// (issue #315) must extend this frame and bump [`PROTOCOL_VERSION`] with it.
+/// Nothing constructs that column yet.
 pub fn encode_series_frame(series: &FetchedSeriesSoa) -> pb::SeriesFrame {
     pb::SeriesFrame {
         series_id: series.series_id.0.to_vec(),
@@ -301,6 +310,9 @@ pub fn decode_series_frame(frame: pb::SeriesFrame) -> Result<Vec<FetchedSeriesSo
                 created_unix_ns: run.created_unix_ns,
                 writer_epoch: run.writer_epoch,
                 writer_seq: run.writer_seq,
+                // `pb::Run` carries run-wide provenance only; see
+                // `encode_series_frame`.
+                per_sample_priorities: None,
             })
         })
         .collect()
@@ -863,6 +875,7 @@ mod tests {
                     created_unix_ns: created,
                     writer_epoch: epoch,
                     writer_seq: seq,
+                    per_sample_priorities: None,
                 }
             })
     }
@@ -915,6 +928,7 @@ mod tests {
             created_unix_ns: 7,
             writer_epoch: 1,
             writer_seq: 2,
+            per_sample_priorities: None,
         };
         let decoded = decode_series_frame(encode_series_frame(&soa)).expect("decode");
         assert_eq!(decoded.len(), 1);

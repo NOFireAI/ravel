@@ -51,9 +51,9 @@
 use ravel_catalog::Snapshot;
 use ravel_logseg::{AttrValue, LogRecord};
 use ravel_segment::SeriesEntry;
-use ravel_types::{LabelSet, Sample};
+use ravel_types::LabelSet;
 
-use crate::fetcher::{FetchedHistogramSeries, FetchedSeries, FetchedSeriesSoa};
+use crate::fetcher::{FetchedHistogramSeries, FetchedSeries, FetchedSeriesSoa, SamplePriority};
 
 /// One pending erasure predicate to exclude at scan time (ADR-0064 decision
 /// 1). A conjunction of exact `key = value` matchers plus an optional
@@ -233,7 +233,12 @@ pub fn retain_series_soa(series: &mut Vec<FetchedSeriesSoa>, predicates: &[Erasu
         if matching.iter().any(|p| !p.has_window()) {
             return false;
         }
-        compact_parallel(&mut s.timestamps, &mut s.values, &matching);
+        compact_parallel(
+            &mut s.timestamps,
+            &mut s.values,
+            s.per_sample_priorities.as_mut(),
+            &matching,
+        );
         !s.timestamps.is_empty()
     });
 }
@@ -252,8 +257,29 @@ pub fn retain_series_aos(series: &mut Vec<FetchedSeries>, predicates: &[ErasureP
         if matching.iter().any(|p| !p.has_window()) {
             return false;
         }
-        s.samples
-            .retain(|smp: &Sample| sample_survives(smp.ts_ns, &matching));
+        // A per-sample dedup priority column is positional, so it is compacted
+        // in lockstep with the samples: dropping samples under it would hand
+        // the survivors another sample's provenance, which decides duplicate
+        // winners. Same rule as `compact_parallel` on the SoA shapes.
+        let sample_count = s.samples.len();
+        let mut column = s
+            .per_sample_priorities
+            .as_mut()
+            .filter(|c| c.len() == sample_count);
+        let mut write = 0usize;
+        for read in 0..sample_count {
+            if sample_survives(s.samples[read].ts_ns, &matching) {
+                s.samples.swap(write, read);
+                if let Some(c) = column.as_deref_mut() {
+                    c.swap(write, read);
+                }
+                write += 1;
+            }
+        }
+        s.samples.truncate(write);
+        if let Some(c) = column {
+            c.truncate(write);
+        }
         !s.samples.is_empty()
     });
 }
@@ -275,7 +301,12 @@ pub fn retain_histogram_series(
         if matching.iter().any(|p| !p.has_window()) {
             return false;
         }
-        compact_parallel(&mut s.timestamps, &mut s.values, &matching);
+        compact_parallel(
+            &mut s.timestamps,
+            &mut s.values,
+            s.per_sample_priorities.as_mut(),
+            &matching,
+        );
         !s.timestamps.is_empty()
     });
 }
@@ -347,26 +378,42 @@ pub fn snapshot_pending_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePr
         .collect()
 }
 
-/// Compacts two positionally-aligned vecs (timestamps and values) in place,
-/// keeping only the indices whose timestamp survives the matching windowed
-/// predicates. `timestamps` and `values` must have equal length; both are
-/// truncated to the surviving prefix, preserving on-disk order.
+/// Compacts positionally-aligned vecs (timestamps, values, and a run's
+/// optional per-sample dedup priority column) in place, keeping only the
+/// indices whose timestamp survives the matching windowed predicates.
+/// `timestamps` and `values` must have equal length; all are truncated to the
+/// surviving prefix, preserving on-disk order.
+///
+/// `priorities` is compacted in lockstep because it is positional: leaving it
+/// whole would give the surviving samples other samples' provenance, which
+/// decides duplicate winners at query time. A column whose length disagrees
+/// with the sample count is left alone rather than swapped past its end; it
+/// reaches the merge as the `QueryError::PrioritySampleCountMismatch` it
+/// already was, never a panic here.
 fn compact_parallel<V>(
     timestamps: &mut Vec<i64>,
     values: &mut Vec<V>,
+    priorities: Option<&mut Vec<SamplePriority>>,
     matching: &[&ErasurePredicate],
 ) {
     debug_assert_eq!(timestamps.len(), values.len());
+    let mut column = priorities.filter(|c| c.len() == timestamps.len());
     let mut write = 0usize;
     for read in 0..timestamps.len() {
         if sample_survives(timestamps[read], matching) {
             timestamps.swap(write, read);
             values.swap(write, read);
+            if let Some(c) = column.as_deref_mut() {
+                c.swap(write, read);
+            }
             write += 1;
         }
     }
     timestamps.truncate(write);
     values.truncate(write);
+    if let Some(c) = column {
+        c.truncate(write);
+    }
 }
 
 #[cfg(test)]
@@ -376,7 +423,7 @@ mod tests {
     use proptest::prelude::*;
     use ravel_logseg::LogStreamId;
     use ravel_segment::HistogramValue;
-    use ravel_types::{Label, SeriesId};
+    use ravel_types::{Label, Sample, SeriesId};
 
     /// One SoA series projected to comparable owned data: its label pairs and
     /// its parallel timestamp/value vecs.
@@ -451,6 +498,7 @@ mod tests {
             created_unix_ns: 0,
             writer_epoch: 0,
             writer_seq: 0,
+            per_sample_priorities: None,
         }
     }
 
@@ -526,6 +574,115 @@ mod tests {
         assert_eq!(series[0].values, vec![1.0, 4.0]);
     }
 
+    /// Distinct per-sample priorities, one per sample, so a column compacted
+    /// out of step with its samples is visible rather than accidentally right.
+    fn priority_column(count: u32) -> Vec<SamplePriority> {
+        (0..count)
+            .map(|i| SamplePriority {
+                created_unix_ns: 1_000 + i64::from(i),
+                writer_epoch: u64::from(i),
+                writer_seq: u64::from(i) * 2,
+                in_page_index: i,
+            })
+            .collect()
+    }
+
+    /// A windowed erasure drops samples in place. A run's per-sample dedup
+    /// priority column is positional, so it must be compacted in lockstep:
+    /// leaving it whole would hand the surviving samples another sample's
+    /// provenance, which decides duplicate winners at query time.
+    #[test]
+    fn windowed_erasure_compacts_the_per_sample_priority_column() {
+        let column = priority_column(4);
+        let mut series = vec![soa(
+            labels(&[("__name__", "m"), ("user_id", "u1")]),
+            &[(50, 1.0), (100, 2.0), (150, 3.0), (200, 4.0)],
+        )];
+        series[0].per_sample_priorities = Some(column.clone());
+        retain_series_soa(&mut series, &[pred(&[("user_id", "u1")], 100, 200)]);
+        assert_eq!(series[0].timestamps, vec![50, 200]);
+        // Indices 0 and 3 survived, so their priorities must be the ones left.
+        assert_eq!(
+            series[0].per_sample_priorities,
+            Some(vec![column[0], column[3]])
+        );
+    }
+
+    /// The AoS and histogram shapes compact the column the same way.
+    #[test]
+    fn windowed_erasure_compacts_the_column_on_aos_and_histogram_shapes() {
+        let column = priority_column(3);
+        let mut aos = vec![FetchedSeries {
+            series_id: SeriesId([0; 16]),
+            labels: labels(&[("user_id", "u1")]),
+            samples: vec![
+                Sample {
+                    ts_ns: 50,
+                    value: 1.0,
+                },
+                Sample {
+                    ts_ns: 120,
+                    value: 2.0,
+                },
+                Sample {
+                    ts_ns: 250,
+                    value: 3.0,
+                },
+            ],
+            created_unix_ns: 0,
+            writer_epoch: 0,
+            writer_seq: 0,
+            per_sample_priorities: Some(column.clone()),
+        }];
+        retain_series_aos(&mut aos, &[pred(&[("user_id", "u1")], 100, 200)]);
+        assert_eq!(
+            aos[0].samples.iter().map(|s| s.ts_ns).collect::<Vec<_>>(),
+            vec![50, 250]
+        );
+        assert_eq!(
+            aos[0].per_sample_priorities,
+            Some(vec![column[0], column[2]])
+        );
+
+        let mut hist = vec![FetchedHistogramSeries {
+            series_id: SeriesId([0; 16]),
+            labels: labels(&[("user_id", "u1")]),
+            timestamps: vec![50, 120, 250],
+            values: vec![
+                empty_histogram_value(),
+                empty_histogram_value(),
+                empty_histogram_value(),
+            ],
+            created_unix_ns: 0,
+            writer_epoch: 0,
+            writer_seq: 0,
+            per_sample_priorities: Some(column.clone()),
+        }];
+        retain_histogram_series(&mut hist, &[pred(&[("user_id", "u1")], 100, 200)]);
+        assert_eq!(hist[0].timestamps, vec![50, 250]);
+        assert_eq!(
+            hist[0].per_sample_priorities,
+            Some(vec![column[0], column[2]])
+        );
+    }
+
+    /// A column that already disagrees with the sample count is not swapped
+    /// past its end: the samples are still filtered (erasure is never skipped)
+    /// and the column is left for the merge to reject as
+    /// `QueryError::PrioritySampleCountMismatch`.
+    #[test]
+    fn mismatched_priority_column_neither_panics_nor_skips_the_erasure() {
+        let column = priority_column(2);
+        let mut series = vec![soa(
+            labels(&[("user_id", "u1")]),
+            &[(50, 1.0), (100, 2.0), (150, 3.0)],
+        )];
+        series[0].per_sample_priorities = Some(column.clone());
+        retain_series_soa(&mut series, &[pred(&[("user_id", "u1")], 100, 200)]);
+        assert_eq!(series[0].timestamps, vec![50]);
+        assert_eq!(series[0].per_sample_priorities, Some(column));
+    }
+
     #[test]
     fn metrics_windowed_predicate_dropping_all_samples_drops_series() {
         let mut series = vec![soa(labels(&[("user_id", "u1")]), &[(100, 1.0), (150, 2.0)])];
@@ -563,6 +720,7 @@ mod tests {
             created_unix_ns: 0,
             writer_epoch: 0,
             writer_seq: 0,
+            per_sample_priorities: None,
         }];
         retain_series_aos(&mut aos, &[pred(&[("user_id", "u1")], 100, 200)]);
         assert_eq!(aos.len(), 1);
@@ -578,6 +736,7 @@ mod tests {
             created_unix_ns: 0,
             writer_epoch: 0,
             writer_seq: 0,
+            per_sample_priorities: None,
         }];
         retain_histogram_series(&mut hist, &[pred(&[("user_id", "u1")], 0, 0)]);
         assert!(hist.is_empty());

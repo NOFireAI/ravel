@@ -28,7 +28,7 @@ use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
 use crate::fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
-    SegmentFetcher,
+    SamplePriority, SegmentFetcher,
 };
 use crate::segment_admission;
 
@@ -2093,15 +2093,81 @@ fn is_greater(a: &Candidate, b: &Candidate) -> bool {
     (a.priority, a.value.to_bits()) > (b.priority, b.value.to_bits())
 }
 
-/// One decoded per-segment run of a single series, kept in on-disk order
-/// (ascending ts, duplicate timestamps preserved; docs/segment-format.md
-/// "Sample order within a page"). The run-wide prefix of the ADR-0010 §5
-/// order is shared by every sample in the run; the per-sample in-page index
-/// (position in `timestamps`) completes the tuple.
+/// Where one run's samples get their ADR-0010 §5 dedup priorities from. The
+/// two shapes are exclusive by construction (an enum, not a prefix plus an
+/// optional column): a run either shares one write's provenance or carries its
+/// own per-sample column, and "both" or "neither" must not be
+/// representable, since either would leave the winner at an overlapping
+/// timestamp silently ambiguous.
+///
+/// [`RunWide`](Self::RunWide) is the common path and the only one any object
+/// in existence produces: it holds three integers inline, allocates nothing,
+/// and derives the fourth element of the key from array position exactly as
+/// before. [`PerSample`](Self::PerSample) is for a run that merged several
+/// writes' samples, where positions no longer reconstruct that fourth element
+/// (ADR-0092 "Why 11.46 is not the target", decision 1).
+#[derive(Debug, Clone)]
+enum RunPriorities {
+    /// `(created_unix_ns, writer_epoch, writer_seq)` shared by every sample in
+    /// the run; the sample's position in `timestamps` is the fourth element.
+    RunWide((i64, u64, u64)),
+    /// One explicit four-element key per sample, positionally parallel to the
+    /// run's `timestamps`/`values`.
+    PerSample(Vec<SamplePriority>),
+}
+
+impl RunPriorities {
+    /// The dedup priority of the sample at `pos`, or `None` if a per-sample
+    /// column is too short to have one (impossible after
+    /// [`check_len`](Self::check_len), and an error rather than an index panic
+    /// if that ever regresses).
+    #[inline]
+    fn at(&self, pos: usize) -> Option<(i64, u64, u64, u32)> {
+        match self {
+            RunPriorities::RunWide((created, epoch, seq)) => Some((
+                *created,
+                *epoch,
+                *seq,
+                u32::try_from(pos).unwrap_or(u32::MAX),
+            )),
+            RunPriorities::PerSample(column) => column.get(pos).map(SamplePriority::as_tuple),
+        }
+    }
+
+    /// Number of entries a per-sample column holds; `None` for the run-wide
+    /// shape, which has no column to disagree with anything.
+    fn column_len(&self) -> Option<usize> {
+        match self {
+            RunPriorities::RunWide(_) => None,
+            RunPriorities::PerSample(column) => Some(column.len()),
+        }
+    }
+
+    /// Rejects a per-sample column that is not parallel to a run of `samples`
+    /// samples. A short column would leave later samples with no priority and a
+    /// long one would carry priorities for samples that do not exist; both are
+    /// a typed error, never a silent truncation of either side.
+    fn check_len(&self, samples: usize) -> Result<(), QueryError> {
+        match self.column_len() {
+            None => Ok(()),
+            Some(len) if len == samples => Ok(()),
+            Some(len) => Err(QueryError::PrioritySampleCountMismatch {
+                priorities: len,
+                samples,
+            }),
+        }
+    }
+}
+
+/// One decoded run of a single series, kept in on-disk order (ascending ts,
+/// duplicate timestamps preserved; docs/segment-format.md "Sample order within
+/// a page"). `priorities` says where each sample's ADR-0010 §5 dedup key comes
+/// from: one run-wide prefix plus array position (every run any object holds
+/// today), or an explicit per-sample column (a run-merged run, issue #315).
 struct SeriesRun {
     timestamps: Vec<i64>,
     values: Vec<f64>,
-    prefix: (i64, u64, u64),
+    priorities: RunPriorities,
 }
 
 /// Counts samples as the k-way merge *yields* them (post-dedup), enforcing
@@ -2159,10 +2225,18 @@ pub(crate) fn merge_soa_runs(
             let entry = by_series
                 .entry(fs.series_id)
                 .or_insert_with(|| (fs.labels.clone(), Vec::new()));
+            let priorities = match fs.per_sample_priorities {
+                Some(column) => RunPriorities::PerSample(column),
+                // The common path: run-wide provenance, fourth element from
+                // array position.
+                None => {
+                    RunPriorities::RunWide((fs.created_unix_ns, fs.writer_epoch, fs.writer_seq))
+                }
+            };
             entry.1.push(SeriesRun {
                 timestamps: fs.timestamps,
                 values: fs.values,
-                prefix: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
+                priorities,
             });
         }
     }
@@ -2187,11 +2261,23 @@ pub(crate) fn merge_soa_runs(
 /// candidate across all runs (including duplicate timestamps within a run)
 /// is considered and the greatest under [`is_greater`] wins, never arrival
 /// order. Every emitted sample is counted through `budget`.
+///
+/// A candidate's priority comes from its run's [`RunPriorities`], so a
+/// run-merged run's explicit per-sample column is read per sample while a
+/// run-wide run still derives the fourth element from position. The comparison
+/// itself is unchanged: the same four-element tuple, same `f64::to_bits`
+/// tie-break.
 fn merge_series_runs(
     runs: &[SeriesRun],
     budget: &mut YieldBudget,
     out: &mut Vec<Sample>,
 ) -> Result<(), QueryError> {
+    // Up front, before any sample is emitted: a per-sample column that is not
+    // parallel to its run fails the whole merge rather than yielding a prefix
+    // of the right answer.
+    for run in runs {
+        run.priorities.check_len(run.timestamps.len())?;
+    }
     // Min-heap of each run's current head as (ts, run_idx); `Reverse` turns
     // the max-heap into a min-heap so the smallest pending ts pops first.
     let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
@@ -2214,10 +2300,15 @@ fn merge_series_runs(
             let run = &runs[idx];
             let mut pos = cursors[idx];
             while pos < run.timestamps.len() && run.timestamps[pos] == ts {
-                let in_page_index = u32::try_from(pos).unwrap_or(u32::MAX);
+                let Some(priority) = run.priorities.at(pos) else {
+                    return Err(QueryError::PrioritySampleCountMismatch {
+                        priorities: run.priorities.column_len().unwrap_or(0),
+                        samples: run.timestamps.len(),
+                    });
+                };
                 let candidate = Candidate {
                     value: run.values[pos],
-                    priority: (run.prefix.0, run.prefix.1, run.prefix.2, in_page_index),
+                    priority,
                 };
                 best = match best {
                     Some(current) if is_greater(&current, &candidate) => Some(current),
@@ -2375,24 +2466,29 @@ fn histogram_is_greater(a: &HistogramCandidate, b: &HistogramCandidate) -> bool 
     (a.priority, histogram_sort_key(&a.value)) > (b.priority, histogram_sort_key(&b.value))
 }
 
-/// Histogram counterpart to [`SeriesRun`]: one decoded per-segment run of a
-/// single histogram-kind series, kept in on-disk order.
+/// Histogram counterpart to [`SeriesRun`]: one decoded run of a single
+/// histogram-kind series, kept in on-disk order, carrying its dedup priorities
+/// in either [`RunPriorities`] shape.
 #[derive(Debug, Clone)]
 struct HistogramSeriesRun {
     timestamps: Vec<i64>,
     values: Vec<ravel_segment::HistogramValue>,
-    prefix: (i64, u64, u64),
+    priorities: RunPriorities,
 }
 
 /// Histogram counterpart to [`merge_series_runs`]: identical k-way merge
 /// shape (min-heap by ts, drain same-ts heads, [`histogram_is_greater`]
 /// picks the winner), substituting [`HistogramCandidate`] for [`Candidate`]
-/// and yielding [`ravel_segment::HistogramSample`]s.
+/// and yielding [`ravel_segment::HistogramSample`]s. Priorities are read
+/// through [`RunPriorities`] per sample, exactly as on the scalar path.
 fn merge_histogram_series_runs(
     runs: &[HistogramSeriesRun],
     budget: &mut YieldBudget,
     out: &mut Vec<ravel_segment::HistogramSample>,
 ) -> Result<(), QueryError> {
+    for run in runs {
+        run.priorities.check_len(run.timestamps.len())?;
+    }
     let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
     let mut cursors = vec![0usize; runs.len()];
     for (idx, run) in runs.iter().enumerate() {
@@ -2411,10 +2507,15 @@ fn merge_histogram_series_runs(
             let run = &runs[idx];
             let mut pos = cursors[idx];
             while pos < run.timestamps.len() && run.timestamps[pos] == ts {
-                let in_page_index = u32::try_from(pos).unwrap_or(u32::MAX);
+                let Some(priority) = run.priorities.at(pos) else {
+                    return Err(QueryError::PrioritySampleCountMismatch {
+                        priorities: run.priorities.column_len().unwrap_or(0),
+                        samples: run.timestamps.len(),
+                    });
+                };
                 let candidate = HistogramCandidate {
                     value: run.values[pos].clone(),
-                    priority: (run.prefix.0, run.prefix.1, run.prefix.2, in_page_index),
+                    priority,
                 };
                 best = match best {
                     Some(current) if histogram_is_greater(&current, &candidate) => Some(current),
@@ -2537,10 +2638,16 @@ fn merge_histogram_soa_runs(
             let entry = by_series
                 .entry(fs.series_id)
                 .or_insert_with(|| (fs.labels.clone(), Vec::new()));
+            let priorities = match fs.per_sample_priorities {
+                Some(column) => RunPriorities::PerSample(column),
+                None => {
+                    RunPriorities::RunWide((fs.created_unix_ns, fs.writer_epoch, fs.writer_seq))
+                }
+            };
             entry.1.push(HistogramSeriesRun {
                 timestamps: fs.timestamps,
                 values: fs.values,
-                prefix: (fs.created_unix_ns, fs.writer_epoch, fs.writer_seq),
+                priorities,
             });
         }
     }
@@ -2658,6 +2765,7 @@ mod merge_tests {
             created_unix_ns: created,
             writer_epoch: epoch,
             writer_seq: seq,
+            per_sample_priorities: None,
         }
     }
 
@@ -3214,6 +3322,7 @@ mod tests {
             created_unix_ns: 0,
             writer_epoch: 0,
             writer_seq: 0,
+            per_sample_priorities: None,
         }
     }
 
@@ -3343,6 +3452,310 @@ mod tests {
     // against every segment fetched. That end-to-end behavior, which a
     // `build_series_by_id` unit test could not reach, is proven in
     // tests/bytes_scanned_budget.rs.
+
+    // --- Per-sample dedup priorities (ADR-0092 decision 1, issue #313) ---
+    //
+    // The equivalence these tests pin: expressing one set of samples as N
+    // run-wide runs, or as ONE run whose per-sample priority column repeats
+    // each original run's triple plus that sample's original in-run index,
+    // must merge to the identical output. That is what makes a future
+    // run-merging L1 compaction (issue #315) query-equivalent to its inputs
+    // (ADR-0018 "The correctness core", overlap harmlessness).
+
+    /// A NaN with payload 1 and a NaN with a much greater payload: distinct bit
+    /// patterns, so a merge that compared floats with `==`/`PartialOrd`
+    /// instead of `to_bits` could not tell them apart.
+    const NAN_A_BITS: u64 = 0x7ff8_0000_0000_0001;
+    const NAN_B_BITS: u64 = 0x7ff8_0000_dead_beef;
+
+    /// One input run of the fixture: a run-wide provenance triple plus that
+    /// run's samples in on-disk (ascending-ts) order.
+    struct FixtureRun {
+        prefix: (i64, u64, u64),
+        samples: Vec<(i64, f64)>,
+    }
+
+    /// Overlapping samples across several runs with distinct provenance,
+    /// covering every way the ADR-0010 §5 order can be decided: two runs
+    /// disagreeing at one timestamp, a three-way tie broken by the fourth
+    /// element, equal priorities falling through to the value tie-break, NaN
+    /// payloads and negative zero as values, and duplicate timestamps inside a
+    /// single run.
+    fn overlapping_fixture() -> Vec<FixtureRun> {
+        let nan_a = f64::from_bits(NAN_A_BITS);
+        let nan_b = f64::from_bits(NAN_B_BITS);
+        vec![
+            // Duplicate timestamps within one run (ts 20 twice), and the
+            // sample that takes ts 30 on provenance while carrying -0.0.
+            FixtureRun {
+                prefix: (100, 1, 1),
+                samples: vec![(10, 1.0), (20, 2.0), (20, nan_a), (30, -0.0)],
+            },
+            // Same prefix AND same in-run index 0 at ts 10 as the run above,
+            // so the whole four-element key ties and the value bits decide:
+            // -1.0's sign bit makes it the greater pattern.
+            FixtureRun {
+                prefix: (100, 1, 1),
+                samples: vec![(10, -1.0)],
+            },
+            // Greater writer_seq, so it takes ts 20 whatever the indices are.
+            FixtureRun {
+                prefix: (100, 1, 2),
+                samples: vec![(20, 7.0)],
+            },
+            // Three runs sharing one prefix at ts 40: the fourth element
+            // (in-run index) breaks the three-way tie, and index 2 wins.
+            FixtureRun {
+                prefix: (200, 2, 3),
+                samples: vec![(40, 4.0)],
+            },
+            FixtureRun {
+                prefix: (200, 2, 3),
+                samples: vec![(40, 5.0), (40, 6.0)],
+            },
+            FixtureRun {
+                prefix: (200, 2, 3),
+                samples: vec![(35, 0.5), (40, nan_b), (40, 8.0)],
+            },
+            // Loses ts 30 on created_unix_ns despite the greater value bits.
+            FixtureRun {
+                prefix: (50, 0, 0),
+                samples: vec![(30, 0.0)],
+            },
+            // A NaN payload wins ts 50 on index inside one run.
+            FixtureRun {
+                prefix: (300, 5, 5),
+                samples: vec![(50, nan_a), (50, nan_b)],
+            },
+            // Equal keys, -0.0 against 0.0: the sign bit makes -0.0 greater.
+            FixtureRun {
+                prefix: (400, 0, 0),
+                samples: vec![(60, -0.0)],
+            },
+            FixtureRun {
+                prefix: (400, 0, 0),
+                samples: vec![(60, 0.0)],
+            },
+        ]
+    }
+
+    /// The winner at each timestamp under the ADR-0010 §5 order, written out by
+    /// hand from `overlapping_fixture`'s comments. Pinned so the two
+    /// representations cannot agree on a *wrong* answer.
+    fn expected_winners() -> Vec<(i64, u64)> {
+        vec![
+            (10, (-1.0f64).to_bits()), // key ties, value bits decide
+            (20, 7.0f64.to_bits()),    // writer_seq decides
+            (30, (-0.0f64).to_bits()), // created_unix_ns decides
+            (35, 0.5f64.to_bits()),    // sole candidate
+            (40, 8.0f64.to_bits()),    // three-way tie, in-run index 2 wins
+            (50, NAN_B_BITS),          // index decides between two NaNs
+            (60, (-0.0f64).to_bits()), // key ties, -0.0's bits beat 0.0's
+        ]
+    }
+
+    /// The fixture as N run-wide runs: what every object in existence produces.
+    fn run_wide_runs(fixture: &[FixtureRun]) -> Vec<SeriesRun> {
+        fixture
+            .iter()
+            .map(|r| SeriesRun {
+                timestamps: r.samples.iter().map(|(ts, _)| *ts).collect(),
+                values: r.samples.iter().map(|(_, v)| *v).collect(),
+                priorities: RunPriorities::RunWide(r.prefix),
+            })
+            .collect()
+    }
+
+    /// The same samples flattened into one run's three parallel columns, each
+    /// sample keeping the provenance of the run it came from and its original
+    /// in-run index. Sorted ascending by ts (stably, so same-ts samples keep
+    /// their relative order) because a run is ascending by definition.
+    fn merged_columns(fixture: &[FixtureRun]) -> (Vec<i64>, Vec<f64>, Vec<SamplePriority>) {
+        let mut flat: Vec<(i64, f64, SamplePriority)> = Vec::new();
+        for r in fixture {
+            for (index, (ts, value)) in r.samples.iter().enumerate() {
+                flat.push((
+                    *ts,
+                    *value,
+                    SamplePriority {
+                        created_unix_ns: r.prefix.0,
+                        writer_epoch: r.prefix.1,
+                        writer_seq: r.prefix.2,
+                        in_page_index: u32::try_from(index).expect("small index"),
+                    },
+                ));
+            }
+        }
+        flat.sort_by_key(|(ts, _, _)| *ts);
+        (
+            flat.iter().map(|(ts, _, _)| *ts).collect(),
+            flat.iter().map(|(_, v, _)| *v).collect(),
+            flat.iter().map(|(_, _, p)| *p).collect(),
+        )
+    }
+
+    /// The fixture as ONE run carrying an explicit per-sample priority column.
+    fn merged_run(fixture: &[FixtureRun]) -> SeriesRun {
+        let (timestamps, values, column) = merged_columns(fixture);
+        SeriesRun {
+            timestamps,
+            values,
+            priorities: RunPriorities::PerSample(column),
+        }
+    }
+
+    /// Merges with a generous budget and projects to `(ts, value bits)`, so
+    /// comparison is bit-exact and never a float `==`.
+    fn drain_runs(runs: &[SeriesRun]) -> Vec<(i64, u64)> {
+        let mut budget = YieldBudget {
+            yielded: 0,
+            max: usize::MAX,
+        };
+        let mut out = Vec::new();
+        merge_series_runs(runs, &mut budget, &mut out).expect("merge succeeds");
+        out.iter().map(|s| (s.ts_ns, s.value.to_bits())).collect()
+    }
+
+    /// The equivalence property: N run-wide runs and one run-merged run with a
+    /// per-sample priority column produce identical merged output, and both
+    /// produce the hand-computed winners.
+    #[test]
+    fn per_sample_priorities_reproduce_run_wide_merge() {
+        let fixture = overlapping_fixture();
+        let from_run_wide = drain_runs(&run_wide_runs(&fixture));
+        let from_per_sample = drain_runs(&[merged_run(&fixture)]);
+        assert_eq!(from_run_wide, expected_winners());
+        assert_eq!(from_per_sample, expected_winners());
+        assert_eq!(from_run_wide, from_per_sample);
+    }
+
+    /// The same equivalence through `merge_soa_runs`, the entry point the live
+    /// query path uses, so `FetchedSeriesSoa::per_sample_priorities` is proven
+    /// to reach the merge rather than only the hand-built `SeriesRun` shape.
+    #[test]
+    fn per_sample_priority_column_survives_the_soa_entry_point() {
+        let fixture = overlapping_fixture();
+        let series_id = SeriesId([7; 16]);
+        let lbls = labels(&[("__name__", "merged")]);
+        let run_wide: Vec<FetchedSeriesSoa> = fixture
+            .iter()
+            .map(|r| FetchedSeriesSoa {
+                series_id,
+                labels: lbls.clone(),
+                timestamps: r.samples.iter().map(|(ts, _)| *ts).collect(),
+                values: r.samples.iter().map(|(_, v)| *v).collect(),
+                created_unix_ns: r.prefix.0,
+                writer_epoch: r.prefix.1,
+                writer_seq: r.prefix.2,
+                per_sample_priorities: None,
+            })
+            .collect();
+        let (timestamps, values, column) = merged_columns(&fixture);
+        let merged = FetchedSeriesSoa {
+            series_id,
+            labels: lbls,
+            timestamps,
+            values,
+            // Run-wide fields are ignored when a per-sample column is present;
+            // deliberately set to values that would produce a different winner
+            // at every timestamp if they were read instead.
+            created_unix_ns: i64::MAX,
+            writer_epoch: u64::MAX,
+            writer_seq: u64::MAX,
+            per_sample_priorities: Some(column),
+        };
+
+        let project = |series: Vec<SeriesData>| -> Vec<(i64, u64)> {
+            assert_eq!(series.len(), 1, "one series expected");
+            series[0]
+                .samples
+                .iter()
+                .map(|s| (s.ts_ns, s.value.to_bits()))
+                .collect()
+        };
+        let from_run_wide =
+            project(merge_soa_runs(vec![run_wide], usize::MAX, usize::MAX).expect("merge"));
+        let from_per_sample =
+            project(merge_soa_runs(vec![vec![merged]], usize::MAX, usize::MAX).expect("merge"));
+        assert_eq!(from_run_wide, expected_winners());
+        assert_eq!(from_per_sample, expected_winners());
+    }
+
+    /// A per-sample column shorter than the run's samples is a typed error
+    /// before any sample is emitted, never a panic and never a merge over the
+    /// prefix that does line up.
+    #[test]
+    fn short_per_sample_priority_column_is_a_typed_error() {
+        let runs = vec![SeriesRun {
+            timestamps: vec![1, 2, 3],
+            values: vec![1.0, 2.0, 3.0],
+            priorities: RunPriorities::PerSample(vec![
+                SamplePriority {
+                    created_unix_ns: 1,
+                    writer_epoch: 0,
+                    writer_seq: 0,
+                    in_page_index: 0,
+                },
+                SamplePriority {
+                    created_unix_ns: 1,
+                    writer_epoch: 0,
+                    writer_seq: 0,
+                    in_page_index: 1,
+                },
+            ]),
+        }];
+        let mut budget = YieldBudget {
+            yielded: 0,
+            max: usize::MAX,
+        };
+        let mut out = Vec::new();
+        let err = merge_series_runs(&runs, &mut budget, &mut out).expect_err("length mismatch");
+        match err {
+            QueryError::PrioritySampleCountMismatch {
+                priorities,
+                samples,
+            } => {
+                assert_eq!(priorities, 2);
+                assert_eq!(samples, 3);
+            }
+            other => panic!("expected PrioritySampleCountMismatch, got {other:?}"),
+        }
+        assert!(out.is_empty(), "no sample may be emitted before the error");
+    }
+
+    /// A column LONGER than the samples is rejected too: it carries priorities
+    /// for samples that do not exist, so silently ignoring the tail would mean
+    /// merging a run nobody wrote.
+    #[test]
+    fn long_per_sample_priority_column_is_a_typed_error() {
+        let column: Vec<SamplePriority> = (0..3)
+            .map(|i| SamplePriority {
+                created_unix_ns: 1,
+                writer_epoch: 0,
+                writer_seq: 0,
+                in_page_index: i,
+            })
+            .collect();
+        let soa = FetchedSeriesSoa {
+            series_id: SeriesId([3; 16]),
+            labels: labels(&[("__name__", "mismatch")]),
+            timestamps: vec![1, 2],
+            values: vec![1.0, 2.0],
+            created_unix_ns: 5,
+            writer_epoch: 1,
+            writer_seq: 1,
+            per_sample_priorities: Some(column),
+        };
+        let err =
+            merge_soa_runs(vec![vec![soa]], usize::MAX, usize::MAX).expect_err("length mismatch");
+        assert!(matches!(
+            err,
+            QueryError::PrioritySampleCountMismatch {
+                priorities: 3,
+                samples: 2
+            }
+        ));
+    }
 }
 
 /// Histogram counterpart to `merge_tests`: exercises `merge_histogram_series_runs`
@@ -3393,7 +3806,7 @@ mod histogram_merge_tests {
         HistogramSeriesRun {
             timestamps: ts.to_vec(),
             values,
-            prefix: (created, epoch, seq),
+            priorities: RunPriorities::RunWide((created, epoch, seq)),
         }
     }
 
@@ -3526,7 +3939,7 @@ mod histogram_merge_tests {
                     HistogramSeriesRun {
                         timestamps: raw_ts.clone(),
                         values,
-                        prefix: (created, epoch, seq),
+                        priorities: RunPriorities::RunWide((created, epoch, seq)),
                     }
                 })
             })
@@ -3543,6 +3956,22 @@ mod histogram_merge_tests {
     /// [`HistogramSortKey`].
     type OrderKey = (PriorityKey, HistogramSortKey);
 
+    /// The dedup key of the sample at `pos`, restated independently of
+    /// [`RunPriorities::at`] so the oracle below does not inherit a bug from
+    /// the code it checks: a run-wide run's fourth element is array position,
+    /// a per-sample column's is whatever the column says.
+    fn oracle_priority(priorities: &RunPriorities, pos: usize) -> PriorityKey {
+        match priorities {
+            RunPriorities::RunWide((created, epoch, seq)) => (
+                *created,
+                *epoch,
+                *seq,
+                u32::try_from(pos).unwrap_or(u32::MAX),
+            ),
+            RunPriorities::PerSample(column) => column[pos].as_tuple(),
+        }
+    }
+
     /// Linear-scan reference: for each timestamp, keeps the greatest
     /// `(priority, HistogramSortKey)` tuple across every run, mirroring
     /// `merge_tests::oracle`'s differential-testing pattern.
@@ -3550,8 +3979,7 @@ mod histogram_merge_tests {
         let mut best: HashMap<i64, OrderKey> = HashMap::new();
         for run in runs {
             for (pos, (&ts, value)) in run.timestamps.iter().zip(run.values.iter()).enumerate() {
-                let in_page_index = u32::try_from(pos).unwrap_or(u32::MAX);
-                let priority = (run.prefix.0, run.prefix.1, run.prefix.2, in_page_index);
+                let priority = oracle_priority(&run.priorities, pos);
                 let key = histogram_sort_key(value);
                 match best.get(&ts) {
                     Some((cur_priority, cur_key))
@@ -3583,6 +4011,186 @@ mod histogram_merge_tests {
                 want.into_iter().map(|(ts, (_, key))| (ts, key)).collect();
             prop_assert_eq!(got, want_keys);
         }
+    }
+
+    // --- Per-sample dedup priorities (issue #313), histogram path ---
+
+    /// One input run of the histogram fixture: a run-wide provenance triple
+    /// plus that run's `(ts, sum, zero_threshold)` samples in on-disk order.
+    /// `sum` and `zero_threshold` are the two float fields
+    /// [`histogram_sort_key`] compares by bit pattern, so they carry the NaN
+    /// payload and negative-zero cases.
+    struct HistFixtureRun {
+        prefix: (i64, u64, u64),
+        samples: Vec<(i64, Option<f64>, f64)>,
+    }
+
+    /// Histogram counterpart to `tests::overlapping_fixture`: the same
+    /// decision cases (cross-run disagreement at one timestamp, a three-way
+    /// tie broken by the fourth element, equal priorities falling through to
+    /// the structural bit-pattern tie-break, NaN payloads and -0.0, duplicate
+    /// timestamps inside one run).
+    fn hist_fixture() -> Vec<HistFixtureRun> {
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0x7ff8_0000_dead_beef);
+        vec![
+            HistFixtureRun {
+                prefix: (100, 1, 1),
+                samples: vec![
+                    (10, Some(1.0), 0.0),
+                    (20, Some(2.0), 0.0),
+                    (20, Some(nan_a), 0.0),
+                    (30, Some(1.0), -0.0),
+                ],
+            },
+            // Same prefix and same in-run index 0 at ts 10: the key ties, so
+            // the structural key decides, and `None` sorts below `Some`.
+            HistFixtureRun {
+                prefix: (100, 1, 1),
+                samples: vec![(10, None, 0.0)],
+            },
+            HistFixtureRun {
+                prefix: (100, 1, 2),
+                samples: vec![(20, Some(7.0), 0.0)],
+            },
+            HistFixtureRun {
+                prefix: (200, 2, 3),
+                samples: vec![(40, Some(4.0), 0.0)],
+            },
+            HistFixtureRun {
+                prefix: (200, 2, 3),
+                samples: vec![(40, Some(5.0), 0.0), (40, Some(6.0), 0.0)],
+            },
+            HistFixtureRun {
+                prefix: (200, 2, 3),
+                samples: vec![
+                    (35, Some(0.5), 0.0),
+                    (40, Some(nan_b), 0.0),
+                    (40, Some(8.0), 0.0),
+                ],
+            },
+            HistFixtureRun {
+                prefix: (50, 0, 0),
+                samples: vec![(30, Some(f64::from_bits(u64::MAX)), 0.0)],
+            },
+            HistFixtureRun {
+                prefix: (300, 5, 5),
+                samples: vec![(50, Some(nan_a), 0.0), (50, Some(nan_b), 0.0)],
+            },
+        ]
+    }
+
+    fn hist_run_wide_runs(fixture: &[HistFixtureRun]) -> Vec<HistogramSeriesRun> {
+        fixture
+            .iter()
+            .map(|r| HistogramSeriesRun {
+                timestamps: r.samples.iter().map(|(ts, _, _)| *ts).collect(),
+                values: r
+                    .samples
+                    .iter()
+                    .map(|(_, sum, zt)| histogram_value(*sum, *zt))
+                    .collect(),
+                priorities: RunPriorities::RunWide(r.prefix),
+            })
+            .collect()
+    }
+
+    /// The same samples as ONE run whose per-sample priority column repeats
+    /// each original run's triple plus that sample's original in-run index.
+    fn hist_merged_run(fixture: &[HistFixtureRun]) -> HistogramSeriesRun {
+        let mut flat: Vec<(i64, HistogramValue, SamplePriority)> = Vec::new();
+        for r in fixture {
+            for (index, (ts, sum, zt)) in r.samples.iter().enumerate() {
+                flat.push((
+                    *ts,
+                    histogram_value(*sum, *zt),
+                    SamplePriority {
+                        created_unix_ns: r.prefix.0,
+                        writer_epoch: r.prefix.1,
+                        writer_seq: r.prefix.2,
+                        in_page_index: u32::try_from(index).expect("small index"),
+                    },
+                ));
+            }
+        }
+        flat.sort_by_key(|(ts, _, _)| *ts);
+        HistogramSeriesRun {
+            timestamps: flat.iter().map(|(ts, _, _)| *ts).collect(),
+            values: flat.iter().map(|(_, v, _)| v.clone()).collect(),
+            priorities: RunPriorities::PerSample(flat.iter().map(|(_, _, p)| *p).collect()),
+        }
+    }
+
+    /// Merges and projects to `(ts, structural sort key)`: every float field
+    /// compared by bit pattern, never by `==`.
+    fn hist_drain(runs: &[HistogramSeriesRun]) -> Vec<(i64, HistogramSortKey)> {
+        let mut budget = YieldBudget {
+            yielded: 0,
+            max: usize::MAX,
+        };
+        let mut out = Vec::new();
+        merge_histogram_series_runs(runs, &mut budget, &mut out).expect("merge succeeds");
+        out.iter()
+            .map(|s| (s.ts_ns, histogram_sort_key(&s.value)))
+            .collect()
+    }
+
+    /// Histogram counterpart to
+    /// `tests::per_sample_priorities_reproduce_run_wide_merge`.
+    #[test]
+    fn per_sample_priorities_reproduce_run_wide_merge() {
+        let fixture = hist_fixture();
+        let from_run_wide = hist_drain(&hist_run_wide_runs(&fixture));
+        let from_per_sample = hist_drain(&[hist_merged_run(&fixture)]);
+        assert_eq!(from_run_wide, from_per_sample);
+        // Pinned winners, so the two representations cannot agree on a wrong
+        // answer: ts 10 (key ties, `Some` beats `None`), ts 20 (writer_seq),
+        // ts 30 (created_unix_ns beats the louder bit pattern), ts 40
+        // (three-way tie, in-run index 2), ts 50 (index picks the greater NaN
+        // payload).
+        let nan_b = f64::from_bits(0x7ff8_0000_dead_beef);
+        let want = vec![
+            (10, histogram_sort_key(&histogram_value(Some(1.0), 0.0))),
+            (20, histogram_sort_key(&histogram_value(Some(7.0), 0.0))),
+            (30, histogram_sort_key(&histogram_value(Some(1.0), -0.0))),
+            (35, histogram_sort_key(&histogram_value(Some(0.5), 0.0))),
+            (40, histogram_sort_key(&histogram_value(Some(8.0), 0.0))),
+            (50, histogram_sort_key(&histogram_value(Some(nan_b), 0.0))),
+        ];
+        assert_eq!(from_run_wide, want);
+    }
+
+    /// Histogram counterpart to
+    /// `tests::short_per_sample_priority_column_is_a_typed_error`.
+    #[test]
+    fn per_sample_priority_column_length_mismatch_is_a_typed_error() {
+        let runs = vec![HistogramSeriesRun {
+            timestamps: vec![1, 2],
+            values: vec![
+                histogram_value(Some(1.0), 0.0),
+                histogram_value(Some(2.0), 0.0),
+            ],
+            priorities: RunPriorities::PerSample(vec![SamplePriority {
+                created_unix_ns: 1,
+                writer_epoch: 0,
+                writer_seq: 0,
+                in_page_index: 0,
+            }]),
+        }];
+        let mut budget = YieldBudget {
+            yielded: 0,
+            max: usize::MAX,
+        };
+        let mut out = Vec::new();
+        let err = merge_histogram_series_runs(&runs, &mut budget, &mut out).expect_err("mismatch");
+        assert!(matches!(
+            err,
+            QueryError::PrioritySampleCountMismatch {
+                priorities: 1,
+                samples: 2
+            }
+        ));
+        assert!(out.is_empty(), "no sample may be emitted before the error");
     }
 }
 
@@ -3648,6 +4256,7 @@ mod histogram_source_tests {
             created_unix_ns: created,
             writer_epoch: epoch,
             writer_seq: seq,
+            per_sample_priorities: None,
         }
     }
 

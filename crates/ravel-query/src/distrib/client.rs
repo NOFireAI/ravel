@@ -493,6 +493,7 @@ mod tests {
             created_unix_ns: 7,
             writer_epoch: 1,
             writer_seq: 2,
+            per_sample_priorities: None,
         }
     }
 

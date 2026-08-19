@@ -627,6 +627,7 @@ fn worker_runs(tenant_id: &TenantId) -> Vec<FetchedSeriesSoa> {
                 created_unix_ns: 0,
                 writer_epoch: 1,
                 writer_seq: 0,
+                per_sample_priorities: None,
             }
         })
         .collect()

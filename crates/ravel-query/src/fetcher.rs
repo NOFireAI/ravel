@@ -156,6 +156,41 @@ impl From<StoreError> for CacheFetchError {
     }
 }
 
+/// The full four-element dedup key of ONE sample (docs/catalog-and-mvcc.md,
+/// ADR-0010 §5): `(created_unix_ns, writer_epoch, writer_seq, in_page_index)`,
+/// greatest wins.
+///
+/// A run whose samples all came from the same write shares the first three
+/// elements and derives the fourth from array position, which is what every
+/// object in existence carries and what the run-wide provenance fields on
+/// [`FetchedSeries`]/[`FetchedSeriesSoa`]/[`FetchedHistogramSeries`] express.
+/// This type exists for the shape those fields cannot express: a run that
+/// merged several inputs' samples, where each sample keeps the provenance of
+/// the write it came from and array position no longer reconstructs the fourth
+/// element (ADR-0092 "Why 11.46 is not the target", decision 1). Nothing
+/// produces that shape yet; issue #315 makes L1 compaction emit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SamplePriority {
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    pub in_page_index: u32,
+}
+
+impl SamplePriority {
+    /// The key as the plain tuple the merge's comparison uses. Field order
+    /// here IS the comparison order, so the tuple is a reordering-free
+    /// projection.
+    pub fn as_tuple(&self) -> (i64, u64, u64, u32) {
+        (
+            self.created_unix_ns,
+            self.writer_epoch,
+            self.writer_seq,
+            self.in_page_index,
+        )
+    }
+}
+
 /// One matched series' decoded samples plus the provenance fields needed for
 /// cross-segment duplicate-sample resolution (docs/catalog-and-mvcc.md).
 #[derive(Debug, Clone)]
@@ -168,6 +203,13 @@ pub struct FetchedSeries {
     pub created_unix_ns: i64,
     pub writer_epoch: u64,
     pub writer_seq: u64,
+    /// Per-sample dedup keys, parallel to `samples`, for a run that merged
+    /// several writes' samples. `None` (the default and, today, the only shape
+    /// any object produces) means the run-wide fields above plus array
+    /// position give every sample's key. When `Some`, its length must equal
+    /// `samples.len()`; the merge rejects a disagreement as
+    /// `QueryError::PrioritySampleCountMismatch` rather than truncating.
+    pub per_sample_priorities: Option<Vec<SamplePriority>>,
 }
 
 /// SoA counterpart to `FetchedSeries`: timestamps and values as separate
@@ -184,6 +226,10 @@ pub struct FetchedSeriesSoa {
     pub created_unix_ns: i64,
     pub writer_epoch: u64,
     pub writer_seq: u64,
+    /// Per-sample dedup keys, parallel to `timestamps`/`values`; see
+    /// [`FetchedSeries::per_sample_priorities`]. `None` for every run the
+    /// fetcher emits today.
+    pub per_sample_priorities: Option<Vec<SamplePriority>>,
 }
 
 /// Histogram counterpart to `FetchedSeriesSoa`: the decoded
@@ -202,6 +248,10 @@ pub struct FetchedHistogramSeries {
     pub created_unix_ns: i64,
     pub writer_epoch: u64,
     pub writer_seq: u64,
+    /// Per-sample dedup keys, parallel to `timestamps`/`values`; see
+    /// [`FetchedSeries::per_sample_priorities`]. `None` for every run the
+    /// fetcher emits today.
+    pub per_sample_priorities: Option<Vec<SamplePriority>>,
 }
 
 /// Page-kind counters accumulated over one `fetch_soa` call, for downstream
@@ -1862,6 +1912,12 @@ struct RunDecode {
 }
 
 impl RunDecode {
+    // `per_sample_priorities: None` on both conversions is the level-keyed
+    // emission contract above, not a stub: an emission unit is one series' runs
+    // from one L0, or one L1 run, and every sample in it shares the run-wide
+    // provenance the unit carries. A per-sample column only becomes possible
+    // once a run merges several writes' samples (ADR-0092 decision 1, issue
+    // #315).
     fn into_soa(self) -> FetchedSeriesSoa {
         FetchedSeriesSoa {
             series_id: self.series_id,
@@ -1871,6 +1927,7 @@ impl RunDecode {
             created_unix_ns: self.created_unix_ns,
             writer_epoch: self.writer_epoch,
             writer_seq: self.writer_seq,
+            per_sample_priorities: None,
         }
     }
 
@@ -1888,6 +1945,7 @@ impl RunDecode {
             created_unix_ns: self.created_unix_ns,
             writer_epoch: self.writer_epoch,
             writer_seq: self.writer_seq,
+            per_sample_priorities: None,
         }
     }
 }
@@ -1906,6 +1964,7 @@ struct RunHistogramDecode {
 }
 
 impl RunHistogramDecode {
+    // Run-wide provenance only, for the same reason as [`RunDecode::into_soa`].
     fn into_fetched(self) -> FetchedHistogramSeries {
         FetchedHistogramSeries {
             series_id: self.series_id,
@@ -1915,6 +1974,7 @@ impl RunHistogramDecode {
             created_unix_ns: self.created_unix_ns,
             writer_epoch: self.writer_epoch,
             writer_seq: self.writer_seq,
+            per_sample_priorities: None,
         }
     }
 }

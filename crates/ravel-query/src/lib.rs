@@ -23,7 +23,8 @@ pub use config::{
 pub use engine::{Coverage, QueryEngine, QueryStats, snapshot_erasure_predicates};
 pub use error::QueryError;
 pub use fetcher::{
-    CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, SegmentFetcher,
+    CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, SamplePriority,
+    SegmentFetcher,
 };
 pub use log_fetcher::{
     LogFetchError, LogFetchOutput, LogQuery, LogSegmentFetcher, LogSegmentScan, StreamAttrEquals,
