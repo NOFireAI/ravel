@@ -37,13 +37,15 @@ use std::sync::Arc;
 
 use futures::{StreamExt, stream};
 use ravel_catalog::{SegmentRef, Snapshot};
+use ravel_logseg::LogRecord;
 use ravel_promql::LabelMatcher;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::logstream::canonical_attr_bytes;
 use ravel_types::{SeriesId, Signal, TenantHash};
 
 use crate::config::{ByteLimit, EngineConfig};
-use crate::distrib::client::{DistribError, SliceFetcher};
+use crate::distrib::client::{DistribError, SliceFetcher, SliceLogResponse};
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
 use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
@@ -337,6 +339,158 @@ impl Distributed {
 
         Ok(Some((per_slice, stats, Vec::new())))
     }
+
+    /// Partitions the snapshot, dispatches one RLOG-family (Logs, Alerts, Audit)
+    /// slice request per slice, and merges the decoded records into the single
+    /// cross-segment total order a local multi-segment read produces (#284). The
+    /// log sibling of [`fetch`](Self::fetch).
+    ///
+    /// Returns:
+    /// - `Ok(Some(records))` when every slice succeeded: the coordinator-ordered,
+    ///   deduped record set, bit-identical to a local `LogSegmentFetcher` read
+    ///   over the same segments merged under the same rule (see
+    ///   [`merge_log_records`]).
+    /// - `Ok(None)` for whole-query local fallback: a worker reported
+    ///   `Unsupported` (version skew, a worker with no log fetcher wired, matcher
+    ///   pushdown, or a resolve-scope slice).
+    /// - `Err(QueryError::Fetch(Store { NotFound }))` for a `SnapshotInvalidated`
+    ///   slice, so the engine re-resolves and re-dispatches once.
+    /// - `Err(..)` for a terminal slice failure or a re-enforced budget overrun.
+    ///
+    /// This machinery is correct and tested, but no caller in the engine or SQL
+    /// layer dispatches a non-Metrics distributed fetch yet
+    /// (`fetch_samples_and_histograms_maybe_distributed` only ever passes
+    /// `Signal::Metrics`); wiring a real log caller is out of #284's scope.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_logs(
+        &self,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        snapshot: &Snapshot,
+        matchers: &[LabelMatcher],
+        erasure: &[ErasurePredicate],
+        accounting: &QueryAccounting,
+        config: &EngineConfig,
+        deadline_unix_ns: i64,
+    ) -> Result<Option<Vec<LogRecord>>, QueryError> {
+        let slices = partition_snapshot(snapshot, self.thresholds.max_parallel_slices);
+        if slices.is_empty() {
+            // An empty snapshot merges to an empty record set identically whether
+            // local or distributed.
+            return Ok(Some(Vec::new()));
+        }
+
+        let encoded_matchers = codec::encode_matchers(matchers);
+        let encoded_erasure = codec::encode_erasure(erasure);
+        let budgets = encode_budgets(config);
+        let tenant_bytes = tenant_hash.0.to_vec();
+        let signal_disc = codec::signal_to_u32(signal);
+        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
+
+        let concurrency = self.thresholds.max_parallel_slices.max(1);
+        let mut stream = stream::iter(slices)
+            .map(|slice| {
+                let (window_start_ns, window_end_ns) = slice_event_window(&slice.segments);
+                let request = pb::FetchRequest {
+                    protocol_version: codec::PROTOCOL_VERSION,
+                    query_id: query_id.to_vec(),
+                    tenant_hash: tenant_bytes.clone(),
+                    signal: signal_disc,
+                    scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+                        segments: slice
+                            .segments
+                            .iter()
+                            .map(codec::encode_segment_identity)
+                            .collect(),
+                    })),
+                    matchers: encoded_matchers.clone(),
+                    window_start_ns,
+                    window_end_ns,
+                    budgets: Some(budgets),
+                    deadline_unix_ns,
+                    erasure: encoded_erasure.clone(),
+                    trace_context: String::new(),
+                    fragment_capability: Vec::new(),
+                };
+                let fetcher = Arc::clone(&self.fetcher);
+                async move { fetcher.fetch_logs(request).await }
+            })
+            .buffer_unordered(concurrency);
+
+        // Collect each slice's records into a flat per-slice pool, folding its
+        // accounting into the query's aggregate and re-enforcing the
+        // bytes-scanned budget over the running total, exactly as the metrics
+        // path does. Precedence on soft outcomes matches `fetch`: a later hard
+        // error dominates an invalidation, which dominates an Unsupported
+        // fallback.
+        let mut per_slice: Vec<Vec<LogRecord>> = Vec::new();
+        let mut running = QueryAccountingSnapshot::default();
+        let mut invalidated = false;
+        let mut unsupported = false;
+
+        while let Some(result) = stream.next().await {
+            let response = result.map_err(distrib_error)?;
+            match response.status {
+                pb::status::Code::Ok => {
+                    fold_log_slice(accounting, &mut running, &response);
+                    if let Some(err) =
+                        bytes_scanned_exceeded(running.total_s3_bytes(), config.max_bytes_scanned)
+                    {
+                        return Err(err);
+                    }
+                    per_slice.push(response.records);
+                }
+                pb::status::Code::SnapshotInvalidated => invalidated = true,
+                pb::status::Code::Unsupported => {
+                    fold_log_slice(accounting, &mut running, &response);
+                    unsupported = true;
+                }
+                pb::status::Code::BudgetExceeded => {
+                    fold_log_slice(accounting, &mut running, &response);
+                    return Err(bytes_scanned_exceeded(
+                        running.total_s3_bytes(),
+                        config.max_bytes_scanned,
+                    )
+                    .unwrap_or_else(|| QueryError::Distrib {
+                        reason: format!("slice tripped its budget: {}", response.status_message),
+                    }));
+                }
+                pb::status::Code::Corrupt => {
+                    return Err(QueryError::Distrib {
+                        reason: format!(
+                            "slice reported a corrupt segment: {}",
+                            response.status_message
+                        ),
+                    });
+                }
+                pb::status::Code::Unavailable => {
+                    return Err(QueryError::Distrib {
+                        reason: format!(
+                            "slice unavailable after re-dispatch and local execution: {}",
+                            response.status_message
+                        ),
+                    });
+                }
+                other => {
+                    return Err(QueryError::Distrib {
+                        reason: format!("slice returned {other:?}: {}", response.status_message),
+                    });
+                }
+            }
+        }
+
+        if invalidated {
+            return Err(QueryError::Fetch(FetchError::Store {
+                key: "distributed-slice".to_string(),
+                source: ravel_object_store::StoreError::NotFound,
+            }));
+        }
+        if unsupported {
+            return Ok(None);
+        }
+
+        Ok(Some(merge_log_records(per_slice)))
+    }
 }
 
 /// Folds one OK/Unsupported slice's reported cost into both the query's live
@@ -358,6 +512,121 @@ fn fold_slice(
     stats.raw_f64_bytes = stats
         .raw_f64_bytes
         .saturating_add(response.stats.raw_f64_bytes);
+}
+
+/// Folds one RLOG-family slice's accounting into the query's live handle and the
+/// coordinator's running snapshot (the basis for the incremental bytes-scanned
+/// check). The log sibling of [`fold_slice`]; a log slice carries no `FetchStats`
+/// page counters (a metric-path concept), so there is none to sum.
+fn fold_log_slice(
+    live: &QueryAccounting,
+    running: &mut QueryAccountingSnapshot,
+    response: &SliceLogResponse,
+) {
+    live.merge_snapshot(&response.accounting);
+    *running = running.saturating_merge(&response.accounting);
+}
+
+/// The stated cross-segment total order and dedup rule for RLOG records, and the
+/// coordinator merge that reproduces it (#284, ADR-0071 amendment decision 4).
+///
+/// # The invariant this reproduces
+///
+/// A distributed Logs/Alerts/Audit fetch must be bit-identical to reading every
+/// pinned segment locally with `LogSegmentFetcher` and combining the records
+/// under one defined total order. Because ADR-0052 online resharding routes a
+/// single stream to different shard indices across generations, a stream's
+/// segments can land in different slices; the merge is therefore defined purely
+/// on record identity and this total order, never on slice or shard arrival
+/// order (mirroring the metrics lane's `merge_soa_runs`, which is order-
+/// independent over the flat run pool).
+///
+/// The **total order** over records is ascending, lexicographic, over the whole
+/// record content in a fixed field sequence:
+///
+/// `(ts_ns, stream_id, stream_attrs, observed_ts_ns, severity_num,
+///   severity_text, body, trace_id, span_id, flags, attrs)`
+///
+/// where `attrs` is compared by the concatenation of each `(key, value)` pair's
+/// frozen `canonical_attr_bytes` encoding **in the record's own attribute
+/// order** (so `f64` values compare by bit pattern, preserving NaN/-0.0, and two
+/// records differing only in attribute order are ordered, not conflated). Every
+/// field participates, so the key is a total order: two records with an equal
+/// key are byte-identical.
+///
+/// The **dedup / tie-break rule**: records with an equal key are exact
+/// duplicates (identical in every field, e.g. one record copied verbatim into
+/// two overlapping segments), and the merge keeps one. This is the log analog of
+/// the metrics `(series_id, ts)` dedup: the identity is the full record because
+/// an RLOG record carries no separate id, and the tie-break is total because the
+/// key already orders every field. Distinct records never share a key, so dedup
+/// can never drop a genuine record.
+///
+/// The naive alternative -- concatenating each slice's records in slice arrival
+/// order -- is wrong precisely when one stream's segments straddle two slices:
+/// it emits one slice's records (some with large `ts`) before another slice's
+/// (some with small `ts`), an order the local read never produces. The
+/// `sort_by` below is the line that fixes it; replacing this merge with a
+/// slice-order concatenation fails the reshard-straddling differential test.
+///
+/// The merge is order-independent over the flat pool: sorting the flattened
+/// multiset of records is a pure function of that multiset, so the per-slice
+/// grouping (which differs from the local per-segment grouping) never changes
+/// the result -- exactly the property the differential test exercises.
+pub(crate) fn merge_log_records(per_slice: Vec<Vec<LogRecord>>) -> Vec<LogRecord> {
+    let mut keyed: Vec<(LogOrderKey, LogRecord)> = per_slice
+        .into_iter()
+        .flatten()
+        .map(|record| (log_record_order_key(&record), record))
+        .collect();
+    // A stable sort on the precomputed full-content key; equal-key records are
+    // byte-identical, so which of a duplicate run survives `dedup_by` is
+    // immaterial.
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.dedup_by(|a, b| a.0 == b.0);
+    keyed.into_iter().map(|(_, record)| record).collect()
+}
+
+/// The total-order key for one RLOG record (see [`merge_log_records`]). A tuple
+/// so `Ord` derives structurally; the trailing `Vec<u8>` is the order-preserving
+/// canonical encoding of the record's attributes.
+type LogOrderKey = (
+    i64,
+    [u8; 16],
+    Vec<u8>,
+    i64,
+    u8,
+    String,
+    String,
+    Option<[u8; 16]>,
+    Option<[u8; 8]>,
+    u32,
+    Vec<u8>,
+);
+
+fn log_record_order_key(record: &LogRecord) -> LogOrderKey {
+    // Encode each attribute pair with the frozen canonical grammar and
+    // concatenate in the record's own order. Each single-entry encoding is
+    // self-delimiting (leading count 1, then `len(key) key encode_value`), so
+    // the concatenation is injective and order-preserving, and `f64` values are
+    // compared by `to_bits` (NaN payloads and -0.0 significant).
+    let mut attrs_key = Vec::new();
+    for pair in &record.attrs {
+        attrs_key.extend_from_slice(&canonical_attr_bytes(std::slice::from_ref(pair)));
+    }
+    (
+        record.ts_ns,
+        record.stream_id.0,
+        record.stream_attrs.clone(),
+        record.observed_ts_ns,
+        record.severity_num,
+        record.severity_text.clone(),
+        record.body.clone(),
+        record.trace_id,
+        record.span_id,
+        record.flags,
+        attrs_key,
+    )
 }
 
 /// Maps a per-slice `Budgets` share from the engine config. `Unlimited` bytes
