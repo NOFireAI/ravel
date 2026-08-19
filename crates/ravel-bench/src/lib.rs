@@ -1,6 +1,7 @@
 //! Benchmark harness for Ravel. Report-only: this crate never changes library
 //! behavior, it only measures it.
 
+pub mod bench_env;
 pub mod codecs;
 pub mod concurrent;
 pub mod distrib_crossover;

@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
+ravel-codec = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-ingest = { workspace = true }
@@ -140,6 +141,16 @@ bench = false
 [[bin]]
 name = "histogram_size"
 path = "src/bin/histogram_size.rs"
+bench = false
+
+[[bin]]
+name = "codec_bakeoff"
+path = "src/bin/codec_bakeoff.rs"
+bench = false
+
+[[bin]]
+name = "ts_bakeoff"
+path = "src/bin/ts_bakeoff.rs"
 bench = false
 
 [[bin]]

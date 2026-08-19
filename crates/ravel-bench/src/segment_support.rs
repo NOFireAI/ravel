@@ -15,9 +15,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_segment::{
-    CompactionMetaV4, Footer, IngestBounds, ReaderLimits, RunInputV4, RunValuePageV4,
+    CompactionMetaV4, Footer, IngestBounds, ReaderLimits, RunEntry, RunInputV4, RunValuePageV4,
     SegmentIdentity, SegmentWriter, SeriesEntry, SeriesEntryV4, SeriesInputV3, SeriesInputV4,
-    SeriesValues, WrittenSegment, decode_catalog_v5, open_from_full,
+    SeriesValues, WrittenSegment, decode_catalog_v5, decode_run_pages_soa, encode_run_v4,
+    open_from_full,
 };
 use ravel_types::{LabelSet, Sample, SeriesId};
 
@@ -196,6 +197,117 @@ pub fn decode_matching_entries(
         .map(fold_entry)
         .collect();
     (loc.footer, folded)
+}
+
+// --- production single-run page access for the codec bake-offs ----------
+//
+// The value and timestamp bake-offs (`src/bin/codec_bakeoff.rs`,
+// `src/bin/ts_bakeoff.rs`) need the *production* encoding of one page, reached
+// through the public API rather than reimplemented. `encode_run_v4` is the only
+// public entry that frames a real RSEG run (a 6-byte-header TS page under the
+// TS_DELTA_VARINT + 64-byte-floor-LZ4 rule, and a VAL page under the
+// Gorilla/raw-fallback rule), and `decode_run_pages_soa` is its inverse. Both
+// frame a whole run, so a value measurement carries a fixed TS-framing cost the
+// payload-only challengers do not; the bins state this in their output.
+
+/// Fixed synthetic timestamp base and 15 s step for a value-codec run. A value
+/// codec only cares about the value payload, but the production writer frames a
+/// whole run, so it is handed regular millisecond-epoch timestamps.
+const BAKEOFF_TS_START_NS: i64 = 1_700_000_000_000_000_000;
+const BAKEOFF_TS_STEP_NS: i64 = 15_000_000_000;
+
+/// A fixed series id for bake-off runs. Any value works: the page crc binds
+/// `series_id || enc || comp || payload`, and encode and decode here use the
+/// same id, so verification passes.
+fn bakeoff_series_id() -> SeriesId {
+    SeriesId([7u8; 16])
+}
+
+/// One scalar run framed through the production writer ([`encode_run_v4`]) over
+/// `values` with synthetic regular timestamps. The value bake-off reads
+/// [`scalar_val_page`] off the result; the timestamps exist only because the
+/// run frames a TS page too.
+pub fn production_scalar_run(values: &[f64]) -> RunInputV4 {
+    let samples: Vec<Sample> = values
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| Sample {
+            ts_ns: BAKEOFF_TS_START_NS + i as i64 * BAKEOFF_TS_STEP_NS,
+            value,
+        })
+        .collect();
+    encode_run_v4(
+        &bakeoff_series_id(),
+        0,
+        0,
+        0,
+        &SeriesValues::Scalar(samples),
+    )
+    .expect("encode scalar run through production writer")
+}
+
+/// The framed VAL page of a scalar run: byte 0 is the enc tag (16 Gorilla,
+/// 17 raw f64), byte 1 the comp tag, bytes 2..6 the crc, bytes 6.. the payload.
+pub fn scalar_val_page(run: &RunInputV4) -> &[u8] {
+    let RunValuePageV4::Scalar(bytes) = &run.value_page else {
+        panic!("production_scalar_run always frames a scalar value page");
+    };
+    bytes
+}
+
+/// One scalar run framed through the production writer over `ts_ns` (values are
+/// irrelevant to the TS page, so they are all zero). The timestamp bake-off
+/// reads `ts_page` off the result: a real 6-byte-header TS_DELTA_VARINT page,
+/// LZ4-compressed exactly when the writer's 64-byte floor rule fires.
+pub fn production_ts_run(ts_ns: &[i64]) -> RunInputV4 {
+    let samples: Vec<Sample> = ts_ns
+        .iter()
+        .map(|&ts_ns| Sample { ts_ns, value: 0.0 })
+        .collect();
+    encode_run_v4(
+        &bakeoff_series_id(),
+        0,
+        0,
+        0,
+        &SeriesValues::Scalar(samples),
+    )
+    .expect("encode scalar run through production writer")
+}
+
+/// Decodes a production scalar run's TS and VAL pages back to `(timestamps,
+/// values)` through [`decode_run_pages_soa`], the inverse of
+/// [`production_scalar_run`]. Used to time the production decode path and to
+/// assert the production round trip is bit-exact.
+pub fn decode_scalar_run(run: &RunInputV4) -> (Vec<i64>, Vec<f64>) {
+    let entry = RunEntry {
+        created_unix_ns: run.created_unix_ns,
+        writer_epoch: run.writer_epoch,
+        writer_seq: run.writer_seq,
+        sample_count: run.sample_count,
+        min_ts_ns: run.min_ts_ns,
+        max_ts_ns: run.max_ts_ns,
+        ts_page: (0, 0),
+        val_page: (0, 0),
+        hist_page: (0, 0),
+    };
+    let RunValuePageV4::Scalar(val_bytes) = &run.value_page else {
+        panic!("production_scalar_run always frames a scalar value page");
+    };
+    let mut scratch = Vec::new();
+    let mut timestamps = Vec::new();
+    let mut values = Vec::new();
+    decode_run_pages_soa(
+        &bakeoff_series_id(),
+        &entry,
+        &run.ts_page,
+        val_bytes,
+        ReaderLimits::default(),
+        &mut scratch,
+        &mut timestamps,
+        &mut values,
+    )
+    .expect("decode scalar run");
+    (timestamps, values)
 }
 
 /// Raw VAL page bytes for one series entry (header + payload, undecoded):

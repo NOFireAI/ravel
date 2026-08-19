@@ -4312,6 +4312,7 @@ dependencies = [
  "prost",
  "rand 0.10.2",
  "ravel-catalog",
+ "ravel-codec",
  "ravel-commit",
  "ravel-ingest",
  "ravel-maintain",
