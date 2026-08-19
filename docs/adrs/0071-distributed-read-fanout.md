@@ -1089,3 +1089,300 @@ dedicated clones; only the merges serialize.
 - No persistent format, protocol version, proto schema, or durable state
   changes anywhere in this amendment. `queryfrag` is untouched; all new
   state is config-time or in-memory.
+
+## Amendment: log and span distributed fan-out
+
+Status: Proposed. Amends the Decision, Architecture, and Failure semantics
+sections above to extend fan-out from Metrics to Logs and Spans. Tracked
+by #63.
+
+### Context
+
+Fan-out today resolves and distributes metrics only. The fragment
+service's `run_slice_inner` (`crates/ravel-query/src/distrib/service.rs:145-152`)
+inspects the request's `signal` field and, for any known non-Metrics
+value, returns `Unsupported` so the coordinator falls back to local
+execution. Half the telemetry surface (logs, spans, and the alerts/audit
+signals layered over RLOG) therefore never leaves single-process query
+execution, no matter how large the tenant.
+
+Re-reading the surface this amendment touches, more of it already
+generalizes than the epic's original risk estimate assumed:
+
+- `Signal` (`crates/ravel-types/src/lib.rs:21-28`) already has `Logs` and
+  `Spans` variants. Nothing new to add there.
+- `queryfrag.proto`'s `FetchRequest` (`proto/ravel/queryfrag.proto:24-54`)
+  already carries `signal` as a plain discriminant alongside a
+  signal-agnostic shape: matchers, an event-time window, budgets, a
+  deadline, and `repeated ErasurePredicate erasure`. None of that needed
+  a metrics-specific field to begin with.
+- `partition_snapshot` (`crates/ravel-query/src/distrib/partition.rs:102-140`)
+  already guarantees a shard is never split across slices
+  (`a_shard_is_never_split_across_slices`, partition.rs:225-251). This is a
+  load-balance and determinism rule, NOT a stream/trace-atomicity proof: it
+  groups by the bare shard index (partition.rs:112-114), and under ADR-0052
+  online resharding the same `stream_id`/`trace_id` routes to different
+  shard indices in different generations (`shard_for_log` /
+  `shard_for_span` take a generation-versioned `shard_count`; existing data
+  is never moved, docs/adrs/0052-online-resharding.md). A query window
+  spanning a reshard activation can see one stream's or one trace's
+  segments under two shard indices, landed in two different slices. The
+  merge and erasure decisions below are therefore designed to be correct
+  without any stream-to-slice or trace-to-slice atomicity, which is exactly
+  how the metrics lane already works: `merge_soa_runs` is an
+  order-independent k-way merge with a provenance tie-break
+  (`dedup_tiebreak_chain_survives_the_wire`, distrib/tests.rs:546-600),
+  and the SQL lane's distributed plan is
+  `RsegDedupExec -> SortPreservingMergeExec -> DistributedScanExec`, tested
+  against a `(series_id, ts)` deliberately shared by two shards' slices
+  (`crates/ravel-sql/tests/flight_distributed.rs` module doc).
+- Every RLOG segment is self-contained for the attribute view: the
+  stream's `stream_attrs` blob is embedded in every segment that carries
+  that stream's records, so `RlogReader`'s resource/scope-vs-record merged
+  view is derivable from one segment alone; RSPAN likewise rebuilds a
+  span's merged `attrs` per segment. This self-containment, not shard
+  atomicity, is what makes worker-local decode and worker-local erasure
+  correct.
+- ADR-0071's fan-out has two lanes: the queryfrag fragment service
+  (`ravel-query/src/distrib`) and the SQL lane's slice tickets redeemed
+  through Flight `do_get` (`plan_distributed_slices` /
+  `DistributedScanExec`, proven in
+  `crates/ravel-sql/tests/flight_distributed.rs`). Log and trace *search*
+  is served by the SQL surface (the `logs`/`alerts`/`audit`/`spans`
+  tables); extending only queryfrag would leave #63's headline use case
+  single-process.
+- `Federation` (`crates/ravel-query/src/distrib/federation.rs`) operates
+  over the abstract `SliceFetcher` trait and the `skip_unavailable`/
+  `partial` contract at the transport layer; it carries no metrics-typed
+  state itself.
+- `snapshot_pending_erasure_predicates` (`crates/ravel-query/src/erasure.rs:335-348`)
+  builds `ErasurePredicate`s from `Snapshot.pending_erasure`, which is
+  already signal-agnostic.
+- ADR-0071's own Consequences section already states the queryfrag proto
+  is "a versioned transient wire contract," not a frozen persistent
+  format. Extending it is not a format-change-procedure event.
+
+What is genuinely metrics-shaped and needs new code:
+
+1. `run_slice_inner`'s signal check itself — today a blanket rejection,
+   needs to become a per-signal dispatch.
+2. `FetchResponse`'s frame oneof (`proto/ravel/queryfrag.proto:133-139`:
+   `SeriesFrame` / `HistogramFrame` / `Summary`) — additive new variants
+   for a log-record frame and a span frame.
+3. `SeriesFetchService` and its `SegmentResolver`/`SegmentFetcher` pair
+   (`crates/ravel-query/src/distrib/service.rs:87-126`) are typed around
+   metrics segment fetch. Logs and spans need their own fetch path
+   reusing the same fragment listener and per-tenant capability
+   machinery (the prior amendment above), not a new listener. Logs reuse
+   `LogSegmentFetcher` (already in ravel-query). Spans have NO fetch
+   surface in ravel-query at all today: `SpanSegmentFetcher` lives in
+   `crates/ravel-sql/src/spans_fetcher.rs`, deliberately (its module doc:
+   "until a broader span query path earns a home in ravel-query"), and
+   ravel-sql depends on ravel-query, so the span worker path includes
+   promoting that fetcher (or an equivalent) into ravel-query. This is
+   real scope inside T3, not a footnote.
+4. The coordinator-side merge. `FetchedTriple`
+   (`crates/ravel-query/src/distrib/mod.rs:58-62`) and `merge_soa_runs`
+   are SoA/metrics-shaped. RLOG already has the real per-signal record
+   semantics this must match: the resource-vs-per-record attribute
+   merged view proven in `crates/ravel-logseg/src/reader.rs` (e.g.
+   `merged_view_prune_returns_every_match_and_skips_nonmatching_blocks`,
+   reader.rs:1722-1766). Workers ship that merged view (it is
+   per-segment derivable); the coordinator's job is ordering and dedup
+   only, never attribute merging, and never a reimplementation that
+   happens to look similar.
+
+### Decision
+
+1. Extend `run_slice_inner` to dispatch the RLOG family (Logs, Alerts,
+   Audit) and Spans to their own fetch-and-encode paths instead of the
+   blanket `Unsupported`. #63's scope is the log-family AND spans;
+   Alerts and Audit ride the identical `LogSegmentFetcher` funnel the
+   `logs` path uses (`alerts_scan.rs`/`audit_scan.rs` already prove
+   this), so excluding them would be a scope cut against the epic for
+   near-zero savings. Profiles stay rejected as today.
+2. Add `LogRecordFrame` and `SpanFrame` to `FetchResponse`'s oneof.
+   Additive, no `protocol_version` bump. Skew is governed by the signal
+   gate, not the version field: an old worker already decodes
+   `signal=Logs`/`Spans` (`signal_from_u32`, distrib/codec.rs:223-233)
+   and returns `Unsupported` (service.rs:143-148), which the coordinator
+   maps to whole-query silent local fallback (`Ok(None)`,
+   distrib/mod.rs:118-121). The new frame variants can never reach an
+   old coordinator, because an old coordinator never dispatches these
+   signals. That fallback direction has never been exercised over the
+   wire (today's coordinator refuses non-Metrics before dispatch), so
+   T4 includes an explicit skew test: new coordinator against a worker
+   pinned to old behavior asserts silent whole-query local fallback and
+   a correct result, plus the federation analog under
+   `skip_unavailable`/partial marking.
+3. Reuse the fragment listener and per-tenant/per-query capability
+   token as-is (both are already signal-parameterized: the capability
+   claim set embeds `signal`, per `queryfrag.proto:49-54`). No new
+   listener, no new credential shape.
+4. The coordinator merge for each signal must reproduce the
+   corresponding single-process reader's output bit for bit, and must be
+   correct WITHOUT assuming a stream or trace maps to one slice
+   (ADR-0052 resharding breaks that across generations; see Context).
+   Two facts carry the proof instead:
+   - Segments are self-contained: a worker emits the exact per-record
+     merged attribute view `RlogReader` produces locally, because the
+     `stream_attrs` blob lives in every segment that carries the
+     stream. The coordinator never re-derives attribute merging.
+   - The merge is defined on record identity and the local path's total
+     order, never on slice or shard arrival order: the coordinator
+     k-way merges worker streams under the same sort key and the same
+     dedup/tie-break rule the local multi-segment path uses, exactly as
+     the metrics lane already does (`merge_soa_runs` keyed on
+     `(series_id, ts)` with the provenance tie-break; SQL lane's
+     `RsegDedupExec -> SortPreservingMergeExec`). Shard-major slicing
+     remains a balance/determinism device only. T2 must first pin down
+     the local total order and cross-segment dedup rule for RLOG
+     records (the sort key and tie-break for records with equal `ts`)
+     as a stated invariant, because "bit for bit identical" is only
+     testable against a defined order.
+   For spans the same shape holds: within one shard generation a
+   trace's spans land on one shard (`shard_for_span`,
+   `one_trace_lands_in_exactly_one_shard`,
+   crates/ravel-ingest/src/span_router.rs:464-507), but
+   `SpanIngestRouter` embeds the same `GenerationSwitch` (span_router.rs:91),
+   so a trace whose spans are written on both sides of a reshard
+   activation straddles shards. Span merge is likewise keyed on
+   `(trace_id, span_id, ...)`, never on slice order.
+5. Erasure exclusion at the correct attribute view: correct because
+   each segment is self-contained, not because of slice atomicity. The
+   worker applies the shipped predicates per segment through the same
+   funnel the local path uses (`LogSegmentFetcher::fetch`'s retain
+   step; resource-attribute-row exclusion already proven at
+   crates/ravel-sql/src/logs_provider.rs:1034-1080 and
+   crates/ravel-query/tests/log_fetcher.rs:802-887), so a
+   resource-attribute-only exclusion evaluates identically wherever the
+   segment is read, including when one stream's segments straddle two
+   slices. The acceptance test is a property test that erases by a
+   resource-only key against a distributed slice set and a local read
+   of the same segments and diffs the two, with at least one generated
+   case placing one stream's segments in two slices (simulating a
+   reshard-straddling window).
+6. Federation composes once the per-signal `SliceFetcher` exists; no new
+   code expected at the `Federation`/`RemoteCluster` layer itself. Task
+   list still includes an explicit federation test per signal, because
+   "should compose" is not "proven to compose" (see #82's evidence-
+   integrity rule).
+7. Both fan-out lanes are in scope. queryfrag carries the engine-level
+   fetch; the SQL lane's slice tickets / `DistributedScanExec` carry
+   the `logs`/`alerts`/`audit`/`spans` tables where log and trace
+   search actually runs. The rules above (order-independent merge on
+   record identity, per-segment worker-side erasure, skew via
+   `Unsupported` fallback) bind both lanes; the SQL lane gets its own
+   per-signal scan/merge/dedup tasks (T6). Distributing only queryfrag
+   would leave #63's headline use case single-process.
+8. T6 depends on ADR-0087 (streaming, column-projecting logs SQL scan;
+   Proposed as of this writing, landed alongside this amendment's
+   research). ADR-0087 drops `logs_scan.rs`'s leaf-level global `ts`
+   ordering guarantee in favor of `RlogReader`'s native per-block
+   `(stream_ref, ts)` order, with `ORDER BY ts` satisfied by an explicit
+   sort operator above the scan rather than a leaf-level promise. That
+   is the same shape T6's distributed scan needs (no global leaf order
+   to reproduce across slices, only the sort-preserving-merge pattern
+   the metrics lane already proves). Sequence T6 after ADR-0087 lands:
+   building it against today's collect-and-globally-sort contract would
+   be discarded work the moment ADR-0087 merges, and building it
+   correctly requires ADR-0087's decision already in place.
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph Coordinator
+        Q[Query: Logs or Spans signal] --> P[partition_snapshot\nshard-major, never splits a shard]
+        P --> S1[Slice 1: shard 0,2]
+        P --> S2[Slice 2: shard 1,3]
+        S1 --> F1[FetchRequest\nsignal=Logs, erasure, budgets]
+        S2 --> F2[FetchRequest\nsignal=Logs, erasure, budgets]
+        M[Coordinator merge:\nk-way merge + dedup on record identity\nsame total order as the local read] 
+    end
+    subgraph Worker1[Worker A]
+        F1 --> W1[run_slice_inner\ndispatch on signal]
+        W1 --> RL1[RlogReader over pinned segments]
+        RL1 --> LF1[LogRecordFrame stream]
+    end
+    subgraph Worker2[Worker B]
+        F2 --> W2[run_slice_inner\ndispatch on signal]
+        W2 --> RL2[RlogReader over pinned segments]
+        RL2 --> LF2[LogRecordFrame stream]
+    end
+    LF1 --> M
+    LF2 --> M
+    M --> R[Result: bit-identical to\nsingle-process RlogReader\nover the same segments]
+```
+
+### Failure semantics
+
+Unchanged from the base ADR: an unknown discriminant is `BadData`,
+version skew triggers the coordinator's silent local fallback, and a
+worker declining a signal it does not yet implement (Profiles, or any
+of these signals on a not-yet-upgraded worker) returns `Unsupported`
+exactly as all non-Metrics signals do today. The load-bearing skew
+direction is a NEW coordinator against an OLD worker: it degrades to
+whole-query local execution via `Unsupported`, never a wrong or partial
+result. An old coordinator never emits the new signals, so the new
+frame variants are never on the wire toward one.
+
+### Rejected alternatives
+
+- **A type-erased `FetchResponse` payload (opaque bytes keyed by
+  signal)** instead of new oneof frame variants. Rejected: this throws
+  away the wire-level type safety and the `protocol_version` skew
+  contract already gives every existing frame; a worker or coordinator
+  on mismatched versions would need to speculatively decode instead of
+  cleanly falling back.
+- **A dedicated fragment service per signal** instead of extending
+  `queryfrag`. Rejected: doubles the operational surface (credential
+  rotation, version-skew awareness, the fragment listener itself) the
+  base ADR already built and the per-tenant capability amendment
+  already hardened, for signals that share every concern except the
+  payload shape.
+- **Re-deriving log/span merge semantics at the coordinator** instead of
+  shipping the per-segment merged view from workers (segments are
+  self-contained; the coordinator only orders and dedups). Rejected:
+  RLOG's resource-vs-per-record attribute merge is subtle enough that
+  it already needed five targeted tests to get right once
+  (`reader.rs`); a second, coordinator-side reimplementation is exactly
+  the kind of "looks right, silently diverges" risk the
+  differential-test culture in this repo exists to catch (see #82).
+- **Making the stream/trace-to-slice atomicity invariant actually true**
+  (partition by `(generation, shard)` and merge a stream's groups
+  across generations into one slice) so the coordinator could
+  concatenate in slice order without a dedup/ordering rule. Rejected:
+  `SegmentRef` carries no generation field, the catalog would need
+  per-stream segment metadata it does not have, and the invariant would
+  still be load-bearing for correctness in a way no other lane needs —
+  the metrics lane already proves the order-independent dedup-merge
+  works and stays correct under ADR-0052 without any partitioning
+  precondition. Balance stays shard-major; correctness must not depend
+  on it.
+
+### Consequences
+
+- No storage format, catalog format, key layout, or GC rule changes.
+  `queryfrag.proto` gains additive oneof members; existing frames are
+  untouched.
+- The differential invariant (distributed equals local, bit for bit)
+  extends to the RLOG family and Spans, with its own acceptance test per
+  signal per the ADR's existing pattern
+  (`assert_distributed_matches_local`, `distrib/tests.rs:273-330`), and
+  it must hold with no stream/trace-to-slice atomicity assumption
+  (ADR-0052).
+- Profiles remain single-process only until a future amendment; nothing
+  in this change forecloses extending them the same way.
+
+### Task table (feeds Stage 2 decomposition)
+
+| ID | crates | predicted files | deps | risk |
+|---|---|---|---|---|
+| T1 | ravel-query | distrib/service.rs, distrib/mod.rs, proto/ravel/queryfrag.proto | - | medium |
+| T2 | ravel-query, ravel-logseg | distrib/service.rs (RLOG-family fetch path over LogSegmentFetcher), distrib/mod.rs (log merge: stated total order + dedup rule) | T1 | high (merge correctness) |
+| T3 | ravel-query, ravel-rspan, ravel-sql | promote a span fetch surface from ravel-sql/src/spans_fetcher.rs into ravel-query, distrib/service.rs (span fetch path), span merge | T1 | high (merge correctness + fetcher promotion) |
+| T4 | ravel-query | distrib/tests.rs (differential tests per signal incl. a reshard-straddled stream/trace split across slices; erasure property test; old-worker/new-coordinator skew test) | T2, T3 | medium |
+| T5 | ravel-query | federation.rs (per-signal federation test, incl. old-remote Unsupported under skip_unavailable) | T2, T3 | low |
+| T6 | ravel-sql | SQL-lane per-signal distributed scan: slice tickets + DistributedScanExec for logs/alerts/audit/spans, per-signal dedup/merge execs, flight_distributed.rs coverage | T1, ADR-0087 landed | high (same merge-correctness class as T2/T3) |
+| T7 | docs | docs/query-engine.md, docs/adrs/0071-distributed-read-fanout.md currency | T4, T5, T6 | low |
