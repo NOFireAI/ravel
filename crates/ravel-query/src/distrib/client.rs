@@ -7,7 +7,9 @@
 //! [`SliceResponse`] shape, so the merge cannot tell a remote slice from a
 //! local one.
 
+use ravel_logseg::LogRecord;
 use ravel_proto::queryfrag::v1 as pb;
+use ravel_types::accounting::QueryAccountingSnapshot;
 use tonic::transport::Channel;
 
 use crate::distrib::codec::{self, CodecError};
@@ -86,12 +88,70 @@ pub struct SliceResponse {
     pub status_message: String,
 }
 
+/// One RLOG-family slice's fully-decoded response (Logs, Alerts, Audit). The
+/// log sibling of [`SliceResponse`]: `records` carries the worker's decoded
+/// per-segment merged view, post-erasure, in the worker's local scan order (the
+/// coordinator re-orders and dedups them, so this order is not load-bearing).
+/// Only meaningful when `status` is `Ok`.
+#[derive(Debug)]
+pub struct SliceLogResponse {
+    /// Decoded RLOG records, each carrying its full per-segment merged view.
+    pub records: Vec<LogRecord>,
+    /// The worker's per-slice cost accounting.
+    pub accounting: QueryAccountingSnapshot,
+    /// The worker's per-slice `FetchStats` page counters.
+    pub stats: FetchStats,
+    /// Records the worker reported returning (carried in the summary's
+    /// `series_returned` field, reused for the record count on this signal).
+    pub records_returned: u64,
+    /// The worker's terminal typed status.
+    pub status: pb::status::Code,
+    /// The status' human-readable detail (empty for `Ok`).
+    pub status_message: String,
+}
+
+impl SliceLogResponse {
+    /// A synthetic `Unsupported` response carrying no records, for a
+    /// [`SliceFetcher`] that has not wired the log path. The coordinator maps
+    /// `Unsupported` to whole-query local fallback (ADR-0071 failure
+    /// semantics), never a wrong or partial result.
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        SliceLogResponse {
+            records: Vec::new(),
+            accounting: QueryAccountingSnapshot::default(),
+            stats: FetchStats::default(),
+            records_returned: 0,
+            status: pb::status::Code::Unsupported,
+            status_message: message.into(),
+        }
+    }
+}
+
 /// The seam between the coordinator merge and a slice worker. Object-safe (via
 /// `async_trait`) so the engine holds one `dyn SliceFetcher`.
 #[async_trait::async_trait]
 pub trait SliceFetcher: Send + Sync {
     /// Dispatches one slice request and collects its full response.
     async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError>;
+
+    /// Dispatches one RLOG-family (Logs/Alerts/Audit) slice request and collects
+    /// its decoded records (#284).
+    ///
+    /// The default implementation reports [`pb::status::Code::Unsupported`], so
+    /// a `SliceFetcher` that has not wired the log fetch path degrades to
+    /// whole-query local execution rather than erroring. A real transport
+    /// (`RemoteSliceFetcher`) overrides it to drain the worker's stream and
+    /// decode its [`pb::LogRecordFrame`]s. This mirrors the base ADR's silent
+    /// version-skew fallback: an unimplemented log fetch is a coverage gap the
+    /// coordinator fills locally, never a hard failure.
+    async fn fetch_logs(
+        &self,
+        _request: pb::FetchRequest,
+    ) -> Result<SliceLogResponse, DistribError> {
+        Ok(SliceLogResponse::unsupported(
+            "distributed log fetch is not implemented by this slice fetcher",
+        ))
+    }
 }
 
 /// A [`SliceFetcher`] backed by a real gRPC worker over a `tonic` channel. The
@@ -124,6 +184,27 @@ impl SliceFetcher for RemoteSliceFetcher {
             frames.push(frame);
         }
         decode_slice_frames(frames)
+    }
+
+    async fn fetch_logs(
+        &self,
+        request: pb::FetchRequest,
+    ) -> Result<SliceLogResponse, DistribError> {
+        let mut client = SeriesFetchClient::new(self.channel.clone());
+        let response = client
+            .fetch(request)
+            .await
+            .map_err(|s| DistribError::Transport(s.to_string()))?;
+        let mut stream = response.into_inner();
+        let mut frames = Vec::new();
+        while let Some(frame) = stream
+            .message()
+            .await
+            .map_err(|s| DistribError::Transport(s.to_string()))?
+        {
+            frames.push(frame);
+        }
+        decode_log_slice_frames(frames)
     }
 }
 
@@ -192,6 +273,65 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
         },
         series_returned: summary.series_returned,
         samples_returned: summary.samples_returned,
+        status: code,
+        status_message: status.message,
+    })
+}
+
+/// Decode an RLOG-family slice's full frame sequence into a [`SliceLogResponse`]
+/// (#284). The log sibling of [`decode_slice_frames`]: it accepts
+/// [`pb::LogRecordFrame`]s and exactly one terminal [`pb::Summary`], and rejects
+/// any metric/histogram/span frame as [`DistribError::FrameSignalUnsupported`]
+/// (a log slice must not carry them). Every malformation is a typed error, never
+/// a panic: a malformed record ([`DistribError::Codec`]), a mixed-signal frame,
+/// an empty frame, a second summary, a missing summary, a summary with no
+/// status, or an unknown status code.
+pub fn decode_log_slice_frames(
+    frames: Vec<pb::FetchResponse>,
+) -> Result<SliceLogResponse, DistribError> {
+    let mut records = Vec::new();
+    let mut summary: Option<pb::Summary> = None;
+    for frame in frames {
+        match frame.frame {
+            Some(pb::fetch_response::Frame::LogRecord(lr)) => {
+                records.push(codec::decode_log_record(lr)?);
+            }
+            Some(pb::fetch_response::Frame::Series(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("series"));
+            }
+            Some(pb::fetch_response::Frame::Hist(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("histogram"));
+            }
+            Some(pb::fetch_response::Frame::Span(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("span"));
+            }
+            Some(pb::fetch_response::Frame::Summary(s)) => {
+                if summary.is_some() {
+                    return Err(DistribError::MultipleSummaries);
+                }
+                summary = Some(s);
+            }
+            None => return Err(DistribError::EmptyFrame),
+        }
+    }
+
+    let summary = summary.ok_or(DistribError::NoSummary)?;
+    let status = summary
+        .status
+        .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
+    let code = codec::decode_status_code(status.code)?;
+    let accounting = summary
+        .accounting
+        .map(codec::decode_accounting)
+        .unwrap_or_default();
+    Ok(SliceLogResponse {
+        records,
+        accounting,
+        stats: FetchStats {
+            raw_f64_pages: summary.raw_f64_pages,
+            raw_f64_bytes: summary.raw_f64_bytes,
+        },
+        records_returned: summary.series_returned,
         status: code,
         status_message: status.message,
     })

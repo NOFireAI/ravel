@@ -32,14 +32,21 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Server};
 use uuid::Uuid;
 
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_types::logstream::{LogStreamId, log_stream_id};
+
 use crate::config::EngineConfig;
 use crate::distrib::Distributed;
 use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, SliceResponse};
-use crate::distrib::partition::DistribThresholds;
-use crate::distrib::service::{SeriesFetchService, SnapshotSegmentResolver};
+use crate::distrib::partition::{DistribThresholds, partition_snapshot};
+use crate::distrib::{
+    merge_log_records, service::SeriesFetchService, service::SnapshotSegmentResolver,
+};
 use crate::engine::merge_soa_runs;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::SegmentFetcher;
+use crate::log_fetcher::{LogQuery, LogSegmentFetcher};
 
 const NS: i64 = 1_000_000;
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -165,9 +172,15 @@ async fn spawn_worker(
     store: Arc<MemoryStore>,
     segments: Vec<SegmentRef>,
 ) -> (RemoteSliceFetcher, JoinHandle<()>) {
+    // Wire both the metric and the RLOG-family fetch path over the same store,
+    // so one worker serves Metrics and Logs/Alerts/Audit slices.
+    let log_store: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let log_fetcher = LogSegmentFetcher::new(log_store);
     let fetcher = SegmentFetcher::new(store);
     let resolver = Arc::new(SnapshotSegmentResolver::new(segments));
-    let service = SeriesFetchService::new(fetcher, resolver).into_server();
+    let service = SeriesFetchService::new(fetcher, resolver)
+        .with_log_fetcher(log_fetcher)
+        .into_server();
 
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
     let addr = incoming.local_addr().expect("local addr");
@@ -918,13 +931,12 @@ fn many_invalidated_slices_map_to_one_retryable_error() {
     });
 }
 
-/// ADR-0071 protocol: the worker validates `request.signal` before touching
-/// storage. A known non-metrics signal (logs, spans, ...) is answered with an
-/// `Unsupported` summary so the coordinator falls back to the local path, and
+/// ADR-0071 protocol: the worker dispatches on `request.signal` after decoding.
+/// A still-unimplemented distributed signal (Spans, until #285) is answered with
+/// an `Unsupported` summary so the coordinator falls back to the local path, and
 /// an unknown discriminant is `BadData` (a broken or newer peer, not a
-/// capability gap). Deleting the signal-validation block in `run_slice_inner`
-/// (`service.rs`) makes both requests fetch and return `Ok` scalar frames, and
-/// the status assertions below fail.
+/// capability gap). The RLOG family (Logs/Alerts/Audit) is now served (#284), so
+/// a Logs request reaches the real log path rather than a blanket rejection.
 #[test]
 fn worker_rejects_non_metrics_and_unknown_signals() {
     let rt = Runtime::new().expect("runtime");
@@ -961,6 +973,24 @@ fn worker_rejects_non_metrics_and_unknown_signals() {
             fragment_capability: Vec::new(),
         };
 
+        // Spans is still unimplemented (#285), so it must be Unsupported, not
+        // silently answered with metrics.
+        let spans = SliceFetcher::fetch(
+            &fetcher,
+            request(crate::distrib::codec::signal_to_u32(Signal::Spans)),
+        )
+        .await
+        .expect("worker responds to a spans request");
+        assert_eq!(
+            spans.status,
+            pb::status::Code::Unsupported,
+            "an unimplemented distributed signal must be Unsupported, not silently answered with metrics"
+        );
+
+        // Logs is now served (#284): the request reaches the real RLOG path.
+        // This RSEG-only corpus has no records in the [0,0] window, so the log
+        // fetcher skips it and the slice returns an empty Ok summary -- proving
+        // Logs is dispatched to a real path, not the former blanket rejection.
         let logs = SliceFetcher::fetch(
             &fetcher,
             request(crate::distrib::codec::signal_to_u32(Signal::Logs)),
@@ -969,8 +999,8 @@ fn worker_rejects_non_metrics_and_unknown_signals() {
         .expect("worker responds to a logs request");
         assert_eq!(
             logs.status,
-            pb::status::Code::Unsupported,
-            "a known non-metrics signal must be Unsupported, not silently answered with metrics"
+            pb::status::Code::Ok,
+            "the RLOG family is now served, not rejected"
         );
 
         let unknown = SliceFetcher::fetch(&fetcher, request(u32::MAX))
@@ -1035,9 +1065,11 @@ fn run_slice_inner_dispatches_on_signal_not_blanket_rejects() {
             fragment_capability: Vec::new(),
         };
 
-        // Logs and Spans reach the new stub branch: Unsupported, but with the
-        // distinct "not yet implemented" message the old code never produced.
-        for signal in [Signal::Logs, Signal::Spans] {
+        // Spans reaches the per-signal stub branch: Unsupported, but with the
+        // distinct "not yet implemented" message the old blanket code never
+        // produced. (Logs/Alerts/Audit are now served by #284, so they no longer
+        // take a stub branch; see the Logs assertion below.)
+        for signal in [Signal::Spans] {
             let resp = SliceFetcher::fetch(
                 &fetcher,
                 request(
@@ -1059,6 +1091,30 @@ fn run_slice_inner_dispatches_on_signal_not_blanket_rejects() {
                 resp.status_message
             );
         }
+
+        // Logs now dispatches to the real RLOG path (#284), no longer a stub. The
+        // RSEG-only corpus has no records in the [0,0] window, so the log fetcher
+        // skips it and the slice returns an empty Ok summary. The key point is
+        // that the status is not the "not yet implemented" stub.
+        let logs = SliceFetcher::fetch(
+            &fetcher,
+            request(
+                crate::distrib::codec::signal_to_u32(Signal::Logs),
+                TENANT.0.to_vec(),
+            ),
+        )
+        .await
+        .expect("worker responds to a logs request");
+        assert_eq!(
+            logs.status,
+            pb::status::Code::Ok,
+            "Logs is served by the real path, not the stub"
+        );
+        assert!(
+            !logs.status_message.contains("not yet implemented"),
+            "Logs must not take a stub branch, got {:?}",
+            logs.status_message
+        );
 
         // Structural proof the signal check now runs AFTER decoding: a Logs
         // request with a malformed tenant hash is BadData (decode failed), not
@@ -1330,6 +1386,561 @@ fn histogram_slice_falls_back_with_spend_folded() {
         assert!(
             accounting.snapshot().total_s3_bytes() > 0,
             "the worker's real spend must be folded into the query accounting before fallback"
+        );
+        server.abort();
+    });
+}
+
+// --- RLOG-family distributed fan-out (#284) --------------------------------
+//
+// The centerpiece is `assert_log_distributed_matches_local`: over a real
+// loopback worker, a distributed Logs/Alerts/Audit fetch merged by the
+// coordinator is bit-identical to a local `LogSegmentFetcher` read over the same
+// segments, merged under the same stated total order (`merge_log_records`),
+// including a corpus where one stream's segments straddle two slices (a
+// reshard-activation window). Both paths feed the same order-independent merge,
+// so the test proves the codec preserves every record and the partition is total
+// -- and, on the split corpus, that the coordinator ORDERS rather than
+// concatenates in slice order.
+
+/// Resource attributes and the derived stream identity/blob for a named
+/// service. Records sharing a service name share one `LogStreamId`, so a corpus
+/// can place one stream's records in segments under different shards (the
+/// reshard-straddle case).
+fn log_stream(service: &str) -> (LogStreamId, Vec<u8>) {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str(service.to_string()),
+    )];
+    let id = log_stream_id(&resource, "scope", "1.0", &[]);
+    let blob = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+    (id, blob)
+}
+
+/// One log record on `service`'s stream at event time `ts`, with `body` and the
+/// given per-record string attributes.
+fn log_record(service: &str, ts: i64, body: &str, attrs: &[(&str, &str)]) -> LogRecord {
+    let (stream_id, stream_attrs) = log_stream(service);
+    LogRecord {
+        stream_id,
+        stream_attrs,
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: body.to_string(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: attrs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), AttrValue::Str((*v).to_string())))
+            .collect(),
+    }
+}
+
+/// Writes one RLOG object holding `records` under `shard`/`hour`, returning an
+/// L0 `SegmentRef` with a distinct content hash (blake3 of the bytes) so the
+/// worker's content-hash resolver keys each segment uniquely.
+async fn write_log_segment(
+    store: &MemoryStore,
+    key: u64,
+    shard: u32,
+    hour: u32,
+    records: &[LogRecord],
+) -> SegmentRef {
+    // Small blocks so a multi-block object is exercised; this never changes the
+    // record set returned.
+    let cfg = RlogConfig {
+        block_target_records: 3,
+        ..RlogConfig::default()
+    };
+    let identity = ObjectIdentity {
+        tenant_hash: TENANT.0,
+        shard,
+        writer_id: [2u8; 16],
+        writer_epoch: 1,
+        writer_seq: key,
+    };
+    let mut writer = RlogWriter::new(cfg, identity);
+    for r in records {
+        writer.push(r.clone()).expect("push record");
+    }
+    let bytes = writer.finish().expect("finish object");
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+    let size = bytes.len() as u64;
+    let object_key = format!("logs/{key}.rlog");
+    store
+        .put(
+            &object_key,
+            bytes::Bytes::from(bytes),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put log object");
+    let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+    let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+    SegmentRef {
+        data_object_key: object_key,
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: hour,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard,
+        content_hash,
+        writer_id: Uuid::from_u128(u128::from(key) + 1),
+        writer_epoch: 1,
+        writer_seq: key,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+    }
+}
+
+/// The whole-snapshot event window: `[min over all segments, max over all]`, a
+/// superset of every segment's own span, so a local read over it prunes nothing.
+fn whole_window(segments: &[SegmentRef]) -> (i64, i64) {
+    let min = segments
+        .iter()
+        .map(|s| s.min_event_ts_ns)
+        .min()
+        .unwrap_or(i64::MIN);
+    let max = segments
+        .iter()
+        .map(|s| s.max_event_ts_ns)
+        .max()
+        .unwrap_or(i64::MAX);
+    (min, max)
+}
+
+/// The local reference for logs: read every segment with `LogSegmentFetcher`
+/// over the whole-snapshot window (a superset of each segment), then merge under
+/// the stated total order. This is exactly what a local multi-segment read
+/// produces.
+async fn local_log_records(
+    store: Arc<MemoryStore>,
+    segments: &[SegmentRef],
+    erasure: &[ErasurePredicate],
+) -> Vec<LogRecord> {
+    let fetcher = LogSegmentFetcher::new(store);
+    let (min, max) = whole_window(segments);
+    let query = LogQuery::new(min, max).with_erasure(erasure.to_vec());
+    let mut per_segment = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let out = fetcher.fetch(seg, &query).await.expect("local log fetch");
+        per_segment.push(out.map(|o| o.records).unwrap_or_default());
+    }
+    merge_log_records(per_segment)
+}
+
+/// The distributed reference for logs: dispatch `signal` over a real loopback
+/// worker at width `cap`, merged by the coordinator's `fetch_logs`.
+async fn distributed_log_records(
+    store: Arc<MemoryStore>,
+    segments: Vec<SegmentRef>,
+    snapshot: &Snapshot,
+    signal: Signal,
+    erasure: &[ErasurePredicate],
+    cap: usize,
+) -> Vec<LogRecord> {
+    let (fetcher, server) = spawn_worker(store, segments).await;
+    let distributed = Distributed::new(
+        Arc::new(fetcher),
+        DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: cap,
+        },
+    );
+    let accounting = QueryAccounting::new();
+    let records = distributed
+        .fetch_logs(
+            TENANT,
+            signal,
+            snapshot,
+            &[],
+            erasure,
+            &accounting,
+            &EngineConfig::default(),
+            i64::MAX,
+        )
+        .await
+        .expect("distributed log fetch")
+        .expect("distributed produced a result (not a fallback)");
+    server.abort();
+    records
+}
+
+/// The split corpus: two segments under two DIFFERENT shards (a reshard-
+/// activation window), each carrying records of BOTH the `alpha` and `beta`
+/// streams. Because the corpus has exactly two shards, `cap = 2` puts each
+/// segment in its own slice (shard-major partitioning), so both streams straddle
+/// the two slices: `alpha`'s and `beta`'s records live on both sides. Their
+/// timestamps interleave across the two segments, so a coordinator that
+/// concatenated slice results in arrival order would misorder them.
+///
+/// Per-record `user_id`: u1 at ts {10, 15, 20}, u2 at ts {25, 30, 40}. Erasing
+/// u1 therefore leaves {25, 30, 40}, and the erased rows straddle the two slices.
+async fn split_stream_corpus(store: &MemoryStore) -> Vec<SegmentRef> {
+    // seg_a shard 0: alpha ts 10 (u1), 40 (u2); beta ts 15 (u1).
+    // seg_b shard 1: alpha ts 20 (u1), 30 (u2); beta ts 25 (u2).
+    // Global ts order 10,15,20,25,30,40 interleaves the two shards, so slice-order
+    // concatenation (all of seg_a's ts before all of seg_b's) is NOT sorted.
+    let seg_a = write_log_segment(
+        store,
+        0,
+        0,
+        100,
+        &[
+            log_record("alpha", 10, "a-early", &[("user_id", "u1")]),
+            log_record("alpha", 40, "a-late", &[("user_id", "u2")]),
+            log_record("beta", 15, "b-early", &[("user_id", "u1")]),
+        ],
+    )
+    .await;
+    let seg_b = write_log_segment(
+        store,
+        1,
+        1,
+        101,
+        &[
+            log_record("alpha", 20, "a-mid1", &[("user_id", "u1")]),
+            log_record("alpha", 30, "a-mid2", &[("user_id", "u2")]),
+            log_record("beta", 25, "b-mid", &[("user_id", "u2")]),
+        ],
+    )
+    .await;
+    vec![seg_a, seg_b]
+}
+
+/// Drives the per-signal differential: distributed == local, over both a
+/// single-slice (`cap = 1`) and a stream-straddling two-slice (`cap = 2`)
+/// partition of the same split corpus. On the two-slice case it also proves the
+/// corpus is discriminating: a naive concatenate-in-slice-order coordinator
+/// would emit an order the local read never produces, so the `sort_by` line in
+/// `merge_log_records` is the line under test.
+async fn run_log_differential(signal: Signal) {
+    let store = Arc::new(MemoryStore::new());
+    let segments = split_stream_corpus(&store).await;
+    let snapshot = Snapshot {
+        segments: segments.clone(),
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+
+    // Single-slice: every segment in one slice. Distributed == local.
+    let local = local_log_records(Arc::clone(&store), &segments, &[]).await;
+    let one_slice = distributed_log_records(
+        Arc::clone(&store),
+        segments.clone(),
+        &snapshot,
+        signal,
+        &[],
+        1,
+    )
+    .await;
+    assert_eq!(
+        one_slice, local,
+        "{signal:?}: single-slice distributed must equal local"
+    );
+
+    // Two-slice straddle: confirm the partition genuinely places each segment in
+    // its own slice, so both streams' segments straddle two slices (not the easy
+    // single-slice case). One segment per slice, two slices, and each segment
+    // carries alpha and beta records, so both streams are split across slices.
+    let slices = partition_snapshot(&snapshot, 2);
+    assert_eq!(
+        slices.len(),
+        2,
+        "{signal:?}: the reshard-straddle corpus must produce two slices"
+    );
+    assert_eq!(
+        slices[0].segments.len(),
+        1,
+        "{signal:?}: slice 0 must hold exactly one segment, so the streams straddle"
+    );
+    assert_eq!(
+        slices[1].segments.len(),
+        1,
+        "{signal:?}: slice 1 must hold exactly one segment, so the streams straddle"
+    );
+
+    let two_slice = distributed_log_records(
+        Arc::clone(&store),
+        segments.clone(),
+        &snapshot,
+        signal,
+        &[],
+        2,
+    )
+    .await;
+    assert_eq!(
+        two_slice, local,
+        "{signal:?}: two-slice distributed must equal local even when a stream straddles slices"
+    );
+
+    // Prove-the-test: the naive wrong coordinator concatenates each slice's local
+    // read in slice order. On this corpus that order is observably NOT the global
+    // total order the correct merge produces, so the differential is not vacuous.
+    let ref_store: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let ref_fetcher = LogSegmentFetcher::new(ref_store);
+    let (min, max) = whole_window(&segments);
+    let full = LogQuery::new(min, max);
+    let mut naive_ts = Vec::new();
+    for slice in &slices {
+        for seg in &slice.segments {
+            let out = ref_fetcher
+                .fetch(seg, &full)
+                .await
+                .expect("fetch")
+                .expect("in range");
+            naive_ts.extend(out.records.iter().map(|r| r.ts_ns));
+        }
+    }
+    let correct_ts: Vec<i64> = two_slice.iter().map(|r| r.ts_ns).collect();
+    assert_ne!(
+        naive_ts, correct_ts,
+        "{signal:?}: slice-order concatenation must differ from the correct merge, else the test is vacuous"
+    );
+    // The correct order is the globally sorted timestamps: 10,15,20,25,30,40.
+    assert_eq!(
+        correct_ts,
+        vec![10, 15, 20, 25, 30, 40],
+        "{signal:?}: the merge must emit the global cross-segment ts order"
+    );
+}
+
+#[test]
+fn logs_distributed_matches_local_including_reshard_straddle() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(run_log_differential(Signal::Logs));
+}
+
+#[test]
+fn alerts_distributed_matches_local_including_reshard_straddle() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(run_log_differential(Signal::Alerts));
+}
+
+#[test]
+fn audit_distributed_matches_local_including_reshard_straddle() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(run_log_differential(Signal::Audit));
+}
+
+/// A record present verbatim in two overlapping segments that land in two
+/// different slices is collapsed to one by the coordinator's record-identity
+/// dedup, matching a local read merged under the same rule. Pins the dedup /
+/// tie-break half of the stated invariant (the ordering half is pinned by
+/// `run_log_differential`).
+#[test]
+fn logs_coordinator_dedups_identical_record_across_slices() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        // The SAME record (same stream, ts, body, attrs) written into two
+        // segments under two shards -> two slices at cap 2.
+        let dup = log_record("gamma", 50, "dup", &[("k", "v")]);
+        let seg_a = write_log_segment(&store, 0, 0, 100, std::slice::from_ref(&dup)).await;
+        let seg_b = write_log_segment(&store, 1, 1, 100, std::slice::from_ref(&dup)).await;
+        let segments = vec![seg_a, seg_b];
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        let local = local_log_records(Arc::clone(&store), &segments, &[]).await;
+        assert_eq!(local.len(), 1, "local merge collapses the identical record");
+
+        let distributed = distributed_log_records(
+            Arc::clone(&store),
+            segments,
+            &snapshot,
+            Signal::Logs,
+            &[],
+            2,
+        )
+        .await;
+        assert_eq!(
+            distributed, local,
+            "the coordinator dedups the cross-slice duplicate to one record"
+        );
+        assert_eq!(distributed.len(), 1);
+    });
+}
+
+/// Worker-side erasure property: erasing rows by a per-record attribute against
+/// a distributed slice set equals a local read of the same segments erased the
+/// same way, including when the affected stream's segments straddle two slices.
+/// The worker applies erasure per segment through the same `LogSegmentFetcher`
+/// funnel the local path uses; correctness rests on segment self-containment,
+/// not slice atomicity (ADR-0071 amendment decision 5).
+///
+/// Note on "resource-only key": `ravel-query`'s erasure funnel
+/// (`retain_log_records`) evaluates PER-RECORD attributes only; merged-view
+/// (resource-attribute) exclusion is the SQL lane's residual (ADR-0064,
+/// `logs_provider`), out of #284's scope. So the row-removing case uses a
+/// per-record key (`user_id`), and a resource-only key is separately shown to be
+/// a consistent no-op through this funnel.
+#[test]
+fn logs_worker_applies_erasure_across_straddling_slices() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        for cap in [1usize, 2] {
+            let store = Arc::new(MemoryStore::new());
+            let segments = split_stream_corpus(&store).await;
+            let snapshot = Snapshot {
+                segments: segments.clone(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            };
+
+            // Erase every row carrying user_id=u1. alpha's u1 rows are ts 10
+            // (slice 0) and ts 20 (slice 1), so the erased stream straddles
+            // slices at cap 2.
+            let erasure = vec![ErasurePredicate::windowless(vec![(
+                "user_id".to_string(),
+                "u1".to_string(),
+            )])];
+
+            let local = local_log_records(Arc::clone(&store), &segments, &erasure).await;
+            let distributed = distributed_log_records(
+                Arc::clone(&store),
+                segments.clone(),
+                &snapshot,
+                Signal::Logs,
+                &erasure,
+                cap,
+            )
+            .await;
+            assert_eq!(
+                distributed, local,
+                "cap {cap}: distributed erasure must equal local erasure over the same segments"
+            );
+            // The erasure genuinely removed the u1 rows (not a vacuous no-op),
+            // and did so across the straddling slices.
+            assert!(
+                distributed.iter().all(|r| !r
+                    .attrs
+                    .iter()
+                    .any(|(k, v)| k == "user_id" && *v == AttrValue::Str("u1".to_string()))),
+                "cap {cap}: no surviving row carries the erased user_id=u1"
+            );
+            let kept_ts: Vec<i64> = distributed.iter().map(|r| r.ts_ns).collect();
+            assert_eq!(
+                kept_ts,
+                vec![25, 30, 40],
+                "cap {cap}: exactly the u2 rows survive, in global ts order"
+            );
+        }
+    });
+}
+
+/// A resource-only attribute key erases nothing through this funnel (per-record
+/// attributes only), consistently in both paths -- the "resource-only" wording
+/// of the ADR's acceptance test, made a consistent no-op here. The row-removing
+/// straddle case above carries the real erasure property.
+#[test]
+fn logs_resource_only_erasure_key_is_a_consistent_no_op() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = split_stream_corpus(&store).await;
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        // `service.name` is a resource attribute (in `stream_attrs`), never a
+        // per-record attribute, so this funnel matches no row.
+        let erasure = vec![ErasurePredicate::windowless(vec![(
+            "service.name".to_string(),
+            "alpha".to_string(),
+        )])];
+
+        let baseline = local_log_records(Arc::clone(&store), &segments, &[]).await;
+        let local = local_log_records(Arc::clone(&store), &segments, &erasure).await;
+        assert_eq!(local, baseline, "resource-only key erases nothing locally");
+
+        let distributed = distributed_log_records(
+            Arc::clone(&store),
+            segments,
+            &snapshot,
+            Signal::Logs,
+            &erasure,
+            2,
+        )
+        .await;
+        assert_eq!(
+            distributed, baseline,
+            "resource-only key erases nothing distributed either (consistent no-op)"
+        );
+    });
+}
+
+/// A worker with no log fetcher wired returns `Unsupported` for a Logs slice, so
+/// the coordinator falls back to whole-query local execution (`Ok(None)`), never
+/// an error. This is the load-bearing skew direction (a not-yet-upgraded worker)
+/// exercised over the real wire.
+#[test]
+fn logs_worker_without_log_fetcher_signals_local_fallback() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = split_stream_corpus(&store).await;
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // A worker WITHOUT `.with_log_fetcher(..)`: the metric path only.
+        let metric_store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+        let metric_fetcher = SegmentFetcher::new(metric_store);
+        let resolver = Arc::new(SnapshotSegmentResolver::new(segments.clone()));
+        let service = SeriesFetchService::new(metric_fetcher, resolver).into_server();
+        let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+        let addr = incoming.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect_lazy();
+        let fetcher = RemoteSliceFetcher::new(channel);
+
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 2,
+            },
+        );
+        let accounting = QueryAccounting::new();
+        let result = distributed
+            .fetch_logs(
+                TENANT,
+                Signal::Logs,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &EngineConfig::default(),
+                i64::MAX,
+            )
+            .await
+            .expect("unsupported must not be an error");
+        assert!(
+            result.is_none(),
+            "a worker with no log fetcher signals whole-query local fallback (Ok(None))"
         );
         server.abort();
     });
