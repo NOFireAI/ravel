@@ -26,10 +26,12 @@ use ravel_types::accounting::{AccountedOp, QueryAccountingSnapshot};
 use ravel_types::{Label, LabelSet, SeriesId, Signal};
 
 use ravel_logseg::LogRecord;
+use ravel_rspan::{SpanRecord, StatusCode};
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::FetchedSeriesSoa;
+use crate::span_fetcher::SpanRow;
 
 /// The queryfrag protocol version this build speaks. A `FetchRequest` carrying
 /// any other value is rejected by [`check_protocol_version`] so the coordinator
@@ -198,6 +200,14 @@ pub enum CodecError {
     SeverityOutOfRange { got: u32 },
     #[error("log attribute carried no value")]
     MissingAttrValue,
+    #[error("span trace id is {got} bytes, expected 16")]
+    BadSpanTraceId { got: usize },
+    #[error("span id is {got} bytes, expected 8")]
+    BadSpanSpanId { got: usize },
+    #[error("span parent id is {got} bytes, expected 8 (or 0 for absent)")]
+    BadSpanParentId { got: usize },
+    #[error("span status code {got} is not a known OTLP StatusCode (0 Unset, 1 Ok, 2 Error)")]
+    UnknownSpanStatusCode { got: u32 },
 }
 
 /// Rejects any protocol version this build does not speak. `Ok(())` only for
@@ -496,6 +506,113 @@ fn decode_span_id(bytes: &[u8]) -> Result<Option<[u8; 8]>, CodecError> {
         .try_into()
         .map_err(|_| CodecError::BadSpanId { got: bytes.len() })?;
     Ok(Some(arr))
+}
+
+// ---- SpanFrame <-> SpanRow ------------------------------------------------
+
+/// Encodes one decoded RSPAN span (its rebuilt [`SpanRecord`] plus the lifted
+/// `service_name` column, ADR-0054) as a [`pb::SpanFrame`], field for field. The
+/// worker produces the row through the same [`SpanSegmentFetcher`] funnel a
+/// local `spans` read uses, so the shipped per-span merged `attrs` view is
+/// byte-identical to what a local read produces; the coordinator never
+/// re-derives attribute merging. Span attribute values are always strings (the
+/// RSPAN merged-attrs map is `Map<Utf8, Utf8>`), so no bit-pattern discipline is
+/// needed here as it is for `f64` log/metric values.
+///
+/// [`SpanRecord`]: ravel_rspan::SpanRecord
+/// [`SpanSegmentFetcher`]: crate::span_fetcher::SpanSegmentFetcher
+pub fn encode_span_frame(row: &SpanRow) -> pb::SpanFrame {
+    let record = &row.record;
+    pb::SpanFrame {
+        trace_id: record.trace_id.to_vec(),
+        span_id: record.span_id.to_vec(),
+        // An absent parent (a root span) is the empty byte string; a present one
+        // is its fixed 8 bytes. A real all-zero parent id is still its full 8
+        // bytes, so it stays distinguishable from absent.
+        parent_span_id: record
+            .parent_span_id
+            .map(|p| p.to_vec())
+            .unwrap_or_default(),
+        name: record.name.clone(),
+        start_ts_ns: record.start_ts_ns,
+        end_ts_ns: record.end_ts_ns,
+        status_code: u32::from(record.status_code.to_u8()),
+        status_message: record.status_message.clone(),
+        attrs: record
+            .attrs
+            .iter()
+            .map(|(key, value)| pb::SpanAttr {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        service_name: row.service_name.clone(),
+    }
+}
+
+/// Inverse of [`encode_span_frame`]. Every malformation (a mis-sized trace,
+/// span, or parent id, or a status code discriminant this build does not model)
+/// is a typed [`CodecError`], never a panic or a silently truncated span. The
+/// `status_message`/`service_name` proto3 `optional`s round-trip `None` vs
+/// `Some("")` exactly.
+pub fn decode_span_frame(frame: pb::SpanFrame) -> Result<SpanRow, CodecError> {
+    let trace_id: [u8; 16] =
+        frame
+            .trace_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| CodecError::BadSpanTraceId {
+                got: frame.trace_id.len(),
+            })?;
+    let span_id: [u8; 8] =
+        frame
+            .span_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| CodecError::BadSpanSpanId {
+                got: frame.span_id.len(),
+            })?;
+    let parent_span_id = decode_parent_span_id(&frame.parent_span_id)?;
+    let status_code = decode_span_status_code(frame.status_code)?;
+    let attrs = frame
+        .attrs
+        .into_iter()
+        .map(|a| (a.key, a.value))
+        .collect::<Vec<_>>();
+    Ok(SpanRow {
+        record: SpanRecord {
+            trace_id,
+            span_id,
+            parent_span_id,
+            name: frame.name,
+            start_ts_ns: frame.start_ts_ns,
+            end_ts_ns: frame.end_ts_ns,
+            status_code,
+            status_message: frame.status_message,
+            attrs,
+        },
+        service_name: frame.service_name,
+    })
+}
+
+/// Decodes an optional parent span id: an empty byte string is `None` (a root
+/// span), an 8-byte string is `Some`, and any other length is a typed error.
+fn decode_parent_span_id(bytes: &[u8]) -> Result<Option<[u8; 8]>, CodecError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| CodecError::BadSpanParentId { got: bytes.len() })?;
+    Ok(Some(arr))
+}
+
+/// Decodes a span's OTLP status code. The wire carries the byte widened to a
+/// `u32`; a value past `u8` or one [`StatusCode::from_u8`] does not model is a
+/// typed error, never a silent default to `Unset`.
+fn decode_span_status_code(raw: u32) -> Result<StatusCode, CodecError> {
+    let byte = u8::try_from(raw).map_err(|_| CodecError::UnknownSpanStatusCode { got: raw })?;
+    StatusCode::from_u8(byte).ok_or(CodecError::UnknownSpanStatusCode { got: raw })
 }
 
 // ---- LabelMatcher <-> pb::LabelMatcher ------------------------------------
@@ -1247,6 +1364,119 @@ mod tests {
         assert!(matches!(
             decode_log_record(missing_value),
             Err(CodecError::MissingAttrValue)
+        ));
+    }
+
+    fn span_row(
+        parent: Option<[u8; 8]>,
+        status_code: StatusCode,
+        status_message: Option<String>,
+        service_name: Option<String>,
+        attrs: Vec<(&str, &str)>,
+    ) -> SpanRow {
+        SpanRow {
+            record: SpanRecord {
+                trace_id: [3u8; 16],
+                span_id: [7u8; 8],
+                parent_span_id: parent,
+                name: "GET /api".to_string(),
+                start_ts_ns: -42,
+                end_ts_ns: i64::MAX,
+                status_code,
+                status_message,
+                attrs: attrs
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+            service_name,
+        }
+    }
+
+    /// A full span with a present parent, an error status with a message, a
+    /// lifted `service_name`, and a merged `attrs` map round-trips field for
+    /// field. Span attribute values are plain strings, so there is no bit
+    /// pattern to preserve, only exact byte equality.
+    #[test]
+    fn span_frame_round_trips_field_for_field() {
+        let row = span_row(
+            Some([9u8; 8]),
+            StatusCode::Error,
+            Some("boom".to_string()),
+            Some("checkout".to_string()),
+            vec![("service.name", "checkout"), ("http.method", "GET")],
+        );
+        let decoded = decode_span_frame(encode_span_frame(&row)).expect("decode");
+        assert_eq!(decoded.record, row.record, "span record round-trips");
+        assert_eq!(decoded.service_name, row.service_name);
+    }
+
+    /// The `status_message` and `service_name` proto3 `optional`s keep `None`
+    /// distinct from `Some("")`, and an absent parent (`None`, a root span)
+    /// distinct from a present all-zero id. A naive plain-`string` encoding would
+    /// collapse `Some("")` to `None`; a naive non-optional parent would turn a
+    /// root span into a zero-parent span.
+    #[test]
+    fn span_frame_distinguishes_none_from_empty_and_absent_parent() {
+        // None everywhere, root span.
+        let none = span_row(None, StatusCode::Unset, None, None, vec![]);
+        let d = decode_span_frame(encode_span_frame(&none)).expect("decode");
+        assert_eq!(d.record.parent_span_id, None);
+        assert_eq!(d.record.status_message, None);
+        assert_eq!(d.service_name, None);
+
+        // Some("") everywhere, present all-zero parent -- all distinct from None.
+        let empties = span_row(
+            Some([0u8; 8]),
+            StatusCode::Ok,
+            Some(String::new()),
+            Some(String::new()),
+            vec![],
+        );
+        let d = decode_span_frame(encode_span_frame(&empties)).expect("decode");
+        assert_eq!(d.record.parent_span_id, Some([0u8; 8]));
+        assert_eq!(d.record.status_message, Some(String::new()));
+        assert_eq!(d.service_name, Some(String::new()));
+    }
+
+    #[test]
+    fn span_frame_bad_lengths_and_status_are_typed_errors() {
+        let good = encode_span_frame(&span_row(None, StatusCode::Unset, None, None, vec![]));
+
+        let bad_trace = pb::SpanFrame {
+            trace_id: vec![0u8; 15],
+            ..good.clone()
+        };
+        assert!(matches!(
+            decode_span_frame(bad_trace),
+            Err(CodecError::BadSpanTraceId { got: 15 })
+        ));
+
+        let bad_span = pb::SpanFrame {
+            span_id: vec![0u8; 7],
+            ..good.clone()
+        };
+        assert!(matches!(
+            decode_span_frame(bad_span),
+            Err(CodecError::BadSpanSpanId { got: 7 })
+        ));
+
+        let bad_parent = pb::SpanFrame {
+            parent_span_id: vec![0u8; 4],
+            ..good.clone()
+        };
+        assert!(matches!(
+            decode_span_frame(bad_parent),
+            Err(CodecError::BadSpanParentId { got: 4 })
+        ));
+
+        let bad_status = pb::SpanFrame {
+            status_code: 3,
+            ..good
+        };
+        assert!(matches!(
+            decode_span_frame(bad_status),
+            Err(CodecError::UnknownSpanStatusCode { got: 3 })
         ));
     }
 

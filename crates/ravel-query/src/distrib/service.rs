@@ -37,12 +37,16 @@ use ravel_proto::queryfrag::v1 as pb;
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{Signal, TenantHash};
 
+use ravel_rspan::SpanQuery;
+
 use crate::config::ByteLimit;
 use crate::distrib::codec;
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use crate::engine::bytes_scanned_exceeded;
+use crate::erasure::is_erased_span;
 use crate::fetcher::{FetchError, FetchStats, SegmentFetcher};
 use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
+use crate::span_fetcher::{SpanFetchError, SpanSegmentFetcher};
 
 /// Resolves a shipped [`pb::SegmentIdentity`] back to the [`SegmentRef`] a
 /// worker fetches. The production resolver reconstructs the
@@ -95,6 +99,13 @@ pub struct SeriesFetchService<R: SegmentResolver + 'static> {
     /// out-of-crate coordinator wiring that calls it) is unchanged; a worker that
     /// wants to serve logs opts in with the builder.
     log_fetcher: Option<LogSegmentFetcher>,
+    /// The RSPAN span fetcher, wired via [`with_span_fetcher`](Self::with_span_fetcher).
+    /// `None` (the default) means this worker cannot serve a distributed span
+    /// fetch: a Spans slice returns `Unsupported` so the coordinator falls back
+    /// to local execution. Kept optional for the same reason `log_fetcher` is:
+    /// the crate-internal `new` constructor and its out-of-crate callers are
+    /// unchanged; a worker that wants to serve spans opts in with the builder.
+    span_fetcher: Option<SpanSegmentFetcher>,
     resolver: Arc<R>,
 }
 
@@ -103,6 +114,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         SeriesFetchService {
             fetcher,
             log_fetcher: None,
+            span_fetcher: None,
             resolver,
         }
     }
@@ -115,6 +127,17 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     #[must_use]
     pub fn with_log_fetcher(mut self, log_fetcher: LogSegmentFetcher) -> Self {
         self.log_fetcher = Some(log_fetcher);
+        self
+    }
+
+    /// Wires the Spans fetch path (#285) onto this worker. Built over the same
+    /// object store the metrics [`SegmentFetcher`] reads, so a Spans slice
+    /// fetches the same pinned RSPAN segments the resolver maps. Without this, a
+    /// Spans slice returns `Unsupported` and the coordinator runs the query
+    /// locally.
+    #[must_use]
+    pub fn with_span_fetcher(mut self, span_fetcher: SpanSegmentFetcher) -> Self {
+        self.span_fetcher = Some(span_fetcher);
         self
     }
 
@@ -208,15 +231,24 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                 )
                 .await
             }
-            // Spans reach a real per-signal branch after decoding but their
-            // fetch-and-encode path lands in #285; until then the branch returns
-            // a distinct "not yet implemented" Unsupported, so the coordinator
-            // still silently falls back to fully local execution (ADR-0071
-            // failure semantics).
-            Signal::Spans => Err((
-                pb::status::Code::Unsupported,
-                format!("distributed fetch for signal {signal:?} is not yet implemented"),
-            )),
+            // Spans fetch through the RSPAN `SpanSegmentFetcher` funnel promoted
+            // into this crate (#285), the same one a local `spans` SQL read uses,
+            // so the per-span merged attribute view and the erasure exclusion are
+            // byte-identical to a local read. A worker with no span fetcher wired
+            // returns Unsupported inside `run_slice_spans`, so the coordinator
+            // falls back to local.
+            Signal::Spans => {
+                self.run_slice_spans(
+                    request.scope,
+                    request.budgets,
+                    tenant_hash,
+                    matchers,
+                    erasure,
+                    request.window_start_ns,
+                    request.window_end_ns,
+                )
+                .await
+            }
             // Profiles has no distributed fetch path planned in this lane, so it
             // stays rejected exactly as every non-Metrics signal was before
             // #283: Unsupported, whole-query local fallback.
@@ -498,6 +530,153 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         ));
         Ok(frames)
     }
+
+    /// The Spans slice path (#285): resolve the pinned scope to refs, fetch each
+    /// segment through the production [`SpanSegmentFetcher`] funnel (so the
+    /// per-span merged attribute view is byte-identical to a local `spans`
+    /// read), enforce the per-slice bytes-scanned budget, apply erasure per
+    /// segment through the same `is_erased_span` funnel the local scan uses, and
+    /// stream one `SpanFrame` per surviving span ending in a terminal summary.
+    ///
+    /// Correctness under ADR-0052 resharding rests on segment self-containment,
+    /// not slice atomicity: RSPAN rebuilds a span's whole merged `attrs` map
+    /// from one segment alone (the reader re-inserts the lifted `service.name`
+    /// column), so a worker reading only this slice's segments produces the
+    /// exact per-span view a local read produces, and applies erasure identically
+    /// per segment, whether or not a trace's spans straddle two slices (a trace
+    /// whose spans were written on both sides of a reshard activation does). The
+    /// coordinator (see [`crate::distrib::merge_spans`]) re-orders under a total
+    /// order but never dedups (spans have no query-time dedup); this path never
+    /// assumes a trace maps to one slice.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_slice_spans(
+        &self,
+        scope: Option<pb::fetch_request::Scope>,
+        budgets: Option<pb::Budgets>,
+        tenant_hash: TenantHash,
+        matchers: Vec<ravel_promql::LabelMatcher>,
+        erasure: Vec<crate::erasure::ErasurePredicate>,
+        window_start_ns: i64,
+        window_end_ns: i64,
+    ) -> Result<Vec<pb::FetchResponse>, (pb::status::Code, String)> {
+        let Some(span_fetcher) = self.span_fetcher.as_ref() else {
+            return Err((
+                pb::status::Code::Unsupported,
+                "distributed span fetch is not configured on this worker".to_string(),
+            ));
+        };
+
+        // Span matcher pushdown (service_name/name/duration/status) has no
+        // defined mapping in this lane yet (that is the SQL lane / spans pushdown,
+        // out of #285's scope). Ignoring matchers would under-filter, so fail
+        // closed to the coordinator's local fallback rather than a wrong result,
+        // exactly as the log path does.
+        if !matchers.is_empty() {
+            return Err((
+                pb::status::Code::Unsupported,
+                "distributed span fetch does not support matcher pushdown yet".to_string(),
+            ));
+        }
+
+        let identities = match scope {
+            Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments,
+            Some(pb::fetch_request::Scope::Resolve(_)) | None => {
+                return Err((
+                    pb::status::Code::Unsupported,
+                    "resolve-scope slices are not supported yet".to_string(),
+                ));
+            }
+        };
+
+        let mut segments = Vec::with_capacity(identities.len());
+        for identity in &identities {
+            match self.resolver.resolve(identity) {
+                Some(seg) => segments.push(seg),
+                None => {
+                    return Err((
+                        pb::status::Code::SnapshotInvalidated,
+                        "pinned segment not found on worker".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let byte_limit = match budgets.as_ref().map(|b| b.max_bytes_scanned) {
+            Some(0) | None => ByteLimit::Unlimited,
+            Some(max) => ByteLimit::Bounded(max),
+        };
+
+        // The slice's event-time window is the ts range for the scan. The
+        // coordinator sets it to the envelope of this slice's pinned segments, a
+        // superset of every one of them, so the interval-overlap filter drops no
+        // span a local read (over the whole-snapshot window) would keep. A bare
+        // time-range query with no trace_id, no duration/status prune, and no
+        // bloom predicates: matcher pushdown fell back above, so nothing narrows
+        // the scan beyond the window.
+        let query = SpanQuery::ts_range(window_start_ns, window_end_ns);
+
+        let accounting = QueryAccounting::new();
+        let mut spans: Vec<crate::span_fetcher::SpanRow> = Vec::new();
+        // Spans carry no raw-f64 page counters (a metric-path concept), so
+        // `FetchStats` stays zero, exactly what a local span read reports.
+        let stats = FetchStats::default();
+        for seg in &segments {
+            let out = span_fetcher
+                .fetch_accounted(seg, tenant_hash, &query, None, None, &[], &accounting)
+                .await
+                .map_err(map_span_fetch_error)?;
+            if let Some(output) = out {
+                spans.extend(output.records);
+            }
+            // Per-segment bytes-scanned short-circuit, matching the metric and
+            // log paths and the local per-segment check. The terminal summary
+            // carries the spend so far so the coordinator folds this slice's real
+            // cost before failing the query.
+            if let Some(err) =
+                bytes_scanned_exceeded(accounting.snapshot().total_s3_bytes(), byte_limit)
+            {
+                return Ok(vec![summary_frame(
+                    &accounting.snapshot(),
+                    0,
+                    0,
+                    pb::status::Code::BudgetExceeded,
+                    err.to_string(),
+                    &stats,
+                )]);
+            }
+        }
+
+        // Selective-erasure exclusion, applied post-decode exactly as the local
+        // `spans` scan applies it (ADR-0064 decision 2, `is_erased_span`): the
+        // coordinator does not re-apply, so worker-side application must match
+        // the local rule. Correct under a straddling trace because each segment
+        // is self-contained.
+        if !erasure.is_empty() {
+            spans
+                .retain(|row| !is_erased_span(&row.record.attrs, row.record.start_ts_ns, &erasure));
+        }
+
+        let spans_returned = spans.len() as u64;
+        let mut frames = Vec::with_capacity(spans.len() + 1);
+        for row in &spans {
+            frames.push(pb::FetchResponse {
+                frame: Some(pb::fetch_response::Frame::Span(codec::encode_span_frame(
+                    row,
+                ))),
+            });
+        }
+        // The span count rides the summary's `series_returned` field (reused per
+        // signal); `decode_span_slice_frames` reads it back as `spans_returned`.
+        frames.push(summary_frame(
+            &accounting.snapshot(),
+            spans_returned,
+            0,
+            pb::status::Code::Ok,
+            String::new(),
+            &stats,
+        ));
+        Ok(frames)
+    }
 }
 
 /// The stream type the generated trait requires: a boxed stream of already-
@@ -577,5 +756,23 @@ fn map_log_fetch_error(err: LogFetchError) -> (pb::status::Code, String) {
         } => (pb::status::Code::SnapshotInvalidated, err.to_string()),
         LogFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         LogFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
+    }
+}
+
+/// Maps a span fetch-path error to the worker's typed status, mirroring
+/// [`map_fetch_error`]/[`map_log_fetch_error`]: a vanished object is a snapshot
+/// invalidation (retryable), a transient store error is unavailable, a corrupt
+/// object is terminal, and an object belonging to another tenant is terminal
+/// corruption of the coordinator's contract (a pinned segment must be this
+/// tenant's), never a retry or a silent skip.
+fn map_span_fetch_error(err: SpanFetchError) -> (pb::status::Code, String) {
+    match err {
+        SpanFetchError::Store {
+            source: ravel_object_store::StoreError::NotFound,
+            ..
+        } => (pb::status::Code::SnapshotInvalidated, err.to_string()),
+        SpanFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
+        SpanFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        SpanFetchError::TenantMismatch { .. } => (pb::status::Code::Corrupt, err.to_string()),
     }
 }

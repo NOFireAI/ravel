@@ -256,16 +256,51 @@ message LogAttrMap {
 }
 
 // One span frame for a slice of the Spans signal, carrying the worker's
-// per-span merged view so the coordinator orders and dedups spans keyed on
-// (trace_id, span_id) without re-deriving attribute merging (ADR-0071 "log and
-// span distributed fan-out" amendment). Additive oneof member with the same
-// no-version-bump rationale as LogRecordFrame. The span payload grammar is
-// deferred to the span distribution ticket (#285); the field is reserved here
-// as opaque bytes with its number frozen.
+// per-span merged view so the coordinator ORDERS (never dedups) spans keyed on
+// the record's full content without re-deriving attribute merging (ADR-0071
+// "log and span distributed fan-out" amendment). Additive oneof member with the
+// same no-version-bump rationale as LogRecordFrame.
+//
+// #285 defines the concrete grammar below. It carries one decoded
+// `ravel_rspan::SpanRecord` field-for-field plus the `service_name` lifted
+// column (ADR-0054): the RSPAN reader rebuilds the whole merged `attrs` map from
+// one segment alone (same self-containment property RLOG has), so a worker ships
+// exactly what a local `SpanSegmentFetcher` read produces and the coordinator
+// never re-derives attribute merging. That whole content is also the span's
+// identity for the coordinator's total order: two frames sort equal iff every
+// field matches, and equal-keyed spans are BOTH kept (no query-time dedup for
+// spans -- docs/consistency-model.md "logs and spans", ADR-0051 section 5).
+// Field 1 was a deferred opaque `bytes span_payload` placeholder in #283; its
+// number is retired (reserved) rather than reused with a new type, per this
+// file's frozen-field-number discipline. Every field below is additive.
 message SpanFrame {
-  // Opaque encoded per-span merged view for this slice. Grammar deferred to
-  // #285; treated as an opaque blob by this contract.
-  bytes span_payload = 1;
+  reserved 1;                   // was the deferred opaque `bytes span_payload`
+
+  bytes trace_id = 2;           // 16 bytes; RSPAN primary sort/lookup key
+  bytes span_id = 3;            // 8 bytes
+  bytes parent_span_id = 4;     // 8 bytes when present, empty = absent (root)
+  string name = 5;
+  sint64 start_ts_ns = 6;       // span start event time
+  sint64 end_ts_ns = 7;         // span end event time
+  uint32 status_code = 8;       // OTLP StatusCode: 0 Unset, 1 Ok, 2 Error
+  // OTLP status message. proto3 `optional` so absent (None) is distinct from an
+  // explicit empty string, preserving the `SpanRecord::status_message` round
+  // trip exactly.
+  optional string status_message = 9;
+  repeated SpanAttr attrs = 10; // merged resource+scope+span view, order preserved
+  // The `service.name` value lifted into RSPAN's COL_SERVICE_NAME (ADR-0054).
+  // proto3 `optional` so a span carrying no `service.name` (None) is distinct
+  // from one whose value is the empty string.
+  optional string service_name = 11;
+}
+
+// One merged span attribute: a key and its string value. Mirrors one entry of
+// `ravel_rspan::SpanRecord::attrs` (a `(String, String)` pair). Span attribute
+// values are always strings (the RSPAN merged-attrs map is `Map<Utf8, Utf8>`),
+// so unlike `LogAttr` this needs no typed value union.
+message SpanAttr {
+  string key = 1;
+  string value = 2;
 }
 
 // The terminal frame of a slice: the worker's accounting snapshot, the counts

@@ -15,6 +15,7 @@ use tonic::transport::Channel;
 use crate::distrib::codec::{self, CodecError};
 use crate::distrib::proto::series_fetch_client::SeriesFetchClient;
 use crate::fetcher::{FetchStats, FetchedSeriesSoa};
+use crate::span_fetcher::SpanRow;
 
 /// A distributed fetch failed in a way that is not a per-slice typed status.
 /// Distinct from a [`pb::Status`] a worker returns in a summary (which the
@@ -128,6 +129,47 @@ impl SliceLogResponse {
     }
 }
 
+/// One Spans slice's fully-decoded response (#285). The span sibling of
+/// [`SliceLogResponse`]: `spans` carries the worker's decoded per-segment merged
+/// view (each [`SpanRow`] is a rebuilt `SpanRecord` plus its lifted
+/// `service_name`), post-erasure, in the worker's local scan order. The
+/// coordinator re-orders them under the stated span total order and does NOT
+/// dedup, so this arrival order is not load-bearing. Only meaningful when
+/// `status` is `Ok`.
+#[derive(Debug)]
+pub struct SliceSpanResponse {
+    /// Decoded spans, each carrying its full per-segment merged view.
+    pub spans: Vec<SpanRow>,
+    /// The worker's per-slice cost accounting.
+    pub accounting: QueryAccountingSnapshot,
+    /// The worker's per-slice `FetchStats` page counters.
+    pub stats: FetchStats,
+    /// Spans the worker reported returning (carried in the summary's
+    /// `series_returned` field, reused for the span count on this signal).
+    pub spans_returned: u64,
+    /// The worker's terminal typed status.
+    pub status: pb::status::Code,
+    /// The status' human-readable detail (empty for `Ok`).
+    pub status_message: String,
+}
+
+impl SliceSpanResponse {
+    /// A synthetic `Unsupported` response carrying no spans, for a
+    /// [`SliceFetcher`] that has not wired the span path. The coordinator maps
+    /// `Unsupported` to whole-query local fallback (ADR-0071 failure
+    /// semantics), never a wrong or partial result.
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        SliceSpanResponse {
+            spans: Vec::new(),
+            accounting: QueryAccountingSnapshot::default(),
+            stats: FetchStats::default(),
+            spans_returned: 0,
+            status: pb::status::Code::Unsupported,
+            status_message: message.into(),
+        }
+    }
+}
+
 /// The seam between the coordinator merge and a slice worker. Object-safe (via
 /// `async_trait`) so the engine holds one `dyn SliceFetcher`.
 #[async_trait::async_trait]
@@ -151,6 +193,23 @@ pub trait SliceFetcher: Send + Sync {
     ) -> Result<SliceLogResponse, DistribError> {
         Ok(SliceLogResponse::unsupported(
             "distributed log fetch is not implemented by this slice fetcher",
+        ))
+    }
+
+    /// Dispatches one Spans slice request and collects its decoded spans (#285).
+    ///
+    /// The default implementation reports [`pb::status::Code::Unsupported`], so
+    /// a `SliceFetcher` that has not wired the span fetch path degrades to
+    /// whole-query local execution rather than erroring. A real transport
+    /// (`RemoteSliceFetcher`) overrides it to drain the worker's stream and
+    /// decode its [`pb::SpanFrame`]s. Mirrors [`fetch_logs`](Self::fetch_logs)
+    /// exactly.
+    async fn fetch_spans(
+        &self,
+        _request: pb::FetchRequest,
+    ) -> Result<SliceSpanResponse, DistribError> {
+        Ok(SliceSpanResponse::unsupported(
+            "distributed span fetch is not implemented by this slice fetcher",
         ))
     }
 }
@@ -206,6 +265,27 @@ impl SliceFetcher for RemoteSliceFetcher {
             frames.push(frame);
         }
         decode_log_slice_frames(frames)
+    }
+
+    async fn fetch_spans(
+        &self,
+        request: pb::FetchRequest,
+    ) -> Result<SliceSpanResponse, DistribError> {
+        let mut client = SeriesFetchClient::new(self.channel.clone());
+        let response = client
+            .fetch(request)
+            .await
+            .map_err(|s| DistribError::Transport(s.to_string()))?;
+        let mut stream = response.into_inner();
+        let mut frames = Vec::new();
+        while let Some(frame) = stream
+            .message()
+            .await
+            .map_err(|s| DistribError::Transport(s.to_string()))?
+        {
+            frames.push(frame);
+        }
+        decode_span_slice_frames(frames)
     }
 }
 
@@ -333,6 +413,65 @@ pub fn decode_log_slice_frames(
             raw_f64_bytes: summary.raw_f64_bytes,
         },
         records_returned: summary.series_returned,
+        status: code,
+        status_message: status.message,
+    })
+}
+
+/// Decode a Spans slice's full frame sequence into a [`SliceSpanResponse`]
+/// (#285). The span sibling of [`decode_log_slice_frames`]: it accepts
+/// [`pb::SpanFrame`]s and exactly one terminal [`pb::Summary`], and rejects any
+/// metric/histogram/log frame as [`DistribError::FrameSignalUnsupported`] (a
+/// span slice must not carry them). Every malformation is a typed error, never a
+/// panic: a malformed span ([`DistribError::Codec`]), a mixed-signal frame, an
+/// empty frame, a second summary, a missing summary, a summary with no status,
+/// or an unknown status code.
+pub fn decode_span_slice_frames(
+    frames: Vec<pb::FetchResponse>,
+) -> Result<SliceSpanResponse, DistribError> {
+    let mut spans = Vec::new();
+    let mut summary: Option<pb::Summary> = None;
+    for frame in frames {
+        match frame.frame {
+            Some(pb::fetch_response::Frame::Span(sf)) => {
+                spans.push(codec::decode_span_frame(sf)?);
+            }
+            Some(pb::fetch_response::Frame::Series(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("series"));
+            }
+            Some(pb::fetch_response::Frame::Hist(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("histogram"));
+            }
+            Some(pb::fetch_response::Frame::LogRecord(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("log-record"));
+            }
+            Some(pb::fetch_response::Frame::Summary(s)) => {
+                if summary.is_some() {
+                    return Err(DistribError::MultipleSummaries);
+                }
+                summary = Some(s);
+            }
+            None => return Err(DistribError::EmptyFrame),
+        }
+    }
+
+    let summary = summary.ok_or(DistribError::NoSummary)?;
+    let status = summary
+        .status
+        .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
+    let code = codec::decode_status_code(status.code)?;
+    let accounting = summary
+        .accounting
+        .map(codec::decode_accounting)
+        .unwrap_or_default();
+    Ok(SliceSpanResponse {
+        spans,
+        accounting,
+        stats: FetchStats {
+            raw_f64_pages: summary.raw_f64_pages,
+            raw_f64_bytes: summary.raw_f64_bytes,
+        },
+        spans_returned: summary.series_returned,
         status: code,
         status_message: status.message,
     })

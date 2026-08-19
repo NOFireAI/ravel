@@ -46,11 +46,13 @@ use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, Sli
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
 use crate::distrib::{
     log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver,
+    span_order_key,
 };
 use crate::engine::merge_soa_runs;
-use crate::erasure::ErasurePredicate;
+use crate::erasure::{ErasurePredicate, is_erased_span};
 use crate::fetcher::SegmentFetcher;
 use crate::log_fetcher::{LogQuery, LogSegmentFetcher};
+use crate::span_fetcher::{SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -191,10 +193,15 @@ async fn spawn_worker_with_log_fetcher(
     log_fetcher: LogSegmentFetcher,
     segments: Vec<SegmentRef>,
 ) -> (RemoteSliceFetcher, JoinHandle<()>) {
+    // Wire the span fetch path (#285) over the same store, so one worker also
+    // serves Spans slices. Harmless to the metric/log tests: it is only reached
+    // on a `Signal::Spans` request.
+    let span_fetcher = SpanSegmentFetcher::new(Arc::clone(&metrics_store));
     let fetcher = SegmentFetcher::new(metrics_store);
     let resolver = Arc::new(SnapshotSegmentResolver::new(segments));
     let service = SeriesFetchService::new(fetcher, resolver)
         .with_log_fetcher(log_fetcher)
+        .with_span_fetcher(span_fetcher)
         .into_server();
 
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
@@ -947,11 +954,11 @@ fn many_invalidated_slices_map_to_one_retryable_error() {
 }
 
 /// ADR-0071 protocol: the worker dispatches on `request.signal` after decoding.
-/// A still-unimplemented distributed signal (Spans, until #285) is answered with
-/// an `Unsupported` summary so the coordinator falls back to the local path, and
-/// an unknown discriminant is `BadData` (a broken or newer peer, not a
-/// capability gap). The RLOG family (Logs/Alerts/Audit) is now served (#284), so
-/// a Logs request reaches the real log path rather than a blanket rejection.
+/// Profiles has no distributed path, so it is answered with an `Unsupported`
+/// summary so the coordinator falls back to the local path, and an unknown
+/// discriminant is `BadData` (a broken or newer peer, not a capability gap). The
+/// RLOG family (Logs/Alerts/Audit, #284) and Spans (#285) are now served, so
+/// those requests reach a real fetch path rather than a blanket rejection.
 #[test]
 fn worker_rejects_non_metrics_and_unknown_signals() {
     let rt = Runtime::new().expect("runtime");
@@ -988,8 +995,11 @@ fn worker_rejects_non_metrics_and_unknown_signals() {
             fragment_capability: Vec::new(),
         };
 
-        // Spans is still unimplemented (#285), so it must be Unsupported, not
-        // silently answered with metrics.
+        // Spans is now served (#285): the request reaches the real span path.
+        // This RSEG-only corpus has no spans in the [0,0] window, so the span
+        // fetcher's ts-relevance check skips the object (no GET, no RSPAN decode
+        // of the RSEG bytes) and the slice returns an empty Ok summary -- proving
+        // Spans is dispatched to a real path, not the former blanket rejection.
         let spans = SliceFetcher::fetch(
             &fetcher,
             request(crate::distrib::codec::signal_to_u32(Signal::Spans)),
@@ -998,8 +1008,8 @@ fn worker_rejects_non_metrics_and_unknown_signals() {
         .expect("worker responds to a spans request");
         assert_eq!(
             spans.status,
-            pb::status::Code::Unsupported,
-            "an unimplemented distributed signal must be Unsupported, not silently answered with metrics"
+            pb::status::Code::Ok,
+            "Spans is now served, not rejected"
         );
 
         // Logs is now served (#284): the request reaches the real RLOG path.
@@ -1032,15 +1042,15 @@ fn worker_rejects_non_metrics_and_unknown_signals() {
 
 /// #283: `run_slice_inner` dispatches on the signal via a real per-signal match
 /// arm reached AFTER decoding tenant/matchers/erasure, not the former
-/// pre-decode blanket rejection. Logs and Spans route to their own branch (a
-/// stub returning a distinct "not yet implemented" Unsupported until #284/#285
-/// fill it in); Profiles stays rejected exactly as every non-Metrics signal was
-/// before #283.
+/// pre-decode blanket rejection. Logs (#284) and Spans (#285) now route to their
+/// real fetch paths; Profiles stays rejected exactly as every non-Metrics signal
+/// was before #283.
 ///
 /// Two facts here would each FAIL against the old blanket-rejection code:
-///  1. Logs/Spans now carry the distinct "not yet implemented" message; the old
-///     code produced "not distributed yet; only Metrics" for every non-Metrics
-///     signal, so it never distinguished the stubbed family from Profiles.
+///  1. Logs/Spans reach a real path (served Ok on this empty-window corpus), and
+///     Profiles keeps the reject arm; the old code produced one identical
+///     "not distributed yet; only Metrics" for every non-Metrics signal, so it
+///     never distinguished a served signal from Profiles.
 ///  2. A Logs request with a malformed `tenant_hash` now returns `BadData`
 ///     (tenant decode runs before the signal dispatch); the old code returned
 ///     `Unsupported` because the signal check preceded any decode.
@@ -1080,32 +1090,30 @@ fn run_slice_inner_dispatches_on_signal_not_blanket_rejects() {
             fragment_capability: Vec::new(),
         };
 
-        // Spans reaches the per-signal stub branch: Unsupported, but with the
-        // distinct "not yet implemented" message the old blanket code never
-        // produced. (Logs/Alerts/Audit are now served by #284, so they no longer
-        // take a stub branch; see the Logs assertion below.)
-        for signal in [Signal::Spans] {
-            let resp = SliceFetcher::fetch(
-                &fetcher,
-                request(
-                    crate::distrib::codec::signal_to_u32(signal),
-                    TENANT.0.to_vec(),
-                ),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("worker responds to a {signal:?} request: {e:?}"));
-            assert_eq!(
-                resp.status,
-                pb::status::Code::Unsupported,
-                "{signal:?} stub is still Unsupported so the coordinator falls back to local"
-            );
-            assert!(
-                resp.status_message.contains("not yet implemented"),
-                "{signal:?} must reach the new per-signal stub branch (distinct message), \
-                 got {:?}",
-                resp.status_message
-            );
-        }
+        // Spans now dispatches to the real span path (#285), no longer a stub.
+        // The RSEG-only corpus has no spans in the [0,0] window, so the span
+        // fetcher skips it and the slice returns an empty Ok summary. The key
+        // point is that the status is served, not the old "not yet implemented"
+        // stub.
+        let spans = SliceFetcher::fetch(
+            &fetcher,
+            request(
+                crate::distrib::codec::signal_to_u32(Signal::Spans),
+                TENANT.0.to_vec(),
+            ),
+        )
+        .await
+        .expect("worker responds to a spans request");
+        assert_eq!(
+            spans.status,
+            pb::status::Code::Ok,
+            "Spans is served by the real path, not the stub"
+        );
+        assert!(
+            !spans.status_message.contains("not yet implemented"),
+            "Spans must not take a stub branch, got {:?}",
+            spans.status_message
+        );
 
         // Logs now dispatches to the real RLOG path (#284), no longer a stub. The
         // RSEG-only corpus has no records in the [0,0] window, so the log fetcher
@@ -2102,6 +2110,555 @@ fn logs_worker_without_log_fetcher_signals_local_fallback() {
         assert!(
             result.is_none(),
             "a worker with no log fetcher signals whole-query local fallback (Ok(None))"
+        );
+        server.abort();
+    });
+}
+
+// --- Spans distributed fan-out (#285) --------------------------------------
+//
+// The centerpiece is `run_span_differential`: over a real loopback worker, a
+// distributed Spans fetch merged by the coordinator equals, as a multiset under
+// the stated span total order, a raw local `SpanSegmentFetcher` read over the
+// same segments -- concatenated directly, NOT through `merge_spans`, so the
+// reference is independent of the function under test and the differential can
+// actually catch a merge regression. This includes a corpus where one trace's
+// spans straddle two slices (a reshard-activation window). The test proves the
+// codec preserves every span and the partition is total -- and, on the split
+// corpus, that the coordinator ORDERS rather than concatenates in slice order.
+// Duplicate-span preservation (no query-time dedup for spans) is pinned
+// separately by `spans_coordinator_preserves_duplicate_spans_across_slices`.
+
+const TA: [u8; 16] = [0xAA; 16];
+const TB: [u8; 16] = [0xBB; 16];
+const S1: [u8; 8] = [1u8; 8];
+const S2: [u8; 8] = [2u8; 8];
+
+/// A span record on `trace_id`/`span_id` over `[start, end]`, with string
+/// attributes. The attrs include `service.name` so the RSPAN `service_name`
+/// lifted column (ADR-0054) is exercised: the writer lifts it out and the reader
+/// re-inserts it, so a round-tripped record's `attrs` still carry it.
+fn span_record(
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    start: i64,
+    end: i64,
+    attrs: &[(&str, &str)],
+) -> ravel_rspan::SpanRecord {
+    ravel_rspan::SpanRecord {
+        trace_id,
+        span_id,
+        parent_span_id: None,
+        name: "op".to_string(),
+        start_ts_ns: start,
+        end_ts_ns: end,
+        status_code: ravel_rspan::StatusCode::Unset,
+        status_message: None,
+        attrs: attrs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+    }
+}
+
+/// Writes one RSPAN object holding `records` under `shard`/`hour`, returning an
+/// L0 `SegmentRef` with a distinct content hash (blake3 of the bytes) so the
+/// worker's content-hash resolver keys each segment uniquely. Small blocks so a
+/// multi-block object is exercised; this never changes the span set returned.
+async fn write_span_segment(
+    store: &MemoryStore,
+    key: u64,
+    shard: u32,
+    hour: u32,
+    records: &[ravel_rspan::SpanRecord],
+) -> SegmentRef {
+    let cfg = ravel_rspan::RspanConfig {
+        block_target_records: 2,
+        ..ravel_rspan::RspanConfig::default()
+    };
+    let identity = ravel_rspan::ObjectIdentity {
+        tenant_hash: TENANT.0,
+        shard,
+        writer_id: [4u8; 16],
+        writer_epoch: 1,
+        writer_seq: key,
+    };
+    let mut writer = ravel_rspan::RspanWriter::new(cfg, identity);
+    for r in records {
+        writer.push(r.clone());
+    }
+    let bytes = writer.finish().expect("finish rspan object");
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+    let size = bytes.len() as u64;
+    let object_key = format!("spans/{key}.rspan");
+    store
+        .put(
+            &object_key,
+            bytes::Bytes::from(bytes),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put span object");
+    let min = records
+        .iter()
+        .map(|r| r.start_ts_ns)
+        .min()
+        .expect("nonempty");
+    let max = records.iter().map(|r| r.end_ts_ns).max().expect("nonempty");
+    SegmentRef {
+        data_object_key: object_key,
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: hour,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard,
+        content_hash,
+        writer_id: Uuid::from_u128(u128::from(key) + 1),
+        writer_epoch: 1,
+        writer_seq: key,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+    }
+}
+
+/// The local reference for spans: read every segment with `SpanSegmentFetcher`
+/// over the whole-snapshot window (a superset of each segment) and concatenate
+/// the per-segment spans directly, with NO merge or dedup, applying erasure per
+/// segment through the same `is_erased_span` funnel the local `spans` scan uses.
+/// This is exactly the multiset of spans a local multi-segment read observes, and
+/// it is deliberately independent of `merge_spans` (the function under test) so
+/// the differential compares distributed output against a reference the function
+/// cannot influence. Callers compare via [`sorted_spans_by_order_key`] as a
+/// multiset (duplicates preserved on both sides).
+async fn local_span_rows(
+    store: Arc<MemoryStore>,
+    segments: &[SegmentRef],
+    erasure: &[ErasurePredicate],
+) -> Vec<SpanRow> {
+    let fetcher = SpanSegmentFetcher::new(store);
+    let (min, max) = whole_window(segments);
+    let query = ravel_rspan::SpanQuery::ts_range(min, max);
+    let mut all = Vec::new();
+    for seg in segments {
+        let out = fetcher
+            .fetch(seg, &query, None, None, &[])
+            .await
+            .expect("local span fetch");
+        let mut rows = out.map(|o| o.records).unwrap_or_default();
+        if !erasure.is_empty() {
+            rows.retain(|row| !is_erased_span(&row.record.attrs, row.record.start_ts_ns, erasure));
+        }
+        all.extend(rows);
+    }
+    all
+}
+
+/// Stable-sort a span multiset under the production total-order key, preserving
+/// duplicates. Applying this to both sides of a differential turns an
+/// order-sensitive `Vec` equality into a multiset equality under the stated
+/// order, without ever calling `merge_spans`.
+fn sorted_spans_by_order_key(mut spans: Vec<SpanRow>) -> Vec<SpanRow> {
+    spans.sort_by_key(span_order_key);
+    spans
+}
+
+/// The distributed reference for spans: dispatch over a real loopback worker at
+/// width `cap`, merged by the coordinator's `fetch_spans`.
+async fn distributed_span_rows(
+    store: Arc<MemoryStore>,
+    segments: Vec<SegmentRef>,
+    snapshot: &Snapshot,
+    erasure: &[ErasurePredicate],
+    cap: usize,
+) -> Vec<SpanRow> {
+    let (fetcher, server) = spawn_worker(store, segments).await;
+    let distributed = Distributed::new(
+        Arc::new(fetcher),
+        DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: cap,
+        },
+    );
+    let accounting = QueryAccounting::new();
+    let spans = distributed
+        .fetch_spans(
+            TENANT,
+            Signal::Spans,
+            snapshot,
+            &[],
+            erasure,
+            &accounting,
+            &EngineConfig::default(),
+            i64::MAX,
+        )
+        .await
+        .expect("distributed span fetch")
+        .expect("distributed produced a result (not a fallback)");
+    server.abort();
+    spans
+}
+
+/// The (trace_id, span_id) identity sequence of a span list, for order-sensitive
+/// prove-the-test comparisons.
+fn span_id_seq(spans: &[SpanRow]) -> Vec<([u8; 16], [u8; 8])> {
+    spans
+        .iter()
+        .map(|s| (s.record.trace_id, s.record.span_id))
+        .collect()
+}
+
+/// The split corpus: two segments under two DIFFERENT shards (a reshard-
+/// activation window), each carrying spans of BOTH trace `TA` and trace `TB`.
+/// Because the corpus has exactly two shards, `cap = 2` puts each segment in its
+/// own slice (shard-major partitioning), so both traces straddle the two slices.
+///
+/// Span identities are laid out so slice-order concatenation is observably NOT
+/// the correct total order `(trace_id, span_id, ...)`:
+/// - seg_a (shard 0), sorted on disk by (trace_id, start): TA/S2 (start 20),
+///   TB/S1 (start 15).
+/// - seg_b (shard 1): TA/S1 (start 10), TB/S2 (start 25).
+///
+/// The correct merge order is TA/S1, TA/S2, TB/S1, TB/S2; slice-order concat
+/// (seg_a then seg_b) is TA/S2, TB/S1, TA/S1, TB/S2 -- different, so the merge's
+/// `sort_by` line is under test.
+///
+/// Per-span `user_id`: the two TA spans carry u1, the two TB spans carry u2.
+/// Erasing u1 therefore removes both TA spans, which straddle the two slices.
+async fn split_trace_corpus(store: &MemoryStore) -> Vec<SegmentRef> {
+    let seg_a = write_span_segment(
+        store,
+        0,
+        0,
+        100,
+        &[
+            span_record(
+                TA,
+                S2,
+                20,
+                21,
+                &[("service.name", "alpha"), ("user_id", "u1")],
+            ),
+            span_record(
+                TB,
+                S1,
+                15,
+                16,
+                &[("service.name", "beta"), ("user_id", "u2")],
+            ),
+        ],
+    )
+    .await;
+    let seg_b = write_span_segment(
+        store,
+        1,
+        1,
+        101,
+        &[
+            span_record(
+                TA,
+                S1,
+                10,
+                11,
+                &[("service.name", "alpha"), ("user_id", "u1")],
+            ),
+            span_record(
+                TB,
+                S2,
+                25,
+                26,
+                &[("service.name", "beta"), ("user_id", "u2")],
+            ),
+        ],
+    )
+    .await;
+    vec![seg_a, seg_b]
+}
+
+/// Differential: distributed span fetch == local read, as a multiset under the
+/// stated total order, at cap 1 (one slice) and cap 2 (a stream-straddling two
+/// slice partition of the same split corpus). On the two-slice case it also
+/// proves the corpus is discriminating: a naive concatenate-in-slice-order
+/// coordinator would emit an order the local read never produces, so the
+/// `sort_by` line in `merge_spans` is the line under test. Reintroducing a
+/// slice-order concatenation there fails the `assert_ne!` prove-the-test and the
+/// cap-2 multiset assertion.
+#[test]
+fn spans_distributed_matches_local_including_reshard_straddle() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = split_trace_corpus(&store).await;
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // Single-slice: every segment in one slice. Distributed == local, bit
+        // identical (SpanRow: PartialEq) as a multiset under the total order.
+        let local = local_span_rows(Arc::clone(&store), &segments, &[]).await;
+        let one_slice =
+            distributed_span_rows(Arc::clone(&store), segments.clone(), &snapshot, &[], 1).await;
+        assert_eq!(
+            sorted_spans_by_order_key(one_slice),
+            sorted_spans_by_order_key(local.clone()),
+            "single-slice distributed spans must equal local, bit identical"
+        );
+
+        // Two-slice straddle: confirm the partition genuinely places each segment
+        // in its own slice, so both traces' spans straddle two slices (not the
+        // easy single-slice case).
+        let slices = partition_snapshot(&snapshot, 2);
+        assert_eq!(
+            slices.len(),
+            2,
+            "the reshard-straddle corpus must produce two slices"
+        );
+        assert_eq!(
+            slices[0].segments.len(),
+            1,
+            "slice 0 must hold exactly one segment, so the traces straddle"
+        );
+        assert_eq!(
+            slices[1].segments.len(),
+            1,
+            "slice 1 must hold exactly one segment, so the traces straddle"
+        );
+
+        let two_slice =
+            distributed_span_rows(Arc::clone(&store), segments.clone(), &snapshot, &[], 2).await;
+        assert_eq!(
+            sorted_spans_by_order_key(two_slice.clone()),
+            sorted_spans_by_order_key(local),
+            "two-slice distributed spans must equal local even when a trace straddles slices"
+        );
+
+        // Prove-the-test: the naive wrong coordinator concatenates each slice's
+        // local read in slice order. On this corpus that order is observably NOT
+        // the global total order the correct merge produces, so the differential
+        // is not vacuous.
+        let ref_store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+        let ref_fetcher = SpanSegmentFetcher::new(ref_store);
+        let (min, max) = whole_window(&segments);
+        let full = ravel_rspan::SpanQuery::ts_range(min, max);
+        let mut naive = Vec::new();
+        for slice in &slices {
+            for seg in &slice.segments {
+                let out = ref_fetcher
+                    .fetch(seg, &full, None, None, &[])
+                    .await
+                    .expect("fetch")
+                    .expect("in range");
+                naive.extend(out.records);
+            }
+        }
+        let naive_ids = span_id_seq(&naive);
+        let correct_ids = span_id_seq(&two_slice);
+        assert_ne!(
+            naive_ids, correct_ids,
+            "slice-order concatenation must differ from the correct merge, else the test is vacuous"
+        );
+        assert_eq!(
+            correct_ids,
+            vec![(TA, S1), (TA, S2), (TB, S1), (TB, S2)],
+            "the merge must emit the global (trace_id, span_id) order"
+        );
+    });
+}
+
+/// Two byte-identical spans split across two segments/slices must BOTH survive
+/// the coordinator's merge. Per docs/consistency-model.md ("logs and spans") and
+/// ADR-0051 section 5, spans have NO query-time dedup: a retry after a lost ack
+/// produces byte-identical spans that are legitimately duplicate user data and
+/// must stay visible, so collapsing them is silent data loss. This is the
+/// focused minimal-repro for the dedup trap #284 shipped and this task must not
+/// repeat: reintroducing a `dedup_by` on the merged pool collapses the two
+/// spans to one and fails the `distributed.len() == 2` assertion.
+#[test]
+fn spans_coordinator_preserves_duplicate_spans_across_slices() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        // The SAME span written into two segments under two shards -> two slices
+        // at cap 2. A raw local read of the two segments returns TWO spans; the
+        // distributed merge must too.
+        let dup = span_record(
+            [0xCC; 16],
+            [9u8; 8],
+            50,
+            51,
+            &[("service.name", "gamma"), ("k", "v")],
+        );
+        let seg_a = write_span_segment(&store, 0, 0, 100, std::slice::from_ref(&dup)).await;
+        let seg_b = write_span_segment(&store, 1, 1, 100, std::slice::from_ref(&dup)).await;
+        let segments = vec![seg_a, seg_b];
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // Confirm the two duplicate spans genuinely land in two different slices,
+        // not the easy single-slice case where any merge would trivially preserve
+        // both.
+        let slices = partition_snapshot(&snapshot, 2);
+        assert_eq!(
+            slices.len(),
+            2,
+            "the two segments must partition into two slices for this to be a
+             cross-slice duplicate, not a within-slice one"
+        );
+
+        // Reference: a raw local read of both segments, independent of the merge.
+        let local = local_span_rows(Arc::clone(&store), &segments, &[]).await;
+        assert_eq!(
+            local.len(),
+            2,
+            "a raw local read of the two segments returns both duplicate spans"
+        );
+
+        let distributed =
+            distributed_span_rows(Arc::clone(&store), segments, &snapshot, &[], 2).await;
+        assert_eq!(
+            distributed.len(),
+            2,
+            "the coordinator must preserve both cross-slice duplicate spans, not collapse them"
+        );
+        assert_eq!(
+            sorted_spans_by_order_key(distributed),
+            sorted_spans_by_order_key(local),
+            "the distributed result is the same multiset as the raw local read"
+        );
+    });
+}
+
+/// Worker-side erasure property: erasing spans by a per-span attribute against a
+/// distributed slice set equals a local read of the same segments erased the
+/// same way, including when the affected trace's spans straddle two slices. The
+/// worker applies erasure per segment through the same `is_erased_span` funnel
+/// the local scan uses; correctness rests on segment self-containment, not slice
+/// atomicity (ADR-0071 amendment decision 5). Deleting the worker's
+/// `is_erased_span` retain in `run_slice_spans` makes the erased spans reappear
+/// and the "no surviving u1" / kept-set assertions below fail.
+#[test]
+fn spans_worker_applies_erasure_across_straddling_slices() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        for cap in [1usize, 2] {
+            let store = Arc::new(MemoryStore::new());
+            let segments = split_trace_corpus(&store).await;
+            let snapshot = Snapshot {
+                segments: segments.clone(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            };
+
+            // Erase every span carrying user_id=u1. Both TA spans carry u1, at
+            // ts 10 (slice 1) and ts 20 (slice 0), so the erased trace straddles
+            // slices at cap 2.
+            let erasure = vec![ErasurePredicate::windowless(vec![(
+                "user_id".to_string(),
+                "u1".to_string(),
+            )])];
+
+            let local = local_span_rows(Arc::clone(&store), &segments, &erasure).await;
+            let distributed = distributed_span_rows(
+                Arc::clone(&store),
+                segments.clone(),
+                &snapshot,
+                &erasure,
+                cap,
+            )
+            .await;
+            assert_eq!(
+                sorted_spans_by_order_key(distributed.clone()),
+                sorted_spans_by_order_key(local),
+                "cap {cap}: distributed erasure must equal local erasure over the same segments"
+            );
+            // The erasure genuinely removed the u1 spans (not a vacuous no-op),
+            // and did so across the straddling slices.
+            assert!(
+                distributed.iter().all(|row| !row
+                    .record
+                    .attrs
+                    .iter()
+                    .any(|(k, v)| k == "user_id" && v == "u1")),
+                "cap {cap}: no surviving span carries the erased user_id=u1"
+            );
+            assert_eq!(
+                span_id_seq(&sorted_spans_by_order_key(distributed)),
+                vec![(TB, S1), (TB, S2)],
+                "cap {cap}: exactly the u2 (TB) spans survive, in total order"
+            );
+        }
+    });
+}
+
+/// A worker with no span fetcher wired returns `Unsupported` for a Spans slice,
+/// so the coordinator falls back to whole-query local execution (`Ok(None)`),
+/// never an error. This is the load-bearing skew direction (a not-yet-upgraded
+/// worker) exercised over the real wire.
+#[test]
+fn spans_worker_without_span_fetcher_signals_local_fallback() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = split_trace_corpus(&store).await;
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // A worker WITHOUT `.with_span_fetcher(..)`: the metric path only.
+        let metric_store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+        let metric_fetcher = SegmentFetcher::new(metric_store);
+        let resolver = Arc::new(SnapshotSegmentResolver::new(segments.clone()));
+        let service = SeriesFetchService::new(metric_fetcher, resolver).into_server();
+        let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+        let addr = incoming.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect_lazy();
+        let fetcher = RemoteSliceFetcher::new(channel);
+
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 2,
+            },
+        );
+        let accounting = QueryAccounting::new();
+        let result = distributed
+            .fetch_spans(
+                TENANT,
+                Signal::Spans,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &EngineConfig::default(),
+                i64::MAX,
+            )
+            .await
+            .expect("unsupported must not be an error");
+        assert!(
+            result.is_none(),
+            "a worker with no span fetcher signals whole-query local fallback (Ok(None))"
         );
         server.abort();
     });
