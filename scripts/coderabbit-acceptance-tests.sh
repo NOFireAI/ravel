@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Executable part of the CodeRabbit acceptance matrix (ADR-0090).
+# Executable part of the CodeRabbit acceptance matrix (ADR-0091).
 #
 # Covers every case in docs/guides/coderabbit-runbook.md that can be decided
 # without a GitHub account, a CodeRabbit credential, or an administrator

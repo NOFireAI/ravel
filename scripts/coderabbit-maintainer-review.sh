@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Review one Ravel pull request with the CodeRabbit CLI, locally, as yourself.
 #
-# This is the fallback path in ADR-0090, and the path to use whenever the
+# This is the fallback path in ADR-0091, and the path to use whenever the
 # `coderabbit-oss` GitHub Environment does not exist: if the Open Source plan
 # does not grant an Agentic API key, Ravel does not buy one. It reviews with the
 # maintainer's own CodeRabbit login instead, which means the allowance spent is
@@ -139,7 +139,7 @@ config_hash=$(cat "${policy_dir}/trusted-config.yaml" "${policy_dir}/ravel-revie
 installed_version=$(coderabbit --version 2>/dev/null | tr -d '[:space:]') || installed_version=""
 if [[ "$installed_version" != "$CODERABBIT_CLI_VERSION" ]]; then
   die "CodeRabbit CLI ${installed_version:-<unknown>} is installed, but this repository pins ${CODERABBIT_CLI_VERSION}.
-     ADR-0090 pins the version because the review policy depends on this build's
+     ADR-0091 pins the version because the review policy depends on this build's
      --config behaviour. Install the pinned build (see the runbook) or update the
      pin deliberately."
 fi

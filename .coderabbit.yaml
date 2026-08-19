@@ -17,7 +17,7 @@
 #      controls a pull request cannot edit. See
 #      docs/guides/coderabbit-runbook.md.
 #   2. Not installing the App on this repository at all, which is the posture
-#      ADR-0090 prefers if OSS entitlement does not require the installation.
+#      ADR-0091 prefers if OSS entitlement does not require the installation.
 #   3. .github/workflows/coderabbit-maintainer-review.yml, which is the only
 #      supported way to obtain a CodeRabbit review of a Ravel pull request. It
 #      is dispatched by hand, it verifies the actor holds `maintain` or `admin`
