@@ -291,3 +291,92 @@ measures the prune ratio and finds it is 1.0.
 would decode `stream_attrs` per block to decide whether a prune is safe. It
 moves per-record work onto the path whose whole point is to avoid reading
 records, and it still cannot recover a record the index never listed.
+
+## Amendment 2026-08-20: precedence among a record's own duplicate occurrences
+
+The 2026-08-03 amendment said POSTINGS indexes "the union of a record's
+resource, scope, and own attributes, with its own winning on a key collision,
+which is exactly what `ravel_sql::rlog_attrs::merged_attrs` computes". That
+defined precedence *between* layers (record over resource/scope) but left
+precedence *among* a single record's own multiple occurrences of one key
+undefined. `LogRecord::attrs` is an ordered list that has always permitted
+duplicate keys of any type mix (`encode_attrs` in `ravel-types` is written to
+keep both), so this gap was reachable.
+
+### What was wrong
+
+Two functions folded a record's own duplicates in two different orders, and
+nothing said which was authoritative:
+
+- `writer.rs::merged_indexed_terms` (write side) folded a record's attributes
+  last-wins over their **original write-time occurrence order**.
+- `reader.rs::rebuild_record` reconstructs a record's attributes in a fixed
+  order the on-disk format dictates -- its FIELD_DIR columnar entries in
+  `(name bytes, type)`-ascending order, then its `attrs_raw` overflow entries
+  in the canonical `(key bytes, encoded value bytes)`-ascending order -- and
+  `rlog_attrs::merged_attrs` (read side) then folds *that* list last-wins.
+
+Write-time order and reconstruction order can disagree, so the POSTINGS term
+for a key could be built from a value the query-time merged view does not
+return, and an equality prune on the value the query truly needs could drop the
+block that has it. This shipped and is reachable through the `attrs['k'] = 'v'`
+pushdown; it has nothing to do with declared columns.
+
+The on-disk format does not preserve write-time occurrence order, and inventing
+a way to preserve it would break ADR-0029's frozen `attrs_raw` canonical
+encoding. It is also unnecessary: no consumer needs write-time order, only a
+single deterministic answer that write and read agree on.
+
+### Decision
+
+The winner among a record's own occurrences of one key is defined as **the last
+entry in the read side's reconstruction order**, which is:
+
+1. the record's columnar occurrences of that key, ascending by `FieldType`
+   type byte (FIELD_DIR's `(name, type)` sort key restricted to one name);
+   then
+2. the record's overflow (`attrs_raw`) occurrences of that key, ascending by
+   the frozen canonical `(key, encoded value)` order of `encode_attrs`
+   (`ravel-types`); with the name fixed, this is the encoded-value-byte order.
+
+The last entry of that combined order wins, then the record layer wins over the
+stream (resource/scope) layer as before. This is exactly what `rebuild_record`
+followed by `merged_attrs` already, incidentally, produces.
+
+This amendment is what makes that incidental read-side behavior an intentional,
+documented contract. It now governs both sides: `merged_indexed_terms` computes
+this same winner (its job is to *predict* what `rebuild_record` + `merged_attrs`
+will report for an indexed key, not to independently pick one), and the read
+side is its authoritative definition. No on-disk format changes: `ResolvedRow`'s
+shape, `attrs_raw`'s encoding, and FIELD_DIR's layout are untouched, and the
+`POSTINGS_VERSION` byte stays 2 (the change fixes which value a v2 list records,
+not what a v2 list means).
+
+### Version 1 objects
+
+A version 1 POSTINGS list indexes the per-record column layer's first
+occurrence per type only. A record-level duplicate key therefore can put the
+merged-view winner in a value no v1 posting indexes: a same-type duplicate's
+later occurrence lands in `attrs_raw`, which no posting covers, and a v1 object
+records nothing that distinguishes "carried such a duplicate" from "did not".
+Since that cannot be told apart per object without bookkeeping the v1 format
+never wrote, a v1-grammar object now declines POSTINGS pruning for its equality
+arms unconditionally, on both the content and prune channels. This is
+widen-only (ADR-0013): it costs the pruning optimization on legacy objects,
+never correctness, and it subsumes the narrower version-1 resource/scope
+exclusion the 2026-08-03 amendment introduced (which covered only the
+stream-level hazard, not the duplicate one).
+
+### A distinct, adjacent hazard: cross-type stringification
+
+Separately from the fold order, the reader resolved a merged-view prune
+literal against a single `(name, type)` column: a pushed-down `attrs['k'] = 'v'`
+is a `Str` literal (SQL's `attrs` is `Map(Utf8, Utf8)`), and a value of another
+type that stringifies to the same text is a merged-view match that lives in a
+different column's postings, which POSTINGS stores bit-exact per type, never
+stringified. Probing only the `(name, Str)` column would prune away a block
+whose match is, for example, an `I64` value with that text. The reader now
+declines a `Str`-literal prune arm on a name that also has a non-`Str` column
+(widen-only, ADR-0013). This is a different mechanism than the duplicate fold
+order -- the term written is right, the column probed is wrong -- and is fixed
+here because it sits in the same prune path.
