@@ -99,3 +99,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0094](0094-parallel-final-aggregation-exact-typed.md) | Parallel final aggregation for exact-typed inputs | Proposed |
 | [0095](0095-numstat-crosstype-declared-column-agreement.md) | NumStat cross-type resolution fix and RLOG v3 | Accepted |
 | [0096](0096-queryfrag-per-sample-provenance-and-histograms.md) | Query fan-out frame carries per-sample provenance and histograms | Claimed |
+| [0097](0097-sql-scalar-function-surface.md) | The SQL scalar and window function surface: extend the fail-closed registry gate beyond aggregates | Proposed |
