@@ -9,10 +9,10 @@ use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError, Version};
 use ravel_promql::{LabelMatcher, matches_series};
 use ravel_segment::{
-    ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry, SeriesEntry,
-    SeriesEntryV4, ValPageKind, ValueKind, check_identity, decode_catalog_v4, decode_catalog_v5,
-    decode_catalog_v5_chunked, decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix,
-    plan_ranges_v4,
+    ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry,
+    SampleProvenance, SeriesEntry, SeriesEntryV4, ValPageKind, ValueKind, check_identity,
+    decode_catalog_v4, decode_catalog_v5, decode_catalog_v5_chunked, decode_run_histogram_pages,
+    decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
@@ -1394,6 +1394,7 @@ impl SegmentFetcher {
                         created_unix_ns: seg_ref.created_unix_ns,
                         writer_epoch: seg_ref.writer_epoch,
                         writer_seq: seg_ref.writer_seq,
+                        per_sample_priorities: concat_priority_column(&entry.per_sample_provenance),
                     });
                 }
                 SegmentLevel::L1 { .. } => {
@@ -1430,6 +1431,10 @@ impl SegmentFetcher {
                             created_unix_ns: run.created_unix_ns,
                             writer_epoch: run.writer_epoch,
                             writer_seq: run.writer_seq,
+                            per_sample_priorities: run_priority_column(
+                                &entry.per_sample_provenance,
+                                run_index,
+                            ),
                         });
                     }
                 }
@@ -1553,6 +1558,7 @@ impl SegmentFetcher {
                         created_unix_ns: seg_ref.created_unix_ns,
                         writer_epoch: seg_ref.writer_epoch,
                         writer_seq: seg_ref.writer_seq,
+                        per_sample_priorities: concat_priority_column(&entry.per_sample_provenance),
                     });
                 }
                 SegmentLevel::L1 { .. } => {
@@ -1585,6 +1591,10 @@ impl SegmentFetcher {
                             created_unix_ns: run.created_unix_ns,
                             writer_epoch: run.writer_epoch,
                             writer_seq: run.writer_seq,
+                            per_sample_priorities: run_priority_column(
+                                &entry.per_sample_provenance,
+                                run_index,
+                            ),
                         });
                     }
                 }
@@ -1898,6 +1908,51 @@ impl SegmentFetcher {
     }
 }
 
+/// Maps one segment [`SampleProvenance`] to the query merge's
+/// [`SamplePriority`]; the four fields are the same comparison tuple.
+fn to_sample_priority(p: &SampleProvenance) -> SamplePriority {
+    SamplePriority {
+        created_unix_ns: p.created_unix_ns,
+        writer_epoch: p.writer_epoch,
+        writer_seq: p.writer_seq,
+        in_page_index: p.in_page_index,
+    }
+}
+
+/// The per-sample priority column for one L1 run (one emission unit per run):
+/// `Some` when the catalog carried the optional provenance columns for that
+/// run, `None` (the common shape) when the run keeps its run-wide provenance.
+/// `provenance` is `SeriesEntryV4::per_sample_provenance`, empty when the object
+/// has no columns at all.
+fn run_priority_column(
+    provenance: &[Option<Vec<SampleProvenance>>],
+    run_index: usize,
+) -> Option<Vec<SamplePriority>> {
+    provenance
+        .get(run_index)
+        .and_then(|opt| opt.as_ref())
+        .map(|col| col.iter().map(to_sample_priority).collect())
+}
+
+/// The per-sample priority column for an L0 emission unit (one series, runs
+/// concatenated). `None` when the object carries no columns (every real L0
+/// object) or when the runs disagree on whether they carry them, which cannot
+/// be expressed as a single column; `Some` concatenates the runs' columns in
+/// run order when every run carries one. No production writer emits L0
+/// provenance, so this is defensive rather than a live path.
+fn concat_priority_column(
+    provenance: &[Option<Vec<SampleProvenance>>],
+) -> Option<Vec<SamplePriority>> {
+    if provenance.is_empty() || provenance.iter().any(|p| p.is_none()) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for col in provenance.iter().flatten() {
+        out.extend(col.iter().map(to_sample_priority));
+    }
+    Some(out)
+}
+
 /// One decoded, provenance-resolved emission unit, convertible to either the
 /// AoS or SoA fetched shape. For L0 this is one series (runs concatenated);
 /// for L1 this is one (series, run).
@@ -1909,15 +1964,20 @@ struct RunDecode {
     created_unix_ns: i64,
     writer_epoch: u64,
     writer_seq: u64,
+    /// The run's per-sample dedup provenance (ADR-0092 decision 1), parallel to
+    /// `timestamps`/`values`, or `None` when the run keeps its run-wide
+    /// provenance (every object an L0 flush or a v6 verbatim compaction
+    /// produces). Populated from the catalog's optional provenance columns; the
+    /// producer that writes them is issue #315.
+    per_sample_priorities: Option<Vec<SamplePriority>>,
 }
 
 impl RunDecode {
-    // `per_sample_priorities: None` on both conversions is the level-keyed
-    // emission contract above, not a stub: an emission unit is one series' runs
-    // from one L0, or one L1 run, and every sample in it shares the run-wide
-    // provenance the unit carries. A per-sample column only becomes possible
-    // once a run merges several writes' samples (ADR-0092 decision 1, issue
-    // #315).
+    // `per_sample_priorities` carries the run's optional provenance column
+    // straight through to the fetched shape: `None` is the level-keyed emission
+    // contract above (an emission unit whose samples share one run-wide
+    // provenance), `Some` a run-merged run whose samples each keep their own key
+    // (ADR-0092 decision 1).
     fn into_soa(self) -> FetchedSeriesSoa {
         FetchedSeriesSoa {
             series_id: self.series_id,
@@ -1927,7 +1987,7 @@ impl RunDecode {
             created_unix_ns: self.created_unix_ns,
             writer_epoch: self.writer_epoch,
             writer_seq: self.writer_seq,
-            per_sample_priorities: None,
+            per_sample_priorities: self.per_sample_priorities,
         }
     }
 
@@ -1945,7 +2005,7 @@ impl RunDecode {
             created_unix_ns: self.created_unix_ns,
             writer_epoch: self.writer_epoch,
             writer_seq: self.writer_seq,
-            per_sample_priorities: None,
+            per_sample_priorities: self.per_sample_priorities,
         }
     }
 }
@@ -1961,10 +2021,13 @@ struct RunHistogramDecode {
     created_unix_ns: i64,
     writer_epoch: u64,
     writer_seq: u64,
+    /// The run's per-sample dedup provenance (ADR-0092 decision 1), parallel to
+    /// `timestamps`/`values`, or `None` for a run-wide-provenance run; see
+    /// [`RunDecode::per_sample_priorities`].
+    per_sample_priorities: Option<Vec<SamplePriority>>,
 }
 
 impl RunHistogramDecode {
-    // Run-wide provenance only, for the same reason as [`RunDecode::into_soa`].
     fn into_fetched(self) -> FetchedHistogramSeries {
         FetchedHistogramSeries {
             series_id: self.series_id,
@@ -1974,7 +2037,7 @@ impl RunHistogramDecode {
             created_unix_ns: self.created_unix_ns,
             writer_epoch: self.writer_epoch,
             writer_seq: self.writer_seq,
-            per_sample_priorities: None,
+            per_sample_priorities: self.per_sample_priorities,
         }
     }
 }
@@ -2119,11 +2182,14 @@ mod tests {
     use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence};
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{
-        HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
-        SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues,
+        CompactionMetaV4, HistogramCounts, HistogramSample, HistogramSpan, HistogramValue,
+        IngestBounds, ResetHint, RunInputV7, SampleProvenance, SegmentIdentity, SegmentWriter,
+        SeriesInput, SeriesInputV3, SeriesInputV7, SeriesValues, encode_run_v4,
     };
-    use ravel_types::{Label, LabelSet};
+    use ravel_types::{Label, LabelSet, TenantId};
     use uuid::Uuid;
+
+    use crate::engine::merge_soa_runs;
 
     use super::*;
 
@@ -2255,6 +2321,263 @@ mod tests {
         // raw-f64 bytes (6-byte header + 2 * 8-byte values).
         assert_eq!(stats.raw_f64_pages, 1);
         assert_eq!(stats.raw_f64_bytes, 6 + 2 * 8);
+    }
+
+    fn e2e_series_id() -> SeriesId {
+        SeriesId::compute(&TenantId::new("t".to_string()), "m", &labels("m")).expect("series id")
+    }
+
+    fn e2e_tenant() -> TenantHash {
+        TenantHash([9u8; 16])
+    }
+
+    /// Writes an L1 object whose single merged run carries per-sample
+    /// provenance, and returns a matching L1 `SegmentRef`. The merged sample
+    /// order is deliberately the OPPOSITE of the per-sample created order at the
+    /// duplicate timestamp, so a reader that fell back to run-wide position for
+    /// the fourth dedup element would pick a different winner than the columns
+    /// dictate.
+    async fn write_l1_with_provenance() -> (Arc<MemoryStore>, SegmentRef) {
+        let id = e2e_series_id();
+        let identity = SegmentIdentity {
+            tenant_hash: e2e_tenant().0,
+            shard: 0,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let input_set_hash = [0x33u8; 32];
+        let meta = CompactionMetaV4 {
+            ingest_hour_bucket: 0,
+            input_set_hash,
+            part_index: 0,
+            level: 1,
+        };
+
+        // Merged run, samples in on-disk order (ascending ts, dup ts kept):
+        //   idx0: ts=10 val=1.0  from write A (created 200)
+        //   idx1: ts=10 val=9.0  from write B (created 100)
+        //   idx2: ts=20 val=2.0  from write A (created 200)
+        let samples = SeriesValues::Scalar(vec![
+            Sample {
+                ts_ns: 10,
+                value: 1.0,
+            },
+            Sample {
+                ts_ns: 10,
+                value: 9.0,
+            },
+            Sample {
+                ts_ns: 20,
+                value: 2.0,
+            },
+        ]);
+        // Run-wide created deliberately 100 (the base): if the reader ignored
+        // the columns, run-wide position order would make idx1 (9.0) win ts=10.
+        let run = encode_run_v4(&id, 100, 0, 0, &samples).expect("frame merged run");
+        let provenance = Some(vec![
+            SampleProvenance {
+                created_unix_ns: 200,
+                writer_epoch: 1,
+                writer_seq: 1,
+                in_page_index: 0,
+            },
+            SampleProvenance {
+                created_unix_ns: 100,
+                writer_epoch: 1,
+                writer_seq: 1,
+                in_page_index: 0,
+            },
+            SampleProvenance {
+                created_unix_ns: 200,
+                writer_epoch: 1,
+                writer_seq: 1,
+                in_page_index: 1,
+            },
+        ]);
+        let series = vec![SeriesInputV7 {
+            series_id: id,
+            labels: labels("m"),
+            runs: vec![RunInputV7 { run, provenance }],
+        }];
+        let written =
+            SegmentWriter::write_v7_with_provenance(series, identity, bounds, meta, Vec::new())
+                .expect("write L1 with provenance");
+
+        let store = Arc::new(MemoryStore::new());
+        let key = "test/l1-provenance.rseg";
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put L1 object");
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 100,
+            level: SegmentLevel::L1 {
+                input_set_hash,
+                part_index: 0,
+            },
+        };
+        (store, seg_ref)
+    }
+
+    /// Writes one L0 object for series `m` with run-wide provenance carried by
+    /// its `SegmentRef` (`created_unix_ns`), the shape a pre-merge flush has.
+    async fn write_l0_run_wide(
+        key: &str,
+        created_unix_ns: i64,
+        samples: &[(i64, f64)],
+    ) -> (Arc<MemoryStore>, SegmentRef) {
+        let identity = SegmentIdentity {
+            tenant_hash: e2e_tenant().0,
+            shard: 0,
+            writer_id: Uuid::from_u128(created_unix_ns as u128).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: created_unix_ns,
+        };
+        let written = SegmentWriter::write(vec![series_named("m", samples)], identity, bounds)
+            .expect("write L0");
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put L0 object");
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::from_u128(created_unix_ns as u128),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns,
+            level: SegmentLevel::L0,
+        };
+        (store, seg_ref)
+    }
+
+    fn series_named(metric: &str, samples: &[(i64, f64)]) -> SeriesInput {
+        let label_set = labels(metric);
+        let series_id =
+            SeriesId::compute(&TenantId::new("t".to_string()), metric, &label_set).expect("id");
+        SeriesInput {
+            series_id,
+            labels: label_set,
+            samples: samples
+                .iter()
+                .map(|(ts_ns, value)| Sample {
+                    ts_ns: *ts_ns,
+                    value: *value,
+                })
+                .collect(),
+        }
+    }
+
+    /// End-to-end: an L1 run written with per-sample provenance decodes back
+    /// through the real fetch path with `per_sample_priorities` populated, and
+    /// the merge over it picks the same winners as the merge over the
+    /// equivalent run-wide L0 runs. The scenario is constructed so the columns
+    /// override run-wide position at a duplicate timestamp.
+    #[tokio::test]
+    async fn l1_per_sample_provenance_reproduces_run_wide_merge() {
+        let (l1_store, l1_ref) = write_l1_with_provenance().await;
+        let backend: Arc<dyn ObjectStoreBackend> = l1_store;
+        let fetcher = SegmentFetcher::new(backend);
+        let (l1_soa, _stats) = fetcher
+            .fetch_soa(e2e_tenant(), &l1_ref, &[])
+            .await
+            .expect("fetch L1");
+
+        // The read path populated the column, bit-for-bit as written.
+        assert_eq!(l1_soa.len(), 1);
+        let column = l1_soa[0]
+            .per_sample_priorities
+            .as_ref()
+            .expect("per-sample priorities populated for the merged run");
+        assert_eq!(
+            column,
+            &vec![
+                SamplePriority {
+                    created_unix_ns: 200,
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    in_page_index: 0,
+                },
+                SamplePriority {
+                    created_unix_ns: 100,
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    in_page_index: 0,
+                },
+                SamplePriority {
+                    created_unix_ns: 200,
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                    in_page_index: 1,
+                },
+            ]
+        );
+
+        let l1_merged = merge_soa_runs(vec![l1_soa], 100, 100).expect("merge L1");
+
+        // The equivalent run-wide runs: write A (created 200) holds ts10=1.0 and
+        // ts20=2.0, write B (created 100) holds ts10=9.0.
+        let (a_store, a_ref) = write_l0_run_wide("test/a.rseg", 200, &[(10, 1.0), (20, 2.0)]).await;
+        let (b_store, b_ref) = write_l0_run_wide("test/b.rseg", 100, &[(10, 9.0)]).await;
+        let a_fetcher = SegmentFetcher::new(a_store as Arc<dyn ObjectStoreBackend>);
+        let (a_soa, _) = a_fetcher
+            .fetch_soa(e2e_tenant(), &a_ref, &[])
+            .await
+            .expect("fetch A");
+        let b_fetcher = SegmentFetcher::new(b_store as Arc<dyn ObjectStoreBackend>);
+        let (b_soa, _) = b_fetcher
+            .fetch_soa(e2e_tenant(), &b_ref, &[])
+            .await
+            .expect("fetch B");
+        let run_wide_merged = merge_soa_runs(vec![a_soa, b_soa], 100, 100).expect("merge run-wide");
+
+        // Same winners: ts10 -> 1.0 (write A, created 200, beats B's 9.0), ts20
+        // -> 2.0. This is the winner the columns dictate; run-wide position over
+        // the merged run alone would instead pick 9.0 at ts10.
+        assert_eq!(l1_merged.len(), 1);
+        assert_eq!(run_wide_merged.len(), 1);
+        let l1_samples = &l1_merged[0].samples;
+        let rw_samples = &run_wide_merged[0].samples;
+        assert_eq!(l1_samples.len(), rw_samples.len());
+        for (a, b) in l1_samples.iter().zip(rw_samples.iter()) {
+            assert_eq!(a.ts_ns, b.ts_ns);
+            assert_eq!(a.value.to_bits(), b.value.to_bits());
+        }
+        // Pin the actual winners so the test is not merely "two equal things".
+        assert_eq!(l1_samples.len(), 2);
+        assert_eq!(l1_samples[0].ts_ns, 10);
+        assert_eq!(l1_samples[0].value.to_bits(), 1.0f64.to_bits());
+        assert_eq!(l1_samples[1].ts_ns, 20);
+        assert_eq!(l1_samples[1].value.to_bits(), 2.0f64.to_bits());
     }
 
     /// ADR-0044: `guarded_get`'s counters must match what the store itself

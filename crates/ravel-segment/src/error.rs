@@ -59,6 +59,15 @@ pub enum WriteError {
     #[error("v5 sparse-section assembly failed re-reading the v4 base: {0}")]
     SparseAssembly(String),
 
+    // --- Per-sample dedup provenance columns (ADR-0092 decision 1): optional
+    // SERIES_META extension. No L0 flush or v6 verbatim compaction emits them. ---
+    #[error("run per-sample provenance has {provenance} entries but the run has {samples} samples")]
+    PerSampleProvenanceLengthMismatch { provenance: usize, samples: usize },
+    #[error(
+        "per-sample provenance columns are not yet supported in the sparse (chunked) SERIES_META form"
+    )]
+    PerSampleProvenanceInSparse,
+
     // --- RSEG v6 only (ADR-0047, docs/segment-format.md "RSEG v6
     // amendment"): EXEMPLARS section encode. v1-v5 objects never produce
     // these. ---
@@ -246,4 +255,20 @@ pub enum SegmentError {
     ExemplarSeriesIndexOutOfRange(u64),
     #[error("EXEMPLARS records are not sorted ascending by (series_index, ts_ns)")]
     ExemplarRecordsUnsorted,
+
+    // --- RSEG per-sample dedup provenance columns (ADR-0092 decision 1): the
+    // optional SERIES_META extension blocks. Absent from every object an L0
+    // flush or a v6 verbatim compaction produces. ---
+    #[error("SERIES_META provenance-presence value {0} is neither 0 nor 1")]
+    InvalidProvenancePresence(u64),
+    #[error(
+        "SERIES_META carries a per-sample provenance extension but no run is flagged as carrying it"
+    )]
+    EmptyProvenanceExtension,
+    #[error("SERIES_META provenance column codec error: {0}")]
+    ProvenanceColumnCodec(String),
+    #[error(
+        "SERIES_META provenance columns would decode to {live_bytes} live bytes, exceeding the {cap}-byte section budget"
+    )]
+    ProvenanceLiveBudgetExceeded { live_bytes: u64, cap: u64 },
 }

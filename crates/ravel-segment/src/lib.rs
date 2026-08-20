@@ -29,8 +29,8 @@ pub use format::{
 pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 pub use identity::{ExpectedIdentity, check_identity};
 pub use reader::{
-    FooterLocation, FooterOutcome, PlannedRunRange, RunEntry, SeriesEntry, SeriesEntryV4,
-    ValPageKind, ValueKind, decode_catalog_matching_v4, decode_catalog_v4,
+    FooterLocation, FooterOutcome, PlannedRunRange, RunEntry, SampleProvenance, SeriesEntry,
+    SeriesEntryV4, ValPageKind, ValueKind, decode_catalog_matching_v4, decode_catalog_v4,
     decode_run_histogram_pages, decode_run_pages_soa, open_from_full, open_from_suffix,
     parse_footer, plan_ranges_v4, validate_sections,
 };
@@ -46,9 +46,9 @@ pub use sparse::{
     verify_id_window,
 };
 pub use writer::{
-    CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunValuePageV4, SegmentIdentity,
-    SegmentSummary, SegmentWriter, SeriesInput, SeriesInputV3, SeriesInputV4, SeriesValues,
-    WrittenSegment, encode_run_v4,
+    CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunInputV7, RunValuePageV4,
+    SegmentIdentity, SegmentSummary, SegmentWriter, SeriesInput, SeriesInputV3, SeriesInputV4,
+    SeriesInputV7, SeriesValues, WrittenSegment, encode_run_v4,
 };
 
 pub use ravel_proto::segment::v1::Footer;
