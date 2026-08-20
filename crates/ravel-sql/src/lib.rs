@@ -52,6 +52,8 @@ mod declared;
 mod dedup;
 #[cfg(feature = "flight-sql")]
 pub mod distributed;
+#[cfg(feature = "flight-sql")]
+pub mod distributed_rlog;
 mod error;
 mod executor;
 #[cfg(feature = "flight-sql")]
@@ -101,6 +103,12 @@ pub use distributed::{
     DistributedFlightConfig, DistributedScanExec, FlightWorkerSliceClient, StaticWorkerEndpoints,
     WorkerEndpoints, WorkerSlice, WorkerSliceClient, distributed_samples_plan,
     plan_distributed_slices,
+};
+#[cfg(feature = "flight-sql")]
+pub use distributed_rlog::{
+    ALERTS_ORDER_COLS, AUDIT_ORDER_COLS, DistributedSliceScanExec, LOGS_ORDER_COLS,
+    distributed_alerts_plan, distributed_audit_plan, distributed_logs_plan, distributed_slice_plan,
+    sort_slice_fragment,
 };
 pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_UNAVAILABLE,
