@@ -375,6 +375,92 @@ leader, no assignment object, no new durable state — and the per-process
 content-addressed read caches behave as one aggregate cache because segments
 are immutable.
 
+### Signals that fan out
+
+The queryfrag lane distributes all five queryable signals: Metrics, Logs,
+Alerts, Audit, and Spans. The worker's `run_slice_inner` decodes the request's
+`signal` discriminant and dispatches to a per-signal fetch path
+(`crates/ravel-query/src/distrib/service.rs`):
+
+- **Metrics** resolves the pinned scope and fetches scalar series through the
+  metric `SegmentFetcher`. Native-histogram series are not distributed yet: a
+  slice that decodes any histogram series answers `Unsupported` (with its spend
+  folded first) and the whole query falls back to local.
+- **Logs, Alerts, Audit** are one RLOG object family and share a single fetch
+  path over `LogSegmentFetcher`, distinguished only by the object-key prefix the
+  coordinator already resolved (the worker never re-derives it, it fetches the
+  pinned segments the resolver maps). Each yields one `LogRecordFrame` per
+  decoded record.
+- **Spans** fetch through `SpanSegmentFetcher` (promoted into ravel-query from
+  the SQL crate for this lane), the same funnel a local `spans` read uses, and
+  yield one `SpanFrame` per surviving span.
+- **Profiles** has no distributed path and stays single-process: the worker
+  answers `Unsupported` exactly as every non-Metrics signal did before this
+  amendment.
+
+Two per-signal preconditions on the worker also degrade to local fallback
+(`Unsupported`), never a wrong or partial result: a Logs/Alerts/Audit or Spans
+slice on a worker with no log/span fetcher wired (both are opt-in builder
+extras, `with_log_fetcher`/`with_span_fetcher`), and a log/span slice carrying
+matchers (matcher pushdown for those signals has no mapping in this lane yet, so
+it fails closed rather than under-filter).
+
+This is the engine-level (queryfrag) fetch, merge, and federation machinery for
+all five signals — shipped and covered by the per-signal differential, erasure,
+skew, and federation tests. The coordinator caller that actually dispatches a
+Logs/Alerts/Audit/Spans distributed *search* is the SQL surface (log and trace
+search runs through the `logs`/`alerts`/`audit`/`spans` tables, not PromQL); the
+PromQL engine's own fetch/federation flow drives `Signal::Metrics` only today.
+The SQL-lane distributed scan is a separate, not-yet-landed step and is not
+described here.
+
+### The log/span coordinator merge: order-independent, no dedup
+
+The metrics coordinator merge is the order-insensitive k-way merge keyed on
+`(series_id, ts)` with the provenance tie-break already described under Flow;
+duplicates there are harmless and collapse. The RLOG-family and span merges
+(`merge_log_records`, `merge_spans` in `distrib/mod.rs`) differ in one decisive
+way: **they never dedup.** `docs/consistency-model.md` ("logs and spans") and
+ADR-0051 section 5 are explicit that logs, alerts, audit, and spans carry no
+query-time dedup — a retry after a lost ack produces byte-identical rows that
+are legitimately duplicate user data and must stay visible. Every record in the
+pool is returned.
+
+Correctness rests on two facts, neither of which is slice or shard atomicity
+(ADR-0052 online resharding routes one stream's or one trace's segments to
+different shard indices across generations, so a query window spanning a reshard
+activation can land one stream's or one trace's segments in two different
+slices):
+
+- **Segment self-containment.** Every RLOG segment embeds the resource+scope
+  `stream_attrs` blob for the streams it carries, and RSPAN rebuilds a span's
+  whole merged `attrs` from one segment alone, so a worker reading only its
+  slice's segments produces the exact per-record/per-span merged view a local
+  read produces. The coordinator never re-derives attribute merging; it only
+  orders.
+- **Order defined on record identity, not arrival order.** The coordinator
+  stable-sorts the flat pool under a stated total order over the whole record
+  content (for logs: `(ts_ns, stream_id, stream_attrs, observed_ts_ns,
+  severity_num, severity_text, body, trace_id, span_id, flags, attrs)`, with
+  `attrs` compared by the frozen `canonical_attr_bytes` encoding so f64 values
+  compare by bit pattern; for spans: `(trace_id, span_id, start_ts_ns,
+  end_ts_ns, parent_span_id, name, status_code, status_message, service_name,
+  attrs)`). Sorting the flattened multiset is a pure function of that multiset,
+  so the shard-major slice grouping — which differs from the local per-segment
+  grouping, and which a reshard-straddling stream or trace makes differ further
+  — never changes the result. The output is bit-identical to a local
+  multi-segment read merged under the same order, which the differential test
+  exercises with at least one generated case placing one stream's or trace's
+  segments in two slices.
+
+Erasure is applied worker-side, per segment, through the same funnel the local
+path uses (`retain_series_soa` for metrics, `LogQuery` erasure for the RLOG
+family, `is_erased_span` for spans); the coordinator never re-applies it.
+Because each segment is self-contained, a resource-attribute-only exclusion
+evaluates identically wherever the segment is read, including when one stream's
+segments straddle two slices — proven by an erasure property test that diffs a
+distributed slice set against a local read of the same segments.
+
 ### Budgets and the fault matrix
 
 The coordinator re-enforces the query's budgets over the folded per-slice
@@ -406,11 +492,17 @@ Failures map to the same typed outcomes the local path produces:
   `max_query_duration` that keeps workers inside the GC protection horizon)
   cancels the fan-out; stream teardown reaches workers and drop-based
   cancellation frees their GETs and permits.
-- **Protocol version mismatch** (rolling deploy) or a **non-metrics signal**
-  or a **histogram-bearing slice:** the worker answers `Unsupported`, and the
+- **Protocol version mismatch** (rolling deploy), a **`Profiles` signal**, a
+  **histogram-bearing metrics slice**, an **unwired log/span fetcher**, or a
+  **matcher-bearing log/span slice:** the worker answers `Unsupported`, and the
   coordinator silently falls back to fully local execution for the whole
-  query — never an error, never a partial result. Intra-cluster execution is
-  all-or-nothing; only cross-cluster federation (below) ever returns partial.
+  query — never an error, never a partial result. This is the load-bearing skew
+  direction: a *new* coordinator against an *old* worker that predates the
+  log/span fan-out sees `Unsupported` for Logs/Alerts/Audit/Spans and degrades
+  to local execution, so the new `LogRecordFrame`/`SpanFrame` variants never
+  reach a coordinator that cannot decode them (an *old* coordinator never
+  dispatches these signals). Intra-cluster execution is all-or-nothing; only
+  cross-cluster federation (below) ever returns partial.
 
 Fragment admission runs under a separate internal workload class with its own
 cap, so a coordinator holding a client-query permit can never deadlock
@@ -488,6 +580,23 @@ under `skip_unavailable` it degrades to partial coverage with a truthful
 warning (the remote returned a data kind this build cannot federate yet),
 and without `skip_unavailable` it fails with that same typed reason rather
 than a generic transport error.
+
+A remote that answers `Unsupported` for the whole query is handled the same
+way, and this is the federation analog of the intra-cluster skew fallback: a
+remote resolves its own snapshot, so `Unsupported` can only mean "this cluster
+does not serve this query kind yet" — an availability/coverage property, not a
+wrong-data one. The concrete case is a remote running code that predates the
+log/span fan-out: it rejects a Logs/Alerts/Audit/Spans query with `Unsupported`
+(its `run_slice_inner` rejects every non-Metrics signal). Federation routes that
+through the same `skip_unavailable` path an unavailable or histogram-bearing
+remote takes: under `skip_unavailable=true` the cluster is skipped, coverage is
+marked partial, and the warning names only the operator-facing cluster (the
+remote's internal status text is redacted out); under `=false` it fails with a
+typed `Federation` error naming the cluster. Treating it as a non-skippable hard
+fault would defeat exactly the availability `skip_unavailable` exists to provide
+during a mixed-version fan-out rollout. Federation composes over all five fan-out
+signals with no code beyond the per-signal `SliceFetcher`, and a per-signal
+federation test proves it rather than assuming it.
 
 #### The engine API cannot hand a caller a value without its coverage
 
