@@ -2394,6 +2394,125 @@ mod tests {
         );
     }
 
+    /// Writes a single-series RSEG object whose lone sample is an incompressible
+    /// double (`0x4008_9abc_def0_1234`, a normal value with a random mantissa).
+    /// Gorilla and both integer-model codecs (ALP, GCD-delta-FOR) lose to a raw
+    /// copy on it, so the writer selects VAL_RAW_F64 -- the positive case the
+    /// `raw_f64_pages` counter must count.
+    async fn write_incompressible_segment() -> (Arc<MemoryStore>, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([11u8; 16]);
+        let writer_id = Uuid::from_u128(2);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        const NS: i64 = 1_000_000_000;
+        let incompressible = f64::from_bits(0x4008_9abc_def0_1234);
+        let only = series("incompressible_metric", &[(1_000 * NS, incompressible)]);
+        let written = SegmentWriter::write(vec![only], identity, bounds).expect("write segment");
+
+        let store = Arc::new(MemoryStore::new());
+        let key = "test/incompressible.rseg";
+        store
+            .put(key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment object");
+
+        let seg_ref = SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 42,
+            level: ravel_catalog::SegmentLevel::L0,
+        };
+        (store, tenant_hash, seg_ref)
+    }
+
+    /// Positive case for the `raw_f64_pages` counter. Its predecessor,
+    /// `fetch_soa_matches_fetch_and_counts_raw_f64_pages`, only asserts the
+    /// counter stays zero now that every fixture selects ALP / GCD-delta-FOR;
+    /// nothing there proves the counter increments when a raw page IS present.
+    /// This publishes an incompressible value that genuinely stores as
+    /// VAL_RAW_F64 and asserts both the counter and the decoded page kind.
+    #[tokio::test]
+    async fn fetch_soa_counts_raw_f64_page_for_incompressible_value() {
+        let (store, tenant_hash, seg_ref) = write_incompressible_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let fetcher = SegmentFetcher::new(backend);
+
+        let (soa, stats) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &[])
+            .await
+            .expect("fetch_soa");
+
+        assert_eq!(soa.len(), 1);
+        assert_eq!(
+            stats.raw_f64_pages, 1,
+            "the incompressible value must select and count one raw f64 page"
+        );
+        assert!(
+            stats.raw_f64_bytes > 0,
+            "a counted raw f64 page must contribute nonzero bytes"
+        );
+
+        // Prove the page really is raw f64, not merely that the counter moved.
+        let object = store
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get object")
+            .data;
+        let loc = ravel_segment::open_from_full(&object, ReaderLimits::default()).expect("open");
+        let entries = decode_catalog_v5(&loc.footer, &object, ReaderLimits::default())
+            .expect("decode catalog");
+        let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
+        let ranges = plan_ranges_v4(&loc.footer, &selected).expect("plan ranges");
+        let mut kinds = Vec::new();
+        for entry in &entries {
+            for (run_index, run) in entry.runs.iter().enumerate() {
+                let range = ranges
+                    .iter()
+                    .find(|r| r.series_id == entry.entry.series_id && r.run_index == run_index)
+                    .expect("range for run");
+                let ts = &object
+                    [range.ts_range.0 as usize..(range.ts_range.0 + range.ts_range.1) as usize];
+                let val = &object
+                    [range.val_range.0 as usize..(range.val_range.0 + range.val_range.1) as usize];
+                let mut scratch = Vec::new();
+                let mut tss = Vec::new();
+                let mut vals = Vec::new();
+                let kind = decode_run_pages_soa(
+                    &entry.entry.series_id,
+                    run,
+                    ts,
+                    val,
+                    ReaderLimits::default(),
+                    &mut scratch,
+                    &mut tss,
+                    &mut vals,
+                )
+                .expect("decode run");
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(kinds, vec![ValPageKind::RawF64]);
+    }
+
     fn e2e_series_id() -> SeriesId {
         SeriesId::compute(&TenantId::new("t".to_string()), "m", &labels("m")).expect("series id")
     }
