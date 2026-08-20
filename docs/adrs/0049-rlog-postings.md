@@ -308,7 +308,7 @@ keep both), so this gap was reachable.
 Two functions folded a record's own duplicates in two different orders, and
 nothing said which was authoritative:
 
-- `writer.rs::merged_indexed_terms` (write side) folded a record's attributes
+- `writer.rs::indexed_term_columns` (write side) folded a record's attributes
   last-wins over their **original write-time occurrence order**.
 - `reader.rs::rebuild_record` reconstructs a record's attributes in a fixed
   order the on-disk format dictates -- its FIELD_DIR columnar entries in
@@ -344,7 +344,7 @@ stream (resource/scope) layer as before. This is exactly what `rebuild_record`
 followed by `merged_attrs` already, incidentally, produces.
 
 This amendment is what makes that incidental read-side behavior an intentional,
-documented contract. It now governs both sides: `merged_indexed_terms` computes
+documented contract. It now governs both sides: `indexed_term_columns` computes
 this same winner (its job is to *predict* what `rebuild_record` + `merged_attrs`
 will report for an indexed key, not to independently pick one), and the read
 side is its authoritative definition. No on-disk format changes: `ResolvedRow`'s

@@ -1529,6 +1529,17 @@ fn rlog_field_type_name(ty: FieldType) -> &'static str {
 }
 
 /// Prints the numeric stats attached to a skip-index entry, one per line.
+///
+/// Under RLOG v3 (ADR-0095) `min_bits`/`max_bits` bound the value each row
+/// *resolves* for the column's attribute name -- the row's resource and scope
+/// layers overridden by its own attributes -- and `null_count` counts every row
+/// whose resolved value for that name is of another type, or which resolves it
+/// to nothing. So a stat's bounds can legitimately exclude a value that is
+/// sitting in the same column's value page, can cover a value that is in no
+/// value page at all (a name the rows resolve off their stream), and can appear
+/// on a block that has no page for the column whatsoever. `null_count` can
+/// likewise exceed the FIELD_DIR `null_count` printed below, which still counts
+/// raw column presence.
 fn rlog_print_stats(stats: &[NumStat]) {
     for st in stats {
         println!(

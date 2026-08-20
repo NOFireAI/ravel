@@ -174,7 +174,7 @@ Field by field:
 ## `rlog inspect`: what's inside one log segment
 
 Log data lives in RLOG objects (`.rlog`), the columnar log segment format
-(docs/log-segment-format.md, ADR-0029; trailer version 2, ADR-0032). RLOG is
+(docs/log-segment-format.md, ADR-0029; trailer version 3, ADR-0095). RLOG is
 a sibling of RSEG. It shares the same 16-byte trailer, protobuf footer, and
 crc32c discipline, but it has its own sections and none of the bytes. Ingest, query, and lifecycle all run today: the production ingest path writes
 RLOG objects through `ravel-ingest`'s log shard, the `logs` SQL table on
@@ -189,7 +189,7 @@ cargo run -p ravel-cli -- rlog inspect "t/abab.../l/l0/0000/....rlog"
 
 ```
 total_size: 732
-version: 2
+version: 3
 signal: 2
 tenant_hash: abababababababababababababababab
 shard: 3
@@ -228,8 +228,9 @@ field_dir (2 entry(ies)):
 Field by field:
 
 - `total_size`, `version`, `signal`: the byte length of the object, the
-  trailer format version (currently `2`; any other version gets a typed
-  error, with no dual-reader path), and the signal byte (`2` = logs). Like
+  trailer format version (currently `3`; any other version gets a typed
+  error, with no dual-reader path, so a stored v2 object is unreadable rather
+  than migratable), and the signal byte (`2` = logs). Like
   RSEG, the object is footer-first-readable. The 16-byte trailer at the end
   gives the footer's length and crc. A reader therefore validates the footer
   in one suffix GET before it fetches anything else.
@@ -258,13 +259,26 @@ Field by field:
   `offset` (into BLOCKS) and `len`, the `crc32c` that the reader verifies
   before it decodes the block, `record_count`, and the block's `ts_range` and
   `stream_ref_range` (both inclusive). The skip index prunes on those two
-  ranges. Under each block line is one `stat` line per numeric column present
-  in the block: `column_id`, `type` (`i64`/`f64`/`bool`/`bytes`),
-  `min_bits`/`max_bits`, `null_count`, and `has_nan`. `min_bits`/`max_bits`
+  ranges. Under each block line is one `stat` line per numeric column the
+  block's records resolve a value for: `column_id`, `type`
+  (`i64`/`f64`/`bool`/`bytes`), `min_bits`/`max_bits`, `null_count`, and
+  `has_nan`. `min_bits`/`max_bits`
   are the bit pattern that the min/max are stored as: two's complement for
   i64, and `to_bits` for f64, so f64 comparison is bit-exact. In the example,
   both blocks carry column 10 (`code`), an i64 attribute. The string column
-  `svc` is not numeric and so has no stat.
+  `svc` is not numeric and so has no stat. Since trailer v3 (ADR-0095) a stat
+  bounds the value each row *resolves* for the column's attribute name, not
+  whatever sits in the column's value page. Resolution is what a query sees:
+  the record's resource and scope attributes, overridden by the record's own,
+  with a record carrying `code` twice (two types, or a duplicate that spilled
+  into `attrs_raw`) reduced to the one value a read reports. A row whose
+  resolved value is of another type, or which resolves the name to nothing,
+  counts in `null_count` instead. Three things follow that look odd until you
+  know the rule: a `stat`'s `null_count` can exceed the same column's
+  `field_dir` `null_count`, which counts raw column presence; the bounds can
+  exclude a value stored in the block; and a stat can appear for a column the
+  block has no page for at all, when its records resolve the name off their
+  resource or scope rather than carrying it themselves.
 - `stream_dir`: one line per stream, in the object's sorted stream_id order.
   The line number is the `stream_ref` used everywhere else (the entry's
   0-based ordinal). `stream_id` is the 16-byte identity in hex. `blob_len` is

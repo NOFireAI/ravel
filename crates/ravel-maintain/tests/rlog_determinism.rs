@@ -32,7 +32,11 @@ const SHARD: u32 = 7;
 const HOUR: u32 = 495_000;
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const EPOCH: u64 = 10;
-const OUTPUT_FORMAT_VERSION: u32 = 2;
+/// The RLOG format version this build writes, read from the compactor's own
+/// single-sourced constant rather than mirrored as a literal here: a trailer
+/// bump (v2 -> v3, ADR-0095) must not fail this test on a stale number instead
+/// of on the behaviour it pins.
+const OUTPUT_FORMAT_VERSION: u32 = ravel_maintain::rlog::OUTPUT_FORMAT_VERSION;
 
 fn tenant_hash() -> TenantHash {
     TenantId::new(TENANT).hash()

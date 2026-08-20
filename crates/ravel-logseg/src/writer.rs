@@ -256,34 +256,45 @@ impl RlogWriter {
                 distinct.insert((k.clone(), ty.to_u8()));
             }
         }
-        // Stream-level-only indexed columns (ADR-0049 amendment). A key that
-        // is resource- or scope-level across the whole object and per-record
-        // on no record gets no column from the per-record loop above, yet
-        // `service.name` on the resource is the ordinary OTLP shape the
-        // amendment exists for. Give each indexed stream-level (name, type) a
-        // column so `merged_indexed_terms` can key its merged-view postings
-        // by it.
+        // Stream-level-only columns. A key that is resource- or scope-level
+        // across the whole object and per-record on no record gets no column
+        // from the per-record loop above, yet `service.name` on the resource is
+        // the ordinary OTLP shape. Two kinds of key get one anyway:
         //
-        // The column is a POSTINGS KEY, not a materialized per-record value: no
-        // row writes a value to it (`resolve_row` populates `columns` from
-        // `r.attrs` only), so it stays all-null in every block. The reader's
-        // `equals` on a `FieldSel::Attr` therefore still reads only the
-        // per-record layer and returns false for a value that lives solely in
-        // the resource blob -- the exact channel stays a strict per-record
-        // predicate, distinct from the prune channel that probes these postings
+        // - Indexed keys (ADR-0049 amendment), so `indexed_term_columns` can
+        //   key their merged-view postings by a column.
+        // - Numeric keys (I64, F64, Bool), so `stat_winner_columns` has a
+        //   column to key their NumStat by. Without it a name only ever
+        //   resolved off the stream layer gets no column, drops out of
+        //   `numstat_names`, and so gets no stat anywhere -- and a query
+        //   ranging on the declared column then scans every block instead of
+        //   pruning on bounds the writer could have written. Restricting this
+        //   to numeric types is what keeps it cheap: a string resource key
+        //   feeds no stat, so it still only takes a column when it is indexed.
+        //
+        // The column is a POSTINGS/stat KEY, not a materialized per-record
+        // value: no row writes a value to it (`resolve_row` populates `columns`
+        // from `r.attrs` only), so it stays all-null in every value page --
+        // `stage_column` in fact emits no page at all for a wholly absent
+        // column, so it costs zero BLOCKS bytes. The reader's `equals` on a
+        // `FieldSel::Attr` therefore still reads only the per-record layer and
+        // returns false for a value that lives solely in the resource blob --
+        // the exact channel stays a strict per-record predicate, distinct from
+        // the prune channel that probes these postings
         // (docs/log-segment-format.md "FIELD_DIR"). These count against the same
         // `max_dynamic_columns` budget as any dynamic column: they occupy a real
-        // FIELD_DIR entry, and the indexed list is small and opt-in, so the cost
-        // is a handful of columns; one that cannot fit degrades to bloom + exact
-        // scan, always legal (decision 5). Decoding `stream_attrs` can fail on a
-        // corrupt blob; that is propagated rather than silently under-indexing.
-        if !indexed_names.is_empty() {
-            for blob in streams.values() {
-                for (k, v) in stream_attr_pairs(blob)? {
-                    if indexed_names.contains(k.as_str()) {
-                        let (ty, _) = resolve_value(&v);
-                        distinct.insert((k, ty.to_u8()));
-                    }
+        // FIELD_DIR entry. A key that cannot fit degrades to bloom + exact scan
+        // for postings, and to no stat for NumStat -- an absent stat is "no
+        // information" and prunes nothing, always legal (decision 5). Decoding
+        // `stream_attrs` can fail on a corrupt blob; that is propagated rather
+        // than silently under-indexing.
+        for blob in streams.values() {
+            for (k, v) in stream_attr_pairs(blob)? {
+                let (ty, _) = resolve_value(&v);
+                let eligible = indexed_names.contains(k.as_str())
+                    || matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool);
+                if eligible {
+                    distinct.insert((k, ty.to_u8()));
                 }
             }
         }
@@ -301,6 +312,29 @@ impl RlogWriter {
         let ty_of_column: HashMap<u32, FieldType> =
             columns.iter().map(|(_, ty, id)| (*id, *ty)).collect();
 
+        // Attribute names carrying at least one NumStat-eligible column
+        // (I64/F64/Bool: the types `write_block` writes a stat for). Every row's
+        // merged-view value for these names has to be resolved so a block's
+        // stats bound the merged view rather than the raw columnar occurrences
+        // (ADR-0095 decision 1). Scoped to these names, not every attribute in
+        // the record: the winner maps are built per row in the hot
+        // `resolve_row` loop, and this set is small (one name per numeric
+        // column, typically a handful) where "every attribute" is unbounded.
+        //
+        // Derived from `columns`, so a name in this set always has a column
+        // already. That includes a name that appears *only* at stream level:
+        // the allocation loop above gives every numeric-typed stream-level key
+        // a column precisely so it lands here and gets a stat, the same way an
+        // indexed one gets a column to key its postings by. A name still drops
+        // out when it overflows `max_dynamic_columns`; then no stat is written
+        // for it anywhere, and an absent stat is "no information" (no prune),
+        // not an under-bound.
+        let numstat_names: std::collections::HashSet<&str> = columns
+            .iter()
+            .filter(|(_, ty, _)| matches!(ty, FieldType::I64 | FieldType::F64 | FieldType::Bool))
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+
         // Columns whose name is in the caller's indexed-field list get postings.
         // A name past the dynamic-column budget above has no matching column_id
         // here, so it has no postings -- legal degradation, not an error.
@@ -310,17 +344,49 @@ impl RlogWriter {
             .map(|(_, _, cid)| *cid)
             .collect();
 
+        // Each stream's resource and scope pairs, restricted to the tracked names
+        // (`indexed_names` union `numstat_names`) and resolved to
+        // `(type byte, value)`. This is the seed of every record's merged-view
+        // resolution ([`resolved_tracked_values`]), which both POSTINGS and the
+        // SKIP_IDX NumStats are projections of. Decoded once per stream, not once
+        // per record: a stream's blob is byte-identical across its records (the
+        // check above refuses an object where it is not), so the per-record decode
+        // would repeat the same work. Skipped entirely when nothing is tracked.
+        // A corrupt blob fails the write rather than silently dropping
+        // stream-level values, since an under-populated posting list or an
+        // under-bounded stat would prune a block a merged-view query needs.
+        let mut stream_tracked: HashMap<LogStreamId, TrackedValues> = HashMap::new();
+        if !indexed_names.is_empty() || !numstat_names.is_empty() {
+            for (id, blob) in &streams {
+                let mut pairs: TrackedValues = Vec::new();
+                for (k, v) in stream_attr_pairs(blob)? {
+                    if indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str()) {
+                        let (ty, cv) = resolve_value(&v);
+                        pairs.push((k, (ty.to_u8(), cv)));
+                    }
+                }
+                stream_tracked.insert(*id, pairs);
+            }
+        }
+
         // Resolve every record into storage form, then sort by (stream_ref, ts).
-        // `resolve_row` also computes each row's merged-view POSTINGS terms,
-        // which decodes the record's `stream_attrs` blob and so can fail on a
-        // corrupt blob; that failure is propagated rather than silently
-        // under-indexing (an under-populated posting list would prune a block a
-        // merged-view query needs).
+        // `resolve_row` also computes each row's merged-view POSTINGS terms and
+        // its per-name NumStat winners, both read off the one resolved merged
+        // view seeded from `stream_tracked`.
         let mut rows: Vec<ResolvedRow> = self
             .records
             .iter()
-            .map(|r| resolve_row(r, &ref_of, &column_of, &indexed_names))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|r| {
+                resolve_row(
+                    r,
+                    &ref_of,
+                    &column_of,
+                    &indexed_names,
+                    &numstat_names,
+                    &stream_tracked,
+                )
+            })
+            .collect();
         rows.sort_by(|a, b| {
             a.stream_ref
                 .cmp(&b.stream_ref)
@@ -364,7 +430,33 @@ impl RlogWriter {
                     present_cols.insert(*cid);
                 }
             }
-            let plans: Vec<ColumnPlan> = present_cols
+            // Columns this block gets a plan for, which is a superset of
+            // `present_cols`: every column some row of this block resolves a
+            // NumStat winner for is planned too, even when no row of the block
+            // carries a per-record occurrence of it (a name every row here
+            // resolves off its resource or scope). Without that, such a block
+            // gets no stat at all for the column, and `merge_stats` folds only
+            // children that carry one -- so the level-1 group summary would
+            // bound the group over its other blocks alone and silently drop
+            // this block's real resolved values from min/max/null_count
+            // (ADR-0095 decision 2: a stat bounds what a reader materializes,
+            // and level 1 has to bound the whole group, not the part of it that
+            // happened to have record-level occurrences).
+            //
+            // A stat-only column adds no bytes to the block: `write_block`
+            // stages an all-absent column's pages through `stage_column`, which
+            // returns before pushing anything when no row is present. It only
+            // adds the (null-only or stream-resolved) NumStat the plan asks
+            // for. The FIELD_DIR accounting below deliberately stays on the
+            // narrower `present_cols`: a column with no value page must not
+            // count as a block the column appears in.
+            let mut plan_cols: BTreeSet<u32> = present_cols.clone();
+            for row in block_rows {
+                for (cid, _) in &row.stat_winners {
+                    plan_cols.insert(*cid);
+                }
+            }
+            let plans: Vec<ColumnPlan> = plan_cols
                 .iter()
                 .map(|cid| ColumnPlan {
                     column_id: *cid,
@@ -600,35 +692,54 @@ impl RlogWriter {
     }
 }
 
+/// Tracked attribute values as `(name, (type byte, value))`, in the order a
+/// reader merges them. Used for one stream's contribution and for one record's
+/// resolved view of it ([`resolved_tracked_values`]).
+type TrackedValues = Vec<(String, (u8, ColumnValue))>;
+
 /// Resolves one record into storage form: dense stream ref, dynamic columns
-/// split by type, overflow attributes canonicalized into `attrs_raw`, and the
-/// merged-view POSTINGS terms this record contributes ([`merged_indexed_terms`]).
+/// split by type, overflow attributes canonicalized into `attrs_raw`, the
+/// merged-view POSTINGS terms this record contributes
+/// ([`indexed_term_columns`]), and its per-name NumStat winners
+/// ([`stat_winner_columns`]).
+///
+/// The last two are two projections of one merged view
+/// ([`resolved_tracked_values`]), not two independently derived answers: they
+/// must not disagree about which value a reader resolves for a tracked name
+/// (ADR-0095 decision 1).
 fn resolve_row(
     r: &LogRecord,
     ref_of: &HashMap<LogStreamId, u32>,
     column_of: &HashMap<(String, u8), u32>,
     indexed_names: &std::collections::HashSet<&str>,
-) -> Result<ResolvedRow, LogSegError> {
+    numstat_names: &std::collections::HashSet<&str>,
+    stream_tracked: &HashMap<LogStreamId, TrackedValues>,
+) -> ResolvedRow {
     let stream_ref = ref_of.get(&r.stream_id).copied().unwrap_or(0);
     let mut cols: BTreeMap<u32, ColumnValue> = BTreeMap::new();
     let mut overflow: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
-    // For each indexed name this record carries, its own occurrences split the
-    // same way the read side reconstructs them: the columnar ones (those that
-    // took a fresh dynamic-column slot, one per distinct type, each with its
-    // type byte kept alongside its value) and the overflow ones (any type,
-    // duplicates and budget overflow alike). `merged_indexed_terms` reduces
-    // these to the single occurrence `rebuild_record` + `merged_attrs` report
-    // for the name (docs/adrs/0049-rlog-postings.md amendment 2026-08-20).
-    let mut idx_cols: BTreeMap<String, Vec<(u8, ColumnValue)>> = BTreeMap::new();
-    let mut idx_overflow: BTreeMap<String, Vec<ravel_types::logstream::AttrValue>> =
+    // For each *tracked* name this record carries -- indexed (POSTINGS) or
+    // NumStat-eligible (ADR-0095 decision 1: `indexed_names` union
+    // `numstat_names`) -- its own occurrences split the same way the read side
+    // reconstructs them: the columnar ones (those that took a fresh
+    // dynamic-column slot, one per distinct type, each with its type byte kept
+    // alongside its value) and the overflow ones (any type, duplicates and
+    // budget overflow alike). [`record_level_winners`] reduces these to the
+    // single occurrence `rebuild_record` + `merged_attrs` report for the name
+    // (docs/adrs/0049-rlog-postings.md amendment 2026-08-20). That is the record
+    // layer only; [`resolved_tracked_values`] then lays it over the stream layer,
+    // and both consumers below read that one merged answer -- there is no second
+    // resolution rule.
+    let mut tracked_cols: BTreeMap<String, Vec<(u8, ColumnValue)>> = BTreeMap::new();
+    let mut tracked_overflow: BTreeMap<String, Vec<ravel_types::logstream::AttrValue>> =
         BTreeMap::new();
     for (k, v) in &r.attrs {
         let (ty, cv) = resolve_value(v);
-        let indexed = indexed_names.contains(k.as_str());
+        let tracked = indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str());
         match column_of.get(&(k.clone(), ty.to_u8())) {
             Some(cid) if !cols.contains_key(cid) => {
-                if indexed {
-                    idx_cols
+                if tracked {
+                    tracked_cols
                         .entry(k.clone())
                         .or_default()
                         .push((ty.to_u8(), cv.clone()));
@@ -638,8 +749,11 @@ fn resolve_row(
             // Overflow column, or a duplicate (name,type) already columnar this
             // row: fold into attrs_raw so no value is lost.
             _ => {
-                if indexed {
-                    idx_overflow.entry(k.clone()).or_default().push(v.clone());
+                if tracked {
+                    tracked_overflow
+                        .entry(k.clone())
+                        .or_default()
+                        .push(v.clone());
                 }
                 overflow.push((k.clone(), v.clone()));
             }
@@ -650,9 +764,16 @@ fn resolve_row(
     } else {
         Some(canonical_attr_bytes(&overflow))
     };
-    let indexed_terms =
-        merged_indexed_terms(r, indexed_names, column_of, &idx_cols, &idx_overflow)?;
-    Ok(ResolvedRow {
+    let winners = record_level_winners(&tracked_cols, &tracked_overflow);
+    let resolved = resolved_tracked_values(
+        stream_tracked
+            .get(&r.stream_id)
+            .map_or(&[][..], Vec::as_slice),
+        &winners,
+    );
+    let indexed_terms = indexed_term_columns(&resolved, indexed_names, column_of);
+    let stat_winners = stat_winner_columns(&resolved, numstat_names, column_of);
+    ResolvedRow {
         stream_ref,
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
@@ -665,76 +786,141 @@ fn resolve_row(
         attrs_raw,
         columns: cols.into_iter().collect(),
         indexed_terms,
-    })
+        stat_winners,
+    }
 }
 
-/// The merged-view POSTINGS terms one record contributes.
+/// One record's merged view of every tracked name (`indexed_names` union
+/// `numstat_names`, ADR-0095 decision 1), in the order and with the precedence
+/// `ravel_sql::rlog_attrs::merged_attrs` produces: the stream layer first
+/// (`stream_seed`, resource pairs then scope pairs, already restricted to the
+/// tracked names by the caller), then each name's record-level winner
+/// overriding in place or appending. Each entry carries the type byte its value
+/// resolves to, so a record-level winner of a different type than the stream
+/// value is keyed by the right column downstream.
 ///
-/// For each indexed field the record resolves to after merging its resource,
-/// scope, and per-record attributes (the record winning on a key collision),
-/// this returns `(column_id, value)` under the dynamic column that value's type
-/// resolves to. That precedence is exactly what
+/// This is the single resolution step both POSTINGS ([`indexed_term_columns`])
+/// and the SKIP_IDX NumStats ([`stat_winner_columns`]) are projections of. They
+/// used to derive their own answers, and diverged: the stats saw only the
+/// record layer, so a name a record carried only on its resource or scope
+/// contributed nothing to the stat even though a reader resolves the
+/// stream-level value for it, and the stat then under-bounded its own column
+/// (ADR-0095 decision 1, corrected). Adding a value here reaches both.
+///
+/// Precedence per layer, mirroring the read side exactly: a name absent from
+/// the record keeps its stream-level value rather than being dropped, and the
+/// record wins a collision. Duplicate names *within* the stream layer (the same
+/// key on both the resource and the scope) are kept as the blob carries them,
+/// exactly as `merged_attrs` keeps them; `find_attr` reads the first, which is
+/// what [`stat_winner_columns`] resolves to.
+///
+/// A record-level winner is the occurrence `rebuild_record` + `merged_attrs`
+/// will report, not a re-derived guess: see [`record_level_winners`] for the
+/// exact two-tier order (docs/adrs/0049-rlog-postings.md amendment 2026-08-20,
+/// closing issue #333).
+fn resolved_tracked_values(
+    stream_seed: &[(String, (u8, ColumnValue))],
+    winners: &BTreeMap<String, (u8, ColumnValue)>,
+) -> TrackedValues {
+    let mut merged: TrackedValues = stream_seed.to_vec();
+    for (name, winner) in winners {
+        if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == name) {
+            slot.1 = winner.clone();
+        } else {
+            merged.push((name.clone(), winner.clone()));
+        }
+    }
+    merged
+}
+
+/// The NumStat contribution of one record: each NumStat-eligible name's
+/// resolved merged-view value, keyed by the dynamic column that value's type
+/// resolves to (ADR-0095 decision 2).
+///
+/// Read off [`resolved_tracked_values`], so a name the record carries only on
+/// its resource or scope contributes the stream-level value a reader resolves
+/// for it, and a record-level occurrence overrides that. Only the first entry
+/// per name counts, matching `rlog_attrs::find_attr`, which is how a declared
+/// typed column resolves the name.
+///
+/// A resolved value of a non-numeric type (a string or bytes occurrence that
+/// outranked the numeric one) yields no entry at all, so the name's numeric
+/// column gets none either and the row counts as a null there -- which is
+/// exactly what a reader materializing that typed column produces for the row.
+/// A value whose own type has no in-budget column likewise yields no entry,
+/// again matching the read side (no column, no value).
+fn stat_winner_columns(
+    resolved: &[(String, (u8, ColumnValue))],
+    numstat_names: &std::collections::HashSet<&str>,
+    column_of: &HashMap<(String, u8), u32>,
+) -> Vec<(u32, ColumnValue)> {
+    let mut out: Vec<(u32, ColumnValue)> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (name, (ty_byte, cv)) in resolved {
+        if !numstat_names.contains(name.as_str()) || !seen.insert(name.as_str()) {
+            continue;
+        }
+        if !matches!(
+            FieldType::from_u8(*ty_byte),
+            Some(FieldType::I64 | FieldType::F64 | FieldType::Bool)
+        ) {
+            continue;
+        }
+        if let Some(&cid) = column_of.get(&(name.clone(), *ty_byte)) {
+            out.push((cid, cv.clone()));
+        }
+    }
+    out
+}
+
+/// The merged-view POSTINGS terms one record contributes: each indexed field's
+/// resolved merged-view value(s) from [`resolved_tracked_values`], keyed by the
+/// dynamic column that value's type resolves to. That view is exactly what
 /// `ravel_sql::rlog_attrs::merged_attrs` computes for SQL's `attrs` column,
-/// reproduced here so the writer does not depend on ravel-sql
+/// reproduced in this crate so the writer does not depend on ravel-sql
 /// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
 ///
-/// When a record carries one indexed key more than once (any type mix), the
-/// winning occurrence is the one `rebuild_record` + `merged_attrs` will report,
-/// not a re-derived guess: see [`record_level_winners`] for the exact two-tier
-/// order (docs/adrs/0049-rlog-postings.md amendment 2026-08-20, closing issue
-/// #333). The record layer then wins over the stream (resource/scope) layer as
-/// before.
+/// `resolved` covers every tracked name (indexed and NumStat-eligible alike);
+/// only the indexed ones may key a posting, so the rest are skipped here.
+/// Letting a NumStat-only name through would write postings for a column the
+/// caller never asked to index, which the accumulation loop in `build_object`
+/// (no `indexed_column_ids` re-check) relies on not happening.
+///
+/// Every entry is emitted, including a name the resource and the scope both
+/// carry: the term set a posting list holds may be a superset of what
+/// `find_attr` resolves, which costs precision and never soundness (an extra
+/// term keeps a block, it cannot drop one).
 ///
 /// A field with no matching dynamic column contributes nothing. The writer
 /// gives an indexed field a column even when it appears only at stream
 /// level, so a resource-only indexed key normally does have a column to
 /// key a posting by; a key stays column-less only when it overflowed the
 /// dynamic-column budget or is not in the indexed-field list. Absence is legal;
-/// no posting for a field means no pruning on it, never a wrong prune. The
-/// decode of `stream_attrs` can fail on a corrupt blob, which is propagated
-/// (the caller fails the write) rather than silently dropping stream-level
-/// terms, since an under-populated posting list would prune a needed block.
-fn merged_indexed_terms(
-    r: &LogRecord,
+/// no posting for a field means no pruning on it, never a wrong prune.
+fn indexed_term_columns(
+    resolved: &[(String, (u8, ColumnValue))],
     indexed_names: &std::collections::HashSet<&str>,
     column_of: &HashMap<(String, u8), u32>,
-    idx_cols: &BTreeMap<String, Vec<(u8, ColumnValue)>>,
-    idx_overflow: &BTreeMap<String, Vec<ravel_types::logstream::AttrValue>>,
-) -> Result<Vec<(u32, ColumnValue)>, LogSegError> {
-    if indexed_names.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Merge, restricted to indexed keys, record-wins: resource/scope pairs
-    // first, then each indexed key's record-level winner overrides in place or
-    // appends. This mirrors `merged_attrs` (resource/scope, then record attrs
-    // win). Each entry carries the type byte its value resolves to, so a
-    // record-level winner of a different type than the stream value keys its
-    // posting by the right column.
-    let mut merged: Vec<(String, (u8, ColumnValue))> = Vec::new();
-    for (k, v) in stream_attr_pairs(&r.stream_attrs)? {
-        if indexed_names.contains(k.as_str()) {
-            let (ty, cv) = resolve_value(&v);
-            merged.push((k, (ty.to_u8(), cv)));
+) -> Vec<(u32, ColumnValue)> {
+    let mut out = Vec::with_capacity(resolved.len());
+    for (name, (ty_byte, cv)) in resolved {
+        if !indexed_names.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(&cid) = column_of.get(&(name.clone(), *ty_byte)) {
+            out.push((cid, cv.clone()));
         }
     }
-    for (name, winner) in record_level_winners(idx_cols, idx_overflow) {
-        if let Some(slot) = merged.iter_mut().find(|(mk, _)| *mk == name) {
-            slot.1 = winner;
-        } else {
-            merged.push((name, winner));
-        }
-    }
-    let mut out = Vec::with_capacity(merged.len());
-    for (name, (ty_byte, cv)) in merged {
-        if let Some(&cid) = column_of.get(&(name, ty_byte)) {
-            out.push((cid, cv));
-        }
-    }
-    Ok(out)
+    out
 }
 
-/// The record-level winning occurrence of each indexed key this record carries,
+/// The record-level winning occurrence of each tracked key this record carries,
 /// keyed by name and carrying the winner's `(type byte, value)`.
+///
+/// "Tracked" is `indexed_names` union `numstat_names` (ADR-0095 decision 1):
+/// POSTINGS and the SKIP_IDX NumStats consume the same answer from this one
+/// function, so the two sections cannot disagree about which occurrence of a
+/// duplicated key a reader will see.
 ///
 /// The winner is defined as whatever the read side already, deterministically
 /// produces: `rebuild_record` lays a record's own attributes out as its
@@ -751,19 +937,19 @@ fn merged_indexed_terms(
 /// on-disk format does not preserve, is the issue #333 fix
 /// (docs/adrs/0049-rlog-postings.md amendment 2026-08-20).
 fn record_level_winners(
-    idx_cols: &BTreeMap<String, Vec<(u8, ColumnValue)>>,
-    idx_overflow: &BTreeMap<String, Vec<ravel_types::logstream::AttrValue>>,
+    tracked_cols: &BTreeMap<String, Vec<(u8, ColumnValue)>>,
+    tracked_overflow: &BTreeMap<String, Vec<ravel_types::logstream::AttrValue>>,
 ) -> BTreeMap<String, (u8, ColumnValue)> {
     let mut names: BTreeSet<&String> = BTreeSet::new();
-    names.extend(idx_cols.keys());
-    names.extend(idx_overflow.keys());
+    names.extend(tracked_cols.keys());
+    names.extend(tracked_overflow.keys());
 
     let mut out: BTreeMap<String, (u8, ColumnValue)> = BTreeMap::new();
     for name in names {
         let mut combined: Vec<(u8, ColumnValue)> = Vec::new();
         // Columnar occurrences first, ascending by type byte (FIELD_DIR's
         // (name, type) sort key restricted to this one name).
-        if let Some(cols) = idx_cols.get(name) {
+        if let Some(cols) = tracked_cols.get(name) {
             let mut cols = cols.clone();
             cols.sort_by_key(|(ty_byte, _)| *ty_byte);
             combined.extend(cols);
@@ -772,7 +958,7 @@ fn record_level_winners(
         // one-entry value set. They all share this name, so this orders by
         // encoded value bytes exactly as `attrs_raw` stores (and the reader
         // decodes) them.
-        if let Some(over) = idx_overflow.get(name) {
+        if let Some(over) = tracked_overflow.get(name) {
             let mut keyed: Vec<(Vec<u8>, (u8, ColumnValue))> = over
                 .iter()
                 .map(|v| {
@@ -1046,9 +1232,14 @@ mod tests {
         let raw = zstd::bulk::decompress(&obj[start..end], fd_desc.uncomp_len as usize)
             .expect("decompress");
         let fd = FieldDir::decode(&raw, 10_000).expect("decode");
-        assert_eq!(fd.len(), 2);
         assert!(fd.column("x", FieldType::Str).is_some());
         assert!(fd.column("x", FieldType::I64).is_some());
+        // Plus one: `base_record`'s stream blob carries `lib` as a scope-level
+        // I64, and a numeric stream-level name takes a column of its own so its
+        // NumStat has an id to be keyed by (ADR-0095). No record writes a value
+        // to it.
+        assert!(fd.column("lib", FieldType::I64).is_some());
+        assert_eq!(fd.len(), 3);
     }
 
     /// Decodes the STREAM_DIR of a written object.
@@ -1193,6 +1384,111 @@ mod tests {
             .expect("decompress");
         let fd = FieldDir::decode(&raw, 10_000).expect("decode");
         assert_eq!(fd.len(), 1000);
+    }
+
+    /// Decodes the SKIP_IDX of a written object through the reader's own
+    /// section path.
+    fn read_skip_index(obj: &[u8]) -> SkipIndex {
+        let cfg = RlogConfig::default();
+        let footer = open(obj).expect("open");
+        let desc = footer.section(kind::SKIP_IDX).expect("skip_idx");
+        let raw = read_section(obj, desc, &cfg).expect("read section");
+        SkipIndex::decode(&raw, 1 << 20).expect("decode")
+    }
+
+    /// The whole-object form of `block::tests::numstat_reflects_cross_type_winner`
+    /// (ADR-0095): the writer, not a hand-built `ResolvedRow`, must compute the
+    /// winners the stats fold in.
+    ///
+    /// Record A carries `dur` three times: `I64(5)` and `Bool(true)` take the
+    /// two columnar slots for `(dur, i64)` and `(dur, bool)`, and the duplicate
+    /// `Bool(false)` spills into `attrs_raw`. The read side resolves that to one
+    /// value per name -- columnar occurrences by ascending type byte (i64 = 2,
+    /// bool = 4), then overflow, last wins -- so A's `dur` is `Bool(false)`.
+    /// Record B carries `dur` once, as `I64(70)`.
+    ///
+    /// So the i64 stat must bound `{70}` and count A as a null (its winner is a
+    /// bool, and a reader materializing a declared `dur: i64` column produces
+    /// NULL for A), and the bool stat must bound `{false}` -- the *overflow*
+    /// occurrence, not the `true` sitting in the bool value page -- and count B
+    /// as a null.
+    #[test]
+    fn numstat_reflects_cross_type_winner_end_to_end() {
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let mut a = base_record(0, 1);
+        a.attrs = vec![
+            ("dur".into(), AttrValue::I64(5)),
+            ("dur".into(), AttrValue::Bool(true)),
+            ("dur".into(), AttrValue::Bool(false)),
+        ];
+        let mut b = base_record(0, 2);
+        b.attrs = vec![("dur".into(), AttrValue::I64(70))];
+        w.push(a).expect("push");
+        w.push(b).expect("push");
+        let obj = w.finish().expect("finish");
+
+        let footer = open(&obj).expect("open");
+        let fd = read_field_dir(&obj, &footer);
+        let i64_cid = fd
+            .column("dur", FieldType::I64)
+            .expect("dur i64 column")
+            .column_id;
+        let bool_cid = fd
+            .column("dur", FieldType::Bool)
+            .expect("dur bool column")
+            .column_id;
+
+        let skip = read_skip_index(&obj);
+        assert_eq!(skip.l0.len(), 1, "both records land in one block");
+        let stat = |cid: u32| {
+            *skip.l0[0]
+                .stats
+                .iter()
+                .find(|s| s.column_id == cid)
+                .unwrap_or_else(|| panic!("stat for column {cid}"))
+        };
+
+        let i = stat(i64_cid);
+        assert_eq!(
+            i.min_bits, 70i64 as u64,
+            "record A's losing 5 must not count"
+        );
+        assert_eq!(i.max_bits, 70i64 as u64);
+        assert_eq!(i.null_count, 1, "record A's i64 occurrence lost the merge");
+
+        let b_stat = stat(bool_cid);
+        assert_eq!(
+            (b_stat.min_bits, b_stat.max_bits),
+            (0, 0),
+            "the winning bool is the overflow `false`, not the columnar `true`"
+        );
+        assert_eq!(b_stat.null_count, 1, "record B carries no bool winner");
+
+        // The winner the stats claim is the one the reader actually resolves:
+        // fold each rebuilt record's attributes last-wins by name, exactly as
+        // `ravel_sql::rlog_attrs::merged_attrs` does over the same list.
+        let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let mut winner: Option<AttrValue> = None;
+            for (k, v) in &row.attrs {
+                if k == "dur" {
+                    winner = Some(v.clone());
+                }
+            }
+            let expected = if row.ts_ns == 1 {
+                AttrValue::Bool(false)
+            } else {
+                AttrValue::I64(70)
+            };
+            assert_eq!(
+                winner,
+                Some(expected),
+                "reader's merged winner for ts {}",
+                row.ts_ns
+            );
+        }
     }
 
     #[test]

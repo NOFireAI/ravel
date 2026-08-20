@@ -173,7 +173,7 @@ window.ARCHMAP = {
     { id: "rlog", code: "RL", hood: "formats", title: "RLOG (logs)", paths: ["crates/ravel-logseg"],
       purpose: "The log segment: stream and field directories, blocks, a skip index, blooms, and optional postings that let <code>attrs['k']='v'</code> prune blocks without decoding them.",
       built: "<code>RlogWriter</code> and <code>LogFooter</code>; the stream-identity check happens in <code>finish()</code>.",
-      source: ["crates/ravel-logseg/src"], stack: ["RLOG v2", "ADR-0029", "ADR-0049"],
+      source: ["crates/ravel-logseg/src"], stack: ["RLOG v3", "ADR-0029", "ADR-0049"],
       docs: [{ title: "docs/log-segment-format.md", path: "docs/log-segment-format.md" }] },
     { id: "rspan", code: "RP", hood: "formats", title: "RSPAN (spans)", paths: ["crates/ravel-rspan"],
       purpose: "The span segment: blocks sorted by <code>(trace_id, start_ts)</code>, a skip index, a mandatory bloom, and a per-block column directory. Routed by trace id so a trace lands in one shard.",

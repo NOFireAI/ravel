@@ -1,5 +1,5 @@
 total_size: 814
-version: 2
+version: 3
 signal: 2
 tenant_hash: abababababababababababababababab
 shard: 3

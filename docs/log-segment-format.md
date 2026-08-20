@@ -1,9 +1,18 @@
 # RLOG: Ravel Log Segment Format
 
 Persistent contract (ADR-0029). Any change bumps the trailer version. The
-current trailer version is 2 (ADR-0032 added the footer's compaction-identity
-fields; version 1 was the format-only initial release and no reader accepts it
-any longer).
+current trailer version is 3 (ADR-0095 redefined what a SKIP_IDX numeric stat
+means; version 2 added the footer's compaction-identity fields and version 1 was
+the format-only initial release, and no reader accepts either any longer).
+
+Version 3 changes no byte layout: it changes which value a `NumStat` bounds
+(see "SKIP_IDX" below). Nothing in the bytes distinguishes a v2 stat from a v3
+one, which is exactly why the trailer version moved rather than a section-local
+one. v2 read and write support is deleted in the same change that introduced v3,
+so every stored v2 object is unreadable by a v3 build; there is no dual-reader
+window and no `maintain migrate` path for this transition (a single-version
+reader cannot open its own inputs to rewrite them). Convergence is retention
+aging those objects out, or re-ingestion.
 
 **Version lifecycle and migration (ADR-0066, normative).** RLOG is a Class A
 bulk data-object format. Until first public release, ADR-0032's
@@ -13,11 +22,19 @@ N/N-1 (single-sourced as `ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer,
 reader gate, `audit-versions`, `migrate`, and the compactor's output-version
 constant all read it), rolled out readers-before-writers: a release writing N+1
 requires a fleet already reading N+1. RLOG compaction already decodes every
-input's records and re-encodes them from scratch, so an old-version object is
-migrated forward by the normal compaction and `maintain migrate` paths with no
-special page-copy carve-out; retention also ages old objects out. The migrate
-job verifies and raises the per-(tenant, signal) format floor, and N-1 read
-support is deleted only once every bucket's floor is >= N, citing those floors.
+input's records and re-encodes them from scratch, so once that window exists an
+old-version object is migrated forward by the normal compaction and
+`maintain migrate` paths with no special page-copy carve-out; retention also
+ages old objects out. The migrate job verifies and raises the per-(tenant,
+signal) format floor, and N-1 read support is deleted only once every bucket's
+floor is >= N, citing those floors.
+
+Today, pre-release, that window is one version wide, so neither path can touch
+an object below it: compaction and `migrate` both go through the reader, and the
+reader refuses the old version outright. A bump therefore strands every stored
+object at the previous version until retention or re-ingestion replaces it
+(ADR-0095 for the v2 → v3 bump). `audit-versions` is what reports live objects
+left behind.
 
 Parsers treat every offset, length, count, and tag read from stored bytes
 as untrusted input: bounds-check everything, overflow-check every
@@ -46,7 +63,7 @@ encodings.
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 2)                       |
+|   version:      u16   (= 3)                       |
 |   signal:       u8    (2 = logs)                  |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RLG1"                   |
@@ -224,17 +241,24 @@ non-ascending sequence, an entry count over the cap, an unknown type
 byte, and truncation.
 
 A FIELD_DIR column normally exists because at least one record carries the
-key as a per-record attribute. An **indexed** field (POSTINGS, below) is the
-one exception: if the writer was told to index a name (`with_indexed_fields`)
-that appears only at stream level (a resource or scope attribute) across the
-whole object and per-record on no record, that `(name, type)` still gets a
-column, so its merged-view postings have a `column_id` to key by (ADR-0049).
-Such a column is a POSTINGS key, not a materialized value: no
-row writes a per-record value to it, so it is all-null in every block, its
-`present_blocks` is 0, and the reader's exact per-record equality on the key
-still reads only the per-record layer (it never resolves against the resource
-or scope blob). It counts against the same 1000-dynamic-column budget as any
-column; one that cannot fit degrades to bloom plus exact scan, always legal.
+key as a per-record attribute. Two kinds of key that appear only at stream
+level (a resource or scope attribute) across the whole object, and per-record
+on no record, get a `(name, type)` column anyway:
+
+- An **indexed** field (POSTINGS, below), if the writer was told to index the
+  name (`with_indexed_fields`), so its merged-view postings have a `column_id`
+  to key by (ADR-0049).
+- A **numeric** field (i64, f64, bool), so its SKIP_IDX numeric stat has a
+  `column_id` to key by (ADR-0095). String and bytes keys get no such column,
+  since they feed no stat.
+
+Such a column is a POSTINGS or stat key, not a materialized value: no
+row writes a per-record value to it, so it is all-null in every block, it gets
+no page in any block, its `present_blocks` is 0, and the reader's exact
+per-record equality on the key still reads only the per-record layer (it never
+resolves against the resource or scope blob). It counts against the same 1000-
+dynamic-column budget as any column; one that cannot fit degrades to bloom plus
+exact scan and to no stat, always legal.
 
 ## BLOCKS
 
@@ -434,12 +458,86 @@ count1 level-1 entries: same fields as a level-0 entry with the byte
   children
 ```
 
+A level-1 stat merges only the children that carry a stat for that column, so
+its bounds are the group's bounds only because every child that resolves a
+value for the column carries one (see "What a numeric stat bounds" below). A
+child block that resolved values but carried no stat would read as "no
+information" here and be dropped from the merge silently, leaving a level-1
+entry that looks complete and bounds a subset of its group.
+
 Fanout is 64: one level-1 entry per 64 level-0 blocks. A numeric stat
 stores i64 as its two's-complement `u64` bit pattern (`v as u64`), and
 f64 as its `to_bits` pattern; min/max for f64 use `total_cmp` order over
 non-NaN values, and NaN values are counted in `has_nan` and excluded from
 min/max. Readers reject a block count over the configured cap and any
 truncation.
+
+### What a numeric stat bounds (trailer version 3, ADR-0095, normative)
+
+A numeric stat for a `(name, type)` dynamic column bounds, over the rows of
+its block, each row's **resolved merged-view value** for that column's
+attribute name, and only when that value's type is the column's type. A row
+whose resolved value for the name is of another type, or which does not resolve
+the name at all, contributes to `null_count` and to neither bound.
+
+The resolved value is the one a reader reports for the name, which is
+`ravel_sql::rlog_attrs::find_attr` over `merged_attrs`: the record's stream
+layer (its resource attributes, then its scope attributes) seeds the view and
+the record layer overrides it, the record winning a collision. A name the
+record itself does not carry keeps its resource- or scope-level value -- the
+ordinary OTLP shape, where an attribute like `service.version` lives only on
+the resource -- and a stat over that name has to bound that value like any
+other.
+
+Within the record layer, when a record carries the name more than once, the
+winning occurrence is fixed by the order `rebuild_record` lays a record's
+attributes out and `merged_attrs` folds them last-wins (see "FIELD_DIR" and
+POSTINGS "Version"): the record's columnar occurrences ascending by FIELD_DIR
+type byte, then its `attrs_raw` overflow occurrences ascending by canonical
+encoded value bytes, last entry wins.
+
+The writer resolves this once per record and both POSTINGS and SKIP_IDX are
+projections of that one resolved view, so the two sections cannot disagree
+about which value a reader sees for a key.
+
+Three consequences a reader must expect, all by design:
+
+- A block's value page for the column may hold values outside the stat's
+  `[min, max]`: a losing occurrence is still stored (nothing is dropped), it
+  just does not widen the bounds. Anything reading the page directly must
+  resolve the value itself, exactly as `rebuild_record` plus `merged_attrs` do.
+- Conversely, the stat's `[min, max]` may cover values that appear in no value
+  page of the block at all: a row that resolves the name off its stream layer
+  contributes its resource- or scope-level value, which is stored once in
+  STREAM_DIR and not per row.
+- A stat's `null_count` may exceed the FIELD_DIR `null_count` for the same
+  column, which counts raw column presence over the whole object rather than
+  merged-view resolution per row.
+
+A block carries a stat for every column some row of it resolves a value for,
+which is a superset of the columns it has value pages for: a block where the
+name is resolved only off the stream layer, with no per-record occurrence in the
+block at all, still carries the stat, and that stat still bounds the resolved
+values. The block's pages are unaffected -- a column no row of the block wrote a
+value to gets no page, so a stat-only column costs zero BLOCKS bytes.
+
+For the same reason, a numeric name (i64, f64, bool) that no record in the
+object carries per-record still takes a dynamic column, on the strength of its
+stream-level occurrences alone, so its stat has a column to be keyed by. That
+mirrors what an indexed name already gets (see "FIELD_DIR"); the column holds no
+value page anywhere in the object, it exists to key the stat and the postings.
+
+A name still ends up with no column, and so no stat, when it overflows the
+writer's dynamic-column budget. An absent stat is "no information": it prunes
+nothing, exactly like an absent posting list.
+
+This is what makes range pruning on these stats sound: where a stat exists, a
+reader materializing a declared typed column produces exactly the value the
+stat folded in (or NULL when that value is of another type), so a block whose
+stat range cannot overlap a queried range holds no matching row. Under version
+2 the stats bounded the raw columnar occurrences instead, which could exclude
+the block holding the record a range query wanted; that is the defect version 3
+fixes, and it is why a v2 object cannot be read as a v3 one.
 
 `candidate_blocks(ts_min, ts_max, stream_refs)` returns the level-0 block
 indices whose entries survive the coarse predicate. The pruning is sound
@@ -620,10 +718,16 @@ unchanged. A version-2 object that carries no posting list for a given key is
 handled as "no information" (probe returns `Ok(None)`, no prune) exactly as
 for any unindexed field.
 
-A reader accepts both versions. Stored version-1 objects are not rewritten,
-so the conservative rule keeps them correct with no migration.
+The section decoder still accepts a version-1 byte and applies the
+conservative rule above, but no stored object can reach it: POSTINGS version 1
+was only ever written under trailer version 2, and a reader refuses that
+trailer outright (see the top of this document -- v2 read support was deleted
+with ADR-0095, with no dual-reader window). So the version-1 arm is dead for
+stored data, and the "reader accepts both versions" migration story it used to
+carry no longer applies to anything. It is kept as a decoder arm, not a
+supported input: only the trailer version window decides what opens.
 
-Adding POSTINGS did not bump the trailer `version` (still 2): ADR-0029's
+Adding POSTINGS did not bump the trailer `version` (2 at the time): ADR-0029's
 versioning carve-out excepts a new section kind, since unknown kinds are
 already skipped by old readers and an absent kind is already legal --
 exactly POSTINGS's own fallback behavior. The POSTINGS `version` byte above
@@ -631,6 +735,12 @@ is this section's own grammar version, separate from the trailer version;
 its 1 → 2 bump changed no bytes and needs no trailer bump. Only a change to
 an *existing* section's grammar shape, or to a mandatory/optional kind's
 legality, needs a trailer version bump and an ADR.
+
+SKIP_IDX's v3 change (above) is the other side of that rule: SKIP_IDX is a
+mandatory section that already existed, and redefining what one of its fields
+means -- with no byte a reader could use to tell the two meanings apart -- is
+precisely the case the carve-out does not cover, so it took the trailer bump
+to 3 (ADR-0095).
 
 ## Compaction (L0 → L1)
 

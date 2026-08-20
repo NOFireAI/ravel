@@ -206,6 +206,34 @@ pub struct ResolvedRow {
     /// amendment 2026-08-03); it never affects block encoding, only postings
     /// accumulation.
     pub indexed_terms: Vec<(u32, ColumnValue)>,
+    /// The resolved merged-view value of each NumStat-eligible attribute name
+    /// this row resolves, keyed by the dynamic column the *value's* type
+    /// resolves to, `(column_id, value)`, at most one entry per column id.
+    ///
+    /// This is what [`crate::block::write_block`] folds into a block's
+    /// `NumStat` min/max, and it is deliberately not the same thing as
+    /// [`ResolvedRow::columns`] (ADR-0095). The value is the one the read side
+    /// reports for the name: the record's resource and scope layer, then its
+    /// own attributes overriding, and within its own attributes the two-tier
+    /// winner `writer::record_level_winners` computes when it carries the name
+    /// more than once (two types, or a same-type duplicate that spilled into
+    /// `attrs_raw`). A declared typed column materializes a value only when
+    /// that resolved value's type matches, so a row whose resolved value for a
+    /// name is of some other type has no entry for that name's numeric column
+    /// here and contributes to the stat's `null_count` exactly as an absent
+    /// attribute does, rather than contributing a value the reader will never
+    /// produce.
+    ///
+    /// A name the row carries only on its resource or scope still has an entry:
+    /// a reader resolves that stream-level value for the row, so the stat has
+    /// to bound it (that is the same shape `indexed_terms` indexes).
+    ///
+    /// Empty when the object has no I64/F64/Bool dynamic column, or the row
+    /// resolves none of those names. Absence is always a null contribution,
+    /// never a fallback to the raw columnar value: a fallback would silently
+    /// restore the pre-v3 semantics for any producer that forgot to populate
+    /// this.
+    pub stat_winners: Vec<(u32, ColumnValue)>,
 }
 
 /// Selects the field a predicate arm applies to.
