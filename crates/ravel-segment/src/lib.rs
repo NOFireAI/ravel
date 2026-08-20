@@ -15,6 +15,8 @@ mod identity;
 mod reader;
 mod sparse;
 mod ts_delta;
+mod ts_gcd;
+mod value_codecs;
 mod varint;
 mod writer;
 

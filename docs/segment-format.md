@@ -510,14 +510,32 @@ and a flipped enc/comp byte cannot cause silent misdecoding.
 
 | enc | payload |
 |---|---|
-| 1 TS_DELTA_VARINT | first ts_ns as varint-zigzag from 0; then deltas varint-zigzag. Handles irregular and out-of-order deltas. Accumulation is overflow-checked; each decoded ts must lie within the run's [min_ts_ns, max_ts_ns]. |
+| 1 TS_DELTA_VARINT | first ts_ns as varint-zigzag from the run minimum; then deltas varint-zigzag. Handles irregular and out-of-order deltas. Accumulation is overflow-checked; each decoded ts must lie within the run's [min_ts_ns, max_ts_ns]. |
+| 2 TS_GCD_I64 | `uvarint gcd`, one `ravel_codec::encode_i64` tag byte, then the encode_i64 bytes for every timestamp divided by the page GCD (ADR-0092 decision 6). Decode multiplies back by the GCD; each ts is bounds-checked as above. A second timestamp encoding, selected per page against enc 1 (see below), never a replacement. |
 | 16 VAL_GORILLA | Gorilla XOR bit stream: first f64 raw 64 bits; then XOR with previous, classic control-bit scheme (Gorilla paper 4.1.2), padded to byte. Pure bit manipulation: NaN payloads, -0.0, denormals round-trip exactly. |
 | 17 VAL_RAW_F64 | count * f64 LE. Fallback when XOR encodes larger than raw. |
+| 18 VAL_ALP | ALP (ADR-0092 decision 6): `e` (1 byte decimal exponent), one `encode_i64` tag byte, `uvarint int_len`, the encode_i64 bytes for the fit digits, `uvarint exception_count`, then each exception as `uvarint index` + 8-byte raw f64. A value the exponent does not reproduce bit-exactly (non-finite, out of the i64 domain, -0.0) is an exception, so every bit round-trips. |
+| 19 VAL_GCD_DELTA_FOR | GCD-of-deltas + frame-of-reference (ADR-0092 decision 6): a marker byte (0 = whole-page raw f64 fallback, 1 = model), then for the model `e`, `zigzag first digit`, `uvarint delta-gcd`, and a FOR bit-pack (`zigzag min`, width byte, LSB-packed offsets) of the GCD-reduced digit deltas. The raw fallback stores count * f64 LE, so every bit round-trips. |
 | 32 HIST_SPANS | native-histogram records (below). |
 
-Writers choose VAL encoding per page by encoded size (raw-fallback rule: emit
-GORILLA unless size `>= 8*count` bytes). The raw-fallback rule means a
-1-sample series always stores VAL as enc 17. HIST_SPANS pages always use
+Writers choose VAL encoding per page by encoded size, keeping the smallest
+final page and the incumbent (GORILLA, then RAW_F64) on a tie: GORILLA unless
+it encodes `>= 8*count` bytes (then RAW_F64), and either integer-model codec
+(ALP, GCD_DELTA_FOR) only when it is strictly smaller than that incumbent
+choice (ADR-0092 decision 6). Every VAL page is stored `comp = 0`, so a
+candidate's payload length is its final page size. Because a new codec must be
+strictly smaller, a VAL page is never larger than the incumbent would have
+produced, and the integer-model codecs fall back rather than expand on noisy
+floats. The raw-fallback rule means a 1-sample series stores VAL as enc 17
+unless an integer-model codec is smaller.
+
+Writers likewise choose TS encoding per page, but the comparison is
+post-compression: TS_DELTA_VARINT is lz4-compressed when it clears the 64-byte
+floor and shrinks (see below), and its *final* payload is compared against the
+uncompressed TS_GCD_I64 candidate, keeping the smaller with TS_DELTA_VARINT on
+a tie. This is what stops the GCD stack from regressing an exactly-regular
+millisecond stream, where the repeated varint collapses under lz4 to a fraction
+of the bare-encode_i64 size. HIST_SPANS pages always use
 `comp = 0`. TS_PAGES is shared by scalar and histogram series; a histogram
 series' `k`-th timestamp corresponds positionally to its `k`-th histogram
 record. A page's record count is implicit: it equals the run's
