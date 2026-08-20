@@ -70,6 +70,7 @@ async fn drain(
         &SqlConfig::default(),
         Arc::clone(&pool),
         SessionTable::Metrics(provider),
+        false,
     )
     .expect("session");
 
@@ -249,6 +250,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
     let config = SqlConfig {
         engine: util::engine_config(),
         max_query_bytes: 1_400_000,
+        parallel_final_aggregation: false,
     };
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
@@ -261,8 +263,13 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         config,
         QueryAccounting::new(),
     ));
-    let ctx = build_session(&config, Arc::clone(&pool), SessionTable::Metrics(provider))
-        .expect("session");
+    let ctx = build_session(
+        &config,
+        Arc::clone(&pool),
+        SessionTable::Metrics(provider),
+        false,
+    )
+    .expect("session");
     let mut stream = ctx
         .sql("SELECT ts, value FROM samples")
         .await

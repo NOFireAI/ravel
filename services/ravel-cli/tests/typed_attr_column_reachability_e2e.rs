@@ -190,6 +190,7 @@ fn build_app(store: Arc<dyn ObjectStoreBackend>, clock: Arc<AtomicI64>) -> Route
         ravel_query::EngineConfig::default(),
         ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
         ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
+        false,
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
@@ -396,6 +397,7 @@ async fn an_explicitly_empty_declaration_overrides_the_cli_default() {
         ravel_query::EngineConfig::default(),
         ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
         ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
+        false,
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),

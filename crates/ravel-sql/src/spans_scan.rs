@@ -681,6 +681,7 @@ mod tests {
             &SqlConfig::default(),
             pool,
             SessionTable::Spans(Arc::new(provider)),
+            false,
         )
         .expect("spans session builds");
 

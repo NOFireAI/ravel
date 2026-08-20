@@ -51,14 +51,26 @@
 //!   planner as a second, ungoverned data source alongside `samples`.
 //!
 //! Determinism:
-//! every `repartition_*` knob is turned off. Float aggregation is
-//! order-dependent, so v1 requires aggregations to execute
+//! every `repartition_*` knob except aggregation is turned off unconditionally.
+//! Float aggregation is order-dependent, so v1 requires it to execute
 //! single-partitioned above the merged, deduplicated stream. Left on,
 //! `EnforceDistribution` would insert a `RepartitionExec` above
 //! `RsegDedupExec` and fan an aggregate out across partitions, reordering
 //! summation and breaking bit-exactness against the differential gate's
-//! reference. Parallel aggregation is banned until an ADR defines a
-//! tolerance policy or a compensated-summation scheme.
+//! reference.
+//!
+//! `repartition_aggregations` is the one exception (ADR-0094): it reads the
+//! `exact_typed_aggregates` argument [`session_config`] receives, rather than a
+//! hardcoded `false`. That argument is `true` only when a per-query
+//! classification (`executor::SqlExecutor`) has proven every aggregate and
+//! GROUP BY key in the query is order/partition-independent -- `count`, and
+//! `sum`/`min`/`max` over a resolved non-float input, with no float group key;
+//! `avg`/`mean` (always plain IEEE f64 addition) and any float input or key are
+//! never eligible. It is `false` for every other query and behind a default-off
+//! `SqlConfig` flag, so this is byte-identical to the old single-partition plan
+//! unless an operator opts in. The join/sort/window/file-scan knobs stay
+//! unconditionally `false`: their determinism requirements are out of ADR-0094's
+//! scope.
 
 use std::sync::Arc;
 
@@ -153,12 +165,19 @@ impl ObjectStoreRegistry for EmptyObjectStoreRegistry {
 
 /// Build the per-query `SessionConfig`. Separated from [`build_session`] so
 /// the invariants above can be asserted without constructing a provider.
-pub fn session_config(config: &SqlConfig) -> SessionConfig {
+///
+/// `exact_typed_aggregates` (ADR-0094 decision 2) is the one per-query input:
+/// `true` only when the caller's classification proved the query's aggregates
+/// and GROUP BY keys are order/partition-independent, allowing DataFusion to
+/// fan the final aggregation across partitions. `false` for every other query,
+/// which reproduces the old single-partition plan exactly.
+pub fn session_config(config: &SqlConfig, exact_typed_aggregates: bool) -> SessionConfig {
     SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(config.engine.fetch_concurrency.max(1))
-        // See the module docs: v1 aggregates must stay single-partitioned.
-        .with_repartition_aggregations(false)
+        // ADR-0094: the only knob that is ever true, and only for a query whose
+        // aggregates and group keys are all exact-typed. See the module docs.
+        .with_repartition_aggregations(exact_typed_aggregates)
         .with_repartition_joins(false)
         .with_repartition_sorts(false)
         .with_repartition_windows(false)
@@ -185,13 +204,15 @@ pub fn build_session(
     config: &SqlConfig,
     pool: Arc<dyn MemoryPool>,
     table: SessionTable,
+    exact_typed_aggregates: bool,
 ) -> DFResult<SessionContext> {
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(Arc::new(EmptyObjectStoreRegistry))
         .build_arc()?;
 
-    let mut ctx = SessionContext::new_with_config_rt(session_config(config), runtime);
+    let mut ctx =
+        SessionContext::new_with_config_rt(session_config(config, exact_typed_aggregates), runtime);
 
     // Register a hand-written `ExprPlanner` so `col['key']`
     // (`logs.attrs`, `samples.labels`) plans instead of failing with
@@ -329,6 +350,7 @@ mod tests {
             &SqlConfig::default(),
             test_pool(),
             SessionTable::Spans(Arc::new(provider)),
+            false,
         )
         .expect("spans session builds");
 
@@ -364,13 +386,31 @@ mod tests {
 
     #[test]
     fn information_schema_is_disabled_and_repartitioning_is_off() {
-        let config = session_config(&SqlConfig::default());
+        let config = session_config(&SqlConfig::default(), false);
         let options = config.options();
         assert!(
             !options.catalog.information_schema,
             "information_schema must stay disabled (security invariant 1)"
         );
         assert!(!options.optimizer.repartition_aggregations);
+        assert!(!options.optimizer.repartition_joins);
+        assert!(!options.optimizer.repartition_sorts);
+        assert!(!options.optimizer.repartition_windows);
+        assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// ADR-0094 decision 2: `exact_typed_aggregates = true` flips ONLY
+    /// `repartition_aggregations` on; every other `repartition_*` knob stays
+    /// unconditionally off, and `information_schema` stays disabled.
+    #[test]
+    fn exact_typed_aggregates_flips_only_repartition_aggregations() {
+        let config = session_config(&SqlConfig::default(), true);
+        let options = config.options();
+        assert!(!options.catalog.information_schema);
+        assert!(
+            options.optimizer.repartition_aggregations,
+            "exact-typed queries repartition their final aggregation (ADR-0094)"
+        );
         assert!(!options.optimizer.repartition_joins);
         assert!(!options.optimizer.repartition_sorts);
         assert!(!options.optimizer.repartition_windows);
