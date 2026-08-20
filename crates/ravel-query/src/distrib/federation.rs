@@ -388,11 +388,38 @@ impl Federation {
                         reason: format!("remote tripped its budget: {}", response.status_message),
                     }));
                 }
+                pb::status::Code::Unsupported => {
+                    // A remote reporting `Unsupported` for this query is a
+                    // coverage gap, not corruption: it declines to serve this
+                    // signal, exactly as a remote predating the ADR-0071 log/span
+                    // fan-out amendment rejects Logs/Spans/Alerts/Audit (its
+                    // `run_slice_inner` returns `Unsupported` for any non-Metrics
+                    // signal, distrib/service.rs). A remote resolves its own
+                    // snapshot, so `Unsupported` can only mean "this cluster does
+                    // not serve this query kind yet" -- an availability/coverage
+                    // property, not a wrong-data one. Route it through the same
+                    // skip_unavailable path a native-histogram coverage gap
+                    // (`DistribError::HistogramUnsupported` above) takes: skipped
+                    // with a redacted partial-coverage warning when
+                    // `skip_unavailable` is set, a truthful typed `Federation`
+                    // error naming only the cluster otherwise. Treating it as a
+                    // non-skippable hard fault (the `other` arm) would make
+                    // `skip_unavailable` unable to tolerate an old remote during a
+                    // mixed-version fan-out rollout, which is exactly the
+                    // availability the flag exists to provide.
+                    handle_unavailable(
+                        &name,
+                        skip_unavailable,
+                        format!("remote reported unsupported: {}", response.status_message),
+                        &mut outcome,
+                    )?;
+                }
                 other => {
-                    // SnapshotInvalidated/Unsupported/Corrupt/etc. A remote
-                    // resolves its own snapshot, so none of these is an
-                    // availability signal: they are hard faults, typed, never
-                    // masked by skip_unavailable.
+                    // SnapshotInvalidated/Corrupt/etc. A remote resolves its own
+                    // snapshot, so none of these is an availability signal: they
+                    // are hard faults, typed, never masked by skip_unavailable.
+                    // (`Unsupported` is handled above as a skippable coverage gap,
+                    // not here.)
                     return Err(QueryError::Federation {
                         cluster: name.clone(),
                         reason: format!("remote returned {other:?}: {}", response.status_message),
@@ -512,6 +539,31 @@ mod tests {
         }
     }
 
+    /// A remote whose metrics-shaped `fetch` answers with a well-formed summary
+    /// carrying a terminal `Unsupported` status and no frames -- byte-for-byte
+    /// what a pre-amendment remote (predating the ADR-0071 log/span fan-out)
+    /// returns for a signal it does not serve: its `run_slice_inner` rejects any
+    /// non-Metrics `Signal` with `Unsupported` before decoding the request body
+    /// (distrib/service.rs). The `status_message` embeds internal identifiers
+    /// (endpoint) exactly as the old stub's would, so the redaction boundary is
+    /// under test here too.
+    struct OldUnsupportedFetcher(String);
+
+    #[async_trait]
+    impl SliceFetcher for OldUnsupportedFetcher {
+        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            Ok(SliceResponse {
+                scalar: Vec::new(),
+                accounting: QueryAccountingSnapshot::default(),
+                stats: FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: pb::status::Code::Unsupported,
+                status_message: self.0.clone(),
+            })
+        }
+    }
+
     fn one_remote(fetcher: Arc<dyn SliceFetcher>, skip: bool, timeout: Duration) -> Federation {
         Federation::new(vec![RemoteCluster {
             name: "eu-west".to_string(),
@@ -522,9 +574,17 @@ mod tests {
     }
 
     async fn run(fed: &Federation) -> Result<FederationOutcome, QueryError> {
+        run_signal(fed, Signal::Metrics).await
+    }
+
+    /// `run`, parameterized by the queried signal, so a federation test can prove
+    /// the availability/skip contract holds for the ADR-0071 fan-out signals
+    /// (Logs, Alerts, Audit, Spans), not only Metrics. Everything but `signal` is
+    /// held identical to `run`.
+    async fn run_signal(fed: &Federation, signal: Signal) -> Result<FederationOutcome, QueryError> {
         fed.fetch(
             TenantHash([1u8; 16]),
-            Signal::Metrics,
+            signal,
             Vec::new(),
             Vec::new(),
             0,
@@ -535,6 +595,10 @@ mod tests {
         )
         .await
     }
+
+    /// The ADR-0071 fan-out signals this task proves federation composes over.
+    /// Metrics is already covered by the blocks above; these are the new ones.
+    const FANOUT_SIGNALS: &[Signal] = &[Signal::Logs, Signal::Alerts, Signal::Audit, Signal::Spans];
 
     /// The internal identifiers a client-facing warning must never carry.
     const LEAKS: &[&str] = &[
@@ -670,6 +734,172 @@ mod tests {
         let err = run(&fed)
             .await
             .expect_err("a histogram remote fails the query when not skippable");
+        match err {
+            QueryError::Federation { cluster, .. } => assert_eq!(cluster, "eu-west"),
+            other => panic!("expected QueryError::Federation, got {other:?}"),
+        }
+    }
+
+    // --- ADR-0071 amendment (#287, T5): the fan-out signals compose ----------
+    //
+    // "Federation composes once the per-signal SliceFetcher exists" is the
+    // amendment's Decision 6, and "should compose" is not "proven to compose"
+    // (#82's evidence-integrity rule). These blocks drive `Federation::fetch`
+    // with each new signal directly and assert the availability/skip contract
+    // holds unchanged: an unavailable remote under `skip_unavailable = true`
+    // marks the outcome partial, skips the cluster, and redacts every internal
+    // identifier from the client-facing warning -- the same shape the Metrics
+    // blocks above prove.
+
+    /// Shared body for the per-signal unavailable-remote assertion
+    /// (deliverable 1). A transport-failing remote whose error text embeds an
+    /// endpoint/errno is skipped under `skip_unavailable = true` for whichever
+    /// `signal` is queried, and the warning names only the cluster.
+    ///
+    /// Flip-line proof: `Federation::fetch`'s availability handling
+    /// (`handle_unavailable`) takes no `signal`, so a partial result here proves
+    /// the skip path is signal-agnostic; were it to special-case Metrics (skip
+    /// only when `signal == Signal::Metrics`), the `expect` below would panic for
+    /// every new signal because the query would error typed instead. The
+    /// redaction half is the same flip as
+    /// `skip_unavailable_marks_partial_and_redacts_the_warning`: push the raw
+    /// `reason` instead of `skipped_cluster_warning` and the `LEAKS` loop fires.
+    async fn assert_unavailable_signal_is_partial_and_redacted(signal: Signal) {
+        let fetcher = Arc::new(TransportErrFetcher(
+            "connection refused (os error 111) dialing 10.1.2.3:9443".to_string(),
+        ));
+        let fed = one_remote(fetcher, true, Duration::from_secs(5));
+        let outcome = run_signal(&fed, signal)
+            .await
+            .expect("skip_unavailable keeps the query alive for every fan-out signal");
+
+        assert!(
+            outcome.partial,
+            "coverage is partial when a remote is skipped ({signal:?})"
+        );
+        assert_eq!(
+            outcome.skipped,
+            vec!["eu-west".to_string()],
+            "the skipped cluster is recorded ({signal:?})"
+        );
+        assert_eq!(
+            outcome.warnings.len(),
+            1,
+            "one warning per skipped cluster ({signal:?})"
+        );
+        let w = &outcome.warnings[0];
+        assert!(
+            w.contains("eu-west"),
+            "warning names the operator-facing cluster ({signal:?}): {w}"
+        );
+        for leak in LEAKS {
+            assert!(
+                !w.contains(leak),
+                "client warning leaked internal identifier {leak:?} for {signal:?}: {w}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_unavailable_remote_marks_partial_and_redacts() {
+        assert_unavailable_signal_is_partial_and_redacted(Signal::Logs).await;
+    }
+
+    #[tokio::test]
+    async fn alerts_unavailable_remote_marks_partial_and_redacts() {
+        assert_unavailable_signal_is_partial_and_redacted(Signal::Alerts).await;
+    }
+
+    #[tokio::test]
+    async fn audit_unavailable_remote_marks_partial_and_redacts() {
+        assert_unavailable_signal_is_partial_and_redacted(Signal::Audit).await;
+    }
+
+    #[tokio::test]
+    async fn spans_unavailable_remote_marks_partial_and_redacts() {
+        assert_unavailable_signal_is_partial_and_redacted(Signal::Spans).await;
+    }
+
+    /// Deliverable 2: a remote running pre-amendment code rejects a new fan-out
+    /// signal with a terminal `Unsupported` status. That is a coverage gap (the
+    /// remote does not serve this signal yet), so under `skip_unavailable = true`
+    /// it is handled exactly like any other unavailable remote -- partial, the
+    /// cluster skipped, and a redacted warning naming only the cluster -- never a
+    /// hard fault and never a leak of the remote's internal status text.
+    ///
+    /// Flip-line proof: delete the `pb::status::Code::Unsupported` arm in
+    /// `Federation::fetch` (federation.rs) so `Unsupported` falls into the
+    /// `other =>` hard-fault arm. `run_signal(...).expect(...)` then panics for
+    /// every signal, because the query errors typed
+    /// (`QueryError::Federation`) instead of degrading to partial. This is the
+    /// exact line a naive-wrong implementation -- surfacing an old remote's
+    /// `Unsupported` as a hard error rather than triggering `skip_unavailable` --
+    /// would fail on.
+    #[tokio::test]
+    async fn old_remote_unsupported_new_signal_is_skippable_partial_and_redacted() {
+        for &signal in FANOUT_SIGNALS {
+            let fetcher = Arc::new(OldUnsupportedFetcher(
+                "signal unsupported by run_slice_inner at 10.1.2.3:9443".to_string(),
+            ));
+            let fed = one_remote(fetcher, true, Duration::from_secs(5));
+            let outcome = run_signal(&fed, signal).await.expect(
+                "an old remote's Unsupported is a coverage gap, skippable under skip_unavailable",
+            );
+
+            assert!(
+                outcome.partial,
+                "an old-remote Unsupported marks coverage partial ({signal:?})"
+            );
+            assert_eq!(
+                outcome.skipped,
+                vec!["eu-west".to_string()],
+                "the old remote is recorded as skipped, not surfaced as a hard fault ({signal:?})"
+            );
+            assert_eq!(
+                outcome.warnings.len(),
+                1,
+                "one warning per skipped cluster ({signal:?})"
+            );
+            let w = &outcome.warnings[0];
+            assert!(
+                w.contains("eu-west"),
+                "warning names the cluster ({signal:?}): {w}"
+            );
+            for leak in LEAKS {
+                assert!(
+                    !w.contains(leak),
+                    "client warning leaked internal identifier {leak:?} for {signal:?}: {w}"
+                );
+            }
+            // The remote's raw status text (its internal reason) must not reach
+            // the client warning: it is the stable redacted message, same as the
+            // unavailable/histogram cases.
+            assert!(
+                !w.contains("run_slice_inner"),
+                "internal status text leaked into the client warning ({signal:?}): {w}"
+            );
+            assert!(
+                !w.contains("unsupported"),
+                "internal status text leaked into the client warning ({signal:?}): {w}"
+            );
+        }
+    }
+
+    /// Deliverable 2, default half: with `skip_unavailable = false` the same old
+    /// remote fails the query typed (never silently dropped, never partial) as a
+    /// `Federation` error naming the cluster -- the identical shape the
+    /// unavailable and histogram cases take without `skip_unavailable`. The raw
+    /// status text it carries is redacted at the HTTP boundary (http/error.rs),
+    /// not here.
+    #[tokio::test]
+    async fn old_remote_unsupported_new_signal_without_skip_fails_typed() {
+        let fetcher = Arc::new(OldUnsupportedFetcher(
+            "signal unsupported by run_slice_inner at 10.1.2.3:9443".to_string(),
+        ));
+        let fed = one_remote(fetcher, false, Duration::from_secs(5));
+        let err = run_signal(&fed, Signal::Logs)
+            .await
+            .expect_err("an old remote's Unsupported fails the query when not skippable");
         match err {
             QueryError::Federation { cluster, .. } => assert_eq!(cluster, "eu-west"),
             other => panic!("expected QueryError::Federation, got {other:?}"),
