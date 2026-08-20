@@ -2189,7 +2189,7 @@ mod tests {
     use ravel_catalog::{Catalog, CatalogConfig};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_segment::{SeriesInputV3, VERSION_V6};
+    use ravel_segment::{SeriesInputV3, VERSION_V7};
     use ravel_types::{Label, METRIC_NAME_LABEL, SeriesId, TenantId, TimeRange};
     use uuid::Uuid;
 
@@ -2293,7 +2293,7 @@ mod tests {
             max_event_ts_ns: written.summary.max_event_ts_ns,
             min_ingest_ts_ns: created,
             max_ingest_ts_ns: created,
-            segment_format_version: u32::from(VERSION_V6),
+            segment_format_version: u32::from(VERSION_V7),
             created_unix_ns: created,
             ingest_hour_bucket: HOUR,
         })

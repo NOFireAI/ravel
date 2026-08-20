@@ -639,7 +639,7 @@ pub async fn migrate_family(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    //! Exercises the driver end to end on a `MemoryStore` over real v6 RSEG
+    //! Exercises the driver end to end on a `MemoryStore` over real v7 RSEG
     //! objects: the resumable cursor and budget (a migration interrupted after
     //! partial progress resumes exactly where it stopped, migrating every bucket
     //! exactly once), the floor-raise race close (a fresh straggler between the
@@ -659,7 +659,7 @@ mod tests {
         PageToken, PutOptions, PutOutcome,
     };
     use ravel_segment::{
-        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V6,
+        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V7,
     };
     use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantHash, TenantId};
     use uuid::Uuid;
@@ -671,10 +671,10 @@ mod tests {
     const FAMILY: &str = "rseg";
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
     const EPOCH: u64 = 10;
-    /// A version above the current writer's output, so every real v6 object
+    /// A version above the current writer's output, so every real v7 object
     /// counts as "below target" and the rewrite path runs. Stands in for the
     /// N-1 version an actual reader window would supply.
-    const FUTURE_VERSION: u32 = VERSION_V6 as u32 + 1;
+    const FUTURE_VERSION: u32 = VERSION_V7 as u32 + 1;
 
     fn tenant_hash() -> TenantHash {
         TenantId::new(TENANT).hash()
@@ -716,7 +716,7 @@ mod tests {
 
     /// Seed one L0 input (data object + commit record) at `(shard, hour)` via
     /// the production flush writer, recording `segment_format_version` in the
-    /// commit record as given. The object bytes are always real v6; only the
+    /// commit record as given. The object bytes are always real v7; only the
     /// metadata a caller reads without decoding can be made to disagree, which
     /// is how a "below target" or "straggler" record is fabricated over a real
     /// object. A distinct `seq` keeps each seeded object's key unique.
@@ -832,10 +832,10 @@ mod tests {
     async fn budget_interrupts_and_resume_covers_every_bucket_exactly_once() {
         let store = MemoryStore::new();
         provision(&store, 2).await;
-        // Shard 0 hours 100, 101; shard 1 hour 100. All real v6 objects.
-        seed_at(&store, 0, 100, 1, "alpha", VERSION_V6 as u32).await;
-        seed_at(&store, 0, 101, 2, "beta", VERSION_V6 as u32).await;
-        seed_at(&store, 1, 100, 3, "gamma", VERSION_V6 as u32).await;
+        // Shard 0 hours 100, 101; shard 1 hour 100. All real v7 objects.
+        seed_at(&store, 0, 100, 1, "alpha", VERSION_V7 as u32).await;
+        seed_at(&store, 0, 101, 2, "beta", VERSION_V7 as u32).await;
+        seed_at(&store, 1, 100, 3, "gamma", VERSION_V7 as u32).await;
 
         let clock = FixedClock::new(sealed_now_ns_for(101));
         let config = CompactorConfig::default();
@@ -900,7 +900,7 @@ mod tests {
     async fn floor_raise_refuses_when_a_fresh_straggler_survives_the_walk() {
         let store = MemoryStore::new();
         provision(&store, 1).await;
-        let target = VERSION_V6 as u32;
+        let target = VERSION_V7 as u32;
 
         // A sealed, at-target bucket: the walk confirms it, nothing to rewrite.
         seed_at(&store, 0, 100, 1, "alpha", target).await;
@@ -952,7 +952,7 @@ mod tests {
     async fn drained_walk_with_no_stragglers_raises_the_floor() {
         let store = MemoryStore::new();
         provision(&store, 2).await;
-        let target = VERSION_V6 as u32;
+        let target = VERSION_V7 as u32;
         seed_at(&store, 0, 100, 1, "alpha", target).await;
         seed_at(&store, 0, 101, 2, "beta", target).await;
         seed_at(&store, 1, 100, 3, "gamma", target).await;
@@ -1008,17 +1008,17 @@ mod tests {
     /// "below target" eligibility required a target *above* the writer
     /// ([`FUTURE_VERSION`]), which then made the rewrite's own output count as
     /// below target and blocked the floor. Now, targeting the current version,
-    /// an input recorded at `VERSION_V6 - 1` (real v6 bytes, older recorded
+    /// an input recorded at `VERSION_V7 - 1` (real v7 bytes, older recorded
     /// version -- the synthetic-N-1 shape, since no real N-1 RSEG version has
-    /// shipped) is decoded and re-encoded to `VERSION_V6 == target`, the fresh
+    /// shipped) is decoded and re-encoded to `VERSION_V7 == target`, the fresh
     /// re-audit finds nothing below the target, and the floor is raised to
-    /// `VERSION_V6`.
+    /// `VERSION_V7`.
     #[tokio::test]
     async fn rseg_below_output_input_migrates_and_raises_floor() {
         let store = MemoryStore::new();
         provision(&store, 1).await;
-        let target = VERSION_V6 as u32;
-        // Real v6 bytes recorded below the target: eligible for the walk, and now
+        let target = VERSION_V7 as u32;
+        // Real v7 bytes recorded below the target: eligible for the walk, and now
         // genuinely rewritable up to the target rather than refused.
         seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
 
@@ -1138,7 +1138,7 @@ mod tests {
             let inner = self.inner.as_ref();
             match self.injection {
                 Injection::Straggler => {
-                    seed_at(inner, 0, 105, 42, "straggler", VERSION_V6 as u32 - 1).await;
+                    seed_at(inner, 0, 105, 42, "straggler", VERSION_V7 as u32 - 1).await;
                 }
                 Injection::ReshardWithStragglerInNewShard => {
                     ravel_catalog::append_generation(
@@ -1151,7 +1151,7 @@ mod tests {
                     )
                     .await
                     .expect("append shard generation mid-flight");
-                    seed_at(inner, 1, 105, 43, "straggler", VERSION_V6 as u32 - 1).await;
+                    seed_at(inner, 1, 105, 43, "straggler", VERSION_V7 as u32 - 1).await;
                 }
             }
         }
@@ -1218,7 +1218,7 @@ mod tests {
     async fn a_straggler_landing_after_the_walk_refuses_the_floor_raise() {
         let inner = Arc::new(MemoryStore::new());
         provision(inner.as_ref(), 1).await;
-        let target = VERSION_V6 as u32;
+        let target = VERSION_V7 as u32;
         seed_at(inner.as_ref(), 0, 100, 1, "alpha", target).await;
 
         let trigger =
@@ -1272,7 +1272,7 @@ mod tests {
     async fn a_reshard_during_the_walk_widens_the_verification_audit() {
         let inner = Arc::new(MemoryStore::new());
         provision(inner.as_ref(), 1).await;
-        let target = VERSION_V6 as u32;
+        let target = VERSION_V7 as u32;
         seed_at(inner.as_ref(), 0, 100, 1, "alpha", target).await;
 
         let trigger =
@@ -1330,8 +1330,8 @@ mod tests {
     async fn a_completed_walk_does_not_strand_later_buckets_in_lower_shards() {
         let store = MemoryStore::new();
         provision(&store, 2).await;
-        seed_at(&store, 0, 100, 1, "alpha", VERSION_V6 as u32).await;
-        seed_at(&store, 1, 100, 2, "beta", VERSION_V6 as u32).await;
+        seed_at(&store, 0, 100, 1, "alpha", VERSION_V7 as u32).await;
+        seed_at(&store, 1, 100, 2, "beta", VERSION_V7 as u32).await;
 
         let config = CompactorConfig::default();
         let first = migrate_family(
@@ -1353,7 +1353,7 @@ mod tests {
 
         // A new sealed bucket lands in shard 0, lexicographically *below* the
         // position the completed walk ended at (shard 1, hour 100).
-        seed_at(&store, 0, 200, 3, "gamma", VERSION_V6 as u32).await;
+        seed_at(&store, 0, 200, 3, "gamma", VERSION_V7 as u32).await;
 
         let second = migrate_family(
             &store,
@@ -1392,7 +1392,7 @@ mod tests {
     async fn rerun_after_floor_reached_is_idempotent() {
         let store = MemoryStore::new();
         provision(&store, 1).await;
-        let target = VERSION_V6 as u32;
+        let target = VERSION_V7 as u32;
         seed_at(&store, 0, 100, 1, "alpha", target).await;
         let clock = FixedClock::new(sealed_now_ns_for(100));
         let config = CompactorConfig::default();
@@ -1455,10 +1455,10 @@ mod tests {
     /// older-recorded input to the current version, so it *can* drive a
     /// `FloorRaised` end to end when the target is the current version -- see
     /// [`rseg_below_output_input_migrates_and_raises_floor`]. This test instead
-    /// seeds an at-`VERSION_V6` record and uses `FUTURE_VERSION` (a target above
+    /// seeds an at-`VERSION_V7` record and uses `FUTURE_VERSION` (a target above
     /// the writer, the trick that makes an at-current record count as "below
     /// target" and eligible for the walk); that same fictional target then makes
-    /// the rewrite's own L1 output (recorded at `VERSION_V6`, genuinely
+    /// the rewrite's own L1 output (recorded at `VERSION_V7`, genuinely
     /// `< FUTURE_VERSION`) count as below target too, so a `FloorRaised` result
     /// is structurally unreachable in *this* setup, orthogonal to the
     /// just-rewrote case. Calling `count_below_target` directly isolates exactly
@@ -1478,14 +1478,14 @@ mod tests {
     async fn a_bucket_migrated_this_walk_does_not_straggler_on_its_own_pre_rewrite_record() {
         let store = MemoryStore::new();
         provision(&store, 1).await;
-        // Real v6 bytes recorded at the current version, so RsegCodec's
+        // Real v7 bytes recorded at the current version, so RsegCodec's
         // validate_rewrite_inputs (which refuses an input genuinely below the
         // *current writer* version, since RSEG copies pages verbatim and
         // cannot really decode-and-reencode an older layout) accepts it; using
         // FUTURE_VERSION as the migration target is what makes this same
         // record count as "below target" and eligible for the walk to
         // rewrite, exactly as the other tests in this module do.
-        seed_at(&store, 0, 100, 1, "alpha", VERSION_V6 as u32).await;
+        seed_at(&store, 0, 100, 1, "alpha", VERSION_V7 as u32).await;
 
         let clock = FixedClock::new(sealed_now_ns_for(100));
         let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
@@ -1569,7 +1569,7 @@ mod tests {
 
         // One L0 record, migrated: the published compaction record's inputs
         // name `alpha` and nothing else.
-        seed_at(&store, 0, 100, 1, "alpha", VERSION_V6 as u32).await;
+        seed_at(&store, 0, 100, 1, "alpha", VERSION_V7 as u32).await;
         let outcome = migrate_bucket_format(
             &store,
             &clock,
@@ -1588,7 +1588,7 @@ mod tests {
         // A second below-target L0 record lands in the same bucket afterward,
         // named by no compaction or rewrite record: still live, still
         // un-migrated.
-        seed_at(&store, 0, 100, 2, "beta", VERSION_V6 as u32).await;
+        seed_at(&store, 0, 100, 2, "beta", VERSION_V7 as u32).await;
         let l0_present = list_bucket(&store, &bucket)
             .await
             .expect("list bucket")

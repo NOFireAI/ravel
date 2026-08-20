@@ -30,7 +30,7 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_proto::catalog::v1::SnapshotEntry;
 use ravel_segment::{
     ExpectedIdentity, IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInput,
-    VERSION_V6,
+    VERSION_V7,
 };
 use ravel_types::{
     Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId,
@@ -118,7 +118,7 @@ async fn publish_real_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: u32::from(VERSION_V6),
+        segment_format_version: u32::from(VERSION_V7),
         created_unix_ns: 0,
         ingest_hour_bucket,
     };
@@ -171,7 +171,7 @@ async fn brute_force_names(
     ravel_segment::check_identity(&location.footer, &expected).expect("identity checks out");
 
     assert_eq!(
-        location.version, VERSION_V6,
+        location.version, VERSION_V7,
         "ADR-0027: v6 is the only version"
     );
     // The chunked v5-shaped catalog (unchanged by the v6 EXEMPLARS addition)

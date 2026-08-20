@@ -10,7 +10,7 @@
 
 use ravel_segment::{
     Footer, IngestBounds, ReaderLimits, SegmentError, SegmentIdentity, SegmentWriter, SeriesInput,
-    VERSION_V6, open_from_full, validate_sections,
+    VERSION_V7, open_from_full, validate_sections,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
@@ -81,7 +81,7 @@ fn valid_footer() -> (Footer, u64) {
 fn valid_v6_footer_accepted() {
     let (footer, region) = valid_footer();
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
         Ok(())
     );
 }
@@ -93,7 +93,7 @@ fn missing_mandatory_section_rejected() {
     let (mut footer, region) = valid_footer();
     footer.sections.retain(|s| s.kind != SERIES_IDS);
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
         Err(SegmentError::MissingSection("SERIES_IDS"))
     );
 }
@@ -111,7 +111,7 @@ fn duplicate_known_kind_rejected() {
         .expect("LABEL_DICT present");
     footer.sections.push(dup);
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
         Err(SegmentError::DuplicateSection(LABEL_DICT))
     );
 }
@@ -129,7 +129,7 @@ fn section_offset_len_overflow_rejected() {
     s.offset = u64::MAX;
     s.len = 1;
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
         Err(SegmentError::SectionOutOfBounds)
     );
 }
@@ -147,7 +147,7 @@ fn section_range_past_region_rejected() {
     s.offset = 0;
     s.len = region + 1;
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
         Err(SegmentError::SectionOutOfBounds)
     );
 }
@@ -164,7 +164,7 @@ fn section_uncompressed_len_over_cap_rejected() {
         .expect("LABEL_DICT present");
     s.uncompressed_len = limits.max_section_uncompressed_bytes + 1;
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, limits),
+        validate_sections(&footer, VERSION_V7, region, limits),
         Err(SegmentError::SectionTooLarge {
             len: limits.max_section_uncompressed_bytes + 1,
             cap: limits.max_section_uncompressed_bytes,
@@ -187,7 +187,7 @@ fn unknown_kind_is_skipped_not_rejected() {
     unknown.kind = 0xBEEF;
     footer.sections.push(unknown);
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
         Ok(())
     );
 }
@@ -207,7 +207,7 @@ fn both_whole_and_sparse_catalog_rejected() {
     idx.kind = SERIES_IDX;
     footer.sections.push(idx);
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
         Err(SegmentError::DuplicateSection(SERIES_META))
     );
 }
@@ -228,7 +228,7 @@ fn incomplete_sparse_catalog_rejected() {
     footer.sections.push(idx);
     footer.sections.retain(|s| s.kind != SERIES_META);
     assert_eq!(
-        validate_sections(&footer, VERSION_V6, region, ReaderLimits::default()),
+        validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
         Err(SegmentError::SparseSectionsIncomplete)
     );
 }

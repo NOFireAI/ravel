@@ -36,7 +36,7 @@ use ravel_maintain::{
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{FetchedSeriesSoa, SegmentFetcher};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V6};
+use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange};
 use uuid::Uuid;
 
@@ -161,7 +161,7 @@ async fn build_l0(store: &dyn ObjectStoreBackend, spec: &WriterSpec) -> L0Handle
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: hour_start(),
         max_ingest_ts_ns: hour_start() + 10,
-        segment_format_version: u32::from(VERSION_V6),
+        segment_format_version: u32::from(VERSION_V7),
         created_unix_ns: hour_start() + spec.created_offset_ns,
         ingest_hour_bucket: HOUR,
     })

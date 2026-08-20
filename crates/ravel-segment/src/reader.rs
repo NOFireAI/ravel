@@ -12,7 +12,7 @@ use ravel_types::{Label, LabelSet, SeriesId};
 use crate::crc::page_crc;
 use crate::error::SegmentError;
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SUPPORTED_VERSIONS, VERSION_V6, compression,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, SUPPORTED_VERSIONS, VERSION_V7, compression,
     page_comp, page_enc, section_kind,
 };
 use crate::histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
@@ -81,9 +81,9 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
     }
     // The reader accepts only versions inside its supported-version window
     // (ADR-0066 decision 1). Today that window is the single current version
-    // [`VERSION_V6`]; versions 1-5 and any unknown future version fail closed
-    // with the same typed error, so a stray pre-v6 object is rejected, never
-    // half-parsed.
+    // [`VERSION_V7`]; versions 1-6 and any unknown future version fail closed
+    // with the same typed error, so a stray pre-v7 object (including a retired
+    // v6) is rejected, never half-parsed.
     if !SUPPORTED_VERSIONS.contains(version) {
         return Err(SegmentError::UnsupportedVersion(version));
     }
@@ -134,8 +134,8 @@ pub fn parse_footer(total_size: u64, tail: &[u8]) -> Result<FooterOutcome, Segme
 }
 
 /// Validates footer-level section invariants (docs/segment-format.md).
-/// ADR-0027 leaves v5 the only supported version, so this dispatches to the
-/// v5 rule set or rejects with `UnsupportedVersion`: at most one section per
+/// ADR-0027 leaves v7 the only supported version, so this dispatches to the
+/// v7 rule set or rejects with `UnsupportedVersion`: at most one section per
 /// known kind, every mandatory kind present, exactly one of the whole
 /// SERIES_META or the sparse SERIES_IDX+SERIES_META_CHUNKS pair, every
 /// section range within `[0, page_region_end)` with checked arithmetic, and
@@ -157,18 +157,20 @@ pub fn validate_sections(
     limits: ReaderLimits,
 ) -> Result<(), SegmentError> {
     match version {
-        VERSION_V6 => validate_sections_v6(footer, page_region_end, limits),
+        VERSION_V7 => validate_sections_v7(footer, page_region_end, limits),
         other => Err(SegmentError::UnsupportedVersion(other)),
     }
 }
 
-/// v6 mandatory-kind validation: LABEL_DICT and SERIES_IDS always; exactly
+/// v7 mandatory-kind validation: LABEL_DICT and SERIES_IDS always; exactly
 /// one of the whole SERIES_META (below the sparse threshold) or the
 /// SERIES_IDX + SERIES_META_CHUNKS pair (at or above it); TS_PAGES/VAL_PAGES/
 /// HIST_PAGES conditional on the series present; EXEMPLARS (ADR-0047)
 /// optional regardless of series count -- present only when at least one
-/// sample in the object carried an exemplar.
-fn validate_sections_v6(
+/// sample in the object carried an exemplar. The v7 per-sample provenance
+/// extension (ADR-0092 decision 1) lives inside the whole SERIES_META bytes,
+/// so it adds no section and changes nothing about this section-level check.
+fn validate_sections_v7(
     footer: &Footer,
     page_region_end: u64,
     limits: ReaderLimits,

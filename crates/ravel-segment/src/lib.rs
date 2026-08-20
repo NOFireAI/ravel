@@ -25,7 +25,8 @@ pub use exemplars::{
     ExemplarInput, ExemplarRecord, decode_exemplars_section, probe_exemplars_by_series,
 };
 pub use format::{
-    ReaderLimits, SUPPORTED_VERSIONS, SupportedVersions, V5_SPARSE_THRESHOLD, V5_STRIDE, VERSION_V6,
+    ReaderLimits, SUPPORTED_VERSIONS, SupportedVersions, V5_SPARSE_THRESHOLD, V5_STRIDE,
+    VERSION_V6, VERSION_V7,
 };
 
 pub use histogram::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};

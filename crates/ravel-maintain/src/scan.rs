@@ -1738,7 +1738,7 @@ mod invalidate_tests {
     use ravel_rspan::writer::ObjectIdentity as SpanObjectIdentity;
     use ravel_rspan::{RspanConfig, RspanWriter, SpanRecord, StatusCode};
     use ravel_segment::{
-        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V6,
+        IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues, VERSION_V7,
     };
     use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
     use uuid::Uuid;
@@ -1849,7 +1849,7 @@ mod invalidate_tests {
             max_event_ts_ns: written.summary.max_event_ts_ns,
             min_ingest_ts_ns: created,
             max_ingest_ts_ns: created,
-            segment_format_version: u32::from(VERSION_V6),
+            segment_format_version: u32::from(VERSION_V7),
             created_unix_ns: created,
             ingest_hour_bucket: HOUR,
         })

@@ -14,6 +14,12 @@ const START_TS_NS: i64 = 1_700_000_000_000_000_000;
 const INTERVAL_NS: i64 = 1_000_000_000;
 const VAL_GORILLA: u8 = 16;
 const VAL_RAW_F64: u8 = 17;
+// ADR-0092 decision 6 added two value page encodings, selected per page against
+// the prior ones and kept only when smaller. A bench workload can now land on
+// either, so this measurement must name them rather than panic on an
+// "unexpected" encoding.
+const VAL_ALP: u8 = 18;
+const VAL_GCD_DELTA_FOR: u8 = 19;
 
 fn labels_for(workload: &str) -> LabelSet {
     LabelSet::new(vec![Label {
@@ -83,6 +89,8 @@ fn measure(workload: &'static str, series: (SeriesId, LabelSet, Vec<Sample>)) ->
     let enc = match enc_byte {
         VAL_GORILLA => "gorilla",
         VAL_RAW_F64 => "raw_f64",
+        VAL_ALP => "alp",
+        VAL_GCD_DELTA_FOR => "gcd_delta_for",
         other => panic!("unexpected val page encoding: {other}"),
     };
     Row {

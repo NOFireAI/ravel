@@ -90,7 +90,7 @@ const COALESCE_GAP: u64 = 64 * 1024;
 /// `ravel_segment::SUPPORTED_VERSIONS.newest()` rather than a mirrored literal
 /// so a future format bump moves the writer, the reader gate, `audit-versions`,
 /// and this compactor constant together (the sixteen-hand-edited-sites hazard
-/// ADR-0049 measured). Today the window is `single(VERSION_V6)`, so this is 6.
+/// ADR-0049 measured). Today the window is `single(VERSION_V7)`, so this is 7.
 pub const OUTPUT_FORMAT_VERSION: u32 = ravel_segment::SUPPORTED_VERSIONS.newest() as u32;
 
 /// One built (not yet published) L1 part: its content-addressed key, its

@@ -16,7 +16,7 @@ use crate::crc::{footer_crc, page_crc};
 use crate::error::WriteError;
 use crate::exemplars::{ExemplarInput, ResolvedExemplar, encode_exemplars_section};
 use crate::format::{
-    MAGIC, RESERVED, SIGNAL_METRICS, V5_SPARSE_THRESHOLD, VERSION_V4, VERSION_V6, ZSTD_LEVEL,
+    MAGIC, RESERVED, SIGNAL_METRICS, V5_SPARSE_THRESHOLD, VERSION_V4, VERSION_V7, ZSTD_LEVEL,
     compression, page_comp, page_enc, section_kind,
 };
 use crate::gorilla::encode_gorilla_into;
@@ -765,7 +765,7 @@ fn assemble_v4_body_impl(
 /// Appends the trailer for `version` to an assembled body and computes the
 /// whole-object blake3 exactly once: the single finalization step for both
 /// `write_v4` (always version 4) and the direct-emit non-sparse path in
-/// [`SegmentWriter::write_v5_with_exemplars`] (version 6, no retrailer).
+/// [`SegmentWriter::write_v5_with_exemplars`] (version 7, no retrailer).
 fn finalize_v4_trailer(body: AssembledV4Body, version: u16) -> WrittenSegment {
     let AssembledV4Body {
         mut object,
@@ -842,7 +842,7 @@ impl SegmentWriter {
     ) -> Result<WrittenSegment, WriteError> {
         let body = assemble_v4_body(series, identity, ingest_bounds, meta, exemplars)?;
         if body.series_count < V5_SPARSE_THRESHOLD {
-            return Ok(finalize_v4_trailer(body, VERSION_V6));
+            return Ok(finalize_v4_trailer(body, VERSION_V7));
         }
         let base = finalize_v4_trailer(body, VERSION_V4);
         crate::sparse::build_sparse_object(&base)
@@ -906,7 +906,7 @@ impl SegmentWriter {
             exemplars,
         )?;
         if body.series_count < V5_SPARSE_THRESHOLD {
-            return Ok(finalize_v4_trailer(body, VERSION_V6));
+            return Ok(finalize_v4_trailer(body, VERSION_V7));
         }
         // The sparse (chunked) SERIES_META form does not carry the provenance
         // extension yet. `assemble_v4_body_impl` already rejected a
@@ -966,7 +966,7 @@ pub fn encode_run_v4(
 /// flush adapter owns exactly one of these and hands it to every series;
 /// each buffer is cleared before use, so reuse never changes the framed bytes:
 /// encode output stays byte-identical to a fresh-scratch encode (proven by the
-/// `direct_v6_emit_bit_parity` module).
+/// `direct_v7_emit_bit_parity` module).
 #[derive(Default)]
 pub(crate) struct WriteScratch {
     ts_values: Vec<i64>,
@@ -2189,7 +2189,7 @@ mod v4_tests {
         .expect("writes");
 
         let obj = written.bytes.as_ref();
-        let footer = decode_footer(obj, VERSION_V6);
+        let footer = decode_footer(obj, VERSION_V7);
         assert!(section_desc(&footer, section_kind::EXEMPLARS).is_some());
         let records = crate::exemplars::decode_exemplars_section(
             &footer,
@@ -2228,7 +2228,7 @@ mod v4_tests {
         }];
         let written = SegmentWriter::write_histograms(series, test_identity(), test_bounds())
             .expect("writes");
-        let footer = decode_footer(written.bytes.as_ref(), VERSION_V6);
+        let footer = decode_footer(written.bytes.as_ref(), VERSION_V7);
         assert!(
             section_desc(&footer, section_kind::EXEMPLARS).is_none(),
             "a flush with no exemplars must emit no EXEMPLARS section"
@@ -2591,7 +2591,7 @@ mod v4_tests {
         let v3_written = SegmentWriter::write_histograms(v3_series, test_identity(), test_bounds())
             .expect("writes");
         let v3_object = v3_written.bytes.as_ref();
-        let v3_footer = decode_footer(v3_object, VERSION_V6);
+        let v3_footer = decode_footer(v3_object, VERSION_V7);
         let v3_ts_page = section(v3_object, &v3_footer, section_kind::TS_PAGES).to_vec();
         let v3_hist_page = section(v3_object, &v3_footer, section_kind::HIST_PAGES).to_vec();
 
@@ -2975,7 +2975,7 @@ mod v4_tests {
         .expect("write v5");
         let object = written.bytes.as_ref();
         let loc = crate::open_from_full(object, ReaderLimits::default()).expect("open v5");
-        assert_eq!(loc.version, 6);
+        assert_eq!(loc.version, 7);
         assert!(
             section_desc(&loc.footer, section_kind::SERIES_META).is_some(),
             "below-threshold v5 must carry whole SERIES_META"
@@ -3180,13 +3180,13 @@ mod v4_tests {
 ///
 /// The reference implementation below (`old_*`) is self-contained and shares
 /// no code with the production writer: it assembles and finalizes as v4 with
-/// a full `retrailer_v4_to_v6` copy and per-series-fresh-`Vec`
+/// a full `retrailer_v4_to_v7` copy and per-series-fresh-`Vec`
 /// `frame_*_page`/`ts_values`. A divergence here means the production
 /// assembly actually changed a byte, not that the reference drifted
 /// alongside it.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod direct_v6_emit_bit_parity {
+mod direct_v7_emit_bit_parity {
     use proptest::prelude::*;
     use ravel_types::{Label, Sample};
 
@@ -3600,9 +3600,9 @@ mod direct_v6_emit_bit_parity {
         })
     }
 
-    /// A standalone `retrailer_v4_to_v6`: a full-object copy plus a second
+    /// A standalone `retrailer_v4_to_v7`: a full-object copy plus a second
     /// `footer_crc` and a second whole-object blake3.
-    fn reference_retrailer_v4_to_v6(base: WrittenSegment) -> WrittenSegment {
+    fn reference_retrailer_v4_to_v7(base: WrittenSegment) -> WrittenSegment {
         let obj = base.bytes.as_ref();
         let total = obj.len();
         let trailer_start = total - crate::format::TRAILER_LEN as usize;
@@ -3618,7 +3618,7 @@ mod direct_v6_emit_bit_parity {
         let crc = footer_crc(
             footer_bytes,
             footer_len,
-            VERSION_V6,
+            VERSION_V7,
             SIGNAL_METRICS,
             RESERVED,
         );
@@ -3627,7 +3627,7 @@ mod direct_v6_emit_bit_parity {
         out.extend_from_slice(&obj[..footer_end]);
         out.extend_from_slice(&footer_len.to_le_bytes());
         out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&VERSION_V6.to_le_bytes());
+        out.extend_from_slice(&VERSION_V7.to_le_bytes());
         out.push(SIGNAL_METRICS);
         out.push(RESERVED);
         out.extend_from_slice(&MAGIC);
@@ -3650,7 +3650,7 @@ mod direct_v6_emit_bit_parity {
     ) -> Result<WrittenSegment, WriteError> {
         let base = reference_write_v4(series, identity, ingest_bounds, meta, exemplars)?;
         if base.summary.series_count < V5_SPARSE_THRESHOLD {
-            return Ok(reference_retrailer_v4_to_v6(base));
+            return Ok(reference_retrailer_v4_to_v7(base));
         }
         crate::sparse::build_sparse_object(&base)
     }
@@ -3983,7 +3983,7 @@ mod direct_v6_emit_bit_parity {
         /// varying series count, sample count, and value content, optionally
         /// carrying exemplars, must write identically under both algorithms.
         #[test]
-        fn direct_v6_emit_bit_parity(
+        fn direct_v7_emit_bit_parity(
             specs in series_specs_strategy(),
             exemplar_raw in prop::collection::vec(
                 (any::<u16>(), any::<i64>(), -1_000.0f64..1_000.0, any::<u8>(), any::<u8>(), any::<bool>()),

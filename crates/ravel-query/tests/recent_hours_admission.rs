@@ -32,7 +32,7 @@ use ravel_object_store::{
 };
 use ravel_promql::{LabelMatcher, Value};
 use ravel_query::{EngineConfig, QueryEngine, QueryError, RequestLimit};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V6};
+use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
 use ravel_types::{
     CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash,
     TenantId, TimeRange,
@@ -112,7 +112,7 @@ async fn publish_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: written.summary.min_event_ts_ns,
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: u32::from(VERSION_V6),
+        segment_format_version: u32::from(VERSION_V7),
         created_unix_ns: 0,
         ingest_hour_bucket,
     };

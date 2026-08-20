@@ -34,24 +34,42 @@ pub const VERSION_V4: u16 = 4;
 #[allow(dead_code)]
 pub const VERSION_V5: u16 = 5;
 
-/// RSEG v6 trailer version (docs/segment-format.md, ADR-0047). ADR-0027's
-/// single-supported-version rule leaves this the only readable and writable
-/// version: the v5 run-major grammar plus two optional sparse-catalog
-/// sections, SERIES_IDX (kind 8) and chunked SERIES_META (kind 9, replacing
-/// the kind 6 whole-section form when present), plus the optional EXEMPLARS
-/// section (kind 10, present only when at least one sample in the object
-/// carried an exemplar). The sparse sections are emitted only when the
-/// output object carries [`V5_SPARSE_THRESHOLD`] or more series; below that
-/// the object omits them and uses the whole SERIES_META. Written by every
-/// writer.
+/// Retired RSEG v6 trailer version (ADR-0047, retired by ADR-0092). Rejected
+/// by the reader; reserved, never reused. The v6 grammar itself lives on
+/// unchanged as the v7 grammar: v7 is v6 plus the optional per-sample dedup
+/// provenance extension in SERIES_META and three additional per-page value/
+/// timestamp encodings, none of which change how a v6-shaped object is laid
+/// out. Kept only to pin the retired value and to reject stray v6 objects.
+#[allow(dead_code)]
 pub const VERSION_V6: u16 = 6;
+
+/// RSEG v7 trailer version (docs/segment-format.md, ADR-0092). ADR-0027's
+/// single-supported-version rule leaves this the only readable and writable
+/// version: the v6 run-major grammar (the v5 grammar plus two optional
+/// sparse-catalog sections, SERIES_IDX (kind 8) and chunked SERIES_META
+/// (kind 9, replacing the kind 6 whole-section form when present), plus the
+/// optional EXEMPLARS section (kind 10)) with three additions from ADR-0092:
+///
+/// - an optional per-sample dedup provenance extension appended to the
+///   whole-section SERIES_META (kind 6), present only when at least one run in
+///   the object merged several writes' samples;
+/// - two new value page encodings, `VAL_ALP` (18) and `VAL_GCD_DELTA_FOR`
+///   (19), and one new timestamp page encoding, `TS_GCD_I64` (2), each
+///   selected per page against the prior encoding and kept only when smaller;
+/// - a run's first timestamp encoded as a delta from the run minimum, and
+///   single-sample raw-`f64` value pages that drop the 8-byte alignment pad.
+///
+/// The sparse sections are emitted only when the output object carries
+/// [`V5_SPARSE_THRESHOLD`] or more series; below that the object omits them and
+/// uses the whole SERIES_META. Written by every writer.
+pub const VERSION_V7: u16 = 7;
 
 /// The set of RSEG trailer versions this build's reader accepts (ADR-0066
 /// decision 1: "N/N-1 window, readers first"). Writers always emit the current
-/// version [`VERSION_V6`]; readers accept the current version and, once a
+/// version [`VERSION_V7`]; readers accept the current version and, once a
 /// version bump lands, the immediately preceding one. The window is at most two
 /// versions wide by construction and never accepts anything below the
-/// immediately preceding version, so a retired version (RSEG v1-v5) stays
+/// immediately preceding version, so a retired version (RSEG v1-v6) stays
 /// rejected.
 ///
 /// This is the single source the reader gate, `audit-versions`, and `migrate`
@@ -104,9 +122,11 @@ impl SupportedVersions {
 }
 
 /// RSEG's supported-version window. Today it resolves to the single current
-/// version [`VERSION_V6`] (ADR-0027's single-version state persists until the
-/// first bump); the machinery carries ADR-0066's two-wide shape ready for it.
-pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION_V6);
+/// version [`VERSION_V7`] (ADR-0027's single-version state persists after the
+/// v7 bump, which deleted the v6 read and write paths in the same change,
+/// ADR-0092 decision 7); the machinery carries ADR-0066's two-wide shape ready
+/// for the first post-release bump.
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION_V7);
 
 /// Series-count threshold at or above which `SegmentWriter::write_v5` emits
 /// the sparse SERIES_IDX + chunked SERIES_META sections (ADR-0026 decision
@@ -247,6 +267,7 @@ mod tests {
         assert_eq!(VERSION_V4, 4);
         assert_eq!(VERSION_V5, 5);
         assert_eq!(VERSION_V6, 6);
+        assert_eq!(VERSION_V7, 7);
         assert_eq!(MAGIC, *b"RSG1");
         assert_eq!(section_kind::LABEL_DICT, 1);
         assert_eq!(section_kind::SERIES_TABLE, 2);
@@ -271,15 +292,15 @@ mod tests {
 
     /// Today's RSEG window resolves to exactly the single current version, so
     /// the reader's accepted set is byte-for-byte the pre-ADR-0066 behaviour:
-    /// v6 accepted, everything else (including v5 and a hypothetical v7)
-    /// rejected. Only the window's shape is new machinery.
+    /// v7 accepted, everything else (including the now-retired v6 and a
+    /// hypothetical v8) rejected. Only the window's shape is new machinery.
     #[test]
     fn todays_window_accepts_only_the_current_version() {
-        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION_V6);
-        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION_V6);
-        assert!(SUPPORTED_VERSIONS.contains(VERSION_V6));
-        assert!(!SUPPORTED_VERSIONS.contains(VERSION_V5));
-        assert!(!SUPPORTED_VERSIONS.contains(VERSION_V6 + 1));
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION_V7);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION_V7);
+        assert!(SUPPORTED_VERSIONS.contains(VERSION_V7));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION_V6));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION_V7 + 1));
         assert!(!SUPPORTED_VERSIONS.contains(0));
     }
 
