@@ -151,22 +151,32 @@ declared type until #277 lands (decision 1).
    A new `TenantConfig` field, `typed_attr_columns` (`TenantConfigRecord`
    field 12, the next free number), holds an optional list of declared
    columns: key, one of the four logical types. A CLI-provided default
-   (`--typed-attr-column key=type[,key=type...]`) resolves for any
-   tenant with no durable override; a per-tenant CLI override
-   (`--typed-attr-column-tenant TENANT=key=type,...`) mirrors
-   `IndexedFieldConfig`'s base-plus-override flag pair exactly (not
-   just the base). Validation (both flags, and any durable write)
-   rejects: an empty key, a duplicate key within one declaration, the
-   same key declared twice with different types, an unknown type name,
-   and a key colliding with any of the nine fixed column names (`ts`,
-   `body`, `attrs`, ...). The SQL column name is the attribute key
-   verbatim, never mangled: a key containing `.` or uppercase
-   characters (real examples: `http.status_code`, `k8s.namespace.name`)
-   requires double-quoting in SQL per DataFusion's identifier rules.
-   A new `ravel-cli typed-attr-column set
-   --tenant T key=type,...` command writes the durable override via
-   `set_tenant_config` — without it, the durable half of decision 1
-   is unreachable (see Context on `TenantConfig`'s missing write path).
+   (repeatable `--typed-attr-column KEY:TYPE`) resolves for any tenant
+   with no durable override; a per-tenant CLI override (repeatable
+   `--typed-attr-column-tenant TENANT:KEY:TYPE`, flags for the same
+   tenant accumulating into that tenant's one ordered declaration)
+   mirrors `IndexedFieldConfig`'s base-plus-override flag *pairing* (not
+   its literal `key=value[,...]` syntax): #302 shipped `:`-delimited,
+   repeatable flags rather than `=`/comma-delimited ones so an
+   attribute key may itself contain a comma or `=` without escaping,
+   splitting each spec on its *last* `:` so a key may contain `:` too
+   (the type spelling never does). Validation (both flags, and any
+   durable write) rejects: an empty key, a duplicate key within one
+   declaration, the same key declared twice with different types, an
+   unknown type name, and a key colliding with any of the nine fixed
+   column names (`ts`, `body`, `attrs`, ...). The SQL column name is
+   the attribute key verbatim, never mangled: a key containing `.` or
+   uppercase characters (real examples: `http.status_code`,
+   `k8s.namespace.name`) requires double-quoting in SQL per
+   DataFusion's identifier rules.
+   A new `ravel-cli typed-attr-column set <TENANT> [KEY:TYPE ...]`
+   command (positional, matching this crate's existing subcommand
+   convention rather than a `--tenant` flag) writes the durable
+   override via `set_tenant_config` — without it, the durable half of
+   decision 1 is unreachable (see Context on `TenantConfig`'s missing
+   write path). Passing no `KEY:TYPE` specs writes an explicit empty
+   declaration (decision 3's durable `Some([])`, "this tenant declares
+   nothing," distinct from no override at all).
 2. **Query-time resolution is a `DeclaredColumnSource` trait, owned by
    `ravel-sql`, resolved once per plan and passed in — not read by
    `SqlExecutor` reaching sideways into an injected overlay per call.**
@@ -401,3 +411,49 @@ flowchart TD
   `services/ravel-server` is not independent of either: it implements
   a trait `ravel-sql` defines and reads a field `ravel-catalog` defines,
   so it lands in a following wave, after both.
+
+## Amendment: #302's shipped CLI syntax, and a narrow catalog-visibility
+   exception for validation reuse
+
+Two divergences from this ADR's original text, found at #302's
+checkpoint and recorded here rather than left implicit.
+
+**CLI syntax.** Decision 1's examples above (`--typed-attr-column
+key=type[,key=type...]`, `--typed-attr-column-tenant
+TENANT=key=type,...`, `ravel-cli typed-attr-column set --tenant T
+key=type,...`) described the flag *pairing* correctly but not the
+syntax #302 actually shipped. The real flags are repeatable and
+`:`-delimited: `--typed-attr-column KEY:TYPE`,
+`--typed-attr-column-tenant TENANT:KEY:TYPE` (flags for the same
+tenant accumulating into one ordered declaration), and `ravel-cli
+typed-attr-column set <TENANT> [KEY:TYPE ...]` (positional, matching
+this crate's other subcommands, not a `--tenant` flag). Rationale:
+a repeatable flag with `:` as the sole delimiter, split on the *last*
+`:` (`parse_column_spec`, `services/ravel-server/src/config.rs`),
+lets an attribute key contain `:` without escaping and avoids a
+comma-list's ambiguity if a key ever contains a comma; this is a
+closer match to `--indexed-field-tenant`'s repeatable shape than the
+original text's comma-list was. The decision text above is corrected
+in place to the shipped syntax; this amendment exists so the
+divergence itself, and its reasoning, is on the record.
+
+**Catalog-visibility exception.** Decision 1 also required
+`ravel-server`'s CLI validation to reuse `ravel-catalog`'s
+`validate_typed_attr_columns` rather than reimplement it, while #302's
+dispatch spec separately forbade any change under `crates/ravel-catalog/`.
+Both cannot hold: on the tree #300 landed, `validate_typed_attr_columns`,
+`DeclaredTypedColumn`, `DeclaredColumnType`, `TypedAttrColumnError`, and
+`FIXED_LOGS_SQL_COLUMNS` were unreachable outside `ravel-catalog` (the
+crate's `tenant_config` module is private, and its existing `pub use`
+re-export block named none of them) — a free function and enum variants
+have no call-site-side workaround the way a field access sometimes does.
+#302 widened `crates/ravel-catalog/src/lib.rs`'s existing `pub use
+tenant_config::{...}` block to add those five names: no shape, signature,
+or behavior change, additive visibility only, the same kind of change
+`crates/ravel-catalog` will need again for its own `f64`/date/timestamp
+extension once #277 lands. This is accepted as the correct resolution:
+reusing the validator (decision 1's actual requirement) is worth a
+narrow, disclosed visibility widening, over either reimplementing
+validation in `ravel-server` (a second, driftable source of truth for
+what a valid declared-column list is) or leaving `crates/ravel-catalog`
+untouched at the cost of that duplication.
