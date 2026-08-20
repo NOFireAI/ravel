@@ -1026,10 +1026,24 @@ pub(crate) fn encode_run_v4_with_scratch(
 }
 
 /// Frames one series' TS page (6-byte header + payload) into a fresh buffer
-/// for the raw-sample v5 adapters. TS_DELTA_VARINT payload, lz4-compressed
-/// only when it clears the size floor and shrinks. The returned page is
-/// copied verbatim (any alignment gap re-applied) by `append_ts_run_page_v4`.
-/// `payload` is caller-owned scratch (cleared here, reused across series).
+/// for the raw-sample v5 adapters, selecting the smaller of two candidate
+/// encodings per page (ADR-0092 decision 6, issue #312):
+///
+/// - The incumbent TS_DELTA_VARINT payload, lz4-compressed only when it clears
+///   the size floor and shrinks. This is unchanged, so a page that keeps the
+///   incumbent is byte-identical to the pre-decision-6 writer.
+/// - The TS_GCD_I64 candidate (`crate::ts_gcd`), stored uncompressed.
+///
+/// Selection compares each candidate's FINAL page payload -- the incumbent's
+/// *after* its LZ4 stage, the candidate's raw -- and keeps the smaller, so it
+/// never regresses the exactly-regular millisecond stream, where the incumbent
+/// varint page collapses under LZ4 to about 0.16 bytes per sample while a bare
+/// `encode_i64` would regress it about 6x. A tie keeps the incumbent
+/// TS_DELTA_VARINT encoding.
+///
+/// The returned page is copied verbatim (any alignment gap re-applied) by
+/// `append_ts_run_page_v4`. `payload` is caller-owned scratch (cleared here,
+/// reused across series).
 fn frame_ts_page(
     series_id: &SeriesId,
     ts_values: &[i64],
@@ -1039,7 +1053,6 @@ fn frame_ts_page(
     payload.clear();
     encode_ts_deltas_into(payload, ts_values, run_min_ts_ns)
         .ok_or(WriteError::TimestampDeltaOverflow)?;
-    let enc = page_enc::TS_DELTA_VARINT;
     let compressed = if payload.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
         let candidate = lz4_flex::compress_prepend_size(payload);
         (candidate.len() < payload.len()).then_some(candidate)
@@ -1050,28 +1063,84 @@ fn frame_ts_page(
         Some(candidate) => (page_comp::LZ4, candidate),
         None => (page_comp::NONE, payload.as_slice()),
     };
-    Ok(frame_page(&series_id.0, enc, comp, body))
+    let incumbent = frame_page(&series_id.0, page_enc::TS_DELTA_VARINT, comp, body);
+
+    let gcd_payload = crate::ts_gcd::encode_ts_gcd(ts_values);
+    let candidate = frame_page(
+        &series_id.0,
+        page_enc::TS_GCD_I64,
+        page_comp::NONE,
+        &gcd_payload,
+    );
+
+    // Keep whichever final page is smaller; a tie keeps the incumbent.
+    if candidate.len() < incumbent.len() {
+        Ok(candidate)
+    } else {
+        Ok(incumbent)
+    }
 }
 
-/// Frames one scalar series' VAL page into a fresh buffer: Gorilla unless it
-/// fails to beat raw f64 (the raw-fallback rule). No alignment gap is applied
-/// here; `append_val_run_page_v4` inserts the VAL_RAW_F64 pad when it copies
-/// the page into the section. `payload` is caller-owned scratch (cleared
-/// here, reused across series).
+/// Frames one scalar series' VAL page into a fresh buffer, selecting the
+/// smallest of four candidate encodings (ADR-0092 decision 6, issue #312).
+/// Every VAL page is stored uncompressed (`comp = 0`), so each candidate's
+/// payload length IS its final page size and selection compares them directly:
+///
+/// - VAL_GORILLA and VAL_RAW_F64: the incumbent pair, chosen by the unchanged
+///   raw-fallback rule (raw when Gorilla encodes `>= 8*count`, i.e. raw wins a
+///   tie). A page that keeps one of these is byte-identical to the
+///   pre-decision-6 writer.
+/// - VAL_ALP and VAL_GCD_DELTA_FOR (`crate::value_codecs`): the integer-model
+///   codecs, adopted only when *strictly* smaller than the incumbent choice.
+///
+/// Because a new codec only wins when strictly smaller, and both fall back to
+/// about raw size on noisy floats, a VAL page is never larger than the
+/// incumbent would have produced, and a tie keeps the incumbent encoding.
+///
+/// No alignment gap is applied here; `append_val_run_page_v4` inserts the
+/// VAL_RAW_F64 pad when it copies the page into the section (only VAL_RAW_F64
+/// is padded, so the integer-model pages carry no pad). `payload` is
+/// caller-owned scratch (cleared here, reused across series).
 fn frame_val_page(series_id: &SeriesId, values: &[f64], payload: &mut Vec<u8>) -> Vec<u8> {
+    // Incumbent selection first (unchanged): Gorilla into `payload`, then raw
+    // when Gorilla does not beat it (raw wins the tie, matching the historical
+    // `>= 8*count` rule).
     payload.clear();
     encode_gorilla_into(values, payload);
-    let count = values.len() as u64;
-    let enc = if (payload.len() as u64) >= 8 * count {
-        payload.clear();
-        for v in values {
-            payload.extend_from_slice(&v.to_le_bytes());
+    let raw_len = values.len() * 8;
+    let mut best_enc = page_enc::VAL_GORILLA;
+    let mut best_len = payload.len();
+    if raw_len <= best_len {
+        best_enc = page_enc::VAL_RAW_F64;
+        best_len = raw_len;
+    }
+
+    // Integer-model candidates: adopt only when strictly smaller, so the stored
+    // page is never larger than the incumbent choice.
+    let alp = crate::value_codecs::encode_alp(values);
+    if alp.len() < best_len {
+        best_enc = page_enc::VAL_ALP;
+        best_len = alp.len();
+    }
+    let gdf = crate::value_codecs::encode_gcd_delta_for(values);
+    if gdf.len() < best_len {
+        best_enc = page_enc::VAL_GCD_DELTA_FOR;
+        best_len = gdf.len();
+    }
+    let _ = best_len;
+
+    match best_enc {
+        page_enc::VAL_GORILLA => frame_page(&series_id.0, best_enc, page_comp::NONE, payload),
+        page_enc::VAL_RAW_F64 => {
+            payload.clear();
+            for v in values {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+            frame_page(&series_id.0, best_enc, page_comp::NONE, payload)
         }
-        page_enc::VAL_RAW_F64
-    } else {
-        page_enc::VAL_GORILLA
-    };
-    frame_page(&series_id.0, enc, page_comp::NONE, payload)
+        page_enc::VAL_ALP => frame_page(&series_id.0, best_enc, page_comp::NONE, &alp),
+        _ => frame_page(&series_id.0, best_enc, page_comp::NONE, &gdf),
+    }
 }
 
 /// Frames one histogram series' HIST page into a fresh buffer: back-to-back
@@ -3175,11 +3244,11 @@ mod direct_v6_emit_bit_parity {
         series_id: &SeriesId,
         ts_values: &[i64],
     ) -> Result<Vec<u8>, WriteError> {
+        // Incumbent TS_DELTA_VARINT page (LZ4 above the floor when it shrinks).
         let mut payload = Vec::new();
         let run_min = ts_values.first().copied().unwrap_or(0);
         encode_ts_deltas_into(&mut payload, ts_values, run_min)
             .ok_or(WriteError::TimestampDeltaOverflow)?;
-        let enc = page_enc::TS_DELTA_VARINT;
         let compressed = if payload.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
             let candidate = lz4_flex::compress_prepend_size(&payload);
             (candidate.len() < payload.len()).then_some(candidate)
@@ -3190,23 +3259,49 @@ mod direct_v6_emit_bit_parity {
             Some(candidate) => (page_comp::LZ4, candidate),
             None => (page_comp::NONE, &payload),
         };
-        Ok(frame_page(&series_id.0, enc, comp, body))
+        let incumbent = frame_page(&series_id.0, page_enc::TS_DELTA_VARINT, comp, body);
+
+        // TS_GCD_I64 candidate (uncompressed); keep the smaller, incumbent on tie
+        // (ADR-0092 decision 6).
+        let candidate = frame_page(
+            &series_id.0,
+            page_enc::TS_GCD_I64,
+            page_comp::NONE,
+            &crate::ts_gcd::encode_ts_gcd(ts_values),
+        );
+        Ok(if candidate.len() < incumbent.len() {
+            candidate
+        } else {
+            incumbent
+        })
     }
 
     fn reference_frame_val_page(series_id: &SeriesId, values: &[f64]) -> Vec<u8> {
-        let mut payload = Vec::new();
-        encode_gorilla_into(values, &mut payload);
+        // Incumbent Gorilla-vs-raw choice (raw wins the `>= 8*count` tie).
+        let mut gorilla = Vec::new();
+        encode_gorilla_into(values, &mut gorilla);
         let count = values.len() as u64;
-        let enc = if (payload.len() as u64) >= 8 * count {
-            payload.clear();
-            for v in values {
-                payload.extend_from_slice(&v.to_le_bytes());
-            }
-            page_enc::VAL_RAW_F64
+        let mut raw = Vec::new();
+        for v in values {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let (mut best_enc, mut best_bytes) = if (gorilla.len() as u64) >= 8 * count {
+            (page_enc::VAL_RAW_F64, raw)
         } else {
-            page_enc::VAL_GORILLA
+            (page_enc::VAL_GORILLA, gorilla)
         };
-        frame_page(&series_id.0, enc, page_comp::NONE, &payload)
+        // Integer-model candidates: adopt only when strictly smaller.
+        let alp = crate::value_codecs::encode_alp(values);
+        if alp.len() < best_bytes.len() {
+            best_enc = page_enc::VAL_ALP;
+            best_bytes = alp;
+        }
+        let gdf = crate::value_codecs::encode_gcd_delta_for(values);
+        if gdf.len() < best_bytes.len() {
+            best_enc = page_enc::VAL_GCD_DELTA_FOR;
+            best_bytes = gdf;
+        }
+        frame_page(&series_id.0, best_enc, page_comp::NONE, &best_bytes)
     }
 
     fn reference_frame_hist_page(
@@ -3924,6 +4019,370 @@ mod direct_v6_emit_bit_parity {
                 instantiate_exemplars(&exemplar_specs),
             );
             prop_assert_eq!(normalize(new_result), normalize(reference_result));
+        }
+    }
+}
+
+/// Per-page codec selection adopted in RSEG v7 (ADR-0092 decision 6, issue
+/// #312), exercised through the production framing path (`frame_ts_page` /
+/// `frame_val_page`, the same functions `encode_run_v4_with_scratch` calls on
+/// every L0 flush). The value pages add ALP and GCD-of-deltas + FOR; the
+/// timestamp pages add the GCD stack. Selection keeps the smaller page, so a
+/// noisy input keeps the incumbent encoding and no input ever grows.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod page_codec_selection_v7 {
+    use proptest::prelude::*;
+    use ravel_types::Sample;
+
+    use super::*;
+    use crate::format::ReaderLimits;
+    use crate::reader::{RunEntry, ValPageKind, decode_run_pages_soa};
+
+    const START: i64 = 1_700_000_000_000_000_000;
+    /// 15 s in ns, a multiple of one millisecond (1e6 ns), so a stream stepped
+    /// by it stays millisecond-resolution.
+    const STEP_MS: i64 = 15_000_000_000;
+    const MS: i64 = 1_000_000;
+
+    fn sid() -> SeriesId {
+        SeriesId([0x42; 16])
+    }
+
+    /// An exactly-regular millisecond stream of `n` timestamps.
+    fn regular_ms(n: usize) -> Vec<i64> {
+        (0..n).map(|i| START + i as i64 * STEP_MS).collect()
+    }
+
+    /// Frames one scalar run through the production path (`encode_run_v4`, which
+    /// an L0 flush reaches via `encode_run_v4_with_scratch`). `ts` must be
+    /// ascending.
+    fn frame_run(ts: &[i64], values: &[f64]) -> RunInputV4 {
+        assert_eq!(ts.len(), values.len());
+        let samples: Vec<Sample> = ts
+            .iter()
+            .zip(values)
+            .map(|(&ts_ns, &value)| Sample { ts_ns, value })
+            .collect();
+        encode_run_v4(&sid(), 0, 0, 0, &SeriesValues::Scalar(samples)).expect("frame run")
+    }
+
+    fn val_page(run: &RunInputV4) -> &[u8] {
+        match &run.value_page {
+            RunValuePageV4::Scalar(b) => b,
+            RunValuePageV4::Histogram(_) => panic!("scalar run"),
+        }
+    }
+
+    fn val_enc(run: &RunInputV4) -> u8 {
+        val_page(run)[0]
+    }
+
+    fn ts_enc(run: &RunInputV4) -> u8 {
+        run.ts_page[0]
+    }
+
+    /// Round-trips a framed run back through the reader, returning the decoded
+    /// timestamps, values, and the VAL page kind the reader saw.
+    fn decode_run(run: &RunInputV4) -> (Vec<i64>, Vec<f64>, ValPageKind) {
+        let entry = RunEntry {
+            created_unix_ns: run.created_unix_ns,
+            writer_epoch: run.writer_epoch,
+            writer_seq: run.writer_seq,
+            sample_count: run.sample_count,
+            min_ts_ns: run.min_ts_ns,
+            max_ts_ns: run.max_ts_ns,
+            ts_page: (0, 0),
+            val_page: (0, 0),
+            hist_page: (0, 0),
+        };
+        let mut scratch = Vec::new();
+        let mut ts = Vec::new();
+        let mut vals = Vec::new();
+        let kind = decode_run_pages_soa(
+            &sid(),
+            &entry,
+            &run.ts_page,
+            val_page(run),
+            ReaderLimits::default(),
+            &mut scratch,
+            &mut ts,
+            &mut vals,
+        )
+        .expect("decode run");
+        (ts, vals, kind)
+    }
+
+    /// The incumbent (pre-decision-6) VAL page, byte-for-byte the old
+    /// `frame_val_page`: Gorilla unless it fails to beat raw f64.
+    fn incumbent_val_page(values: &[f64]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        encode_gorilla_into(values, &mut payload);
+        let count = values.len() as u64;
+        let enc = if (payload.len() as u64) >= 8 * count {
+            payload.clear();
+            for v in values {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+            page_enc::VAL_RAW_F64
+        } else {
+            page_enc::VAL_GORILLA
+        };
+        frame_page(&sid().0, enc, page_comp::NONE, &payload)
+    }
+
+    /// The incumbent (pre-decision-6) TS page, byte-for-byte the old
+    /// `frame_ts_page`: TS_DELTA_VARINT, LZ4 above the floor when it shrinks.
+    fn incumbent_ts_page(ts: &[i64], run_min: i64) -> Vec<u8> {
+        let mut payload = Vec::new();
+        encode_ts_deltas_into(&mut payload, ts, run_min).expect("no overflow");
+        let compressed = if payload.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
+            let c = lz4_flex::compress_prepend_size(&payload);
+            (c.len() < payload.len()).then_some(c)
+        } else {
+            None
+        };
+        let (comp, body): (u8, &[u8]) = match &compressed {
+            Some(c) => (page_comp::LZ4, c),
+            None => (page_comp::NONE, payload.as_slice()),
+        };
+        frame_page(&sid().0, page_enc::TS_DELTA_VARINT, comp, body)
+    }
+
+    // --- timestamp selection --------------------------------------------
+
+    #[test]
+    fn exactly_regular_ms_keeps_incumbent_delta_varint_and_does_not_grow() {
+        // The single most important constraint (ADR-0092 decision 6): an
+        // exactly-regular ms stream collapses under LZ4 to ~0.16 B/sample in
+        // the incumbent, and a bare encode_i64 GCD stack would regress it ~6x.
+        // Post-compression selection must keep TS_DELTA_VARINT, and the kept
+        // page is byte-identical to the base writer's, so it cannot grow.
+        //
+        // Vacuity guard: flip `frame_ts_page`'s tie rule to
+        // `candidate.len() <= incumbent.len()` (or force it to return the
+        // candidate) and this assertion fails with `ts_enc == TS_GCD_I64 (2)`.
+        let ts = regular_ms(240);
+        let vals = vec![0.0f64; ts.len()];
+        let run = frame_run(&ts, &vals);
+        assert_eq!(
+            ts_enc(&run),
+            page_enc::TS_DELTA_VARINT,
+            "exactly-regular ms stream must keep TS_DELTA_VARINT"
+        );
+        assert_eq!(
+            run.ts_page,
+            incumbent_ts_page(&ts, ts[0]),
+            "the kept page must equal the base writer's page exactly, so it cannot grow"
+        );
+        let (dts, _, _) = decode_run(&run);
+        assert_eq!(dts, ts, "regular ms stream round-trips");
+    }
+
+    #[test]
+    fn jittered_ms_selects_the_gcd_stack_and_shrinks() {
+        // 15 s cadence with pseudo-random +/-200 ms jitter at ms resolution:
+        // dividing out the millisecond factor before delta coding wins here
+        // (bake-off: 4.66 -> 1.82 B/sample), so the GCD stack is selected. The
+        // jitter is a deterministic xorshift so the stream stays fixed, but it
+        // is aperiodic enough that LZ4 cannot collapse the incumbent varints.
+        let n = 240usize;
+        let mut s: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let ts: Vec<i64> = (0..n)
+            .map(|i| {
+                let jitter = (rng() % 401) as i64 - 200;
+                START + i as i64 * STEP_MS + jitter * MS
+            })
+            .collect();
+        // Ascending by construction (15 s >> 400 ms).
+        assert!(ts.windows(2).all(|w| w[0] < w[1]));
+        let vals = vec![0.0f64; n];
+        let run = frame_run(&ts, &vals);
+        assert_eq!(
+            ts_enc(&run),
+            page_enc::TS_GCD_I64,
+            "jittered ms stream must select the GCD stack"
+        );
+        assert!(
+            run.ts_page.len() < incumbent_ts_page(&ts, ts[0]).len(),
+            "the GCD page must be strictly smaller than the incumbent here"
+        );
+        let (dts, _, _) = decode_run(&run);
+        assert_eq!(dts, ts, "jittered ms stream round-trips exactly");
+    }
+
+    #[test]
+    fn true_nanosecond_stream_falls_back_to_incumbent() {
+        // Non-ms-aligned nanosecond timestamps: page GCD is 1, so the GCD stack
+        // gains nothing and selection keeps the incumbent (never regresses).
+        let n = 240usize;
+        let ts: Vec<i64> = (0..n)
+            .map(|i| START + i as i64 * STEP_MS + (i as i64 * 7919) % 400_000_001 - 200_000_000)
+            .collect();
+        let ts: Vec<i64> = {
+            // Enforce strict ascent after the jitter.
+            let mut v = ts;
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let vals = vec![0.0f64; ts.len()];
+        let run = frame_run(&ts, &vals);
+        assert!(
+            run.ts_page.len() <= incumbent_ts_page(&ts, ts[0]).len(),
+            "a nanosecond stream must never produce a larger TS page than the incumbent"
+        );
+        let (dts, _, _) = decode_run(&run);
+        assert_eq!(dts, ts, "nanosecond stream round-trips");
+    }
+
+    // --- value selection per workload shape -----------------------------
+
+    fn assert_integer_model_wins(vals: &[f64], shape: &str) {
+        let ts = regular_ms(vals.len());
+        let run = frame_run(&ts, vals);
+        let enc = val_enc(&run);
+        assert!(
+            enc == page_enc::VAL_ALP || enc == page_enc::VAL_GCD_DELTA_FOR,
+            "{shape}: an integer-model codec (ALP/GCD) must win, got enc {enc}"
+        );
+        assert!(
+            val_page(&run).len() < incumbent_val_page(vals).len(),
+            "{shape}: the adopted page must be strictly smaller than the incumbent"
+        );
+        let (_, dvals, kind) = decode_run(&run);
+        assert!(matches!(kind, ValPageKind::Alp | ValPageKind::GcdDeltaFor));
+        assert_eq!(
+            dvals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{shape}: values round-trip bit-exactly"
+        );
+    }
+
+    #[test]
+    fn integer_counter_selects_an_integer_model_codec() {
+        // Measured winner ALP 0.415 / GCD 0.511 (a clean linear counter favours
+        // the GCD stack; either adopted codec is a large win over Gorilla).
+        let vals: Vec<f64> = (0..240).map(|i| (1_000_000 + i * 7) as f64).collect();
+        assert_integer_model_wins(&vals, "integer counter");
+    }
+
+    #[test]
+    fn integer_gauge_selects_an_integer_model_codec() {
+        // Measured winner GCD 0.446. A bounded integer random walk.
+        let vals: Vec<f64> = (0..240)
+            .map(|i| (500 + ((i * 97) % 61) - 30) as f64)
+            .collect();
+        assert_integer_model_wins(&vals, "integer gauge");
+    }
+
+    #[test]
+    fn decimal_gauge_selects_an_integer_model_codec() {
+        // Measured winner GCD 0.165 / ALP 0.226. Two-decimal fixed precision.
+        let vals: Vec<f64> = (0..240)
+            .map(|i| (30_000 + (i % 47)) as f64 / 100.0)
+            .collect();
+        assert_integer_model_wins(&vals, "decimal gauge");
+    }
+
+    #[test]
+    fn constant_series_selects_an_integer_model_codec() {
+        // Measured winner ALP 0.070 / GCD 0.085.
+        let vals = vec![42.5f64; 240];
+        assert_integer_model_wins(&vals, "constant series");
+    }
+
+    #[test]
+    fn noisy_float_series_falls_back_without_expanding() {
+        // Irrational-ish values that no short decimal exponent reproduces:
+        // both integer-model codecs fall back to about raw size, so selection
+        // keeps the incumbent and the page does not expand.
+        //
+        // Vacuity guard: make `frame_val_page` force VAL_ALP unconditionally and
+        // this assertion fails, because ALP-of-all-exceptions exceeds raw.
+        //
+        // Large-magnitude values (> 1e19) that no decimal exponent within the
+        // i64 domain can model, so both integer-model codecs fall back. (A
+        // small-magnitude irrational-looking float is often exactly a short
+        // decimal in f64 and ALP models it -- that is ALP working, not a bug.)
+        let mut s: u64 = 0x243f_6a88_85a3_08d3;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let vals: Vec<f64> = (0..240)
+            .map(|_| (rng() % 1_000_000) as f64 * 1e18 + (rng() % 1000) as f64 + 0.5)
+            .collect();
+        let ts = regular_ms(vals.len());
+        let run = frame_run(&ts, &vals);
+        let enc = val_enc(&run);
+        assert!(
+            enc == page_enc::VAL_GORILLA || enc == page_enc::VAL_RAW_F64,
+            "noisy floats must keep the incumbent Gorilla/raw encoding, got enc {enc}"
+        );
+        assert!(
+            val_page(&run).len() <= incumbent_val_page(&vals).len(),
+            "the adopted codecs must not expand a noisy-float page"
+        );
+        let (_, dvals, _) = decode_run(&run);
+        assert_eq!(
+            dvals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+    }
+
+    // --- the never-larger invariant, over arbitrary input ---------------
+
+    proptest! {
+        /// No adopted VAL encoding ever produces a page larger than the
+        /// incumbent would have, on ANY input (selection keeps the smaller).
+        #[test]
+        fn val_page_never_larger_than_incumbent(
+            values in proptest::collection::vec(any::<f64>(), 1..96),
+        ) {
+            let mut scratch = Vec::new();
+            let got = frame_val_page(&sid(), &values, &mut scratch);
+            let incumbent = incumbent_val_page(&values);
+            prop_assert!(
+                got.len() <= incumbent.len(),
+                "frame_val_page produced {} bytes vs incumbent {}",
+                got.len(),
+                incumbent.len()
+            );
+        }
+
+        /// No adopted TS encoding ever produces a page larger than the
+        /// incumbent would have, on any ascending stream.
+        #[test]
+        fn ts_page_never_larger_than_incumbent(
+            base in -1_000_000_000_000i64..1_000_000_000_000,
+            steps in proptest::collection::vec(1i64..2_000_000_000, 1..96),
+            scale in prop::sample::select(vec![1i64, MS, 1000, STEP_MS]),
+        ) {
+            let mut ts = Vec::with_capacity(steps.len() + 1);
+            let mut acc = base;
+            ts.push(acc);
+            for s in &steps {
+                acc = acc.saturating_add(s.saturating_mul(scale));
+                ts.push(acc);
+            }
+            let mut scratch = Vec::new();
+            let got = frame_ts_page(&sid(), &ts, ts[0], &mut scratch).expect("frame ts");
+            let incumbent = incumbent_ts_page(&ts, ts[0]);
+            prop_assert!(
+                got.len() <= incumbent.len(),
+                "frame_ts_page produced {} bytes vs incumbent {}",
+                got.len(),
+                incumbent.len()
+            );
         }
     }
 }

@@ -182,8 +182,23 @@ pub mod compression {
 /// Page encodings (docs/segment-format.md).
 pub mod page_enc {
     pub const TS_DELTA_VARINT: u8 = 1;
+    /// TS page GCD stack (ADR-0092 decision 6, issue #312): every timestamp
+    /// divided by the page GCD then `ravel_codec::encode_i64`, selected per
+    /// page against [`TS_DELTA_VARINT`] and kept only when smaller
+    /// (`crate::ts_gcd`, docs/segment-format.md). A second timestamp encoding,
+    /// not a replacement.
+    pub const TS_GCD_I64: u8 = 2;
     pub const VAL_GORILLA: u8 = 16;
     pub const VAL_RAW_F64: u8 = 17;
+    /// ALP value page (ADR-0092 decision 6, issue #312): one decimal exponent,
+    /// the fit digits through `ravel_codec::encode_i64`, non-fitting values as
+    /// raw-`f64` exceptions (`crate::value_codecs`, docs/segment-format.md).
+    pub const VAL_ALP: u8 = 18;
+    /// GCD-of-deltas + frame-of-reference value page (ADR-0092 decision 6,
+    /// issue #312): one decimal exponent for every value, deltas divided by
+    /// their GCD, FOR bit-packed, with a whole-page raw fallback
+    /// (`crate::value_codecs`, docs/segment-format.md).
+    pub const VAL_GCD_DELTA_FOR: u8 = 19;
     /// RSEG v3 only (ADR-0017); native-histogram record grammar
     /// (docs/segment-format.md "RSEG v3 amendment", HIST_PAGES). Emitted by
     /// `SegmentWriter::write_v3`.
@@ -243,6 +258,12 @@ mod tests {
         assert_eq!(section_kind::SERIES_IDX, 8);
         assert_eq!(section_kind::SERIES_META_CHUNKS, 9);
         assert_eq!(section_kind::EXEMPLARS, 10);
+        assert_eq!(page_enc::TS_DELTA_VARINT, 1);
+        assert_eq!(page_enc::TS_GCD_I64, 2);
+        assert_eq!(page_enc::VAL_GORILLA, 16);
+        assert_eq!(page_enc::VAL_RAW_F64, 17);
+        assert_eq!(page_enc::VAL_ALP, 18);
+        assert_eq!(page_enc::VAL_GCD_DELTA_FOR, 19);
         assert_eq!(page_enc::HIST_SPANS, 32);
         assert_eq!(V5_SPARSE_THRESHOLD, 4096);
         assert_eq!(V5_STRIDE, 512);
