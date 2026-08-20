@@ -737,12 +737,17 @@ fn decode_ts_page_into(
     out: &mut Vec<i64>,
 ) -> Result<(), SegmentError> {
     let (enc, comp, payload) = split_page_header(series_id, page)?;
-    if enc != page_enc::TS_DELTA_VARINT {
-        return Err(SegmentError::InvalidEncoding(enc));
-    }
     decompress_page_payload_into(comp, payload, limits, scratch)?;
     let count = to_usize(u64::from(sample_count))?;
-    crate::ts_delta::decode_ts_deltas_into(scratch, count, min_ts_ns, max_ts_ns, out)
+    match enc {
+        page_enc::TS_DELTA_VARINT => {
+            crate::ts_delta::decode_ts_deltas_into(scratch, count, min_ts_ns, max_ts_ns, out)
+        }
+        page_enc::TS_GCD_I64 => {
+            crate::ts_gcd::decode_ts_gcd_into(scratch, count, min_ts_ns, max_ts_ns, out)
+        }
+        other => Err(SegmentError::InvalidEncoding(other)),
+    }
 }
 
 /// Decodes `count` little-endian f64s, *appending* them to `out` (existing
@@ -769,6 +774,12 @@ fn decode_raw_f64_into(bytes: &[u8], count: usize, out: &mut Vec<f64>) -> Result
 pub enum ValPageKind {
     Gorilla,
     RawF64,
+    /// VAL_ALP (ADR-0092 decision 6, issue #312): a compressed integer-model
+    /// page, not raw-`f64`, so it never serves an Arrow zero-copy view.
+    Alp,
+    /// VAL_GCD_DELTA_FOR (ADR-0092 decision 6, issue #312): a compressed
+    /// integer-model page, not raw-`f64`.
+    GcdDeltaFor,
 }
 
 fn decode_val_page_into(
@@ -790,6 +801,14 @@ fn decode_val_page_into(
         page_enc::VAL_RAW_F64 => {
             decode_raw_f64_into(scratch, count, out)?;
             Ok(ValPageKind::RawF64)
+        }
+        page_enc::VAL_ALP => {
+            out.extend(crate::value_codecs::decode_alp(scratch, count)?);
+            Ok(ValPageKind::Alp)
+        }
+        page_enc::VAL_GCD_DELTA_FOR => {
+            out.extend(crate::value_codecs::decode_gcd_delta_for(scratch, count)?);
+            Ok(ValPageKind::GcdDeltaFor)
         }
         other => Err(SegmentError::InvalidEncoding(other)),
     }
