@@ -325,10 +325,12 @@ the decoded live footprint is bounded by the same section byte cap the run-major
 columns use. The columns live inside SERIES_META, under its existing section
 `crc32c`; no page CRC or checksum boundary changes.
 
-The columns exist only in the whole-section SERIES_META (kind 6) form. The
-sparse (chunked) SERIES_META_CHUNKS form does not carry them yet; a writer asked
-to emit provenance on an object large enough to take the sparse form fails
-closed rather than dropping the columns.
+Both SERIES_META forms carry the columns. In the whole-section form (kind 6)
+they are the trailing blocks 17-21 above. In the sparse (chunked)
+SERIES_META_CHUNKS form (kind 9) the same columns are re-laid per chunk, scoped
+to each frame's runs; see SERIES_META_CHUNKS below. A merged L1 object over a
+large tenant is exactly the sparse case, so the sparse form must carry them
+(ADR-0092 decision 1); it is no longer a fail-closed gap.
 
 ## Sparse catalog
 
@@ -405,6 +407,10 @@ hist_base: varint   (running HIST_PAGES end before this frame's first run)
 then the same block_len-prefixed columns as SERIES_META blocks 1-16, scoped
 to this frame (schema_ref/value_ord over n series, the run columns over
 frame_run_total runs)
+then, iff at least one run in this frame carries per-sample provenance,
+the five provenance blocks 17-21 scoped to this frame: presence over
+frame_run_total runs, then the four value columns over this frame's flagged
+samples (same Enc-tagged encode_i64 blocks, same base-relative deltas)
 ```
 
 The column meanings and reconstruction arithmetic are SERIES_META's, verbatim,
@@ -420,7 +426,13 @@ needed for a by-id fetch) via their `block_len` prefixes.
 The chunked form re-lays the identical raw delta/gap/len columns plus per-frame
 bases, so the whole-catalog decode of a sparse object is bit-identical to the
 whole-catalog decode of the same batch below the threshold, and a sparse
-point-probe of any series is bit-identical to that series' slice of it.
+point-probe of any series is bit-identical to that series' slice of it. The
+per-sample provenance columns re-lay the same way: a frame emits blocks 17-21
+only when one of its runs is flagged, so a provenance-free frame is byte-
+identical to one written without the capability, and the deltas (relative to
+the same `footer.base_created_unix_ns`) transfer verbatim from the whole-section
+form. A frame with no flagged run omits the extension, and its series decode as
+run-wide, exactly as below the threshold.
 
 ## EXEMPLARS (kind 10, uncompressed body)
 

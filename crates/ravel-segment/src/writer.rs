@@ -511,17 +511,11 @@ fn assemble_v4_body_impl(
             return Err(WriteError::MixedValueKindInSeries);
         }
     }
-
-    // Per-sample provenance is not yet supported in the sparse (chunked)
-    // SERIES_META form. Fail closed here rather than silently drop the columns
-    // during the sparse rebuild (which would re-parse the whole SERIES_META and
-    // reject its extension as trailing bytes anyway).
-    if !prov_by_series.is_empty()
-        && series.len() as u64 >= V5_SPARSE_THRESHOLD
-        && prov_by_series.iter().any(|s| s.iter().any(|r| r.is_some()))
-    {
-        return Err(WriteError::PerSampleProvenanceInSparse);
-    }
+    // Per-sample provenance is carried by both SERIES_META forms: the
+    // whole-section extension below the sparse threshold (blocks 17-21, built by
+    // `build_series_meta_v4`), and the per-chunk extension at or above it (the
+    // sparse rebuild in `crate::sparse` re-lays those columns frame by frame,
+    // ADR-0092 decision 1). Nothing to gate here.
 
     let series_count = u64::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
 
@@ -856,12 +850,12 @@ impl SegmentWriter {
     /// SERIES_META gains the extension only when at least one run carries them
     /// (absent columns cost zero bytes).
     ///
-    /// The read path for these columns is complete (reader plus query wiring);
-    /// no production caller emits them yet (issue #315 wires the compactor).
-    /// The columns are supported only in the whole-section SERIES_META form:
-    /// an object large enough to take the sparse (chunked) form fails closed
-    /// with `WriteError::PerSampleProvenanceInSparse` rather than silently
-    /// dropping the columns.
+    /// The read path for these columns is complete (reader plus query wiring),
+    /// in both SERIES_META forms. The columns are carried by the whole-section
+    /// form below the sparse threshold and by the per-chunk form at or above it
+    /// (`crate::sparse` re-lays the extension frame by frame), so a merged L1
+    /// object over a large tenant stores them rather than failing closed
+    /// (ADR-0092 decision 1, issue #315).
     pub fn write_v7_with_provenance(
         series: Vec<SeriesInputV7>,
         identity: SegmentIdentity,
@@ -908,10 +902,10 @@ impl SegmentWriter {
         if body.series_count < V5_SPARSE_THRESHOLD {
             return Ok(finalize_v4_trailer(body, VERSION_V7));
         }
-        // The sparse (chunked) SERIES_META form does not carry the provenance
-        // extension yet. `assemble_v4_body_impl` already rejected a
-        // provenance-carrying object here, so reaching this point means no run
-        // carried columns and the sparse rebuild is safe.
+        // At or above the sparse threshold the base's whole-section SERIES_META
+        // (including any provenance extension) is re-laid into per-chunk frames
+        // by the sparse rebuild, which carries the provenance columns per chunk
+        // (ADR-0092 decision 1).
         let base = finalize_v4_trailer(body, VERSION_V4);
         crate::sparse::build_sparse_object(&base)
     }

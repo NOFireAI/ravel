@@ -1741,7 +1741,7 @@ fn parse_series_meta_tail_v4(
 /// first byte is the [`ravel_codec::encoding::Enc`] tag and whose remainder is
 /// the codec payload for exactly `count` values. Every codec/tag/length
 /// violation is a typed `ProvenanceColumnCodec`, never a panic.
-fn take_encoded_i64_block(
+pub(crate) fn take_encoded_i64_block(
     bytes: &[u8],
     pos: &mut usize,
     count: usize,

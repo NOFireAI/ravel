@@ -37,10 +37,11 @@ use crate::format::{
     section_kind,
 };
 use crate::reader::{
-    DictResolver, RUN_LIVE_BYTES_CHUNK, RunEntry, SeriesEntry, SeriesEntryV4, ValueKind,
-    check_run_total_live_budget, check_series_counts_v2, decode_section_bytes, find_section,
-    index_label_dict, parse_schema_list_v2, parse_schema_ref_block_v2, parse_series_ids_v2,
-    parse_value_ord_block_all_v2, take_block, take_u32_le,
+    DictResolver, RUN_LIVE_BYTES_CHUNK, RunEntry, SampleProvenance, SeriesEntry, SeriesEntryV4,
+    ValueKind, check_run_total_live_budget, check_series_counts_v2, decode_section_bytes,
+    find_section, index_label_dict, parse_schema_list_v2, parse_schema_ref_block_v2,
+    parse_series_ids_v2, parse_value_ord_block_all_v2, take_block, take_encoded_i64_block,
+    take_u32_le,
 };
 use crate::varint::{read_uvarint, write_uvarint};
 use crate::writer::WrittenSegment;
@@ -492,6 +493,11 @@ struct ChunkFrame {
     /// Per-run reconstructed entries (`frame_run_total` entries, in series
     /// then run order), with absolute page offsets and provenance.
     runs: Vec<RunEntry>,
+    /// Optional per-sample dedup provenance (ADR-0092 decision 1), parallel to
+    /// `runs`: empty when this chunk frame carries no provenance extension, else
+    /// `frame_run_total` long with `None` for a run that keeps its run-wide
+    /// provenance and `Some(column)` for a flagged run.
+    provenance: Vec<Option<Vec<SampleProvenance>>>,
 }
 
 /// Decodes one meta-chunk frame's full run-major column set, reconstructing
@@ -571,6 +577,19 @@ fn decode_chunk_frame(
     let val_len = read_uvarint_block(frame_raw, &mut pos, frame_run_total)?;
     let hist_gap = read_uvarint_block(frame_raw, &mut pos, frame_run_total)?;
     let hist_len = read_uvarint_block(frame_raw, &mut pos, frame_run_total)?;
+
+    // Optional per-chunk per-sample provenance extension (ADR-0092 decision 1),
+    // the frame-local counterpart of the whole-section reader's blocks 17-21:
+    // a run-major presence column then four sample-major `encode_i64` columns
+    // over the flagged runs' samples, deltas relative to
+    // `footer.base_created_unix_ns`. Absent for a provenance-free frame, in
+    // which case the trailing-bytes check below still fires on real garbage.
+    let provenance = if pos < frame_raw.len() {
+        parse_chunk_provenance(frame_raw, &mut pos, footer, &sample_count, limits)?
+    } else {
+        Vec::new()
+    };
+
     if pos != frame_raw.len() {
         return Err(SegmentError::TrailingBytes);
     }
@@ -636,7 +655,97 @@ fn decode_chunk_frame(
         schema_ref,
         value_ord: value_ord_block_to_flat(&value_ord_block)?,
         runs,
+        provenance,
     })
+}
+
+/// Parses one chunk frame's per-sample provenance extension into a
+/// `frame_run_total`-long vector parallel to the frame's runs: `None` for a run
+/// that keeps its run-wide provenance, `Some(column)` with one
+/// [`SampleProvenance`] per sample for a flagged run. The frame-local
+/// counterpart of the reader's `parse_provenance_extension`, reading the same
+/// block shape (presence, then `created_unix_ns` delta / `writer_epoch` /
+/// `writer_seq` / in-page index, deltas relative to `footer.base_created_unix_ns`)
+/// and enforcing the same invariants (a present-but-empty extension, an invalid
+/// presence flag, and an over-budget live decode are typed errors, never panics
+/// or wrong keys).
+fn parse_chunk_provenance(
+    frame_raw: &[u8],
+    pos: &mut usize,
+    footer: &Footer,
+    sample_count: &[u64],
+    limits: ReaderLimits,
+) -> Result<Vec<Option<Vec<SampleProvenance>>>, SegmentError> {
+    let run_total = sample_count.len();
+    let presence = take_encoded_i64_block(frame_raw, pos, run_total)?;
+
+    let mut prov_sample_total: u64 = 0;
+    let mut any_present = false;
+    for (&flag, &sc) in presence.iter().zip(sample_count) {
+        match flag {
+            0 => {}
+            1 => {
+                any_present = true;
+                prov_sample_total = prov_sample_total
+                    .checked_add(sc)
+                    .ok_or(SegmentError::FieldOverflow)?;
+            }
+            _ => {
+                return Err(SegmentError::InvalidProvenancePresence(
+                    u64::try_from(flag).unwrap_or(u64::MAX),
+                ));
+            }
+        }
+    }
+    if !any_present {
+        return Err(SegmentError::EmptyProvenanceExtension);
+    }
+
+    // Bound the live decode as the whole-section reader does: four i64 columns
+    // plus one `SampleProvenance` per flagged sample.
+    let live_bytes = prov_sample_total
+        .checked_mul(4 * 8 + std::mem::size_of::<SampleProvenance>() as u64)
+        .ok_or(SegmentError::FieldOverflow)?;
+    if live_bytes > limits.max_section_uncompressed_bytes {
+        return Err(SegmentError::ProvenanceLiveBudgetExceeded {
+            live_bytes,
+            cap: limits.max_section_uncompressed_bytes,
+        });
+    }
+    let prov_total = usize::try_from(prov_sample_total).map_err(|_| SegmentError::FieldOverflow)?;
+
+    let created_delta = take_encoded_i64_block(frame_raw, pos, prov_total)?;
+    let epoch = take_encoded_i64_block(frame_raw, pos, prov_total)?;
+    let seq = take_encoded_i64_block(frame_raw, pos, prov_total)?;
+    let in_page_index = take_encoded_i64_block(frame_raw, pos, prov_total)?;
+
+    let mut out: Vec<Option<Vec<SampleProvenance>>> = Vec::with_capacity(run_total);
+    let mut cursor = 0usize;
+    for (&flag, &sc) in presence.iter().zip(sample_count) {
+        if flag == 0 {
+            out.push(None);
+            continue;
+        }
+        let n = usize::try_from(sc).map_err(|_| SegmentError::FieldOverflow)?;
+        let mut column = Vec::with_capacity(n.min(prov_total));
+        for _ in 0..n {
+            let created = i64::try_from(
+                i128::from(footer.base_created_unix_ns) + i128::from(created_delta[cursor]),
+            )
+            .map_err(|_| SegmentError::ProvenanceBoundsOverflow)?;
+            let ipi =
+                u32::try_from(in_page_index[cursor]).map_err(|_| SegmentError::FieldOverflow)?;
+            column.push(SampleProvenance {
+                created_unix_ns: created,
+                writer_epoch: epoch[cursor] as u64,
+                writer_seq: seq[cursor] as u64,
+                in_page_index: ipi,
+            });
+            cursor += 1;
+        }
+        out.push(Some(column));
+    }
+    Ok(out)
 }
 
 /// The value_ord block is series-major but its per-series lengths need the
@@ -878,6 +987,15 @@ pub fn decode_catalog_v5_chunked(
 
             let rc = frame.run_count[i] as usize;
             let runs: Vec<RunEntry> = frame.runs[roff..roff + rc].to_vec();
+            // Per-sample provenance for this series' runs (ADR-0092 decision 1).
+            // Empty when the frame carried no extension, else the run slice
+            // parallel to `runs`, exactly as the whole-section decode produces.
+            let per_sample_provenance: Vec<Option<Vec<SampleProvenance>>> =
+                if frame.provenance.is_empty() {
+                    Vec::new()
+                } else {
+                    frame.provenance[roff..roff + rc].to_vec()
+                };
             roff += rc;
 
             let mut sample_count: u32 = 0;
@@ -906,12 +1024,7 @@ pub fn decode_catalog_v5_chunked(
                     hist_page: (0, 0),
                 },
                 runs,
-                // The sparse (chunked) SERIES_META form does not carry the
-                // per-sample provenance extension: the writer fails closed
-                // (`PerSampleProvenanceInSparse`) rather than emit a large
-                // object with provenance, so a decoded sparse object never has
-                // per-sample columns (ADR-0092 decision 1, this task's scope).
-                per_sample_provenance: Vec::new(),
+                per_sample_provenance,
             });
         }
         if voff != frame.value_ord.len() {
@@ -1023,6 +1136,22 @@ struct MetaColumns {
     ts_end: Vec<u64>,
     val_end: Vec<u64>,
     hist_end: Vec<u64>,
+    /// Optional per-sample provenance (ADR-0092 decision 1), carried verbatim as
+    /// the whole-section extension's raw columns so the chunk rebuild re-slices
+    /// them without reconstruction. Empty when the SERIES_META has no extension.
+    /// `presence` is one 0/1 per run (`run_total` long); the four value columns
+    /// are sample-major over the flagged runs in run order, exactly as the
+    /// whole-section form stores them (deltas relative to the same
+    /// `footer.base_created_unix_ns`, so they transfer bit-for-bit).
+    prov_presence: Vec<i64>,
+    prov_created_delta: Vec<i64>,
+    prov_epoch: Vec<i64>,
+    prov_seq: Vec<i64>,
+    prov_in_page_index: Vec<i64>,
+    /// Prefix sample offset into the four value columns, per run (length
+    /// `run_total + 1`): `prov_sample_offsets[r]` is the count of provenance
+    /// samples in runs `[0, r)`. Empty when there is no extension.
+    prov_sample_offsets: Vec<usize>,
 }
 
 fn read_raw_uvarint_block(
@@ -1104,6 +1233,54 @@ fn parse_v4_meta_columns(
     let val_len = read_raw_uvarint_block(meta, &mut pos, run_total)?;
     let hist_gap = read_raw_uvarint_block(meta, &mut pos, run_total)?;
     let hist_len = read_raw_uvarint_block(meta, &mut pos, run_total)?;
+
+    // Optional per-sample provenance extension (blocks 17-21, ADR-0092
+    // decision 1): a run-major presence column then four sample-major columns
+    // over the flagged runs' samples, matching the whole-section reader. Absent
+    // (`pos == meta.len()`) for every object without provenance, so the columns
+    // stay empty and the chunk rebuild appends nothing.
+    let mut prov_presence: Vec<i64> = Vec::new();
+    let mut prov_created_delta: Vec<i64> = Vec::new();
+    let mut prov_epoch: Vec<i64> = Vec::new();
+    let mut prov_seq: Vec<i64> = Vec::new();
+    let mut prov_in_page_index: Vec<i64> = Vec::new();
+    let mut prov_sample_offsets: Vec<usize> = Vec::new();
+    if pos < meta.len() {
+        let presence = take_encoded_i64_block(meta, &mut pos, run_total)?;
+        // Sample offset per run, and the total flagged-sample count the four
+        // columns hold. A run flagged present contributes its `sample_count`
+        // samples; a run not flagged contributes none.
+        prov_sample_offsets = Vec::with_capacity(run_total + 1);
+        prov_sample_offsets.push(0usize);
+        let mut acc = 0usize;
+        let mut any_present = false;
+        for (&flag, &sc) in presence.iter().zip(&sample_count) {
+            match flag {
+                0 => {}
+                1 => {
+                    any_present = true;
+                    acc = acc
+                        .checked_add(usize::try_from(sc).map_err(|_| SegmentError::FieldOverflow)?)
+                        .ok_or(SegmentError::FieldOverflow)?;
+                }
+                _ => {
+                    return Err(SegmentError::InvalidProvenancePresence(
+                        u64::try_from(flag).unwrap_or(u64::MAX),
+                    ));
+                }
+            }
+            prov_sample_offsets.push(acc);
+        }
+        if !any_present {
+            return Err(SegmentError::EmptyProvenanceExtension);
+        }
+        prov_created_delta = take_encoded_i64_block(meta, &mut pos, acc)?;
+        prov_epoch = take_encoded_i64_block(meta, &mut pos, acc)?;
+        prov_seq = take_encoded_i64_block(meta, &mut pos, acc)?;
+        prov_in_page_index = take_encoded_i64_block(meta, &mut pos, acc)?;
+        prov_presence = presence;
+    }
+
     if pos != meta.len() {
         return Err(SegmentError::TrailingBytes);
     }
@@ -1136,6 +1313,12 @@ fn parse_v4_meta_columns(
         ts_end,
         val_end,
         hist_end,
+        prov_presence,
+        prov_created_delta,
+        prov_epoch,
+        prov_seq,
+        prov_in_page_index,
+        prov_sample_offsets,
     })
 }
 
@@ -1174,6 +1357,17 @@ fn push_u32_uvarint_block(buf: &mut Vec<u8>, values: &[u32]) {
 fn push_bytes_block(buf: &mut Vec<u8>, bytes: &[u8]) {
     write_uvarint(buf, bytes.len() as u64);
     buf.extend_from_slice(bytes);
+}
+
+/// Appends one `encode_i64` column as a `block_len`-prefixed body whose first
+/// byte is the chosen [`ravel_codec::encoding::Enc`] tag, the exact shape the
+/// whole-section provenance extension uses (writer's `push_encoded_i64_block`)
+/// and the inverse of [`take_encoded_i64_block`].
+fn push_encoded_i64_block(buf: &mut Vec<u8>, values: &[i64]) {
+    let (enc, bytes) = ravel_codec::encoding::encode_i64(values);
+    write_uvarint(buf, (1 + bytes.len()) as u64);
+    buf.push(enc.to_u8());
+    buf.extend_from_slice(&bytes);
 }
 
 /// Builds the SERIES_META_CHUNKS section (header + per-chunk zstd frames) and
@@ -1217,6 +1411,25 @@ fn build_meta_chunks(cols: &MetaColumns) -> Result<(Vec<u8>, Vec<ChunkDirEntry>)
         push_uvarint_block(&mut frame, &cols.val_len[r0..r1]);
         push_uvarint_block(&mut frame, &cols.hist_gap[r0..r1]);
         push_uvarint_block(&mut frame, &cols.hist_len[r0..r1]);
+
+        // Optional per-sample provenance for this chunk (ADR-0092 decision 1).
+        // Emitted iff the object carries the extension AND at least one run in
+        // this chunk is flagged present, so a chunk with no flagged run appends
+        // nothing and decodes exactly as a provenance-free frame. Presence spans
+        // every run in the chunk (0 for the unflagged); the four value columns
+        // are the sample-major slice covering this chunk's flagged samples.
+        if !cols.prov_presence.is_empty() {
+            let presence = &cols.prov_presence[r0..r1];
+            if presence.iter().any(|&p| p == 1) {
+                let sc0 = cols.prov_sample_offsets[r0];
+                let sc1 = cols.prov_sample_offsets[r1];
+                push_encoded_i64_block(&mut frame, presence);
+                push_encoded_i64_block(&mut frame, &cols.prov_created_delta[sc0..sc1]);
+                push_encoded_i64_block(&mut frame, &cols.prov_epoch[sc0..sc1]);
+                push_encoded_i64_block(&mut frame, &cols.prov_seq[sc0..sc1]);
+                push_encoded_i64_block(&mut frame, &cols.prov_in_page_index[sc0..sc1]);
+            }
+        }
 
         let stored = zstd::bulk::compress(&frame, ZSTD_LEVEL)
             .map_err(|e| WriteError::Zstd(e.to_string()))?;
