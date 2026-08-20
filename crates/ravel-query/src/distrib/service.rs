@@ -363,6 +363,37 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             )]);
         }
 
+        // Run-merged provenance is not representable on the wire: `pb::Run`
+        // carries the run-wide triple only, so a series with an explicit
+        // per-sample provenance column (a merged L1 v7 run, produced since
+        // issue #315) cannot cross the distributed path without silently
+        // dropping the column and letting the coordinator pick a different
+        // dedup winner than the local path at an overlapping timestamp. Refuse
+        // the whole slice back to the coordinator's local fallback rather than
+        // return a degraded frame, exactly as the histogram arm above does. The
+        // summary carries this slice's accounting/stats so the coordinator
+        // folds its spend once before falling back (ADR-0071); otherwise the
+        // query would pay for this fetch twice and report it once. The wire
+        // format extension that would let this fan out is issue #348, bundled
+        // with the identical `HistogramRun` change so `PROTOCOL_VERSION` bumps
+        // once rather than twice.
+        if scalar
+            .iter()
+            .flatten()
+            .any(|fs| fs.per_sample_priorities.is_some())
+        {
+            return Ok(vec![summary_frame(
+                &accounting.snapshot(),
+                0,
+                0,
+                pb::status::Code::Unsupported,
+                "run-merged series (per-sample provenance column) are not \
+                 distributed yet (#348)"
+                    .to_string(),
+                &stats,
+            )]);
+        }
+
         // Selective-erasure exclusion, applied post-decode exactly as the local
         // path applies it (ADR-0064, ADR-0071): the coordinator does not
         // re-apply, so worker-side application must match the local rule.
