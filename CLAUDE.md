@@ -440,6 +440,12 @@ file.
   heredocs run through Bash: heredoc writes bypass the post-edit hooks
   and leave no auditable diff in the session. Heredocs are fine for
   scratchpad files.
+- Code comments are for the next reader, not the reviewer. Write one
+  only when the code cannot show the constraint itself, keep it to a
+  sentence or two, and write none when the code is self-explanatory.
+  Do not narrate history ("this used to", "a session once", incident
+  stories): the why belongs in the comment only as the live constraint,
+  the story belongs in the commit message.
 - Parallel agents (fleet or local fan-out): derive every scratch path
   from your own task or agent id (`<scratchpad>/<agent-id>/...`), never a
   bare shared filename. Agents that share a name overwrite each other
