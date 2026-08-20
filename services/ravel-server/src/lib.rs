@@ -8,6 +8,8 @@ pub mod analytics;
 pub mod bucket_protection;
 pub mod cache_warm;
 pub mod config;
+#[cfg(feature = "sql")]
+pub mod declared_columns;
 pub mod distrib;
 #[cfg(test)]
 mod erasure_e2e;
@@ -56,6 +58,8 @@ pub mod tenant_kms;
 #[cfg(all(test, feature = "sql"))]
 mod tests;
 pub mod traces_ingest;
+pub mod typed_attr_config;
+pub mod typed_attr_metrics;
 pub mod wire_byte_count;
 
 use std::net::SocketAddr;
@@ -335,6 +339,17 @@ pub struct ServerConfig {
     /// result to `RlogWriter::with_indexed_fields`. This is the one production
     /// call site that reads the configuration.
     pub indexed_fields: crate::postings_config::IndexedFieldConfig,
+    /// Per-tenant declared typed attribute columns for the `logs` SQL table
+    /// (ADR-0090 decision 1), resolved from `--typed-attr-column` /
+    /// `--typed-attr-column-tenant`. [`start`] wraps it in a
+    /// `TenantConfigDeclaredColumns` cache-aside overlay (so a durable
+    /// `TenantConfig.typed_attr_columns` override applies per tenant without a
+    /// restart) and installs that on the shared `SqlExecutor`, which is the one
+    /// production call site that reads it. Empty by default: a deployment that
+    /// passes neither flag and writes no durable override serves every tenant
+    /// the `logs` table's zero-declaration base schema, exactly as before these
+    /// flags existed.
+    pub typed_attr_columns: crate::typed_attr_config::TypedAttrColumnConfig,
     /// `--disable-cache`: turn off every ADR-0046 read cache in the process,
     /// not just the fetcher cache. `main` sets it from
     /// `Cli::disable_cache`, the same flag `store::build_cache` reads to return
@@ -1149,6 +1164,13 @@ pub async fn start(
     // no SQL surface.
     #[cfg(feature = "sql")]
     let mut sweep_sql_executor: Option<Arc<ravel_sql::SqlExecutor>> = None;
+    // The declared-typed-attribute-column overlay (ADR-0090 decision 2) the
+    // same sweep evicts idle per-tenant cache entries from. Assigned in the
+    // query block below beside the executor it is installed on; `None` in a
+    // mode that builds no SQL surface.
+    #[cfg(feature = "sql")]
+    let mut sweep_declared_columns: Option<Arc<declared_columns::TenantConfigDeclaredColumns>> =
+        None;
 
     // The alert evaluator runs in exactly the modes that build a query engine:
     // a rule is a query, and a gateway-only or maintain-only process has
@@ -1232,6 +1254,25 @@ pub async fn start(
             // ravel_catalog_isolation_breach_total, ADR-0050 section 2,
             // counts breaches hit through either path) but nothing else:
             // the SQL path builds its own session per query.
+            // The real, TenantConfig-backed source of each tenant's declared
+            // typed attribute columns (ADR-0090 decision 2): the CLI-derived
+            // declaration as the base, overlaid cache-aside with the durable
+            // per-tenant override, resolved once per plan by the executor. One
+            // instance, installed on the one shared executor, so the HTTP and
+            // Flight SQL surfaces resolve through the same cache.
+            let declared_columns = Arc::new(declared_columns::TenantConfigDeclaredColumns::new(
+                config.typed_attr_columns.clone(),
+                store.clone(),
+            ));
+            if !config.typed_attr_columns.declares_nothing() {
+                tracing::info!(
+                    default_columns = %crate::typed_attr_config::TypedAttrColumnConfig::render(
+                        config.typed_attr_columns.default_columns()
+                    ),
+                    "declared typed attribute columns resolved for the logs SQL table"
+                );
+            }
+            sweep_declared_columns = Some(declared_columns.clone());
             let state = query::build_sql_state(
                 catalog.clone(),
                 store.clone(),
@@ -1247,6 +1288,7 @@ pub async fn start(
                 config.query_budgets.sql_tenant_max_bytes,
                 query_accounting.clone(),
                 query_admission.clone(),
+                Some(declared_columns),
             )?;
             alert_sql_executor = Some(state.executor.clone());
             // The same executor the idle-tenant sweep evicts idle accountants
@@ -1901,6 +1943,10 @@ pub async fn start(
         #[cfg(feature = "sql")]
         if let Some(executor) = sweep_sql_executor {
             evictors.push(executor);
+        }
+        #[cfg(feature = "sql")]
+        if let Some(overlay) = sweep_declared_columns {
+            evictors.push(overlay);
         }
         idle_tenant_state::spawn(evictors, config.idle_tenant_state_ttl)
     };

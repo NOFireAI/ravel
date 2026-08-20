@@ -83,6 +83,20 @@ ravel-query = { workspace = true }
 # LIST) needs the same async-trait the trait itself uses. Already a workspace
 # pin; adds no new external crate.
 async-trait = { workspace = true }
+# The ADR-0090 reachability test (tests/typed_attr_column_reachability_e2e.rs)
+# drives a real `POST /api/v1/sql` request through ravel-server's own handler
+# and its `build_sql_state` wiring, because proving a CLI-written declaration
+# reaches a query means going through the server's declared-column source, not
+# a hand-built SqlExecutor. `sql` is the feature that compiles that surface.
+# ravel-server is a workspace path crate not listed in
+# `[workspace.dependencies]`, so it is named by path with a pinned version here,
+# exactly as ravel-sql above is; no new external crate enters Cargo.lock.
+ravel-server = { path = "../ravel-server", version = "0.9.5", features = ["sql"] }
+# The reachability test's axum request/response plumbing (the same shape
+# ravel-server's own endpoint tests use). Already resolved in this workspace's
+# dependency graph; test-only.
+axum = { workspace = true }
+tower = { workspace = true }
 # A real deployment-key file on disk for the `tenant_token` CLI tests (they
 # exercise `--deployment-key-file`, not an in-memory key). Already a
 # workspace pin; adds no new external crate.
