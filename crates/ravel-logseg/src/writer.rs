@@ -23,7 +23,7 @@ use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_
 use crate::reader::stream_attr_pairs;
 use crate::record::{
     COL_BODY, COL_SEVERITY_TEXT, ColumnValue, FIRST_DYNAMIC_COL, FieldType, LogRecord, ResolvedRow,
-    resolve_value,
+    canonical_value_bytes, resolve_value,
 };
 use crate::skip_index::{Level0Entry, SkipIndex};
 use crate::stream_dir::{StreamDir, StreamEntry};
@@ -612,15 +612,37 @@ fn resolve_row(
     let stream_ref = ref_of.get(&r.stream_id).copied().unwrap_or(0);
     let mut cols: BTreeMap<u32, ColumnValue> = BTreeMap::new();
     let mut overflow: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
+    // For each indexed name this record carries, its own occurrences split the
+    // same way the read side reconstructs them: the columnar ones (those that
+    // took a fresh dynamic-column slot, one per distinct type, each with its
+    // type byte kept alongside its value) and the overflow ones (any type,
+    // duplicates and budget overflow alike). `merged_indexed_terms` reduces
+    // these to the single occurrence `rebuild_record` + `merged_attrs` report
+    // for the name (docs/adrs/0049-rlog-postings.md amendment 2026-08-20).
+    let mut idx_cols: BTreeMap<String, Vec<(u8, ColumnValue)>> = BTreeMap::new();
+    let mut idx_overflow: BTreeMap<String, Vec<ravel_types::logstream::AttrValue>> =
+        BTreeMap::new();
     for (k, v) in &r.attrs {
         let (ty, cv) = resolve_value(v);
+        let indexed = indexed_names.contains(k.as_str());
         match column_of.get(&(k.clone(), ty.to_u8())) {
             Some(cid) if !cols.contains_key(cid) => {
+                if indexed {
+                    idx_cols
+                        .entry(k.clone())
+                        .or_default()
+                        .push((ty.to_u8(), cv.clone()));
+                }
                 cols.insert(*cid, cv);
             }
             // Overflow column, or a duplicate (name,type) already columnar this
             // row: fold into attrs_raw so no value is lost.
-            _ => overflow.push((k.clone(), v.clone())),
+            _ => {
+                if indexed {
+                    idx_overflow.entry(k.clone()).or_default().push(v.clone());
+                }
+                overflow.push((k.clone(), v.clone()));
+            }
         }
     }
     let attrs_raw = if overflow.is_empty() {
@@ -628,7 +650,8 @@ fn resolve_row(
     } else {
         Some(canonical_attr_bytes(&overflow))
     };
-    let indexed_terms = merged_indexed_terms(r, indexed_names, column_of)?;
+    let indexed_terms =
+        merged_indexed_terms(r, indexed_names, column_of, &idx_cols, &idx_overflow)?;
     Ok(ResolvedRow {
         stream_ref,
         ts_ns: r.ts_ns,
@@ -655,6 +678,13 @@ fn resolve_row(
 /// reproduced here so the writer does not depend on ravel-sql
 /// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
 ///
+/// When a record carries one indexed key more than once (any type mix), the
+/// winning occurrence is the one `rebuild_record` + `merged_attrs` will report,
+/// not a re-derived guess: see [`record_level_winners`] for the exact two-tier
+/// order (docs/adrs/0049-rlog-postings.md amendment 2026-08-20, closing issue
+/// #333). The record layer then wins over the stream (resource/scope) layer as
+/// before.
+///
 /// A field with no matching dynamic column contributes nothing. The writer
 /// gives an indexed field a column even when it appears only at stream
 /// level, so a resource-only indexed key normally does have a column to
@@ -668,37 +698,96 @@ fn merged_indexed_terms(
     r: &LogRecord,
     indexed_names: &std::collections::HashSet<&str>,
     column_of: &HashMap<(String, u8), u32>,
+    idx_cols: &BTreeMap<String, Vec<(u8, ColumnValue)>>,
+    idx_overflow: &BTreeMap<String, Vec<ravel_types::logstream::AttrValue>>,
 ) -> Result<Vec<(u32, ColumnValue)>, LogSegError> {
     if indexed_names.is_empty() {
         return Ok(Vec::new());
     }
     // Merge, restricted to indexed keys, record-wins: resource/scope pairs
-    // first, then each per-record attribute overrides in place or appends. This
-    // mirrors `merged_attrs` (resource/scope, then record attrs win).
-    let mut merged: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
+    // first, then each indexed key's record-level winner overrides in place or
+    // appends. This mirrors `merged_attrs` (resource/scope, then record attrs
+    // win). Each entry carries the type byte its value resolves to, so a
+    // record-level winner of a different type than the stream value keys its
+    // posting by the right column.
+    let mut merged: Vec<(String, (u8, ColumnValue))> = Vec::new();
     for (k, v) in stream_attr_pairs(&r.stream_attrs)? {
         if indexed_names.contains(k.as_str()) {
-            merged.push((k, v));
+            let (ty, cv) = resolve_value(&v);
+            merged.push((k, (ty.to_u8(), cv)));
         }
     }
-    for (k, v) in &r.attrs {
-        if !indexed_names.contains(k.as_str()) {
-            continue;
-        }
-        if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == k) {
-            slot.1 = v.clone();
+    for (name, winner) in record_level_winners(idx_cols, idx_overflow) {
+        if let Some(slot) = merged.iter_mut().find(|(mk, _)| *mk == name) {
+            slot.1 = winner;
         } else {
-            merged.push((k.clone(), v.clone()));
+            merged.push((name, winner));
         }
     }
     let mut out = Vec::with_capacity(merged.len());
-    for (name, value) in merged {
-        let (ty, cv) = resolve_value(&value);
-        if let Some(&cid) = column_of.get(&(name, ty.to_u8())) {
+    for (name, (ty_byte, cv)) in merged {
+        if let Some(&cid) = column_of.get(&(name, ty_byte)) {
             out.push((cid, cv));
         }
     }
     Ok(out)
+}
+
+/// The record-level winning occurrence of each indexed key this record carries,
+/// keyed by name and carrying the winner's `(type byte, value)`.
+///
+/// The winner is defined as whatever the read side already, deterministically
+/// produces: `rebuild_record` lays a record's own attributes out as its
+/// columnar entries in FIELD_DIR `(name bytes, type)`-ascending order, followed
+/// by its `attrs_raw` overflow entries in `encode_attrs`'s canonical
+/// `(key bytes, encoded value bytes)`-ascending order, and
+/// `rlog_attrs::merged_attrs` then folds that list last-wins by name. Restricted
+/// to one name, that combined order is: the columnar occurrences ascending by
+/// [`FieldType::to_u8`], then the overflow occurrences ascending by the frozen
+/// canonical encoding of the value ([`canonical_value_bytes`], which shares the
+/// exact comparator `encode_attrs` uses so the two cannot drift). The last entry
+/// of that order wins. Making the write side predict this, rather than
+/// independently pick a winner over the original write-time occurrence order the
+/// on-disk format does not preserve, is the issue #333 fix
+/// (docs/adrs/0049-rlog-postings.md amendment 2026-08-20).
+fn record_level_winners(
+    idx_cols: &BTreeMap<String, Vec<(u8, ColumnValue)>>,
+    idx_overflow: &BTreeMap<String, Vec<ravel_types::logstream::AttrValue>>,
+) -> BTreeMap<String, (u8, ColumnValue)> {
+    let mut names: BTreeSet<&String> = BTreeSet::new();
+    names.extend(idx_cols.keys());
+    names.extend(idx_overflow.keys());
+
+    let mut out: BTreeMap<String, (u8, ColumnValue)> = BTreeMap::new();
+    for name in names {
+        let mut combined: Vec<(u8, ColumnValue)> = Vec::new();
+        // Columnar occurrences first, ascending by type byte (FIELD_DIR's
+        // (name, type) sort key restricted to this one name).
+        if let Some(cols) = idx_cols.get(name) {
+            let mut cols = cols.clone();
+            cols.sort_by_key(|(ty_byte, _)| *ty_byte);
+            combined.extend(cols);
+        }
+        // Overflow occurrences next, ascending by the canonical encoding of a
+        // one-entry value set. They all share this name, so this orders by
+        // encoded value bytes exactly as `attrs_raw` stores (and the reader
+        // decodes) them.
+        if let Some(over) = idx_overflow.get(name) {
+            let mut keyed: Vec<(Vec<u8>, (u8, ColumnValue))> = over
+                .iter()
+                .map(|v| {
+                    let (ty, cv) = resolve_value(v);
+                    (canonical_value_bytes(v), (ty.to_u8(), cv))
+                })
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            combined.extend(keyed.into_iter().map(|(_, entry)| entry));
+        }
+        if let Some(winner) = combined.pop() {
+            out.insert(name.clone(), winner);
+        }
+    }
+    out
 }
 
 /// Splits row indices into block spans by record target and an estimated

@@ -131,11 +131,12 @@ impl<'a> RlogReader<'a> {
     /// to hold no record carrying the term; it is widen-only by construction
     /// (docs/adrs/0013, docs/adrs/0049 decision 7).
     ///
-    /// For a version 1 object one more arm is declined: a key that also appears
-    /// at resource or scope level anywhere in this object. A v1 POSTINGS list
-    /// indexes the per-record layer only, so an exact index over one layer
-    /// cannot prune a merged-view query that spans two. A version 2 object
-    /// indexes the merged view directly, so no arm is declined. See
+    /// A version 1 object declines POSTINGS pruning outright: its lists index
+    /// the per-record column layer only, and a record-level duplicate key (which
+    /// the v1 format records nothing about) can put the merged-view winner in a
+    /// value no posting indexes, so an exact index over one layer cannot prune a
+    /// merged-view query. A version 2 object indexes the merged view directly and
+    /// prunes normally. See [`RlogReader::scan_blocks`] and
     /// [`RlogReader::prune_postings_arms`].
     ///
     /// The separation is deliberate and load-bearing. A `prune` `Equals` on
@@ -249,37 +250,45 @@ impl<'a> RlogReader<'a> {
             // postings pruning; an unindexed or capped field on either falls
             // through to bloom + exact scan via the `Ok(None)` path below.
             //
-            // The prune-only arms need the object's POSTINGS version to know
-            // whether the stream-attribute exclusion applies (version 1) or not
-            // (version 2, whose lists already index the merged view). Building
-            // the version-2 arm set (no exclusion, hence a superset of the
-            // version-1 set) first tells us whether any postings work exists at
-            // all, so a query with no eligible arm still skips the section
-            // exactly as before.
+            // Both channels resolve to equality arms; building them first tells
+            // us whether any postings work exists at all, so a query with no
+            // eligible arm still skips the section exactly as before.
             let content_arms = self.postings_arms(&arms);
-            let prune_arms_no_exclusion = self.prune_postings_arms(&prune_arms, false);
-            if !content_arms.is_empty() || !prune_arms_no_exclusion.is_empty() {
+            let prune_arms = self.prune_postings_arms(&prune_arms);
+            if !content_arms.is_empty() || !prune_arms.is_empty() {
                 match self
                     .postings_section_verified(desc)
                     .and_then(PostingsSection::parse)
                 {
                     Ok(section) => {
-                        let prune_arms = if section.version() == POSTINGS_VERSION_V1 {
-                            self.prune_postings_arms(&prune_arms, true)
-                        } else {
-                            prune_arms_no_exclusion
-                        };
-                        let mut postings_arms = content_arms;
-                        postings_arms.extend(prune_arms);
-                        for (cid, term) in &postings_arms {
-                            match section.probe(*cid, term) {
-                                Ok(Some(blocks)) => {
-                                    let allowed: std::collections::HashSet<usize> =
-                                        blocks.iter().map(|&b| b as usize).collect();
-                                    candidates.retain(|b| allowed.contains(b));
+                        // A version 1 POSTINGS list indexes the per-record
+                        // column layer's first occurrence per type only. A
+                        // record that carries one indexed key more than once
+                        // (any type) has a merged-view winner the list can omit
+                        // -- a same-type duplicate's later value lands in
+                        // `attrs_raw`, which no posting indexes -- and a v1
+                        // object records nothing that distinguishes "had such a
+                        // duplicate" from "did not". So a v1 object declines ALL
+                        // equality pruning, on both channels, widen-only
+                        // (ADR-0013): it costs the optimization on legacy
+                        // objects, never correctness (docs/adrs/0049 amendment
+                        // 2026-08-20, issue #333). A v2 list indexes the merged
+                        // view and prunes both channels. This subsumes the old
+                        // version-1 resource/scope exclusion, which only covered
+                        // the stream-level hazard.
+                        if section.version() != POSTINGS_VERSION_V1 {
+                            let mut postings_arms = content_arms;
+                            postings_arms.extend(prune_arms);
+                            for (cid, term) in &postings_arms {
+                                match section.probe(*cid, term) {
+                                    Ok(Some(blocks)) => {
+                                        let allowed: std::collections::HashSet<usize> =
+                                            blocks.iter().map(|&b| b as usize).collect();
+                                        candidates.retain(|b| allowed.contains(b));
+                                    }
+                                    Ok(None) => {}
+                                    Err(_) => stats.postings_degraded = true,
                                 }
-                                Ok(None) => {}
-                                Err(_) => stats.postings_degraded = true,
                             }
                         }
                     }
@@ -414,34 +423,25 @@ impl<'a> RlogReader<'a> {
 
     /// Prune-only postings arms for a merged-view query.
     ///
-    /// The soundness question is whether an exact posting list can prune a
-    /// query over the merged attribute view (`ravel_sql::rlog_attrs`: the union
-    /// of a record's resource, scope, and per-record attributes, the record
-    /// winning on a key collision). The answer depends on what the object's
-    /// POSTINGS lists index, which its grammar version records:
+    /// A `prune` arm is the SQL merged-view equality pushed down over the `attrs`
+    /// column, which DataFusion re-applies exactly above the scan, so this may
+    /// only ever widen the fetch (ADR-0013). It answers, per arm, "which blocks
+    /// can hold a record whose merged `attrs[name]` equals this value", by
+    /// probing the `(name, type)` column the literal resolves to. Version
+    /// handling (a version 1 object declines pruning entirely) lives in
+    /// [`RlogReader::scan_blocks`], which knows the grammar version after parse.
     ///
-    /// - `apply_stream_exclusion == false` (a version 2 object): the lists
-    ///   index the merged view already, so probing a term is sound for every
-    ///   arm. No arm is dropped.
-    /// - `apply_stream_exclusion == true` (a version 1 object): the lists index
-    ///   the per-record layer only. `field_dir` is object-wide, so one record
-    ///   carrying a key per-record makes it an indexed column for the whole
-    ///   object, including records whose value for that key lives in their
-    ///   resource blob; those records are in no posting list, so probing the
-    ///   term would prune their block away. An exact index over one layer
-    ///   cannot prune a union over two, so when the key appears at stream level
-    ///   anywhere in this object this declines to prune it. Declining is
-    ///   widen-only (ADR-0013), which pruning wrongly is not.
-    ///
-    /// Only the prune channel needs the exclusion. A `content` arm is the
-    /// caller's own exact per-record predicate ([`RlogReader::postings_arms`]),
-    /// so pruning it to the records that carry the term per-record is precisely
-    /// right regardless of version.
-    fn prune_postings_arms(
-        &self,
-        arms: &[&Predicate],
-        apply_stream_exclusion: bool,
-    ) -> Vec<(u32, Vec<u8>)> {
+    /// One arm is declined here regardless of version: a `Str` literal on a name
+    /// that also has a non-`Str` column. SQL's `attrs` is `Map(Utf8, Utf8)`, so
+    /// `attrs['k'] = 'v'` arrives as a `Str` literal, but a value of another
+    /// type that stringifies to the same text is a merged-view match too and
+    /// lives in a different column's postings. POSTINGS terms are bit-exact per
+    /// type, never stringified, so probing only the `(name, Str)` column would
+    /// prune away a block whose match is, say, an `I64` value with that text.
+    /// Declining is widen-only; the exact SQL residual still filters. This is a
+    /// distinct hazard from the duplicate-occurrence fold order (issue #333):
+    /// the term written is right, the column probed is wrong.
+    fn prune_postings_arms(&self, arms: &[&Predicate]) -> Vec<(u32, Vec<u8>)> {
         let mut out = Vec::new();
         for a in arms {
             if let Predicate::Equals {
@@ -449,10 +449,10 @@ impl<'a> RlogReader<'a> {
                 value,
             } = a
             {
-                if apply_stream_exclusion && self.name_in_stream_attrs(name) {
+                let (ty, cv) = resolve_value(value);
+                if ty == FieldType::Str && self.name_has_non_str_column(name) {
                     continue;
                 }
-                let (ty, cv) = resolve_value(value);
                 if let Some(entry) = self.field_dir.column(name, ty) {
                     out.push((entry.column_id, term_key(&cv)));
                 }
@@ -461,18 +461,15 @@ impl<'a> RlogReader<'a> {
         out
     }
 
-    /// Whether `name` appears as a resource or scope attribute of any stream in
-    /// this object. A blob that fails to decode counts as "present", so a
-    /// corrupt STREAM_DIR declines to prune rather than pruning on a partial
-    /// read.
-    fn name_in_stream_attrs(&self, name: &str) -> bool {
-        self.stream_dir
+    /// Whether `name` has any dynamic column of a type other than `Str` in this
+    /// object. A `Str`-literal merged-view prune on such a name is unsound
+    /// (a non-`Str` value can stringify to the same text yet sit in a different
+    /// column's postings), so [`RlogReader::prune_postings_arms`] declines it.
+    fn name_has_non_str_column(&self, name: &str) -> bool {
+        self.field_dir
             .entries()
             .iter()
-            .any(|e| match stream_attr_names(&e.blob) {
-                Ok(names) => names.iter().any(|n| n == name),
-                Err(_) => true,
-            })
+            .any(|e| e.name == name && e.ty != FieldType::Str)
     }
 
     /// The bloom column id for a string field selector, if one exists.
@@ -1100,9 +1097,8 @@ fn phrase_match(value: &[u8], word: &str) -> bool {
 /// [`crate::record::stream_attrs_bytes`]); the two length-prefixed scope
 /// strings are positional, not key-value entries, so they are skipped over.
 ///
-/// Shared by [`stream_attr_names`] (which drops the values) and the writer's
-/// merged-view POSTINGS accumulation (which keeps them, to index the union of
-/// a record's stream and per-record attributes). Kept in this crate so the
+/// Used by the writer's merged-view POSTINGS accumulation (to index the union
+/// of a record's stream and per-record attributes). Kept in this crate so the
 /// merge does not depend on `ravel-sql`
 /// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
 pub(crate) fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
@@ -1120,14 +1116,6 @@ pub(crate) fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>,
     }
     pairs.extend(decode_attr_set(blob, &mut pos, 0)?);
     Ok(pairs)
-}
-
-/// The attribute names a STREAM_DIR blob carries, at resource and scope level.
-fn stream_attr_names(blob: &[u8]) -> Result<Vec<String>, LogSegError> {
-    Ok(stream_attr_pairs(blob)?
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect())
 }
 
 fn decode_canonical_attrs(bytes: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
@@ -2029,48 +2017,336 @@ mod tests {
         assert!(!stats.postings_degraded);
     }
 
-    /// A version 1 object still reads and still prunes: for a key that is NOT at
-    /// stream level, the conservative rule does not fire, so the per-record
-    /// index prunes exactly as it did before the amendment. Built by pinning the
-    /// version byte in a fixture.
+    /// A version 1 object declines POSTINGS pruning outright, even for a key
+    /// that is NOT at stream level and carries no duplicates: the v1 grammar
+    /// records nothing that could prove a record-level duplicate was absent, so
+    /// the reader cannot know its per-record-layer index is complete, and
+    /// declines rather than risk dropping a merged-view match (widen-only,
+    /// ADR-0013; docs/adrs/0049 amendment 2026-08-20). It still reads back every
+    /// record; the identical v2 object below prunes, proving the decline is a
+    /// version choice, not a missing index. Built by pinning the version byte in
+    /// a fixture.
     #[test]
-    fn version_1_object_prunes_key_not_at_stream_level() {
+    fn version_1_object_declines_all_equality_pruning() {
         let cfg = RlogConfig {
             block_target_records: 5,
             ..RlogConfig::default()
         };
-        // `svc` is per-record only (never a resource/scope attribute), 12 blocks
-        // cycling 3 values, so a probe for one value prunes to 4 blocks. For
-        // this key the v1 and v2 posting lists are identical, so downgrading the
-        // version byte faithfully models a real v1 object.
+        // `svc` is per-record only, 12 blocks cycling 3 values.
         let mut recs = Vec::new();
         for i in 0..60i64 {
             let block = i / 5;
             recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
         }
-        let obj = downgrade_postings_to_v1(&build_indexed(cfg, recs, &["svc"]));
-        let reader = RlogReader::new(&obj, &cfg).expect("open");
-
+        let v2 = build_indexed(cfg, recs, &["svc"]);
         let prune = [Predicate::Equals {
             field: FieldSel::Attr("svc".into()),
             value: AttrValue::Str("s0".into()),
         }];
+
+        // v2 prunes to the 4 blocks that carry "s0".
+        let reader = RlogReader::new(&v2, &cfg).expect("open v2");
+        let (_rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(stats.blocks_after_postings, 4, "v2 prunes");
+
+        // The same object read as v1 declines: no block is pruned, and every
+        // record still reads back (content is match-all here).
+        let v1 = downgrade_postings_to_v1(&v2);
+        let reader = RlogReader::new(&v1, &cfg).expect("open v1");
         let (rows, stats) = reader
             .scan_pruned(&Predicate::And(Vec::new()), &prune)
             .expect("scan");
         assert_eq!(stats.blocks_total, 12);
-        assert_eq!(stats.blocks_after_postings, 4);
-        assert_eq!(stats.blocks_scanned, 4);
+        assert_eq!(
+            stats.blocks_after_postings, stats.blocks_after_skip,
+            "v1 declines to prune"
+        );
+        assert_eq!(rows.len(), 60, "every record survives");
         assert!(!stats.postings_degraded);
-        // Reads back the pruned rows correctly.
-        assert!(rows.iter().all(|r| (r.ts_ns / 5) % 3 == 0));
     }
 
-    /// A version 1 object declines to prune a key that appears at stream level:
-    /// its posting list indexes the per-record layer only, so an exact index
-    /// over one layer cannot prune a merged-view query over two. Every record
-    /// the merged view matches is returned, and no block is pruned. This is the
-    /// conservative behaviour version 2 replaces
+    /// Step-4 regression for issue #333: a v1-grammar object carrying a
+    /// cross-type duplicate-key record must decline to prune, returning the row
+    /// a wrong v1 prune would drop. The record has `dur = I64(5)` and
+    /// `dur = Str("x")`; its merged-view winner is the reconstruction-order last
+    /// occurrence, `I64(5)` (`Str` type byte < `I64`, so the `(dur, Str)` column
+    /// sorts first and `(dur, I64)` last). A v2 posting therefore lists this
+    /// block only under `(dur, I64) = 5`. Downgrading the version byte models a
+    /// v1 object; under v1 the reader declines all equality pruning, so a prune
+    /// on `Str("x")` -- which resolves to the `(dur, Str)` column whose posting
+    /// is empty and would otherwise drop the block -- keeps it.
+    #[test]
+    fn version_1_object_with_cross_type_duplicate_declines_to_prune() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut r = rec(0, 0, "msg");
+        r.attrs.push(("dur".into(), AttrValue::I64(5)));
+        r.attrs.push(("dur".into(), AttrValue::Str("x".into())));
+        let obj = downgrade_postings_to_v1(&build_indexed(cfg, vec![r], &["dur"]));
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // A prune whose literal resolves to the empty (dur, Str) posting would
+        // drop the only block if v1 pruned; declining keeps it.
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("dur".into()),
+            value: AttrValue::Str("x".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(rows.len(), 1, "v1 declines: the row survives");
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// The `attrs` merged view a query sees for one record, duplicating
+    /// `ravel_sql::rlog_attrs::merged_attrs` inline (a test dependency on
+    /// ravel-sql would be a dependency cycle): its decoded stream (resource +
+    /// scope) attributes, then its own attributes folded last-wins by name.
+    /// Operates on a record already reconstructed by `rebuild_record` (i.e. one
+    /// returned by `scan`), so its `attrs` are in on-disk reconstruction order.
+    fn merged_attrs_local(r: &LogRecord) -> Vec<(String, AttrValue)> {
+        let mut merged = stream_attr_pairs(&r.stream_attrs).expect("decode stream_attrs");
+        for (k, v) in &r.attrs {
+            if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == k) {
+                slot.1 = v.clone();
+            } else {
+                merged.push((k.clone(), v.clone()));
+            }
+        }
+        merged
+    }
+
+    /// Decodes an object's FIELD_DIR.
+    fn field_dir_of(obj: &[u8]) -> FieldDir {
+        let cfg = RlogConfig::default();
+        let footer = open(obj).expect("open");
+        let desc = footer.section(kind::FIELD_DIR).expect("field_dir");
+        let raw = read_section(obj, desc, &cfg).expect("read field_dir");
+        FieldDir::decode(&raw, 1 << 20).expect("decode field_dir")
+    }
+
+    /// The POSTINGS section bytes of an object, for a `PostingsSection::parse`.
+    fn postings_bytes_of(obj: &[u8]) -> Vec<u8> {
+        let footer = open(obj).expect("open");
+        let desc = footer.section(kind::POSTINGS).expect("postings");
+        obj[desc.offset as usize..(desc.offset + desc.len) as usize].to_vec()
+    }
+
+    /// Issue #333 repro 1 (cross-type duplicate). A record carrying `dur = I64(5)`
+    /// then `dur = Str("x")`, with `dur` indexed. The read-side merged view is
+    /// the reconstruction-order last occurrence: `Str` type byte (1) sorts before
+    /// `I64` (2), so `rebuild_record` lays out `(dur, Str) = "x"` then
+    /// `(dur, I64) = 5`, and `merged_attrs` folds to `I64(5)`. Before the fix the
+    /// writer folded over write-time order and chose `Str("x")`, leaving the
+    /// `(dur, I64)` posting empty, so a prune on `I64(5)` dropped the block. It
+    /// must now keep it.
+    #[test]
+    fn issue_333_cross_type_duplicate_prune_keeps_row() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut r = rec(0, 0, "msg");
+        r.attrs.push(("dur".into(), AttrValue::I64(5)));
+        r.attrs.push(("dur".into(), AttrValue::Str("x".into())));
+        let obj = build_indexed(cfg, vec![r], &["dur"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("dur".into()),
+            value: AttrValue::I64(5),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the merged view returns dur=I64(5); the prune must not drop its block"
+        );
+        assert!(!stats.postings_degraded);
+
+        // Directly: the (dur, I64) posting lists this block for term 5.
+        let fd = field_dir_of(&obj);
+        let cid = fd
+            .column("dur", FieldType::I64)
+            .expect("(dur, I64) column")
+            .column_id;
+        let pd = postings_bytes_of(&obj);
+        let section = PostingsSection::parse(&pd).expect("parse postings");
+        assert_eq!(
+            section
+                .probe(cid, &term_key(&resolve_value(&AttrValue::I64(5)).1))
+                .expect("probe"),
+            Some(vec![0]),
+            "the winning I64(5) value must be the indexed term"
+        );
+    }
+
+    /// Issue #333 repro 2 (cross-type stringification). Two single-record blocks,
+    /// `dur = I64(5)` and `dur = Str("q")`, `dur` indexed. This is not about
+    /// duplicates: it is the reader resolving a `Str` prune literal only against
+    /// the `(dur, Str)` column. A prune on the I64 value keeps the I64 block; a
+    /// prune on `Str("5")` must NOT drop the I64 block, because `I64(5)`
+    /// stringifies to `"5"` in the merged view and would match. The fix declines
+    /// a `Str`-literal prune on a name that also has a non-`Str` column.
+    #[test]
+    fn issue_333_cross_type_stringification_prune_does_not_overprune() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut r0 = rec(0, 0, "msg");
+        r0.attrs.push(("dur".into(), AttrValue::I64(5)));
+        let mut r1 = rec(0, 1, "msg");
+        r1.attrs.push(("dur".into(), AttrValue::Str("q".into())));
+        let obj = build_indexed(cfg, vec![r0, r1], &["dur"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // A prune on the I64 value keeps the I64 record's block.
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("dur".into()),
+            value: AttrValue::I64(5),
+        }];
+        let (rows, _stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert!(
+            rows.iter().any(|r| r.ts_ns == 0),
+            "an I64 prune must keep the I64 record's block"
+        );
+
+        // A Str("5") prune must not drop the I64 block: I64(5) stringifies to
+        // "5" and is a merged-view match. The reader declines the arm.
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("dur".into()),
+            value: AttrValue::Str("5".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert!(
+            rows.iter().any(|r| r.ts_ns == 0),
+            "a Str('5') prune must not drop the block holding I64(5), which stringifies to '5'"
+        );
+        assert_eq!(
+            stats.blocks_after_postings, stats.blocks_after_skip,
+            "the cross-type Str arm is declined, not pruned on"
+        );
+        assert!(!stats.postings_degraded);
+    }
+
+    /// The general differential test for issue #333: for varied duplicate-key
+    /// shapes, the POSTINGS term the writer chose for an indexed name must equal
+    /// what a full write-then-read round trip through `rebuild_record` (via
+    /// `scan`) and `merged_attrs` (via [`merged_attrs_local`]) reports. Each
+    /// shape is written as its own one-record object, so the block index is
+    /// trivially 0 and the probe assertion is exact. This proves the fix in
+    /// general, not just for the two known repros, and checks write against an
+    /// independent read path rather than against the writer's own algorithm.
+    #[test]
+    fn issue_333_write_side_winner_matches_read_side_merged_view() {
+        // Each shape: the record's per-record attrs (dur duplicated variously),
+        // plus an optional resource-level dur to exercise layer precedence.
+        struct Shape {
+            name: &'static str,
+            record_attrs: Vec<AttrValue>,
+            resource_dur: Option<AttrValue>,
+        }
+        let shapes = vec![
+            Shape {
+                name: "two same type",
+                record_attrs: vec![AttrValue::I64(5), AttrValue::I64(6)],
+                resource_dur: None,
+            },
+            Shape {
+                name: "three same type, encoded order != write order",
+                record_attrs: vec![AttrValue::I64(3), AttrValue::I64(10), AttrValue::I64(7)],
+                resource_dur: None,
+            },
+            Shape {
+                name: "two different types",
+                record_attrs: vec![AttrValue::I64(5), AttrValue::Str("x".into())],
+                resource_dur: None,
+            },
+            Shape {
+                name: "three different types",
+                record_attrs: vec![
+                    AttrValue::Str("s".into()),
+                    AttrValue::Bool(true),
+                    AttrValue::I64(42),
+                ],
+                resource_dur: None,
+            },
+            Shape {
+                name: "duplicate plus resource-level same name",
+                record_attrs: vec![AttrValue::I64(5), AttrValue::I64(9)],
+                resource_dur: Some(AttrValue::Str("R".into())),
+            },
+        ];
+
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        for shape in &shapes {
+            let mut r = rec(0, 0, "msg");
+            if let Some(rd) = &shape.resource_dur {
+                r.stream_attrs = crate::record::stream_attrs_bytes(
+                    &[
+                        ("service.name".into(), AttrValue::Str("svc0".into())),
+                        ("dur".into(), rd.clone()),
+                    ],
+                    "scope",
+                    "1",
+                    &[],
+                );
+            }
+            for v in &shape.record_attrs {
+                r.attrs.push(("dur".into(), v.clone()));
+            }
+            let obj = build_indexed(cfg, vec![r], &["dur"]);
+            let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+            // Read side: reconstruct the record and compute the merged value.
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            assert_eq!(rows.len(), 1, "{}", shape.name);
+            let merged = merged_attrs_local(&rows[0]);
+            let value = merged
+                .iter()
+                .find(|(k, _)| k == "dur")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{}: merged view has dur", shape.name));
+            let (ty, cv) = resolve_value(&value);
+
+            // Write side: the POSTINGS term for dur must be exactly that value.
+            let fd = field_dir_of(&obj);
+            let cid = fd
+                .column("dur", ty)
+                .unwrap_or_else(|| panic!("{}: (dur, {ty:?}) column exists", shape.name))
+                .column_id;
+            let pd = postings_bytes_of(&obj);
+            let section = PostingsSection::parse(&pd).expect("parse postings");
+            assert_eq!(
+                section.probe(cid, &term_key(&cv)).expect("probe"),
+                Some(vec![0]),
+                "{}: write-side POSTINGS term must equal the read-side merged winner {value:?}",
+                shape.name
+            );
+        }
+    }
+
+    /// A version 1 object declines to prune (here for a key that also appears at
+    /// stream level, one of the hazards): a v1 posting list indexes the
+    /// per-record layer only, so an exact index over one layer cannot prune a
+    /// merged-view query over two. Every record the merged view matches is
+    /// returned, and no block is pruned. This is the conservative behaviour
+    /// version 2 replaces
     /// (see [`prune_must_not_drop_a_resource_only_match_when_the_key_is_also_a_column`]).
     #[test]
     fn version_1_object_declines_to_prune_key_at_stream_level() {
