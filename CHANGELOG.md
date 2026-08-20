@@ -6,6 +6,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0]
+
+The metrics segment format moves to RSEG v7 and the L1 compactor stops
+copying runs verbatim. Measured over 500 series at a 15-second scrape, an
+L1 object falls from 26.52 to 8.88 bytes per sample, a 2.99x reduction.
+
 ### Changed
 
 - RSEG segment format bumped to v7 (ADR-0092). v7 is v6 plus three additive
@@ -22,6 +28,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deleted in the same change. The reader accepts trailer `version = 7` only and
   fails closed on any other version, including a stray v6 object, with a typed
   `UnsupportedVersion`. There is no v6 reader and no v6-to-v7 migration path.
+- L1 compaction merges runs instead of preserving them verbatim (ADR-0092,
+  reversing ADR-0018's choice). An L1 object now holds one run per series
+  rather than one run per input object per series, carrying each sample's
+  dedup key in v7's per-sample provenance columns so late duplicates still
+  resolve exactly. A series with a single contributing run keeps its bytes
+  and carries no column, so an L0 flush is unchanged. Part splitting now
+  accumulates encoded output bytes rather than predicted input bytes, since
+  per-page codec selection makes output size a function of the data's shape.
+
+### Known limitations
+
+- A run-merged series cannot be executed over the distributed query path.
+  `ravel.queryfrag.v1`'s `Run` message carries run-wide dedup provenance
+  only, so a distributed fetch would resolve an overlapping timestamp to a
+  different winner than the same query run locally. The worker refuses the
+  merged shape and the coordinator falls back to local execution, which is
+  exact. Any query touching run-merged L1 therefore loses read fan-out until
+  the wire format carries per-sample provenance (#348). Results stay correct;
+  the cost is parallelism.
 
 ## [0.9.5]
 
