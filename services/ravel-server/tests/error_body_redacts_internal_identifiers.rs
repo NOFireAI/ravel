@@ -146,6 +146,7 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
         max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
         scrub_period: std::time::Duration::from_secs(7 * 86_400),
         indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,

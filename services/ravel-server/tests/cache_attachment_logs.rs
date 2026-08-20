@@ -213,6 +213,7 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
+        None,
     )
     .expect("sql state");
     // Freeze the clock so the epoch-start window resolves to an ordinary

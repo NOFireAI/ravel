@@ -342,6 +342,17 @@ async fn main() -> anyhow::Result<()> {
         default_fields = ?indexed_fields.default_fields(),
         "POSTINGS indexed-field defaults resolved"
     );
+    // Per-tenant declared typed attribute columns for the logs SQL table
+    // (ADR-0090 decision 1). Validated here, on the same rules a durable write
+    // is held to (ravel_catalog::validate_typed_attr_columns), so an empty key,
+    // a duplicate, a conflicting type, or a collision with a fixed logs column
+    // fails startup rather than silently declaring a schema the operator did
+    // not ask for. `ravel_server::start` wraps this in the cache-aside overlay
+    // that resolves each query's declaration.
+    let typed_attr_columns = ravel_server::typed_attr_config::TypedAttrColumnConfig::from_policy(
+        cli.parse_typed_attr_column_policy()?,
+    )
+    .context("failed to parse --typed-attr-column / --typed-attr-column-tenant")?;
     if !alert_rules.is_empty() && alert_sinks.is_empty() {
         tracing::info!(
             "alert rules are configured but no sink is: transitions will be written as durable \
@@ -447,6 +458,7 @@ async fn main() -> anyhow::Result<()> {
             .parse_scrub_period()
             .context("failed to parse --scrub-period")?,
         indexed_fields,
+        typed_attr_columns,
         disable_cache: cli.disable_cache,
         cache_max_bytes: cli.cache_max_bytes,
         ingest_concurrency_limit: cli

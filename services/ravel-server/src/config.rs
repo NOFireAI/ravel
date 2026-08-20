@@ -11,6 +11,9 @@ use ravel_types::{TenantHash, TenantId};
 
 use crate::alert_sink::{AlertSink, Credential};
 use crate::postings_config::IndexedFieldPolicy;
+use crate::typed_attr_config::{
+    DECLARED_TYPE_SPELLINGS, TypedAttrColumnPolicy, parse_declared_column_type,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
@@ -210,6 +213,31 @@ pub struct Cli {
     /// `--retention-tenant` overrides `--retention-default`.
     #[arg(long = "indexed-field-tenant", value_name = "TENANT=FIELDS")]
     pub indexed_field_tenants: Vec<String>,
+
+    /// Declared typed attribute column for the `logs` SQL table (ADR-0090
+    /// decision 1), as a repeatable `--typed-attr-column KEY:TYPE` (e.g.
+    /// `--typed-attr-column http.duration_ms:i64`). The declared key becomes a
+    /// native typed SQL column named exactly `KEY` (double-quote it in SQL if
+    /// it contains `.` or uppercase characters), in addition to still appearing
+    /// in the `attrs` map. `TYPE` is one of `str`, `i64`, `bool`, `bytes`,
+    /// case-insensitive; `f64`, date, and timestamp are deferred by ADR-0090.
+    /// This is the process-wide default, applied to every tenant with no
+    /// per-tenant override and no durable `TenantConfig.typed_attr_columns`
+    /// override. Unset means zero declared columns: there is no shipped
+    /// default declaration, because a declared column changes the SQL schema a
+    /// tenant's queries see.
+    #[arg(long = "typed-attr-column", value_name = "KEY:TYPE")]
+    pub typed_attr_columns: Vec<String>,
+
+    /// Repeatable per-tenant declared typed attribute column,
+    /// `TENANT:KEY:TYPE` (e.g. `--typed-attr-column-tenant
+    /// acme:http.duration_ms:i64`). Every flag naming the same tenant
+    /// accumulates into that tenant's one ordered declaration, in flag order;
+    /// a tenant with any override declares exactly those columns and does NOT
+    /// inherit the `--typed-attr-column` default (a total override, matching
+    /// how `--indexed-field-tenant` overrides `--indexed-field`).
+    #[arg(long = "typed-attr-column-tenant", value_name = "TENANT:KEY:TYPE")]
+    pub typed_attr_column_tenants: Vec<String>,
 
     /// Path to the JSON alert-rules file (ADR-0043 decision 2). Alert
     /// evaluation is off unless this names a file with at least one rule. A
@@ -1252,6 +1280,56 @@ impl Cli {
             tenants.push((tenant.to_string(), list));
         }
         Ok(IndexedFieldPolicy { default, tenants })
+    }
+
+    /// Build the raw [`TypedAttrColumnPolicy`] from the repeatable
+    /// `--typed-attr-column KEY:TYPE` and `--typed-attr-column-tenant
+    /// TENANT:KEY:TYPE` (ADR-0090 decision 1).
+    ///
+    /// This resolves the flag *syntax* and the type spelling; the declaration
+    /// rules (empty key, duplicate key, the same key with two types, a
+    /// collision with one of the nine fixed logs SQL columns) are checked by
+    /// [`TypedAttrColumnConfig::from_policy`](crate::typed_attr_config::TypedAttrColumnConfig::from_policy),
+    /// which calls `ravel_catalog::validate_typed_attr_columns` -- the same
+    /// function guarding a durable write -- so the flags and the durable record
+    /// are held to identical rules. `main` calls both, so any violation fails
+    /// startup, never a silent partial parse. The same deferral of validation to
+    /// `from_policy` that `parse_indexed_field_policy` uses.
+    ///
+    /// A key may itself contain `:` (the type is split off the right), but a
+    /// tenant id may not (the tenant is split off the left). Repeated
+    /// `--typed-attr-column-tenant` flags for one tenant accumulate in flag
+    /// order into that tenant's single declaration.
+    pub fn parse_typed_attr_column_policy(&self) -> anyhow::Result<TypedAttrColumnPolicy> {
+        let mut default = Vec::with_capacity(self.typed_attr_columns.len());
+        for spec in &self.typed_attr_columns {
+            default.push(parse_column_spec("--typed-attr-column", spec.trim())?);
+        }
+
+        // A Vec of (tenant, columns) rather than a map, so a tenant's
+        // declaration keeps flag order and the whole policy stays ordered.
+        let mut tenants: Vec<(String, Vec<ravel_catalog::DeclaredTypedColumn>)> = Vec::new();
+        for spec in &self.typed_attr_column_tenants {
+            let spec = spec.trim();
+            let (tenant, rest) = spec.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --typed-attr-column-tenant '{spec}', expected TENANT:KEY:TYPE"
+                )
+            })?;
+            let tenant = tenant.trim();
+            if tenant.is_empty() {
+                anyhow::bail!(
+                    "invalid --typed-attr-column-tenant '{spec}': the tenant id is empty, \
+                     expected TENANT:KEY:TYPE"
+                );
+            }
+            let column = parse_column_spec("--typed-attr-column-tenant", rest.trim())?;
+            match tenants.iter_mut().find(|(id, _)| id == tenant) {
+                Some((_, columns)) => columns.push(column),
+                None => tenants.push((tenant.to_string(), vec![column])),
+            }
+        }
+        Ok(TypedAttrColumnPolicy { default, tenants })
     }
 
     /// Build the alert sink list from the unauthenticated `--alert-webhook-url`
@@ -2320,6 +2398,37 @@ fn parse_gc_duration_ns(flag: &str, s: &str) -> anyhow::Result<i64> {
     Ok(ns)
 }
 
+/// Parse one `KEY:TYPE` declared-column spec (ADR-0090 decision 1), the shared
+/// right-hand side of `--typed-attr-column` and `--typed-attr-column-tenant`.
+///
+/// Split on the LAST `:`, so an attribute key may itself contain a colon; the
+/// type spelling never does. An unknown type spelling names what is accepted,
+/// because a silently-dropped declaration is a query that fails with an
+/// unknown-column error at some later point instead of at startup. An empty key
+/// is caught here too, with the flag named, rather than only by
+/// `validate_typed_attr_columns` later: the error is more useful when it can
+/// quote the spec the operator typed.
+fn parse_column_spec(flag: &str, spec: &str) -> anyhow::Result<ravel_catalog::DeclaredTypedColumn> {
+    let (key, ty) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid {flag} '{spec}', expected KEY:TYPE"))?;
+    let key = key.trim();
+    if key.is_empty() {
+        anyhow::bail!("invalid {flag} '{spec}': the attribute key is empty, expected KEY:TYPE");
+    }
+    let ty = parse_declared_column_type(ty).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid {flag} '{spec}': unknown declared type '{}', expected one of {}",
+            ty.trim(),
+            DECLARED_TYPE_SPELLINGS.join(", ")
+        )
+    })?;
+    Ok(ravel_catalog::DeclaredTypedColumn {
+        key: key.to_string(),
+        ty,
+    })
+}
+
 /// Reject a sink URL that is empty or not HTTP(S) at startup rather than
 /// logging a delivery failure once a minute forever.
 fn validated_sink_url<'a>(flag: &str, url: &'a str) -> anyhow::Result<&'a str> {
@@ -3107,6 +3216,7 @@ pub mod limits {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_catalog::DeclaredTypedColumn;
     use ravel_ingest::{CountLimit, RateLimit};
 
     /// `RemoteClusterConfig`'s `Debug` must never print the bearer credential:
@@ -4134,6 +4244,196 @@ mod tests {
             err.to_string().contains("--indexed-field-tenant"),
             "error names the flag: {err}"
         );
+    }
+
+    // ---- --typed-attr-column / --typed-attr-column-tenant (ADR-0090) -------
+
+    /// The declaration these flags parse into, resolved and validated the way
+    /// `main` does it: parse, then `TypedAttrColumnConfig::from_policy`, which
+    /// is where `ravel_catalog::validate_typed_attr_columns` runs.
+    fn typed_attr_config(
+        args: &[&str],
+    ) -> anyhow::Result<crate::typed_attr_config::TypedAttrColumnConfig> {
+        let policy = cli(args).parse_typed_attr_column_policy()?;
+        Ok(crate::typed_attr_config::TypedAttrColumnConfig::from_policy(policy)?)
+    }
+
+    fn declared(key: &str, ty: ravel_catalog::DeclaredColumnType) -> DeclaredTypedColumn {
+        DeclaredTypedColumn {
+            key: key.to_string(),
+            ty,
+        }
+    }
+
+    #[test]
+    fn absent_typed_attr_column_flags_declare_nothing() {
+        let config = typed_attr_config(&[]).expect("absent flags are not an error");
+        assert!(
+            config.declares_nothing(),
+            "there is no shipped default declaration"
+        );
+        assert!(config.columns_for(&TenantId::new("acme").hash()).is_empty());
+    }
+
+    #[test]
+    fn typed_attr_column_flags_parse_default_and_per_tenant_overrides() {
+        use ravel_catalog::DeclaredColumnType as T;
+        let config = typed_attr_config(&[
+            "--typed-attr-column",
+            "http.duration_ms:i64",
+            "--typed-attr-column",
+            "cache.hit:BOOL",
+            "--typed-attr-column-tenant",
+            "acme:http.route:str",
+            "--typed-attr-column-tenant",
+            "acme:payload:bytes",
+            "--typed-attr-column-tenant",
+            "globex:retries:i64",
+        ])
+        .expect("valid flags parse");
+
+        assert_eq!(
+            config.default_columns(),
+            [
+                declared("http.duration_ms", T::I64),
+                declared("cache.hit", T::Bool),
+            ],
+            "the default keeps flag order, and the type spelling is \
+             case-insensitive"
+        );
+        assert_eq!(
+            config.columns_for(&TenantId::new("acme").hash()),
+            [
+                declared("http.route", T::Str),
+                declared("payload", T::Bytes),
+            ],
+            "repeated per-tenant flags accumulate into one ordered declaration, \
+             replacing the default outright"
+        );
+        assert_eq!(
+            config.columns_for(&TenantId::new("globex").hash()),
+            [declared("retries", T::I64)]
+        );
+        assert_eq!(
+            config.columns_for(&TenantId::new("initech").hash()),
+            config.default_columns(),
+            "a tenant with no override gets the default declaration"
+        );
+    }
+
+    /// A key may contain `:` (the type is split off the right); whitespace
+    /// around the spec is trimmed the way the indexed-field flags trim theirs,
+    /// so a leading space does not declare a column nothing matches.
+    #[test]
+    fn a_colon_in_a_key_is_kept_and_whitespace_is_trimmed() {
+        use ravel_catalog::DeclaredColumnType as T;
+        let config = typed_attr_config(&[
+            "--typed-attr-column",
+            " db:table:str ",
+            "--typed-attr-column-tenant",
+            " acme : ns:key : i64 ",
+        ])
+        .expect("valid flags parse");
+        assert_eq!(config.default_columns(), [declared("db:table", T::Str)]);
+        assert_eq!(
+            config.columns_for(&TenantId::new("acme").hash()),
+            [declared("ns:key", T::I64)]
+        );
+    }
+
+    #[test]
+    fn an_unknown_declared_type_spelling_is_rejected_naming_the_alternatives() {
+        let err = typed_attr_config(&["--typed-attr-column", "dur:f64"])
+            .expect_err("f64 is deferred by ADR-0090 and must fail startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--typed-attr-column"), "names the flag: {msg}");
+        assert!(msg.contains("f64"), "quotes the bad spelling: {msg}");
+        assert!(
+            msg.contains("str, i64, bool, bytes"),
+            "lists what is accepted: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_spec_without_a_type_is_rejected() {
+        let err = typed_attr_config(&["--typed-attr-column", "dur"])
+            .expect_err("a missing ':TYPE' fails startup");
+        assert!(
+            err.to_string().contains("expected KEY:TYPE"),
+            "error says what the flag expects: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_key_is_rejected() {
+        let err = typed_attr_config(&["--typed-attr-column", ":i64"])
+            .expect_err("an empty key fails startup");
+        assert!(
+            err.to_string().contains("the attribute key is empty"),
+            "error names the empty key: {err}"
+        );
+    }
+
+    #[test]
+    fn a_typed_attr_column_tenant_without_a_tenant_is_rejected() {
+        let missing = typed_attr_config(&["--typed-attr-column-tenant", "dur:i64"])
+            .expect_err("'dur:i64' has no tenant and must fail startup");
+        // Split on the first ':' takes "dur" as the tenant, leaving "i64" as
+        // the spec, which has no type: either way it fails naming the flag.
+        assert!(
+            missing.to_string().contains("--typed-attr-column-tenant"),
+            "error names the flag: {missing}"
+        );
+        let empty_tenant = typed_attr_config(&["--typed-attr-column-tenant", ":dur:i64"])
+            .expect_err("an empty tenant id fails startup");
+        assert!(
+            empty_tenant.to_string().contains("the tenant id is empty"),
+            "error names the empty tenant: {empty_tenant}"
+        );
+    }
+
+    /// The four declaration rules are `ravel_catalog`'s, reached through
+    /// `from_policy`: a duplicate key, the same key with two types, and a
+    /// collision with a fixed logs SQL column each fail startup, and the error
+    /// says which declaration and which key.
+    #[test]
+    fn duplicate_conflicting_and_fixed_column_declarations_fail_startup() {
+        let dup = typed_attr_config(&[
+            "--typed-attr-column",
+            "dur:i64",
+            "--typed-attr-column",
+            "dur:i64",
+        ])
+        .expect_err("a duplicate key fails startup");
+        assert!(
+            dup.to_string().contains("declared more than once") && dup.to_string().contains("dur"),
+            "error names the duplicate: {dup}"
+        );
+
+        let conflicting = typed_attr_config(&[
+            "--typed-attr-column-tenant",
+            "acme:dur:i64",
+            "--typed-attr-column-tenant",
+            "acme:dur:str",
+        ])
+        .expect_err("the same key with two types fails startup");
+        assert!(
+            conflicting.to_string().contains("conflicting types"),
+            "error names the conflict: {conflicting}"
+        );
+        assert!(
+            conflicting.to_string().contains("acme"),
+            "error names the tenant whose declaration failed: {conflicting}"
+        );
+
+        for fixed in ravel_catalog::FIXED_LOGS_SQL_COLUMNS {
+            let err = typed_attr_config(&["--typed-attr-column", &format!("{fixed}:str")])
+                .expect_err("declaring a fixed logs SQL column must fail startup");
+            assert!(
+                err.to_string().contains("fixed logs SQL column"),
+                "declaring the fixed column {fixed} must fail startup: {err}"
+            );
+        }
     }
 
     #[test]

@@ -761,6 +761,7 @@ mod logs {
             ravel_query::QueryAdmissionController::shared(
                 ravel_query::QueryConcurrencyLimit::Unlimited,
             ),
+            None,
         )
         .expect("sql state");
         sql_state.clock = Arc::new(FixedQueryClock);

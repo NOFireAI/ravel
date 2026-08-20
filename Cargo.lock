@@ -4378,6 +4378,7 @@ dependencies = [
  "anyhow",
  "arrow 59.1.0",
  "async-trait",
+ "axum",
  "blake3",
  "bytes",
  "clap",
@@ -4397,6 +4398,7 @@ dependencies = [
  "ravel-query",
  "ravel-rspan",
  "ravel-segment",
+ "ravel-server",
  "ravel-sql",
  "ravel-types",
  "serde",
@@ -4405,6 +4407,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tower",
  "uuid",
 ]
 

@@ -57,6 +57,11 @@ Also live:
 - Distributed read fan-out and cross-cluster federation, off by default and
   byte-identical to local execution.
 - OTAP (OpenTelemetry Arrow) ingest, behind a cargo feature.
+- Per-tenant typed attribute columns on the `logs` SQL table: an operator
+  declares an attribute key (`ravel-cli typed-attr-column set acme
+  http.duration_ms:i64`, or the `--typed-attr-column` server flags) and it
+  becomes a native `Int64`/`Boolean`/`Utf8`/`Binary` column, so typed
+  comparisons and aggregates need no `CAST` over the stringified `attrs` map.
 
 Not there yet:
 
