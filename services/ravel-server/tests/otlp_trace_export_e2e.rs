@@ -252,6 +252,7 @@ fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
         query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
         max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
         indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,

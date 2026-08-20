@@ -18,6 +18,7 @@ pub mod reconstruct;
 pub mod store;
 pub mod tenancy;
 pub mod tenant_token;
+pub mod typed_attr_column;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

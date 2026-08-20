@@ -87,6 +87,10 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Hold { .. }
         | Command::Erase { .. }
         | Command::Provision { .. }
+        // The tenant config record lives at `t/<tenant_hash>/config`, so
+        // typed-attr-column hashes a tenant (unlike gc-config, whose object is
+        // at the bucket root).
+        | Command::TypedAttrColumn { .. }
         | Command::Load { .. } => true,
         // `commit reconstruct` computes a `t/<tenant_hash>/` prefix from its
         // `--tenant`, so it needs the bucket's scheme resolved first; the
@@ -177,6 +181,15 @@ enum Command {
     GcConfig {
         #[command(subcommand)]
         command: GcConfigCommand,
+    },
+    /// Show or set a tenant's durable declared typed attribute columns for the
+    /// `logs` SQL table (ADR-0090 decision 1), in
+    /// `TenantConfig.typed_attr_columns` at `t/<tenant_hash>/config`. A
+    /// query-serving process picks a change up within its declared-column
+    /// staleness horizon; no restart is needed.
+    TypedAttrColumn {
+        #[command(subcommand)]
+        command: TypedAttrColumnCommand,
     },
     /// Manage the durable deployment-wide bearer-token map `sys/auth`
     /// (ADR-0072 decision 4): the writer of `sys/auth`.
@@ -269,6 +282,32 @@ enum TenantTokenCommand {
         /// 32 raw bytes); the same key used for `--tenant-hash-key-file`.
         #[arg(long, value_name = "PATH")]
         deployment_key_file: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TypedAttrColumnCommand {
+    /// Print the tenant's durable declaration, or report that it is unset (in
+    /// which case the deployment default, from ravel-server's
+    /// `--typed-attr-column` flags, applies).
+    Show {
+        /// The tenant whose declaration to print.
+        tenant: String,
+    },
+    /// Replace the tenant's declaration wholesale, validating it first and
+    /// swapping the record with `CasVersion` so a concurrent write is a
+    /// reported conflict rather than a silent overwrite. Not additive and with
+    /// no per-key remove: pass the full intended list. Passing no declaration
+    /// writes an explicit empty one, which means "this tenant declares nothing"
+    /// and is distinct from having no override at all.
+    Set {
+        /// The tenant whose declaration to replace.
+        tenant: String,
+        /// The declaration, as `KEY:TYPE` specs in schema-append order, where
+        /// TYPE is one of str/i64/bool/bytes (case-insensitive). A key may
+        /// contain `:`; the type is split off the right.
+        #[arg(value_name = "KEY:TYPE")]
+        columns: Vec<String>,
     },
 }
 
@@ -997,6 +1036,20 @@ async fn main() -> anyhow::Result<()> {
                 signal,
                 shard_count,
                 lead_hours,
+                now_ns()?,
+            )
+            .await
+        }
+        Command::TypedAttrColumn {
+            command: TypedAttrColumnCommand::Show { tenant },
+        } => ravel_cli::typed_attr_column::show(store::build_store(&cli.store)?, &tenant).await,
+        Command::TypedAttrColumn {
+            command: TypedAttrColumnCommand::Set { tenant, columns },
+        } => {
+            ravel_cli::typed_attr_column::set(
+                store::build_store(&cli.store)?,
+                &tenant,
+                &columns,
                 now_ns()?,
             )
             .await

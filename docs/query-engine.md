@@ -996,6 +996,52 @@ never drop a true result):
   `attrs['k'] IN (...)` stays unextracted, because an `IN` list is a
   disjunction the intersecting prune channel cannot represent soundly.
 
+### Declared typed attribute columns (ADR-0090)
+
+An operator can declare a per-tenant set of attribute keys as native typed
+columns, appended after `attrs` (schema index 9 onward) in declaration order.
+The column name is the attribute key verbatim, never mangled, so a key
+containing `.` or uppercase characters needs double-quoting in SQL. Four
+declarable types: `str` (`Utf8`), `i64` (`Int64`), `bool` (`Boolean`), and
+`bytes` (`Binary`). `f64` is deferred (a declared float aggregate is
+order-sensitive under ADR-0013/ADR-0022, which #277 decides), and so are date
+and timestamp (they need a lifting rule from `i64` storage plus a declared
+unit); the four shipped types all aggregate exactly under any partitioning.
+
+A declared key stays in `attrs` too, so `SELECT attrs` and `SELECT *` keep
+working for a tenant that adopts typed columns after querying through the map.
+A row whose stored value has a different type than the declaration reads NULL:
+there is no cast, ever, and the raw value stays reachable through
+`attrs['key']`. A query naming a column the tenant has not declared fails at
+planning with an unknown-column error, never silently as NULLs.
+
+Resolution happens once per plan, at the entry point that carries both the
+tenant and the query's `now_ns` (`SqlExecutor::execute`/`run` for HTTP, Flight
+SQL's `get_flight_info`), and the resolved list is threaded down as a plain
+parameter. Flight pins it into the ticket, so the paired `DoGet` streams
+against the exact schema `get_flight_info` planned; a refresh in between cannot
+change it. The declaration itself comes from two places: the process flags
+`--typed-attr-column`/`--typed-attr-column-tenant`, and the durable per-tenant
+`TenantConfig.typed_attr_columns` override (written by `ravel-cli
+typed-attr-column set`), which replaces the flag-derived list for that tenant
+when present -- including when present and empty, which means "declares
+nothing". A query process reads that override cache-aside on a 60s staleness
+horizon and never fails a query on an unreadable config object; it serves the
+last resolved declaration instead and counts
+`ravel_typed_attr_columns_stale_fallback_total`. See
+[guides/operations.md](guides/operations.md#declared-typed-attribute-columns-adr-0090)
+for the operator-facing contract.
+
+Predicates on a declared column are NOT pushed down in this version: a typed
+comparison is evaluated as a residual filter above the scan (typed-predicate
+pushdown is #278). A declared column referenced by the query's projection --
+which DataFusion also folds residual-filter columns into -- is decoded by the
+scan's column selection, so `WHERE` on a declared column still decodes only the
+pages it needs. The practical consequence: moving an equality predicate from
+`attrs['k'] = 'v'` (which prunes blocks through POSTINGS) to a declared
+`k = 'v'` makes it slower until #278 lands. Declare for typed comparisons and
+aggregates, which the map cannot express at all.
+
 ### Scan execution: streaming and column projection (ADR-0087)
 
 `LogsScanExec` streams. A partition opens its segments one at a time, decodes

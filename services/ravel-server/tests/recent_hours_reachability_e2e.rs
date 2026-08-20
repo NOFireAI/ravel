@@ -223,6 +223,7 @@ fn sql_app(
             std::collections::HashSet::new(),
         )),
         QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+        None,
     )
     .expect("build_sql_state");
     ravel_server::sql::router(state)

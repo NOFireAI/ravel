@@ -70,7 +70,8 @@ pub use snapshot_format::{
     VERSION, decode_head, decode_part, decode_postings, encode_head, encode_part, encode_postings,
 };
 pub use tenant_config::{
+    DeclaredColumnType, DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS,
     SetOutcome as TenantConfigSetOutcome, TENANT_CONFIG_FORMAT_VERSION, TenantConfig,
-    TenantConfigError, TenantLifecycleState, config_key, read_config, read_config_values,
-    set_tenant_config,
+    TenantConfigError, TenantLifecycleState, TypedAttrColumnError, config_key, read_config,
+    read_config_values, set_tenant_config, validate_typed_attr_columns,
 };

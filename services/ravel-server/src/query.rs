@@ -212,6 +212,17 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 /// Threading them here rather than taking `SqlConfig::default()` is what makes an
 /// operator's override the value the executor's pool and per-tenant accountant
 /// actually enforce.
+///
+/// `declared_columns` is the source of each tenant's declared typed attribute
+/// columns (ADR-0090 decision 2), installed on the executor with
+/// `SqlExecutor::with_declared_column_source`. `None` leaves the executor's
+/// built-in empty `StaticDeclaredColumns`, i.e. the `logs` table's
+/// zero-declaration base schema for every tenant regardless of what any durable
+/// `TenantConfig` says; [`crate::start`] always passes
+/// `Some(TenantConfigDeclaredColumns)`. It is a parameter rather than something
+/// built here so the caller owns the concrete overlay: `start` registers it with
+/// the idle-tenant sweep, and a test can build one with a short staleness
+/// horizon and still exercise this exact wiring.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state(
@@ -224,6 +235,7 @@ pub fn build_sql_state(
     max_tenant_bytes: usize,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
+    declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -257,6 +269,16 @@ pub fn build_sql_state(
         config,
         max_tenant_bytes,
     );
+    // ADR-0090 decision 2: one source, installed on the one shared executor, so
+    // the HTTP endpoint and Flight SQL resolve a tenant's declared columns
+    // through the same cache. Flight needs no second wiring point: its
+    // `get_flight_info` resolves through this executor's
+    // `resolve_declared_columns` and pins the result into the ticket, so `DoGet`
+    // plans against the declaration `get_flight_info` saw.
+    let executor = match declared_columns {
+        Some(source) => executor.with_declared_column_source(source),
+        None => executor,
+    };
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -449,6 +471,7 @@ mod tests {
                 std::collections::HashSet::new(),
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
         )
         .expect("sql state builds");
 
@@ -492,6 +515,7 @@ mod tests {
                 std::collections::HashSet::new(),
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
         )
         .expect("sql state builds");
         assert_eq!(
@@ -531,6 +555,7 @@ mod tests {
                 std::collections::HashSet::new(),
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
         )
         .expect("sql state builds")
     }

@@ -1221,6 +1221,34 @@ fn render_query_postings_family(out: &mut String, mode: Mode, blocks: (u64, u64,
     );
 }
 
+/// The declared-typed-attribute-column staleness family (ADR-0090 decision 2):
+/// query-time resolutions of a tenant's declared `logs` columns that were
+/// served from a stale cache entry, a backoff-suppressed read, a failed
+/// `TenantConfig` read, or a malformed durable declaration, cumulative.
+///
+/// Nonzero means at least one query planned against a declaration that is not
+/// the durable one: a newly written declaration is not in effect yet, and two
+/// query replicas can disagree about a tenant's `logs` schema. A brief blip
+/// after a config write is expected (the staleness horizon); a counter that
+/// keeps climbing means the config object is unreadable and the operations
+/// guide pages on it. Process-global atomic read from
+/// [`crate::typed_attr_metrics`], single source, and `signal` is always `logs`:
+/// declared typed attribute columns exist only on the `logs` table.
+fn render_typed_attr_columns_family(out: &mut String, mode: Mode, stale_fallbacks: u64) {
+    write_header(
+        out,
+        "ravel_typed_attr_columns_stale_fallback_total",
+        "Declared typed attribute column resolutions served from a stale cache entry or a failed TenantConfig read, cumulative (ADR-0090 decision 2).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_typed_attr_columns_stale_fallback_total",
+        &[Label::Mode(mode), Label::Signal(Signal::Logs)],
+        stale_fallbacks,
+    );
+}
+
 /// Dynamic-tenant `shard_count` provisioning failures (ADR-0050 section 5,
 /// EC5): a dynamically-resolved tenant's durable provisioning check failed,
 /// either a real disagreement against this process's configured `--shards`
@@ -2807,6 +2835,7 @@ pub fn render(
         render_durable_auth_family(&mut out, mode, snapshot);
     }
     render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
+    render_typed_attr_columns_family(&mut out, mode, crate::typed_attr_metrics::stale_fallbacks());
     if let Some(snapshot) = maintain {
         render_maintain_family(&mut out, mode, snapshot);
     }

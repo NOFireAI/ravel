@@ -316,6 +316,20 @@ The `logs` table columns are `ts`, `observed_ts` (both `Timestamp(ns)`),
 per-record attributes (see docs/query-engine.md for the full schema and
 semantics).
 
+Beyond those fixed columns, an operator can declare per-tenant *typed
+attribute columns*: an attribute key promoted to a native `Int64`, `Boolean`,
+`Utf8`, or `Binary` column named exactly after the key, so a typed comparison
+or aggregate over it needs no `CAST` over the stringified map. Declared keys
+still appear in `attrs`. A declaration comes from the server's
+`--typed-attr-column` flags or from the durable per-tenant override written by
+`ravel-cli typed-attr-column set`, and a query process picks a durable change
+up within 60s. Querying an undeclared column is an unknown-column error, and a
+row whose stored value has another type reads NULL rather than being cast. See
+[operations.md](operations.md#declared-typed-attribute-columns-adr-0090) and
+docs/query-engine.md for the full contract, including why an equality predicate
+moved onto a declared column is slower than the equivalent `attrs['k'] = 'v'`
+today.
+
 A `ts` range scan. `ts` is a timestamp, so the bounds are `TIMESTAMP` literals,
 not bare integers:
 

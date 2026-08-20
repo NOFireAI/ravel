@@ -38,6 +38,8 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--retention-tenant TENANT=DURATION` | | none, repeatable | Used only in `--mode maintain`. The per-tenant retention window; it overrides `--retention-default` for that tenant. Parsed with `humantime::parse_duration`. Same below-floor validation. |
 | `--indexed-field FIELD` | | shipped default list, repeatable | POSTINGS indexed field for a tenant with no `--indexed-field-tenant` override (ADR-0049 decision 3). Pass the flag once per field. The shipped default is `service.name`, `k8s.namespace.name`, and `http.status_code`. Any value you pass replaces the shipped default list, not adds to it. |
 | `--indexed-field-tenant TENANT=FIELDS` | | none, repeatable | Per-tenant POSTINGS indexed-field override, as `TENANT=field1,field2`. It replaces the default list for that tenant only. An empty field list (`--indexed-field-tenant acme=`) turns off POSTINGS indexing for that tenant. |
+| `--typed-attr-column KEY:TYPE` | | none, repeatable | Declares an attribute key as a native typed `logs` SQL column for every tenant with no override (ADR-0090 decision 1). `TYPE` is one of `str`, `i64`, `bool`, `bytes`, case-insensitive; `f64`, date, and timestamp are deferred. Pass the flag once per column; declaration order is the order the columns are appended to the schema. Unset declares nothing: there is no shipped default, because a declared column changes the SQL schema a tenant's queries see. An empty key, a duplicate key, the same key with two types, or a key colliding with one of the nine fixed logs columns (`ts`, `observed_ts`, `severity_num`, `severity_text`, `body`, `trace_id`, `span_id`, `flags`, `attrs`) fails startup. Meaningful only in a build with the `sql` feature. See "Declared typed attribute columns" below. |
+| `--typed-attr-column-tenant TENANT:KEY:TYPE` | | none, repeatable | Per-tenant declaration override, as `TENANT:KEY:TYPE`. Repeating the flag for one tenant accumulates that tenant's ordered declaration. It replaces the default for that tenant outright rather than adding to it, the same way `--indexed-field-tenant` overrides `--indexed-field`. A tenant id may not contain `:`; an attribute key may (the type is split off the right). |
 | `--limits-file <path>` | | none (shipped defaults) | TOML admission-limits file (ADR-0051 section 3): `[defaults]` plus per-tenant `[tenants.<id>]` overrides. Parsed and validated at startup; an unparseable file, an unknown key, or a nonsensical limit (zero, or a burst set with no rate to pair it with) fails startup rather than falling back to defaults. See "Admission limits file" below. |
 | `--cache-max-bytes <n>` | | `268435456` (256 MiB) | Maximum resident bytes for the ADR-0046 read cache's RAM tier. Read once at startup; there is no live resize. Ignored when `--disable-cache` is set. See [guides/caching.md](caching.md). |
 | `--cache-dir <path>` | | none | Directory for the read cache's local-disk tier. Not wired to anything yet: the query fetchers only accept a RAM cache. Setting this flag fails startup rather than silently running with no disk tier. See [guides/caching.md](caching.md#known-gaps). |
@@ -185,6 +187,8 @@ above).
 | `ravel-cli catalog inspect --tenant <name>` | | Decodes and prints HEAD and every referenced snapshot part: watermark, part keys, hashes, entry counts. It reports rather than errors when no HEAD exists yet. |
 | `ravel-cli catalog verify --tenant <name>` | | Re-lists every sealed commit record and diffs it against the current snapshot. Prints counts of entries missing from or mismatched against the snapshot; exits nonzero on any divergence. It reports rather than errors when no HEAD exists yet. |
 | `ravel-cli provision adopt --tenant <name> --shards <n> [--signal <metrics\|logs\|spans>]` | | Writes the durable `shard_count` provisioning record for a tenant with pre-ADR data, ahead of any server touching it (ADR-0050 section 5). Runs the same adoption path the server runs: writes the record only when every observed shard index is below `--shards`, and refuses (writing nothing, exiting nonzero) when a higher index proves `--shards` would hide data. Prints one line per signal. A signal with no data and no record is left untouched (its record is written on first ingest). |
+| `ravel-cli typed-attr-column show <tenant>` | | Prints the tenant's durable declared typed attribute columns (ADR-0090 decision 1) from `TenantConfig.typed_attr_columns`, in schema-append order. Distinguishes three states: no config record, a record with no declaration (both leave the deployment default in force), and a present declaration (which replaces the default, including when it is explicitly empty). |
+| `ravel-cli typed-attr-column set <tenant> [KEY:TYPE ...]` | | Replaces the tenant's durable declaration wholesale, validated on the same rules the server's flags are (empty key, duplicate key, conflicting types, fixed-column collision), then swapped with `CasVersion` so a concurrent write is a reported conflict rather than a silent overwrite. Not additive and with no per-key remove: pass the full intended list. Passing no declaration writes an explicit empty one, which means "this tenant declares nothing" and is distinct from having no override. Every other field of the record is carried through unchanged. A query-serving process picks the change up within its staleness horizon (60s); no restart is needed. |
 
 `segment inspect` and `commit decode` accept a local file path or an
 object-store key. A path that exists on disk is read directly; otherwise it is
@@ -443,6 +447,63 @@ Each name is a counter, cumulative across queries:
 Prune selectivity is `blocks_survived` divided by `blocks_total`. A ratio of
 1.0 means the query pruned no blocks. A lower ratio means POSTINGS did more
 work.
+
+## Declared typed attribute columns (ADR-0090)
+
+The `logs` SQL table exposes every attribute through one merged
+`attrs: Map(Utf8, Utf8)` column, so a numeric or boolean comparison over an
+attribute is a `CAST(attrs['k'] AS ...)` over a stringified value. An operator
+*declares* a per-tenant set of attribute keys as native typed columns, appended
+after `attrs` in declaration order, and the same value then reads back as a
+real `Int64`/`Boolean`/`Utf8`/`Binary` Arrow column. A declared key still
+appears in `attrs` as well, so no existing query breaks.
+
+Two ways to declare, one resolution:
+
+- The process flags `--typed-attr-column` and `--typed-attr-column-tenant`
+  (see the flag table above) are the deployment default and its per-tenant
+  override. Changing them is a restart.
+- The durable per-tenant record `TenantConfig.typed_attr_columns`, written by
+  `ravel-cli typed-attr-column set`, is the no-restart path. When present it
+  replaces the flag-derived declaration for that tenant outright, **including
+  when it is present but empty**: an empty declaration means "this tenant
+  declares nothing", which is a different state from having no durable override
+  at all (in which case the flags apply). This is the same
+  present-but-empty-versus-absent distinction `indexed_fields` carries in the
+  same record.
+
+### The staleness contract
+
+A query-serving process reads the durable override cache-aside, per tenant, on
+a 60s staleness horizon: a resolution newer than that is served from cache with
+no store read, and a stale or missing entry triggers one `TenantConfig` GET on
+the query's own path. So an operator's `typed-attr-column set` takes effect
+within 60s, and during that window two replicas can answer the same query
+against different declarations. A failed read never fails a query: the process
+serves the last declaration it successfully resolved, or the flag-derived one if
+it has never resolved for that tenant, and a failed read is not retried for one
+second (so a degraded config store costs at most one failed GET per tenant per
+second).
+
+That fallback is a real degradation, so it is counted, never silent:
+
+- `ravel_typed_attr_columns_stale_fallback_total` (counter, labels `mode` and a
+  constant `signal="logs"`) counts every resolution served from a stale cache
+  entry, a backoff-suppressed read, a failed `TenantConfig` read, or a durable
+  declaration that failed validation.
+
+A brief rise right after a config write is expected. A counter that keeps
+climbing means the tenant config object is unreadable and the declarations in
+effect are not the ones written: page on a sustained increase.
+
+### Cost note
+
+Declaring a key does not make predicates on it faster, and for equality it
+makes them slower until typed-predicate pushdown lands: `attrs['k'] = 'v'`
+prunes blocks through POSTINGS today, while `k = 'v'` on the declared column is
+evaluated as a residual filter above the scan. Declare for typed comparisons
+and aggregates (`k > 5`, `SUM(k)`), which are impossible over the map, not to
+speed up an equality that already prunes.
 
 ## At-rest integrity scrubber (ADR-0059)
 
