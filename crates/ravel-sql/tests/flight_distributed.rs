@@ -2057,3 +2057,337 @@ async fn distributed_audit_preserves_duplicate_rows() {
         "both duplicate audit rows survive; a reintroduced dedup would drop one"
     );
 }
+
+// ===========================================================================
+// spans SQL-lane distributed fan-out (#327, T6b)
+// ===========================================================================
+//
+// The span sibling of the RLOG family above. Spans also have NO query-time
+// dedup (docs/consistency-model.md, "logs and spans"; ADR-0051 section 5), so
+// the coordinator merges under the span total order (`SPAN_ORDER_COLS`) with
+// nothing above it. The two shapes mirror the RLOG ones exactly:
+//
+// - *reshard-straddle*: one trace's spans live in TWO shards (two slices), with
+//   `start_ts` interleaving across the shards. The span total-order key is
+//   primary on `(trace_id, span_id, start_ts, ...)`, so the fixture gives every
+//   span the SAME trace_id and makes span_id order agree with start_ts order;
+//   the total-order merge then emits start_ts [10, 20, 30, 40], an order NO
+//   slice-order concatenation produces ([10,30,20,40] or [20,40,10,30]). The
+//   specific line a naive concat breaks: the coordinator `SortPreservingMergeExec`
+//   in `distributed_slice_plan` (equivalently the worker `SortExec` in
+//   `sort_slice_fragment`). Replace either with an unordered coalesce and the
+//   ordered assertion below fails.
+//
+// - *duplicate-preservation*: two byte-identical spans, one per shard (a retry
+//   after a lost ack). Both must survive. The specific line a reintroduced dedup
+//   breaks: the absence of any dedup node above the merge. Add a dedup/distinct
+//   and the row count drops from 2 to 1 and the assertion below fails.
+//
+// prove-the-test discipline: the "local" reference on every differential is the
+// plain single-process `SpansTableProvider::plan(..)` scan, collected and sorted
+// IN-TEST -- it never calls the distributed merge exec under test, so a
+// regression in that exec cannot hide by appearing on both sides.
+
+use ravel_rspan::{
+    ObjectIdentity as RspanObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode,
+};
+use ravel_sql::{SpanSegmentFetcher, SpansTableProvider};
+
+/// A span on trace `trace` with the given `span_id`, `start_ts`, and `name`
+/// (the differential's read-back discriminator). `end_ts = start_ts + 1`, root
+/// span, `Ok` status, one attribute -- the fields the span total-order key does
+/// not otherwise pin are held constant so a test controls the order through
+/// `span_id`/`start_ts` alone.
+fn span(trace: [u8; 16], span_id: [u8; 8], start: i64, name: &str) -> SpanRecord {
+    SpanRecord {
+        trace_id: trace,
+        span_id,
+        parent_span_id: None,
+        name: name.to_string(),
+        start_ts_ns: start,
+        end_ts_ns: start + 1,
+        status_code: StatusCode::Ok,
+        status_message: None,
+        attrs: vec![("service.name".to_string(), "svc".to_string())],
+    }
+}
+
+/// Write one RSPAN object from `records` on `shard`, put it at `key`, and return
+/// a matching L0 `SegmentRef` carrying `shard` (so `partition_snapshot` groups
+/// it shard-major into its own slice). The identity's `tenant_hash` must match
+/// [`TENANT`], which the span read path enforces in `fetch_accounted`.
+async fn write_rspan_segment(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    shard: u32,
+    writer_seq: u64,
+    created_unix_ns: i64,
+    records: &[SpanRecord],
+) -> SegmentRef {
+    let identity = RspanObjectIdentity {
+        tenant_hash: TENANT.0,
+        shard,
+        writer_id: [2u8; 16],
+        writer_epoch: 1,
+        writer_seq,
+    };
+    let mut w = RspanWriter::new(RspanConfig::default(), identity);
+    for r in records {
+        w.push(r.clone());
+    }
+    let bytes = w.finish().expect("finish object");
+    let size = bytes.len() as u64;
+    store
+        .put(key, Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put object");
+
+    let min = records
+        .iter()
+        .map(|r| r.start_ts_ns)
+        .min()
+        .expect("nonempty");
+    let max = records.iter().map(|r| r.end_ts_ns).max().expect("nonempty");
+    SegmentRef {
+        data_object_key: key.to_string(),
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: 0,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard,
+        content_hash: [0u8; 32],
+        writer_id: Uuid::from_u128(shard as u128 + 1),
+        writer_epoch: 1,
+        writer_seq,
+        created_unix_ns,
+        level: SegmentLevel::L0,
+    }
+}
+
+/// The in-process spans worker: rebuilds the slice's snapshot from the ticket and
+/// runs `SpansTableProvider::worker_fragment` (`SpansScanExec -> SortExec`, public
+/// spans schema, one sorted partition, NO dedup), streaming the result back. The
+/// span analog of `RlogWorker`, using the `SpanSegmentFetcher` the spans path
+/// reads through.
+struct SpanWorker {
+    fetcher: SpanSegmentFetcher,
+}
+
+impl std::fmt::Debug for SpanWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("SpanWorker")
+    }
+}
+
+impl WorkerSliceClient for SpanWorker {
+    fn fetch_slice(
+        &self,
+        _location: &str,
+        ticket: &FlightTicket,
+        _limit: Option<usize>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let snapshot = ticket.snapshot();
+        let target_partitions = snapshot.segments.len().max(1);
+        let plan = SpansTableProvider::new(
+            snapshot,
+            TENANT,
+            self.fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .worker_fragment(target_partitions)?;
+        execute_stream(plan, Arc::new(TaskContext::default()))
+    }
+}
+
+#[tokio::test]
+async fn distributed_spans_reshard_straddle_equals_sorted_local() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    // One trace straddles two shards; span_id order agrees with start_ts order,
+    // and the two shards interleave ts [10, 20, 30, 40].
+    let trace = [1u8; 16];
+    let s0 = write_rspan_segment(
+        backend.as_ref(),
+        "spans/reshard-0.rspan",
+        0,
+        1,
+        10,
+        &[
+            span(trace, [1u8; 8], 10, "s10"),
+            span(trace, [3u8; 8], 30, "s30"),
+        ],
+    )
+    .await;
+    let s1 = write_rspan_segment(
+        backend.as_ref(),
+        "spans/reshard-1.rspan",
+        1,
+        1,
+        20,
+        &[
+            span(trace, [2u8; 8], 20, "s20"),
+            span(trace, [4u8; 8], 40, "s40"),
+        ],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = SpanSegmentFetcher::new(Arc::clone(&backend));
+
+    assert!(
+        rlog_endpoints_for(&snapshot).len() >= 2,
+        "fixture must genuinely partition into more than one slice"
+    );
+
+    // Independent local reference: plain scan, sorted in-test (never the merge
+    // exec under test).
+    let local = collect_plan(
+        SpansTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .plan(4)
+        .expect("local plan"),
+    )
+    .await;
+    let mut want = ts_and(&local, "start_ts", "name");
+    want.sort();
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(SpanWorker {
+        fetcher: fetcher.clone(),
+    });
+    let dist: Arc<dyn TableProvider> = Arc::new(
+        SpansTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+            .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
+    );
+    let got = ts_and(&collect_distributed(dist).await, "start_ts", "name");
+
+    assert_eq!(
+        got, want,
+        "the distributed output is the total-order merge of both slices; a slice-order concat would differ"
+    );
+    assert_eq!(
+        got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![10, 20, 30, 40],
+        "the straddling trace's start_ts are globally sorted across slices, not slice-concatenated"
+    );
+}
+
+#[tokio::test]
+async fn distributed_spans_preserves_duplicate_rows() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    // Two byte-identical spans, one per shard: a retry after a lost ack.
+    let dup = span([9u8; 16], [9u8; 8], 50, "dup");
+    let s0 = write_rspan_segment(
+        backend.as_ref(),
+        "spans/dup-0.rspan",
+        0,
+        1,
+        10,
+        std::slice::from_ref(&dup),
+    )
+    .await;
+    let s1 = write_rspan_segment(
+        backend.as_ref(),
+        "spans/dup-1.rspan",
+        1,
+        1,
+        20,
+        std::slice::from_ref(&dup),
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = SpanSegmentFetcher::new(Arc::clone(&backend));
+
+    let local = collect_plan(
+        SpansTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .plan(4)
+        .expect("local plan"),
+    )
+    .await;
+    let mut want = ts_and(&local, "start_ts", "name");
+    want.sort();
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(SpanWorker {
+        fetcher: fetcher.clone(),
+    });
+    let dist: Arc<dyn TableProvider> = Arc::new(
+        SpansTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+            .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
+    );
+    let mut got = ts_and(&collect_distributed(dist).await, "start_ts", "name");
+    got.sort();
+
+    assert_eq!(
+        got, want,
+        "spans distributed multiset equals local multiset"
+    );
+    assert_eq!(
+        got,
+        vec![(50, "dup".to_string()), (50, "dup".to_string())],
+        "both byte-identical spans survive; a reintroduced dedup would collapse them to one"
+    );
+}
+
+#[tokio::test]
+async fn distributed_spans_plan_merges_without_dedup() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let s0 = write_rspan_segment(
+        backend.as_ref(),
+        "spans/shape-0.rspan",
+        0,
+        1,
+        10,
+        &[span([1u8; 16], [1u8; 8], 10, "s10")],
+    )
+    .await;
+    let s1 = write_rspan_segment(
+        backend.as_ref(),
+        "spans/shape-1.rspan",
+        1,
+        1,
+        20,
+        &[span([2u8; 16], [2u8; 8], 20, "s20")],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = SpanSegmentFetcher::new(Arc::clone(&backend));
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(SpanWorker {
+        fetcher: fetcher.clone(),
+    });
+    let dist = SpansTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+        .with_distributed_scan(rlog_endpoints_for(&snapshot), client);
+    let ctx = SessionContext::new();
+    let plan = dist
+        .scan(&ctx.state(), None, &[], None)
+        .await
+        .expect("distributed scan");
+    let text = displayable(plan.as_ref()).indent(true).to_string();
+
+    assert!(
+        text.contains("SortPreservingMergeExec"),
+        "the spans merge is a SortPreservingMergeExec:\n{text}"
+    );
+    assert!(
+        text.contains("DistributedSliceScanExec"),
+        "over the fan-out slice scan:\n{text}"
+    );
+    // The load-bearing negative: spans have NO query-time dedup, so the plan must
+    // never grow an RsegDedupExec (or any dedup node) above the merge. This is
+    // trap #1 from the task, guarded directly.
+    assert!(
+        !text.to_lowercase().contains("dedup"),
+        "spans have no query-time dedup; the merge must not introduce one:\n{text}"
+    );
+}
