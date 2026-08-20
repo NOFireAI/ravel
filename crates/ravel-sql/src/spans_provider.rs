@@ -29,10 +29,18 @@ use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
+#[cfg(feature = "flight-sql")]
+use ravel_query::ByteLimit;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
+#[cfg(feature = "flight-sql")]
+use crate::distributed::{WorkerSlice, WorkerSliceClient};
+#[cfg(feature = "flight-sql")]
+use crate::distributed_rlog::{
+    DistributedRlogContext, SPAN_ORDER_COLS, distributed_spans_plan, sort_slice_fragment,
+};
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_pushdown::{SpansPushdown, extract_spans};
 use crate::spans_scan::SpansScanExec;
@@ -54,6 +62,12 @@ pub struct SpansTableProvider {
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `SpansScanExec` the provider builds.
     erasure: Arc<Vec<ErasurePredicate>>,
+    /// The coordinator-side distributed fan-out (ADR-0071; #327, T6b). `None` --
+    /// the default, and every non-Flight build -- is the local scan path
+    /// unchanged. Reuses the signal-neutral [`DistributedRlogContext`], which
+    /// carries no schema or key, exactly as the RLOG providers do.
+    #[cfg(feature = "flight-sql")]
+    distributed: Option<DistributedRlogContext>,
 }
 
 impl SpansTableProvider {
@@ -75,6 +89,72 @@ impl SpansTableProvider {
             schema: spans_schema(),
             accounting,
             erasure,
+            #[cfg(feature = "flight-sql")]
+            distributed: None,
+        }
+    }
+
+    /// Install a coordinator-side distributed scan context (ADR-0071; #327, T6b).
+    /// The span-signal sibling of
+    /// [`LogsTableProvider::with_distributed_scan`](crate::LogsTableProvider):
+    /// [`TableProvider::scan`] fans the `spans` scan out to the given worker
+    /// endpoints -- one [`crate::distributed_rlog::DistributedSliceScanExec`]
+    /// partition per slice, feeding the no-dedup `SortPreservingMergeExec` --
+    /// instead of scanning the local snapshot. Without it, the provider is
+    /// unchanged. Only compiled with the Flight transport, which is the only
+    /// thing that can carry a slice ticket.
+    #[cfg(feature = "flight-sql")]
+    pub fn with_distributed_scan(
+        mut self,
+        endpoints: Vec<WorkerSlice>,
+        client: Arc<dyn WorkerSliceClient>,
+    ) -> Self {
+        self.distributed = Some(DistributedRlogContext { endpoints, client });
+        self
+    }
+
+    /// The worker-side fragment for a distributed `spans` scan (ADR-0071; #327,
+    /// T6b): the whole-snapshot [`SpansScanExec`] (no pushdown) wrapped in a
+    /// single globally-sorted partition under the `spans` total-order key
+    /// ([`SPAN_ORDER_COLS`]), streamed to the coordinator's no-dedup merge. A
+    /// worker executes this over its slice; the coordinator's
+    /// `DistributedSliceScanExec` exposes each worker stream as one sorted
+    /// partition feeding the SAME no-dedup merge. There is NO dedup, in the
+    /// worker or the coordinator: spans have no query-time dedup, so every
+    /// fetched span is returned.
+    ///
+    /// Note the local `SpansScanExec` already declares a `(trace_id, start_ts)`
+    /// ordering, but the distributed total order is the full [`SPAN_ORDER_COLS`]
+    /// key, so this is a full [`sort_slice_fragment`] `SortExec` (not a
+    /// preserving merge over the leaf's weaker order).
+    #[cfg(feature = "flight-sql")]
+    pub fn worker_fragment(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let scan = self.build_scan(target_partitions, &SpansPushdown::default())?;
+        sort_slice_fragment(scan, &self.schema, SPAN_ORDER_COLS)
+    }
+
+    /// Apply projection pushdown (column selection only) above `plan` on the
+    /// distributed path, where the fan-out returns the full public schema and
+    /// DataFusion asked for a subset. The local path applies the same
+    /// `ProjectionExec` inline in [`TableProvider::scan`].
+    #[cfg(feature = "flight-sql")]
+    fn apply_projection(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        projection: Option<&Vec<usize>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        match projection {
+            Some(proj) => {
+                let exprs = proj
+                    .iter()
+                    .map(|&i| {
+                        let name = self.schema.field(i).name();
+                        Ok((col(name, &self.schema)?, name.to_string()))
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+                Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+            }
+            None => Ok(plan),
         }
     }
 
@@ -182,6 +262,26 @@ impl TableProvider for SpansTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Distributed coordinator path (ADR-0071; #327, T6b): fan out to worker
+        // slices instead of scanning locally, folding worker bytes into the query
+        // accounting under an `Unlimited` ceiling (no per-query byte budget on the
+        // spans provider). See the `logs` provider for the full rationale: the
+        // scan's `_limit` is a fetch-stop hint across partitions with the exact
+        // limit re-applied above the merge, and filters are re-applied above the
+        // returned plan by DataFusion (the provider reports `Inexact`).
+        #[cfg(feature = "flight-sql")]
+        if let Some(dist) = &self.distributed {
+            let plan = distributed_spans_plan(
+                dist.endpoints.clone(),
+                Arc::clone(&dist.client),
+                Arc::clone(&self.schema),
+                _limit,
+                self.accounting.clone(),
+                ByteLimit::Unlimited,
+            )?;
+            return self.apply_projection(plan, projection);
+        }
+
         let target_partitions = state.config().target_partitions();
         let pushdown = extract_spans(filters);
         let plan = self.build_scan(target_partitions, &pushdown)?;
