@@ -799,7 +799,12 @@ pub(crate) fn encode_run_v4_with_scratch(
     let min_ts_ns = values.first_ts().unwrap_or(0);
     let max_ts_ns = values.last_ts().unwrap_or(0);
     values.extend_ts_values_into(&mut scratch.ts_values);
-    let ts_page = frame_ts_page(series_id, &scratch.ts_values, &mut scratch.payload)?;
+    let ts_page = frame_ts_page(
+        series_id,
+        &scratch.ts_values,
+        min_ts_ns,
+        &mut scratch.payload,
+    )?;
     let value_page = match values {
         SeriesValues::Scalar(samples) => {
             scratch.scalar_values.clear();
@@ -836,10 +841,12 @@ pub(crate) fn encode_run_v4_with_scratch(
 fn frame_ts_page(
     series_id: &SeriesId,
     ts_values: &[i64],
+    run_min_ts_ns: i64,
     payload: &mut Vec<u8>,
 ) -> Result<Vec<u8>, WriteError> {
     payload.clear();
-    encode_ts_deltas_into(payload, ts_values).ok_or(WriteError::TimestampDeltaOverflow)?;
+    encode_ts_deltas_into(payload, ts_values, run_min_ts_ns)
+        .ok_or(WriteError::TimestampDeltaOverflow)?;
     let enc = page_enc::TS_DELTA_VARINT;
     let compressed = if payload.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
         let candidate = lz4_flex::compress_prepend_size(payload);
@@ -1619,7 +1626,8 @@ mod v4_tests {
 
     fn ts_page(series_id: &SeriesId, ts_ns: &[i64]) -> Vec<u8> {
         let mut payload = Vec::new();
-        encode_ts_deltas_into(&mut payload, ts_ns).expect("ts deltas encode");
+        let run_min = ts_ns.iter().copied().min().unwrap_or(0);
+        encode_ts_deltas_into(&mut payload, ts_ns, run_min).expect("ts deltas encode");
         raw_page(series_id, page_enc::TS_DELTA_VARINT, &payload)
     }
 
@@ -2840,7 +2848,9 @@ mod direct_v6_emit_bit_parity {
         ts_values: &[i64],
     ) -> Result<Vec<u8>, WriteError> {
         let mut payload = Vec::new();
-        encode_ts_deltas_into(&mut payload, ts_values).ok_or(WriteError::TimestampDeltaOverflow)?;
+        let run_min = ts_values.first().copied().unwrap_or(0);
+        encode_ts_deltas_into(&mut payload, ts_values, run_min)
+            .ok_or(WriteError::TimestampDeltaOverflow)?;
         let enc = page_enc::TS_DELTA_VARINT;
         let compressed = if payload.len() >= LZ4_MIN_TS_PAYLOAD_BYTES {
             let candidate = lz4_flex::compress_prepend_size(&payload);
