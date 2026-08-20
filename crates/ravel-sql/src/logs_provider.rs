@@ -28,14 +28,26 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+#[cfg(feature = "flight-sql")]
+use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
+#[cfg(feature = "flight-sql")]
+use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
+#[cfg(feature = "flight-sql")]
+use ravel_query::ByteLimit;
 use ravel_query::LogSegmentFetcher;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::declared::DeclaredColumn;
+#[cfg(feature = "flight-sql")]
+use crate::distributed::{WorkerSlice, WorkerSliceClient};
+#[cfg(feature = "flight-sql")]
+use crate::distributed_rlog::{
+    DistributedRlogContext, LOGS_ORDER_COLS, distributed_logs_plan, sort_slice_fragment,
+};
 use crate::logs_pushdown::{LogsPushdown, extract_logs};
 use crate::logs_scan::LogsScanExec;
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
@@ -62,6 +74,11 @@ pub struct LogsTableProvider {
     /// exactly. The provider's advertised [`Self::schema`] and every
     /// `LogsScanExec` it builds are derived from this list.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// The coordinator-side distributed fan-out (ADR-0071; #326), if this
+    /// provider is acting as a distributed coordinator. `None` -- the default,
+    /// and every non-Flight build -- is the local scan path unchanged.
+    #[cfg(feature = "flight-sql")]
+    distributed: Option<DistributedRlogContext>,
 }
 
 impl LogsTableProvider {
@@ -84,6 +101,64 @@ impl LogsTableProvider {
             accounting,
             erasure,
             declared: Arc::new(Vec::new()),
+            #[cfg(feature = "flight-sql")]
+            distributed: None,
+        }
+    }
+
+    /// Install a coordinator-side distributed scan context (ADR-0071; #326). With
+    /// it, [`TableProvider::scan`] fans the `logs` scan out to the given worker
+    /// endpoints -- one [`crate::distributed_rlog::DistributedSliceScanExec`]
+    /// partition per slice, feeding the no-dedup `SortPreservingMergeExec` --
+    /// instead of scanning the local snapshot. Without it, the provider is
+    /// unchanged. Only compiled with the Flight transport, which is the only
+    /// thing that can carry a slice ticket.
+    #[cfg(feature = "flight-sql")]
+    pub fn with_distributed_scan(
+        mut self,
+        endpoints: Vec<WorkerSlice>,
+        client: Arc<dyn WorkerSliceClient>,
+    ) -> Self {
+        self.distributed = Some(DistributedRlogContext { endpoints, client });
+        self
+    }
+
+    /// The worker-side fragment for a distributed `logs` scan (ADR-0071; #326):
+    /// the whole-snapshot [`LogsScanExec`] (all columns, no pushdown) wrapped in a
+    /// single globally-sorted partition under the `logs` total-order key. A worker
+    /// executes this over its slice and streams the result to the coordinator,
+    /// whose `DistributedSliceScanExec` exposes each worker stream as one sorted
+    /// partition feeding the SAME no-dedup merge. There is NO dedup, in the worker
+    /// or the coordinator: logs have no query-time dedup, so every fetched record
+    /// is returned.
+    #[cfg(feature = "flight-sql")]
+    pub fn worker_fragment(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let scan = self.build_scan(target_partitions, &LogsPushdown::default(), None)?;
+        sort_slice_fragment(scan, &self.schema, LOGS_ORDER_COLS)
+    }
+
+    /// Apply projection pushdown (column selection only) above `plan`, used only
+    /// on the distributed path where the fan-out returns the full public schema
+    /// and DataFusion asked for a subset. The local path pushes projection into
+    /// the scan instead (see [`Self::build_scan`]).
+    #[cfg(feature = "flight-sql")]
+    fn apply_projection(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        projection: Option<&Vec<usize>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        match projection {
+            Some(proj) => {
+                let exprs = proj
+                    .iter()
+                    .map(|&i| {
+                        let name = self.schema.field(i).name();
+                        Ok((col(name, &self.schema)?, name.to_string()))
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+                Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+            }
+            None => Ok(plan),
         }
     }
 
@@ -203,6 +278,29 @@ impl TableProvider for LogsTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Distributed coordinator path (ADR-0071; #326): fan out to worker slices
+        // instead of scanning locally. The scan's `_limit` is honored as a
+        // fetch-stop hint across the distributed partitions, with the exact limit
+        // re-applied above the merge (over-fetch is safe, under-fetch is not).
+        // Filters are re-applied above the returned plan by DataFusion (the
+        // provider reports `Inexact`), so not pushing them to workers only widens
+        // each worker's read, never changes a row. The `logs` provider carries no
+        // per-query byte budget (admission is decided at resolve time), so the
+        // fan-out folds bytes into the query accounting under an `Unlimited`
+        // ceiling, matching the local path.
+        #[cfg(feature = "flight-sql")]
+        if let Some(dist) = &self.distributed {
+            let plan = distributed_logs_plan(
+                dist.endpoints.clone(),
+                Arc::clone(&dist.client),
+                Arc::clone(&self.schema),
+                _limit,
+                self.accounting.clone(),
+                ByteLimit::Unlimited,
+            )?;
+            return self.apply_projection(plan, projection);
+        }
+
         let target_partitions = state.config().target_partitions();
         let pushdown = extract_logs(filters);
         // Projection pushdown reaches the reader (ADR-0087 decision 3): the

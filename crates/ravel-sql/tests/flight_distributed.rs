@@ -1340,3 +1340,720 @@ async fn distributed_scan_folds_bytes_into_coordinator_accounting() {
         "the byte ceiling surfaces as a scanned-too-many-bytes error: {err}"
     );
 }
+
+// ===========================================================================
+// RLOG family (logs / alerts / audit) SQL-lane distributed fan-out (#326, T6a)
+// ===========================================================================
+//
+// These reproduce, at the SQL layer, the queryfrag-layer merge-correctness
+// invariant #284 established (`ravel_query::distrib::merge_log_records`):
+// logs/alerts/audit merge under a total order with NO dedup. Two shapes, per
+// signal, both from T2:
+//
+// - *reshard-straddle*: one stream's records live in TWO shards (two slices),
+//   with `ts` interleaving across the shards. The distributed output must be
+//   the total-order merge of both slices, which differs from any slice-order
+//   concatenation. The specific line a naive concat breaks: the coordinator
+//   `SortPreservingMergeExec` in `distributed_slice_plan` (equivalently the
+//   worker `SortExec` in `sort_slice_fragment`). Replace either with an
+//   unordered coalesce and the ordered assertion below fails, because the
+//   fixture's `ts` values interleave [10,20,30,40] across the two shards, an
+//   order neither slice-concat produces ([10,30,20,40] or [20,40,10,30]).
+//
+// - *duplicate-preservation*: two byte-identical records, one per shard (a
+//   retry after a lost ack). Both must survive: logs/alerts/audit have no
+//   query-time dedup (docs/consistency-model.md, "logs and spans"). The
+//   specific line a reintroduced dedup breaks: the absence of any dedup node
+//   above the merge. Add a `.dedup`/distinct and the row count drops from 2 to
+//   1 and the assertion below fails.
+//
+// prove-the-test discipline (the second #284 trap): the "local" reference on
+// every differential is the plain single-process provider scan (`plan(..)`)
+// collected and sorted IN-TEST by a hand-written comparator -- it never calls
+// the distributed merge exec under test on the reference side, so a regression
+// in that exec cannot hide by appearing on both sides.
+
+use bytes::Bytes;
+use datafusion::arrow::array::StringArray;
+use datafusion::physical_plan::ExecutionPlan;
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_sql::{AlertsTableProvider, AuditTableProvider, LogsTableProvider};
+use ravel_types::logstream::log_stream_id;
+
+/// A generic RLOG record on the stream identified by `resource`, carrying
+/// per-record dynamic `attrs`. Structurally shared by all three signals (an
+/// alert/audit record rides RLOG verbatim, ADR-0040).
+fn log_record(
+    resource: &[(String, AttrValue)],
+    attrs: &[(String, AttrValue)],
+    ts: i64,
+    body: &str,
+) -> LogRecord {
+    LogRecord {
+        stream_id: log_stream_id(resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body.into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: attrs.to_vec(),
+    }
+}
+
+/// An alert record: the four promoted scalar fields carried as attributes
+/// (ADR-0040 decision 2), `alert_id` the differentiator this test reads back.
+fn alert_record(resource: &[(String, AttrValue)], ts: i64, alert_id: &str) -> LogRecord {
+    log_record(
+        resource,
+        &[
+            ("alert_id".to_string(), AttrValue::Str(alert_id.into())),
+            ("rule_id".to_string(), AttrValue::Str("rule-1".into())),
+            ("state".to_string(), AttrValue::Str("firing".into())),
+            ("generation".to_string(), AttrValue::I64(1)),
+        ],
+        ts,
+        "",
+    )
+}
+
+/// Write one RLOG object from `records` on `shard`, put it at `key`, and return a
+/// matching L0 `SegmentRef` carrying the object's true ts span and `shard` (so
+/// `partition_snapshot` groups it shard-major into its own slice). The identity's
+/// `tenant_hash` must match [`TENANT`], which the RLOG read path enforces.
+async fn write_rlog_segment(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    shard: u32,
+    writer_seq: u64,
+    created_unix_ns: i64,
+    records: &[LogRecord],
+) -> SegmentRef {
+    let identity = ObjectIdentity {
+        tenant_hash: TENANT.0,
+        shard,
+        writer_id: [2u8; 16],
+        writer_epoch: 1,
+        writer_seq,
+    };
+    let mut w = RlogWriter::new(RlogConfig::default(), identity);
+    for r in records {
+        w.push(r.clone()).expect("push record");
+    }
+    let bytes = w.finish().expect("finish object");
+    let size = bytes.len() as u64;
+    store
+        .put(key, Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put object");
+
+    let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+    let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+    SegmentRef {
+        data_object_key: key.to_string(),
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: 0,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard,
+        content_hash: [0u8; 32],
+        writer_id: Uuid::from_u128(shard as u128 + 1),
+        writer_epoch: 1,
+        writer_seq,
+        created_unix_ns,
+        level: SegmentLevel::L0,
+    }
+}
+
+fn rlog_snapshot(segments: Vec<SegmentRef>) -> Snapshot {
+    Snapshot {
+        segments,
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// One worker endpoint per shard-major slice, minting a slice ticket for each.
+/// Reuses the signal-agnostic slice-ticket plumbing (`partition_snapshot`,
+/// `FlightTicket`, `SegmentPin`) unchanged -- it carries no signal discriminator.
+fn rlog_endpoints_for(snapshot: &Snapshot) -> Vec<WorkerSlice> {
+    let slices = partition_snapshot(snapshot, 8);
+    let count = slices.len() as u32;
+    slices
+        .iter()
+        .enumerate()
+        .map(|(k, slice)| WorkerSlice {
+            location: format!("grpc://rlog-worker-{k}"),
+            ticket: FlightTicket {
+                tenant: TENANT,
+                statement: String::new(),
+                segments: slice
+                    .segments
+                    .iter()
+                    .map(SegmentPin::from_segment_ref)
+                    .collect(),
+                min_commit_tokens: Vec::new(),
+                now_ns: NOW_NS,
+                deadline_ns: NOW_NS + 1_000_000_000,
+                slice_index: k as u32,
+                slice_count: count,
+                pending_erasure: Vec::new(),
+                declared_columns: Vec::new(),
+            },
+        })
+        .collect()
+}
+
+/// The in-process RLOG worker: rebuilds the slice's snapshot from the ticket and
+/// runs that signal's worker fragment (`<signal>ScanExec -> SortExec`, public
+/// schema, one sorted partition, NO dedup), streaming the result back. The
+/// signal is selected by the `build` fn pointer, so one worker type serves all
+/// three signals (and, later, spans).
+struct RlogWorker {
+    fetcher: LogSegmentFetcher,
+    build: fn(Snapshot, LogSegmentFetcher, usize) -> DFResult<Arc<dyn ExecutionPlan>>,
+}
+
+impl std::fmt::Debug for RlogWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("RlogWorker")
+    }
+}
+
+impl WorkerSliceClient for RlogWorker {
+    fn fetch_slice(
+        &self,
+        _location: &str,
+        ticket: &FlightTicket,
+        _limit: Option<usize>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let snapshot = ticket.snapshot();
+        let target_partitions = snapshot.segments.len().max(1);
+        let plan = (self.build)(snapshot, self.fetcher.clone(), target_partitions)?;
+        execute_stream(plan, Arc::new(TaskContext::default()))
+    }
+}
+
+fn logs_fragment(
+    snapshot: Snapshot,
+    fetcher: LogSegmentFetcher,
+    target_partitions: usize,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    LogsTableProvider::new(snapshot, TENANT, fetcher, QueryAccounting::new())
+        .worker_fragment(target_partitions)
+}
+
+fn alerts_fragment(
+    snapshot: Snapshot,
+    fetcher: LogSegmentFetcher,
+    target_partitions: usize,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    AlertsTableProvider::new(snapshot, TENANT, fetcher, QueryAccounting::new())
+        .worker_fragment(target_partitions)
+}
+
+fn audit_fragment(
+    snapshot: Snapshot,
+    fetcher: LogSegmentFetcher,
+    target_partitions: usize,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    AuditTableProvider::new(snapshot, TENANT, fetcher, QueryAccounting::new())
+        .worker_fragment(target_partitions)
+}
+
+/// Extract `(ts, discriminator)` rows in emission order. `ts_col` is the
+/// signal's timestamp column (`ts` for logs, `ts_ns` for alerts/audit);
+/// `other_col` a nullable/non-null Utf8 differentiator. A NULL differentiator
+/// renders as the empty string.
+fn ts_and(batches: &[RecordBatch], ts_col: &str, other_col: &str) -> Vec<(i64, String)> {
+    let mut out = Vec::new();
+    for b in batches {
+        let ts = b
+            .column_by_name(ts_col)
+            .unwrap_or_else(|| panic!("column {ts_col}"))
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("ts column type");
+        let other = b
+            .column_by_name(other_col)
+            .unwrap_or_else(|| panic!("column {other_col}"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("discriminator column type");
+        for i in 0..b.num_rows() {
+            let s = if other.is_null(i) {
+                String::new()
+            } else {
+                other.value(i).to_string()
+            };
+            out.push((ts.value(i), s));
+        }
+    }
+    out
+}
+
+async fn collect_plan(plan: Arc<dyn ExecutionPlan>) -> Vec<RecordBatch> {
+    collect(plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("collect plan")
+}
+
+async fn collect_distributed(provider: Arc<dyn TableProvider>) -> Vec<RecordBatch> {
+    let ctx = SessionContext::new();
+    let plan = provider
+        .scan(&ctx.state(), None, &[], None)
+        .await
+        .expect("distributed scan");
+    collect(plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("collect distributed")
+}
+
+// --- logs -----------------------------------------------------------------
+
+#[tokio::test]
+async fn distributed_logs_reshard_straddle_equals_sorted_local() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    // One stream (`service.name = api`) straddles two shards, ts interleaving.
+    let res = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let s0 = write_rlog_segment(
+        backend.as_ref(),
+        "logs/reshard-0.rlog",
+        0,
+        1,
+        10,
+        &[
+            log_record(&res, &[], 10, "b10"),
+            log_record(&res, &[], 30, "b30"),
+        ],
+    )
+    .await;
+    let s1 = write_rlog_segment(
+        backend.as_ref(),
+        "logs/reshard-1.rlog",
+        1,
+        1,
+        20,
+        &[
+            log_record(&res, &[], 20, "b20"),
+            log_record(&res, &[], 40, "b40"),
+        ],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+
+    assert!(
+        rlog_endpoints_for(&snapshot).len() >= 2,
+        "fixture must genuinely partition into more than one slice"
+    );
+
+    // Independent local reference: plain scan, sorted in-test (never the merge
+    // exec under test).
+    let local = collect_plan(
+        LogsTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .plan(4)
+        .expect("local plan"),
+    )
+    .await;
+    let mut want = ts_and(&local, "ts", "body");
+    want.sort();
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RlogWorker {
+        fetcher: fetcher.clone(),
+        build: logs_fragment,
+    });
+    let dist: Arc<dyn TableProvider> = Arc::new(
+        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+            .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
+    );
+    let got = ts_and(&collect_distributed(dist).await, "ts", "body");
+
+    assert_eq!(
+        got, want,
+        "the distributed output is the total-order merge of both slices; a slice-order concat would differ"
+    );
+    assert_eq!(
+        got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![10, 20, 30, 40],
+        "the straddling stream's ts are globally sorted across slices, not slice-concatenated"
+    );
+}
+
+#[tokio::test]
+async fn distributed_logs_preserves_duplicate_rows() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let res = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    // Two byte-identical records, one per shard: a retry after a lost ack.
+    let s0 = write_rlog_segment(
+        backend.as_ref(),
+        "logs/dup-0.rlog",
+        0,
+        1,
+        10,
+        &[log_record(&res, &[], 50, "dup")],
+    )
+    .await;
+    let s1 = write_rlog_segment(
+        backend.as_ref(),
+        "logs/dup-1.rlog",
+        1,
+        1,
+        20,
+        &[log_record(&res, &[], 50, "dup")],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+
+    let local = collect_plan(
+        LogsTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .plan(4)
+        .expect("local plan"),
+    )
+    .await;
+    let mut want = ts_and(&local, "ts", "body");
+    want.sort();
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RlogWorker {
+        fetcher: fetcher.clone(),
+        build: logs_fragment,
+    });
+    let dist: Arc<dyn TableProvider> = Arc::new(
+        LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+            .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
+    );
+    let mut got = ts_and(&collect_distributed(dist).await, "ts", "body");
+    got.sort();
+
+    assert_eq!(got, want, "distributed multiset equals local multiset");
+    assert_eq!(
+        got,
+        vec![(50, "dup".to_string()), (50, "dup".to_string())],
+        "both byte-identical rows survive; a reintroduced dedup would collapse them to one"
+    );
+}
+
+#[tokio::test]
+async fn distributed_logs_plan_merges_without_dedup() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let res = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let s0 = write_rlog_segment(
+        backend.as_ref(),
+        "logs/shape-0.rlog",
+        0,
+        1,
+        10,
+        &[log_record(&res, &[], 10, "b10")],
+    )
+    .await;
+    let s1 = write_rlog_segment(
+        backend.as_ref(),
+        "logs/shape-1.rlog",
+        1,
+        1,
+        20,
+        &[log_record(&res, &[], 20, "b20")],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RlogWorker {
+        fetcher: fetcher.clone(),
+        build: logs_fragment,
+    });
+    let dist = LogsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+        .with_distributed_scan(rlog_endpoints_for(&snapshot), client);
+    let ctx = SessionContext::new();
+    let plan = dist
+        .scan(&ctx.state(), None, &[], None)
+        .await
+        .expect("distributed scan");
+    let text = displayable(plan.as_ref()).indent(true).to_string();
+
+    assert!(
+        text.contains("SortPreservingMergeExec"),
+        "the RLOG merge is a SortPreservingMergeExec:\n{text}"
+    );
+    assert!(
+        text.contains("DistributedSliceScanExec"),
+        "over the fan-out slice scan:\n{text}"
+    );
+    // The load-bearing negative: logs/alerts/audit have NO query-time dedup, so
+    // the plan must never grow an RsegDedupExec (or any dedup node) above the
+    // merge. This is trap #1 from the task, guarded directly.
+    assert!(
+        !text.to_lowercase().contains("dedup"),
+        "logs/alerts/audit have no query-time dedup; the merge must not introduce one:\n{text}"
+    );
+}
+
+// --- alerts ----------------------------------------------------------------
+
+#[tokio::test]
+async fn distributed_alerts_reshard_straddle_equals_sorted_local() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let res = vec![("service.name".to_string(), AttrValue::Str("alerts".into()))];
+    let s0 = write_rlog_segment(
+        backend.as_ref(),
+        "alerts/reshard-0.rlog",
+        0,
+        1,
+        10,
+        &[alert_record(&res, 10, "a10"), alert_record(&res, 30, "a30")],
+    )
+    .await;
+    let s1 = write_rlog_segment(
+        backend.as_ref(),
+        "alerts/reshard-1.rlog",
+        1,
+        1,
+        20,
+        &[alert_record(&res, 20, "a20"), alert_record(&res, 40, "a40")],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+
+    let local = collect_plan(
+        AlertsTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .plan(4)
+        .expect("local plan"),
+    )
+    .await;
+    let mut want = ts_and(&local, "ts_ns", "alert_id");
+    want.sort();
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RlogWorker {
+        fetcher: fetcher.clone(),
+        build: alerts_fragment,
+    });
+    let dist: Arc<dyn TableProvider> = Arc::new(
+        AlertsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+            .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
+    );
+    let got = ts_and(&collect_distributed(dist).await, "ts_ns", "alert_id");
+
+    assert_eq!(got, want, "alerts distributed merge equals sorted local");
+    assert_eq!(
+        got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![10, 20, 30, 40],
+        "the straddling stream's ts are globally sorted across slices"
+    );
+}
+
+#[tokio::test]
+async fn distributed_alerts_preserves_duplicate_rows() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let res = vec![("service.name".to_string(), AttrValue::Str("alerts".into()))];
+    let s0 = write_rlog_segment(
+        backend.as_ref(),
+        "alerts/dup-0.rlog",
+        0,
+        1,
+        10,
+        &[alert_record(&res, 50, "adup")],
+    )
+    .await;
+    let s1 = write_rlog_segment(
+        backend.as_ref(),
+        "alerts/dup-1.rlog",
+        1,
+        1,
+        20,
+        &[alert_record(&res, 50, "adup")],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+
+    let local = collect_plan(
+        AlertsTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .plan(4)
+        .expect("local plan"),
+    )
+    .await;
+    let mut want = ts_and(&local, "ts_ns", "alert_id");
+    want.sort();
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RlogWorker {
+        fetcher: fetcher.clone(),
+        build: alerts_fragment,
+    });
+    let dist: Arc<dyn TableProvider> = Arc::new(
+        AlertsTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+            .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
+    );
+    let mut got = ts_and(&collect_distributed(dist).await, "ts_ns", "alert_id");
+    got.sort();
+
+    assert_eq!(
+        got, want,
+        "alerts distributed multiset equals local multiset"
+    );
+    assert_eq!(
+        got,
+        vec![(50, "adup".to_string()), (50, "adup".to_string())],
+        "both duplicate alert rows survive; a reintroduced dedup would drop one"
+    );
+}
+
+// --- audit -----------------------------------------------------------------
+
+#[tokio::test]
+async fn distributed_audit_reshard_straddle_equals_sorted_local() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let res = vec![("service.name".to_string(), AttrValue::Str("audit".into()))];
+    let s0 = write_rlog_segment(
+        backend.as_ref(),
+        "audit/reshard-0.rlog",
+        0,
+        1,
+        10,
+        &[
+            log_record(&res, &[], 10, "e10"),
+            log_record(&res, &[], 30, "e30"),
+        ],
+    )
+    .await;
+    let s1 = write_rlog_segment(
+        backend.as_ref(),
+        "audit/reshard-1.rlog",
+        1,
+        1,
+        20,
+        &[
+            log_record(&res, &[], 20, "e20"),
+            log_record(&res, &[], 40, "e40"),
+        ],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+
+    let local = collect_plan(
+        AuditTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .plan(4)
+        .expect("local plan"),
+    )
+    .await;
+    let mut want = ts_and(&local, "ts_ns", "body");
+    want.sort();
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RlogWorker {
+        fetcher: fetcher.clone(),
+        build: audit_fragment,
+    });
+    let dist: Arc<dyn TableProvider> = Arc::new(
+        AuditTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+            .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
+    );
+    let got = ts_and(&collect_distributed(dist).await, "ts_ns", "body");
+
+    assert_eq!(got, want, "audit distributed merge equals sorted local");
+    assert_eq!(
+        got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![10, 20, 30, 40],
+        "the straddling stream's ts are globally sorted across slices"
+    );
+}
+
+#[tokio::test]
+async fn distributed_audit_preserves_duplicate_rows() {
+    let store = Arc::new(MemoryStore::new());
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let res = vec![("service.name".to_string(), AttrValue::Str("audit".into()))];
+    let s0 = write_rlog_segment(
+        backend.as_ref(),
+        "audit/dup-0.rlog",
+        0,
+        1,
+        10,
+        &[log_record(&res, &[], 50, "edup")],
+    )
+    .await;
+    let s1 = write_rlog_segment(
+        backend.as_ref(),
+        "audit/dup-1.rlog",
+        1,
+        1,
+        20,
+        &[log_record(&res, &[], 50, "edup")],
+    )
+    .await;
+    let snapshot = rlog_snapshot(vec![s0, s1]);
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&backend));
+
+    let local = collect_plan(
+        AuditTableProvider::new(
+            snapshot.clone(),
+            TENANT,
+            fetcher.clone(),
+            QueryAccounting::new(),
+        )
+        .plan(4)
+        .expect("local plan"),
+    )
+    .await;
+    let mut want = ts_and(&local, "ts_ns", "body");
+    want.sort();
+
+    let client: Arc<dyn WorkerSliceClient> = Arc::new(RlogWorker {
+        fetcher: fetcher.clone(),
+        build: audit_fragment,
+    });
+    let dist: Arc<dyn TableProvider> = Arc::new(
+        AuditTableProvider::new(snapshot.clone(), TENANT, fetcher, QueryAccounting::new())
+            .with_distributed_scan(rlog_endpoints_for(&snapshot), client),
+    );
+    let mut got = ts_and(&collect_distributed(dist).await, "ts_ns", "body");
+    got.sort();
+
+    assert_eq!(
+        got, want,
+        "audit distributed multiset equals local multiset"
+    );
+    assert_eq!(
+        got,
+        vec![(50, "edup".to_string()), (50, "edup".to_string())],
+        "both duplicate audit rows survive; a reintroduced dedup would drop one"
+    );
+}
