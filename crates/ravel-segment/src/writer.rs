@@ -1152,21 +1152,29 @@ fn append_ts_run_page_v4(page: &[u8], ts_pages: &mut Vec<u8>) -> Result<u64, Wri
 }
 
 /// Copies one run's pre-framed VAL page verbatim into `val_pages`,
-/// applying the v2/v3 raw-f64 alignment rule (ADR-0027) by
-/// inspecting the page's own `enc` byte (its first byte) rather than
-/// re-deciding the encoding: this writer never decodes the payload.
-/// Returns the pad length inserted before this page's header (the
-/// caller's `val_page_gap` column); the page itself is copied unmodified,
-/// so its crc32c (bound to series_id/enc/comp/payload, not position)
-/// stays valid.
-fn append_val_run_page_v4(page: &[u8], val_pages: &mut Vec<u8>) -> Result<u64, WriteError> {
+/// applying the raw-f64 alignment rule by inspecting the page's own `enc`
+/// byte (its first byte) rather than re-deciding the encoding: this writer
+/// never decodes the payload. Returns the pad length inserted before this
+/// page's header (the caller's `val_page_gap` column); the page itself is
+/// copied unmodified, so its crc32c (bound to series_id/enc/comp/payload, not
+/// position) stays valid.
+///
+/// A single-sample VAL_RAW_F64 page carries no pad (ADR-0092 decision 4): the
+/// 8-byte alignment exists only so a multi-sample raw payload is eligible for
+/// an Arrow zero-copy view (ADR-0013), and a one-value page is never viewed
+/// that way. Every multi-sample raw page keeps its pad.
+fn append_val_run_page_v4(
+    page: &[u8],
+    sample_count: u32,
+    val_pages: &mut Vec<u8>,
+) -> Result<u64, WriteError> {
     if page.len() < RUN_PAGE_HEADER_LEN_V4 {
         return Err(WriteError::RunPageTooShort);
     }
     let enc = page[0];
 
     let mut gap = 0u64;
-    if enc == page_enc::VAL_RAW_F64 {
+    if enc == page_enc::VAL_RAW_F64 && sample_count > 1 {
         let unaligned_payload_start = val_pages.len() as u64 + RUN_PAGE_HEADER_LEN_V4 as u64;
         let rem = unaligned_payload_start % 8;
         if rem != 0 {
@@ -1305,7 +1313,7 @@ fn build_series_meta_v4(
 
             match &r.value_page {
                 RunValuePageV4::Scalar(page) => {
-                    let val_gap = append_val_run_page_v4(page, val_pages)?;
+                    let val_gap = append_val_run_page_v4(page, r.sample_count, val_pages)?;
                     write_uvarint(&mut col_val_page_gap, val_gap);
                     write_uvarint(&mut col_val_page_len, page.len() as u64);
                     write_uvarint(&mut col_hist_page_gap, 0);
@@ -2165,6 +2173,68 @@ mod v4_tests {
         );
     }
 
+    #[test]
+    fn single_sample_raw_f64_page_carries_no_pad_multi_sample_still_does() {
+        // ADR-0092 decision 4: a one-sample VAL_RAW_F64 page never serves an
+        // Arrow zero-copy view (ADR-0013), so it drops the 8-byte alignment
+        // pad; every multi-sample raw page keeps it. Series A is a single raw
+        // sample (id sorts first), series B two raw samples.
+        let id_a = SeriesId([0x01; 16]);
+        let id_b = SeriesId([0x02; 16]);
+        let run_a = scalar_run(1_000, 1, 1, &id_a, &[10], &[1.5], true);
+        let run_b = scalar_run(1_000, 1, 1, &id_b, &[10, 20], &[1.5, 2.5], true);
+        let series = vec![
+            SeriesInputV4 {
+                series_id: id_a,
+                labels: labels("m"),
+                runs: vec![run_a],
+            },
+            SeriesInputV4 {
+                series_id: id_b,
+                labels: labels("m"),
+                runs: vec![run_b],
+            },
+        ];
+        let written = SegmentWriter::write_v4(
+            series,
+            test_identity(),
+            test_bounds(),
+            test_compaction_meta(),
+            Vec::new(),
+        )
+        .expect("writes");
+        let object = written.bytes.as_ref();
+        let footer = decode_footer(object, VERSION_V4);
+        let val_desc = section_desc(&footer, section_kind::VAL_PAGES).expect("present");
+        let meta_desc = section_desc(&footer, section_kind::SERIES_META).expect("mandatory");
+        let meta_raw = decompress_section(
+            section(object, &footer, section_kind::SERIES_META),
+            meta_desc.uncompressed_len,
+        );
+        let meta = parse_series_meta_v4(&meta_raw);
+
+        // Series A (run 0): single sample, no pad.
+        assert_eq!(
+            meta.val_page_gap[0], 0,
+            "single-sample raw page must carry no alignment pad"
+        );
+
+        // Series B (run 1): multi-sample, padded so its payload start is
+        // 8-byte aligned relative to the section (and object).
+        let gap_b = meta.val_page_gap[1];
+        let running_before_b = 0 + meta.val_page_len[0] + gap_b;
+        let payload_start_b = val_desc.offset + running_before_b + 6;
+        assert_eq!(
+            payload_start_b % 8,
+            0,
+            "multi-sample raw page payload must stay 8-byte aligned"
+        );
+        assert!(
+            gap_b > 0,
+            "the multi-sample raw page here needs a non-zero pad to align"
+        );
+    }
+
     // --- histogram runs: verbatim reuse of real HIST_PAGES bytes framed by
     // the raw-sample v5 writer, never re-encoded (the ticket's core
     // requirement). ---
@@ -2519,7 +2589,9 @@ mod v4_tests {
                     val_enc == page_enc::VAL_GORILLA || val_enc == page_enc::VAL_RAW_F64,
                     "unexpected VAL page enc byte {val_enc}"
                 );
-                if val_enc == page_enc::VAL_RAW_F64 {
+                // A multi-sample raw page stays 8-byte aligned; a single-sample
+                // one carries no pad (ADR-0092 decision 4), so it need not align.
+                if val_enc == page_enc::VAL_RAW_F64 && run.sample_count > 1 {
                     prop_assert_eq!((val_desc_offset(&footer) + val_offset + 6) % 8, 0);
                 }
                 val_running = val_end;
