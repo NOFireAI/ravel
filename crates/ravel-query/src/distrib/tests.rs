@@ -44,6 +44,7 @@ use crate::config::EngineConfig;
 use crate::distrib::Distributed;
 use crate::distrib::client::{DistribError, RemoteSliceFetcher, SliceFetcher, SliceResponse};
 use crate::distrib::partition::{DistribThresholds, partition_snapshot};
+use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use crate::distrib::{
     log_record_order_key, service::SeriesFetchService, service::SnapshotSegmentResolver, span_cmp,
     span_order_key,
@@ -2950,4 +2951,305 @@ fn span_cmp_agrees_with_span_order_key() {
             );
         }
     }
+}
+
+// --- Old-worker version skew (T4, #286) ------------------------------------
+//
+// ADR-0071's amendment (Decision 2) governs the skew direction a NEW coordinator
+// faces against an OLD worker that predates the log/span fan-out: such a worker
+// still runs the deleted pre-#283 `run_slice_inner` stub, which rejected ANY
+// non-Metrics `Signal` with `Unsupported` BEFORE decoding the request body. The
+// coordinator maps that `Unsupported` to a silent whole-query local fallback
+// (`Distributed::fetch*` returning `Ok(None)`, distrib/mod.rs), never a wrong or
+// partial answer. That fallback direction has never been exercised over the wire
+// because today's coordinator refuses non-Metrics before dispatch and the real
+// worker no longer carries the stub; this section reconstructs the old wire
+// behavior with a worker double and pins it for Logs, Alerts, Audit, and Spans.
+
+/// A gRPC `SeriesFetch` worker double pinned to the PRE-#283 behavior: it rejects
+/// ANY non-Metrics `Signal` with `Unsupported` BEFORE decoding the request body,
+/// exactly as `run_slice_inner`'s now-deleted stub did (a "not yet implemented;
+/// only Metrics is distributed" summary). This is the not-yet-upgraded-worker
+/// skew direction ADR-0071's amendment (Decision 2) calls out.
+///
+/// It is deliberately NOT `SeriesFetchService` with a fetcher left unwired (that
+/// is the `*_without_*_fetcher_signals_local_fallback` tests): the real service
+/// now decodes tenant/matchers/erasure and dispatches on the signal, so a
+/// fetcher-missing worker rejects INSIDE the per-signal path (after decode) and
+/// never emits the "not yet implemented" stub message. This double reproduces
+/// the old pre-decode blanket rejection instead, so the skew test exercises an
+/// old worker's actual wire behavior, not a mis-wired new one.
+struct OldMetricsOnlyWorker;
+
+#[tonic::async_trait]
+impl SeriesFetch for OldMetricsOnlyWorker {
+    type FetchStream = std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<pb::FetchResponse, tonic::Status>> + Send + 'static>,
+    >;
+
+    async fn fetch(
+        &self,
+        request: tonic::Request<pb::FetchRequest>,
+    ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
+        // The old worker inspected the raw signal discriminant and rejected any
+        // non-Metrics value immediately, before decoding tenant/matchers/erasure.
+        // Reproduce exactly that: no request-body decode happens here.
+        let signal = request.into_inner().signal;
+        let (code, message) = if signal == crate::distrib::codec::signal_to_u32(Signal::Metrics) {
+            // Metrics was served by the old worker; not exercised by this test
+            // (which only dispatches non-Metrics signals). An empty Ok summary.
+            (pb::status::Code::Ok, String::new())
+        } else {
+            (
+                pb::status::Code::Unsupported,
+                "signal not yet implemented; only Metrics is distributed".to_string(),
+            )
+        };
+        let summary = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Summary(pb::Summary {
+                accounting: None,
+                series_returned: 0,
+                samples_returned: 0,
+                status: Some(pb::Status {
+                    code: code as i32,
+                    message,
+                }),
+                raw_f64_pages: 0,
+                raw_f64_bytes: 0,
+            })),
+        };
+        let stream = futures::stream::iter(vec![Ok(summary)]);
+        Ok(tonic::Response::new(Box::pin(stream)))
+    }
+}
+
+/// Starts an [`OldMetricsOnlyWorker`] on `127.0.0.1:0` and returns a
+/// `RemoteSliceFetcher` connected to it plus the server task handle.
+async fn spawn_old_worker() -> (RemoteSliceFetcher, JoinHandle<()>) {
+    let service = SeriesFetchServer::new(OldMetricsOnlyWorker);
+    let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+    let addr = incoming.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .expect("serve");
+    });
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    (RemoteSliceFetcher::new(channel), handle)
+}
+
+/// A raw slice request for a signal, used to probe the worker double at the wire
+/// level (below the coordinator). `tenant` is passed through verbatim so a
+/// malformed value can prove the old worker rejects BEFORE tenant decode.
+fn raw_slice_request(signal: Signal, tenant: Vec<u8>) -> pb::FetchRequest {
+    pb::FetchRequest {
+        protocol_version: crate::distrib::codec::PROTOCOL_VERSION,
+        query_id: Vec::new(),
+        tenant_hash: tenant,
+        signal: crate::distrib::codec::signal_to_u32(signal),
+        scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+            segments: Vec::new(),
+        })),
+        matchers: Vec::new(),
+        window_start_ns: 0,
+        window_end_ns: 0,
+        budgets: None,
+        deadline_unix_ns: 0,
+        erasure: Vec::new(),
+        trace_context: String::new(),
+        fragment_capability: Vec::new(),
+    }
+}
+
+/// The one skew direction the epic confirmed is not yet covered: a NEW
+/// coordinator dispatching a non-Metrics signal to an OLD worker that still runs
+/// the pre-#283 blanket rejection. For each of Logs, Alerts, Audit, and Spans the
+/// coordinator must degrade to a silent whole-query local fallback (`Ok(None)`,
+/// never an error and never a partial result), and the local path it falls back
+/// to must produce the complete, correctly ordered result over the same corpus.
+///
+/// Distinct from `logs_worker_without_log_fetcher_signals_local_fallback` /
+/// `spans_worker_without_span_fetcher_signals_local_fallback`, which use the real
+/// dispatch service with a fetcher left unwired (a mis-wired NEW worker). Here the
+/// double reproduces the OLD worker's pre-decode reject, proven two ways below:
+/// the "not yet implemented" stub message on the wire, and a malformed-tenant
+/// Logs request that still returns `Unsupported` (the new worker returns `BadData`
+/// there, because it decodes the tenant before dispatching on the signal -- see
+/// `run_slice_inner_dispatches_on_signal_not_blanket_rejects`).
+#[test]
+fn old_worker_rejecting_nonmetrics_signals_yields_silent_local_fallback() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        // --- Wire-level proof the double IS the old pre-decode reject. ---
+        let (old, server) = spawn_old_worker().await;
+
+        // A Logs request with a malformed tenant hash still comes back
+        // Unsupported, NOT BadData: the old worker rejects the signal before it
+        // decodes the tenant. This is the structural inverse of the new worker's
+        // `BadData`-on-bad-tenant behavior, so it pins the double to the deleted
+        // pre-decode stub rather than a fetcher-missing new service.
+        let bad_tenant =
+            SliceFetcher::fetch_logs(&old, raw_slice_request(Signal::Logs, vec![0u8; 3]))
+                .await
+                .expect("old worker responds to a malformed-tenant logs request");
+        assert_eq!(
+            bad_tenant.status,
+            pb::status::Code::Unsupported,
+            "the old worker rejects the signal before decoding the tenant (pre-decode stub), \
+             so a bad tenant is still Unsupported, not BadData"
+        );
+        assert!(
+            bad_tenant.status_message.contains("not yet implemented"),
+            "the reject carries the old stub message, got {:?}",
+            bad_tenant.status_message
+        );
+
+        // Every RLOG-family signal is rejected with the old stub message.
+        for signal in [Signal::Logs, Signal::Alerts, Signal::Audit] {
+            let resp = SliceFetcher::fetch_logs(&old, raw_slice_request(signal, TENANT.0.to_vec()))
+                .await
+                .expect("old worker responds to a log-family request");
+            assert_eq!(
+                resp.status,
+                pb::status::Code::Unsupported,
+                "{signal:?}: the old worker rejects it as Unsupported"
+            );
+            assert!(
+                resp.status_message.contains("not yet implemented"),
+                "{signal:?}: the reject carries the old stub message, got {:?}",
+                resp.status_message
+            );
+        }
+        // Spans likewise, over the span decode path.
+        let span_reject =
+            SliceFetcher::fetch_spans(&old, raw_slice_request(Signal::Spans, TENANT.0.to_vec()))
+                .await
+                .expect("old worker responds to a spans request");
+        assert_eq!(
+            span_reject.status,
+            pb::status::Code::Unsupported,
+            "Spans: the old worker rejects it as Unsupported"
+        );
+        assert!(
+            span_reject.status_message.contains("not yet implemented"),
+            "Spans: the reject carries the old stub message, got {:?}",
+            span_reject.status_message
+        );
+        server.abort();
+
+        // --- RLOG family: coordinator degrades to silent Ok(None). ---
+        let store = Arc::new(MemoryStore::new());
+        let segments = split_stream_corpus(&store).await;
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        // A non-empty corpus that partitions into two slices, so an Ok(None) here
+        // is a genuine whole-query fallback, not the empty-snapshot
+        // Ok(Some(vec![])) shortcut in `fetch_logs`.
+        assert_eq!(
+            partition_snapshot(&snapshot, 2).len(),
+            2,
+            "the corpus must produce a real multi-slice fan-out for the fallback to be meaningful"
+        );
+        // The result the local fallback path yields over this corpus: complete
+        // (all six records) and in the global cross-segment total order. Ok(None)
+        // routes the engine to exactly this local read, so this is the eventual
+        // answer -- correct, never partial.
+        let local_logs = local_log_records(Arc::clone(&store), &segments, &[]).await;
+        let local_log_ts: Vec<i64> = sorted_by_order_key(local_logs)
+            .iter()
+            .map(|r| r.ts_ns)
+            .collect();
+        assert_eq!(
+            local_log_ts,
+            vec![10, 15, 20, 25, 30, 40],
+            "the local fallback produces the complete, correctly ordered record set"
+        );
+
+        for signal in [Signal::Logs, Signal::Alerts, Signal::Audit] {
+            let (old, server) = spawn_old_worker().await;
+            let distributed = Distributed::new(
+                Arc::new(old),
+                DistribThresholds {
+                    min_store_bytes: 0,
+                    min_segments: 0,
+                    max_parallel_slices: 2,
+                },
+            );
+            let result = distributed
+                .fetch_logs(
+                    TENANT,
+                    signal,
+                    &snapshot,
+                    &[],
+                    &[],
+                    &QueryAccounting::new(),
+                    &EngineConfig::default(),
+                    i64::MAX,
+                )
+                .await
+                .expect("an old worker's Unsupported must not surface as an error");
+            assert!(
+                result.is_none(),
+                "{signal:?}: an old worker rejecting the signal yields whole-query local \
+                 fallback Ok(None), never a wrong or partial result"
+            );
+            server.abort();
+        }
+
+        // --- Spans: same silent Ok(None) fallback, correct local result. ---
+        let span_store = Arc::new(MemoryStore::new());
+        let span_segments = split_trace_corpus(&span_store).await;
+        let span_snapshot = Snapshot {
+            segments: span_segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        assert_eq!(
+            partition_snapshot(&span_snapshot, 2).len(),
+            2,
+            "the span corpus must produce a real multi-slice fan-out"
+        );
+        let local_spans = local_span_rows(Arc::clone(&span_store), &span_segments, &[]).await;
+        assert_eq!(
+            span_id_seq(&sorted_spans_by_order_key(local_spans)),
+            vec![(TA, S1), (TA, S2), (TB, S1), (TB, S2)],
+            "the local fallback produces the complete, correctly ordered span set"
+        );
+
+        let (old, server) = spawn_old_worker().await;
+        let distributed = Distributed::new(
+            Arc::new(old),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 2,
+            },
+        );
+        let result = distributed
+            .fetch_spans(
+                TENANT,
+                Signal::Spans,
+                &span_snapshot,
+                &[],
+                &[],
+                &QueryAccounting::new(),
+                &EngineConfig::default(),
+                i64::MAX,
+            )
+            .await
+            .expect("an old worker's Unsupported must not surface as an error");
+        assert!(
+            result.is_none(),
+            "Spans: an old worker rejecting the signal yields whole-query local fallback \
+             Ok(None), never a wrong or partial result"
+        );
+        server.abort();
+    });
 }
