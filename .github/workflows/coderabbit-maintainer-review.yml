@@ -418,8 +418,17 @@ jobs:
   # Tells the maintainer the command was heard, without giving anyone else a
   # way to make this workflow speak. It runs only after authorization succeeded,
   # so an unauthorised comment gets no reaction and no reply: silence, and a
-  # failed run that only maintainers can see. `issues: write` lives here and
-  # nowhere else, and this job never touches pull-request content.
+  # failed run that only maintainers can see. Both permissions below live here
+  # and nowhere else, and this job never touches pull-request content.
+  #
+  # `pull-requests: write` is required alongside `issues: write` because the
+  # triggering comment always belongs to a pull request (the `authorize` job's
+  # `if` only admits comments where `github.event.issue.pull_request != null`).
+  # The REST docs list reaction endpoints under the "Issues" permission
+  # category, but GitHub's real enforcement for a reaction on a PR-linked
+  # comment also checks `pull-requests`; without it the API returns 403
+  # "Resource not accessible by integration" even though `issues: write` is
+  # present. Confirmed against run 32361349210 on 2026-08-20.
   ack:
     name: acknowledge the command
     needs: authorize
@@ -428,6 +437,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       issues: write
+      pull-requests: write
     steps:
       - name: React to the triggering comment
         env:
