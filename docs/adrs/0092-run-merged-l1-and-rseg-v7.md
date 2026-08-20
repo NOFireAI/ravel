@@ -7,6 +7,16 @@ by retention, by rewrite-on-touch, and by the `maintain migrate` job. The
 pre-release regime of ADR-0027 applies: exactly one supported version, and
 v6 read and write support is deleted in the same change that introduces v7.
 
+**Amended 2026-08-20 (epic #309 outcome).** Every number this ADR projected
+has been superseded by measurement on the shipped tree: the fragmented shape
+costs 26.52 bytes per sample (not 42.14), the shipped merged shape costs 8.88
+(below the 11.46 this ADR called an unreachable floor), the reduction is
+2.99x (not 2.5x), and the per-sample provenance cost is near zero on regular
+data (not ~5.20). The decision itself stands. v7 also removed a capability
+this ADR did not flag: run-merged series cannot be executed over the
+distributed query path until #348 lands. See the Amendment at the end of this
+file before quoting any figure from the sections below.
+
 ## Context
 
 ADR-0018 chose verbatim run preservation for L0-to-L1 compaction. An L1
@@ -57,7 +67,17 @@ the merged one and 2.6 times raw. The marginal catalog cost is 11.04 bytes
 per run after zstd, about half ADR-0018's pre-compression estimate, because
 the run-major columns sit inside a zstd-compressed `SERIES_META`.
 
+> **Amended:** this table was measured at commit `2e1a3ed7`, before this
+> epic's own page-level and codec changes landed. It records what was known
+> at decision time. Shipped outcome: fragmented 26.52 B/sample, merged 8.88.
+> See Amendment 2026-08-20.
+
 ### Why 11.46 is not the target
+
+> **Amended:** the shipped merged shape measures 8.88 B/sample, below this
+> floor, because decision 6's codecs moved the page bytes the floor was
+> computed over. The provenance argument here remains correct and provenance
+> is still paid. See Amendment 2026-08-20.
 
 The merged column above is a floor no exact system reaches. ADR-0018's
 correctness core requires per-sample dedup provenance for any merged
@@ -309,6 +329,7 @@ separate version numbers.
   long-retention tenants: ADR-0076's 97% request share is a short-retention
   figure, and storage and request cost approach parity at retention windows
   measured in hundreds of days.
+  **Amended: measured 2.99x for this shape; see Amendment 2026-08-20.**
 - **Downsampling (#118) gets its prerequisite.** A downsampling job reads an
   hour of L1 and writes a window. Against fragmented L1 it pays the
   fragmentation on every read.
@@ -385,7 +406,10 @@ flowchart LR
   M --> Q2["query merge<br/>one unit per series<br/>priority read per sample"]
 ```
 
-Where the bytes go, measured:
+Where the bytes go, as measured at decision time. **Amended:** every figure
+in this diagram is superseded; the shipped endpoints are fragmented 26.52
+and merged 8.88, and the "unreachable" 11.46 was passed. See Amendment
+2026-08-20.
 
 ```mermaid
 flowchart TB
@@ -396,3 +420,108 @@ flowchart TB
   T --> T2["per-sample provenance ~5"]
   I["ideal, unreachable<br/>11.46 B/sample"] --> I1["no provenance at all<br/>needs a different dedup model"]
 ```
+
+## Amendment 2026-08-20: measured outcome of epic #309
+
+Epic #309 shipped every decision in this ADR: run-merged L1 with per-sample
+provenance (decision 1, #315), the differential test as the exactness gate
+(decision 2), output-byte part splitting (decision 3), both page-level wins
+(decision 4), the single bump to v7 (decision 5), and, from decision 6's
+gated codec work, three new page encodings: `TS_GCD_I64` (2), `VAL_ALP` (18),
+and `VAL_GCD_DELTA_FOR` (19) (`crates/ravel-segment/src/format.rs`,
+docs/segment-format.md).
+
+This amendment records the measured outcome, because every quantitative
+claim in the Context section is superseded. Figures marked *(issue record)*
+come from the epic's issue thread and are not reproducible from the current
+tree; every other figure is pinned by
+`crates/ravel-bench/tests/catalog_byte_gates.rs` and reprintable with
+`cargo test -p ravel-bench --test catalog_byte_gates -- --nocapture`.
+
+### The shipped numbers
+
+On the byte-gate fixture (500 series, 240 samples each, 15 s spacing,
+millisecond timestamps with 200 ms jitter, the same shape as this ADR's
+table):
+
+| | This ADR projected | Shipped, measured |
+|---|---|---|
+| Fragmented, 240 runs x 1 sample | 42.14 B/sample | 26.52 |
+| Merged L1, per-sample provenance | 16 to 17 | 8.88 |
+| No-provenance floor | 11.46, "unreachable" | passed: 8.88 with provenance |
+| Reduction | ~2.5x | 2.99x |
+
+The gate pins the ratio at `FRAG_RATIO_MIN = 2.4` (about 20% below the
+measured 2.99, the same margin policy #312 used), for both the
+provenance-free and the provenance-carrying merged shape.
+
+How the numbers moved, so the next reader does not treat any intermediate as
+current *(issue record for the intermediates)*: this ADR's 42.14 became
+36.52 when #312's committed gate modelled run provenance realistically (the
+whole delta was in `SERIES_META`); decision 4's two page wins took the
+fragmented shape to 26.52; decision 6's codecs then took the merged shape to
+8.88 while leaving the fragmented shape at 26.52, because single-sample runs
+have no delta structure for a codec to exploit.
+
+### What the 2.99x does and does not claim
+
+It compares one merged L1 object against the fragmented L1 layout it
+replaces, on the dominant production shape (2 s strict-mode flushes of a
+15 s scrape), with both sides written by the shipped v7 writer. Read it as
+the L1 storage reduction for that shape. Do not read it as a whole-store
+reduction: other shapes fragment less and win less. Do not divide 42.14 by
+8.88, either; those two numbers come from different measurement
+methodologies two codec generations apart.
+
+### Why 8.88 is below the "unreachable" 11.46
+
+The Context section's floor argument said no exact system reaches 11.46
+because per-sample dedup provenance must be paid. Both halves of that
+argument remain true. 11.46 was the no-provenance floor *under the v6 page
+encodings*; decision 6's codecs shrank the merged pages themselves, moving
+the floor the argument was relative to. Provenance is still paid: the gate
+asserts the provenance-carrying object is strictly larger than the
+provenance-free one, so the columns are present, not dropped. The floor was
+a statement about a codec set, not a law, and the shipped number does not
+contradict the exactness reasoning.
+
+### The per-sample provenance cost: do not quote a single number
+
+This ADR estimated the four provenance columns at about 5.20 bytes per
+sample. That figure is superseded and must not be quoted; it assumed the
+columns survive to storage at near their encoded width, and they do not.
+
+The measured cost on the gate fixture is 320 bytes over 120,000 samples,
+about 0.003 bytes per sample. That figure is honest for its fixture and is
+a best case, and the two must be said together: the fixture merges runs
+from one writer, so `writer_epoch` is constant, `in_page_index` is zero,
+and `writer_seq` and `created_unix_ns` are arithmetic sequences, which
+`encode_i64` (Constant, RLE, delta) plus the section zstd flatten to almost
+nothing. The correct general statement is that the cost is governed by
+provenance regularity, not by sample count: near zero when merged runs come
+from one writer on a steady flush cadence, and rising with cross-writer
+merges, varying epochs, and nonzero in-page indexes. No measurement of that
+irregular case exists in this repository. The measurement that would settle
+it is a gate fixture that merges runs from multiple writers with distinct
+epochs and nonzero in-page indexes; until it exists, quote the cost as
+"about 0.003 B/sample on regular single-writer data, unmeasured for
+cross-writer merges, bounded well below the superseded 5.20 estimate for any
+plausible shape".
+
+### What this epic removed: distributed execution of merged series
+
+Before v7, every L1 series could be executed over the distributed query
+path. A run-merged series cannot: `ravel.queryfrag.v1`'s `Run` message
+(`proto/ravel/queryfrag.proto`) carries one run-wide provenance triple, and
+the triple a merged run would report is the lexicographic minimum over its
+samples, so a distributed fetch would resolve an overlapping timestamp to a
+different dedup winner than the same query run locally. The worker therefore
+refuses the merged shape at runtime with an `Unsupported` summary frame
+(carrying the slice's folded accounting), and the coordinator falls back to
+fully local execution, which is exact.
+
+The consequence is operational, not a correctness one: any query touching
+run-merged L1 loses read fan-out until the wire format carries per-sample
+provenance. That extension is #348, under ADR-0096 (claimed). A reader
+sizing distributed-read capacity against ADR-0071 must account for this
+regression until #348 lands.
