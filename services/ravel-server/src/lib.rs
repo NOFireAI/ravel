@@ -1286,6 +1286,10 @@ pub async fn start(
                 // 256 MiB and the compiled-in 1 GiB tenant ceiling.
                 config.query_budgets.sql_max_query_bytes,
                 config.query_budgets.sql_tenant_max_bytes,
+                // ADR-0094: the exact-typed final-aggregation repartition switch,
+                // from `--sql-parallel-final-aggregation`. Default-off, so an
+                // unset flag leaves every SQL query single-partitioned.
+                config.query_budgets.sql_parallel_final_aggregation,
                 query_accounting.clone(),
                 query_admission.clone(),
                 Some(declared_columns),

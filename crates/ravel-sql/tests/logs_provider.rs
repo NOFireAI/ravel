@@ -596,6 +596,7 @@ fn logs_session(
         &config,
         pool,
         ravel_sql::SessionTable::Logs(Arc::new(provider)),
+        false,
     )
 }
 

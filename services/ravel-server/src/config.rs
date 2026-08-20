@@ -430,6 +430,20 @@ pub struct Cli {
     #[arg(long = "sql-tenant-max-bytes", value_name = "BYTES", default_value_t = DEFAULT_SQL_TENANT_MAX_BYTES)]
     pub sql_tenant_max_bytes: usize,
 
+    /// Allow an exact-typed SQL query to repartition its final aggregation
+    /// (ADR-0094), threaded into `ravel_sql::SqlConfig::parallel_final_aggregation`.
+    /// Off by default: a process with this unset plans every aggregation
+    /// single-partitioned, byte-identical to before this flag existed. When set,
+    /// a per-query classification flips DataFusion's `repartition_aggregations`
+    /// on only for a query whose aggregates and GROUP BY keys are all provably
+    /// order/partition-independent (`count`, and `sum`/`min`/`max` over non-float
+    /// input, no float group key); `avg`/`mean` and any float input or key are
+    /// never eligible and stay single-partitioned. Process-wide, not per-tenant;
+    /// flipping it needs a restart, like every other SQL budget. Meaningful only
+    /// in a build with the `sql` feature; inert otherwise.
+    #[arg(long = "sql-parallel-final-aggregation")]
+    pub sql_parallel_final_aggregation: bool,
+
     /// Bound on concurrent in-flight segment fetches per query (ADR-0088),
     /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is a
     /// single knob with three coupled effects, NOT decoupled by this change: it
@@ -920,6 +934,10 @@ pub struct QueryBudgets {
     /// Per-tenant SQL memory ceiling. Reaches the `SqlExecutor`'s per-tenant
     /// accountant (`max_tenant_bytes`).
     pub sql_tenant_max_bytes: usize,
+    /// Whether an exact-typed SQL query may repartition its final aggregation
+    /// (ADR-0094). Reaches `SqlConfig::parallel_final_aggregation`. Default
+    /// `false`, so a server built without the flag is byte-identical to before.
+    pub sql_parallel_final_aggregation: bool,
 }
 
 impl Default for QueryBudgets {
@@ -929,6 +947,7 @@ impl Default for QueryBudgets {
             max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
+            sql_parallel_final_aggregation: false,
         }
     }
 }
@@ -1614,6 +1633,7 @@ impl Cli {
             max_segments: self.max_segments,
             sql_max_query_bytes: self.sql_max_query_bytes,
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
+            sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
         }
     }
 
@@ -3667,6 +3687,10 @@ mod tests {
         assert_eq!(budgets.max_segments, EngineConfig::default().max_segments);
         assert_eq!(budgets.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
         assert_eq!(budgets.sql_tenant_max_bytes, DEFAULT_SQL_TENANT_MAX_BYTES);
+        assert!(
+            !budgets.sql_parallel_final_aggregation,
+            "ADR-0094: exact-typed final-aggregation repartitioning defaults off"
+        );
         // The two EngineConfig-bound defaults leave a base config untouched.
         assert_eq!(
             budgets.apply_to_engine(EngineConfig::default()),

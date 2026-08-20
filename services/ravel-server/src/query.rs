@@ -213,6 +213,12 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 /// operator's override the value the executor's pool and per-tenant accountant
 /// actually enforce.
 ///
+/// `parallel_final_aggregation` (ADR-0094 decision 4) is the process-wide
+/// switch, from `--sql-parallel-final-aggregation`, that lets an exact-typed
+/// query repartition its final aggregation. Default `false`; threaded here so an
+/// operator's opt-in is the value the executor's classification gate actually
+/// reads rather than `SqlConfig::default()`'s off.
+///
 /// `declared_columns` is the source of each tenant's declared typed attribute
 /// columns (ADR-0090 decision 2), installed on the executor with
 /// `SqlExecutor::with_declared_column_source`. `None` leaves the executor's
@@ -233,6 +239,7 @@ pub fn build_sql_state(
     engine_config: EngineConfig,
     max_query_bytes: usize,
     max_tenant_bytes: usize,
+    parallel_final_aggregation: bool,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
@@ -243,6 +250,10 @@ pub fn build_sql_state(
     let config = SqlConfig {
         engine: engine_config,
         max_query_bytes,
+        // ADR-0094: the process-wide exact-typed repartition switch, from
+        // `--sql-parallel-final-aggregation`. Default-off leaves every query
+        // single-partitioned exactly as before.
+        parallel_final_aggregation,
     };
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone());
@@ -467,6 +478,7 @@ mod tests {
             non_default,
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
+            false,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
@@ -511,6 +523,7 @@ mod tests {
             engine_config,
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
+            false,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
@@ -551,6 +564,7 @@ mod tests {
             EngineConfig::default(),
             budgets.sql_max_query_bytes,
             budgets.sql_tenant_max_bytes,
+            budgets.sql_parallel_final_aggregation,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
@@ -585,6 +599,27 @@ mod tests {
         assert_eq!(
             state.executor.config().max_query_bytes,
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+        );
+    }
+
+    /// ADR-0094 reachability: `--sql-parallel-final-aggregation` must reach the
+    /// `SqlConfig::parallel_final_aggregation` the executor's classification
+    /// gate reads, not stop at a parsed field. Traced from the CLI through
+    /// `query_budgets()` and `build_sql_state` to `executor.config()`. Default
+    /// unset stays `false`, so the shipped posture is single-partition.
+    #[test]
+    fn sql_parallel_final_aggregation_is_reachable_from_cli() {
+        let state = sql_state_from_cli(&["ravel-server", "--sql-parallel-final-aggregation"]);
+        assert!(
+            state.executor.config().parallel_final_aggregation,
+            "the SQL executor must carry the configured flag, not the default false"
+        );
+
+        // Unset: the default-off posture, single-partition for every query.
+        let state = sql_state_from_cli(&["ravel-server"]);
+        assert!(
+            !state.executor.config().parallel_final_aggregation,
+            "default must stay off (ADR-0094 decision 4)"
         );
     }
 

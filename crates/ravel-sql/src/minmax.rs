@@ -123,7 +123,12 @@ impl std::hash::Hash for TotalOrderMinMax {
 /// Whether `data_type` gets the total-order accumulator. Only floating-point
 /// types can disagree between the total order and `partial_cmp`; every other
 /// type delegates.
-fn is_float(data_type: &DataType) -> bool {
+///
+/// `pub(crate)` so `executor.rs`'s ADR-0094 exact-typed classification reuses
+/// the exact float predicate that drives this UDAF's accumulator choice: the
+/// same resolved-type test decides both "needs the total-order accumulator"
+/// and "must not repartition its final aggregation".
+pub(crate) fn is_float(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Float16 | DataType::Float32 | DataType::Float64
