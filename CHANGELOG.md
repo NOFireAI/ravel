@@ -4,6 +4,25 @@ All notable changes to Ravel are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Ravel aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- RSEG segment format bumped to v7 (ADR-0092). v7 is v6 plus three additive
+  changes: an optional per-sample dedup provenance extension in the whole
+  SERIES_META (so an L1 run can merge several writes' samples and still preserve
+  exact dedup order); two value page encodings, `VAL_ALP` (18) and
+  `VAL_GCD_DELTA_FOR` (19), and one timestamp encoding, `TS_GCD_I64` (2), each
+  selected per page against the prior encoding and kept only when smaller; and
+  two page-level byte savings (a run's first timestamp stored as a delta from
+  the run minimum, and single-sample raw-`f64` value pages dropping the 8-byte
+  alignment pad). `docs/segment-format.md` is rewritten as the self-contained v7
+  specification.
+- Pre-release single-version policy (ADR-0027): v6 read and write support is
+  deleted in the same change. The reader accepts trailer `version = 7` only and
+  fails closed on any other version, including a stray v6 object, with a typed
+  `UnsupportedVersion`. There is no v6 reader and no v6-to-v7 migration path.
+
 ## [0.9.5]
 
 Documentation only. No code changed since 0.9.4, so the binaries and images

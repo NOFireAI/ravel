@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1310" height="560" viewBox="0 0 1310 560" font-family="system-ui, sans-serif">
   <rect x="0" y="0" width="1310" height="740" fill="#f4f5f7"/>
 
-  <text x="30" y="34" font-size="20" font-weight="bold" fill="#17191c">RSEG v6 object byte layout</text>
-  <text x="30" y="54" font-size="12" fill="#4a4f57">docs/segment-format.md + ADR-0004 + ADR-0010 §4 (checksum coverage). ADR-0027 and ADR-0047: v6 is the only readable/writable version.</text>
+  <text x="30" y="34" font-size="20" font-weight="bold" fill="#17191c">RSEG v7 object byte layout</text>
+  <text x="30" y="54" font-size="12" fill="#4a4f57">docs/segment-format.md + ADR-0004 + ADR-0010 §4 (checksum coverage). ADR-0027 and ADR-0092: v7 is the only readable/writable version.</text>
 
   <!-- legend -->
   <g>
@@ -15,7 +15,7 @@
     <text x="856" y="85" font-size="12" fill="#17191c">sparse catalog (at &#8805; 4096 series)</text>
   </g>
 
-  <!-- main section tape: below-threshold v6 layout -->
+  <!-- main section tape: below-threshold v7 layout -->
   <text x="30" y="96" font-size="13" font-weight="bold" fill="#17191c">Sections (physical order; readers locate everything through footer offsets)</text>
 
   <g stroke-width="2">
@@ -70,7 +70,7 @@
   <text x="265" y="348" font-size="13" font-weight="bold" fill="#17191c" text-anchor="middle">footer: FooterProto</text>
   <text x="265" y="368" font-size="11" fill="#4a4f57" text-anchor="middle">identity, event/ingest bounds, sections[], compaction provenance</text>
   <text x="800" y="342" font-size="13" font-weight="bold" fill="#17191c" text-anchor="middle">trailer (16 bytes)</text>
-  <text x="800" y="362" font-size="11" fill="#4a4f57" text-anchor="middle">footer_len:u32 &#183; footer_crc32c:u32 &#183; version:u16(=6) &#183; signal:u8 &#183; reserved:u8 &#183; magic:"RSG1"</text>
+  <text x="800" y="362" font-size="11" fill="#4a4f57" text-anchor="middle">footer_len:u32 &#183; footer_crc32c:u32 &#183; version:u16(=7) &#183; signal:u8 &#183; reserved:u8 &#183; magic:"RSG1"</text>
 
   <!-- checksum coverage -->
   <text x="30" y="418" font-size="13" font-weight="bold" fill="#17191c">Checksum coverage (a reader verifies exactly the bytes it touches)</text>
