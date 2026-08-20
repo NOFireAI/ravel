@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
+ravel-codec = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 blake3 = { workspace = true }

@@ -4803,6 +4803,7 @@ dependencies = [
  "lz4_flex 0.14.0",
  "proptest",
  "prost",
+ "ravel-codec",
  "ravel-proto",
  "ravel-types",
  "thiserror",

@@ -257,12 +257,64 @@ Semantics and validation (all violations Corrupted, never panics):
   section's `len`. A series with N runs has N TS pages (and N VAL or N HIST
   pages), back to back in run order.
 - Each block consumes exactly its `block_len` and holds exactly its element
-  count (`count` for blocks 1-4, `run_total` for 5-16); the last ends exactly
-  at SERIES_META's uncompressed end. Trailing bytes are Corrupted.
+  count (`count` for blocks 1-4, `run_total` for 5-16). Block 16 ends exactly
+  at SERIES_META's uncompressed end unless the optional per-sample provenance
+  extension (blocks 17-21, below) follows, in which case that extension ends
+  exactly at it. Trailing bytes past the last present block are Corrupted.
 - Pre-allocation from any count/length is capped by remaining input size.
 
 Readers that only need per-series identity parse blocks 1-4 and skip 5-16
 wholesale via their `block_len` prefixes, at zero cost.
+
+### Optional per-sample dedup provenance columns (ADR-0092 decision 1)
+
+A run may carry an explicit per-sample dedup key
+(`created_unix_ns`, `writer_epoch`, `writer_seq`, in-page index) instead of
+sharing its run-wide triple (blocks 5-7) plus array position. This is what a
+run-merged L1 run needs, since merging several writes' samples into one run
+destroys the array-position reconstruction of the fourth key element. Every
+object an L0 flush or a v6 verbatim (non-run-merging) compaction produces omits
+these columns entirely.
+
+The columns are **optional per run**, and their absence costs zero bytes: when
+no run in the object carries them, SERIES_META ends at block 16 exactly as
+above and is byte-identical to an object written without the capability. When
+at least one run carries them, five more `block_len`-prefixed blocks follow
+block 16, each holding a single byte (the `ravel-codec` `Enc` tag) then that
+codec's payload for the stated element count:
+
+```
+17 run_has_provenance:  run-major, run_total values, each 0 or 1
+                        (1 = this run carries the four columns below)
+18 prov_created_delta:  sample-major, one value per sample of every flagged run,
+                        in run order (sample.created_unix_ns
+                        - footer.base_created_unix_ns)
+19 prov_epoch:          sample-major, sample.writer_epoch
+20 prov_seq:            sample-major, sample.writer_seq
+21 prov_in_page_index:  sample-major, sample's original in-page index
+```
+
+All five are encoded through `ravel_codec::encode_i64`, which picks the
+smallest of Constant, RLE, delta-zigzag, double-delta, frame-of-reference
+bit-pack, and Plain; the chosen encoding is self-describing via the leading
+tag byte. Samples from one source write share a `created_unix_ns`, an epoch,
+and a seq, so blocks 18-20 are long constant/RLE runs in practice.
+
+Semantics and validation (all violations Corrupted, never panics): a presence
+value other than 0 or 1 is rejected; an extension in which no run is flagged is
+rejected (absence, not an all-zero presence column, is the canonical "no
+provenance" form); the four columns' total length is the sum of
+`run_sample_count` over the flagged runs; `created_unix_ns` reconstructs as
+`footer.base_created_unix_ns + prov_created_delta` under checked i128
+arithmetic; an in-page index that is negative or exceeds `u32` is rejected; and
+the decoded live footprint is bounded by the same section byte cap the run-major
+columns use. The columns live inside SERIES_META, under its existing section
+`crc32c`; no page CRC or checksum boundary changes.
+
+The columns exist only in the whole-section SERIES_META (kind 6) form. The
+sparse (chunked) SERIES_META_CHUNKS form does not carry them yet; a writer asked
+to emit provenance on an object large enough to take the sparse form fails
+closed rather than dropping the columns.
 
 ## Sparse catalog
 
