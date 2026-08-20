@@ -1,6 +1,6 @@
 # ADR-0095: NumStat cross-type resolution fix and RLOG v3
 
-Status: Proposed
+Status: Accepted
 
 Migration class: A (bulk data objects), ADR-0066 decision 4. Convergence is
 by retention and re-ingest only. The pre-release regime of ADR-0027 applies:
@@ -41,10 +41,29 @@ occurrences of the same key with different types (or a same-type occurrence
 that spilled to overflow) produce a merged-view winner that the old
 write-path logic never consulted. #333's fix
 (`writer.rs:753-791`, `record_level_winners`) computes, per record and per
-*indexed* name, the true cross-type winner: columnar entries sorted by type
-byte, then overflow entries sorted by `canonical_value_bytes`, take the
-last entry of the combined list. That is exactly what `rebuild_record` and
-`merged_attrs` reconstruct on read. NumStat has no equivalent.
+*indexed* name, the record-level cross-type winner: columnar entries sorted
+by type byte, then overflow entries sorted by `canonical_value_bytes`, take
+the last entry of the combined list. NumStat has no equivalent.
+
+That record-level winner is only half of what a reader actually sees,
+though. `merged_attrs` (`ravel-sql/src/rlog_attrs.rs`) seeds its result from
+`decode_stream_attrs` (resource, then scope) *before* folding in the
+record's own attributes, record-wins on a key collision
+(`rlog_attrs.rs:40-50`). `merged_indexed_terms`
+(`writer.rs`, this section renumbers with the fix below) already reproduces
+that full precedence for POSTINGS: it seeds its own merge from
+`stream_attr_pairs(&r.stream_attrs)` first, then overlays each indexed
+name's record-level winner on top — a name that appears only at resource or
+scope level, with no record-level occurrence at all, still gets a posting
+from its stream-level value. A write-path fix for NumStat that reduces
+"the merged-view winner" to "the record-level winner" reproduces the exact
+hazard the epic's own issue (#331) already found once, in a different
+design: a stream carrying a key as a resource attribute, sharing a block
+with another stream's unrelated per-record occurrence of the same key, can
+have that block's stat reflect only the per-record values and miss the
+resource-level one entirely. The fix below has to seed from the stream
+layer the same way `merged_indexed_terms` does, not skip straight to the
+record layer.
 
 ### What a declared column actually resolves to
 
@@ -80,7 +99,7 @@ independent of the write-path bug above.
 
 ## Decision
 
-### 1. Generalize the cross-type winner computation
+### 1. Generalize the cross-type winner computation, seeded from the same layer merged_attrs uses
 
 Widen the name set that `resolve_row`'s winner-tracking
 (`idx_cols`/`idx_overflow`, currently gated on `indexed_names`) covers, from
@@ -88,25 +107,49 @@ indexed names only to `indexed_names ∪ numstat_names`, where
 `numstat_names` is the set of attribute names with an I64, F64, or Bool
 dynamic column eligible for a NumStat. Reuse `record_level_winners`'s
 two-tier ordering (columnar by type byte, then overflow by
-`canonical_value_bytes`, last wins) as the single source of per-record,
-per-name winner resolution for both POSTINGS and NumStat. Do not write a
-second implementation of that order — a second copy is the exact kind of
+`canonical_value_bytes`, last wins) as the single source of *record-level*
+winner resolution for both POSTINGS and NumStat. Do not write a second
+implementation of that order — a second copy is the exact kind of
 divergence that produced #333.
+
+That record-level winner is not the whole answer by itself (see Context).
+Both POSTINGS and NumStat must resolve a name the same way
+`merged_indexed_terms` already resolves an indexed name today: seed from
+`stream_attr_pairs(&r.stream_attrs)` restricted to the tracked name set,
+then overlay each name's record-level winner on top, record wins a
+collision. A name with no record-level occurrence in this record keeps its
+stream-level value rather than being treated as absent. This is not a new
+rule invented for NumStat — it is the existing indexed-name behavior,
+widened to also cover `numstat_names` so both consumers read one shared
+resolution, not two.
+
+Where a purely stream-level occurrence needs a dynamic column to key a
+stat by (the same situation `merged_indexed_terms`'s doc already describes
+for indexed names: "the writer gives an indexed field a column even when
+it appears only at stream level"), extend that same proactive
+column-allocation behavior to `numstat_names`. Verify this at the dynamic
+column planning step, not only in the merge step — a merged stream-level
+value with nowhere to land is silently dropped exactly like an absent one,
+which reproduces the bug instead of closing it.
 
 Scope the widened tracking to `numstat_names` specifically, not every
 attribute in the record: growing `idx_cols`/`idx_overflow`-equivalent maps
 for every attribute on every row in the hot `resolve_row` loop is an
 unbounded cost increase; scoping to the (typically small) set of names that
 actually get a NumStat keeps it bounded to today's indexed-name cost shape.
+The stream-attrs seed pass is already paid once per record for indexed
+names; widening its restriction set to include `numstat_names` does not add
+a second pass.
 
-### 2. Block-encode step consults the winner, not the raw column value
+### 2. Block-encode step consults the resolved value, not the raw column value
 
-`i64_stat`/`f64_stat`/`bool_stat` take the per-record winner for a given
-name and include the row's value in the stat if and only if the winner's
-type matches the stat's type. A row whose winner for that name is a
-different type (or absent) contributes to `null_count` the same way an
-absent attribute does today — it does not contribute its raw columnar
-value.
+`i64_stat`/`f64_stat`/`bool_stat` take the per-record resolved value for a
+given name (decision 1: record-level winner if the record carries one,
+else the stream-level value) and include the row's value in the stat if
+and only if the resolved value's type matches the stat's type. A row whose
+resolved value for that name is a different type, or has no resolved value
+at all, contributes to `null_count` the same way an absent attribute does
+today — it does not contribute its raw columnar value.
 
 ### 3. Fix all three types uniformly
 
@@ -142,7 +185,14 @@ None. Pre-release single-version regime: no N-1 reader, no window, no
 fleet rollout ordering. This is the direct answer the format-change skill
 requires stated explicitly.
 
-### 6. Reader-side wiring, in scope for this epic
+### 6. Reader-side wiring, epic #331's second wave
+
+Landed as a separate, dependent fleet task after the write-path fix and
+version bump merge to main — not folded into the same task, so the write
+path lands and gates on its own first. Still owned by this epic, not a
+follow-up epic: #278's planner-side pushdown depends on this wiring, not on
+the write-path fix alone.
+
 
 `SkipIndex::candidate_blocks` gains an optional numeric-range predicate
 input (per NumStat-eligible column) and prunes a block when the range
@@ -216,11 +266,12 @@ whenever a future ADR-0090 amendment adds declared f64 columns.
 
 - NumStat's I64/F64/Bool min/max now matches what `declared_column_array`
   actually materializes per row, including the cross-type-loser-nulls-out
-  case. Range pruning built on it is sound, not merely present.
-- POSTINGS (#333) and NumStat now share one winner-computation path
-  (`record_level_winners`, widened), reducing the chance of a third
-  divergent reimplementation the next time a section needs record-level
-  duplicate resolution.
+  case and the stream-level-only case. Range pruning built on it is sound,
+  not merely present.
+- POSTINGS (#333) and NumStat now share one resolution path end to end
+  (stream-attrs seed, then `record_level_winners` overlay, widened to
+  `numstat_names`), reducing the chance of a third divergent
+  reimplementation the next time a section needs merged-view resolution.
 - Every existing RLOG object (trailer version 2) becomes unreadable once
   v3-only readers ship. No `maintain migrate` path exists for this
   transition. Convergence is retention expiry or re-ingestion, full stop.
@@ -235,8 +286,10 @@ whenever a future ADR-0090 amendment adds declared f64 columns.
 
 ```mermaid
 flowchart TD
-    ROW["record with duplicate key across types/overflow"] --> WIN["record_level_winners: two-tier order, columnar by type byte then overflow by canonical_value_bytes, last wins"]
-    WIN --> TYPECHECK{"winner type equals stat type (I64/F64/Bool)?"}
+    STREAM["stream_attr_pairs: resource then scope, restricted to indexed_names union numstat_names"] --> SEED["seeded per-name value for this record"]
+    ROW["record's own attrs: duplicate key across types/overflow"] --> WIN["record_level_winners: two-tier order, columnar by type byte then overflow by canonical_value_bytes, last wins"]
+    WIN -->|"record-level occurrence exists, overrides seed"| SEED
+    SEED --> TYPECHECK{"resolved value's type equals stat type (I64/F64/Bool)?"}
     TYPECHECK -->|no| NULLCONTRIB["row contributes to null_count only"]
     TYPECHECK -->|yes| STATCONTRIB["row's winner value folds into block NumStat min/max"]
     NULLCONTRIB --> BLOCK["block-level NumStat, RLOG trailer v3"]
