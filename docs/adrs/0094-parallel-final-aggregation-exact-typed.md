@@ -1,0 +1,471 @@
+# ADR-0094: parallel final aggregation for exact-typed inputs
+
+Status: Proposed
+
+## Context
+
+`crates/ravel-sql/src/session.rs`'s module doc states the current
+invariant plainly: every DataFusion `repartition_*` config knob is off
+(`session_config`, `session.rs:154-165`) because "every `repartition_*`
+knob is turned off. Float aggregation is order-dependent, so v1 requires
+aggregations to execute single-partitioned above the merged, deduplicated
+stream... Parallel aggregation is banned until an ADR defines a tolerance
+policy or a compensated-summation scheme" (`session.rs:54-61`). This is
+ADR-0013's determinism invariant (differential gate bit-exactness against
+a reference), ADR-0022's sequential-fold `avg` UDAF
+(`crate::avg`), and ADR-0023's total-order `min`/`max` UDAF
+(`crate::minmax`) — both built specifically to be deterministic under the
+single-partition plan; ADR-0022's opening paragraph states min/max's
+total-order semantics are "a sibling gap decided separately in ADR-0023;
+this ADR does not touch them," so the two are cited separately below
+rather than folded together.
+
+With `repartition_aggregations` off, DataFusion's `EnforceDistribution`
+never fans a `Final` `AggregateExec` across partitions: today's actual
+plan (confirmed by reading it, not assumed) is a `Partial`
+`AggregateExec` per scan partition — the logs scan already produces up
+to `fetch_concurrency` partitions (default 8, `EngineConfig::fetch_concurrency`,
+consumed by `session_config`'s `with_target_partitions`) — collapsed by
+a `CoalescePartitionsExec` into one stream, then a single, serial
+`Final` `AggregateExec` over the whole result. For a low-cardinality
+`GROUP BY` this merge is cheap; the epic's premise is that for a
+high-cardinality `GROUP BY` over a large log table, this serial merge
+is the actual bottleneck, not the (already-parallel) partial
+aggregation or the scan itself.
+
+**This premise had never been measured before this ADR** — the epic's
+own dependency list named "measurement showing the final merge
+dominates on representative queries" as a precondition, and no such
+measurement or benchmark harness existed in this repo. A throwaway,
+uncommitted local benchmark was built for this ADR (real `RlogWriter`-
+produced objects, a real `SessionContext`, real query execution,
+`fetch_concurrency=1` vs `=8` at two data volumes) and found:
+
+| rows / groups | 1 partition (avg) | 8 partitions (avg) | ratio |
+|---|---|---|---|
+| 40k / 10k | 225ms | 257ms | 0.88x (8-way slower) |
+| 400k / 100k | 2.58s | 2.52s | 1.02x (no measurable gain) |
+
+Widening the scan/partial-aggregation stage's parallelism from 1 to 8
+partitions produced **no wall-clock improvement across a 10x data
+range** — consistent with the serial single-partition final merge (or
+some other partition-count-invariant cost) dominating, exactly as the
+epic assumed. This measurement is **preliminary, not production-grade**:
+`--profile ci` (unoptimized), `MemoryStore` (no network/object-store
+latency), a single contended dev-machine process, not the real
+multi-tenant server. It is enough to justify drafting this design; it
+is explicitly **not** enough to justify shipping the resulting feature
+without a release-build, production-scale (S3-backed, multi-GB,
+realistic cardinality distribution) validation pass — Consequences
+below makes that a required follow-up, not optional polish.
+
+The type-exactness half of the epic's premise needs more care than "int
+vs float." Two aggregates behave very differently once repartitioning is
+on the table:
+
+- `sum`, `min`, `max` over a non-float input are genuinely order- and
+  partition-independent. Integer `sum` accumulates as integer addition
+  end to end (DataFusion's built-in; ADR-0024, tracking whether `sum`
+  should ever change, is still Proposed and does not affect this), and
+  integer overflow wraps rather than raising an intermediate error, so
+  the result bits are identical regardless of merge order even at the
+  overflow boundary. `min`/`max` over non-float input delegate to the
+  plain comparison order (`minmax.rs`'s `is_float`, below, only forces
+  the slower total-order accumulator for float input) and are
+  associative/commutative under any grouping of partial results.
+- `avg`/`mean` are **not** eligible, regardless of input type, and this
+  ADR excludes them unconditionally. `crates/ravel-sql/src/avg.rs`'s
+  module doc is explicit: the sequential-fold UDAF's "metadata (name,
+  aliases, signature, return type, coercion) delegates to the wrapped
+  built-in so integer input still coerces to Float64 exactly as before"
+  — every `avg`/`mean` call, integer or float input, runs as plain IEEE
+  f64 addition (`as_float64`, `SequentialAvgAccumulator::update_batch`),
+  and "a merge of partial states adds sums with the same plain IEEE
+  addition" (avg.rs). f64 addition is not associative once a running sum
+  exceeds 2^53, trivially reachable summing ordinary `i64` values, so
+  `avg`'s bit-exactness depends entirely on the deterministic
+  single-partition fold order avg.rs states as its own precondition: "in
+  the deterministic `(series_id, ts)` order v1 guarantees by executing
+  aggregation single-partitioned." Treating `avg(int_col)` as exact
+  because its argument's *declared* type is non-float would silently
+  break this UDAF's own documented contract the moment two partitions'
+  partial sums are added in a different order than today's. An earlier
+  draft of this ADR admitted `avg`/`mean` over non-float input on
+  exactly this reasoning; it was wrong, caught by adversarial review
+  before any code was written against it (this Context section records
+  the mistake so it is not made twice).
+
+`crates/ravel-sql/src/minmax.rs`'s `is_float(data_type: &DataType) -> bool`
+(`minmax.rs:126-131`, checking `Float16`/`Float32`/`Float64`) already
+exists and already drives a real behavioral branch —
+`groups_accumulator_supported` (`minmax.rs:170-`) delegates to the fast
+native accumulator only for non-float input, forcing the slower
+total-order accumulator for float. It is a private `fn`; this ADR's
+classification (decision 1) needs it visible from `executor.rs`, so a
+visibility change (`pub(crate)`) travels with that change. It classifies
+an accumulator's *resolved* scalar return type, not a raw pre-coercion
+argument type — decision 1 below is deliberately built to match that
+(classify from a fully type-coerced plan, not a raw one), for reasons
+explained there.
+
+## Decision
+
+1. **A per-query exact-typed check runs before session construction,
+   using the same "throwaway plan, discard it, build the real session"
+   pattern this crate already uses for a different purpose**
+   (`SqlExecutor::pushed_down_name_filter`, `executor.rs:838-861`:
+   builds a `SessionContext` over an *empty* snapshot, with the real
+   fetcher but nothing for it to fetch, purely to logical-plan the SQL
+   and inspect its structure, then discards the session before the
+   real, snapshot-backed one is built). This ADR's check reuses that
+   shape with one deliberate difference: **it runs the query through
+   DataFusion's analyzer (type coercion), not just `create_logical_plan`,
+   before walking it.** `create_logical_plan` alone does not coerce
+   `avg`'s argument to Float64 or apply any other UDAF/operator
+   coercion — classifying from that raw plan would see `avg(int_col)`'s
+   *argument* as `Int64` and misclassify it, and more generally would
+   misjudge any expression whose resolved type differs from its
+   syntactic operands (`a + b` where `a` and `b` are different numeric
+   types, for instance). Running the plan through DataFusion's
+   `Analyzer` (the same coercion pass `create_logical_plan`'s normal
+   callers eventually apply before physical planning) before
+   classification closes this for every admitted aggregate, not only
+   `avg` — `avg` is additionally excluded unconditionally regardless of
+   what this resolves to (Context section), so this mainly protects
+   `sum`/`min`/`max` against a coercion this ADR did not anticipate.
+   Against the coerced plan, walk every `LogicalPlan::Aggregate` node,
+   reached by:
+   - `plan.inputs()` recursion, mirroring `collect_filter_predicates`
+     (`executor.rs:1260-1267`) — a new `collect_aggregate_exprs` helper,
+     sibling to it, for the direct-descendant case.
+   - **Also**, at every node visited, a scan of that node's own
+     `expressions()` for an embedded subquery plan
+     (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`), each
+     of which wraps its own `LogicalPlan` that `plan.inputs()` never
+     descends into. `crate::validate`'s own aggregate-name check
+     recurses into subqueries too (`validate.rs:729`'s test,
+     `stddev_var_is_rejected_in_a_subquery_and_case_insensitively`) —
+     that test exercises a FROM-clause derived-table subquery, which
+     `plan.inputs()` already descends into on its own, so it confirms
+     subqueries are admitted, reachable surface in this SQL dialect in
+     general, not specifically evidence for the expression-embedded case
+     this bullet exists for. A float `avg` hidden inside a scalar
+     subquery must be found the same as one at the top level regardless,
+     which is why this scan runs unconditionally rather than only where
+     a precedent happens to demonstrate the exact shape. Each embedded
+     subquery's `LogicalPlan` is walked with the identical
+     `collect_aggregate_exprs` recursion, recursively.
+   - Classify every `Aggregate` node found this way:
+     - Zero aggregate expressions (a `SELECT DISTINCT` lowers to an
+       `Aggregate` node with an empty aggregate-expression list) is
+       still visited for its **group-by keys** — see below.
+     - `count(...)` over any input type: always exact. Counting
+       presence is order-independent regardless of the counted value's
+       type or floatness — reordering never changes how many non-null
+       values existed. `count(DISTINCT x)` is included in this
+       exactness (partial-count merge is exact integer addition
+       regardless of `x`'s type; distinctness is a per-row property
+       merge order cannot change).
+     - `sum`/`min`/`max` (the only other exact-eligible aggregates) over
+       a resolved-non-float input (via the now-`pub(crate)`
+       `minmax::is_float` on the coerced type): exact under any
+       partitioning.
+     - `avg`/`mean`, over **any** input type: never exact (Context
+       section). Their presence anywhere in the query, like a float
+       `sum`/`min`/`max`, forces the single-partition plan.
+     - Any `sum`/`min`/`max` over a `Float16`/`Float32`/`Float64`
+       (resolved) input: not exact.
+   - **Every `Aggregate` node's GROUP BY key expressions are also
+     type-checked, independent of its aggregate expressions.** A
+     `Float64` (or narrower float) group key is excluded even when
+     every aggregate in the same query is exact: this repo's own
+     conventions make `-0.0` and NaN payloads bit-significant
+     (`minmax.rs`'s reason for existing at all; ADR-0013's differential
+     gate), and this ADR has no proof that DataFusion's grouping
+     mechanism picks a merge-order-stable representative bit pattern
+     for a float group key under an arbitrary partition split. Absent
+     that proof, a float group key disqualifies the query — this also
+     covers `SELECT DISTINCT float_col`, since that lowers to an
+     `Aggregate` node whose group-by key is the `DISTINCT` column, with
+     no aggregate expression to otherwise flag it.
+   - A single disqualifying aggregate or group key, anywhere in the
+     query including inside a subquery, forces the *whole* query onto
+     today's single-partition plan — this ADR is query-granular, not
+     expression- or subquery-granular: DataFusion's
+     `EnforceDistribution` reads `repartition_aggregations` as one
+     session-wide config knob, not a per-`AggregateExec`-node or
+     per-subquery choice.
+   - **Any error while building or analyzing the throwaway plan
+     classifies the query as not exact (fail closed), the opposite
+     polarity from `pushed_down_name_filter`'s fail-open `None` on
+     error.** `pushed_down_name_filter`'s `None` is safe there because
+     "no name filter extracted" only costs a missed optimization
+     (widen-only); here, wrongly admitting an unclassifiable query into
+     the exact-typed set could repartition an aggregate this check
+     never actually verified. The throwaway session must register
+     everything a legitimate query might need to plan successfully —
+     the query's table-specific UDFs (`has_word`, `label`/
+     `label_match`), the map-field `ExprPlanner`, and the tenant's
+     ADR-0090 declared columns — or a normal, otherwise-safe query fails
+     to plan in this check and (per fail-closed) silently loses the
+     optimization rather than erroring the query; this is a performance
+     regression risk to note in the implementation task, not a
+     correctness one, precisely because fail-closed is the chosen
+     default.
+2. **`session_config` gains an `exact_typed_aggregates: bool` parameter**,
+   threaded from decision 1's check into the one place that currently
+   hardcodes `.with_repartition_aggregations(false)`
+   (`session.rs:161`) — set to `.with_repartition_aggregations(exact_typed_aggregates)`
+   instead. Every other `repartition_*` knob (`joins`, `sorts`,
+   `windows`, `file_scans`, `session.rs:162-165`) stays unconditionally
+   `false`: this ADR is scoped to aggregation only, per the epic; a
+   join or sort's own determinism requirements are untouched and out of
+   scope. `build_session`'s callers thread the same computed value they
+   already have in scope from decision 1's check, run once per query
+   right before the real session is built, at every production call
+   site that funnels through `plan_pinned_with`'s single `build_session`
+   call (`executor.rs:660`): `execute` (`executor.rs:427`, the HTTP
+   `run` path's caller), `plan_pinned` (`:540`), and
+   `plan_pinned_distributed` (`:576`, whose only production caller is
+   the Flight SQL lane's `start_pinned`). `worker_fragment_stream`
+   (`executor.rs:718`, the Flight SQL worker-fragment path) is a
+   distinct call site that plans no new SQL and runs no aggregation of
+   its own — it passes `false` unconditionally, not through decision
+   1's check. Test-only call sites (`session.rs`, `logs_provider.rs`,
+   `spans_scan.rs`) are unaffected and continue passing `false`.
+   To avoid planning every query three times (name-filter extraction,
+   this classification, the real plan) when the feature is off,
+   decision 1's check does not run at all unless
+   `parallel_final_aggregation` (decision 4) is `true` — skipping it
+   when the flag is off is strictly equivalent (an unclassified query
+   already gets `false`) and costs nothing. The flag is process-wide
+   (decision 4: one `SqlConfig` value, no per-tenant dimension), so
+   this is a single global check, not a per-request tenant lookup.
+3. **No amendment to ADR-0013's no-spill invariant, but its cost profile
+   changes in a specific, previously-misstated way, and must be
+   validated, not assumed.** Spilling stays disabled (`session.rs`'s
+   `MemoryPool`, unchanged; ADR-0013's hard-cap guarantee for
+   scan/sort/aggregate operators via the enforced `try_grow` path is
+   unaffected in kind — budget exhaustion is still always an error,
+   never a silent partial result). **What does not change**: up to
+   `fetch_concurrency` `Partial` `AggregateExec` instances already run
+   concurrently today, one per scan partition, each building its own
+   partial hash table — that concurrency is `repartition_aggregations`-
+   independent and exists under today's single-partition plan too.
+   **What changes** is the `Final` stage: today, `CoalescePartitionsExec`
+   collapses every partial partition into one stream feeding a single
+   `Final` `AggregateExec`, whose one hash table approaches the query's
+   full group cardinality. Under this ADR, a hash-partitioning
+   `RepartitionExec` (new buffered exchange memory, not present today)
+   redistributes each partial partition's rows by group-key hash across
+   up to `fetch_concurrency` `Final` `AggregateExec` instances, each
+   building a hash table for its own hash-partitioned *share* of the
+   group space rather than the full cardinality — so the real memory
+   delta is a new redistribution buffer plus N final tables that
+   jointly, not individually, approach the prior single table's total
+   size, not "N tables each near full cardinality" (an earlier draft's
+   wrong claim, corrected here). This still is not free: the
+   redistribution buffer is new memory that did not exist in today's
+   plan, and DataFusion's partial-aggregation early-emit mechanism
+   (`skip_partial_aggregation`, which bounds an individual partial
+   table's growth once its distinct-key ratio suggests grouping isn't
+   shrinking the data, and which already runs under both plans) does
+   not bound the redistribution buffer itself. The shared per-query
+   memory pool's hard cap still makes any outcome *safe* (a query that
+   would overshoot the budget fails closed exactly as it does today,
+   per ADR-0013), but the new redistribution buffer means a query that
+   fit comfortably under single-partition execution could newly hit the
+   budget error under the repartitioned plan for the same data — a real
+   behavior change worth surfacing to an operator, not silently
+   absorbing. This ADR does not change the budget or the no-spill
+   stance; it requires (Consequences) a peak-memory measurement across
+   representative high-cardinality `GROUP BY` shapes, specifically
+   comparing the redistribution-buffer cost against today's single
+   final table, as part of the same production-scale validation pass
+   the Context section's benchmark caveat already demands, before this
+   ships to a default-on posture (decision 4).
+4. **Ships behind the existing `SqlConfig`, not force-enabled everywhere
+   at once.** Given the wall-clock benchmark above is preliminary and
+   decision 3's memory-shape change is unvalidated at production scale,
+   this ADR does not claim "always beneficial, always safe" as a launch
+   condition. Whether a tenant's exact-typed queries are *allowed* to
+   actually repartition is gated by a new `SqlConfig` field,
+   `parallel_final_aggregation: bool` (default `false` at merge). This
+   repo has no live-reload mechanism for `SqlConfig` today — it is
+   built once at server startup from CLI/env
+   (`services/ravel-server/src/config.rs`) — so flipping the default
+   means a config change plus a process restart, the same rollback
+   story every other `SqlConfig` field already has; an earlier draft
+   incorrectly described this as flippable without a redeploy, which
+   this repo's config loading does not support.
+5. **Differential test proves bit-identical results across partition
+   counts under an explicit canonical ordering, not "bit-identical rows"
+   unqualified.** A `GROUP BY` without an `ORDER BY` has no row-order
+   guarantee in this engine today, single-partition or not (nothing in
+   the HTTP/Flight contract promises aggregate output order absent an
+   explicit `ORDER BY`), and under repartitioned final aggregation the
+   physical merge order is completion-order-dependent, i.e.
+   nondeterministic *even for a fixed partition count* across repeated
+   runs. The differential test therefore:
+   - Sorts result rows by the full group-by key tuple (a total order,
+     since group-by columns are exactly what distinguishes rows) before
+     comparing, both for the baseline (`fetch_concurrency=1`, today's
+     plan) and every repartitioned run (`4`, `8`, `16`) — proving
+     identical *content*, which is the actual invariant this ADR must
+     preserve, not identical *arrival order*, which was never
+     guaranteed.
+   - Runs each repartitioned partition count multiple times (not once),
+     to catch a merge-order-dependent race that a single run could miss
+     by chance.
+   - Includes an explicit comparison of `parallel_final_aggregation` on
+     with `fetch_concurrency=1` against today's shipped single-partition
+     configuration, rather than assuming the two are the same test.
+     With `target_partitions=1` a single partition already satisfies
+     `EnforceDistribution`'s distribution requirement, so no
+     `RepartitionExec` is expected and the physical plan should in fact
+     converge with today's — the comparison exists to confirm that
+     convergence actually holds (decision 1's classification and
+     decision 2's config flip both still ran, even though the resulting
+     plan shape is expected to be unchanged), not because the code path
+     differs.
+   - Includes adversarial data specifically chosen to distinguish a
+     correct integer `sum`/`avg` boundary from a silently-wrong one: an
+     integer column whose running sum crosses 2^53 within a single group
+     (this exact case is what would have caught the avg mistake this
+     Context section records, had `avg` still been admitted).
+   A separate test asserts a query with a disqualifying float aggregate,
+   a float group-by key, or a `SELECT DISTINCT` on a float column still
+   produces the single-partition plan's `EXPLAIN` shape (no
+   `RepartitionExec` above the scan feeding a fanned-out `Final`
+   `AggregateExec`) regardless of `parallel_final_aggregation`, proving
+   decision 1's classification, not just decision 2's config wiring, is
+   what gates the behavior. A third asserts a query with a disqualifying
+   aggregate hidden inside a scalar subquery is also classified
+   not-exact, covering decision 1's subquery-walk requirement
+   specifically.
+
+## Rejected alternatives
+
+- **Turn `repartition_aggregations` on unconditionally (drop the
+  per-query type check entirely).** Rejected outright: this breaks
+  ADR-0013's differential-gate bit-exactness for every float aggregate
+  query, which is not a performance trade-off this ADR is authorized to
+  make — ADR-0013 requires float aggregation to stay single-partitioned
+  until an ADR defines a tolerance policy or a compensated-summation
+  scheme (`session.rs:60-61`), and this ADR defines neither; it only
+  proves the *exact*-typed case (now correctly excluding `avg`/`mean`
+  entirely, and any float group key) needs no such policy in the first
+  place.
+- **Define a float tolerance policy or compensated-summation scheme now,
+  so float aggregates (including `avg`) can repartition too.** Rejected
+  as out of scope: this is explicitly issue #65's problem (named in the
+  epic body), a numerically substantial design question (which
+  tolerance? Kahan summation's own ordering sensitivity? how does a
+  tolerance interact with the differential gate's current bit-exact
+  comparison?) entirely independent of whether exact-typed aggregation
+  can safely repartition today. Bundling it here would block a design
+  that needs no such policy behind one that does.
+- **Admit `avg`/`mean` over non-float input as exact, on the reasoning
+  that "sum-then-divide over integers is associative."** This was this
+  ADR's original position and is rejected: it is false for this specific
+  UDAF regardless of the *declared* input type, because
+  `crate::avg`'s numerator always runs as plain IEEE f64 addition
+  (Context section) — coercion happens before the accumulator ever
+  sees the value, so there is no integer-arithmetic path to be
+  associative in the first place. A future amendment could admit `avg`
+  by reworking its numerator to genuine fixed-point/integer arithmetic
+  for non-float input, but that is a UDAF redesign with its own
+  correctness surface, not something this ADR's classification alone
+  can grant.
+- **Classify exactness from the raw SQL text, the parse-gate's AST
+  (`crate::validate`), or an unanalyzed logical plan.** Rejected for all
+  three: `sum(dur)`'s exactness depends on `dur`'s *resolved, coerced*
+  Arrow type, which requires running the plan through DataFusion's type
+  coercion (decision 1) — an unanalyzed plan can misreport an
+  argument's type for any UDAF or operator with non-identity coercion
+  (`avg` is the concrete example that surfaced this, Context section).
+  A syntactic check would either reject conservatively (defeating the
+  ADR's purpose for expressions it can't parse) or wrongly admit an
+  expression whose real, coerced type it never resolved.
+- **Make the exactness check span-granular within one query (repartition
+  the exact-typed aggregates, keep the float ones single-partition, in
+  the same physical plan).** Rejected: `repartition_aggregations` is one
+  `SessionConfig` boolean `EnforceDistribution` reads for the whole
+  physical-plan pass, not a per-`AggregateExec`-node override;
+  achieving per-expression granularity would need a custom physical
+  optimizer rule replacing `EnforceDistribution`'s aggregate handling
+  entirely — real, separate design work with its own correctness
+  surface (getting DataFusion's own distribution-enforcement invariants
+  right for a partially-repartitioned plan), not justified by the
+  epic's stated scope (whole-query admission, not per-expression).
+- **Ship with `parallel_final_aggregation` defaulting to `true`
+  immediately, since the preliminary benchmark is directionally
+  positive.** Rejected: the benchmark is explicitly caveated as
+  non-production (Context section) and decision 3 identifies a real,
+  unvalidated peak-memory cost shape (the new redistribution buffer).
+  Shipping default-off with an explicit flag costs nothing but a
+  redeploy once validation completes, and avoids a silent behavior
+  change (a query newly hitting its memory budget) reaching every
+  tenant on a benchmark this ADR itself says isn't strong enough to
+  justify that.
+
+## Consequences
+
+- `crates/ravel-sql/src/session.rs`: `session_config` signature gains
+  `exact_typed_aggregates: bool`; `with_repartition_aggregations` reads
+  it instead of a hardcoded `false`. Every other `repartition_*` call
+  unchanged.
+- `crates/ravel-sql/src/minmax.rs`: `is_float` becomes `pub(crate)` so
+  `executor.rs` can reuse it for classification.
+- `crates/ravel-sql/src/executor.rs`: a new `collect_aggregate_exprs`
+  helper (sibling to `collect_filter_predicates`, extended to also
+  descend into `Expr::ScalarSubquery`/`InSubquery`/`Exists`-embedded
+  plans); a new per-query classification step running DataFusion's
+  analyzer over `pushed_down_name_filter`'s throwaway-session pattern
+  (registering the query's table-specific UDFs, `ExprPlanner`, and
+  ADR-0090 declared columns), run once before `build_session` at
+  `plan_pinned_with`'s call site, but only when
+  `parallel_final_aggregation` is `true` (decision 2). `worker_fragment_stream`
+  passes `false` unconditionally.
+- New `parallel_final_aggregation: bool` field on `SqlConfig`
+  (`crates/ravel-sql/src/config.rs`), default `false`; set at startup
+  from `services/ravel-server/src/config.rs` like every other `SqlConfig`
+  field — no live-reload.
+- No format change: this is pure query-execution-plan behavior, no
+  proto, no `TenantConfig`, no RSEG/RLOG change.
+- Required before `parallel_final_aggregation` defaults to `true` in any
+  deployment (not required to merge this ADR's code, gated by the flag
+  itself per decision 4): a release-build, S3-backed, production-scale
+  (multi-GB objects, realistic group-key cardinality distribution)
+  re-run of the Context section's benchmark, plus decision 3's
+  peak-memory measurement — specifically isolating the new
+  redistribution-buffer cost — across the same shapes. Track as a
+  follow-up issue at decompose time, not silently assumed done by this
+  ADR's landing.
+- `docs/query-engine.md` gains a short note on `parallel_final_aggregation`,
+  the exact-typed admission rule (including that `avg`/`mean` and any
+  float group-by key are never eligible), and that a `GROUP BY` without
+  an explicit `ORDER BY` has no row-order guarantee, unchanged by this
+  ADR. `docs/sql-conformance.md` needs no new row (this changes
+  execution plan shape, not which SQL constructs are supported).
+- Out-of-scope bug found during this ADR's review, reported per this
+  repo's rules rather than fixed here: `session.rs`'s doc comment near
+  `ADMITTED_AGGREGATES` (around `:115`) still says "`avg`/`mean` are
+  admitted (ADR-0022 decision 7) and stay excluded here until their
+  custom UDAF lands" — the UDAF has landed and `avg`/`mean` are in the
+  admitted array a few lines below, so the comment is stale and
+  self-contradicting; it also cites "decision 7" where the rest of this
+  file cites "decisions 3, 4" for the same UDAF.
+
+```mermaid
+flowchart TD
+    Q["incoming query"] --> FLAG{"parallel_final_aggregation flag on (process-wide)?"}
+    FLAG -->|no| SINGLE["single-partition plan (current behavior, unchanged)"]
+    FLAG -->|yes| THROW["throwaway logical plan, analyzed: coerced types, table UDFs/planners/declared columns registered, no I/O; same session pattern as pushed_down_name_filter"]
+    THROW -->|"plan/analyze error"| SINGLE
+    THROW --> WALK["collect_aggregate_exprs: Aggregate nodes, direct plus inside ScalarSubquery/InSubquery/Exists"]
+    WALK -->|"any avg/mean; any float sum/min/max; any float GROUP BY key; DISTINCT on a float column"| SINGLE
+    WALK -->|"only count()/count(DISTINCT), or non-float sum/min/max, non-float GROUP BY keys"| REPART["repartition_aggregations = true: Parallel Final AggregateExec"]
+    REPART --> EXEC["real session, plan, execute"]
+    SINGLE --> EXEC
+```

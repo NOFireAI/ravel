@@ -1092,9 +1092,14 @@ dedicated clones; only the merges serialize.
 
 ## Amendment: log and span distributed fan-out
 
-Status: Proposed. Amends the Decision, Architecture, and Failure semantics
-sections above to extend fan-out from Metrics to Logs and Spans. Tracked
-by #63.
+Status: Accepted; the queryfrag (engine-level) lane is shipped. Amends the
+Decision, Architecture, and Failure semantics sections above to extend fan-out
+from Metrics to Logs and Spans. Tracked by #63. The design below shipped as
+proposed for the queryfrag lane (tasks T1-T5); the SQL lane (task T6) has not
+landed. See "Shipped status" at the end of this amendment for where the
+as-built code differs from the proposal below (in short: it does not, except
+that the RLOG/span total orders T2 was to pin down are now concretely stated,
+and T6 remains outstanding).
 
 ### Context
 
@@ -1386,3 +1391,56 @@ frame variants are never on the wire toward one.
 | T5 | ravel-query | federation.rs (per-signal federation test, incl. old-remote Unsupported under skip_unavailable) | T2, T3 | low |
 | T6 | ravel-sql | SQL-lane per-signal distributed scan: slice tickets + DistributedScanExec for logs/alerts/audit/spans, per-signal merge execs (dedup for metrics only -- NOT for logs/alerts/audit/spans, see T2/T3), flight_distributed.rs coverage | T1, ADR-0087 landed | high (same merge-correctness class as T2/T3) |
 | T7 | docs | docs/query-engine.md, docs/adrs/0071-distributed-read-fanout.md currency | T4, T5, T6 | low |
+
+### Shipped status
+
+The queryfrag lane shipped as proposed above. The as-built code matches the
+Decision points with no design divergence; the differences from the proposal
+are that forward-looking work is now landed, not that any decision changed:
+
+- **Per-signal dispatch (T1, T2, T3).** `run_slice_inner`
+  (`crates/ravel-query/src/distrib/service.rs`) decodes the signal and
+  dispatches: Metrics keeps its exact prior path; Logs, Alerts, and Audit share
+  one `LogSegmentFetcher` path (`run_slice_logs`); Spans fetch through
+  `SpanSegmentFetcher`, promoted into ravel-query as planned (`run_slice_spans`);
+  Profiles stays `Unsupported`. The log and span fetchers are opt-in builder
+  extras (`with_log_fetcher`/`with_span_fetcher`); an unwired fetcher, and a
+  log/span slice carrying matchers (no pushdown mapping in this lane yet), both
+  answer `Unsupported` and fall back to local — a fail-closed choice inside the
+  proposal's "correct without atomicity" envelope.
+- **Frames (T1).** `FetchResponse` gained `LogRecordFrame` and `SpanFrame`
+  additively, no `protocol_version` bump, exactly as decided; skew is governed
+  by the signal gate.
+- **The total orders T2 was to "pin down" are now stated** and load-bearing, in
+  the doc comments and code of `merge_log_records` and `merge_spans`
+  (`crates/ravel-query/src/distrib/mod.rs`). RLOG records sort under
+  `(ts_ns, stream_id, stream_attrs, observed_ts_ns, severity_num,
+  severity_text, body, trace_id, span_id, flags, attrs)` (attrs by frozen
+  `canonical_attr_bytes`, so f64 compares by bit pattern); spans under
+  `(trace_id, span_id, start_ts_ns, end_ts_ns, parent_span_id, name,
+  status_code, status_message, service_name, attrs)`. Both are stable sorts of
+  the flattened multiset with **no dedup** (docs/consistency-model.md "logs and
+  spans", ADR-0051 section 5), so the shard-major slice grouping — and a
+  reshard-straddling stream or trace — never changes the result. The
+  coordinator only orders; workers ship the per-segment merged view (segment
+  self-containment), never a coordinator-side attribute re-merge.
+- **Erasure (T2, T3).** Applied worker-side per segment through the same funnel
+  the local path uses, never re-applied at the coordinator.
+- **Skew and federation (T4, T5).** The new-coordinator/old-worker direction
+  degrades to whole-query silent local fallback via `Unsupported`; under
+  federation, an old remote's `Unsupported` for a new fan-out signal is a
+  skippable coverage gap (`crates/ravel-query/src/distrib/federation.rs`),
+  redacted-partial under `skip_unavailable` and typed otherwise. Per-signal
+  differential, erasure-property, skew, and federation tests are in place.
+
+**Not yet shipped: the SQL lane (T6).** Decision 7 puts both fan-out lanes in
+scope; only the queryfrag lane is built. The SQL-lane per-signal distributed
+scan (slice tickets, `DistributedScanExec`, per-signal merge execs for the
+`logs`/`alerts`/`audit`/`spans` tables) is unimplemented and still sequenced
+after ADR-0087 per Decision 8. Consequently the engine's own query flow only
+dispatches `Signal::Metrics` today
+(`fetch_samples_and_histograms_maybe_distributed` / `federate_scalar` in
+`crates/ravel-query/src/engine.rs`): the per-signal queryfrag fetch, merge, and
+federation machinery for Logs/Alerts/Audit/Spans is present and tested, but the
+coordinator caller that drives log and trace *search* over the wire is the SQL
+lane, which is where that fan-out becomes live.
