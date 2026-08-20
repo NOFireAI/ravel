@@ -237,9 +237,14 @@ fn provenance_round_trips_through_sparse_chunked_form() {
         }
     }
 
-    let written =
-        SegmentWriter::write_v7_with_provenance(series_v7, identity(), bounds(), meta(), Vec::new())
-            .expect("write_v7_with_provenance over a sparse tenant");
+    let written = SegmentWriter::write_v7_with_provenance(
+        series_v7,
+        identity(),
+        bounds(),
+        meta(),
+        Vec::new(),
+    )
+    .expect("write_v7_with_provenance over a sparse tenant");
 
     let loc = open_from_full(&written.bytes, ReaderLimits::default()).expect("open");
     // Sanity: this really is the sparse (chunked) form, not the whole-section
@@ -270,6 +275,62 @@ fn provenance_round_trips_through_sparse_chunked_form() {
             assert!(entry.per_sample_provenance.iter().all(|p| p.is_none()));
         }
     }
+}
+
+/// Two samples at the SAME timestamp in one run, with distinct provenance --
+/// the shape run merging produces that no L0 run ever has. The column must stay
+/// aligned to the value page through the round trip, so the higher-priority
+/// sample keeps its own value.
+#[test]
+fn provenance_round_trips_with_duplicate_timestamps_in_one_run() {
+    let id = SeriesId([9u8; 16]);
+    let column = vec![
+        SampleProvenance {
+            created_unix_ns: 100,
+            writer_epoch: 1,
+            writer_seq: 2,
+            in_page_index: 0,
+        },
+        SampleProvenance {
+            created_unix_ns: 50,
+            writer_epoch: 1,
+            writer_seq: 1,
+            in_page_index: 0,
+        },
+    ];
+    let series_v7 = vec![SeriesInputV7 {
+        series_id: id,
+        labels: labels("dup"),
+        runs: vec![run_with_prov(
+            &id,
+            50,
+            1,
+            1,
+            &[(10, f64::from_bits(0x7FF8_0000_0000_0000)), (10, 2.0)],
+            Some(column.clone()),
+        )],
+    }];
+    let written = SegmentWriter::write_v7_with_provenance(
+        series_v7,
+        identity(),
+        bounds(),
+        meta(),
+        Vec::new(),
+    )
+    .expect("write");
+    let loc = open_from_full(&written.bytes, ReaderLimits::default()).expect("open");
+    let entries =
+        decode_catalog_v5(&loc.footer, &written.bytes, ReaderLimits::default()).expect("decode");
+    let e = entries
+        .iter()
+        .find(|e| e.entry.series_id == id)
+        .expect("series present");
+    assert_eq!(e.per_sample_provenance.len(), 1);
+    let got = e.per_sample_provenance[0].as_ref().expect("column present");
+    assert_eq!(
+        got, &column,
+        "column must round-trip aligned with the duplicate-ts value page"
+    );
 }
 
 proptest! {

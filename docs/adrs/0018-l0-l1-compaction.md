@@ -9,6 +9,22 @@ docs/catalog-and-mvcc.md, and docs/segment-format.md remain authoritative
 as written until their amendments land. Nothing in this ADR changes any
 stored byte today.
 
+**Amended by ADR-0092 (run-merged L1, RSEG v7).** This ADR's verbatim
+run-preservation decision -- an L1 object holds one run per input segment per
+series, page bytes copied unchanged -- is reversed for the metrics path.
+Since ADR-0092 (issue #315) L1 compaction decodes every contributing run,
+merges the samples in timestamp order, and re-encodes one run per series,
+carrying each sample's dedup key in the RSEG v7 per-sample provenance columns.
+The exactness property this ADR relies on (a snapshot with an L1 part plus any
+subset of its inputs answers identically to the pre-compaction snapshot) is
+preserved: the merged run reproduces the same candidate multiset with the same
+priorities, proven by
+`crates/ravel-query/tests/differential_compaction.rs`. Part splitting also
+moves from predicted input bytes to encoded output bytes (ADR-0092 decision 3),
+since re-encoding decouples output size from input size. The overlap-harmlessness
+and non-atomic-swap reasoning below still holds; only the "page bytes copied
+verbatim" mechanism is superseded.
+
 ## Context
 
 Phase 1 never deletes or rewrites anything. Every flush leaves one L0

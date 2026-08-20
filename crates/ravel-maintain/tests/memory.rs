@@ -42,9 +42,13 @@ async fn peak_memory_on_3600_input_bucket() {
     const HOT_SERIES: usize = 10;
 
     let store = MemoryStore::new();
-    // Each input is one flush of the same HOT_SERIES series with 2 samples,
-    // so the merge produces HOT_SERIES output series each with 3,600 runs
-    // (the §9 hot-series shape).
+    // Each input is one flush of the same HOT_SERIES series with 2 samples. Under
+    // run-merged L1 compaction (ADR-0092 decision 1) every series' 3,600
+    // contributing runs are decoded, merged in timestamp order, and re-encoded
+    // into ONE run, so the output holds exactly HOT_SERIES runs. Decoding those
+    // 3,600 runs' samples one series at a time is the memory shape this test
+    // pins: it must stay under the ceiling even though the decoded samples now
+    // live alongside the fetch buffer.
     let mut input_bytes: u64 = 0;
     for i in 0..INPUTS {
         let series: Vec<RawSeries> = (0..HOT_SERIES)
@@ -81,7 +85,8 @@ async fn peak_memory_on_3600_input_bucket() {
     let total_runs: u64 = record.parts.iter().map(|p| p.run_count).sum();
     assert!(matches!(outcome, CompactionOutcome::Compacted { .. }));
     assert_eq!(record.inputs.len(), INPUTS);
-    assert_eq!(total_runs, (INPUTS * HOT_SERIES) as u64);
+    // One run per series after merging, not one per (input, series).
+    assert_eq!(total_runs, HOT_SERIES as u64);
 
     match (after_seed, after_compact) {
         (Some((rss_seed, hwm_seed)), Some((rss_c, hwm_c))) => {

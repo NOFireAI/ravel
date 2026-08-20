@@ -105,6 +105,66 @@ async fn compacts_bucket_and_preserves_all_samples() {
     assert_eq!(got, expected);
 }
 
+/// The epic's reachability test (ADR-0092, issue #315): drive a real bucket
+/// through the SHIPPING compaction path, prove the L1 object holds exactly one
+/// run per series (the whole point of run-merged L1), and confirm the samples
+/// read back through the real segment decode path match the inputs bit-for-bit.
+///
+/// The input set has a series (`http_requests{job=a}`) present in two L0 flushes
+/// with an overlapping timestamp, so it takes the multi-run merge path and its
+/// two runs must collapse to one carrying per-sample provenance. The engine-level
+/// dedup equivalence (that a query over the merged L1 picks the same winners as a
+/// query over the inputs) is proven separately and rigorously by
+/// `crates/ravel-query/tests/differential_compaction.rs`.
+#[tokio::test]
+async fn compacted_bucket_holds_one_run_per_series_and_query_matches_inputs() {
+    let store = MemoryStore::new();
+    let specs = three_inputs();
+    for s in &specs {
+        seed_input(&store, s).await;
+    }
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = bucket();
+
+    let outcome = compact_bucket(&store, &clock, &cfg(), &bucket)
+        .await
+        .expect("compact");
+    assert!(
+        matches!(outcome, CompactionOutcome::Compacted { .. }),
+        "expected Compacted, got {outcome:?}"
+    );
+
+    let record = fetch_compaction_record(&store, &bucket).await;
+    for p in &record.parts {
+        assert_eq!(p.segment_format_version, u32::from(VERSION_V7));
+    }
+
+    // Exactly one run per series after merging: the run-merged L1 invariant.
+    let run_counts = record_run_counts(&store, &record).await;
+    assert!(
+        !run_counts.is_empty(),
+        "the compacted bucket must carry series"
+    );
+    for (id, count) in &run_counts {
+        assert_eq!(
+            *count,
+            1,
+            "series {:02x?} must hold exactly one merged run, got {count}",
+            &id[..8]
+        );
+    }
+
+    // Query the L1 through the real decode path and compare to the union of the
+    // inputs, bit-for-bit (compaction preserves every input sample; dedup is a
+    // query-time concern, exercised by the differential test).
+    let got = read_record_samples(&store, &record).await;
+    let expected = expected_samples(&specs);
+    assert_eq!(
+        got, expected,
+        "L1 samples must match the inputs bit-for-bit"
+    );
+}
+
 #[tokio::test]
 async fn dry_run_reports_the_plan_but_writes_nothing() {
     // Dry-run: config.dry_run computes the identical eligible set and part plan a

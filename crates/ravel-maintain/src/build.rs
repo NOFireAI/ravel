@@ -1,51 +1,55 @@
-//! Whole-bucket catalog group-by and verbatim-page copy into RSEG v5 parts
-//! (with the ADR-0026/0027
-//! v5 writer substitution). Every input catalog's series is grouped into one
-//! `BTreeMap` keyed by series id (all inputs' per-series metadata resident at
-//! once), then iterated in id order; this is a group-by-then-iterate, not a
-//! bounded-window k-way merge. Only the page bytes stream: every run of a
-//! series is gathered from every input that carries it, its TS and VAL-or-HIST
-//! pages are fetched by range and copied verbatim (never decoded), and parts
-//! are split on series boundaries once accumulated page bytes reach
-//! `max_l1_part_bytes`, so a series' runs never straddle a part and part
-//! id-ranges are disjoint. Each finished part is a whole object written with a
-//! single `CreateIfAbsent` PUT (no multipart), and its encoded
-//! bytes are retained in the returned `Vec` until publish so the
-//! convergence-repair path can re-PUT a part a racing winner is missing.
+//! Whole-bucket catalog group-by and run-merged rewrite into RSEG v7 parts.
+//! Every input catalog's series is grouped into one `BTreeMap` keyed by series
+//! id (all inputs' per-series metadata resident at once), then iterated in id
+//! order; this is a group-by-then-iterate, not a bounded-window k-way merge.
 //!
-//! Format-migration exception (ADR-0066 decision 5): an input recorded *below*
-//! the current output version (its commit record's `segment_format_version` is
-//! older than [`OUTPUT_FORMAT_VERSION`]) cannot be copied verbatim -- copying an
-//! older layout's pages under a current-version trailer would be a mislabeled
-//! object, not a migration. Its object key is passed in `migrate_keys`, and
-//! every one of its runs is instead fully decoded
-//! ([`ravel_segment::decode_run_pages_soa`] /
-//! [`ravel_segment::decode_run_histogram_pages`]) and re-encoded at the current
-//! version ([`ravel_segment::encode_run_v4`]) at the page-materialization step,
-//! the exact point a current-version run is copied. Everything else -- the
-//! series group-by, the size-capped part split, exemplar assignment, and the
-//! record-count conservation gate -- is the one shared merge, unchanged. When
-//! `migrate_keys` is empty (every input at the current version, the normal
-//! compaction case) the fast verbatim path runs exactly as before. RLOG and
-//! RSPAN already decode and re-encode on every merge, so this
-//! decode-and-re-encode primitive is RSEG-specific.
+//! Since ADR-0092 decision 1, L1 compaction is a rewrite, not a re-layout. Per
+//! series, every contributing run's pages are decoded, the samples are merged in
+//! timestamp order, and the whole series is re-encoded into a SINGLE run
+//! (`RunInputV7`) carrying each sample's dedup key (`created_unix_ns`,
+//! `writer_epoch`, `writer_seq`, original in-page index) in the run-major
+//! per-sample provenance columns, so a query over the merged part answers every
+//! request identically to a query over the pre-compaction inputs
+//! (`crates/ravel-query/tests/differential_compaction.rs`). A series that
+//! appears in only one input already is one run: it is copied verbatim with no
+//! provenance column (byte-identical to the L0 shape), which costs nothing.
 //!
-//! Page fetch mechanics: the pages for one part are
-//! fetched as a batch, not one blocking GET per page. First the per-run TS and
-//! VAL-or-HIST byte ranges of every series in the batch are grouped by input
-//! object and coalesced (adjacent/near ranges merged into one GET, mirroring
-//! `ravel-query`'s `SegmentFetcher::coalesce_ranges`), collapsing the ~2R
-//! sequential GETs the naive path issued toward a couple of GETs per input.
-//! The coalesced GETs then run concurrently under a bounded semaphore + a
-//! `buffer_unordered` window, so a bucket's page fetch collapses from k RTT
-//! toward ceil(k/parallelism) RTT on real object storage. Emission stays
-//! deterministic: results are collected before any page is materialized, then
-//! sliced (zero-copy `Bytes::slice`, no per-page `to_vec` off the wire) into
-//! `RunInputV4` in the exact series-then-run order the sequential path used,
-//! so the built part bytes are identical. Fetch buffering is bounded to one
-//! part's worth of page bytes because a batch is exactly the series that fit
-//! under `max_l1_part_bytes`; the encoded parts held until publish still
-//! dominate peak memory.
+//! Parts are split on ENCODED OUTPUT page bytes (ADR-0092 decision 3), not on
+//! input catalog byte ranges: after run merging the output size is a function of
+//! the data's shape through per-page codec selection, so the input-byte figure
+//! no longer predicts it. Input page bytes are retained only as a fetch-buffer
+//! bound (the window below). A series' runs never straddle a part and part
+//! id-ranges are disjoint, since series are emitted in ascending id order and a
+//! part is a contiguous id range. Each finished part is a whole object written
+//! with a single `CreateIfAbsent` PUT (no multipart), and its encoded bytes are
+//! retained in the returned `Vec` until publish so the convergence-repair path
+//! can re-PUT a part a racing winner is missing.
+//!
+//! Format-migration note (ADR-0066 decision 5): an input recorded *below* the
+//! current output version (its commit record's `segment_format_version` is older
+//! than [`OUTPUT_FORMAT_VERSION`]) cannot be copied verbatim, so its object key
+//! is passed in `migrate_keys`. Under the run-merged rewrite this is largely
+//! moot: a multi-run series is decoded and re-encoded regardless of version, and
+//! a single-run series whose input is a migrate key takes the
+//! decode-and-re-encode path ([`reencode_run_to_current_version`]) instead of
+//! the verbatim copy. Under RSEG v7's single-version window `migrate_keys` is
+//! empty in practice (a below-v7 input is unreadable), so the distinction only
+//! affects the single-run verbatim fast path.
+//!
+//! Page fetch mechanics: pages are fetched in windows, not one blocking GET per
+//! page. A fetch window is a run of consecutive series whose INPUT page bytes
+//! stay under `max_l1_part_bytes` (the fetch-buffer bound). For each window the
+//! per-run TS and VAL-or-HIST byte ranges are grouped by input object and
+//! coalesced (adjacent/near ranges merged into one GET, mirroring
+//! `ravel-query`'s `SegmentFetcher::coalesce_ranges`), then the coalesced GETs
+//! run concurrently under a bounded semaphore + a `buffer_unordered` window, so
+//! a bucket's page fetch collapses from k RTT toward ceil(k/parallelism) RTT on
+//! real object storage. Each window's series are materialized (decoded, merged,
+//! re-encoded) in ascending id order and the window's fetched buffers are then
+//! dropped, so peak fetch buffering is one window's worth. A part accumulates
+//! re-encoded series across windows until its OUTPUT page bytes reach
+//! `max_l1_part_bytes`; the encoded parts held until publish, plus one series'
+//! decoded samples at a time, dominate peak memory.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -57,9 +61,9 @@ use ravel_commit::keys;
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::commit::v1::CompactionPart;
 use ravel_segment::{
-    CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunEntry, RunInputV4,
-    RunValuePageV4, SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
-    decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
+    CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunEntry, RunInputV4, RunInputV7,
+    RunValuePageV4, SampleProvenance, SegmentIdentity, SegmentWriter, SeriesInputV7, SeriesValues,
+    ValueKind, decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
 };
 use ravel_types::{LabelSet, Sample, SeriesId};
 use tokio::sync::Semaphore;
@@ -102,9 +106,10 @@ pub struct BuiltPart {
     pub part: CompactionPart,
 }
 
-/// Merge all inputs into size-capped v5 parts. `catalogs` MUST be
-/// aligned with `inputs` (both in canonical input order): the alignment is
-/// what makes run tie-breaking by canonical input position deterministic.
+/// Merge all inputs into size-capped run-merged RSEG v7 parts. `catalogs` MUST
+/// be aligned with `inputs` (both in canonical input order): the alignment is
+/// what makes run tie-breaking by canonical input position deterministic, which
+/// in turn fixes each merged sample's provenance in-page index.
 ///
 /// `catalogs` is taken by value, and this call is their last use, so the
 /// exemplar records are moved out of them (`std::mem::take` below) rather than
@@ -116,9 +121,9 @@ pub struct BuiltPart {
 /// `migrate_keys` holds the object keys of any input recorded below the current
 /// output version (ADR-0066 decision 5): a run whose input key is in this set is
 /// decoded and re-encoded at the current version rather than page-copied
-/// verbatim (see the module doc and [`materialize_batch`]). It is empty for
+/// verbatim (see the module doc and [`materialize_series`]). It is empty for
 /// ordinary compaction, where every input is already at the current version, and
-/// the verbatim path then runs unchanged.
+/// the single-run verbatim fast path then runs unchanged.
 pub async fn build_parts(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -217,66 +222,89 @@ pub async fn build_parts(
         });
     }
 
-    // One shared cap for every batch's fetches (batches run sequentially, so
+    // One shared cap for every window's fetches (windows run sequentially, so
     // this bounds total in-flight GETs at `FETCH_CONCURRENCY`).
     let semaphore = Semaphore::new(FETCH_CONCURRENCY);
+    let limits = ReaderLimits::default();
 
     let mut parts = Vec::new();
     let mut part_index: u32 = 0;
-    let mut batch_start = 0usize;
-    let mut batch_bytes: u64 = 0;
 
-    // Accumulate series into a batch until its predicted page bytes reach the
-    // cap, exactly as the sequential path did (the last series pushes a batch
-    // over the cap; a single series larger than the cap is its own part). Then
-    // fetch that batch's pages (coalesced + concurrent), materialize them in
-    // order, and flush the part.
+    // The rolling output part: series already decoded, merged, and re-encoded
+    // whose accumulated ENCODED page bytes have not yet reached
+    // `max_l1_part_bytes`. Part boundaries are chosen on output bytes (ADR-0092
+    // decision 3), which after run merging no longer track input bytes, so a
+    // part may span several fetch windows and a window may finish several parts.
+    let mut pending: Vec<SeriesInputV7> = Vec::new();
+    let mut pending_exemplars: Vec<ExemplarInput> = Vec::new();
+    let mut pending_output_bytes: u64 = 0;
     let mut exemplars_assigned = 0usize;
+
+    // Accumulate consecutive series into a fetch window until their INPUT page
+    // bytes reach the cap (the fetch-buffer bound; the last series closes the
+    // final window). Fetch that window's pages (coalesced + concurrent),
+    // materialize each series in ascending id order into a run-merged
+    // `SeriesInputV7`, and flush a part whenever the pending output reaches the
+    // cap. A single series whose output alone exceeds the cap becomes its own
+    // part. Series stay in ascending id order throughout, so every part is a
+    // contiguous, disjoint id range.
+    let mut window_start = 0usize;
+    let mut window_input_bytes: u64 = 0;
     for i in 0..builds.len() {
-        batch_bytes = batch_bytes.saturating_add(builds[i].page_bytes);
-        if batch_bytes >= config.max_l1_part_bytes {
-            let batch = &builds[batch_start..=i];
-            let batch_exemplars = take_batch_exemplars(&mut exemplars_by_series, batch);
-            exemplars_assigned += batch_exemplars.len();
-            let part = build_part_from_batch(
-                store,
-                &semaphore,
-                bucket,
-                config,
-                &ingest_bounds,
-                input_set_hash,
-                &input_set_hash16,
-                part_index,
-                batch,
-                batch_exemplars,
-                migrate_keys,
-            )
-            .await?;
-            parts.push(part);
-            part_index += 1;
-            batch_start = i + 1;
-            batch_bytes = 0;
+        window_input_bytes = window_input_bytes.saturating_add(builds[i].page_bytes);
+        let last = i + 1 == builds.len();
+        if window_input_bytes < config.max_l1_part_bytes && !last {
+            continue;
         }
+        let window = &builds[window_start..=i];
+        let regions = fetch_batch_pages(store, &semaphore, window).await?;
+        for build in window {
+            let (series_v7, output_bytes) =
+                materialize_series(build, &regions, migrate_keys, limits)?;
+            pending.push(series_v7);
+            pending_output_bytes = pending_output_bytes.saturating_add(output_bytes);
+            if let Some(mut records) = exemplars_by_series.remove(&build.series_id.0) {
+                exemplars_assigned += records.len();
+                pending_exemplars.append(&mut records);
+            }
+            if pending_output_bytes >= config.max_l1_part_bytes {
+                let part = flush_part(
+                    bucket,
+                    config,
+                    &ingest_bounds,
+                    input_set_hash,
+                    &input_set_hash16,
+                    part_index,
+                    std::mem::take(&mut pending),
+                    std::mem::take(&mut pending_exemplars),
+                )?;
+                if !config.dry_run {
+                    put_part(store, &part).await?;
+                }
+                parts.push(part);
+                part_index += 1;
+                pending_output_bytes = 0;
+            }
+        }
+        window_start = i + 1;
+        window_input_bytes = 0;
     }
 
-    if batch_start < builds.len() {
-        let batch = &builds[batch_start..];
-        let batch_exemplars = take_batch_exemplars(&mut exemplars_by_series, batch);
-        exemplars_assigned += batch_exemplars.len();
-        let part = build_part_from_batch(
-            store,
-            &semaphore,
+    // The tail part: whatever series remain below the cap.
+    if !pending.is_empty() {
+        let part = flush_part(
             bucket,
             config,
             &ingest_bounds,
             input_set_hash,
             &input_set_hash16,
             part_index,
-            batch,
-            batch_exemplars,
-            migrate_keys,
-        )
-        .await?;
+            pending,
+            pending_exemplars,
+        )?;
+        if !config.dry_run {
+            put_part(store, &part).await?;
+        }
         parts.push(part);
     }
 
@@ -303,75 +331,15 @@ pub async fn build_parts(
     Ok(parts)
 }
 
-/// Take the exemplars belonging to one batch's series out of the by-series map,
-/// in the batch's own series order (ascending series id, the same order the
-/// output's SERIES_IDS takes) and, within a series, in the order the inputs
-/// carried them.
-///
-/// Removing rather than copying is what lets [`build_parts`] prove conservation:
-/// a series is in exactly one batch, so after the last batch the map must be
-/// empty. The output writer re-resolves each record's `series_index` against
-/// its own SERIES_IDS and stable-sorts by `(series_index, ts_ns)`, so this
-/// ordering is what breaks ties between two records sharing a key, and the
-/// encoded section stays a function of the canonical input order alone.
-fn take_batch_exemplars(
-    by_series: &mut BTreeMap<[u8; 16], Vec<ExemplarInput>>,
-    batch: &[SeriesBuild<'_>],
-) -> Vec<ExemplarInput> {
-    let mut out = Vec::new();
-    for build in batch {
-        if let Some(mut records) = by_series.remove(&build.series_id.0) {
-            out.append(&mut records);
-        }
-    }
-    out
-}
-
 /// One output series' merge plan without its page bytes: identity, borrowed
 /// labels, and its ordered runs (each tagged with the input object to fetch
-/// from), plus the total page bytes those runs will contribute to a part.
+/// from), plus the total INPUT page bytes those runs contribute to a fetch
+/// window (the fetch-buffer bound; part sizing is on output bytes).
 struct SeriesBuild<'a> {
     series_id: SeriesId,
     labels: &'a LabelSet,
     runs: Vec<(&'a str, &'a RunPlan)>,
     page_bytes: u64,
-}
-
-/// Fetch every page of one batch of series (coalesced per object, concurrent
-/// under `semaphore`), materialize the runs in deterministic order, and build
-/// the part. The fetch/materialize split keeps the buffered page bytes bounded
-/// to this one part's worth and makes emission independent of GET completion
-/// order.
-#[allow(clippy::too_many_arguments)]
-async fn build_part_from_batch(
-    store: &dyn ObjectStoreBackend,
-    semaphore: &Semaphore,
-    bucket: &Bucket,
-    config: &CompactorConfig,
-    ingest_bounds: &IngestBounds,
-    input_set_hash: &[u8; 32],
-    input_set_hash16: &str,
-    part_index: u32,
-    builds: &[SeriesBuild<'_>],
-    exemplars: Vec<ExemplarInput>,
-    migrate_keys: &HashSet<String>,
-) -> Result<BuiltPart> {
-    let regions = fetch_batch_pages(store, semaphore, builds).await?;
-    let batch = materialize_batch(builds, &regions, migrate_keys)?;
-    let part = flush_part(
-        bucket,
-        config,
-        ingest_bounds,
-        input_set_hash,
-        input_set_hash16,
-        part_index,
-        batch,
-        exemplars,
-    )?;
-    if !config.dry_run {
-        put_part(store, &part).await?;
-    }
-    Ok(part)
 }
 
 /// The fetched, coalesced byte regions of one batch, keyed by input object
@@ -458,53 +426,65 @@ async fn fetch_one_range<'a>(
     Ok((key, start, got.data))
 }
 
-/// Slice each run's TS and VAL-or-HIST page out of the fetched regions in the
-/// batch's series-then-run order and pack them into [`SeriesInputV4`], stamping
-/// each run's provenance from its commit record. The page
-/// bytes are sliced zero-copy from the coalesced GET buffers; the single
-/// `to_vec` per page here is the copy `RunInputV4`'s owned `Vec<u8>` fields
-/// require, not a redundant copy off the wire.
-fn materialize_batch(
-    builds: &[SeriesBuild<'_>],
+/// Decode, merge, and re-encode one series into a single run-merged
+/// [`SeriesInputV7`], returning it with its encoded output page-byte size (the
+/// figure `build_parts` splits parts on, ADR-0092 decision 3).
+///
+/// A series with exactly one contributing run is already one run: it is copied
+/// verbatim (no per-sample provenance column, so the merged object stays
+/// byte-identical to the L0 shape for that series), unless its input is a
+/// migrate key, in which case it is decoded and re-encoded at the current
+/// version. A series with two or more runs is fully decoded across every input,
+/// its samples merged in timestamp order, and re-encoded into one run carrying
+/// each sample's dedup key -- `(created_unix_ns, writer_epoch, writer_seq,
+/// original in-page index)` -- in the per-sample provenance column, so a query
+/// over the merged run reproduces the same candidate multiset with the same
+/// priorities the unmerged runs produced (ADR-0092 decision 2).
+fn materialize_series(
+    build: &SeriesBuild<'_>,
     regions: &BatchRegions<'_>,
     migrate_keys: &HashSet<String>,
-) -> Result<Vec<SeriesInputV4>> {
-    let limits = ReaderLimits::default();
-    let mut batch = Vec::with_capacity(builds.len());
-    for build in builds {
-        let mut runs = Vec::with_capacity(build.runs.len());
-        for (key, run) in &build.runs {
-            let object = regions.get(key).ok_or_else(|| {
-                MaintainError::Invariant(format!("no fetched region for object {key}"))
-            })?;
-            let ts_page = slice_region(object, run.ts_abs).ok_or_else(|| {
-                MaintainError::Invariant("coalesced fetch missing a TS page range".into())
-            })?;
-            let page = slice_region(object, run.page_abs).ok_or_else(|| {
-                MaintainError::Invariant("coalesced fetch missing a value page range".into())
-            })?;
-            if migrate_keys.contains(*key) {
-                // Format-migration path (ADR-0066 decision 5): this run's input
-                // is recorded below the current output version, so its pages are
-                // decoded to samples and re-encoded at the current version
-                // rather than copied verbatim. Run provenance
-                // (`created_unix_ns`/`writer_epoch`/`writer_seq`) and the sample
-                // multiset are preserved -- a migration changes the byte format,
-                // never the run's dedup-priority identity or its samples.
-                runs.push(reencode_run_to_current_version(
-                    &build.series_id,
-                    run,
-                    ts_page.as_ref(),
-                    page.as_ref(),
-                    limits,
-                )?);
-                continue;
-            }
+    limits: ReaderLimits,
+) -> Result<(SeriesInputV7, u64)> {
+    let series_id = build.series_id;
+    let kind = match build.runs.first() {
+        Some((_, run)) => run.kind,
+        // A series with no runs cannot reach here: `build_parts` only builds a
+        // `SeriesBuild` from a non-empty contribution list.
+        None => {
+            return Err(MaintainError::Invariant(format!(
+                "series {} has no runs to materialize",
+                series_id.to_hex()
+            )));
+        }
+    };
+
+    // Single-run fast path: no decode/merge, no provenance column.
+    if build.runs.len() == 1 {
+        let (key, run) = build.runs[0];
+        let object = regions.get(key).ok_or_else(|| {
+            MaintainError::Invariant(format!("no fetched region for object {key}"))
+        })?;
+        let ts_page = slice_region(object, run.ts_abs).ok_or_else(|| {
+            MaintainError::Invariant("coalesced fetch missing a TS page range".into())
+        })?;
+        let page = slice_region(object, run.page_abs).ok_or_else(|| {
+            MaintainError::Invariant("coalesced fetch missing a value page range".into())
+        })?;
+        let run_v4 = if migrate_keys.contains(key) {
+            reencode_run_to_current_version(
+                &series_id,
+                run,
+                ts_page.as_ref(),
+                page.as_ref(),
+                limits,
+            )?
+        } else {
             let value_page = match run.kind {
                 ValueKind::Scalar => RunValuePageV4::Scalar(page.to_vec()),
                 ValueKind::Histogram => RunValuePageV4::Histogram(page.to_vec()),
             };
-            runs.push(RunInputV4 {
+            RunInputV4 {
                 created_unix_ns: run.created_unix_ns,
                 writer_epoch: run.writer_epoch,
                 writer_seq: run.writer_seq,
@@ -513,15 +493,239 @@ fn materialize_batch(
                 sample_count: run.sample_count,
                 ts_page: ts_page.to_vec(),
                 value_page,
-            });
-        }
-        batch.push(SeriesInputV4 {
-            series_id: build.series_id,
-            labels: build.labels.clone(),
-            runs,
-        });
+            }
+        };
+        let output_bytes = run_output_bytes(&run_v4);
+        return Ok((
+            SeriesInputV7 {
+                series_id,
+                labels: build.labels.clone(),
+                runs: vec![RunInputV7 {
+                    run: run_v4,
+                    provenance: None,
+                }],
+            },
+            output_bytes,
+        ));
     }
-    Ok(batch)
+
+    // Multi-run merge: decode every run, tagging each sample with its run's
+    // dedup key and its original in-page index, merge in timestamp order (stable
+    // by insertion order for equal timestamps, which is canonical input order
+    // then run order then in-page order -- deterministic), and re-encode into
+    // one run carrying the per-sample provenance column.
+    let (run_v4, provenance) = match kind {
+        ValueKind::Scalar => merge_scalar_runs(&series_id, build, regions, limits)?,
+        ValueKind::Histogram => merge_histogram_runs(&series_id, build, regions, limits)?,
+    };
+    let output_bytes = run_output_bytes(&run_v4);
+    Ok((
+        SeriesInputV7 {
+            series_id,
+            labels: build.labels.clone(),
+            runs: vec![RunInputV7 {
+                run: run_v4,
+                provenance: Some(provenance),
+            }],
+        },
+        output_bytes,
+    ))
+}
+
+/// The encoded output page bytes one run contributes to a part, the counterpart
+/// of the input `page_bytes` figure a fetch window is bounded by. Provenance
+/// columns live in the zstd-compressed SERIES_META, not the page sections, so
+/// they are not counted here; part sizing tracks the TS/VAL/HIST page sections,
+/// which dominate object size, exactly as the pre-merge input figure did.
+fn run_output_bytes(run: &RunInputV4) -> u64 {
+    let value_len = match &run.value_page {
+        RunValuePageV4::Scalar(p) => p.len(),
+        RunValuePageV4::Histogram(p) => p.len(),
+    };
+    run.ts_page.len() as u64 + value_len as u64
+}
+
+/// A sample's full ADR-0010 §5 dedup key, the ordering key within one
+/// timestamp: `(created_unix_ns, writer_epoch, writer_seq, in_page_index)`.
+fn provenance_key(p: &SampleProvenance) -> (i64, u64, u64, u32) {
+    (
+        p.created_unix_ns,
+        p.writer_epoch,
+        p.writer_seq,
+        p.in_page_index,
+    )
+}
+
+/// Order a merged run's scalar samples by `(ts_ns, dedup key, value bits)`
+/// ascending. The primary key keeps the run ascending-by-ts, as every RSEG page
+/// must be. The secondary keys matter because a query over a run-merged run may
+/// fall back to run-wide-plus-position provenance (the fourth dedup element from
+/// on-disk position) as well as read the explicit per-sample column: ordering
+/// same-timestamp samples by ascending dedup priority makes on-disk position a
+/// monotone proxy for that priority, so the two representations pick the same
+/// winner at a duplicate timestamp. The tie-break on value bits keeps equal-key
+/// duplicates (a re-sent identical sample) deterministic.
+fn sort_merged_scalar(merged: &mut [(Sample, SampleProvenance)]) {
+    merged.sort_by(|(sa, pa), (sb, pb)| {
+        sa.ts_ns
+            .cmp(&sb.ts_ns)
+            .then_with(|| provenance_key(pa).cmp(&provenance_key(pb)))
+            .then_with(|| sa.value.to_bits().cmp(&sb.value.to_bits()))
+    });
+}
+
+/// The run-wide `(created_unix_ns, writer_epoch, writer_seq)` a merged run
+/// carries: the lexicographic minimum over its samples' dedup keys. A merged
+/// run's dedup source is its per-sample provenance column, not this triple, so
+/// the value is not query-observable; the minimum keeps the SERIES_META
+/// `created_delta` column (relative to the footer base) compact and makes the
+/// choice a deterministic function of the samples.
+fn merged_run_prefix(provenance: &[SampleProvenance]) -> (i64, u64, u64) {
+    provenance
+        .iter()
+        .map(|p| (p.created_unix_ns, p.writer_epoch, p.writer_seq))
+        .min()
+        .unwrap_or((0, 0, 0))
+}
+
+/// Decode and merge every scalar run of one multi-run series into a single
+/// re-encoded run plus its per-sample provenance column.
+fn merge_scalar_runs(
+    series_id: &SeriesId,
+    build: &SeriesBuild<'_>,
+    regions: &BatchRegions<'_>,
+    limits: ReaderLimits,
+) -> Result<(RunInputV4, Vec<SampleProvenance>)> {
+    let mut merged: Vec<(Sample, SampleProvenance)> = Vec::new();
+    let mut scratch = Vec::new();
+    let mut timestamps = Vec::new();
+    let mut values = Vec::new();
+    for (key, run) in &build.runs {
+        let (ts_page, page) = slice_run_pages(regions, key, run)?;
+        let entry = run_entry_for_decode(run);
+        timestamps.clear();
+        values.clear();
+        decode_run_pages_soa(
+            series_id,
+            &entry,
+            ts_page.as_ref(),
+            page.as_ref(),
+            limits,
+            &mut scratch,
+            &mut timestamps,
+            &mut values,
+        )?;
+        for (in_page_index, (&ts_ns, &value)) in timestamps.iter().zip(&values).enumerate() {
+            merged.push((
+                Sample { ts_ns, value },
+                sample_provenance(run, in_page_index)?,
+            ));
+        }
+    }
+    sort_merged_scalar(&mut merged);
+
+    let (samples, provenance): (Vec<Sample>, Vec<SampleProvenance>) = merged.into_iter().unzip();
+    let (created, epoch, seq) = merged_run_prefix(&provenance);
+    let run_v4 = encode_run_v4(
+        series_id,
+        created,
+        epoch,
+        seq,
+        &SeriesValues::Scalar(samples),
+    )?;
+    Ok((run_v4, provenance))
+}
+
+/// Histogram counterpart of [`merge_scalar_runs`].
+fn merge_histogram_runs(
+    series_id: &SeriesId,
+    build: &SeriesBuild<'_>,
+    regions: &BatchRegions<'_>,
+    limits: ReaderLimits,
+) -> Result<(RunInputV4, Vec<SampleProvenance>)> {
+    let mut merged: Vec<(ravel_segment::HistogramSample, SampleProvenance)> = Vec::new();
+    for (key, run) in &build.runs {
+        let (ts_page, page) = slice_run_pages(regions, key, run)?;
+        let entry = run_entry_for_decode(run);
+        let samples =
+            decode_run_histogram_pages(series_id, &entry, ts_page.as_ref(), page.as_ref(), limits)?;
+        for (in_page_index, sample) in samples.into_iter().enumerate() {
+            merged.push((sample, sample_provenance(run, in_page_index)?));
+        }
+    }
+    // Order by `(ts_ns, dedup key)` ascending, the histogram counterpart of the
+    // scalar sort: primary ts keeps the run ascending, and ordering same-ts
+    // samples by ascending dedup priority keeps on-disk position a monotone
+    // proxy for priority (there is no bit-pattern value tie-break for a
+    // histogram; the structural order is decided by the priority column).
+    merged.sort_by(|(sa, pa), (sb, pb)| {
+        sa.ts_ns
+            .cmp(&sb.ts_ns)
+            .then_with(|| provenance_key(pa).cmp(&provenance_key(pb)))
+    });
+
+    let (samples, provenance): (Vec<ravel_segment::HistogramSample>, Vec<SampleProvenance>) =
+        merged.into_iter().unzip();
+    let (created, epoch, seq) = merged_run_prefix(&provenance);
+    let run_v4 = encode_run_v4(
+        series_id,
+        created,
+        epoch,
+        seq,
+        &SeriesValues::Histogram(samples),
+    )?;
+    Ok((run_v4, provenance))
+}
+
+/// This sample's dedup key: its run's `(created_unix_ns, writer_epoch,
+/// writer_seq)` plus the sample's original position in that run's page. The
+/// fourth element is what the query engine reconstructs from array position for
+/// an unmerged run (ADR-0018), made explicit here because merging destroys that
+/// position.
+fn sample_provenance(run: &RunPlan, in_page_index: usize) -> Result<SampleProvenance> {
+    Ok(SampleProvenance {
+        created_unix_ns: run.created_unix_ns,
+        writer_epoch: run.writer_epoch,
+        writer_seq: run.writer_seq,
+        in_page_index: u32::try_from(in_page_index)
+            .map_err(|_| MaintainError::Invariant("run sample index exceeds u32".into()))?,
+    })
+}
+
+/// A [`RunEntry`] carrying only the fields the decode primitives read (run
+/// provenance, sample count, event-time bounds); the page byte ranges are
+/// supplied directly, so the `(0, 0)` section-range sentinels are correct
+/// (mirrors the erasure-rewrite decode path).
+fn run_entry_for_decode(run: &RunPlan) -> RunEntry {
+    RunEntry {
+        created_unix_ns: run.created_unix_ns,
+        writer_epoch: run.writer_epoch,
+        writer_seq: run.writer_seq,
+        sample_count: run.sample_count,
+        min_ts_ns: run.min_ts_ns,
+        max_ts_ns: run.max_ts_ns,
+        ts_page: (0, 0),
+        val_page: (0, 0),
+        hist_page: (0, 0),
+    }
+}
+
+/// Slice one run's TS and VAL-or-HIST pages out of the fetched regions.
+fn slice_run_pages<'a>(
+    regions: &BatchRegions<'a>,
+    key: &str,
+    run: &RunPlan,
+) -> Result<(Bytes, Bytes)> {
+    let object = regions
+        .get(key)
+        .ok_or_else(|| MaintainError::Invariant(format!("no fetched region for object {key}")))?;
+    let ts_page = slice_region(object, run.ts_abs).ok_or_else(|| {
+        MaintainError::Invariant("coalesced fetch missing a TS page range".into())
+    })?;
+    let page = slice_region(object, run.page_abs).ok_or_else(|| {
+        MaintainError::Invariant("coalesced fetch missing a value page range".into())
+    })?;
+    Ok((ts_page, page))
 }
 
 /// Decode one run's TS and VAL-or-HIST pages to samples and re-encode them at
@@ -656,7 +860,7 @@ fn flush_part(
     input_set_hash: &[u8; 32],
     input_set_hash16: &str,
     part_index: u32,
-    batch: Vec<SeriesInputV4>,
+    batch: Vec<SeriesInputV7>,
     exemplars: Vec<ExemplarInput>,
 ) -> Result<BuiltPart> {
     let run_count: u64 = batch.iter().map(|s| s.runs.len() as u64).sum();
@@ -685,7 +889,8 @@ fn flush_part(
     // only field the copy changes (ADR-0047 decision 3). An exemplar naming a
     // series this part does not carry is a writer error, not a silent drop, so
     // a mis-assignment above fails the run instead of shrinking the output.
-    let written = SegmentWriter::write_v5_with_exemplars(batch, identity, ingest, meta, exemplars)?;
+    let written =
+        SegmentWriter::write_v7_with_provenance(batch, identity, ingest, meta, exemplars)?;
     let content_hash = written.summary.blake3;
     let hash16 = hex::encode(&content_hash[..8]);
     let key = keys::l1_part_key(
