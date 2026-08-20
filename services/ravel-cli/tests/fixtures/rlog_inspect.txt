@@ -25,9 +25,9 @@ sections:
   kind=6 name=POSTINGS offset=547 len=66 comp=none uncompressed_len=66
 skip_index level 0 (2 block(s)):
   block[0] offset=0 len=105 crc32c=e97c8ea6 record_count=2 ts_range=[100, 200] stream_ref_range=[0, 0]
-    stat column_id=10 type=i64 min_bits=200 max_bits=504 null_count=0 has_nan=false
+    stat column_id=10 type=i64 min_bits=200 max_bits=504 null_count=0 has_nan=false resolved_min=200 resolved_max=504
   block[1] offset=105 len=109 crc32c=c009cac7 record_count=2 ts_range=[150, 250] stream_ref_range=[1, 1]
-    stat column_id=10 type=i64 min_bits=200 max_bits=401 null_count=0 has_nan=false
+    stat column_id=10 type=i64 min_bits=200 max_bits=401 null_count=0 has_nan=false resolved_min=200 resolved_max=401
 stream_dir (2 entry(ies)):
   stream_ref=0 stream_id=01000000000000000000000000000000 blob_len=27 blocks=[0, 0]
   stream_ref=1 stream_id=02000000000000000000000000000000 blob_len=27 blocks=[1, 1]

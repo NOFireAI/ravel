@@ -1543,14 +1543,33 @@ fn rlog_field_type_name(ty: FieldType) -> &'static str {
 fn rlog_print_stats(stats: &[NumStat]) {
     for st in stats {
         println!(
-            "    stat column_id={} type={} min_bits={} max_bits={} null_count={} has_nan={}",
+            "    stat column_id={} type={} min_bits={} max_bits={} null_count={} has_nan={} \
+             resolved_min={} resolved_max={}",
             st.column_id,
             rlog_field_type_name(st.ty),
             st.min_bits,
             st.max_bits,
             st.null_count,
             st.has_nan,
+            rlog_stat_value(st.ty, st.min_bits),
+            rlog_stat_value(st.ty, st.max_bits),
         );
+    }
+}
+
+/// Decodes a NumStat `min_bits`/`max_bits` bit pattern to its typed value for
+/// display. Under RLOG v3 (ADR-0095) this is the resolved merged-view bound an
+/// operator reasons about when a range prune keeps or drops a block, so the
+/// inspector prints it decoded next to the raw bits rather than leaving an
+/// operator to reinterpret an `i64`-as-`u64` or an `f64::to_bits` pattern by
+/// hand. A NumStat only ever carries a numeric type; the string arms are
+/// defensive and never reached.
+fn rlog_stat_value(ty: FieldType, bits: u64) -> String {
+    match ty {
+        FieldType::I64 => (bits as i64).to_string(),
+        FieldType::F64 => f64::from_bits(bits).to_string(),
+        FieldType::Bool => (bits != 0).to_string(),
+        FieldType::Str | FieldType::Bytes => format!("{bits}"),
     }
 }
 

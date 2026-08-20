@@ -171,7 +171,7 @@ impl RlogRangeReader {
         };
         let blocks = self
             .skip
-            .candidate_blocks(i64::MIN, i64::MAX, Some(&[stream_ref]));
+            .candidate_blocks(i64::MIN, i64::MAX, Some(&[stream_ref]), &[]);
         if blocks.is_empty() {
             return Ok(None);
         }
@@ -277,7 +277,7 @@ impl RlogRangeReader {
         };
         let blocks = self
             .skip
-            .candidate_blocks(i64::MIN, i64::MAX, Some(&[stream_ref]));
+            .candidate_blocks(i64::MIN, i64::MAX, Some(&[stream_ref]), &[]);
         if blocks.is_empty() {
             return Ok(None);
         }

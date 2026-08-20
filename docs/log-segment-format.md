@@ -539,11 +539,20 @@ stat range cannot overlap a queried range holds no matching row. Under version
 the block holding the record a range query wanted; that is the defect version 3
 fixes, and it is why a v2 object cannot be read as a v3 one.
 
-`candidate_blocks(ts_min, ts_max, stream_refs)` returns the level-0 block
-indices whose entries survive the coarse predicate. The pruning is sound
-(ADR-0013): a block is dropped only when its min/max bounds prove no
-record in it can match. Precision is not guaranteed; survivors are
-scanned and re-evaluated exactly.
+`candidate_blocks(ts_min, ts_max, stream_refs, numeric)` returns the level-0
+block indices whose entries survive the coarse predicate. Alongside the ts and
+stream-ref bounds, `numeric` carries prune-only inclusive range arms, one per
+NumStat-eligible column: a block is dropped when its stat's min/max for that
+column proves no overlap with the queried range, and a whole level-1 group is
+dropped the same way before its blocks are examined. A column with no stat in
+the entry under test prunes nothing there (absence is "no information"), so a
+level-1 group carrying no stat for the column is descended into and a level-0
+block with none survives. These arms drive block pruning only, through
+`RlogReader::scan_blocks`'s prune channel (ADR-0095 decision 6); the exact,
+exactly-typed range is re-evaluated above the scan by the caller. The pruning is
+sound (ADR-0013): a block is dropped only when its bounds prove no record in it
+can match. Precision is not guaranteed; survivors are scanned and re-evaluated
+exactly.
 
 ## BLOOM
 
