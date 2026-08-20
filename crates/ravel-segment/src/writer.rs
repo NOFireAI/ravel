@@ -1119,9 +1119,7 @@ fn frame_val_page(series_id: &SeriesId, values: &[f64], payload: &mut Vec<u8>) -
     let gdf = crate::value_codecs::encode_gcd_delta_for(values);
     if gdf.len() < best_len {
         best_enc = page_enc::VAL_GCD_DELTA_FOR;
-        best_len = gdf.len();
     }
-    let _ = best_len;
 
     match best_enc {
         page_enc::VAL_GORILLA => frame_page(&series_id.0, best_enc, page_comp::NONE, payload),

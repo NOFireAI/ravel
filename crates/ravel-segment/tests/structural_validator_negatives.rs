@@ -1,8 +1,8 @@
 //! Negative-path coverage for the RSEG structural footer/section validator.
 //! A byte-flip test cannot reach these branches: a flip in a length/offset/
 //! count field also invalidates the covering crc and is caught earlier. Each
-//! test below violates exactly one structural rule of `validate_sections_v6`
-//! (the only version ADR-0047 keeps, superseding ADR-0027's v5) and asserts
+//! test below violates exactly one structural rule of `validate_sections_v7`
+//! (the only version ADR-0092 keeps, superseding ADR-0047's v6) and asserts
 //! the exact typed corruption error, never a panic and never wrong data. The
 //! test name names the precise rule pinned, so an editor who weakens that
 //! branch sees one red test.
@@ -52,7 +52,7 @@ fn bounds() -> IngestBounds {
     }
 }
 
-/// A minimal real, valid v6 object (one series, one sample) -- below the
+/// A minimal real, valid v7 object (one series, one sample) -- below the
 /// sparse threshold, so LABEL_DICT/SERIES_IDS/SERIES_META/TS_PAGES/VAL_PAGES.
 fn one_sample_object() -> bytes::Bytes {
     let series = vec![SeriesInput {
@@ -68,7 +68,7 @@ fn one_sample_object() -> bytes::Bytes {
         .bytes
 }
 
-/// A real, valid v6 footer plus its `page_region_end` (the footer offset,
+/// A real, valid v7 footer plus its `page_region_end` (the footer offset,
 /// exactly what `open_from_full` passes to `validate_sections`).
 fn valid_footer() -> (Footer, u64) {
     let object = one_sample_object();
@@ -76,9 +76,9 @@ fn valid_footer() -> (Footer, u64) {
     (loc.footer, loc.footer_offset)
 }
 
-/// Control: a real, unmutated v6 footer validates.
+/// Control: a real, unmutated v7 footer validates.
 #[test]
-fn valid_v6_footer_accepted() {
+fn valid_v7_footer_accepted() {
     let (footer, region) = valid_footer();
     assert_eq!(
         validate_sections(&footer, VERSION_V7, region, ReaderLimits::default()),
@@ -86,7 +86,7 @@ fn valid_v6_footer_accepted() {
     );
 }
 
-/// Pins: every mandatory v6 kind must be present. SERIES_IDS is a kind that
+/// Pins: every mandatory v7 kind must be present. SERIES_IDS is a kind that
 /// did not exist in the retired v1 layout; dropping it is rejected.
 #[test]
 fn missing_mandatory_section_rejected() {
@@ -233,13 +233,13 @@ fn incomplete_sparse_catalog_rejected() {
     );
 }
 
-/// Pins: `validate_sections` rejects any trailer version other than 6
-/// (ADR-0047), matching `parse_footer`'s accepted set.
+/// Pins: `validate_sections` rejects any trailer version other than 7
+/// (ADR-0092), matching `parse_footer`'s accepted set.
 #[test]
 fn unsupported_version_rejected() {
     let (footer, region) = valid_footer();
-    // v5 (ADR-0026) is retired by the v6 EXEMPLARS bump; rejected the same
-    // way as any other non-6 version.
+    // v5 (ADR-0026) is retired; rejected the same way as any other
+    // non-7 version.
     assert_eq!(
         validate_sections(&footer, 5, region, ReaderLimits::default()),
         Err(SegmentError::UnsupportedVersion(5))
