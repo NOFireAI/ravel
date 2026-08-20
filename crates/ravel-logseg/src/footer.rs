@@ -15,11 +15,21 @@ use crate::error::LogSegError;
 /// Trailer magic, last 4 bytes of every RLOG object.
 pub const MAGIC: [u8; 4] = *b"RLG1";
 /// RLOG trailer version. Bumped 1 -> 2 by ADR-0032 to carry compaction
-/// identity (`level`, `input_set_hash`, `part_index`) in the footer. The reader
-/// gates on exact equality (`open` below), so a v1 object is rejected outright;
-/// there is no dual-reader path (ADR-0032: RLOG had no data outside development
-/// when v2 landed).
-pub const VERSION: u16 = 2;
+/// identity (`level`, `input_set_hash`, `part_index`) in the footer, and 2 -> 3
+/// by ADR-0095, which redefined what a SKIP_IDX numeric stat (`NumStat`) means:
+/// an I64/F64/Bool stat now bounds the value each row *resolves* for the
+/// column's attribute name -- its resource and scope layers overridden by its
+/// own attributes, cross-type duplicates resolved -- rather than the raw
+/// columnar occurrence. A row that carries no occurrence of the name at all is
+/// bounded too, by whatever its stream layer gives it. The bytes are unchanged
+/// in shape, so nothing but this version byte distinguishes the two meanings.
+///
+/// The reader gates on the single-version window below, so a v1 or v2 object is
+/// rejected outright; there is no dual-reader path and no `maintain migrate`
+/// rewrite (ADR-0095: pre-release single-supported-version regime, ADR-0027).
+/// Every stored v2 object becomes unreadable when this build ships;
+/// convergence is retention expiry or re-ingestion.
+pub const VERSION: u16 = 3;
 
 /// The set of RLOG trailer versions this build's reader accepts (ADR-0066
 /// decision 1: "N/N-1 window, readers first"). Writers always emit the current
@@ -36,10 +46,10 @@ pub struct SupportedVersions {
 }
 
 impl SupportedVersions {
-    /// A window accepting exactly one version. This is the shape today: only
-    /// one RLOG version has existed since ADR-0032 deleted the v1 reader, so
-    /// there is no N-1 to accept and the reader behaves identically to the old
-    /// single-version gate.
+    /// A window accepting exactly one version. This is the shape today: RLOG is
+    /// still pre-release, so each bump deletes the previous version's reader in
+    /// the same change (ADR-0032 for v1, ADR-0095 for v2). There is no N-1 to
+    /// accept and the reader behaves identically to the old single-version gate.
     pub const fn single(version: u16) -> Self {
         Self {
             newest: version,
@@ -76,8 +86,10 @@ impl SupportedVersions {
 }
 
 /// RLOG's supported-version window. Today it resolves to the single current
-/// version [`VERSION`]; the machinery carries ADR-0066's two-wide shape ready
-/// for the first bump.
+/// version [`VERSION`] (v3, ADR-0095); the machinery carries ADR-0066's
+/// two-wide shape ready for the first post-release bump. This is the single
+/// source the writer, the reader gate, `audit-versions`, `migrate`, and the
+/// compactor's `OUTPUT_FORMAT_VERSION` all read.
 pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);
 
 /// Signal byte for log segments.
@@ -501,11 +513,12 @@ mod tests {
         assert_eq!(got.section(kind::BLOCKS).map(|s| s.offset), Some(2));
     }
 
-    /// A v2 footer carrying non-default compaction identity round-trips exactly
-    /// through encode then decode (ADR-0032). The three new fields live inside
-    /// the same protobuf `LogFooter` the `footer_crc32c` already covers.
+    /// A footer carrying non-default compaction identity round-trips exactly
+    /// through encode then decode (the fields ADR-0032 added in v2, carried
+    /// unchanged by v3). The three fields live inside the same protobuf
+    /// `LogFooter` the `footer_crc32c` already covers.
     #[test]
-    fn v2_footer_round_trips_level_input_set_hash_part_index() {
+    fn footer_round_trips_level_input_set_hash_part_index() {
         let mut footer = sample_footer(sample_sections());
         footer.level = 1;
         footer.input_set_hash = vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0xff];
@@ -550,6 +563,34 @@ mod tests {
         }
     }
 
+    /// The immediately preceding version (v2) is rejected too, and with the
+    /// typed variant: ADR-0095 deletes v2 read support in the same change that
+    /// introduces v3, so there is no dual-reader window. A stored v2 object is
+    /// unreadable by this build by design, and it must say so as
+    /// `UnsupportedVersion(2)` rather than looking like corruption.
+    #[test]
+    fn rejects_v2_trailer_as_unsupported_version() {
+        const V2: u16 = 2;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, V2, SIGNAL_LOGS, RESERVED);
+
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&V2.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        assert!(matches!(
+            open(&obj),
+            Err(LogSegError::UnsupportedVersion(2))
+        ));
+    }
+
     /// The version/corruption split is real: an older version (v1) is also the
     /// typed `UnsupportedVersion` variant, never `Corrupted`.
     #[test]
@@ -577,7 +618,7 @@ mod tests {
 
     /// Today's RLOG window resolves to exactly the single current version, so
     /// the reader's accepted set is byte-for-byte the pre-ADR-0066 behaviour:
-    /// v2 accepted, v1 and a hypothetical v3 rejected. Only the window's shape
+    /// v3 accepted, v2 and a hypothetical v4 rejected. Only the window's shape
     /// is new machinery.
     #[test]
     fn todays_window_accepts_only_the_current_version() {
@@ -811,10 +852,10 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
 
-        /// Arbitrary v2 compaction-identity values survive a footer
-        /// encode/decode round-trip exactly (ADR-0032).
+        /// Arbitrary compaction-identity values survive a footer encode/decode
+        /// round-trip exactly (ADR-0032's fields, carried unchanged by v3).
         #[test]
-        fn footer_v2_fields_round_trip(
+        fn footer_compaction_identity_fields_round_trip(
             level in any::<u32>(),
             part_index in any::<u32>(),
             hash in proptest::collection::vec(any::<u8>(), 0..40),

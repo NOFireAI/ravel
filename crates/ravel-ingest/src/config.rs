@@ -9,12 +9,20 @@ use std::time::Duration;
 /// Changing it is a format-level ADR, not a routine edit.
 pub const SEGMENT_FORMAT_VERSION: u16 = ravel_segment::VERSION_V7;
 
-/// RLOG trailer version every log flush emits. Mirrors `ravel_logseg`'s own
-/// object trailer version (`docs/log-segment-format.md`, ADR-0029); like
-/// [`SEGMENT_FORMAT_VERSION`] it is not a configurable knob, and is stamped
-/// verbatim into the commit record's `segment_format_version`. Changing it is
-/// a format-level ADR, not a routine edit.
-pub const LOG_SEGMENT_FORMAT_VERSION: u16 = 2;
+/// RLOG trailer version every log flush emits. Tied to `ravel_logseg`'s own
+/// object trailer version (`docs/log-segment-format.md`, ADR-0029) at compile
+/// time rather than hand-mirrored; like [`SEGMENT_FORMAT_VERSION`] it is not a
+/// configurable knob, and is stamped verbatim into the commit record's
+/// `segment_format_version`. Changing it is a format-level ADR, not a routine
+/// edit.
+///
+/// It was a mirrored literal (`2`), which is the same defect the RSPAN v2 bump
+/// shipped: the writer stamps the object trailer from the format crate while a
+/// stale literal keeps claiming the old number, so every published object gets
+/// a commit record naming a version it is not, permanently (commit records are
+/// immutable, and `ravel-cli maintain audit-versions` reads them). The v2 -> v3
+/// bump (ADR-0095) is what surfaced it.
+pub const LOG_SEGMENT_FORMAT_VERSION: u16 = ravel_logseg::footer::VERSION;
 
 /// RSPAN trailer version every span flush emits. Stamped verbatim into the
 /// commit record's `segment_format_version`. Changing it is a format-level
@@ -273,11 +281,6 @@ mod tests {
         // version-1 claim in every span commit record while this style of
         // test stayed green (see the same fix for spans and logs).
         assert_eq!(SEGMENT_FORMAT_VERSION, ravel_segment::VERSION_V7);
-    }
-
-    #[test]
-    fn log_segment_format_version_is_v2() {
-        assert_eq!(LOG_SEGMENT_FORMAT_VERSION, 2);
     }
 
     #[test]

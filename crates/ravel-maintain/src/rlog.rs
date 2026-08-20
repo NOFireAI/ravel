@@ -121,8 +121,9 @@ use crate::config::{CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
 
-/// The RLOG output trailer version every L1 part carries (ADR-0032, trailer
-/// version 2). Recorded in each part's `CompactionPart.segment_format_version`,
+/// The RLOG output trailer version every L1 part carries (currently 3:
+/// ADR-0032 introduced v2, ADR-0095 moved it to v3). Recorded in each part's
+/// `CompactionPart.segment_format_version`,
 /// the log analogue of RSEG's [`crate::build::OUTPUT_FORMAT_VERSION`].
 ///
 /// Read from `ravel_logseg`'s single-sourced supported-version window

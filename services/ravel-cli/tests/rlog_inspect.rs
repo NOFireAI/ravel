@@ -119,7 +119,7 @@ fn rlog_inspect_output_matches_golden_fixture() {
     assert_eq!(
         stdout, expected,
         "`rlog inspect` output regressed; the RLOG format is frozen \
-         (docs/log-segment-format.md, currently trailer v2) -- this must not \
+         (docs/log-segment-format.md, currently trailer v3) -- this must not \
          change without a version bump and ADR"
     );
     assert!(

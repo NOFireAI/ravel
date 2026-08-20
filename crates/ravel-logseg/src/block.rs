@@ -43,6 +43,16 @@ pub struct ColumnPlan {
 /// its two's-complement `u64`, or an f64 as its `to_bits` pattern; f64 min/max
 /// use `total_cmp` order over non-NaN values, and NaN values are counted in
 /// `has_nan` and excluded from min/max.
+///
+/// Since RLOG v3 (ADR-0095) the values folded in are each row's resolved
+/// merged-view value for the column's attribute name
+/// ([`ResolvedRow::stat_winners`]), not the row's raw columnar occurrence. A row
+/// whose resolved value for that name is of another type counts in `null_count`
+/// only. That makes the bounds bound what a reader materializing a declared
+/// typed column actually produces per row, which is the whole point of pruning
+/// on them; the raw value page may hold a losing occurrence outside these
+/// bounds, and the bounds may cover a value that lives only in STREAM_DIR
+/// (a name a row resolves off its resource or scope).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NumStat {
     pub column_id: u32,
@@ -106,7 +116,20 @@ fn stage_column(
     });
 }
 
-/// i64 min/max stat over the present values (two's-complement bits).
+/// i64 min/max stat over the contributing values (two's-complement bits).
+///
+/// `vals` is one entry per row of the block: `Some` when the value that row
+/// resolves for this column's name is an i64 (the value being the resolved one,
+/// [`winner_value`]), `None` when it is of another type or the row resolves the
+/// name to nothing. Every `None` counts in `null_count` (ADR-0095 decision 2).
+///
+/// "Resolves" spans both layers, not the record's own attributes alone: a row
+/// carrying no occurrence of the name still contributes the value its resource
+/// or scope carries, so a `Some` here need not correspond to anything in the
+/// block's value page for the column -- and a block may get a stat for a column
+/// it has no page for at all.
+///
+/// `f64_stat` and `bool_stat` below carry the same contract for their types.
 fn i64_stat(column_id: u32, vals: &[Option<i64>]) -> NumStat {
     let mut min = i64::MAX;
     let mut max = i64::MIN;
@@ -136,8 +159,9 @@ fn i64_stat(column_id: u32, vals: &[Option<i64>]) -> NumStat {
     }
 }
 
-/// f64 min/max stat over non-NaN present values; NaN presence is flagged and
-/// those values are excluded from min/max.
+/// f64 min/max stat over the non-NaN contributing values; NaN presence is
+/// flagged and those values are excluded from min/max. `vals` carries the same
+/// merged-view-resolved, one-entry-per-row shape [`i64_stat`] documents.
 fn f64_stat(column_id: u32, vals: &[Option<u64>]) -> NumStat {
     let mut min: Option<f64> = None;
     let mut max: Option<f64> = None;
@@ -173,7 +197,8 @@ fn f64_stat(column_id: u32, vals: &[Option<u64>]) -> NumStat {
     }
 }
 
-/// bool min/max stat (0/1 bits) over present values.
+/// bool min/max stat (0/1 bits) over the contributing values. `vals` carries
+/// the same merged-view-resolved, one-entry-per-row shape [`i64_stat`] documents.
 fn bool_stat(column_id: u32, vals: &[Option<bool>]) -> NumStat {
     let mut min = 1u64;
     let mut max = 0u64;
@@ -268,7 +293,12 @@ pub fn write_block(
     let (enc, b) = encode_strings(&raw_vals);
     stage_column(&mut pages, COL_ATTRS_RAW, &raw_present, enc, b);
 
-    // Dynamic columns, in plan order.
+    // Dynamic columns, in plan order. The value pages carry each row's own
+    // columnar occurrence ([`row_column`]); the stats carry each row's
+    // merged-view winner ([`winner_value`]). Those are the same value for the
+    // ordinary row that carries a name once, and deliberately differ for a row
+    // with a duplicate of that name (ADR-0095): the page stores what the row
+    // put in the column, the stat bounds what a reader will resolve.
     for plan in plans {
         let cid = plan.column_id;
         let present: Vec<bool> = rows.iter().map(|r| row_column(r, cid).is_some()).collect();
@@ -281,9 +311,16 @@ pub fn write_block(
                         _ => None,
                     })
                     .collect();
+                let stat_vals: Vec<Option<i64>> = rows
+                    .iter()
+                    .map(|r| match winner_value(r, cid) {
+                        Some(ColumnValue::I64(v)) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
                 let present_vals: Vec<i64> = vals.iter().flatten().copied().collect();
                 let (enc, b) = encode_i64(&present_vals);
-                stats.push(i64_stat(cid, &vals));
+                stats.push(i64_stat(cid, &stat_vals));
                 stage_column(&mut pages, cid, &present, enc, b);
             }
             FieldType::F64 => {
@@ -294,9 +331,16 @@ pub fn write_block(
                         _ => None,
                     })
                     .collect();
+                let stat_vals: Vec<Option<u64>> = rows
+                    .iter()
+                    .map(|r| match winner_value(r, cid) {
+                        Some(ColumnValue::F64(v)) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
                 let present_vals: Vec<u64> = vals.iter().flatten().copied().collect();
                 let (enc, b) = encode_f64(&present_vals);
-                stats.push(f64_stat(cid, &vals));
+                stats.push(f64_stat(cid, &stat_vals));
                 stage_column(&mut pages, cid, &present, enc, b);
             }
             FieldType::Bool => {
@@ -307,8 +351,15 @@ pub fn write_block(
                         _ => None,
                     })
                     .collect();
+                let stat_vals: Vec<Option<bool>> = rows
+                    .iter()
+                    .map(|r| match winner_value(r, cid) {
+                        Some(ColumnValue::Bool(v)) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
                 let present_vals: Vec<bool> = vals.iter().flatten().copied().collect();
-                stats.push(bool_stat(cid, &vals));
+                stats.push(bool_stat(cid, &stat_vals));
                 stage_column(
                     &mut pages,
                     cid,
@@ -379,6 +430,22 @@ pub fn write_block(
 
 fn row_column(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
     row.columns
+        .iter()
+        .find(|(cid, _)| *cid == column_id)
+        .map(|(_, v)| v)
+}
+
+/// The value this row contributes to `column_id`'s [`NumStat`]: its resolved
+/// merged-view value for that column's attribute name (its resource and scope
+/// layer, overridden by its own attributes), keyed by the column that value's
+/// own type resolves to ([`ResolvedRow::stat_winners`], ADR-0095 decision 2).
+///
+/// `None` means this row contributes to `null_count` only, which covers both
+/// "the row resolves no value for this name" and "the row resolves one but of a
+/// different type, so a reader materializing this typed column produces NULL
+/// for this row".
+fn winner_value(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
+    row.stat_winners
         .iter()
         .find(|(cid, _)| *cid == column_id)
         .map(|(_, v)| v)
@@ -720,7 +787,18 @@ mod tests {
             attrs_raw: None,
             columns: Vec::new(),
             indexed_terms: Vec::new(),
+            stat_winners: Vec::new(),
         }
+    }
+
+    /// Adds a dynamic attribute the way the writer does for the ordinary row
+    /// that carries a name exactly once: the value goes in the column *and* is
+    /// that row's winner for the name, so the value page and the stat see the
+    /// same value. Tests that care about the two diverging set `stat_winners`
+    /// by hand.
+    fn put(r: &mut ResolvedRow, column_id: u32, v: ColumnValue) {
+        r.columns.push((column_id, v.clone()));
+        r.stat_winners.push((column_id, v));
     }
 
     #[test]
@@ -812,20 +890,18 @@ mod tests {
         for i in 0..10i64 {
             let mut r = row(0, i);
             if i < 6 {
-                r.columns.push((10, ColumnValue::I64(i - 2)));
+                put(&mut r, 10, ColumnValue::I64(i - 2));
             }
             rows.push(r);
         }
         // f64 column: values including a NaN payload; NaN excluded from min/max.
-        rows[0]
-            .columns
-            .push((11, ColumnValue::F64(1.5f64.to_bits())));
-        rows[1]
-            .columns
-            .push((11, ColumnValue::F64((-3.0f64).to_bits())));
-        rows[2]
-            .columns
-            .push((11, ColumnValue::F64((f64::NAN.to_bits()) | 0x7)));
+        put(&mut rows[0], 11, ColumnValue::F64(1.5f64.to_bits()));
+        put(&mut rows[1], 11, ColumnValue::F64((-3.0f64).to_bits()));
+        put(
+            &mut rows[2],
+            11,
+            ColumnValue::F64((f64::NAN.to_bits()) | 0x7),
+        );
         let out = write_block(&rows, &plans, 3).expect("write");
 
         let s10 = out.stats.iter().find(|s| s.column_id == 10).expect("s10");
@@ -839,6 +915,95 @@ mod tests {
         assert_eq!(f64::from_bits(s11.min_bits), -3.0);
         assert_eq!(f64::from_bits(s11.max_bits), 1.5);
         assert_eq!(s11.null_count, 7);
+    }
+
+    /// A row whose cross-type winner for an attribute name is of another type
+    /// contributes nothing but a null to that name's numeric stats, even though
+    /// its losing occurrence still occupies the value page (ADR-0095 decisions
+    /// 2 and 3).
+    ///
+    /// Rows here model a record carrying `dur` twice: once in the I64 column
+    /// (id 10) and once as a Str (id 12) that wins the merge, plus the mirror
+    /// case for a Bool (id 11) and an F64 (id 13). The stats must bound only
+    /// the winning-type occurrences: 7 (row 1's uncontested i64), never row 0's
+    /// losing 9999; `true` (row 1), never row 0's losing `false`; 2.5 (row 1),
+    /// never row 0's losing -1e9.
+    #[test]
+    fn numstat_reflects_cross_type_winner() {
+        let plans = vec![
+            ColumnPlan {
+                column_id: 10,
+                ty: FieldType::I64,
+            },
+            ColumnPlan {
+                column_id: 11,
+                ty: FieldType::Bool,
+            },
+            ColumnPlan {
+                column_id: 12,
+                ty: FieldType::Str,
+            },
+            ColumnPlan {
+                column_id: 13,
+                ty: FieldType::F64,
+            },
+        ];
+
+        // Row 0: every numeric occurrence loses to a Str occurrence of the same
+        // name, so its winner maps to the Str column (12) alone.
+        let mut loser = row(0, 1);
+        loser.columns.push((10, ColumnValue::I64(9999)));
+        loser.columns.push((11, ColumnValue::Bool(false)));
+        loser
+            .columns
+            .push((13, ColumnValue::F64((-1e9f64).to_bits())));
+        loser.columns.push((12, ColumnValue::Str(b"late".to_vec())));
+        loser
+            .stat_winners
+            .push((12, ColumnValue::Str(b"late".to_vec())));
+
+        // Row 1: the ordinary shape, each name carried once and winning.
+        let mut winner = row(0, 2);
+        put(&mut winner, 10, ColumnValue::I64(7));
+        put(&mut winner, 11, ColumnValue::Bool(true));
+        put(&mut winner, 13, ColumnValue::F64(2.5f64.to_bits()));
+
+        let out = write_block(&[loser, winner], &plans, 3).expect("write");
+        let stat = |cid: u32| {
+            *out.stats
+                .iter()
+                .find(|s| s.column_id == cid)
+                .unwrap_or_else(|| panic!("stat for column {cid}"))
+        };
+
+        let i64_stat = stat(10);
+        assert_eq!(i64_stat.min_bits, 7i64 as u64, "losing 9999 must not widen");
+        assert_eq!(i64_stat.max_bits, 7i64 as u64, "losing 9999 must not widen");
+        assert_eq!(
+            i64_stat.null_count, 1,
+            "the cross-type loser counts as a null, like an absent attribute"
+        );
+
+        let bool_stat = stat(11);
+        assert_eq!(bool_stat.min_bits, 1, "losing false must not widen");
+        assert_eq!(bool_stat.max_bits, 1);
+        assert_eq!(bool_stat.null_count, 1);
+
+        let f64_stat = stat(13);
+        assert_eq!(f64::from_bits(f64_stat.min_bits), 2.5);
+        assert_eq!(f64::from_bits(f64_stat.max_bits), 2.5);
+        assert_eq!(f64_stat.null_count, 1);
+
+        // The losing values are still stored: the fix changes the stats, never
+        // the rows. Both occurrences survive so the read side can resolve the
+        // winner itself.
+        let dec = read_block(&out.bytes, out.crc32c, &plans, 1 << 30).expect("read");
+        assert_eq!(dec.i64_col(10).and_then(|c| c[0]), Some(9999));
+        assert_eq!(dec.bool_col(11).and_then(|c| c[0]), Some(false));
+        assert_eq!(
+            dec.f64_col(13).and_then(|c| c[0]).map(f64::from_bits),
+            Some(-1e9)
+        );
     }
 
     /// A column filter decodes only the named columns' pages, leaves every

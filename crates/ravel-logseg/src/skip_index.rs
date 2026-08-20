@@ -7,6 +7,21 @@
 //! descends only into surviving groups, so pruning cost scales with surviving
 //! data. Pruning is sound (ADR-0013): a block is dropped only when its bounds
 //! prove no record in it can match.
+//!
+//! Since RLOG v3 (ADR-0095) a numeric stat bounds the value each row *resolves*
+//! for its column's attribute name -- the row's resource and scope layers
+//! overridden by its own attributes, cross-type duplicates resolved -- not the
+//! row's raw columnar occurrence (see [`crate::block::NumStat`]). A row that
+//! carries no occurrence of the name is bounded too, by its stream-level value,
+//! so a level-0 entry carries a stat for every column its rows resolve, not just
+//! the ones its block has pages for. The byte grammar is unchanged, which is
+//! exactly why the trailer version had to move: nothing in these bytes tells a
+//! v2 stat from a v3 one.
+//!
+//! [`merge_stats`] relies on that completeness: it folds only the children that
+//! carry a stat for a column, so a level-0 entry that omitted one would be read
+//! as "no information about this column" and its rows would silently drop out of
+//! the level-1 bounds a query prunes on.
 
 use crate::block::NumStat;
 use crate::error::LogSegError;
@@ -432,6 +447,104 @@ mod tests {
                 if ts_overlaps && ref_hit {
                     prop_assert!(cands.contains(&i));
                 }
+            }
+        });
+    }
+
+    /// A level-0 entry carrying one stat of each numeric type, for the
+    /// stat-grammar corruption tests below.
+    fn entry_with_stats(idx: u64) -> Level0Entry {
+        let mut e = entry(idx, 0, 9, 0, 0);
+        e.stats = vec![
+            NumStat {
+                column_id: 10,
+                ty: FieldType::I64,
+                min_bits: (-7i64) as u64,
+                max_bits: 900i64 as u64,
+                null_count: 3,
+                has_nan: false,
+            },
+            NumStat {
+                column_id: 11,
+                ty: FieldType::F64,
+                min_bits: (-1.5f64).to_bits(),
+                max_bits: 2.5f64.to_bits(),
+                null_count: 0,
+                has_nan: true,
+            },
+            NumStat {
+                column_id: 12,
+                ty: FieldType::Bool,
+                min_bits: 0,
+                max_bits: 1,
+                null_count: 1,
+                has_nan: false,
+            },
+        ];
+        e
+    }
+
+    /// An index carrying v3 numeric stats round-trips exactly, including the
+    /// merged level-1 stats: the semantics changed in v3, the encoding did not,
+    /// so a decode must reproduce every stat field bit-for-bit.
+    #[test]
+    fn stats_round_trip_including_level1_merge() {
+        let l0: Vec<Level0Entry> = (0..3u64).map(entry_with_stats).collect();
+        let idx = SkipIndex::build(l0);
+        let got = SkipIndex::decode(&idx.encode(), 100).expect("decode");
+        assert_eq!(got, idx);
+        // Level 1 merged the three children's identical stats: same bounds,
+        // summed null counts, OR-ed NaN flag.
+        let l1 = &got.l1[0].stats;
+        let i = l1.iter().find(|s| s.column_id == 10).expect("i64 stat");
+        assert_eq!(i.min_bits as i64, -7);
+        assert_eq!(i.max_bits as i64, 900);
+        assert_eq!(i.null_count, 9);
+        assert!(l1.iter().any(|s| s.column_id == 11 && s.has_nan));
+    }
+
+    /// Truncating a stat-bearing SKIP_IDX at every prefix length is always a
+    /// typed `Corrupted` error, never a panic and never a short read that
+    /// silently drops entries. Every field of the stat grammar (varint column
+    /// id, type byte, two 8-byte bit patterns, varint null count, has_nan byte)
+    /// falls inside some prefix, so this covers each of their truncation paths.
+    #[test]
+    fn truncated_stats_are_typed_errors() {
+        let bytes = SkipIndex::build((0..2u64).map(entry_with_stats).collect()).encode();
+        for cut in 0..bytes.len() {
+            match SkipIndex::decode(&bytes[..cut], 100) {
+                Err(LogSegError::Corrupted(_)) => {}
+                other => panic!("prefix of {cut} byte(s) must be Corrupted, got {other:?}"),
+            }
+        }
+        assert!(
+            SkipIndex::decode(&bytes, 100).is_ok(),
+            "the whole thing decodes"
+        );
+    }
+
+    /// Flipping any single byte of a stat-bearing SKIP_IDX either fails with a
+    /// typed `Corrupted` error or decodes to some index that is itself
+    /// canonical (re-encoding and decoding again reproduces it). It never
+    /// panics and never yields a value the encoder could not have written: a
+    /// flip inside a `min_bits` field really is indistinguishable from a
+    /// different legitimate bound, which is why the section carries a crc
+    /// (verified before this decoder ever runs on a real object).
+    #[test]
+    fn flipped_stat_bytes_never_panic_and_stay_canonical() {
+        use proptest::prelude::*;
+        let bytes = SkipIndex::build((0..2u64).map(entry_with_stats).collect()).encode();
+        proptest!(|(at in any::<usize>(), xor in any::<u8>())| {
+            let mut m = bytes.clone();
+            let i = at % m.len();
+            m[i] ^= xor | 1;
+            match SkipIndex::decode(&m, 100) {
+                Ok(idx) => {
+                    let again = SkipIndex::decode(&idx.encode(), 100).expect("re-decode");
+                    prop_assert_eq!(again, idx);
+                }
+                Err(LogSegError::Corrupted(_)) => {}
+                Err(other) => prop_assert!(false, "expected Corrupted, got {:?}", other),
             }
         });
     }

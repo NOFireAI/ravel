@@ -454,7 +454,11 @@ pub async fn seed_rlog_input(
         max_event_ts_ns: max_ts,
         min_ingest_ts_ns: created,
         max_ingest_ts_ns: created,
-        segment_format_version: 2,
+        // The RLOG version the object above was actually written at, read from
+        // the format crate's single-sourced constant. A literal here goes stale
+        // on every trailer bump (v2 -> v3, ADR-0095) and makes the seeded input
+        // claim a version its bytes are not.
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         created_unix_ns: created,
         ingest_hour_bucket: HOUR,
     })

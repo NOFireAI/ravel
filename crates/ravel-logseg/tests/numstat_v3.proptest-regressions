@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 87bb4b5532eda7fa536fa24bcf8b544df92283eda14b0d321c9d13c6e24cb985 # shrinks to corpus = [[("dur", I64(0)), ("dur", I64(1))]]

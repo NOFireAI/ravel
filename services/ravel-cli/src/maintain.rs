@@ -392,8 +392,8 @@ pub async fn audit_versions(
     if anomalies > 0 {
         anyhow::bail!(
             "audit-versions found {anomalies} live object(s) at an unsupported version; there is \
-             no dual-reader or migration path (ADR-0027 for RSEG, ADR-0032 for RLOG, ADR-0041 for \
-             RSPAN)"
+             no dual-reader or migration path (ADR-0027 for RSEG, ADR-0032 and ADR-0095 for RLOG, \
+             ADR-0041 for RSPAN)"
         );
     }
     println!("audit-versions: all live objects are at a supported version");
