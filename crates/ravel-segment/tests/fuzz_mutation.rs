@@ -4,14 +4,14 @@
 //! or a valid decode, never panic and never yield wrong data
 //! (docs/segment-format.md, CLAUDE.md testing patterns).
 //!
-//! ADR-0047 leaves v6 the only readable version. The live seed corpus is a
+//! ADR-0092 leaves v7 the only readable version. The live seed corpus is a
 //! pair of real objects (below and above the sparse-emission threshold,
-//! built via the current writer and so v6-trailered); proptest-driven
+//! built via the current writer and so v7-trailered); proptest-driven
 //! single-bit and truncation mutations, plus fully arbitrary byte vectors,
 //! run through the public read pipeline and must never panic.
 //!
-//! Retired-version rejection: four checked-in pre-v6 goldens (v1, v2, v3,
-//! v5) are kept only as rejection seeds. `parse_footer` rejects a non-6
+//! Retired-version rejection: five checked-in pre-v7 goldens (v1, v2, v3,
+//! v5, v6) are kept only as rejection seeds. `parse_footer` rejects a non-7
 //! trailer version before it ever touches a section, so each decodes to a
 //! typed `UnsupportedVersion`, never a parse attempt or panic. This is why
 //! the two historically inconsistent v3 histogram fixtures (dense_spans,
@@ -54,8 +54,9 @@ const SECTION_KIND_SERIES_IDX: u32 = 8;
 const SECTION_KIND_SERIES_META_CHUNKS: u32 = 9;
 
 /// Retired-version goldens kept only as rejection seeds (one per retired
-/// layout that has a checked-in fixture): v1-v3 predate v5 (ADR-0026), and
-/// v5 itself was retired in turn by the v6 EXEMPLARS bump (ADR-0047). This
+/// layout that has a checked-in fixture): v1-v3 predate v5 (ADR-0026), v5
+/// itself was retired in turn by the v6 EXEMPLARS bump (ADR-0047), and v6 by
+/// the v7 run-merge / provenance bump (ADR-0092). This
 /// is the corpus convention (crates/ravel-segment/tests/fixtures/): once a
 /// version is superseded, its golden is never deleted and never updated --
 /// it stays exactly as the old writer produced it, and its only remaining
@@ -67,6 +68,7 @@ const REJECTION_SEEDS: &[&[u8]] = &[
     include_bytes!("fixtures/golden_v2_single_schema.bin"),
     include_bytes!("fixtures/golden_v3_integer_histogram.bin"),
     include_bytes!("fixtures/golden_v5_no_sparse.bin"),
+    include_bytes!("fixtures/golden_v6_with_exemplars.bin"),
 ];
 
 fn range_bytes(bytes: &[u8], range: (u64, u64)) -> Result<&[u8], SegmentError> {
@@ -396,15 +398,20 @@ fn sparse_seed_point_probe_finds_known_id_unmutated() {
 
 #[test]
 fn retired_version_objects_are_rejected_with_typed_error() {
-    // ADR-0027/ADR-0047: a stray pre-v6 object must stay detectably foreign.
-    // Each of these is a real v1/v2/v3/v5 golden; `parse_footer` rejects the
-    // non-6 trailer version before touching a section, so the decode never
+    // ADR-0027/ADR-0092: a stray pre-v7 object must stay detectably foreign.
+    // Each of these is a real v1/v2/v3/v5/v6 golden; `parse_footer` rejects the
+    // non-7 trailer version before touching a section, so the decode never
     // gets far enough to observe the historical v3 count inconsistency -- it
-    // is now unreachable, as the removal predicted.
+    // is now unreachable, as the removal predicted. The v6 golden proves the
+    // just-retired version is rejected rather than half-parsed, exactly the way
+    // every earlier retired version is.
     for (i, bytes) in REJECTION_SEEDS.iter().enumerate() {
         match open_from_full(bytes, ReaderLimits::default()) {
             Err(SegmentError::UnsupportedVersion(v)) => {
-                assert!([1, 2, 3, 5].contains(&v), "rejection seed {i} version {v}");
+                assert!(
+                    [1, 2, 3, 5, 6].contains(&v),
+                    "rejection seed {i} version {v}"
+                );
             }
             other => panic!("rejection seed {i} must be UnsupportedVersion, got {other:?}"),
         }

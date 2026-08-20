@@ -173,7 +173,7 @@ pub enum MigrateOutcome {
 /// become sweepable exactly like any superseded compaction input.
 ///
 /// `target_version` is the format version the migration is raising toward
-/// (`ravel_segment::VERSION_V6 as u32` in production). Passing a version above
+/// (`ravel_segment::VERSION_V7 as u32` in production). Passing a version above
 /// the current writer's output makes every current-version object eligible,
 /// which is how the tests exercise the migration path before an actual N-1
 /// version exists to read.
@@ -293,7 +293,7 @@ async fn dispatch_rewrite(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    //! Exercises the shared primitive end to end over real RSEG v6 objects on a
+    //! Exercises the shared primitive end to end over real RSEG v7 objects on a
     //! `MemoryStore`: a format-migration round trip that conserves record
     //! content, the conservation-abort path (a rejecting predicate publishes
     //! nothing), the crash-and-rerun convergence at the content-addressed key,
@@ -308,7 +308,7 @@ mod tests {
     use ravel_proto::commit::v1::CompactionRecord;
     use ravel_segment::{
         IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInputV3, SeriesValues,
-        VERSION_V6,
+        VERSION_V7,
     };
     use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantHash, TenantId};
     use uuid::Uuid;
@@ -323,10 +323,10 @@ mod tests {
     const HOUR: u32 = 495_000;
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
     const EPOCH: u64 = 10;
-    /// A version above the current writer's output, so every real v6 object
+    /// A version above the current writer's output, so every real v7 object
     /// counts as "old" and the migration path runs. Stands in for the N-1
     /// version an actual reader window would supply.
-    const FUTURE_VERSION: u32 = VERSION_V6 as u32 + 1;
+    const FUTURE_VERSION: u32 = VERSION_V7 as u32 + 1;
 
     fn tenant_hash() -> TenantHash {
         TenantId::new(TENANT).hash()
@@ -370,15 +370,15 @@ mod tests {
     }
 
     /// Seed one L0 input (data object + commit record) through the production
-    /// flush writer, so the seeded object is byte-for-byte a real v6 L0 flush.
+    /// flush writer, so the seeded object is byte-for-byte a real v7 L0 flush.
     /// Returns the data object's bytes.
     async fn seed(store: &dyn ObjectStoreBackend, seq: u64, series: Vec<SeriesInputV3>) -> Bytes {
-        seed_with_version(store, seq, series, VERSION_V6 as u32).await
+        seed_with_version(store, seq, series, VERSION_V7 as u32).await
     }
 
     /// Like [`seed`], but records `segment_format_version` in the commit
     /// record as given rather than the writer's true output version. The
-    /// object bytes are always real v6 -- only the metadata a caller reads
+    /// object bytes are always real v7 -- only the metadata a caller reads
     /// without decoding (the guard under test) can disagree with them.
     async fn seed_with_version(
         store: &dyn ObjectStoreBackend,
@@ -528,7 +528,7 @@ mod tests {
         out
     }
 
-    /// The migration round trip: two real v6 L0 objects decode, re-encode, and
+    /// The migration round trip: two real v7 L0 objects decode, re-encode, and
     /// publish into a current-version L1 part carrying the same series content,
     /// with the record-count conserved exactly.
     #[tokio::test]
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(record.parts.len(), 1);
         let part = &record.parts[0];
         assert_eq!(
-            part.segment_format_version, VERSION_V6 as u32,
+            part.segment_format_version, VERSION_V7 as u32,
             "the output is stamped the current writer version"
         );
 
@@ -608,8 +608,8 @@ mod tests {
     /// No real N-1 RSEG version has ever shipped, so the "old" object is built
     /// the way slice A's window tests use a synthetic version number
     /// (`n_and_prev_window_is_exactly_two_wide_with_a_floor`): real, fully
-    /// decodable v6 bytes under a commit record that records an older version.
-    /// The reader accepts the bytes (they are real v6); the compactor's
+    /// decodable v7 bytes under a commit record that records an older version.
+    /// The reader accepts the bytes (they are real v7); the compactor's
     /// `build_parts` sees an input recorded below the output version and routes
     /// its runs through the decode-and-re-encode path
     /// ([`crate::build::build_parts`]'s `migrate_keys` branch) rather than the
@@ -624,8 +624,8 @@ mod tests {
     #[tokio::test]
     async fn migrates_an_input_recorded_below_the_output_version() {
         let store = MemoryStore::new();
-        let old = VERSION_V6 as u32 - 1;
-        // Two inputs recorded below the output version, over real v6 bytes; one
+        let old = VERSION_V7 as u32 - 1;
+        // Two inputs recorded below the output version, over real v7 bytes; one
         // carries two series (one of them with two samples) so the round-trip
         // check spans multiple series and a multi-sample run.
         let a = seed_with_version(
@@ -651,7 +651,7 @@ mod tests {
             &clock,
             &CompactorConfig::default(),
             &bucket(),
-            VERSION_V6 as u32,
+            VERSION_V7 as u32,
         )
         .await
         .expect("migrate");
@@ -667,12 +667,12 @@ mod tests {
         assert_eq!(record.parts.len(), 1);
         let part = &record.parts[0];
         assert_eq!(
-            part.segment_format_version, VERSION_V6 as u32,
+            part.segment_format_version, VERSION_V7 as u32,
             "the re-encoded output is stamped the current writer version"
         );
 
         // Record count conserved: the L1 part carries every input sample. The
-        // input total is read from the objects' own footers (the real v6 bytes),
+        // input total is read from the objects' own footers (the real v7 bytes),
         // independent of the commit records' (deliberately older) version tag.
         let input_samples: u64 = [&a, &b]
             .iter()
@@ -720,7 +720,7 @@ mod tests {
             &store,
             1,
             vec![series("alpha", &[(10, 1.0)])],
-            VERSION_V6 as u32 + 1,
+            VERSION_V7 as u32 + 1,
         )
         .await;
         let listing = list_bucket(&store, &bucket()).await.expect("list");
@@ -867,7 +867,7 @@ mod tests {
             &clock,
             &CompactorConfig::default(),
             &bucket(),
-            VERSION_V6 as u32,
+            VERSION_V7 as u32,
         )
         .await
         .expect("migrate");

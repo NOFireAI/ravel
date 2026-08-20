@@ -26,7 +26,7 @@ use ravel_proto::commit::v1::{
     CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord,
     ErasurePredicateMatcher, ErasureRequest, RewriteDrop, RewriteRecord,
 };
-use ravel_segment::VERSION_V6;
+use ravel_segment::VERSION_V7;
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
@@ -69,7 +69,7 @@ fn l0_record(
         max_event_ts_ns,
         min_ingest_ts_ns: min_event_ts_ns,
         max_ingest_ts_ns: max_event_ts_ns,
-        segment_format_version: u32::from(VERSION_V6),
+        segment_format_version: u32::from(VERSION_V7),
         created_unix_ns,
         ingest_hour_bucket: hour,
     })
@@ -96,7 +96,7 @@ fn part(part_index: u32, min_event_ts_ns: i64, max_event_ts_ns: i64, seed: u8) -
         run_count: 3,
         min_event_ts_ns,
         max_event_ts_ns,
-        segment_format_version: u32::from(VERSION_V6),
+        segment_format_version: u32::from(VERSION_V7),
     }
 }
 

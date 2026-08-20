@@ -33,7 +33,7 @@ use ravel_proto::segment::v1::{Footer, Section};
 use crate::crc::footer_crc;
 use crate::error::{SegmentError, WriteError};
 use crate::format::{
-    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, V5_STRIDE, VERSION_V6, ZSTD_LEVEL, compression,
+    MAGIC, RESERVED, ReaderLimits, SIGNAL_METRICS, V5_STRIDE, VERSION_V7, ZSTD_LEVEL, compression,
     section_kind,
 };
 use crate::reader::{
@@ -1428,13 +1428,13 @@ pub(crate) fn build_sparse_object(base: &WrittenSegment) -> Result<WrittenSegmen
     let crc = footer_crc(
         &footer_bytes,
         footer_len,
-        VERSION_V6,
+        VERSION_V7,
         SIGNAL_METRICS,
         RESERVED,
     );
     object.extend_from_slice(&footer_len.to_le_bytes());
     object.extend_from_slice(&crc.to_le_bytes());
-    object.extend_from_slice(&VERSION_V6.to_le_bytes());
+    object.extend_from_slice(&VERSION_V7.to_le_bytes());
     object.push(SIGNAL_METRICS);
     object.push(RESERVED);
     object.extend_from_slice(&MAGIC);

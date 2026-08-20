@@ -5050,13 +5050,22 @@ mod prefetch_tests {
     async fn shared_matcher_plans_do_not_double_count_page_stats() {
         let store = Arc::new(MemoryStore::new());
         let tenant_hash = TenantId::new("acme").hash();
+        // An incompressible value so the single-sample VAL page falls back to
+        // raw f64. Under v7's per-page codec selection (ADR-0092 decision 6) a
+        // round value like 1.0 now encodes as a smaller ALP page, which
+        // `FetchStats` does not count -- leaving `raw_f64_bytes` zero and the
+        // double-count property below vacuous. The only page-kind counter the
+        // stats expose is the raw-f64 one, so the fixture must genuinely emit a
+        // raw page for "shared plans don't double-count" to have something
+        // non-zero to double.
+        let incompressible = f64::from_bits(0x4008_9abc_def0_1234);
         publish_metric(
             &store,
             tenant_hash,
             1,
             "metric_a",
             BASE_NS - NS_PER_MIN,
-            1.0,
+            incompressible,
         )
         .await;
 

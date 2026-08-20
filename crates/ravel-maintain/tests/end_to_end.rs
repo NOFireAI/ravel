@@ -9,7 +9,7 @@ use ravel_maintain::{
     CompactionOutcome, CompactorConfig, FixedClock, PublishOutcome, compact_bucket,
 };
 use ravel_object_store::memory::MemoryStore;
-use ravel_segment::VERSION_V6;
+use ravel_segment::VERSION_V7;
 use uuid::Uuid;
 
 fn cfg() -> CompactorConfig {
@@ -93,7 +93,7 @@ async fn compacts_bucket_and_preserves_all_samples() {
     for p in &record.parts {
         assert_eq!(
             p.segment_format_version,
-            u32::from(VERSION_V6),
+            u32::from(VERSION_V7),
             "v6 output (ADR-0026/0027)"
         );
     }

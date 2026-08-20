@@ -22,7 +22,7 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, RetentionTombstone,
 };
-use ravel_segment::VERSION_V6;
+use ravel_segment::VERSION_V7;
 use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
 
@@ -94,7 +94,7 @@ async fn seed_compaction(store: &MemoryStore, tenant: &str, inputs: &[(Uuid, u64
         run_count: 1,
         min_event_ts_ns: 100,
         max_event_ts_ns: 200,
-        segment_format_version: u32::from(VERSION_V6),
+        segment_format_version: u32::from(VERSION_V7),
     };
     let record = CompactionRecord {
         format_version: 1,
@@ -498,7 +498,7 @@ fn decode_compaction_record_prints_fields() {
             run_count: 3,
             min_event_ts_ns: 100,
             max_event_ts_ns: 200,
-            segment_format_version: u32::from(VERSION_V6),
+            segment_format_version: u32::from(VERSION_V7),
         }],
         created_unix_ns: 999,
     };
@@ -540,7 +540,7 @@ async fn migrate_raises_floor_on_a_clean_tenant() {
     .expect("read floor");
     assert_eq!(
         floor,
-        Some(u32::from(VERSION_V6)),
+        Some(u32::from(VERSION_V7)),
         "the rseg floor is raised to the current version"
     );
 }
@@ -566,7 +566,7 @@ async fn migrate_exits_nonzero_and_holds_the_floor_when_a_straggler_survives() {
     .await
     .expect("provision");
 
-    // A below-target (version 1 < VERSION_V6) commit record in the current,
+    // A below-target (version 1 < VERSION_V7) commit record in the current,
     // still-unsealed ingest hour: the walk examines but cannot migrate it, and
     // the fresh re-audit counts it. `migrate` reads only the record's recorded
     // version here (never decodes the object), so a placeholder L0 payload is

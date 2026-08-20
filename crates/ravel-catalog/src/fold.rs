@@ -2049,14 +2049,15 @@ pub async fn fetch_segment_names(
     };
     ravel_segment::check_identity(&location.footer, &expected)?;
 
-    // ADR-0027: v6 is the only supported version (`open_from_full` above has
-    // already rejected anything else). The chunked v5-shaped catalog
-    // (unchanged by the v6 EXEMPLARS addition) spans sections, so it is
-    // decoded over the whole object -- already in hand here via the
-    // `GetRange::Full` GET -- and folded to the per-series `SeriesEntry` view
-    // the postings build consumes.
+    // ADR-0027: v7 is the only supported version (`open_from_full` above has
+    // already rejected anything else, including the retired v6). The chunked
+    // v5-shaped catalog (unchanged by the v6 EXEMPLARS addition and the v7
+    // per-sample provenance extension, which the postings build ignores) spans
+    // sections, so it is decoded over the whole object -- already in hand here
+    // via the `GetRange::Full` GET -- and folded to the per-series
+    // `SeriesEntry` view the postings build consumes.
     let series: Vec<ravel_segment::SeriesEntry> = match location.version {
-        ravel_segment::VERSION_V6 => {
+        ravel_segment::VERSION_V7 => {
             ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)?
                 .into_iter()
                 .map(|e| e.entry)

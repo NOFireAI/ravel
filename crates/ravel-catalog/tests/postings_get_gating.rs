@@ -27,7 +27,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V6};
+use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
 use ravel_types::{
     Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TenantId,
 };
@@ -116,7 +116,7 @@ async fn publish_real_segment(
         max_event_ts_ns: written.summary.max_event_ts_ns,
         min_ingest_ts_ns: event_ts,
         max_ingest_ts_ns: event_ts,
-        segment_format_version: u32::from(VERSION_V6),
+        segment_format_version: u32::from(VERSION_V7),
         created_unix_ns: event_ts,
         ingest_hour_bucket: hour,
     })

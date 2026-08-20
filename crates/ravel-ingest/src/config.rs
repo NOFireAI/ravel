@@ -2,13 +2,12 @@
 
 use std::time::Duration;
 
-/// RSEG trailer version every flush emits. ADR-0027 leaves v5 the only
-/// writable version, so this is no longer a configurable knob; it mirrors
-/// `ravel_segment`'s private `format::VERSION_V5` constant (that crate keeps
-/// its `format` module private), and is stamped verbatim into the commit
-/// record's `segment_format_version`. Changing it is a format-level ADR, not
-/// a routine edit.
-pub const SEGMENT_FORMAT_VERSION: u16 = ravel_segment::VERSION_V6;
+/// RSEG trailer version every flush emits. ADR-0027 leaves v7 the only
+/// writable version (ADR-0092 bumped it from v6), so this is no longer a
+/// configurable knob; it mirrors `ravel_segment`'s `VERSION_V7` constant, and
+/// is stamped verbatim into the commit record's `segment_format_version`.
+/// Changing it is a format-level ADR, not a routine edit.
+pub const SEGMENT_FORMAT_VERSION: u16 = ravel_segment::VERSION_V7;
 
 /// RLOG trailer version every log flush emits. Mirrors `ravel_logseg`'s own
 /// object trailer version (`docs/log-segment-format.md`, ADR-0029); like
@@ -273,7 +272,7 @@ mod tests {
         // literal here is exactly what let the RSPAN v2 bump ship a
         // version-1 claim in every span commit record while this style of
         // test stayed green (see the same fix for spans and logs).
-        assert_eq!(SEGMENT_FORMAT_VERSION, ravel_segment::VERSION_V6);
+        assert_eq!(SEGMENT_FORMAT_VERSION, ravel_segment::VERSION_V7);
     }
 
     #[test]

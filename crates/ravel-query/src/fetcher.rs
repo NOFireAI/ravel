@@ -2219,12 +2219,13 @@ mod tests {
         }
     }
 
-    /// Writes a real RSEG segment with two series: one whose values Gorilla
-    /// compresses well (identical values -> VAL_GORILLA) and one whose
-    /// values are maximally incompressible (two samples with disjoint bit
-    /// patterns -> VAL_RAW_F64, since the writer falls back to raw once the
-    /// Gorilla encoding is not smaller than 8 bytes/sample). Puts the bytes
-    /// directly on a `MemoryStore` and returns a matching `SegmentRef`.
+    /// Writes a real RSEG segment with two series: one whose values compress
+    /// trivially (identical 1.0 values) and one whose values are two samples
+    /// with disjoint bit patterns (a 0.0 and an all-ones NaN payload). Before
+    /// ADR-0092 the latter forced VAL_RAW_F64; under v7's per-page codec
+    /// selection both now land on the smaller ALP / GCD-delta-FOR integer-model
+    /// page. Puts the bytes directly on a `MemoryStore` and returns a matching
+    /// `SegmentRef`.
     async fn write_test_segment() -> (Arc<MemoryStore>, TenantHash, SegmentRef) {
         let tenant_hash = TenantHash([7u8; 16]);
         let writer_id = Uuid::from_u128(1);
@@ -2280,7 +2281,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_soa_matches_fetch_and_counts_raw_f64_pages() {
         let (store, tenant_hash, seg_ref) = write_test_segment().await;
-        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
         let fetcher = SegmentFetcher::new(backend);
 
         let mut aos = fetcher
@@ -2315,12 +2316,82 @@ mod tests {
             }
         }
 
-        // "chaotic_metric" (2 maximally-differing samples) must have forced
-        // VAL_RAW_F64; "smooth_metric" (identical values) must have stayed
-        // VAL_GORILLA. Exactly one raw page, exactly one page's worth of
-        // raw-f64 bytes (6-byte header + 2 * 8-byte values).
-        assert_eq!(stats.raw_f64_pages, 1);
-        assert_eq!(stats.raw_f64_bytes, 6 + 2 * 8);
+        // "smooth_metric" (identical values) stays VAL_GORILLA. "chaotic_metric"
+        // (a 0.0 and an all-ones NaN payload) no longer falls back to
+        // VAL_RAW_F64: ADR-0092 decision 6 added the ALP and GCD-delta-FOR value
+        // pages, selected per page whenever smaller, and the chaotic fixture now
+        // encodes as one of those. So the raw-f64 counter must report zero
+        // pages. To prove that is a real fixture change rather than a broken
+        // counter, the object must genuinely carry one enc-18/19 (non-raw,
+        // non-Gorilla) page alongside the smooth series' Gorilla page.
+        assert_eq!(
+            stats.raw_f64_pages, 0,
+            "no series falls back to raw f64 under v7's per-page codec selection"
+        );
+        assert_eq!(stats.raw_f64_bytes, 0);
+
+        // Decode each series' actual VAL page kind straight from the stored
+        // object, so the page-kind accounting is asserted end to end.
+        let object = store
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get object")
+            .data;
+        let loc = ravel_segment::open_from_full(&object, ReaderLimits::default()).expect("open");
+        let entries = decode_catalog_v5(&loc.footer, &object, ReaderLimits::default())
+            .expect("decode catalog");
+        let selected: Vec<&SeriesEntryV4> = entries.iter().collect();
+        let ranges = plan_ranges_v4(&loc.footer, &selected).expect("plan ranges");
+        let mut kinds = Vec::new();
+        for entry in &entries {
+            for (run_index, run) in entry.runs.iter().enumerate() {
+                let range = ranges
+                    .iter()
+                    .find(|r| r.series_id == entry.entry.series_id && r.run_index == run_index)
+                    .expect("range for run");
+                let ts = &object
+                    [range.ts_range.0 as usize..(range.ts_range.0 + range.ts_range.1) as usize];
+                let val = &object
+                    [range.val_range.0 as usize..(range.val_range.0 + range.val_range.1) as usize];
+                let mut scratch = Vec::new();
+                let mut tss = Vec::new();
+                let mut vals = Vec::new();
+                let kind = decode_run_pages_soa(
+                    &entry.entry.series_id,
+                    run,
+                    ts,
+                    val,
+                    ReaderLimits::default(),
+                    &mut scratch,
+                    &mut tss,
+                    &mut vals,
+                )
+                .expect("decode run");
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(
+            kinds.len(),
+            2,
+            "two series, one val page each, got {kinds:?}"
+        );
+        // Under v7's per-page selection both fixtures land on an ALP / GCD-delta-FOR
+        // integer-model page (enc 18/19): the smooth series' constant 1.0 and the
+        // chaotic series' 0.0-plus-NaN both encode smaller that way than as raw
+        // f64 or Gorilla. The property under test survives: no page falls back to
+        // raw f64, and the object genuinely carries the new enc-18/19 pages, so a
+        // regression that reintroduced a raw page (or broke codec selection back
+        // to Gorilla) still fails here.
+        assert!(
+            kinds
+                .iter()
+                .all(|k| matches!(k, ValPageKind::Alp | ValPageKind::GcdDeltaFor)),
+            "both series must select an enc-18/19 page under v7, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&ValPageKind::RawF64),
+            "no raw f64 page under v7, got {kinds:?}"
+        );
     }
 
     fn e2e_series_id() -> SeriesId {
@@ -2847,10 +2918,20 @@ mod tests {
             let metric = format!("sparse_metric_{i}");
             let samples: Vec<(i64, f64)> = (0..samples_per)
                 .map(|j| {
-                    (
-                        (1_000 + j as i64) * NS,
-                        (i as f64) * 7.0 + (j as f64) * 13.0 + 0.5,
-                    )
+                    // Incompressible values: a bit-mixed pattern per (series,
+                    // sample) so every VAL page falls back to raw f64 rather than
+                    // an ALP / GCD-delta-FOR / Gorilla page. Under v7's per-page
+                    // codec selection a smoothly-varying value stream compresses
+                    // to almost nothing, which would shrink the object below the
+                    // sparse-probe floor and, worse, leave the fixed-size catalog
+                    // dominating the object so the catalog-probe read (which
+                    // fetches the whole catalog) would no longer be a fraction of
+                    // it. Keeping the pages genuinely large is what makes "probe
+                    // reads far less than the whole object" a real property.
+                    let bits = (i as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add((j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+                    ((1_000 + j as i64) * NS, f64::from_bits(bits))
                 })
                 .collect();
             inputs.push(series(&metric, &samples));
@@ -2901,7 +2982,11 @@ mod tests {
     /// size, and returns exactly the matched series' samples.
     #[tokio::test]
     async fn sparse_segment_uses_catalog_probe_path_not_whole_object() {
-        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 8).await;
+        // 4096 series (the sparse-emission threshold) each with 32 raw-f64
+        // samples: enough page bytes that the object clears the probe floor and
+        // the whole-catalog probe stays a small fraction of it under v7's
+        // codecs.
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
         let object_size = seg_ref.object_size;
         assert!(
             object_size > SPARSE_PROBE_MIN_OBJECT_SIZE,
@@ -2927,8 +3012,8 @@ mod tests {
 
         assert_eq!(soa.len(), 1, "exactly the matched series is returned");
         assert_eq!(soa[0].labels, labels("sparse_metric_2000"));
-        assert_eq!(soa[0].timestamps.len(), 8);
-        assert_eq!(soa[0].values.len(), 8);
+        assert_eq!(soa[0].timestamps.len(), 32);
+        assert_eq!(soa[0].values.len(), 32);
 
         let probe = metrics.snapshot().get;
         // The probe path never GETs the whole object: its total bytes stay well

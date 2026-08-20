@@ -243,12 +243,18 @@ fn print_split(name: &str, s: &SectionSplit) {
 }
 
 /// Pinned lower bound on `fragmented_total / merged_total`. Measured on this
-/// tree the ratio is about 3.0 (see the printed splits); ADR-0092's own table
-/// reports 3.68 for the same workload built through the full production writer
-/// with real per-run provenance. This gate pins a conservative 2.5x with
-/// margin so it flags a regression in the fragmentation penalty without being
-/// brittle to codec-level byte wobble.
-const FRAG_RATIO_MIN: f64 = 2.5;
+/// tree (RSEG v7, #314) the ratio is 2.987: fragmented 26.52 B/sample against
+/// merged 8.88 (see the printed splits). That is down from the 3.126 #312
+/// measured and the 3.68 ADR-0092's table reports, because the page-codec wins
+/// in this train (ALP, GCD-delta-FOR, GCD timestamps, first-ts-as-delta, the
+/// single-sample no-pad rule) shrank the fragmented regime's per-run pages more
+/// than the merged one. Re-derived here from the 2.987 measured value using the
+/// same ~20%-below-measured margin policy #312 used to pin 2.5 against its then
+/// 3.126, which lands at 2.4. The gate flags a regression in the fragmentation
+/// penalty without being brittle to codec-level byte wobble; it is not a no-op,
+/// and a superseded pin (2.5 was pinned against a measurement two page-codec
+/// generations old) is exactly the drift this epic keeps finding.
+const FRAG_RATIO_MIN: f64 = 2.4;
 
 #[test]
 fn fragmented_multi_run_shape_costs_more_than_merged() {

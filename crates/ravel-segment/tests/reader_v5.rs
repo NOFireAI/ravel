@@ -233,7 +233,7 @@ fn build_v5(n: usize, hist_every: usize) -> Vec<u8> {
 fn sparse_object_has_the_sparse_sections() {
     let v5 = build_v5(SPARSE_N, 0);
     let loc = open_from_full(&v5, ReaderLimits::default()).expect("open sparse v5");
-    assert_eq!(loc.version, 6);
+    assert_eq!(loc.version, 7);
     assert!(section_present(&loc.footer, SERIES_IDX));
     assert!(section_present(&loc.footer, SERIES_META_CHUNKS));
     assert!(!section_present(&loc.footer, 6), "no whole SERIES_META");
@@ -470,11 +470,11 @@ fn chunk_run_total_live_budget_rejects_disproportionate_allocation() {
 
 #[test]
 fn unknown_version_still_fails_closed() {
-    // A v6 object with its version field hand-set to an unknown 7 must fail
-    // closed, the same way the reader rejects a retired v1-v5 object.
+    // A v7 object with its version field hand-set to an unknown 8 must fail
+    // closed, the same way the reader rejects a retired v1-v6 object.
     let mut v5 = build_v5(200, 0);
     let total = v5.len();
-    v5[total - 8] = 7;
+    v5[total - 8] = 8;
     v5[total - 7] = 0;
     assert!(matches!(
         open_from_full(&v5, ReaderLimits::default()),
