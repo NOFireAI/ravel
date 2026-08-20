@@ -75,6 +75,10 @@ trap cleanup EXIT
 trap cleanup ERR
 
 # --- Pre-flight guard ----------------------------------------------------
+# Authenticate first: a dead token found at the push step, after the
+# rewrite and gates, strands finished work. Fail here while it is cheap.
+"${script_dir}/guards/assert-gh-auth.sh"
+
 # Compute the merge base against main, not against whatever HEAD happens to
 # be: a HEAD pointing at an old commit would yield a too-old base and replay
 # already-landed commits as duplicates. Require HEAD to be main (or a
@@ -308,6 +312,10 @@ git checkout -q "${start_checkout}"
 if [[ -n "${prev_rewrite_branch}" && "${prev_rewrite_branch}" != "${authorship_branch}" ]]; then
   git branch -D "${prev_rewrite_branch}" 2>/dev/null || true
 fi
+
+# Prove the rewrite worked before anything is pushed: a fleet-executor
+# identity that reaches protected main cannot be fixed later.
+"${script_dir}/guards/assert-clean-authorship.sh" "${clean_ref}" "${merge_email}"
 # --- end authorship rewrite ----------------------------------------------
 
 if [[ "${dry_run}" == "1" ]]; then
@@ -330,8 +338,35 @@ fi
 # the gate; the failure mode is discovering a red PR ~15 minutes later
 # instead of a red gate now. Never use it when the merged tree diverges
 # from what was already gated (a conflict resolution, a manual edit).
+#
+# The precondition is enforced, not remembered: gates.sh writes a receipt
+# (keyed by tree hash, which the rewrite above preserves) for every full
+# clean-tree run, and skip is honored only when the history about to be
+# pushed has a receipt younger than 24 h. An amend or manual edit changes
+# the tree and voids the receipt.
 if [[ "${FLEET_MERGE_SKIP_GATES:-0}" == "1" ]]; then
-  echo "==> Skipping local pre-flight gates (FLEET_MERGE_SKIP_GATES=1); PR required checks are the gate"
+  skip_tree="$(git rev-parse "${clean_ref}^{tree}")"
+  receipt_file="$(cd "$(git rev-parse --git-common-dir)" && pwd)/gates-pass/${skip_tree}"
+  receipt_ok=0
+  if [[ -f "${receipt_file}" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+      receipt_mtime="$(stat -f %m "${receipt_file}")"
+    else
+      receipt_mtime="$(stat -c %Y "${receipt_file}")"
+    fi
+    if (( $(date +%s) - receipt_mtime < 86400 )); then
+      receipt_ok=1
+    fi
+  fi
+  if [[ ${receipt_ok} -ne 1 ]]; then
+    echo "fleet-result-merge.sh: FLEET_MERGE_SKIP_GATES=1 refused:" >&2
+    echo "  no gates-pass receipt (< 24 h) for tree ${skip_tree}." >&2
+    echo "  This tree was never taken through a full scripts/gates.sh run here" >&2
+    echo "  (or was amended since). Run the gates, or drop SKIP_GATES and let" >&2
+    echo "  this script run them." >&2
+    exit 65
+  fi
+  echo "==> Skipping local pre-flight gates (receipt found for tree ${skip_tree}); PR required checks re-verify"
 else
   echo "==> Running local pre-flight gates"
   git checkout -q --detach "${clean_ref}"
