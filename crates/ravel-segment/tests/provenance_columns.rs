@@ -15,8 +15,8 @@
 use proptest::prelude::*;
 use ravel_segment::{
     CompactionMetaV4, IngestBounds, ReaderLimits, RunInputV7, SampleProvenance, SegmentIdentity,
-    SegmentWriter, SeriesInputV4, SeriesInputV7, SeriesValues, decode_catalog_v5, encode_run_v4,
-    open_from_full,
+    SegmentWriter, SeriesInputV4, SeriesInputV7, SeriesValues, V5_SPARSE_THRESHOLD,
+    decode_catalog_v5, encode_run_v4, open_from_full,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
@@ -169,6 +169,107 @@ fn run_strategy() -> impl Strategy<Value = (Vec<(i64, f64)>, Option<Vec<SamplePr
             samples.sort_by_key(|(ts, _)| *ts);
             (samples, prov)
         })
+}
+
+/// A merged L1 object over a large tenant is the sparse case (>= 4096 series,
+/// chunked SERIES_META). This proves the per-sample provenance columns survive
+/// a write-then-read round trip through that form too, not just the whole-
+/// section form: without the sparse-form support (ADR-0092 decision 1, issue
+/// #315) `write_v7_with_provenance` failed closed here, so L1 compaction broke
+/// for every tenant above the threshold.
+#[test]
+fn provenance_round_trips_through_sparse_chunked_form() {
+    const N: usize = V5_SPARSE_THRESHOLD as usize + 37;
+
+    // A handful of series carry a merged (multi-sample) run with a per-sample
+    // provenance column; the rest are single-sample runs with no column. The
+    // flagged indices are spread across several 512-wide chunks (and include the
+    // last series) so the chunked rebuild is exercised end to end.
+    let flagged: [usize; 5] = [3, 511, 512, 2000, N - 1];
+    let column = vec![
+        SampleProvenance {
+            created_unix_ns: 40,
+            writer_epoch: 7,
+            writer_seq: 11,
+            in_page_index: 0,
+        },
+        SampleProvenance {
+            created_unix_ns: 55,
+            writer_epoch: 7,
+            writer_seq: 12,
+            in_page_index: 2,
+        },
+        SampleProvenance {
+            created_unix_ns: 55,
+            writer_epoch: 8,
+            writer_seq: 1,
+            in_page_index: 1,
+        },
+    ];
+
+    let mut series_v7 = Vec::with_capacity(N);
+    for i in 0..N {
+        // Big-endian index ids so the writer's ascending-id sort matches input
+        // order, keeping the flagged indices' chunk placement predictable.
+        let mut raw = [0u8; 16];
+        raw[8..].copy_from_slice(&(i as u64).to_be_bytes());
+        let id = SeriesId(raw);
+        let name = format!("m{i:05}");
+        if flagged.contains(&i) {
+            series_v7.push(SeriesInputV7 {
+                series_id: id,
+                labels: labels(&name),
+                runs: vec![run_with_prov(
+                    &id,
+                    40,
+                    1,
+                    1,
+                    &[(100, 1.0), (200, 2.0), (300, 3.0)],
+                    Some(column.clone()),
+                )],
+            });
+        } else {
+            series_v7.push(SeriesInputV7 {
+                series_id: id,
+                labels: labels(&name),
+                runs: vec![run_with_prov(&id, 40, 1, 1, &[(100 + i as i64, 1.0)], None)],
+            });
+        }
+    }
+
+    let written =
+        SegmentWriter::write_v7_with_provenance(series_v7, identity(), bounds(), meta(), Vec::new())
+            .expect("write_v7_with_provenance over a sparse tenant");
+
+    let loc = open_from_full(&written.bytes, ReaderLimits::default()).expect("open");
+    // Sanity: this really is the sparse (chunked) form, not the whole-section
+    // one, so the assertion below exercises the chunk rebuild.
+    assert!(loc.footer.series_count >= V5_SPARSE_THRESHOLD);
+    let entries = decode_catalog_v5(&loc.footer, &written.bytes, ReaderLimits::default())
+        .expect("decode sparse catalog");
+    assert_eq!(entries.len(), N);
+
+    for i in 0..N {
+        let mut raw = [0u8; 16];
+        raw[8..].copy_from_slice(&(i as u64).to_be_bytes());
+        let entry = entries
+            .iter()
+            .find(|e| e.entry.series_id.0 == raw)
+            .expect("series present");
+        assert_eq!(entry.runs.len(), 1, "one run per series");
+        if flagged.contains(&i) {
+            assert_eq!(entry.per_sample_provenance.len(), 1);
+            let got = entry.per_sample_provenance[0]
+                .as_ref()
+                .expect("flagged run keeps its per-sample column");
+            assert_eq!(got, &column, "sparse-form provenance must round-trip exact");
+        } else {
+            // An unflagged run reads back as run-wide: either no column in its
+            // chunk (empty vector) or an explicit `None` when its chunk also
+            // carried a flagged run. Both mean the same dedup key.
+            assert!(entry.per_sample_provenance.iter().all(|p| p.is_none()));
+        }
+    }
 }
 
 proptest! {
