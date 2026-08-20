@@ -755,6 +755,7 @@ mod logs {
             ravel_query::EngineConfig::default(),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             crate::query::DEFAULT_MAX_TENANT_BYTES,
+            false,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),

@@ -38,6 +38,14 @@ pub struct SqlConfig {
     /// Ceiling, in bytes, on the query's DataFusion memory pool. Fed by
     /// measured `RecordBatch` sizes, never a sample count.
     pub max_query_bytes: usize,
+    /// Whether an exact-typed query is allowed to repartition its final
+    /// aggregation (ADR-0094 decision 4). Process-wide, default `false`: a
+    /// per-query classification (ADR-0094 decision 1) only ever flips
+    /// DataFusion's `repartition_aggregations` on when this is `true` *and*
+    /// every aggregate expression and GROUP BY key in the query is provably
+    /// order/partition-independent. Set once at server startup
+    /// (`services/ravel-server`); no live-reload, like every other field here.
+    pub parallel_final_aggregation: bool,
 }
 
 impl Default for SqlConfig {
@@ -45,6 +53,7 @@ impl Default for SqlConfig {
         SqlConfig {
             engine: EngineConfig::default(),
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            parallel_final_aggregation: false,
         }
     }
 }

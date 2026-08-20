@@ -94,6 +94,7 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
     let config = SqlConfig {
         engine: util::engine_config(),
         max_query_bytes: 1024 * 1024,
+        parallel_final_aggregation: false,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

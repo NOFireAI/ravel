@@ -75,10 +75,13 @@ use std::time::Duration;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
+use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+use datafusion::logical_expr::{Aggregate, Distinct, Expr, ExprSchemable, LogicalPlan};
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
@@ -610,6 +613,21 @@ impl SqlExecutor {
         let (pool, breach) = self
             .config
             .query_pool(self.tenant_budget(tenant_hash), accounting.clone());
+        // ADR-0094 decision 1/2: classify the query's aggregates and GROUP BY
+        // keys before the real session is built, right here at the one call site
+        // that funnels into `build_session`. The result flips
+        // `repartition_aggregations` on only for a query proven exact-typed.
+        // Skipped entirely when the process-wide flag is off (decision 2): an
+        // unclassified query already gets `false`, so the extra plan+analyze
+        // pass costs nothing when the feature is disabled. Classified against
+        // `extras.declared` (the same declared columns the real logs provider
+        // installs), before it is moved into the table below.
+        let exact_typed_aggregates = if self.config.parallel_final_aggregation {
+            self.classify_exact_typed(tenant_hash, sql, &extras.declared)
+                .await
+        } else {
+            false
+        };
         // Build the one table the query targets over the snapshot resolved for
         // its signal. `resolve` already resolved `snapshot` against exactly
         // this signal, so the provider and the snapshot always agree.
@@ -657,7 +675,8 @@ impl SqlExecutor {
             ))),
         };
 
-        let ctx = build_session(&self.config, pool, table).map_err(plan_error)?;
+        let ctx =
+            build_session(&self.config, pool, table, exact_typed_aggregates).map_err(plan_error)?;
         let frame = ctx.sql(sql).await.map_err(plan_error)?;
         let schema = frame.schema().inner().clone();
         Ok(PinnedQuery {
@@ -736,10 +755,14 @@ impl SqlExecutor {
         let plan = provider
             .worker_fragment(target_partitions, &segments)
             .map_err(plan_error)?;
+        // ADR-0094 decision 2: the worker fragment plans no new SQL and runs no
+        // aggregation of its own, so it never repartitions -- always `false`,
+        // never through the classification check.
         let ctx = build_session(
             &self.config,
             pool,
             SessionTable::Metrics(Arc::clone(&provider)),
+            false,
         )
         .map_err(plan_error)?;
         let schema = plan.schema();
@@ -860,6 +883,115 @@ impl SqlExecutor {
         equality_name_filter(&extract(&predicates).matchers)
     }
 
+    /// ADR-0094 decision 1: whether every aggregate expression and GROUP BY key
+    /// in `sql`, once fully type-coerced, is provably order/partition-independent
+    /// -- the precondition for fanning the final aggregation across partitions.
+    ///
+    /// Reuses `pushed_down_name_filter`'s throwaway-session shape (an empty
+    /// snapshot, no I/O) but with one deliberate difference: the plan is run
+    /// through DataFusion's `Analyzer` (type coercion) before classification, so
+    /// a `sum`/`min`/`max` argument or a group key is classified by its
+    /// *resolved* Arrow type, not its syntactic operands (ADR-0094 decision 1;
+    /// `create_logical_plan` alone does not coerce). The throwaway session
+    /// registers everything a real query needs to plan -- the table's scalar
+    /// UDFs, the map-field `ExprPlanner`, and the tenant's ADR-0090 declared
+    /// columns -- via `build_session`, so a legitimate query does not silently
+    /// lose the optimization by failing to plan here.
+    ///
+    /// Fail-closed, the opposite polarity from `pushed_down_name_filter`'s
+    /// fail-open `None`: any error building or analyzing the throwaway plan
+    /// classifies the query as NOT exact, because wrongly admitting an
+    /// unclassifiable query could repartition an aggregate this check never
+    /// verified.
+    async fn classify_exact_typed(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        match self
+            .analyzed_classification_plan(tenant_hash, sql, declared)
+            .await
+        {
+            Some(plan) => plan_is_exact_typed(&plan),
+            None => false,
+        }
+    }
+
+    /// Build the throwaway empty-snapshot session for `sql`'s target signal,
+    /// logical-plan `sql`, and run DataFusion's analyzer (type coercion) over
+    /// the result. `None` on any error (the fail-closed source for
+    /// [`Self::classify_exact_typed`]).
+    ///
+    /// The analyzer step is the `execute_and_check` pass DataFusion's own
+    /// physical planning applies before optimization; running it here is what
+    /// resolves, for example, `avg`'s argument to `Float64` and an integer
+    /// `sum`'s argument to `Int64` before the walk inspects their types.
+    async fn analyzed_classification_plan(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        declared: &[DeclaredColumn],
+    ) -> Option<LogicalPlan> {
+        let target = Self::target_signal(sql).ok()?;
+        let table = self.empty_snapshot_table(target, tenant_hash, declared);
+        // A private, unbounded pool: this session never executes, so nothing is
+        // ever reserved against it and it never touches the tenant accountant.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        // `exact_typed_aggregates` is irrelevant to a plan we only inspect; the
+        // classification decides the real session's value, not this throwaway.
+        let ctx = build_session(&self.config, pool, table, false).ok()?;
+        let state = ctx.state();
+        let plan = state.create_logical_plan(sql).await.ok()?;
+        let config_options = Arc::clone(state.config_options());
+        state
+            .analyzer()
+            .execute_and_check(plan, &config_options, |_, _| {})
+            .ok()
+    }
+
+    /// A throwaway [`SessionTable`] over an empty snapshot for `target`,
+    /// carrying the same table-specific surface a real query of that signal
+    /// would (the logs provider's ADR-0090 declared columns included), so the
+    /// classification plan resolves identically to the real one. Issues no I/O:
+    /// the snapshot has no segments and the session is discarded unexecuted.
+    fn empty_snapshot_table(
+        &self,
+        target: TargetSignal,
+        tenant_hash: TenantHash,
+        declared: &[DeclaredColumn],
+    ) -> SessionTable {
+        let empty_snapshot = || Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        match target {
+            TargetSignal::Metrics => SessionTable::Metrics(Arc::new(RavelTableProvider::new(
+                empty_snapshot(),
+                tenant_hash,
+                self.fetcher.clone(),
+                self.config,
+                QueryAccounting::new(),
+            ))),
+            TargetSignal::Logs => SessionTable::Logs(Arc::new(
+                LogsTableProvider::new(
+                    empty_snapshot(),
+                    tenant_hash,
+                    self.log_fetcher.clone(),
+                    QueryAccounting::new(),
+                )
+                .with_declared_columns(declared.to_vec()),
+            )),
+            TargetSignal::Spans => SessionTable::Spans(Arc::new(SpansTableProvider::new(
+                empty_snapshot(),
+                tenant_hash,
+                self.span_fetcher.clone(),
+                QueryAccounting::new(),
+            ))),
+        }
+    }
+
     /// The table (and thus the signal) a query resolves against, decided from
     /// its `FROM` clause before any planning (ADR-0033 "one SQL endpoint, two
     /// tables").
@@ -972,6 +1104,19 @@ impl PinnedQuery {
     /// The planned result schema.
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+
+    /// Build the physical plan for this query without consuming it or starting
+    /// a stream, for plan-shape inspection (ADR-0094 decision 5's EXPLAIN-shape
+    /// tests assert whether a `RepartitionExec` fans the `Final` `AggregateExec`
+    /// out). This is the same first step [`Self::execute`] takes, run over the
+    /// frame's logical plan by reference so it can be called on a borrow.
+    pub async fn create_physical_plan(&self) -> Result<Arc<dyn ExecutionPlan>, SqlError> {
+        self.ctx
+            .state()
+            .create_physical_plan(self.frame.logical_plan())
+            .await
+            .map_err(plan_error)
     }
 
     /// Start the plan's stream. The session stays alive inside the returned
@@ -1263,6 +1408,159 @@ fn collect_filter_predicates(plan: &LogicalPlan, out: &mut Vec<Expr>) {
     }
     for input in plan.inputs() {
         collect_filter_predicates(input, out);
+    }
+}
+
+/// Collect every grouping node reachable in `plan` for ADR-0094 decision 1's
+/// exact-typed classification: [`LogicalPlan::Aggregate`] nodes into
+/// `aggregates`, and [`LogicalPlan::Distinct`] nodes into `distincts`. A
+/// `SELECT DISTINCT` lowers to a `GROUP BY` on its distinct keys only in the
+/// optimizer; the analyzer this walk runs over leaves it as a `Distinct` node,
+/// so it is captured here and classified for its keys (the
+/// `SELECT DISTINCT float_col` case). Sibling to [`collect_filter_predicates`],
+/// with two reach rules:
+///
+/// - `plan.inputs()` recursion, for grouping nodes in the direct operator tree.
+/// - a scan of every visited node's own `expressions()` for an embedded
+///   subquery plan (`Expr::ScalarSubquery`/`InSubquery`/`Exists`), each of
+///   which wraps a `LogicalPlan` that `plan.inputs()` never descends into. Every
+///   embedded plan is walked with this same recursion, so a disqualifying
+///   aggregate hidden inside a scalar subquery is found the same as one at the
+///   top level.
+///
+/// Nodes are cloned out (both variants hold an `Arc`-backed input and their own
+/// expression vectors, so a clone is cheap) rather than borrowed, because the
+/// subquery plans live inside the owned `Vec<Expr>` that `expressions()` returns
+/// and would not outlive the walk.
+fn collect_aggregate_exprs(
+    plan: &LogicalPlan,
+    aggregates: &mut Vec<Aggregate>,
+    distincts: &mut Vec<Distinct>,
+) {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => aggregates.push(aggregate.clone()),
+        LogicalPlan::Distinct(distinct) => distincts.push(distinct.clone()),
+        _ => {}
+    }
+    for input in plan.inputs() {
+        collect_aggregate_exprs(input, aggregates, distincts);
+    }
+    for expr in plan.expressions() {
+        // Never errors: the closure only recurses and returns `Continue`.
+        let _ = expr.apply(|node| {
+            match node {
+                Expr::ScalarSubquery(subquery) => {
+                    collect_aggregate_exprs(&subquery.subquery, aggregates, distincts);
+                }
+                Expr::InSubquery(in_subquery) => {
+                    collect_aggregate_exprs(&in_subquery.subquery.subquery, aggregates, distincts);
+                }
+                Expr::Exists(exists) => {
+                    collect_aggregate_exprs(&exists.subquery.subquery, aggregates, distincts);
+                }
+                _ => {}
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+}
+
+/// Whether every grouping node in `plan` (analyzed/type-coerced) is
+/// order/partition-independent (ADR-0094 decision 1). A single disqualifying
+/// aggregate, GROUP BY key, or DISTINCT key anywhere, including inside a
+/// subquery, makes the whole query not exact -- `repartition_aggregations` is
+/// one session-wide knob, not a per-node choice.
+fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    aggregates.iter().all(aggregate_node_is_exact) && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// Classify a DISTINCT node's implicit group keys (ADR-0094 decision 1): a
+/// float key disqualifies exactly as a float `GROUP BY` key does, since a
+/// DISTINCT lowers to a `GROUP BY` on these keys. Plain `DISTINCT` keys on
+/// every output column; `DISTINCT ON` keys on its `on_expr` list.
+fn distinct_node_is_exact(distinct: &Distinct) -> bool {
+    match distinct {
+        Distinct::All(input) => input
+            .schema()
+            .fields()
+            .iter()
+            .all(|field| !crate::minmax::is_float(field.data_type())),
+        Distinct::On(distinct_on) => {
+            let schema = distinct_on.input.schema().as_ref();
+            distinct_on
+                .on_expr
+                .iter()
+                .all(|key| match key.get_type(schema) {
+                    Ok(ty) => !crate::minmax::is_float(&ty),
+                    Err(_) => false,
+                })
+        }
+    }
+}
+
+/// Classify one [`Aggregate`] node (ADR-0094 decision 1): every GROUP BY key
+/// must be non-float, and every aggregate expression must be exact-eligible.
+/// Types are resolved against the node's *input* schema, over which both group
+/// and aggregate-argument expressions are evaluated.
+fn aggregate_node_is_exact(aggregate: &Aggregate) -> bool {
+    let schema = aggregate.input.schema().as_ref();
+    // A float GROUP BY key disqualifies the query even when every aggregate is
+    // exact (`-0.0`/NaN bit-significance, ADR-0013): this ADR has no proof
+    // DataFusion picks a merge-order-stable representative bit pattern for a
+    // float group key. This also covers `SELECT DISTINCT float_col`, a
+    // zero-aggregate `Aggregate` whose group key is the DISTINCT column.
+    for key in &aggregate.group_expr {
+        match key.get_type(schema) {
+            Ok(ty) if crate::minmax::is_float(&ty) => return false,
+            Ok(_) => {}
+            // Fail closed: a key whose type will not resolve is not admitted.
+            Err(_) => return false,
+        }
+    }
+    aggregate
+        .aggr_expr
+        .iter()
+        .all(|expr| aggregate_expr_is_exact(expr, schema))
+}
+
+/// Whether one aggregate expression is exact-eligible (ADR-0094 decision 1):
+///
+/// - `count(...)`/`count(DISTINCT ...)`: always exact, any input type.
+/// - `sum`/`min`/`max` over a resolved non-float input: exact.
+/// - `avg`/`mean` over any input, `sum`/`min`/`max` over a float input, and
+///   anything unexpected: never exact (fail closed).
+fn aggregate_expr_is_exact(expr: &Expr, schema: &DFSchema) -> bool {
+    // `aggr_expr` entries are either an `AggregateFunction` or an `Alias`
+    // wrapping one; unwrap a single alias layer.
+    let inner = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let Expr::AggregateFunction(aggregate_function) = inner else {
+        // Not an aggregate function where one is required: fail closed.
+        return false;
+    };
+    match aggregate_function.func.name().to_ascii_lowercase().as_str() {
+        // Counting presence is order-independent regardless of the counted
+        // value's type; a partial-count merge is exact integer addition, and
+        // distinctness is a per-row property merge order cannot change.
+        "count" => true,
+        // Exact only over a resolved non-float input.
+        "sum" | "min" | "max" => match aggregate_function.params.args.first() {
+            Some(arg) => match arg.get_type(schema) {
+                Ok(ty) => !crate::minmax::is_float(&ty),
+                Err(_) => false,
+            },
+            // A sum/min/max with no argument should not occur; fail closed.
+            None => false,
+        },
+        // `avg`/`mean` always run plain IEEE f64 addition (crate::avg), so they
+        // are never exact regardless of input type; any other name is outside
+        // the admitted aggregate set and fails closed.
+        _ => false,
     }
 }
 
@@ -1699,6 +1997,126 @@ mod tests {
         let err = execution_error(df);
         assert!(matches!(err, SqlError::ResourcesExhausted(_)));
         assert!(err.client_message().contains("limit 8"));
+    }
+
+    /// ADR-0094 report sanity check: the analyzer step
+    /// ([`SqlExecutor::analyzed_classification_plan`]) actually resolves `avg`'s
+    /// argument to `Float64` for an integer input -- the whole reason
+    /// classification runs DataFusion's analyzer and not `create_logical_plan`
+    /// alone. Proven by inspecting the coerced argument's type, not just that the
+    /// code compiles.
+    #[tokio::test]
+    async fn analyzer_coerces_avg_argument_to_float64() {
+        use datafusion::arrow::datatypes::DataType;
+
+        let exec = eviction_test_executor();
+        let plan = exec
+            .analyzed_classification_plan(
+                TenantHash([9u8; 16]),
+                "SELECT avg(CAST(value AS BIGINT)) AS a FROM samples",
+                &[],
+            )
+            .await
+            .expect("throwaway avg plan analyzes");
+
+        let mut aggregates = Vec::new();
+        let mut distincts = Vec::new();
+        collect_aggregate_exprs(&plan, &mut aggregates, &mut distincts);
+        let aggregate = aggregates.first().expect("one aggregate node");
+        let schema = aggregate.input.schema().as_ref();
+        let expr = aggregate.aggr_expr.first().expect("one aggregate expr");
+        let inner = match expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            other => other,
+        };
+        let Expr::AggregateFunction(af) = inner else {
+            panic!("aggregate expression is not an AggregateFunction: {inner:?}");
+        };
+        assert_eq!(af.func.name().to_ascii_lowercase(), "avg");
+        let arg_type = af
+            .params
+            .args
+            .first()
+            .expect("avg has an argument")
+            .get_type(schema)
+            .expect("argument type resolves");
+        assert_eq!(
+            arg_type,
+            DataType::Float64,
+            "the analyzer must coerce avg(int) to a Float64 argument"
+        );
+        // And avg is never exact regardless of that resolved type.
+        assert!(
+            !aggregate_expr_is_exact(expr, schema),
+            "avg is never exact-eligible (ADR-0094 decision 1)"
+        );
+    }
+
+    /// ADR-0094 decision 1: the classifier admits exactly the exact-typed
+    /// shapes and rejects the rest, exercised through the real throwaway-session
+    /// plan+analyze path (not the pure helpers in isolation).
+    #[tokio::test]
+    async fn classify_exact_typed_admits_and_rejects_per_adr_0094() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([3u8; 16]);
+
+        // Integer sum + string group key + count: exact.
+        assert!(
+            exec.classify_exact_typed(
+                t,
+                "SELECT label(labels,'__name__') AS m, \
+                 sum(CAST(value AS BIGINT)) AS s, count(*) AS c FROM samples GROUP BY m",
+                &[],
+            )
+            .await
+        );
+        // count(DISTINCT float): count is always exact.
+        assert!(
+            exec.classify_exact_typed(t, "SELECT count(DISTINCT value) FROM samples", &[])
+                .await
+        );
+        // No aggregate at all: trivially exact.
+        assert!(
+            exec.classify_exact_typed(t, "SELECT ts, value FROM samples", &[])
+                .await
+        );
+        // Float sum: not exact.
+        assert!(
+            !exec
+                .classify_exact_typed(t, "SELECT sum(value) FROM samples", &[])
+                .await
+        );
+        // Float GROUP BY key (aggregate itself exact): not exact.
+        assert!(
+            !exec
+                .classify_exact_typed(t, "SELECT value, count(*) FROM samples GROUP BY value", &[])
+                .await
+        );
+        // SELECT DISTINCT on a float column (zero-aggregate float group key):
+        // not exact.
+        assert!(
+            !exec
+                .classify_exact_typed(t, "SELECT DISTINCT value FROM samples", &[])
+                .await
+        );
+        // avg over integer input: not exact.
+        assert!(
+            !exec
+                .classify_exact_typed(t, "SELECT avg(CAST(value AS BIGINT)) FROM samples", &[])
+                .await
+        );
+        // A disqualifying float avg hidden inside a scalar subquery: not exact,
+        // proving the expression-embedded subquery walk (decision 1).
+        assert!(
+            !exec
+                .classify_exact_typed(
+                    t,
+                    "SELECT count(*) FROM samples \
+                     WHERE value > (SELECT avg(value) FROM samples)",
+                    &[],
+                )
+                .await
+        );
     }
 
     /// An executor over an empty store, for the idle-accountant eviction tests.

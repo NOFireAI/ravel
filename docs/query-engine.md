@@ -1360,6 +1360,48 @@ of its disjuncts; a **cross-axis** disjunction (`status_code = 2 OR duration_ns
 > 5e8`) is refused. `trace_id` is a single-point lookup with no range primitive
 to union, so a `trace_id` disjunction is refused too.
 
+## Parallel final aggregation for exact-typed queries (ADR-0094)
+
+Every SQL query plans its aggregation single-partitioned by default: DataFusion's
+`repartition_aggregations` knob is off, so a `Partial` `AggregateExec` runs per
+scan partition, a `CoalescePartitionsExec` collapses them into one stream, and a
+single serial `Final` `AggregateExec` produces the result. This keeps float
+aggregation bit-exact against the differential gate (ADR-0013), whose reference
+depends on a deterministic fold order.
+
+`--sql-parallel-final-aggregation` (the process-wide `SqlConfig`
+`parallel_final_aggregation`, default off; no live-reload, flipping it needs a
+restart) lets a query whose aggregation is provably order- and
+partition-independent instead fan its `Final` stage across partitions behind a
+hash-partitioning `RepartitionExec`. Admission is per-query and decided from the
+query's fully type-coerced (analyzed) plan:
+
+- **Eligible:** `count(...)` and `count(DISTINCT ...)` over any type; `sum`,
+  `min`, `max` over a resolved **non-float** input.
+- **Never eligible:** `avg`/`mean` over **any** input type (their UDAF always
+  runs plain IEEE f64 addition, which is not associative once a running sum
+  exceeds 2^53, so it depends on the single-partition fold order); any `sum`,
+  `min`, `max` over a `Float16`/`Float32`/`Float64` input; and any **float
+  GROUP BY key** (including a bare `SELECT DISTINCT float_col`), because
+  `-0.0`/NaN payloads are bit-significant here and no merge-order-stable
+  representative bit pattern for a float group key is proven.
+
+A single disqualifying aggregate or key anywhere in the query -- including inside
+a scalar/`IN`/`EXISTS` subquery -- forces the whole query onto the
+single-partition plan: `repartition_aggregations` is one session-wide switch, not
+a per-node choice. Any error building or analyzing the classification plan
+fails closed to the single-partition plan (a missed optimization, never a wrong
+result). With the flag off, no classification runs and every query is
+single-partition, byte-identical to before this feature existed.
+
+Row order is unaffected. A `GROUP BY` without an explicit `ORDER BY` has **no
+row-order guarantee** in this engine -- single-partition or repartitioned, and
+unchanged by ADR-0094. Under repartitioned final aggregation the physical merge
+order is completion-order-dependent (nondeterministic even at a fixed partition
+count), so a client that needs a stable order must add `ORDER BY`. The result
+*content* is identical across partition counts for an admitted query; only
+arrival order varies.
+
 ## Caching note
 
 ADR-0046 added a content-addressed RAM read-cache tier (`ravel-cache`,
