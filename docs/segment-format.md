@@ -39,9 +39,10 @@ protobuf-style LEB128; signed values use zigzag.
 > the union of those layouts. v7 is v6 plus three additive changes from
 > ADR-0092, none of which alter how a v6-shaped object is laid out:
 >
-> - an optional per-sample dedup provenance extension appended to the
->   whole-section SERIES_META, present only when a run merged several writes'
->   samples (decision 1);
+> - an optional per-sample dedup provenance extension carried by both
+>   SERIES_META forms (appended to the whole-section form, re-laid per chunk in
+>   the sparse form), present only when a run merged several writes' samples
+>   (decision 1);
 > - two value page encodings, VAL_ALP (18) and VAL_GCD_DELTA_FOR (19), and one
 >   timestamp encoding, TS_GCD_I64 (2), each selected per page against the prior
 >   encoding and kept only when smaller (decision 6);

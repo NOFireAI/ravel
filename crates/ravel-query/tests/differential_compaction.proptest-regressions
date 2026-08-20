@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0de44b3b3b9c11492915150965bd4fada9f3256f18be3b9551ae777f40e165e0 # shrinks to specs = [WriterSpec { created_offset_ns: 0, seq: 1, samples: [(1, 0, 4611686018427387904)] }, WriterSpec { created_offset_ns: 60000000000, seq: 1, samples: [(1, 0, 18446744073709551615), (1, 2, 13832806255468478464)] }]

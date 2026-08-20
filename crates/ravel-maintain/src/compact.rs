@@ -616,10 +616,13 @@ mod tests {
 
     /// Exemplars on the sparse-catalog decode path.
     ///
-    /// `read.rs` routes an input with `series_count >= V5_SPARSE_THRESHOLD`
-    /// (4096) to the whole-object `decode_catalog_v5`, and every other test
-    /// here (and `ravel-ingest`'s `exemplar_flush.rs`) stays far below that, so
-    /// the chunked decoder is the only one exercised for exemplars. Exemplar
+    /// `read.rs` routes an input whose object carries the sparse sections
+    /// (SERIES_IDX + SERIES_META_CHUNKS) to the whole-object `decode_catalog_v5`
+    /// via `catalog_is_sparse` -- presence-signalled since #311, not the old
+    /// `series_count >= V5_SPARSE_THRESHOLD` test. A 4096+-series object takes
+    /// the sparse form, and every other test here (and `ravel-ingest`'s
+    /// `exemplar_flush.rs`) stays far below that, so the chunked decoder is the
+    /// only one exercised for exemplars. Exemplar
     /// `series_index` resolution depends on the decoder returning entries in
     /// SERIES_IDS order; if a future change to the sparse decoder broke that,
     /// every exemplar here would resolve to the wrong series while the smaller

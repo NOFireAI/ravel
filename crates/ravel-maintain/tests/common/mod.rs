@@ -724,6 +724,27 @@ pub async fn fetch_compaction_record(
 
 /// Read every part of a compaction record back down to per-series samples,
 /// merged across parts.
+/// Total number of runs each series holds across every L1 part of `record`,
+/// decoded through the real catalog reader. Under run-merged L1 compaction
+/// (ADR-0092 decision 1) every series must resolve to exactly one run.
+pub async fn record_run_counts(
+    store: &dyn ObjectStoreBackend,
+    record: &ravel_proto::commit::v1::CompactionRecord,
+) -> BTreeMap<[u8; 16], usize> {
+    let limits = ReaderLimits::default();
+    let mut out: BTreeMap<[u8; 16], usize> = BTreeMap::new();
+    for part in &record.parts {
+        let key = keys::reconstruct_l1_part_key(record, part).expect("part key");
+        let bytes = get_full(store, &key).await;
+        let loc = open_from_full(&bytes, limits).expect("open part");
+        let entries = decode_catalog_v5(&loc.footer, &bytes, limits).expect("decode part catalog");
+        for entry in &entries {
+            *out.entry(entry.entry.series_id.0).or_default() += entry.runs.len();
+        }
+    }
+    out
+}
+
 pub async fn read_record_samples(
     store: &dyn ObjectStoreBackend,
     record: &ravel_proto::commit::v1::CompactionRecord,

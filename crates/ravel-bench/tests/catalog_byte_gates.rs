@@ -21,8 +21,8 @@ use ravel_bench::segment_support::{
     bench_bounds, bench_identity, bench_meta, build_segment_v5,
 };
 use ravel_segment::{
-    ReaderLimits, RunInputV4, SegmentWriter, SeriesInputV4, SeriesValues, WrittenSegment,
-    encode_run_v4, open_from_full,
+    ReaderLimits, RunInputV4, RunInputV7, SampleProvenance, SegmentWriter, SeriesInputV4,
+    SeriesInputV7, SeriesValues, WrittenSegment, encode_run_v4, open_from_full,
 };
 use ravel_types::{LabelSet, Sample, SeriesId};
 
@@ -207,6 +207,56 @@ fn build_fragmented(raw: &[(SeriesId, LabelSet, Vec<Sample>)]) -> WrittenSegment
         .expect("write fragmented v5")
 }
 
+/// The run-merged L1 layout the SHIPPING compactor actually produces (ADR-0092
+/// decision 1, issue #315): one run of N samples per series, carrying the
+/// per-sample dedup provenance column that a merge of N distinct L0 flushes
+/// requires. Each sample keeps the flush it came from: `created_unix_ns` and
+/// `writer_seq` vary per flush, `in_page_index` is 0 (each fragmented flush held
+/// one sample). This is `build_merged` plus the real provenance cost, so its
+/// bytes-per-sample is the epic's actual result, not the no-provenance floor.
+fn build_merged_with_provenance(raw: &[(SeriesId, LabelSet, Vec<Sample>)]) -> WrittenSegment {
+    let base = 1_700_000_000_000_000_000i64;
+    let inputs: Vec<SeriesInputV7> = raw
+        .iter()
+        .map(|(series_id, labels, samples)| {
+            let run = encode_run_v4(
+                series_id,
+                base,
+                0,
+                0,
+                &SeriesValues::Scalar(samples.clone()),
+            )
+            .expect("encode merged run");
+            let column: Vec<SampleProvenance> = samples
+                .iter()
+                .enumerate()
+                .map(|(k, _)| SampleProvenance {
+                    created_unix_ns: base + k as i64 * FRAG_FLUSH_SPACING_NS,
+                    writer_epoch: 0,
+                    writer_seq: k as u64,
+                    in_page_index: 0,
+                })
+                .collect();
+            SeriesInputV7 {
+                series_id: *series_id,
+                labels: labels.clone(),
+                runs: vec![RunInputV7 {
+                    run,
+                    provenance: Some(column),
+                }],
+            }
+        })
+        .collect();
+    SegmentWriter::write_v7_with_provenance(
+        inputs,
+        bench_identity(),
+        bench_bounds(),
+        bench_meta(),
+        Vec::new(),
+    )
+    .expect("write merged v7 with provenance")
+}
+
 /// The five per-section byte-per-sample figures ADR-0092 reports, plus the
 /// object total.
 struct SectionSplit {
@@ -290,6 +340,73 @@ fn fragmented_multi_run_shape_costs_more_than_merged() {
         "fragmented layout ({:.2} B/sample) must exceed merged ({:.2} B/sample) by >= {FRAG_RATIO_MIN}x, got {ratio:.3}x",
         fragmented_split.total,
         merged_split.total,
+    );
+}
+
+/// Pinned lower bound on `fragmented_total / merged_with_provenance_total`,
+/// the epic's headline result: a run-merged L1 object carrying the per-sample
+/// provenance columns still costs materially less per sample than the fragmented
+/// inputs it replaces. Measured on this tree the merged-with-provenance shape is
+/// 8.88 B/sample against the fragmented 26.52, a ratio of 2.986. The per-sample
+/// provenance cost is negligible here: 320 bytes over 120,000 samples (~0.003
+/// B/sample), because the four columns are constant/arithmetic sequences that
+/// `encode_i64` and zstd flatten almost to nothing on a regular flush cadence.
+/// That is far below ADR-0092's ~5 B/sample estimate, which assumed the
+/// columns did not compress. The gate is pinned ~20% below the measured ratio,
+/// matching the `FRAG_RATIO_MIN` margin policy, so it flags a real regression in
+/// the merge win without wobbling on codec-level byte drift.
+const MERGED_WITH_PROV_RATIO_MIN: f64 = 2.4;
+
+#[test]
+fn run_merged_l1_with_provenance_costs_materially_less_than_inputs() {
+    let raw = fragmentation_workload();
+    let total_samples: usize = raw.iter().map(|(_, _, s)| s.len()).sum();
+    assert_eq!(total_samples, FRAG_SERIES * FRAG_SAMPLES_PER_SERIES);
+
+    let fragmented = build_fragmented(&raw);
+    let merged_no_prov = build_merged(&raw);
+    let merged_with_prov = build_merged_with_provenance(&raw);
+
+    let fragmented_split = section_split(&fragmented, total_samples);
+    let merged_no_prov_split = section_split(&merged_no_prov, total_samples);
+    let merged_with_prov_split = section_split(&merged_with_prov, total_samples);
+
+    print_split("fragmented (inputs)", &fragmented_split);
+    print_split("merged (no provenance)", &merged_no_prov_split);
+    print_split(
+        "merged + per-sample provenance (shipping L1)",
+        &merged_with_prov_split,
+    );
+
+    let provenance_cost = merged_with_prov_split.total - merged_no_prov_split.total;
+    println!(
+        "[fragmentation] exact object bytes: merged_no_prov={} merged_with_prov={} delta={} \
+         over {total_samples} samples",
+        merged_no_prov.bytes.len(),
+        merged_with_prov.bytes.len(),
+        merged_with_prov.bytes.len() as i64 - merged_no_prov.bytes.len() as i64,
+    );
+    // The provenance-carrying object must actually differ from the no-provenance
+    // one: the columns are present, just highly compressible (constant/arithmetic
+    // sequences under encode_i64 inside zstd), so their per-sample cost is small,
+    // not zero-because-dropped.
+    assert!(
+        merged_with_prov.bytes.len() > merged_no_prov.bytes.len(),
+        "the provenance columns must add bytes; equal size means they were dropped"
+    );
+    let ratio = fragmented_split.total / merged_with_prov_split.total;
+    println!(
+        "[fragmentation] merged+provenance = {:.2} B/sample (per-sample provenance cost = {:.2} \
+         B/sample); fragmented/merged+prov ratio = {ratio:.3} (gate >= {MERGED_WITH_PROV_RATIO_MIN})",
+        merged_with_prov_split.total, provenance_cost,
+    );
+
+    assert!(
+        ratio >= MERGED_WITH_PROV_RATIO_MIN,
+        "run-merged L1 with provenance ({:.2} B/sample) must cost materially less than the \
+         fragmented inputs ({:.2} B/sample): ratio {ratio:.3} < {MERGED_WITH_PROV_RATIO_MIN}",
+        merged_with_prov_split.total,
+        fragmented_split.total,
     );
 }
 

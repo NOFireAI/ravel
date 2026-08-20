@@ -1420,7 +1420,7 @@ fn build_meta_chunks(cols: &MetaColumns) -> Result<(Vec<u8>, Vec<ChunkDirEntry>)
         // are the sample-major slice covering this chunk's flagged samples.
         if !cols.prov_presence.is_empty() {
             let presence = &cols.prov_presence[r0..r1];
-            if presence.iter().any(|&p| p == 1) {
+            if presence.contains(&1) {
                 let sc0 = cols.prov_sample_offsets[r0];
                 let sc1 = cols.prov_sample_offsets[r1];
                 push_encoded_i64_block(&mut frame, presence);
