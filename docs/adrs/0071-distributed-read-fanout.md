@@ -1433,14 +1433,27 @@ are that forward-looking work is now landed, not that any decision changed:
   redacted-partial under `skip_unavailable` and typed otherwise. Per-signal
   differential, erasure-property, skew, and federation tests are in place.
 
-**Not yet shipped: the SQL lane (T6).** Decision 7 puts both fan-out lanes in
-scope; only the queryfrag lane is built. The SQL-lane per-signal distributed
-scan (slice tickets, `DistributedScanExec`, per-signal merge execs for the
-`logs`/`alerts`/`audit`/`spans` tables) is unimplemented and still sequenced
-after ADR-0087 per Decision 8. Consequently the engine's own query flow only
-dispatches `Signal::Metrics` today
+**The SQL lane (T6) has landed, but is not yet wired into a running server.**
+Decision 7 puts both fan-out lanes in scope. T6 shipped in two halves — T6a
+(#326, the RLOG family: `logs`/`alerts`/`audit`) and T6b (#327, the `spans`
+table) — and both are built. The SQL-lane distributed scan reuses the same
+total-order/no-dedup merge rule as the queryfrag lane, reproduced at the SQL
+layer as a `SortPreservingMergeExec` under each table's total-order key with no
+dedup node above it (`crates/ravel-sql/src/distributed_rlog.rs`). The slice-
+ticket plumbing (`WorkerSlice`, `WorkerSliceClient`, `plan_distributed_slices`)
+is shared with the metrics SQL lane, not reimplemented.
+
+The scan is installed on a table provider via each provider's
+`with_distributed_scan` (`LogsTableProvider` and the alerts/audit/spans
+siblings) and is exercised end to end by the acceptance tests
+(`crates/ravel-sql/tests/flight_distributed.rs`) driving `provider.scan(..)`.
+It is **not yet wired into a running server's real query path**: the server-side
+coordinator that installs the distributed context from
+`get_flight_info_statement`, and the worker `do_get` slice-fragment branch that
+runs each provider's `worker_fragment`, are still later wiring. Consequently the
+engine's own query flow still dispatches `Signal::Metrics` only today
 (`fetch_samples_and_histograms_maybe_distributed` / `federate_scalar` in
 `crates/ravel-query/src/engine.rs`): the per-signal queryfrag fetch, merge, and
-federation machinery for Logs/Alerts/Audit/Spans is present and tested, but the
-coordinator caller that drives log and trace *search* over the wire is the SQL
-lane, which is where that fan-out becomes live.
+federation machinery for Logs/Alerts/Audit/Spans is present and tested, and the
+SQL lane that drives log and trace *search* over the wire now exists and is
+tested, but neither is reached from a live server binary yet.
