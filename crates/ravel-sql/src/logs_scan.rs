@@ -263,7 +263,10 @@ fn resolve_columns(
 fn content_columns(pred: &Predicate, sel: ColumnSelection) -> ColumnSelection {
     match pred {
         Predicate::And(arms) => arms.iter().fold(sel, |acc, a| content_columns(a, acc)),
-        Predicate::TsRange { .. } | Predicate::StreamIn(_) => sel,
+        // `NumRange` is prune-only (ADR-0095 decision 6): it never reaches the
+        // exact content channel, so it reads no columns, same as ts/stream. The
+        // planner-side pushdown that would emit it is #278's job.
+        Predicate::TsRange { .. } | Predicate::StreamIn(_) | Predicate::NumRange { .. } => sel,
         Predicate::HasWord { field, .. } | Predicate::Equals { field, .. } => match field {
             FieldSel::Body => sel.with_body(),
             FieldSel::SeverityText => sel.with_severity_text(),

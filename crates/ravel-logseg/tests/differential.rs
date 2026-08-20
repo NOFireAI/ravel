@@ -184,6 +184,10 @@ fn eval(rec: &LogRecord, pred: &Predicate) -> bool {
                 .iter()
                 .any(|(k, v)| k == name && value_eq(v, value)),
         },
+        // Prune-only (ADR-0095 decision 6): never an exact per-row filter, and
+        // `arb_predicate` never generates it. Mirror the reader's exact channel
+        // (match every row) so the differential stays correct if one appears.
+        Predicate::NumRange { .. } => true,
     }
 }
 

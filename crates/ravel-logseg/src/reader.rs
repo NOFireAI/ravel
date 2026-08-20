@@ -22,7 +22,7 @@ use crate::record::{
     COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
     COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate, resolve_value,
 };
-use crate::skip_index::SkipIndex;
+use crate::skip_index::{NumRangeArm, SkipIndex};
 use crate::stream_dir::StreamDir;
 use crate::tokenizer::tokens;
 use crate::writer::RlogConfig;
@@ -233,10 +233,17 @@ impl<'a> RlogReader<'a> {
             return Ok(self.empty_scan(stats));
         }
 
+        // Numeric-range prune arms (ADR-0095 decision 6): resolved from the
+        // prune-only channel, they drive block pruning through the skip index
+        // and nothing else. An arm whose field does not resolve to a dynamic
+        // column of that exact type contributes zero pruning (the `Ok(None)`
+        // shape of the unindexed POSTINGS path), never an error.
+        let numeric = self.numeric_range_arms(&prune_arms);
+
         // Skip-index pruning.
-        let mut candidates = self
-            .skip
-            .candidate_blocks(ts_min, ts_max, stream_refs.as_deref());
+        let mut candidates =
+            self.skip
+                .candidate_blocks(ts_min, ts_max, stream_refs.as_deref(), &numeric);
         stats.blocks_after_skip = candidates.len() as u32;
 
         // Postings pruning. Exact (not probabilistic): a probed term's block
@@ -456,6 +463,39 @@ impl<'a> RlogReader<'a> {
                 if let Some(entry) = self.field_dir.column(name, ty) {
                     out.push((entry.column_id, term_key(&cv)));
                 }
+            }
+        }
+        out
+    }
+
+    /// Resolves the prune-only `NumRange` arms to [`NumRangeArm`] inputs for
+    /// [`SkipIndex::candidate_blocks`].
+    ///
+    /// Each arm names an attribute and its exact column type; it resolves to the
+    /// dynamic column [`FieldDir::column`] returns for that `(name, type)`. An
+    /// arm whose field does not resolve to such a column -- an unknown name, a
+    /// name stored only under other types, or a non-attribute selector -- yields
+    /// no [`NumRangeArm`] and so prunes nothing, matching the degrade-safe
+    /// fallthrough the unindexed POSTINGS field takes. The bounds pass straight
+    /// through as bit patterns; the range is prune-only, so the exact residual
+    /// stays the caller's (SQL layer's) job (ADR-0095 decision 6, ADR-0013).
+    fn numeric_range_arms(&self, arms: &[&Predicate]) -> Vec<NumRangeArm> {
+        let mut out = Vec::new();
+        for a in arms {
+            if let Predicate::NumRange {
+                field: FieldSel::Attr(name),
+                ty,
+                min,
+                max,
+            } = a
+                && let Some(entry) = self.field_dir.column(name, *ty)
+            {
+                out.push(NumRangeArm {
+                    column_id: entry.column_id,
+                    ty: *ty,
+                    min_bits: *min,
+                    max_bits: *max,
+                });
             }
         }
         out
@@ -699,6 +739,13 @@ fn eval(
             }
         }
         Predicate::Equals { field, value } => equals(field_dir, field, value, block, row)?,
+        // `NumRange` is prune-only (ADR-0095 decision 6): it drives block
+        // pruning through `scan_blocks`'s `prune` channel and is never an exact
+        // per-row filter. Reaching exact evaluation means the caller wired it
+        // into `content`; it matches every row (a no-op) rather than filtering,
+        // and the caller re-evaluates the real, exactly-typed range above the
+        // scan.
+        Predicate::NumRange { .. } => true,
     })
 }
 
@@ -2615,5 +2662,171 @@ mod tests {
         assert!(stats.postings_degraded);
         // No pruning applied, so every record survives.
         assert_eq!(rows.len(), 10);
+    }
+
+    /// A record carrying an i64 attribute `code`, in `stream`, at `ts`.
+    fn rec_code(stream: u8, ts: i64, code: i64) -> LogRecord {
+        let mut r = rec(stream, ts, "msg");
+        r.attrs.push(("code".into(), AttrValue::I64(code)));
+        r
+    }
+
+    /// Decodes an object's level-0 skip index.
+    fn skip_of(obj: &[u8]) -> SkipIndex {
+        let cfg = RlogConfig::default();
+        let footer = open(obj).expect("open");
+        let raw = read_section(obj, footer.section(kind::SKIP_IDX).expect("skip"), &cfg)
+            .expect("read skip");
+        SkipIndex::decode(&raw, MAX_BLOCKS).expect("decode skip")
+    }
+
+    /// Reachability (ADR-0095 decision 6): a `NumRange` prune arm, driven
+    /// through the real public `scan_pruned` entry point, excludes the block
+    /// whose merged-view winner for the column falls outside the range and keeps
+    /// the block whose winner falls inside it.
+    ///
+    /// Two single-record blocks: block 0 resolves `code = 200`, block 1 resolves
+    /// `code = 999`. A prune for `code IN [900, 1000]` must drop block 0 and keep
+    /// block 1. Asserted on `ScanStats` (the block actually left the candidate
+    /// set) and on the returned rows, not on either alone.
+    #[test]
+    fn num_range_prune_excludes_out_of_range_block_keeps_in_range() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let obj = build(cfg, vec![rec_code(0, 0, 200), rec_code(0, 1, 999)]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::NumRange {
+            field: FieldSel::Attr("code".into()),
+            ty: FieldType::I64,
+            min: Some(900i64 as u64),
+            max: Some(1000i64 as u64),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+
+        assert_eq!(stats.blocks_total, 2);
+        assert_eq!(
+            stats.blocks_after_skip, 1,
+            "the out-of-range block (code=200) is pruned by the numeric arm"
+        );
+        assert_eq!(rows.len(), 1, "only the in-range block's record survives");
+        assert_eq!(rows[0].ts_ns, 1);
+        assert_eq!(
+            rows[0]
+                .attrs
+                .iter()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v),
+            Some(&AttrValue::I64(999))
+        );
+    }
+
+    /// Soundness (ADR-0095 decision 6, ADR-0013): a block that resolves no value
+    /// for the arm's column carries no stat for it, and such a block is NEVER
+    /// pruned by the arm -- even though a naive "the block holds no matching
+    /// value" reading would drop it. Getting this backwards silently drops
+    /// correct results.
+    ///
+    /// Three single-record blocks: block 0 resolves `code = 15`, block 1 carries
+    /// no `code` at all (and its resource has none), block 2 resolves
+    /// `code = 999`. A prune for `code IN [10, 20]` keeps block 0 (in range),
+    /// prunes block 2 (out of range), and MUST keep block 1 (no stat). The test
+    /// first proves the premise off the decoded index -- block 1 genuinely has
+    /// no `code` stat -- so it is testing the absent-stat path, not a stat that
+    /// merely happens to overlap.
+    #[test]
+    fn num_range_prune_keeps_block_with_no_stat_for_the_column() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        // Block 1 (ts 1) carries no `code`; `rec` gives it only a resource
+        // `service.name`, so no row of block 1 resolves the `code` column.
+        let obj = build(
+            cfg,
+            vec![
+                rec_code(0, 0, 15),
+                rec(0, 1, "no-code"),
+                rec_code(0, 2, 999),
+            ],
+        );
+
+        // Premise: the (code, i64) column exists object-wide, and block 1 has no
+        // stat for it. Blocks are one record each, sorted by ts, so l0[1] is the
+        // no-code block.
+        let fd = field_dir_of(&obj);
+        let cid = fd
+            .column("code", FieldType::I64)
+            .expect("(code, i64) column exists")
+            .column_id;
+        let skip = skip_of(&obj);
+        assert_eq!(skip.l0.len(), 3, "one record per block");
+        assert!(
+            !skip.l0[1].stats.iter().any(|s| s.column_id == cid),
+            "block 1 must genuinely carry no stat for the code column"
+        );
+        assert!(
+            skip.l0[0].stats.iter().any(|s| s.column_id == cid)
+                && skip.l0[2].stats.iter().any(|s| s.column_id == cid),
+            "blocks 0 and 2 do carry a code stat"
+        );
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let prune = [Predicate::NumRange {
+            field: FieldSel::Attr("code".into()),
+            ty: FieldType::I64,
+            min: Some(10i64 as u64),
+            max: Some(20i64 as u64),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+
+        // Block 2 (code=999) pruned; blocks 0 and 1 survive.
+        assert_eq!(stats.blocks_total, 3);
+        assert_eq!(stats.blocks_after_skip, 2);
+        let by_ts: Vec<i64> = rows.iter().map(|r| r.ts_ns).collect();
+        assert!(
+            by_ts.contains(&1),
+            "the no-stat block must survive: absence is no information, never no match"
+        );
+        assert!(
+            !by_ts.contains(&2),
+            "the out-of-range block (code=999) is pruned"
+        );
+        assert!(by_ts.contains(&0), "the in-range block (code=15) survives");
+    }
+
+    /// A `NumRange` arm whose field does not resolve to a dynamic column of the
+    /// named type prunes nothing (degrade-safe fallthrough), the same way an
+    /// unindexed POSTINGS field does. Here `code` exists as i64 but the arm asks
+    /// for it as f64, which resolves to no column, so every block survives.
+    #[test]
+    fn num_range_prune_unresolved_column_prunes_nothing() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let obj = build(cfg, vec![rec_code(0, 0, 200), rec_code(0, 1, 999)]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::NumRange {
+            field: FieldSel::Attr("code".into()),
+            ty: FieldType::F64,
+            min: Some(0.0f64.to_bits()),
+            max: Some(1.0f64.to_bits()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(
+            stats.blocks_after_skip, stats.blocks_total,
+            "a NumRange over an unresolved (name, type) must not prune"
+        );
+        assert_eq!(rows.len(), 2);
     }
 }

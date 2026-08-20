@@ -64,6 +64,25 @@ pub struct SkipIndex {
     pub l1: Vec<Level1Entry>,
 }
 
+/// A resolved numeric-range prune arm for [`SkipIndex::candidate_blocks`]: the
+/// dynamic column to probe and the inclusive bounds a query wants to keep.
+///
+/// `min_bits`/`max_bits` are in the same bit-pattern encoding
+/// [`NumStat::min_bits`]/[`NumStat::max_bits`] store -- an `i64` as its
+/// two's-complement `u64`, an `f64` as `to_bits`, a `bool` as `0`/`1` -- so the
+/// overlap test reuses the exact type-aware order [`merge_stats`] folds under
+/// (nothing re-implements per-type comparison). `None` is an open end. The
+/// bounds are treated as inclusive, which is always the widen-only choice: a
+/// strict SQL bound resolves to an inclusive arm here, so pruning can only ever
+/// keep a block the exact residual would drop, never the reverse (ADR-0013).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NumRangeArm {
+    pub column_id: u32,
+    pub ty: FieldType,
+    pub min_bits: Option<u64>,
+    pub max_bits: Option<u64>,
+}
+
 /// Merges the stats of `children` by column id (type-aware min/max, summed
 /// null counts, OR-ed NaN flags).
 fn merge_stats(children: &[Level0Entry]) -> Vec<NumStat> {
@@ -123,6 +142,56 @@ fn max_bits(ty: FieldType, a: u64, b: u64) -> u64 {
     }
 }
 
+/// Strict less-than over two bit patterns in the same per-type order
+/// [`min_bits`]/[`max_bits`] fold under, so a range-overlap test and the stat
+/// merge can never disagree on ordering. `a < b` iff `a` is the pair's minimum
+/// and the two are not equal.
+fn bits_lt(ty: FieldType, a: u64, b: u64) -> bool {
+    a != b && min_bits(ty, a, b) == a
+}
+
+/// True when `arm`'s inclusive bounds cannot overlap `stat`'s recorded
+/// `[min_bits, max_bits]` range -- the only case in which the arm proves the
+/// entry holds no row it can match.
+///
+/// Null rows and NaN rows never satisfy a numeric range, so a stat's min/max
+/// (which bound exactly the non-NaN resolved values, ADR-0095) is the whole
+/// test; `null_count`/`has_nan` are irrelevant to it. A stat whose type does
+/// not match the arm's proves nothing (the reader resolves an arm to one exact
+/// `(name, type)` column, so this is defensive, not expected).
+fn stat_disjoint(stat: &NumStat, arm: &NumRangeArm) -> bool {
+    if stat.ty != arm.ty {
+        return false;
+    }
+    // Query entirely below the block: its top is strictly under the stat's min.
+    if let Some(qmax) = arm.max_bits
+        && bits_lt(stat.ty, qmax, stat.min_bits)
+    {
+        return true;
+    }
+    // Query entirely above the block: its bottom is strictly over the stat's max.
+    if let Some(qmin) = arm.min_bits
+        && bits_lt(stat.ty, stat.max_bits, qmin)
+    {
+        return true;
+    }
+    false
+}
+
+/// True if some numeric arm proves `stats` holds no matching row. An arm whose
+/// column has no stat in `stats` proves nothing and is skipped: absence is "no
+/// information", never "no match" (ADR-0013, and the completeness contract in
+/// this module's header). Pruning on an absent stat would silently drop correct
+/// results, so this degrade-safe fallthrough is unconditional.
+fn numeric_prunes(stats: &[NumStat], numeric: &[NumRangeArm]) -> bool {
+    numeric.iter().any(|arm| {
+        stats
+            .iter()
+            .find(|s| s.column_id == arm.column_id)
+            .is_some_and(|stat| stat_disjoint(stat, arm))
+    })
+}
+
 impl SkipIndex {
     /// Builds the index from level-0 entries, deriving level 1 at fanout 64.
     pub fn build(l0: Vec<Level0Entry>) -> Self {
@@ -152,16 +221,31 @@ impl SkipIndex {
         SkipIndex { l0, l1 }
     }
 
-    /// Block indices whose level-0 entries survive the coarse ts/stream
-    /// predicate. Sound: a block is included unless its bounds prove no record
-    /// matches. `stream_refs`, when given, is the set of stream refs of
-    /// interest; a block survives only if its `[min, max]` ref range contains
-    /// at least one.
+    /// Block indices whose level-0 entries survive the coarse ts/stream and
+    /// numeric-range predicates. Sound: a block is included unless its bounds
+    /// prove no record matches. `stream_refs`, when given, is the set of stream
+    /// refs of interest; a block survives only if its `[min, max]` ref range
+    /// contains at least one.
+    ///
+    /// `numeric` carries the prune-only numeric-range arms (ADR-0095 decision
+    /// 6). Each probes one NumStat-eligible column at both tiers this method
+    /// already prunes at: a whole level-1 group is skipped when its merged stat
+    /// for the column proves no overlap, then a surviving group's individual
+    /// level-0 blocks are skipped the same way. An arm whose column has no stat
+    /// in the entry being tested prunes nothing there -- absence is "no
+    /// information" (ADR-0013), which is why a level-1 group carrying no stat
+    /// for the column is descended into rather than dropped, and a level-0 block
+    /// with none survives. A group *does* carry a merged stat whenever any of
+    /// its children resolve the column; a child that resolves none holds only
+    /// nulls for it (write-path completeness, this module's header), and nulls
+    /// never satisfy a range, so pruning such a group on its merged stat still
+    /// drops no matching row.
     pub fn candidate_blocks(
         &self,
         ts_min: i64,
         ts_max: i64,
         stream_refs: Option<&[u32]>,
+        numeric: &[NumRangeArm],
     ) -> Vec<usize> {
         let mut out = Vec::new();
         for (g, group) in self.l1.iter().enumerate() {
@@ -174,6 +258,9 @@ impl SkipIndex {
             }) {
                 continue;
             }
+            if numeric_prunes(&group.stats, numeric) {
+                continue;
+            }
             let start = g * FANOUT;
             let end = (start + FANOUT).min(self.l0.len());
             for (j, e) in self.l0[start..end].iter().enumerate() {
@@ -183,6 +270,9 @@ impl SkipIndex {
                 if stream_refs
                     .is_some_and(|refs| !refs_intersect(refs, e.min_stream_ref, e.max_stream_ref))
                 {
+                    continue;
+                }
+                if numeric_prunes(&e.stats, numeric) {
                     continue;
                 }
                 out.push(start + j);
@@ -403,7 +493,7 @@ mod tests {
             l0.push(entry(i, t, t + 9, 0, 0));
         }
         let idx = SkipIndex::build(l0);
-        let got = idx.candidate_blocks(30, 55, None);
+        let got = idx.candidate_blocks(30, 55, None, &[]);
         assert_eq!(got, vec![3, 4, 5]);
     }
 
@@ -416,8 +506,194 @@ mod tests {
         }
         let idx = SkipIndex::build(l0);
         let refs = [7u32, 42u32];
-        let got = idx.candidate_blocks(0, 1000, Some(&refs));
+        let got = idx.candidate_blocks(0, 1000, Some(&refs), &[]);
         assert_eq!(got, vec![7, 42]);
+    }
+
+    /// A level-0 entry spanning all ts/streams, carrying one i64 stat for
+    /// `column_id` over `[min, max]`.
+    fn i64_entry(idx: u64, column_id: u32, min: i64, max: i64) -> Level0Entry {
+        let mut e = entry(idx, 0, 1000, 0, 0);
+        e.record_count = 1;
+        e.stats = vec![NumStat {
+            column_id,
+            ty: FieldType::I64,
+            min_bits: min as u64,
+            max_bits: max as u64,
+            null_count: 0,
+            has_nan: false,
+        }];
+        e
+    }
+
+    fn i64_arm(column_id: u32, min: Option<i64>, max: Option<i64>) -> NumRangeArm {
+        NumRangeArm {
+            column_id,
+            ty: FieldType::I64,
+            min_bits: min.map(|v| v as u64),
+            max_bits: max.map(|v| v as u64),
+        }
+    }
+
+    /// A numeric arm drops exactly the level-0 blocks whose stat range is
+    /// disjoint from the query, at both an inclusive lower and upper bound, and
+    /// keeps a block whose range overlaps.
+    #[test]
+    fn candidate_blocks_numeric_range_prunes_disjoint_blocks() {
+        // Block 0: [0,10], block 1: [50,60], block 2: [100,110].
+        let l0 = vec![
+            i64_entry(0, 10, 0, 10),
+            i64_entry(1, 10, 50, 60),
+            i64_entry(2, 10, 100, 110),
+        ];
+        let idx = SkipIndex::build(l0);
+
+        // Range [45, 65] overlaps only block 1.
+        let arm = [i64_arm(10, Some(45), Some(65))];
+        assert_eq!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            vec![1]
+        );
+
+        // Open upper bound: >= 55 keeps blocks 1 and 2, drops block 0.
+        let arm = [i64_arm(10, Some(55), None)];
+        assert_eq!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            vec![1, 2]
+        );
+
+        // Open lower bound: <= 5 keeps only block 0.
+        let arm = [i64_arm(10, None, Some(5))];
+        assert_eq!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            vec![0]
+        );
+    }
+
+    /// The soundness rule of ADR-0095 decision 6: a block with NO stat for the
+    /// arm's column is never pruned by that arm, even though a naive "the block
+    /// holds no value in range" reading would drop it. Block 1 carries no stat
+    /// for column 10; a range that excludes block 0's value must still keep
+    /// block 1.
+    #[test]
+    fn candidate_blocks_numeric_range_never_prunes_a_block_missing_the_stat() {
+        // Block 0 has a stat [0,10]; block 1 has NO stat for column 10. They are
+        // in different level-1 groups (block 1 is the 65th block) so the group
+        // summary cannot prune block 1 either: block 1's own group carries no
+        // stat for the column and is descended into.
+        let mut l0 = vec![i64_entry(0, 10, 0, 10)];
+        for i in 1..FANOUT as u64 {
+            // Filler blocks in group 0, also without the stat, ts-disjoint from
+            // the query below so they never appear in the candidate set.
+            l0.push(entry(i, 5000, 5000, 0, 0));
+        }
+        // Block 64: the no-stat block under test, in level-1 group 1.
+        let mut no_stat = entry(FANOUT as u64, 0, 1000, 0, 0);
+        no_stat.record_count = 1;
+        no_stat.stats = Vec::new();
+        l0.push(no_stat);
+        let idx = SkipIndex::build(l0);
+        assert_eq!(idx.l1.len(), 2, "block 64 forces a second level-1 group");
+
+        // A range far above block 0's [0,10]. Block 0 is pruned; the no-stat
+        // block (index 64) survives -- absence is no information.
+        let arm = [i64_arm(10, Some(1_000_000), None)];
+        let got = idx.candidate_blocks(0, 1000, None, &arm);
+        assert!(
+            !got.contains(&0),
+            "block 0's stat is disjoint, so it prunes"
+        );
+        assert!(
+            got.contains(&(FANOUT)),
+            "a block with no stat for the column must never be pruned by the arm"
+        );
+    }
+
+    /// The level-1 coarse tier prunes too: a whole group whose merged stat is
+    /// disjoint from the query is skipped without descending. 128 blocks (two
+    /// groups): group 0's values are all low, group 1's all high, so a
+    /// high range drops every block of group 0 at the group tier.
+    #[test]
+    fn candidate_blocks_numeric_range_prunes_at_level1_group() {
+        let mut l0 = Vec::new();
+        for i in 0..FANOUT as u64 {
+            l0.push(i64_entry(i, 10, 0, 100));
+        }
+        for i in FANOUT as u64..(2 * FANOUT) as u64 {
+            l0.push(i64_entry(i, 10, 1000, 1100));
+        }
+        let idx = SkipIndex::build(l0);
+        assert_eq!(idx.l1.len(), 2);
+
+        // Range [1050, 1200] overlaps only group 1's blocks.
+        let arm = [i64_arm(10, Some(1050), Some(1200))];
+        let got = idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm);
+        assert_eq!(got.len(), FANOUT, "only the 64 blocks of group 1 survive");
+        assert!(got.iter().all(|&b| b >= FANOUT));
+    }
+
+    /// f64 arms compare by `total_cmp` order (via the shared `min_bits` helper),
+    /// and bool arms by their 0/1 bit, so both prune the same way i64 does.
+    #[test]
+    fn candidate_blocks_numeric_range_f64_and_bool() {
+        let f = |bits_min: f64, bits_max: f64| {
+            let mut e = entry(0, 0, 1000, 0, 0);
+            e.record_count = 1;
+            e.stats = vec![NumStat {
+                column_id: 11,
+                ty: FieldType::F64,
+                min_bits: bits_min.to_bits(),
+                max_bits: bits_max.to_bits(),
+                null_count: 0,
+                has_nan: false,
+            }];
+            e
+        };
+        let idx = SkipIndex::build(vec![f(1.0, 2.0)]);
+        let arm = [NumRangeArm {
+            column_id: 11,
+            ty: FieldType::F64,
+            min_bits: Some(3.0f64.to_bits()),
+            max_bits: Some(4.0f64.to_bits()),
+        }];
+        assert!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm)
+                .is_empty(),
+            "f64 [1,2] is disjoint from [3,4]"
+        );
+        let arm = [NumRangeArm {
+            column_id: 11,
+            ty: FieldType::F64,
+            min_bits: Some(1.5f64.to_bits()),
+            max_bits: None,
+        }];
+        assert_eq!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            vec![0]
+        );
+
+        // Bool block carrying only `false` (0), queried for `true` (1): pruned.
+        let mut b = entry(0, 0, 1000, 0, 0);
+        b.record_count = 1;
+        b.stats = vec![NumStat {
+            column_id: 12,
+            ty: FieldType::Bool,
+            min_bits: 0,
+            max_bits: 0,
+            null_count: 0,
+            has_nan: false,
+        }];
+        let idx = SkipIndex::build(vec![b]);
+        let arm = [NumRangeArm {
+            column_id: 12,
+            ty: FieldType::Bool,
+            min_bits: Some(1),
+            max_bits: Some(1),
+        }];
+        assert!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -438,7 +714,7 @@ mod tests {
             let idx = SkipIndex::build(l0.clone());
             let qmax = qmin.saturating_add(qspan);
             let refs = [qref];
-            let cands = idx.candidate_blocks(qmin, qmax, Some(&refs));
+            let cands = idx.candidate_blocks(qmin, qmax, Some(&refs), &[]);
             // Soundness: any block that actually contains a matching (ts,ref)
             // pair must be a candidate.
             for (i, e) in l0.iter().enumerate() {

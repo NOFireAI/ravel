@@ -264,6 +264,37 @@ pub enum Predicate {
         field: FieldSel,
         value: AttrValue,
     },
+    /// Prune-only inclusive numeric range on a dynamic numeric column
+    /// (I64/F64/Bool), selected by attribute name and exact column type.
+    ///
+    /// `min`/`max` are inclusive bounds in the same bit-pattern encoding
+    /// [`crate::block::NumStat`] stores: an `i64` as its two's-complement `u64`,
+    /// an `f64` as `to_bits`, a `bool` as `0`/`1`. `None` is an open end.
+    ///
+    /// This arm may drive block pruning ONLY, through
+    /// [`crate::RlogReader::scan_blocks`]'s `prune` channel (exactly like the
+    /// POSTINGS `Equals` prune channel). It is never an exact per-row filter:
+    /// the caller (the SQL layer, not this crate) re-evaluates the real,
+    /// exactly-typed and exactly-bounded range above the scan. Placing it in the
+    /// `content` channel matches every row rather than filtering (ADR-0095
+    /// decision 6, ADR-0013).
+    ///
+    /// An `f64` bound is ordered by [`crate::block::NumStat`]'s own
+    /// `total_cmp`-based comparison, under which `-0.0 < +0.0` and NaN sorts to
+    /// an extreme -- both disagree with SQL's float equality. A caller building
+    /// a range that should include zero MUST widen it to cover both zero bit
+    /// patterns explicitly, and MUST NOT construct a NaN bound (this pruning
+    /// layer has no way to detect or reject one; a NaN bound silently prunes
+    /// either everything or nothing depending on its sign bit). Neither case is
+    /// reachable through any caller in this crate today; this is a contract
+    /// note for the first caller that builds one (ADR-0095 decision 6's
+    /// planner-side consumer, tracked separately).
+    NumRange {
+        field: FieldSel,
+        ty: FieldType,
+        min: Option<u64>,
+        max: Option<u64>,
+    },
 }
 
 #[cfg(test)]
