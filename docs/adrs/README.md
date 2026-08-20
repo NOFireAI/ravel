@@ -87,5 +87,15 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0082](0082-provisioning-shard-count-drift-tolerance.md) | Provisioning shard-count drift tolerance for an evolving default | Accepted |
 | [0083](0083-alert-sink-auth.md) | Alert sink delivery supports optional credentials | Accepted |
 | [0084](0084-otlp-gzip-ingest.md) | Accept gzip-compressed OTLP ingest on HTTP and gRPC, with a decompressed-size cap and an explicit decision on which bytes the ingest byte-rate charges | Accepted |
+| [0085](0085-metric-metadata-and-otlp-suffixing.md) | Metric metadata store and OTLP name suffixing | Accepted |
+| [0086](0086-github-releases-and-release-hygiene.md) | GitHub Releases, downloadable binaries, and release hygiene | Accepted |
+| [0087](0087-streaming-projected-logs-scan.md) | Streaming, column-projecting logs SQL scan | Accepted |
+| [0088](0088-operator-configurable-query-budgets.md) | Operator-configurable query budgets | Accepted |
+| [0089](0089-bulk-import-logs-signal.md) | Bulk import of structured event data into the logs signal | Accepted |
+| [0090](0090-typed-attribute-columns-logs-sql.md) | Typed attribute columns for the logs SQL table | Accepted |
 | [0091](0091-maintainer-gated-coderabbit-reviews.md) | Maintainer-gated CodeRabbit reviews: a workflow started by hand or by a `/coderabbit review` comment, which verifies `role_name` is maintain or admin, keeps the credential behind a main-only protected environment, loads policy from main by absolute path, and never executes pull-request code | Proposed |
 | [0092](0092-run-merged-l1-and-rseg-v7.md) | Run-merged L1 compaction and RSEG v7: per-sample dedup provenance columns, first timestamp as a delta from the run minimum, no alignment pad on single-sample raw value pages, and three measured page encodings, landed as one version bump | Accepted |
+| [0093](0093-typed-column-pushdown-logs.md) | Skip-index and postings pushdown for declared typed logs columns | Claimed |
+| [0094](0094-parallel-final-aggregation-exact-typed.md) | Parallel final aggregation for exact-typed inputs | Proposed |
+| [0095](0095-numstat-crosstype-declared-column-agreement.md) | NumStat cross-type resolution fix and RLOG v3 | Accepted |
+| [0096](0096-queryfrag-per-sample-provenance-and-histograms.md) | Query fan-out frame carries per-sample provenance and histograms | Claimed |
