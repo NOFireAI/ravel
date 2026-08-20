@@ -27,7 +27,10 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::SeriesData;
 use ravel_proto::queryfrag::v1 as pb;
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_segment::{
+    CompactionMetaV4, IngestBounds, RunInputV7, SampleProvenance, SegmentIdentity, SegmentWriter,
+    SeriesInput, SeriesInputV7, SeriesValues, encode_run_v4,
+};
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use tokio::runtime::Runtime;
@@ -447,6 +450,268 @@ fn reshard_activation_hour_series_spans_two_slices() {
         ];
         // cap 2 => the two shards land in two distinct slices.
         run_acceptance(corpus, 2).await;
+    });
+}
+
+// --- run-merged (per-sample provenance) refusal (#315/#348) -----------------
+
+/// Writes one L1 merged RSEG segment for series `m0` whose single run carries a
+/// per-sample provenance column (the shape an L1 compaction produces since
+/// issue #315), and returns a matching L1 `SegmentRef`.
+///
+/// The layout is the reviewed hazard: the merged run's run-wide minimum-prefix
+/// `(created_unix_ns, ...)` picks a DIFFERENT dedup winner at a duplicate
+/// timestamp than the explicit per-sample column does. At ts=10 the column gives
+/// the `created=200` sample (value 1.0) the win, while the run-wide prefix
+/// `created=100` applied by array position would instead pick the `created=100`
+/// sample (value 9.0). So a distributed path that dropped the column (degrading
+/// the frame rather than refusing it) returns 9.0 where the local path returns
+/// 1.0 -- the silent wrong result this fix closes.
+async fn write_l1_merged_provenance(store: &MemoryStore) -> SegmentRef {
+    let label_set = labels("m0");
+    let series_id = SeriesId::compute(&tenant_id(), "m0", &label_set).expect("series id");
+    let identity = SegmentIdentity {
+        tenant_hash: TENANT.0,
+        shard: 0,
+        writer_id: Uuid::nil().to_string(),
+        writer_epoch: 0,
+        writer_seq: 0,
+    };
+    let bounds = IngestBounds {
+        min_ingest_ts_ns: 0,
+        max_ingest_ts_ns: 0,
+    };
+    let input_set_hash = [0x33u8; 32];
+    let meta = CompactionMetaV4 {
+        ingest_hour_bucket: 100,
+        input_set_hash,
+        part_index: 0,
+        level: 1,
+    };
+    // Merged run, samples in on-disk order (ascending ts, dup ts kept):
+    //   idx0: ts=10 val=1.0  from write A (created 200)
+    //   idx1: ts=10 val=9.0  from write B (created 100)
+    //   idx2: ts=20 val=2.0  from write A (created 200)
+    let samples = SeriesValues::Scalar(vec![
+        Sample {
+            ts_ns: 10,
+            value: 1.0,
+        },
+        Sample {
+            ts_ns: 10,
+            value: 9.0,
+        },
+        Sample {
+            ts_ns: 20,
+            value: 2.0,
+        },
+    ]);
+    // Run-wide created deliberately 100 (the min-prefix): a reader that ignored
+    // the columns would let idx1 (9.0) win ts=10 by array position.
+    let run = encode_run_v4(&series_id, 100, 0, 0, &samples).expect("frame merged run");
+    let provenance = Some(vec![
+        SampleProvenance {
+            created_unix_ns: 200,
+            writer_epoch: 1,
+            writer_seq: 1,
+            in_page_index: 0,
+        },
+        SampleProvenance {
+            created_unix_ns: 100,
+            writer_epoch: 1,
+            writer_seq: 1,
+            in_page_index: 0,
+        },
+        SampleProvenance {
+            created_unix_ns: 200,
+            writer_epoch: 1,
+            writer_seq: 1,
+            in_page_index: 1,
+        },
+    ]);
+    let series = vec![SeriesInputV7 {
+        series_id,
+        labels: label_set,
+        runs: vec![RunInputV7 { run, provenance }],
+    }];
+    let written =
+        SegmentWriter::write_v7_with_provenance(series, identity, bounds, meta, Vec::new())
+            .expect("write L1 with provenance");
+    let key = "seg/l1-merged-provenance.rseg";
+    store
+        .put(key, written.bytes.clone(), PutOptions::default())
+        .await
+        .expect("put L1 object");
+    SegmentRef {
+        data_object_key: key.to_string(),
+        object_size: written.bytes.len() as u64,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        ingest_hour_bucket: 100,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        shard: 0,
+        content_hash: written.summary.blake3,
+        writer_id: Uuid::nil(),
+        writer_epoch: 0,
+        writer_seq: 0,
+        created_unix_ns: 100,
+        level: SegmentLevel::L1 {
+            input_set_hash,
+            part_index: 0,
+        },
+    }
+}
+
+/// A fetched scalar series carrying a per-sample provenance column must be
+/// REFUSED at the service level in every build profile, handing the slice to the
+/// coordinator's local fallback rather than being encoded as a degraded run-wide
+/// frame. `Distributed::fetch` returning `Ok(None)` is that refusal-driven
+/// fallback.
+///
+/// This guards the release-build hazard directly. The old `debug_assert`-only
+/// guard in `encode_series_frame` compiles to nothing under
+/// `debug_assertions = off`, so before the service-level refusal this same fetch
+/// encoded the degraded frame and `fetch` returned `Ok(Some(..))`. Asserting
+/// `None` here therefore FAILS against the unfixed code compiled in release --
+/// the exact profile the defect shipped in -- and it does not merely trip the
+/// `debug_assert`: it drives the full loopback worker and coordinator, and the
+/// pass condition is the coordinator's fallback decision, not a panic.
+#[test]
+fn run_merged_series_refuses_over_the_wire_not_degrades() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let seg = write_l1_merged_provenance(&store).await;
+        let snapshot = Snapshot {
+            segments: vec![seg.clone()],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // Ground-truth cost of fetching this one slice's segment once, to prove
+        // the refusal folds the slice's spend exactly once (not zero, not twice):
+        // the worker returns its accounting in the terminal summary before the
+        // Unsupported status, exactly as the histogram arm does.
+        let (_local_runs, local_acct, _local_stats) =
+            local_scalar(Arc::clone(&store), &snapshot).await;
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), vec![seg]).await;
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+        let accounting = QueryAccounting::new();
+        let result = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &EngineConfig::default(),
+                i64::MAX,
+            )
+            .await
+            .expect("distributed fetch");
+        server.abort();
+
+        assert!(
+            result.is_none(),
+            "a run-merged series (per-sample provenance column) must trigger the \
+             Unsupported local fallback (Ok(None)), never a degraded run-wide \
+             frame; got a distributed result"
+        );
+        // The refusal folded the slice's real S3 spend exactly once: equal to a
+        // single local fetch of the segment, not zero and not doubled.
+        assert_eq!(
+            accounting.snapshot(),
+            local_acct,
+            "the refusal path must fold the slice's spend exactly once \
+             (histogram-arm accounting behaviour)"
+        );
+    });
+}
+
+/// Closes the reviewed coverage gap: drive a run-merged series (per-sample
+/// provenance column) through the distributed query path and assert the result
+/// is bit-identical to the same query run purely locally, compared by
+/// `f64::to_bits`.
+///
+/// Today the slice is refused and the coordinator falls back to local, so the
+/// distributed-with-fallback result IS the local result. The winner pin proves
+/// the corpus is the discriminating one (the column winner 1.0 at ts=10, never
+/// the degraded run-wide 9.0). When #348 lands and the frame carries the column,
+/// `fetch` returns the real distributed result and this same assertion proves the
+/// wire preserved the column's winners. The test survives that change because it
+/// compares the coordinator's answer -- however produced -- to local, mirroring
+/// the engine's own `None`-means-local-fallback rule (engine.rs).
+#[test]
+fn run_merged_series_distributed_equals_local_bitwise() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let seg = write_l1_merged_provenance(&store).await;
+        let snapshot = Snapshot {
+            segments: vec![seg.clone()],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // Pure-local reference.
+        let (local_runs, _acct, _stats) = local_scalar(Arc::clone(&store), &snapshot).await;
+        let local_merged = merge_soa_runs(local_runs, usize::MAX, usize::MAX).expect("local merge");
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), vec![seg]).await;
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+        let accounting = QueryAccounting::new();
+        let distributed_merged = match distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &EngineConfig::default(),
+                i64::MAX,
+            )
+            .await
+            .expect("distributed fetch")
+        {
+            // #348: the frame carries the column; merge the real distributed runs.
+            Some(triple) => merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("dist merge"),
+            // Today: refusal -> the engine runs the query locally instead.
+            None => {
+                let (runs, _a, _s) = local_scalar(Arc::clone(&store), &snapshot).await;
+                merge_soa_runs(runs, usize::MAX, usize::MAX).expect("fallback merge")
+            }
+        };
+        server.abort();
+
+        assert_series_bit_identical(&local_merged, &distributed_merged);
+        // Pin the column-dictated winners so this is not "two equal empties": the
+        // merge keeps 1.0 at ts=10 (created=200 beats created=100's 9.0) and 2.0
+        // at ts=20. A degraded run-wide path would put 9.0 at ts=10.
+        assert_eq!(local_merged.len(), 1);
+        let samples = &local_merged[0].samples;
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].ts_ns, 10);
+        assert_eq!(samples[0].value.to_bits(), 1.0f64.to_bits());
+        assert_eq!(samples[1].ts_ns, 20);
+        assert_eq!(samples[1].value.to_bits(), 2.0f64.to_bits());
     });
 }
 

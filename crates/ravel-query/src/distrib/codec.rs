@@ -269,17 +269,25 @@ pub fn signal_from_u32(raw: u32) -> Result<Signal, CodecError> {
 /// are not in the frozen `ravel.queryfrag.v1` `Run` message, and silently
 /// dropping them would make a distributed fetch pick a different winner at an
 /// overlapping timestamp than a local fetch. Since issue #315 the run-merged
-/// L1 producer exists, so this path REFUSES the merged shape rather than
-/// degrading it: the `debug_assert` trips in test the moment such a run reaches
-/// the wire encoder. Carrying it means extending the `Run` message (next field
-/// number 6) and bumping [`PROTOCOL_VERSION`] with it; until then the merged
-/// shape must not be sent over the distributed path.
+/// L1 producer exists, so such a run must never reach this encoder.
+///
+/// This function does NOT itself enforce that. The enforcing guard is at the
+/// service level ([`crate::distrib::service`]): a slice whose fetched scalar
+/// series carry a `per_sample_priorities` column is refused with
+/// [`pb::status::Code::Unsupported`] before the encode loop, handing the slice
+/// to the coordinator's local fallback (which is exact). The `debug_assert`
+/// below is a second line of defence that trips in test builds only; it
+/// compiles to nothing under `debug_assertions = off`, so it is not the guard.
+/// Carrying the merged shape over the wire means extending the `Run` message
+/// and bumping [`PROTOCOL_VERSION`] with it, tracked as issue #348 (bundled
+/// with the identical `HistogramRun` change); until then the merged shape must
+/// not be sent over the distributed path.
 pub fn encode_series_frame(series: &FetchedSeriesSoa) -> pb::SeriesFrame {
     debug_assert!(
         series.per_sample_priorities.is_none(),
         "distributed frame cannot carry a per-sample provenance column; \
-         extend the ravel.queryfrag.v1 Run message and bump PROTOCOL_VERSION \
-         before sending a run-merged series over the distributed path (#315)"
+         the service-level guard must refuse a run-merged series before it \
+         reaches this encoder (#348)"
     );
     pb::SeriesFrame {
         series_id: series.series_id.0.to_vec(),
