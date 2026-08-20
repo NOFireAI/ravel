@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "services/*"]
 
 [workspace.package]
-version = "0.9.5"
+version = "0.10.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.97"
@@ -26,29 +26,29 @@ expect_used = "warn"
 # Version fields pin each path dependency so cargo-deny does not count them as
 # wildcards. allow-wildcard-paths is not usable here because these
 # crates are not marked publish = false, so it does not exempt them.
-ravel-types = { path = "crates/ravel-types", version = "0.9.5" }
-ravel-tenant-resolve = { path = "crates/ravel-tenant-resolve", version = "0.9.5" }
-ravel-proto = { path = "crates/ravel-proto", version = "0.9.5" }
-ravel-codec = { path = "crates/ravel-codec", version = "0.9.5" }
-ravel-object-store = { path = "crates/ravel-object-store", version = "0.9.5" }
-ravel-segment = { path = "crates/ravel-segment", version = "0.9.5" }
-ravel-logseg = { path = "crates/ravel-logseg", version = "0.9.5" }
-ravel-rspan = { path = "crates/ravel-rspan", version = "0.9.5" }
-ravel-commit = { path = "crates/ravel-commit", version = "0.9.5" }
-ravel-catalog = { path = "crates/ravel-catalog", version = "0.9.5" }
-ravel-cache = { path = "crates/ravel-cache", version = "0.9.5" }
-ravel-maintain = { path = "crates/ravel-maintain", version = "0.9.5" }
-ravel-fleet = { path = "crates/ravel-fleet", version = "0.9.5" }
-ravel-otlp = { path = "crates/ravel-otlp", version = "0.9.5" }
-ravel-otap = { path = "crates/ravel-otap", version = "0.9.5" }
-ravel-remote-write = { path = "crates/ravel-remote-write", version = "0.9.5" }
-ravel-alerting = { path = "crates/ravel-alerting", version = "0.9.5" }
-ravel-ingest = { path = "crates/ravel-ingest", version = "0.9.5" }
-ravel-promql = { path = "crates/ravel-promql", version = "0.9.5" }
-ravel-query = { path = "crates/ravel-query", version = "0.9.5" }
-ravel-analytics = { path = "crates/ravel-analytics", version = "0.9.5" }
-ravel-tracing-export = { path = "crates/ravel-tracing-export", version = "0.9.5" }
-ravel-affinity = { path = "crates/ravel-affinity", version = "0.9.5" }
+ravel-types = { path = "crates/ravel-types", version = "0.10.0" }
+ravel-tenant-resolve = { path = "crates/ravel-tenant-resolve", version = "0.10.0" }
+ravel-proto = { path = "crates/ravel-proto", version = "0.10.0" }
+ravel-codec = { path = "crates/ravel-codec", version = "0.10.0" }
+ravel-object-store = { path = "crates/ravel-object-store", version = "0.10.0" }
+ravel-segment = { path = "crates/ravel-segment", version = "0.10.0" }
+ravel-logseg = { path = "crates/ravel-logseg", version = "0.10.0" }
+ravel-rspan = { path = "crates/ravel-rspan", version = "0.10.0" }
+ravel-commit = { path = "crates/ravel-commit", version = "0.10.0" }
+ravel-catalog = { path = "crates/ravel-catalog", version = "0.10.0" }
+ravel-cache = { path = "crates/ravel-cache", version = "0.10.0" }
+ravel-maintain = { path = "crates/ravel-maintain", version = "0.10.0" }
+ravel-fleet = { path = "crates/ravel-fleet", version = "0.10.0" }
+ravel-otlp = { path = "crates/ravel-otlp", version = "0.10.0" }
+ravel-otap = { path = "crates/ravel-otap", version = "0.10.0" }
+ravel-remote-write = { path = "crates/ravel-remote-write", version = "0.10.0" }
+ravel-alerting = { path = "crates/ravel-alerting", version = "0.10.0" }
+ravel-ingest = { path = "crates/ravel-ingest", version = "0.10.0" }
+ravel-promql = { path = "crates/ravel-promql", version = "0.10.0" }
+ravel-query = { path = "crates/ravel-query", version = "0.10.0" }
+ravel-analytics = { path = "crates/ravel-analytics", version = "0.10.0" }
+ravel-tracing-export = { path = "crates/ravel-tracing-export", version = "0.10.0" }
+ravel-affinity = { path = "crates/ravel-affinity", version = "0.10.0" }
 
 # async runtime / rpc / http
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
