@@ -263,15 +263,24 @@ pub fn signal_from_u32(raw: u32) -> Result<Signal, CodecError> {
 /// become zig-zag deltas (delta-from-zero for the first), values become raw
 /// bit patterns.
 ///
-/// `pb::Run` carries run-wide provenance only, which is exactly what every
-/// object in existence holds, so this mapping is total for every run the
-/// fetcher emits today. It cannot express a run-merged run's per-sample dedup
-/// priority column ([`FetchedSeriesSoa::per_sample_priorities`]): adding four
-/// per-sample columns to the frozen `ravel.queryfrag.v1` messages is a wire
-/// contract change, so whatever makes a worker able to produce such a run
-/// (issue #315) must extend this frame and bump [`PROTOCOL_VERSION`] with it.
-/// Nothing constructs that column yet.
+/// `pb::Run` carries run-wide provenance only. It CANNOT express a run-merged
+/// run's per-sample dedup priority column
+/// ([`FetchedSeriesSoa::per_sample_priorities`]): the four per-sample columns
+/// are not in the frozen `ravel.queryfrag.v1` `Run` message, and silently
+/// dropping them would make a distributed fetch pick a different winner at an
+/// overlapping timestamp than a local fetch. Since issue #315 the run-merged
+/// L1 producer exists, so this path REFUSES the merged shape rather than
+/// degrading it: the `debug_assert` trips in test the moment such a run reaches
+/// the wire encoder. Carrying it means extending the `Run` message (next field
+/// number 6) and bumping [`PROTOCOL_VERSION`] with it; until then the merged
+/// shape must not be sent over the distributed path.
 pub fn encode_series_frame(series: &FetchedSeriesSoa) -> pb::SeriesFrame {
+    debug_assert!(
+        series.per_sample_priorities.is_none(),
+        "distributed frame cannot carry a per-sample provenance column; \
+         extend the ravel.queryfrag.v1 Run message and bump PROTOCOL_VERSION \
+         before sending a run-merged series over the distributed path (#315)"
+    );
     pb::SeriesFrame {
         series_id: series.series_id.0.to_vec(),
         labels: encode_labels(&series.labels),
