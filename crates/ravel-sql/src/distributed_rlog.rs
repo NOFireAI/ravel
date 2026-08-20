@@ -8,13 +8,13 @@
 //! signal-neutral. [`DistributedSliceScanExec`] takes a [`SchemaRef`] and an
 //! ordering column list and knows nothing about logs, alerts, or audit;
 //! [`distributed_slice_plan`] assembles the fan-out around any schema and key.
-//! A later task (#327, T6b) reuses both verbatim for the `spans` table by
-//! passing the spans schema and the span total-order key -- it does not
-//! reimplement the scan exec, the merge assembly, the byte accounting, or the
-//! schema validation. The only RLOG-specific surface is
-//! [`LOGS_ORDER_COLS`]/[`ALERTS_ORDER_COLS`]/[`AUDIT_ORDER_COLS`] and the three
-//! thin wrappers ([`distributed_logs_plan`] and siblings) that bind a signal's
-//! public schema to its key.
+//! The `spans` table (#327, T6b) reuses both verbatim by passing the spans
+//! schema and the span total-order key -- it does not reimplement the scan exec,
+//! the merge assembly, the byte accounting, or the schema validation. The only
+//! signal-specific surface is
+//! [`LOGS_ORDER_COLS`]/[`ALERTS_ORDER_COLS`]/[`AUDIT_ORDER_COLS`]/[`SPAN_ORDER_COLS`]
+//! and the thin wrappers ([`distributed_logs_plan`] and siblings, plus
+//! [`distributed_spans_plan`]) that bind a signal's public schema to its key.
 //!
 //! The slice-ticket plumbing is not reimplemented here at all: the fan-out
 //! reuses [`crate::distributed`]'s [`WorkerSlice`], [`WorkerSliceClient`],
@@ -33,10 +33,10 @@
 //! is only decidable once every slice's candidates meet, so the coordinator's
 //! dedup is authoritative.
 //!
-//! Logs, alerts, and audit have **no query-time dedup**
+//! Logs, alerts, audit, and spans have **no query-time dedup**
 //! (`docs/consistency-model.md`, "logs and spans"; ADR-0051 section 5). A retry
 //! after a lost acknowledgement produces byte-identical rows that are
-//! legitimately duplicate user data and MUST stay visible. So the RLOG merge is
+//! legitimately duplicate user data and MUST stay visible. So the merge is
 //! a `SortPreservingMergeExec` under a total-order key and **nothing above it**:
 //! no dedup node, no `.dedup_by`, no distinct. Every row every slice returns is
 //! emitted. This mirrors [`ravel_query::distrib`]'s `merge_log_records`, which
@@ -113,6 +113,28 @@ pub const ALERTS_ORDER_COLS: &[&str] = &["ts_ns", "alert_id", "rule_id", "state"
 /// The `audit` table's total-order key: the orderable public columns in schema
 /// order (ADR-0040). `attrs` excluded, as above.
 pub const AUDIT_ORDER_COLS: &[&str] = &["ts_ns", "severity_text", "body"];
+
+/// The `spans` table's total-order key (ADR-0041): the orderable public columns
+/// in the exact field sequence `ravel_query::distrib`'s `span_cmp`/
+/// `span_order_key` use -- `(trace_id, span_id, start_ts_ns, end_ts_ns,
+/// parent_span_id, name, status_code, status_message, service_name)` -- mapped
+/// to the public `spans` schema column names (`start_ts`/`end_ts` for the two
+/// timestamp columns). The trailing `attrs` `Map` column is excluded because
+/// Arrow maps are not orderable; this is sound because spans have no query-time
+/// dedup, so two rows tying on every orderable column are indistinguishable to
+/// SQL and their relative order never matters (the same rationale that excludes
+/// `attrs` from the RLOG keys above and from the queryfrag-layer span key).
+pub const SPAN_ORDER_COLS: &[&str] = &[
+    "trace_id",
+    "span_id",
+    "start_ts",
+    "end_ts",
+    "parent_span_id",
+    "name",
+    "status_code",
+    "status_message",
+    "service_name",
+];
 
 /// A coordinator-side distributed RLOG scan context (ADR-0071): the worker
 /// endpoints one query fans out to, and the client that fetches each slice.
@@ -464,6 +486,29 @@ pub fn distributed_audit_plan(
         client,
         schema,
         AUDIT_ORDER_COLS,
+        limit,
+        accounting,
+        max_bytes_scanned,
+    )
+}
+
+/// The `spans` distributed plan (#327, T6b): [`distributed_slice_plan`] bound to
+/// the `spans` public schema and [`SPAN_ORDER_COLS`]. Like the RLOG wrappers it
+/// merges under the total-order key with NO dedup above it, because spans have
+/// no query-time dedup (see the module docs).
+pub fn distributed_spans_plan(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    schema: SchemaRef,
+    limit: Option<usize>,
+    accounting: QueryAccounting,
+    max_bytes_scanned: ByteLimit,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    distributed_slice_plan(
+        endpoints,
+        client,
+        schema,
+        SPAN_ORDER_COLS,
         limit,
         accounting,
         max_bytes_scanned,
