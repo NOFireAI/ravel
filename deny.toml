@@ -29,19 +29,6 @@ ignore = [
   # forks, pastey and with_builtin_macros, are not drop-in and parquet
   # does not depend on either); revisit if parquet drops paste upstream.
   "RUSTSEC-2024-0436",
-  # arrayref: every published version satisfying blake3's `^0.3.5`
-  # requirement (0.3.5 through 0.3.9, the crates.io max as of 2026-08-20)
-  # is yanked. No RUSTSEC advisory exists for this yank; it is a plain
-  # crates.io yank with no stated reason, not a known vulnerability.
-  # blake3 1.8.6 (latest) still depends on the same `^0.3.5` range, so no
-  # dependency bump avoids it, and downgrading to the last non-yanked
-  # 0.3.4 fails blake3's requirement. arrayref is a small, stable
-  # array-reference macro crate with no history of security advisories;
-  # accepting the currently-locked 0.3.9 (last version published before
-  # the yank) carries no known additional risk. Revisit when blake3 or
-  # arrayref publish a release that resolves this without a yanked
-  # dependency.
-  "arrayref",
 ]
 
 [licenses]
