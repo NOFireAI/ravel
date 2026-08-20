@@ -118,7 +118,9 @@ script's pre-flight, a re-push) may skip the repeat run and let the PR's
 required checks enforce it; that is what `FLEET_MERGE_SKIP_GATES=1`
 (described under Scripts below) is for. The full list still runs at least
 once locally before the commit exists; protection makes the repeats
-redundant, not the first run.
+redundant, not the first run. This precondition is enforced, not
+remembered: `gates.sh` writes a receipt for every full clean-tree run,
+and the merge script refuses the skip without a matching receipt.
 
 ### Long commands and the Bash tool
 
@@ -134,6 +136,26 @@ polling can consume a large share of a session's turns.
 On an 8 GB host, default cargo parallelism gets ld killed with signal 9;
 `gates.sh` caps build jobs there automatically. If you invoke cargo
 directly on such a host, pass `--jobs 2`.
+
+### Waiting on fleet tasks and PRs
+
+Waiting is event-driven, never babysat. The harness kills background
+processes after about 10 minutes; an unbounded watcher dies unnoticed and
+the fallback becomes no-op status polls that burn turns and tokens.
+
+- Arm `scripts/fleet-watch-managed.sh` under a Monitor until-loop: each
+  bounded run exits 75 when its budget elapses and the Monitor relaunches
+  it; exit 0 prints the terminal event. Never nohup a watcher and never
+  poll one with `ps`.
+- Idle fallback wakeups: 15 minutes or longer. Embed the current ledger
+  state in every wakeup prompt so a compaction between wakeups costs
+  nothing.
+- If two consecutive polls on the same task return nothing new, stop
+  polling: fetch the fleet transcript and diagnose, or escalate.
+- "Where are we at?" has one answer: `scripts/epic-status.sh <epic>`.
+  Run it instead of repeated `gh issue view` reads, and post a one-line
+  status to the epic ledger at each state transition so the user can
+  self-serve.
 
 ### CI workflow changes
 
@@ -167,7 +189,28 @@ connection, a pushed-but-broken main).
   a loop. The SSE stream it wraps drops the connection almost immediately
   in this environment, so a single long-lived `curl -N` never sees the
   terminal event; this retries instead. Prints the terminal event and
-  exits 0 once one arrives.
+  exits 0 once one arrives. Prefer `fleet-watch-managed.sh` below when a
+  harness lifetime cap applies (it always does in Claude Code sessions).
+- `scripts/fleet-watch-managed.sh <watch-url> [budget-s] [poll-s]`: the
+  same polling, in bounded runs sized to survive the harness's 10-minute
+  background cap. Exit 0 = terminal event printed; exit 75 = budget
+  elapsed, relaunch (arm it under a Monitor until-loop that relaunches
+  on 75).
+- `scripts/epic-status.sh <epic-issue> [--fresh]`: one-call "where are we
+  at?": reads the epic ledger (cached 60 s) and reconciles every task id
+  in it against `refs/heads/task/*` on origin and the task-branch PRs.
+  This is the mandatory pre-dispatch ledger reconciliation as a single
+  command.
+- `scripts/fleet-dispatch-intent.sh intent|record|failed ...`: intent-first
+  dispatch bookkeeping on the epic ledger. `intent <epic> <ticket> <sha>`
+  refuses while a previous intent for the ticket is unresolved, runs the
+  fresh-ref guard, and posts a marker comment; `record`/`failed` close it
+  out after the `fleet_dispatch` call. A start push lost to a 5xx then
+  leaves a record instead of a ghost task, and a retry cannot
+  double-dispatch. Use it around every dispatch.
+- `scripts/ci-sweep-cancelled.sh [-y]`: finds cancelled ci runs on open PR
+  head SHAs and reruns them (dry run by default). A cancelled required
+  check blocks auto-merge the same as a red one, and nothing retries it.
 - `scripts/fleet-result-inspect.sh <task-id>`: fetches a dispatched
   task's result branch and prints its commits and diff scope vs `main`,
   for review before merging. Never trust an executor's own "gates green"
@@ -183,12 +226,15 @@ connection, a pushed-but-broken main).
   Run `fleet-result-inspect.sh` first: this script does not pause for
   review, it assumes you already decided the scope is correct.
   `FLEET_MERGE_SKIP_GATES=1` skips the local `gates.sh` run and lets the
-  PR's required checks be the gate. Use it only when the tree being
-  merged is byte-identical to one that already passed the full gates
-  this session (the common case: the orchestrator gated the result
-  branch minutes earlier); the cost is learning about a red PR from CI
-  instead of immediately. Never combine it with a conflict resolution
-  or any manual edit to the branch.
+  PR's required checks be the gate; the cost is learning about a red PR
+  from CI instead of immediately. The precondition is mechanical:
+  `gates.sh` writes a receipt keyed by tree hash on every full
+  clean-tree run, and the merge script refuses the skip unless the
+  history about to be pushed has a receipt younger than 24 h. An amend,
+  conflict resolution, or manual edit changes the tree and voids the
+  receipt: rerun the gates. The script also runs `assert-gh-auth.sh`
+  first and `assert-clean-authorship.sh` on the rewritten history before
+  it pushes.
 - `scripts/verify-dispatch-gates.sh <ref> <scratchpad-dir>`: the tier-1
   gate check behind the `verify-dispatch` skill: an isolated worktree
   outside the repo, a cold `CARGO_TARGET_DIR`, and the full workspace
@@ -231,6 +277,17 @@ as a precondition, not after the damage.
   SHA read earlier in the session goes stale the moment another PR merges,
   and dispatching it silently rebuilds on a superseded tree.
   `ALLOW_STALE_REF=1` to dispatch an intentionally older ref.
+- `scripts/guards/assert-gh-auth.sh [hostname]`: exits non-zero when gh
+  cannot complete an authenticated API call. Run it before any landing
+  sequence: tokens die mid-session, and a failure found at push time
+  strands committed work. `fleet-result-merge.sh` runs it first.
+- `scripts/guards/assert-clean-authorship.sh <ref> [email]`: exits
+  non-zero if any commit on `<ref>` not yet on origin/main has an author,
+  committer, or Signed-off-by other than the expected identity (default:
+  `git config user.email`), or carries an AI attribution trailer. The
+  merge script runs it after its rewrite; run it yourself after any
+  manual amend or script-bypassing merge. A wrong identity on protected
+  `main` cannot be fixed later.
 
 ### Writing gate and poll shell
 
@@ -302,6 +359,10 @@ processed as if it were done.
   the epic issue body), and regenerate any "Wave N landed" claim from a
   live `gh pr list --json number,state,mergedAt` query over that wave's PR
   numbers, never from memory of which MERGED notifications fired.
+- `scripts/epic-status.sh <epic>` performs this reconciliation as one
+  command; run it on every tick instead of hand-rolling the queries.
+- Wrap every dispatch in `scripts/fleet-dispatch-intent.sh`: `intent`
+  before the `fleet_dispatch` call, `record`/`failed` after.
 
 ## Commits
 
@@ -372,3 +433,17 @@ file.
 - Stay inside the crates your task names. The workspace root Cargo.toml,
   CI config, and other crates are out of scope unless the task says
   otherwise.
+
+## Editing and hygiene
+
+- Edit repo files with the Edit/Write tools, never `cat <<EOF` or python
+  heredocs run through Bash: heredoc writes bypass the post-edit hooks
+  and leave no auditable diff in the session. Heredocs are fine for
+  scratchpad files.
+- Parallel agents (fleet or local fan-out): derive every scratch path
+  from your own task or agent id (`<scratchpad>/<agent-id>/...`), never a
+  bare shared filename. Agents that share a name overwrite each other
+  mid-task.
+- Never paste live credentials into the conversation, and flag it in your
+  report if the user does: transcripts persist on disk and later agents
+  read them. Point at a keychain entry or environment variable instead.

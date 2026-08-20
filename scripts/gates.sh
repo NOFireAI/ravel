@@ -133,4 +133,20 @@ if [[ ${want_features} -eq 1 ]]; then
   run_feature_lane flight-sql -p ravel-server -p ravel-sql
 fi
 
+# --- Gates-pass receipt ---------------------------------------------------
+# Record the tree this run passed. fleet-result-merge.sh honors
+# FLEET_MERGE_SKIP_GATES=1 only for a tree with a receipt here. Keyed by
+# TREE hash because the merge path's authorship/squash rewrite changes
+# commit ids but not content. Receipts live in the shared common dir (one
+# file per tree) so worktrees see each other's runs and concurrent
+# sessions never clobber each other. Written only for a full (unscoped)
+# run on a clean tree; a scoped or dirty run does not prove the tree.
+if [[ ${#crate_args[@]} -eq 0 && -z "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  receipt_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd)/gates-pass"
+  mkdir -p "${receipt_dir}"
+  gated_tree="$(git rev-parse 'HEAD^{tree}')"
+  date -u +%Y-%m-%dT%H:%M:%SZ >"${receipt_dir}/${gated_tree}"
+  echo "gates.sh: receipt written for tree ${gated_tree}"
+fi
+
 echo "All gates passed."

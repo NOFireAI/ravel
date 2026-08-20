@@ -69,9 +69,36 @@ named crates plus every crate that depends on them). The commit that
 gets gated must already be formatted; never append a formatting-only
 fixup commit after a failed --check.
 Commit with trailer "Refs: #N".
+Self-check before the commit (see the checklist below): no tool-call
+artifacts in files, no debug_assert-only guards, generated docs
+regenerated, tests demonstrated failing, no stray files staged.
 Report: <what the orchestrator needs to merge: deviations, counts,
 ambiguities found>.
 ```
+
+## Self-check before the commit
+
+Adversarial checkpoint review runs on every result branch before merge,
+and the same defect classes keep coming back as extra review/fix rounds.
+Each item below has blocked a real result branch. Put the self-check line
+in every spec; the executor runs it against its own diff right before the
+commit:
+
+- **Tool-call artifacts in files**: a pasted tool result, a stray
+  transcript fragment, an editor conflict marker, or a placeholder left
+  in committed content. `git diff --staged` and read your own hunks.
+- **`debug_assert`-only guards**: a safety check that compiles out of
+  release builds is not a guard. If the condition matters in production,
+  it is a runtime check with a typed error.
+- **Generated docs**: if the change touches anything a doc generator
+  derives (counts, tables, indexes), regenerate against YOUR tree and
+  commit the output in the same commit. A hand-edit of generated output
+  is undone at the next regeneration.
+- **Vacuous tests**: the prove-the-test skill's rule applies to you -
+  demonstrate the new test failing against the pre-fix code and name the
+  flipped line in your report. A test that cannot fail proves nothing.
+- **Stray files**: nothing staged that the deliverables do not name
+  (scratch scripts, logs, `__pycache__/`, editor droppings).
 
 ## Executor test scope
 
