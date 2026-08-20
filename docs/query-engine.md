@@ -411,8 +411,9 @@ skew, and federation tests. The coordinator caller that actually dispatches a
 Logs/Alerts/Audit/Spans distributed *search* is the SQL surface (log and trace
 search runs through the `logs`/`alerts`/`audit`/`spans` tables, not PromQL); the
 PromQL engine's own fetch/federation flow drives `Signal::Metrics` only today.
-The SQL-lane distributed scan is a separate, not-yet-landed step and is not
-described here.
+The SQL-lane distributed scan that drives that log and trace search is a
+separate step, now landed but not yet wired into a running server; see "The
+SQL-lane distributed scan" below.
 
 ### The log/span coordinator merge: order-independent, no dedup
 
@@ -460,6 +461,40 @@ Because each segment is self-contained, a resource-attribute-only exclusion
 evaluates identically wherever the segment is read, including when one stream's
 segments straddle two slices — proven by an erasure property test that diffs a
 distributed slice set against a local read of the same segments.
+
+### The SQL-lane distributed scan (logs, alerts, audit, spans)
+
+The two sections above describe the engine-level (queryfrag) machinery. The SQL
+surface has its own distributed scan that drives log and trace *search* over the
+`logs`, `alerts`, `audit`, and `spans` tables (ADR-0071 task T6, shipped as T6a
+#326 for the RLOG family and T6b #327 for spans;
+`crates/ravel-sql/src/distributed_rlog.rs`). It fans a table scan out to worker
+slices instead of scanning the local snapshot, then merges the per-slice streams
+at the coordinator.
+
+It reproduces the same total-order, no-dedup merge rule the queryfrag lane uses,
+one layer up in the DataFusion plan. Each worker returns its slice as one
+globally-sorted partition under the table's total-order key, and the coordinator
+runs a `SortPreservingMergeExec` under that key with **nothing above it** — no
+dedup node, no distinct. Logs, alerts, audit, and spans have no query-time dedup
+(`docs/consistency-model.md`, ADR-0051 section 5), so every row every slice
+returns stays visible, exactly as `merge_log_records`/`merge_spans` do in the
+queryfrag lane. The scan machinery (`DistributedSliceScanExec`, the merge
+assembly, byte accounting, schema validation) is signal-neutral and shared
+across all four tables; the only per-signal surface is each table's ordering-key
+column list. The slice-ticket plumbing (`WorkerSlice`, `WorkerSliceClient`,
+`plan_distributed_slices`) is reused unchanged from the metrics SQL lane, since
+a slice ticket pins a snapshot subset and carries no signal discriminator.
+
+Reachability: the distributed scan is installed on a table provider through each
+provider's `with_distributed_scan` (`LogsTableProvider` and the
+alerts/audit/spans siblings) and is exercised end to end by the acceptance tests
+(`crates/ravel-sql/tests/flight_distributed.rs`) driving `provider.scan(..)`. It
+is **not yet wired into a running server's coordinator and worker paths**: the
+server-side coordinator that installs the distributed context from
+`get_flight_info_statement`, and the worker `do_get` slice-fragment branch that
+runs each provider's `worker_fragment`, are still later wiring. The SQL lane
+exists and is tested, but no live server binary reaches it yet.
 
 ### Budgets and the fault matrix
 
