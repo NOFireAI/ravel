@@ -59,8 +59,8 @@ key to feed into `segment inspect` or `commit decode`.
 
 ![RSEG layout](../diagrams/rseg-layout.svg)
 
-Every segment is RSEG v6. ADR-0027 leaves one supported version at a time,
-and ADR-0047 moved it from v5 to v6. The command is:
+Every segment is RSEG v7. ADR-0027 leaves one supported version at a time,
+and ADR-0092 moved it from v6 to v7. The command is:
 
 ```sh
 cargo run -p ravel-cli -- segment inspect \
@@ -68,15 +68,15 @@ cargo run -p ravel-cli -- segment inspect \
 ```
 
 ```
-total_size: 949
-trailer_offset: 933
-version: 6
-footer_offset: 699
-tenant_hash: c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5
-shard: 5
-writer_id: golden-v5-writer
-writer_epoch: 5
-writer_seq: 50
+total_size: 924
+trailer_offset: 908
+version: 7
+footer_offset: 660
+tenant_hash: c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7
+shard: 7
+writer_id: golden-v7-writer
+writer_epoch: 7
+writer_seq: 70
 min_event_ts_ns: 1650000000000000000
 max_event_ts_ns: 1650000000000000758
 min_ingest_ts_ns: -2000
@@ -85,26 +85,28 @@ sample_count: 15
 series_count (footer): 9
 base_created_unix_ns: 219
 level: 1
+input_set_hash: 4747474747474747474747474747474747474747474747474747474747474747
 part_index: 2
 sections:
-  kind=1 name=LABEL_DICT offset=0 len=88 uncompressed_len=89 comp=2
-  kind=5 name=SERIES_IDS offset=88 len=148 uncompressed_len=148 comp=0
-  kind=6 name=SERIES_META offset=236 len=117 uncompressed_len=200 comp=2
-  kind=3 name=TS_PAGES offset=353 len=147 uncompressed_len=147 comp=0
-  kind=4 name=VAL_PAGES offset=504 len=99 uncompressed_len=99 comp=0
-  kind=7 name=HIST_PAGES offset=603 len=96 uncompressed_len=96 comp=0
+  kind=1 name=LABEL_DICT offset=0 len=106 uncompressed_len=111 comp=2
+  kind=5 name=SERIES_IDS offset=106 len=148 uncompressed_len=148 comp=0
+  kind=6 name=SERIES_META offset=254 len=116 uncompressed_len=200 comp=2
+  kind=3 name=TS_PAGES offset=370 len=75 uncompressed_len=75 comp=0
+  kind=4 name=VAL_PAGES offset=448 len=75 uncompressed_len=75 comp=0
+  kind=7 name=HIST_PAGES offset=523 len=96 uncompressed_len=96 comp=0
+  kind=10 name=EXEMPLARS offset=619 len=41 uncompressed_len=41 comp=0
 schema_count (derived): 1
   schema[0]: __name__,inst,job
 series_count (decoded): 9
 series:
-  series_id=00000000000000000000000000000000 labels=__name__=golden_v5,inst=i0,job=job0 sample_count=1 min_ts_ns=1650000000000000000 max_ts_ns=1650000000000000000 value_kind=HIST_SPANS run_count=1
-    run[0] created_unix_ns=219 writer_epoch=2 writer_seq=3 sample_count=1 ts_range=[353, 368) hist_range=[603, 635)
+  series_id=00000000000000000000000000000000 labels=__name__=golden_v7,inst=i0,job=job0 sample_count=1 min_ts_ns=1650000000000000000 max_ts_ns=1650000000000000000 value_kind=HIST_SPANS run_count=1
+    run[0] created_unix_ns=219 writer_epoch=2 writer_seq=3 sample_count=1 ts_range=[370, 377) hist_range=[523, 555)
     hist[0]: ts_ns=1650000000000000000 scale=2 zero_threshold=0.000001 sum=0.125 reset_hint=UNKNOWN
       count_kind=INT zero_count=1 count=4
       positive: spans=[(0, 2)] counts=[2,1]
       negative: spans=[] counts=[]
-  series_id=010000000000010000000100000001b3 labels=__name__=golden_v5,inst=i1,job=job1 sample_count=2 min_ts_ns=1650000000000000001 max_ts_ns=1650000000000000751 value_kind=VAL_SCALAR run_count=1
-    run[0] created_unix_ns=220 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[368, 385) val_range=[504, 522)
+  series_id=010000000000010000000100000001b3 labels=__name__=golden_v7,inst=i1,job=job1 sample_count=2 min_ts_ns=1650000000000000001 max_ts_ns=1650000000000000751 value_kind=VAL_SCALAR run_count=1
+    run[0] created_unix_ns=220 writer_epoch=2 writer_seq=3 sample_count=2 ts_range=[377, 386) val_range=[448, 460)
   ... (7 more series)
 ```
 
@@ -115,8 +117,9 @@ Field by field:
   the very end gives the footer's length and checksum. A reader therefore
   needs one suffix GET to find and validate the footer before it fetches
   anything else.
-- `version`: the trailer format version, always `5`. A non-5 version (a
-  stray pre-release object) gets a typed error; Ravel never half-parses it.
+- `version`: the trailer format version, always `7`. A non-7 version (a
+  stray pre-release object, including a retired v6) gets a typed error; Ravel
+  never half-parses it.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
   identity components embedded in the object's key and its commit token. They
   let you confirm that a segment and a commit token or record agree on what

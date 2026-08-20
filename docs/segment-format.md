@@ -1,11 +1,13 @@
-# RSEG v6: Ravel Segment Format (metrics)
+# RSEG v7: Ravel Segment Format (metrics)
 
 Persistent contract. ADR-0027 leaves exactly one supported version until the
-first public release: v6. The reader accepts trailer `version = 6` only;
-versions 1 through 5 fail closed with the same typed `UnsupportedVersion`
+first public release: v7. The reader accepts trailer `version = 7` only;
+versions 1 through 6 fail closed with the same typed `UnsupportedVersion`
 error as any unknown future version. Any change to the layout bumps the
 version and retires the previous one in the same change (an ADR plus a
-version bump, never an in-place edit under the same number).
+version bump, never an in-place edit under the same number). v7 (ADR-0092)
+retired v6 read and write support in the same change that introduced it, so a
+stray v6 object is rejected, never half-parsed.
 
 **Version lifecycle and migration (ADR-0066, normative).** RSEG is a Class A
 bulk data-object format. Until the first public release, ADR-0027's
@@ -30,15 +32,27 @@ panic. No `unsafe`. All integers little-endian. "varint" means
 protobuf-style LEB128; signed values use zigzag.
 
 > History (v1-v4 were retired as readable/writable versions by ADR-0027,
-> and v5 by ADR-0047): the v1 baseline and its row-major catalog; the v2
-> columnar catalog (ADR-0027); native histograms (ADR-0017); the multi-run
-> compaction layout (ADR-0018); and the sparse id index and chunked catalog
-> (ADR-0026). v5 was the union of those layouts. v6 is v5 plus the optional
-> EXEMPLARS section (ADR-0047) and changes nothing else: every v5 grammar
-> below is unchanged, and an object carrying no exemplars differs from its
-> v5 equivalent only in the trailer's version field. This document is the
-> self-contained specification of v6; earlier versions live only in those
-> ADRs.
+> v5 by ADR-0047, and v6 by ADR-0092): the v1 baseline and its row-major
+> catalog; the v2 columnar catalog (ADR-0027); native histograms (ADR-0017);
+> the multi-run compaction layout (ADR-0018); the sparse id index and chunked
+> catalog (ADR-0026); and the optional EXEMPLARS section (v6, ADR-0047). v6 was
+> the union of those layouts. v7 is v6 plus three additive changes from
+> ADR-0092, none of which alter how a v6-shaped object is laid out:
+>
+> - an optional per-sample dedup provenance extension appended to the
+>   whole-section SERIES_META, present only when a run merged several writes'
+>   samples (decision 1);
+> - two value page encodings, VAL_ALP (18) and VAL_GCD_DELTA_FOR (19), and one
+>   timestamp encoding, TS_GCD_I64 (2), each selected per page against the prior
+>   encoding and kept only when smaller (decision 6);
+> - a run's first timestamp stored as a delta from the run minimum, and
+>   single-sample raw-`f64` value pages that drop the 8-byte alignment pad
+>   (decision 4).
+>
+> An object with no merged runs and no page landing on a new encoding differs
+> from its v6 equivalent only in the trailer's version field and the two
+> page-level rules above. This document is the self-contained specification of
+> v7; earlier versions live only in those ADRs.
 
 ![RSEG object byte layout](diagrams/rseg-layout.svg)
 
@@ -52,7 +66,7 @@ protobuf-style LEB128; signed values use zigzag.
 | trailer (16 bytes):                        |
 |   footer_len:   u32                        |
 |   footer_crc32c:u32                        |
-|   version:      u16   (= 6)                |
+|   version:      u16   (= 7)                |
 |   signal:       u8    (1 = metrics)        |
 |   reserved:     u8    (= 0)                |
 |   magic:        [u8;4] = "RSG1"            |
@@ -63,14 +77,14 @@ protobuf-style LEB128; signed values use zigzag.
 LE), version (u16 LE), signal, reserved, magic. Every trailer byte except
 the crc field itself is covered (ADR-0010 §4). `magic` identifies the format
 family, not a specific layout; the version field selects the layout and is
-covered by `footer_crc32c`, so a reader that meets any non-6 version fails
+covered by `footer_crc32c`, so a reader that meets any non-7 version fails
 closed with `UnsupportedVersion`, never a silent misdecode.
 
 ### Reader protocol
 
 1. Reject objects smaller than 16 bytes as Corrupted.
 2. Suffix-GET 64 KiB (or the whole object if smaller). Verify magic,
-   `version == 6`, signal, reserved.
+   `version == 7`, signal, reserved.
 3. Require `footer_len > 0` and `16 + footer_len <= total_size`; otherwise
    Corrupted. If the suffix does not cover the footer, issue one more ranged
    GET.
@@ -273,8 +287,8 @@ A run may carry an explicit per-sample dedup key
 sharing its run-wide triple (blocks 5-7) plus array position. This is what a
 run-merged L1 run needs, since merging several writes' samples into one run
 destroys the array-position reconstruction of the fourth key element. Every
-object an L0 flush or a v6 verbatim (non-run-merging) compaction produces omits
-these columns entirely.
+object an L0 flush produces, and any write that does not merge runs, omits these
+columns entirely; absence is the canonical "no provenance" representation.
 
 The columns are **optional per run**, and their absence costs zero bytes: when
 no run in the object carries them, SERIES_META ends at block 16 exactly as
@@ -327,10 +341,10 @@ the sections themselves. The stride is `K = 512` for both the sparse-id index
 and the meta-chunk grouping: every Kth id is indexed, and every K series form
 one chunk.
 
-Below the threshold a v6 object carries the kind-6 catalog verbatim and its
+Below the threshold a v7 object carries the kind-6 catalog whole and its
 grammar is identical to the pre-sparse compaction layout byte for byte, so a
-small L0 object with no exemplars pays nothing for being v6 beyond the
-trailer version field.
+small L0 object with no exemplars and no merged runs pays nothing for being v7
+beyond the trailer version field.
 
 ### SERIES_IDX (kind 8, uncompressed body)
 
@@ -410,9 +424,9 @@ point-probe of any series is bit-identical to that series' slice of it.
 
 ## EXEMPLARS (kind 10, uncompressed body)
 
-New in v6 (ADR-0047). Optional: present iff at least one sample in the
-object carried an exemplar. Absence is always legal and means the object
-has no exemplars.
+Added in v6 (ADR-0047), unchanged in v7. Optional: present iff at least one
+sample in the object carried an exemplar. Absence is always legal and means the
+object has no exemplars.
 
 ```
 count: u32                    (record count)
@@ -586,12 +600,20 @@ records ending exactly at the page payload end; nonzero reserved flag bits.
 
 ### VAL_RAW_F64 alignment
 
-The VAL_PAGES section `offset` is congruent to 0 mod 8, and every VAL_RAW_F64
-(enc 17) page's payload start (page offset + 6) is congruent to 0 mod 8
-relative to the section start, so raw f64 payloads are eligible for aligned
+The VAL_PAGES section `offset` is congruent to 0 mod 8, and every multi-sample
+VAL_RAW_F64 (enc 17) page's payload start (page offset + 6) is congruent to 0
+mod 8 relative to the section start, so raw f64 payloads are eligible for aligned
 zero-copy views (docs/adrs/0013). The writer inserts `0x00` pad before such a
 page's header and records it in that run's `val_page_gap`. TS and HIST pages
 are never aligned (varint/field-decoded, never viewed directly).
+
+Single-sample no-pad rule (ADR-0092 decision 4). A raw-`f64` VAL page holding
+exactly one sample carries no alignment pad: a one-sample page never serves an
+Arrow zero-copy view (the query path materializes it), so the pad it would pay
+buys nothing. Such a page's `val_page_gap` is zero and its payload start is not
+required to be 8-aligned. Multi-sample raw pages are aligned as above. This is a
+pure byte saving; readers do not depend on the alignment of any raw page they
+decode field by field.
 
 ## Checksums
 
@@ -608,9 +630,13 @@ Every byte a reader interprets is checksum-verified before use (ADR-0010 §4).
   covered). A whole SERIES_META_CHUNKS read verifies the section crc; a
   single-frame read verifies the frame's own crc32c from the directory.
 - The page crc guards series binding, enc, comp, and payload, checked on
-  first touch. Pages copied verbatim by the compactor keep their original
-  per-page crc (a verbatim copy alters none of `series_id || enc || comp ||
-  payload`).
+  first touch. A compacted metrics page is no longer a verbatim copy: under v7
+  (ADR-0092 decision 1) L1 compaction merges every contributing run of a series
+  into one run and re-encodes its pages, so page CRCs are recomputed rather than
+  carried. (An L0 flush and any path that does copy a page byte-for-byte still
+  keeps the original per-page crc, since a verbatim copy alters none of
+  `series_id || enc || comp || payload`; the metrics compaction path just no
+  longer takes that shortcut.)
 - EXEMPLARS carries no crc beyond its section crc32c, and that is sufficient
   because every read of it decompresses and verifies the whole section
   first: there is no ranged fetch into the section, so there is no partial

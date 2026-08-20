@@ -19,7 +19,8 @@ exemplar is a sampled signal, not a complete record of every request.
 ## How Ravel stores an exemplar
 
 Ravel stores exemplars in the RSEG `EXEMPLARS` section (kind 10). The section
-is new in RSEG v6 (ADR-0047). Each object holds at most one `EXEMPLARS`
+was added in RSEG v6 (ADR-0047) and is unchanged in the current v7 (ADR-0092).
+Each object holds at most one `EXEMPLARS`
 section. The section is present only when at least one sample in the object
 carried an exemplar. Absence is always legal and means the object has no
 exemplars.
