@@ -308,6 +308,20 @@ pub struct RunEntry {
     pub hist_page: (u64, u64),
 }
 
+/// One sample's ADR-0010 §5 dedup key, carried explicitly by a run that merged
+/// several writes' samples (ADR-0092 decision 1). The four fields ARE the
+/// comparison tuple, in comparison order: `(created_unix_ns, writer_epoch,
+/// writer_seq, in_page_index)`, greatest wins. Every object an L0 flush or a
+/// v6 verbatim compaction produces omits these columns entirely; the run-wide
+/// provenance on [`RunEntry`] plus array position reconstructs the key there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleProvenance {
+    pub created_unix_ns: i64,
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    pub in_page_index: u32,
+}
+
 /// A decoded v4 SERIES_META entry: `entry` is the folded per-series view
 /// callers keyed by
 /// [`SeriesEntry`] already expect (`sample_count` summed over every run,
@@ -315,10 +329,18 @@ pub struct RunEntry {
 /// `hist_page` always `(0, 0)` sentinels since a multi-run series has no
 /// single page range at the series level); `runs` is the per-run view the
 /// page fetcher needs to actually read TS/VAL/HIST bytes.
+///
+/// `per_sample_provenance` carries the optional per-sample dedup columns
+/// (ADR-0092 decision 1): empty when no run in the object carries them (the
+/// only shape any object in existence has today), otherwise one entry per run
+/// positionally parallel to `runs`, each `None` (run keeps its run-wide
+/// provenance) or `Some(column)` with one [`SampleProvenance`] per sample of
+/// that run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesEntryV4 {
     pub entry: SeriesEntry,
     pub runs: Vec<RunEntry>,
+    pub per_sample_provenance: Vec<Option<Vec<SampleProvenance>>>,
 }
 
 pub(crate) fn find_section(footer: &Footer, kind: u32) -> Option<&Section> {
@@ -1358,6 +1380,12 @@ struct SeriesMetaTailV4 {
     value_kind: Vec<ValueKind>,
     run_count: Vec<u32>,
     runs: Vec<RunEntry>,
+    /// Optional per-sample dedup provenance columns (ADR-0092 decision 1),
+    /// run-major and parallel to `runs`: empty when the SERIES_META carries no
+    /// provenance extension (the only shape any object in existence has), else
+    /// `run_total` long with a `None` per run that keeps its run-wide
+    /// provenance and a `Some(column)` per run that carries per-sample keys.
+    per_sample_provenance: Vec<Option<Vec<SampleProvenance>>>,
 }
 
 /// SERIES_META blocks 3-16: `value_kind` and `run_count` (series-major, identical shape to v3's
@@ -1624,6 +1652,18 @@ fn parse_series_meta_tail_v4(
     }
     let hist_page = reconstruct_ranges_v2(&hist_gap, &hist_len, hist_section_len)?;
 
+    // Optional per-sample provenance extension (ADR-0092 decision 1). Absent
+    // costs zero bytes: the section ends exactly at block 16 for every object
+    // an L0 flush or a v6 verbatim compaction produces, and this branch never
+    // runs. Present, five more block_len-prefixed blocks (presence plus four
+    // `encode_i64` columns) follow, consumed here so the trailing-bytes check
+    // below still catches genuine garbage past the extension.
+    let per_sample_provenance = if *pos < meta_bytes.len() {
+        parse_provenance_extension(meta_bytes, pos, footer, &sample_count, limits)?
+    } else {
+        Vec::new()
+    };
+
     if *pos != meta_bytes.len() {
         return Err(SegmentError::TrailingBytes);
     }
@@ -1672,7 +1712,127 @@ fn parse_series_meta_tail_v4(
         value_kind,
         run_count,
         runs,
+        per_sample_provenance,
     })
+}
+
+/// Decodes one `encode_i64` column block: a `block_len`-prefixed body whose
+/// first byte is the [`ravel_codec::encoding::Enc`] tag and whose remainder is
+/// the codec payload for exactly `count` values. Every codec/tag/length
+/// violation is a typed `ProvenanceColumnCodec`, never a panic.
+fn take_encoded_i64_block(
+    bytes: &[u8],
+    pos: &mut usize,
+    count: usize,
+) -> Result<Vec<i64>, SegmentError> {
+    let block = take_block(bytes, pos)?;
+    let (&enc_byte, payload) = block
+        .split_first()
+        .ok_or_else(|| SegmentError::ProvenanceColumnCodec("empty column block".into()))?;
+    let enc = ravel_codec::encoding::Enc::from_u8(enc_byte)
+        .map_err(|e| SegmentError::ProvenanceColumnCodec(e.to_string()))?;
+    ravel_codec::encoding::decode_i64(enc, payload, count)
+        .map_err(|e| SegmentError::ProvenanceColumnCodec(e.to_string()))
+}
+
+/// Parses the optional per-sample provenance extension (ADR-0092 decision 1),
+/// SERIES_META blocks 17-21: a run-major presence column (one 0/1 per run) then
+/// four sample-major `encode_i64` columns (`created_unix_ns` delta from
+/// `footer.base_created_unix_ns`, `writer_epoch`, `writer_seq`, in-page index)
+/// over the samples of the flagged runs, in run order. Returns a `run_total`-
+/// long vector parallel to the tail's `runs`: `None` for a run that keeps its
+/// run-wide provenance, `Some(column)` with one [`SampleProvenance`] per sample
+/// for a flagged run. Every violation is a typed error, never a panic or a
+/// silently wrong key.
+fn parse_provenance_extension(
+    meta_bytes: &[u8],
+    pos: &mut usize,
+    footer: &Footer,
+    sample_count: &[u32],
+    limits: ReaderLimits,
+) -> Result<Vec<Option<Vec<SampleProvenance>>>, SegmentError> {
+    let run_total = sample_count.len();
+    let presence = take_encoded_i64_block(meta_bytes, pos, run_total)?;
+
+    // Which runs carry a column, and how many sample entries the four columns
+    // hold in total. A run flagged present contributes its `sample_count`
+    // entries; a run not flagged contributes none.
+    let mut prov_sample_total: u64 = 0;
+    let mut any_present = false;
+    for (&flag, &sc) in presence.iter().zip(sample_count) {
+        match flag {
+            0 => {}
+            1 => {
+                any_present = true;
+                prov_sample_total = prov_sample_total
+                    .checked_add(u64::from(sc))
+                    .ok_or(SegmentError::FieldOverflow)?;
+            }
+            other => {
+                return Err(SegmentError::InvalidProvenancePresence(
+                    u64::try_from(other).unwrap_or(u64::MAX),
+                ));
+            }
+        }
+    }
+    // Absence is the canonical "no provenance" representation, so an extension
+    // that flags no run is a malformed object, not an empty-but-legal one.
+    if !any_present {
+        return Err(SegmentError::EmptyProvenanceExtension);
+    }
+
+    // Bound the live decode the same way the run-major columns are bounded:
+    // four i64 columns plus one 32-byte `SampleProvenance` per flagged sample.
+    let live_bytes = prov_sample_total
+        .checked_mul(4 * 8 + std::mem::size_of::<SampleProvenance>() as u64)
+        .ok_or(SegmentError::FieldOverflow)?;
+    if live_bytes > limits.max_section_uncompressed_bytes {
+        return Err(SegmentError::ProvenanceLiveBudgetExceeded {
+            live_bytes,
+            cap: limits.max_section_uncompressed_bytes,
+        });
+    }
+    let prov_total = to_usize(prov_sample_total)?;
+
+    let created_delta = take_encoded_i64_block(meta_bytes, pos, prov_total)?;
+    let epoch = take_encoded_i64_block(meta_bytes, pos, prov_total)?;
+    let seq = take_encoded_i64_block(meta_bytes, pos, prov_total)?;
+    let in_page_index = take_encoded_i64_block(meta_bytes, pos, prov_total)?;
+
+    let mut out: Vec<Option<Vec<SampleProvenance>>> = Vec::with_capacity(run_total);
+    let mut cursor = 0usize;
+    for (&flag, &sc) in presence.iter().zip(sample_count) {
+        if flag == 0 {
+            out.push(None);
+            continue;
+        }
+        let n = sc as usize;
+        let mut column = Vec::with_capacity(n.min(cap_prov(prov_total)));
+        for _ in 0..n {
+            let created = i64::try_from(
+                i128::from(footer.base_created_unix_ns) + i128::from(created_delta[cursor]),
+            )
+            .map_err(|_| SegmentError::ProvenanceBoundsOverflow)?;
+            let ipi =
+                u32::try_from(in_page_index[cursor]).map_err(|_| SegmentError::FieldOverflow)?;
+            column.push(SampleProvenance {
+                created_unix_ns: created,
+                writer_epoch: epoch[cursor] as u64,
+                writer_seq: seq[cursor] as u64,
+                in_page_index: ipi,
+            });
+            cursor += 1;
+        }
+        out.push(Some(column));
+    }
+    Ok(out)
+}
+
+/// Defensive pre-allocation cap for one run's provenance column, mirroring the
+/// codec crate's `cap`: trust the count for the common case but never reserve
+/// an unbounded amount from a single field.
+fn cap_prov(total: usize) -> usize {
+    total.min(1 << 16)
 }
 
 /// Footer-level cross-checks that need the fully parsed SERIES_META tail
@@ -1817,6 +1977,12 @@ pub(crate) fn decode_catalog_v4_from_decoded(
 
         let run_count = tail.run_count[i] as usize;
         let runs: Vec<RunEntry> = tail.runs[roff..roff + run_count].to_vec();
+        let per_sample_provenance: Vec<Option<Vec<SampleProvenance>>> =
+            if tail.per_sample_provenance.is_empty() {
+                Vec::new()
+            } else {
+                tail.per_sample_provenance[roff..roff + run_count].to_vec()
+            };
         roff += run_count;
 
         let mut sample_count: u32 = 0;
@@ -1843,6 +2009,7 @@ pub(crate) fn decode_catalog_v4_from_decoded(
                 hist_page: (0, 0),
             },
             runs,
+            per_sample_provenance,
         });
     }
     Ok(entries)
@@ -1943,6 +2110,12 @@ pub fn decode_catalog_matching_v4(
     for i in 0..series_ids.len() {
         let run_count = tail.run_count[i] as usize;
         let run_slice = &tail.runs[roff..roff + run_count];
+        let prov_slice: &[Option<Vec<SampleProvenance>>] = if tail.per_sample_provenance.is_empty()
+        {
+            &[]
+        } else {
+            &tail.per_sample_provenance[roff..roff + run_count]
+        };
         roff += run_count;
 
         let Some(vals) = &value_ord[i] else {
@@ -1994,6 +2167,7 @@ pub fn decode_catalog_matching_v4(
                 hist_page: (0, 0),
             },
             runs: run_slice.to_vec(),
+            per_sample_provenance: prov_slice.to_vec(),
         });
     }
     Ok(entries)
@@ -2154,5 +2328,184 @@ mod dict_resolver_tests {
         // series on string equality, but the matcher path's ordinal
         // equality check (series_value_ord == matcher_ord) rejects it.
         assert_ne!(series_value_ord, matcher_ord);
+    }
+}
+
+/// Corrupt- and truncated-input coverage for the per-sample provenance
+/// extension parser (ADR-0092 decision 1): every malformed shape must yield a
+/// typed [`SegmentError`], never a panic and never a wrong key.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod provenance_extension_tests {
+    use super::{SampleProvenance, parse_provenance_extension, take_encoded_i64_block};
+    use crate::error::SegmentError;
+    use crate::reader::ReaderLimits;
+    use crate::varint::write_uvarint;
+    use ravel_proto::segment::v1::Footer;
+
+    /// One `encode_i64` column block: `block_len` varint, then the `Enc` tag
+    /// byte, then the codec payload -- the exact shape `push_encoded_i64_block`
+    /// writes and `take_encoded_i64_block` reads.
+    fn encoded_block(values: &[i64]) -> Vec<u8> {
+        let (enc, bytes) = ravel_codec::encoding::encode_i64(values);
+        let mut out = Vec::new();
+        write_uvarint(&mut out, (1 + bytes.len()) as u64);
+        out.push(enc.to_u8());
+        out.extend_from_slice(&bytes);
+        out
+    }
+
+    fn footer(base_created_unix_ns: i64) -> Footer {
+        Footer {
+            base_created_unix_ns,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn valid_extension_round_trips() {
+        // Two runs: the first flagged (2 samples), the second unflagged.
+        let sample_count = [2u32, 1];
+        let mut meta = encoded_block(&[1, 0]); // presence
+        meta.extend(encoded_block(&[5, 6])); // created delta (base 100 -> 105, 106)
+        meta.extend(encoded_block(&[7, 8])); // epoch
+        meta.extend(encoded_block(&[9, 10])); // seq
+        meta.extend(encoded_block(&[0, 1])); // in-page index
+
+        let mut pos = 0usize;
+        let out = parse_provenance_extension(
+            &meta,
+            &mut pos,
+            &footer(100),
+            &sample_count,
+            ReaderLimits::default(),
+        )
+        .expect("valid extension parses");
+        assert_eq!(pos, meta.len(), "parser consumes exactly the extension");
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0],
+            Some(vec![
+                SampleProvenance {
+                    created_unix_ns: 105,
+                    writer_epoch: 7,
+                    writer_seq: 9,
+                    in_page_index: 0,
+                },
+                SampleProvenance {
+                    created_unix_ns: 106,
+                    writer_epoch: 8,
+                    writer_seq: 10,
+                    in_page_index: 1,
+                },
+            ])
+        );
+        assert_eq!(out[1], None);
+    }
+
+    #[test]
+    fn presence_value_out_of_range_is_typed() {
+        let meta = encoded_block(&[2]); // presence value 2 is neither 0 nor 1
+        let mut pos = 0usize;
+        let err = parse_provenance_extension(
+            &meta,
+            &mut pos,
+            &footer(0),
+            &[3u32],
+            ReaderLimits::default(),
+        )
+        .expect_err("presence 2 must be rejected");
+        assert!(matches!(err, SegmentError::InvalidProvenancePresence(2)));
+    }
+
+    #[test]
+    fn all_zero_presence_is_typed() {
+        let meta = encoded_block(&[0]); // extension present but no run flagged
+        let mut pos = 0usize;
+        let err = parse_provenance_extension(
+            &meta,
+            &mut pos,
+            &footer(0),
+            &[3u32],
+            ReaderLimits::default(),
+        )
+        .expect_err("all-zero presence must be rejected");
+        assert!(matches!(err, SegmentError::EmptyProvenanceExtension));
+    }
+
+    #[test]
+    fn truncated_columns_are_typed() {
+        // presence flags one run of 3 samples, but only three of the four
+        // columns follow: the missing fourth block truncates.
+        let sample_count = [3u32];
+        let mut meta = encoded_block(&[1]);
+        meta.extend(encoded_block(&[0, 0, 0]));
+        meta.extend(encoded_block(&[0, 0, 0]));
+        meta.extend(encoded_block(&[0, 0, 0]));
+        let mut pos = 0usize;
+        let err = parse_provenance_extension(
+            &meta,
+            &mut pos,
+            &footer(0),
+            &sample_count,
+            ReaderLimits::default(),
+        )
+        .expect_err("a missing column must be a typed error");
+        // A typed SegmentError, never a panic (the assert above proves no
+        // panic; this pins the shape as a structural corruption error).
+        assert!(matches!(
+            err,
+            SegmentError::Truncated | SegmentError::SectionOutOfBounds | SegmentError::BadBlockLen
+        ));
+    }
+
+    #[test]
+    fn bad_enc_tag_is_typed() {
+        let mut meta = encoded_block(&[1]); // presence: one flagged run
+        // A hand-built column block whose Enc tag byte (0) is invalid.
+        let mut bad = Vec::new();
+        write_uvarint(&mut bad, 1); // block_len = 1 (just the tag)
+        bad.push(0u8); // invalid Enc tag
+        meta.extend(bad);
+        let mut pos = 0usize;
+        let err = parse_provenance_extension(
+            &meta,
+            &mut pos,
+            &footer(0),
+            &[1u32],
+            ReaderLimits::default(),
+        )
+        .expect_err("invalid enc tag must be rejected");
+        assert!(matches!(err, SegmentError::ProvenanceColumnCodec(_)));
+    }
+
+    #[test]
+    fn negative_in_page_index_is_typed() {
+        let sample_count = [1u32];
+        let mut meta = encoded_block(&[1]);
+        meta.extend(encoded_block(&[0])); // created delta
+        meta.extend(encoded_block(&[0])); // epoch
+        meta.extend(encoded_block(&[0])); // seq
+        meta.extend(encoded_block(&[-1])); // in-page index cannot be negative
+        let mut pos = 0usize;
+        let err = parse_provenance_extension(
+            &meta,
+            &mut pos,
+            &footer(0),
+            &sample_count,
+            ReaderLimits::default(),
+        )
+        .expect_err("negative in-page index must be rejected");
+        assert!(matches!(err, SegmentError::FieldOverflow));
+    }
+
+    #[test]
+    fn empty_block_body_is_typed() {
+        let mut meta = Vec::new();
+        write_uvarint(&mut meta, 0); // block_len = 0: no room for the Enc tag
+        let mut pos = 0usize;
+        let err = take_encoded_i64_block(&meta, &mut pos, 1)
+            .expect_err("an empty column block has no Enc tag");
+        assert!(matches!(err, SegmentError::ProvenanceColumnCodec(_)));
     }
 }

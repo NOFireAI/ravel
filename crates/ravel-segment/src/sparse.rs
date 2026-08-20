@@ -906,6 +906,12 @@ pub fn decode_catalog_v5_chunked(
                     hist_page: (0, 0),
                 },
                 runs,
+                // The sparse (chunked) SERIES_META form does not carry the
+                // per-sample provenance extension: the writer fails closed
+                // (`PerSampleProvenanceInSparse`) rather than emit a large
+                // object with provenance, so a decoded sparse object never has
+                // per-sample columns (ADR-0092 decision 1, this task's scope).
+                per_sample_provenance: Vec::new(),
             });
         }
         if voff != frame.value_ord.len() {

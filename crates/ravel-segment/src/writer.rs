@@ -21,6 +21,7 @@ use crate::format::{
 };
 use crate::gorilla::encode_gorilla_into;
 use crate::histogram::{HistogramValue, encode_histogram_record_into};
+use crate::reader::SampleProvenance;
 use crate::ts_delta::encode_ts_deltas_into;
 use crate::varint::write_uvarint;
 
@@ -178,6 +179,33 @@ pub struct SeriesInputV4 {
     pub series_id: SeriesId,
     pub labels: LabelSet,
     pub runs: Vec<RunInputV4>,
+}
+
+/// One run plus its optional per-sample dedup provenance column (ADR-0092
+/// decision 1). `run` is the ordinary pre-framed [`RunInputV4`]; `provenance`
+/// is `None` for a run that keeps its run-wide provenance (the only shape an
+/// L0 flush produces) or `Some(column)` with one [`SampleProvenance`] per
+/// sample, in the run's on-disk sample order, for a run that merged several
+/// writes' samples. When `Some`, `column.len()` must equal
+/// `run.sample_count`, or the write fails with
+/// `WriteError::PerSampleProvenanceLengthMismatch`.
+#[derive(Debug, Clone)]
+pub struct RunInputV7 {
+    pub run: RunInputV4,
+    pub provenance: Option<Vec<SampleProvenance>>,
+}
+
+/// One series' identity, labels, and ordered runs-with-provenance for a write
+/// through [`SegmentWriter::write_v7_with_provenance`]. Deliberately a separate
+/// type from [`SeriesInputV4`] so the ordinary compaction and L0 paths (and
+/// every existing caller that constructs [`SeriesInputV4`]) are untouched: the
+/// per-sample provenance capability is additive and only this input type
+/// carries it.
+#[derive(Debug)]
+pub struct SeriesInputV7 {
+    pub series_id: SeriesId,
+    pub labels: LabelSet,
+    pub runs: Vec<RunInputV7>,
 }
 
 /// Compaction-specific Footer provenance a caller supplies (ADR-0018).
@@ -360,23 +388,112 @@ struct AssembledV4Body {
 /// assembles (moved out of that method, unchanged, so `write_v4` and
 /// [`SegmentWriter::write_v5_with_exemplars`] share one assembly path).
 fn assemble_v4_body(
-    mut series: Vec<SeriesInputV4>,
+    series: Vec<SeriesInputV4>,
     identity: SegmentIdentity,
     ingest_bounds: IngestBounds,
     meta: CompactionMetaV4,
     exemplars: Vec<ExemplarInput>,
 ) -> Result<AssembledV4Body, WriteError> {
-    for s in &mut series {
-        s.runs.retain(|r| r.sample_count != 0);
-    }
-    series.retain(|s| !s.runs.is_empty());
+    assemble_v4_body_impl(series, None, identity, ingest_bounds, meta, exemplars)
+}
 
-    series.sort_unstable_by_key(|s| s.series_id.0);
-    if series
-        .windows(2)
-        .any(|w| w[0].series_id.0 == w[1].series_id.0)
-    {
-        return Err(WriteError::DuplicateSeriesId);
+/// The v4-grammar assembly core, with optional per-sample provenance columns
+/// (ADR-0092 decision 1). `provenance`, when `Some`, is parallel to `series`
+/// (one entry per series, itself one entry per run) in input order; it is
+/// normalized in lockstep with `series` (dropping zero-sample runs, sorting by
+/// series id then by run key) so a column always tracks its run. `None` is the
+/// common path shared by every existing writer and is byte-for-byte the
+/// pre-provenance assembly.
+fn assemble_v4_body_impl(
+    mut series: Vec<SeriesInputV4>,
+    provenance: Option<Vec<Vec<Option<Vec<SampleProvenance>>>>>,
+    identity: SegmentIdentity,
+    ingest_bounds: IngestBounds,
+    meta: CompactionMetaV4,
+    exemplars: Vec<ExemplarInput>,
+) -> Result<AssembledV4Body, WriteError> {
+    // Per-(series, run) provenance in the same order as `series` after
+    // normalization; empty when no run carries columns.
+    let mut prov_by_series: Vec<Vec<Option<Vec<SampleProvenance>>>> = Vec::new();
+    match provenance {
+        None => {
+            for s in &mut series {
+                s.runs.retain(|r| r.sample_count != 0);
+            }
+            series.retain(|s| !s.runs.is_empty());
+
+            series.sort_unstable_by_key(|s| s.series_id.0);
+            if series
+                .windows(2)
+                .any(|w| w[0].series_id.0 == w[1].series_id.0)
+            {
+                return Err(WriteError::DuplicateSeriesId);
+            }
+
+            for s in &mut series {
+                s.runs
+                    .sort_by_key(|r| (r.created_unix_ns, r.writer_epoch, r.writer_seq));
+            }
+        }
+        Some(prov) => {
+            if prov.len() != series.len() {
+                return Err(WriteError::PerSampleProvenanceLengthMismatch {
+                    provenance: prov.len(),
+                    samples: series.len(),
+                });
+            }
+            let mut paired: Vec<(SeriesInputV4, Vec<Option<Vec<SampleProvenance>>>)> =
+                series.into_iter().zip(prov).collect();
+
+            // Drop zero-sample runs, carrying each run's provenance with it.
+            for (s, p) in &mut paired {
+                if p.len() != s.runs.len() {
+                    return Err(WriteError::PerSampleProvenanceLengthMismatch {
+                        provenance: p.len(),
+                        samples: s.runs.len(),
+                    });
+                }
+                let rp: Vec<(RunInputV4, Option<Vec<SampleProvenance>>)> =
+                    std::mem::take(&mut s.runs)
+                        .into_iter()
+                        .zip(std::mem::take(p))
+                        .filter(|(r, _)| r.sample_count != 0)
+                        .collect();
+                let (runs, kept): (Vec<_>, Vec<_>) = rp.into_iter().unzip();
+                s.runs = runs;
+                *p = kept;
+            }
+            paired.retain(|(s, _)| !s.runs.is_empty());
+
+            paired.sort_unstable_by_key(|(s, _)| s.series_id.0);
+            if paired
+                .windows(2)
+                .any(|w| w[0].0.series_id.0 == w[1].0.series_id.0)
+            {
+                return Err(WriteError::DuplicateSeriesId);
+            }
+
+            // Stable sort of runs by key, matching the plain path exactly, with
+            // provenance moved alongside.
+            for (s, p) in &mut paired {
+                let mut rp: Vec<(RunInputV4, Option<Vec<SampleProvenance>>)> =
+                    std::mem::take(&mut s.runs)
+                        .into_iter()
+                        .zip(std::mem::take(p))
+                        .collect();
+                rp.sort_by_key(|(r, _)| (r.created_unix_ns, r.writer_epoch, r.writer_seq));
+                let (runs, sorted): (Vec<_>, Vec<_>) = rp.into_iter().unzip();
+                s.runs = runs;
+                *p = sorted;
+            }
+
+            series = Vec::with_capacity(paired.len());
+            prov_by_series = Vec::with_capacity(paired.len());
+            for (s, p) in paired {
+                series.push(s);
+                prov_by_series.push(p);
+            }
+        }
     }
 
     for s in &series {
@@ -395,9 +512,15 @@ fn assemble_v4_body(
         }
     }
 
-    for s in &mut series {
-        s.runs
-            .sort_by_key(|r| (r.created_unix_ns, r.writer_epoch, r.writer_seq));
+    // Per-sample provenance is not yet supported in the sparse (chunked)
+    // SERIES_META form. Fail closed here rather than silently drop the columns
+    // during the sparse rebuild (which would re-parse the whole SERIES_META and
+    // reject its extension as trailing bytes anyway).
+    if !prov_by_series.is_empty()
+        && series.len() as u64 >= V5_SPARSE_THRESHOLD
+        && prov_by_series.iter().any(|s| s.iter().any(|r| r.is_some()))
+    {
+        return Err(WriteError::PerSampleProvenanceInSparse);
     }
 
     let series_count = u64::try_from(series.len()).map_err(|_| WriteError::TooManySeries)?;
@@ -474,6 +597,7 @@ fn assemble_v4_body(
 
     let series_meta_raw = build_series_meta_v4(
         &series,
+        &prov_by_series,
         &dict.occurrence_ordinals,
         min_event_ts_ns,
         base_created_unix_ns,
@@ -720,6 +844,73 @@ impl SegmentWriter {
         if body.series_count < V5_SPARSE_THRESHOLD {
             return Ok(finalize_v4_trailer(body, VERSION_V6));
         }
+        let base = finalize_v4_trailer(body, VERSION_V4);
+        crate::sparse::build_sparse_object(&base)
+    }
+
+    /// Writes a segment whose runs may carry per-sample dedup provenance
+    /// columns (ADR-0092 decision 1). A run with `provenance == None` is
+    /// byte-identical to what [`SegmentWriter::write_v5`] would emit for the
+    /// same [`RunInputV4`]; a run with `provenance == Some(column)` additionally
+    /// stores the four optional run-major provenance columns, and the emitted
+    /// SERIES_META gains the extension only when at least one run carries them
+    /// (absent columns cost zero bytes).
+    ///
+    /// The read path for these columns is complete (reader plus query wiring);
+    /// no production caller emits them yet (issue #315 wires the compactor).
+    /// The columns are supported only in the whole-section SERIES_META form:
+    /// an object large enough to take the sparse (chunked) form fails closed
+    /// with `WriteError::PerSampleProvenanceInSparse` rather than silently
+    /// dropping the columns.
+    pub fn write_v7_with_provenance(
+        series: Vec<SeriesInputV7>,
+        identity: SegmentIdentity,
+        ingest_bounds: IngestBounds,
+        meta: CompactionMetaV4,
+        exemplars: Vec<ExemplarInput>,
+    ) -> Result<WrittenSegment, WriteError> {
+        // Split each SeriesInputV7 into the ordinary SeriesInputV4 shape plus a
+        // parallel per-run provenance column, so the whole assembly path stays
+        // the one shared with the L0 and verbatim-compaction writers.
+        let mut plain = Vec::with_capacity(series.len());
+        let mut provenance = Vec::with_capacity(series.len());
+        for s in series {
+            let mut runs = Vec::with_capacity(s.runs.len());
+            let mut prov = Vec::with_capacity(s.runs.len());
+            for r in s.runs {
+                if let Some(column) = &r.provenance
+                    && column.len() != r.run.sample_count as usize {
+                        return Err(WriteError::PerSampleProvenanceLengthMismatch {
+                            provenance: column.len(),
+                            samples: r.run.sample_count as usize,
+                        });
+                    }
+                runs.push(r.run);
+                prov.push(r.provenance);
+            }
+            plain.push(SeriesInputV4 {
+                series_id: s.series_id,
+                labels: s.labels,
+                runs,
+            });
+            provenance.push(prov);
+        }
+
+        let body = assemble_v4_body_impl(
+            plain,
+            Some(provenance),
+            identity,
+            ingest_bounds,
+            meta,
+            exemplars,
+        )?;
+        if body.series_count < V5_SPARSE_THRESHOLD {
+            return Ok(finalize_v4_trailer(body, VERSION_V6));
+        }
+        // The sparse (chunked) SERIES_META form does not carry the provenance
+        // extension yet. `assemble_v4_body_impl` already rejected a
+        // provenance-carrying object here, so reaching this point means no run
+        // carried columns and the sparse rebuild is safe.
         let base = finalize_v4_trailer(body, VERSION_V4);
         crate::sparse::build_sparse_object(&base)
     }
@@ -1211,6 +1402,7 @@ fn append_hist_run_page_v4(page: &[u8], hist_pages: &mut Vec<u8>) -> Result<(), 
 #[allow(clippy::too_many_arguments)]
 fn build_series_meta_v4(
     series: &[SeriesInputV4],
+    provenance: &[Vec<Option<Vec<SampleProvenance>>>],
     occurrence_ordinals: &[u32],
     footer_min_event_ts_ns: i64,
     footer_base_created_unix_ns: i64,
@@ -1243,7 +1435,20 @@ fn build_series_meta_v4(
 
     let mut next_occurrence = occurrence_ordinals.iter();
 
-    for s in series {
+    // Optional per-sample provenance extension accumulators (ADR-0092
+    // decision 1). `presence` is one 0/1 per run; the four value columns are
+    // sample-major over the flagged runs in run order. Populated only when
+    // `provenance` is non-empty and at least one run carries a column, so an
+    // object with no columns appends nothing and stays byte-identical.
+    let has_provenance = !provenance.is_empty();
+    let mut prov_presence: Vec<i64> = Vec::new();
+    let mut prov_created_delta: Vec<i64> = Vec::new();
+    let mut prov_epoch: Vec<i64> = Vec::new();
+    let mut prov_seq: Vec<i64> = Vec::new();
+    let mut prov_in_page_index: Vec<i64> = Vec::new();
+    let mut any_provenance = false;
+
+    for (series_index, s) in series.iter().enumerate() {
         let label_count = s.labels.len();
         let mut name_ords: Vec<u32> = Vec::with_capacity(label_count);
         let mut value_ords: Vec<u32> = Vec::with_capacity(label_count);
@@ -1290,7 +1495,34 @@ fn build_series_meta_v4(
         let run_count = u32::try_from(s.runs.len()).map_err(|_| WriteError::TooManyRuns)?;
         write_uvarint(&mut col_run_count, u64::from(run_count));
 
-        for r in &s.runs {
+        for (run_index, r) in s.runs.iter().enumerate() {
+            if has_provenance {
+                let column = provenance[series_index][run_index].as_ref();
+                match column {
+                    Some(column) => {
+                        if column.len() != r.sample_count as usize {
+                            return Err(WriteError::PerSampleProvenanceLengthMismatch {
+                                provenance: column.len(),
+                                samples: r.sample_count as usize,
+                            });
+                        }
+                        prov_presence.push(1);
+                        any_provenance = true;
+                        for sp in column {
+                            let created_delta = i64::try_from(
+                                i128::from(sp.created_unix_ns)
+                                    - i128::from(footer_base_created_unix_ns),
+                            )
+                            .map_err(|_| WriteError::TimestampDeltaOverflow)?;
+                            prov_created_delta.push(created_delta);
+                            prov_epoch.push(sp.writer_epoch as i64);
+                            prov_seq.push(sp.writer_seq as i64);
+                            prov_in_page_index.push(i64::from(sp.in_page_index));
+                        }
+                    }
+                    None => prov_presence.push(0),
+                }
+            }
             write_uvarint(
                 &mut col_run_created_delta,
                 (i128::from(r.created_unix_ns) - i128::from(footer_base_created_unix_ns)) as u64,
@@ -1382,7 +1614,30 @@ fn build_series_meta_v4(
         write_uvarint(&mut buf, col.len() as u64);
         buf.extend_from_slice(col);
     }
+
+    // Optional per-sample provenance extension (blocks 17-21). Appended only
+    // when at least one run carried a column, so absence costs zero bytes and
+    // the section still ends exactly at block 16 for every object without
+    // provenance.
+    if any_provenance {
+        push_encoded_i64_block(&mut buf, &prov_presence);
+        push_encoded_i64_block(&mut buf, &prov_created_delta);
+        push_encoded_i64_block(&mut buf, &prov_epoch);
+        push_encoded_i64_block(&mut buf, &prov_seq);
+        push_encoded_i64_block(&mut buf, &prov_in_page_index);
+    }
     Ok(buf)
+}
+
+/// Appends one `encode_i64` column as a `block_len`-prefixed body whose first
+/// byte is the chosen [`ravel_codec::encoding::Enc`] tag (ADR-0092 decision 1).
+/// The reader's `take_encoded_i64_block` is the exact inverse.
+fn push_encoded_i64_block(buf: &mut Vec<u8>, values: &[i64]) {
+    let (enc, bytes) = ravel_codec::encoding::encode_i64(values);
+    let block_len = 1 + bytes.len();
+    write_uvarint(buf, block_len as u64);
+    buf.push(enc.to_u8());
+    buf.extend_from_slice(&bytes);
 }
 
 /// Same operation as v1/v2/v3's zstd compress; kept separate per this
@@ -2222,7 +2477,7 @@ mod v4_tests {
         // Series B (run 1): multi-sample, padded so its payload start is
         // 8-byte aligned relative to the section (and object).
         let gap_b = meta.val_page_gap[1];
-        let running_before_b = 0 + meta.val_page_len[0] + gap_b;
+        let running_before_b = meta.val_page_len[0] + gap_b;
         let payload_start_b = val_desc.offset + running_before_b + 6;
         assert_eq!(
             payload_start_b % 8,
@@ -3081,6 +3336,7 @@ mod direct_v6_emit_bit_parity {
 
         let series_meta_raw = build_series_meta_v4(
             &series,
+            &[],
             &dict.occurrence_ordinals,
             min_event_ts_ns,
             base_created_unix_ns,
