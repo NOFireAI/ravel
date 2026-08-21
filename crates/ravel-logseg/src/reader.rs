@@ -1214,7 +1214,13 @@ fn attr_value_eq(a: &AttrValue, b: &AttrValue) -> bool {
 /// Phrase/word match: `word` tokenizes to one or more query tokens; a single
 /// token requires containment, multiple tokens require an in-order contiguous
 /// run in the tokenized value (docs/log-segment-format.md "Tokenizer").
-fn phrase_match(value: &[u8], word: &str) -> bool {
+///
+/// `pub` so `ravel-sql`'s `has_word` UDF calls this directly instead of
+/// keeping its own copy: the pushed `Predicate::HasWord` filter here and the
+/// UDF re-applied above the scan must agree on every row for the pushdown to
+/// stay sound, and two independently maintained implementations can drift
+/// without either crate's own tests noticing.
+pub fn phrase_match(value: &[u8], word: &str) -> bool {
     let query = tokens(word);
     if query.is_empty() {
         return true;

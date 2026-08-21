@@ -21,7 +21,8 @@
 //! rows the residual `has_word` above the scan would remove, so no row the
 //! query needs is ever dropped. This is the same agreement that makes the
 //! metrics `label_match` regex pushdown sound (crate::udf): the pushed arm and
-//! the re-applied UDF are the identical predicate.
+//! the re-applied UDF call the identical [`ravel_logseg::reader::phrase_match`],
+//! not two implementations kept in sync by hand.
 
 use std::sync::Arc;
 
@@ -30,7 +31,6 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
 use datafusion::scalar::ScalarValue;
-use ravel_logseg::tokenizer::tokens;
 
 /// The name of the `has_word(text, 'word') -> Boolean` UDF.
 pub const HAS_WORD_UDF: &str = "has_word";
@@ -46,18 +46,13 @@ pub fn has_word_udf() -> ScalarUDF {
     )
 }
 
-/// True iff `word` tokenizes to an in-order contiguous run of tokens present in
-/// the tokenized `text`. Mirrors `RlogReader`'s own `phrase_match` exactly so
-/// the pushed [`ravel_logseg::Predicate::HasWord`] and this UDF agree on every
-/// row (docs/log-segment-format.md "Tokenizer"). An empty query (a `word` with
-/// no tokens) matches every row, matching the reader.
+/// Forwards to `ravel_logseg::reader::phrase_match`, the same function
+/// `RlogReader::scan` applies as the pushed [`ravel_logseg::Predicate::HasWord`]
+/// filter, so the two can no longer drift into disagreement (there is only one
+/// implementation). `text` is always valid UTF-8 here (it comes from an Arrow
+/// `StringArray`), so the byte conversion cannot itself change the result.
 fn phrase_match(text: &str, word: &str) -> bool {
-    let query = tokens(word);
-    if query.is_empty() {
-        return true;
-    }
-    let toks = tokens(text);
-    toks.windows(query.len()).any(|w| w == query.as_slice())
+    ravel_logseg::reader::phrase_match(text.as_bytes(), word)
 }
 
 pub(crate) fn has_word_impl(args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
@@ -115,6 +110,15 @@ mod tests {
         assert!(!phrase_match("connection timeout", "time"));
         // Case-insensitive, split on non-alphanumerics.
         assert!(phrase_match("GET /api/v1 TIMEOUT", "timeout"));
+    }
+
+    #[test]
+    fn empty_word_matches_every_row() {
+        // ravel_logseg::reader::phrase_match checks query.is_empty() before the
+        // UTF-8 conversion, so this is the one input where the shim's control
+        // flow order actually matters, not just its output.
+        assert!(phrase_match("connection timeout", ""));
+        assert!(phrase_match("", ""));
     }
 
     #[test]
