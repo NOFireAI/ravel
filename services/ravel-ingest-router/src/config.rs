@@ -421,6 +421,12 @@ impl Cli {
                 if self.oidc_audiences.iter().any(|a| a.is_empty()) {
                     anyhow::bail!("--oidc-audience must be non-empty");
                 }
+                if self.oidc_jwks_refresh_interval_secs == 0 {
+                    anyhow::bail!(
+                        "--oidc-jwks-refresh-interval-secs must be at least 1: a zero interval \
+                         cannot drive the JWKS refresh timer"
+                    );
+                }
                 Some(OidcSettings {
                     issuer: issuer.to_string(),
                     jwks_url: jwks_url.to_string(),
@@ -689,5 +695,53 @@ mod tests {
             .into_config()
             .expect_err("subset size 0 must fail");
         assert!(err.to_string().contains("--subset-size"));
+    }
+
+    #[test]
+    fn oidc_jwks_refresh_interval_zero_rejected() {
+        let err = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--oidc-issuer",
+            "https://issuer.example.com",
+            "--oidc-jwks-url",
+            "https://issuer.example.com/jwks",
+            "--oidc-audience",
+            "ravel",
+            "--oidc-jwks-refresh-interval-secs",
+            "0",
+        ])
+        .into_config()
+        .expect_err("a zero JWKS refresh interval must fail");
+        assert!(
+            err.to_string()
+                .contains("--oidc-jwks-refresh-interval-secs"),
+            "error must name the flag, got: {err}"
+        );
+    }
+
+    #[test]
+    fn oidc_jwks_refresh_interval_one_accepted() {
+        let config = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--oidc-issuer",
+            "https://issuer.example.com",
+            "--oidc-jwks-url",
+            "https://issuer.example.com/jwks",
+            "--oidc-audience",
+            "ravel",
+            "--oidc-jwks-refresh-interval-secs",
+            "1",
+        ])
+        .into_config()
+        .expect("the smallest positive refresh interval is valid");
+        match config.key {
+            KeyConfig::CanonicalTenant(settings) => {
+                let oidc = settings.oidc.expect("OIDC settings present");
+                assert_eq!(oidc.refresh_interval, Duration::from_secs(1));
+            }
+            other => panic!("expected canonical key config, got {other:?}"),
+        }
     }
 }
