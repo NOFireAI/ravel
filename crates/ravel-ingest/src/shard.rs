@@ -32,7 +32,7 @@ use ravel_segment::{
     SeriesValues,
 };
 use ravel_types::{
-    CommitToken, ExemplarCap, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId,
+    CommitToken, ExemplarCap, Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId,
 };
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -196,8 +196,13 @@ impl TenantBuf {
     }
 
     /// Merges `points` into this buffer, returning the estimated byte cost
-    /// added (samples * 16 plus label bytes the first time a series is
-    /// seen), per docs/ingest.md's `est_bytes` rule.
+    /// added (samples * 16, plus each label's `Label` struct header and its
+    /// name/value bytes the first time a series is seen), per
+    /// docs/ingest.md's `est_bytes` rule. The header term is the same one
+    /// [`IngestPoint::est_charge_bytes`] and [`IngestExemplar::est_bytes`]
+    /// apply: a `Label` is two `String` headers whatever the strings hold, so
+    /// leaving it out understates a label-heavy buffer by roughly an order of
+    /// magnitude and both flush triggers fire late.
     ///
     /// Fails loud on a series-id collision (ADR-0005) or a value-kind
     /// mismatch (a series is scalar or
@@ -253,7 +258,7 @@ impl TenantBuf {
                     let label_bytes: usize = point
                         .labels
                         .iter()
-                        .map(|l| l.name.len() + l.value.len())
+                        .map(|l| size_of::<Label>() + l.name.len() + l.value.len())
                         .sum();
                     bytes_added += label_bytes;
                     vac.insert(SeriesAccum {
@@ -1371,5 +1376,85 @@ mod adaptive_delay_tests {
                  unconditionally"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod buffer_accounting_tests {
+    use super::*;
+
+    fn labels_of(count: usize) -> LabelSet {
+        let labels = (0..count)
+            .map(|i| Label {
+                name: format!("k{i}"),
+                value: "v".to_string(),
+            })
+            .collect();
+        LabelSet::new(labels).expect("distinct label names")
+    }
+
+    fn point(series: u8, labels: LabelSet) -> IngestPoint {
+        let mut id = [0u8; 16];
+        id[0] = series;
+        IngestPoint {
+            series_id: SeriesId(id),
+            labels,
+            value: IngestValue::Scalar(Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }),
+        }
+    }
+
+    /// The flush triggers read `TenantBuf::est_bytes`; the process-wide ceiling
+    /// reads `IngestPoint::est_charge_bytes`. On a batch of first-sighting
+    /// series the two must produce the same number, or one of them is lying
+    /// about the same bytes -- which is exactly how the label-header term went
+    /// missing from the budget side while the exemplar side kept it.
+    #[test]
+    fn merge_accounting_matches_the_budget_charge() {
+        for width in [1usize, 10, 64] {
+            let points: Vec<IngestPoint> = (0..3u8)
+                .map(|i| {
+                    let mut labels: Vec<Label> = labels_of(width).iter().cloned().collect();
+                    labels.push(Label {
+                        name: "series".to_string(),
+                        value: i.to_string(),
+                    });
+                    point(i, LabelSet::new(labels).expect("distinct label names"))
+                })
+                .collect();
+            let charged: u64 = points.iter().map(IngestPoint::est_charge_bytes).sum();
+
+            let mut buf = TenantBuf::default();
+            let added = buf
+                .merge(points, 1_000)
+                .expect("distinct series ids, one value kind") as u64;
+
+            assert_eq!(
+                added, charged,
+                "{width} labels: buffer counted {added} bytes, budget charged {charged}"
+            );
+            assert_eq!(buf.est_bytes as u64, charged);
+        }
+    }
+
+    /// A second point for a series already in the buffer costs only its sample:
+    /// the label bytes (headers included) are already counted. This is the
+    /// deliberate asymmetry with `est_charge_bytes`, which cannot see buffer
+    /// state and so over-counts in the safe direction.
+    #[test]
+    fn repeat_series_adds_only_the_sample() {
+        let labels = labels_of(10);
+        let mut buf = TenantBuf::default();
+        let first = buf
+            .merge(vec![point(1, labels.clone())], 1_000)
+            .expect("first sighting");
+        let repeat = buf
+            .merge(vec![point(1, labels)], 2_000)
+            .expect("same series again");
+        assert_eq!(repeat, 16, "a repeat sighting charges the sample only");
+        assert_eq!(first, 16 + 10 * (size_of::<Label>() + 3));
     }
 }
