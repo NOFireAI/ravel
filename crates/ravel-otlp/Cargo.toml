@@ -28,6 +28,21 @@ hex = { workspace = true }
 tokio = { workspace = true }
 blake3 = { workspace = true }
 proptest = { workspace = true }
+criterion = { workspace = true }
+# Same version already vendored by ravel-otap and ravel-bench; not a
+# workspace.dependencies entry, so it is pinned here to match theirs.
+stats_alloc = "0.1.10"
+
+[features]
+# Compiles the SeriesIdMemo hit/miss counters (normalize::memo_stats) into the
+# build. Off by default: the counters are otherwise present only under
+# `cfg(test)`, so the production normalize path carries none of them. The
+# normalize_alloc bench enables this to report the memo hit rate.
+memo-stats = []
+
+[[bench]]
+name = "normalize_alloc"
+harness = false
 
 [lints]
 workspace = true
