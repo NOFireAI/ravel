@@ -228,6 +228,19 @@ mod tests {
         }
     }
 
+    /// A log record whose single top-level attribute is a `Map` of `entry_count`
+    /// identical `("", Bool)` entries, isolating the nested-level per-entry
+    /// header. The top-level attribute is present at every `entry_count`, so
+    /// differencing two counts cancels it and leaves only the nested cost.
+    fn log_record_with_nested_map(entry_count: usize) -> NormalizedLogRecord {
+        let entries = (0..entry_count)
+            .map(|_| (String::new(), AttrValue::Bool(false)))
+            .collect();
+        let mut rec = log_record_with(0);
+        rec.attrs = vec![("m".to_string(), AttrValue::Map(entries))];
+        rec
+    }
+
     /// A span carrying `attr_count` attributes, each the identical
     /// `("attr", "v")` pair, everything else empty/zero. Same differencing
     /// trick as [`log_record_with`].
@@ -256,11 +269,12 @@ mod tests {
     /// while the others charge honestly -- exactly the skew this pin exists to
     /// catch.
     ///
-    /// Scope, so this doc does not read as more than it proves: the pin covers
-    /// depth 0 only, with `AttrValue::Str` values. A log attribute whose value
-    /// is a nested `Map` is measured by `attr_value_len`, which still counts
-    /// string bytes alone at every level below the top, and this test does not
-    /// catch that.
+    /// Scope: the four-way top-level check below uses `AttrValue::Str` values at
+    /// depth 0. The final block extends the log estimator one level deeper, to a
+    /// nested `Map` value, pinning that `attr_value_len` charges the
+    /// `(String, AttrValue)` header for every nested entry, not only for the
+    /// top-level attribute. It does not exercise the metrics/span estimators
+    /// below depth 0, which have no nested attribute values to charge.
     ///
     /// Each estimator's header term is isolated by differencing two attribute
     /// widths with identical per-attribute content, which cancels every fixed
@@ -344,6 +358,22 @@ mod tests {
             "point and exemplar headers must agree"
         );
         assert_eq!(point_hdr, span_hdr, "point and span headers must agree");
+
+        // Nested level: a log attribute whose value is a `Map` charges the
+        // `(String, AttrValue)` header for each of its entries too, not only for
+        // the top-level attribute. Differencing a W-entry nested `Map` against an
+        // empty one cancels the (identical) top-level attribute and isolates the
+        // nested-entry cost, W * (`(String, AttrValue)` header + one Bool byte).
+        let nested_delta = (est_record_bytes(&log_record_with_nested_map(W as usize))
+            - est_record_bytes(&log_record_with_nested_map(0))) as u64;
+        let nested_hdr = nested_delta - W; // subtract each entry's Bool payload byte
+        assert_eq!(
+            nested_hdr,
+            W * log_pair,
+            "attr_value_len dropped the per-entry header inside a nested Map: \
+             {nested_hdr} != {}",
+            W * log_pair
+        );
     }
 
     /// The two buffered-byte estimators must charge one label the same way, or
