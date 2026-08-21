@@ -87,7 +87,7 @@
 //! the key to the record's value, which wins). The merged column and the
 //! residual are the whole correctness story.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -114,9 +114,12 @@ use datafusion::physical_plan::{
 };
 use futures::Stream;
 use ravel_catalog::SegmentRef;
-use ravel_logseg::{ColumnSelection, FieldSel, LogRecord, Predicate, ScanStats};
+use ravel_logseg::{
+    AttrColumn, ColumnSelection, ColumnarBlockView, FieldSel, FieldType, LogRecord, Predicate,
+    ScanStats,
+};
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::{LogQuery, LogSegmentFetcher, LogSegmentScan};
+use ravel_query::{ColumnarBlockOutcome, LogQuery, LogSegmentFetcher, LogSegmentScan};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
@@ -128,7 +131,9 @@ use crate::logs_schema::{
     LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
     SPAN_ID_WIDTH, TRACE_ID_WIDTH,
 };
-use crate::rlog_attrs::{attr_value_to_string, find_attr, merged_attrs, retain_unerased};
+use crate::rlog_attrs::{
+    attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs, retain_unerased,
+};
 use ravel_logseg::record::canonical_value_bytes;
 
 /// Rows accumulated into one output batch before it is emitted.
@@ -275,6 +280,33 @@ fn content_columns(pred: &Predicate, sel: ColumnSelection) -> ColumnSelection {
     }
 }
 
+/// The query-shape half of the columnar fast-path eligibility rule (ADR-0099
+/// decision 2), decided once at plan time. The fast path is taken only when
+/// this AND the per-block `has_attrs_raw_page() == false` check both hold;
+/// otherwise the row path runs unchanged.
+///
+/// Two clauses live here because they do not vary per block:
+///
+/// - **(a) the projection touches only fixed and declared typed columns.** A
+///   reference to the merged `attrs` map ([`LOG_COL_ATTRS`]) makes the query
+///   ineligible: the map needs the stream-blob overlay the fast path exists to
+///   avoid. A declared typed column (index `>= FIRST_DECLARED_COL`) is fine --
+///   it resolves to a FIELD_DIR column the view reads directly.
+/// - **(c) no pending erasure predicate applies.** Erasure exclusion is
+///   record-level and has no columnar form yet, so a scan carrying one drains
+///   the row path. This clause fails closed on purpose: the failure mode of
+///   getting erasure wrong is an erased record served to a client, not a slow
+///   query. In practice this also falls out of handling
+///   [`ColumnarBlockOutcome::ErasurePending`], but it is asserted here as its
+///   own condition so the fast path is never even attempted under erasure.
+///
+/// Content predicates are deliberately absent: the reader evaluates them into
+/// the surviving-row set before the view is handed out, so the fast path never
+/// re-evaluates them and their shape cannot make it unsound.
+fn columnar_static_eligible(projection: &[usize], erasure: &[ErasurePredicate]) -> bool {
+    erasure.is_empty() && projection.iter().all(|&i| i != LOG_COL_ATTRS)
+}
+
 /// Log segment scan producing block-at-a-time batches over a projection of the
 /// public `logs` schema. Declares no ordering (ADR-0087 decision 1).
 pub struct LogsScanExec {
@@ -315,6 +347,12 @@ pub struct LogsScanExec {
     /// This scan's output schema: the resolved full schema
     /// (`logs_schema_with_declared(&declared)`) projected by `projection`.
     schema: SchemaRef,
+    /// Whether this scan may take the columnar fast path (ADR-0099 decision 2),
+    /// decided once from the query shape: the projection touches only fixed and
+    /// declared columns (no `attrs` map), and no pending erasure predicate
+    /// applies. The remaining per-block clause (no `attrs_raw` overflow page) is
+    /// checked as each block is decoded; see [`columnar_static_eligible`].
+    columnar_eligible: bool,
     properties: Arc<PlanProperties>,
     /// This query's accounting handle (ADR-0044), threaded into every
     /// per-partition fetch so log fetches are recorded like every other
@@ -344,6 +382,16 @@ struct BlockMetrics {
     /// post-decode filter: a query that touches two of a hundred attributes
     /// leaves this large and `pages_decoded` small.
     pages_skipped: Count,
+    /// Output batches this partition built through the columnar fast path
+    /// (ADR-0099 decisions 2-3), straight from a [`ColumnarBlockView`] with no
+    /// `LogRecord` and no `merged_attrs`. The output of the two paths is
+    /// identical by construction, so this and [`Self::rowpath_batches`] are the
+    /// only externally visible proof of which path a query took.
+    columnar_batches: Count,
+    /// Output batches this partition built through the row path: an ineligible
+    /// query (an `attrs` projection, a pending erasure predicate) or an
+    /// eligible one that hit a block carrying an `attrs_raw` overflow page.
+    rowpath_batches: Count,
 }
 
 impl BlockMetrics {
@@ -355,6 +403,8 @@ impl BlockMetrics {
                 .counter("blocks_pruned_by_postings", partition),
             pages_decoded: MetricBuilder::new(metrics).counter("pages_decoded", partition),
             pages_skipped: MetricBuilder::new(metrics).counter("pages_skipped", partition),
+            columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
+            rowpath_batches: MetricBuilder::new(metrics).counter("rowpath_batches", partition),
         }
     }
 
@@ -436,6 +486,7 @@ impl LogsScanExec {
         }
         let columns = resolve_columns(&projection, &content, &erasure, &declared);
         let schema: SchemaRef = Arc::new(full.project(&projection)?);
+        let columnar_eligible = columnar_static_eligible(&projection, &erasure);
         let properties = Arc::new(Self::compute_properties(&schema, n));
         Ok(LogsScanExec {
             tenant_hash,
@@ -450,6 +501,7 @@ impl LogsScanExec {
             columns,
             declared,
             schema,
+            columnar_eligible,
             properties,
             accounting,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -563,13 +615,15 @@ impl ExecutionPlan for LogsScanExec {
                 accounting: self.accounting.clone(),
             }),
             erasure: Arc::clone(&self.erasure),
+            columnar_eligible: self.columnar_eligible,
             blocks: BlockMetrics::new(&self.metrics, partition),
             segments,
             reservation,
             held: 0,
             emitted: 0,
-            pending: Vec::new(),
-            pos: 0,
+            pending: Pending::None,
+            current_seg: None,
+            seg_columnar_blocks: 0,
             state: LogScanState::NextSegment,
         }))
     }
@@ -612,9 +666,45 @@ enum LogScanState {
     NextSegment,
     /// Awaiting one segment's GET and prune.
     Opening(OpenFuture),
-    /// Draining one segment's surviving blocks, one at a time.
-    Draining(Box<LogSegmentScan>),
+    /// Draining one segment's surviving blocks through the columnar fast path
+    /// (ADR-0099 decision 2). Entered only when the scan is statically eligible;
+    /// a block carrying an `attrs_raw` overflow page falls this segment back to
+    /// the row path via [`LogScanState::ReopenRows`].
+    Columnar(Box<LogSegmentScan>),
+    /// Draining one segment's surviving blocks through the row path
+    /// ([`LogSegmentScan::next_block`]), rebuilding a [`LogRecord`] per row: the
+    /// unchanged pre-ADR-0099 path, taken by an ineligible scan or by the
+    /// `attrs_raw` fallback. `skip` blocks are drained and discarded first, to
+    /// step past the blocks a fallback already emitted columnar before it hit
+    /// the overflow page (0 for an ineligible scan that never ran the fast path).
+    Rows {
+        scan: Box<LogSegmentScan>,
+        skip: usize,
+    },
+    /// Re-opening the current segment to restart it on the row path after a
+    /// block turned out to carry an `attrs_raw` overflow page. `skip` is the
+    /// number of blocks already emitted columnar for this segment, which the
+    /// re-opened row scan drains and discards so no row is emitted twice.
+    ReopenRows {
+        fut: OpenFuture,
+        skip: usize,
+    },
     Done,
+}
+
+/// The block currently being drained into output batches, and the form it is
+/// held in. The reservation charge tracked by [`LogScanStream::held`] covers
+/// whichever variant is live.
+enum Pending {
+    /// Nothing held.
+    None,
+    /// Row path: the block's surviving records, drained `BATCH_ROWS` at a time
+    /// from `pos`.
+    Rows { records: Vec<LogRecord>, pos: usize },
+    /// Columnar fast path: the block's already-built output batches, emitted one
+    /// per poll. Built whole from the [`ColumnarBlockView`] so the view (which
+    /// borrows the scan) is dropped before the next block is decoded.
+    Batches(VecDeque<RecordBatch>),
 }
 
 /// Per-partition record-batch stream (ADR-0087 decisions 1 and 2).
@@ -634,10 +724,15 @@ struct LogScanStream {
     /// Indices into the resolved full schema to emit, in output order.
     projection: Arc<Vec<usize>>,
     /// The tenant's declared typed attribute columns (ADR-0090), consulted by
-    /// [`build_batch`] for a projected declared index.
+    /// [`build_batch`] and [`build_columnar_batches`] for a projected declared
+    /// index.
     declared: Arc<Vec<DeclaredColumn>>,
     ctx: Arc<PartitionCtx>,
     erasure: Arc<Vec<ErasurePredicate>>,
+    /// Whether this scan may attempt the columnar fast path (the query-shape
+    /// clauses of [`columnar_static_eligible`]). When false, every segment
+    /// drains the row path.
+    columnar_eligible: bool,
     blocks: BlockMetrics,
     segments: VecDeque<SegmentRef>,
     reservation: MemoryReservation,
@@ -645,49 +740,105 @@ struct LogScanStream {
     held: usize,
     /// Reservation bytes currently covering the batch emitted last poll.
     emitted: usize,
-    /// The block being drained into batches.
-    pending: Vec<LogRecord>,
-    pos: usize,
+    /// The block being drained into batches, in row or columnar form.
+    pending: Pending,
+    /// The segment currently being drained, kept so the `attrs_raw` fallback can
+    /// re-open it on the row path. Set when a segment's open resolves.
+    current_seg: Option<SegmentRef>,
+    /// How many blocks of the current segment the columnar fast path has already
+    /// emitted. The `attrs_raw` fallback re-opens the segment and skips this many
+    /// blocks so none is emitted twice. Reset when a new segment starts draining.
+    seg_columnar_blocks: usize,
     state: LogScanState,
 }
 
 impl LogScanStream {
-    /// Build the next batch out of `pending`, moving the reservation with it:
-    /// the previous batch's charge is released (it is downstream's now), the new
-    /// batch's charge is taken before it is handed over.
-    fn emit_next_batch(&mut self) -> DFResult<RecordBatch> {
+    /// Emit the next row-path batch out of `pending`, moving the reservation
+    /// with it: the previous batch's charge is released (it is downstream's
+    /// now), the new batch's charge is taken before it is handed over.
+    fn emit_next_row_batch(&mut self) -> DFResult<RecordBatch> {
         self.reservation.shrink(std::mem::take(&mut self.emitted));
-        let end = (self.pos + BATCH_ROWS).min(self.pending.len());
+        let Pending::Rows { records, pos } = &mut self.pending else {
+            return Err(DataFusionError::Internal(
+                "emit_next_row_batch called without a row block held".into(),
+            ));
+        };
+        let end = (*pos + BATCH_ROWS).min(records.len());
         let batch = build_batch(
-            &self.pending[self.pos..end],
+            &records[*pos..end],
             Arc::clone(&self.schema),
             &self.projection,
             &self.declared,
         )?;
-        self.pos = end;
+        *pos = end;
         let bytes = batch.get_array_memory_size();
         self.reservation.try_grow(bytes)?;
         self.emitted = bytes;
+        self.blocks.rowpath_batches.add(1);
         Ok(batch)
     }
 
-    /// Take ownership of one decoded block, charging the pool for it before it
-    /// is held. An empty block (every row filtered out) charges nothing and
-    /// leaves the stream to ask for the next one.
+    /// Emit the next columnar-path batch: pop the front pre-built batch, relabel
+    /// its already-reserved bytes from `held` to `emitted`, and release the
+    /// batch handed out on the previous poll. No new reservation is taken -- the
+    /// whole block's batches were charged once in [`Self::hold_batches`].
+    fn emit_next_columnar_batch(&mut self) -> DFResult<RecordBatch> {
+        self.reservation.shrink(std::mem::take(&mut self.emitted));
+        let Pending::Batches(queue) = &mut self.pending else {
+            return Err(DataFusionError::Internal(
+                "emit_next_columnar_batch called without columnar batches held".into(),
+            ));
+        };
+        let Some(batch) = queue.pop_front() else {
+            return Err(DataFusionError::Internal(
+                "emit_next_columnar_batch called on an empty queue".into(),
+            ));
+        };
+        let bytes = batch.get_array_memory_size();
+        // The batch's bytes were reserved as part of `held`; moving it
+        // downstream relabels that charge rather than growing or releasing it.
+        self.held = self.held.saturating_sub(bytes);
+        self.emitted = bytes;
+        self.blocks.columnar_batches.add(1);
+        Ok(batch)
+    }
+
+    /// Take ownership of one decoded block's records (row path), charging the
+    /// pool for `records_memory` before it is held. An empty block (every row
+    /// filtered out) charges nothing and leaves the stream to ask for the next.
     fn hold_block(&mut self, records: Vec<LogRecord>) -> DFResult<()> {
         let bytes = records_memory(&records);
         self.reservation.try_grow(bytes)?;
         self.held = bytes;
-        self.pending = records;
-        self.pos = 0;
+        self.pending = Pending::Rows { records, pos: 0 };
         Ok(())
+    }
+
+    /// Take ownership of one block's pre-built columnar batches, charging the
+    /// pool for their total Arrow footprint before they are held. This is the
+    /// fast path's live-bytes unit (ADR-0099 decision 2): the scan holds the
+    /// batches it built straight from the view rather than a `Vec<LogRecord>`.
+    fn hold_batches(&mut self, batches: Vec<RecordBatch>) -> DFResult<()> {
+        let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+        self.reservation.try_grow(bytes)?;
+        self.held = bytes;
+        self.pending = Pending::Batches(batches.into());
+        Ok(())
+    }
+
+    /// True when the current block still has a batch to emit.
+    fn has_pending(&self) -> bool {
+        match &self.pending {
+            Pending::None => false,
+            Pending::Rows { records, pos } => *pos < records.len(),
+            Pending::Batches(queue) => !queue.is_empty(),
+        }
     }
 
     /// Drop the drained block and release its charge.
     fn release_block(&mut self) {
         self.reservation.shrink(std::mem::take(&mut self.held));
-        self.pending = Vec::new();
-        self.pos = 0;
+        self.pending = Pending::None;
     }
 
     /// Abandon the stream on error, releasing everything the scan still holds.
@@ -696,6 +847,20 @@ impl LogScanStream {
         self.release_block();
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         Poll::Ready(Some(Err(e)))
+    }
+
+    /// Take one decoded block's surviving records through the row path: apply
+    /// scan-layer selective-erasure exclusion (ADR-0064) and hold the records.
+    ///
+    /// The exclusion here is authoritative because it sees the same merged
+    /// `attrs` view the surface returns (resource + scope + record), so a
+    /// subject named only in a resource/scope attribute is dropped; the
+    /// fetcher-level filter matches per-record attributes alone and cannot see
+    /// it. An empty `records` is normal, not end-of-segment: a block can survive
+    /// pruning and hold no matching row, or have every matching row erased.
+    fn take_row_block(&mut self, mut records: Vec<LogRecord>) -> DFResult<()> {
+        retain_unerased(&mut records, &self.erasure)?;
+        self.hold_block(records)
     }
 }
 
@@ -706,21 +871,28 @@ impl Stream for LogScanStream {
         let this = self.get_mut();
         loop {
             // Anything buffered from the current block goes out first.
-            if this.pos < this.pending.len() {
-                return match this.emit_next_batch() {
+            if this.has_pending() {
+                let emitted = match &this.pending {
+                    Pending::Rows { .. } => this.emit_next_row_batch(),
+                    Pending::Batches(_) => this.emit_next_columnar_batch(),
+                    Pending::None => unreachable!("has_pending() ruled this out"),
+                };
+                return match emitted {
                     Ok(batch) => Poll::Ready(Some(Ok(batch))),
                     Err(e) => this.fail(e),
                 };
             }
             // The block is drained: release it before decoding another, so the
             // reservation never covers two blocks at once.
-            if this.held > 0 {
+            if this.held > 0 || !matches!(this.pending, Pending::None) {
                 this.release_block();
             }
 
             match &mut this.state {
                 LogScanState::NextSegment => match this.segments.pop_front() {
                     Some(seg) => {
+                        this.current_seg = Some(seg.clone());
+                        this.seg_columnar_blocks = 0;
                         this.state =
                             LogScanState::Opening(open_segment(Arc::clone(&this.ctx), seg));
                     }
@@ -730,7 +902,14 @@ impl Stream for LogScanStream {
                 },
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
-                        this.state = LogScanState::Draining(Box::new(scan));
+                        this.state = if this.columnar_eligible {
+                            LogScanState::Columnar(Box::new(scan))
+                        } else {
+                            LogScanState::Rows {
+                                scan: Box::new(scan),
+                                skip: 0,
+                            }
+                        };
                     }
                     // The segment's ts span could not satisfy the query: no GET
                     // was issued and there is nothing to drain.
@@ -738,32 +917,121 @@ impl Stream for LogScanStream {
                     Poll::Ready(Err(e)) => return this.fail(e),
                     Poll::Pending => return Poll::Pending,
                 },
-                LogScanState::Draining(scan) => {
-                    let decoded = scan.next_block().map_err(SqlError::from);
-                    match decoded {
-                        Ok(Some(mut records)) => {
-                            // Scan-layer selective-erasure exclusion (ADR-0064).
-                            // This is the authoritative exclusion because it
-                            // sees the same merged `attrs` view the surface
-                            // returns (resource + scope + record), so a subject
-                            // named only in a resource/scope attribute is
-                            // dropped; the fetcher-level filter matches
-                            // per-record attributes alone and cannot see it.
-                            if let Err(e) = retain_unerased(&mut records, &this.erasure) {
-                                return this.fail(e);
+                LogScanState::ReopenRows { fut, skip } => match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(Some(scan))) => {
+                        let skip = *skip;
+                        this.state = LogScanState::Rows {
+                            scan: Box::new(scan),
+                            skip,
+                        };
+                    }
+                    // Cannot happen for a segment already opened once this scan;
+                    // treat a vanished segment as end-of-segment rather than
+                    // panicking.
+                    Poll::Ready(Ok(None)) => this.state = LogScanState::NextSegment,
+                    Poll::Ready(Err(e)) => return this.fail(e),
+                    Poll::Pending => return Poll::Pending,
+                },
+                LogScanState::Columnar(scan) => {
+                    // One of three outcomes, folded into an owned step so the
+                    // view (which borrows `scan`) is dropped before `this.state`
+                    // or the reservation is touched.
+                    enum Step {
+                        Exhausted(ScanStats),
+                        // A block carrying an `attrs_raw` overflow page (or, only
+                        // defensively, an unexpected pending erasure): fall the
+                        // rest of this segment back to the row path.
+                        Fallback,
+                        // A clean block's built batches (possibly empty for a
+                        // block with no surviving row).
+                        Held(Vec<RecordBatch>),
+                        // A decode or build error, carried out of the view's
+                        // borrow so it can be handled once the borrow ends.
+                        Failed(DataFusionError),
+                    }
+                    // The view borrows `scan`, so every outcome is folded into an
+                    // owned `Step` here; `this.fail`/`this.state` are only touched
+                    // after the match, once that borrow has ended.
+                    let step = match scan.next_block_columnar() {
+                        Ok(ColumnarBlockOutcome::Exhausted) => Step::Exhausted(scan.stats()),
+                        // The fast path is only entered with no erasure, so this
+                        // is unreachable in practice; fall back rather than
+                        // risk serving an erased record columnar.
+                        Ok(ColumnarBlockOutcome::ErasurePending) => Step::Fallback,
+                        Ok(ColumnarBlockOutcome::Block(view)) => {
+                            if view.has_attrs_raw_page() {
+                                Step::Fallback
+                            } else {
+                                match build_columnar_batches(
+                                    &view,
+                                    &this.schema,
+                                    &this.projection,
+                                    &this.declared,
+                                ) {
+                                    Ok(batches) => Step::Held(batches),
+                                    Err(e) => Step::Failed(e),
+                                }
                             }
-                            // Every surviving record is emitted:
-                            // stream-attribute equalities are not pushed (a
-                            // stream-level prune is unsound against the merged
-                            // `attrs` column), so nothing here narrows below
-                            // what DataFusion's residual keeps.
-                            //
-                            // An empty `records` here is normal, not the end of
-                            // the segment: a block can survive pruning and hold
-                            // no row matching the exact filter, or have every
-                            // matching row erased. The loop just asks for the
-                            // next block.
-                            if let Err(e) = this.hold_block(records) {
+                        }
+                        Err(e) => Step::Failed(SqlError::from(e).into()),
+                    };
+                    match step {
+                        Step::Failed(e) => return this.fail(e),
+                        Step::Exhausted(stats) => {
+                            this.blocks.record(&stats);
+                            this.state = LogScanState::NextSegment;
+                        }
+                        Step::Fallback => {
+                            // Re-open the segment and restart it on the row path,
+                            // skipping the blocks already emitted columnar so no
+                            // row is emitted twice. The abandoned columnar scan's
+                            // partial counters are dropped; the row scan re-counts
+                            // the whole segment.
+                            let seg = match this.current_seg.clone() {
+                                Some(seg) => seg,
+                                None => {
+                                    return this.fail(DataFusionError::Internal(
+                                        "attrs_raw fallback with no current segment".into(),
+                                    ));
+                                }
+                            };
+                            let fut = open_segment(Arc::clone(&this.ctx), seg);
+                            this.state = LogScanState::ReopenRows {
+                                fut,
+                                skip: this.seg_columnar_blocks,
+                            };
+                        }
+                        Step::Held(batches) => {
+                            // Count every consumed clean block, empty or not, so
+                            // a later `attrs_raw` fallback skips exactly the
+                            // blocks the columnar cursor advanced past.
+                            this.seg_columnar_blocks += 1;
+                            if !batches.is_empty() {
+                                if let Err(e) = this.hold_batches(batches) {
+                                    return this.fail(e);
+                                }
+                            }
+                        }
+                    }
+                }
+                LogScanState::Rows { scan, skip } => {
+                    // Drain and discard the blocks a columnar fallback already
+                    // emitted, then hold the next block's records.
+                    if *skip > 0 {
+                        match scan.next_block() {
+                            Ok(Some(_)) => *skip -= 1,
+                            Ok(None) => {
+                                let stats = scan.stats();
+                                this.blocks.record(&stats);
+                                this.state = LogScanState::NextSegment;
+                            }
+                            Err(e) => return this.fail(SqlError::from(e).into()),
+                        }
+                        continue;
+                    }
+                    match scan.next_block() {
+                        Ok(Some(records)) => {
+                            if let Err(e) = this.take_row_block(records) {
                                 return this.fail(e);
                             }
                         }
@@ -774,7 +1042,7 @@ impl Stream for LogScanStream {
                             this.blocks.record(&stats);
                             this.state = LogScanState::NextSegment;
                         }
-                        Err(e) => return this.fail(e.into()),
+                        Err(e) => return this.fail(SqlError::from(e).into()),
                     }
                 }
                 LogScanState::Done => return Poll::Ready(None),
@@ -993,4 +1261,346 @@ fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>
             Arc::new(b.finish())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Columnar fast path (ADR-0099 decision 2)
+// ---------------------------------------------------------------------------
+
+/// One declared column's FIELD_DIR resolution for a block, done once via
+/// [`ColumnarBlockView::resolve_attr`] rather than per row via
+/// [`find_attr`] (ADR-0099 decision 2).
+struct DeclaredPlan<'d> {
+    dc: &'d DeclaredColumn,
+    /// The FIELD_DIR column carrying this key at the declared type, if any. A
+    /// record row whose value lives here reads that value; a row whose value
+    /// lives in a different-typed column of the same key reads NULL (record
+    /// wins, wrong variant), matching the row path exactly.
+    matching: Option<AttrColumn>,
+    /// Every FIELD_DIR column for this key, across all stored types. Used only
+    /// to answer "does this record set the key at all" so record-wins precedence
+    /// matches the merged view: if the record sets the key (any type), the
+    /// resource/scope fallback is not consulted.
+    all_cols: Vec<AttrColumn>,
+}
+
+/// The [`FieldType`] a declared column resolves its FIELD_DIR column at. A
+/// `match` (not a two-arm `if`) so a future declared `f64` (ADR-0090, deferred)
+/// slots in as one more arm rather than silently falling through.
+fn declared_field_type(ty: DeclaredType) -> FieldType {
+    match ty {
+        DeclaredType::Str => FieldType::Str,
+        DeclaredType::I64 => FieldType::I64,
+        DeclaredType::Bool => FieldType::Bool,
+        DeclaredType::Bytes => FieldType::Bytes,
+    }
+}
+
+/// Whether a FIELD_DIR column carries a value at surviving row `i`.
+fn attr_present(view: &ColumnarBlockView<'_>, col: AttrColumn, i: usize) -> bool {
+    match col.ty {
+        FieldType::Str | FieldType::Bytes => view.bytes_at(col.column_id, i).is_some(),
+        FieldType::I64 => view.i64_at(col.column_id, i).is_some(),
+        FieldType::F64 => view.f64_bits_at(col.column_id, i).is_some(),
+        FieldType::Bool => view.bool_at(col.column_id, i).is_some(),
+    }
+}
+
+/// The block's per-`stream_ref` decoded resource/scope scalar attributes, cached
+/// so a block's streams are each decoded once even though the fallback is a
+/// per-row lookup. This is the fast path's only stream-blob decode, reached only
+/// for a declared key a record row does not set in a FIELD_DIR column; a query
+/// whose declared keys are all record attributes never enters it.
+fn resource_attrs<'c>(
+    view: &ColumnarBlockView<'_>,
+    cache: &'c mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+    stream_ref: u32,
+) -> DFResult<&'c Arc<Vec<(String, AttrValue)>>> {
+    if !cache.contains_key(&stream_ref) {
+        let blob = view.stream_attrs_of(stream_ref).ok_or_else(|| {
+            DataFusionError::from(SqlError::CorruptStreamAttrs(
+                "columnar fast path: stream_ref has no STREAM_DIR entry".to_string(),
+            ))
+        })?;
+        let decoded = Arc::new(decode_stream_attrs(blob)?);
+        cache.insert(stream_ref, decoded);
+    }
+    Ok(cache
+        .get(&stream_ref)
+        .expect("just inserted the stream_ref entry"))
+}
+
+/// The merged value of a declared key at surviving row `i`, under the same
+/// record-wins-over-resource precedence the row path's [`merged_attrs`] +
+/// [`find_attr`] produce: the record's own value if it sets the key (in any
+/// FIELD_DIR column), otherwise the resource/scope scalar.
+///
+/// Returns the record-column value directly when the record sets the key at the
+/// declared type; `None` when the record sets it at a different type (wrong
+/// variant, NULL by ADR-0090 decision 7). Only when the record does not set the
+/// key at all is the resource/scope fallback consulted, returning a cloned
+/// [`AttrValue`] whose variant the caller checks against the declared type.
+fn declared_merged_value(
+    view: &ColumnarBlockView<'_>,
+    plan: &DeclaredPlan<'_>,
+    i: usize,
+    cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+) -> DFResult<Option<AttrValue>> {
+    let record_sets_key = plan.all_cols.iter().any(|&c| attr_present(view, c, i));
+    if record_sets_key {
+        let Some(mc) = plan.matching else {
+            return Ok(None);
+        };
+        return Ok(read_typed_cell(view, mc, i));
+    }
+    let Some(stream_ref) = view.stream_ref(i) else {
+        return Ok(None);
+    };
+    let resource = resource_attrs(view, cache, stream_ref)?;
+    Ok(find_attr(resource, &plan.dc.key).cloned())
+}
+
+/// Read the value of a FIELD_DIR column at surviving row `i` as an
+/// [`AttrValue`], or `None` when the cell is NULL.
+fn read_typed_cell(view: &ColumnarBlockView<'_>, col: AttrColumn, i: usize) -> Option<AttrValue> {
+    match col.ty {
+        FieldType::Str => view
+            .bytes_at(col.column_id, i)
+            .map(|b| AttrValue::Str(String::from_utf8_lossy(b).into_owned())),
+        FieldType::I64 => view.i64_at(col.column_id, i).map(AttrValue::I64),
+        FieldType::F64 => view
+            .f64_bits_at(col.column_id, i)
+            .map(|bits| AttrValue::F64(f64::from_bits(bits))),
+        FieldType::Bool => view.bool_at(col.column_id, i).map(AttrValue::Bool),
+        FieldType::Bytes => view
+            .bytes_at(col.column_id, i)
+            .map(|b| AttrValue::Bytes(b.to_vec())),
+    }
+}
+
+/// Build one declared typed attribute column for surviving rows `start..end`
+/// straight from the view (ADR-0099 decision 2). Byte-identical to
+/// [`declared_column_array`] over the same input: a value whose variant matches
+/// the declared type is appended natively, and every other case -- absent key,
+/// or a value of a different variant -- appends NULL, never a cast (ADR-0090
+/// decision 7). The `Bytes` arm applies the same `List`/`Map` canonicalization.
+///
+/// The `match` on the declared type mirrors [`declared_column_array`], so a
+/// future declared `f64` slots in as one arm on both paths.
+fn build_declared_columnar_array(
+    view: &ColumnarBlockView<'_>,
+    plan: &DeclaredPlan<'_>,
+    start: usize,
+    end: usize,
+    cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+) -> DFResult<ArrayRef> {
+    Ok(match plan.dc.ty {
+        DeclaredType::Str => {
+            let mut b = StringBuilder::new();
+            for i in start..end {
+                match declared_merged_value(view, plan, i, cache)? {
+                    Some(AttrValue::Str(s)) => b.append_value(s),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::I64 => {
+            let mut b = Int64Builder::new();
+            for i in start..end {
+                match declared_merged_value(view, plan, i, cache)? {
+                    Some(AttrValue::I64(v)) => b.append_value(v),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::Bool => {
+            let mut b = BooleanBuilder::new();
+            for i in start..end {
+                match declared_merged_value(view, plan, i, cache)? {
+                    Some(AttrValue::Bool(v)) => b.append_value(v),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DeclaredType::Bytes => {
+            let mut b = BinaryBuilder::new();
+            for i in start..end {
+                match declared_merged_value(view, plan, i, cache)? {
+                    Some(AttrValue::Bytes(bytes)) => b.append_value(bytes),
+                    // Parity with the row path: a resource/scope `List`/`Map`
+                    // value is canonicalized. In the eligible (no `attrs_raw`)
+                    // case a record's `List`/`Map` is already stored as a
+                    // canonicalized `Bytes` column, and `decode_stream_attrs`
+                    // omits nested resource values, so this arm is effectively
+                    // dead here; it is kept identical to `declared_column_array`.
+                    Some(v @ (AttrValue::List(_) | AttrValue::Map(_))) => {
+                        b.append_value(canonical_value_bytes(&v))
+                    }
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+    })
+}
+
+/// A UTF-8 log field (`body`, `severity_text`) read from the view; a violation
+/// is the same client-visible corruption class the row path's `string_from_bytes`
+/// produces, never a panic or silently-wrong data.
+fn view_str(bytes: &[u8]) -> DFResult<&str> {
+    std::str::from_utf8(bytes)
+        .map_err(|_| SqlError::CorruptStreamAttrs("log text field not utf-8".to_string()).into())
+}
+
+/// Build all of one block's output batches straight from its columnar view
+/// (ADR-0099 decision 2), chunked at [`BATCH_ROWS`] exactly as the row path
+/// chunks its records, so the two paths' batches are byte-identical. Returns an
+/// empty vec for a block with no surviving row. The view borrows the scan, so
+/// the whole block is built here and the batches handed back owned, letting the
+/// caller drop the view before decoding the next block.
+fn build_columnar_batches(
+    view: &ColumnarBlockView<'_>,
+    schema: &SchemaRef,
+    projection: &[usize],
+    declared: &[DeclaredColumn],
+) -> DFResult<Vec<RecordBatch>> {
+    let n = view.surviving_count();
+    // Resolve each projected declared column's FIELD_DIR column once for the
+    // whole block (ADR-0099 decision 2), not per row and not per chunk.
+    let mut plans: HashMap<usize, DeclaredPlan> = HashMap::new();
+    for &idx in projection {
+        if idx >= FIRST_DECLARED_COL
+            && let Some(dc) = declared.get(idx - FIRST_DECLARED_COL)
+        {
+            plans.insert(
+                idx,
+                DeclaredPlan {
+                    dc,
+                    matching: view.resolve_attr(&dc.key, declared_field_type(dc.ty)),
+                    all_cols: view.attr_columns_for(&dc.key).collect(),
+                },
+            );
+        }
+    }
+    let mut cache: HashMap<u32, Arc<Vec<(String, AttrValue)>>> = HashMap::new();
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let end = (start + BATCH_ROWS).min(n);
+        out.push(build_columnar_batch(
+            view, schema, projection, &plans, &mut cache, start, end,
+        )?);
+        start = end;
+    }
+    Ok(out)
+}
+
+/// Build one output batch for surviving rows `start..end` from the view, one
+/// array per projected column. The column set is the same eligible set
+/// [`columnar_static_eligible`] admits: fixed columns and declared typed
+/// columns, never the `attrs` map.
+#[allow(clippy::too_many_arguments)]
+fn build_columnar_batch(
+    view: &ColumnarBlockView<'_>,
+    schema: &SchemaRef,
+    projection: &[usize],
+    plans: &HashMap<usize, DeclaredPlan<'_>>,
+    cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+    start: usize,
+    end: usize,
+) -> DFResult<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
+    for &idx in projection {
+        let array: ArrayRef = match idx {
+            LOG_COL_TS => Arc::new(TimestampNanosecondArray::from(
+                (start..end)
+                    .map(|i| view.ts(i).unwrap_or_default())
+                    .collect::<Vec<_>>(),
+            )),
+            LOG_COL_OBSERVED_TS => Arc::new(TimestampNanosecondArray::from(
+                (start..end)
+                    .map(|i| view.observed_ts(i).unwrap_or_default())
+                    .collect::<Vec<_>>(),
+            )),
+            LOG_COL_SEVERITY_NUM => Arc::new(UInt8Array::from(
+                (start..end)
+                    .map(|i| view.severity_num(i).unwrap_or_default() as u8)
+                    .collect::<Vec<_>>(),
+            )),
+            LOG_COL_SEVERITY_TEXT => {
+                let mut b = StringBuilder::new();
+                for i in start..end {
+                    match view.severity_text(i) {
+                        Some(bytes) => b.append_value(view_str(bytes)?),
+                        None => b.append_value(""),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            LOG_COL_BODY => {
+                let mut b = StringBuilder::new();
+                for i in start..end {
+                    match view.body(i) {
+                        Some(bytes) => b.append_value(view_str(bytes)?),
+                        None => b.append_value(""),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            LOG_COL_TRACE_ID => {
+                let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, TRACE_ID_WIDTH);
+                for i in start..end {
+                    match view.trace_id(i) {
+                        Some(id) => b
+                            .append_value(id)
+                            .map_err(|e| SqlError::Internal(format!("trace_id array build: {e}")))?,
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            LOG_COL_SPAN_ID => {
+                let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, SPAN_ID_WIDTH);
+                for i in start..end {
+                    match view.span_id(i) {
+                        Some(id) => b
+                            .append_value(id)
+                            .map_err(|e| SqlError::Internal(format!("span_id array build: {e}")))?,
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            LOG_COL_FLAGS => Arc::new(UInt32Array::from(
+                (start..end)
+                    .map(|i| view.flags(i).unwrap_or_default() as u32)
+                    .collect::<Vec<_>>(),
+            )),
+            // Ruled out by `columnar_static_eligible`; a projection reaching the
+            // fast path never carries the `attrs` map.
+            LOG_COL_ATTRS => {
+                return Err(DataFusionError::Internal(
+                    "columnar fast path reached with an attrs map projection".into(),
+                ));
+            }
+            other => match plans.get(&other) {
+                Some(plan) => build_declared_columnar_array(view, plan, start, end, cache)?,
+                None => {
+                    return Err(DataFusionError::Internal(format!(
+                        "logs columnar scan projection index {other} out of range"
+                    )));
+                }
+            },
+        };
+        columns.push(array);
+    }
+    debug_assert_eq!(schema.fields().len(), columns.len());
+    // Carry the row count explicitly so an empty projection (a bare `COUNT(*)`)
+    // still reports its rows, exactly as the row path does.
+    let options = RecordBatchOptions::new().with_row_count(Some(end - start));
+    RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)
+        .map_err(DataFusionError::from)
 }
