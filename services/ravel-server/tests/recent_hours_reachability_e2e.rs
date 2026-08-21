@@ -142,7 +142,7 @@ async fn ingest_hot_segments(
         let ts_ns = base_ns + (i as i64) * 2 * NS_PER_SEC;
         let point = NormalizedPoint {
             series_id,
-            labels: label_set(),
+            labels: Arc::new(label_set()),
             sample: Sample {
                 ts_ns,
                 value: sample_value(i),

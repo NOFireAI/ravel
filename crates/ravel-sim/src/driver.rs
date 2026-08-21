@@ -653,7 +653,7 @@ fn ingest_point_at(
                 sample.ts_ns,
                 IngestPoint {
                     series_id: series.series_id,
-                    labels: series.labels.clone(),
+                    labels: Arc::new(series.labels.clone()),
                     value: IngestValue::Scalar(*sample),
                 },
             )
@@ -663,7 +663,7 @@ fn ingest_point_at(
                 sample.ts_ns,
                 IngestPoint {
                     series_id: series.series_id,
-                    labels: series.labels.clone(),
+                    labels: Arc::new(series.labels.clone()),
                     value: IngestValue::Histogram(sample.clone()),
                 },
             )

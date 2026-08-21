@@ -123,7 +123,7 @@ fn to_points(tenant: &TenantId, dataset: &Dataset) -> Result<Vec<IngestPoint>, R
     // against the pinned Prometheus side.
     let mut points = Vec::new();
     for series in &dataset.series {
-        let labels = build_label_set(&series.labels)?;
+        let labels = Arc::new(build_label_set(&series.labels)?);
         let series_id = SeriesId::compute(tenant, series.metric_name(), &labels)
             .map_err(RavelStackError::SeriesId)?;
         for (ts_ms, value) in &series.samples {
@@ -166,7 +166,7 @@ fn histogram_series_to_points(
     tenant: &TenantId,
     series: &GeneratedHistogramSeries,
 ) -> Result<Vec<IngestPoint>, RavelStackError> {
-    let labels = build_label_set(&series.labels)?;
+    let labels = Arc::new(build_label_set(&series.labels)?);
     let series_id = SeriesId::compute(tenant, series.metric_name(), &labels)
         .map_err(RavelStackError::SeriesId)?;
     Ok(series

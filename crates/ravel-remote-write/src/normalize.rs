@@ -32,6 +32,8 @@
 //! re-checked here so an accepted point can never fail either (see
 //! [`build_histogram_value`]).
 
+use std::sync::Arc;
+
 use ravel_otlp::normalize::{NormalizedExemplar, NormalizedHistogramPoint, NormalizedPoint};
 use ravel_otlp::{IngestLimits, Rejection};
 use ravel_segment::{
@@ -380,6 +382,10 @@ fn normalize_series(
             return;
         }
     };
+
+    // ADR-0098: one label set shared across this series' samples and
+    // histograms. All points built below clone the same `Arc`.
+    let label_set = Arc::new(label_set);
 
     admit_exemplars(
         series,
