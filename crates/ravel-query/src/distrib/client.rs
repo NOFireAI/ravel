@@ -14,7 +14,7 @@ use tonic::transport::Channel;
 
 use crate::distrib::codec::{self, CodecError};
 use crate::distrib::proto::series_fetch_client::SeriesFetchClient;
-use crate::fetcher::{FetchStats, FetchedSeriesSoa};
+use crate::fetcher::{FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
 use crate::span_fetcher::SpanRow;
 
 /// A distributed fetch failed in a way that is not a per-slice typed status.
@@ -39,23 +39,12 @@ pub enum DistribError {
     /// A frame carried no `frame` oneof variant.
     #[error("slice stream carried an empty frame")]
     EmptyFrame,
-    /// The remote streamed a native-histogram frame, which this build cannot
-    /// decode across the slice boundary yet (worker histogram decode is a later
-    /// ticket). This is NOT corruption: the frame is well-formed, the remote
-    /// simply carries data kind this coordinator cannot consume. The federation
-    /// layer treats it as a coverage gap (skippable under `skip_unavailable`),
-    /// never a malformed-response hard fault.
-    #[error(
-        "remote returned native-histogram data this build cannot decode across the slice boundary"
-    )]
-    HistogramUnsupported,
     /// The remote streamed a per-signal record frame (a log record or a span)
     /// for a signal this coordinator's metrics fetch path cannot consume.
     /// Unreachable from a real query today: the metrics coordinator only ever
     /// dispatches `Signal::Metrics`, and the log/span coordinators that would
     /// receive these frames are built by #284/#285. The `frame` oneof is
-    /// exhaustive, so the metrics decoder must still name the variants; like
-    /// [`HistogramUnsupported`](Self::HistogramUnsupported) this is a
+    /// exhaustive, so the metrics decoder must still name the variants: this is a
     /// well-formed frame this build does not consume, not corruption.
     #[error(
         "remote returned a {0} frame this metrics coordinator cannot decode across the slice boundary"
@@ -73,6 +62,10 @@ pub struct SliceResponse {
     /// (the worker applied the request's predicates). Only meaningful when
     /// `status` is `Ok`.
     pub scalar: Vec<FetchedSeriesSoa>,
+    /// Decoded native-histogram series, one [`FetchedHistogramSeries`] per run
+    /// (ADR-0096 decision 3 step 4). Post-erasure (the worker applied the
+    /// request's predicates). Only meaningful when `status` is `Ok`.
+    pub histogram: Vec<FetchedHistogramSeries>,
     /// The worker's per-slice cost accounting.
     pub accounting: ravel_types::accounting::QueryAccountingSnapshot,
     /// The worker's per-slice `FetchStats` page counters, folded (summed) by
@@ -290,25 +283,24 @@ impl SliceFetcher for RemoteSliceFetcher {
 ///
 /// Every malformation is a typed [`DistribError`], never a panic: a series
 /// frame that fails to decode ([`DistribError::Codec`]), a native-histogram
-/// frame this build cannot decode across the slice boundary
-/// ([`DistribError::HistogramUnsupported`] -- well-formed, not corruption, so
-/// the federation layer treats it as a coverage gap skippable under
-/// `skip_unavailable` rather than a malformed response, and the data is never
-/// silently dropped), a frame carrying no oneof variant
-/// ([`DistribError::EmptyFrame`]), a second summary
-/// ([`DistribError::MultipleSummaries`]), a stream that ended with no summary
-/// ([`DistribError::NoSummary`]), a summary with no status, or an unknown
-/// status code.
+/// frame that fails to decode ([`DistribError::Codec`], the same as a malformed
+/// scalar frame -- as of `PROTOCOL_VERSION` 3 a `Hist` frame is real data this
+/// build consumes, so a decode failure is corruption, never a coverage gap), a
+/// frame carrying no oneof variant ([`DistribError::EmptyFrame`]), a second
+/// summary ([`DistribError::MultipleSummaries`]), a stream that ended with no
+/// summary ([`DistribError::NoSummary`]), a summary with no status, or an
+/// unknown status code.
 pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceResponse, DistribError> {
     let mut scalar = Vec::new();
+    let mut histogram = Vec::new();
     let mut summary: Option<pb::Summary> = None;
     for frame in frames {
         match frame.frame {
             Some(pb::fetch_response::Frame::Series(sf)) => {
                 scalar.extend(codec::decode_series_frame(sf)?);
             }
-            Some(pb::fetch_response::Frame::Hist(_)) => {
-                return Err(DistribError::HistogramUnsupported);
+            Some(pb::fetch_response::Frame::Hist(hf)) => {
+                histogram.extend(codec::decode_histogram_frame(hf)?);
             }
             Some(pb::fetch_response::Frame::LogRecord(_)) => {
                 return Err(DistribError::FrameSignalUnsupported("log-record"));
@@ -337,6 +329,7 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
         .unwrap_or_default();
     Ok(SliceResponse {
         scalar,
+        histogram,
         accounting,
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
@@ -596,22 +589,79 @@ mod tests {
         ));
     }
 
-    /// A native-histogram frame this build cannot decode across the slice
-    /// boundary is the distinct `HistogramUnsupported` coverage-gap error, never
-    /// a generic malformed-frame error and never a panic.
+    /// A well-formed native-histogram frame plus a terminal summary decodes
+    /// through the live `decode_slice_frames` path (ADR-0096 decision 3 step 4):
+    /// `SliceResponse.histogram` carries the decoded series, proving the coordinator
+    /// consumes `Hist` frames as real data rather than refusing them. This exercises
+    /// the production decode arm, not just the unit-level codec function.
     #[test]
-    fn histogram_frame_is_histogram_unsupported() {
-        let hist = pb::FetchResponse {
-            frame: Some(pb::fetch_response::Frame::Hist(pb::HistogramFrame {
-                series_id: vec![0u8; 16],
-                labels: Vec::new(),
-                runs: Vec::new(),
-            })),
+    fn histogram_frame_round_trips_through_decode_slice_frames() {
+        use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
+
+        let hs = FetchedHistogramSeries {
+            series_id: SeriesId([2u8; 16]),
+            labels: label_set(),
+            timestamps: vec![10, 20],
+            values: vec![
+                HistogramValue {
+                    scale: 0,
+                    zero_threshold: 0.0,
+                    sum: Some(1.5),
+                    custom_values: None,
+                    positive_spans: vec![HistogramSpan {
+                        offset: 0,
+                        length: 1,
+                    }],
+                    negative_spans: Vec::new(),
+                    counts: HistogramCounts::Int {
+                        zero_count: 0,
+                        count: 1,
+                        positive: vec![1],
+                        negative: Vec::new(),
+                    },
+                    reset_hint: ResetHint::Unknown,
+                },
+                HistogramValue {
+                    scale: 0,
+                    zero_threshold: 0.0,
+                    sum: Some(3.0),
+                    custom_values: None,
+                    positive_spans: vec![HistogramSpan {
+                        offset: 0,
+                        length: 1,
+                    }],
+                    negative_spans: Vec::new(),
+                    counts: HistogramCounts::Int {
+                        zero_count: 0,
+                        count: 2,
+                        positive: vec![2],
+                        negative: Vec::new(),
+                    },
+                    reset_hint: ResetHint::Unknown,
+                },
+            ],
+            created_unix_ns: 7,
+            writer_epoch: 1,
+            writer_seq: 2,
+            per_sample_priorities: None,
         };
-        assert!(matches!(
-            decode_slice_frames(vec![hist]),
-            Err(DistribError::HistogramUnsupported)
-        ));
+        let hist = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::Hist(
+                codec::encode_histogram_frame(&hs),
+            )),
+        };
+        let response = decode_slice_frames(vec![hist, summary_frame(pb::status::Code::Ok)])
+            .expect("a well-formed histogram frame decodes");
+        assert!(response.scalar.is_empty());
+        assert_eq!(response.histogram.len(), 1);
+        let got = &response.histogram[0];
+        assert_eq!(got.series_id, hs.series_id);
+        assert_eq!(got.timestamps, hs.timestamps);
+        // Bit-exact on the wire: the decoded records equal the source records.
+        assert_eq!(
+            codec::encode_histogram_records(&got.values),
+            codec::encode_histogram_records(&hs.values)
+        );
     }
 
     /// A summary that carries no status is a typed `MissingStatus` codec error.

@@ -50,6 +50,7 @@ impl SliceFetcher for FixedCostFetcher {
         accounting.s3_bytes[0] = self.bytes;
         Ok(SliceResponse {
             scalar: Vec::new(),
+            histogram: Vec::new(),
             accounting,
             stats: Default::default(),
             series_returned: 0,

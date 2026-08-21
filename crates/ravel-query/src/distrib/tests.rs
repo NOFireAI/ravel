@@ -257,6 +257,65 @@ async fn local_scalar(
     (out, accounting.snapshot(), stats)
 }
 
+/// The local histogram reference: fetch every snapshot segment's histogram runs
+/// directly (the third element of the fetch tuple the local path merges), so a
+/// distributed histogram fetch can be compared run-for-run against it.
+async fn local_histograms(
+    store: Arc<MemoryStore>,
+    snapshot: &Snapshot,
+) -> Vec<Vec<crate::fetcher::FetchedHistogramSeries>> {
+    let fetcher = SegmentFetcher::new(store);
+    let accounting = QueryAccounting::new();
+    let mut out = Vec::with_capacity(snapshot.segments.len());
+    for seg in &snapshot.segments {
+        let (_scalar, _stats, hist) = fetcher
+            .fetch_soa_and_histograms_accounted(TENANT, seg, &[], &accounting)
+            .await
+            .expect("local histogram fetch");
+        out.push(hist);
+    }
+    out
+}
+
+/// Asserts two histogram run pools carry the same series with the same
+/// timestamps and bit-identical records. Both pools are flattened and sorted by
+/// series id + first timestamp, so per-slice vs per-segment grouping does not
+/// matter. Records compare via `encode_histogram_records`, whose every `f64`
+/// crosses as its `to_bits` pattern, so `-0.0`/NaN bucket counts and sums cannot
+/// pass as equal when they differ.
+fn assert_histograms_bit_identical(
+    local: &[Vec<crate::fetcher::FetchedHistogramSeries>],
+    distributed: &[Vec<crate::fetcher::FetchedHistogramSeries>],
+) {
+    let flatten = |pool: &[Vec<crate::fetcher::FetchedHistogramSeries>]| {
+        let mut v: Vec<crate::fetcher::FetchedHistogramSeries> =
+            pool.iter().flatten().cloned().collect();
+        v.sort_by_key(|s| {
+            (
+                s.series_id.0,
+                s.timestamps.first().copied().unwrap_or(i64::MIN),
+            )
+        });
+        v
+    };
+    let a = flatten(local);
+    let b = flatten(distributed);
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "histogram series count differs local vs distributed"
+    );
+    for (la, lb) in a.iter().zip(b.iter()) {
+        assert_eq!(la.series_id, lb.series_id, "histogram series id differs");
+        assert_eq!(la.timestamps, lb.timestamps, "histogram timestamps differ");
+        assert_eq!(
+            crate::distrib::codec::encode_histogram_records(&la.values),
+            crate::distrib::codec::encode_histogram_records(&lb.values),
+            "histogram record bit patterns differ (sum/count/bucket corruption)"
+        );
+    }
+}
+
 fn assert_series_bit_identical(local: &[SeriesData], distributed: &[SeriesData]) {
     let key = |s: &SeriesData| {
         s.labels
@@ -563,23 +622,31 @@ async fn write_l1_merged_provenance(store: &MemoryStore) -> SegmentRef {
     }
 }
 
-/// A fetched scalar series carrying a per-sample provenance column must be
-/// REFUSED at the service level in every build profile, handing the slice to the
-/// coordinator's local fallback rather than being encoded as a degraded run-wide
-/// frame. `Distributed::fetch` returning `Ok(None)` is that refusal-driven
-/// fallback.
+/// ADR-0096 acceptance (decision 3 step 4, deliverable 7 bullet 1): a
+/// distributed query over run-merged L1 data (a segment written with an explicit
+/// `per_sample_priorities` column) is SERVED over the wire -- not refused to the
+/// coordinator's local fallback -- and its coordinator-merged result is
+/// bit-identical (`f64::to_bits`) to the same query run purely locally,
+/// including at the overlapping timestamp where the winner depends on per-sample
+/// provenance.
 ///
-/// This pins the service-level refusal, which is now the only guard: the
-/// `debug_assert` that once sat in `encode_series_frame` was removed, because it
-/// compiled to nothing under `debug_assertions = off` and the refusal already
-/// covers the exact set of series that can reach the encoder. Before that
-/// refusal existed, a release build of this same fetch encoded the degraded
-/// frame and `fetch` returned `Ok(Some(..))`, so asserting `None` here fails
-/// against the unfixed code in the exact profile the defect shipped in. The
-/// pass condition is the coordinator's fallback decision, driven through the
-/// full loopback worker, not a panic from an assert.
+/// This is the direct inverse of the pre-flip
+/// `run_merged_series_refuses_over_the_wire_not_degrades`, which asserted the
+/// slice was refused (`Ok(None)`). Post-flip the encoder emits the four packed
+/// provenance columns, so `Distributed::fetch` returns `Ok(Some(..))` and the
+/// distributed path itself (not a fallback) carries the column-dictated winners.
+///
+/// The corpus is the reviewed hazard: at ts=10 the per-sample column gives the
+/// `created=200` sample (value 1.0) the win, while the run-wide prefix
+/// `created=100` applied by array position would pick the `created=100` sample
+/// (value 9.0). A degraded run-wide frame would return 9.0 here; the assertion
+/// pins 1.0, so it fails against any encode that drops the column.
+///
+/// Mutation proof: stubbing `encode_series_frame` to emit empty provenance
+/// columns (the pre-flip degraded encode) turns ts=10's winner into 9.0 and this
+/// test goes RED at the `to_bits` comparison.
 #[test]
-fn run_merged_series_refuses_over_the_wire_not_degrades() {
+fn run_merged_series_distributed_over_the_wire_not_refused() {
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async {
         let store = Arc::new(MemoryStore::new());
@@ -590,12 +657,10 @@ fn run_merged_series_refuses_over_the_wire_not_degrades() {
             pending_erasure: Vec::new(),
         };
 
-        // Ground-truth cost of fetching this one slice's segment once, to prove
-        // the refusal folds the slice's spend exactly once (not zero, not twice):
-        // the worker returns its accounting in the terminal summary before the
-        // Unsupported status, exactly as the histogram arm does.
-        let (_local_runs, local_acct, _local_stats) =
+        // Pure-local reference plus the ground-truth single-fetch cost.
+        let (local_runs, local_acct, _local_stats) =
             local_scalar(Arc::clone(&store), &snapshot).await;
+        let local_merged = merge_soa_runs(local_runs, usize::MAX, usize::MAX).expect("local merge");
 
         let (fetcher, server) = spawn_worker(Arc::clone(&store), vec![seg]).await;
         let distributed = Distributed::new(
@@ -607,7 +672,7 @@ fn run_merged_series_refuses_over_the_wire_not_degrades() {
             },
         );
         let accounting = QueryAccounting::new();
-        let result = distributed
+        let triple = distributed
             .fetch(
                 TENANT,
                 Signal::Metrics,
@@ -619,22 +684,34 @@ fn run_merged_series_refuses_over_the_wire_not_degrades() {
                 i64::MAX,
             )
             .await
-            .expect("distributed fetch");
+            .expect("distributed fetch")
+            .expect(
+                "a run-merged series is now served over the wire (PROTOCOL_VERSION 3), \
+                 not refused to local fallback",
+            );
         server.abort();
 
-        assert!(
-            result.is_none(),
-            "a run-merged series (per-sample provenance column) must trigger the \
-             Unsupported local fallback (Ok(None)), never a degraded run-wide \
-             frame; got a distributed result"
-        );
-        // The refusal folded the slice's real S3 spend exactly once: equal to a
-        // single local fetch of the segment, not zero and not doubled.
+        let distributed_merged =
+            merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("dist merge");
+        assert_series_bit_identical(&local_merged, &distributed_merged);
+
+        // Pin the column-dictated winners so this is not "two equal empties": the
+        // merge keeps 1.0 at ts=10 (created=200 beats created=100's 9.0) and 2.0
+        // at ts=20. A degraded run-wide frame would put 9.0 at ts=10.
+        assert_eq!(distributed_merged.len(), 1);
+        let samples = &distributed_merged[0].samples;
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].ts_ns, 10);
+        assert_eq!(samples[0].value.to_bits(), 1.0f64.to_bits());
+        assert_eq!(samples[1].ts_ns, 20);
+        assert_eq!(samples[1].value.to_bits(), 2.0f64.to_bits());
+
+        // The served path folded the slice's real S3 spend exactly once: equal to
+        // a single local fetch of the segment, not zero and not doubled.
         assert_eq!(
             accounting.snapshot(),
             local_acct,
-            "the refusal path must fold the slice's spend exactly once \
-             (histogram-arm accounting behaviour)"
+            "the distributed fetch must fold the slice's spend exactly once"
         );
     });
 }
@@ -1040,6 +1117,7 @@ impl SliceFetcher for LyingBudgetWorker {
         acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, self.spend_bytes);
         Ok(SliceResponse {
             scalar: Vec::new(),
+            histogram: Vec::new(),
             accounting: acct.snapshot(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
@@ -1135,6 +1213,7 @@ impl SliceFetcher for AlwaysInvalidated {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(SliceResponse {
             scalar: Vec::new(),
+            histogram: Vec::new(),
             accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
@@ -1475,6 +1554,7 @@ impl SliceFetcher for OverflowingLyingWorker {
         acct.add_s3_bytes(ravel_types::accounting::AccountedOp::Get, spend);
         Ok(SliceResponse {
             scalar: Vec::new(),
+            histogram: Vec::new(),
             accounting: acct.snapshot(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
@@ -1554,19 +1634,21 @@ fn coordinator_fold_saturates_overflowing_worker_reports() {
     });
 }
 
-/// ADR-0071 scalar-only distribution (finding 5): a histogram-bearing slice is
-/// handed back to the coordinator as `Unsupported` -- but its S3 spend is real,
-/// so the worker's summary carries the slice's true accounting and stats, and
-/// the coordinator folds them into the query's accounting handle BEFORE
-/// signalling local fallback (`Ok(None)`). Without the fold, a histogram query
-/// pays for the distributed fetch twice and reports it once. The fold this
-/// pins is the precondition for the documented engine consequence (the local
-/// fallback re-enforces `max_bytes_scanned` against a handle carrying the
-/// remote spend -- see the fallthrough comment in `engine.rs`).
-/// Deleting the worker's `any_histograms` Unsupported branch, or the
-/// coordinator's pre-fallback fold, fails the assertions below.
+/// ADR-0096 acceptance (decision 3 step 4, deliverable 7 bullet 2): a
+/// distributed query over a segment with real native-histogram series returns
+/// results bit-identical to the local equivalent. The histogram records now
+/// cross the wire (`encode_histogram_frame`/`decode_histogram_frame`) rather
+/// than triggering the removed refusal, so `Distributed::fetch` returns the real
+/// histogram runs in the triple's third element and they equal the local fetch
+/// run-for-run, `to_bits` on every `f64`.
+///
+/// Mutation proof: stubbing `encode_histogram_frame` to omit `records` (the
+/// pre-flip degraded encode) makes the decoded run length disagree with its
+/// timestamps, so the coordinator's decode raises
+/// `CodecError::HistogramRunLengthMismatch` and `Distributed::fetch` errors --
+/// this test goes RED at `.expect("distributed fetch")`.
 #[test]
-fn histogram_slice_falls_back_with_spend_folded() {
+fn histogram_series_distributed_equals_local_bitwise() {
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async {
         use ravel_segment::{
@@ -1578,10 +1660,13 @@ fn histogram_slice_falls_back_with_spend_folded() {
         let metric = "h0";
         let label_set = labels(metric);
         let series_id = SeriesId::compute(&tenant_id(), metric, &label_set).expect("series id");
-        let hist = HistogramValue {
+        // Two samples with distinct, data-bearing sums, so the fixture's answer
+        // depends on the records actually crossing the wire (not just an empty
+        // shell): a dropped/blanked record set changes the compared bit patterns.
+        let hist = |sum: f64, count: u64, bucket: u64| HistogramValue {
             scale: 0,
             zero_threshold: 0.0,
-            sum: Some(1.0),
+            sum: Some(sum),
             custom_values: None,
             positive_spans: vec![ravel_segment::HistogramSpan {
                 offset: 0,
@@ -1590,8 +1675,8 @@ fn histogram_slice_falls_back_with_spend_folded() {
             negative_spans: Vec::new(),
             counts: HistogramCounts::Int {
                 zero_count: 0,
-                count: 1,
-                positive: vec![1],
+                count,
+                positive: vec![bucket],
                 negative: Vec::new(),
             },
             reset_hint: ResetHint::Unknown,
@@ -1607,10 +1692,16 @@ fn histogram_slice_falls_back_with_spend_folded() {
             vec![SeriesInputV3 {
                 series_id,
                 labels: label_set,
-                values: SeriesValues::Histogram(vec![HistogramSample {
-                    ts_ns: NS,
-                    value: hist,
-                }]),
+                values: SeriesValues::Histogram(vec![
+                    HistogramSample {
+                        ts_ns: NS,
+                        value: hist(2.5, 1, 1),
+                    },
+                    HistogramSample {
+                        ts_ns: 2 * NS,
+                        value: hist(9.0, 3, 3),
+                    },
+                ]),
             }],
             identity,
             IngestBounds {
@@ -1646,6 +1737,9 @@ fn histogram_slice_falls_back_with_spend_folded() {
             pending_erasure: Vec::new(),
         };
 
+        // Local reference: the same segment's histogram runs, fetched directly.
+        let local_hist = local_histograms(Arc::clone(&store), &snapshot).await;
+
         let (fetcher, server) = spawn_worker(Arc::clone(&store), vec![seg]).await;
         let distributed = Distributed::new(
             Arc::new(fetcher),
@@ -1656,7 +1750,7 @@ fn histogram_slice_falls_back_with_spend_folded() {
             },
         );
         let accounting = QueryAccounting::new();
-        let result = distributed
+        let triple = distributed
             .fetch(
                 TENANT,
                 Signal::Metrics,
@@ -1668,36 +1762,46 @@ fn histogram_slice_falls_back_with_spend_folded() {
                 i64::MAX,
             )
             .await
-            .expect("unsupported must not be an error");
+            .expect("distributed fetch")
+            .expect(
+                "a histogram slice is now served over the wire (PROTOCOL_VERSION 3), \
+                 not refused to local fallback",
+            );
+        server.abort();
+
+        // The distributed histogram runs (triple's third element) equal the local
+        // fetch run-for-run, records bit-identical. The scalar half is empty.
         assert!(
-            result.is_none(),
-            "a histogram-bearing snapshot signals local fallback (Ok(None))"
+            triple.0.iter().all(|s| s.is_empty()),
+            "a histogram-only segment yields no scalar series"
+        );
+        assert_histograms_bit_identical(&local_hist, &triple.2);
+        // Not "two equal empties": the segment really carried histogram series.
+        assert!(
+            triple.2.iter().any(|s| !s.is_empty()),
+            "the distributed path must actually carry the histogram series"
         );
         assert!(
             accounting.snapshot().total_s3_bytes() > 0,
-            "the worker's real spend must be folded into the query accounting before fallback"
+            "the worker's real spend is folded into the query accounting"
         );
-        server.abort();
     });
 }
 
 /// The worker-side histogram erasure wiring (ADR-0096 decision 3 step 3) is
-/// real, not latent. An erasure predicate that erases every sample of the only
-/// histogram series present leaves nothing to refuse, so the
-/// `Unsupported`/"histogram series are not distributed yet" refusal does NOT
-/// fire: the slice returns an ordinary (empty) result and the coordinator does
-/// not fall back to local (`Ok(Some(..))`, not `Ok(None)`).
+/// real, not latent, and runs before the histogram series are encoded onto the
+/// wire (decision 3 step 4). An erasure predicate that erases every sample of
+/// the only histogram series present drops it entirely, so the distributed
+/// result carries no histogram runs (and no scalar ones), exactly as a local
+/// fetch over the same erasure would.
 ///
-/// This is the counterpart to `histogram_slice_falls_back_with_spend_folded`,
-/// which drives the identical segment with NO erasure and asserts the refusal
-/// DOES fire (`Ok(None)`). The single line that makes this test pass is the
+/// The single line that makes this hold is the
 /// `crate::erasure::retain_histogram_series(&mut histograms, &erasure)` call in
-/// `service.rs::run_slice_metrics`, placed before the refusal check which now
-/// keys on the post-filter `!histograms.is_empty()`. Deleting that call, or
-/// reverting the refusal to the pre-filter per-segment `seg_hist.is_empty()`
-/// check, leaves the histogram set non-empty and flips this back to `Ok(None)`.
+/// `service.rs::run_slice_metrics`: deleting it leaves the histogram series
+/// standing and the distributed result would carry it, failing the empty-result
+/// assertions below.
 #[test]
-fn erased_histogram_series_no_longer_triggers_the_unsupported_refusal() {
+fn erased_histogram_series_is_dropped_before_the_wire() {
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async {
         use ravel_segment::{
@@ -1808,13 +1912,16 @@ fn erased_histogram_series_no_longer_triggers_the_unsupported_refusal() {
             .expect("unsupported must not be an error");
         assert!(
             result.is_some(),
-            "an erasure that empties the only histogram series leaves nothing to \
-             refuse, so no Unsupported local fallback fires"
+            "an erased histogram slice is served (empty), never a local fallback"
         );
-        let (per_slice, _stats, _hist) = result.expect("a real (non-fallback) result");
+        let (per_slice, _stats, per_slice_hist) = result.expect("a real (non-fallback) result");
         assert!(
             per_slice.iter().all(|series| series.is_empty()),
-            "the erased histogram series must not surface as a scalar series either"
+            "the erased histogram series must not surface as a scalar series"
+        );
+        assert!(
+            per_slice_hist.iter().all(|series| series.is_empty()),
+            "the erased histogram series must be dropped before the wire, not sent"
         );
         server.abort();
     });

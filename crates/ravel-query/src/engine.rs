@@ -997,10 +997,30 @@ impl QueryEngine {
                 .zip(windows_ref.iter())
                 .map(|(plan, w)| (plan.matchers.clone(), w.start_ns, w.end_ns))
                 .collect();
-            let (fed_runs, fed_stats, fed_warnings, fed_partial) = self
+            let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
                 .federate_scalar(tenant_hash, fed_plans, &accounting)
                 .await?;
             all_scalar_runs.extend(fed_runs);
+            // Merge every remote's native-histogram runs into the same
+            // deduplicated pool the local per-selector histograms populated
+            // (ADR-0096 decision 3 step 4): each remote resolved its own
+            // snapshot and merged its own runs under the same provenance total
+            // order, so per cluster we run the identical `merge_histogram_soa_runs`
+            // and union by label set. `or_insert` keeps the first cluster's
+            // series on the assumption that clusters own disjoint series identity
+            // (the same cross-cluster assumption `series` relies on, documented in
+            // the federation module); the alternative -- a globally meaningful
+            // cross-cluster histogram tie-break -- is out of scope, exactly as it
+            // is for scalars.
+            if !fed_hist_runs.is_empty() {
+                let fed_histograms =
+                    merge_histogram_soa_runs(fed_hist_runs, max_series, max_samples)?;
+                for series in fed_histograms {
+                    combined_histograms
+                        .entry(series.labels.clone())
+                        .or_insert(series);
+                }
+            }
             // `fed_stats` is reported by a remote cluster over the wire, so a
             // buggy or hostile remote could report values that overflow a plain
             // `+=` (a debug-build panic, a release-build wrap). Saturate instead:
@@ -1361,12 +1381,14 @@ impl QueryEngine {
         .await
     }
 
-    /// Cross-cluster federation fan-out for the scalar-sample path (ADR-0071).
+    /// Cross-cluster federation fan-out for the metrics path (ADR-0071, ADR-0096).
     ///
-    /// Returns the remote series runs (to be unioned into the local pool and
-    /// merged once, since [`merge_soa_runs`] keys by canonical `SeriesId`),
-    /// the folded remote `FetchStats`, the deduplicated `skip_unavailable`
-    /// warnings, and whether any cluster was skipped (partial coverage).
+    /// Returns the remote scalar series runs (to be unioned into the local pool
+    /// and merged once, since [`merge_soa_runs`] keys by canonical `SeriesId`),
+    /// the remote native-histogram series runs (merged per cluster and unioned
+    /// into the local histogram pool, ADR-0096 decision 3 step 4), the folded
+    /// remote `FetchStats`, the deduplicated `skip_unavailable` warnings, and
+    /// whether any cluster was skipped (partial coverage).
     ///
     /// This is a named `async fn` on purpose: its future is higher-ranked over
     /// its input lifetimes, so borrows taken across the inner `SliceFetcher`
@@ -1374,18 +1396,29 @@ impl QueryEngine {
     /// snapshot-resolution future, which must satisfy axum's `Handler` `Send`
     /// bound. The `plan_matchers_windows` argument is owned for the same
     /// reason. No federation configured is a cheap empty result.
+    #[allow(clippy::type_complexity)]
     async fn federate_scalar(
         &self,
         tenant_hash: TenantHash,
         plan_matchers_windows: Vec<(Vec<LabelMatcher>, i64, i64)>,
         accounting: &QueryAccounting,
-    ) -> Result<(Vec<Vec<FetchedSeriesSoa>>, FetchStats, Vec<String>, bool), QueryError> {
+    ) -> Result<
+        (
+            Vec<Vec<FetchedSeriesSoa>>,
+            Vec<Vec<FetchedHistogramSeries>>,
+            FetchStats,
+            Vec<String>,
+            bool,
+        ),
+        QueryError,
+    > {
         let mut runs: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
+        let mut hist_runs: Vec<Vec<FetchedHistogramSeries>> = Vec::new();
         let mut stats = FetchStats::default();
         let mut warnings: Vec<String> = Vec::new();
         let mut partial = false;
         let Some(federation) = &self.federation else {
-            return Ok((runs, stats, warnings, partial));
+            return Ok((runs, hist_runs, stats, warnings, partial));
         };
         for (matchers, start_ns, end_ns) in plan_matchers_windows {
             // Empty erasure and empty min-commit-tokens cross the boundary: the
@@ -1441,8 +1474,9 @@ impl QueryEngine {
                 }
             }
             runs.extend(outcome.series);
+            hist_runs.extend(outcome.histogram);
         }
-        Ok((runs, stats, warnings, partial))
+        Ok((runs, hist_runs, stats, warnings, partial))
     }
 
     async fn fetch_all_series(
@@ -4582,6 +4616,7 @@ mod prefetch_tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(crate::distrib::client::SliceResponse {
                 scalar: Vec::new(),
+                histogram: Vec::new(),
                 accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
                 stats: crate::fetcher::FetchStats::default(),
                 series_returned: 0,
@@ -5222,6 +5257,7 @@ mod coverage_wrapper_tests {
         async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
             Ok(SliceResponse {
                 scalar: Vec::new(),
+                histogram: Vec::new(),
                 accounting: QueryAccountingSnapshot::default(),
                 stats: FetchStats::default(),
                 series_returned: 0,

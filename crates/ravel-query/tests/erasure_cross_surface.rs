@@ -638,6 +638,7 @@ fn ok_response(scalar: Vec<FetchedSeriesSoa>) -> SliceResponse {
     let samples_returned = scalar.iter().map(|s| s.timestamps.len() as u64).sum();
     SliceResponse {
         scalar,
+        histogram: Vec::new(),
         accounting: QueryAccountingSnapshot::default(),
         stats: FetchStats::default(),
         series_returned,

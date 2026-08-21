@@ -184,8 +184,8 @@ distinction is a security invariant: collapsing the two would let a
 coordinator name any tenant on a remote it holds one credential for.
 
 Partial coverage (a soft-timed-out or skipped remote, or a remote that
-returned a data kind this build cannot decode, such as native histograms
-across the slice boundary) is never silent. The query stats carry
+answers `Unsupported` for the whole request, such as one on an older
+`PROTOCOL_VERSION`) is never silent. The query stats carry
 `partial: true` and one warning per degraded remote, merged into the
 Prometheus JSON envelope. Warnings name only the operator-facing cluster
 name; remote IP:port and errno are redacted, and `RemoteClusterConfig`'s
@@ -198,9 +198,10 @@ evaluation or final aggregation dominates; that ceiling is explicit and is
 what a future aggregation-pushdown ADR would move. Network bytes to the
 coordinator are matcher-pruned, window-clipped decoded samples, bounded by
 the existing per-selector budgets; total S3 request count is identical to
-local execution for scalar-only queries (a histogram-bearing query pays the
-distributed fetch and then the local fallback fetch, with both folded into
-its reported cost), and instantaneous rate is capped by
+local execution (as of ADR-0096 a native-histogram or run-merged scalar query
+is served over the wire rather than falling back, so it no longer double-fetches;
+a version-skew fallback still pays both, with both folded into its reported
+cost), and instantaneous rate is capped by
 `max_parallel_slices` times the per-worker GET semaphore. Initial gate
 thresholds (distribute above 256 MiB estimated store bytes or 64 segments)
 are set from the crossover benchmark before defaults freeze, and every later
