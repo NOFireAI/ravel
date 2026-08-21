@@ -31,7 +31,7 @@ use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
 use crate::erasure::ErasurePredicate;
-use crate::fetcher::{FetchedSeriesSoa, SamplePriority};
+use crate::fetcher::{FetchedHistogramSeries, FetchedSeriesSoa, SamplePriority};
 use crate::span_fetcher::SpanRow;
 
 /// The queryfrag protocol version this build speaks. A `FetchRequest` carrying
@@ -225,6 +225,21 @@ pub enum CodecError {
     MissingHistogramCounts,
     #[error("unknown histogram reset-hint discriminant {0}")]
     UnknownResetHint(i32),
+    #[error("histogram run has {timestamps} timestamp deltas but {records} records")]
+    HistogramRunLengthMismatch { timestamps: usize, records: usize },
+    #[error("histogram span has length 0 (every span must cover at least one bucket)")]
+    HistogramSpanLengthZero,
+    #[error("histogram scale {scale} is below the -53 custom-boundary minimum")]
+    HistogramScaleTooSmall { scale: i32 },
+    #[error(
+        "histogram custom_values must be present, non-empty, and strictly ascending iff \
+         scale == -53"
+    )]
+    HistogramCustomValuesMismatch,
+    #[error("histogram side has {buckets} bucket counts but its spans cover {spans} buckets")]
+    HistogramBucketCountMismatch { spans: u64, buckets: usize },
+    #[error("histogram count is less than its zero_count or its total bucket count")]
+    HistogramCountInconsistent,
 }
 
 /// Rejects any protocol version this build does not speak. `Ok(())` only for
@@ -675,6 +690,185 @@ fn decode_reset_hint(raw: i32) -> Result<ResetHint, CodecError> {
         Pb::No => Ok(ResetHint::No),
         Pb::Gauge => Ok(ResetHint::Gauge),
     }
+}
+
+// ---- HistogramFrame <-> FetchedHistogramSeries ----------------------------
+
+/// Encodes one decoded per-segment histogram series as a `HistogramFrame`
+/// carrying a single run, mirroring [`encode_series_frame`]. A
+/// [`FetchedHistogramSeries`] is one series' histogram samples from one segment
+/// (the fetch path produces one run per segment per series, the same as
+/// scalar), so it maps to exactly one [`pb::HistogramRun`]; the labels are
+/// written once. Timestamps become zig-zag deltas via [`encode_ts_deltas`], the
+/// values become typed [`pb::HistogramRecord`]s via [`encode_histogram_records`]
+/// (every `f64` as its `to_bits` pattern), and the optional per-sample
+/// provenance column crosses through the same four packed columns
+/// [`encode_series_frame`] uses ([`encode_sample_priorities`]).
+///
+/// No live caller wires this into the distributed fetch path yet: the worker
+/// still never sends a `Hist` frame, and the coordinator's `decode_slice_frames`
+/// still refuses any `Hist` frame with `DistribError::HistogramUnsupported`.
+/// Flipping [`PROTOCOL_VERSION`] and removing both refusals is a later step of
+/// the same epic (ADR-0096 decision 3 step 4). The round trip is exercised
+/// entirely by this module's tests.
+pub fn encode_histogram_frame(series: &FetchedHistogramSeries) -> pb::HistogramFrame {
+    let (prov_created_delta, prov_epoch_delta, prov_seq_delta, prov_in_page_index) =
+        encode_sample_priorities(&series.per_sample_priorities);
+    pb::HistogramFrame {
+        series_id: series.series_id.0.to_vec(),
+        labels: encode_labels(&series.labels),
+        runs: vec![pb::HistogramRun {
+            created_unix_ns: series.created_unix_ns,
+            writer_epoch: series.writer_epoch,
+            writer_seq: series.writer_seq,
+            ts_delta: encode_ts_deltas(&series.timestamps),
+            prov_created_delta,
+            prov_epoch_delta,
+            prov_seq_delta,
+            prov_in_page_index,
+            records: encode_histogram_records(&series.values),
+        }],
+    }
+}
+
+/// Decodes a `HistogramFrame` back into one [`FetchedHistogramSeries`] per run,
+/// mirroring [`decode_series_frame`]. Beyond the record-level decode
+/// ([`decode_histogram_records`]) and the shared run-length/provenance-length
+/// checks, every decoded [`HistogramValue`] is passed through
+/// [`validate_histogram_value`], which ports `ravel-segment`'s reader-side
+/// structural invariants to the wire (`crates/ravel-segment/src/reader.rs`,
+/// `decode_histogram_record`): a record that could not have come from a
+/// well-formed RSEG histogram is a typed [`CodecError`], never a silently-wrong
+/// value handed to the coordinator's histogram merge.
+pub fn decode_histogram_frame(
+    frame: pb::HistogramFrame,
+) -> Result<Vec<FetchedHistogramSeries>, CodecError> {
+    let series_id = decode_series_id(&frame.series_id)?;
+    let labels = decode_labels(frame.labels)?;
+    frame
+        .runs
+        .into_iter()
+        .map(|run| {
+            if run.records.len() != run.ts_delta.len() {
+                return Err(CodecError::HistogramRunLengthMismatch {
+                    timestamps: run.ts_delta.len(),
+                    records: run.records.len(),
+                });
+            }
+            let per_sample_priorities = decode_sample_priorities(
+                &run.prov_created_delta,
+                &run.prov_epoch_delta,
+                &run.prov_seq_delta,
+                &run.prov_in_page_index,
+                run.ts_delta.len(),
+            )?;
+            let values = decode_histogram_records(&run.records)?;
+            for value in &values {
+                validate_histogram_value(value)?;
+            }
+            Ok(FetchedHistogramSeries {
+                series_id,
+                labels: labels.clone(),
+                timestamps: decode_ts_deltas(&run.ts_delta),
+                values,
+                created_unix_ns: run.created_unix_ns,
+                writer_epoch: run.writer_epoch,
+                writer_seq: run.writer_seq,
+                per_sample_priorities,
+            })
+        })
+        .collect()
+}
+
+/// Ports `ravel-segment`'s reader-side structural invariants
+/// (`crates/ravel-segment/src/reader.rs`, `decode_histogram_record`) to the wire
+/// decoder, which otherwise has none. The comparisons match the reader's
+/// exactly, including the float count check's `<` form so NaN/Inf bucket counts
+/// (legal per docs/segment-format.md section 3.5) pass through unchanged rather
+/// than being rejected: a NaN comparison is always false, so the check accepts
+/// them the same way the reader does. Each malformation is its own typed
+/// [`CodecError`], never a panic and never a value the merge would tie-break on
+/// wrongly.
+fn validate_histogram_value(value: &HistogramValue) -> Result<(), CodecError> {
+    if value.scale < -53 {
+        return Err(CodecError::HistogramScaleTooSmall { scale: value.scale });
+    }
+    // custom_values present, non-empty, and strictly ascending iff scale == -53;
+    // absent otherwise. `<` on f64 matches the reader's strict-ascending check.
+    match &value.custom_values {
+        Some(bounds) if value.scale == -53 => {
+            if bounds.is_empty() || !bounds.windows(2).all(|w| w[0] < w[1]) {
+                return Err(CodecError::HistogramCustomValuesMismatch);
+            }
+        }
+        None if value.scale != -53 => {}
+        _ => return Err(CodecError::HistogramCustomValuesMismatch),
+    }
+    let positive_len = hist_span_bucket_total(&value.positive_spans)?;
+    let negative_len = hist_span_bucket_total(&value.negative_spans)?;
+    match &value.counts {
+        HistogramCounts::Int {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => {
+            check_bucket_len(positive_len, positive.len())?;
+            check_bucket_len(negative_len, negative.len())?;
+            let mut total: u64 = 0;
+            for &v in positive.iter().chain(negative.iter()) {
+                total = total
+                    .checked_add(v)
+                    .ok_or(CodecError::HistogramCountInconsistent)?;
+            }
+            if *count < *zero_count || *count < total {
+                return Err(CodecError::HistogramCountInconsistent);
+            }
+        }
+        HistogramCounts::Float {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => {
+            check_bucket_len(positive_len, positive.len())?;
+            check_bucket_len(negative_len, negative.len())?;
+            let mut total = 0.0f64;
+            for &v in positive.iter().chain(negative.iter()) {
+                total += v;
+            }
+            if *count < *zero_count || *count < total {
+                return Err(CodecError::HistogramCountInconsistent);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The total bucket count one side's spans cover (`sum(length)`), rejecting a
+/// zero-length span the same way the reader's `decode_hist_spans` does
+/// (`HistogramSpanLengthZero`). `saturating_add` cannot overflow in practice
+/// (each length is a `u32` and a real histogram has a handful of spans); if it
+/// ever saturated, the bucket-length check downstream would reject the record
+/// as a [`CodecError::HistogramBucketCountMismatch`] rather than wrapping.
+fn hist_span_bucket_total(spans: &[HistogramSpan]) -> Result<u64, CodecError> {
+    let mut total: u64 = 0;
+    for span in spans {
+        if span.length == 0 {
+            return Err(CodecError::HistogramSpanLengthZero);
+        }
+        total = total.saturating_add(u64::from(span.length));
+    }
+    Ok(total)
+}
+
+/// A histogram side's bucket-count vector must be exactly as long as its spans
+/// cover, mirroring the reader decoding exactly `sum(length)` counts per side.
+fn check_bucket_len(spans: u64, buckets: usize) -> Result<(), CodecError> {
+    if buckets as u64 != spans {
+        return Err(CodecError::HistogramBucketCountMismatch { spans, buckets });
+    }
+    Ok(())
 }
 
 fn decode_series_id(bytes: &[u8]) -> Result<SeriesId, CodecError> {
@@ -1590,40 +1784,83 @@ mod tests {
         ]
     }
 
+    /// A span with `length >= 1`: a zero-length span is structurally invalid
+    /// (`HistogramSpanLengthZero`, `validate_histogram_value`), so the generator
+    /// can no longer construct one and call it a passing round-trip case.
     fn arb_hist_span() -> impl Strategy<Value = HistogramSpan> {
-        (any::<i32>(), any::<u32>()).prop_map(|(offset, length)| HistogramSpan { offset, length })
+        (any::<i32>(), 1u32..=4).prop_map(|(offset, length)| HistogramSpan { offset, length })
     }
 
-    fn arb_hist_counts() -> impl Strategy<Value = HistogramCounts> {
+    /// One histogram side: its spans and the exact bucket-count total those
+    /// spans cover (`sum(length)`), so the coupled count generators below emit a
+    /// bucket vector of the length `validate_histogram_value` requires.
+    fn arb_hist_side() -> impl Strategy<Value = (Vec<HistogramSpan>, usize)> {
+        prop::collection::vec(arb_hist_span(), 0..3).prop_map(|spans| {
+            let total = spans.iter().map(|s| s.length as usize).sum();
+            (spans, total)
+        })
+    }
+
+    /// Integer counts whose `positive`/`negative` vectors match the span totals
+    /// and whose `count` is `>= zero_count` and `>= sum(all buckets)` by
+    /// construction, so the record satisfies the reader's count-consistency
+    /// invariant. All values stay small so the total never overflows.
+    fn arb_int_counts(pos_len: usize, neg_len: usize) -> impl Strategy<Value = HistogramCounts> {
+        (
+            0u64..100,
+            prop::collection::vec(0u64..100, pos_len..=pos_len),
+            prop::collection::vec(0u64..100, neg_len..=neg_len),
+            0u64..100,
+        )
+            .prop_map(|(zero_count, positive, negative, extra)| {
+                let total: u64 = positive.iter().chain(negative.iter()).sum();
+                HistogramCounts::Int {
+                    zero_count,
+                    count: zero_count + total + extra,
+                    positive,
+                    negative,
+                }
+            })
+    }
+
+    /// Float counts whose bucket vectors match the span totals and carry
+    /// arbitrary `f64` payloads (NaN, `-0.0`, infinities). `count` is
+    /// `f64::INFINITY`, which is `>=` any finite `zero_count` and total and
+    /// passes the reader's NaN-transparent `<` check for every bucket payload,
+    /// so the record is always structurally valid while still exercising every
+    /// bit pattern in the bucket and `zero_count` fields.
+    fn arb_float_counts(pos_len: usize, neg_len: usize) -> impl Strategy<Value = HistogramCounts> {
+        (
+            arb_hist_float(),
+            prop::collection::vec(arb_hist_float(), pos_len..=pos_len),
+            prop::collection::vec(arb_hist_float(), neg_len..=neg_len),
+        )
+            .prop_map(|(zero_count, positive, negative)| HistogramCounts::Float {
+                zero_count,
+                count: f64::INFINITY,
+                positive,
+                negative,
+            })
+    }
+
+    /// A scale and its `custom_values`, coupled so the pair always satisfies the
+    /// custom-boundary invariant: scale `-53` with a non-empty strictly
+    /// ascending finite boundary vector, or any other in-range scale with no
+    /// boundaries.
+    fn arb_scale_and_custom() -> impl Strategy<Value = (i32, Option<Vec<f64>>)> {
         prop_oneof![
-            (
-                any::<u64>(),
-                any::<u64>(),
-                prop::collection::vec(any::<u64>(), 0..6),
-                prop::collection::vec(any::<u64>(), 0..6),
-            )
-                .prop_map(|(zero_count, count, positive, negative)| {
-                    HistogramCounts::Int {
-                        zero_count,
-                        count,
-                        positive,
-                        negative,
-                    }
-                }),
-            (
-                arb_hist_float(),
-                arb_hist_float(),
-                prop::collection::vec(arb_hist_float(), 0..6),
-                prop::collection::vec(arb_hist_float(), 0..6),
-            )
-                .prop_map(|(zero_count, count, positive, negative)| {
-                    HistogramCounts::Float {
-                        zero_count,
-                        count,
-                        positive,
-                        negative,
-                    }
-                }),
+            prop::collection::vec(1u32..1000, 1..5).prop_map(|deltas| {
+                let mut acc = 0.0f64;
+                let bounds = deltas
+                    .into_iter()
+                    .map(|d| {
+                        acc += f64::from(d);
+                        acc
+                    })
+                    .collect();
+                (-53, Some(bounds))
+            }),
+            (-52i32..=20).prop_map(|scale| (scale, None)),
         ]
     }
 
@@ -1636,78 +1873,53 @@ mod tests {
         ]
     }
 
-    /// Generates a [`HistogramValue`] spanning both `HistogramCounts` variants,
-    /// `sum` present and absent, `custom_values` present (scale `-53`) and
-    /// absent, every `ResetHint`, and float payloads including NaN/`-0.0`/finite
-    /// extremes. The two arms keep `custom_values: Some` bound to `scale == -53`
-    /// and `custom_values: None` bound to any other scale, mirroring the storage
-    /// invariant (custom boundaries iff the custom scale).
+    /// Generates a structurally valid [`HistogramValue`] spanning both
+    /// `HistogramCounts` variants, `sum` present and absent, `custom_values`
+    /// present (scale `-53`) and absent, every `ResetHint`, and float payloads
+    /// including NaN/`-0.0`/finite extremes. Every generated value satisfies the
+    /// invariants `validate_histogram_value` enforces: spans have `length >= 1`,
+    /// each side's bucket vector matches its span total, `custom_values` is
+    /// present iff scale is `-53` (non-empty, strictly ascending), and `count`
+    /// is consistent with its buckets. So the round-trip test pins the PRESENCE
+    /// of validation (a decode that rejected any of these would fail the test),
+    /// not its absence.
     fn arb_histogram_value() -> impl Strategy<Value = HistogramValue> {
-        let with_custom = (
-            prop::collection::vec(arb_hist_float(), 1..5),
+        (
+            arb_hist_side(),
+            arb_hist_side(),
+            arb_scale_and_custom(),
             arb_hist_float(),
             prop::option::of(arb_hist_float()),
-            prop::collection::vec(arb_hist_span(), 0..4),
-            prop::collection::vec(arb_hist_span(), 0..4),
-            arb_hist_counts(),
             arb_reset_hint(),
+            any::<bool>(),
         )
-            .prop_map(
+            .prop_flat_map(
                 |(
-                    custom,
+                    (positive_spans, pos_len),
+                    (negative_spans, neg_len),
+                    (scale, custom_values),
                     zero_threshold,
                     sum,
-                    positive_spans,
-                    negative_spans,
-                    counts,
                     reset_hint,
+                    int_kind,
                 )| {
-                    HistogramValue {
-                        scale: -53,
+                    let counts = if int_kind {
+                        arb_int_counts(pos_len, neg_len).boxed()
+                    } else {
+                        arb_float_counts(pos_len, neg_len).boxed()
+                    };
+                    counts.prop_map(move |counts| HistogramValue {
+                        scale,
                         zero_threshold,
                         sum,
-                        custom_values: Some(custom),
-                        positive_spans,
-                        negative_spans,
+                        custom_values: custom_values.clone(),
+                        positive_spans: positive_spans.clone(),
+                        negative_spans: negative_spans.clone(),
                         counts,
                         reset_hint,
-                    }
+                    })
                 },
-            );
-        let without_custom = (
-            any::<i32>(),
-            arb_hist_float(),
-            prop::option::of(arb_hist_float()),
-            prop::collection::vec(arb_hist_span(), 0..4),
-            prop::collection::vec(arb_hist_span(), 0..4),
-            arb_hist_counts(),
-            arb_reset_hint(),
-        )
-            .prop_map(
-                |(
-                    scale,
-                    zero_threshold,
-                    sum,
-                    positive_spans,
-                    negative_spans,
-                    counts,
-                    reset_hint,
-                )| {
-                    HistogramValue {
-                        // Keep this arm off the custom scale so `None`
-                        // custom_values never implies the custom-scale shape.
-                        scale: if scale == -53 { -52 } else { scale },
-                        zero_threshold,
-                        sum,
-                        custom_values: None,
-                        positive_spans,
-                        negative_spans,
-                        counts,
-                        reset_hint,
-                    }
-                },
-            );
-        prop_oneof![with_custom, without_custom]
+            )
     }
 
     fn opt_f64_bits_eq(a: Option<f64>, b: Option<f64>) -> bool {
@@ -1783,25 +1995,38 @@ mod tests {
     }
 
     proptest! {
-        /// Typed histogram records survive the real prost wire (encode ->
-        /// prost bytes -> prost decode -> codec decode) field for field, every
-        /// `f64` bit-exact. Covers both count variants, `sum`/`custom_values`
-        /// present and absent, every `ResetHint`, and NaN/`-0.0`/extreme float
-        /// payloads (compared by `to_bits`, never `==`).
+        /// Structurally valid histogram records survive the real prost wire
+        /// (encode -> prost bytes -> prost decode -> validated codec decode)
+        /// field for field, every `f64` bit-exact. Routed through
+        /// `encode_histogram_frame`/`decode_histogram_frame` so the decode runs
+        /// the full structural validation: since `arb_histogram_value` only
+        /// generates valid records, a decode that rejected any of them (or one
+        /// that let a corrupted value through) fails the test. This pins the
+        /// PRESENCE of validation, not its absence. Covers both count variants,
+        /// `sum`/`custom_values` present and absent, every `ResetHint`, and
+        /// NaN/`-0.0`/extreme float payloads (compared by `to_bits`, never `==`).
         #[test]
         fn histogram_records_round_trip_bit_for_bit(
             values in prop::collection::vec(arb_histogram_value(), 0..6)
         ) {
             use prost::Message;
-            let run = pb::HistogramRun {
-                records: encode_histogram_records(&values),
-                ..Default::default()
+            let series = FetchedHistogramSeries {
+                series_id: SeriesId([2u8; 16]),
+                labels: label_set(&[("__name__", "h")]),
+                timestamps: (0..values.len() as i64).map(|i| i * 1_000).collect(),
+                values: values.clone(),
+                created_unix_ns: 1,
+                writer_epoch: 2,
+                writer_seq: 3,
+                per_sample_priorities: None,
             };
-            let bytes = run.encode_to_vec();
-            let back = pb::HistogramRun::decode(bytes.as_slice()).expect("prost decode");
-            let decoded = decode_histogram_records(&back.records).expect("codec decode");
-            prop_assert_eq!(decoded.len(), values.len());
-            for (got, want) in decoded.iter().zip(values.iter()) {
+            let bytes = encode_histogram_frame(&series).encode_to_vec();
+            let wire = pb::HistogramFrame::decode(bytes.as_slice()).expect("prost decode");
+            let decoded = decode_histogram_frame(wire).expect("codec decode");
+            prop_assert_eq!(decoded.len(), 1);
+            let got = &decoded[0].values;
+            prop_assert_eq!(got.len(), values.len());
+            for (got, want) in got.iter().zip(values.iter()) {
                 prop_assert!(
                     histogram_bits_eq(got, want),
                     "histogram record corrupted on the wire: {:?} vs {:?}",
@@ -1944,6 +2169,396 @@ mod tests {
             decode_histogram_records(std::slice::from_ref(&record)),
             Err(CodecError::UnknownResetHint(99))
         );
+    }
+
+    // ---- HistogramFrame round-trip and structural validation ----------------
+
+    /// A full histogram series round-trips through
+    /// `encode_histogram_frame`/`decode_histogram_frame` field for field, every
+    /// `f64` bit-exact. The fixture spans both `HistogramCounts` variants,
+    /// `sum: None` and `Some`, both `custom_values` states, every `ResetHint`,
+    /// and a `Some` per-sample provenance column, so one round trip exercises
+    /// the whole matrix.
+    #[test]
+    fn histogram_frame_round_trips() {
+        // int, sum Some, custom None, ResetHint::Yes.
+        let int_sum = sample_histogram_int();
+        // float, sum None, custom Some (scale -53), ResetHint::Gauge, with NaN
+        // and -0.0 bucket payloads.
+        let float_custom = HistogramValue {
+            scale: -53,
+            zero_threshold: 0.25,
+            sum: None,
+            custom_values: Some(vec![1.0, 2.5, 4.0]),
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 2,
+            }],
+            negative_spans: vec![HistogramSpan {
+                offset: 1,
+                length: 1,
+            }],
+            counts: HistogramCounts::Float {
+                zero_count: -0.0,
+                count: f64::INFINITY,
+                positive: vec![f64::NAN, 3.0],
+                negative: vec![-0.0],
+            },
+            reset_hint: ResetHint::Gauge,
+        };
+        // int, sum None, custom None, ResetHint::No, empty spans.
+        let int_empty = HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: None,
+            custom_values: None,
+            positive_spans: vec![],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: 0,
+                positive: vec![],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::No,
+        };
+        // float, sum Some, custom None, ResetHint::Unknown.
+        let float_plain = HistogramValue {
+            scale: 3,
+            zero_threshold: 1.0,
+            sum: Some(5.0),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: -1,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Float {
+                zero_count: 1.0,
+                count: 5.0,
+                positive: vec![4.0],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Unknown,
+        };
+
+        let values = vec![int_sum, float_custom, int_empty, float_plain];
+        let priorities = vec![
+            SamplePriority {
+                created_unix_ns: 10,
+                writer_epoch: 1,
+                writer_seq: 4,
+                in_page_index: 0,
+            },
+            SamplePriority {
+                created_unix_ns: 20,
+                writer_epoch: 1,
+                writer_seq: 3,
+                in_page_index: 1,
+            },
+            SamplePriority {
+                created_unix_ns: -5,
+                writer_epoch: u64::MAX,
+                writer_seq: 9,
+                in_page_index: 2,
+            },
+            SamplePriority {
+                created_unix_ns: 30,
+                writer_epoch: 2,
+                writer_seq: 0,
+                in_page_index: 3,
+            },
+        ];
+        let series = FetchedHistogramSeries {
+            series_id: SeriesId([8u8; 16]),
+            labels: label_set(&[("__name__", "h"), ("k", "v")]),
+            timestamps: vec![100, 200, 300, 400],
+            values: values.clone(),
+            created_unix_ns: 42,
+            writer_epoch: 7,
+            writer_seq: 11,
+            per_sample_priorities: Some(priorities.clone()),
+        };
+
+        use prost::Message;
+        let bytes = encode_histogram_frame(&series).encode_to_vec();
+        let wire = pb::HistogramFrame::decode(bytes.as_slice()).expect("prost decode");
+        let decoded = decode_histogram_frame(wire).expect("codec decode");
+        assert_eq!(decoded.len(), 1);
+        let got = &decoded[0];
+        assert_eq!(got.series_id, series.series_id);
+        assert_eq!(&got.labels, &series.labels);
+        assert_eq!(got.created_unix_ns, series.created_unix_ns);
+        assert_eq!(got.writer_epoch, series.writer_epoch);
+        assert_eq!(got.writer_seq, series.writer_seq);
+        assert_eq!(&got.timestamps, &series.timestamps);
+        assert_eq!(got.per_sample_priorities, Some(priorities));
+        assert_eq!(got.values.len(), values.len());
+        for (a, b) in got.values.iter().zip(values.iter()) {
+            assert!(
+                histogram_bits_eq(a, b),
+                "histogram value corrupted on the wire: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    /// A hand-built `HistogramFrame` (one series id, one label) wrapping the
+    /// given run, for the structural-error tests. These frames are built by hand
+    /// rather than through `encode_histogram_frame`, because the encoder never
+    /// produces a structurally invalid record.
+    fn hist_frame(run: pb::HistogramRun) -> pb::HistogramFrame {
+        pb::HistogramFrame {
+            series_id: vec![0u8; 16],
+            labels: vec![pb::Label {
+                name: "__name__".to_string(),
+                value: "h".to_string(),
+            }],
+            runs: vec![run],
+        }
+    }
+
+    /// A valid single-record `HistogramRun` (one int record, one timestamp) the
+    /// structural-error tests mutate into exactly one invalid shape each.
+    fn valid_hist_run() -> pb::HistogramRun {
+        pb::HistogramRun {
+            ts_delta: encode_ts_deltas(&[1_000]),
+            records: encode_histogram_records(&[sample_histogram_int()]),
+            ..Default::default()
+        }
+    }
+
+    /// `records.len() != ts_delta.len()` is a typed error (mirrors
+    /// `RunLengthMismatch` for scalars), never a panic or a truncated series.
+    #[test]
+    fn histogram_run_length_mismatch_is_typed_error() {
+        let run = pb::HistogramRun {
+            ts_delta: encode_ts_deltas(&[1_000, 2_000]),
+            records: encode_histogram_records(&[sample_histogram_int()]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramRunLengthMismatch {
+                timestamps: 2,
+                records: 1,
+            })
+        ));
+    }
+
+    /// A zero-length span is a typed error (the reader's
+    /// `HistogramSpanLengthZero`), never a panic.
+    #[test]
+    fn histogram_zero_length_span_is_typed_error() {
+        let mut run = valid_hist_run();
+        run.records[0].positive_spans[0].length = 0;
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramSpanLengthZero)
+        ));
+    }
+
+    /// A scale below `-53` is a typed error (the reader's
+    /// `HistogramScaleTooSmall`), never a panic.
+    #[test]
+    fn histogram_scale_too_small_is_typed_error() {
+        let mut run = valid_hist_run();
+        run.records[0].scale = -54;
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramScaleTooSmall { scale: -54 })
+        ));
+    }
+
+    /// `custom_values` present at a non-custom scale is a typed error (the
+    /// reader's `HistogramCustomValuesMismatch`): the sample_histogram_int
+    /// record has scale 2, so attaching custom boundaries violates the
+    /// present-iff-scale-is-`-53` invariant.
+    #[test]
+    fn histogram_custom_values_at_wrong_scale_is_typed_error() {
+        let mut run = valid_hist_run();
+        run.records[0].custom_values_bits = vec![1.0f64.to_bits(), 2.0f64.to_bits()];
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramCustomValuesMismatch)
+        ));
+    }
+
+    /// A bucket-count vector shorter than its spans cover is a typed error (the
+    /// reader decodes exactly `sum(length)` counts per side).
+    #[test]
+    fn histogram_bucket_count_mismatch_is_typed_error() {
+        let mut run = valid_hist_run();
+        // sample_histogram_int has one positive span of length 2 and positive
+        // counts [2, 3]; drop one so the vector no longer matches the span.
+        if let Some(pb::histogram_record::Counts::IntCounts(c)) = run.records[0].counts.as_mut() {
+            c.positive = vec![2];
+        } else {
+            panic!("sample record is int-counts");
+        }
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramBucketCountMismatch {
+                spans: 2,
+                buckets: 1,
+            })
+        ));
+    }
+
+    /// A `count` below its bucket total is a typed error (the reader's
+    /// `HistogramCountInconsistent`). This is the check mutation-proved in the
+    /// task report: removing the `count` comparison in `validate_histogram_value`
+    /// turns this test green when it must be red.
+    #[test]
+    fn histogram_count_inconsistent_is_typed_error() {
+        let mut run = valid_hist_run();
+        // Positive counts [2, 3] total 5; a count of 4 is below the total.
+        if let Some(pb::histogram_record::Counts::IntCounts(c)) = run.records[0].counts.as_mut() {
+            c.zero_count = 0;
+            c.count = 4;
+        } else {
+            panic!("sample record is int-counts");
+        }
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramCountInconsistent)
+        ));
+    }
+
+    /// `count < zero_count`, with `count >= total`, is a typed error on its own
+    /// (the two clauses of the reader's `HistogramCountInconsistent` are
+    /// independently ORed, not just the total clause): int variant.
+    #[test]
+    fn histogram_count_below_zero_count_is_typed_error_int() {
+        let mut run = valid_hist_run();
+        // Positive counts [2, 3] total 5; count 5 clears the total clause but
+        // not a zero_count of 10.
+        if let Some(pb::histogram_record::Counts::IntCounts(c)) = run.records[0].counts.as_mut() {
+            c.zero_count = 10;
+            c.count = 5;
+        } else {
+            panic!("sample record is int-counts");
+        }
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramCountInconsistent)
+        ));
+    }
+
+    /// A float-count histogram, otherwise valid, for the float-arm
+    /// `HistogramCountInconsistent` tests: the int arm and the float arm of
+    /// `validate_histogram_value` are separate branches, so a check pinned only
+    /// on the int side leaves the float side unguarded.
+    fn valid_hist_run_float() -> pb::HistogramRun {
+        let record = HistogramValue {
+            scale: 1,
+            zero_threshold: 0.25,
+            sum: Some(6.0),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 2,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Float {
+                zero_count: 1.0,
+                count: 6.0,
+                positive: vec![2.0, 3.0],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::No,
+        };
+        pb::HistogramRun {
+            ts_delta: encode_ts_deltas(&[1_000]),
+            records: encode_histogram_records(&[record]),
+            ..Default::default()
+        }
+    }
+
+    /// A `count` below its bucket total is a typed error on the float arm too
+    /// (the reader's `HistogramCountInconsistent` applies identically to both
+    /// `HistogramCounts` variants).
+    #[test]
+    fn histogram_count_inconsistent_is_typed_error_float() {
+        let mut run = valid_hist_run_float();
+        // Positive counts [2.0, 3.0] total 5.0; a count of 4.0 is below it.
+        if let Some(pb::histogram_record::Counts::FloatCounts(c)) = run.records[0].counts.as_mut() {
+            c.zero_count_bits = 0.0f64.to_bits();
+            c.count_bits = 4.0f64.to_bits();
+        } else {
+            panic!("sample record is float-counts");
+        }
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramCountInconsistent)
+        ));
+    }
+
+    /// `count < zero_count`, with `count >= total`, is a typed error on the
+    /// float arm too.
+    #[test]
+    fn histogram_count_below_zero_count_is_typed_error_float() {
+        let mut run = valid_hist_run_float();
+        // Positive counts [2.0, 3.0] total 5.0; count 5.0 clears the total
+        // clause but not a zero_count of 10.0.
+        if let Some(pb::histogram_record::Counts::FloatCounts(c)) = run.records[0].counts.as_mut() {
+            c.zero_count_bits = 10.0f64.to_bits();
+            c.count_bits = 5.0f64.to_bits();
+        } else {
+            panic!("sample record is float-counts");
+        }
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramCountInconsistent)
+        ));
+    }
+
+    /// `scale == -53` with `custom_values` absent is a typed error (the
+    /// reader's `HistogramCustomValuesMismatch`): the present-iff-scale-is-`-53`
+    /// invariant fails in the "scale demands them but none are present"
+    /// direction, the mirror image of `histogram_custom_values_at_wrong_scale_is_typed_error`.
+    #[test]
+    fn histogram_custom_values_missing_at_custom_scale_is_typed_error() {
+        let mut run = valid_hist_run();
+        run.records[0].scale = -53;
+        // custom_values_bits stays empty (sample_histogram_int has custom_values: None).
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramCustomValuesMismatch)
+        ));
+    }
+
+    /// `scale == -53` with non-strictly-ascending `custom_values` bounds is a
+    /// typed error (the reader's `HistogramCustomValuesMismatch`): equal
+    /// adjacent bounds, not just descending ones, must be rejected.
+    #[test]
+    fn histogram_custom_values_not_ascending_is_typed_error() {
+        let record = HistogramValue {
+            scale: -53,
+            zero_threshold: 0.0,
+            sum: Some(1.0),
+            custom_values: Some(vec![1.0, 1.0]),
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: 1,
+                positive: vec![1],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Unknown,
+        };
+        let run = pb::HistogramRun {
+            ts_delta: encode_ts_deltas(&[1_000]),
+            records: encode_histogram_records(&[record]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_histogram_frame(hist_frame(run)),
+            Err(CodecError::HistogramCustomValuesMismatch)
+        ));
     }
 
     /// Provenance columns that disagree in length -- among themselves or with
