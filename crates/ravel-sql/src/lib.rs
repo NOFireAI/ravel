@@ -139,8 +139,9 @@ pub use pushdown::Pushdown;
 pub use redact::{RedactError, redact};
 pub use schema::{internal_schema, public_schema};
 pub use session::{
-    EmptyObjectStoreRegistry, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, build_session,
-    session_config,
+    ADMITTED_SCALARS, ADMITTED_TABLE_FUNCTIONS, ADMITTED_WINDOWS, EXCLUDED_SCALARS,
+    EXCLUDED_TABLE_FUNCTIONS, EXCLUDED_WINDOWS, EmptyObjectStoreRegistry, LOGS_TABLE,
+    SAMPLES_TABLE, SPANS_TABLE, SessionTable, build_session, session_config,
 };
 pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
 pub use spans_provider::SpansTableProvider;
