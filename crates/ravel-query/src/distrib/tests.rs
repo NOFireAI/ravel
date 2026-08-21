@@ -1681,6 +1681,145 @@ fn histogram_slice_falls_back_with_spend_folded() {
     });
 }
 
+/// The worker-side histogram erasure wiring (ADR-0096 decision 3 step 3) is
+/// real, not latent. An erasure predicate that erases every sample of the only
+/// histogram series present leaves nothing to refuse, so the
+/// `Unsupported`/"histogram series are not distributed yet" refusal does NOT
+/// fire: the slice returns an ordinary (empty) result and the coordinator does
+/// not fall back to local (`Ok(Some(..))`, not `Ok(None)`).
+///
+/// This is the counterpart to `histogram_slice_falls_back_with_spend_folded`,
+/// which drives the identical segment with NO erasure and asserts the refusal
+/// DOES fire (`Ok(None)`). The single line that makes this test pass is the
+/// `crate::erasure::retain_histogram_series(&mut histograms, &erasure)` call in
+/// `service.rs::run_slice_metrics`, placed before the refusal check which now
+/// keys on the post-filter `!histograms.is_empty()`. Deleting that call, or
+/// reverting the refusal to the pre-filter per-segment `seg_hist.is_empty()`
+/// check, leaves the histogram set non-empty and flips this back to `Ok(None)`.
+#[test]
+fn erased_histogram_series_no_longer_triggers_the_unsupported_refusal() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        use ravel_segment::{
+            HistogramCounts, HistogramSample, HistogramValue, ResetHint, SeriesInputV3,
+            SeriesValues,
+        };
+
+        let store = Arc::new(MemoryStore::new());
+        let metric = "h0";
+        let label_set = labels(metric);
+        let series_id = SeriesId::compute(&tenant_id(), metric, &label_set).expect("series id");
+        let hist = HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: Some(1.0),
+            custom_values: None,
+            positive_spans: vec![ravel_segment::HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: 1,
+                positive: vec![1],
+                negative: Vec::new(),
+            },
+            reset_hint: ResetHint::Unknown,
+        };
+        let identity = SegmentIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 0,
+        };
+        let written = SegmentWriter::write_histograms(
+            vec![SeriesInputV3 {
+                series_id,
+                labels: label_set,
+                values: SeriesValues::Histogram(vec![HistogramSample {
+                    ts_ns: NS,
+                    value: hist,
+                }]),
+            }],
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write histogram segment");
+        let object_key = "seg/hist_erase0.rseg".to_string();
+        store
+            .put(&object_key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment");
+        let seg = SegmentRef {
+            data_object_key: object_key,
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 100,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 0,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        };
+        let snapshot = Snapshot {
+            segments: vec![seg.clone()],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), vec![seg]).await;
+        let distributed = Distributed::new(
+            Arc::new(fetcher),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+        // A windowless predicate on the series' own label erases the whole
+        // series (`retain_histogram_series` drops it entirely).
+        let erasure = vec![ErasurePredicate::windowless(vec![(
+            "__name__".to_string(),
+            metric.to_string(),
+        )])];
+        let accounting = QueryAccounting::new();
+        let result = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &erasure,
+                &accounting,
+                &EngineConfig::default(),
+                i64::MAX,
+            )
+            .await
+            .expect("unsupported must not be an error");
+        assert!(
+            result.is_some(),
+            "an erasure that empties the only histogram series leaves nothing to \
+             refuse, so no Unsupported local fallback fires"
+        );
+        let (per_slice, _stats, _hist) = result.expect("a real (non-fallback) result");
+        assert!(
+            per_slice.iter().all(|series| series.is_empty()),
+            "the erased histogram series must not surface as a scalar series either"
+        );
+        server.abort();
+    });
+}
+
 // --- RLOG-family distributed fan-out (#284) --------------------------------
 //
 // The centerpiece is `run_log_differential`: over a real loopback worker, a

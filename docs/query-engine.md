@@ -383,9 +383,12 @@ Alerts, Audit, and Spans. The worker's `run_slice_inner` decodes the request's
 (`crates/ravel-query/src/distrib/service.rs`):
 
 - **Metrics** resolves the pinned scope and fetches scalar series through the
-  metric `SegmentFetcher`. Native-histogram series are not distributed yet: a
-  slice that decodes any histogram series answers `Unsupported` (with its spend
-  folded first) and the whole query falls back to local.
+  metric `SegmentFetcher`. Native-histogram series are not distributed yet:
+  erasure predicates are applied to decoded histogram series before the
+  refusal check (ADR-0096 decision 2), so a slice whose histograms are fully
+  erased is not refused; a slice with any histogram series still standing
+  after erasure answers `Unsupported` (with its spend folded first) and the
+  whole query falls back to local.
 - **Logs, Alerts, Audit** are one RLOG object family and share a single fetch
   path over `LogSegmentFetcher`, distinguished only by the object-key prefix the
   coordinator already resolved (the worker never re-derives it, it fetches the

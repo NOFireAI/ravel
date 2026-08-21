@@ -27,6 +27,7 @@ use ravel_types::{Label, LabelSet, SeriesId, Signal};
 
 use ravel_logseg::LogRecord;
 use ravel_rspan::{SpanRecord, StatusCode};
+use ravel_segment::{HistogramCounts, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
 use crate::erasure::ErasurePredicate;
@@ -220,6 +221,10 @@ pub enum CodecError {
     BadSpanParentId { got: usize },
     #[error("span status code {got} is not a known OTLP StatusCode (0 Unset, 1 Ok, 2 Error)")]
     UnknownSpanStatusCode { got: u32 },
+    #[error("histogram record carried no `counts` oneof variant")]
+    MissingHistogramCounts,
+    #[error("unknown histogram reset-hint discriminant {0}")]
+    UnknownResetHint(i32),
 }
 
 /// Rejects any protocol version this build does not speak. `Ok(())` only for
@@ -482,6 +487,194 @@ fn decode_sample_priorities(
         })
         .collect();
     Ok(Some(priorities))
+}
+
+// ---- HistogramRecord <-> ravel_segment::HistogramValue --------------------
+
+/// Encodes decoded native-histogram samples as typed [`pb::HistogramRecord`]s
+/// (ADR-0096 decision 2), mirroring [`HistogramValue`] field for field. Every
+/// `f64` crosses as its [`f64::to_bits`] pattern (proto `fixed64`), never a
+/// proto double, so NaN payloads, signalling NaNs, and `-0.0` survive the wire
+/// byte-for-byte, the same discipline [`encode_series_frame`] applies to scalar
+/// sample values.
+///
+/// `sum: None` stays distinct from a present value (proto3 `optional`).
+/// `custom_values: None` maps to an empty repeated field, which proto3 omits;
+/// on decode an empty field is read back as `None`. For a well-formed
+/// histogram this is lossless: a `Some` custom-values set is never empty (it is
+/// present iff `scale == -53`, with ascending boundaries), so the only value
+/// that maps to the empty wire form is `None`.
+///
+/// No live caller wires this encoder into the distributed fetch path yet: the
+/// worker still refuses any histogram-bearing slice (see
+/// [`crate::distrib::service`]), and flipping the protocol version to enable
+/// the encoder is a later step of the same epic (ADR-0096 decision 3 step 4,
+/// #379). It is proven structurally by this module's round-trip property test
+/// against [`HistogramValue`].
+pub fn encode_histogram_records(values: &[HistogramValue]) -> Vec<pb::HistogramRecord> {
+    values.iter().map(encode_histogram_record).collect()
+}
+
+fn encode_histogram_record(value: &HistogramValue) -> pb::HistogramRecord {
+    pb::HistogramRecord {
+        scale: value.scale,
+        zero_threshold_bits: value.zero_threshold.to_bits(),
+        sum_bits: value.sum.map(f64::to_bits),
+        custom_values_bits: value
+            .custom_values
+            .as_ref()
+            .map(|bounds| bounds.iter().map(|b| b.to_bits()).collect())
+            .unwrap_or_default(),
+        positive_spans: value
+            .positive_spans
+            .iter()
+            .map(encode_histogram_span)
+            .collect(),
+        negative_spans: value
+            .negative_spans
+            .iter()
+            .map(encode_histogram_span)
+            .collect(),
+        counts: Some(encode_histogram_counts(&value.counts)),
+        reset_hint: encode_reset_hint(value.reset_hint) as i32,
+    }
+}
+
+/// Inverse of [`encode_histogram_records`]. Every malformation is a typed
+/// [`CodecError`], never a panic or a silently defaulted field: a record with
+/// no `counts` oneof member is [`CodecError::MissingHistogramCounts`], and an
+/// unknown reset-hint discriminant is [`CodecError::UnknownResetHint`].
+pub fn decode_histogram_records(
+    records: &[pb::HistogramRecord],
+) -> Result<Vec<HistogramValue>, CodecError> {
+    records.iter().map(decode_histogram_record).collect()
+}
+
+fn decode_histogram_record(record: &pb::HistogramRecord) -> Result<HistogramValue, CodecError> {
+    let counts = record
+        .counts
+        .as_ref()
+        .ok_or(CodecError::MissingHistogramCounts)?;
+    // An empty repeated field is absent on the wire (proto3), so it decodes to
+    // `None`; a non-empty one to `Some`. See `encode_histogram_records` on why
+    // this is lossless for a well-formed histogram.
+    let custom_values = if record.custom_values_bits.is_empty() {
+        None
+    } else {
+        Some(
+            record
+                .custom_values_bits
+                .iter()
+                .map(|b| f64::from_bits(*b))
+                .collect(),
+        )
+    };
+    Ok(HistogramValue {
+        scale: record.scale,
+        zero_threshold: f64::from_bits(record.zero_threshold_bits),
+        sum: record.sum_bits.map(f64::from_bits),
+        custom_values,
+        positive_spans: record
+            .positive_spans
+            .iter()
+            .map(decode_histogram_span)
+            .collect(),
+        negative_spans: record
+            .negative_spans
+            .iter()
+            .map(decode_histogram_span)
+            .collect(),
+        counts: decode_histogram_counts(counts),
+        reset_hint: decode_reset_hint(record.reset_hint)?,
+    })
+}
+
+fn encode_histogram_span(span: &HistogramSpan) -> pb::HistogramSpan {
+    pb::HistogramSpan {
+        offset: span.offset,
+        length: span.length,
+    }
+}
+
+fn decode_histogram_span(span: &pb::HistogramSpan) -> HistogramSpan {
+    HistogramSpan {
+        offset: span.offset,
+        length: span.length,
+    }
+}
+
+/// Encodes the counts variant, carrying every float as its [`f64::to_bits`]
+/// pattern so `-0.0` and NaN bucket counts survive exactly (the float variant
+/// really does hold arbitrary `f64` counts after exponential-histogram scaling).
+fn encode_histogram_counts(counts: &HistogramCounts) -> pb::histogram_record::Counts {
+    use pb::histogram_record::Counts;
+    match counts {
+        HistogramCounts::Int {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => Counts::IntCounts(pb::HistogramCountsInt {
+            zero_count: *zero_count,
+            count: *count,
+            positive: positive.clone(),
+            negative: negative.clone(),
+        }),
+        HistogramCounts::Float {
+            zero_count,
+            count,
+            positive,
+            negative,
+        } => Counts::FloatCounts(pb::HistogramCountsFloat {
+            zero_count_bits: zero_count.to_bits(),
+            count_bits: count.to_bits(),
+            positive_bits: positive.iter().map(|v| v.to_bits()).collect(),
+            negative_bits: negative.iter().map(|v| v.to_bits()).collect(),
+        }),
+    }
+}
+
+fn decode_histogram_counts(counts: &pb::histogram_record::Counts) -> HistogramCounts {
+    use pb::histogram_record::Counts;
+    match counts {
+        Counts::IntCounts(c) => HistogramCounts::Int {
+            zero_count: c.zero_count,
+            count: c.count,
+            positive: c.positive.clone(),
+            negative: c.negative.clone(),
+        },
+        Counts::FloatCounts(c) => HistogramCounts::Float {
+            zero_count: f64::from_bits(c.zero_count_bits),
+            count: f64::from_bits(c.count_bits),
+            positive: c.positive_bits.iter().map(|b| f64::from_bits(*b)).collect(),
+            negative: c.negative_bits.iter().map(|b| f64::from_bits(*b)).collect(),
+        },
+    }
+}
+
+/// Maps a [`ResetHint`] to its wire enum. Explicit, not `as i32`: mirrors
+/// [`signal_to_u32`]'s discipline so the wire contract does not shift if a
+/// variant is ever inserted into either enum.
+fn encode_reset_hint(hint: ResetHint) -> pb::histogram_record::ResetHint {
+    use pb::histogram_record::ResetHint as Pb;
+    match hint {
+        ResetHint::Unknown => Pb::Unknown,
+        ResetHint::Yes => Pb::Yes,
+        ResetHint::No => Pb::No,
+        ResetHint::Gauge => Pb::Gauge,
+    }
+}
+
+/// Inverse of [`encode_reset_hint`]; an unrecognized discriminant is a typed
+/// error, never a silent default to `Unknown`.
+fn decode_reset_hint(raw: i32) -> Result<ResetHint, CodecError> {
+    use pb::histogram_record::ResetHint as Pb;
+    match Pb::try_from(raw).map_err(|_| CodecError::UnknownResetHint(raw))? {
+        Pb::Unknown => Ok(ResetHint::Unknown),
+        Pb::Yes => Ok(ResetHint::Yes),
+        Pb::No => Ok(ResetHint::No),
+        Pb::Gauge => Ok(ResetHint::Gauge),
+    }
 }
 
 fn decode_series_id(bytes: &[u8]) -> Result<SeriesId, CodecError> {
@@ -1289,10 +1482,11 @@ mod tests {
     }
 
     /// The `HistogramRun` provenance columns share `Run`'s codec, so they
-    /// round-trip identically through the real wire. `HistogramRun`'s value
-    /// payload (`span_payload`) is untouched by this step (a later ticket
-    /// retires it), so this proves only that the provenance columns survive and
-    /// that `span_payload` is carried through unchanged alongside them.
+    /// round-trip identically through the real wire. `span_payload` (field 5)
+    /// is now retired (`reserved`, ADR-0096 decision 2) and the typed
+    /// `records` field carries the value payload; this test still isolates the
+    /// provenance columns, driving them alongside one typed record to prove the
+    /// two coexist on `HistogramRun` without interfering.
     #[test]
     fn histogram_run_carries_per_sample_provenance_round_trip() {
         use prost::Message;
@@ -1313,25 +1507,25 @@ mod tests {
         ];
         let (prov_created_delta, prov_epoch_delta, prov_seq_delta, prov_in_page_index) =
             encode_sample_priorities(&Some(priorities.clone()));
+        let records = encode_histogram_records(&[sample_histogram_int(), sample_histogram_int()]);
         let run = pb::HistogramRun {
             created_unix_ns: 7,
             writer_epoch: 2,
             writer_seq: 100,
             ts_delta: encode_ts_deltas(&[1_000, 900]),
-            // Opaque, out of this step's scope; must survive unchanged.
-            span_payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
             prov_created_delta,
             prov_epoch_delta,
             prov_seq_delta,
             prov_in_page_index,
+            records,
         };
 
         let bytes = run.encode_to_vec();
         let back = pb::HistogramRun::decode(bytes.as_slice()).expect("prost decode");
         assert_eq!(
-            back.span_payload,
-            vec![0xDE, 0xAD, 0xBE, 0xEF],
-            "the opaque histogram payload is carried through untouched"
+            decode_histogram_records(&back.records).expect("decode records"),
+            vec![sample_histogram_int(), sample_histogram_int()],
+            "the typed histogram records are carried through alongside provenance"
         );
         let decoded = decode_sample_priorities(
             &back.prov_created_delta,
@@ -1345,6 +1539,410 @@ mod tests {
             decoded,
             Some(priorities),
             "the histogram run's per-sample provenance key round-trips"
+        );
+    }
+
+    // ---- HistogramRecord round-trip -----------------------------------------
+
+    /// A small consistent integer-count histogram, used where the surrounding
+    /// test compares whole `HistogramValue`s with `==` (so it must carry no NaN
+    /// or `-0.0`, which `==` would mis-handle).
+    fn sample_histogram_int() -> HistogramValue {
+        HistogramValue {
+            scale: 2,
+            zero_threshold: 0.5,
+            sum: Some(3.0),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 1,
+                length: 2,
+            }],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: 1,
+                count: 6,
+                positive: vec![2, 3],
+                negative: vec![],
+            },
+            reset_hint: ResetHint::Yes,
+        }
+    }
+
+    /// f64 generator weighted toward the bit patterns a naive `double`-based
+    /// codec would corrupt: quiet/signalling/payload NaNs, both zeros, both
+    /// infinities, and the finite extremes, plus uniform arbitrary bit patterns.
+    fn arb_hist_float() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            2 => any::<u64>().prop_map(f64::from_bits),
+            1 => prop::sample::select(vec![
+                0.0_f64,
+                -0.0_f64,
+                f64::NAN,
+                -f64::NAN,
+                f64::from_bits(0x7ff0_0000_0000_0001), // signalling NaN
+                f64::from_bits(0x7ff8_0000_dead_beef), // NaN with payload
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::MAX,
+                f64::MIN,
+                f64::MIN_POSITIVE,
+            ]),
+        ]
+    }
+
+    fn arb_hist_span() -> impl Strategy<Value = HistogramSpan> {
+        (any::<i32>(), any::<u32>()).prop_map(|(offset, length)| HistogramSpan { offset, length })
+    }
+
+    fn arb_hist_counts() -> impl Strategy<Value = HistogramCounts> {
+        prop_oneof![
+            (
+                any::<u64>(),
+                any::<u64>(),
+                prop::collection::vec(any::<u64>(), 0..6),
+                prop::collection::vec(any::<u64>(), 0..6),
+            )
+                .prop_map(|(zero_count, count, positive, negative)| {
+                    HistogramCounts::Int {
+                        zero_count,
+                        count,
+                        positive,
+                        negative,
+                    }
+                }),
+            (
+                arb_hist_float(),
+                arb_hist_float(),
+                prop::collection::vec(arb_hist_float(), 0..6),
+                prop::collection::vec(arb_hist_float(), 0..6),
+            )
+                .prop_map(|(zero_count, count, positive, negative)| {
+                    HistogramCounts::Float {
+                        zero_count,
+                        count,
+                        positive,
+                        negative,
+                    }
+                }),
+        ]
+    }
+
+    fn arb_reset_hint() -> impl Strategy<Value = ResetHint> {
+        prop_oneof![
+            Just(ResetHint::Unknown),
+            Just(ResetHint::Yes),
+            Just(ResetHint::No),
+            Just(ResetHint::Gauge),
+        ]
+    }
+
+    /// Generates a [`HistogramValue`] spanning both `HistogramCounts` variants,
+    /// `sum` present and absent, `custom_values` present (scale `-53`) and
+    /// absent, every `ResetHint`, and float payloads including NaN/`-0.0`/finite
+    /// extremes. The two arms keep `custom_values: Some` bound to `scale == -53`
+    /// and `custom_values: None` bound to any other scale, mirroring the storage
+    /// invariant (custom boundaries iff the custom scale).
+    fn arb_histogram_value() -> impl Strategy<Value = HistogramValue> {
+        let with_custom = (
+            prop::collection::vec(arb_hist_float(), 1..5),
+            arb_hist_float(),
+            prop::option::of(arb_hist_float()),
+            prop::collection::vec(arb_hist_span(), 0..4),
+            prop::collection::vec(arb_hist_span(), 0..4),
+            arb_hist_counts(),
+            arb_reset_hint(),
+        )
+            .prop_map(
+                |(
+                    custom,
+                    zero_threshold,
+                    sum,
+                    positive_spans,
+                    negative_spans,
+                    counts,
+                    reset_hint,
+                )| {
+                    HistogramValue {
+                        scale: -53,
+                        zero_threshold,
+                        sum,
+                        custom_values: Some(custom),
+                        positive_spans,
+                        negative_spans,
+                        counts,
+                        reset_hint,
+                    }
+                },
+            );
+        let without_custom = (
+            any::<i32>(),
+            arb_hist_float(),
+            prop::option::of(arb_hist_float()),
+            prop::collection::vec(arb_hist_span(), 0..4),
+            prop::collection::vec(arb_hist_span(), 0..4),
+            arb_hist_counts(),
+            arb_reset_hint(),
+        )
+            .prop_map(
+                |(
+                    scale,
+                    zero_threshold,
+                    sum,
+                    positive_spans,
+                    negative_spans,
+                    counts,
+                    reset_hint,
+                )| {
+                    HistogramValue {
+                        // Keep this arm off the custom scale so `None`
+                        // custom_values never implies the custom-scale shape.
+                        scale: if scale == -53 { -52 } else { scale },
+                        zero_threshold,
+                        sum,
+                        custom_values: None,
+                        positive_spans,
+                        negative_spans,
+                        counts,
+                        reset_hint,
+                    }
+                },
+            );
+        prop_oneof![with_custom, without_custom]
+    }
+
+    fn opt_f64_bits_eq(a: Option<f64>, b: Option<f64>) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => x.to_bits() == y.to_bits(),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn vec_f64_bits_eq(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    fn opt_vec_f64_bits_eq(a: &Option<Vec<f64>>, b: &Option<Vec<f64>>) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => vec_f64_bits_eq(x, y),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn counts_bits_eq(a: &HistogramCounts, b: &HistogramCounts) -> bool {
+        match (a, b) {
+            (
+                HistogramCounts::Int {
+                    zero_count: za,
+                    count: ca,
+                    positive: pa,
+                    negative: na,
+                },
+                HistogramCounts::Int {
+                    zero_count: zb,
+                    count: cb,
+                    positive: p2,
+                    negative: n2,
+                },
+            ) => za == zb && ca == cb && pa == p2 && na == n2,
+            (
+                HistogramCounts::Float {
+                    zero_count: za,
+                    count: ca,
+                    positive: pa,
+                    negative: na,
+                },
+                HistogramCounts::Float {
+                    zero_count: zb,
+                    count: cb,
+                    positive: p2,
+                    negative: n2,
+                },
+            ) => {
+                za.to_bits() == zb.to_bits()
+                    && ca.to_bits() == cb.to_bits()
+                    && vec_f64_bits_eq(pa, p2)
+                    && vec_f64_bits_eq(na, n2)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whole-`HistogramValue` equality by bit pattern for every `f64`, so
+    /// `-0.0` and NaN (including payloads) compare by pattern, never `==`.
+    fn histogram_bits_eq(a: &HistogramValue, b: &HistogramValue) -> bool {
+        a.scale == b.scale
+            && a.zero_threshold.to_bits() == b.zero_threshold.to_bits()
+            && opt_f64_bits_eq(a.sum, b.sum)
+            && opt_vec_f64_bits_eq(&a.custom_values, &b.custom_values)
+            && a.positive_spans == b.positive_spans
+            && a.negative_spans == b.negative_spans
+            && counts_bits_eq(&a.counts, &b.counts)
+            && a.reset_hint == b.reset_hint
+    }
+
+    proptest! {
+        /// Typed histogram records survive the real prost wire (encode ->
+        /// prost bytes -> prost decode -> codec decode) field for field, every
+        /// `f64` bit-exact. Covers both count variants, `sum`/`custom_values`
+        /// present and absent, every `ResetHint`, and NaN/`-0.0`/extreme float
+        /// payloads (compared by `to_bits`, never `==`).
+        #[test]
+        fn histogram_records_round_trip_bit_for_bit(
+            values in prop::collection::vec(arb_histogram_value(), 0..6)
+        ) {
+            use prost::Message;
+            let run = pb::HistogramRun {
+                records: encode_histogram_records(&values),
+                ..Default::default()
+            };
+            let bytes = run.encode_to_vec();
+            let back = pb::HistogramRun::decode(bytes.as_slice()).expect("prost decode");
+            let decoded = decode_histogram_records(&back.records).expect("codec decode");
+            prop_assert_eq!(decoded.len(), values.len());
+            for (got, want) in decoded.iter().zip(values.iter()) {
+                prop_assert!(
+                    histogram_bits_eq(got, want),
+                    "histogram record corrupted on the wire: {:?} vs {:?}",
+                    got,
+                    want
+                );
+            }
+        }
+    }
+
+    /// The float payloads a naive `double`/`==` codec corrupts, driven through
+    /// every `f64`-bearing field of both count variants and the scalar fields,
+    /// plus the `sum: None`/`Some` and `custom_values: None`/`Some` distinctions
+    /// and all four reset hints, across the real prost wire.
+    #[test]
+    fn histogram_record_special_values_and_optionals_round_trip() {
+        use prost::Message;
+
+        let payload_nan = f64::from_bits(0x7ff8_0000_dead_beef);
+        let specials = [
+            f64::NAN,
+            payload_nan,
+            -0.0_f64,
+            0.0_f64,
+            f64::INFINITY,
+            f64::MAX,
+        ];
+
+        // A float-count histogram at the custom scale, carrying specials in
+        // every f64 field and `sum: None`.
+        let float_custom = HistogramValue {
+            scale: -53,
+            zero_threshold: payload_nan,
+            sum: None,
+            custom_values: Some(specials.to_vec()),
+            positive_spans: vec![HistogramSpan {
+                offset: -2,
+                length: 3,
+            }],
+            negative_spans: vec![HistogramSpan {
+                offset: 5,
+                length: 1,
+            }],
+            counts: HistogramCounts::Float {
+                zero_count: -0.0,
+                count: f64::INFINITY,
+                positive: vec![f64::NAN, -0.0, f64::MAX],
+                negative: vec![payload_nan],
+            },
+            reset_hint: ResetHint::Gauge,
+        };
+
+        // An int-count histogram with `sum: Some`, `custom_values: None`, and a
+        // distinct reset hint, so both optional distinctions and another enum
+        // value are exercised in one pass.
+        let int_plain = HistogramValue {
+            scale: 4,
+            zero_threshold: 0.0,
+            sum: Some(-0.0),
+            custom_values: None,
+            positive_spans: vec![],
+            negative_spans: vec![],
+            counts: HistogramCounts::Int {
+                zero_count: u64::MAX,
+                count: 0,
+                positive: vec![],
+                negative: vec![7],
+            },
+            reset_hint: ResetHint::No,
+        };
+
+        let values = vec![float_custom, int_plain];
+        let run = pb::HistogramRun {
+            records: encode_histogram_records(&values),
+            ..Default::default()
+        };
+        let back = pb::HistogramRun::decode(run.encode_to_vec().as_slice()).expect("prost decode");
+        let decoded = decode_histogram_records(&back.records).expect("codec decode");
+        assert_eq!(decoded.len(), values.len());
+        for (got, want) in decoded.iter().zip(values.iter()) {
+            assert!(
+                histogram_bits_eq(got, want),
+                "special histogram value corrupted: {got:?} vs {want:?}"
+            );
+        }
+        // `sum: None` must stay distinct from a present zero.
+        assert_eq!(decoded[0].sum, None);
+        assert_eq!(decoded[1].sum.map(f64::to_bits), Some((-0.0_f64).to_bits()));
+    }
+
+    /// Every `ResetHint` variant round-trips to itself across the wire.
+    #[test]
+    fn histogram_record_every_reset_hint_round_trips() {
+        use prost::Message;
+        for hint in [
+            ResetHint::Unknown,
+            ResetHint::Yes,
+            ResetHint::No,
+            ResetHint::Gauge,
+        ] {
+            let mut value = sample_histogram_int();
+            value.reset_hint = hint;
+            let run = pb::HistogramRun {
+                records: encode_histogram_records(&[value]),
+                ..Default::default()
+            };
+            let back =
+                pb::HistogramRun::decode(run.encode_to_vec().as_slice()).expect("prost decode");
+            let decoded = decode_histogram_records(&back.records).expect("codec decode");
+            assert_eq!(decoded[0].reset_hint, hint, "reset hint {hint:?} changed");
+        }
+    }
+
+    /// A record with no `counts` oneof member is a typed error, never a panic
+    /// or a silently defaulted count set.
+    #[test]
+    fn histogram_record_missing_counts_is_typed_error() {
+        let record = pb::HistogramRecord {
+            counts: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_histogram_records(std::slice::from_ref(&record)),
+            Err(CodecError::MissingHistogramCounts)
+        );
+    }
+
+    /// An unknown reset-hint discriminant is a typed error, never a silent
+    /// default to `Unknown`.
+    #[test]
+    fn histogram_record_unknown_reset_hint_is_typed_error() {
+        let record = pb::HistogramRecord {
+            reset_hint: 99,
+            counts: Some(pb::histogram_record::Counts::IntCounts(
+                pb::HistogramCountsInt::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_histogram_records(std::slice::from_ref(&record)),
+            Err(CodecError::UnknownResetHint(99))
         );
     }
 

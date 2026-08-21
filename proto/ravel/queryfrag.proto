@@ -185,10 +185,8 @@ message Run {
   repeated uint32 prov_in_page_index = 9 [packed = true];
 }
 
-// One histogram series. Mirrors SeriesFrame, but each run carries an opaque
-// encoded span payload instead of scalar value bits. The payload grammar is a
-// later ticket; the field is reserved here as opaque bytes with its number
-// frozen, so adding the grammar is a decode-side change, not a wire change.
+// One histogram series. Mirrors SeriesFrame, but each run carries one typed
+// HistogramRecord per sample instead of scalar value bits.
 message HistogramFrame {
   bytes series_id = 1;
   repeated Label labels = 2;
@@ -200,9 +198,7 @@ message HistogramRun {
   uint64 writer_epoch = 2;
   uint64 writer_seq = 3;
   repeated sint64 ts_delta = 4 [packed = true];
-  // Opaque encoded histogram span payload for this run. Grammar deferred to a
-  // later ticket; treated as an opaque blob by this contract.
-  bytes span_payload = 5;
+  reserved 5;  // was `bytes span_payload`, the deferred opaque histogram payload (ADR-0096 decision 2)
 
   // Per-sample dedup key columns, identical in shape and semantics to
   // `Run`'s fields 6-9 (ADR-0096 decision 1): either all four present with
@@ -213,6 +209,71 @@ message HistogramRun {
   repeated sint64 prov_epoch_delta = 7 [packed = true];
   repeated sint64 prov_seq_delta = 8 [packed = true];
   repeated uint32 prov_in_page_index = 9 [packed = true];
+
+  // One typed HistogramRecord per sample, parallel to ts_delta (ADR-0096
+  // decision 2, retiring the opaque span_payload above). Mirrors
+  // ravel_segment::HistogramValue field for field; every f64 crosses as its
+  // to_bits fixed64, never a proto double, so NaN payloads and -0.0 survive the
+  // wire byte-for-byte, the same discipline Run.value_bits uses for scalars.
+  repeated HistogramRecord records = 10;
+}
+
+// One native-histogram sample value, mirroring ravel_segment::HistogramValue
+// field for field (ADR-0096 decision 2). Every f64 crosses as its to_bits
+// fixed64, never a proto double, so NaN payloads, signalling NaNs, and -0.0
+// survive the round trip exactly, matching the scalar Run.value_bits path.
+message HistogramRecord {
+  sint32 scale = 1;
+  fixed64 zero_threshold_bits = 2;   // f64::to_bits
+  // Absent (None) stays distinct from a present value: proto3 `optional`, not a
+  // bare field, so a histogram with no sum is distinct from one whose sum is a
+  // present zero.
+  optional fixed64 sum_bits = 3;     // f64::to_bits when present
+  // Present iff scale == -53 (custom bucket boundaries), ascending. Empty means
+  // absent (None), non-empty means present, exactly as proto3 handles a
+  // repeated field. Each boundary crosses as its to_bits fixed64.
+  repeated fixed64 custom_values_bits = 4 [packed = true];
+  repeated HistogramSpan positive_spans = 5;
+  repeated HistogramSpan negative_spans = 6;
+  // All-integer or all-float counts, never mixed within one sample, mirroring
+  // ravel_segment::HistogramCounts. Exactly one member is set for a well-formed
+  // record; a record with neither is a typed decode error.
+  oneof counts {
+    HistogramCountsInt int_counts = 7;
+    HistogramCountsFloat float_counts = 8;
+  }
+  // Reset-hint states, mirroring ravel_segment::ResetHint (the default, 0, is
+  // Unknown, matching that enum's own zero value).
+  enum ResetHint {
+    UNKNOWN = 0;
+    YES = 1;
+    NO = 2;
+    GAUGE = 3;
+  }
+  ResetHint reset_hint = 9;
+}
+
+// One populated run on a histogram side, mirroring ravel_segment::HistogramSpan.
+message HistogramSpan {
+  sint32 offset = 1;
+  uint32 length = 2;
+}
+
+// All-integer bucket/zero/total counts (ravel_segment::HistogramCounts::Int).
+message HistogramCountsInt {
+  uint64 zero_count = 1;
+  uint64 count = 2;
+  repeated uint64 positive = 3 [packed = true];
+  repeated uint64 negative = 4 [packed = true];
+}
+
+// All-float bucket/zero/total counts (ravel_segment::HistogramCounts::Float),
+// every f64 as its to_bits fixed64 so NaN payloads and -0.0 survive the wire.
+message HistogramCountsFloat {
+  fixed64 zero_count_bits = 1;       // f64::to_bits
+  fixed64 count_bits = 2;            // f64::to_bits
+  repeated fixed64 positive_bits = 3 [packed = true];
+  repeated fixed64 negative_bits = 4 [packed = true];
 }
 
 // One log-record frame for a slice of the RLOG family (Logs, Alerts, Audit),
