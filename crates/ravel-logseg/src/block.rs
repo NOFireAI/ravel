@@ -467,6 +467,10 @@ pub struct DecodedBlock {
     bool_cols: HashMap<u32, Vec<Option<bool>>>,
     str_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
     fixed_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
+    /// Whether any page descriptor in this block named [`COL_ATTRS_RAW`], read
+    /// off the header and independent of the column filter (see
+    /// [`DecodedBlock::has_attrs_raw_page`]).
+    attrs_raw_page: bool,
     pages_decoded: usize,
     pages_skipped: usize,
 }
@@ -487,6 +491,18 @@ impl DecodedBlock {
     /// projection reached the page level rather than being applied after decode.
     pub fn pages_skipped(&self) -> usize {
         self.pages_skipped
+    }
+
+    /// Whether this block carries any page for the `attrs_raw` overflow column.
+    ///
+    /// Read off the page descriptors in the block header, so it is true for a
+    /// block that has such a page even when the column filter excluded it and
+    /// nothing of it was decompressed. A block whose records all fit their
+    /// FIELD_DIR columns has no `attrs_raw` page at all
+    /// (`absent_column_occupies_no_page`), which is what makes this a metadata
+    /// read rather than a decode.
+    pub fn has_attrs_raw_page(&self) -> bool {
+        self.attrs_raw_page
     }
     pub fn i64_col(&self, column_id: u32) -> Option<&[Option<i64>]> {
         self.i64_cols.get(&column_id).map(Vec::as_slice)
@@ -712,6 +728,7 @@ pub fn read_block_columns(
         bool_cols: HashMap::new(),
         str_cols: HashMap::new(),
         fixed_cols: HashMap::new(),
+        attrs_raw_page: descs.iter().any(|d| d.column_id == COL_ATTRS_RAW),
         pages_decoded,
         pages_skipped,
     };
