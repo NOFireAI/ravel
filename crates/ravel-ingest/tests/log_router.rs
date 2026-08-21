@@ -20,6 +20,9 @@ use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_ingest::{IngestConfig, LogIngestRouter, LogWriteError, WriteMode};
 use ravel_logseg::{Predicate, RlogConfig, RlogReader, stream_attrs_bytes};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -369,6 +372,230 @@ async fn dead_shard_is_observable_and_counted_once() {
         1,
         "a permanently dead shard is counted once, not once per routed write"
     );
+
+    router.shutdown().await;
+}
+
+/// Issue #296: a multi-shard Strict write where one shard's flush is abandoned
+/// (its data-object PUT fails permanently) while a sibling shard commits
+/// durably in the same `write()` call. The failure must still surface as an
+/// error, and the sibling's commit token must be recoverable from that error
+/// via `LogWriteError::durable_tokens` rather than being silently discarded.
+///
+/// Non-vacuity (prove-the-test): the failing shard (shard 0) sorts *first* in
+/// the router's ack-collection loop, so before the fix the loop's `inner?`
+/// returned at shard 0 and never looked at shard 1's successful ack. Against
+/// that unfixed loop this test fails at the `durable_tokens().len() == 1`
+/// assertion (the recovered list is empty). The injected fault is asserted via
+/// the `FaultStore` counter so the test proves the abandonment actually fired.
+#[tokio::test]
+async fn partial_failure_recovers_the_surviving_shards_token() {
+    let shard_count = 4;
+    // Fail every data-object PUT for shard 0 (`/l0/0000/`) permanently: a
+    // non-retryable store error abandons that flush on the first attempt with
+    // no backoff, so the outcome is deterministic and needs no clock advance.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+        )
+        .with_key_contains("/l0/0000/")
+        .with_occurrence(Occurrence::Always),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let clock = TestClock::new(BASE_NS);
+    let router = LogIngestRouter::new(
+        flush_on_first(shard_count),
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        clock.clone(),
+    );
+
+    let tenant = tenant("acme");
+    let victim = record_on_shard(0, shard_count, 1_000, "victim");
+    let survivor = record_on_shard(1, shard_count, 2_000, "survivor");
+    assert_ne!(
+        shard_for_log(&victim.stream_id, shard_count),
+        shard_for_log(&survivor.stream_id, shard_count),
+        "the fixture must span two shards"
+    );
+
+    let err = router
+        .write(
+            tenant.clone(),
+            vec![victim, survivor],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("one shard's flush was abandoned, so the write is a failure");
+
+    // The failure is still a failure, and still classifies as its underlying
+    // (retryable) abandonment cause.
+    assert!(
+        err.is_retryable(),
+        "an abandoned-flush partial write stays retryable, got {err}"
+    );
+
+    // The surviving shard's durable token is recoverable from the error.
+    let recovered = err.durable_tokens();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "exactly the surviving shard's token is recoverable, got {recovered:?}"
+    );
+    let records = read_back(store.as_ref(), &tenant.hash(), &recovered[0]).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].body, "survivor",
+        "the recovered token points at the shard that actually committed"
+    );
+
+    // Prove the injected fault fired: the victim shard's data PUT was rejected.
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::Permanent),
+        1,
+        "the permanent data-object PUT fault fired exactly once (shard 0, no retry)"
+    );
+
+    router.shutdown().await;
+}
+
+/// Lands a conflicting commit record at shard 0's commit key and reports
+/// `AlreadyExists`, driving the pinned-identity split-brain panic in *that
+/// specific* shard actor. Unlike `SplitBrainOnFirstCommit`, it targets shard 0
+/// only (`/c/0000/`), so a sibling shard's commit is untouched and the panic is
+/// deterministic regardless of inter-actor flush ordering.
+struct SplitBrainOnShardZeroCommit {
+    inner: MemoryStore,
+    poisoned: AtomicBool,
+}
+
+impl SplitBrainOnShardZeroCommit {
+    fn new() -> Self {
+        SplitBrainOnShardZeroCommit {
+            inner: MemoryStore::new(),
+            poisoned: AtomicBool::new(false),
+        }
+    }
+
+    fn conflicting_record(&self) -> Bytes {
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: tenant("acme").hash(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id: Uuid::nil(),
+            writer_epoch: 1,
+            writer_seq: 0,
+            object_size: 1,
+            content_hash: [0xAA; 32],
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid conflicting record");
+        record::encode(&rec)
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for SplitBrainOnShardZeroCommit {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        if key.contains("/c/0000/") && !self.poisoned.swap(true, Ordering::SeqCst) {
+            self.inner
+                .put(key, self.conflicting_record(), PutOptions::default())
+                .await?;
+            return Err(StoreError::AlreadyExists);
+        }
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+/// Issue #296: a shard whose ack never resolves (its actor panics mid-flush,
+/// so the ack sender is dropped) must contribute NO token to the recovered
+/// partial-success list, while a sibling that did commit durably is still
+/// recovered. Reporting the panicked shard's records as durable would be worse
+/// than the original bug, since nothing was acked.
+#[tokio::test]
+async fn an_unresolved_ack_contributes_no_token() {
+    let shard_count = 4;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(SplitBrainOnShardZeroCommit::new());
+    let clock = TestClock::new(BASE_NS);
+    let router = LogIngestRouter::new(
+        flush_on_first(shard_count),
+        Arc::clone(&store),
+        clock.clone(),
+    );
+
+    let tenant = tenant("acme");
+    let victim = record_on_shard(0, shard_count, 1_000, "victim");
+    let survivor = record_on_shard(1, shard_count, 2_000, "survivor");
+
+    let err = router
+        .write(
+            tenant.clone(),
+            vec![victim, survivor],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("the split-brain panic takes shard 0's actor down mid-flush");
+
+    // The write still fails as ShardUnavailable, and the death is counted once.
+    assert!(
+        err.is_retryable(),
+        "ShardUnavailable is retryable, got {err}"
+    );
+    assert_eq!(router.metrics().snapshot().shard_deaths, 1);
+
+    // Only the surviving shard's token is recovered; the panicked shard, whose
+    // ack never resolved, contributes none.
+    let recovered = err.durable_tokens();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "only the committed sibling's token is recovered, not the panicked shard's, got {recovered:?}"
+    );
+    let records = read_back(store.as_ref(), &tenant.hash(), &recovered[0]).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].body, "survivor");
 
     router.shutdown().await;
 }

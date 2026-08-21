@@ -1,6 +1,8 @@
 //! Errors returned to strict-mode waiters of the log pipeline, the log-side
 //! counterpart of [`crate::WriteError`].
 
+use ravel_types::CommitToken;
+
 /// Failure classification for a single log shard's contribution to a write.
 ///
 /// Variants carry only owned strings (not the underlying store/publish
@@ -53,21 +55,63 @@ pub enum LogWriteError {
     /// The gateway maps it to HTTP 429 / gRPC `RESOURCE_EXHAUSTED`.
     #[error("ingest buffer byte budget reached")]
     BufferBudgetExceeded,
+    /// A multi-shard Strict write in which at least one shard failed *after*
+    /// one or more sibling shards had already acked their commit durably in
+    /// the same [`LogIngestRouter::write`](crate::LogIngestRouter::write) call
+    /// (issue #296). `inner` is the underlying single-shard classification the
+    /// write would otherwise have surfaced; `durable` carries the commit
+    /// tokens the successful siblings actually acked, so that durable data is
+    /// reportable instead of being silently discarded by the error return.
+    ///
+    /// The router constructs this only when `durable` is non-empty: a failure
+    /// that touched no durably-committed sibling still surfaces as the bare
+    /// underlying variant, so an existing single-shard caller sees no change.
+    /// `durable` never includes a shard whose ack failed to resolve (a
+    /// panicked actor): an unresolved ack is not a durable write and reporting
+    /// it as one would be worse than the bug this closes.
+    ///
+    /// This is an information-carrying wrapper, not a new failure mode: it is
+    /// exactly as retryable as its `inner` cause ([`Self::is_retryable`]), and
+    /// a caller that ignores [`Self::durable_tokens`] behaves exactly as it did
+    /// before (the write is still reported as a failure).
+    #[error("{inner}")]
+    PartialWrite {
+        inner: Box<LogWriteError>,
+        durable: Vec<CommitToken>,
+    },
 }
 
 impl LogWriteError {
     /// Whether a client may reasonably retry the whole write after this
     /// error. `SegmentBuild` and `StreamIdCollision` are excluded: both
     /// reflect a problem with the input itself, not a transient condition.
+    /// A [`Self::PartialWrite`] is exactly as retryable as its underlying
+    /// cause: it is the same failure, carrying recovered sibling tokens.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
+        match self {
             LogWriteError::ShardUnavailable
-                | LogWriteError::AckTimeout
-                | LogWriteError::Abandoned(_)
-                | LogWriteError::StaleProvisioningView
-                | LogWriteError::BufferBudgetExceeded
-        )
+            | LogWriteError::AckTimeout
+            | LogWriteError::Abandoned(_)
+            | LogWriteError::StaleProvisioningView
+            | LogWriteError::BufferBudgetExceeded => true,
+            LogWriteError::SegmentBuild(_) | LogWriteError::StreamIdCollision(_) => false,
+            LogWriteError::PartialWrite { inner, .. } => inner.is_retryable(),
+        }
+    }
+
+    /// The commit tokens for sibling shards that acked durable in the same
+    /// multi-shard `write()` call as this failure (issue #296). Empty for
+    /// every variant except [`Self::PartialWrite`]: a failure that committed
+    /// no sibling durably carries no tokens, and neither does a failure whose
+    /// ack round never resolved (an [`Self::AckTimeout`], or a
+    /// [`Self::ShardUnavailable`] raised at send time before any ack was
+    /// awaited). A caller that ignores this loses only information, never
+    /// correctness -- the write is still an error.
+    pub fn durable_tokens(&self) -> &[CommitToken] {
+        match self {
+            LogWriteError::PartialWrite { durable, .. } => durable,
+            _ => &[],
+        }
     }
 }
 
@@ -90,5 +134,44 @@ mod tests {
         assert!(LogWriteError::Abandoned("x".into()).is_retryable());
         assert!(LogWriteError::AckTimeout.is_retryable());
         assert!(LogWriteError::ShardUnavailable.is_retryable());
+    }
+
+    #[test]
+    fn non_partial_variants_carry_no_durable_tokens() {
+        assert!(LogWriteError::AckTimeout.durable_tokens().is_empty());
+        assert!(
+            LogWriteError::Abandoned("x".into())
+                .durable_tokens()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn partial_write_carries_tokens_and_delegates_retryability_and_display() {
+        use ravel_types::CommitToken;
+
+        let token = CommitToken {
+            shard: 3,
+            writer_id: uuid::Uuid::nil(),
+            epoch: 0,
+            seq: 7,
+            ingest_hour_bucket: 0,
+        };
+        // A retryable cause: the wrapper is retryable and surfaces the cause's
+        // own Display, not a new string.
+        let retryable = LogWriteError::PartialWrite {
+            inner: Box::new(LogWriteError::Abandoned("data put exhausted".into())),
+            durable: vec![token.clone()],
+        };
+        assert!(retryable.is_retryable());
+        assert_eq!(retryable.durable_tokens(), std::slice::from_ref(&token));
+        assert_eq!(retryable.to_string(), "flush abandoned: data put exhausted");
+
+        // A non-retryable cause makes the wrapper non-retryable too.
+        let not_retryable = LogWriteError::PartialWrite {
+            inner: Box::new(LogWriteError::StreamIdCollision("clash".into())),
+            durable: vec![token],
+        };
+        assert!(!not_retryable.is_retryable());
     }
 }

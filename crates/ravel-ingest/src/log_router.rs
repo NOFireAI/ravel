@@ -346,24 +346,62 @@ impl LogIngestRouter {
         }
 
         // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
+        // On a deadline elapse the whole `join_all` future is dropped, so no
+        // per-shard ack is observed: `AckTimeout` carries no recovered tokens
+        // (a sibling that committed inside the elapsed window is unknowable
+        // here, and reporting an unresolved ack as durable would be wrong).
         let joined = tokio::time::timeout(ack_deadline, futures::future::join_all(ack_rxs))
             .await
             .map_err(|_| LogWriteError::AckTimeout)?;
-        let mut tokens = Vec::with_capacity(joined.len());
+
+        // Every ack resolved. Scan them all: collect every shard that acked a
+        // durable commit (issue #296), and record the first failure in shard
+        // order so the returned classification and `mark_shard_dead` side
+        // effect are exactly what the pre-fix early-return produced. A shard
+        // whose ack failed to resolve (`RecvError`: the actor panicked
+        // mid-flush) is NOT a durable write and contributes no token.
+        let mut durable = Vec::with_capacity(joined.len());
+        let mut first_error: Option<LogWriteError> = None;
+        let mut dead_shard: Option<u32> = None;
         for (shard, result) in ack_shards.into_iter().zip(joined) {
-            // A `RecvError` here means the actor dropped the ack sender without
-            // sending: it panicked mid-flush (a healthy actor always acks, even
-            // on abandonment). Count the death and report it as unavailable.
-            let inner = match result {
-                Ok(inner) => inner,
+            match result {
+                Ok(Ok(token)) => durable.push(token),
+                Ok(Err(shard_error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(shard_error);
+                    }
+                }
                 Err(_) => {
-                    self.mark_shard_dead(&set[shard as usize]);
-                    return Err(LogWriteError::ShardUnavailable);
+                    if first_error.is_none() {
+                        first_error = Some(LogWriteError::ShardUnavailable);
+                        dead_shard = Some(shard);
+                    }
+                }
+            }
+        }
+
+        if let Some(inner) = first_error {
+            // Preserve the exact failure semantics: the death is counted once,
+            // only when the first failure in shard order is a dropped ack, and
+            // only then (a resolved shard-level error never marked a death).
+            if let Some(shard) = dead_shard {
+                self.mark_shard_dead(&set[shard as usize]);
+            }
+            // Carry the durably-acked sibling tokens only when there are any;
+            // a failure with no partial success surfaces as the bare variant,
+            // unchanged from before this fix.
+            let error = if durable.is_empty() {
+                inner
+            } else {
+                LogWriteError::PartialWrite {
+                    inner: Box::new(inner),
+                    durable,
                 }
             };
-            tokens.push(inner?);
+            return Err(error);
         }
-        Ok(LogWriteReceipt { tokens })
+
+        Ok(LogWriteReceipt { tokens: durable })
     }
 
     /// Records the first observation of a shard actor's death, deduped so a
