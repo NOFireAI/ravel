@@ -678,11 +678,52 @@ impl SeriesIdMemo {
         if let Some((last_labels, last_id)) = &self.last
             && last_labels == labels
         {
+            #[cfg(any(test, feature = "memo-stats"))]
+            memo_stats::record_hit();
             return Ok(*last_id);
         }
+        #[cfg(any(test, feature = "memo-stats"))]
+        memo_stats::record_miss();
         let id = SeriesId::compute(tenant, metric_name, labels)?;
         self.last = Some((labels.clone(), id));
         Ok(id)
+    }
+}
+
+/// Hit/miss counters for [`SeriesIdMemo`], compiled only under `cfg(test)` or
+/// the `memo-stats` cargo feature; the production normalize path (neither cfg
+/// active) carries none of this. Counts are thread-local and process-global
+/// across every `SeriesIdMemo` on the thread, so a caller measures the memo's
+/// aggregate behaviour over a whole `normalize_metrics` call by resetting
+/// before it and reading the snapshot after. Used by the `normalize_alloc`
+/// bench and pinned by a unit test; there is no production reader.
+#[cfg(any(test, feature = "memo-stats"))]
+pub mod memo_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HITS: Cell<u64> = const { Cell::new(0) };
+        static MISSES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_hit() {
+        HITS.with(|h| h.set(h.get() + 1));
+    }
+
+    pub(super) fn record_miss() {
+        MISSES.with(|m| m.set(m.get() + 1));
+    }
+
+    /// Zero both counters on the current thread.
+    pub fn reset() {
+        HITS.with(|h| h.set(0));
+        MISSES.with(|m| m.set(0));
+    }
+
+    /// `(hits, misses)` recorded on the current thread since the last
+    /// [`reset`].
+    pub fn snapshot() -> (u64, u64) {
+        (HITS.with(Cell::get), MISSES.with(Cell::get))
     }
 }
 
@@ -1907,6 +1948,67 @@ mod tests {
         );
         assert!(out.points.is_empty());
         assert!(out.rejected.is_empty());
+    }
+
+    // --- SeriesIdMemo hit rate (pins the memo_stats counter, deliverable 3
+    //     of #367) ---
+
+    #[test]
+    fn memo_hit_rate_grouped_vs_interleaved() {
+        let tenant = tenant();
+        let limits = IngestLimits::default();
+        const P: usize = 100;
+
+        // Grouped: one metric, P points all carrying the same attribute set, so
+        // every point after the first is one series the memo already holds.
+        let grouped = request(vec![resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "grouped",
+                (0..P)
+                    .map(|i| {
+                        number_point(
+                            vec![string_kv("k", "v")],
+                            1_000 + i as i64,
+                            NumberValue::AsDouble(i as f64),
+                        )
+                    })
+                    .collect(),
+            )],
+        )]);
+        memo_stats::reset();
+        let out = normalize_metrics(&tenant, grouped, &limits, 1_000_000);
+        assert_eq!(out.points.len(), P);
+        let (hits, misses) = memo_stats::snapshot();
+        // One miss to seed the single series, then a hit for every later point.
+        assert_eq!(misses, 1, "grouped: expected one seeding miss");
+        assert_eq!(hits, (P - 1) as u64, "grouped: expected P-1 hits");
+
+        // Interleaved: one metric, P points alternating between two distinct
+        // attribute sets, so no point ever matches the one before it. The
+        // one-entry memo never hits.
+        let interleaved = request(vec![resource_metrics(
+            vec![],
+            vec![gauge_metric(
+                "interleaved",
+                (0..P)
+                    .map(|i| {
+                        let v = if i % 2 == 0 { "a" } else { "b" };
+                        number_point(
+                            vec![string_kv("k", v)],
+                            1_000 + i as i64,
+                            NumberValue::AsDouble(i as f64),
+                        )
+                    })
+                    .collect(),
+            )],
+        )]);
+        memo_stats::reset();
+        let out = normalize_metrics(&tenant, interleaved, &limits, 1_000_000);
+        assert_eq!(out.points.len(), P);
+        let (hits, misses) = memo_stats::snapshot();
+        assert_eq!(hits, 0, "interleaved: one-entry memo must never hit");
+        assert_eq!(misses, P as u64, "interleaved: every point is a miss");
     }
 
     // --- mapping table: job/instance synthesis ---
