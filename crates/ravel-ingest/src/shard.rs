@@ -1503,6 +1503,45 @@ mod buffer_accounting_tests {
         assert_eq!(buf.series.len(), 1, "both points merged into one series");
     }
 
+    /// ADR-0098 consequence: after a run of points that shared one
+    /// `Arc<LabelSet>` merges into the accumulator, the accumulator holds the
+    /// LAST reference to that set (strong_count == 1). This is what lets the
+    /// flush `Arc::try_unwrap` move the allocation into `SeriesInputV3` rather
+    /// than deep-copy it on the common path. The points that shared the set are
+    /// consumed by `merge` and their `Arc` clones dropped; nothing outside the
+    /// buffer keeps one, because the request-scoped memo does not outlive the
+    /// normalize call.
+    #[test]
+    fn accumulator_holds_the_last_reference_after_a_shared_run() {
+        // Five points of one series run sharing a single Arc, as the normalizer
+        // produces them. The original binding is dropped when this block ends,
+        // so only the point clones (about to be consumed by merge) reference it.
+        let pts: Vec<IngestPoint> = {
+            let shared = Arc::new(labels_of(3));
+            (0..5)
+                .map(|i| IngestPoint {
+                    series_id: SeriesId([1u8; 16]),
+                    labels: Arc::clone(&shared),
+                    value: IngestValue::Scalar(Sample {
+                        ts_ns: 1_000 + i,
+                        value: i as f64,
+                    }),
+                })
+                .collect()
+        };
+        let mut buf = TenantBuf::default();
+        buf.merge(pts, 1_000).expect("one series, one value kind");
+        let accum = buf
+            .series
+            .get(&SeriesId([1u8; 16]))
+            .expect("series present");
+        assert_eq!(
+            Arc::strong_count(&accum.labels),
+            1,
+            "the accumulator must hold the last reference so flush unwraps by move"
+        );
+    }
+
     /// A second point for a series already in the buffer costs only its sample:
     /// the label bytes (headers included) are already counted. This is the
     /// deliberate asymmetry with `est_charge_bytes`, which cannot see buffer
