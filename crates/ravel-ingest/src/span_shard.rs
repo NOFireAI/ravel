@@ -82,8 +82,21 @@ pub(crate) enum SpanShardMsg {
 /// covering the two i64 timestamps, the 16-byte trace id, the two 8-byte span
 /// ids, and the status code. A `target_bytes` flush-trigger estimate, not a
 /// byte-exact accounting of the RSPAN output.
+///
+/// Each attribute also costs its `(String, String)` pair header, the span
+/// analogue of the `size_of::<Label>()` term [`crate::shard::TenantBuf::merge`]
+/// and [`crate::value::IngestPoint::est_charge_bytes`] apply per label (and
+/// byte-identical to it, since a span attribute pair is two `String` headers
+/// just as `Label` is): the buffer holds that struct whatever the key and value
+/// bytes contain, and all three signals charge the one process-wide byte budget
+/// (ADR-0069), so leaving the header term out here would undercharge the shared
+/// ceiling on attribute-heavy spans while metrics charge it honestly.
 pub(crate) fn est_span_bytes(span: &NormalizedSpan) -> usize {
-    let attr_bytes: usize = span.attrs.iter().map(|(k, v)| k.len() + v.len()).sum();
+    let attr_bytes: usize = span
+        .attrs
+        .iter()
+        .map(|(k, v)| size_of::<(String, String)>() + k.len() + v.len())
+        .sum();
     span.name.len() + span.status_message.as_ref().map(String::len).unwrap_or(0) + attr_bytes + 64
 }
 
