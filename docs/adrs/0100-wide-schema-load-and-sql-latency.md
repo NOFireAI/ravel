@@ -57,8 +57,9 @@ ClickBench is used here as an external dataset and query suite, the way the
 `parquet_baseline` bin already uses Parquet as an external comparison point:
 it is a fixed, public, wide-table analytical workload that exercises the SQL
 surface far past any fixture in the tree. Its `hits` schema is also a useful
-forcing function on decision 2 — it is all integers, strings, and date/time
-columns, so it lands squarely on the declared-column type gaps named there.
+forcing function on decision 2: it is all integers, strings, and date/time
+columns, so declaring it exercises the derivation at full width and settles
+what a time column costs when it is declared as `i64`.
 
 Relevant facts this decision leans on:
 
@@ -128,17 +129,27 @@ column and no `DeclaredType` extension — only a corpus rewrite pointing that
 column's references at `ts`. For ClickBench that is `EventTime`, which
 carries a large share of the suite's time filtering.
 
-What remains is a real gap, named here rather than discovered later.
-`DeclaredType` has no `F64`, so a float attribute cannot be declared at all;
-and it has no date or time variant, so every *secondary* time column stays
-untyped — `EventDate`, `ClientEventTime`, `LocalEventTime` in ClickBench's
-schema. Statements filtering or grouping on those pay a per-row string cast,
-which is the largest remaining latency cliff on this workload after the
-columnar and pushdown work. Both gaps get a follow-up issue filed at this
-epic's decomposition, not deferred to an unnamed later. This ADR does not
-extend `DeclaredType`: that is an ADR-0090 amendment with its own
-schema-append and projection consequences, and folding it in here would
-couple the measurement work to a format-adjacent change.
+A *secondary* time column — `EventDate`, `ClientEventTime`,
+`LocalEventTime` in ClickBench's schema — is declared as `i64` and gets the
+full typed treatment: the same NumStat pruning, the same typed comparison
+and pushdown, and exact-typed status for ADR-0094's parallel final
+aggregation. `DeclaredType` has no date or time variant, so what such a
+column does not get is ergonomic: a `DATE` or `TIMESTAMP` literal comparing
+directly rather than against an epoch integer, and `date_trunc`/`extract`
+applying without manual arithmetic. Corpus statements filtering on a
+secondary time column therefore compare against integers and carry the
+modified-query flag decision 3 requires. #432 records the ergonomic gap
+with the analysis.
+
+One gap is real rather than ergonomic: `DeclaredType` has no `F64`, and
+declaring a float key as `i64` yields NULL for every row (a declared type
+describes how a value is read, and the variants do not match), so a float
+attribute cannot be declared at all and every predicate over it pays a
+per-row string cast with no operator opt-out. ADR-0101 closes that; #431
+tracks it. Neither gap blocks this epic's measurements, and this ADR does
+not extend `DeclaredType` itself: that is a frozen-contract change to
+`TypedAttrColumnType` with its own rollout rule, and folding it in here
+would couple the measurement work to a format change.
 
 Derivation rules:
 
@@ -266,10 +277,9 @@ rather than building a second one.
 
 Competitive latency on this workload does not come from this ADR. It comes
 from ADR-0099's columnar decode, typed predicate and limit pushdown
-(#331, #278), multi-core execution and spill behavior (#361), the
-post-load object layout this harness now measures, and the declared-column
-type gaps named in decision 2. What this ADR delivers is the only thing that
-can tell those apart.
+(#331, #278), multi-core execution and spill behavior (#361), and the
+post-load object layout this harness now measures. What this ADR delivers is
+the only thing that can tell those apart.
 
 ### 5. Reachability through the shipping surfaces
 

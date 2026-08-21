@@ -102,3 +102,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0097](0097-sql-scalar-function-surface.md) | The SQL scalar and window function surface: extend the fail-closed registry gate beyond aggregates | Proposed |
 | [0099](0099-columnar-decode-to-arrow.md) | Columnar decode-to-Arrow path for SQL scans: a block view out of ravel-logseg, dictionary pages preserved end to end, and SoA buffer adoption on the metrics scan | Accepted |
 | [0100](0100-wide-schema-load-and-sql-latency.md) | Wide-schema load validation and SQL query latency measurement: dynamic-column budget counters, declared columns derived from a load mapping, a versioned analytical query corpus, and a cold/warm per-query latency harness | Accepted |
+| [0101](0101-declared-column-type-vocabulary.md) | Declarable f64 typed attribute columns: one additive TypedAttrColumnType value, Float64 projection, the NaN pruning rule, and a readers-before-writers rollout | Accepted |
