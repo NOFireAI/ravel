@@ -646,6 +646,56 @@ carries max token per shard).
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 | idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |
 
+## CPU cost of the write path (measured)
+
+A CPU flamegraph of the write path, from `ravel-bench`'s `ingest_bench` bin
+built `--release --features profiling`. A `pprof` sampler at 997 Hz brackets
+only the measured region (fixture generation and report assembly excluded).
+While a profile is active the harness disables its own visibility poller,
+per-batch catalog resolves, and depth sampler, so samples attribute to the
+ingest path and not the benchmark measuring itself; such a run reports no
+visibility-lag figures and in-flight depth `n=0`.
+
+- Host: aarch64, 4 cores, ~8 GiB RAM. Build profile: `release`.
+- Workload: `--store memory --shards 4 --target-series 2000
+  --points-per-sec 4000000 --duration-secs 1 --batch-size 5000
+  --ack-timeout-secs 120`; 4,000,000 points, all accepted, no errors.
+- Sampler collected 648 on-CPU samples.
+
+What this profile supports and what it does not:
+
+- It is a composition of on-CPU time, not of wall time. `pprof` uses
+  `ITIMER_PROF`, which samples only running threads, so parked tokio workers
+  never appear. 0% of the profile is idle/park frames by construction, and
+  the write path spends most of its wall time off-CPU awaiting flushes,
+  where this profile is blind.
+- At 648 samples the 95% binomial interval on a 50%-of-samples group is
+  about +/-4%, so only the broad grouping below is supportable, not
+  per-function figures to better than a few percent. Across three
+  independent runs (251, 648, 932 on-CPU samples) the two dominant costs,
+  memory movement and the series-id hash map, are stable in rank; the finer
+  splits below them shift with sample count and label cardinality.
+
+Essentially all on-CPU time is the ingest write path: 99.4% of samples fall
+in `ravel_ingest`/`ravel_segment`/`ravel_codec`/`ravel_commit` frames, the
+remaining 0.6% in tokio worker scheduling. Grouped by self time:
+
+| group | share of on-CPU samples |
+|---|---|
+| point/buffer memory traffic (moves, copies, `Vec<u8>`/`Vec<i64>` growth including segment byte-buffer construction, `String` drops) | ~56% |
+| router per-point conversion loop (`IngestRouter::write_points`) | ~16% |
+| series-id hash map (`hashbrown` probe + SipHash) | ~15% |
+| CRC32C checksum on the object-store PUT | ~6% |
+| segment codec encode (`encode_i64`, varint) | ~5% |
+| sample sort + tokio scheduling | ~2% |
+
+The dominant cost is memory movement, not compression, hashing, or I/O:
+building `IngestPoint`s, growing the per-shard byte buffers, and dropping
+label `String`s. Byte-slice label comparison during series accumulation is
+also visible and grows with shared-label cardinality. The only object-store
+work is the CRC32C over the in-memory PUT; a real S3 backend adds network
+I/O this in-memory profile omits.
+
 ## Metrics (self-observability)
 
 `IngestMetrics` (crates/ravel-ingest/src/metrics.rs) exposes process-global
