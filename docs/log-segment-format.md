@@ -454,16 +454,19 @@ count0 level-0 entries:
     has_nan:   u8   (0 or 1)
 count1: u32
 count1 level-1 entries: same fields as a level-0 entry with the byte
-  range and crc omitted, mins/maxes merged over the entry's <= 64
-  children
+  range and crc omitted, merged over the entry's <= 64 children:
+  mins/maxes by the per-type order, has_nan OR-ed, null_count as
+  defined in "null_count at both levels" below
 ```
 
-A level-1 stat merges only the children that carry a stat for that column, so
-its bounds are the group's bounds only because every child that resolves a
-value for the column carries one (see "What a numeric stat bounds" below). A
-child block that resolved values but carried no stat would read as "no
-information" here and be dropped from the merge silently, leaving a level-1
-entry that looks complete and bounds a subset of its group.
+A level-1 stat merges the min/max bounds of only the children that carry a stat
+for that column, so its bounds are the group's bounds only because every child
+that resolves a value for the column carries one (see "What a numeric stat
+bounds" below). A child block that resolved values but carried no stat would
+read as "no information" for the bounds and be dropped from the merge silently,
+leaving a level-1 entry that looks complete and bounds a subset of its group.
+`null_count`, unlike the bounds, does account for the children that carry no
+stat: see "null_count at both levels" below.
 
 Fanout is 64: one level-1 entry per 64 level-0 blocks. A numeric stat
 stores i64 as its two's-complement `u64` bit pattern (`v as u64`), and
@@ -538,6 +541,55 @@ stat range cannot overlap a queried range holds no matching row. Under version
 2 the stats bounded the raw columnar occurrences instead, which could exclude
 the block holding the record a range query wanted; that is the defect version 3
 fixes, and it is why a v2 object cannot be read as a v3 one.
+
+### null_count at both levels (trailer version 3, normative)
+
+A stat's `null_count` counts rows that resolve nothing the stat's `[min, max]`
+bounds. It never contributes to pruning (`candidate_blocks` reads only min/max,
+and null rows never satisfy a range); it is a per-column cardinality hint for a
+future reader, and this section is its only contract.
+
+- **Level-0** (per block). `null_count` is the number of rows of the block whose
+  resolved merged-view value for the column's name is absent or of a type other
+  than the column's type, i.e. the block's `record_count` minus the count of
+  rows that resolve a value of the column's type (the rows the bounds fold in).
+  A block carries a stat for a column iff at least one of its rows resolves a
+  value of that type, so an existing level-0 stat always has
+  `null_count < record_count`, and a column no row of the block resolves has no
+  stat at all rather than a stat with `null_count == record_count` (see "What a
+  numeric stat bounds").
+
+- **Level-1** (per <= 64 children). `null_count` is the number of rows *beneath
+  the entry* -- summed across all children -- that resolve nothing of the
+  column's type. This counts, for each child, the rows that child's own stat
+  reports null, PLUS every row of any child that carries no stat for the column
+  at all: by the level-0 rule a child with no stat for a column resolves nothing
+  of that type in any of its rows, so all `record_count` of them are null. The
+  writer computes it as `sum(child.stat.null_count for children with the stat) +
+  sum(child.record_count for children without it)`. Because a level-1 stat
+  exists iff some child carries one, at least one row beneath resolves the
+  column, so an existing level-1 stat also has `null_count < record_count`.
+
+The distinction the two levels share and a reader must honor: **"no stat for the
+column" and "a stat whose `null_count` covers every row" are different
+encodings and are never interchangeable.** No writer emits a stat whose
+`null_count` equals the entry's `record_count`; an all-null column is encoded as
+the *absence* of a stat, at both levels. Absence is "no information" for
+pruning (it prunes nothing, exactly like an absent posting list); a present stat
+with a `null_count` is positive information about how many rows are null. A
+reader must not read an absent stat as "null_count == record_count", nor read a
+present stat's `null_count` as license to prune.
+
+`null_count` is a `u32` written as a varint, and the level-1 sum above can in
+principle exceed `u32::MAX` (up to 64 children, each with a `u32` `record_count`).
+The merge saturates: a level-1 `null_count` of `u32::MAX` means "at least
+`u32::MAX` null rows beneath this entry", an exact value lost to saturation. A
+reader that consumes the field must treat `u32::MAX` as a saturated lower bound,
+not an exact count. Saturation is the only approximation in the field and is
+confined to this case; every non-saturated value is exact. (The current writer's
+block sizing keeps real `record_count` values far below `u32::MAX / 64`, so
+saturation is unreachable in practice; it is documented because the format
+contract, not the current writer, bounds `record_count`.)
 
 `candidate_blocks(ts_min, ts_max, stream_refs, numeric)` returns the level-0
 block indices whose entries survive the coarse predicate. Alongside the ts and
