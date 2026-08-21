@@ -297,6 +297,25 @@ carries `interactive` or `background`. Only `interactive` occurs today.
 | `ravel_query_estimated_store_bytes_total` | Pre-execution upper-envelope estimate of object-store bytes. |
 | `ravel_query_estimated_decompressed_bytes_total` | Pre-execution upper-envelope estimate of decompressed sample bytes. |
 
+### Metric metadata cache (`query_metadata_cache_*`)
+
+Labels: `mode` only. This is the per-process cache over each tenant's metric
+metadata record that serves `/api/v1/metadata` at one GET per (tenant, refresh
+horizon, process) (ADR-0085 decision 1). It renders only in a request-serving
+mode that built the cache (`Mode::All`/`Mode::Query`); a gateway- or
+maintain-only process omits the family. All four are cumulative counters.
+
+| Metric | Meaning |
+|---|---|
+| `query_metadata_cache_hits_total` | Metadata requests served from an already-cached tenant record, fresh or stale. |
+| `query_metadata_cache_misses_total` | Metadata requests that found no cached record and did an inline fill GET. |
+| `query_metadata_cache_refreshes_total` | Background refreshes started by a past-horizon request that won the single-flight (includes refreshes that later errored). |
+| `query_metadata_cache_refresh_errors_total` | Background refreshes that failed their GET or decode. The stale record keeps being served and the client never sees the error; a climbing value means the record is becoming unreadable. |
+
+The request hit rate is `hits / (hits + misses)`. A refresh-error rate rising
+toward the refresh rate means the metadata record is unreadable while stale data
+is still being served, which the operations guide pages on.
+
 ### Distributed read fan-out (`ravel_distrib_*`)
 
 Labels: `mode` only, plus `le` on the histogram buckets. This family carries no
@@ -315,6 +334,9 @@ explosion. It renders only when the process runs with `--distributed-query`
 | `ravel_distrib_slices_redispatched_total` | Slices whose rendezvous-primary worker was lost at transport or returned `Unavailable`, so the coordinator re-dispatched the slice once to the next rendezvous worker (ADR-0071 deliverable 1). |
 | `ravel_distrib_slices_fallback_total` | Slices that fell back to coordinator-local execution after the primary and its one re-dispatch both failed re-dispatchably (transport loss or `Unavailable`), rather than failing the query. |
 | `ravel_distrib_slice_fetch_seconds` | Per-slice fetch latency histogram, covering both locally-run and remote slices. |
+| `ravel_distrib_quarantine_marks_total` | Dead fragment endpoints marked into the coordinator's quarantine map after a re-dispatchable dispatch failure (transport loss or an `Unavailable` summary), cumulative (ADR-0071 amendment decision 3). |
+| `ravel_distrib_quarantine_readmits_total` | Quarantined endpoints readmitted by a strictly newer worker heartbeat stamp (the half-open probe), cumulative. |
+| `ravel_distrib_quarantine_current` | Gauge. Fragment endpoints currently held in the coordinator's quarantine map. |
 
 Fragment admission is a distinct workload class from client-query admission
 (`--max-inflight-fragments`, separate from the query concurrency limit), so a

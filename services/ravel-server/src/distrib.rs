@@ -2413,6 +2413,16 @@ mod tests {
             "no re-mark: the skip happens before any dispatch"
         );
         assert_eq!(metrics.quarantine_readmits_total(), 0);
+        // The skip must not mutate the quarantine map: a mere skip is neither a
+        // readmit nor a prune, so the exported `ravel_distrib_quarantine_current`
+        // gauge stays at 1. Without this the gauge could silently drift from the
+        // map (e.g. a skip that erroneously cleared the entry) and every later
+        // step would still pass, since routing-local is the same either way.
+        assert_eq!(
+            metrics.quarantine_current(),
+            1,
+            "a skip leaves the endpoint quarantined; the gauge is unchanged"
+        );
 
         // Step 3: advance the live view with a strictly newer started_unix_ns for
         // the dead endpoint. The next query readmits and ranks it again, so it is
@@ -2450,6 +2460,102 @@ mod tests {
             metrics.quarantine_current(),
             1,
             "re-quarantined at the newer stamp"
+        );
+    }
+
+    /// The quarantine counters reach the `/metrics` exposition from their real
+    /// source (#269, ADR-0071 amendment decision 3). A genuine transport-failure
+    /// mark on a real [`RoutingSliceFetcher`] drives [`FragmentMetrics`], and the
+    /// same [`crate::metrics::DistribSnapshot::from_metrics`] mapping the scrape
+    /// handler uses then feeds [`crate::metrics::render`], whose output must carry
+    /// the three quarantine series. A hand-built snapshot could pass even if the
+    /// exporter never read `FragmentMetrics`; this drives that read end to end.
+    #[tokio::test]
+    async fn quarantine_counters_reach_the_metrics_renderer() {
+        let metrics = Arc::new(FragmentMetrics::new());
+        let service = test_service(metrics.clone());
+        let self_id = uuid::Uuid::from_u128(1);
+        let other_id = uuid::Uuid::from_u128(2);
+        let dead_endpoint = "192.0.2.1:9";
+        let self_cell = Arc::new(OnceLock::new());
+        self_cell.set(self_id).expect("set self id");
+        let live: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>> = Arc::new(RwLock::new(Arc::new(vec![
+            QueryWorkerRecord {
+                process_id: self_id.to_string(),
+                fragment_endpoint: "127.0.0.1:1".to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 0,
+            },
+            QueryWorkerRecord {
+                process_id: other_id.to_string(),
+                fragment_endpoint: dead_endpoint.to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 0,
+            },
+        ])));
+        let fetcher = RoutingSliceFetcher::new(
+            self_cell,
+            live.clone(),
+            test_keys(),
+            service,
+            metrics.clone(),
+        );
+
+        // Drive a real transport-failure quarantine mark: find a tenant whose
+        // unit maps to the unreachable remote and stop on the first fallback.
+        for i in 0..256u128 {
+            let tenant = uuid::Uuid::from_u128(i).into_bytes();
+            let before = metrics.slices_fallback_total();
+            fetcher
+                .fetch(pinned_request(tenant, &[0]))
+                .await
+                .expect("fetch resolves via local fallback");
+            if metrics.slices_fallback_total() > before {
+                break;
+            }
+        }
+        assert_eq!(
+            metrics.quarantine_marks_total(),
+            1,
+            "the transport failure marked exactly one endpoint"
+        );
+        assert_eq!(metrics.quarantine_current(), 1);
+
+        // The handler's real source-to-snapshot mapping picks up the quarantine
+        // counters.
+        let snapshot = crate::metrics::DistribSnapshot::from_metrics(&metrics);
+        assert_eq!(snapshot.quarantine_marks_total, 1);
+        assert_eq!(snapshot.quarantine_current, 1);
+
+        // And the full render entry point emits them.
+        let body = crate::metrics::render(
+            crate::config::Mode::Query,
+            &Default::default(),
+            &[],
+            &crate::metrics::CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::metrics::AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            crate::metrics::IngestBufferBudgetSnapshot::default(),
+            Some(&snapshot),
+            None,
+            &[],
+            None,
+        );
+        assert!(
+            body.contains("ravel_distrib_quarantine_marks_total{mode=\"query\"} 1"),
+            "the real quarantine mark must reach the exposition:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_distrib_quarantine_current{mode=\"query\"} 1"),
+            "the real currently-quarantined gauge must reach the exposition:\n{body}"
         );
     }
 

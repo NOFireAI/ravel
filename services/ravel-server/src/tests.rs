@@ -198,6 +198,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         ingest_byte_metrics: std::sync::Arc::new(
             crate::ingest_byte_metrics::IngestByteMetrics::new(),
         ),
+        metadata_cache: None,
     });
 
     Harness {

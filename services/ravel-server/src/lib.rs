@@ -1142,6 +1142,7 @@ pub async fn start(
         distrib: distrib_metrics.clone(),
         durable_auth: durable_auth.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
+        metadata_cache: metadata_cache.clone(),
     };
     http_router = http_router.merge(metrics::router(metrics_state));
 

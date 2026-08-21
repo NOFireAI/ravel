@@ -58,6 +58,7 @@ use ravel_object_store::instrument::{
     LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT, StoreErrorClass, StoreMetricsSnapshot,
     StoreOp,
 };
+use ravel_query::http::MetadataCacheCounters;
 use ravel_types::accounting::{
     CostEstimate, QueryAccountingSnapshot, QueryCostRecorder, QueryWorkloadClass,
 };
@@ -1293,6 +1294,76 @@ fn render_typed_attr_columns_family(out: &mut String, mode: Mode, stale_fallback
         "ravel_typed_attr_columns_stale_fallback_total",
         &[Label::Mode(mode), Label::Signal(Signal::Logs)],
         stale_fallbacks,
+    );
+}
+
+/// The per-process metric-metadata cache family (ADR-0085 decision 1 read
+/// path), read at scrape time from
+/// [`ravel_query::http::MetadataCache::counters`]. The cache serves
+/// `/api/v1/metadata` at one GET per (tenant, refresh horizon, process); these
+/// four cumulative counters expose its hit rate and refresh health so an
+/// operator can see the cache is doing its job and that background refreshes are
+/// not silently failing (a climbing `refresh_errors_total` means the record is
+/// becoming unreadable while stale data is still served).
+///
+/// Every sample carries only `{mode}` (the ADR-0044 allowlist): the cache is one
+/// process-global structure over every tenant it has answered for, with no
+/// per-tenant or per-signal breakdown to render, the same mode-only shape as
+/// [`render_durable_auth_family`]. Rendered only when the process built a cache
+/// (a request-serving mode, `Mode::All`/`Mode::Query`); a process without one
+/// omits the whole `query_metadata_cache_*` family. All four are cumulative
+/// totals, so each name carries the `_total` suffix.
+fn render_metadata_cache_family(out: &mut String, mode: Mode, counters: &MetadataCacheCounters) {
+    write_header(
+        out,
+        "query_metadata_cache_hits_total",
+        "Metric-metadata requests served from an already-cached tenant record, fresh or stale (ADR-0085 decision 1).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "query_metadata_cache_hits_total",
+        &[Label::Mode(mode)],
+        counters.hits,
+    );
+
+    write_header(
+        out,
+        "query_metadata_cache_misses_total",
+        "Metric-metadata requests that found no cached record and did an inline fill GET (ADR-0085 decision 1).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "query_metadata_cache_misses_total",
+        &[Label::Mode(mode)],
+        counters.misses,
+    );
+
+    write_header(
+        out,
+        "query_metadata_cache_refreshes_total",
+        "Background metric-metadata refreshes started by a past-horizon request that won the single-flight; includes refreshes that later errored (ADR-0085 decision 1).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "query_metadata_cache_refreshes_total",
+        &[Label::Mode(mode)],
+        counters.refreshes,
+    );
+
+    write_header(
+        out,
+        "query_metadata_cache_refresh_errors_total",
+        "Background metric-metadata refreshes that failed their GET or decode; the stale record keeps being served and the client never sees the error (ADR-0085 decision 1).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "query_metadata_cache_refresh_errors_total",
+        &[Label::Mode(mode)],
+        counters.refresh_errors,
     );
 }
 
@@ -2689,6 +2760,38 @@ pub struct DistribSnapshot {
     pub slices_fallback_total: u64,
     pub slice_fetch_micros_buckets: [u64; LATENCY_BUCKET_COUNT],
     pub slice_fetch_nanos_total: u64,
+    /// Dead-endpoint quarantine marks, cumulative (ADR-0071 amendment "dead-
+    /// endpoint quarantine", decision 3). A counter.
+    pub quarantine_marks_total: u64,
+    /// Dead-endpoint quarantine readmits, cumulative (ADR-0071 amendment
+    /// decision 3). A counter.
+    pub quarantine_readmits_total: u64,
+    /// Endpoints currently held in the coordinator's quarantine map (ADR-0071
+    /// amendment decision 3). A currently-N value, so a gauge.
+    pub quarantine_current: u64,
+}
+
+impl DistribSnapshot {
+    /// Read a scrape from the live [`crate::distrib::FragmentMetrics`], the same
+    /// atomic-load mapping the `/metrics` handler uses. Kept beside the snapshot
+    /// so the handler and the tests share one definition of which counter feeds
+    /// which field, rather than two copies that can drift.
+    pub fn from_metrics(metrics: &crate::distrib::FragmentMetrics) -> Self {
+        DistribSnapshot {
+            fragment_requests_total: metrics.fragment_requests_total(),
+            fragment_auth_failures_total: metrics.fragment_auth_failures_total(),
+            fragment_inflight: metrics.fragment_inflight(),
+            slices_local_total: metrics.slices_local_total(),
+            slices_remote_total: metrics.slices_remote_total(),
+            slices_redispatched_total: metrics.slices_redispatched_total(),
+            slices_fallback_total: metrics.slices_fallback_total(),
+            slice_fetch_micros_buckets: metrics.slice_fetch_buckets(),
+            slice_fetch_nanos_total: metrics.slice_fetch_nanos_total(),
+            quarantine_marks_total: metrics.quarantine_marks_total(),
+            quarantine_readmits_total: metrics.quarantine_readmits_total(),
+            quarantine_current: metrics.quarantine_current(),
+        }
+    }
 }
 
 /// The ADR-0071 distributed read fan-out family. Follows the store
@@ -2817,6 +2920,50 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
         &[Label::Mode(mode)],
         cumulative[LATENCY_BUCKET_COUNT - 1],
     );
+
+    // Dead-endpoint quarantine (ADR-0071 amendment decision 3). The two totals
+    // are cumulative counters; the currently-quarantined count is a gauge (a
+    // present-value, no `_total` suffix), kept in step with the coordinator's
+    // quarantine map after every mark, readmit, and prune. Same `{mode}`-only
+    // label as the rest of the family.
+    write_header(
+        out,
+        "ravel_distrib_quarantine_marks_total",
+        "Dead fragment endpoints marked into the coordinator's quarantine map after a re-dispatchable dispatch failure (transport loss or an Unavailable summary), cumulative (ADR-0071 amendment decision 3).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_quarantine_marks_total",
+        &[Label::Mode(mode)],
+        snapshot.quarantine_marks_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_quarantine_readmits_total",
+        "Quarantined fragment endpoints readmitted by a strictly newer worker heartbeat stamp (the half-open probe), cumulative (ADR-0071 amendment decision 3).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_quarantine_readmits_total",
+        &[Label::Mode(mode)],
+        snapshot.quarantine_readmits_total,
+    );
+
+    write_header(
+        out,
+        "ravel_distrib_quarantine_current",
+        "Fragment endpoints currently held in the coordinator's quarantine map (ADR-0071 amendment decision 3).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_distrib_quarantine_current",
+        &[Label::Mode(mode)],
+        snapshot.quarantine_current,
+    );
 }
 
 // One argument per metric source, each a distinct snapshot type: bundling
@@ -2853,6 +3000,7 @@ pub fn render(
     distrib: Option<&DistribSnapshot>,
     durable_auth: Option<&DurableAuthCountersSnapshot>,
     attribution: &[TenantAttributionRow],
+    metadata_cache: Option<&MetadataCacheCounters>,
 ) -> String {
     let mut out = String::new();
     render_store_family(&mut out, mode, store);
@@ -2883,6 +3031,9 @@ pub fn render(
     }
     render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
     render_typed_attr_columns_family(&mut out, mode, crate::typed_attr_metrics::stale_fallbacks());
+    if let Some(counters) = metadata_cache {
+        render_metadata_cache_family(&mut out, mode, counters);
+    }
     if let Some(snapshot) = maintain {
         render_maintain_family(&mut out, mode, snapshot);
     }
@@ -3012,6 +3163,11 @@ pub struct MetricsState {
     /// that turned compression off. Always present; empty until an OTLP request
     /// is admitted. Folded by the same `--metrics-tenant-labels` gate.
     pub ingest_byte_metrics: Arc<crate::ingest_byte_metrics::IngestByteMetrics>,
+    /// The per-process metric-metadata cache (ADR-0085 decision 1), read at
+    /// scrape time for its four `query_metadata_cache_*` counters. `Some` only
+    /// in a request-serving mode that built one (`Mode::All`/`Mode::Query`);
+    /// `None` otherwise leaves the whole family off the exposition.
+    pub metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -3128,17 +3284,15 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         shed_total: state.ingest_buffer_budget.shed_total(),
     };
 
-    let distrib_snapshot = state.distrib.as_ref().map(|metrics| DistribSnapshot {
-        fragment_requests_total: metrics.fragment_requests_total(),
-        fragment_auth_failures_total: metrics.fragment_auth_failures_total(),
-        fragment_inflight: metrics.fragment_inflight(),
-        slices_local_total: metrics.slices_local_total(),
-        slices_remote_total: metrics.slices_remote_total(),
-        slices_redispatched_total: metrics.slices_redispatched_total(),
-        slices_fallback_total: metrics.slices_fallback_total(),
-        slice_fetch_micros_buckets: metrics.slice_fetch_buckets(),
-        slice_fetch_nanos_total: metrics.slice_fetch_nanos_total(),
-    });
+    let distrib_snapshot = state
+        .distrib
+        .as_ref()
+        .map(|metrics| DistribSnapshot::from_metrics(metrics));
+
+    // Metric-metadata cache counters (ADR-0085 decision 1), read at scrape time
+    // (atomic loads). `None` when this process built no cache (a non-request
+    // mode), which omits the whole `query_metadata_cache_*` family.
+    let metadata_cache_snapshot = state.metadata_cache.as_ref().map(|cache| cache.counters());
 
     // Read the durable-auth refresh-loop counters at scrape time (atomic loads),
     // like every other family. `None` when this process built no
@@ -3199,6 +3353,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         distrib_snapshot.as_ref(),
         durable_auth_snapshot.as_ref(),
         &attribution,
+        metadata_cache_snapshot.as_ref(),
     );
     (
         StatusCode::OK,
@@ -3271,6 +3426,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(
@@ -3409,6 +3565,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         let postings_lines: Vec<&str> = body
@@ -3485,6 +3642,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         let lines: Vec<&str> = body
@@ -3616,6 +3774,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -3787,6 +3946,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(body.contains(
@@ -3841,6 +4001,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(
@@ -3870,6 +4031,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -3931,6 +4093,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(
@@ -3978,6 +4141,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(
@@ -4017,6 +4181,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -4114,6 +4279,7 @@ mod tests {
             None,
             Some(&snapshot),
             &[],
+            None,
         );
 
         // All three counters appear, mode-labeled, carrying the driven value.
@@ -4160,6 +4326,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         assert!(
             !body.contains("ravel_durable_auth_"),
@@ -4210,6 +4377,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(
@@ -4272,6 +4440,9 @@ mod tests {
             slices_fallback_total: 1,
             slice_fetch_micros_buckets: buckets,
             slice_fetch_nanos_total: 123_000,
+            quarantine_marks_total: 0,
+            quarantine_readmits_total: 0,
+            quarantine_current: 0,
         };
         let body = render(
             Mode::Query,
@@ -4292,6 +4463,7 @@ mod tests {
             Some(&snapshot),
             None,
             &[],
+            None,
         );
 
         for expected in [
@@ -4360,6 +4532,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         assert!(
             !off.contains("ravel_distrib_"),
@@ -4408,6 +4581,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(
@@ -4488,6 +4662,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -4536,6 +4711,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         for line in body.lines() {
@@ -4611,6 +4787,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         // Fetcher cache, labeled cache="fetch".
@@ -4718,6 +4895,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -4752,6 +4930,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert!(
@@ -4838,6 +5017,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         assert_eq!(
@@ -4912,6 +5092,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -4985,6 +5166,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         assert!(
             body.contains(&format!(
@@ -5034,6 +5216,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
     }
 
@@ -5216,6 +5399,213 @@ mod tests {
                  workload_class=\"background\"} 1"
             ),
             "background row missing:\n{body}"
+        );
+    }
+
+    /// Drive the real [`render`] entry point with every optional source off
+    /// except `distrib` and `metadata_cache`, so a family test asserts what the
+    /// scrape actually produces, not what a formatting helper produces in
+    /// isolation.
+    fn render_distrib_and_metadata(
+        mode: Mode,
+        distrib: Option<&DistribSnapshot>,
+        metadata_cache: Option<&MetadataCacheCounters>,
+    ) -> String {
+        render(
+            mode,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            distrib,
+            None,
+            &[],
+            metadata_cache,
+        )
+    }
+
+    /// Every line for `name` (a sample, not a `# HELP`/`# TYPE` header) carries
+    /// exactly the allowed label keys and no other, mirroring the distrib
+    /// family's own label guard.
+    fn assert_only_labels(body: &str, name_prefix: &str, allowed: &[&str]) -> usize {
+        let mut samples = 0;
+        for line in body.lines() {
+            if !line.starts_with(name_prefix) || line.starts_with("# ") {
+                continue;
+            }
+            samples += 1;
+            let labels = line
+                .split_once('{')
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(labels, _)| labels)
+                .unwrap_or("");
+            for pair in labels.split(',').filter(|p| !p.is_empty()) {
+                let key = pair.split('=').next().unwrap_or(pair);
+                assert!(
+                    allowed.contains(&key),
+                    "disallowed label `{key}` on `{name_prefix}` series: {line}"
+                );
+            }
+        }
+        samples
+    }
+
+    /// The metric-metadata cache family (#258, ADR-0085 decision 1) renders its
+    /// four `query_metadata_cache_*` counters through the real [`render`] entry
+    /// point, each as a counter carrying only the closed `{mode}` label, and the
+    /// whole family is absent when no cache is wired (a non-request mode).
+    ///
+    /// prove-the-test: removing the `render_metadata_cache_family` call from
+    /// [`render`] drops every `query_metadata_cache_*` line, so the
+    /// `hits`/`misses`/`refreshes`/`refresh_errors` `assert!`s below fail with
+    /// "missing" and the sample-count assertion fails `4 != 0`.
+    #[test]
+    fn metadata_cache_family_carries_only_allowlisted_labels() {
+        let counters = MetadataCacheCounters {
+            hits: 9,
+            misses: 1,
+            refreshes: 3,
+            refresh_errors: 2,
+        };
+        let body = render_distrib_and_metadata(Mode::Query, None, Some(&counters));
+
+        for expected in [
+            "query_metadata_cache_hits_total{mode=\"query\"} 9",
+            "query_metadata_cache_misses_total{mode=\"query\"} 1",
+            "query_metadata_cache_refreshes_total{mode=\"query\"} 3",
+            "query_metadata_cache_refresh_errors_total{mode=\"query\"} 2",
+        ] {
+            assert!(body.contains(expected), "missing `{expected}`:\n{body}");
+        }
+        // Each of the four names is a counter, not a gauge.
+        for name in [
+            "query_metadata_cache_hits_total",
+            "query_metadata_cache_misses_total",
+            "query_metadata_cache_refreshes_total",
+            "query_metadata_cache_refresh_errors_total",
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {name} counter")),
+                "`{name}` must declare a counter TYPE line:\n{body}"
+            );
+        }
+        // Exactly four samples, each carrying only `{mode}`.
+        let samples = assert_only_labels(&body, "query_metadata_cache_", &["mode"]);
+        assert_eq!(
+            samples, 4,
+            "the family renders exactly four samples:\n{body}"
+        );
+
+        // Absent entirely when no cache is wired.
+        let without = render_distrib_and_metadata(Mode::Query, None, None);
+        assert!(
+            !without.contains("query_metadata_cache_"),
+            "the family must be omitted when no cache is present:\n{without}"
+        );
+    }
+
+    /// The metadata-cache counters reach the renderer from their real source:
+    /// a live [`ravel_query::http::MetadataCache`] over a `MemoryStore` driven
+    /// through a miss then a hit, whose [`MetadataCache::counters`] snapshot the
+    /// renderer then emits. A hand-built snapshot could pass even if the exporter
+    /// never read the cache; this drives the same `counters()` the handler reads.
+    #[tokio::test]
+    async fn metadata_cache_counters_reach_renderer_from_real_cache() {
+        use ravel_object_store::ObjectStoreBackend;
+        use std::sync::Arc;
+
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let cache = ravel_query::http::MetadataCache::new(
+            store,
+            ravel_query::http::MetadataCacheConfig::default(),
+            Arc::new(ravel_cache::SystemClock),
+        );
+        let tenant = TenantHash([0x5Au8; 16]);
+        // First request: a miss that fills inline. Second: a hit within the
+        // horizon, no I/O. So misses == 1 and hits == 1 at the real source.
+        let _ = cache.get(tenant).await;
+        let _ = cache.get(tenant).await;
+        let counters = cache.counters();
+        assert_eq!(counters.misses, 1, "one miss drove the fill");
+        assert_eq!(counters.hits, 1, "the second request was a hit");
+
+        let body = render_distrib_and_metadata(Mode::Query, None, Some(&counters));
+        assert!(
+            body.contains("query_metadata_cache_misses_total{mode=\"query\"} 1"),
+            "the real miss count must reach the exposition:\n{body}"
+        );
+        assert!(
+            body.contains("query_metadata_cache_hits_total{mode=\"query\"} 1"),
+            "the real hit count must reach the exposition:\n{body}"
+        );
+    }
+
+    /// The dead-endpoint quarantine metrics (#269, ADR-0071 amendment decision 3)
+    /// render through the real [`render`] entry point: the two totals as counters
+    /// and the currently-quarantined value as a gauge, each carrying only the
+    /// closed `{mode}` label.
+    ///
+    /// prove-the-test: removing the three quarantine `write_header`/`write_sample`
+    /// blocks at the end of `render_distrib_family` drops these lines, so the
+    /// `contains` assertions fail with "missing" and the gauge-TYPE assertion
+    /// fails.
+    #[test]
+    fn distrib_quarantine_family_carries_only_allowlisted_labels() {
+        let snapshot = DistribSnapshot {
+            fragment_requests_total: 0,
+            fragment_auth_failures_total: 0,
+            fragment_inflight: 0,
+            slices_local_total: 0,
+            slices_remote_total: 0,
+            slices_redispatched_total: 0,
+            slices_fallback_total: 0,
+            slice_fetch_micros_buckets: [0u64; LATENCY_BUCKET_COUNT],
+            slice_fetch_nanos_total: 0,
+            quarantine_marks_total: 4,
+            quarantine_readmits_total: 2,
+            quarantine_current: 1,
+        };
+        let body = render_distrib_and_metadata(Mode::Query, Some(&snapshot), None);
+
+        for expected in [
+            "ravel_distrib_quarantine_marks_total{mode=\"query\"} 4",
+            "ravel_distrib_quarantine_readmits_total{mode=\"query\"} 2",
+            "ravel_distrib_quarantine_current{mode=\"query\"} 1",
+        ] {
+            assert!(body.contains(expected), "missing `{expected}`:\n{body}");
+        }
+        // The two totals are counters; the currently-quarantined value is a gauge
+        // (a present-value with no `_total` suffix).
+        assert!(
+            body.contains("# TYPE ravel_distrib_quarantine_marks_total counter"),
+            "marks must be a counter:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_distrib_quarantine_readmits_total counter"),
+            "readmits must be a counter:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_distrib_quarantine_current gauge"),
+            "the currently-quarantined value must be a gauge:\n{body}"
+        );
+        // Every quarantine sample carries only `{mode}`, no per-worker or
+        // per-endpoint label (the exact unbounded-cardinality shape ADR-0044
+        // rejects for this data).
+        let samples = assert_only_labels(&body, "ravel_distrib_quarantine_", &["mode"]);
+        assert_eq!(
+            samples, 3,
+            "the quarantine family renders exactly three samples:\n{body}"
         );
     }
 }
