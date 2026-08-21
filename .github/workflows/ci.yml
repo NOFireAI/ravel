@@ -304,7 +304,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       # Share compiled objects across the six workspace-compiling jobs via the
       # GitHub Actions cache backend. rust-cache only restores the dependency
