@@ -4657,6 +4657,7 @@ name = "ravel-otlp"
 version = "0.10.0"
 dependencies = [
  "blake3",
+ "criterion",
  "hex",
  "opentelemetry-proto",
  "proptest",
@@ -4665,6 +4666,7 @@ dependencies = [
  "ravel-rspan",
  "ravel-segment",
  "ravel-types",
+ "stats_alloc",
  "thiserror",
  "tokio",
 ]
