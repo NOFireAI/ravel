@@ -569,14 +569,15 @@ async fn write_l1_merged_provenance(store: &MemoryStore) -> SegmentRef {
 /// frame. `Distributed::fetch` returning `Ok(None)` is that refusal-driven
 /// fallback.
 ///
-/// This guards the release-build hazard directly. The old `debug_assert`-only
-/// guard in `encode_series_frame` compiles to nothing under
-/// `debug_assertions = off`, so before the service-level refusal this same fetch
-/// encoded the degraded frame and `fetch` returned `Ok(Some(..))`. Asserting
-/// `None` here therefore FAILS against the unfixed code compiled in release --
-/// the exact profile the defect shipped in -- and it does not merely trip the
-/// `debug_assert`: it drives the full loopback worker and coordinator, and the
-/// pass condition is the coordinator's fallback decision, not a panic.
+/// This pins the service-level refusal, which is now the only guard: the
+/// `debug_assert` that once sat in `encode_series_frame` was removed, because it
+/// compiled to nothing under `debug_assertions = off` and the refusal already
+/// covers the exact set of series that can reach the encoder. Before that
+/// refusal existed, a release build of this same fetch encoded the degraded
+/// frame and `fetch` returned `Ok(Some(..))`, so asserting `None` here fails
+/// against the unfixed code in the exact profile the defect shipped in. The
+/// pass condition is the coordinator's fallback decision, driven through the
+/// full loopback worker, not a panic from an assert.
 #[test]
 fn run_merged_series_refuses_over_the_wire_not_degrades() {
     let rt = Runtime::new().expect("runtime");
