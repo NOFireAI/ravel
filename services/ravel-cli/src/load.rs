@@ -240,8 +240,9 @@ pub fn dynamic_column_warnings(
 /// Returns `Err` (nonzero exit) for any failure. On a flush failure or a
 /// rejected row, the durable commit tokens are printed rather than swallowed
 /// (ADR-0089): a failure mid-file is a genuine partial load. See
-/// [`print_durable_tokens`] for the one case (a flush failure) where the
-/// printed list is a lower bound rather than exact.
+/// [`print_durable_tokens`] for the residual cases (a flush that timed out or
+/// lost a shard at send time) where the printed list can still be a lower
+/// bound rather than exact.
 pub async fn run(
     store: Arc<dyn ObjectStoreBackend>,
     parquet_path: &Path,
@@ -336,21 +337,24 @@ fn print_summary(report: &LoadReport) {
 
 /// Print the commit tokens known durable before a failure, one per line, so
 /// an operator can see what landed (ADR-0089 deliverable 7). On
-/// [`LoadError::Flush`] this is a lower bound, not an exact account: the
-/// listed tokens are batches completed *before* the failing one, and do not
-/// include a shard that may have committed within the failing batch itself
-/// while a sibling shard's ack failed (see that variant's doc). Every other
-/// variant's tokens are exact -- the failing row or batch never reached
-/// `LogIngestRouter::write`.
+/// [`LoadError::Flush`] the list now includes the failing batch's own shards
+/// that acked durable before a sibling shard failed, recovered from the
+/// router error via `LogWriteError::durable_tokens` (issue #296), so it is
+/// exact for the common partial-flush case. It remains a lower bound only when
+/// the failing batch's ack round did not resolve at all -- an ack-deadline
+/// timeout, or a shard channel dying at send time -- because no per-shard ack
+/// is observed then. Every non-flush variant's tokens are exact: the failing
+/// row or batch never reached `LogIngestRouter::write`.
 fn print_durable_tokens(err: &LoadError) {
     let tokens = err.durable_tokens();
     let is_flush = matches!(err, LoadError::Flush { .. });
     if tokens.is_empty() {
         if is_flush {
             println!(
-                "no commit tokens were durable from a completed batch before the failure \
-                 (earlier batches, if any, all landed; the failing batch's own shards may or \
-                 may not have -- ravel-ingest does not report partial-shard success on error)"
+                "no commit tokens were durable before the failure (any earlier batches, and any \
+                 shard of the failing batch that acked durable, are listed here; none did -- if \
+                 the failing batch timed out or a shard died at send time, a shard may still have \
+                 committed without an observable ack)"
             );
         } else {
             println!("no commit tokens were durable before the failure (nothing landed)");
@@ -358,8 +362,9 @@ fn print_durable_tokens(err: &LoadError) {
         return;
     }
     let suffix = if is_flush {
-        " (this list may undercount: a shard within the failing batch itself may also have \
-          committed, but ravel-ingest does not report that on error)"
+        " (exact for a partial flush where a sibling shard committed; still a lower bound if the \
+          failing batch timed out or a shard died at send time, where a commit can land with no \
+          observable ack)"
     } else {
         ""
     };
@@ -427,15 +432,18 @@ pub enum LoadError {
         reason: String,
         durable: Vec<CommitToken>,
     },
-    /// A flush (object-store PUT) failed. The tokens are what was durable
-    /// from *earlier* batches. `LogIngestRouter::write` shards the failing
-    /// batch and waits for every shard's ack, but on the first shard error it
-    /// returns before collecting tokens from shards that acked successfully
-    /// in that same call (`LogWriteError` carries no partial-success data),
-    /// so a shard's records from the failing batch can be durable and still
-    /// go unreported here. Narrowing that gap needs `ravel-ingest` to return
-    /// per-shard outcomes on error; tracked as a follow-up, not fixed by this
-    /// type.
+    /// A flush (object-store PUT) failed. The tokens are what was durable from
+    /// *earlier* batches, plus any shard of the failing batch itself that acked
+    /// its commit durably before a sibling shard failed:
+    /// `LogIngestRouter::write` returns those recovered tokens on the error via
+    /// `LogWriteError::durable_tokens` (issue #296), and this variant appends
+    /// them. This list is therefore exact for the common partial-flush case (a
+    /// shard's flush abandoned or rejected while a sibling committed, all
+    /// within a completed ack round). It remains a lower bound only when the
+    /// ack round itself did not resolve: an ack-deadline timeout, or a shard's
+    /// channel dying at send time, returns before any per-shard ack is
+    /// observed, so no sibling token can be attributed even though one may have
+    /// landed. See [`print_durable_tokens`].
     #[error("flush failed: {cause}")]
     Flush {
         durable: Vec<CommitToken>,
@@ -471,12 +479,15 @@ impl LoadError {
 ///
 /// Fail-fast on the first row that fails a kept admission check. A run that
 /// returns `Ok` has every row durable; a run that returns `Err` reports the
-/// tokens durable from batches that completed before the failure (a partial
-/// load — re-running re-ingests the whole file, there is no resumability or
-/// dedup in this version). On a [`LoadError::Flush`], the reported tokens can
-/// undercount: a shard within the failing batch may have committed while a
-/// sibling shard's ack failed, and that shard's token is not recoverable from
-/// the current `LogIngestRouter::write` error (see the variant's doc).
+/// tokens durable from batches that completed before the failure, plus any
+/// shard of the failing batch that acked durable before a sibling shard failed
+/// (recovered from the router error, issue #296) — a partial load, re-running
+/// re-ingests the whole file, there is no resumability or dedup in this
+/// version. On a [`LoadError::Flush`], the reported tokens are exact for a
+/// partial flush where a sibling committed; they can still undercount only when
+/// the failing batch's ack round did not resolve (a timeout, or a shard dying
+/// at send time), where a commit can land with no observable ack (see the
+/// variant's doc).
 #[allow(clippy::too_many_arguments)]
 pub async fn load(
     store: Arc<dyn ObjectStoreBackend>,
@@ -589,9 +600,16 @@ pub async fn load(
                 WRITE_ACK_DEADLINE,
             )
             .await
-            .map_err(|e| LoadError::Flush {
-                durable: report.tokens.clone(),
-                cause: e.to_string(),
+            .map_err(|e| {
+                // Earlier batches are already durable; append this batch's own
+                // durably-acked shards, which `LogWriteError::durable_tokens`
+                // recovers from a multi-shard partial failure (issue #296).
+                let mut durable = report.tokens.clone();
+                durable.extend_from_slice(e.durable_tokens());
+                LoadError::Flush {
+                    durable,
+                    cause: e.to_string(),
+                }
             })?;
         report.rows_processed += n;
         report.tokens.extend(receipt.tokens);
@@ -1545,6 +1563,133 @@ type = "i64"
         assert!(
             err.to_string().contains("--batch-rows must be at least 1"),
             "the error names the lever: {err}"
+        );
+    }
+
+    /// The first host value (by an incrementing suffix) whose loader stream
+    /// identity routes to `target` under `shards`. Uses the loader's own
+    /// identity inputs -- resource attributes in mapping order, empty scope --
+    /// so it matches how `build_record` computes `stream_id`.
+    fn host_for_shard(target: u32, shards: u32) -> String {
+        use ravel_types::shard_for_log;
+        for i in 0..1_000_000u32 {
+            let host = format!("h{i}");
+            let resource = vec![
+                (
+                    "service.name".to_string(),
+                    AttrValue::Str("api".to_string()),
+                ),
+                ("host".to_string(), AttrValue::Str(host.clone())),
+            ];
+            let stream_id = log_stream_id(&resource, "", "", &[]);
+            if shard_for_log(&stream_id, shards) == target {
+                return host;
+            }
+        }
+        panic!("no host routes to shard {target} of {shards}");
+    }
+
+    /// Issue #296 reachability, end to end through the loader: a multi-shard
+    /// batch where one shard's data-object PUT fails permanently while a
+    /// sibling shard commits durably. `load` must return `LoadError::Flush`
+    /// whose durable-token list -- the exact list `print_durable_tokens` prints
+    /// -- includes the surviving shard's token, where before the fix that token
+    /// was structurally unreportable and the list undercounted.
+    ///
+    /// Non-vacuity (prove-the-test): the failing shard (shard 0) sorts first in
+    /// the router's ack loop, so the pre-fix early return dropped shard 1's
+    /// token; against that code this fails at `durable.len() == 1` (the list is
+    /// empty). The `FaultStore` counter is asserted so the abandonment is
+    /// proven to have fired.
+    #[tokio::test]
+    async fn flush_failure_reports_the_surviving_shards_durable_token() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+        use ravel_object_store::memory::MemoryStore;
+
+        let shards = 4;
+        let h_victim = host_for_shard(0, shards);
+        let h_survivor = host_for_shard(1, shards);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("two_shards.parquet");
+        let cols: Vec<(String, ArrayRef)> = vec![
+            ("ts".to_string(), i64_col(vec![NOW_NS, NOW_NS])),
+            ("svc".to_string(), str_col(vec!["api", "api"])),
+            (
+                "host".to_string(),
+                str_col(vec![h_victim.as_str(), h_survivor.as_str()]),
+            ),
+        ];
+        let batch = RecordBatch::try_from_iter(cols).expect("two-row batch");
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let m = parse_mapping(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+        )
+        .expect("valid mapping");
+
+        // Fail every data-object PUT for shard 0 (`/l0/0000/`) permanently: a
+        // non-retryable error abandons that flush at once, deterministically,
+        // while shard 1 commits normally in the same Strict write.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+            )
+            .with_key_contains("/l0/0000/")
+            .with_occurrence(Occurrence::Always),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+
+        let err = load(
+            store.clone() as Arc<dyn ObjectStoreBackend>,
+            &pq,
+            "acme",
+            &m,
+            shards,
+            // Both rows in one batch, so one Strict write spans both shards.
+            10,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect_err("one shard's flush was abandoned, so the load fails");
+
+        let durable = match &err {
+            LoadError::Flush { durable, cause } => {
+                assert!(
+                    cause.contains("flush abandoned"),
+                    "the flush failure classifies as the underlying abandonment: {cause}"
+                );
+                durable.clone()
+            }
+            other => panic!("expected LoadError::Flush, got {other:?}"),
+        };
+
+        // The exact list `print_durable_tokens` iterates: the surviving shard's
+        // token, recovered from the write error (issue #296).
+        assert_eq!(
+            err.durable_tokens().len(),
+            1,
+            "the surviving shard's token reaches the printed durable list, got {durable:?}"
+        );
+        assert_eq!(
+            durable[0].shard, 1,
+            "the recovered token is the surviving shard's (shard 1), not the abandoned shard 0"
+        );
+
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Permanent),
+            1,
+            "the permanent data-object PUT fault fired exactly once (shard 0, no retry)"
         );
     }
 }

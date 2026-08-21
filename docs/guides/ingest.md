@@ -525,14 +525,18 @@ cap) is rejected **fail-fast**: the run stops at the first bad row, prints a
 per-row error, and exits non-zero. Batches durable before that row stay durable.
 
 A failed flush (an object-store PUT failure) exits non-zero and prints the
-commit tokens durable from batches completed before the failure. This list is
-a lower bound, not an exact account: the loader shards a batch across the
-target signal's shards and waits for every shard's ack, but on the first
-shard error it returns before collecting tokens from shards that acked
-successfully in that same batch, so a shard's records can be durable and
-still go unreported. A failure mid-file is a genuine **partial load, not a
-rollback**. There is **no resumability or deduplication**: re-running after
-any failure re-ingests the whole file from the start.
+commit tokens durable from batches completed before the failure, plus any shard
+of the failing batch itself that acked its commit durably before a sibling
+shard failed. The loader shards a batch across the target signal's shards and
+waits for every shard's ack; when one shard fails while a sibling committed,
+the sibling's token is recovered from the write error and reported, so the
+printed list is **exact** for that partial-flush case. It remains a lower bound
+only when the failing batch's ack round did not resolve at all -- an
+ack-deadline timeout, or a shard's channel dying at send time -- because no
+per-shard ack is observed then, and a commit can land without an observable
+ack. A failure mid-file is a genuine **partial load, not a rollback**. There is
+**no resumability or deduplication**: re-running after any failure re-ingests
+the whole file from the start.
 
 Retention and GC key on ingest-hour buckets, which the loader derives from
 *load* time. A bulk-loaded record with an old event timestamp is therefore
