@@ -420,6 +420,9 @@ distribution is off.
 | `ravel_distrib_slices_redispatched_total` | counter | Slices re-dispatched after a failed first attempt. |
 | `ravel_distrib_slices_fallback_total` | counter | Slices that ended up running coordinator-local after remote attempts failed. |
 | `ravel_distrib_slice_fetch_seconds` | histogram | Per-slice fetch latency, sharing the object-store histogram's bucket layout. |
+| `ravel_distrib_quarantine_marks_total` | counter | Dead endpoints marked into the coordinator's quarantine map after a re-dispatchable dispatch failure. A jump after a node loss is expected; a steady climb means workers keep failing. |
+| `ravel_distrib_quarantine_readmits_total` | counter | Quarantined endpoints readmitted by a strictly newer worker heartbeat (the recovered worker's own probe). |
+| `ravel_distrib_quarantine_current` | gauge | Endpoints quarantined right now. Rides above zero for the ~2 heartbeat intervals a dead worker takes to readmit or age out. |
 
 `slices_local_total` staying high while `slices_remote_total` stays at zero on
 a multi-node cluster is the signature of a membership problem: no gRPC
