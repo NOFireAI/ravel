@@ -1054,6 +1054,7 @@ fn series_frame(series_id: [u8; 16]) -> pb::FetchResponse {
                 writer_seq: 1,
                 ts_delta: vec![0],
                 value_bits: vec![1.0f64.to_bits()],
+                ..Default::default()
             }],
         })),
     }

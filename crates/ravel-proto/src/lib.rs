@@ -94,6 +94,7 @@ mod queryfrag_tests {
                 writer_seq: 9,
                 ts_delta: ts_delta.clone(),
                 value_bits: value_bits.clone(),
+                ..Default::default()
             }],
         };
         let response = FetchResponse {
