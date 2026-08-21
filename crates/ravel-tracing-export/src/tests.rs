@@ -161,7 +161,18 @@ fn wait_until(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
 /// Decision 2/5: with `otlp: Some(_)`, a span emitted through the installed
 /// subscriber reaches the collector, carrying the span name and the
 /// `service.name` / `ravel.mode` resource attributes.
-#[tokio::test]
+///
+/// Runs on a multi-thread runtime, the same shape the service binaries install,
+/// not the single-thread default `#[tokio::test]` gives. `guard.flush()` drives
+/// `SdkTracerProvider::shutdown`, a synchronous call that internally waits on
+/// the batch processor's async export (with its own bounded timeout) to drain.
+/// On a single-thread runtime that async work cannot make progress while the
+/// blocking shutdown holds the runtime, so a collector that accepts the
+/// connection but is slow to answer leaves the flush waiting forever (issue
+/// #454: a 28-minute CI stall until the workflow timeout). A second worker lets
+/// the export's own timeout fire, so the flush returns in about ten seconds
+/// even against a collector that never responds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn some_exports_the_emitted_span_to_the_collector() {
     let mock = start_mock_collector();
     let (dispatch, guard, degraded) =
@@ -180,10 +191,22 @@ async fn some_exports_the_emitted_span_to_the_collector() {
     }
 
     // Force the batch processor to flush on this call, off the mock's thread.
-    let flushed = tokio::task::spawn_blocking(move || {
-        guard.flush();
-    })
-    .await;
+    // The multi-thread runtime above is the fix for the #454 stall; this bound
+    // is the safety net. If the flush ever blocks past 20s anyway, fail with an
+    // attributable message rather than hang to the workflow timeout. A healthy
+    // flush against the live mock returns in milliseconds and even a
+    // never-responding collector returns in about ten seconds, so 20s never
+    // fires on a healthy run yet sits far below the workflow timeout. Nested
+    // results: `timeout`'s outer Ok means it returned, the inner `JoinHandle`'s
+    // Ok means `flush()` did not panic.
+    let flushed = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || {
+            guard.flush();
+        }),
+    )
+    .await
+    .expect("flush against the live mock collector must return within 20s, not hang");
     flushed.expect("flush join");
 
     assert!(
@@ -405,10 +428,18 @@ async fn a_refused_collector_logs_a_runtime_export_failure_warning() {
     // Force an export attempt off the test's runtime. The export dials the
     // refused endpoint, fails, and the wrapper logs its one-shot warning on the
     // background thread, which reaches the global default installed above.
-    tokio::task::spawn_blocking(move || {
-        let _ = provider.shutdown();
-    })
+    // Bound the shutdown for the same reason the flush above is bounded (issue
+    // #454): a provider shutdown that drives the batch processor to talk to a
+    // network peer must never hang the test to the workflow timeout. A refused
+    // port fails fast, so 20s is generous.
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || {
+            let _ = provider.shutdown();
+        }),
+    )
     .await
+    .expect("shutdown against the refused collector must return within 20s, not hang")
     .expect("shutdown join");
 
     let matched = |w: &str| {
