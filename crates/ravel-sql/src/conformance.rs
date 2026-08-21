@@ -297,6 +297,17 @@ const RAVEL_SCALAR_UDFS: [(&str, &str); 3] = [
     ),
 ];
 
+/// The number of admitted-scalar conformance rows the registry is expected to
+/// emit: one per admitted family plus each Ravel UDF. Recorded as a hard
+/// literal, independent of the array lengths, so a row silently deleted from
+/// [`ADMITTED_SCALAR_FAMILIES`] or [`RAVEL_SCALAR_UDFS`] fails the drift test
+/// (`registry_reads_the_live_allowlist_sets`) instead of shrinking the score's
+/// denominator along with its numerator and holding the reported score at 100%
+/// (#408). A deliberate change to the family/UDF set updates this literal in the
+/// same edit.
+#[cfg(test)]
+const EXPECTED_ADMITTED_SCALAR_ROW_COUNT: usize = 9;
+
 /// The eight admitted native window functions (ADR-0097 decision 6), each with
 /// an `OVER` example whose aggregated result is re-derived from the four
 /// fixture samples in `tests/conformance.rs`. Every name is a member of
@@ -1012,6 +1023,19 @@ mod tests {
             admitted_scalar_rows.len(),
             ADMITTED_SCALAR_FAMILIES.len() + RAVEL_SCALAR_UDFS.len(),
             "admitted scalar rows must be one per family plus each Ravel UDF"
+        );
+        // Bind the source arrays to a hard-recorded count, not just to each
+        // other. The check above compares the registry's rows against the same
+        // arrays that built them, so deleting a family or UDF entry shrinks both
+        // sides together and the score's denominator drops silently with its
+        // numerator (#408). This floor fails a silent deletion: the combined
+        // array length must equal the recorded count, which a deliberate change
+        // updates in the same edit.
+        assert_eq!(
+            ADMITTED_SCALAR_FAMILIES.len() + RAVEL_SCALAR_UDFS.len(),
+            EXPECTED_ADMITTED_SCALAR_ROW_COUNT,
+            "admitted-scalar row count changed: update EXPECTED_ADMITTED_SCALAR_ROW_COUNT \
+             deliberately if a family or Ravel UDF was intentionally added or removed"
         );
         for name in &admitted_scalar_rows {
             assert!(
