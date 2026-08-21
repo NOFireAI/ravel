@@ -8,15 +8,29 @@
 //! ordering is declared through `PlanProperties` so the optimizer honors it
 //! with a `SortPreservingMergeExec`, never a `CoalescePartitionsExec`.
 //!
-//! Emission is a streaming k-way merge, not a materialize-then-sort. Each
-//! segment decodes into its own sorted run (bounded by one segment), the runs
-//! are merged by a binary heap, and rows are emitted in bounded batches. This
-//! replaces B1's build-one-giant-`Vec<ScanRow>`-then-`sort_by_key`-then-one-
-//! batch pattern: that pattern sorted every sample from every segment before
-//! any budget check and produced a single end-of-partition batch, which
-//! defeats both the per-batch byte accounting the memory pool needs (below) and
-//! the reduced fetch that pushdown enables. A partition's stream is still
-//! globally sorted across all its batches, so the declared ordering holds.
+//! Emission is a streaming k-way merge, not a materialize-then-sort, and it is
+//! columnar end to end (ADR-0099 decision 6). Each fetched series' SoA
+//! (`FetchedSeriesSoa`'s `timestamps`/`values`, moved straight out of the
+//! decoder) is kept as one merge run: the fetched vectors become
+//! `ScalarBuffer`s without a copy, the runs are merged by a binary heap over
+//! `(run, offset)` cursors, and `build_batch` gathers columns from those
+//! cursors. No per-sample row struct is ever built. A partition's stream is
+//! still globally sorted across all its batches, so the declared ordering
+//! holds.
+//!
+//! Where a batch's rows all come from one run at consecutive ascending offsets
+//! -- one series covered by one run, the common shape -- the `ts` and `value`
+//! columns are slices of that run's buffers, shared with the run rather than
+//! copied. Any other batch (rows straddling runs, or interleaved by
+//! timestamp) gathers its values through the cursors. The two paths are
+//! counted as the `adopted_batches`/`gathered_batches` metrics, so
+//! `EXPLAIN ANALYZE` and a test can see which one ran instead of inferring it
+//! from output that is identical by construction.
+//!
+//! The three provenance columns `created_unix_ns`, `writer_epoch`, and
+//! `writer_seq` are constant within a run, so they are filled by run length.
+//! `in_page_index` is per sample: the offset within the run, which is the
+//! sample's position in the fetcher's on-disk order.
 //!
 //! Pushdown: label/series matchers are threaded into `fetch_soa` so the fetcher prunes
 //! series (and their page GETs) against SERIES_TABLE. A `series_id` allow-set
@@ -30,24 +44,33 @@
 //!
 //! - Fetch/decode phase (`prepare_partition`): after each segment's
 //!   `fetch_soa` call returns, the reservation grows by that segment's
-//!   decoded run size (`runs` entries, `size_of::<ScanRow>()` each) plus
-//!   `FetchStats::raw_f64_bytes` (the one fetched-buffer byte figure
-//!   `SegmentFetcher` already exposes without a ravel-query API change --
-//!   see the crate module doc's context-discipline note). A `try_grow`
-//!   failure here returns before the next segment is fetched at all.
-//! - Batch phase (`ScanStream::poll_next`, `ScanState::Merging`): the
-//!   existing per-batch grow by `RecordBatch::get_array_memory_size`.
+//!   decoded SoA bytes -- the `timestamps` and `values` buffers the merge
+//!   keeps as its runs, plus `per_sample_priorities` when the fetched series
+//!   carries that column -- plus `FetchStats::raw_f64_bytes` (the one
+//!   fetched-buffer byte figure `SegmentFetcher` already exposes without a
+//!   ravel-query API change -- see the crate module doc's context-discipline
+//!   note). A `try_grow` failure here returns before the next segment is
+//!   fetched at all. This is the same live-bytes contract the pre-columnar
+//!   scan charged as `rows * size_of::<ScanRow>()`, measured on the buffers
+//!   that now exist instead of on a row struct that no longer does
+//!   (ADR-0099 decision 6).
+//! - Batch phase (`ScanStream::poll_next`, `ScanState::Merging`): a per-batch
+//!   grow by the bytes that batch's own Arrow arrays allocate.
 //!
 //! These two phases charge disjoint, simultaneously-live allocations, not the
-//! same bytes twice: the decoded `ScanRow` runs stay allocated in `Merger` for
-//! the whole partition (batches only advance a cursor into them, they never
-//! free the run), while each built `RecordBatch` is a separate Arrow-array
-//! allocation constructed from a slice of those rows. Both are real,
-//! concurrently resident memory at the point a batch is emitted, so charging
-//! both is the correct accounting, not double-counting. docs/arrow-
-//! datafusion-plan.md's "Session config, memory pool, budgets" section
-//! describes only the shrink-per-yielded-batch half of this; it does not yet
-//! describe the fetch/decode charge added here (see the note added there).
+//! same bytes twice: the decoded SoA runs stay allocated in `Merger` for the
+//! whole partition (batches only advance a cursor into them, they never free
+//! the run), while a built `RecordBatch`'s arrays are separate Arrow
+//! allocations. The one place those two would overlap is an adopted batch's
+//! `ts`/`value` columns, which are slices of a run's buffers and allocate
+//! nothing: the batch charge therefore sums the batch's columns and skips
+//! exactly those two on the adoption path, because the fetch/decode phase has
+//! already charged those bytes and charging them again per batch would count
+//! one buffer once per batch that reads it. Every other column, on either
+//! path, is freshly allocated and charged in full. What the reservation
+//! tracks is concurrently-held scan memory, never cumulative output; the
+//! per-query and per-tenant ceilings it is checked against are in
+//! docs/query-engine.md's "Budgets" section.
 //!
 //! Each partition's reservation is threaded through `prepare_partition` (the
 //! fetch/decode phase owns it first) and back into `ScanStream` (the batch
@@ -80,9 +103,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
-    ArrayRef, FixedSizeBinaryArray, Float64Array, Int64Array, TimestampNanosecondArray,
+    Array, ArrayRef, FixedSizeBinaryArray, Float64Array, Int64Array, TimestampNanosecondArray,
     UInt32Array, UInt64Array,
 };
+use datafusion::arrow::buffer::ScalarBuffer;
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -92,6 +116,9 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
@@ -100,13 +127,16 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_promql::LabelMatcher;
 use ravel_query::erasure::{ErasurePredicate, retain_series_soa};
-use ravel_query::{ByteLimit, RequestLimit, SegmentFetcher, request_budget_exceeded};
+use ravel_query::{
+    ByteLimit, FetchedSeriesSoa, RequestLimit, SamplePriority, SegmentFetcher,
+    request_budget_exceeded,
+};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{LabelSet, TenantHash};
 
 use crate::error::SqlError;
 use crate::labels::build_labels_dict;
-use crate::schema::{COL_SERIES_ID, COL_TS, internal_schema};
+use crate::schema::{COL_SERIES_ID, COL_TS, COL_VALUE, internal_schema};
 
 /// Rows accumulated into one output batch before it is emitted. Bounds the
 /// per-batch working set and gives the memory reservation a per-batch
@@ -117,28 +147,126 @@ const BATCH_ROWS: usize = 8192;
 /// writer_seq, in_page_index)`.
 type SortKey = ([u8; 16], i64, i64, u64, u64, u32);
 
-/// One decoded sample plus its full provenance tuple.
-#[derive(Clone, Copy)]
-struct ScanRow {
+/// One fetched series' samples from one segment, kept in the SoA form the
+/// fetcher decoded them into: one merge run, ordered by [`SortKey`].
+///
+/// `series_id`, `created_unix_ns`, `writer_epoch` and `writer_seq` are
+/// constant across the run, so the key's ordering within a run is decided by
+/// `ts` then in-page index alone.
+struct Run {
     series_id: [u8; 16],
-    ts: i64,
-    value: f64,
+    /// Sample timestamps, key-ascending; `values[i]` is `ts[i]`'s sample.
+    /// Adopted from `FetchedSeriesSoa::timestamps` without a copy.
+    ts: ScalarBuffer<i64>,
+    values: ScalarBuffer<f64>,
     created_unix_ns: i64,
     writer_epoch: u64,
     writer_seq: u64,
-    in_page_index: u32,
+    /// Per-sample in-page index, when it is not the offset itself. `None` --
+    /// every run a segment in on-disk order produces -- means offset `i` has
+    /// in-page index `i`. `Some` carries the original positions of a run whose
+    /// timestamps did not arrive key-ascending and had to be reordered here.
+    in_page: Option<Vec<u32>>,
 }
 
-impl ScanRow {
-    fn sort_key(&self) -> SortKey {
+impl Run {
+    /// Build a run from one fetched series, reordering only if the fetched
+    /// timestamps are not already key-ascending.
+    ///
+    /// A segment stores a run's samples in ascending ts order with ties in
+    /// insertion order (docs/segment-format.md, "Sample order within a
+    /// page"), which is exactly [`SortKey`]'s order inside a run, so the
+    /// common path moves the fetched vectors into buffers untouched. The
+    /// fetcher can still concatenate several runs of one series from one L0
+    /// object into a single SoA, and that concatenation is not ordered; the
+    /// merge and the scan's declared ordering both require a sorted run, so
+    /// such a run is stable-sorted here and keeps its original positions as
+    /// in-page indices.
+    fn from_soa(series_id: [u8; 16], fs: FetchedSeriesSoa) -> Run {
+        let FetchedSeriesSoa {
+            mut timestamps,
+            mut values,
+            created_unix_ns,
+            writer_epoch,
+            writer_seq,
+            ..
+        } = fs;
+        // A series whose two SoA vectors disagree in length carries no
+        // sample past the shorter of the two, the same truncation the
+        // zip over them did before this path was columnar.
+        let n = timestamps.len().min(values.len());
+        timestamps.truncate(n);
+        values.truncate(n);
+        if timestamps.windows(2).all(|w| w[0] <= w[1]) {
+            return Run {
+                series_id,
+                ts: timestamps.into(),
+                values: values.into(),
+                created_unix_ns,
+                writer_epoch,
+                writer_seq,
+                in_page: None,
+            };
+        }
+        let mut order: Vec<usize> = (0..timestamps.len()).collect();
+        order.sort_by_key(|&i| timestamps[i]);
+        Run {
+            series_id,
+            ts: order
+                .iter()
+                .map(|&i| timestamps[i])
+                .collect::<Vec<_>>()
+                .into(),
+            values: order.iter().map(|&i| values[i]).collect::<Vec<_>>().into(),
+            created_unix_ns,
+            writer_epoch,
+            writer_seq,
+            in_page: Some(
+                order
+                    .iter()
+                    .map(|&i| u32::try_from(i).unwrap_or(u32::MAX))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ts.len()
+    }
+
+    /// The in-page index of the sample at `offset`, which is its position in
+    /// the fetcher's on-disk order.
+    fn in_page_at(&self, offset: usize) -> u32 {
+        match &self.in_page {
+            Some(idx) => idx.get(offset).copied().unwrap_or(u32::MAX),
+            None => u32::try_from(offset).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The full sort key of the sample at `offset`. Callers hold an offset
+    /// below `len()`.
+    fn key_at(&self, offset: usize) -> SortKey {
         (
             self.series_id,
-            self.ts,
+            self.ts[offset],
             self.created_unix_ns,
             self.writer_epoch,
             self.writer_seq,
-            self.in_page_index,
+            self.in_page_at(offset),
         )
+    }
+
+    /// Bytes this run holds: the two adopted sample buffers, plus the
+    /// explicit in-page indices when it has them.
+    fn soa_bytes(&self) -> usize {
+        let indices = self.in_page.as_ref().map_or(0, |idx| {
+            idx.len().saturating_mul(std::mem::size_of::<u32>())
+        });
+        self.ts
+            .len()
+            .saturating_mul(std::mem::size_of::<i64>())
+            .saturating_add(self.values.len().saturating_mul(std::mem::size_of::<f64>()))
+            .saturating_add(indices)
     }
 }
 
@@ -180,6 +308,27 @@ pub struct RsegScanExec {
     /// This query's accounting handle (ADR-0044), cloned into every
     /// partition's `fetch_soa_accounted` call.
     accounting: QueryAccounting,
+    /// Per-partition batch-path counters (ADR-0099 decision 6), published so
+    /// `EXPLAIN ANALYZE` and tests can see which batch-building path ran.
+    metrics: ExecutionPlanMetricsSet,
+}
+
+/// The per-partition batch-path counters this scan publishes as DataFusion
+/// metrics. A batch is `adopted` when its `ts`/`value` columns are slices of
+/// one run's buffers and `gathered` when its values were copied through the
+/// merge cursors; every emitted batch increments exactly one of the two.
+struct ScanMetrics {
+    adopted: Count,
+    gathered: Count,
+}
+
+impl ScanMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        ScanMetrics {
+            adopted: MetricBuilder::new(metrics).counter("adopted_batches", partition),
+            gathered: MetricBuilder::new(metrics).counter("gathered_batches", partition),
+        }
+    }
 }
 
 impl RsegScanExec {
@@ -222,6 +371,7 @@ impl RsegScanExec {
             schema,
             properties,
             accounting,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -294,6 +444,10 @@ impl ExecutionPlan for RsegScanExec {
         Ok(self)
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -331,19 +485,20 @@ impl ExecutionPlan for RsegScanExec {
         Ok(Box::pin(ScanStream {
             schema,
             state: ScanState::Fetching(fut),
+            metrics: ScanMetrics::new(&self.metrics, partition),
         }))
     }
 }
 
-/// Decoded, per-segment sorted runs plus the per-series label sets, ready to
-/// merge. Built by [`prepare_partition`].
+/// Decoded, sorted SoA runs -- one per (segment, fetched series) -- plus the
+/// per-series label sets, ready to merge. Built by [`prepare_partition`].
 struct Prepared {
-    runs: Vec<Vec<ScanRow>>,
+    runs: Vec<Run>,
     labels: HashMap<[u8; 16], LabelSet>,
 }
 
 /// Fetch every segment in this partition (matchers pushed into the fetcher),
-/// decode each into its own ts/provenance-sorted run, and collect per-series
+/// keep each fetched series' SoA as one sorted run, and collect per-series
 /// labels. Applies the `series_id` allow-set as a post-fetch row filter.
 ///
 /// Enforces four budgets before the next segment is ever fetched: the
@@ -368,7 +523,7 @@ async fn prepare_partition(
     reservation: MemoryReservation,
     accounting: QueryAccounting,
 ) -> DFResult<(Prepared, MemoryReservation)> {
-    let mut runs: Vec<Vec<ScanRow>> = Vec::with_capacity(segs.len());
+    let mut runs: Vec<Run> = Vec::with_capacity(segs.len());
     let mut labels: HashMap<[u8; 16], LabelSet> = HashMap::new();
 
     for seg in &segs {
@@ -404,7 +559,11 @@ async fn prepare_partition(
         {
             return Err(SqlError::RequestBudgetExceeded { requests, max }.into());
         }
-        let mut run: Vec<ScanRow> = Vec::new();
+        // The SoA bytes this segment contributes to the merge, plus the
+        // per-sample priority column when the fetched series carries one:
+        // both are live at this point, and the buffers stay live in `Merger`
+        // for the whole partition.
+        let mut segment_bytes = usize::try_from(stats.raw_f64_bytes).unwrap_or(usize::MAX);
         for fs in series {
             let sid = fs.series_id.0;
             if let Some(allow) = &series_ids
@@ -420,33 +579,23 @@ async fn prepare_partition(
                 .into());
             }
             labels.entry(sid).or_insert_with(|| fs.labels.clone());
-            for (i, (&ts, &value)) in fs.timestamps.iter().zip(fs.values.iter()).enumerate() {
-                run.push(ScanRow {
-                    series_id: sid,
-                    ts,
-                    value,
-                    created_unix_ns: fs.created_unix_ns,
-                    writer_epoch: fs.writer_epoch,
-                    writer_seq: fs.writer_seq,
-                    in_page_index: u32::try_from(i).unwrap_or(u32::MAX),
-                });
+            let priority_bytes = fs.per_sample_priorities.as_ref().map_or(0, |p| {
+                p.len()
+                    .saturating_mul(std::mem::size_of::<SamplePriority>())
+            });
+            let run = Run::from_soa(sid, fs);
+            segment_bytes = segment_bytes
+                .saturating_add(run.soa_bytes())
+                .saturating_add(priority_bytes);
+            if run.len() > 0 {
+                runs.push(run);
             }
         }
-        // Charge this segment's decoded run plus its fetched buffer bytes
+        // Charge this segment's decoded SoA plus its fetched buffer bytes
         // before fetching the next segment: a byte-budget overrun surfaces
         // here as the pool's typed ResourcesExhausted, not after every
         // segment in the partition has already been pulled.
-        let segment_bytes = run
-            .len()
-            .saturating_mul(std::mem::size_of::<ScanRow>())
-            .saturating_add(usize::try_from(stats.raw_f64_bytes).unwrap_or(usize::MAX));
         reservation.try_grow(segment_bytes)?;
-        // Sort this segment's rows into one run under the full total order.
-        // Bounded by a single segment, never all segments at once.
-        run.sort_by_key(ScanRow::sort_key);
-        if !run.is_empty() {
-            runs.push(run);
-        }
     }
 
     Ok((Prepared { runs, labels }, reservation))
@@ -456,23 +605,30 @@ async fn prepare_partition(
 /// `Reverse` turns the max-heap into a min-heap on the key.
 type HeapEntry = Reverse<(SortKey, usize)>;
 
-/// Streaming k-way merge over the per-segment sorted runs.
+/// One merged row: the run it came from and its offset inside that run. The
+/// merge yields these instead of copying a sample out of its run.
+type Cursor = (usize, usize);
+
+/// Streaming k-way merge over the sorted SoA runs.
 struct Merger {
-    runs: Vec<Vec<ScanRow>>,
+    runs: Vec<Run>,
+    /// Next unpopped offset in each run.
     cursors: Vec<usize>,
     heap: BinaryHeap<HeapEntry>,
     labels: HashMap<[u8; 16], LabelSet>,
+    /// The current batch's cursors, in emitted order. Reused across batches,
+    /// so a batch costs no cursor allocation.
+    batch: Vec<Cursor>,
 }
 
 impl Merger {
     fn new(prepared: Prepared) -> Self {
         let Prepared { runs, labels } = prepared;
-        let mut cursors = vec![0usize; runs.len()];
+        let cursors = vec![0usize; runs.len()];
         let mut heap = BinaryHeap::with_capacity(runs.len());
         for (idx, run) in runs.iter().enumerate() {
-            if let Some(first) = run.first() {
-                heap.push(Reverse((first.sort_key(), idx)));
-                cursors[idx] = 1;
+            if run.len() > 0 {
+                heap.push(Reverse((run.key_at(0), idx)));
             }
         }
         Merger {
@@ -480,24 +636,42 @@ impl Merger {
             cursors,
             heap,
             labels,
+            batch: Vec::with_capacity(BATCH_ROWS),
         }
     }
 
-    /// Pop up to `n` rows in global sort order.
-    fn next_batch(&mut self, n: usize) -> Vec<ScanRow> {
-        let mut out = Vec::with_capacity(n.min(self.heap.len().max(1)));
-        while out.len() < n {
+    /// Advance the merge by up to `n` rows in global sort order, into
+    /// `self.batch`. Returns the number of rows it holds.
+    fn fill(&mut self, n: usize) -> usize {
+        self.batch.clear();
+        while self.batch.len() < n {
             let Some(Reverse((_key, idx))) = self.heap.pop() else {
                 break;
             };
-            let pos = self.cursors[idx] - 1;
-            out.push(self.runs[idx][pos]);
-            if let Some(next) = self.runs[idx].get(self.cursors[idx]) {
-                self.heap.push(Reverse((next.sort_key(), idx)));
-                self.cursors[idx] += 1;
+            let offset = self.cursors[idx];
+            self.batch.push((idx, offset));
+            let next = offset + 1;
+            self.cursors[idx] = next;
+            if next < self.runs[idx].len() {
+                self.heap.push(Reverse((self.runs[idx].key_at(next), idx)));
             }
         }
-        out
+        self.batch.len()
+    }
+
+    /// The run and start offset of the current batch when every one of its
+    /// rows comes from that one run at consecutive ascending offsets, so the
+    /// `ts`/`value` columns can be slices of the run's buffers rather than
+    /// gathered copies. `None` means the batch straddles runs or interleaves
+    /// them, and its values are gathered.
+    fn contiguous_run(&self) -> Option<(usize, usize)> {
+        let &(run, start) = self.batch.first()?;
+        for (i, &(r, offset)) in self.batch.iter().enumerate() {
+            if r != run || offset != start + i {
+                return None;
+            }
+        }
+        Some((run, start))
     }
 }
 
@@ -520,6 +694,7 @@ enum ScanState {
 struct ScanStream {
     schema: SchemaRef,
     state: ScanState,
+    metrics: ScanMetrics,
 }
 
 impl Stream for ScanStream {
@@ -540,22 +715,25 @@ impl Stream for ScanStream {
                     Poll::Pending => return Poll::Pending,
                 },
                 ScanState::Merging(merger, reservation) => {
-                    let rows = merger.next_batch(BATCH_ROWS);
-                    if rows.is_empty() {
+                    if merger.fill(BATCH_ROWS) == 0 {
                         this.state = ScanState::Done;
                         return Poll::Ready(None);
                     }
-                    let batch = match build_batch(&rows, &merger.labels, Arc::clone(&this.schema)) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            this.state = ScanState::Done;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    };
-                    // Grow the reservation by the batch's measured footprint.
-                    // A byte-budget overrun surfaces here as the pool's typed
-                    // ResourcesExhausted error, never a silent partial result.
-                    if let Err(e) = reservation.try_grow(batch.get_array_memory_size()) {
+                    let (batch, batch_bytes) =
+                        match build_batch(merger, Arc::clone(&this.schema), &this.metrics) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                this.state = ScanState::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        };
+                    // Grow the reservation by the bytes this batch's own
+                    // arrays allocate (see the module doc: an adopted
+                    // ts/value column allocates none, the fetch/decode phase
+                    // already charged it). A byte-budget overrun surfaces
+                    // here as the pool's typed ResourcesExhausted error,
+                    // never a silent partial result.
+                    if let Err(e) = reservation.try_grow(batch_bytes) {
                         this.state = ScanState::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
@@ -573,54 +751,120 @@ impl RecordBatchStream for ScanStream {
     }
 }
 
+/// Build one `RecordBatch` from the merge's current batch of cursors, and
+/// return it with the bytes its own arrays allocate (the batch-phase
+/// reservation charge; see the module doc).
+///
+/// `ts` and `value` are slices of one run's buffers when the batch is
+/// contiguous inside that run, and gathered copies otherwise. The three
+/// run-constant provenance columns are filled by run length either way;
+/// `in_page_index`, `series_id`, and the labels dictionary key are per row.
 fn build_batch(
-    rows: &[ScanRow],
-    labels_by_series: &HashMap<[u8; 16], LabelSet>,
+    merger: &Merger,
     schema: SchemaRef,
-) -> DFResult<RecordBatch> {
-    let ts = TimestampNanosecondArray::from(rows.iter().map(|r| r.ts).collect::<Vec<_>>());
-    let value = Float64Array::from(rows.iter().map(|r| r.value).collect::<Vec<_>>());
-    let series_id = FixedSizeBinaryArray::try_from_iter(rows.iter().map(|r| r.series_id))
-        .map_err(|e| SqlError::Internal(format!("series_id array build: {e}")))?;
-    let created = Int64Array::from(rows.iter().map(|r| r.created_unix_ns).collect::<Vec<_>>());
-    let epoch = UInt64Array::from(rows.iter().map(|r| r.writer_epoch).collect::<Vec<_>>());
-    let seq = UInt64Array::from(rows.iter().map(|r| r.writer_seq).collect::<Vec<_>>());
-    let in_page = UInt32Array::from(rows.iter().map(|r| r.in_page_index).collect::<Vec<_>>());
+    metrics: &ScanMetrics,
+) -> DFResult<(RecordBatch, usize)> {
+    let cursors = &merger.batch;
+    let rows = cursors.len();
+    let adopted = merger.contiguous_run();
 
+    let (ts, value): (ArrayRef, ArrayRef) = match adopted {
+        Some((run, start)) => {
+            metrics.adopted.add(1);
+            let r = &merger.runs[run];
+            (
+                Arc::new(TimestampNanosecondArray::new(r.ts.slice(start, rows), None)),
+                Arc::new(Float64Array::new(r.values.slice(start, rows), None)),
+            )
+        }
+        None => {
+            metrics.gathered.add(1);
+            let mut ts: Vec<i64> = Vec::with_capacity(rows);
+            let mut value: Vec<f64> = Vec::with_capacity(rows);
+            for &(run, offset) in cursors {
+                let r = &merger.runs[run];
+                ts.push(r.ts[offset]);
+                value.push(r.values[offset]);
+            }
+            (
+                Arc::new(TimestampNanosecondArray::from(ts)),
+                Arc::new(Float64Array::from(value)),
+            )
+        }
+    };
+
+    let series_id = FixedSizeBinaryArray::try_from_iter(
+        cursors.iter().map(|&(run, _)| merger.runs[run].series_id),
+    )
+    .map_err(|e| SqlError::Internal(format!("series_id array build: {e}")))?;
+
+    let mut created: Vec<i64> = Vec::with_capacity(rows);
+    let mut epoch: Vec<u64> = Vec::with_capacity(rows);
+    let mut seq: Vec<u64> = Vec::with_capacity(rows);
+    let mut in_page: Vec<u32> = Vec::with_capacity(rows);
     // Dictionary-encode labels: one dictionary entry per distinct series in
     // this batch, an Int32 key per row. Rows are globally sorted by series_id,
     // so distinct series appear in contiguous runs (a series split across two
-    // batches simply appears in each batch's dictionary).
+    // batches simply appears in each batch's dictionary), and two runs of the
+    // same series that meet inside a batch share its one entry.
     let mut distinct: Vec<LabelSet> = Vec::new();
-    let mut keys: Vec<i32> = Vec::with_capacity(rows.len());
-    let mut last: Option<[u8; 16]> = None;
-    let mut idx: i32 = -1;
-    for r in rows {
-        if last != Some(r.series_id) {
-            let labels = labels_by_series
-                .get(&r.series_id)
-                .cloned()
-                .unwrap_or_default();
-            distinct.push(labels);
-            idx += 1;
-            last = Some(r.series_id);
+    let mut keys: Vec<i32> = Vec::with_capacity(rows);
+    let mut last_series: Option<[u8; 16]> = None;
+    let mut key: i32 = -1;
+
+    // Walk the batch one run-length at a time: the provenance a run stamps on
+    // every one of its samples is written per run, never per row.
+    let mut i = 0;
+    while i < rows {
+        let (run, _) = cursors[i];
+        let mut end = i + 1;
+        while end < rows && cursors[end].0 == run {
+            end += 1;
         }
-        keys.push(idx);
+        let len = end - i;
+        let r = &merger.runs[run];
+        created.extend(std::iter::repeat_n(r.created_unix_ns, len));
+        epoch.extend(std::iter::repeat_n(r.writer_epoch, len));
+        seq.extend(std::iter::repeat_n(r.writer_seq, len));
+        for &(_, offset) in &cursors[i..end] {
+            in_page.push(r.in_page_at(offset));
+        }
+        if last_series != Some(r.series_id) {
+            distinct.push(merger.labels.get(&r.series_id).cloned().unwrap_or_default());
+            key += 1;
+            last_series = Some(r.series_id);
+        }
+        keys.extend(std::iter::repeat_n(key, len));
+        i = end;
     }
     let labels = build_labels_dict(&distinct, &keys).map_err(DataFusionError::from)?;
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(ts),
-        Arc::new(value),
+        ts,
+        value,
         Arc::new(series_id),
         labels,
-        Arc::new(created),
-        Arc::new(epoch),
-        Arc::new(seq),
-        Arc::new(in_page),
+        Arc::new(Int64Array::from(created)),
+        Arc::new(UInt64Array::from(epoch)),
+        Arc::new(UInt64Array::from(seq)),
+        Arc::new(UInt32Array::from(in_page)),
     ];
     debug_assert_eq!(schema.fields().len(), columns.len());
     debug_assert_eq!(COL_TS, 0);
     debug_assert_eq!(COL_SERIES_ID, 2);
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+
+    // The batch-phase charge: every column this batch allocated. An adopted
+    // ts/value column is a slice of a run's buffer, already charged by the
+    // fetch/decode phase, so it is skipped here rather than counted once per
+    // batch that reads it.
+    let mut batch_bytes = 0usize;
+    for (i, column) in columns.iter().enumerate() {
+        if adopted.is_some() && (i == COL_TS || i == COL_VALUE) {
+            continue;
+        }
+        batch_bytes = batch_bytes.saturating_add(column.get_array_memory_size());
+    }
+
+    let batch = RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)?;
+    Ok((batch, batch_bytes))
 }

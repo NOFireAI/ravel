@@ -510,9 +510,15 @@ async fn byte_budget_rejects_during_fetch_decode_not_only_after_batches() {
     let snapshot = build_snapshot(raw_store.as_ref(), &specs).await;
     let counting_store = CountingStore::wrap(raw_store);
 
-    // 20,000 rows at 64 bytes/row (ScanRow) is ~1.25 MiB decoded; a 200 KiB
-    // ceiling is comfortably below that on its own, before any batch phase
-    // growth would even be reachable.
+    // The fetch/decode charge is the decoded SoA the merge holds: 20,000
+    // samples at one i64 timestamp plus one f64 value each is ~313 KiB, plus
+    // this segment's fetched raw-f64 page bytes. A 200 KB ceiling is below
+    // that on its own, before any batch-phase growth would even be reachable.
+    // The unit is the SoA's bytes, not `rows * size_of::<ScanRow>()`: ADR-0099
+    // decision 6 deleted the 64-byte row struct this threshold used to be
+    // written against, and the reservation charges the buffers that replaced
+    // it. Same live-bytes contract, smaller per-sample figure, which is why
+    // the ceiling here is now the tighter bound of the two.
     let task_ctx = task_ctx_with_query_bytes(200_000);
 
     let fetcher = SegmentFetcher::new(Arc::clone(&counting_store) as Arc<dyn ObjectStoreBackend>);
