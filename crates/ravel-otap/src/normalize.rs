@@ -13,8 +13,10 @@
 //! identical rejection classes for the same logical input. Where
 //! `ravel_otlp::normalize` exposes a helper as `pub`, we call it directly;
 //! where a helper is private (sanitization, `push_checked`,
-//! `any_value_to_label_value`), we mirror it exactly below. See the crate
-//! report for a shared-helper refactor suggestion.
+//! `any_value_to_label_value`), we mirror it exactly below. The OTel unit
+//! mapping is one such shared helper: the metadata unit word is taken from the
+//! canonical `ravel_otlp::normalize::metadata_unit_word` rather than re-derived
+//! here, so a single edit to that table changes both ingest paths at once.
 //!
 //! Known scope gap (flagged, not silently worked around): the OTAP test
 //! encoder in `encode.rs` never emits `RESOURCE_ATTRS` or `SCOPE_ATTRS`
@@ -78,7 +80,7 @@ use arrow::array::{
 use arrow::datatypes::UInt8Type;
 use ravel_otlp::metadata::{MetricKind as PromMetricKind, MetricMetadata};
 use ravel_otlp::normalize::{
-    MetricsNormalizeResult, NormalizedExemplar, map_unit, prometheus_family_name,
+    MetricsNormalizeResult, NormalizedExemplar, metadata_unit_word, prometheus_family_name,
 };
 use ravel_otlp::promcompat::format_float;
 use ravel_otlp::{IngestLimits, NormalizeOutput, NormalizedPoint, Rejection};
@@ -941,93 +943,6 @@ fn metadata_kind(kind: &RootKind) -> PromMetricKind {
         RootKind::Summary => PromMetricKind::Summary,
         RootKind::Unsupported => PromMetricKind::Unknown,
     }
-}
-
-/// The unit word stored in a metadata tuple: the mapped Prometheus word when the
-/// unit maps (so it agrees with the suffix [`prometheus_family_name`] put on the
-/// name), otherwise the raw unit with annotations stripped, otherwise empty
-/// (ADR-0085 Decision 1/2).
-///
-/// This mirrors `ravel_otlp::normalize`'s private `metadata_unit_word` /
-/// `unit_suffix` pair, the same way this module already mirrors that crate's
-/// private sanitization helpers: the mapped-word table itself is reused through
-/// the pub `map_unit`, and only the compound (`a/b`) and annotation handling is
-/// restated. Exporting `metadata_unit_word` from `ravel-otlp` would let both
-/// paths share one function; that is a `ravel-otlp` change, outside this task's
-/// scope, and is flagged rather than made here.
-fn metadata_unit_word(unit: &str, kind: PromMetricKind) -> String {
-    match metadata_unit_suffix(unit, kind) {
-        Some(word) => word,
-        // Unmapped: carry the raw unit through as free text. This is a metadata
-        // field, not a metric name, so metric-name sanitizing does not apply.
-        None => strip_unit_annotations(unit).trim().to_string(),
-    }
-}
-
-/// The mapped unit suffix (without a leading `_`), or `None` when the unit adds
-/// no suffix (empty, unrecognized simple unit, or `1` on a non-gauge).
-fn metadata_unit_suffix(unit: &str, kind: PromMetricKind) -> Option<String> {
-    let stripped = strip_unit_annotations(unit);
-    let trimmed = stripped.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed == "1" {
-        return match kind {
-            PromMetricKind::Gauge => Some("ratio".to_string()),
-            _ => None,
-        };
-    }
-    if let Some((num_raw, den_raw)) = trimmed.split_once('/') {
-        let num = num_raw.trim();
-        let den = den_raw.trim();
-        let num_mapped =
-            (!num.is_empty()).then(|| map_unit(num).unwrap_or_else(|| num.to_string()));
-        let den_mapped =
-            (!den.is_empty()).then(|| map_per_unit(den).unwrap_or_else(|| den.to_string()));
-        match (num_mapped, den_mapped) {
-            (Some(n), Some(d)) => Some(format!("{n}_per_{d}")),
-            (Some(n), None) => Some(n),
-            (None, Some(d)) => Some(format!("per_{d}")),
-            (None, None) => None,
-        }
-    } else {
-        map_unit(trimmed)
-    }
-}
-
-/// Strip every `{...}` annotation from a unit, at any nesting, tolerating
-/// unbalanced braces (a unit string is attacker-influenced and must never
-/// panic). Mirrors `ravel_otlp::normalize`'s private `strip_annotations`.
-fn strip_unit_annotations(unit: &str) -> String {
-    let mut out = String::with_capacity(unit.len());
-    let mut depth: usize = 0;
-    for c in unit.chars() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => out.push(c),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// A per-unit denominator through the Collector's `perUnitMapper` table, where
-/// `m` is `minute` rather than `meters`. Mirrors `ravel_otlp::normalize`'s
-/// private `map_per_unit`.
-fn map_per_unit(unit: &str) -> Option<String> {
-    let mapped = match unit {
-        "s" => "second",
-        "m" => "minute",
-        "h" => "hour",
-        "d" => "day",
-        "w" => "week",
-        "mo" => "month",
-        "y" => "year",
-        _ => return None,
-    };
-    Some(mapped.to_string())
 }
 
 fn payloads_of(batch: &DecodedBatch, ty: ArrowPayloadType) -> Vec<&RecordBatch> {
@@ -2690,51 +2605,62 @@ fn explode_summary_point(
 mod tests {
     use super::*;
 
-    /// The unit word this module stores must be the same word
-    /// `ravel_otlp::normalize`'s private `metadata_unit_word` stores, since the
-    /// two surfaces write the same durable record. Pinned against the exact
-    /// table that crate's own tests pin (mapped word, dimensionless ratio,
-    /// unmapped raw passthrough, annotation-only collapse, compound form), so a
-    /// future divergence in either mirror fails here.
+    /// Run ravel-otap's real metadata path for a single gauge metric carrying
+    /// `unit` and return the unit word it stores. Drives [`build_metadata`], the
+    /// same function `normalize_impl` calls, so the word returned here is the
+    /// one an ingested OTAP metric would carry, not a re-derived value.
+    fn otap_stored_unit_word(unit: &str) -> String {
+        let root = vec![Some(RootEntry {
+            name: "m".to_string(),
+            kind: RootKind::Gauge,
+            unit: unit.to_string(),
+            description: String::new(),
+        })];
+        let decisions = vec![Some(MetricDecision {
+            name: "m".to_string(),
+            is_sum: false,
+            is_monotonic: false,
+        })];
+        let meta = build_metadata(&root, &decisions, &[None], &[None], &[true]);
+        meta.into_iter()
+            .next()
+            .expect("a produced metric yields one metadata tuple")
+            .unit
+    }
+
+    /// The unit word ravel-otap stores must be exactly the one ravel-otlp's
+    /// canonical `metadata_unit_word` produces: the two surfaces write the same
+    /// durable record, so they must agree on every shape the mapping handles.
+    ///
+    /// This compares ravel-otap's real-path output against ravel-otlp's function
+    /// directly (first assert), which catches a private mirror reappearing in
+    /// this crate and drifting, and pins ravel-otlp's canonical output to the
+    /// expected Prometheus word (second assert), so an edit to that single table
+    /// cannot silently change what ravel-otap stores. Covers the annotated,
+    /// per-unit, mapped-word, unmapped, and empty shapes.
     #[test]
-    fn metadata_unit_word_mirrors_the_otlp_mapping() {
-        assert_eq!(metadata_unit_word("By", PromMetricKind::Counter), "bytes");
-        assert_eq!(
-            metadata_unit_word("s", PromMetricKind::Histogram),
-            "seconds"
-        );
-        assert_eq!(metadata_unit_word("", PromMetricKind::Gauge), "");
-        // Dimensionless `1` is `ratio` on a gauge and nothing on any other kind,
-        // where "nothing" still carries the raw unit as free text.
-        assert_eq!(metadata_unit_word("1", PromMetricKind::Gauge), "ratio");
-        assert_eq!(metadata_unit_word("1", PromMetricKind::Counter), "1");
-        // Unmapped units pass through raw, never metric-name sanitized.
-        assert_eq!(
-            metadata_unit_word("furlong", PromMetricKind::Gauge),
-            "furlong"
-        );
-        assert_eq!(metadata_unit_word("2h", PromMetricKind::Gauge), "2h");
-        // Annotations are stripped; an annotation-only unit is empty.
-        assert_eq!(metadata_unit_word("{request}", PromMetricKind::Gauge), "");
-        assert_eq!(
-            metadata_unit_word("{packet}/s", PromMetricKind::Gauge),
-            "per_second"
-        );
-        // Compound form, each side mapped independently. `m` is `minute` in the
-        // denominator, not `meters`.
-        assert_eq!(
-            metadata_unit_word("By/s", PromMetricKind::Gauge),
-            "bytes_per_second"
-        );
-        assert_eq!(
-            metadata_unit_word("By/m", PromMetricKind::Gauge),
-            "bytes_per_minute"
-        );
-        // An unrecognized side passes through rather than being dropped.
-        assert_eq!(
-            metadata_unit_word("furlong/fortnight", PromMetricKind::Gauge),
-            "furlong_per_fortnight"
-        );
+    fn otap_metadata_unit_word_matches_ravel_otlp_canonical() {
+        // (raw unit, the word ravel-otlp's canonical table currently produces
+        // for a gauge).
+        let cases = [
+            ("{packets}", ""),            // annotation-only, stripped to empty
+            ("By/s", "bytes_per_second"), // per-unit compound
+            ("By", "bytes"),              // simple unit needing a metadata word
+            ("furlong", "furlong"),       // no mapping, raw passthrough
+            ("", ""),                     // empty
+        ];
+        for (unit, pinned) in cases {
+            let canonical = ravel_otlp::normalize::metadata_unit_word(unit, PromMetricKind::Gauge);
+            assert_eq!(
+                otap_stored_unit_word(unit),
+                canonical,
+                "ravel-otap must store ravel-otlp's canonical word for {unit:?}"
+            );
+            assert_eq!(
+                canonical, pinned,
+                "ravel-otlp unit table changed for {unit:?}"
+            );
+        }
     }
 
     /// The METRICS `metric_type`/`is_monotonic` pair maps to the same Prometheus
