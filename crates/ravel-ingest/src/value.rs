@@ -134,19 +134,116 @@ impl IngestPoint {
     /// ingest byte budget's admission charge (ADR-0069, [`crate::IngestByteBudget`]).
     ///
     /// Mirrors `TenantBuf::merge`'s `est_bytes` rule -- 16 bytes per sample plus
-    /// the label name/value bytes -- but counts label bytes for *every* point,
-    /// not only the first sighting of a series in a buffer: the charge happens
-    /// before routing, without the shard's buffer state, so it cannot know
-    /// which series are already present. That makes the charge a deliberate
-    /// slight over-estimate of what finally lands in the buffer, which is the
-    /// safe direction for a memory ceiling (it sheds a touch early rather than
-    /// a touch late).
+    /// each label's `Label` struct header and its name/value bytes, the same
+    /// per-label rule [`IngestExemplar::est_bytes`] applies -- but counts label
+    /// bytes for *every* point, not only the first sighting of a series in a
+    /// buffer: the charge happens before routing, without the shard's buffer
+    /// state, so it cannot know which series are already present. That makes
+    /// the charge a deliberate slight over-estimate of what finally lands in
+    /// the buffer, which is the safe direction for a memory ceiling (it sheds a
+    /// touch early rather than a touch late).
+    ///
+    /// The header term is what the buffer actually holds: a `Label` is two
+    /// `String` headers (24 bytes each) whatever the strings contain, so
+    /// counting only `name.len() + value.len()` undercharges a ten-label series
+    /// with short values by about 480 bytes against the roughly 200 it counts,
+    /// and the error grows with label count. Undercharging the ceiling is the
+    /// unsafe direction: the process passes a limit it believes it is under.
     pub(crate) fn est_charge_bytes(&self) -> u64 {
         let label_bytes: u64 = self
             .labels
             .iter()
-            .map(|l| (l.name.len() + l.value.len()) as u64)
+            .map(|l| (size_of::<Label>() + l.name.len() + l.value.len()) as u64)
             .sum();
         16 + label_bytes
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ravel_types::Exemplar;
+
+    fn labels_of(count: usize) -> LabelSet {
+        let labels = (0..count)
+            .map(|i| Label {
+                name: format!("k{i}"),
+                value: "v".to_string(),
+            })
+            .collect();
+        LabelSet::new(labels).expect("distinct label names")
+    }
+
+    fn point_with(labels: LabelSet) -> IngestPoint {
+        IngestPoint {
+            series_id: SeriesId([0u8; 16]),
+            labels,
+            value: IngestValue::Scalar(Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }),
+        }
+    }
+
+    fn exemplar_with(labels: LabelSet) -> IngestExemplar {
+        IngestExemplar {
+            series_id: SeriesId([0u8; 16]),
+            exemplar: Exemplar {
+                ts_ns: 1_000,
+                value_bits: 1.0f64.to_bits(),
+                trace_id: [0u8; 16],
+                span_id: [0u8; 8],
+                filtered_attributes: labels.iter().cloned().collect(),
+            },
+        }
+    }
+
+    /// The two buffered-byte estimators must charge one label the same way, or
+    /// the process-wide ceiling and the exemplar accounting drift apart again.
+    ///
+    /// Two bounds, both stated here so a future edit has to break one of them:
+    /// the per-label part of each estimate is byte-identical at every width,
+    /// and once labels dominate the fixed struct overheads (10 labels and up)
+    /// the totals stay within 25% of each other. At one label the fixed
+    /// overheads still dominate -- an `IngestExemplar` carries a trace id, a
+    /// span id, and a `Vec` header where a point carries 16 bytes of sample --
+    /// so only the per-label bound is meaningful there.
+    #[test]
+    fn both_estimators_charge_a_label_the_same_way() {
+        for width in [1usize, 10, 64] {
+            let labels = labels_of(width);
+            let point = point_with(labels.clone());
+            let exemplar = exemplar_with(labels);
+
+            let point_labels = point.est_charge_bytes() - 16;
+            let exemplar_attrs = (exemplar.est_bytes() - size_of::<IngestExemplar>()) as u64;
+            assert_eq!(
+                point_labels, exemplar_attrs,
+                "{width} labels: point charges {point_labels} label bytes, \
+                 exemplar charges {exemplar_attrs}"
+            );
+
+            // Every label costs at least a `Label` header, whatever its strings
+            // hold. This is the specific undercount the pin exists to catch:
+            // dropping the header term leaves 3 to 4 bytes per label here.
+            assert!(
+                point_labels >= (width * size_of::<Label>()) as u64,
+                "{width} labels: {point_labels} bytes charged is below the \
+                 {} bytes of `Label` headers the buffer holds",
+                width * size_of::<Label>()
+            );
+
+            if width >= 10 {
+                let ratio = point.est_charge_bytes() as f64 / exemplar.est_bytes() as f64;
+                assert!(
+                    (0.75..=1.25).contains(&ratio),
+                    "{width} labels: estimator ratio {ratio} outside [0.75, 1.25] \
+                     (point {}, exemplar {})",
+                    point.est_charge_bytes(),
+                    exemplar.est_bytes()
+                );
+            }
+        }
     }
 }
