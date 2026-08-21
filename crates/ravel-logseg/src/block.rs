@@ -1006,6 +1006,58 @@ mod tests {
         );
     }
 
+    /// A planned numeric column that no row resolves still gets a stat, and
+    /// that stat's `null_count` covers every row of the block. This is the
+    /// case docs/log-segment-format.md's `null_count` contract turns on: a
+    /// present stat is not evidence that any row resolves the column, and its
+    /// bounds are the degenerate 0/0 pair.
+    ///
+    /// Scope: this pins the emit half, taking the plan as given. That the
+    /// writer plans such a column at all, from a record-level occurrence whose
+    /// merged-view winner is of another type, is decided in `writer.rs` and is
+    /// not covered here.
+    #[test]
+    fn numstat_covers_every_row_when_none_resolves_the_column() {
+        let plans = vec![
+            ColumnPlan {
+                column_id: 10,
+                ty: FieldType::I64,
+            },
+            ColumnPlan {
+                column_id: 12,
+                ty: FieldType::Str,
+            },
+        ];
+
+        // Every row carries the name as both I64 and Str, and Str wins each
+        // time, so no row resolves an I64 value for a column that is planned
+        // because the I64 occurrence is present.
+        let rows: Vec<_> = (0..8i64)
+            .map(|i| {
+                let mut r = row(0, 1 + i);
+                r.columns.push((10, ColumnValue::I64(9999)));
+                r.columns.push((12, ColumnValue::Str(b"wins".to_vec())));
+                r.stat_winners
+                    .push((12, ColumnValue::Str(b"wins".to_vec())));
+                r
+            })
+            .collect();
+
+        let out = write_block(&rows, &plans, 3).expect("write");
+        let i64_stat = *out
+            .stats
+            .iter()
+            .find(|s| s.column_id == 10)
+            .expect("a planned column keeps its stat even when nothing resolves it");
+
+        assert_eq!(
+            i64_stat.null_count, 8,
+            "null_count must cover every row when no row resolves the column"
+        );
+        assert_eq!(i64_stat.min_bits, 0, "an all-null stat bounds nothing");
+        assert_eq!(i64_stat.max_bits, 0, "an all-null stat bounds nothing");
+    }
+
     /// A column filter decodes only the named columns' pages, leaves every
     /// other column absent, and reports how many pages it walked past. The
     /// values it does decode are identical to the all-columns decode's, so
