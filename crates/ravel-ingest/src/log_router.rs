@@ -541,6 +541,78 @@ mod tests {
         );
     }
 
+    /// Issue #389 regression, driven through the real charge path
+    /// (`LogIngestRouter::write` -> `try_charge` -> `IngestByteBudget`): a single
+    /// attribute whose value is a `Map` of 8192 `("", Bool)` entries. Under the
+    /// pre-fix `attr_value_len` the record charged only the 8192 one-byte Bool
+    /// payloads (~8.25 KB), so a 100 KB process budget admitted it; the fix also
+    /// charges each entry's `(String, AttrValue)` header, so the same record now
+    /// charges ~459 KB and the budget refuses it before any shard is touched.
+    ///
+    /// A helper-only assertion on `attr_value_len` would prove the estimate grew
+    /// but not that the budget's admission decision changed, so this asserts the
+    /// `write` call itself is shed.
+    #[tokio::test]
+    async fn wide_nested_map_attribute_is_shed_by_the_budget_after_the_nesting_fix() {
+        use ravel_otlp::logs_normalize::NormalizedLogRecord;
+        use ravel_types::TenantId;
+        use ravel_types::logstream::{AttrValue, LogStreamId};
+
+        let entries: Vec<(String, AttrValue)> = (0..8192)
+            .map(|_| (String::new(), AttrValue::Bool(false)))
+            .collect();
+        let rec = NormalizedLogRecord {
+            stream_id: LogStreamId([0u8; 16]),
+            stream_attrs: Vec::new(),
+            ts_ns: 1_000,
+            observed_ts_ns: 1_000,
+            severity_num: 9,
+            severity_text: String::new(),
+            body: String::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("m".to_string(), AttrValue::Map(entries))],
+        };
+
+        // Magnitude: the fixed estimate is on the order of 459 KB, far above the
+        // ~8.25 KB the old payload-only measure charged.
+        let est = est_record_bytes(&rec);
+        assert!(
+            (400_000..=600_000).contains(&est),
+            "nested-map estimate {est} is not on the ~459 KB order the fix charges"
+        );
+
+        // A budget bounded strictly between the old and new charge: admits the
+        // record under the old measure, sheds it under the fix.
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(100_000));
+        let router = test_router(Arc::new(MemoryStore::new())).with_budget(Arc::clone(&budget));
+
+        let err = router
+            .write(
+                TenantId::new("acme"),
+                vec![rec],
+                WriteMode::Buffered,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("the fixed nesting estimate pushes the record past the 100 KB ceiling");
+        assert!(
+            matches!(err, LogWriteError::BufferBudgetExceeded),
+            "the record must be shed at the byte budget, got {err:?}"
+        );
+        assert_eq!(
+            budget.shed_total(),
+            1,
+            "the shed counter fires exactly once"
+        );
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "a shed request charges nothing, so the gauge is untouched"
+        );
+    }
+
     /// A tenant whose cached view has genuinely changed `shard_count`
     /// (observed via a successful refresh, not grace-extension) routes at the
     /// new count immediately -- grace-extension is never on this router's path

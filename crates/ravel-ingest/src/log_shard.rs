@@ -78,19 +78,30 @@ pub(crate) enum LogShardMsg {
     Shutdown { done: oneshot::Sender<()> },
 }
 
-/// Estimated encoded length of one attribute value, for the `est_bytes`
-/// flush-trigger heuristic. Nested `List`/`Map` values recurse. This is a
-/// sizing estimate only, not the RLOG encoder's exact output.
+/// Estimated buffered byte cost of one attribute value, for the `est_bytes`
+/// flush-trigger heuristic and the process-wide ingest byte budget it feeds
+/// (ADR-0069). Every container charges its per-element struct header at its own
+/// nesting level, not only at the top: a `Map` charges
+/// `size_of::<(String, AttrValue)>()` per entry and a `List` charges
+/// `size_of::<AttrValue>()` per item, each in addition to the recursive cost of
+/// the contained value. The buffer holds those structs whatever the leaf bytes
+/// contain, so counting leaf bytes alone would undercharge a nested value
+/// against the shared ceiling by the header width at every level below the top
+/// (up to ~56x for a wide `Map` of one-byte values). This is a sizing estimate
+/// only, not the RLOG encoder's exact output.
 fn attr_value_len(value: &AttrValue) -> usize {
     match value {
         AttrValue::Str(s) => s.len(),
         AttrValue::Bytes(b) => b.len(),
         AttrValue::I64(_) | AttrValue::F64(_) => 8,
         AttrValue::Bool(_) => 1,
-        AttrValue::List(items) => items.iter().map(attr_value_len).sum(),
+        AttrValue::List(items) => items
+            .iter()
+            .map(|v| size_of::<AttrValue>() + attr_value_len(v))
+            .sum(),
         AttrValue::Map(entries) => entries
             .iter()
-            .map(|(k, v)| k.len() + attr_value_len(v))
+            .map(|(k, v)| size_of::<(String, AttrValue)>() + k.len() + attr_value_len(v))
             .sum(),
     }
 }
@@ -1937,5 +1948,56 @@ mod tests {
     /// constant. Kept in sync with `IndexedFieldsOverlay::new`'s horizon.
     fn ravel_ingest_default_lifecycle_horizon_ns() -> i64 {
         crate::DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS
+    }
+
+    /// A `List` charges the `size_of::<AttrValue>()` slot header for each item,
+    /// on top of the item's own recursive cost. Pre-fix the `List` arm summed
+    /// the item costs alone, so three `Bool`s charged 3 bytes; the fix charges
+    /// the per-item header at this level too.
+    #[test]
+    fn list_charges_the_per_item_slot_header() {
+        let item = size_of::<AttrValue>();
+        let v = AttrValue::List(vec![
+            AttrValue::Bool(true),
+            AttrValue::Bool(false),
+            AttrValue::Bool(true),
+        ]);
+        assert_eq!(
+            attr_value_len(&v),
+            3 * (item + 1),
+            "each of the three Bool items must charge its AttrValue slot header \
+             plus its one payload byte"
+        );
+    }
+
+    /// The "every level" claim: a `Map` containing a `List` containing a `Map`
+    /// charges a per-element struct header at all three nesting levels, not only
+    /// the top. Pre-fix, `attr_value_len` counted no struct header at any level,
+    /// so this value measured 3 bytes (two one-char keys plus one Bool payload);
+    /// the fix charges a `(String, AttrValue)` header per map entry and a
+    /// `size_of::<AttrValue>()` header per list item at their own levels.
+    #[test]
+    fn nested_map_list_map_charges_headers_at_every_level() {
+        let pair = size_of::<(String, AttrValue)>();
+        let item = size_of::<AttrValue>();
+
+        // Map{ "a": List[ Map{ "b": Bool } ] }
+        let inner_map = AttrValue::Map(vec![("b".to_string(), AttrValue::Bool(false))]);
+        let list = AttrValue::List(vec![inner_map]);
+        let top = AttrValue::Map(vec![("a".to_string(), list)]);
+
+        // Hand-computed bottom-up, a header at each level:
+        //   inner Map entry: pair header + key "b" (1) + Bool payload (1)
+        //   List item:       item header + inner-map cost
+        //   top Map entry:   pair header + key "a" (1) + list cost
+        let inner_cost = pair + 1 + 1;
+        let list_cost = item + inner_cost;
+        let expected = pair + 1 + list_cost;
+
+        assert_eq!(
+            attr_value_len(&top),
+            expected,
+            "a header must be charged at the top Map, the List, and the inner Map"
+        );
     }
 }
