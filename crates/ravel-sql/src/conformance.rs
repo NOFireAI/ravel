@@ -107,6 +107,12 @@ pub enum Category {
     /// A window function used with an `OVER` clause (admitted or excluded)
     /// (ADR-0097 decisions 6, 8).
     Window,
+    /// An aggregate used over a moving window frame, whose semantics are
+    /// selected by the frame shape rather than by the function name (ADR-0097
+    /// decision 5). Kept separate from [`Category::Window`] because it enumerates
+    /// aggregate-over-frame positions, not the native window-function registry
+    /// the [`Category::Window`] drift check binds to.
+    WindowFrame,
 }
 
 impl Category {
@@ -117,8 +123,9 @@ impl Category {
             Category::Clause => 1,
             Category::Scalar => 2,
             Category::Window => 3,
-            Category::WriteStatement => 4,
-            Category::TableDispatch => 5,
+            Category::WindowFrame => 4,
+            Category::WriteStatement => 5,
+            Category::TableDispatch => 6,
         }
     }
 
@@ -129,6 +136,7 @@ impl Category {
             Category::Clause => "Clause / operator",
             Category::Scalar => "Scalar function",
             Category::Window => "Window function",
+            Category::WindowFrame => "Window frame",
             Category::WriteStatement => "Write / DDL statement",
             Category::TableDispatch => "Table dispatch",
         }
@@ -200,6 +208,13 @@ const E_EXCLUDED_WINDOW: &str = "ValidationError::ExcludedWindow";
 const E_NOT_READ_ONLY: &str = "ValidationError::NotReadOnly";
 const E_WRITE_IN_QUERY: &str = "ValidationError::WriteInQuery";
 const E_CROSS_SIGNAL: &str = "SqlError::CrossSignalQuery";
+/// The typed error a moving-frame `avg` surfaces (ADR-0097 decision 5): a
+/// DataFusion "retract_batch is not implemented" refusal, mapped to
+/// [`crate::error::SqlError::Execution`]. Unlike the other rejected constructs,
+/// this one is not refused by [`crate::validate`] (`avg` is admitted) and not by
+/// a registry gate; it fails closed inside DataFusion's sliding-window planner,
+/// so the conformance suite verifies it by executing the query.
+const E_SLIDING_AVG: &str = "SqlError::Execution";
 
 /// One admitted upstream scalar *family* (ADR-0097 decision 8), attested by a
 /// single representative row rather than one row per member. The family row is
@@ -596,6 +611,29 @@ pub fn registry() -> Vec<Construct> {
                         row (ADR-0097 decision 6)",
         });
     }
+
+    // --- Window frame (ADR-0097 decision 5) ------------------------------
+    // Moving-frame `avg` fails closed with a typed error rather than diverging:
+    // a frame whose start is not UNBOUNDED PRECEDING routes the aggregate through
+    // DataFusion's sliding accumulator, and `avg` (the sequential-fold UDAF,
+    // crate::avg) implements no `retract_batch`, so DataFusion refuses it. This
+    // records that refusal as a decision, so a future `supports_retract_batch`
+    // override cannot silently reverse it. Moving-frame `min`/`max`, by contrast,
+    // stay admitted and are pinned bit-for-bit against a total-order reference by
+    // tests/sliding_frame_total_order.rs (they run upstream's `total_cmp`-ordered
+    // sliding accumulator, the same order ADR-0023 mandates).
+    out.push(Construct {
+        category: Category::WindowFrame,
+        name: "avg (moving frame)".to_string(),
+        example: "SELECT avg(value) OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) \
+                  FROM samples"
+            .to_string(),
+        classification: Classification::IntentionallyRejected {
+            typed_error: E_SLIDING_AVG,
+        },
+        rationale: "moving-frame avg has no retract_batch, so DataFusion refuses it \
+                    (ADR-0097 decision 5)",
+    });
 
     // --- Write / DDL statements ------------------------------------------
     // The read-only single-statement gate refuses every non-`SELECT` statement

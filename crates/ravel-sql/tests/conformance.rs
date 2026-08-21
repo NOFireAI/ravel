@@ -464,6 +464,27 @@ async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
                         observed: "cross-signal query was accepted".to_string(),
                     },
                 }
+            } else if construct.category == Category::WindowFrame {
+                // Moving-frame `avg` is not refused by `validate` (`avg` is
+                // admitted) nor by a registry gate: it fails closed inside
+                // DataFusion's sliding-window planner, so it must be executed to
+                // see the typed error, and only over a fixture with rows (an
+                // empty frame short-circuits before the accumulator is built).
+                match fixture
+                    .executor
+                    .execute(tenant.hash(), &request(&construct.example))
+                    .await
+                {
+                    Err(SqlError::Execution(msg)) if msg.contains("sliding accumulator") => {
+                        Verdict::Confirmed
+                    }
+                    Err(e) => Verdict::Broken {
+                        observed: format!("wrong error: {e}"),
+                    },
+                    Ok(_) => Verdict::Broken {
+                        observed: "moving-frame avg was accepted".to_string(),
+                    },
+                }
             } else {
                 // Every other rejected construct is refused by the read-only
                 // single-statement gate before any planning, so the typed
@@ -565,8 +586,11 @@ async fn supported_constructs_execute() {
 /// fail cleanly").
 #[tokio::test]
 async fn every_intentionally_rejected_construct_returns_a_typed_error() {
-    let tenant = tenant_id("conformance");
-    let fixture = Fixture::memory(&[(&tenant, &[])]).await;
+    // A data-bearing fixture: most rejected constructs are refused before any
+    // planning and would pass over an empty store, but moving-frame `avg`
+    // (ADR-0097 decision 5) is refused inside DataFusion's sliding-window planner
+    // and only when the frame actually has rows, so it needs real samples.
+    let fixture = conformance_fixture().await;
 
     let mut rejected = 0usize;
     for construct in registry() {
