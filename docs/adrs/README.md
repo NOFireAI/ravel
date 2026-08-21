@@ -100,3 +100,4 @@ One decision per document. Status: Proposed | Accepted | Superseded.
 | [0095](0095-numstat-crosstype-declared-column-agreement.md) | NumStat cross-type resolution fix and RLOG v3 | Accepted |
 | [0096](0096-queryfrag-per-sample-provenance-and-histograms.md) | Query fan-out frame carries per-sample provenance and histograms | Accepted |
 | [0097](0097-sql-scalar-function-surface.md) | The SQL scalar and window function surface: extend the fail-closed registry gate beyond aggregates | Proposed |
+| [0099](0099-columnar-decode-to-arrow.md) | Columnar decode-to-Arrow path for SQL scans: a block view out of ravel-logseg, dictionary pages preserved end to end, and SoA buffer adoption on the metrics scan | Accepted |
