@@ -101,11 +101,19 @@ fn attr_value_len(value: &AttrValue) -> usize {
 /// encoded length, plus a fixed 32 covering the two i64 timestamps,
 /// severity_num, flags, and the optional trace/span ids. A `target_bytes`
 /// flush-trigger estimate, not a byte-exact accounting of the RLOG output.
+///
+/// Each attribute also costs its `(String, AttrValue)` pair header, the log
+/// analogue of the `size_of::<Label>()` term [`crate::shard::TenantBuf::merge`]
+/// and [`crate::value::IngestPoint::est_charge_bytes`] apply per label: the
+/// buffer holds that struct whatever the key and value bytes contain, and all
+/// three signals charge the one process-wide byte budget (ADR-0069), so leaving
+/// the header term out here would undercharge the shared ceiling on exactly the
+/// attribute-heavy records it exists to bound while metrics charge it honestly.
 pub(crate) fn est_record_bytes(rec: &NormalizedLogRecord) -> usize {
     let attr_bytes: usize = rec
         .attrs
         .iter()
-        .map(|(k, v)| k.len() + attr_value_len(v))
+        .map(|(k, v)| size_of::<(String, AttrValue)>() + k.len() + attr_value_len(v))
         .sum();
     rec.body.len() + rec.severity_text.len() + rec.stream_attrs.len() + attr_bytes + 32
 }

@@ -521,7 +521,13 @@ Each ingest write charges its estimated buffered bytes into the gauge in the
 router's write path, after decode/normalize/admission and before any shard
 buffer is touched (`IngestPoint::est_charge_bytes`: 16 bytes per sample plus,
 per label, the `Label` struct header and the name/value bytes, plus each
-exemplar's buffered width). If the charge would push the gauge past the ceiling
+exemplar's buffered width). The log and span routers charge the same gauge with
+`est_record_bytes`/`est_span_bytes`, and those apply the identical per-attribute
+rule: each attribute costs its pair struct header (`(String, AttrValue)` for a
+log attribute, `(String, String)` for a span attribute, the latter byte-for-byte
+the same as a `Label`) plus its key/value bytes. Counting only the string bytes
+on any one signal would undercharge this shared ceiling on that signal while the
+others charge honestly. If the charge would push the gauge past the ceiling
 (`--max-ingest-buffer-bytes`, default 512 MiB, `0` = unlimited) the request
 is shed *before* buffering: no shard is touched, no commit token is minted,
 the shed counter increments, and the caller gets HTTP 429 with `Retry-After`
@@ -545,13 +551,21 @@ terms:
    This ceiling covers the estimated bytes of every shard buffer *and* every
    in-flight pipelined flush across all tenants and signals at once, since a
    flush's buffer stays charged until its PUTs complete. The charge is an
-   estimate (`est_charge_bytes`). It counts a series' label bytes on every
-   point rather than only on first sight, which over-counts, and it counts
-   neither `HashMap` overhead nor allocator slack, which under-counts by
-   more. The second effect dominates: measured on a 50k-series, 11-label
+   estimate. For metrics (`est_charge_bytes`) it counts a series' label bytes
+   on every point rather than only on first sight, which over-counts, and it
+   counts neither `HashMap` overhead nor allocator slack, which under-counts
+   by more. The second effect dominates: measured on a 50k-series, 11-label
    buffered workload, the charged figure was 38.4 MB against a 69.3 MB
-   resident delta. Size a host for roughly twice this ceiling, not for the
-   ceiling itself.
+   resident delta. Size a metrics host for roughly twice this ceiling, not
+   for the ceiling itself.
+
+   That two-times figure is a metrics measurement and does not transfer to
+   logs. `est_record_bytes` counts the pair header for a record's own
+   attributes but `attr_value_len` still measures a nested `Map` value by its
+   string bytes alone, so a record whose attributes nest can under-charge by
+   far more than two times. Until that is fixed, treat the ceiling as a lower
+   bound on log resident memory rather than a proportional estimate, and size
+   a log-heavy host from measurement rather than from this multiplier.
 2. **In-flight decode overhead**: each admitted in-flight request transiently
    holds one decoded/normalized request body during normalization, before its
    points reach a buffer. This is bounded by
