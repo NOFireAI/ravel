@@ -1554,9 +1554,9 @@ fn build_columnar_batch(
                 let mut b = FixedSizeBinaryBuilder::with_capacity(end - start, TRACE_ID_WIDTH);
                 for i in start..end {
                     match view.trace_id(i) {
-                        Some(id) => b
-                            .append_value(id)
-                            .map_err(|e| SqlError::Internal(format!("trace_id array build: {e}")))?,
+                        Some(id) => b.append_value(id).map_err(|e| {
+                            SqlError::Internal(format!("trace_id array build: {e}"))
+                        })?,
                         None => b.append_null(),
                     }
                 }
