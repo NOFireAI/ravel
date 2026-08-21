@@ -123,6 +123,26 @@ pub fn labels_for(metric: &str) -> LabelSet {
     .expect("valid labels")
 }
 
+/// Build a multi-label `LabelSet` from `(name, value)` pairs. Used only by the
+/// conformance fixture, which needs a series with more than one label so the
+/// `label` UDF conformance row can select by a key that is not the first label
+/// in the (name-sorted) set; the single-`__name__` [`labels_for`] cannot
+/// express that. Kept separate from [`labels_for`] on purpose: that helper
+/// backs [`series_id_for`] and every other test's series identity, so widening
+/// it would change series ids crate-wide.
+pub fn labels_for_many(pairs: &[(&str, &str)]) -> LabelSet {
+    LabelSet::new(
+        pairs
+            .iter()
+            .map(|(name, value)| Label {
+                name: (*name).to_string(),
+                value: (*value).to_string(),
+            })
+            .collect(),
+    )
+    .expect("valid labels")
+}
+
 pub fn series_id_for(tenant: &TenantId, metric: &str) -> [u8; 16] {
     SeriesId::compute(tenant, metric, &labels_for(metric))
         .expect("series id")
