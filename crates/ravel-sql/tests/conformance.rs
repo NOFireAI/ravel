@@ -250,6 +250,8 @@ fn validation_variant(err: &ValidationError) -> &'static str {
         ValidationError::NotReadOnly { .. } => "ValidationError::NotReadOnly",
         ValidationError::WriteInQuery { .. } => "ValidationError::WriteInQuery",
         ValidationError::ExcludedAggregate { .. } => "ValidationError::ExcludedAggregate",
+        ValidationError::ExcludedScalar { .. } => "ValidationError::ExcludedScalar",
+        ValidationError::ExcludedWindow { .. } => "ValidationError::ExcludedWindow",
     }
 }
 
