@@ -41,11 +41,10 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use ravel_bench::bench_env::env_header;
 use ravel_bench::codecs::{Alp, ByteSplitZstd, Chimp128, GcdDeltaFor, RawF64, ValueCodec};
 use ravel_bench::segment_support::{decode_scalar_run, production_scalar_run, scalar_val_page};
+use ravel_bench::value_shapes::{ALL_SHAPES, ValueShape, value_stream};
 
 /// Page sizes measured: the small-run regime and a full L1-merged run.
 const PAGE_SIZES: [usize; 2] = [60, 500];
@@ -64,127 +63,15 @@ struct Dataset {
     values: Vec<f64>,
 }
 
-/// Round a float to `places` decimal places, the way a real decimal-valued
-/// gauge (a price, a ratio) arrives: the stored f64 is the nearest double to
-/// the rounded decimal.
-fn round_to(v: f64, places: i32) -> f64 {
-    let scale = 10f64.powi(places);
-    (v * scale).round() / scale
-}
-
-/// Builds one dataset of exactly `n` samples. Deterministic in `(kind, n)`: a
-/// fixed per-kind seed, no wall-clock time, so the byte figures reproduce.
-fn dataset(kind: &str, n: usize) -> Dataset {
-    let mut rng = StdRng::seed_from_u64(0x0C0D_EC00 ^ (n as u64) ^ seed_of(kind));
-    let values: Vec<f64> = match kind {
-        // Cumulative integer counter, small integer increments, ~2% reset to 0.
-        "counter_int_resets" => {
-            let mut acc = 0i64;
-            (0..n)
-                .map(|_| {
-                    if rng.random_bool(0.02) {
-                        acc = 0;
-                    } else {
-                        acc += rng.random_range(1..=10);
-                    }
-                    acc as f64
-                })
-                .collect()
-        }
-        // Integer gauge random walk, non-negative.
-        "gauge_int" => {
-            let mut acc = rng.random_range(0..1000) as i64;
-            (0..n)
-                .map(|_| {
-                    acc = (acc + rng.random_range(-5..=5)).max(0);
-                    acc as f64
-                })
-                .collect()
-        }
-        // 2-decimal gauge (e.g. a price) random walk.
-        "gauge_dec2" => {
-            let mut acc = round_to(rng.random_range(0.0..1000.0), 2);
-            (0..n)
-                .map(|_| {
-                    acc = round_to(acc + rng.random_range(-1.0..1.0), 2);
-                    acc
-                })
-                .collect()
-        }
-        // 3-decimal gauge random walk.
-        "gauge_dec3" => {
-            let mut acc = round_to(rng.random_range(0.0..1000.0), 3);
-            (0..n)
-                .map(|_| {
-                    acc = round_to(acc + rng.random_range(-1.0..1.0), 3);
-                    acc
-                })
-                .collect()
-        }
-        // Arbitrary noisy floats: no low decimal exponent reproduces them.
-        "noisy_float" => (0..n)
-            .map(|_| rng.random_range(-1_000_000.0..1_000_000.0))
-            .collect(),
-        // Constant series.
-        "constant" => vec![42.0; n],
-        // Sparse: mostly zero, ~10% integer spikes.
-        "sparse" => (0..n)
-            .map(|_| {
-                if rng.random_bool(0.1) {
-                    rng.random_range(1..=1000) as f64
-                } else {
-                    0.0
-                }
-            })
-            .collect(),
-        // The round-one control: a counter that increments by a random float.
-        "float_counter" => {
-            let mut acc = 0.0f64;
-            (0..n)
-                .map(|_| {
-                    acc += rng.random_range(0.0..5.0);
-                    acc
-                })
-                .collect()
-        }
-        other => panic!("unknown dataset {other}"),
-    };
+/// Builds one dataset of exactly `n` samples from the shared shape
+/// definitions ([`value_stream`]). Deterministic in `(shape, n)`: the bake-off
+/// uses `salt = 0`, one stream per dataset.
+fn dataset(shape: ValueShape, n: usize) -> Dataset {
     Dataset {
-        name: dataset_label(kind),
-        values,
+        name: shape.label(),
+        values: value_stream(shape, n, 0),
     }
 }
-
-fn seed_of(kind: &str) -> u64 {
-    kind.bytes().fold(1469598103934665603u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(1099511628211)
-    })
-}
-
-fn dataset_label(kind: &str) -> &'static str {
-    match kind {
-        "counter_int_resets" => "counter_int_resets",
-        "gauge_int" => "gauge_int",
-        "gauge_dec2" => "gauge_dec2",
-        "gauge_dec3" => "gauge_dec3",
-        "noisy_float" => "noisy_float",
-        "constant" => "constant",
-        "sparse" => "sparse",
-        "float_counter" => "float_counter(ctrl)",
-        other => panic!("unknown dataset {other}"),
-    }
-}
-
-const DATASET_KINDS: [&str; 8] = [
-    "counter_int_resets",
-    "gauge_int",
-    "gauge_dec2",
-    "gauge_dec3",
-    "noisy_float",
-    "constant",
-    "sparse",
-    "float_counter",
-];
 
 fn bits_eq(a: &[f64], b: &[f64]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
@@ -323,8 +210,8 @@ fn main() {
         out.push_str(&format!(
             "\n======================= {page} samples per page =======================\n"
         ));
-        for kind in DATASET_KINDS {
-            let ds = dataset(kind, page);
+        for shape in ALL_SHAPES {
+            let ds = dataset(shape, page);
             let prod = measure_production(&ds.values);
             let challengers: Vec<Cell> = [
                 &Alp as &dyn ValueCodec,
