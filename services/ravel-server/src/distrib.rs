@@ -2173,6 +2173,46 @@ mod tests {
         let fetcher =
             RoutingSliceFetcher::new(self_cell, live, test_keys(), service, metrics.clone());
 
+        // Pinned BEFORE the loop runs, on purpose. Once the loop's first
+        // dead-mapped tenant quarantines the endpoint, the remote drops out of
+        // every ranking and `ranked_owners` answers `SelfLocal` for every
+        // tenant, so a self-mapped tenant found afterwards proves nothing. This
+        // one ranks self ahead of a live, un-quarantined remote.
+        let self_mapped = (0..1024u128)
+            .map(|i| uuid::Uuid::from_u128(i).into_bytes())
+            .find(|tenant| {
+                matches!(
+                    fetcher
+                        .ranked_owners(&pinned_request(*tenant, &[0]))
+                        .first(),
+                    Some(Owner::SelfLocal)
+                )
+            })
+            .expect("some tenant in 1024 ranks self first under rendezvous hashing");
+
+        // Drive the self-mapped unit BEFORE the loop, while the remote is still
+        // live and un-quarantined. That ordering is the whole point: once the
+        // loop quarantines the dead endpoint, a quarantine-skipped unit also
+        // runs locally without a fallback, so neither `saw_local` nor these
+        // assertions could tell a self-mapped unit from a skipped one. Run
+        // first, and "ran locally, never attempted a remote" means self-mapped.
+        let local_before = metrics.slices_local_total();
+        let fallback_before = metrics.slices_fallback_total();
+        fetcher
+            .fetch(pinned_request(self_mapped, &[0]))
+            .await
+            .expect("a self-mapped unit runs locally");
+        assert_eq!(
+            metrics.slices_local_total(),
+            local_before + 1,
+            "the pinned self-mapped unit ran locally"
+        );
+        assert_eq!(
+            metrics.slices_fallback_total(),
+            fallback_before,
+            "a self-mapped unit is not a fallback: it never attempted a remote"
+        );
+
         // Drive distinct rendezvous units until one maps to the unreachable
         // remote worker and one maps to self. A remote-mapped slice attempts
         // the unreachable endpoint, times out at transport (bounded by
@@ -2182,7 +2222,7 @@ mod tests {
         // timeouts rather than one per iteration.
         let mut saw_fallback = false;
         let mut saw_local = false;
-        let mut fetched = 0u64;
+        let mut fetched = 1u64; // the pinned self-mapped fetch above
         for i in 0..256u128 {
             let tenant = uuid::Uuid::from_u128(i).into_bytes();
             let fallback_before = metrics.slices_fallback_total();
@@ -2208,8 +2248,9 @@ mod tests {
         );
         assert!(
             saw_local,
-            "at least one unit mapped to self and ran locally"
+            "at least one unit ran locally (self-mapped or quarantine-skipped)"
         );
+
         // A fallback is executed locally, not counted as a successful remote.
         assert_eq!(metrics.slices_remote_total(), 0);
         // Every fetch resolved either locally or via local fallback; none failed.
