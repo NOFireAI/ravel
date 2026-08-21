@@ -17,6 +17,15 @@ this ADR did not flag: run-merged series cannot be executed over the
 distributed query path until #348 lands. See the Amendment at the end of this
 file before quoting any figure from the sections below.
 
+**Amended 2026-08-21 (issue #370): 8.88 is a worst-case control, not the
+representative cost.** Every 8.88 in this file, including the 2026-08-20
+amendment above, was measured on a fixture whose values are full-mantissa
+random floats. No integer-model value codec can fire on those by
+construction, so that figure measures the raw-`f64` fallback. Re-pointing the
+same fixture at realistic value shapes gives **2.50 to 3.00 bytes per
+sample** merged. Read 8.88 as the incompressible-value bound wherever it
+appears below. See "Amendment 2026-08-21" at the end of this file.
+
 ## Context
 
 ADR-0018 chose verbatim run preservation for L0-to-L1 compaction. An L1
@@ -525,3 +534,66 @@ run-merged L1 loses read fan-out until the wire format carries per-sample
 provenance. That extension is #348, under ADR-0096 (claimed). A reader
 sizing distributed-read capacity against ADR-0071 must account for this
 regression until #348 lands.
+
+## Amendment 2026-08-21: 8.88 is the incompressible-value bound (issue #370)
+
+The 2026-08-20 amendment recorded 8.88 bytes per sample as the shipped merged
+cost. That measurement was correct for the fixture it used and wrong as a
+representative figure, because of what the fixture put in the value column.
+
+`crates/ravel-bench/src/generator.rs` drew every value from a uniform random
+range, so every value was a full-mantissa `f64`. The integer-model codecs this
+ADR adopted cannot fire on that data: `digit_for`
+(`crates/ravel-segment/src/value_codecs.rs`) admits a decimal digit only when
+the reconstruction is bit-exact, and a 53-bit random mantissa admits no
+exponent in range. Gorilla's XOR gets almost nothing either, since the low
+mantissa bits differ on every sample. So the byte gate exercised the raw-`f64`
+fallback and the resulting number was quoted as the format's cost.
+
+This ADR's own round-two bake-off had already added realistic shapes for
+exactly this reason. The byte gate was never re-pointed at them. Issue #370
+did that, on the same 500x240 fixture, changing only the value column.
+
+### Measured, merged with provenance
+
+| Value shape | B/sample | Value encoding that fired |
+|---|---|---|
+| `gauge_int` | 2.4999 | `VAL_GCD_DELTA_FOR` (500 of 500 runs) |
+| `counter_int_resets` | 3.0038 | `VAL_ALP` (478), `VAL_GCD_DELTA_FOR` (22) |
+| `gauge_dec2` | 3.0043 | `VAL_GCD_DELTA_FOR` (500 of 500) |
+| `random_float` (control) | 8.8794 | `VAL_GORILLA` (362), `VAL_RAW_F64` (35) |
+
+The codecs fire on every realistic shape and never on the control, which is
+the mechanism this ADR predicted when it adopted them.
+
+### The section split, and what it implies
+
+| Value shape | `TS_PAGES` | `VAL_PAGES` | Timestamp share |
+|---|---|---|---|
+| `gauge_int` | 1.7727 | 0.5539 | 71% |
+| `counter_int_resets` | 1.7727 | 1.0555 | 59% |
+| `gauge_dec2` | 1.7727 | 1.0579 | 59% |
+| `random_float` (control) | 1.7727 | 6.9265 | 20% |
+
+On realistic data timestamps are the majority of a merged object and values
+are already well encoded. Work scoped against the control's profile, which put
+`VAL_PAGES` at most of the object and noted that value pages carry no
+general-purpose compressor, is aimed at the smaller term. The value-page
+compression question is correspondingly less valuable than it appeared.
+
+`TS_PAGES` is byte-identical at 15s and 60s scrape intervals, so interval
+length contributes nothing: the whole 1.7727 is the millisecond-resolution
+jitter defeating the GCD path that makes an exactly-regular stream nearly
+free. A jittered millisecond stream is the ordinary real-world shape.
+
+### What stands and what does not
+
+The decisions in this ADR stand. Run merging is what moves the fragmented
+shape to the merged one, and that ratio is unaffected: fragmentation costs
+per-run page headers and catalog rows regardless of value entropy.
+
+What does not stand is 8.88 as the number to quote. It is the bound for
+incompressible values. The representative range is 2.50 to 3.00, and the
+per-shape figures with their exact section splits are pinned in
+`crates/ravel-bench/tests/catalog_byte_gates_golden.txt`, regenerable with
+`REGEN_CATALOG_BYTE_GATES=1`.
