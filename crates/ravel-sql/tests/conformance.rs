@@ -136,6 +136,51 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         // `dur >= 20`; the sum is 60.
         (Category::Clause, "declared i64 typed comparison") => Some(Expect::Rows(2)),
         (Category::Clause, "declared i64 typed aggregate") => Some(Expect::Scalar(60.0)),
+
+        // ADR-0097 decision 8: one representative scalar per admitted family,
+        // each result re-derived from its literal inputs.
+        (Category::Scalar, "upper") => Some(Expect::Str("AB")),
+        // Character-wise reverse: 'résumé' -> 'émusér'. A byte-wise reverse
+        // would corrupt the two-byte 'é', so this is load-bearing for unicode.
+        (Category::Scalar, "reverse") => Some(Expect::Str("émusér")),
+        // to_char over a tz-free Date32, so the format is deterministic.
+        (Category::Scalar, "to_char") => Some(Expect::Str("2024-07-15")),
+        (Category::Scalar, "abs") => Some(Expect::Scalar(3.5)),
+        // Default (non-global) replace hits the first digit run only.
+        (Category::Scalar, "regexp_replace") => Some(Expect::Str("fooXbar")),
+        // hex of the single byte 0x61 ('a').
+        (Category::Scalar, "encode") => Some(Expect::Str("61")),
+        // Ravel UDFs over the fixture. The sample with value 3.0 belongs to
+        // series "b", whose only label is `__name__ = "b"`.
+        (Category::Scalar, "label") => Some(Expect::Str("b")),
+        // Series "b" carries 2 of the 4 samples, so the anchored matcher keeps
+        // exactly 2 rows.
+        (Category::Scalar, "label_match") => Some(Expect::Scalar(2.0)),
+        // Of the three log bodies ("conformance record 0/1/2"), only the second
+        // tokenizes to contain the word "1".
+        (Category::Scalar, "has_word") => Some(Expect::Scalar(1.0)),
+
+        // ADR-0097 decision 8: the eight admitted window functions, each result
+        // re-derived from the four fixture samples (values -1, 1, 2, 3; all
+        // distinct, so no ties). Each example aggregates the window column to a
+        // single deterministic scalar.
+        // 4 rows -> row numbers 1..=4 -> max 4.
+        (Category::Window, "row_number") => Some(Expect::Scalar(4.0)),
+        // Distinct values -> ranks 1,2,3,4 -> max 4.
+        (Category::Window, "rank") => Some(Expect::Scalar(4.0)),
+        // Distinct values -> dense ranks 1,2,3,4 -> max 4.
+        (Category::Window, "dense_rank") => Some(Expect::Scalar(4.0)),
+        // ntile(2) over 4 rows -> buckets 1,1,2,2 -> max bucket 2.
+        (Category::Window, "ntile") => Some(Expect::Scalar(2.0)),
+        // lag is null on the first row -> 3 non-null of 4.
+        (Category::Window, "lag") => Some(Expect::Scalar(3.0)),
+        // lead is null on the last row -> 3 non-null of 4.
+        (Category::Window, "lead") => Some(Expect::Scalar(3.0)),
+        // cume_dist reaches exactly 1.0 on the last row.
+        (Category::Window, "cume_dist") => Some(Expect::Scalar(1.0)),
+        // percent_rank = (rank-1)/(n-1); the last row is (4-1)/(4-1) = 1.0.
+        (Category::Window, "percent_rank") => Some(Expect::Scalar(1.0)),
+
         _ => None,
     }
 }
