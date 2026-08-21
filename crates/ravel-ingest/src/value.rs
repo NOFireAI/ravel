@@ -165,6 +165,13 @@ mod tests {
     use super::*;
     use ravel_types::Exemplar;
 
+    use crate::log_shard::est_record_bytes;
+    use crate::span_shard::est_span_bytes;
+    use ravel_otlp::logs_normalize::NormalizedLogRecord;
+    use ravel_otlp::traces_normalize::NormalizedSpan;
+    use ravel_rspan::StatusCode;
+    use ravel_types::logstream::{AttrValue, LogStreamId};
+
     fn labels_of(count: usize) -> LabelSet {
         let labels = (0..count)
             .map(|i| Label {
@@ -197,6 +204,139 @@ mod tests {
                 filtered_attributes: labels.iter().cloned().collect(),
             },
         }
+    }
+
+    /// A log record carrying `attr_count` attributes, each the identical
+    /// `("attr", "v")` pair, and every other field empty/zero so that
+    /// differencing two attribute widths cancels every fixed term and isolates
+    /// the per-attribute charge.
+    fn log_record_with(attr_count: usize) -> NormalizedLogRecord {
+        NormalizedLogRecord {
+            stream_id: LogStreamId([0u8; 16]),
+            stream_attrs: Vec::new(),
+            ts_ns: 1_000,
+            observed_ts_ns: 1_000,
+            severity_num: 9,
+            severity_text: String::new(),
+            body: String::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: (0..attr_count)
+                .map(|_| ("attr".to_string(), AttrValue::Str("v".to_string())))
+                .collect(),
+        }
+    }
+
+    /// A span carrying `attr_count` attributes, each the identical
+    /// `("attr", "v")` pair, everything else empty/zero. Same differencing
+    /// trick as [`log_record_with`].
+    fn span_with(attr_count: usize) -> NormalizedSpan {
+        NormalizedSpan {
+            trace_id: [0u8; 16],
+            span_id: [0u8; 8],
+            parent_span_id: None,
+            name: String::new(),
+            start_ts_ns: 1_000,
+            end_ts_ns: 1_100,
+            status_code: StatusCode::Unset,
+            status_message: None,
+            attrs: (0..attr_count)
+                .map(|_| ("attr".to_string(), "v".to_string()))
+                .collect(),
+        }
+    }
+
+    /// Every buffered-byte estimator feeding the one process-wide ingest byte
+    /// budget (ADR-0069) must charge a per-attribute struct header, not only the
+    /// attribute's string bytes. Metrics points and exemplars, log records, and
+    /// spans all charge that single shared ceiling by `Arc` (docs/ingest.md), so
+    /// if any one estimator drops the header term it silently undercharges the
+    /// ceiling on its own signal while the others charge honestly -- exactly the
+    /// skew this pin exists to catch.
+    ///
+    /// Each estimator's header term is isolated by differencing two attribute
+    /// widths with identical per-attribute content, which cancels every fixed
+    /// term (sample bytes, timestamps, body/name). The isolated term must equal
+    /// that estimator's own attribute-pair `size_of`: `Label` for metrics,
+    /// `(String, String)` for spans (byte-identical to `Label`), and the wider
+    /// `(String, AttrValue)` for logs. This is the pin that stops the four rules
+    /// drifting apart again.
+    #[test]
+    fn every_estimator_charges_a_per_attribute_header() {
+        const W: u64 = 8;
+        let label_sz = size_of::<Label>() as u64;
+
+        // Metrics point: header per label is `size_of::<Label>()`.
+        let labels = labels_of(W as usize);
+        let label_content: u64 = labels
+            .iter()
+            .map(|l| (l.name.len() + l.value.len()) as u64)
+            .sum();
+        let point = point_with(labels.clone());
+        let point_hdr = point.est_charge_bytes() - 16 - label_content;
+        assert_eq!(
+            point_hdr,
+            W * label_sz,
+            "IngestPoint::est_charge_bytes dropped the per-label header: \
+             {point_hdr} != {}",
+            W * label_sz
+        );
+
+        // Metrics exemplar: same `Label` header per filtered attribute.
+        let exemplar = exemplar_with(labels);
+        let exemplar_hdr =
+            (exemplar.est_bytes() - size_of::<IngestExemplar>()) as u64 - label_content;
+        assert_eq!(
+            exemplar_hdr,
+            W * label_sz,
+            "IngestExemplar::est_bytes dropped the per-attribute header: \
+             {exemplar_hdr} != {}",
+            W * label_sz
+        );
+
+        // Log record: pair is `(String, AttrValue)`, wider than a `Label`.
+        let log_pair = size_of::<(String, AttrValue)>() as u64;
+        let attr_content = W * ("attr".len() + "v".len()) as u64;
+        let log_hdr = (est_record_bytes(&log_record_with(W as usize))
+            - est_record_bytes(&log_record_with(0))) as u64
+            - attr_content;
+        assert_eq!(
+            log_hdr,
+            W * log_pair,
+            "est_record_bytes dropped the per-attribute header: {log_hdr} != {}",
+            W * log_pair
+        );
+
+        // Span: pair is `(String, String)`, byte-identical to a `Label`.
+        let span_pair = size_of::<(String, String)>() as u64;
+        let span_hdr = (est_span_bytes(&span_with(W as usize)) - est_span_bytes(&span_with(0)))
+            as u64
+            - attr_content;
+        assert_eq!(
+            span_hdr,
+            W * span_pair,
+            "est_span_bytes dropped the per-attribute header: {span_hdr} != {}",
+            W * span_pair
+        );
+
+        // Consistency across all four: the two-`String`-pair signals (point,
+        // exemplar, span) charge the identical per-attribute header, and the
+        // log record's `(String, AttrValue)` header is never smaller (a smaller
+        // one would undercharge the shared ceiling on logs against the rest).
+        assert_eq!(
+            span_pair, label_sz,
+            "span attr pair must match `Label` width"
+        );
+        assert!(
+            log_pair >= label_sz,
+            "log attr pair must be at least `Label` width"
+        );
+        assert_eq!(
+            point_hdr, exemplar_hdr,
+            "point and exemplar headers must agree"
+        );
+        assert_eq!(point_hdr, span_hdr, "point and span headers must agree");
     }
 
     /// The two buffered-byte estimators must charge one label the same way, or

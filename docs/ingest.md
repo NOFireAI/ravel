@@ -521,7 +521,13 @@ Each ingest write charges its estimated buffered bytes into the gauge in the
 router's write path, after decode/normalize/admission and before any shard
 buffer is touched (`IngestPoint::est_charge_bytes`: 16 bytes per sample plus,
 per label, the `Label` struct header and the name/value bytes, plus each
-exemplar's buffered width). If the charge would push the gauge past the ceiling
+exemplar's buffered width). The log and span routers charge the same gauge with
+`est_record_bytes`/`est_span_bytes`, and those apply the identical per-attribute
+rule: each attribute costs its pair struct header (`(String, AttrValue)` for a
+log attribute, `(String, String)` for a span attribute, the latter byte-for-byte
+the same as a `Label`) plus its key/value bytes. Counting only the string bytes
+on any one signal would undercharge this shared ceiling on that signal while the
+others charge honestly. If the charge would push the gauge past the ceiling
 (`--max-ingest-buffer-bytes`, default 512 MiB, `0` = unlimited) the request
 is shed *before* buffering: no shard is touched, no commit token is minted,
 the shed counter increments, and the caller gets HTTP 429 with `Retry-After`
