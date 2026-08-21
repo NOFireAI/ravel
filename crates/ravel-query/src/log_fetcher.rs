@@ -40,8 +40,8 @@ use ravel_catalog::SegmentRef;
 use ravel_logseg::footer::{self, kind};
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
-    AttrValue, BlockScan, ColumnSelection, LogRecord, LogSegError, LogStreamId, Predicate,
-    RlogConfig, RlogReader, ScanStats, read_section,
+    AttrValue, BlockScan, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError, LogStreamId,
+    Predicate, RlogConfig, RlogReader, ScanStats, read_section,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
@@ -246,12 +246,7 @@ impl LogSegmentScan {
             .in_scope(|| self.scan.next_block(&self.bytes))
             .map_err(|source| corrupt(&self.key, source))?;
         let Some(mut records) = decoded else {
-            if !self.finished {
-                self.finished = true;
-                let stats = self.scan.stats();
-                self.span.record("blocks_scanned", stats.blocks_scanned);
-                self.span.record("blocks_total", stats.blocks_total);
-            }
+            self.finish();
             return Ok(None);
         };
         // Selective-erasure exclusion (ADR-0064 decision 2), per block rather
@@ -261,6 +256,101 @@ impl LogSegmentScan {
         crate::erasure::retain_log_records(&mut records, &self.erasure);
         Ok(Some(records))
     }
+
+    /// Whether a pending erasure predicate applies to this scan, which is what
+    /// makes [`next_block_columnar`](Self::next_block_columnar) refuse.
+    pub fn erasure_pending(&self) -> bool {
+        !self.erasure.is_empty()
+    }
+
+    /// Columnar counterpart of [`next_block`](Self::next_block) (ADR-0099
+    /// decision 1): the same block, the same surviving rows in the same order,
+    /// handed out as a borrowed [`ColumnarBlockView`] instead of rebuilt
+    /// records. Same object bytes, same pruning, same `decode` span and the same
+    /// block counters recorded on exhaustion.
+    ///
+    /// The returned view borrows this scan, so it must be dropped before the
+    /// next call to either exit.
+    ///
+    /// # This exit refuses when erasure is pending
+    ///
+    /// [`next_block`](Self::next_block) excludes rows matching a pending
+    /// erasure predicate ([`crate::erasure::retain_log_records`], ADR-0064
+    /// decision 2). That exclusion is record-level and there is no columnar
+    /// form of it yet, so a view cannot honour it and this method hands one out
+    /// only when the scan carries no erasure predicate; otherwise it returns
+    /// [`ColumnarBlockOutcome::ErasurePending`] without decoding anything or
+    /// advancing the cursor, and the caller must drain the row exit instead.
+    ///
+    /// Failing closed here is deliberate: the failure mode of getting erasure
+    /// wrong is an erased record served to a client, not a slow query
+    /// (ADR-0099 decision 2).
+    pub fn next_block_columnar(&mut self) -> Result<ColumnarBlockOutcome<'_>, LogFetchError> {
+        if !self.erasure.is_empty() {
+            return Ok(ColumnarBlockOutcome::ErasurePending);
+        }
+        // Exhaustion is reported from the block count rather than from a `None`
+        // out of the cursor. The returned view borrows the cursor for as long as
+        // the caller holds it, which is longer than the counter-recording read
+        // of `scan.stats()` could borrow it for, so the two cannot share one
+        // call site.
+        if self.scan.remaining_blocks() == 0 {
+            self.finish();
+            return Ok(ColumnarBlockOutcome::Exhausted);
+        }
+        // Destructured so entering the span borrows only `span` and the view's
+        // borrow of the cursor is not held by a closure.
+        let Self {
+            bytes,
+            scan,
+            span,
+            key,
+            ..
+        } = self;
+        let entered = span.enter();
+        let decoded = scan.next_block_columnar(bytes);
+        drop(entered);
+        match decoded.map_err(|source| corrupt(key, source))? {
+            Some(view) => Ok(ColumnarBlockOutcome::Block(view)),
+            // Unreachable: a cursor with blocks remaining yields one. Reported
+            // as exhaustion rather than unwrapped, and `finished` is left unset
+            // so a following call still records the counters.
+            None => Ok(ColumnarBlockOutcome::Exhausted),
+        }
+    }
+
+    /// Records the scan's block counters on the `decode` span, exactly once,
+    /// when an exit reports exhaustion.
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let stats = self.scan.stats();
+        self.span.record("blocks_scanned", stats.blocks_scanned);
+        self.span.record("blocks_total", stats.blocks_total);
+    }
+}
+
+/// What [`LogSegmentScan::next_block_columnar`] produced.
+///
+/// Three outcomes rather than an `Option` because "no view" has two distinct
+/// causes that a caller must not conflate: the scan ran out of blocks, or it
+/// carries a pending erasure predicate the columnar path cannot evaluate. An
+/// `Option` would make the second look like the first and silently truncate a
+/// query's results.
+#[derive(Debug)]
+pub enum ColumnarBlockOutcome<'a> {
+    /// The next surviving block, as a borrowed columnar view.
+    Block(ColumnarBlockView<'a>),
+    /// Every surviving block has been decoded. `Block(view)` with a zero
+    /// surviving-row count is different: that block survived pruning and simply
+    /// held no matching row.
+    Exhausted,
+    /// A pending erasure predicate applies to this scan, so no view is handed
+    /// out. Nothing was decoded and the cursor did not advance; drain
+    /// [`LogSegmentScan::next_block`] instead.
+    ErasurePending,
 }
 
 /// Errors fetching and decoding one RLOG segment. Every variant is a hard
