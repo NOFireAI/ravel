@@ -10,12 +10,15 @@
 //!
 //! # Scalar-only, for now
 //!
-//! Distribution carries scalar series only. The histogram span payload grammar
-//! is future work (`proto/ravel/queryfrag.proto`'s `HistogramRun`), so a
-//! slice whose segments decode any native-histogram series returns
-//! [`pb::status::Code::Unsupported`]; the coordinator then silently falls back
-//! to fully local execution for the whole query (ADR-0071 failure semantics),
-//! never a partial or wrong result.
+//! Distribution carries scalar series only. The typed `HistogramRecord` wire
+//! shape now exists (`proto/ravel/queryfrag.proto`, ADR-0096 decision 2) and
+//! its codec is in place, but no encoder writes it onto a frame yet (the
+//! version flip that enables it is ADR-0096 decision 3 step 4, #379). So a
+//! slice whose segments still decode any native-histogram series -- after
+//! erasure filtering (ADR-0096 decision 3 step 3) removes any fully-erased
+//! ones -- returns [`pb::status::Code::Unsupported`]; the coordinator then
+//! silently falls back to fully local execution for the whole query (ADR-0071
+//! failure semantics), never a partial or wrong result.
 //!
 //! # Segment identity resolution
 //!
@@ -44,7 +47,7 @@ use crate::distrib::codec;
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
 use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::is_erased_span;
-use crate::fetcher::{FetchError, FetchStats, SegmentFetcher};
+use crate::fetcher::{FetchError, FetchStats, FetchedHistogramSeries, SegmentFetcher};
 use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
 use crate::span_fetcher::{SpanFetchError, SpanSegmentFetcher};
 
@@ -312,7 +315,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // returned snapshot into the query's aggregate (ADR-0071).
         let accounting = QueryAccounting::new();
         let mut scalar = Vec::new();
-        let mut any_histograms = false;
+        let mut histograms: Vec<FetchedHistogramSeries> = Vec::new();
         let mut stats = FetchStats::default();
         for seg in &segments {
             let (seg_scalar, seg_stats, seg_hist) = self
@@ -320,9 +323,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                 .fetch_soa_and_histograms_accounted(tenant_hash, seg, &matchers, &accounting)
                 .await
                 .map_err(map_fetch_error)?;
-            if !seg_hist.is_empty() {
-                any_histograms = true;
-            }
+            histograms.extend(seg_hist);
             stats.raw_f64_pages += seg_stats.raw_f64_pages;
             stats.raw_f64_bytes += seg_stats.raw_f64_bytes;
             scalar.push(seg_scalar);
@@ -346,13 +347,26 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             }
         }
 
+        // Selective-erasure exclusion on the histogram series, applied
+        // post-decode exactly as the local path applies it (ADR-0064, ADR-0071,
+        // ADR-0096 decision 3 step 3). Run BEFORE the histogram-refusal check so
+        // the refusal keys on the series that actually survive erasure, not on
+        // the raw per-segment fetch: an erasure predicate that erases every
+        // sample of every histogram series present leaves nothing to refuse.
+        // Filtering is observable here even though no encoder writes
+        // HistogramRecord onto the wire yet (that is #379): the Unsupported
+        // refusal below no longer fires when erasure emptied the histogram set.
+        if !erasure.is_empty() {
+            crate::erasure::retain_histogram_series(&mut histograms, &erasure);
+        }
+
         // Scalar-only distribution: hand a histogram-bearing slice back to the
         // coordinator's local fallback rather than return partial results. The
         // summary still carries this slice's accounting/stats so the
         // coordinator folds its spend before falling back to local (ADR-0071);
         // otherwise the histogram query would pay for this fetch twice and
         // report it once.
-        if any_histograms {
+        if !histograms.is_empty() {
             return Ok(vec![summary_frame(
                 &accounting.snapshot(),
                 0,
