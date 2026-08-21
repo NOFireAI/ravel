@@ -23,12 +23,13 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_types::Signal;
 
 /// A single-point write's charge, per [`IngestPoint::est_charge_bytes`]: 16
-/// bytes for the sample plus the label name/value bytes. `make_point(_, "m",
+/// bytes for the sample plus, per label, the `Label` struct header (two
+/// `String` headers, 48 bytes) and the name/value bytes. `make_point(_, "m",
 /// &[], ..)` carries exactly one label, `__name__="m"` (8 + 1 bytes), so the
-/// charge is 16 + 9 = 25. Hard-coded here on purpose: a change to the estimate
-/// formula must break this test, not silently shift the ceiling arithmetic
-/// below.
-const PER_POINT_CHARGE: u64 = 25;
+/// charge is 16 + 48 + 9 = 73. Hard-coded here on purpose: a change to the
+/// estimate formula must break this test, not silently shift the ceiling
+/// arithmetic below.
+const PER_POINT_CHARGE: u64 = 73;
 
 fn budgeted_router(
     store: Arc<dyn ObjectStoreBackend>,
@@ -60,9 +61,9 @@ async fn ceiling_shed_before_buffering() {
     let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
     let clock = TestClock::new(1_700_000_000_000_000_000);
 
-    // Ceiling admits two single-point writes (2 * 25 = 50) but not a third
-    // (50 + 25 = 75 > 60).
-    let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(60));
+    // Ceiling admits two single-point writes (2 * 73 = 146) but not a third
+    // (146 + 73 = 219 > 180).
+    let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(180));
     let router = budgeted_router(store, clock.clone(), budget.clone(), 2);
 
     // Hold every data-object PUT so the two fill flushes stay in flight,
@@ -71,7 +72,7 @@ async fn ceiling_shed_before_buffering() {
     let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
 
     // Two tenants, each one point, each flushing immediately (target_bytes 8 <
-    // the 25-byte point) and parking at the held data PUT.
+    // the 73-byte point) and parking at the held data PUT.
     let mut fills = Vec::new();
     for name in ["acme", "globex"] {
         let router = Arc::clone(&router);
@@ -96,7 +97,7 @@ async fn ceiling_shed_before_buffering() {
         "both fills' charges are held on the gauge while their flushes are in flight"
     );
 
-    // A third write would charge 25 more (75 > 60): it must shed before
+    // A third write would charge 73 more (219 > 180): it must shed before
     // routing. Buffered mode so the assertion does not depend on ack timing;
     // the shed happens in `write_points` before any shard is touched
     // regardless of mode.

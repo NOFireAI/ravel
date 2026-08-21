@@ -162,7 +162,13 @@ Single task per shard. No locks on the hot path; all state actor-local:
 - `exemplars: Vec<IngestExemplar>` in arrival order, one per exemplar the wire
   admitted for a series routed to this shard (ADR-0047)
 - `est_bytes`: running estimate (samples * 16 + label bytes on first sight,
-  plus ~40 bytes and its attribute strings per buffered exemplar)
+  plus the `IngestExemplar` struct width and its attribute bytes per buffered
+  exemplar). "Label bytes" means what the buffer holds, not what the object
+  will hold: each label costs `size_of::<Label>()` (two `String` headers, 48
+  bytes) plus its name and value bytes. Leaving the header term out
+  understates a ten-label series by roughly 480 bytes against the 200 it
+  counts, so both flush triggers and the process-wide budget below fire late
+  on exactly the label-heavy workloads they exist to bound.
 - `oldest_ns`: ingest-arrival time of the oldest buffered point
 - `waiters: Vec<oneshot::Sender<...>>` for strict-mode acks in this flush window
 - writer identity: (writer_id uuid, epoch, next_seq) owned by the process
@@ -513,9 +519,9 @@ covers every signal.
 
 Each ingest write charges its estimated buffered bytes into the gauge in the
 router's write path, after decode/normalize/admission and before any shard
-buffer is touched (`IngestPoint::est_charge_bytes`: 16 bytes per sample plus
-the point's label name/value bytes, plus each exemplar's buffered width). If
-the charge would push the gauge past the ceiling
+buffer is touched (`IngestPoint::est_charge_bytes`: 16 bytes per sample plus,
+per label, the `Label` struct header and the name/value bytes, plus each
+exemplar's buffered width). If the charge would push the gauge past the ceiling
 (`--max-ingest-buffer-bytes`, default 512 MiB, `0` = unlimited) the request
 is shed *before* buffering: no shard is touched, no commit token is minted,
 the shed counter increments, and the caller gets HTTP 429 with `Retry-After`
