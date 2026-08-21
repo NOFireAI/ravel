@@ -450,6 +450,7 @@ jobs:
   # 2026-07-28.
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
+  #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
   features:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
@@ -480,6 +481,8 @@ jobs:
         run: cargo check --locked -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress
         run: cargo check --locked -p ravel-bench --features flight-egress
+      - name: Check ravel-bench --features profiling
+        run: cargo check --locked -p ravel-bench --features profiling
 
   # Supply-chain gate. deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no

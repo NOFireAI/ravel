@@ -47,8 +47,16 @@ allow = [
 # tiny-keccak 2.0.2 is CC0-1.0 (public-domain equivalent). It enters
 # only through ahash's hashing constants (ahash <- arrow-array <- arrow).
 # Scoped so the global allow list above stays tight.
+#
+# inferno 0.11.x is CDDL-1.0. It enters only through pprof's `flamegraph`
+# feature (inferno <- pprof), which ravel-bench pulls behind its
+# off-by-default `profiling` feature. ravel-bench is `publish = false` and
+# is a benchmark harness with no production caller, so inferno never reaches
+# a shipped binary. Scoped to the crate name so the global allow list stays
+# tight and CDDL-1.0 is not permitted for any other dependency.
 exceptions = [
   { name = "tiny-keccak", allow = ["CC0-1.0"] },
+  { name = "inferno", allow = ["CDDL-1.0"] },
 ]
 
 [bans]

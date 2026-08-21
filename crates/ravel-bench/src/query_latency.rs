@@ -235,6 +235,12 @@ pub async fn run(config: &QueryLatencyConfig) -> Report {
     let duration_ms = (duration_ns / 1_000_000).max(1);
     let range_step_ms = (duration_ms / config.range_steps.max(1) as i64).max(1);
 
+    // Bracket only the measured query phase: the ingest + flush above build
+    // the fixture and are excluded, so the flamegraph reflects the PromQL
+    // evaluator and read path rather than workload construction. No-op unless
+    // the `profiling` feature is on and `RAVEL_BENCH_PROFILE_SVG` is set.
+    let profile = crate::profiling::ProfileSession::from_env("query_latency_bench");
+
     let mut instant_latencies_ns = Vec::with_capacity(config.instant_query_count);
     let mut instant_matched_series = 0usize;
     for i in 0..config.instant_query_count {
@@ -284,6 +290,9 @@ pub async fn run(config: &QueryLatencyConfig) -> Report {
             };
         }
     }
+
+    // Measured query phase ends here; write the flamegraph if profiling is on.
+    profile.finish();
 
     Report {
         config: ReportConfig {

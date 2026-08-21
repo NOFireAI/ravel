@@ -9,6 +9,7 @@ pub mod e2e;
 pub mod generator;
 pub mod harness;
 pub mod ingest;
+pub mod profiling;
 pub mod query_latency;
 #[cfg(feature = "parquet-baseline")]
 pub mod read_accounting;
