@@ -119,9 +119,10 @@ impl Distributed {
     /// - `Ok(Some(triple))` when every slice succeeded: the coordinator merges
     ///   it exactly as the local path merges its own fetch.
     /// - `Ok(None)` when the query must fall back to fully local execution: a
-    ///   worker reported [`pb::status::Code::Unsupported`] (version skew, a
-    ///   histogram-bearing slice, or a resolve-scope slice). ADR-0071's silent
-    ///   fallback, never an error to the user.
+    ///   worker reported [`pb::status::Code::Unsupported`] (version skew or a
+    ///   resolve-scope slice). ADR-0071's silent fallback, never an error to the
+    ///   user. As of `PROTOCOL_VERSION` 3 a native-histogram or run-merged scalar
+    ///   slice is served over the wire, not refused (ADR-0096 decision 3 step 4).
     /// - `Err(QueryError::Fetch(Store { NotFound }))` when a slice reported
     ///   [`pb::status::Code::SnapshotInvalidated`]: mapped to the exact error
     ///   the local path raises for a vanished segment, so the engine's existing
@@ -223,7 +224,9 @@ impl Distributed {
         // hard error still dominates them (precedence: hard > invalidated >
         // unsupported), matching the former collect-then-classify behavior.
         let mut distinct: HashSet<SeriesId> = HashSet::new();
+        let mut distinct_hist: HashSet<SeriesId> = HashSet::new();
         let mut per_slice: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
+        let mut per_slice_hist: Vec<Vec<FetchedHistogramSeries>> = Vec::new();
         // Running fold of the per-slice accounting snapshots (ADR-0071),
         // combined via the saturating merge so a worker near `u64::MAX` clamps
         // rather than wrapping past the bytes-scanned budget. This is the
@@ -256,6 +259,27 @@ impl Distributed {
                         }
                         distinct.insert(fs.series_id);
                     }
+                    // The identical distinct-series re-enforcement for histogram
+                    // series (ADR-0096 decision 3 step 4): a lying worker cannot
+                    // overrun the query's distinct-series cap by streaming
+                    // histogram runs any more than scalar ones, and a histogram
+                    // series is heavier per series than a scalar one, so the
+                    // collection-time memory bound matters at least as much here.
+                    // `merge_histogram_soa_runs` re-enforces `max_series` once
+                    // more at the final merge (its own `by_series` map is capped
+                    // the same way `merge_soa_runs` caps scalars), so this is
+                    // defense-in-depth layered on that, not a replacement.
+                    for hs in &response.histogram {
+                        if !distinct_hist.contains(&hs.series_id)
+                            && distinct_hist.len() >= config.max_series
+                        {
+                            return Err(QueryError::TooManySeries {
+                                count: distinct_hist.len() + 1,
+                                max: config.max_series,
+                            });
+                        }
+                        distinct_hist.insert(hs.series_id);
+                    }
                     // Bytes-scanned cap re-enforcement over the folded total so
                     // far, so a distributed query is bounded as tightly as a
                     // local one even if a worker under-reports its own trip.
@@ -265,6 +289,7 @@ impl Distributed {
                         return Err(err);
                     }
                     per_slice.push(response.scalar);
+                    per_slice_hist.push(response.histogram);
                 }
                 pb::status::Code::SnapshotInvalidated => invalidated = true,
                 pb::status::Code::Unsupported => {
@@ -338,7 +363,7 @@ impl Distributed {
             return Ok(None);
         }
 
-        Ok(Some((per_slice, stats, Vec::new())))
+        Ok(Some((per_slice, stats, per_slice_hist)))
     }
 
     /// Partitions the snapshot, dispatches one RLOG-family (Logs, Alerts, Audit)

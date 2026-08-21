@@ -2068,16 +2068,14 @@ mod tests {
         );
     }
 
-    /// A worker reporting `protocol_version` 1 is excluded from
-    /// `ranked_owners`'s candidate set when the coordinator speaks version 2:
-    /// the EXISTING version-skew filter (`record.protocol_version ==
-    /// codec::PROTOCOL_VERSION`) drops it at routing time, so its slices run
-    /// coordinator-local with no round trip. A version-matched worker at the
-    /// same endpoint is kept, proving the exclusion is the version filter, not
-    /// an unrelated routing miss.
+    /// A worker reporting the version below the coordinator's is excluded
+    /// from `ranked_owners`'s candidate set: the EXISTING version-skew filter
+    /// (`record.protocol_version == codec::PROTOCOL_VERSION`) drops it at
+    /// routing time, so its slices run coordinator-local with no round trip.
+    /// A version-matched worker at the same endpoint is kept, proving the
+    /// exclusion is the version filter, not an unrelated routing miss.
     #[test]
     fn version_skewed_worker_is_dropped_from_ranked_owners() {
-        assert_eq!(codec::PROTOCOL_VERSION, 2, "coordinator speaks version 2");
         let metrics = Arc::new(FragmentMetrics::new());
         let self_id = uuid::Uuid::from_u128(1);
         let other_id = uuid::Uuid::from_u128(2);
@@ -2100,20 +2098,22 @@ mod tests {
             )
         };
 
-        // Only a v1 worker in the set: it is filtered out, no owner remains, so
-        // the slice routes local (empty ranked list).
-        let v1 = make(codec::PROTOCOL_VERSION - 1);
+        // Only a skewed (one-below-current) worker in the set: it is filtered
+        // out, no owner remains, so the slice routes local (empty ranked list).
+        let skewed = make(codec::PROTOCOL_VERSION - 1);
         assert!(
-            v1.ranked_owners(&pinned_request([9u8; 16], &[0]))
+            skewed
+                .ranked_owners(&pinned_request([9u8; 16], &[0]))
                 .is_empty(),
-            "a v1 worker is excluded, leaving no remote owner"
+            "a version-skewed worker is excluded, leaving no remote owner"
         );
 
-        // The same worker at v2 is kept as a remote owner: the exclusion above is
-        // the version filter, not the worker being unroutable for another reason.
-        let v2 = make(codec::PROTOCOL_VERSION);
+        // The same worker at the current version is kept as a remote owner:
+        // the exclusion above is the version filter, not the worker being
+        // unroutable for another reason.
+        let matched = make(codec::PROTOCOL_VERSION);
         assert_eq!(
-            v2.ranked_owners(&pinned_request([9u8; 16], &[0])),
+            matched.ranked_owners(&pinned_request([9u8; 16], &[0])),
             vec![Owner::Remote("192.0.2.1:9".to_string())],
             "a version-matched worker is a remote owner"
         );

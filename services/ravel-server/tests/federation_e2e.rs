@@ -27,7 +27,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,12 +38,14 @@ use ravel_ingest::{Clock, SystemClock};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::{LabelMatcher, MatchOp, Value};
-use ravel_proto::queryfrag::v1 as pb;
-use ravel_query::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
+use ravel_query::distrib::proto::series_fetch_server::SeriesFetchServer;
 use ravel_query::distrib::{Federation, RemoteCluster};
 use ravel_query::http::{StaticBearerTokenResolver, TenantResolver};
 use ravel_query::{ByteLimit, EngineConfig, QueryEngine, QueryError};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_segment::{
+    HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, IngestBounds, ResetHint,
+    SegmentIdentity, SegmentWriter, SeriesInput, SeriesInputV3, SeriesValues,
+};
 use ravel_server::config::RemoteClusterConfig;
 use ravel_server::distrib::{FragmentAdmission, FragmentMetrics, FragmentService};
 use ravel_server::query::build_catalog;
@@ -122,6 +123,108 @@ async fn publish_series(
         },
     )
     .expect("write segment");
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: seq,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: base_ns + NS_PER_MIN,
+        ingest_hour_bucket: u32::try_from(base_ns / NS_PER_HOUR).expect("hour bucket fits u32"),
+    })
+    .expect("valid commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// Publish one real native-histogram RSEG segment (one series, one sample) for
+/// `tenant` under an `instance` label, anchored at `base_ns`, carrying `sum` as
+/// its histogram sum. The metrics sibling of [`publish_series`] for the
+/// native-histogram fan-out (ADR-0096); `seq` makes each publish land on a
+/// distinct commit-record key.
+async fn publish_histogram_series(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    base_ns: i64,
+    instance: &str,
+    sum: f64,
+    count: u64,
+    seq: u64,
+) {
+    let tenant_hash = tenant.hash();
+    let label_set = LabelSet::new(vec![
+        Label {
+            name: "__name__".to_string(),
+            value: METRIC.to_string(),
+        },
+        Label {
+            name: "instance".to_string(),
+            value: instance.to_string(),
+        },
+    ])
+    .expect("valid labels");
+    let value = HistogramValue {
+        scale: 0,
+        zero_threshold: 0.0,
+        sum: Some(sum),
+        custom_values: None,
+        positive_spans: vec![HistogramSpan {
+            offset: 0,
+            length: 1,
+        }],
+        negative_spans: Vec::new(),
+        counts: HistogramCounts::Int {
+            zero_count: 0,
+            count,
+            positive: vec![count],
+            negative: Vec::new(),
+        },
+        reset_hint: ResetHint::Unknown,
+    };
+    let inputs = vec![SeriesInputV3 {
+        series_id: SeriesId::compute(tenant, METRIC, &label_set).expect("series id"),
+        labels: label_set,
+        values: SeriesValues::Histogram(vec![HistogramSample {
+            ts_ns: base_ns,
+            value,
+        }]),
+    }];
+
+    let writer_id = uuid::Uuid::from_u128(u128::from(seq) + 0x1000);
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: seq,
+    };
+    let written = SegmentWriter::write_histograms(
+        inputs,
+        identity,
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write histogram segment");
 
     let rec = record::build(NewCommitRecord {
         tenant_hash,
@@ -747,182 +850,101 @@ async fn federated_query_merges_remote_series() {
     remote.stop().await;
 }
 
-/// A fake remote `SeriesFetch` server that answers every fetch with a single
-/// well-formed native-histogram frame.
+/// ADR-0096 acceptance (decision 3 step 4, deliverable 6/7): a healthy remote at
+/// the SAME `PROTOCOL_VERSION`, serving real native-histogram series through the
+/// real `FragmentService` fragment surface, genuinely contributes its histogram
+/// data to the federated merge. The federated result equals a local query over a
+/// single store holding BOTH datasets (histogram `sum` compared as bits), and the
+/// coverage is complete (not partial, no warning) -- the pre-flip contract where
+/// any histogram frame was a skippable coverage gap is gone.
 ///
-/// Unlike [`spawn_remote`]'s real [`FragmentService`], which only ever serves
-/// scalar frames, this drives the coordinator's PRODUCTION decode path down its
-/// native-histogram arm: the frame is well-formed on the wire, so the real
-/// `ravel_query::distrib::client::decode_slice_frames` (reached through the real
-/// [`FederationSliceFetcher`], not a fake fetcher that yields the error
-/// directly) is what returns `DistribError::HistogramUnsupported`. Federation
-/// then routes that through `handle_unavailable` (the skip_unavailable
-/// coverage-gap path), distinct from the non-skippable "malformed response"
-/// hard fault.
-struct HistogramFrameService;
-
-#[tonic::async_trait]
-impl SeriesFetch for HistogramFrameService {
-    type FetchStream =
-        Pin<Box<dyn futures::Stream<Item = Result<pb::FetchResponse, tonic::Status>> + Send>>;
-
-    async fn fetch(
-        &self,
-        _request: tonic::Request<pb::FetchRequest>,
-    ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
-        // One well-formed histogram frame. `decode_slice_frames` returns
-        // `HistogramUnsupported` on the first `Hist` frame, before it looks for
-        // a terminal summary, so no summary frame is needed to reach the arm
-        // under test.
-        let frame = pb::FetchResponse {
-            frame: Some(pb::fetch_response::Frame::Hist(pb::HistogramFrame {
-                series_id: vec![0u8; 16],
-                labels: Vec::new(),
-                runs: Vec::new(),
-            })),
-        };
-        let stream = futures::stream::iter(vec![Ok(frame)]);
-        Ok(tonic::Response::new(Box::pin(stream)))
-    }
-}
-
-/// Stand up the [`HistogramFrameService`] on a real gRPC listener, returning its
-/// endpoint and a shutdown handle. Same server harness as [`spawn_remote`], but
-/// serving a canned histogram frame instead of a real fragment surface. The
-/// `seen_auth` recorder is unused here (the coverage-gap path is about the
-/// decoded frame, not the presented principal), so it stays empty.
-async fn spawn_histogram_remote() -> Remote {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind histogram remote");
-    let addr = listener.local_addr().expect("histogram remote local addr");
-    let (tx, rx) = oneshot::channel::<()>();
-    let task = tokio::spawn(async move {
-        Server::builder()
-            .add_service(SeriesFetchServer::new(HistogramFrameService))
-            .serve_with_incoming_shutdown(TcpIncoming::from(listener), async {
-                let _ = rx.await;
-            })
-            .await
-            .expect("histogram remote serves");
-    });
-    Remote {
-        endpoint: addr.to_string(),
-        seen_auth: Arc::new(Mutex::new(Vec::new())),
-        shutdown: Some(tx),
-        task,
-    }
-}
-
-/// Item 1, skip half: a remote that answers with a real
-/// native-histogram frame over the wire is a coverage gap, not corruption.
-/// Driven through the REAL fetcher (`FederationSliceFetcher` -> the production
-/// `decode_slice_frames` -> `DistribError::HistogramUnsupported`), with
-/// `skip_unavailable = true` the federated query degrades to partial coverage
-/// with a warning naming the cluster; the local series still resolves.
+/// This replaces the pre-flip `federated_query_skips_histogram_remote_through_real_decode`
+/// / `federated_query_histogram_remote_fails_typed_without_skip` pair, which
+/// pinned a well-formed histogram frame as a coverage gap. Post-flip a
+/// well-formed `HistogramFrame` decodes to real data (the version gate means only
+/// a same-version coordinator receives one), so it merges rather than degrading
+/// coverage.
 ///
-/// Flip-line proof (the prove-the-test evidence): change the
-/// `Err(DistribError::HistogramUnsupported)` arm in
-/// `crates/ravel-query/src/distrib/federation.rs::Federation::fetch` to return a
-/// hard `QueryError::Federation { .. }` ("remote returned a malformed response")
-/// instead of routing through `handle_unavailable`, and this test fails: the
-/// `expect("skip_unavailable=true degrades ...")` panics because the query
-/// errors typed rather than degrading to partial. Restore the arm and it passes.
+/// Mutation proof: stubbing `encode_histogram_frame` to omit `records` makes the
+/// remote's decoded run length disagree with its timestamps, so the coordinator's
+/// `decode_slice_frames` raises `HistogramRunLengthMismatch`; with
+/// `skip_unavailable = false` that is a hard `QueryError::Federation` fault and
+/// this test's `expect("federated histogram query")` goes RED.
 #[tokio::test]
-async fn federated_query_skips_histogram_remote_through_real_decode() {
+async fn federated_query_merges_remote_histogram_series() {
     let base = now_ns() - 10 * NS_PER_MIN;
     let acme = TenantId::new("acme");
+    let t_ms = (base + NS_PER_MIN) / NS_PER_MS;
+    let now = now_ns();
+    let query = format!("histogram_sum({METRIC})");
 
+    // Local store: one native-histogram series (instance=local, sum=1.0).
     let local_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    publish_series(local_store.as_ref(), &acme, base, "local", 1.0, 1).await;
+    publish_histogram_series(local_store.as_ref(), &acme, base, "local", 1.0, 1, 1).await;
 
-    // A remote whose gRPC surface returns a well-formed histogram frame, so the
-    // coordinator's real decode path yields HistogramUnsupported.
-    let hist = spawn_histogram_remote().await;
+    // Remote store: a disjoint native-histogram series (instance=remote, sum=2.5),
+    // served through the real fragment surface at the same PROTOCOL_VERSION.
+    let remote_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_histogram_series(remote_store.as_ref(), &acme, base, "remote", 2.5, 3, 1).await;
+    let remote = spawn_remote(remote_store, OPERATOR_CRED, &acme).await;
 
-    let clusters = vec![make_remote_cluster(
-        "west",
-        &hist.endpoint,
-        OPERATOR_CRED,
-        true,
-        Duration::from_secs(5),
-    )];
-    let catalog = build_catalog(local_store.clone(), 1, true, 0).expect("catalog");
-    let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
-        .with_federation(Arc::new(Federation::new(clusters)));
-
-    let (value, stats) = engine
-        .instant_with_stats(
-            acme.hash(),
-            METRIC,
-            (base + NS_PER_MIN) / NS_PER_MS,
-            &[],
-            now_ns(),
-            DEADLINE,
-        )
+    // Oracle: one store holding BOTH datasets, queried with no federation.
+    let oracle_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_histogram_series(oracle_store.as_ref(), &acme, base, "local", 1.0, 1, 1).await;
+    publish_histogram_series(oracle_store.as_ref(), &acme, base, "remote", 2.5, 3, 2).await;
+    let oracle_engine = QueryEngine::new(
+        build_catalog(oracle_store.clone(), 1, true, 0).expect("catalog"),
+        oracle_store,
+        EngineConfig::default(),
+    );
+    let (oracle_value, _) = oracle_engine
+        .instant_with_stats(acme.hash(), &query, t_ms, &[], now, DEADLINE)
         .await
-        .expect("skip_unavailable=true degrades past a histogram-only remote");
+        .expect("oracle histogram query");
 
-    assert!(
-        stats.partial,
-        "a histogram coverage gap must mark the query's coverage partial"
-    );
-    assert!(
-        stats.warnings.iter().any(|w| w.contains("west")),
-        "the histogram remote must be named in warnings: {:?}",
-        stats.warnings
-    );
-
-    // The local series still resolves; the histogram remote contributed nothing
-    // but was skipped rather than failing the query.
-    let bits = vector_bits(&value);
-    assert!(
-        bits.iter().any(|(k, _)| k.contains("instance=local")),
-        "the local series must survive the histogram coverage gap: {bits:?}"
-    );
-
-    hist.stop().await;
-}
-
-/// Item 1, default half: with `skip_unavailable = false`, the same
-/// histogram-bearing remote (decoded through the real `decode_slice_frames`)
-/// fails the whole query typed as a `QueryError::Federation` naming the cluster
-/// -- the truthful skippable path taken non-skippably, never a masked drop and
-/// never a panic.
-#[tokio::test]
-async fn federated_query_histogram_remote_fails_typed_without_skip() {
-    let base = now_ns() - 10 * NS_PER_MIN;
-    let acme = TenantId::new("acme");
-    let local_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    publish_series(local_store.as_ref(), &acme, base, "local", 1.0, 1).await;
-
-    let hist = spawn_histogram_remote().await;
-    let cluster = make_remote_cluster(
-        "west",
-        &hist.endpoint,
+    // Federated: local store + one healthy histogram-serving remote.
+    let fed_engine = QueryEngine::new(
+        build_catalog(local_store.clone(), 1, true, 0).expect("catalog"),
+        local_store.clone(),
+        EngineConfig::default(),
+    )
+    .with_federation(Arc::new(Federation::new(vec![make_remote_cluster(
+        "east",
+        &remote.endpoint,
         OPERATOR_CRED,
         false,
-        Duration::from_secs(5),
-    );
-    let catalog = build_catalog(local_store.clone(), 1, true, 0).expect("catalog");
-    let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
-        .with_federation(Arc::new(Federation::new(vec![cluster])));
-
-    let err = engine
-        .instant_with_stats(
-            acme.hash(),
-            METRIC,
-            (base + NS_PER_MIN) / NS_PER_MS,
-            &[],
-            now_ns(),
-            DEADLINE,
-        )
+        Duration::from_secs(10),
+    )])));
+    let (fed_value, fed_stats) = fed_engine
+        .instant_with_stats(acme.hash(), &query, t_ms, &[], now, DEADLINE)
         .await
-        .expect_err("a histogram remote with skip_unavailable=false must fail the query typed");
+        .expect("federated histogram query");
+
     assert!(
-        matches!(err, QueryError::Federation { .. }),
-        "expected a typed QueryError::Federation, got {err:?}"
+        !fed_stats.partial,
+        "a same-version histogram remote is served, not a coverage gap: coverage is complete"
+    );
+    assert!(
+        fed_stats.warnings.is_empty(),
+        "no warnings when the histogram remote is healthy: {:?}",
+        fed_stats.warnings
+    );
+    let fed_bits = vector_bits(&fed_value);
+    assert_eq!(
+        fed_bits,
+        vector_bits(&oracle_value),
+        "the federated histogram union must equal the locally-computed union of both datasets"
+    );
+    // Not "two equal empties": the remote's histogram series really merged in.
+    assert_eq!(
+        fed_bits.len(),
+        2,
+        "both the local and the remote histogram series must be present: {fed_bits:?}"
+    );
+    assert!(
+        fed_bits.iter().any(|(k, _)| k.contains("instance=remote")),
+        "the remote's histogram series must be merged into the result: {fed_bits:?}"
     );
 
-    hist.stop().await;
+    remote.stop().await;
 }

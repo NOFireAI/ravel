@@ -350,10 +350,12 @@ Two behaviors worth knowing:
   `max_bytes_scanned` over the folded remote spend and fails typed regardless
   of `skip-unavailable`. A budget cap is a correctness bound, not an
   availability property.
-- **A data kind this build cannot decode across the boundary** (native
-  histogram frames) is a coverage gap, not a hard fault: skippable under
-  `skip-unavailable` with a truthful warning naming the reason, and a typed
-  error with that same reason without it.
+- **A malformed frame is never skippable.** A remote's response that fails to
+  decode (including a corrupt native-histogram frame) is treated as
+  corruption, not availability, and fails typed regardless of
+  `skip-unavailable`. Version skew is the only histogram-related coverage
+  gap: a remote at a different `PROTOCOL_VERSION` answers `Unsupported`
+  before it ever encodes a frame, and that is skippable.
 
 Federation assumes each cluster owns a **disjoint** slice of series identity —
 the intended deployment is region- or tenant-sharded, so one series lives in
@@ -479,10 +481,9 @@ operator opted that remote into it.
   <text class="t" x="32" y="170">query re-dispatched</text>
   <text class="t" x="20" y="202">Reached at the same point in the fan-out, without a re-dispatch:</text>
   <rect class="b" x="20" y="210" width="430" height="78"/>
-  <text class="h" x="32" y="228">Unsupported: version skew,</text>
-  <text class="t" x="32" y="244">a non-metrics signal, or a</text>
-  <text class="t" x="32" y="260">histogram-bearing slice</text>
-  <text class="t" x="32" y="276">=&gt; whole query runs fully local</text>
+  <text class="h" x="32" y="228">Unsupported: version skew or</text>
+  <text class="t" x="32" y="244">a non-metrics signal</text>
+  <text class="t" x="32" y="260">=&gt; whole query runs fully local</text>
   <rect class="b" x="480" y="210" width="440" height="78"/>
   <text class="h" x="492" y="228">deadline reached</text>
   <text class="t" x="492" y="244">coordinator cancels the fan-out; stream</text>
@@ -527,7 +528,7 @@ What an operator will actually observe, case by case:
 | A budget trips on a slice, or on the folded total | The same typed `TooManySeries` / `TooManyBytesScanned` a local query raises | HTTP 4xx with the usual budget error |
 | The query deadline is reached | The coordinator cancels the fan-out; stream teardown reaches the workers and drop-based cancellation frees their in-flight GETs and fragment permits | Normal deadline error; no leaked permits |
 | Protocol version skew during a rolling deploy | Skewed workers are dropped at routing time, so a mismatch costs no round trip; if none are eligible, the query runs fully local | `slices_local_total` rising, `slices_remote_total` flat |
-| A non-metrics signal or a histogram-bearing slice | The worker answers `Unsupported` and the coordinator silently re-runs the whole query locally | Nothing to the client; the already-paid remote fetch is still folded into the reported cost, so such a query reports both fetches |
+| A non-metrics signal | The worker answers `Unsupported` and the coordinator silently re-runs the whole query locally | Nothing to the client; the already-paid remote fetch is still folded into the reported cost, so such a query reports both fetches |
 | A remote cluster is slow or down | Fails typed by default; with `skip-unavailable=true`, continues with `partial: true` and one warning | `warnings[]` in the response envelope |
 
 Two invariants that make the retry logic safe, and that are worth knowing when
@@ -548,9 +549,6 @@ Deliberately, in this generation:
   need, are separately tracked.
 - **Logs and traces.** Only the metrics signal distributes. A slice for any
   other signal is answered `Unsupported`, and the query runs locally.
-- **Native histograms across the slice boundary.** A histogram-bearing slice
-  falls back to local execution, and a remote that streams histogram frames is
-  a coverage gap rather than a hard fault.
 - **Straggler hedging and slice rebalancing.** A slow-but-alive worker is
   waited on; only a failed or unavailable one is re-dispatched. An oversized
   ingest shard makes an oversized slice, because a shard is never split.
