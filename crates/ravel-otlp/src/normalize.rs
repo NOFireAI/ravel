@@ -651,30 +651,59 @@ struct NativeHistogramContext<'a> {
     ingest_ts_ns: i64,
 }
 
-/// Last-seen memo for `SeriesId::compute`, scoped to one `Metric`.
+/// Last-seen memo scoped to one `Metric`, keyed on the normalizer's input and
+/// caching the built `Arc<LabelSet>` alongside the `SeriesId` (ADR-0098
+/// decision 2). A hit clones an `Arc` and rebuilds nothing; the realistic OTLP
+/// shape is one series sampled over time, so on a run of points with identical
+/// attributes every point after the first pays one refcount bump instead of
+/// rebuilding the label set and recomputing the id.
 ///
-/// Within a metric `tenant` and `metric_name` are constant, and the built
-/// `LabelSet` (which carries `__name__`) fully determines the canonical
-/// series identity (ADR-0005), so an equal `LabelSet` always yields a
-/// bit-identical `SeriesId`. The realistic OTLP shape is a single series
-/// sampled over time: one metric holding many data points with identical
-/// attributes, emitted consecutively. A one-entry last-seen memo skips the
-/// per-point BLAKE3 hash across such a run while staying correct for
-/// interleaved or single-point metrics (a mismatch just recomputes).
+/// Two keying modes, one per producer shape, chosen by which method the caller
+/// uses:
 ///
-/// A hit is a full structural comparison of the label set, not a pointer
-/// compare: `LabelSet` compares as a `Vec<Label>` of `String` pairs, so it
-/// costs O(L) string comparisons, and it saves no allocation, because
-/// `SeriesId::compute` hashes through a thread-local scratch buffer that
-/// allocates nothing once warm. A miss adds a deep clone of the label set on
-/// top. `benches/normalize_alloc.rs` measures 46.05 allocations per point on
-/// interleaved series against 23.27 grouped, so this memo pays off only while
-/// points arrive in runs.
+/// - [`series_id_for_attributes`](Self::series_id_for_attributes), for gauge,
+///   sum, and native-histogram points. Within a metric `tenant`, `metric_name`
+///   and the resource labels are constant, so the raw attribute slice alone
+///   determines the label set. The key is that slice, compared by borrowed
+///   equality against the previous point's, which allocates nothing;
+///   determinism makes the sound direction hold (byte-equal raw input under a
+///   fixed scope always builds the same label set), and the comparison is
+///   order-sensitive on purpose (a reordered slice misses and rebuilds, which
+///   is correct and merely unsaved). Sanitisation is many-to-one, so distinct
+///   raw slices can build equal label sets; that direction only ever causes a
+///   miss.
 ///
-/// Fixed capacity of one entry; dropped when the metric's loop ends, so
-/// memory is bounded to a single label set.
+/// - [`series_id_for_built`](Self::series_id_for_built), for the classic
+///   histogram and summary explosion. The exploded series of one data point
+///   share a single raw attribute slice and differ only in the exploded name
+///   and the synthesized `le`/`quantile` label, so a raw-attributes-only key
+///   would hand every bucket the first bucket's id and labels -- silent data
+///   corruption the merge collision check cannot detect, because the wrong id
+///   and wrong labels travel as a consistent pair (ADR-0098). This path keeps
+///   the built-set comparison instead: it is correct, and with a one-entry
+///   memo the exploded series never repeat consecutively anyway, so it shares
+///   nothing and merely computes each id once.
+///
+/// A hit records only after `LabelSet::new` and `SeriesId::compute` both
+/// succeeded, and skips only label construction; every other admission check
+/// runs unconditionally in the caller, so the set of rejected points is
+/// identical with and without the memo.
+///
+/// Fixed capacity of one entry; dropped when the metric's loop ends, so memory
+/// is bounded to a single label set plus, on the attribute-keyed path, one
+/// copy of the raw attribute slice that keyed it.
 struct SeriesIdMemo {
-    last: Option<(LabelSet, SeriesId)>,
+    last: Option<MemoEntry>,
+}
+
+/// One cached series identity and the input that produced it.
+struct MemoEntry {
+    /// The raw attribute slice of the point that built this entry, for the
+    /// attribute-keyed path; `None` on the explode paths, which compare the
+    /// built label set held in `labels` instead.
+    attr_key: Option<Vec<KeyValue>>,
+    labels: Arc<LabelSet>,
+    series_id: SeriesId,
 }
 
 impl SeriesIdMemo {
@@ -682,27 +711,73 @@ impl SeriesIdMemo {
         SeriesIdMemo { last: None }
     }
 
-    /// Return the id for `labels`, reusing the last computation when the
-    /// label set is unchanged and otherwise computing and caching it. The
-    /// returned id is identical to calling `SeriesId::compute` directly.
-    fn series_id(
+    /// Resolve the id and shared label set for a gauge/sum/native-histogram
+    /// point keyed on its raw `attributes`. On a hit the cached `Arc` is
+    /// cloned and `build_labels` is never called; on a miss `build_labels`
+    /// consumes `attributes` to build the set (moving attribute-name strings,
+    /// the #367 optimisation), the id is computed, and both are cached along
+    /// with a copy of `attributes` as the key.
+    fn series_id_for_attributes<F>(
         &mut self,
         tenant: &TenantId,
         metric_name: &str,
-        labels: &LabelSet,
-    ) -> Result<SeriesId, TypeError> {
-        if let Some((last_labels, last_id)) = &self.last
-            && last_labels == labels
+        attributes: Vec<KeyValue>,
+        build_labels: F,
+    ) -> Result<(SeriesId, Arc<LabelSet>), Rejection>
+    where
+        F: FnOnce(Vec<KeyValue>) -> Result<LabelSet, Rejection>,
+    {
+        if let Some(entry) = &self.last
+            && entry.attr_key.as_deref() == Some(attributes.as_slice())
         {
             #[cfg(any(test, feature = "memo-stats"))]
             memo_stats::record_hit();
-            return Ok(*last_id);
+            return Ok((entry.series_id, Arc::clone(&entry.labels)));
         }
         #[cfg(any(test, feature = "memo-stats"))]
         memo_stats::record_miss();
-        let id = SeriesId::compute(tenant, metric_name, labels)?;
-        self.last = Some((labels.clone(), id));
-        Ok(id)
+        let key = attributes.clone();
+        let label_set = build_labels(attributes)?;
+        let series_id = SeriesId::compute(tenant, metric_name, &label_set)
+            .map_err(|_| Rejection::OversizedSeriesComponent)?;
+        let labels = Arc::new(label_set);
+        self.last = Some(MemoEntry {
+            attr_key: Some(key),
+            labels: Arc::clone(&labels),
+            series_id,
+        });
+        Ok((series_id, labels))
+    }
+
+    /// Resolve the id and shared label set for an already-built `label_set`,
+    /// keyed on the built set itself. Used by the explode paths, where the raw
+    /// attribute slice does not distinguish the exploded series (see the type
+    /// doc). The returned id is identical to calling `SeriesId::compute`
+    /// directly.
+    fn series_id_for_built(
+        &mut self,
+        tenant: &TenantId,
+        metric_name: &str,
+        label_set: LabelSet,
+    ) -> Result<(SeriesId, Arc<LabelSet>), TypeError> {
+        if let Some(entry) = &self.last
+            && entry.attr_key.is_none()
+            && *entry.labels == label_set
+        {
+            #[cfg(any(test, feature = "memo-stats"))]
+            memo_stats::record_hit();
+            return Ok((entry.series_id, Arc::clone(&entry.labels)));
+        }
+        #[cfg(any(test, feature = "memo-stats"))]
+        memo_stats::record_miss();
+        let series_id = SeriesId::compute(tenant, metric_name, &label_set)?;
+        let labels = Arc::new(label_set);
+        self.last = Some(MemoEntry {
+            attr_key: None,
+            labels: Arc::clone(&labels),
+            series_id,
+        });
+        Ok((series_id, labels))
     }
 }
 
@@ -912,25 +987,32 @@ fn build_point(
         }
     };
 
-    let mut labels = Vec::with_capacity(ctx.resource_labels.len() + dp.attributes.len() + 1);
-    labels.extend_from_slice(ctx.resource_labels);
-    labels.push(Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: ctx.metric_name.to_string(),
-    });
-    push_attribute_labels(&mut labels, std::mem::take(&mut dp.attributes), ctx.limits)?;
-
-    let label_set = LabelSet::new(labels).map_err(|err| match err {
-        TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
-        // LabelSet::new only ever returns DuplicateLabelName; this arm
-        // exists so a future TypeError variant can't silently pass through
-        // as an accepted point.
-        _ => Rejection::DuplicateLabelName(String::new()),
-    })?;
-
-    let series_id = memo
-        .series_id(ctx.tenant, ctx.metric_name, &label_set)
-        .map_err(|_| Rejection::OversizedSeriesComponent)?;
+    // ADR-0098: key the memo on the raw attribute slice, not on a built set.
+    // On a hit `build_labels` never runs and the cached `Arc` is cloned; on a
+    // miss it builds the set once (resource-label prefix, `__name__`, then the
+    // sanitised attributes with their names moved in). Every check above ran
+    // regardless, so a hit changes only whether labels are rebuilt.
+    let (series_id, label_set) = memo.series_id_for_attributes(
+        ctx.tenant,
+        ctx.metric_name,
+        std::mem::take(&mut dp.attributes),
+        |attributes| {
+            let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len() + 1);
+            labels.extend_from_slice(ctx.resource_labels);
+            labels.push(Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: ctx.metric_name.to_string(),
+            });
+            push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+            LabelSet::new(labels).map_err(|err| match err {
+                TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
+                // LabelSet::new only ever returns DuplicateLabelName; this arm
+                // exists so a future TypeError variant can't silently pass
+                // through as an accepted point.
+                _ => Rejection::DuplicateLabelName(String::new()),
+            })
+        },
+    )?;
 
     let mut informational: Vec<Rejection> = precision_loss.into_iter().collect();
     admit_exemplars(
@@ -945,7 +1027,7 @@ fn build_point(
     Ok((
         NormalizedPoint {
             series_id,
-            labels: Arc::new(label_set),
+            labels: label_set,
             sample: Sample {
                 ts_ns: event_ts_ns,
                 value,
@@ -980,22 +1062,26 @@ fn build_native_histogram_point(
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
     let value = build_histogram_value(dp)?;
 
-    let mut labels = Vec::with_capacity(ctx.resource_labels.len() + dp.attributes.len() + 1);
-    labels.extend_from_slice(ctx.resource_labels);
-    labels.push(Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: ctx.metric_name.to_string(),
-    });
-    push_attribute_labels(&mut labels, std::mem::take(&mut dp.attributes), ctx.limits)?;
-
-    let label_set = LabelSet::new(labels).map_err(|err| match err {
-        TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
-        _ => Rejection::DuplicateLabelName(String::new()),
-    })?;
-
-    let series_id = memo
-        .series_id(ctx.tenant, ctx.metric_name, &label_set)
-        .map_err(|_| Rejection::OversizedSeriesComponent)?;
+    // ADR-0098: a native histogram is one series per data point, keyed on the
+    // raw attribute slice like gauge/sum (see [`build_point`]).
+    let (series_id, label_set) = memo.series_id_for_attributes(
+        ctx.tenant,
+        ctx.metric_name,
+        std::mem::take(&mut dp.attributes),
+        |attributes| {
+            let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len() + 1);
+            labels.extend_from_slice(ctx.resource_labels);
+            labels.push(Label {
+                name: METRIC_NAME_LABEL.to_string(),
+                value: ctx.metric_name.to_string(),
+            });
+            push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+            LabelSet::new(labels).map_err(|err| match err {
+                TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
+                _ => Rejection::DuplicateLabelName(String::new()),
+            })
+        },
+    )?;
 
     let mut informational = Vec::new();
     if dp.min.is_some() || dp.max.is_some() {
@@ -1013,7 +1099,7 @@ fn build_native_histogram_point(
     Ok((
         NormalizedHistogramPoint {
             series_id,
-            labels: Arc::new(label_set),
+            labels: label_set,
             sample: HistogramSample {
                 ts_ns: event_ts_ns,
                 value,
@@ -1218,13 +1304,18 @@ fn finish_point(
         _ => Rejection::DuplicateLabelName(String::new()),
     })?;
 
-    let series_id = memo
-        .series_id(ctx.tenant, metric_name, &label_set)
+    // ADR-0098: the explode paths keep the built-set comparison. The exploded
+    // series of one data point share a raw attribute slice and differ only in
+    // `__name__` and the synthesized `le`/`quantile` label, so keying on that
+    // slice would false-hit every bucket after the first onto the first
+    // bucket's id and labels; comparing the built set cannot.
+    let (series_id, label_set) = memo
+        .series_id_for_built(ctx.tenant, metric_name, label_set)
         .map_err(|_| Rejection::OversizedSeriesComponent)?;
 
     Ok(NormalizedPoint {
         series_id,
-        labels: Arc::new(label_set),
+        labels: label_set,
         sample: Sample { ts_ns, value },
         // Whether an exploded bucket/sum/count series behaves like a
         // monotonic counter downstream is not decided here; the field is
@@ -3493,12 +3584,16 @@ mod tests {
         }
         let before = t0.elapsed();
 
-        // after: last-seen memo over the same order.
+        // after: last-seen memo over the same order (built-set comparison).
         let t1 = std::time::Instant::now();
         let mut memo = SeriesIdMemo::new();
         let mut after_ids = Vec::with_capacity(label_sets.len());
         for ls in &label_sets {
-            after_ids.push(memo.series_id(&tenant(), name, ls).expect("compute id"));
+            after_ids.push(
+                memo.series_id_for_built(&tenant(), name, (**ls).clone())
+                    .expect("compute id")
+                    .0,
+            );
         }
         let after = t1.elapsed();
 
@@ -4846,5 +4941,165 @@ mod tests {
         // with bytes identical to the oracle's.
         let out = sanitize_label_name(String::from("http.status.code"));
         assert_eq!(out, "http_status_code");
+    }
+
+    // --- ADR-0098: shared label set per series run ---
+
+    const MEMO_TS: i64 = 1_700_000_000_000_000_000;
+
+    /// ADR-0098 test 1 (the trap). One classic histogram data point with
+    /// several bounds explodes into `{name}_bucket{le=..}` per bound, `+Inf`,
+    /// `_sum`, and `_count`. Every exploded series must get a DISTINCT series
+    /// id, each equal to computing that id directly with no memo. A memo keyed
+    /// on the raw attribute slice alone would hand every bucket after the first
+    /// the first bucket's id and labels (they share one attribute slice and
+    /// differ only in `__name__` and `le`), which this distinctness check
+    /// catches; the explode path keeps the built-set comparison instead.
+    #[test]
+    fn histogram_explode_yields_distinct_ids_through_the_memo() {
+        let dp = histogram_point(
+            vec![string_kv("host", "a")],
+            MEMO_TS,
+            10,
+            Some(5.0),
+            vec![1.0, 2.5, 5.0],
+            vec![2, 3, 4, 1],
+        );
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![resource_metrics(
+                Vec::new(),
+                vec![histogram_metric(
+                    "lat",
+                    vec![dp],
+                    AggregationTemporality::Cumulative,
+                )],
+            )]),
+            &IngestLimits::default(),
+            MEMO_TS,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        // 3 explicit bounds -> 3 bucket series + `+Inf` bucket + `_sum` +
+        // `_count` = 6 exploded series.
+        assert_eq!(out.points.len(), 6);
+
+        let distinct: HashSet<SeriesId> = out.points.iter().map(|p| p.series_id).collect();
+        assert_eq!(
+            distinct.len(),
+            out.points.len(),
+            "every exploded series must have a distinct id; a raw-attributes-only \
+             key would collapse the buckets onto the first bucket's id"
+        );
+
+        // Each id equals computing it directly, with the exploded name (the
+        // point's own `__name__`) and its full label set.
+        for p in &out.points {
+            let name = p.labels.get(METRIC_NAME_LABEL).expect("__name__");
+            let direct = SeriesId::compute(&tenant(), name, &p.labels).expect("compute id");
+            assert_eq!(
+                p.series_id, direct,
+                "memoised id diverged from direct compute"
+            );
+        }
+    }
+
+    /// ADR-0098 test 4. A run of points with identical attributes shares ONE
+    /// `Arc<LabelSet>`: every produced point clones the same allocation, pinned
+    /// with `Arc::ptr_eq` rather than assumed.
+    #[test]
+    fn identical_attribute_run_shares_one_arc() {
+        let points: Vec<NumberDataPoint> = (0..5)
+            .map(|i| {
+                number_point(
+                    vec![string_kv("host", "a")],
+                    MEMO_TS + i,
+                    NumberValue::AsDouble(i as f64),
+                )
+            })
+            .collect();
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![resource_metrics(
+                Vec::new(),
+                vec![gauge_metric("cpu", points)],
+            )]),
+            &IngestLimits::default(),
+            MEMO_TS,
+        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.points.len(), 5);
+        let first = &out.points[0].labels;
+        for p in &out.points[1..] {
+            assert!(
+                Arc::ptr_eq(first, &p.labels),
+                "points of one run must share one Arc<LabelSet>"
+            );
+        }
+    }
+
+    /// ADR-0098 test 2. Memoised output is bit-identical to unmemoised output
+    /// over arbitrary requests, rejections included. The unmemoised oracle is
+    /// the same points split into one-data-point metrics of the same name: each
+    /// gets its own single-entry memo, so the memo never hits, while the
+    /// per-point results (id and full label set) are unchanged. `SeriesId`
+    /// bytes and full `LabelSet` contents are compared via the derived
+    /// `PartialEq` on `NormalizeOutput`.
+    ///
+    /// This exercises the attribute-keyed path (gauge points, where the memo
+    /// does hit on repeats); the intra-data-point explosion trap is pinned
+    /// separately by [`histogram_explode_yields_distinct_ids_through_the_memo`],
+    /// which the split oracle cannot see (one data point explodes through one
+    /// memo in both the grouped and split shapes).
+    fn attrs_of(spec: &[(u8, u8)]) -> Vec<KeyValue> {
+        spec.iter()
+            .enumerate()
+            .map(|(i, (_, v))| string_kv(&format!("k{i}"), &format!("v{v}")))
+            .collect()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn memoised_output_matches_unmemoised(
+            specs in proptest::collection::vec(
+                proptest::collection::vec((0u8..3, 0u8..3), 0usize..4),
+                1usize..12,
+            )
+        ) {
+            let tenant = tenant();
+            let limits = IngestLimits::default();
+
+            // Grouped: all data points in one metric -> the memo hits on
+            // repeated attribute slices.
+            let grouped_points: Vec<NumberDataPoint> = specs
+                .iter()
+                .enumerate()
+                .map(|(i, spec)| number_point(
+                    attrs_of(spec),
+                    MEMO_TS + i as i64,
+                    NumberValue::AsDouble(i as f64),
+                ))
+                .collect();
+            let grouped = request(vec![resource_metrics(
+                Vec::new(),
+                vec![gauge_metric("m", grouped_points)],
+            )]);
+
+            // Unmemoised oracle: each data point alone in its own metric of the
+            // same name, so every SeriesIdMemo sees exactly one point.
+            let split_metrics: Vec<Metric> = specs
+                .iter()
+                .enumerate()
+                .map(|(i, spec)| gauge_metric("m", vec![number_point(
+                    attrs_of(spec),
+                    MEMO_TS + i as i64,
+                    NumberValue::AsDouble(i as f64),
+                )]))
+                .collect();
+            let split = request(vec![resource_metrics(Vec::new(), split_metrics)]);
+
+            let memoised = normalize_metrics(&tenant, grouped, &limits, MEMO_TS);
+            let unmemoised = normalize_metrics(&tenant, split, &limits, MEMO_TS);
+            proptest::prop_assert_eq!(memoised, unmemoised);
+        }
     }
 }

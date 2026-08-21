@@ -1458,6 +1458,51 @@ mod buffer_accounting_tests {
         }
     }
 
+    /// ADR-0098 test 3. Two points with the same `series_id` and genuinely
+    /// different label sets, not sharing an `Arc`, still produce
+    /// `SeriesIdCollision`: the `Arc::ptr_eq` fast path does not fire on
+    /// distinct pointers, so the structural comparison runs and catches the
+    /// collision. If ptr_eq were the whole check this would be missed.
+    #[test]
+    fn distinct_arcs_with_different_labels_still_collide() {
+        let mut buf = TenantBuf::default();
+        let a = point(1, labels_of(3));
+        let b = point(1, {
+            let mut v: Vec<Label> = labels_of(3).iter().cloned().collect();
+            v.push(Label {
+                name: "extra".to_string(),
+                value: "x".to_string(),
+            });
+            LabelSet::new(v).expect("distinct label names")
+        });
+        assert!(
+            !Arc::ptr_eq(&a.labels, &b.labels),
+            "test setup: the two points must hold distinct Arcs"
+        );
+        let err = buf
+            .merge(vec![a, b], 1_000)
+            .expect_err("same id, different labels is a collision");
+        assert!(matches!(err, WriteError::SeriesIdCollision(_)), "{err:?}");
+    }
+
+    /// The complement pinning that `Arc::ptr_eq` is a fast path ONLY: two
+    /// points with the same `series_id` and structurally EQUAL labels but
+    /// distinct `Arc`s must be accepted, not rejected. The structural
+    /// comparison, not pointer identity, decides.
+    #[test]
+    fn distinct_arcs_with_equal_labels_do_not_collide() {
+        let mut buf = TenantBuf::default();
+        let a = point(1, labels_of(3));
+        let b = point(1, labels_of(3));
+        assert!(
+            !Arc::ptr_eq(&a.labels, &b.labels),
+            "test setup: the two points must hold distinct Arcs"
+        );
+        buf.merge(vec![a, b], 1_000)
+            .expect("equal labels under one id are not a collision");
+        assert_eq!(buf.series.len(), 1, "both points merged into one series");
+    }
+
     /// A second point for a series already in the buffer costs only its sample:
     /// the label bytes (headers included) are already counted. This is the
     /// deliberate asymmetry with `est_charge_bytes`, which cannot see buffer
