@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Date32Array, Date64Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 
@@ -206,6 +206,114 @@ type = "i64"
         )
         .await,
         0
+    );
+}
+
+/// A `Date32` (days since the epoch) and a `Date64` (milliseconds since the
+/// epoch) column load end to end as i64 attributes in their native unit, read
+/// back exactly, without being rescaled to nanoseconds or routed through the ts
+/// path (ADR-0100). Before Date32/Date64 were added to `read_i64`, the loader
+/// rejected the batch with "expected an integer column, found Date32", so this
+/// could not load at all.
+#[tokio::test]
+async fn date32_and_date64_columns_load_and_read_back_exactly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("dates.parquet");
+
+    // 19876 days since the epoch (2024-05-16); 1_700_000_000_000 ms since the
+    // epoch. Stored verbatim as i64 attribute values, not rescaled.
+    let d32: i32 = 19_876;
+    let d64: i64 = 1_700_000_000_000;
+    let batch = RecordBatch::try_from_iter(vec![
+        ("ts".to_string(), i64_col(vec![CLOCK_NS])),
+        ("svc".to_string(), str_col(vec!["api"])),
+        (
+            "event_date".to_string(),
+            Arc::new(Date32Array::from(vec![d32])) as ArrayRef,
+        ),
+        (
+            "event_ms".to_string(),
+            Arc::new(Date64Array::from(vec![d64])) as ArrayRef,
+        ),
+    ])
+    .expect("batch");
+    write_parquet(&pq, &batch);
+
+    let m = mapping(
+        r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+[[attribute]]
+key = "event_date"
+column = "event_date"
+type = "i64"
+
+[[attribute]]
+key = "event_ms"
+column = "event_ms"
+type = "i64"
+"#,
+    );
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let report = load::load(
+        Arc::clone(&store),
+        &pq,
+        "acme",
+        &m,
+        4,
+        10_000,
+        CLOCK_NS,
+        Arc::new(FixedClock(CLOCK_NS)),
+    )
+    .await
+    .expect("a date column loads as an i64 attribute");
+    assert_eq!(report.rows_processed, 1);
+
+    // The Date32 value reads back as its exact day count, the Date64 as its
+    // exact millisecond count (stringified in the attrs map).
+    assert_eq!(
+        logs_query_rows(
+            &store,
+            "acme",
+            &format!("SELECT ts FROM logs WHERE attrs['event_date'] = '{d32}'"),
+            &report.tokens,
+        )
+        .await,
+        1,
+        "the Date32 value is stored as its native day count ({d32}), not rescaled"
+    );
+    assert_eq!(
+        logs_query_rows(
+            &store,
+            "acme",
+            &format!("SELECT ts FROM logs WHERE attrs['event_ms'] = '{d64}'"),
+            &report.tokens,
+        )
+        .await,
+        1,
+        "the Date64 value is stored as its native millisecond count ({d64}), not rescaled"
+    );
+    // Not rescaled to nanoseconds: the ns-scaled value must NOT match.
+    assert_eq!(
+        logs_query_rows(
+            &store,
+            "acme",
+            &format!(
+                "SELECT ts FROM logs WHERE attrs['event_ms'] = '{}'",
+                d64 * 1_000_000
+            ),
+            &report.tokens,
+        )
+        .await,
+        0,
+        "the Date64 value is not multiplied to nanoseconds"
     );
 }
 
