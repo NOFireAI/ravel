@@ -346,6 +346,23 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
     };
     let batches = generate_batches(&workload).expect("generate workload");
 
+    // Start the CPU profiler here, immediately after fixture generation, so the
+    // measured region brackets the ingest write path and excludes workload
+    // construction. No-op unless the `profiling` feature is on and
+    // `RAVEL_BENCH_PROFILE_SVG` names an output path.
+    //
+    // pprof samples every on-CPU thread for the whole time its guard is held,
+    // so any harness instrumentation running concurrently with the write loop
+    // lands in the same flamegraph as the ingest path it measures. The
+    // visibility poller and the per-batch min-token catalog resolves, and the
+    // depth sampler, are exactly that: `Catalog::resolve`/`resolve_fanout` is
+    // the benchmark measuring itself, not `IngestRouter::write`. When a profile
+    // is active we skip all three so the samples attribute to the ingest path
+    // alone. A profiling run therefore reports no visibility-lag or
+    // depth-occupancy figures by design; drive an unprofiled run for those.
+    let profile = crate::profiling::ProfileSession::from_env("ingest_bench");
+    let measure_harness = !profile.is_active();
+
     let ack_deadline = Duration::from_secs(config.ack_timeout_secs);
     let pacing_interval = if config.points_per_sec == 0 {
         Duration::ZERO
@@ -364,68 +381,73 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
     // sampler covers the whole run including the trailing manual flushes.
     let run_done = Arc::new(AtomicBool::new(false));
 
-    let poller = tokio::spawn({
-        let catalog = Arc::clone(&catalog);
-        let clock = Arc::clone(&clock);
-        let pending = Arc::clone(&pending);
-        let lags_ns = Arc::clone(&lags_ns);
-        let writes_done = Arc::clone(&writes_done);
-        async move {
-            for _ in 0..VISIBILITY_POLL_MAX_ROUNDS {
-                tokio::time::sleep(VISIBILITY_POLL_INTERVAL).await;
-                let now_ns = clock.now_ns();
-                let listing_range = TimeRange {
-                    start_ns: run_start_ns,
-                    end_ns: now_ns,
-                };
-                match catalog
-                    .resolve(&tenant_hash, signal, listing_range, &[], now_ns)
-                    .await
-                {
-                    Ok(snapshot) => {
-                        let mut pending = pending.lock().expect("pending lock");
-                        let mut lags_ns = lags_ns.lock().expect("lags lock");
-                        for seg in snapshot.segments {
-                            if let Some(ack_wall_ns) = pending.remove(&seg.data_object_key) {
-                                lags_ns.push((now_ns - ack_wall_ns).max(0) as u64);
+    let poller = measure_harness.then(|| {
+        tokio::spawn({
+            let catalog = Arc::clone(&catalog);
+            let clock = Arc::clone(&clock);
+            let pending = Arc::clone(&pending);
+            let lags_ns = Arc::clone(&lags_ns);
+            let writes_done = Arc::clone(&writes_done);
+            async move {
+                for _ in 0..VISIBILITY_POLL_MAX_ROUNDS {
+                    tokio::time::sleep(VISIBILITY_POLL_INTERVAL).await;
+                    let now_ns = clock.now_ns();
+                    let listing_range = TimeRange {
+                        start_ns: run_start_ns,
+                        end_ns: now_ns,
+                    };
+                    match catalog
+                        .resolve(&tenant_hash, signal, listing_range, &[], now_ns)
+                        .await
+                    {
+                        Ok(snapshot) => {
+                            let mut pending = pending.lock().expect("pending lock");
+                            let mut lags_ns = lags_ns.lock().expect("lags lock");
+                            for seg in snapshot.segments {
+                                if let Some(ack_wall_ns) = pending.remove(&seg.data_object_key) {
+                                    lags_ns.push((now_ns - ack_wall_ns).max(0) as u64);
+                                }
+                            }
+                            if writes_done.load(Ordering::Acquire) && pending.is_empty() {
+                                break;
                             }
                         }
-                        if writes_done.load(Ordering::Acquire) && pending.is_empty() {
-                            break;
-                        }
+                        Err(err) => eprintln!("visibility: listing resolve failed: {err}"),
                     }
-                    Err(err) => eprintln!("visibility: listing resolve failed: {err}"),
                 }
             }
-        }
+        })
     });
 
     // Real periodic sample of the per-shard in-flight-flush gauge (ADR-0067
     // decision 2 consequence). Each tick records the max depth across shards;
     // `depth_report` turns the series into an occupancy histogram plus the
     // high-water mark. Samples at least once even for a sub-tick run because
-    // it reads before it sleeps.
+    // it reads before it sleeps. Skipped while profiling (see `profile` above):
+    // the per-tick gauge read is harness work, not the ingest path.
     let depth_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
-    let sampler = tokio::spawn({
-        let router = Arc::clone(&router);
-        let run_done = Arc::clone(&run_done);
-        let depth_samples = Arc::clone(&depth_samples);
-        async move {
-            loop {
-                let max_depth = router
-                    .metrics()
-                    .in_flight_flushes_by_shard()
-                    .into_iter()
-                    .map(|(_, count)| count)
-                    .max()
-                    .unwrap_or(0);
-                depth_samples.lock().expect("depth lock").push(max_depth);
-                if run_done.load(Ordering::Acquire) {
-                    break;
+    let sampler = measure_harness.then(|| {
+        tokio::spawn({
+            let router = Arc::clone(&router);
+            let run_done = Arc::clone(&run_done);
+            let depth_samples = Arc::clone(&depth_samples);
+            async move {
+                loop {
+                    let max_depth = router
+                        .metrics()
+                        .in_flight_flushes_by_shard()
+                        .into_iter()
+                        .map(|(_, count)| count)
+                        .max()
+                        .unwrap_or(0);
+                    depth_samples.lock().expect("depth lock").push(max_depth);
+                    if run_done.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::time::sleep(DEPTH_SAMPLE_INTERVAL).await;
                 }
-                tokio::time::sleep(DEPTH_SAMPLE_INTERVAL).await;
             }
-        }
+        })
     });
 
     let mut handles = Vec::with_capacity(batches.len());
@@ -448,11 +470,14 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
                 .await;
             let latency_ns = start.elapsed().as_nanos() as u64;
             let ack_wall_ns = clock.now_ns();
-            if let Ok(receipt) = &result {
+            if let (true, Ok(receipt)) = (measure_harness, &result) {
                 // Resolve this ack's exact segment (read-your-write min-token
                 // GET) right away, concurrently with every other in-flight
                 // batch, so the poller above can see it on its very next
                 // tick rather than only after the whole write phase ends.
+                // Skipped while profiling: this catalog resolve is the
+                // benchmark measuring visibility, not `IngestRouter::write`,
+                // and it otherwise dominates the flamegraph.
                 for token in &receipt.tokens {
                     let exact_range = TimeRange {
                         start_ns: ack_wall_ns,
@@ -497,9 +522,17 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
 
     router.flush_all().await;
     writes_done.store(true, Ordering::Release);
-    poller.await.expect("join visibility poller");
+    if let Some(poller) = poller {
+        poller.await.expect("join visibility poller");
+    }
     run_done.store(true, Ordering::Release);
-    sampler.await.expect("join depth sampler");
+    if let Some(sampler) = sampler {
+        sampler.await.expect("join depth sampler");
+    }
+
+    // Measured region ends here; write the flamegraph (if profiling is on)
+    // before the report-assembly work below enters the samples.
+    profile.finish();
 
     let visibility = {
         let pending = pending.lock().expect("pending lock");
