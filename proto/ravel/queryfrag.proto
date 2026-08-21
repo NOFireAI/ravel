@@ -162,6 +162,27 @@ message Run {
   uint64 writer_seq = 3;
   repeated sint64 ts_delta = 4 [packed = true];
   repeated fixed64 value_bits = 5 [packed = true];
+
+  // Per-sample dedup key columns (ADR-0092 decision 1, ADR-0096 decision 1),
+  // parallel to ts_delta. Either all four are present with length == ts_delta
+  // length, or all four are absent. Absent means run-wide provenance: the
+  // dedup key's first three elements are the run-wide created_unix_ns/
+  // writer_epoch/writer_seq fields above and its fourth element is the
+  // sample's array position. Present means a run-merged run whose samples came
+  // from different writes: these columns are then the authoritative dedup key
+  // and the run-wide fields above are not consulted for dedup on such a run.
+  //
+  // Delta-transformed exactly as ts_delta is: the first entry a delta from
+  // zero, each later entry a delta from its predecessor (zig-zag sint64 on the
+  // wire). writer_epoch/writer_seq are u64 in memory; they cross as sint64
+  // deltas via a two's-complement bit reinterpretation that round-trips every
+  // u64 losslessly. prov_in_page_index is not delta-transformed. proto3 omits
+  // empty packed repeated fields, so a run-wide run encodes byte-identical to
+  // one predating these fields.
+  repeated sint64 prov_created_delta = 6 [packed = true];
+  repeated sint64 prov_epoch_delta = 7 [packed = true];
+  repeated sint64 prov_seq_delta = 8 [packed = true];
+  repeated uint32 prov_in_page_index = 9 [packed = true];
 }
 
 // One histogram series. Mirrors SeriesFrame, but each run carries an opaque
@@ -182,6 +203,16 @@ message HistogramRun {
   // Opaque encoded histogram span payload for this run. Grammar deferred to a
   // later ticket; treated as an opaque blob by this contract.
   bytes span_payload = 5;
+
+  // Per-sample dedup key columns, identical in shape and semantics to
+  // `Run`'s fields 6-9 (ADR-0096 decision 1): either all four present with
+  // length == ts_delta length, or all absent (run-wide provenance). Same
+  // delta transform, same u64->sint64 reinterpretation, same byte-identity
+  // guarantee for a run-wide run. See `Run` above.
+  repeated sint64 prov_created_delta = 6 [packed = true];
+  repeated sint64 prov_epoch_delta = 7 [packed = true];
+  repeated sint64 prov_seq_delta = 8 [packed = true];
+  repeated uint32 prov_in_page_index = 9 [packed = true];
 }
 
 // One log-record frame for a slice of the RLOG family (Logs, Alerts, Audit),

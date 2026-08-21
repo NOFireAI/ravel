@@ -30,7 +30,7 @@ use ravel_rspan::{SpanRecord, StatusCode};
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
 use crate::erasure::ErasurePredicate;
-use crate::fetcher::FetchedSeriesSoa;
+use crate::fetcher::{FetchedSeriesSoa, SamplePriority};
 use crate::span_fetcher::SpanRow;
 
 /// The queryfrag protocol version this build speaks. A `FetchRequest` carrying
@@ -166,6 +166,18 @@ pub enum CodecError {
     BadContentHash { got: usize },
     #[error("run has {timestamps} timestamp deltas but {values} value words")]
     RunLengthMismatch { timestamps: usize, values: usize },
+    #[error(
+        "run provenance columns disagree in length: prov_created_delta {created}, \
+         prov_epoch_delta {epoch}, prov_seq_delta {seq}, prov_in_page_index \
+         {in_page_index}, samples {samples}"
+    )]
+    ProvenanceLengthMismatch {
+        created: usize,
+        epoch: usize,
+        seq: usize,
+        in_page_index: usize,
+        samples: usize,
+    },
     #[error("unknown label-matcher op discriminant {0}")]
     UnknownMatcherOp(i32),
     #[error("regex matcher {name:?} pattern {pattern:?} did not compile: {reason}")]
@@ -263,32 +275,28 @@ pub fn signal_from_u32(raw: u32) -> Result<Signal, CodecError> {
 /// become zig-zag deltas (delta-from-zero for the first), values become raw
 /// bit patterns.
 ///
-/// `pb::Run` carries run-wide provenance only. It CANNOT express a run-merged
-/// run's per-sample dedup priority column
-/// ([`FetchedSeriesSoa::per_sample_priorities`]): the four per-sample columns
-/// are not in the frozen `ravel.queryfrag.v1` `Run` message, and silently
-/// dropping them would make a distributed fetch pick a different winner at an
-/// overlapping timestamp than a local fetch. Since issue #315 the run-merged
-/// L1 producer exists, so such a run must never reach this encoder.
+/// `pb::Run` now carries the four packed per-sample provenance columns
+/// (`prov_created_delta`/`prov_epoch_delta`/`prov_seq_delta`/
+/// `prov_in_page_index`, ADR-0096 decision 1), so a run-merged run's
+/// per-sample dedup priority column
+/// ([`FetchedSeriesSoa::per_sample_priorities`]) is representable on the wire.
+/// When the column is `Some`, its samples' keys are delta-encoded into those
+/// four fields; when `None` the four fields stay empty and, because proto3
+/// omits empty packed repeated fields, the run encodes byte-identical to one
+/// predating this change.
 ///
-/// This function does NOT itself enforce that. The enforcing guard is at the
-/// service level ([`crate::distrib::service`]): a slice whose fetched scalar
-/// series carry a `per_sample_priorities` column is refused with
-/// [`pb::status::Code::Unsupported`] before the encode loop, handing the slice
-/// to the coordinator's local fallback (which is exact). The `debug_assert`
-/// below is a second line of defence that trips in test builds only; it
-/// compiles to nothing under `debug_assertions = off`, so it is not the guard.
-/// Carrying the merged shape over the wire means extending the `Run` message
-/// and bumping [`PROTOCOL_VERSION`] with it, tracked as issue #348 (bundled
-/// with the identical `HistogramRun` change); until then the merged shape must
-/// not be sent over the distributed path.
+/// This is the decode-side/structural half of the change only (issue #348 T1):
+/// [`PROTOCOL_VERSION`] is unchanged, and the service-level guard
+/// ([`crate::distrib::service`]) still refuses a slice whose fetched scalar
+/// series carry a `per_sample_priorities` column with
+/// [`pb::status::Code::Unsupported`] before the encode loop, handing it to the
+/// coordinator's exact local fallback. So in production a `Some` still never
+/// reaches this encoder; flipping the version and removing that refusal is a
+/// later step of the same epic. The round-trip is exercised entirely by this
+/// module's tests.
 pub fn encode_series_frame(series: &FetchedSeriesSoa) -> pb::SeriesFrame {
-    debug_assert!(
-        series.per_sample_priorities.is_none(),
-        "distributed frame cannot carry a per-sample provenance column; \
-         the service-level guard must refuse a run-merged series before it \
-         reaches this encoder (#348)"
-    );
+    let (prov_created_delta, prov_epoch_delta, prov_seq_delta, prov_in_page_index) =
+        encode_sample_priorities(&series.per_sample_priorities);
     pb::SeriesFrame {
         series_id: series.series_id.0.to_vec(),
         labels: encode_labels(&series.labels),
@@ -298,6 +306,10 @@ pub fn encode_series_frame(series: &FetchedSeriesSoa) -> pb::SeriesFrame {
             writer_seq: series.writer_seq,
             ts_delta: encode_ts_deltas(&series.timestamps),
             value_bits: series.values.iter().map(|v| v.to_bits()).collect(),
+            prov_created_delta,
+            prov_epoch_delta,
+            prov_seq_delta,
+            prov_in_page_index,
         }],
     }
 }
@@ -319,6 +331,13 @@ pub fn decode_series_frame(frame: pb::SeriesFrame) -> Result<Vec<FetchedSeriesSo
                     values: run.value_bits.len(),
                 });
             }
+            let per_sample_priorities = decode_sample_priorities(
+                &run.prov_created_delta,
+                &run.prov_epoch_delta,
+                &run.prov_seq_delta,
+                &run.prov_in_page_index,
+                run.ts_delta.len(),
+            )?;
             Ok(FetchedSeriesSoa {
                 series_id,
                 labels: labels.clone(),
@@ -327,9 +346,7 @@ pub fn decode_series_frame(frame: pb::SeriesFrame) -> Result<Vec<FetchedSeriesSo
                 created_unix_ns: run.created_unix_ns,
                 writer_epoch: run.writer_epoch,
                 writer_seq: run.writer_seq,
-                // `pb::Run` carries run-wide provenance only; see
-                // `encode_series_frame`.
-                per_sample_priorities: None,
+                per_sample_priorities,
             })
         })
         .collect()
@@ -357,6 +374,114 @@ fn decode_ts_deltas(deltas: &[i64]) -> Vec<i64> {
         out.push(acc);
     }
     out
+}
+
+/// The `u64`-domain twin of [`encode_ts_deltas`] for the `writer_epoch` and
+/// `writer_seq` provenance columns. Each value crosses the delta-transform
+/// boundary as `v as i64`, a two's-complement bit reinterpretation, never a
+/// numeric conversion: `u64 as i64` and its inverse `i64 as u64` are total
+/// bitcasts, so every one of the `2^64` possible `u64`s maps to a distinct
+/// `i64` bit pattern and back. The `wrapping_sub` delta then operates on that
+/// bit pattern, and `wrapping_sub`/`wrapping_add` are bit-identical across
+/// `i64` and `u64` (one two's-complement adder). So the round trip through
+/// [`decode_u64_deltas`] recovers every original `u64` exactly; the dedup key
+/// cannot be silently corrupted at this boundary. prost then applies the
+/// sint64 zig-zag transform over the `i64` we hand it, reversed on decode.
+fn encode_u64_deltas(values: &[u64]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(values.len());
+    let mut prev: i64 = 0;
+    for &v in values {
+        let cur = v as i64;
+        out.push(cur.wrapping_sub(prev));
+        prev = cur;
+    }
+    out
+}
+
+/// Inverse of [`encode_u64_deltas`]: a running `wrapping_add` prefix sum whose
+/// `i64` accumulator is reinterpreted back to `u64` per element.
+fn decode_u64_deltas(deltas: &[i64]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(deltas.len());
+    let mut acc: i64 = 0;
+    for &d in deltas {
+        acc = acc.wrapping_add(d);
+        out.push(acc as u64);
+    }
+    out
+}
+
+/// Encodes the optional per-sample provenance column into the four packed run
+/// columns (ADR-0096 decision 1). `None` yields four empty vecs, which proto3
+/// omits from the wire entirely, so a run-wide run stays byte-identical to one
+/// predating these fields. `Some` yields the four parallel columns:
+/// `created`/`epoch`/`seq` delta-transformed (the first two through the signed
+/// transform, the `u64` pair through [`encode_u64_deltas`]) and
+/// `in_page_index` copied verbatim (`uint32`, not delta-transformed).
+fn encode_sample_priorities(
+    priorities: &Option<Vec<SamplePriority>>,
+) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<u32>) {
+    match priorities {
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        Some(ps) => {
+            let created: Vec<i64> = ps.iter().map(|p| p.created_unix_ns).collect();
+            let epoch: Vec<u64> = ps.iter().map(|p| p.writer_epoch).collect();
+            let seq: Vec<u64> = ps.iter().map(|p| p.writer_seq).collect();
+            let in_page_index: Vec<u32> = ps.iter().map(|p| p.in_page_index).collect();
+            (
+                encode_ts_deltas(&created),
+                encode_u64_deltas(&epoch),
+                encode_u64_deltas(&seq),
+                in_page_index,
+            )
+        }
+    }
+}
+
+/// Inverse of [`encode_sample_priorities`]. All four columns empty decodes to
+/// `None` (run-wide provenance). If any is non-empty, all four must be present
+/// and every column's length must equal `sample_count` (the run's `ts_delta`
+/// length); an all-or-nothing disagreement is a typed
+/// [`CodecError::ProvenanceLengthMismatch`], mirroring
+/// [`CodecError::RunLengthMismatch`], never a truncated or fabricated key.
+fn decode_sample_priorities(
+    created_delta: &[i64],
+    epoch_delta: &[i64],
+    seq_delta: &[i64],
+    in_page_index: &[u32],
+    sample_count: usize,
+) -> Result<Option<Vec<SamplePriority>>, CodecError> {
+    if created_delta.is_empty()
+        && epoch_delta.is_empty()
+        && seq_delta.is_empty()
+        && in_page_index.is_empty()
+    {
+        return Ok(None);
+    }
+    if created_delta.len() != sample_count
+        || epoch_delta.len() != sample_count
+        || seq_delta.len() != sample_count
+        || in_page_index.len() != sample_count
+    {
+        return Err(CodecError::ProvenanceLengthMismatch {
+            created: created_delta.len(),
+            epoch: epoch_delta.len(),
+            seq: seq_delta.len(),
+            in_page_index: in_page_index.len(),
+            samples: sample_count,
+        });
+    }
+    let created = decode_ts_deltas(created_delta);
+    let epoch = decode_u64_deltas(epoch_delta);
+    let seq = decode_u64_deltas(seq_delta);
+    let priorities = (0..sample_count)
+        .map(|i| SamplePriority {
+            created_unix_ns: created[i],
+            writer_epoch: epoch[i],
+            writer_seq: seq[i],
+            in_page_index: in_page_index[i],
+        })
+        .collect();
+    Ok(Some(priorities))
 }
 
 fn decode_series_id(bytes: &[u8]) -> Result<SeriesId, CodecError> {
@@ -993,6 +1118,7 @@ mod tests {
                 writer_seq: 0,
                 ts_delta: vec![1, 2, 3],
                 value_bits: vec![1, 2],
+                ..Default::default()
             }],
         };
         assert!(matches!(
@@ -1002,6 +1128,244 @@ mod tests {
                 values: 2,
             })
         ));
+    }
+
+    /// A run whose `per_sample_priorities` is `Some` round-trips its four
+    /// provenance columns losslessly through the real wire (encode -> prost
+    /// bytes -> prost decode -> codec decode). The fixture drives negative
+    /// `created` deltas (1000 -> 900 -> -50), a decreasing `writer_seq`
+    /// (negative signed deltas), and a `writer_epoch` reaching `u64::MAX` (the
+    /// value the two's-complement `u64`->`sint64` reinterpretation is most
+    /// likely to corrupt if the boundary cast were numeric rather than a
+    /// bitcast), so the key survives across the full delta transform.
+    #[test]
+    fn series_run_carries_per_sample_provenance_round_trip() {
+        use prost::Message;
+
+        let priorities = vec![
+            SamplePriority {
+                created_unix_ns: 1000,
+                writer_epoch: 5,
+                writer_seq: 9,
+                in_page_index: 0,
+            },
+            SamplePriority {
+                created_unix_ns: 900,
+                writer_epoch: 5,
+                writer_seq: 3,
+                in_page_index: 2,
+            },
+            SamplePriority {
+                created_unix_ns: -50,
+                writer_epoch: u64::MAX,
+                writer_seq: 0,
+                in_page_index: 7,
+            },
+        ];
+        let soa = FetchedSeriesSoa {
+            series_id: SeriesId([1u8; 16]),
+            labels: label_set(&[("__name__", "m")]),
+            timestamps: vec![10, 20, 30],
+            values: vec![1.0, 2.0, 3.0],
+            created_unix_ns: 1000,
+            writer_epoch: 5,
+            writer_seq: 9,
+            per_sample_priorities: Some(priorities.clone()),
+        };
+
+        let frame = encode_series_frame(&soa);
+        let bytes = frame.encode_to_vec();
+        let wire = pb::SeriesFrame::decode(bytes.as_slice()).expect("prost decode");
+        let decoded = decode_series_frame(wire).expect("codec decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].per_sample_priorities,
+            Some(priorities),
+            "the per-sample provenance key round-trips byte-for-byte"
+        );
+        assert_eq!(&decoded[0].timestamps, &soa.timestamps);
+    }
+
+    /// The `HistogramRun` provenance columns share `Run`'s codec, so they
+    /// round-trip identically through the real wire. `HistogramRun`'s value
+    /// payload (`span_payload`) is untouched by this step (a later ticket
+    /// retires it), so this proves only that the provenance columns survive and
+    /// that `span_payload` is carried through unchanged alongside them.
+    #[test]
+    fn histogram_run_carries_per_sample_provenance_round_trip() {
+        use prost::Message;
+
+        let priorities = vec![
+            SamplePriority {
+                created_unix_ns: 7,
+                writer_epoch: 2,
+                writer_seq: 100,
+                in_page_index: 1,
+            },
+            SamplePriority {
+                created_unix_ns: -3,
+                writer_epoch: u64::MAX,
+                writer_seq: 40,
+                in_page_index: 0,
+            },
+        ];
+        let (prov_created_delta, prov_epoch_delta, prov_seq_delta, prov_in_page_index) =
+            encode_sample_priorities(&Some(priorities.clone()));
+        let run = pb::HistogramRun {
+            created_unix_ns: 7,
+            writer_epoch: 2,
+            writer_seq: 100,
+            ts_delta: encode_ts_deltas(&[1_000, 900]),
+            // Opaque, out of this step's scope; must survive unchanged.
+            span_payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            prov_created_delta,
+            prov_epoch_delta,
+            prov_seq_delta,
+            prov_in_page_index,
+        };
+
+        let bytes = run.encode_to_vec();
+        let back = pb::HistogramRun::decode(bytes.as_slice()).expect("prost decode");
+        assert_eq!(
+            back.span_payload,
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+            "the opaque histogram payload is carried through untouched"
+        );
+        let decoded = decode_sample_priorities(
+            &back.prov_created_delta,
+            &back.prov_epoch_delta,
+            &back.prov_seq_delta,
+            &back.prov_in_page_index,
+            back.ts_delta.len(),
+        )
+        .expect("decode provenance");
+        assert_eq!(
+            decoded,
+            Some(priorities),
+            "the histogram run's per-sample provenance key round-trips"
+        );
+    }
+
+    /// Provenance columns that disagree in length -- among themselves or with
+    /// `ts_delta` -- are a typed error, never a truncated or fabricated key.
+    /// Two shapes: one column short of the others, and all four consistent but
+    /// short of `ts_delta`.
+    #[test]
+    fn provenance_length_mismatch_is_typed_error() {
+        // prov_created_delta is len 2 while the run has 3 samples.
+        let one_short = pb::Run {
+            created_unix_ns: 0,
+            writer_epoch: 0,
+            writer_seq: 0,
+            ts_delta: vec![1, 2, 3],
+            value_bits: vec![1, 2, 3],
+            prov_created_delta: vec![0, 0],
+            prov_epoch_delta: vec![0, 0, 0],
+            prov_seq_delta: vec![0, 0, 0],
+            prov_in_page_index: vec![0, 0, 0],
+        };
+        let frame = pb::SeriesFrame {
+            series_id: vec![0u8; 16],
+            labels: vec![pb::Label {
+                name: "__name__".to_string(),
+                value: "m".to_string(),
+            }],
+            runs: vec![one_short],
+        };
+        assert!(matches!(
+            decode_series_frame(frame),
+            Err(CodecError::ProvenanceLengthMismatch {
+                created: 2,
+                epoch: 3,
+                seq: 3,
+                in_page_index: 3,
+                samples: 3,
+            })
+        ));
+
+        // All four columns len 2, but the run carries 3 samples.
+        let all_short = pb::Run {
+            created_unix_ns: 0,
+            writer_epoch: 0,
+            writer_seq: 0,
+            ts_delta: vec![1, 2, 3],
+            value_bits: vec![1, 2, 3],
+            prov_created_delta: vec![0, 0],
+            prov_epoch_delta: vec![0, 0],
+            prov_seq_delta: vec![0, 0],
+            prov_in_page_index: vec![0, 0],
+        };
+        let frame = pb::SeriesFrame {
+            series_id: vec![0u8; 16],
+            labels: vec![pb::Label {
+                name: "__name__".to_string(),
+                value: "m".to_string(),
+            }],
+            runs: vec![all_short],
+        };
+        assert!(matches!(
+            decode_series_frame(frame),
+            Err(CodecError::ProvenanceLengthMismatch { samples: 3, .. })
+        ));
+    }
+
+    /// A run carrying run-wide provenance only (`per_sample_priorities: None`)
+    /// encodes byte-identical to a run predating the provenance columns. proto3
+    /// omits empty packed repeated fields, so the four new fields must
+    /// contribute zero bytes. The `expected` value fixes the pre-provenance
+    /// shape independently (fields 1-5 only, the four columns defaulted empty),
+    /// so the assertion fails if the encoder ever emits the columns for a `None`
+    /// run. A decode-back check confirms the columns are absent on the wire, not
+    /// merely emitted as zero-length data.
+    #[test]
+    fn run_wide_only_encodes_byte_identical_to_pre_provenance() {
+        use prost::Message;
+
+        let soa = FetchedSeriesSoa {
+            series_id: SeriesId([4u8; 16]),
+            labels: label_set(&[("__name__", "m"), ("k", "v")]),
+            timestamps: vec![10, 20, 30],
+            values: vec![1.0, 2.0, 3.0],
+            created_unix_ns: -42,
+            writer_epoch: 3,
+            writer_seq: 9,
+            per_sample_priorities: None,
+        };
+
+        let got = encode_series_frame(&soa).encode_to_vec();
+
+        let expected = pb::SeriesFrame {
+            series_id: soa.series_id.0.to_vec(),
+            labels: encode_labels(&soa.labels),
+            runs: vec![pb::Run {
+                created_unix_ns: soa.created_unix_ns,
+                writer_epoch: soa.writer_epoch,
+                writer_seq: soa.writer_seq,
+                ts_delta: encode_ts_deltas(&soa.timestamps),
+                value_bits: soa.values.iter().map(|v| v.to_bits()).collect(),
+                // The four provenance columns absent -- the pre-provenance shape.
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            got, expected,
+            "a run-wide-only run must encode byte-identical to the pre-provenance shape"
+        );
+
+        let decoded = pb::SeriesFrame::decode(got.as_slice()).expect("decode");
+        let run = &decoded.runs[0];
+        assert!(
+            run.prov_created_delta.is_empty(),
+            "no prov_created_delta bytes"
+        );
+        assert!(run.prov_epoch_delta.is_empty(), "no prov_epoch_delta bytes");
+        assert!(run.prov_seq_delta.is_empty(), "no prov_seq_delta bytes");
+        assert!(
+            run.prov_in_page_index.is_empty(),
+            "no prov_in_page_index bytes"
+        );
     }
 
     #[test]
