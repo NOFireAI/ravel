@@ -941,6 +941,161 @@ async fn scan_rows(
     rows_from_batches(&batches)
 }
 
+/// A row of the fixed-column projection (no `attrs`), so the columnar fast path
+/// and the reference can be compared over the columns the fast path builds.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ProjRow {
+    ts: i64,
+    observed_ts: i64,
+    severity_num: u8,
+    severity_text: String,
+    body: String,
+    trace_id: Option<Vec<u8>>,
+    span_id: Option<Vec<u8>>,
+    flags: u32,
+}
+
+impl From<&Row> for ProjRow {
+    fn from(r: &Row) -> Self {
+        ProjRow {
+            ts: r.ts,
+            observed_ts: r.observed_ts,
+            severity_num: r.severity_num,
+            severity_text: r.severity_text.clone(),
+            body: r.body.clone(),
+            trace_id: r.trace_id.clone(),
+            span_id: r.span_id.clone(),
+            flags: r.flags,
+        }
+    }
+}
+
+/// The block counters a scan published, and its rows over the fixed-column
+/// projection.
+struct ProjRun {
+    rows: Vec<ProjRow>,
+    columnar_batches: usize,
+    rowpath_batches: usize,
+}
+
+/// The `LogsScanExec` leaf of a physical plan, found by walking rather than by
+/// shape (the optimizer inserts a residual `FilterExec` and possibly a
+/// repartition above it).
+fn find_logs_scan(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    if plan.name() == "LogsScanExec" {
+        return Some(Arc::clone(plan));
+    }
+    plan.children().iter().find_map(|c| find_logs_scan(c))
+}
+
+/// Run the same query with a fixed-column projection (no `attrs`), so a query
+/// with no attribute predicate takes the columnar fast path and one with an
+/// attribute predicate (which folds `attrs` into the scan projection) takes the
+/// row path. Returns the projected rows and both path metrics, so the gate can
+/// assert which path ran as well as that the output is correct.
+async fn scan_projected(
+    store: Arc<dyn ObjectStoreBackend>,
+    snapshot: Snapshot,
+    query: &QuerySpec,
+) -> ProjRun {
+    let fetcher = LogSegmentFetcher::new(store);
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        QueryAccounting::new(),
+    );
+
+    let ctx = SessionContext::new();
+    let get_field = ScalarUDF::from(GetField::new());
+    let has_word = has_word_udf();
+    ctx.register_udf(get_field.clone());
+    ctx.register_udf(has_word.clone());
+    ctx.register_table("logs", Arc::new(provider))
+        .expect("register table");
+
+    let df = ctx.table("logs").await.expect("table");
+    let df = match query.to_filter(&get_field, &has_word) {
+        Some(filter) => df.filter(filter).expect("filter"),
+        None => df,
+    };
+    let df = df
+        .select_columns(&[
+            "ts",
+            "observed_ts",
+            "severity_num",
+            "severity_text",
+            "body",
+            "trace_id",
+            "span_id",
+            "flags",
+        ])
+        .expect("project fixed columns");
+    let plan = df.create_physical_plan().await.expect("physical plan");
+    let scan = find_logs_scan(&plan).expect("a LogsScanExec leaf");
+    let batches = collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
+        .await
+        .expect("collect");
+
+    let metrics = scan.metrics().expect("scan metrics");
+    let count = |name: &str| metrics.sum_by_name(name).map(|v| v.as_usize()).unwrap_or(0);
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ts = col_ts(batch, 0);
+        let observed_ts = col_ts(batch, 1);
+        let severity_num = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .expect("severity_num");
+        let severity_text = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("severity_text");
+        let body = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("body");
+        let trace = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("trace_id");
+        let span = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("span_id");
+        let flags = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("flags");
+        for i in 0..batch.num_rows() {
+            rows.push(ProjRow {
+                ts: ts.value(i),
+                observed_ts: observed_ts.value(i),
+                severity_num: severity_num.value(i),
+                severity_text: severity_text.value(i).to_string(),
+                body: body.value(i).to_string(),
+                trace_id: (!trace.is_null(i)).then(|| trace.value(i).to_vec()),
+                span_id: (!span.is_null(i)).then(|| span.value(i).to_vec()),
+                flags: flags.value(i),
+            });
+        }
+    }
+    ProjRun {
+        rows,
+        columnar_batches: count("columnar_batches"),
+        rowpath_batches: count("rowpath_batches"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The gate
 // ---------------------------------------------------------------------------
@@ -952,6 +1107,13 @@ proptest! {
     /// random ts-range / stream-attribute / has_word predicate combinations, the
     /// `logs` scan's output equals an independent record-by-record reference by
     /// exact multiset equality, every field byte-for-byte.
+    ///
+    /// Both scan paths are exercised (ADR-0099). The full-schema query projects
+    /// the `attrs` map, so it always takes the row path. A second run projects
+    /// only the fixed columns: with no attribute predicate it takes the columnar
+    /// fast path; with one, `attrs` folds back into the scan projection and it
+    /// takes the row path. Either way its output must match the reference's fixed
+    /// columns, and its published metric must name the path it took.
     #[test]
     fn scan_output_exactly_matches_reference_over_random_corpora_and_predicates(
         scenario in arb_scenario(),
@@ -980,6 +1142,40 @@ proptest! {
                 want.len()
             );
             prop_assert_eq!(&got, &want, "scan output must equal the reference exactly for query {:?}", query);
+
+            // The fixed-column projection, exercising the columnar fast path
+            // (and the row-path fallback when the query names an attribute).
+            let proj = scan_projected(Arc::clone(&backend), snapshot.clone(), &query).await;
+            let mut proj_got = proj.rows;
+            let mut proj_want: Vec<ProjRow> = want.iter().map(ProjRow::from).collect();
+            proj_got.sort();
+            proj_want.sort();
+            prop_assert_eq!(
+                &proj_got,
+                &proj_want,
+                "projected scan output must equal the reference for query {:?}",
+                query
+            );
+
+            // The projection carries no `attrs`, so the path is decided by
+            // whether the query names an attribute (which folds `attrs` back into
+            // the scan projection). An attribute predicate here is a stream-attr
+            // equality, evaluated through the `get_field` UDF residual.
+            if query.stream_attr.is_some() {
+                prop_assert_eq!(
+                    proj.columnar_batches, 0,
+                    "an attribute predicate must fold attrs in and take the row path"
+                );
+            } else if !proj_got.is_empty() {
+                prop_assert!(
+                    proj.columnar_batches > 0,
+                    "a fixed-only projection with no attribute predicate must take the fast path"
+                );
+                prop_assert_eq!(
+                    proj.rowpath_batches, 0,
+                    "the fast path must not fall back on this spill-free corpus"
+                );
+            }
             Ok(())
         })?;
     }
