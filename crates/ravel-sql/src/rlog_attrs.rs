@@ -138,7 +138,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// refinement). Per-record dynamic attributes with nested values are unaffected
 /// -- they are merged in verbatim by [`merged_attrs`] and rendered by
 /// [`attr_value_to_string`].
-fn decode_stream_attrs(blob: &[u8]) -> DFResult<Vec<(String, AttrValue)>> {
+pub(crate) fn decode_stream_attrs(blob: &[u8]) -> DFResult<Vec<(String, AttrValue)>> {
     let mut pos = 0usize;
     let mut out = Vec::new();
     // Resource attribute set.
