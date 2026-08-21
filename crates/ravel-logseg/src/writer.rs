@@ -111,6 +111,19 @@ pub struct WriteStats {
     /// Largest distinct-value count of any single non-capped indexed field in
     /// this object, or 0 when no field emitted a posting list.
     pub postings_distinct_max: u32,
+    /// Distinct `(name, type)` pairs that received a real dynamic column in
+    /// this object (docs/log-segment-format.md "FIELD_DIR"). Shaped like the
+    /// POSTINGS counters above: aggregate-only, no per-field label (the
+    /// ADR-0044 allowlist forbids one), so a `/metrics` renderer sees a used
+    /// count and, paired with `dynamic_columns_overflowed`, budget pressure
+    /// without a column name ever leaving this struct.
+    pub dynamic_columns_used: u32,
+    /// Distinct `(name, type)` pairs that found the `max_dynamic_columns`
+    /// budget full and folded into the `attrs_raw` overflow column instead of
+    /// getting their own column. Nonzero exactly when a load crossed the
+    /// budget, which is otherwise silent (ADR-0100 decision 1). Same
+    /// aggregate-only, no-per-field-label shaping as the fields above.
+    pub dynamic_columns_overflowed: u32,
 }
 
 /// The maximum byte length of a string value inserted into the bloom by exact
@@ -298,6 +311,12 @@ impl RlogWriter {
                 }
             }
         }
+        // Both budget numbers are known here without a second pass over the
+        // records: `distinct` holds every distinct `(name, type)` pair, and the
+        // loop below gives the first `max_dynamic_columns` of them a column. The
+        // used count is what `columns` ends with; the overflow is the rest, the
+        // pairs that fold into `attrs_raw` (docs/adrs/0100 decision 1).
+        let distinct_total = distinct.len();
         let mut column_of: HashMap<(String, u8), u32> = HashMap::new();
         let mut columns: Vec<(String, FieldType, u32)> = Vec::new();
         for (idx, (name, ty_byte)) in distinct.into_iter().enumerate() {
@@ -309,6 +328,8 @@ impl RlogWriter {
             column_of.insert((name.clone(), ty_byte), column_id);
             columns.push((name, ty, column_id));
         }
+        let dynamic_columns_used = columns.len() as u32;
+        let dynamic_columns_overflowed = distinct_total.saturating_sub(columns.len()) as u32;
         let ty_of_column: HashMap<u32, FieldType> =
             columns.iter().map(|(_, ty, id)| (*id, *ty)).collect();
 
@@ -687,6 +708,8 @@ impl RlogWriter {
                 postings_indexed_fields,
                 postings_distinct_total,
                 postings_distinct_max,
+                dynamic_columns_used,
+                dynamic_columns_overflowed,
             },
         ))
     }
@@ -1593,11 +1616,22 @@ mod tests {
     #[test]
     fn write_stats_report_no_postings_when_no_field_configured() {
         // No indexed fields: no POSTINGS section, so every write-side POSTINGS
-        // counter reports zero (absence is always legal, decision 5).
+        // counter reports zero (absence is always legal, decision 5). The
+        // dynamic-column counters are not POSTINGS counters: `base_record`'s
+        // stream blob carries `lib` as a scope-level i64, a numeric
+        // stream-level key, which draws one dynamic column even with no
+        // per-record attribute (docs/log-segment-format.md "FIELD_DIR"), so
+        // `dynamic_columns_used` is 1 and nothing overflows.
         let mut w = RlogWriter::new(RlogConfig::default(), identity());
         w.push(base_record(0, 0)).expect("push");
         let (_obj, stats) = w.finish_with_stats().expect("finish");
-        assert_eq!(stats, WriteStats::default());
+        assert_eq!(
+            stats,
+            WriteStats {
+                dynamic_columns_used: 1,
+                ..WriteStats::default()
+            }
+        );
     }
 
     #[test]
@@ -1653,5 +1687,146 @@ mod tests {
             })
             .expect("scan");
         assert_eq!(rows.len(), 1);
+    }
+
+    /// Bit-pattern attribute equality (CLAUDE.md: float compares use
+    /// `f64::to_bits`, never `==`, so -0.0 and a NaN payload are significant).
+    fn attr_eq(a: &AttrValue, b: &AttrValue) -> bool {
+        match (a, b) {
+            (AttrValue::F64(x), AttrValue::F64(y)) => x.to_bits() == y.to_bits(),
+            _ => a == b,
+        }
+    }
+
+    /// The empty resource+scope blob: no stream-level key, so the dynamic-column
+    /// budget below is spent purely on per-record attributes and `lib`/
+    /// `service.name` from `attrs_blob` do not perturb the count.
+    fn empty_stream_blob() -> Vec<u8> {
+        stream_attrs_bytes(&[], "", "", &[])
+    }
+
+    #[test]
+    fn dynamic_column_budget_reports_used_and_overflowed() {
+        // Budget of 3 over 5 distinct (name, type) pairs. The records ARRIVE in
+        // reverse-lexicographic order (e, d, c, b, a), so an arrival-order
+        // selection would give columns to e, d, c; the writer selects
+        // lexicographically, so a, b, c win and d, e overflow. The counts alone
+        // (used 3, overflowed 2) hold under either rule -- the FIELD_DIR
+        // membership check below is what pins the order.
+        let cfg = RlogConfig {
+            max_dynamic_columns: 3,
+            ..RlogConfig::default()
+        };
+        let blob = empty_stream_blob();
+        let mut w = RlogWriter::new(cfg, identity());
+        for (i, name) in ["e", "d", "c", "b", "a"].iter().enumerate() {
+            let mut r = base_record(0, i as i64);
+            r.stream_attrs = blob.clone();
+            r.attrs = vec![((*name).to_string(), AttrValue::Str(format!("v_{name}")))];
+            w.push(r).expect("push");
+        }
+        let (obj, stats) = w.finish_with_stats().expect("finish");
+
+        assert_eq!(stats.dynamic_columns_used, 3, "first 3 pairs get a column");
+        assert_eq!(stats.dynamic_columns_overflowed, 2, "the other 2 overflow");
+
+        let footer = open(&obj).expect("open");
+        let fd = read_field_dir(&obj, &footer);
+        assert_eq!(fd.len(), 3, "exactly the budget of columns");
+        for name in ["a", "b", "c"] {
+            assert!(
+                fd.column(name, FieldType::Str).is_some(),
+                "lexicographic winner {name} must have a column, not the arrival-order pick"
+            );
+        }
+        for name in ["d", "e"] {
+            assert!(
+                fd.column(name, FieldType::Str).is_none(),
+                "overflow key {name} must have no column"
+            );
+        }
+    }
+
+    #[test]
+    fn budget_overflow_folds_to_attrs_raw_without_value_loss() {
+        // Budget of 4 over 6 distinct names, mixed types including f64(-0.0)
+        // (columnar) and f64(1.5)/f64(NaN payload) (overflow), so both the
+        // columnar and the attrs_raw paths carry a float whose bits must
+        // survive. Lexicographic order: a,b,c,d get columns; e,f overflow.
+        let cfg = RlogConfig {
+            max_dynamic_columns: 4,
+            ..RlogConfig::default()
+        };
+        let blob = empty_stream_blob();
+        // Three records, each carrying all six attributes with per-record
+        // values, so every column holds a real per-row value and every record
+        // has two overflow attributes.
+        let nan = f64::from_bits(0x7ff8_0000_0000_0abc);
+        let attrs_for = |rec: i64| -> Vec<(String, AttrValue)> {
+            vec![
+                ("a".into(), AttrValue::I64(rec)),
+                ("b".into(), AttrValue::Str(format!("s{rec}"))),
+                ("c".into(), AttrValue::Bool(rec % 2 == 0)),
+                (
+                    "d".into(),
+                    AttrValue::F64(if rec == 0 { -0.0 } else { rec as f64 }),
+                ),
+                (
+                    "e".into(),
+                    AttrValue::F64(if rec == 2 { nan } else { 1.5 * rec as f64 }),
+                ),
+                (
+                    "f".into(),
+                    AttrValue::Bytes(vec![rec as u8, 0xff, rec as u8]),
+                ),
+            ]
+        };
+
+        let mut w = RlogWriter::new(cfg, identity());
+        for rec in 0..3i64 {
+            let mut r = base_record(0, rec);
+            r.stream_attrs = blob.clone();
+            r.attrs = attrs_for(rec);
+            w.push(r).expect("push");
+        }
+        let (obj, stats) = w.finish_with_stats().expect("finish");
+        assert_eq!(stats.dynamic_columns_used, 4);
+        assert_eq!(stats.dynamic_columns_overflowed, 2, "e and f overflow");
+
+        // e and f are not columnar; they can only be read back through attrs_raw.
+        let footer = open(&obj).expect("open");
+        let fd = read_field_dir(&obj, &footer);
+        assert!(fd.column("e", FieldType::F64).is_none());
+        assert!(fd.column("f", FieldType::Bytes).is_none());
+
+        // Every attribute of every record reads back with its exact value and
+        // type, columnar and overflowed alike -- nothing dropped or corrupted
+        // at or across the budget boundary.
+        let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), 3);
+        for rec in 0..3i64 {
+            let row = rows
+                .iter()
+                .find(|r| r.ts_ns == rec)
+                .unwrap_or_else(|| panic!("record ts {rec} present"));
+            let got: HashMap<&str, &AttrValue> =
+                row.attrs.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            let want = attrs_for(rec);
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "record {rec}: no attribute added or dropped"
+            );
+            for (name, value) in &want {
+                let read = got
+                    .get(name.as_str())
+                    .unwrap_or_else(|| panic!("record {rec} attribute {name} read back"));
+                assert!(
+                    attr_eq(read, value),
+                    "record {rec} attribute {name}: read {read:?} != written {value:?}"
+                );
+            }
+        }
     }
 }

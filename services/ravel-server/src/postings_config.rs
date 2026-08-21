@@ -351,10 +351,16 @@ mod tests {
         let (obj, stats) = writer.finish_with_stats().expect("finish");
 
         // Every POSTINGS counter is zero: no section, no fields, no distinct
-        // values, no capped fields, no bytes.
+        // values, no capped fields, no bytes. The dynamic-column counters are
+        // not POSTINGS counters (ADR-0100): the per-record `http.status_code`
+        // draws one dynamic column, so `dynamic_columns_used` is 1 and nothing
+        // overflows.
         assert_eq!(
             stats,
-            WriteStats::default(),
+            WriteStats {
+                dynamic_columns_used: 1,
+                ..WriteStats::default()
+            },
             "an absent field list must leave every POSTINGS counter at its default"
         );
         // And the object still scans: probing an unindexed field prunes nothing
