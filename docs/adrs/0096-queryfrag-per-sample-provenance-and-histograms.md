@@ -77,13 +77,23 @@ at field 5, decision 2 below):
 // Per-sample dedup key columns (ADR-0092 decision 1), parallel to ts_delta.
 // All four present with length == ts_delta length, or all absent (run-wide
 // provenance, the key's 4th element taken from array position).
-// Delta-transformed exactly as ts_delta is: first entry a delta from the
-// run-wide field, each later entry a delta from its predecessor.
+// Delta-transformed exactly as ts_delta is: first entry a delta from zero,
+// each later entry a delta from its predecessor.
 repeated sint64 prov_created_delta = 6 [packed = true];
 repeated sint64 prov_epoch_delta   = 7 [packed = true];
 repeated sint64 prov_seq_delta     = 8 [packed = true];
 repeated uint32 prov_in_page_index = 9 [packed = true];
 ```
+
+T1's implementation shipped delta-from-zero, reusing `encode_ts_deltas`'s
+existing transform (and its `u64`-safe counterpart for `writer_epoch`/
+`writer_seq`) verbatim rather than inventing a second scheme — this is now
+the shipped, frozen-contract meaning of the field, not an open question.
+The measurement question below is narrower than the code comment once
+implied: whether delta-from-zero or delta-from-predecessor gives a smaller
+`prov_created_delta` in practice, decided before T3 enables the encoder (no
+version flip has happened yet, so the scheme is still freely changeable
+without a second bump).
 
 A length disagreement across the four columns, or against `ts_delta`'s
 length, is a typed `CodecError`, mirroring `RunLengthMismatch`
@@ -118,10 +128,13 @@ alternative to sending these columns is not "send fragmented frames" — it
 is the current refusal — so the wire cost only has to be non-pathological,
 not minimal.
 
-**Settled by measurement, not argument:** delta-from-predecessor vs.
-delta-from-run-base for `prov_created_delta`, and real bytes per sample
-across m=1 scrape, backfill m≫1, and overlapping-timestamp duplicates.
-`crates/ravel-bench/tests/catalog_byte_gates.rs` gets a new wire gate over
+**Settled by measurement, not argument:** the first entry's baseline for
+`prov_created_delta` — delta-from-zero (shipped by T1) vs. delta-from-run-base
+(a delta from the run-wide `created_unix_ns` field instead) — plus real
+bytes per sample across m=1 scrape, backfill m≫1, and overlapping-timestamp
+duplicates. Every later entry is a delta from its predecessor either way,
+unaffected by this choice. `crates/ravel-bench/tests/catalog_byte_gates.rs`
+gets a new wire gate over
 `prost::Message::encoded_len`, reusing its existing generator and
 split-printing pattern rather than inventing a new harness.
 
