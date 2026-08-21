@@ -10,19 +10,37 @@
 //! Fixture: the 10k `many_small` shape (5 label pairs/series, 20k total
 //! samples), at or above the 4096-series sparse-emission threshold. The
 //! generator seed is fixed (the [`WorkloadConfig`] default, 0), so the whole
-//! fixture is deterministic. Measured values are printed on success too, so
-//! `cargo test -- --nocapture` output can be diffed across runs.
+//! fixture is deterministic. The per-shape numbers are pinned by the
+//! committed golden rather than printed; regenerate it with
+//! `REGEN_CATALOG_BYTE_GATES=1`.
+//!
+//! This file also carries the run-fragmentation gate (issue #312, ADR-0092)
+//! and, on top of it, the honest per-shape byte gate (issue #370). The
+//! fragmentation gate historically measured only the generator's default
+//! full-mantissa float, which no integer-model value codec can compress, then
+//! quoted the result as the format's cost. The #370 gate re-points the same
+//! 500x240 fixture at realistic value shapes (integer counter with resets,
+//! integer gauge, two-decimal gauge, shared with the codec bake-off) and
+//! commits the exact per-section split, the value encoding each shape lands
+//! on, and a second scrape interval as a regenerable golden
+//! (`catalog_byte_gates_golden.txt`); the full-entropy float stays as an
+//! explicitly labelled control.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::PathBuf;
 
 use ravel_bench::generator::{CardinalityProfile, WorkloadConfig, generate_raw};
 use ravel_bench::section_accounting::shape_many_small;
 use ravel_bench::segment_support::{
-    LABEL_DICT, SERIES_IDS, SERIES_IDX, SERIES_META, SERIES_META_CHUNKS, TS_PAGES, VAL_PAGES,
-    bench_bounds, bench_identity, bench_meta, build_segment_v5,
+    SERIES_IDX, SERIES_META, SERIES_META_CHUNKS, VAL_PAGES, bench_bounds, bench_identity,
+    bench_meta, build_segment_v5,
 };
+use ravel_bench::value_shapes::{ValueShape, value_stream};
 use ravel_segment::{
     ReaderLimits, RunInputV4, RunInputV7, SampleProvenance, SegmentWriter, SeriesInputV4,
-    SeriesInputV7, SeriesValues, WrittenSegment, encode_run_v4, open_from_full,
+    SeriesInputV7, SeriesValues, WrittenSegment, decode_catalog_v5, encode_run_v4, open_from_full,
 };
 use ravel_types::{LabelSet, Sample, SeriesId};
 
@@ -128,12 +146,23 @@ const FRAG_FLUSH_SPACING_NS: i64 = 2_000_000_000;
 /// One deterministic workload: 500 series x 240 samples, timestamps snapped to
 /// millisecond resolution and sorted ascending. Fixed seed, no wall-clock
 /// time. Both layouts consume this identical data, so the comparison is
-/// apples-to-apples.
+/// apples-to-apples. Values keep the generator's default full-entropy
+/// counter/gauge floats: this is the historical control fixture (issue #370),
+/// the one that produces 8.88 B/sample merged because no integer-model codec
+/// can compress a full-mantissa f64.
 fn fragmentation_workload() -> Vec<(SeriesId, LabelSet, Vec<Sample>)> {
+    fragmentation_workload_at(FRAG_INTERVAL_NS)
+}
+
+/// [`fragmentation_workload`] at an arbitrary scrape interval, so the same
+/// fixture can be measured at 15 s and at a second cadence (issue #370
+/// deliverable 5). Only `interval_ns` moves; series count, sample count,
+/// jitter, resolution, and seed are fixed.
+fn fragmentation_workload_at(interval_ns: i64) -> Vec<(SeriesId, LabelSet, Vec<Sample>)> {
     let config = WorkloadConfig {
         series_count: FRAG_SERIES,
         samples_per_series: FRAG_SAMPLES_PER_SERIES,
-        interval_ns: FRAG_INTERVAL_NS,
+        interval_ns,
         jitter_ns: FRAG_JITTER_NS,
         cardinality: CardinalityProfile::many_small(FRAG_SERIES),
         ..Default::default()
@@ -145,6 +174,23 @@ fn fragmentation_workload() -> Vec<(SeriesId, LabelSet, Vec<Sample>)> {
             s.ts_ns = (s.ts_ns / MS_NS) * MS_NS;
         }
         samples.sort_by_key(|s| s.ts_ns);
+    }
+    raw
+}
+
+/// The control fixture's timestamp shape with the value column replaced by a
+/// realistic metric shape ([`ValueShape`], shared with the codec bake-off).
+/// Timestamps are untouched, so a shape's TS_PAGES cost matches the control's
+/// and only VAL_PAGES (and its dependent codec choice) moves. Each series gets
+/// its own value walk (salt = series index), so the zstd-compressed VAL
+/// section cannot collapse 500 identical streams into an unrealistic figure.
+fn shaped_workload(shape: ValueShape, interval_ns: i64) -> Vec<(SeriesId, LabelSet, Vec<Sample>)> {
+    let mut raw = fragmentation_workload_at(interval_ns);
+    for (idx, (_, _, samples)) in raw.iter_mut().enumerate() {
+        let values = value_stream(shape, samples.len(), idx as u64);
+        for (s, v) in samples.iter_mut().zip(values) {
+            s.value = v;
+        }
     }
     raw
 }
@@ -257,89 +303,187 @@ fn build_merged_with_provenance(raw: &[(SeriesId, LabelSet, Vec<Sample>)]) -> Wr
     .expect("write merged v7 with provenance")
 }
 
-/// The five per-section byte-per-sample figures ADR-0092 reports, plus the
-/// object total.
-struct SectionSplit {
-    label_dict: f64,
-    series_ids: f64,
-    series_meta: f64,
-    ts_pages: f64,
-    val_pages: f64,
-    total: f64,
+/// Total samples in the fragmentation fixture, the denominator of every
+/// bytes-per-sample figure below.
+const FRAG_TOTAL_SAMPLES: usize = FRAG_SERIES * FRAG_SAMPLES_PER_SERIES;
+
+/// A full byte breakdown of one written object: every footer section by kind,
+/// plus the residual. Sections + residual sum exactly to the object.
+///
+/// The old five-part `section_split` did not sum: it divided the whole object
+/// length for the total but summed only five named sections for the parts, so
+/// the footer, the 16-byte trailer, and inter-section alignment padding were an
+/// unaccounted remainder (issue #370 deliverable 4). This view names that
+/// remainder as `residual`, and [`Breakdown::assert_sums`] pins the identity.
+struct Breakdown {
+    object_bytes: u64,
+    total_samples: usize,
+    /// (kind, len) for every section the footer lists, sorted by kind.
+    sections: Vec<(u32, u64)>,
+    /// `object_bytes - sum(section lens)`: footer + 16-byte trailer +
+    /// inter-section alignment padding.
+    residual: u64,
 }
 
-fn section_split(seg: &WrittenSegment, total_samples: usize) -> SectionSplit {
-    let n = total_samples as f64;
-    let per = |kind: u32| section_len(&seg.bytes, kind) as f64 / n;
-    // At 500 series the layout is non-sparse: SERIES_META (kind 6) carries the
-    // run-major columns; SERIES_META_CHUNKS (kind 9) is absent (len 0).
-    let series_meta = per(SERIES_META) + per(SERIES_META_CHUNKS);
-    SectionSplit {
-        label_dict: per(LABEL_DICT),
-        series_ids: per(SERIES_IDS),
-        series_meta,
-        ts_pages: per(TS_PAGES),
-        val_pages: per(VAL_PAGES),
-        total: seg.bytes.len() as f64 / n,
+impl Breakdown {
+    fn of(seg: &WrittenSegment, total_samples: usize) -> Self {
+        let loc = open_from_full(&seg.bytes, ReaderLimits::default()).expect("open");
+        let mut sections: Vec<(u32, u64)> = loc
+            .footer
+            .sections
+            .iter()
+            .map(|s| (s.kind, s.len))
+            .collect();
+        sections.sort_by_key(|(k, _)| *k);
+        let object_bytes = seg.bytes.len() as u64;
+        let section_sum: u64 = sections.iter().map(|(_, l)| *l).sum();
+        let residual = object_bytes
+            .checked_sub(section_sum)
+            .expect("section bytes cannot exceed the object");
+        Breakdown {
+            object_bytes,
+            total_samples,
+            sections,
+            residual,
+        }
+    }
+
+    fn per_sample(&self, bytes: u64) -> f64 {
+        bytes as f64 / self.total_samples as f64
+    }
+
+    fn total_per_sample(&self) -> f64 {
+        self.per_sample(self.object_bytes)
+    }
+
+    fn section_bytes(&self, kind: u32) -> u64 {
+        self.sections
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, l)| *l)
+            .unwrap_or(0)
+    }
+
+    /// The named sections account for all but a small fixed remainder of the
+    /// object.
+    ///
+    /// Sections-plus-residual equalling the object is not asserted here
+    /// because `residual` is defined as that difference, so the equality is an
+    /// identity for any input. The golden is what pins it: it emits every
+    /// section line and the residual, and an exact match proves they close.
+    ///
+    /// What is falsifiable, and what this checks, is that the remainder stays
+    /// small. The residual is meant to be footer plus the 16-byte trailer plus
+    /// inter-section alignment padding, a few hundred bytes. A new section
+    /// that nobody added to `SECTION_KINDS` would land here instead and blow
+    /// the bound.
+    fn assert_sums(&self) {
+        const MAX_RESIDUAL_BYTES: u64 = 4096;
+        assert!(
+            self.residual <= MAX_RESIDUAL_BYTES,
+            "residual {} exceeds {MAX_RESIDUAL_BYTES} bytes for a {}-byte object: \
+             a section is likely missing from the breakdown's section list",
+            self.residual,
+            self.object_bytes,
+        );
     }
 }
 
-fn print_split(name: &str, s: &SectionSplit) {
-    println!(
-        "[fragmentation {name}] total={:.2} B/sample  \
-         LABEL_DICT={:.2} SERIES_IDS={:.2} SERIES_META={:.2} TS_PAGES={:.2} VAL_PAGES={:.2}",
-        s.total, s.label_dict, s.series_ids, s.series_meta, s.ts_pages, s.val_pages,
-    );
+fn section_name(kind: u32) -> &'static str {
+    match kind {
+        1 => "LABEL_DICT",
+        2 => "SERIES_TABLE",
+        3 => "TS_PAGES",
+        4 => "VAL_PAGES",
+        5 => "SERIES_IDS",
+        6 => "SERIES_META",
+        7 => "HIST_PAGES",
+        8 => "SERIES_IDX",
+        9 => "SERIES_META_CHUNKS",
+        10 => "EXEMPLARS",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Value page encoding tag names (docs/segment-format.md, `page_enc`). The
+/// point of the honest fixture is to make these fire: on the random-float
+/// control every page is VAL_RAW_F64, and the integer-model codecs
+/// (VAL_ALP, VAL_GCD_DELTA_FOR) cannot engage by construction.
+fn val_enc_name(tag: u8) -> &'static str {
+    match tag {
+        16 => "VAL_GORILLA",
+        17 => "VAL_RAW_F64",
+        18 => "VAL_ALP",
+        19 => "VAL_GCD_DELTA_FOR",
+        _ => "VAL_UNKNOWN",
+    }
+}
+
+/// Histogram of the value-page encoding tag over every run's VAL page. One
+/// entry per run (fragmented: 240 per series; merged: 1 per series). This is
+/// what confirms or refutes "the integer-model codecs never fire on the
+/// fixture".
+fn val_enc_histogram(seg: &WrittenSegment) -> BTreeMap<u8, usize> {
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(&seg.bytes, limits).expect("open");
+    let entries = decode_catalog_v5(&loc.footer, &seg.bytes, limits).expect("decode catalog");
+    let val_sec = loc
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.kind == VAL_PAGES)
+        .expect("VAL_PAGES present");
+    let mut hist = BTreeMap::new();
+    for e in &entries {
+        for run in &e.runs {
+            let (off, len) = run.val_page;
+            if len == 0 {
+                continue;
+            }
+            let tag = seg.bytes[(val_sec.offset + off) as usize];
+            *hist.entry(tag).or_insert(0) += 1;
+        }
+    }
+    hist
 }
 
 /// Pinned lower bound on `fragmented_total / merged_total`. Measured on this
-/// tree (RSEG v7, #314) the ratio is 2.987: fragmented 26.52 B/sample against
-/// merged 8.88 (see the printed splits). That is down from the 3.126 #312
-/// measured and the 3.68 ADR-0092's table reports, because the page-codec wins
-/// in this train (ALP, GCD-delta-FOR, GCD timestamps, first-ts-as-delta, the
-/// single-sample no-pad rule) shrank the fragmented regime's per-run pages more
-/// than the merged one. Re-derived here from the 2.987 measured value using the
+/// tree (RSEG v7, #314) the ratio is 2.987 on the random-float control:
+/// fragmented 26.52 B/sample against merged 8.88. That is down from the 3.126
+/// #312 measured and the 3.68 ADR-0092's table reports, because the page-codec
+/// wins in this train (ALP, GCD-delta-FOR, GCD timestamps, first-ts-as-delta,
+/// the single-sample no-pad rule) shrank the fragmented regime's per-run pages
+/// more than the merged one. Re-derived from the 2.987 measured value using the
 /// same ~20%-below-measured margin policy #312 used to pin 2.5 against its then
 /// 3.126, which lands at 2.4. The gate flags a regression in the fragmentation
-/// penalty without being brittle to codec-level byte wobble; it is not a no-op,
-/// and a superseded pin (2.5 was pinned against a measurement two page-codec
-/// generations old) is exactly the drift this epic keeps finding.
+/// penalty without being brittle to codec-level byte wobble.
 const FRAG_RATIO_MIN: f64 = 2.4;
 
 #[test]
 fn fragmented_multi_run_shape_costs_more_than_merged() {
     let raw = fragmentation_workload();
     let total_samples: usize = raw.iter().map(|(_, _, s)| s.len()).sum();
-    assert_eq!(total_samples, FRAG_SERIES * FRAG_SAMPLES_PER_SERIES);
+    assert_eq!(total_samples, FRAG_TOTAL_SAMPLES);
 
-    let merged = build_merged(&raw);
-    let fragmented = build_fragmented(&raw);
-
-    let merged_split = section_split(&merged, total_samples);
-    let fragmented_split = section_split(&fragmented, total_samples);
-
-    // Both splits printed on success so the numbers can be diffed across runs.
-    print_split("merged", &merged_split);
-    print_split("fragmented", &fragmented_split);
+    let merged = Breakdown::of(&build_merged(&raw), total_samples);
+    let fragmented = Breakdown::of(&build_fragmented(&raw), total_samples);
+    merged.assert_sums();
+    fragmented.assert_sums();
 
     // Sanity: at 500 series both layouts are non-sparse (plain SERIES_META,
     // no chunked catalog).
     assert_eq!(
-        section_len(&merged.bytes, SERIES_META_CHUNKS),
+        merged.section_bytes(SERIES_META_CHUNKS),
         0,
         "500 series is below the sparse threshold: no SERIES_META_CHUNKS"
     );
 
-    let ratio = fragmented_split.total / merged_split.total;
-    println!(
-        "[fragmentation] fragmented/merged total ratio = {ratio:.3} (gate >= {FRAG_RATIO_MIN})"
-    );
-
+    let ratio = fragmented.total_per_sample() / merged.total_per_sample();
     assert!(
         ratio >= FRAG_RATIO_MIN,
         "fragmented layout ({:.2} B/sample) must exceed merged ({:.2} B/sample) by >= {FRAG_RATIO_MIN}x, got {ratio:.3}x",
-        fragmented_split.total,
-        merged_split.total,
+        fragmented.total_per_sample(),
+        merged.total_per_sample(),
     );
 }
 
@@ -353,39 +497,22 @@ fn fragmented_multi_run_shape_costs_more_than_merged() {
 /// `encode_i64` and zstd flatten almost to nothing on a regular flush cadence.
 /// That is far below ADR-0092's ~5 B/sample estimate, which assumed the
 /// columns did not compress. The gate is pinned ~20% below the measured ratio,
-/// matching the `FRAG_RATIO_MIN` margin policy, so it flags a real regression in
-/// the merge win without wobbling on codec-level byte drift.
+/// matching the `FRAG_RATIO_MIN` margin policy.
 const MERGED_WITH_PROV_RATIO_MIN: f64 = 2.4;
 
 #[test]
 fn run_merged_l1_with_provenance_costs_materially_less_than_inputs() {
     let raw = fragmentation_workload();
     let total_samples: usize = raw.iter().map(|(_, _, s)| s.len()).sum();
-    assert_eq!(total_samples, FRAG_SERIES * FRAG_SAMPLES_PER_SERIES);
+    assert_eq!(total_samples, FRAG_TOTAL_SAMPLES);
 
     let fragmented = build_fragmented(&raw);
     let merged_no_prov = build_merged(&raw);
     let merged_with_prov = build_merged_with_provenance(&raw);
 
-    let fragmented_split = section_split(&fragmented, total_samples);
-    let merged_no_prov_split = section_split(&merged_no_prov, total_samples);
-    let merged_with_prov_split = section_split(&merged_with_prov, total_samples);
+    let fragmented_b = Breakdown::of(&fragmented, total_samples);
+    let merged_with_prov_b = Breakdown::of(&merged_with_prov, total_samples);
 
-    print_split("fragmented (inputs)", &fragmented_split);
-    print_split("merged (no provenance)", &merged_no_prov_split);
-    print_split(
-        "merged + per-sample provenance (shipping L1)",
-        &merged_with_prov_split,
-    );
-
-    let provenance_cost = merged_with_prov_split.total - merged_no_prov_split.total;
-    println!(
-        "[fragmentation] exact object bytes: merged_no_prov={} merged_with_prov={} delta={} \
-         over {total_samples} samples",
-        merged_no_prov.bytes.len(),
-        merged_with_prov.bytes.len(),
-        merged_with_prov.bytes.len() as i64 - merged_no_prov.bytes.len() as i64,
-    );
     // The provenance-carrying object must actually differ from the no-provenance
     // one: the columns are present, just highly compressible (constant/arithmetic
     // sequences under encode_i64 inside zstd), so their per-sample cost is small,
@@ -394,24 +521,18 @@ fn run_merged_l1_with_provenance_costs_materially_less_than_inputs() {
         merged_with_prov.bytes.len() > merged_no_prov.bytes.len(),
         "the provenance columns must add bytes; equal size means they were dropped"
     );
-    let ratio = fragmented_split.total / merged_with_prov_split.total;
-    println!(
-        "[fragmentation] merged+provenance = {:.2} B/sample (per-sample provenance cost = {:.2} \
-         B/sample); fragmented/merged+prov ratio = {ratio:.3} (gate >= {MERGED_WITH_PROV_RATIO_MIN})",
-        merged_with_prov_split.total, provenance_cost,
-    );
-
+    let ratio = fragmented_b.total_per_sample() / merged_with_prov_b.total_per_sample();
     assert!(
         ratio >= MERGED_WITH_PROV_RATIO_MIN,
         "run-merged L1 with provenance ({:.2} B/sample) must cost materially less than the \
          fragmented inputs ({:.2} B/sample): ratio {ratio:.3} < {MERGED_WITH_PROV_RATIO_MIN}",
-        merged_with_prov_split.total,
-        fragmented_split.total,
+        merged_with_prov_b.total_per_sample(),
+        fragmented_b.total_per_sample(),
     );
 }
 
 /// Determinism: the fixed-seed workload -> both writers yields byte-identical
-/// object sizes on a second run, so the pinned ratio never wobbles.
+/// object sizes on a second run, so the pinned numbers never wobble.
 #[test]
 fn fragmentation_measurements_are_deterministic() {
     let measure = || {
@@ -422,4 +543,274 @@ fn fragmentation_measurements_are_deterministic() {
         )
     };
     assert_eq!(measure(), measure());
+}
+
+// --- honest per-shape byte gate + committed golden (issue #370) ---------
+//
+// The gate above measures only the random-float control: the generator's
+// default full-mantissa counter/gauge floats, which no integer-model value
+// codec can compress. Real metrics are integer counters, integer gauges, and
+// low-precision decimals. This section measures those realistic shapes on the
+// SAME 500x240 fixture (only the value column changes) and commits the exact
+// per-section split, the value encoding each shape lands on, and a second
+// scrape interval, as a regenerable golden.
+
+/// One value shape the golden measures. The control is the historical fixture
+/// (generator-default floats, the 8.88 anchor); the realistic shapes overwrite
+/// only the value column of that same fixture.
+#[derive(Clone, Copy)]
+enum GateShape {
+    RandomFloatControl,
+    Realistic(ValueShape),
+}
+
+impl GateShape {
+    fn label(self) -> &'static str {
+        match self {
+            GateShape::RandomFloatControl => "random_float(ctrl)",
+            GateShape::Realistic(s) => s.label(),
+        }
+    }
+
+    fn workload(self, interval_ns: i64) -> Vec<(SeriesId, LabelSet, Vec<Sample>)> {
+        match self {
+            GateShape::RandomFloatControl => fragmentation_workload_at(interval_ns),
+            GateShape::Realistic(s) => shaped_workload(s, interval_ns),
+        }
+    }
+}
+
+/// The shapes measured: an integer counter with resets, an integer gauge, a
+/// two-decimal gauge, and the full-entropy random float kept as an explicitly
+/// labelled control (issue #370 deliverable 1).
+const GATE_SHAPES: [GateShape; 4] = [
+    GateShape::Realistic(ValueShape::CounterIntResets),
+    GateShape::Realistic(ValueShape::GaugeInt),
+    GateShape::Realistic(ValueShape::GaugeDec2),
+    GateShape::RandomFloatControl,
+];
+
+/// The layouts measured per shape: the fragmented inputs, the merged object
+/// without provenance, and the shipping merged object with per-sample
+/// provenance.
+#[derive(Clone, Copy)]
+enum Layout {
+    Fragmented,
+    MergedNoProv,
+    MergedWithProv,
+}
+
+impl Layout {
+    fn tag(self) -> &'static str {
+        match self {
+            Layout::Fragmented => "fragmented",
+            Layout::MergedNoProv => "merged_no_prov",
+            Layout::MergedWithProv => "merged_with_prov",
+        }
+    }
+
+    fn build(self, raw: &[(SeriesId, LabelSet, Vec<Sample>)]) -> WrittenSegment {
+        match self {
+            Layout::Fragmented => build_fragmented(raw),
+            Layout::MergedNoProv => build_merged(raw),
+            Layout::MergedWithProv => build_merged_with_provenance(raw),
+        }
+    }
+}
+
+const GATE_LAYOUTS: [Layout; 3] = [
+    Layout::Fragmented,
+    Layout::MergedNoProv,
+    Layout::MergedWithProv,
+];
+
+/// The two scrape intervals: the fixture's 15 s and a 60 s second point
+/// (issue #370 deliverable 5). No measurement at any interval other than 15 s
+/// existed before.
+const GATE_INTERVALS: [(&str, i64); 2] = [("15s", FRAG_INTERVAL_NS), ("60s", 60_000_000_000)];
+
+/// One measured cell, retained so rendering and the assertions run over a
+/// single build pass.
+struct GateMeasurement {
+    interval: &'static str,
+    shape: &'static str,
+    layout: &'static str,
+    breakdown: Breakdown,
+    val_enc: BTreeMap<u8, usize>,
+}
+
+/// Build every (interval, shape, layout) cell once.
+fn measure_gate() -> Vec<GateMeasurement> {
+    let mut out = Vec::new();
+    for (interval, interval_ns) in GATE_INTERVALS {
+        for shape in GATE_SHAPES {
+            let raw = shape.workload(interval_ns);
+            let total_samples: usize = raw.iter().map(|(_, _, s)| s.len()).sum();
+            assert_eq!(total_samples, FRAG_TOTAL_SAMPLES);
+            for layout in GATE_LAYOUTS {
+                let seg = layout.build(&raw);
+                let breakdown = Breakdown::of(&seg, total_samples);
+                breakdown.assert_sums();
+                out.push(GateMeasurement {
+                    interval,
+                    shape: shape.label(),
+                    layout: layout.tag(),
+                    val_enc: val_enc_histogram(&seg),
+                    breakdown,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Render one measurement as fully-qualified lines, so a golden mismatch on any
+/// single line names the interval, shape, layout, and section it belongs to.
+/// bytes are exact; B/sample = bytes / total_samples.
+fn render_measurement(m: &GateMeasurement, out: &mut String) {
+    let q = format!("{} {} {}", m.interval, m.shape, m.layout);
+    let b = &m.breakdown;
+    let _ = writeln!(out, "{q} object_bytes {}", b.object_bytes);
+    let _ = writeln!(out, "{q} total_per_sample {:.4}", b.total_per_sample());
+    for (kind, len) in &b.sections {
+        let _ = writeln!(
+            out,
+            "{q} section {} {} {:.4}",
+            section_name(*kind),
+            len,
+            b.per_sample(*len),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "{q} residual {} {:.4}",
+        b.residual,
+        b.per_sample(b.residual),
+    );
+    for (tag, count) in &m.val_enc {
+        let _ = writeln!(out, "{q} valenc {} {}", val_enc_name(*tag), count);
+    }
+}
+
+fn render_golden(measurements: &[GateMeasurement]) -> String {
+    let mut out = String::new();
+    out.push_str(GOLDEN_HEADER);
+    for m in measurements {
+        render_measurement(m, &mut out);
+    }
+    out
+}
+
+const GOLDEN_HEADER: &str = "\
+# Catalog byte-gate golden (issue #370). Committed, exact, deterministic.
+#
+# Regenerate after any INTENDED codec or format change:
+#   REGEN_CATALOG_BYTE_GATES=1 cargo test -p ravel-bench --test catalog_byte_gates
+#
+# Fixture: 500 series x 240 samples, 15s/60s spacing, ms resolution, 200ms
+# jitter, seed 0. Only the value column changes across shapes; timestamps are
+# identical, so a shape moves VAL_PAGES (and its codec choice) and nothing else
+# on the value side. bytes are exact and deterministic; timing is not, so only
+# bytes are asserted (see the file header).
+#
+# Each line is fully qualified: <interval> <shape> <layout> <metric...>.
+# 'section <NAME> <bytes> <B/sample>' lines plus the 'residual' line sum
+# exactly to 'object_bytes' (residual = footer + 16-byte trailer + inter-section
+# alignment padding). 'valenc <ENC> <count>' is the value-page encoding tag over
+# every run's VAL page (one per run): it shows which codec actually fired.
+";
+
+fn golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("catalog_byte_gates_golden.txt")
+}
+
+/// The committed golden: the exact per-section split (with residual), the value
+/// encoding each shape lands on, and a second scrape interval, for four value
+/// shapes. This is the honest bytes-per-sample record issue #370 asks for; the
+/// random-float control is the only shape that stays on VAL_RAW_F64 and near
+/// 8.88 merged, and the realistic shapes land well below it.
+#[test]
+fn catalog_byte_gates_golden() {
+    let measurements = measure_gate();
+    let rendered = render_golden(&measurements);
+    let path = golden_path();
+
+    // An empty value must not regenerate: `REGEN_CATALOG_BYTE_GATES= cargo test`
+    // would otherwise rewrite the golden instead of asserting against it, and
+    // report a pass.
+    if std::env::var("REGEN_CATALOG_BYTE_GATES").is_ok_and(|v| !v.is_empty()) {
+        std::fs::write(&path, &rendered).expect("write golden");
+        return;
+    }
+
+    let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}. Regenerate with \
+             REGEN_CATALOG_BYTE_GATES=1 cargo test -p ravel-bench --test catalog_byte_gates",
+            path.display()
+        )
+    });
+
+    if committed != rendered {
+        for (i, (c, r)) in committed.lines().zip(rendered.lines()).enumerate() {
+            assert_eq!(
+                c,
+                r,
+                "catalog byte-gate golden mismatch at line {}. Regenerate INTENDED \
+                 changes with REGEN_CATALOG_BYTE_GATES=1 cargo test -p ravel-bench \
+                 --test catalog_byte_gates",
+                i + 1,
+            );
+        }
+        assert_eq!(
+            committed.lines().count(),
+            rendered.lines().count(),
+            "catalog byte-gate golden line count differs. Regenerate with \
+             REGEN_CATALOG_BYTE_GATES=1 cargo test -p ravel-bench --test catalog_byte_gates",
+        );
+        // Reaching here means the two differ as strings but match line for line
+        // and in line count, so the difference is trailing-newline or
+        // line-ending only. Fail rather than fall out of the branch reporting a
+        // pass on a golden that did not match.
+        panic!(
+            "catalog byte-gate golden differs only in trailing whitespace or line \
+             endings. Regenerate with REGEN_CATALOG_BYTE_GATES=1 cargo test \
+             -p ravel-bench --test catalog_byte_gates"
+        );
+    }
+}
+
+/// Per-shape honesty gate (issue #370 deliverable 2): every realistic shape's
+/// merged-with-provenance cost lands materially below the random-float
+/// control's, because the integer-model codecs fire on realistic values and
+/// cannot on a full-mantissa float. This is the claim the golden's numbers
+/// back, asserted directly so a regression that makes the realistic shapes
+/// stop compressing fails a named gate, not only the golden diff.
+#[test]
+fn realistic_shapes_beat_the_random_float_control() {
+    let total_samples = FRAG_TOTAL_SAMPLES;
+    let control = Breakdown::of(
+        &build_merged_with_provenance(&GateShape::RandomFloatControl.workload(FRAG_INTERVAL_NS)),
+        total_samples,
+    )
+    .total_per_sample();
+
+    for shape in [
+        ValueShape::CounterIntResets,
+        ValueShape::GaugeInt,
+        ValueShape::GaugeDec2,
+    ] {
+        let raw = shaped_workload(shape, FRAG_INTERVAL_NS);
+        let merged = Breakdown::of(&build_merged_with_provenance(&raw), total_samples);
+        assert!(
+            merged.total_per_sample() < control,
+            "realistic shape {} merged cost {:.2} B/sample must be below the random-float \
+             control {:.2} B/sample; if it is not, the integer-model value codecs stopped firing",
+            shape.label(),
+            merged.total_per_sample(),
+            control,
+        );
+    }
 }
