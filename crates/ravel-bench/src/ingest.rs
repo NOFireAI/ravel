@@ -428,6 +428,12 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         }
     });
 
+    // Bracket only the measured write phase: fixture generation
+    // (`generate_batches` above) is excluded so the flamegraph reflects the
+    // ingest path, not workload construction. No-op unless the `profiling`
+    // feature is on and `RAVEL_BENCH_PROFILE_SVG` names an output path.
+    let profile = crate::profiling::ProfileSession::from_env("ingest_bench");
+
     let mut handles = Vec::with_capacity(batches.len());
     let mut next_dispatch = tokio::time::Instant::now();
     for batch in batches {
@@ -500,6 +506,10 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
     poller.await.expect("join visibility poller");
     run_done.store(true, Ordering::Release);
     sampler.await.expect("join depth sampler");
+
+    // Measured region ends here; write the flamegraph (if profiling is on)
+    // before the report-assembly work below enters the samples.
+    profile.finish();
 
     let visibility = {
         let pending = pending.lock().expect("pending lock");

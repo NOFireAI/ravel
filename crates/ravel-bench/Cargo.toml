@@ -66,6 +66,18 @@ futures = { workspace = true, optional = true }
 # below reuses a workspace pin.
 ravel-sql = { path = "../ravel-sql", version = "0.10.0", optional = true, features = ["flight-sql"] }
 arrow-flight = { workspace = true, optional = true }
+# Gated behind `profiling` (off by default). CPU flamegraph lane for the
+# ingest and query bench bins (issue #365). pprof is a NEW external
+# dependency, NOT a workspace pin; its `flamegraph` feature pulls `inferno`
+# for the SVG writer, and the default `cpp` feature supplies the unwinder and
+# symbol demangling. It is Linux-only in practice.
+#
+# It is an OPTIONAL regular dependency, not a dev-dependency: Cargo forbids an
+# optional dev-dependency, and the lane must be reachable from the `[[bin]]`
+# targets (dev-dependencies are visible only to tests/benches/examples, never
+# to bins or the lib). Optional + feature-gated keeps it out of a default
+# build exactly as the arrow/parquet lane above does.
+pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
 
 [features]
 # Parquet baseline harness. Off by default: the standard build
@@ -90,6 +102,11 @@ flight-egress = [
     "dep:arrow-flight",
     "dep:futures",
 ]
+# CPU flamegraph lane (issue #365). Off by default: a default build and the
+# plain gates never link `pprof`/`inferno`. When on, the ingest and query
+# bench bins wrap their measured region in a sampler when
+# `RAVEL_BENCH_PROFILE_SVG` names an output path (see `src/profiling.rs`).
+profiling = ["dep:pprof"]
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -106,9 +106,30 @@ struct Cell {
     bytes_per_sample: f64,
     enc_mvps: f64,
     dec_mvps: f64,
+    /// Decode throughput in MB/s, derived from `dec_mvps` and the codec's real
+    /// compressed byte count (see [`dec_mb_per_sec`]). This is the deliverable-3
+    /// bandwidth figure: single-threaded, so it says whether decode is
+    /// memory-bandwidth-bound or CPU-bound once read next to the core count.
+    dec_mb_per_sec: f64,
     roundtrip_ok: bool,
     /// Production enc tag (16 Gorilla, 17 raw) for the production row only.
     prod_enc: Option<u8>,
+}
+
+/// Decode throughput in MB/s (10^6 bytes/s) from the measured values/s and the
+/// *real compressed byte count* of the encoded input.
+///
+/// `compressed_bytes` is the codec's actual compressed length: the challenger
+/// payload for a challenger, the compressed VAL page for production. It is
+/// deliberately NOT `n * 8`, which would recompute the byte rate straight from
+/// the value rate and add no information over the existing `dec_mvps` column.
+/// `dec_mvps` is millions of values/s, so bytes/s = `dec_mvps * 1e6 *
+/// compressed_bytes / n` and MB/s divides that by `1e6`.
+fn dec_mb_per_sec(dec_mvps: f64, compressed_bytes: usize, n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    dec_mvps * compressed_bytes as f64 / n as f64
 }
 
 /// One challenger's summary numbers, retained for the adoption pass.
@@ -152,6 +173,7 @@ fn measure_challenger(codec: &dyn ValueCodec, values: &[f64]) -> Cell {
         bytes_per_sample: encoded.len() as f64 / n as f64,
         enc_mvps,
         dec_mvps,
+        dec_mb_per_sec: dec_mb_per_sec(dec_mvps, encoded.len(), n),
         roundtrip_ok,
         prod_enc: None,
     }
@@ -184,6 +206,9 @@ fn measure_production(values: &[f64]) -> Cell {
         bytes_per_sample: payload as f64 / n as f64,
         enc_mvps,
         dec_mvps,
+        // dec MB/s from the compressed VAL page length (with its 6-byte
+        // header), the real on-object byte count the decoder consumes; NOT n*8.
+        dec_mb_per_sec: dec_mb_per_sec(dec_mvps, page.len(), n),
         roundtrip_ok,
         prod_enc,
     }
@@ -194,13 +219,23 @@ fn main() {
     out.push_str(&env_header(
         "Value codec bake-off (issue #312, ADR-0092 decision 6)",
     ));
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
     out.push_str(
         "\nbytes/sample = codec payload (production excludes its 6-byte page header).\n\
          throughput = median Mval/s over repeated runs; production timings frame a whole\n\
          run (TS + VAL) through the public API, so they understate value-only speed.\n\
+         'dec MB/s' = decode bandwidth from the REAL compressed byte count (challenger\n\
+         payload; production = compressed VAL page incl. 6-byte header), not n*8. All\n\
+         throughput is single-threaded; read MB/s against the core count to judge whether\n\
+         decode is memory-bandwidth- or CPU-bound.\n\
          'ratio' = challenger bytes / production bytes; adoption needs <= 0.75 AND\n\
          dec >= production dec AND a bit-exact round trip.\n",
     );
+    out.push_str(&format!(
+        "cores (available_parallelism): {cores}   (throughput below is 1 thread)\n"
+    ));
 
     // Retained for the adoption pass: per (page, dataset) the production
     // baselines plus each challenger's summary numbers.
@@ -230,23 +265,30 @@ fn main() {
                 ds.name
             ));
             out.push_str(&format!(
-                "  {:<16} {:>10} {:>12} {:>12} {:>8}  {}\n",
-                "codec", "B/sample", "enc Mval/s", "dec Mval/s", "ratio", "roundtrip"
+                "  {:<16} {:>10} {:>12} {:>12} {:>10} {:>8}  {}\n",
+                "codec", "B/sample", "enc Mval/s", "dec Mval/s", "dec MB/s", "ratio", "roundtrip"
             ));
             let prod_bytes = prod.bytes_per_sample;
             out.push_str(&format!(
-                "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>8}  {}\n",
-                prod.codec, prod.bytes_per_sample, prod.enc_mvps, prod.dec_mvps, "-", "ok"
+                "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>10.1} {:>8}  {}\n",
+                prod.codec,
+                prod.bytes_per_sample,
+                prod.enc_mvps,
+                prod.dec_mvps,
+                prod.dec_mb_per_sec,
+                "-",
+                "ok"
             ));
             let mut summary_cells = Vec::new();
             for c in &challengers {
                 let ratio = c.bytes_per_sample / prod_bytes.max(f64::MIN_POSITIVE);
                 out.push_str(&format!(
-                    "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>8.3}  {}\n",
+                    "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>10.1} {:>8.3}  {}\n",
                     c.codec,
                     c.bytes_per_sample,
                     c.enc_mvps,
                     c.dec_mvps,
+                    c.dec_mb_per_sec,
                     ratio,
                     if c.roundtrip_ok { "ok" } else { "FAIL" },
                 ));
@@ -314,5 +356,53 @@ fn enc_name(tag: u8) -> &'static str {
         16 => "16(gorilla)",
         17 => "17(raw_f64)",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deliverable-3 guard: the decode bandwidth figure must come from the real
+    /// compressed VAL page length, not from `n * 8` (which would only restate
+    /// the values/s rate). A constant series compresses far below its raw
+    /// `n * 8` bytes, so the two byte counts, and the MB/s they produce, must
+    /// differ. This asserts the byte count `measure_production` records equals
+    /// the compressed page length and is strictly smaller than `n * 8`.
+    #[test]
+    fn production_byte_count_is_real_compressed_page_not_value_times_eight() {
+        let values = vec![42.0f64; 500];
+        let n = values.len();
+        let run = production_scalar_run(&values);
+        let page = scalar_val_page(&run);
+
+        assert!(
+            page.len() < n * 8,
+            "a constant series must compress below n*8 = {} bytes, got {}",
+            n * 8,
+            page.len()
+        );
+
+        // Same values/s, two byte counts: the real compressed length and the
+        // n*8 restatement. The bandwidth must not be identical, proving the
+        // figure is not a recompute of the value rate.
+        let dec_mvps = 12.5;
+        let real_mb = dec_mb_per_sec(dec_mvps, page.len(), n);
+        let fake_mb = dec_mb_per_sec(dec_mvps, n * 8, n);
+        assert!(
+            real_mb < fake_mb,
+            "compressed-length bandwidth ({real_mb}) must differ from the n*8 restatement \
+             ({fake_mb})"
+        );
+
+        // And it is exactly what measure_production wired in: its recorded
+        // dec MB/s equals the value rate scaled by the compressed page length.
+        let cell = measure_production(&values);
+        assert!((cell.dec_mb_per_sec - dec_mb_per_sec(cell.dec_mvps, page.len(), n)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dec_mb_per_sec_is_zero_for_empty() {
+        assert_eq!(dec_mb_per_sec(100.0, 0, 0), 0.0);
     }
 }
