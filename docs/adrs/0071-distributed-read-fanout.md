@@ -2,6 +2,10 @@
 
 Status: Accepted
 
+Amended by ADR-0096: per-sample dedup provenance columns on `Run` and
+`HistogramRun`, typed histogram records, and a `PROTOCOL_VERSION` bump to
+carry both over the distributed and federated fan-out paths.
+
 ## Context
 
 Ravel's compute is stateless and disposable over an S3 source of truth. A
