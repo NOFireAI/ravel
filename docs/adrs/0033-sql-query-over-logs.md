@@ -219,6 +219,15 @@ registers a hand-written `ExprPlanner` covering only the map-field case, so
 this ADR weighed therefore survives intact: the subscript is supported and
 the dependency surface did not grow.
 
+**Amended 2026-08-20 (ADR-0097):** "the dependency surface did not grow" is
+true of the *registration* but not the *dependency* under DataFusion 54. The
+registration did not grow — `map_field_planner.rs`'s hand-written `ExprPlanner`
+still does that work and `nested_expressions` stays off — but
+`datafusion-functions-nested` is compiled in, arriving as a mandatory
+dependency of `datafusion-sql`. It is linked but never registered, so no array
+function reaches the surface; the distinction is between what is compiled and
+what is reachable. See ADR-0097 and the `crates/ravel-sql/Cargo.toml` comment.
+
 The paragraph above is left as written because an ADR records what was
 decided and why, and the reasoning that made fail-loud acceptable for v1 is
 still the reasoning that governs any construct outside the subset. Only the

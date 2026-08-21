@@ -40,14 +40,30 @@ ravel-rspan = { workspace = true }
 # so this crate never depends on the workspace `arrow` pin directly. See the
 # module docs for the arrow 58 vs workspace-59 pinning note.
 #
-# `sql` is the only feature enabled on top of `default-features = false`: it is
-# what supplies `datafusion-sql` (the sqlparser front end and the SQL-to-
-# LogicalPlan planner) that the `/api/v1/sql` endpoint parses and plans with.
-# Everything the default feature set would otherwise add stays off, and that is
-# deliberate: no parquet/csv/avro/json file formats, no compression codecs, no
-# nested/regex/crypto expression packs. A file-format factory that is not linked
-# cannot be reached by a `CREATE EXTERNAL TABLE` that slipped a parse gate
-# (security invariant 1).
+# `sql` is the only feature enabled on top of `default-features = false`: it
+# supplies `datafusion-sql` (the sqlparser front end and the SQL-to-LogicalPlan
+# planner) that the `/api/v1/sql` endpoint parses and plans with. The flag does
+# keep the file-format factories off: no parquet/csv/avro/json readers, so a
+# `CREATE EXTERNAL TABLE` that slipped the parse gate has nothing to bind to
+# (security invariant 1), and crypto is off (no md5/sha256 in the live surface).
+#
+# `default-features = false` is NOT the control over the expression packs, and
+# must not be read as one. datafusion 54 declares `datafusion-functions`,
+# `-aggregate`, `-table`, and `-window` as MANDATORY dependencies with their own
+# default features on; a flag on this facade edge cannot subtract a mandatory
+# sub-crate's defaults. So the full string, unicode, datetime, math, regex, and
+# encoding scalar packs, all default aggregates and window functions, and the
+# `range`/`generate_series` table functions all resolve regardless of this flag.
+# `datafusion-functions-nested` is linked too (a mandatory dependency of
+# `datafusion-sql`) but its functions are never registered, gated off by the
+# `nested_expressions` feature this flag does leave off.
+#
+# The enforcement mechanism for the SQL function surface is therefore NOT this
+# manifest: it is the per-registry allowlist enumeration in
+# `crate::session::build_session` plus the drift test
+# (`admitted_and_excluded_cover_all_registries_for_every_table`), which
+# deregister every function outside the admitted set and fail closed when an
+# upgrade adds a new one (ADR-0097).
 datafusion = { version = "54", default-features = false, features = ["sql"] }
 
 # `url::Url` appears in the `ObjectStoreRegistry` trait signature, which
