@@ -652,11 +652,21 @@ struct NativeHistogramContext<'a> {
 /// series identity (ADR-0005), so an equal `LabelSet` always yields a
 /// bit-identical `SeriesId`. The realistic OTLP shape is a single series
 /// sampled over time: one metric holding many data points with identical
-/// attributes, emitted consecutively. A one-entry last-seen memo turns the
-/// per-point BLAKE3 hash into one pointer compare across such a run while
-/// staying correct for interleaved or single-point metrics (a mismatch just
-/// recomputes). Fixed capacity of one entry; dropped when the metric's loop
-/// ends, so memory is bounded to a single label set.
+/// attributes, emitted consecutively. A one-entry last-seen memo skips the
+/// per-point BLAKE3 hash across such a run while staying correct for
+/// interleaved or single-point metrics (a mismatch just recomputes).
+///
+/// A hit is a full structural comparison of the label set, not a pointer
+/// compare: `LabelSet` compares as a `Vec<Label>` of `String` pairs, so it
+/// costs O(L) string comparisons, and it saves no allocation, because
+/// `SeriesId::compute` hashes through a thread-local scratch buffer that
+/// allocates nothing once warm. A miss adds a deep clone of the label set on
+/// top. `benches/normalize_alloc.rs` measures 46.05 allocations per point on
+/// interleaved series against 23.27 grouped, so this memo pays off only while
+/// points arrive in runs.
+///
+/// Fixed capacity of one entry; dropped when the metric's loop ends, so
+/// memory is bounded to a single label set.
 struct SeriesIdMemo {
     last: Option<(LabelSet, SeriesId)>,
 }
