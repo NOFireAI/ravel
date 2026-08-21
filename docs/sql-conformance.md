@@ -54,10 +54,10 @@ and stays conformant.
 
 ## Score
 
-- Supported and covered: 24
-- Intentionally rejected: 55
+- Supported and covered: 41
+- Intentionally rejected: 67
 - Unclassified / broken: 0
-- **Conformance: 79 / 79 = 100.0%**
+- **Conformance: 108 / 108 = 100.0%**
 
 ## Conformance table
 
@@ -124,6 +124,35 @@ and stays conformant.
 | Clause / operator | `date_part(minute)` | `SELECT date_part('minute', ts) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `declared i64 typed aggregate` | `SELECT sum(dur) FROM logs` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a declared column (ADR-0090) |
 | Clause / operator | `declared i64 typed comparison` | `SELECT ts FROM logs WHERE dur >= 20` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a declared column (ADR-0090) |
+| Scalar function | `abs` | `SELECT abs(-3.5) FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | math family representative: abs(-3.5) = 3.5 |
+| Scalar function | `current_date` | `SELECT current_date FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `current_time` | `SELECT current_time FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `current_timestamp` | `SELECT current_timestamp FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `encode` | `SELECT encode('a', 'hex') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | encoding family representative: hex of the byte 0x61 = '61' |
+| Scalar function | `has_word` | `SELECT count(*) FROM logs WHERE has_word(body, '1')` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
+| Scalar function | `label` | `SELECT label(labels, '__name__') FROM samples WHERE value = 3.0` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
+| Scalar function | `label_match` | `SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
+| Scalar function | `now` | `SELECT now() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `rand` | `SELECT rand() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `random` | `SELECT random() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `regexp_replace` | `SELECT regexp_replace('foo123bar', '[0-9]+', 'X') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | regex family representative: first-match replace of the digit run = 'fooXbar' |
+| Scalar function | `reverse` | `SELECT reverse('résumé') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | unicode family representative: reverse('résumé') = 'émusér' (character-wise, not byte-wise) |
+| Scalar function | `to_char` | `SELECT to_char(make_date(2024, 7, 15), '%Y-%m-%d') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | datetime family representative: to_char over a tz-free Date32 = '2024-07-15' |
+| Scalar function | `today` | `SELECT today() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `upper` | `SELECT upper('ab') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | string family representative: upper('ab') = 'AB' |
+| Scalar function | `uuid` | `SELECT uuid() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `version` | `SELECT version() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Window function | `cume_dist` | `SELECT max(c) FROM (SELECT cume_dist() OVER (ORDER BY value) AS c FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
+| Window function | `dense_rank` | `SELECT max(d) FROM (SELECT dense_rank() OVER (ORDER BY value) AS d FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
+| Window function | `first_value` | `SELECT first_value(value) OVER (ORDER BY ts) FROM samples` | Intentionally rejected | `ValidationError::ExcludedWindow` | excluded window function; bare spelling is a separate ExcludedAggregate row (ADR-0097 decision 6) |
+| Window function | `lag` | `SELECT count(p) FROM (SELECT lag(value) OVER (ORDER BY value) AS p FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
+| Window function | `last_value` | `SELECT last_value(value) OVER (ORDER BY ts) FROM samples` | Intentionally rejected | `ValidationError::ExcludedWindow` | excluded window function; bare spelling is a separate ExcludedAggregate row (ADR-0097 decision 6) |
+| Window function | `lead` | `SELECT count(nx) FROM (SELECT lead(value) OVER (ORDER BY value) AS nx FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
+| Window function | `nth_value` | `SELECT nth_value(value, 2) OVER (ORDER BY ts) FROM samples` | Intentionally rejected | `ValidationError::ExcludedWindow` | excluded window function; bare spelling is a separate ExcludedAggregate row (ADR-0097 decision 6) |
+| Window function | `ntile` | `SELECT max(n) FROM (SELECT ntile(2) OVER (ORDER BY value) AS n FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
+| Window function | `percent_rank` | `SELECT max(pr) FROM (SELECT percent_rank() OVER (ORDER BY value) AS pr FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
+| Window function | `rank` | `SELECT max(r) FROM (SELECT rank() OVER (ORDER BY value) AS r FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
+| Window function | `row_number` | `SELECT max(rn) FROM (SELECT row_number() OVER (ORDER BY value) AS rn FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
 | Write / DDL statement | `ALTER TABLE` | `ALTER TABLE samples ADD COLUMN x INT` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `COPY` | `COPY (SELECT 1) TO 's3://evil/out.parquet'` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `CREATE EXTERNAL TABLE` | `CREATE EXTERNAL TABLE t (a INT) STORED AS PARQUET LOCATION '/tmp/x'` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
