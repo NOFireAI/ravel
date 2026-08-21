@@ -18,10 +18,13 @@
 //! 2. [`Classification::IntentionallyRejected`]: refused with a typed error,
 //!    never a panic and never silently-wrong data. This is the deliberate
 //!    allowlist: the aggregates outside the admitted six
-//!    ([`crate::validate::EXCLUDED_AGGREGATES`], ADR-0022 decision 2), every
-//!    write/DDL statement (the read-only single-statement gate,
-//!    [`crate::validate`]), and a query spanning both signal tables
-//!    ([`crate::error::SqlError::CrossSignalQuery`], ADR-0033 decision C).
+//!    ([`crate::validate::EXCLUDED_AGGREGATES`], ADR-0022 decision 2), the
+//!    nondeterministic scalars ([`crate::session::EXCLUDED_SCALARS`]) and the
+//!    excluded window functions ([`crate::session::EXCLUDED_WINDOWS`], ADR-0097
+//!    decisions 4 and 6), every write/DDL statement (the read-only
+//!    single-statement gate, [`crate::validate`]), and a query spanning both
+//!    signal tables ([`crate::error::SqlError::CrossSignalQuery`], ADR-0033
+//!    decision C).
 //! 3. [`Classification::Unclassified`]: implemented but untested, or
 //!    claimed-supported but actually wrong. This module declares no construct
 //!    into this state; it is the state a construct *falls into* when its
@@ -38,7 +41,14 @@
 //! The registry reads the excluded-aggregate set and the admitted set from
 //! their single sources of truth ([`crate::validate::EXCLUDED_AGGREGATES`],
 //! [`crate::session::ADMITTED_AGGREGATES`]) rather than restating them, so the
-//! table cannot drift from what the gate actually enforces.
+//! table cannot drift from what the gate actually enforces. The scalar and
+//! window rows (ADR-0097 decision 8) are bounded rather than exhaustive: one
+//! row per admitted scalar family plus Ravel's own UDFs, each of the eight
+//! admitted window functions, and each excluded scalar/window function. Their
+//! drift test (`registry_reads_the_live_allowlist_sets`) binds each registry's
+//! rows to its constant per-registry: exact set equality for the window and
+//! excluded-scalar registries, and family membership in
+//! [`crate::session::ADMITTED_SCALARS`] for the admitted-scalar families.
 
 use std::fmt::Write as _;
 
@@ -91,6 +101,12 @@ pub enum Category {
     WriteStatement,
     /// The samples/logs table-dispatch behavior (ADR-0033).
     TableDispatch,
+    /// A scalar function (admitted family representative, admitted Ravel UDF,
+    /// or excluded nondeterministic scalar) (ADR-0097 decisions 4, 8).
+    Scalar,
+    /// A window function used with an `OVER` clause (admitted or excluded)
+    /// (ADR-0097 decisions 6, 8).
+    Window,
 }
 
 impl Category {
@@ -99,8 +115,10 @@ impl Category {
         match self {
             Category::Aggregate => 0,
             Category::Clause => 1,
-            Category::WriteStatement => 2,
-            Category::TableDispatch => 3,
+            Category::Scalar => 2,
+            Category::Window => 3,
+            Category::WriteStatement => 4,
+            Category::TableDispatch => 5,
         }
     }
 
@@ -109,6 +127,8 @@ impl Category {
         match self {
             Category::Aggregate => "Aggregate",
             Category::Clause => "Clause / operator",
+            Category::Scalar => "Scalar function",
+            Category::Window => "Window function",
             Category::WriteStatement => "Write / DDL statement",
             Category::TableDispatch => "Table dispatch",
         }
@@ -175,9 +195,178 @@ const T_DISPATCH: &str = "tests/conformance.rs::supported_constructs_execute";
 
 // Typed-error variant names used as evidence for the rejected constructs.
 const E_EXCLUDED_AGGREGATE: &str = "ValidationError::ExcludedAggregate";
+const E_EXCLUDED_SCALAR: &str = "ValidationError::ExcludedScalar";
+const E_EXCLUDED_WINDOW: &str = "ValidationError::ExcludedWindow";
 const E_NOT_READ_ONLY: &str = "ValidationError::NotReadOnly";
 const E_WRITE_IN_QUERY: &str = "ValidationError::WriteInQuery";
 const E_CROSS_SIGNAL: &str = "SqlError::CrossSignalQuery";
+
+/// One admitted upstream scalar *family* (ADR-0097 decision 8), attested by a
+/// single representative row rather than one row per member. The family row is
+/// deliberately NOT exhaustive: the other members of the family stay admitted
+/// (they survive [`crate::session::build_session`]'s scalar gate and are held
+/// exhaustive against the upstream registrations by the drift test in
+/// `crate::session`), but that drift test constrains membership only. No row
+/// here attests the behaviour of any family member other than the
+/// representative. Registering one row per admitted scalar
+/// would mostly test upstream DataFusion rather than Ravel, which ADR-0097
+/// decision 8 rejects.
+struct ScalarFamily {
+    /// The representative function, which must be a member of
+    /// `ADMITTED_SCALARS` (asserted by the drift test). The datafusion-functions
+    /// pack it stands in for is named in `note`.
+    name: &'static str,
+    /// A statement whose result is re-derived by hand from its literal inputs.
+    example: &'static str,
+    /// The re-derivation, quoted in the row's rationale.
+    note: &'static str,
+}
+
+/// The six admitted scalar families (ADR-0097 decision 8: string, unicode,
+/// datetime, math, regex, encoding), each attested by one representative whose
+/// expected result is re-derived from its literal inputs in
+/// `tests/conformance.rs`. Every representative is a member of
+/// [`ADMITTED_SCALARS`]; the drift test asserts that.
+const ADMITTED_SCALAR_FAMILIES: [ScalarFamily; 6] = [
+    ScalarFamily {
+        name: "upper",
+        example: "SELECT upper('ab') FROM samples LIMIT 1",
+        note: "string family representative: upper('ab') = 'AB'",
+    },
+    ScalarFamily {
+        name: "reverse",
+        example: "SELECT reverse('résumé') FROM samples LIMIT 1",
+        note: "unicode family representative: reverse('résumé') = 'émusér' (character-wise, \
+               not byte-wise)",
+    },
+    ScalarFamily {
+        name: "to_char",
+        example: "SELECT to_char(make_date(2024, 7, 15), '%Y-%m-%d') FROM samples LIMIT 1",
+        note: "datetime family representative: to_char over a tz-free Date32 = '2024-07-15'",
+    },
+    ScalarFamily {
+        name: "abs",
+        example: "SELECT abs(-3.5) FROM samples LIMIT 1",
+        note: "math family representative: abs(-3.5) = 3.5",
+    },
+    ScalarFamily {
+        name: "regexp_replace",
+        example: "SELECT regexp_replace('foo123bar', '[0-9]+', 'X') FROM samples LIMIT 1",
+        note: "regex family representative: first-match replace of the digit run = 'fooXbar'",
+    },
+    ScalarFamily {
+        name: "encode",
+        example: "SELECT encode('a', 'hex') FROM samples LIMIT 1",
+        note: "encoding family representative: hex of the byte 0x61 = '61'",
+    },
+];
+
+/// Ravel's own scalar UDFs (ADR-0097 decision 8), each individually attested
+/// because each is Ravel code rather than upstream DataFusion. Every name is a
+/// member of [`ADMITTED_SCALARS`]; the drift test asserts that. Each carries a
+/// real expectation over the conformance fixture in `tests/conformance.rs`:
+/// `label`/`label_match` read the fixture's `__name__` label, `has_word` reads
+/// the fixture's log bodies.
+const RAVEL_SCALAR_UDFS: [(&str, &str); 3] = [
+    (
+        "label",
+        "SELECT label(labels, '__name__') FROM samples WHERE value = 3.0",
+    ),
+    (
+        "label_match",
+        "SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')",
+    ),
+    (
+        "has_word",
+        "SELECT count(*) FROM logs WHERE has_word(body, '1')",
+    ),
+];
+
+/// The eight admitted native window functions (ADR-0097 decision 6), each with
+/// an `OVER` example whose aggregated result is re-derived from the four
+/// fixture samples in `tests/conformance.rs`. Every name is a member of
+/// [`ADMITTED_WINDOWS`]; the drift test asserts the set equality.
+const ADMITTED_WINDOW_EXAMPLES: [(&str, &str); 8] = [
+    (
+        "row_number",
+        "SELECT max(rn) FROM (SELECT row_number() OVER (ORDER BY value) AS rn FROM samples)",
+    ),
+    (
+        "rank",
+        "SELECT max(r) FROM (SELECT rank() OVER (ORDER BY value) AS r FROM samples)",
+    ),
+    (
+        "dense_rank",
+        "SELECT max(d) FROM (SELECT dense_rank() OVER (ORDER BY value) AS d FROM samples)",
+    ),
+    (
+        "ntile",
+        "SELECT max(n) FROM (SELECT ntile(2) OVER (ORDER BY value) AS n FROM samples)",
+    ),
+    (
+        "lag",
+        "SELECT count(p) FROM (SELECT lag(value) OVER (ORDER BY value) AS p FROM samples)",
+    ),
+    (
+        "lead",
+        "SELECT count(nx) FROM (SELECT lead(value) OVER (ORDER BY value) AS nx FROM samples)",
+    ),
+    (
+        "cume_dist",
+        "SELECT max(c) FROM (SELECT cume_dist() OVER (ORDER BY value) AS c FROM samples)",
+    ),
+    (
+        "percent_rank",
+        "SELECT max(pr) FROM (SELECT percent_rank() OVER (ORDER BY value) AS pr FROM samples)",
+    ),
+];
+
+/// The `OVER` example for each excluded window function (ADR-0097 decision 6):
+/// `first_value`/`last_value`/`nth_value`, refused with the window-aware typed
+/// error. Their bare (aggregate-spelled) form is a separate, already-enumerated
+/// `Aggregate` row that yields `ExcludedAggregate` instead (#373); both
+/// spellings are attested because they produce different typed errors. The set
+/// of names must equal [`EXCLUDED_WINDOWS`]; the drift test asserts that.
+const EXCLUDED_WINDOW_EXAMPLES: [(&str, &str); 3] = [
+    (
+        "first_value",
+        "SELECT first_value(value) OVER (ORDER BY ts) FROM samples",
+    ),
+    (
+        "last_value",
+        "SELECT last_value(value) OVER (ORDER BY ts) FROM samples",
+    ),
+    (
+        "nth_value",
+        "SELECT nth_value(value, 2) OVER (ORDER BY ts) FROM samples",
+    ),
+];
+
+/// The excluded nondeterministic/environment-reading scalars (ADR-0097
+/// decision 4), each with an example refused before planning by
+/// `crate::validate` with the scalar-specific typed error. This is an
+/// independent enumeration keyed by name to the constant it must match: the
+/// drift test asserts this array's name set equals [`EXCLUDED_SCALARS`], so
+/// adding an example without adding the name to the constant (or vice versa)
+/// fails rather than passing tautologically.
+///
+/// The set has nine entries, not the eight ADR-0097 decision 4 names, because
+/// `today` is a DataFusion alias of `current_date` that shares its wall-clock
+/// read and its `EXCLUDED_SCALARS` membership; it is refused by the same typed
+/// error and so earns a row. The three `current_*` niladic functions use their
+/// bare SQL-standard spelling (which parses as a function call); the rest,
+/// including `today`, take explicit parentheses.
+const EXCLUDED_SCALAR_EXAMPLES: [(&str, &str); 9] = [
+    ("uuid", "SELECT uuid() FROM samples"),
+    ("random", "SELECT random() FROM samples"),
+    ("rand", "SELECT rand() FROM samples"),
+    ("now", "SELECT now() FROM samples"),
+    ("current_timestamp", "SELECT current_timestamp FROM samples"),
+    ("current_date", "SELECT current_date FROM samples"),
+    ("current_time", "SELECT current_time FROM samples"),
+    ("version", "SELECT version() FROM samples"),
+    ("today", "SELECT today() FROM samples"),
+];
 
 /// A representative aggregate call over the metrics table.
 fn agg_example(name: &str) -> String {
@@ -334,6 +523,77 @@ pub fn registry() -> Vec<Construct> {
             example: example.to_string(),
             classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
             rationale: "typed predicate/aggregate over a declared column (ADR-0090)",
+        });
+    }
+
+    // --- Scalar functions (ADR-0097 decisions 4, 8) ----------------------
+    // One representative row per admitted upstream family. The other members
+    // of each family stay admitted (they survive build_session's scalar gate,
+    // held exhaustive against the upstream registrations by the drift test in
+    // crate::session) but are covered by the family row and that drift test,
+    // NOT individually attested here: 127 rows would mostly test upstream
+    // DataFusion rather than Ravel (ADR-0097 decision 8).
+    for fam in &ADMITTED_SCALAR_FAMILIES {
+        out.push(Construct {
+            category: Category::Scalar,
+            name: fam.name.to_string(),
+            example: fam.example.to_string(),
+            classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
+            rationale: fam.note,
+        });
+    }
+    // Ravel's own scalar UDFs, individually attested: each is Ravel code, not
+    // upstream DataFusion.
+    for (name, example) in RAVEL_SCALAR_UDFS {
+        out.push(Construct {
+            category: Category::Scalar,
+            name: name.to_string(),
+            example: example.to_string(),
+            classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
+            rationale: "Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8)",
+        });
+    }
+    // The excluded nondeterministic/environment-reading scalars: refused before
+    // planning with the scalar-specific typed error (ADR-0097 decisions 4, 9).
+    for (name, example) in EXCLUDED_SCALAR_EXAMPLES {
+        out.push(Construct {
+            category: Category::Scalar,
+            name: name.to_string(),
+            example: example.to_string(),
+            classification: Classification::IntentionallyRejected {
+                typed_error: E_EXCLUDED_SCALAR,
+            },
+            rationale: "nondeterministic or environment-reading; unattestable by the \
+                        differential oracle (ADR-0097 decision 4)",
+        });
+    }
+
+    // --- Window functions (ADR-0097 decisions 6, 8) ----------------------
+    // The eight admitted native window functions, each verified through the
+    // real pipeline against a result re-derived from the fixture samples.
+    for (name, example) in ADMITTED_WINDOW_EXAMPLES {
+        out.push(Construct {
+            category: Category::Window,
+            name: name.to_string(),
+            example: example.to_string(),
+            classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
+            rationale: "admitted native window function (ADR-0097 decision 6)",
+        });
+    }
+    // The three excluded window functions, refused with the window-aware typed
+    // error. Their bare aggregate spelling is a separate Aggregate row above
+    // that yields ExcludedAggregate instead (#373): both spellings are attested
+    // because they produce different typed errors.
+    for (name, example) in EXCLUDED_WINDOW_EXAMPLES {
+        out.push(Construct {
+            category: Category::Window,
+            name: name.to_string(),
+            example: example.to_string(),
+            classification: Classification::IntentionallyRejected {
+                typed_error: E_EXCLUDED_WINDOW,
+            },
+            rationale: "excluded window function; bare spelling is a separate ExcludedAggregate \
+                        row (ADR-0097 decision 6)",
         });
     }
 
@@ -629,32 +889,111 @@ mod tests {
         }
     }
 
+    /// Every registry's row set corresponds to that registry's live constant,
+    /// per-registry so a new registry's rows cannot silently escape the bind
+    /// (ADR-0097 decision 8). The rule differs by registry, matching how each
+    /// is enumerated:
+    ///
+    /// - Aggregate, admitted/excluded window, and excluded scalar: exact. The
+    ///   set of row names must equal the constant. For windows and excluded
+    ///   scalars the rows are built from independent example arrays keyed to
+    ///   the constant by name, so this is a genuine two-way bind, not a
+    ///   tautology: an example added without its constant name (or a constant
+    ///   name without its example) fails here.
+    /// - Admitted scalar: family-based. The bound is not one row per admitted
+    ///   scalar (ADR-0097 decision 8 rejects that); it is one row per declared
+    ///   family plus each Ravel UDF, and every such row must name a live member
+    ///   of [`ADMITTED_SCALARS`]. A row naming a non-admitted scalar, and a
+    ///   family or UDF whose row is missing, fail here. Deleting a family or
+    ///   UDF entry outright does not: the declaration is the only statement of
+    ///   which families are claimed, so removing it removes the claim with it.
+    ///   The size of the admitted-scalar surface is bound by the drift test in
+    ///   [`crate::session`], not by this one.
     #[test]
     fn registry_reads_the_live_allowlist_sets() {
+        use std::collections::BTreeSet;
+
+        use crate::session::{
+            ADMITTED_SCALARS, ADMITTED_WINDOWS, EXCLUDED_SCALARS, EXCLUDED_WINDOWS,
+        };
+
         let registry = registry();
-        let rejected_aggs = registry
-            .iter()
-            .filter(|c| {
-                c.category == Category::Aggregate
-                    && matches!(
-                        c.classification,
-                        Classification::IntentionallyRejected { .. }
-                    )
-            })
-            .count();
+
+        let names = |category: Category, rejected: bool| -> BTreeSet<String> {
+            registry
+                .iter()
+                .filter(|c| {
+                    c.category == category
+                        && matches!(
+                            c.classification,
+                            Classification::IntentionallyRejected { .. }
+                        ) == rejected
+                })
+                .map(|c| c.name.clone())
+                .collect()
+        };
+        let constant =
+            |xs: &[&str]| -> BTreeSet<String> { xs.iter().map(|s| s.to_string()).collect() };
+
+        // Aggregate: exact count, as before (rows are built directly from the
+        // constants, so a count bind catches a filtered-out row).
         assert_eq!(
-            rejected_aggs,
+            names(Category::Aggregate, true).len(),
             EXCLUDED_AGGREGATES.len(),
             "every excluded aggregate must be enumerated"
         );
-        let supported_aggs = registry
-            .iter()
-            .filter(|c| {
-                c.category == Category::Aggregate
-                    && matches!(c.classification, Classification::SupportedAndCovered { .. })
-            })
-            .count();
-        assert_eq!(supported_aggs, ADMITTED_AGGREGATES.len());
+        assert_eq!(
+            names(Category::Aggregate, false).len(),
+            ADMITTED_AGGREGATES.len(),
+            "every admitted aggregate must be enumerated"
+        );
+
+        // Window: exact set equality against both constants.
+        assert_eq!(
+            names(Category::Window, false),
+            constant(&ADMITTED_WINDOWS),
+            "supported window rows must be exactly ADMITTED_WINDOWS"
+        );
+        assert_eq!(
+            names(Category::Window, true),
+            constant(&EXCLUDED_WINDOWS),
+            "rejected window rows must be exactly EXCLUDED_WINDOWS"
+        );
+
+        // Excluded scalar: exact set equality against the constant.
+        assert_eq!(
+            names(Category::Scalar, true),
+            constant(&EXCLUDED_SCALARS),
+            "rejected scalar rows must be exactly EXCLUDED_SCALARS"
+        );
+
+        // Admitted scalar: family-based. One row per family plus each Ravel
+        // UDF, each naming a live admitted scalar.
+        let admitted_scalar_rows = names(Category::Scalar, false);
+        assert_eq!(
+            admitted_scalar_rows.len(),
+            ADMITTED_SCALAR_FAMILIES.len() + RAVEL_SCALAR_UDFS.len(),
+            "admitted scalar rows must be one per family plus each Ravel UDF"
+        );
+        for name in &admitted_scalar_rows {
+            assert!(
+                ADMITTED_SCALARS.contains(&name.as_str()),
+                "admitted scalar row `{name}` is not a live member of ADMITTED_SCALARS"
+            );
+        }
+        for fam in &ADMITTED_SCALAR_FAMILIES {
+            assert!(
+                admitted_scalar_rows.contains(fam.name),
+                "scalar family representative `{}` has no row",
+                fam.name
+            );
+        }
+        for (udf, _) in RAVEL_SCALAR_UDFS {
+            assert!(
+                admitted_scalar_rows.contains(udf),
+                "Ravel UDF `{udf}` has no row"
+            );
+        }
     }
 
     #[test]
