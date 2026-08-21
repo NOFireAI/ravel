@@ -235,12 +235,18 @@ async fn the_executor_returns_tenant_bytes_after_a_multi_batch_query() {
 /// failed query must not leak either budget.
 ///
 /// The reservation's first growth moved from the batch phase into
-/// the fetch/decode phase (`prepare_partition`): the single segment's
-/// decoded run alone (30,000 rows, 64 bytes each = ~1.9 MiB) already exceeds
-/// this test's 1.4 MiB ceiling, so the trip now happens before the scan ever
+/// the fetch/decode phase (`prepare_partition`): the single segment's decoded
+/// SoA alone (30,000 samples, one i64 timestamp and one f64 value each =
+/// ~469 KiB, plus the segment's fetched raw-f64 page bytes) already exceeds
+/// this test's 400 KB ceiling, so the trip happens before the scan ever
 /// builds its first `RecordBatch`. That is the intended, earlier rejection
-/// the issue asked for, not a regression: zero batches is now the correct
+/// the issue asked for, not a regression: zero batches is the correct
 /// outcome for a byte ceiling this far below the decoded input size.
+///
+/// The ceiling moved with the unit. It was 1.4 MiB while the fetch/decode
+/// charge was `rows * size_of::<ScanRow>()` (64 bytes per sample); ADR-0099
+/// decision 6 deleted that row struct, and the same live bytes are now the
+/// SoA buffers the merge holds, 16 bytes per sample.
 #[tokio::test]
 async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
     let tenant = tenant_id("acme");
@@ -249,7 +255,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
 
     let config = SqlConfig {
         engine: util::engine_config(),
-        max_query_bytes: 1_400_000,
+        max_query_bytes: 400_000,
         parallel_final_aggregation: false,
     };
     let accountant = TenantMemoryAccountant::new(1 << 30);
