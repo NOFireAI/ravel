@@ -251,7 +251,40 @@ pub async fn run(
     batch_rows: usize,
     now_ns: i64,
 ) -> anyhow::Result<()> {
-    eprintln!("{ADMISSION_BYPASS_WARNING}");
+    run_warning_to(
+        store,
+        parquet_path,
+        tenant,
+        mapping_path,
+        shards,
+        batch_rows,
+        now_ns,
+        &mut std::io::stderr(),
+    )
+    .await
+}
+
+/// [`run`] with its warning stream injected, so a test can prove the warnings
+/// actually reach a caller of the real entry point.
+///
+/// The seam exists because the alternative was untestable: the dynamic-column
+/// warnings are the whole operator-facing deliverable of ADR-0100 decision 1,
+/// and with `eprintln!` inlined here, deleting the emit loop left every test
+/// green. Only [`run`]'s one-line delegation above is now unproven by a test.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_warning_to(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping_path: &Path,
+    shards: u32,
+    batch_rows: usize,
+    now_ns: i64,
+    warnings: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    // A diagnostic that cannot be written is not worth failing a durable load
+    // over, here or below.
+    let _ = writeln!(warnings, "{ADMISSION_BYPASS_WARNING}");
 
     let mapping_text = std::fs::read_to_string(mapping_path)
         .map_err(|e| anyhow::anyhow!("failed to read --mapping {}: {e}", mapping_path.display()))?;
@@ -275,7 +308,7 @@ pub async fn run(
             // its per-object dynamic-column budget is that default.
             let max_dynamic_columns = ravel_logseg::RlogConfig::default().max_dynamic_columns;
             for warning in dynamic_column_warnings(&report.metrics, max_dynamic_columns) {
-                eprintln!("{warning}");
+                let _ = writeln!(warnings, "{warning}");
             }
             Ok(())
         }
@@ -455,9 +488,6 @@ pub async fn load(
     now_ns: i64,
     clock: Arc<dyn Clock>,
 ) -> Result<LoadReport, LoadError> {
-    // Reject a zero batch size with a typed error rather than silently clamping
-    // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
-    // silent clamp would hide a misconfigured value that changes object layout.
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
     // silent clamp would hide a misconfigured value that changes object layout.
@@ -1360,6 +1390,77 @@ type = "i64"
                 && warnings[0].contains("attrs_raw"),
             "the overflow warning states the count and the attrs_raw consequence: {}",
             warnings[0]
+        );
+    }
+
+    /// The overflow warning reaches a caller of the real entry point, not just
+    /// [`dynamic_column_warnings`].
+    ///
+    /// The sibling tests call that helper directly, so all of them stayed green
+    /// when the emit loop was deleted from the entry point: they prove the text,
+    /// not the wiring. This one drives [`run_warning_to`] end to end -- mapping
+    /// file on disk, Parquet fixture, real router, real write -- and asserts the
+    /// warning came out of the stream the CLI hands it.
+    #[tokio::test]
+    async fn the_entry_point_emits_the_overflow_warning() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+
+        let n_attrs = 1001;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("wide.parquet");
+        let mapping_path = dir.path().join("mapping.toml");
+
+        let mut cols: Vec<(String, ArrayRef)> = vec![
+            ("ts".to_string(), i64_col(vec![NOW_NS])),
+            ("svc".to_string(), str_col(vec!["api"])),
+        ];
+        let mut attr_toml = String::new();
+        for i in 0..n_attrs {
+            let name = format!("a{i}");
+            cols.push((name.clone(), i64_col(vec![i as i64])));
+            attr_toml.push_str(&format!(
+                "\n[[attribute]]\nkey = \"{name}\"\ncolumn = \"{name}\"\ntype = \"i64\"\n"
+            ));
+        }
+        let batch = RecordBatch::try_from_iter(cols).expect("wide batch");
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        std::fs::write(
+            &mapping_path,
+            format!(
+                "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+                 [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n{attr_toml}"
+            ),
+        )
+        .expect("write mapping");
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut sink: Vec<u8> = Vec::new();
+        run_warning_to(
+            store,
+            &pq,
+            "acme",
+            &mapping_path,
+            4,
+            10_000,
+            NOW_NS,
+            &mut sink,
+        )
+        .await
+        .expect("the load itself succeeds; overflow is a warning, not a failure");
+
+        let emitted = String::from_utf8(sink).expect("warnings are utf-8");
+        assert!(
+            emitted.contains("overflowed the per-object dynamic-column budget"),
+            "the entry point must emit the overflow warning it computed: {emitted}"
+        );
+        assert!(
+            emitted.contains(ADMISSION_BYPASS_WARNING),
+            "and the pre-existing admission warning still goes to the same stream: {emitted}"
         );
     }
 
