@@ -29,7 +29,7 @@ use ravel_catalog::{
     Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
     DEFAULT_MAX_FLUSH_LIFETIME_NS,
 };
-use ravel_ingest::{IngestConfig, IngestRouter, SystemClock, WriteMode};
+use ravel_ingest::{Clock, IngestConfig, IngestRouter, WriteMode};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_otlp::NormalizedPoint;
@@ -57,6 +57,17 @@ const METRIC: &str = "hot_open_hour";
 // below if recent segments were not exempt from it (ADR-0073 decision 2).
 const MAX_SEGMENTS: usize = 3;
 const SEGMENT_COUNT: usize = 7;
+/// Spacing between consecutive fixture samples. Two whole seconds keeps every
+/// timestamp distinct at the PromQL JSON API's millisecond granularity.
+const SAMPLE_SPACING_NS: i64 = 2 * NS_PER_SEC;
+/// First-to-last sample distance the fixture covers.
+const SAMPLE_SPAN_NS: i64 = (SEGMENT_COUNT as i64 - 1) * SAMPLE_SPACING_NS;
+const NS_PER_MS: i64 = 1_000_000;
+/// The anchor offset every single-position test uses: far enough from both
+/// hour boundaries that no boundary arithmetic is in play. The sweep in
+/// `hot_reads_hold_at_every_anchor_position_in_the_hour` covers the boundaries
+/// themselves.
+const MID_HOUR_OFFSET_NS: i64 = NS_PER_HOUR / 2;
 
 fn now_ns() -> i64 {
     i64::try_from(
@@ -66,6 +77,36 @@ fn now_ns() -> i64 {
             .as_nanos(),
     )
     .expect("now fits i64")
+}
+
+/// The fixture's anchor: a caller-chosen offset into the wall-clock hour the
+/// suite runs in.
+///
+/// The *hour* has to track real time. The ingest path pins each commit
+/// record's `ingest_hour_bucket` from its clock, and `Catalog::resolve` lists
+/// ingest-hour buckets only out to the querying handler's own
+/// `SystemTime::now()` plus the clock-skew allowance
+/// (`crates/ravel-catalog/src/catalog.rs`'s `window_hour_bounds`), so segments
+/// pinned to an arbitrary fixed hour would sit outside every bucket the real
+/// HTTP handlers below list. The offset *within* that hour is a different
+/// matter: it is the only dimension `hot_window`'s arithmetic keys on, and it
+/// is the fixture's choice, never the clock's.
+fn anchor_in_current_hour(offset_in_hour_ns: i64) -> i64 {
+    now_ns().div_euclid(NS_PER_HOUR) * NS_PER_HOUR + offset_in_hour_ns
+}
+
+/// Frozen ingest clock, the injected-time seam this repository already uses
+/// (`analytics_endpoint.rs`'s `FixedClock`, `reshard_e2e.rs`'s `ManualClock`).
+/// It pins every flush's `ingest_hour_bucket` and `created_unix_ns` to the
+/// fixture's anchor, so which bucket the segments land in is a property of the
+/// anchor rather than of whether the wall clock happens to roll over an hour
+/// mid-run.
+struct FixedClock(i64);
+
+impl Clock for FixedClock {
+    fn now_ns(&self) -> i64 {
+        self.0
+    }
 }
 
 /// First instant at which `hour` is sealed (mirrors
@@ -114,32 +155,40 @@ fn label_set() -> LabelSet {
 
 /// Drives `SEGMENT_COUNT` real strict-mode writes through a real
 /// `IngestRouter` against `store`, one flush (and one L0 segment) per write,
-/// so the open hour accumulates more L0 segments than `MAX_SEGMENTS`. Every
-/// sample lands in the real wall-clock "current" hour (spaced 2 real seconds
-/// apart, floored to a whole millisecond so the PromQL JSON API's
-/// millisecond-granularity timestamps never collide or round), so it reads
-/// back as `Recent` under any handler's own `SystemTime::now()` without a
-/// injected clock. Returns every write's commit token (index-aligned with
-/// `sample_value`) and the millisecond-floored base timestamp the series
-/// started at.
+/// so the open hour accumulates more L0 segments than `MAX_SEGMENTS`.
+///
+/// Everything about where the samples land is derived from `anchor_ns`: the
+/// series starts there (floored to a whole millisecond so the PromQL JSON
+/// API's millisecond-granularity timestamps never collide or round) and runs
+/// `SAMPLE_SPACING_NS` per sample, and the ingest clock is frozen at that same
+/// instant so every flush pins the anchor's `ingest_hour_bucket`. Nothing here
+/// reads the wall clock, so where the samples sit relative to the window
+/// `hot_window` derives from the same anchor is a property of the fixture and
+/// not of when the suite runs. The segments still read back as `Recent` under
+/// each handler's own `SystemTime::now()`: nothing folds them, so the resolve
+/// tags every one of them from live listing.
+///
+/// Returns every write's commit token (index-aligned with `sample_value`) and
+/// the millisecond-floored base timestamp the series started at.
 async fn ingest_hot_segments(
     store: Arc<dyn ObjectStoreBackend>,
     tenant_id: &TenantId,
+    anchor_ns: i64,
 ) -> (Vec<CommitToken>, i64) {
-    let base_ms = now_ns() / 1_000_000;
-    let base_ns = base_ms * 1_000_000;
+    let base_ms = anchor_ns / NS_PER_MS;
+    let base_ns = base_ms * NS_PER_MS;
 
     let router = IngestRouter::new(
         ingest_config(),
         Arc::clone(&store),
         Signal::Metrics,
-        Arc::new(SystemClock),
+        Arc::new(FixedClock(base_ns)),
     );
 
     let series_id = SeriesId::compute(tenant_id, METRIC, &label_set()).expect("series id");
     let mut tokens = Vec::with_capacity(SEGMENT_COUNT);
     for i in 0..SEGMENT_COUNT {
-        let ts_ns = base_ns + (i as i64) * 2 * NS_PER_SEC;
+        let ts_ns = base_ns + (i as i64) * SAMPLE_SPACING_NS;
         let point = NormalizedPoint {
             series_id,
             labels: Arc::new(label_set()),
@@ -363,9 +412,11 @@ async fn sql_post_arrow(
     (status, ipc_bytes_bits(&bytes))
 }
 
-/// The open hour's boundaries and the evaluation instant used throughout:
-/// `base_ns` anchors the first sample, `hour` is its real-wall-clock hour
-/// bucket, and `eval_ns`/`eval_secs` sit strictly after the last sample.
+/// The open hour's boundaries and the evaluation instant used throughout, all
+/// derived from the fixture's own anchor: `base_ns` anchors the first sample,
+/// `hour` is the anchor's hour (the `ingest_hour_bucket` `FixedClock` pinned
+/// on every flush, and so the hour a fold has to seal), and `eval_ns` sits
+/// strictly after the last sample.
 struct HotWindow {
     hour: i64,
     window_start_ns: i64,
@@ -373,14 +424,40 @@ struct HotWindow {
     eval_ns: i64,
 }
 
+/// The window spans every hour the sample series touches, from the anchor's
+/// hour through the last sample's, rather than assuming the series fits inside
+/// the anchor's hour alone. `SAMPLE_SPAN_NS` of samples starting near the top
+/// of an hour genuinely run past the boundary, and a window closed at
+/// `(hour + 1) * NS_PER_HOUR` would drop exactly the ones that crossed it --
+/// making how many samples come back a function of where the anchor sits in
+/// its hour, which is what the fixture must not leave to chance.
 fn hot_window(base_ns: i64) -> HotWindow {
-    let hour = base_ns / NS_PER_HOUR;
+    let hour = base_ns.div_euclid(NS_PER_HOUR);
+    let last_sample_hour = (base_ns + SAMPLE_SPAN_NS).div_euclid(NS_PER_HOUR);
     HotWindow {
         hour,
         window_start_ns: hour * NS_PER_HOUR,
-        window_end_ns: (hour + 1) * NS_PER_HOUR,
-        eval_ns: base_ns + (SEGMENT_COUNT as i64) * 2 * NS_PER_SEC,
+        window_end_ns: (last_sample_hour + 1) * NS_PER_HOUR,
+        eval_ns: base_ns + (SEGMENT_COUNT as i64) * SAMPLE_SPACING_NS,
     }
+}
+
+/// The exact `(ts_ns, value_bits)` pairs the fixture writes at `base_ns`, in
+/// the sorted order both read paths return. Asserting reads against this,
+/// rather than only against a count, is what pins them to the fixture's own
+/// anchor: an anchor that drifted back to the wall clock would still return
+/// seven samples, just seven different ones.
+fn expected_bits(base_ns: i64) -> Vec<(i64, u64)> {
+    let mut out: Vec<(i64, u64)> = (0..SEGMENT_COUNT)
+        .map(|i| {
+            (
+                base_ns + (i as i64) * SAMPLE_SPACING_NS,
+                sample_value(i).to_bits(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// Post-compaction comparison target, at the low `QueryEngine`/`SqlExecutor`
@@ -464,16 +541,28 @@ async fn post_compaction_bits(
     (promql_bits, sql_bits)
 }
 
-/// Deliverable 1: sustaining flushes past `MAX_SEGMENTS`-worth of L0 objects
-/// in the open hour, real PromQL and SQL reads over real HTTP must keep
-/// succeeding and must return results bit-identical to a post-compaction
-/// read of the same data.
-#[tokio::test]
-async fn recent_hour_reads_survive_the_open_hour_and_match_post_compaction_exactly() {
+/// The body of
+/// `recent_hour_reads_survive_the_open_hour_and_match_post_compaction_exactly`,
+/// parameterised on the fixture anchor so the sweep below can drive the same
+/// assertions from every anchor position in an hour. `position` names the
+/// anchor in each failure message, so a sweep failure says which position
+/// broke.
+async fn assert_hot_reads_survive_and_match_post_compaction(position: &str, anchor_ns: i64) {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tid = tenant(TENANT);
-    let (_tokens, base_ns) = ingest_hot_segments(store.clone(), &tid).await;
+    let (_tokens, base_ns) = ingest_hot_segments(store.clone(), &tid, anchor_ns).await;
+    // Non-vacuity guard for the sweep below: every named anchor position is a
+    // claim about where in its hour the series sits, and a fixture that read
+    // the wall clock instead would satisfy all of the assertions below at one
+    // arbitrary position seven times over while proving nothing about the
+    // other six.
+    assert_eq!(
+        base_ns,
+        anchor_ns - anchor_ns.rem_euclid(NS_PER_MS),
+        "the fixture must place its series at the anchor it was handed (anchor {position})"
+    );
     let window = hot_window(base_ns);
+    let expected = expected_bits(base_ns);
 
     let promql_router = promql_app(
         store.clone(),
@@ -489,14 +578,19 @@ async fn recent_hour_reads_survive_the_open_hour_and_match_post_compaction_exact
     assert_eq!(
         status,
         StatusCode::OK,
-        "hot PromQL read must survive {SEGMENT_COUNT} recent segments over max_segments={MAX_SEGMENTS}: {body}"
+        "hot PromQL read must survive {SEGMENT_COUNT} recent segments over max_segments={MAX_SEGMENTS} (anchor {position}): {body}"
     );
     assert_eq!(body["status"], "success");
     let hot_promql_bits = promql_matrix_bits(&body);
     assert_eq!(
         hot_promql_bits.len(),
         SEGMENT_COUNT,
-        "expected all {SEGMENT_COUNT} samples back, got {hot_promql_bits:?}"
+        "expected all {SEGMENT_COUNT} samples back (anchor {position}), got {hot_promql_bits:?}"
+    );
+    assert_eq!(
+        hot_promql_bits, expected,
+        "the hot PromQL read must return exactly the samples the fixture wrote at its anchor \
+         ({position})"
     );
 
     let sql_router = sql_app(
@@ -514,12 +608,17 @@ async fn recent_hour_reads_survive_the_open_hour_and_match_post_compaction_exact
     assert_eq!(
         status,
         StatusCode::OK,
-        "hot SQL read must survive {SEGMENT_COUNT} recent segments over max_segments={MAX_SEGMENTS}"
+        "hot SQL read must survive {SEGMENT_COUNT} recent segments over max_segments={MAX_SEGMENTS} (anchor {position})"
     );
     assert_eq!(
         hot_sql_bits.len(),
         SEGMENT_COUNT,
-        "expected all {SEGMENT_COUNT} samples back, got {hot_sql_bits:?}"
+        "expected all {SEGMENT_COUNT} samples back (anchor {position}), got {hot_sql_bits:?}"
+    );
+    assert_eq!(
+        hot_sql_bits, expected,
+        "the hot SQL read must return exactly the samples the fixture wrote at its anchor \
+         ({position})"
     );
 
     let (post_promql_bits, post_sql_bits) =
@@ -527,16 +626,75 @@ async fn recent_hour_reads_survive_the_open_hour_and_match_post_compaction_exact
 
     assert_eq!(
         hot_promql_bits, post_promql_bits,
-        "hot-window PromQL read must be bit-identical to the post-compaction read"
+        "hot-window PromQL read must be bit-identical to the post-compaction read (anchor \
+         {position})"
     );
     assert_eq!(
         hot_sql_bits, post_sql_bits,
-        "hot-window SQL read must be bit-identical to the post-compaction read"
+        "hot-window SQL read must be bit-identical to the post-compaction read (anchor {position})"
     );
     assert_eq!(
         hot_promql_bits, hot_sql_bits,
-        "PromQL and SQL must agree on the same hot data (parity, over real HTTP)"
+        "PromQL and SQL must agree on the same hot data (parity, over real HTTP, anchor \
+         {position})"
     );
+}
+
+/// Deliverable 1: sustaining flushes past `MAX_SEGMENTS`-worth of L0 objects
+/// in the open hour, real PromQL and SQL reads over real HTTP must keep
+/// succeeding and must return results bit-identical to a post-compaction
+/// read of the same data.
+#[tokio::test]
+async fn recent_hour_reads_survive_the_open_hour_and_match_post_compaction_exactly() {
+    assert_hot_reads_survive_and_match_post_compaction(
+        "mid-hour",
+        anchor_in_current_hour(MID_HOUR_OFFSET_NS),
+    )
+    .await;
+}
+
+/// The determinism proof for the test above: it must hold at every anchor
+/// position in an hour, not at the one the wall clock happens to hand it.
+///
+/// The positions are the ones the window arithmetic keys on: the boundary
+/// `div_euclid(NS_PER_HOUR)` cuts at, either side of it, the mid-hour case
+/// where no boundary is in play, and the four placements of the sample span's
+/// far end relative to the next boundary (short of it, exactly on it, one
+/// sample past it, and every sample but the first past it). Under the
+/// wall-clock anchor this test replaces, which of these the suite got was
+/// luck, and the last two are the ones an hour-wide window drops samples from:
+/// six of seven at the first, one of seven at the second.
+#[tokio::test]
+async fn hot_reads_hold_at_every_anchor_position_in_the_hour() {
+    let positions: [(&str, i64); 7] = [
+        ("exactly on the hour boundary", 0),
+        ("1ms after the hour boundary", NS_PER_MS),
+        ("mid-hour", MID_HOUR_OFFSET_NS),
+        (
+            "last sample 1ms short of the next boundary",
+            NS_PER_HOUR - SAMPLE_SPAN_NS - NS_PER_MS,
+        ),
+        (
+            "last sample exactly on the next boundary",
+            NS_PER_HOUR - SAMPLE_SPAN_NS,
+        ),
+        (
+            "last sample 1ms past the next boundary, the six-of-seven case #399 reported",
+            NS_PER_HOUR - SAMPLE_SPAN_NS + NS_PER_MS,
+        ),
+        (
+            "1ms short of the next boundary, so all but the first sample cross it",
+            NS_PER_HOUR - NS_PER_MS,
+        ),
+    ];
+
+    for (position, offset_in_hour_ns) in positions {
+        assert_hot_reads_survive_and_match_post_compaction(
+            position,
+            anchor_in_current_hour(offset_in_hour_ns),
+        )
+        .await;
+    }
 }
 
 /// Deliverable 1's third bullet: a deliberately low `max_s3_requests`
@@ -549,7 +707,12 @@ async fn recent_hour_reads_survive_the_open_hour_and_match_post_compaction_exact
 async fn low_request_budget_trips_typed_error_not_a_hang_or_partial_result() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tid = tenant(TENANT);
-    let (_tokens, base_ns) = ingest_hot_segments(store.clone(), &tid).await;
+    let (_tokens, base_ns) = ingest_hot_segments(
+        store.clone(),
+        &tid,
+        anchor_in_current_hour(MID_HOUR_OFFSET_NS),
+    )
+    .await;
     let window = hot_window(base_ns);
 
     let engine_config = EngineConfig {
@@ -602,7 +765,12 @@ async fn low_request_budget_trips_typed_error_not_a_hang_or_partial_result() {
 async fn read_your_write_resolves_during_the_open_hour_over_cap_window() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tid = tenant(TENANT);
-    let (tokens, base_ns) = ingest_hot_segments(store.clone(), &tid).await;
+    let (tokens, base_ns) = ingest_hot_segments(
+        store.clone(),
+        &tid,
+        anchor_in_current_hour(MID_HOUR_OFFSET_NS),
+    )
+    .await;
     let window = hot_window(base_ns);
     let last_token = tokens.last().expect("at least one token").encode();
 
