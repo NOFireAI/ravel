@@ -126,3 +126,143 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
         );
     }
 }
+
+/// One segment of `rows` samples in a single series (ts == value == i), so the
+/// scan runs on one partition (segment count caps `target_partitions`) and its
+/// per-partition live set stays small, while every ts is a distinct value the
+/// aggregate/sort above must hold. Sized to overrun a small query budget.
+fn single_series_specs(rows: i64) -> Vec<SegSpec> {
+    vec![SegSpec::new(
+        10,
+        1,
+        0,
+        vec![SeriesSpec::new(
+            "m",
+            (0..rows).map(|i| (i, i as f64)).collect(),
+        )],
+    )]
+}
+
+/// ADR-0102 decision 3: with the disk manager disabled in `build_session`, a
+/// high-cardinality final aggregation whose group state exceeds the query
+/// memory budget fails as `SqlError::ResourcesExhausted` carrying the memory
+/// pool's *own* `try_grow` message, instead of routing through DataFusion's
+/// spill path.
+///
+/// With the disk manager disabled, `GroupedHashAggregateStream` is built in
+/// `ReportError` mode: when its reservation cannot grow it propagates the
+/// pool's error directly, so the message begins with the pool's
+/// `"query memory pool exhausted: ..."` text and never mentions spilling.
+///
+/// Prove-the-test: with the `with_disk_manager_builder(...Disabled)` line
+/// removed from `build_session`, the aggregate is instead built in spill mode
+/// and routes through the (default `OsTmpDirectory`) disk manager. At this
+/// budget it then fails inside the spill machinery with a wrapped
+/// `"Failed to reserve memory for sort during spill: ..."` message, which does
+/// NOT start with the pool's text -- so the `starts_with` assertion below fails.
+/// Verified by removing the line and observing that exact message.
+#[tokio::test]
+async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
+    let tenant = tenant_id("acme");
+    let specs = single_series_specs(300_000);
+
+    let config = SqlConfig {
+        engine: util::engine_config(),
+        max_query_bytes: 16 * 1024 * 1024,
+        parallel_final_aggregation: false,
+    };
+    let fixture = Fixture::build(
+        Arc::new(MemoryStore::new()),
+        &[(&tenant, &specs)],
+        config,
+        1 << 40,
+    )
+    .await;
+
+    let err = fixture
+        .executor
+        .execute(
+            tenant.hash(),
+            &request("SELECT ts, count(*) AS n FROM samples GROUP BY ts"),
+        )
+        .await
+        .expect_err("a high-cardinality aggregation over budget must trip the pool");
+
+    assert!(
+        matches!(err, SqlError::ResourcesExhausted(_)),
+        "aggregation over budget must fail typed rather than spill; got {err:?}"
+    );
+    let SqlError::ResourcesExhausted(msg) = &err else {
+        unreachable!("asserted above");
+    };
+    // The aggregate, unable to spill, surfaces the pool's own try_grow error
+    // directly -- not a spill-path wrapper.
+    assert!(
+        msg.starts_with("query memory pool exhausted"),
+        "aggregation must surface the pool's direct try_grow error, not a spill \
+         wrapper; got {msg:?}"
+    );
+}
+
+/// ADR-0102 decision 3: with the disk manager disabled, a large `ORDER BY` that
+/// overruns the budget through DataFusion's external sort also fails as
+/// `SqlError::ResourcesExhausted` -- but its message originates in
+/// `DiskManager::create_tmp_file`
+/// (`"Memory Exhausted while Sorting (DiskManager is disabled)"`), propagated as
+/// `DataFusionError::ResourcesExhausted` and mapped to the same
+/// `SqlError::ResourcesExhausted` variant the aggregation path uses. Same typed
+/// variant, distinct message from the aggregation case (which is the pool's
+/// `try_grow` text) -- confirmed here by matching the disk-manager wording.
+///
+/// `ORDER BY value` forces a real external sort: the pipeline output is already
+/// ordered by `(series_id, ts)`, so ordering by `ts` alone could be elided,
+/// whereas `value` is unrelated to that order.
+///
+/// Prove-the-test: with the `with_disk_manager_builder(...Disabled)` line
+/// removed, the sorter's spill attempt reaches the default `OsTmpDirectory`
+/// disk manager and the overrun instead surfaces as the pool's
+/// `"query memory pool exhausted: ..."` error (no disk-manager wording), so the
+/// `contains("DiskManager is disabled")` assertion below fails. Verified by
+/// removing the line and observing that exact message.
+#[tokio::test]
+async fn a_large_order_by_over_budget_is_resources_exhausted() {
+    let tenant = tenant_id("acme");
+    let specs = single_series_specs(300_000);
+
+    let config = SqlConfig {
+        engine: util::engine_config(),
+        max_query_bytes: 16 * 1024 * 1024,
+        parallel_final_aggregation: false,
+    };
+    let fixture = Fixture::build(
+        Arc::new(MemoryStore::new()),
+        &[(&tenant, &specs)],
+        config,
+        1 << 40,
+    )
+    .await;
+
+    let err = fixture
+        .executor
+        .execute(
+            tenant.hash(),
+            &request("SELECT ts, value FROM samples ORDER BY value"),
+        )
+        .await
+        .expect_err("a large ORDER BY over budget must trip the disabled disk manager");
+
+    assert!(
+        matches!(err, SqlError::ResourcesExhausted(_)),
+        "ORDER BY over budget must fail typed rather than spill; got {err:?}"
+    );
+    // The sort path's message originates from the disabled disk manager, a
+    // different source than the aggregation path's pool `try_grow`; both are the
+    // same typed variant, and the distinct message is expected.
+    let SqlError::ResourcesExhausted(msg) = &err else {
+        unreachable!("asserted above");
+    };
+    assert!(
+        msg.contains("DiskManager is disabled"),
+        "the sort path's error must name the disabled disk manager; got {msg:?}"
+    );
+}
