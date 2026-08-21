@@ -3445,6 +3445,82 @@ mod tests {
         }
     }
 
+    /// The dynamic-column budget family (ADR-0100 decision 1) renders its three
+    /// samples, each labelled with exactly `{mode, signal="logs"}`.
+    ///
+    /// A sibling of `postings_family_carries_only_allowlisted_labels` rather
+    /// than an addition to it: that test filters the `ravel_logs_postings_`
+    /// prefix and asserts an exact sample count, so these three names fall
+    /// outside its net entirely. Without this, a stray per-attribute-name label
+    /// on the budget family would violate the ADR-0044 allowlist with no test
+    /// failing.
+    #[test]
+    fn dynamic_columns_family_carries_only_allowlisted_labels() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                dynamic_columns_used_total: 13,
+                dynamic_columns_overflowed_total: 5,
+                dynamic_columns_used_max: 8,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &populated_store_snapshot(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+        );
+
+        let lines: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with("ravel_logs_dynamic_columns_"))
+            .collect();
+        // Three metrics, one sample each: only the log pipeline carries them.
+        assert_eq!(
+            lines.len(),
+            3,
+            "one sample per dynamic-column metric, log pipeline only:\n{body}"
+        );
+
+        for line in &lines {
+            let labels = line
+                .split_once('{')
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(inner, _)| inner)
+                .expect("sample carries a label block");
+            let keys: HashSet<&str> = labels
+                .split(',')
+                .map(|kv| kv.split_once('=').expect("label is key=value").0)
+                .collect();
+            assert_eq!(
+                keys,
+                HashSet::from(["mode", "signal"]),
+                "a dynamic-column sample must carry only {{mode, signal}}, never an \
+                 attribute key (ADR-0044): {line}"
+            );
+            assert!(
+                line.contains("signal=\"logs\""),
+                "the dynamic-column budget is a log-only family: {line}"
+            );
+        }
+    }
+
     /// The prune-selectivity family renders its three counters,
     /// each labelled with exactly `{mode, signal="logs"}` and nothing more.
     /// Rendered directly rather than through the process-global so the values

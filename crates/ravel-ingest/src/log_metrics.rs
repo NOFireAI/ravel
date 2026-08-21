@@ -555,13 +555,16 @@ mod tests {
         });
         metrics.record_postings(ravel_logseg::writer::WriteStats {
             dynamic_columns_used: 5,
-            dynamic_columns_overflowed: 0,
+            dynamic_columns_overflowed: 2,
             ..Default::default()
         });
 
         let snap = metrics.snapshot();
         assert_eq!(snap.dynamic_columns_used_total, 13, "8 + 5");
-        assert_eq!(snap.dynamic_columns_overflowed_total, 3, "3 + 0");
+        // Both writes overflow, and by different amounts, so this sum
+        // distinguishes a `fetch_add` fold from a `fetch_max` one: a maximum
+        // would report 3 here.
+        assert_eq!(snap.dynamic_columns_overflowed_total, 5, "3 + 2");
         assert_eq!(
             snap.dynamic_columns_used_max, 8,
             "running maximum keeps the wider object's used count"
