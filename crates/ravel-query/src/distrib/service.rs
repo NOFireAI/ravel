@@ -8,17 +8,18 @@
 //! exactly one [`pb::Summary`] frame (slice atomicity: the slice contributes to
 //! the coordinator merge only after its terminal summary arrives).
 //!
-//! # Scalar-only, for now
+//! # Scalar and native-histogram series
 //!
-//! Distribution carries scalar series only. The typed `HistogramRecord` wire
-//! shape now exists (`proto/ravel/queryfrag.proto`, ADR-0096 decision 2) and
-//! its codec is in place, but no encoder writes it onto a frame yet (the
-//! version flip that enables it is ADR-0096 decision 3 step 4, #379). So a
-//! slice whose segments still decode any native-histogram series -- after
-//! erasure filtering (ADR-0096 decision 3 step 3) removes any fully-erased
-//! ones -- returns [`pb::status::Code::Unsupported`]; the coordinator then
-//! silently falls back to fully local execution for the whole query (ADR-0071
-//! failure semantics), never a partial or wrong result.
+//! As of `PROTOCOL_VERSION` 3 (ADR-0096 decision 3 step 4, #379) a Metrics slice
+//! streams both scalar series (`SeriesFrame`, carrying the four packed per-sample
+//! provenance columns for a run-merged L1 run) and native-histogram series
+//! (`HistogramFrame`, carrying typed `HistogramRecord`s plus the same provenance
+//! columns). Erasure filtering (ADR-0096 decision 3 step 3) is applied to the
+//! decoded histogram series before they are encoded, exactly as it is for scalar
+//! series. The version gate ([`codec::check_protocol_version`], plus the
+//! intra-cluster routing filter) guarantees only a coordinator speaking the same
+//! version ever receives these frames, so the new columns and records are never
+//! silently dropped by an older decoder.
 //!
 //! # Segment identity resolution
 //!
@@ -263,11 +264,11 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     }
 
     /// The Metrics slice path: resolve the pinned scope to refs, fetch each
-    /// segment's scalar (and histogram) series, enforce the per-slice
-    /// bytes-scanned budget, apply erasure, and stream scalar frames ending in
-    /// a terminal summary. Extracted from `run_slice_inner` unchanged so the
-    /// per-signal dispatch there can call it as one arm; Metrics behavior is
-    /// bit-for-bit what it was before #283.
+    /// segment's scalar and histogram series, enforce the per-slice
+    /// bytes-scanned budget, apply erasure, and stream one `SeriesFrame` per
+    /// scalar series and one `HistogramFrame` per native-histogram series,
+    /// ending in a terminal summary (ADR-0096 decision 3 step 4). Extracted from
+    /// `run_slice_inner` so the per-signal dispatch there can call it as one arm.
     async fn run_slice_metrics(
         &self,
         scope: Option<pb::fetch_request::Scope>,
@@ -349,77 +350,32 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
 
         // Selective-erasure exclusion on the histogram series, applied
         // post-decode exactly as the local path applies it (ADR-0064, ADR-0071,
-        // ADR-0096 decision 3 step 3). Run BEFORE the histogram-refusal check so
-        // the refusal keys on the series that actually survive erasure, not on
-        // the raw per-segment fetch: an erasure predicate that erases every
-        // sample of every histogram series present leaves nothing to refuse.
-        // Filtering is observable here even though no encoder writes
-        // HistogramRecord onto the wire yet (that is #379): the Unsupported
-        // refusal below no longer fires when erasure emptied the histogram set.
+        // ADR-0096 decision 3 step 3): the coordinator does not re-apply, so
+        // worker-side application must match the local rule.
         if !erasure.is_empty() {
             crate::erasure::retain_histogram_series(&mut histograms, &erasure);
         }
 
-        // Scalar-only distribution: hand a histogram-bearing slice back to the
-        // coordinator's local fallback rather than return partial results. The
-        // summary still carries this slice's accounting/stats so the
-        // coordinator folds its spend before falling back to local (ADR-0071);
-        // otherwise the histogram query would pay for this fetch twice and
-        // report it once.
-        if !histograms.is_empty() {
-            return Ok(vec![summary_frame(
-                &accounting.snapshot(),
-                0,
-                0,
-                pb::status::Code::Unsupported,
-                "histogram series are not distributed yet".to_string(),
-                &stats,
-            )]);
-        }
-
-        // Run-merged provenance is representable on the wire as of this
-        // commit: `pb::Run` and `pb::HistogramRun` carry the four packed
-        // per-sample provenance columns alongside the run-wide triple. The
-        // refusal below stays for now only because of the staged version-flip
-        // sequencing (ADR-0096 decision 3): a worker must not emit the new
-        // columns until every coordinator in the fleet can decode them, so the
-        // producing side stays off until the version flip lands. Until then a
-        // series with an explicit per-sample provenance column (a merged L1 v7
-        // run, produced since issue #315) would have to cross as a degraded
-        // run-wide frame, silently dropping the column and letting the
-        // coordinator pick a different dedup winner than the local path at an
-        // overlapping timestamp. So refuse the whole slice back to the
-        // coordinator's local fallback rather than return that degraded frame,
-        // exactly as the histogram arm above does. The summary carries this
-        // slice's accounting/stats so the coordinator folds its spend once
-        // before falling back (ADR-0071); otherwise the query would pay for
-        // this fetch twice and report it once.
-        if scalar
-            .iter()
-            .flatten()
-            .any(|fs| fs.per_sample_priorities.is_some())
-        {
-            return Ok(vec![summary_frame(
-                &accounting.snapshot(),
-                0,
-                0,
-                pb::status::Code::Unsupported,
-                "run-merged series (per-sample provenance column) are not \
-                 distributed yet (#348)"
-                    .to_string(),
-                &stats,
-            )]);
-        }
-
-        // Selective-erasure exclusion, applied post-decode exactly as the local
-        // path applies it (ADR-0064, ADR-0071): the coordinator does not
-        // re-apply, so worker-side application must match the local rule.
+        // Selective-erasure exclusion on the scalar series, applied post-decode
+        // exactly as the local path applies it (ADR-0064, ADR-0071): the
+        // coordinator does not re-apply, so worker-side application must match
+        // the local rule.
         if !erasure.is_empty() {
             for series in &mut scalar {
                 crate::erasure::retain_series_soa(series, &erasure);
             }
         }
 
+        // Run-merged scalar runs and native-histogram runs now cross the wire
+        // bit-exactly (ADR-0096 decision 3 step 4, #379): `encode_series_frame`
+        // and `encode_histogram_frame` emit the four packed per-sample
+        // provenance columns, and `HistogramFrame` also carries the typed
+        // records. The version gate (the request-level `check_protocol_version`
+        // above and the intra-cluster routing filter) guarantees only a
+        // coordinator speaking this same version ever receives these frames, so
+        // the columns and records are never silently dropped by an older
+        // decoder -- which is why the #315/#348 refusals that used to sit here
+        // are gone.
         let mut frames = Vec::new();
         let mut series_returned = 0u64;
         let mut samples_returned = 0u64;
@@ -433,6 +389,15 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                     )),
                 });
             }
+        }
+        for hs in histograms {
+            series_returned += 1;
+            samples_returned += hs.timestamps.len() as u64;
+            frames.push(pb::FetchResponse {
+                frame: Some(pb::fetch_response::Frame::Hist(
+                    codec::encode_histogram_frame(&hs),
+                )),
+            });
         }
         frames.push(summary_frame(
             &accounting.snapshot(),

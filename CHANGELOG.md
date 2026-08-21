@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The 0.10.0 known limitation on run-merged series and the distributed query
+  path is resolved. `ravel.queryfrag.v1` (bumped to protocol version 3,
+  ADR-0096) now carries per-sample dedup provenance on the wire, native
+  histograms distribute for the first time, and both the run-merged and
+  histogram refusals are removed. A distributed query over either shape now
+  returns results bit-identical to the same query run locally.
+
 ## [0.10.0]
 
 The metrics segment format moves to RSEG v7 and the L1 compactor stops

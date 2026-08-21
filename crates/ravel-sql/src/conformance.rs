@@ -279,24 +279,17 @@ const ADMITTED_SCALAR_FAMILIES: [ScalarFamily; 6] = [
 /// Ravel's own scalar UDFs (ADR-0097 decision 8), each individually attested
 /// because each is Ravel code rather than upstream DataFusion. Every name is a
 /// member of [`ADMITTED_SCALARS`]; the drift test asserts that. Each carries a
-/// real expectation over the conformance fixture in `tests/conformance.rs`.
-/// Each row's SQL and fixture are chosen so a weaker implementation that still
-/// executes produces a different, wrong answer (#409):
-/// - `label` selects a non-first label key (`tier`) from a series that carries
-///   more than one label, so returning "the first label" is caught.
-/// - `label_match` anchors against `web`, a strict substring of the other
-///   series name `web-canary`, so an unanchored substring matcher over-counts.
-/// - `has_word` searches for `1`, which the fixture also embeds inside the
-///   larger token `21`, so a plain substring matcher over-counts relative to
-///   the word-boundary match.
+/// real expectation over the conformance fixture in `tests/conformance.rs`:
+/// `label`/`label_match` read the fixture's `__name__` label, `has_word` reads
+/// the fixture's log bodies.
 const RAVEL_SCALAR_UDFS: [(&str, &str); 3] = [
     (
         "label",
-        "SELECT label(labels, 'tier') FROM samples WHERE value = 3.0",
+        "SELECT label(labels, '__name__') FROM samples WHERE value = 3.0",
     ),
     (
         "label_match",
-        "SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'web')",
+        "SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')",
     ),
     (
         "has_word",

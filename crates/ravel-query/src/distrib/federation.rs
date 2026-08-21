@@ -70,7 +70,7 @@ use crate::distrib::{codec, encode_budgets};
 use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
-use crate::fetcher::{FetchStats, FetchedSeriesSoa};
+use crate::fetcher::{FetchStats, FetchedHistogramSeries, FetchedSeriesSoa};
 
 /// The default per-remote soft timeout. A remote that has not answered within
 /// this bound is treated as unavailable (skipped or fatal per
@@ -137,6 +137,15 @@ pub struct FederationOutcome {
     /// Decoded scalar series from every healthy remote, one inner `Vec` per
     /// remote. The engine flattens these into its merge pool.
     pub series: Vec<Vec<FetchedSeriesSoa>>,
+    /// Decoded native-histogram series from every healthy remote, one inner
+    /// `Vec` per remote (ADR-0096 decision 3 step 4). The engine keys these by
+    /// `LabelSet` into its histogram pool alongside the local runs. Federation
+    /// assumes disjoint series identity across clusters (see the module doc
+    /// above); on a same-label collision the remote series is dropped in favor
+    /// of whichever insert wins, unlike the scalar pool, which unions samples
+    /// under a shared `SeriesId` instead of picking a winner between whole
+    /// series.
+    pub histogram: Vec<Vec<FetchedHistogramSeries>>,
     /// Summed remote `FetchStats` page counters, folded into the query's stats.
     pub stats: FetchStats,
     /// Human-readable warnings (one per skipped cluster), surfaced in the
@@ -263,6 +272,7 @@ impl Federation {
         }
 
         let mut distinct: HashSet<SeriesId> = HashSet::new();
+        let mut distinct_hist: HashSet<SeriesId> = HashSet::new();
         let mut running = QueryAccountingSnapshot::default();
 
         for (i, (name, skip_unavailable, timeout)) in meta.into_iter().enumerate() {
@@ -317,25 +327,6 @@ impl Federation {
                     )?;
                     continue;
                 }
-                // A remote carrying native-histogram data this build cannot
-                // decode yet is a coverage gap, not corruption: the frame is
-                // well-formed, the remote simply serves a data kind the
-                // coordinator cannot consume across the boundary. Route it
-                // through the same skip_unavailable path an unavailable remote
-                // takes, with a truthful reason -- never the "malformed
-                // response" hard fault, which would be both untrue and
-                // non-skippable.
-                Err(DistribError::HistogramUnsupported) => {
-                    handle_unavailable(
-                        &name,
-                        skip_unavailable,
-                        "remote returned native-histogram data this build cannot decode across \
-                         clusters yet"
-                            .to_string(),
-                        &mut outcome,
-                    )?;
-                    continue;
-                }
                 Err(err) => {
                     return Err(QueryError::Federation {
                         cluster: name.clone(),
@@ -357,6 +348,22 @@ impl Federation {
                         }
                         distinct.insert(fs.series_id);
                     }
+                    // The identical distinct-series re-enforcement for the
+                    // remote's histogram series (ADR-0096 decision 3 step 4): a
+                    // hostile remote cannot overrun the coordinator's cap by
+                    // streaming histogram runs, and a histogram series is heavier
+                    // per series than a scalar one.
+                    for hs in &response.histogram {
+                        if !distinct_hist.contains(&hs.series_id)
+                            && distinct_hist.len() >= config.max_series
+                        {
+                            return Err(QueryError::TooManySeries {
+                                count: distinct_hist.len() + 1,
+                                max: config.max_series,
+                            });
+                        }
+                        distinct_hist.insert(hs.series_id);
+                    }
                     // Bytes-scanned re-enforcement over the folded remote spend.
                     // Always fatal, never skippable: a budget cap bounds
                     // correctness/cost, not availability.
@@ -366,6 +373,7 @@ impl Federation {
                         return Err(err);
                     }
                     outcome.series.push(response.scalar);
+                    outcome.histogram.push(response.histogram);
                 }
                 pb::status::Code::Unavailable => {
                     handle_unavailable(
@@ -398,8 +406,8 @@ impl Federation {
                     // snapshot, so `Unsupported` can only mean "this cluster does
                     // not serve this query kind yet" -- an availability/coverage
                     // property, not a wrong-data one. Route it through the same
-                    // skip_unavailable path a native-histogram coverage gap
-                    // (`DistribError::HistogramUnsupported` above) takes: skipped
+                    // skip_unavailable path an unavailable remote (a transport
+                    // failure or soft timeout above) takes: skipped
                     // with a redacted partial-coverage warning when
                     // `skip_unavailable` is set, a truthful typed `Federation`
                     // error naming only the cluster otherwise. Treating it as a
@@ -528,17 +536,6 @@ mod tests {
         }
     }
 
-    /// A remote that streams native-histogram data this build cannot decode
-    /// across the slice boundary (S5). Well-formed, not corruption.
-    struct HistUnsupportedFetcher;
-
-    #[async_trait]
-    impl SliceFetcher for HistUnsupportedFetcher {
-        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
-            Err(DistribError::HistogramUnsupported)
-        }
-    }
-
     /// A remote whose metrics-shaped `fetch` answers with a well-formed summary
     /// carrying a terminal `Unsupported` status and no frames -- byte-for-byte
     /// what a pre-amendment remote (predating the ADR-0071 log/span fan-out)
@@ -554,6 +551,7 @@ mod tests {
         async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
             Ok(SliceResponse {
                 scalar: Vec::new(),
+                histogram: Vec::new(),
                 accounting: QueryAccountingSnapshot::default(),
                 stats: FetchStats::default(),
                 series_returned: 0,
@@ -693,50 +691,64 @@ mod tests {
         }
     }
 
-    /// S5: a histogram-bearing remote is a coverage gap, not corruption. With
-    /// `skip_unavailable = true` it is skipped (partial + a warning naming the
-    /// cluster and nothing internal), exactly like an unavailable remote --
-    /// never the non-skippable "malformed response" hard fault.
-    #[tokio::test]
-    async fn histogram_remote_is_skippable_not_a_hard_fault() {
-        let fed = one_remote(
-            Arc::new(HistUnsupportedFetcher),
-            true,
-            Duration::from_secs(5),
-        );
-        let outcome = run(&fed)
-            .await
-            .expect("a histogram remote is skippable under skip_unavailable");
-        assert!(
-            outcome.partial,
-            "coverage is partial when the remote is skipped"
-        );
-        assert_eq!(outcome.skipped, vec!["eu-west".to_string()]);
-        assert_eq!(outcome.warnings.len(), 1);
-        let w = &outcome.warnings[0];
-        assert!(w.contains("eu-west"), "warning names the cluster: {w}");
-        assert!(
-            !w.contains("histogram"),
-            "client warning is the stable redacted message, not the internal reason: {w}"
-        );
+    /// A remote whose real decode path yields a malformed native-histogram
+    /// frame. Post-flip (ADR-0096 decision 3 step 4) a `Hist` frame only reaches
+    /// a coordinator whose `PROTOCOL_VERSION` matches the sender's (both the
+    /// intra-cluster routing filter and `service.rs`'s request-level check
+    /// enforce it before any frame crosses), so a `Hist` frame that fails to
+    /// decode is real corruption, not a coverage gap. This produces the exact
+    /// `DistribError` the production `decode_slice_frames` raises for a
+    /// length-mismatched `HistogramRun` (`records.len() != ts_delta.len()`).
+    struct MalformedHistFetcher;
+
+    #[async_trait]
+    impl SliceFetcher for MalformedHistFetcher {
+        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            let frame = pb::FetchResponse {
+                frame: Some(pb::fetch_response::Frame::Hist(pb::HistogramFrame {
+                    series_id: vec![0u8; 16],
+                    labels: Vec::new(),
+                    // One ts delta but zero records: the same shape T3a's
+                    // `histogram_run_length_mismatch_is_typed_error` constructs.
+                    runs: vec![pb::HistogramRun {
+                        created_unix_ns: 0,
+                        writer_epoch: 0,
+                        writer_seq: 0,
+                        ts_delta: vec![10],
+                        prov_created_delta: Vec::new(),
+                        prov_epoch_delta: Vec::new(),
+                        prov_seq_delta: Vec::new(),
+                        prov_in_page_index: Vec::new(),
+                        records: Vec::new(),
+                    }],
+                })),
+            };
+            crate::distrib::client::decode_slice_frames(vec![frame])
+        }
     }
 
-    /// S5: with `skip_unavailable = false` the histogram remote still fails the
-    /// query typed (never silently dropped), but as a `Federation` error naming
-    /// the cluster -- the truthful skippable path -- not a masked drop.
+    /// Post-flip invariant: a remote streaming a genuinely malformed `Hist` frame
+    /// is a hard, non-skippable `QueryError::Federation` fault -- even with
+    /// `skip_unavailable = true`. Corruption is never silently downgraded to a
+    /// coverage gap, regardless of the flag, because the version gate means a
+    /// `Hist` frame that reached decode came from a same-version sender, so a
+    /// decode failure can only be real corruption.
+    ///
+    /// Flip-line proof: were the deleted `Err(DistribError::HistogramUnsupported)`
+    /// coverage-gap arm reinstated (or the generic `Err(err)` hard-fault arm
+    /// relaxed to route decode failures through `handle_unavailable`), this
+    /// `expect_err` would instead see a partial `Ok` under `skip_unavailable`.
     #[tokio::test]
-    async fn histogram_remote_without_skip_fails_typed() {
-        let fed = one_remote(
-            Arc::new(HistUnsupportedFetcher),
-            false,
-            Duration::from_secs(5),
-        );
-        let err = run(&fed)
-            .await
-            .expect_err("a histogram remote fails the query when not skippable");
-        match err {
-            QueryError::Federation { cluster, .. } => assert_eq!(cluster, "eu-west"),
-            other => panic!("expected QueryError::Federation, got {other:?}"),
+    async fn malformed_histogram_frame_is_a_hard_fault_even_when_skippable() {
+        for skip in [true, false] {
+            let fed = one_remote(Arc::new(MalformedHistFetcher), skip, Duration::from_secs(5));
+            let err = run(&fed).await.expect_err(
+                "a malformed histogram frame is corruption, never a skippable coverage gap",
+            );
+            match err {
+                QueryError::Federation { cluster, .. } => assert_eq!(cluster, "eu-west"),
+                other => panic!("expected QueryError::Federation, got {other:?}"),
+            }
         }
     }
 

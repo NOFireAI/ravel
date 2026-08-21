@@ -382,13 +382,17 @@ Alerts, Audit, and Spans. The worker's `run_slice_inner` decodes the request's
 `signal` discriminant and dispatches to a per-signal fetch path
 (`crates/ravel-query/src/distrib/service.rs`):
 
-- **Metrics** resolves the pinned scope and fetches scalar series through the
-  metric `SegmentFetcher`. Native-histogram series are not distributed yet:
-  erasure predicates are applied to decoded histogram series before the
-  refusal check (ADR-0096 decision 2), so a slice whose histograms are fully
-  erased is not refused; a slice with any histogram series still standing
-  after erasure answers `Unsupported` (with its spend folded first) and the
-  whole query falls back to local.
+- **Metrics** resolves the pinned scope and fetches both scalar series (one
+  `SeriesFrame` each) and native-histogram series (one `HistogramFrame` each)
+  through the metric `SegmentFetcher`. As of `PROTOCOL_VERSION` 3 (ADR-0096
+  decision 3 step 4) a run-merged L1 run and a native-histogram run cross the
+  wire bit-exactly: `Run` and `HistogramRun` carry the four packed per-sample
+  provenance columns, and `HistogramRun` also carries typed `HistogramRecord`s.
+  Erasure predicates are applied to the decoded scalar and histogram series
+  before they are encoded, so a fully-erased series is dropped rather than sent.
+  The version gate (the request-level check plus the intra-cluster routing
+  filter) guarantees only a same-version coordinator ever receives these frames,
+  so the columns and records are never silently dropped by an older decoder.
 - **Logs, Alerts, Audit** are one RLOG object family and share a single fetch
   path over `LogSegmentFetcher`, distinguished only by the object-key prefix the
   coordinator already resolved (the worker never re-derives it, it fetches the
@@ -508,9 +512,9 @@ arrive, and the bytes-scanned cap is checked against the saturating fold of
 every slice's reported cost (saturating, never wrapping, so a counter near
 `u64::MAX` clamps rather than slipping under the cap). Every slice's real
 spend is folded into the query's live accounting handle before any failure or
-fallback, so the reported cost reflects work already paid for — a
-histogram-bearing query that fetches remotely and then re-runs locally
-reports both, never one.
+fallback, so the reported cost reflects work already paid for — a query that
+fetches remotely and then re-runs locally (a version-skew fallback) reports
+both, never one.
 
 Failures map to the same typed outcomes the local path produces:
 
@@ -530,9 +534,9 @@ Failures map to the same typed outcomes the local path produces:
   `max_query_duration` that keeps workers inside the GC protection horizon)
   cancels the fan-out; stream teardown reaches workers and drop-based
   cancellation frees their GETs and permits.
-- **Protocol version mismatch** (rolling deploy), a **`Profiles` signal**, a
-  **histogram-bearing metrics slice**, an **unwired log/span fetcher**, or a
-  **matcher-bearing log/span slice:** the worker answers `Unsupported`, and the
+- **Protocol version mismatch** (rolling deploy), a **`Profiles` signal**, an
+  **unwired log/span fetcher**, or a **matcher-bearing log/span slice:** the
+  worker answers `Unsupported`, and the
   coordinator silently falls back to fully local execution for the whole
   query — never an error, never a partial result. This is the load-bearing skew
   direction: a *new* coordinator against an *old* worker that predates the
@@ -612,21 +616,27 @@ warning per degraded remote, merged into the Prometheus JSON envelope's
 IP:port and errno are redacted out, because a client that reads the envelope
 is not entitled to the coordinator's internal topology.
 
-A remote that streams native-histogram frames this build cannot decode
-across the slice boundary is treated as a coverage gap, not a hard fault:
-under `skip_unavailable` it degrades to partial coverage with a truthful
-warning (the remote returned a data kind this build cannot federate yet),
-and without `skip_unavailable` it fails with that same typed reason rather
-than a generic transport error.
+As of `PROTOCOL_VERSION` 3 (ADR-0096 decision 3 step 4) a native-histogram
+frame is real data this build decodes and merges, so a malformed `Hist` frame
+is corruption, never a coverage gap: it fails the query typed as a
+`Federation` "malformed response" fault regardless of `skip_unavailable`, the
+same as a malformed scalar frame. This is sound because the version gate (the
+request-level check on the remote and, intra-cluster, the routing filter)
+guarantees a `Hist` frame only ever reaches a coordinator whose version matches
+the sender's, so if one arrives and fails to decode that is real corruption, not
+a version-skew coverage gap. A version-skewed remote instead answers
+`Unsupported` for the whole request (below), which is the coverage-gap path.
 
-A remote that answers `Unsupported` for the whole query is handled the same
-way, and this is the federation analog of the intra-cluster skew fallback: a
+A remote that answers `Unsupported` for the whole query is the federation analog
+of the intra-cluster skew fallback: a
 remote resolves its own snapshot, so `Unsupported` can only mean "this cluster
 does not serve this query kind yet" — an availability/coverage property, not a
-wrong-data one. The concrete case is a remote running code that predates the
-log/span fan-out: it rejects a Logs/Alerts/Audit/Spans query with `Unsupported`
-(its `run_slice_inner` rejects every non-Metrics signal). Federation routes that
-through the same `skip_unavailable` path an unavailable or histogram-bearing
+wrong-data one. The concrete cases are a remote running code that predates the
+log/span fan-out (it rejects a Logs/Alerts/Audit/Spans query with `Unsupported`,
+its `run_slice_inner` rejecting every non-Metrics signal) and a remote on an
+older `PROTOCOL_VERSION` (its request-level version check answers `Unsupported`).
+Federation routes that
+through the same `skip_unavailable` path an unavailable
 remote takes: under `skip_unavailable=true` the cluster is skipped, coverage is
 marked partial, and the warning names only the operator-facing cluster (the
 remote's internal status text is redacted out); under `=false` it fails with a

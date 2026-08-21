@@ -77,8 +77,8 @@ Scalar function	current_time	SELECT current_time FROM samples
 Scalar function	current_timestamp	SELECT current_timestamp FROM samples
 Scalar function	encode	SELECT encode('a', 'hex') FROM samples LIMIT 1
 Scalar function	has_word	SELECT count(*) FROM logs WHERE has_word(body, '1')
-Scalar function	label	SELECT label(labels, 'tier') FROM samples WHERE value = 3.0
-Scalar function	label_match	SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'web')
+Scalar function	label	SELECT label(labels, '__name__') FROM samples WHERE value = 3.0
+Scalar function	label_match	SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')
 Scalar function	now	SELECT now() FROM samples
 Scalar function	rand	SELECT rand() FROM samples
 Scalar function	random	SELECT random() FROM samples

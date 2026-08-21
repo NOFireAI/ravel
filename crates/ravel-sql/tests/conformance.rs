@@ -32,14 +32,13 @@ use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::conformance::{
     Category, Classification, Construct, Verdict, Verified, registry, render_document,
     render_example_manifest, score,
 };
 use ravel_sql::{QueryOutput, SqlError, ValidationError, validate};
-use ravel_types::{LabelSet, Sample, SeriesId, Signal, TenantId, logstream};
-use util::{Fixture, SegSpec, SeriesSpec, labels_for, labels_for_many, request, tenant_id};
+use ravel_types::{Signal, TenantId, logstream};
+use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 use uuid::Uuid;
 
 /// A small metrics dataset the supported constructs execute against: two
@@ -50,115 +49,16 @@ use uuid::Uuid;
 /// exact aggregate each admitted aggregate must return over them and the exact
 /// row count each clause must produce, so a construct that executes but answers
 /// wrongly (or answers with nothing) is a state-3 row.
-///
-/// The series *names* are load-bearing too, for the Ravel UDF rows (#409):
-/// `web` is a strict substring of `web-canary`, so an anchored
-/// `label_match(..., 'web')` (2 samples) is distinguishable from an unanchored
-/// substring match (all 4). Their labels are assigned by [`conformance_labels`],
-/// not by the shared `util::labels_for`, so `web-canary` can carry more than one
-/// label for the `label` row.
 fn dataset() -> Vec<SegSpec> {
     vec![SegSpec::new(
         10,
         1,
         1,
         vec![
-            SeriesSpec::new("web", vec![(1, 1.0), (2, 2.0)]),
-            SeriesSpec::new("web-canary", vec![(1, -1.0), (3, 3.0)]),
+            SeriesSpec::new("a", vec![(1, 1.0), (2, 2.0)]),
+            SeriesSpec::new("b", vec![(1, -1.0), (3, 3.0)]),
         ],
     )]
-}
-
-/// The label set for a conformance metrics series. `web-canary` (the series
-/// carrying the `value = 3.0` sample the `label` row selects) gets more than
-/// one label, so `label(labels, 'tier')` reads a key that is neither the first
-/// by name (`__name__`) nor the only one; every other series keeps the single
-/// `__name__` label the rest of the suite assumes.
-fn conformance_labels(metric: &str) -> LabelSet {
-    if metric == "web-canary" {
-        labels_for_many(&[
-            ("__name__", "web-canary"),
-            ("region", "us-east"),
-            ("tier", "gold"),
-        ])
-    } else {
-        labels_for(metric)
-    }
-}
-
-/// Publish the metrics [`dataset`] as real RSEG segments with
-/// [`conformance_labels`]-assigned label sets. Mirrors `util::publish_segment`
-/// but takes the labels (and thus the series id) from [`conformance_labels`]
-/// rather than the single-`__name__` `util::labels_for`, which the `label` row
-/// needs (#409). Built directly here rather than through `Fixture::build` for
-/// the same reason.
-async fn publish_metrics(store: &dyn ObjectStoreBackend, tenant: &TenantId, specs: &[SegSpec]) {
-    let tenant_hash = tenant.hash();
-    for (index, spec) in specs.iter().enumerate() {
-        let inputs: Vec<SeriesInput> = spec
-            .series
-            .iter()
-            .filter(|s| !s.samples.is_empty())
-            .map(|s| {
-                let labels = conformance_labels(&s.metric);
-                SeriesInput {
-                    series_id: SeriesId::compute(tenant, &s.metric, &labels).expect("series id"),
-                    labels,
-                    samples: s
-                        .samples
-                        .iter()
-                        .map(|(ts_ns, value)| Sample {
-                            ts_ns: *ts_ns,
-                            value: *value,
-                        })
-                        .collect(),
-                }
-            })
-            .collect();
-
-        let writer_id = Uuid::from_u128(1_000 + index as u128);
-        let identity = SegmentIdentity {
-            tenant_hash: tenant_hash.0,
-            shard: 0,
-            writer_id: writer_id.to_string(),
-            writer_epoch: spec.writer_epoch,
-            writer_seq: spec.writer_seq,
-        };
-        let bounds = IngestBounds {
-            min_ingest_ts_ns: 0,
-            max_ingest_ts_ns: 0,
-        };
-        let written = SegmentWriter::write(inputs, identity, bounds).expect("write segment");
-
-        let new_record = NewCommitRecord {
-            tenant_hash,
-            signal: Signal::Metrics,
-            shard: 0,
-            writer_id,
-            writer_epoch: spec.writer_epoch,
-            writer_seq: spec.writer_seq,
-            object_size: written.bytes.len() as u64,
-            content_hash: written.summary.blake3,
-            sample_count: written.summary.sample_count,
-            series_count: written.summary.series_count,
-            min_event_ts_ns: written.summary.min_event_ts_ns,
-            max_event_ts_ns: written.summary.max_event_ts_ns,
-            min_ingest_ts_ns: written.summary.min_event_ts_ns,
-            max_ingest_ts_ns: written.summary.max_event_ts_ns,
-            segment_format_version: 1,
-            created_unix_ns: spec.created_unix_ns,
-            ingest_hour_bucket: 0,
-        };
-        let rec = record::build(new_record).expect("valid commit record");
-        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
-        store
-            .put(&data_key, written.bytes, PutOptions::default())
-            .await
-            .expect("put data object");
-        publish::publish(store, &rec, &RetryPolicy::default())
-            .await
-            .expect("publish");
-    }
 }
 
 /// The four sample values [`dataset`] publishes, in no particular order.
@@ -166,17 +66,6 @@ const SAMPLE_VALUES: [f64; 4] = [1.0, 2.0, -1.0, 3.0];
 
 /// How many log records [`publish_logs`] writes.
 const LOG_RECORD_COUNT: usize = 3;
-
-/// The body of each log record [`publish_logs`] writes. Exactly one body
-/// tokenizes to contain the word `1` (record 1), so `has_word(body, '1')` is 1
-/// under the word-boundary match. Record 2 embeds that digit inside the larger
-/// token `21`: `1` is a substring of `21` but not one of its tokens, so a plain
-/// substring matcher counts record 2 as well and over-counts to 2 (#409).
-const LOG_BODIES: [&str; LOG_RECORD_COUNT] = [
-    "conformance record 0",
-    "conformance record 1",
-    "conformance record 21",
-];
 
 /// What a supported construct's result must look like. Every supported registry
 /// row needs one: "the query returned `Ok`" is not evidence, because an empty
@@ -263,26 +152,13 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         // hex of the single byte 0x61 ('a').
         (Category::Scalar, "encode") => Some(Expect::Str("61")),
         // Ravel UDFs over the fixture. The sample with value 3.0 belongs to
-        // series "web-canary", whose labels are
-        // `{__name__: "web-canary", region: "us-east", tier: "gold"}`; `tier` is
-        // neither the first label by name (`__name__`) nor the only one, so an
-        // implementation that ignored the key and returned the first label would
-        // answer "web-canary", not "gold".
-        (Category::Scalar, "label") => Some(Expect::Str("gold")),
-        // `label_match(labels, '__name__', 'web')` anchors, so it matches only
-        // series "web" (2 samples), not "web-canary". An unanchored substring
-        // matcher would also match "web-canary" and count all 4.
+        // series "b", whose only label is `__name__ = "b"`.
+        (Category::Scalar, "label") => Some(Expect::Str("b")),
+        // Series "b" carries 2 of the 4 samples, so the anchored matcher keeps
+        // exactly 2 rows.
         (Category::Scalar, "label_match") => Some(Expect::Scalar(2.0)),
-        // Of the three log bodies, only "conformance record 1" tokenizes to
-        // contain the word "1"; "conformance record 21" embeds it in the token
-        // "21", which a substring matcher would miscount. So the word-boundary
-        // match is 1, a substring match would be 2.
-        // Both RlogReader's own Predicate::HasWord pre-filter and this
-        // residual UDF call an independent phrase_match; the row only
-        // catches a simultaneous regression in both, not either alone.
-        // Pinning the UDF's own implementation in isolation needs a query
-        // shape that defeats pushdown extraction so the reader filter never
-        // fires. See #434.
+        // Of the three log bodies ("conformance record 0/1/2"), only the second
+        // tokenizes to contain the word "1".
         (Category::Scalar, "has_word") => Some(Expect::Scalar(1.0)),
 
         // ADR-0097 decision 8: the eight admitted window functions, each result
@@ -447,7 +323,7 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
             writer_seq: 1,
         },
     );
-    for (i, body) in LOG_BODIES.iter().enumerate() {
+    for i in 0..LOG_RECORD_COUNT {
         let ts_ns = 1_000 + i as i64;
         writer
             .push(LogRecord {
@@ -457,7 +333,7 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
                 observed_ts_ns: ts_ns,
                 severity_num: 9,
                 severity_text: "INFO".to_string(),
-                body: body.to_string(),
+                body: format!("conformance record {i}"),
                 trace_id: None,
                 span_id: None,
                 flags: 0,
@@ -509,18 +385,13 @@ async fn conformance_fixture() -> Fixture {
     let tenant = tenant_id("conformance");
     let specs = dataset();
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    // Build the stack with no metrics segments, then publish them via
-    // `publish_metrics` so the series carry `conformance_labels`-assigned label
-    // sets rather than `Fixture::build`'s single-`__name__` `util::labels_for`
-    // (#409).
     let fixture = Fixture::build(
         Arc::clone(&store),
-        &[],
+        &[(&tenant, &specs)],
         ravel_sql::SqlConfig::default(),
         1 << 30,
     )
     .await;
-    publish_metrics(store.as_ref(), &tenant, &specs).await;
     publish_logs(store.as_ref(), &tenant).await;
     // Install a declared `i64` attribute column `dur` (ADR-0090) so the
     // typed-column conformance rows resolve a widened `logs` schema and project

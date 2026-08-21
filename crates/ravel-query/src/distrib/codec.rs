@@ -41,11 +41,15 @@ use crate::span_fetcher::SpanRow;
 ///
 /// Bumped 1 -> 2 for the ADR-0071 amendment: the shared bearer token on
 /// `Pinned` fetches is replaced by a per-tenant, per-query fragment capability
-/// ([`FragmentClaims`]). This is a version bump on an existing versioned wire
-/// field, not a frozen persistent-format change. A version-skewed worker is
-/// dropped at routing time (never a hard error), so a rolling deploy degrades
-/// to coordinator-local execution, never to a wrong answer.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// ([`FragmentClaims`]). Bumped 2 -> 3 for ADR-0096: `Run` and `HistogramRun`
+/// carry the four packed per-sample provenance columns and `HistogramRun`
+/// carries typed `HistogramRecord`s, and both encoders now emit them, so a
+/// run-merged scalar run and a native-histogram run cross the wire bit-exactly
+/// (issue #379, the epic's final commit). This is a version bump on an existing
+/// versioned wire field, not a frozen persistent-format change. A version-skewed
+/// worker is dropped at routing time (never a hard error), so a rolling deploy
+/// degrades to coordinator-local execution, never to a wrong answer.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
 /// Distinct from [`PROTOCOL_VERSION`]: it versions the canonical claim encoding
@@ -305,15 +309,14 @@ pub fn signal_from_u32(raw: u32) -> Result<Signal, CodecError> {
 /// omits empty packed repeated fields, the run encodes byte-identical to one
 /// predating this change.
 ///
-/// This is the decode-side/structural half of the change only (issue #348 T1):
-/// [`PROTOCOL_VERSION`] is unchanged, and the service-level guard
-/// ([`crate::distrib::service`]) still refuses a slice whose fetched scalar
-/// series carry a `per_sample_priorities` column with
-/// [`pb::status::Code::Unsupported`] before the encode loop, handing it to the
-/// coordinator's exact local fallback. So in production a `Some` still never
-/// reaches this encoder; flipping the version and removing that refusal is a
-/// later step of the same epic. The round-trip is exercised entirely by this
-/// module's tests.
+/// As of [`PROTOCOL_VERSION`] 3 (ADR-0096 decision 3 step 4, issue #379) this
+/// encoder is live on the distributed fetch path: the service-level refusal that
+/// once handed a `per_sample_priorities`-bearing slice to the coordinator's
+/// local fallback is gone, so a merged L1 run's column crosses the wire here and
+/// [`decode_series_frame`] restores it. The version gate ([`check_protocol_version`]
+/// at the request level, and the intra-cluster routing filter) guarantees only a
+/// coordinator speaking version 3 ever receives such a frame, so the column is
+/// never silently dropped by an older decoder.
 pub fn encode_series_frame(series: &FetchedSeriesSoa) -> pb::SeriesFrame {
     let (prov_created_delta, prov_epoch_delta, prov_seq_delta, prov_in_page_index) =
         encode_sample_priorities(&series.per_sample_priorities);
@@ -520,12 +523,11 @@ fn decode_sample_priorities(
 /// present iff `scale == -53`, with ascending boundaries), so the only value
 /// that maps to the empty wire form is `None`.
 ///
-/// No live caller wires this encoder into the distributed fetch path yet: the
-/// worker still refuses any histogram-bearing slice (see
-/// [`crate::distrib::service`]), and flipping the protocol version to enable
-/// the encoder is a later step of the same epic (ADR-0096 decision 3 step 4,
-/// #379). It is proven structurally by this module's round-trip property test
-/// against [`HistogramValue`].
+/// As of [`PROTOCOL_VERSION`] 3 (ADR-0096 decision 3 step 4, #379) this encoder
+/// is live: the worker's histogram-slice refusal is gone, so a native-histogram
+/// series' records cross the wire here and [`decode_histogram_records`] restores
+/// them. It is also proven structurally by this module's round-trip property
+/// test against [`HistogramValue`].
 pub fn encode_histogram_records(values: &[HistogramValue]) -> Vec<pb::HistogramRecord> {
     values.iter().map(encode_histogram_record).collect()
 }
@@ -705,12 +707,12 @@ fn decode_reset_hint(raw: i32) -> Result<ResetHint, CodecError> {
 /// provenance column crosses through the same four packed columns
 /// [`encode_series_frame`] uses ([`encode_sample_priorities`]).
 ///
-/// No live caller wires this into the distributed fetch path yet: the worker
-/// still never sends a `Hist` frame, and the coordinator's `decode_slice_frames`
-/// still refuses any `Hist` frame with `DistribError::HistogramUnsupported`.
-/// Flipping [`PROTOCOL_VERSION`] and removing both refusals is a later step of
-/// the same epic (ADR-0096 decision 3 step 4). The round trip is exercised
-/// entirely by this module's tests.
+/// As of [`PROTOCOL_VERSION`] 3 (ADR-0096 decision 3 step 4) this is live on the
+/// distributed fetch path: the worker's histogram-slice refusal and the
+/// coordinator's `Hist`-frame refusal are both gone, so a real `Hist` frame
+/// crosses the wire here and [`decode_histogram_frame`] restores it. The version
+/// gate means only a version-3 coordinator ever receives one. The round trip is
+/// also exercised by this module's tests.
 pub fn encode_histogram_frame(series: &FetchedHistogramSeries) -> pb::HistogramFrame {
     let (prov_created_delta, prov_epoch_delta, prov_seq_delta, prov_in_page_index) =
         encode_sample_priorities(&series.per_sample_priorities);
