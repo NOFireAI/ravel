@@ -434,23 +434,25 @@ jobs:
       - name: Flight SQL tests
         run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
 
-  # Never-compiled feature combinations (ADR-0053 D6). Four cargo
+  # Never-compiled feature combinations (ADR-0053 D6). Five cargo
   # features are off by default and no other job builds them, so a break in
-  # any of them -- an unreachable e2e test path, three bench binaries that
-  # never link -- ships undetected. This lane only proves each combination
-  # still compiles (`cargo check`, not a test run), which is the cheap gap it
-  # closes:
-  #   - ravel-server --features otap        (links ravel-otap + arrow tree)
-  #
-  # `flight-sql` used to be probed here too. It moved to the `flight-sql` job
-  # above, which lints and RUNS it: a compile-only probe let
-  # every test behind that feature ship unexecuted, and this lane is not a
-  # required check, so even its type check could fail unnoticed. It did, and
-  # does: `ravel-bench --features parquet-baseline` has not compiled since
-  # 2026-07-28.
+  # any of them -- an unreachable e2e test path, four bench binaries that
+  # never link -- ships undetected. This lane proves each combination still
+  # compiles (`cargo check`), and for one of them also runs its tests:
+  #   - ravel-server --features otap            (links ravel-otap + arrow tree)
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
   #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
+  #   - ravel-bench --features sql-latency      (ravel-sql; the SQL corpus and
+  #                                              its construct gate, ADR-0100)
+  #
+  # `flight-sql` used to be probed here too. It moved to the `flight-sql` job
+  # above, which lints and RUNS it: a compile-only probe let every test behind
+  # that feature ship unexecuted.
+  #
+  # This job is a required check (main's protect-main ruleset lists it), so a
+  # break here blocks a merge. A feature added to ravel-bench therefore
+  # belongs in the list above in the same change that adds the feature.
   features:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
@@ -483,6 +485,18 @@ jobs:
         run: cargo check --locked -p ravel-bench --features flight-egress
       - name: Check ravel-bench --features profiling
         run: cargo check --locked -p ravel-bench --features profiling
+      - name: Check ravel-bench --features sql-latency
+        run: cargo check --locked -p ravel-bench --features sql-latency --all-targets
+        # The one lane here that also RUNS its tests. A compile probe is the
+        # right trade for a bench binary that only has to keep linking. It is
+        # the wrong trade for the SQL corpus, whose deliverable IS a
+        # test-enforced gate: every construct a corpus entry names must exist
+        # in the conformance registry as supported. A compile-only probe would
+        # let that gate rot while this lane stayed green, the same failure the
+        # flight-sql note above describes. The compile cost is already paid by
+        # the step above (same feature set, same target dir).
+      - name: Test ravel-bench --features sql-latency
+        run: cargo test --locked -p ravel-bench --features sql-latency
 
   # Supply-chain gate. deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
