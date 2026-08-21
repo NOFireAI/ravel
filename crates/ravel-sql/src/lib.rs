@@ -128,8 +128,9 @@ pub use logs_provider::LogsTableProvider;
 pub use logs_pushdown::{LogsPushdown, extract_logs};
 pub use logs_scan::LogsScanExec;
 pub use logs_schema::{
-    LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS, LOG_COL_SEVERITY_NUM,
-    LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS, logs_schema,
+    FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_BODY, LOG_COL_FLAGS, LOG_COL_OBSERVED_TS,
+    LOG_COL_SEVERITY_NUM, LOG_COL_SEVERITY_TEXT, LOG_COL_SPAN_ID, LOG_COL_TRACE_ID, LOG_COL_TS,
+    logs_schema, logs_schema_with_declared,
 };
 pub use logs_udf::{HAS_WORD_UDF, has_word_udf};
 pub use memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
