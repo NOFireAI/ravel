@@ -1781,8 +1781,17 @@ fn unit_suffix(unit: &str, kind: MetricKind) -> Option<String> {
 
 /// The unit word stored in a metric's [`MetricMetadata`]: the mapped Prometheus
 /// word when the unit maps (agreeing with the name suffix), otherwise the raw
-/// unit sanitized as a metric name, otherwise empty (ADR-0085 Decision 1/2).
-fn metadata_unit_word(unit: &str, kind: MetricKind) -> String {
+/// unit with annotations stripped and trimmed, otherwise empty (ADR-0085
+/// Decision 1/2).
+///
+/// This is the canonical OTel-unit-to-metadata-word mapping. Other crates that
+/// store a [`MetricMetadata`] unit for an OTel metric (`ravel-otap`) must call
+/// this rather than re-derive the table: one edit here changes every ingest
+/// surface at once, and a private second copy silently drifts on the first
+/// edit to either. It shares the same compound (`a/b`) and annotation handling
+/// as the [`prometheus_family_name`] suffix, so the word stored in metadata and
+/// the word appended to the metric name always agree.
+pub fn metadata_unit_word(unit: &str, kind: MetricKind) -> String {
     if let Some(word) = unit_suffix(unit, kind) {
         return word;
     }
@@ -4752,6 +4761,34 @@ mod tests {
         }
         assert_eq!(map_unit("furlong"), None);
         assert_eq!(map_unit(""), None);
+    }
+
+    /// Direct contract test for the now-`pub` [`metadata_unit_word`], the
+    /// canonical mapping `ravel-otap` calls rather than re-derive. Other tests
+    /// exercise it only through the end-to-end `suffixed` metadata; this pins
+    /// each shape at the public boundary so a caller in another crate sees a
+    /// stable contract: mapped word, dimensionless ratio (gauge only), raw
+    /// passthrough for an unmapped or non-gauge `1`, annotation stripping, the
+    /// compound per-unit form, and empty.
+    #[test]
+    fn metadata_unit_word_contract() {
+        use MetricKind::{Counter, Gauge};
+        assert_eq!(metadata_unit_word("By", Counter), "bytes");
+        assert_eq!(metadata_unit_word("s", MetricKind::Histogram), "seconds");
+        assert_eq!(metadata_unit_word("", Gauge), "");
+        assert_eq!(metadata_unit_word("1", Gauge), "ratio");
+        // `1` maps to nothing off a gauge, so the raw `1` carries through.
+        assert_eq!(metadata_unit_word("1", Counter), "1");
+        assert_eq!(metadata_unit_word("furlong", Gauge), "furlong");
+        assert_eq!(metadata_unit_word("2h", Gauge), "2h");
+        assert_eq!(metadata_unit_word("{request}", Gauge), "");
+        assert_eq!(metadata_unit_word("{packet}/s", Gauge), "per_second");
+        assert_eq!(metadata_unit_word("By/s", Gauge), "bytes_per_second");
+        assert_eq!(metadata_unit_word("By/m", Gauge), "bytes_per_minute");
+        assert_eq!(
+            metadata_unit_word("furlong/fortnight", Gauge),
+            "furlong_per_fortnight"
+        );
     }
 
     #[test]
