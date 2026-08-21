@@ -7,6 +7,8 @@ pub mod concurrent;
 pub mod distrib_crossover;
 pub mod e2e;
 pub mod generator;
+#[cfg(feature = "sql-latency")]
+pub mod groupby_scaling;
 pub mod harness;
 pub mod ingest;
 pub mod profiling;

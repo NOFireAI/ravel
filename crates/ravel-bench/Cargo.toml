@@ -213,6 +213,12 @@ path = "src/bin/flight_sql_egress.rs"
 required-features = ["flight-egress"]
 bench = false
 
+[[bin]]
+name = "groupby_scaling_bench"
+path = "src/bin/groupby_scaling_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
 [[test]]
 name = "read_accounting"
 path = "tests/read_accounting.rs"
@@ -256,6 +262,14 @@ bench = false
 [[test]]
 name = "distrib_crossover_smoke"
 path = "tests/distrib_crossover_smoke.rs"
+bench = false
+
+# The test body is gated on `sql-latency` (empty crate without it), so this
+# entry stays harmless under the default feature set and only exercises the
+# scaling bench under `--features sql-latency`.
+[[test]]
+name = "groupby_scaling_smoke"
+path = "tests/groupby_scaling_smoke.rs"
 bench = false
 
 [[bench]]
