@@ -1022,6 +1022,62 @@ mod tests {
             })
     }
 
+    /// A `u64` generator weighted toward the values that break a bitcast-based
+    /// delta transform if it is ever rewritten as a numeric conversion: the two
+    /// signed-domain extremes and the sign-bit boundary. Uniform `any::<u64>()`
+    /// alone essentially never lands on them.
+    fn arb_boundary_u64() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            2 => any::<u64>(),
+            1 => prop::sample::select(vec![
+                u64::MAX,
+                u64::MAX - 1,
+                i64::MAX as u64,
+                1u64 << 63,
+                i64::MIN as u64,
+                0u64,
+                1u64,
+            ]),
+        ]
+    }
+
+    /// [`arb_soa`] plus a per-sample provenance column, present about half the
+    /// time and always the same length as the timestamps column. A sibling
+    /// strategy rather than a change to `arb_soa` itself: the run-wide-only
+    /// coverage `series_frame_round_trips_bit_for_bit` already provides stays
+    /// exactly as it was, and the length coupling lives in one place.
+    fn arb_soa_with_priorities() -> impl Strategy<Value = FetchedSeriesSoa> {
+        arb_soa().prop_flat_map(|soa| {
+            let n = soa.timestamps.len();
+            let column = prop::collection::vec(
+                (
+                    any::<i64>(),
+                    arb_boundary_u64(),
+                    arb_boundary_u64(),
+                    any::<u32>(),
+                ),
+                n..=n,
+            );
+            (Just(soa), prop::option::of(column)).prop_map(|(mut soa, ps)| {
+                soa.per_sample_priorities = ps.map(|rows| {
+                    rows.into_iter()
+                        .map(
+                            |(created_unix_ns, writer_epoch, writer_seq, in_page_index)| {
+                                SamplePriority {
+                                    created_unix_ns,
+                                    writer_epoch,
+                                    writer_seq,
+                                    in_page_index,
+                                }
+                            },
+                        )
+                        .collect()
+                });
+                soa
+            })
+        })
+    }
+
     proptest! {
         #[test]
         fn series_frame_round_trips_bit_for_bit(soa in arb_soa()) {
@@ -1046,6 +1102,52 @@ mod tests {
         fn ts_deltas_round_trip_over_i64_extremes(ts in prop::collection::vec(any::<i64>(), 0..32)) {
             let restored = decode_ts_deltas(&encode_ts_deltas(&ts));
             prop_assert_eq!(restored, ts);
+        }
+
+        /// The `u64` twin of the property above. The transform crosses the
+        /// signed domain by bitcast, so the generator is weighted toward the
+        /// sign-bit boundary and both signed extremes.
+        #[test]
+        fn u64_deltas_round_trip_over_u64_extremes(
+            values in prop::collection::vec(arb_boundary_u64(), 0..32)
+        ) {
+            let restored = decode_u64_deltas(&encode_u64_deltas(&values));
+            prop_assert_eq!(restored, values);
+        }
+
+        /// A per-sample provenance column survives the real prost encode/decode
+        /// path field for field. These are integers, so `==` is the right
+        /// comparison (unlike the value column's bit-pattern check above).
+        #[test]
+        fn series_frame_round_trips_per_sample_priorities(soa in arb_soa_with_priorities()) {
+            let decoded = decode_series_frame(encode_series_frame(&soa)).expect("decode");
+            prop_assert_eq!(decoded.len(), 1);
+            let got = decoded[0].per_sample_priorities.as_ref();
+            // An empty column is indistinguishable from absent on the wire:
+            // proto3 omits empty repeated fields, so a zero-sample `Some`
+            // decodes to `None` by design (see `decode_sample_priorities`).
+            let want = soa
+                .per_sample_priorities
+                .as_ref()
+                .filter(|ps| !ps.is_empty());
+            match (got, want) {
+                (Some(a), Some(b)) => {
+                    prop_assert_eq!(a.len(), b.len());
+                    for (x, y) in a.iter().zip(b.iter()) {
+                        prop_assert_eq!(x.created_unix_ns, y.created_unix_ns);
+                        prop_assert_eq!(x.writer_epoch, y.writer_epoch);
+                        prop_assert_eq!(x.writer_seq, y.writer_seq);
+                        prop_assert_eq!(x.in_page_index, y.in_page_index);
+                    }
+                }
+                (None, None) => {}
+                (a, b) => prop_assert!(
+                    false,
+                    "provenance presence changed on the wire: got {:?}, want {:?}",
+                    a.map(|v| v.len()),
+                    b.map(|v| v.len())
+                ),
+            }
         }
     }
 

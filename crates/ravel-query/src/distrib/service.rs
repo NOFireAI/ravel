@@ -363,20 +363,23 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             )]);
         }
 
-        // Run-merged provenance is not representable on the wire: `pb::Run`
-        // carries the run-wide triple only, so a series with an explicit
-        // per-sample provenance column (a merged L1 v7 run, produced since
-        // issue #315) cannot cross the distributed path without silently
-        // dropping the column and letting the coordinator pick a different
-        // dedup winner than the local path at an overlapping timestamp. Refuse
-        // the whole slice back to the coordinator's local fallback rather than
-        // return a degraded frame, exactly as the histogram arm above does. The
-        // summary carries this slice's accounting/stats so the coordinator
-        // folds its spend once before falling back (ADR-0071); otherwise the
-        // query would pay for this fetch twice and report it once. The wire
-        // format extension that would let this fan out is issue #348, bundled
-        // with the identical `HistogramRun` change so `PROTOCOL_VERSION` bumps
-        // once rather than twice.
+        // Run-merged provenance is representable on the wire as of this
+        // commit: `pb::Run` and `pb::HistogramRun` carry the four packed
+        // per-sample provenance columns alongside the run-wide triple. The
+        // refusal below stays for now only because of the staged version-flip
+        // sequencing (ADR-0096 decision 3): a worker must not emit the new
+        // columns until every coordinator in the fleet can decode them, so the
+        // producing side stays off until the version flip lands. Until then a
+        // series with an explicit per-sample provenance column (a merged L1 v7
+        // run, produced since issue #315) would have to cross as a degraded
+        // run-wide frame, silently dropping the column and letting the
+        // coordinator pick a different dedup winner than the local path at an
+        // overlapping timestamp. So refuse the whole slice back to the
+        // coordinator's local fallback rather than return that degraded frame,
+        // exactly as the histogram arm above does. The summary carries this
+        // slice's accounting/stats so the coordinator folds its spend once
+        // before falling back (ADR-0071); otherwise the query would pay for
+        // this fetch twice and report it once.
         if scalar
             .iter()
             .flatten()
