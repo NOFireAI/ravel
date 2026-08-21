@@ -560,12 +560,17 @@ terms:
    for the ceiling itself.
 
    That two-times figure is a metrics measurement and does not transfer to
-   logs. `est_record_bytes` counts the pair header for a record's own
-   attributes but `attr_value_len` still measures a nested `Map` value by its
-   string bytes alone, so a record whose attributes nest can under-charge by
-   far more than two times. Until that is fixed, treat the ceiling as a lower
-   bound on log resident memory rather than a proportional estimate, and size
-   a log-heavy host from measurement rather than from this multiplier.
+   logs. The nesting-accounting gap it once warned about is closed:
+   `attr_value_len` now charges the per-element struct header at every nesting
+   level (a `(String, AttrValue)` per `Map` entry and a `size_of::<AttrValue>()`
+   per `List` item), not only for a record's own top-level attributes, so a
+   record whose attributes nest is charged for the structs the buffer actually
+   holds rather than for leaf bytes alone. What is still unestablished is the
+   ratio itself: no one has measured the charged-to-resident ratio on a log
+   workload the way the 38.4 MB / 69.3 MB metrics figure above was measured, and
+   closing the accounting gap does not by itself make the metrics "roughly twice"
+   ratio hold for logs. Until a log workload is measured, size a log-heavy host
+   from measurement rather than from this multiplier.
 2. **In-flight decode overhead**: each admitted in-flight request transiently
    holds one decoded/normalized request body during normalization, before its
    points reach a buffer. This is bounded by
