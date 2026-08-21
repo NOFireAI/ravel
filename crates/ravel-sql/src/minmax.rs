@@ -161,6 +161,8 @@ impl AggregateUDFImpl for TotalOrderMinMax {
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
+        #[cfg(test)]
+        routing_probe::note_accumulator();
         let return_type = acc_args.return_field.data_type();
         if is_float(return_type) {
             Ok(Box::new(TotalOrderAccumulator::new(
@@ -192,7 +194,15 @@ impl AggregateUDFImpl for TotalOrderMinMax {
         self.inner.create_groups_accumulator(args)
     }
 
+    // Delegate the moving-window (sliding) accumulator to the wrapped built-in
+    // with no float guard, unlike `accumulator` above. Upstream's
+    // `MovingMin`/`MovingMax` order candidates through `ScalarValue`'s
+    // `PartialOrd`, which is `f64::total_cmp` for float types -- the same total
+    // order ADR-0023 mandates -- so the sliding path is total-order by
+    // construction for float input and needs no replacement here.
     fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
+        #[cfg(test)]
+        routing_probe::note_sliding();
         self.inner.create_sliding_accumulator(args)
     }
 
@@ -309,5 +319,138 @@ impl Accumulator for TotalOrderAccumulator {
 
     fn size(&self) -> usize {
         std::mem::size_of_val(self)
+    }
+}
+
+/// Test-only instrumentation that records which accumulator constructor
+/// DataFusion calls for a given window frame shape, so the sliding-path
+/// float-safety guarantee rests on a measured routing fact rather than an
+/// assumption about DataFusion internals. Counters are thread-local: the
+/// routing test drives its plan on a current-thread runtime, so every
+/// constructor call lands on the test thread and parallel tests on other
+/// threads cannot pollute the counts.
+#[cfg(test)]
+mod routing_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACCUMULATOR_CALLS: Cell<usize> = const { Cell::new(0) };
+        static SLIDING_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_accumulator() {
+        ACCUMULATOR_CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn note_sliding() {
+        SLIDING_CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn reset() {
+        ACCUMULATOR_CALLS.with(|c| c.set(0));
+        SLIDING_CALLS.with(|c| c.set(0));
+    }
+
+    pub(super) fn accumulator_calls() -> usize {
+        ACCUMULATOR_CALLS.with(Cell::get)
+    }
+
+    pub(super) fn sliding_calls() -> usize {
+        SLIDING_CALLS.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    use super::*;
+
+    /// Establish, rather than assume, which window frame shapes DataFusion
+    /// routes to `create_sliding_accumulator` versus `accumulator`. This is the
+    /// premise the acceptance test
+    /// (`tests/sliding_frame_total_order.rs`) rests on: a *moving* frame runs
+    /// the sliding accumulator (upstream `MovingMin`/`MovingMax`), while an
+    /// UNBOUNDED PRECEDING frame runs Ravel's own `TotalOrderAccumulator`, so a
+    /// test over only the unbounded shape would never exercise the delegation
+    /// under test.
+    ///
+    /// The routing is observed directly by counting each constructor call on the
+    /// registered total-order `min` UDAF (`routing_probe`), on a current-thread
+    /// runtime so the counts are deterministic.
+    #[test]
+    fn moving_frame_routes_to_the_sliding_accumulator() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("t", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+            ],
+        )
+        .expect("batch");
+
+        // A current-thread runtime keeps all plan execution -- and thus every
+        // accumulator construction -- on this thread, where the thread-local
+        // probe counters live.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        let drain = |sql: &str| {
+            let ctx =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            // Displace the built-in `min` with the total-order UDAF under test,
+            // exactly as `build_session` does.
+            ctx.register_udaf(total_order_min_udaf());
+            let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])
+                .expect("memtable");
+            ctx.register_table("x", Arc::new(table)).expect("register");
+            let batches = rt.block_on(async {
+                ctx.sql(sql)
+                    .await
+                    .expect("plan window query")
+                    .collect()
+                    .await
+                    .expect("execute window query")
+            });
+            // Force full execution.
+            assert!(batches.iter().map(|b| b.num_rows()).sum::<usize>() > 0);
+        };
+
+        // An UNBOUNDED PRECEDING frame runs Ravel's own accumulator, never the
+        // sliding one.
+        routing_probe::reset();
+        drain("SELECT min(v) OVER (ORDER BY t) AS m FROM x");
+        assert!(
+            routing_probe::accumulator_calls() > 0,
+            "the unbounded frame must construct Ravel's own accumulator"
+        );
+        assert_eq!(
+            routing_probe::sliding_calls(),
+            0,
+            "the unbounded frame must NOT construct the sliding accumulator"
+        );
+
+        // A moving `ROWS BETWEEN n PRECEDING AND CURRENT ROW` frame routes to
+        // the sliding accumulator (upstream `MovingMin`), the path the
+        // acceptance test's float-safety guarantee depends on.
+        routing_probe::reset();
+        drain(
+            "SELECT min(v) OVER (ORDER BY t ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS m FROM x",
+        );
+        assert!(
+            routing_probe::sliding_calls() > 0,
+            "a moving frame must construct the sliding accumulator"
+        );
     }
 }

@@ -55,9 +55,9 @@ and stays conformant.
 ## Score
 
 - Supported and covered: 41
-- Intentionally rejected: 67
+- Intentionally rejected: 68
 - Unclassified / broken: 0
-- **Conformance: 108 / 108 = 100.0%**
+- **Conformance: 109 / 109 = 100.0%**
 
 ## Conformance table
 
@@ -153,6 +153,7 @@ and stays conformant.
 | Window function | `percent_rank` | `SELECT max(pr) FROM (SELECT percent_rank() OVER (ORDER BY value) AS pr FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
 | Window function | `rank` | `SELECT max(r) FROM (SELECT rank() OVER (ORDER BY value) AS r FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
 | Window function | `row_number` | `SELECT max(rn) FROM (SELECT row_number() OVER (ORDER BY value) AS rn FROM samples)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | admitted native window function (ADR-0097 decision 6) |
+| Window frame | `avg (moving frame)` | `SELECT avg(value) OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM samples` | Intentionally rejected | `SqlError::Execution` | moving-frame avg has no retract_batch, so DataFusion refuses it (ADR-0097 decision 5) |
 | Write / DDL statement | `ALTER TABLE` | `ALTER TABLE samples ADD COLUMN x INT` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `COPY` | `COPY (SELECT 1) TO 's3://evil/out.parquet'` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `CREATE EXTERNAL TABLE` | `CREATE EXTERNAL TABLE t (a INT) STORED AS PARQUET LOCATION '/tmp/x'` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
