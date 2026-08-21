@@ -129,6 +129,20 @@ pub struct LogIngestMetrics {
     /// Indexed fields dropped from POSTINGS for exceeding the per-field
     /// distinct-value cap (ADR-0049 decision 4), summed over objects.
     postings_capped_fields_total: AtomicU64,
+    /// Distinct `(name, type)` pairs that received a real dynamic column,
+    /// summed over flushed objects (ADR-0100 decision 1).
+    dynamic_columns_used_total: AtomicU64,
+    /// Distinct `(name, type)` pairs that overflowed the `max_dynamic_columns`
+    /// budget and folded into `attrs_raw`, summed over flushed objects
+    /// (ADR-0100 decision 1). A sustained rise means loads are silently losing
+    /// columnar access to attributes past the budget.
+    dynamic_columns_overflowed_total: AtomicU64,
+    /// Largest `dynamic_columns_used` of any single flushed object seen so far
+    /// (a running maximum, not a sum). A total cannot show budget pressure
+    /// before the cap is crossed; this maximum can, so an operator sees a load
+    /// approaching `max_dynamic_columns` before any object overflows it
+    /// (ADR-0100 decision 1).
+    dynamic_columns_used_max: AtomicU64,
     /// Per-shard count of flushes whose flush task has been spawned but has
     /// not yet acked its waiters (ADR-0067 decisions 1-2, the log-pipeline
     /// counterpart of [`crate::IngestMetrics`]'s own gauge). Keyed by shard
@@ -170,6 +184,9 @@ pub struct LogIngestMetricsSnapshot {
     pub postings_indexed_fields_total: u64,
     pub postings_distinct_values_total: u64,
     pub postings_capped_fields_total: u64,
+    pub dynamic_columns_used_total: u64,
+    pub dynamic_columns_overflowed_total: u64,
+    pub dynamic_columns_used_max: u64,
 }
 
 impl LogIngestMetrics {
@@ -307,6 +324,19 @@ impl LogIngestMetrics {
             .fetch_add(stats.postings_distinct_total, Ordering::Relaxed);
         self.postings_capped_fields_total
             .fetch_add(u64::from(stats.postings_capped_fields), Ordering::Relaxed);
+        // Dynamic-column budget (ADR-0100 decision 1). Folded for every object,
+        // not only POSTINGS-carrying ones: an object with no indexed field
+        // still assigns dynamic columns and can overflow the budget. The used
+        // count also feeds a running maximum, which shows budget pressure
+        // before any object crosses the cap.
+        self.dynamic_columns_used_total
+            .fetch_add(u64::from(stats.dynamic_columns_used), Ordering::Relaxed);
+        self.dynamic_columns_overflowed_total.fetch_add(
+            u64::from(stats.dynamic_columns_overflowed),
+            Ordering::Relaxed,
+        );
+        self.dynamic_columns_used_max
+            .fetch_max(u64::from(stats.dynamic_columns_used), Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> LogIngestMetricsSnapshot {
@@ -337,6 +367,11 @@ impl LogIngestMetrics {
                 .postings_distinct_values_total
                 .load(Ordering::Relaxed),
             postings_capped_fields_total: self.postings_capped_fields_total.load(Ordering::Relaxed),
+            dynamic_columns_used_total: self.dynamic_columns_used_total.load(Ordering::Relaxed),
+            dynamic_columns_overflowed_total: self
+                .dynamic_columns_overflowed_total
+                .load(Ordering::Relaxed),
+            dynamic_columns_used_max: self.dynamic_columns_used_max.load(Ordering::Relaxed),
         }
     }
 }
@@ -467,6 +502,8 @@ mod tests {
                     postings_indexed_fields: 3,
                     postings_distinct_total: 40,
                     postings_distinct_max: 25,
+                    dynamic_columns_used: 7,
+                    dynamic_columns_overflowed: 2,
                 })
             },
             LogIngestMetricsSnapshot {
@@ -475,6 +512,9 @@ mod tests {
                 postings_indexed_fields_total: 3,
                 postings_distinct_values_total: 40,
                 postings_capped_fields_total: 1,
+                dynamic_columns_used_total: 7,
+                dynamic_columns_overflowed_total: 2,
+                dynamic_columns_used_max: 7,
                 ..Default::default()
             },
         );
@@ -498,5 +538,33 @@ mod tests {
         assert_eq!(snap.flushes_by_age, 2);
         assert_eq!(snap.buffered_bytes_total, 15);
         assert_eq!(snap.buffered_records_total, 3);
+    }
+
+    #[test]
+    fn dynamic_column_counters_and_used_max_fold_into_snapshot() {
+        // Two objects, the wider one first (used 8) then a narrower one (used
+        // 5). The used and overflowed counts sum; the used_max keeps the larger
+        // 8. A sum would report 13 and a store-latest would report 5, so the
+        // fixture forces the maximum fold to be the real thing that shows budget
+        // pressure a total cannot (ADR-0100 decision 1).
+        let metrics = LogIngestMetrics::default();
+        metrics.record_postings(ravel_logseg::writer::WriteStats {
+            dynamic_columns_used: 8,
+            dynamic_columns_overflowed: 3,
+            ..Default::default()
+        });
+        metrics.record_postings(ravel_logseg::writer::WriteStats {
+            dynamic_columns_used: 5,
+            dynamic_columns_overflowed: 0,
+            ..Default::default()
+        });
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dynamic_columns_used_total, 13, "8 + 5");
+        assert_eq!(snap.dynamic_columns_overflowed_total, 3, "3 + 0");
+        assert_eq!(
+            snap.dynamic_columns_used_max, 8,
+            "running maximum keeps the wider object's used count"
+        );
     }
 }

@@ -600,6 +600,13 @@ pub struct PostingsCounters {
     pub indexed_fields_total: u64,
     pub distinct_values_total: u64,
     pub capped_fields_total: u64,
+    /// Dynamic-column budget counters (ADR-0100 decision 1). `used_total` and
+    /// `overflowed_total` are cumulative over flushed objects;
+    /// `used_max` is a running maximum of one object's used count, so an
+    /// operator sees budget pressure before any object crosses the cap.
+    pub dynamic_columns_used_total: u64,
+    pub dynamic_columns_overflowed_total: u64,
+    pub dynamic_columns_used_max: u64,
 }
 
 impl IngestPipelineSnapshot {
@@ -651,6 +658,9 @@ impl IngestPipelineSnapshot {
                 indexed_fields_total: snapshot.postings_indexed_fields_total,
                 distinct_values_total: snapshot.postings_distinct_values_total,
                 capped_fields_total: snapshot.postings_capped_fields_total,
+                dynamic_columns_used_total: snapshot.dynamic_columns_used_total,
+                dynamic_columns_overflowed_total: snapshot.dynamic_columns_overflowed_total,
+                dynamic_columns_used_max: snapshot.dynamic_columns_used_max,
             }),
             metadata_sink: None,
         }
@@ -976,6 +986,12 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
 /// distinct-per-field without any field-name label, which the ADR-0044 label
 /// allowlist forbids. The prune-selectivity metric is rendered separately, off
 /// the query path's DataFusion counters.
+///
+/// The same family also carries the dynamic-column budget counters (ADR-0100
+/// decision 1): `ravel_logs_dynamic_columns_used_total` and
+/// `_overflowed_total` are cumulative, and `ravel_logs_dynamic_columns_used_max`
+/// is a gauge (a running per-object maximum), all under the same `{mode, signal}`
+/// labels with no per-field dimension.
 fn render_logs_postings_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelineSnapshot]) {
     fn labels(mode: Mode, signal: Signal) -> [Label; 2] {
         [Label::Mode(mode), Label::Signal(signal)]
@@ -987,7 +1003,7 @@ fn render_logs_postings_family(out: &mut String, mode: Mode, pipelines: &[Ingest
     // Each metric is one header then one sample per pipeline that builds
     // postings, keeping the zero-is-not-absence discipline the other families
     // keep for a configured-but-idle pipeline.
-    let metrics: [PostingsMetric; 5] = [
+    let metrics: [PostingsMetric; 7] = [
         (
             "ravel_logs_postings_objects_total",
             "Flushed log objects that carried a POSTINGS section, by signal (the denominator for average section bytes per indexed object).",
@@ -1013,6 +1029,16 @@ fn render_logs_postings_family(out: &mut String, mode: Mode, pipelines: &[Ingest
             "Indexed fields dropped from POSTINGS for exceeding the per-field distinct-value cap (ADR-0049 decision 4), summed over objects, by signal.",
             |p| p.capped_fields_total,
         ),
+        (
+            "ravel_logs_dynamic_columns_used_total",
+            "Distinct (name, type) attribute pairs that received a real dynamic column, summed over flushed log objects, by signal (ADR-0100 decision 1).",
+            |p| p.dynamic_columns_used_total,
+        ),
+        (
+            "ravel_logs_dynamic_columns_overflowed_total",
+            "Distinct (name, type) attribute pairs that overflowed the max_dynamic_columns budget and folded into attrs_raw, summed over flushed log objects, by signal (ADR-0100 decision 1).",
+            |p| p.dynamic_columns_overflowed_total,
+        ),
     ];
 
     for (name, help, get) in metrics {
@@ -1021,6 +1047,27 @@ fn render_logs_postings_family(out: &mut String, mode: Mode, pipelines: &[Ingest
             if let Some(postings) = &pipeline.postings {
                 write_sample(out, name, &labels(mode, pipeline.signal), get(postings));
             }
+        }
+    }
+
+    // The per-object maximum of dynamic_columns_used. A running maximum, not a
+    // cumulative sum, so it is a gauge and its name carries no `_total` suffix
+    // (ADR-0100 decision 1: it shows budget pressure before the cap is crossed,
+    // which a total cannot).
+    write_header(
+        out,
+        "ravel_logs_dynamic_columns_used_max",
+        "Largest per-object dynamic-column count seen so far, by signal: the budget-pressure gauge that rises before any object overflows max_dynamic_columns (ADR-0100 decision 1).",
+        "gauge",
+    );
+    for pipeline in pipelines {
+        if let Some(postings) = &pipeline.postings {
+            write_sample(
+                out,
+                "ravel_logs_dynamic_columns_used_max",
+                &labels(mode, pipeline.signal),
+                postings.dynamic_columns_used_max,
+            );
         }
     }
 }

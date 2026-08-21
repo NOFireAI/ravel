@@ -430,6 +430,25 @@ section:
   flushed object for exceeding the per-field distinct-value cap (ADR-0049
   decision 4).
 
+### Dynamic-column budget metrics (ADR-0100)
+
+Each RLOG object gives the first `max_dynamic_columns` (default 1000) distinct
+`(name, type)` attribute pairs a real typed column, ordered lexicographically
+by name bytes then type byte; the rest fold into the `attrs_raw` overflow
+column and lose columnar access. These `ravel_logs_dynamic_columns_*` metrics
+render at `GET /metrics` for the log ingest pipeline with `mode` and `signal`
+labels, so an operator can see a load approaching or crossing the budget
+instead of it being silent (ADR-0100 decision 1).
+
+- `ravel_logs_dynamic_columns_used_total` (counter): distinct `(name, type)`
+  pairs that received a real dynamic column, summed across flushed objects.
+- `ravel_logs_dynamic_columns_overflowed_total` (counter): distinct
+  `(name, type)` pairs that overflowed the budget and folded into `attrs_raw`,
+  summed across flushed objects. Nonzero means some loads crossed the budget.
+- `ravel_logs_dynamic_columns_used_max` (gauge): the largest per-object used
+  count seen so far. It rises toward `max_dynamic_columns` before any object
+  overflows, so it signals budget pressure a total cannot show.
+
 ### Query-side prune-selectivity metrics
 
 `ravel_logs_prune_*` renders at `GET /metrics` for the logs query path.
