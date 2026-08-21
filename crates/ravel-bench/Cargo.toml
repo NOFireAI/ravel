@@ -108,10 +108,19 @@ flight-egress = [
 # bench bins wrap their measured region in a sampler when
 # `RAVEL_BENCH_PROFILE_SVG` names an output path (see `src/profiling.rs`).
 profiling = ["dep:pprof"]
+# The ADR-0100 decision 3 SQL corpus (`src/sql_corpus.rs`) and, once #428
+# lands, the `sql_latency_bench` harness that runs it. Off by default: the
+# corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
+# same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
+# second datafusion/arrow activation) and the plain gates never compile it.
+sql-latency = ["dep:ravel-sql"]
 
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+# Corpus-loader tests write malformed and well-formed corpus files to a temp
+# directory that cleans itself up; workspace pin, no new external crate.
+tempfile = { workspace = true }
 
 [lib]
 # Only the criterion `[[bench]]` targets below understand `cargo bench`'s
