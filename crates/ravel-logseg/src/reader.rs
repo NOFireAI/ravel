@@ -12,6 +12,7 @@ use ravel_types::logstream::AttrValue;
 
 use crate::block::{ColumnPlan, DecodedBlock, read_block_columns};
 use crate::bloom_section::BloomSection;
+use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
@@ -355,6 +356,8 @@ impl<'a> RlogReader<'a> {
             blocks,
             next: 0,
             stats,
+            current: None,
+            surviving: Vec::new(),
         })
     }
 
@@ -371,6 +374,8 @@ impl<'a> RlogReader<'a> {
             blocks: Vec::new(),
             next: 0,
             stats,
+            current: None,
+            surviving: Vec::new(),
         }
     }
 
@@ -618,6 +623,14 @@ pub struct BlockScan {
     blocks: Vec<BlockLoc>,
     next: usize,
     stats: ScanStats,
+    /// The block [`Self::decode_block`] most recently decoded, held only for as
+    /// long as one of the two exits is reading it. Dropped at the start of the
+    /// next decode, and dropped by [`Self::next_block`] before it returns, so
+    /// the row path holds exactly one block's decoded columns at a time as it
+    /// did before the columnar exit existed (ADR-0087 decision 2).
+    current: Option<DecodedBlock>,
+    /// Row positions of [`Self::current`] that matched `content`, ascending.
+    surviving: Vec<usize>,
 }
 
 impl BlockScan {
@@ -649,8 +662,95 @@ impl BlockScan {
         &mut self,
         object_bytes: &[u8],
     ) -> Result<Option<Vec<LogRecord>>, LogSegError> {
-        let Some(loc) = self.blocks.get(self.next).copied() else {
+        if !self.decode_block(object_bytes)? {
             return Ok(None);
+        }
+        let Some(decoded) = self.current.take() else {
+            return Err(LogSegError::Corrupted("block not decoded".into()));
+        };
+        let strict = self.columns.is_none();
+        let mut out = Vec::with_capacity(self.surviving.len());
+        for &row in &self.surviving {
+            out.push(rebuild_record_projected(
+                &self.stream_dir,
+                &self.field_dir,
+                &decoded,
+                row,
+                strict,
+            )?);
+        }
+        self.surviving.clear();
+        Ok(Some(out))
+    }
+
+    /// Decode the next surviving block and return a borrowed columnar view of
+    /// the rows of it that match the exact filter, or `None` once every
+    /// surviving block has been decoded (ADR-0099 decision 1).
+    ///
+    /// This is the second exit next to [`Self::next_block`], over the same
+    /// decode primitive: the view's surviving rows are exactly the rows
+    /// `next_block` would have returned records for, in the same order. What
+    /// differs is that nothing is rebuilt -- no `String`, no cloned STREAM_DIR
+    /// blob, no per-attribute key clone -- so a caller that is about to build
+    /// columnar output does not pay for a row form first.
+    ///
+    /// `object_bytes` has the same contract as [`Self::next_block`]'s, and the
+    /// same malformed-block cases are the same typed `Corrupted` errors, never
+    /// panics. Two of them are checked here rather than while rebuilding a
+    /// record: every surviving row must have a `ts` and a `stream_ref` that
+    /// resolves to a STREAM_DIR entry. The row path rejects both while building
+    /// each record; this exit builds nothing, so it checks them up front rather
+    /// than handing out a view whose `ts` and stream identity read as absent.
+    ///
+    /// The returned view borrows this cursor, so it must be dropped before the
+    /// next call. The decoded block is released on the next call to either
+    /// exit.
+    pub fn next_block_columnar(
+        &mut self,
+        object_bytes: &[u8],
+    ) -> Result<Option<ColumnarBlockView<'_>>, LogSegError> {
+        if !self.decode_block(object_bytes)? {
+            return Ok(None);
+        }
+        let Some(decoded) = self.current.as_ref() else {
+            return Err(LogSegError::Corrupted("block not decoded".into()));
+        };
+        for &row in &self.surviving {
+            let sref = u32::try_from(i64_at(decoded, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            if self.stream_dir.entries().get(sref as usize).is_none() {
+                return Err(LogSegError::Corrupted("stream_ref out of range".into()));
+            }
+            i64_at(decoded, COL_TS, row)?;
+        }
+        Ok(Some(ColumnarBlockView::new(
+            &self.stream_dir,
+            &self.field_dir,
+            decoded,
+            &self.surviving,
+        )))
+    }
+
+    /// The decode primitive both exits run on: locate the next surviving block,
+    /// decode its selected columns, account for its pages, and evaluate the
+    /// exact content predicate into [`Self::surviving`].
+    ///
+    /// `Ok(false)` means the cursor is exhausted and nothing was decoded.
+    /// `Ok(true)` leaves the decoded block in [`Self::current`] and its
+    /// surviving row positions, ascending, in [`Self::surviving`].
+    ///
+    /// Having one primitive is what keeps the two exits from drifting: the
+    /// surviving row set is computed once, by one predicate evaluation, so a
+    /// columnar view cannot disagree with the records `next_block` would have
+    /// produced for the same block.
+    fn decode_block(&mut self, object_bytes: &[u8]) -> Result<bool, LogSegError> {
+        // Release the previous block before decoding the next, so peak resident
+        // decoded memory stays one block rather than two.
+        self.current = None;
+        self.surviving.clear();
+
+        let Some(loc) = self.blocks.get(self.next).copied() else {
+            return Ok(false);
         };
         self.next += 1;
         let start = usize::try_from(loc.start)
@@ -674,8 +774,6 @@ impl BlockScan {
         self.stats.pages_decoded += decoded.pages_decoded() as u64;
         self.stats.pages_skipped += decoded.pages_skipped() as u64;
 
-        let strict = self.columns.is_none();
-        let mut out = Vec::new();
         for row in 0..decoded.record_count() {
             if eval(
                 &self.stream_dir,
@@ -684,16 +782,11 @@ impl BlockScan {
                 &decoded,
                 row,
             )? {
-                out.push(rebuild_record_projected(
-                    &self.stream_dir,
-                    &self.field_dir,
-                    &decoded,
-                    row,
-                    strict,
-                )?);
+                self.surviving.push(row);
             }
         }
-        Ok(Some(out))
+        self.current = Some(decoded);
+        Ok(true)
     }
 }
 
@@ -2828,5 +2921,519 @@ mod tests {
             "a NumRange over an unresolved (name, type) must not prune"
         );
         assert_eq!(rows.len(), 2);
+    }
+
+    // --- columnar block view (ADR-0099 decision 1) ---------------------------
+
+    /// The attribute key that overflows the dynamic-column budget in
+    /// [`columnar_corpus`] and therefore lands in `attrs_raw`.
+    const OVERFLOW_KEY: &str = "z_over";
+
+    /// The dynamic-column budget [`columnar_corpus`] is built against: exactly
+    /// enough for its five columned attribute names, so the sixth
+    /// ([`OVERFLOW_KEY`], last in the writer's `(name, type)` order) spills into
+    /// `attrs_raw`.
+    const COLUMNAR_MAX_COLUMNS: usize = 5;
+
+    fn rec_attrs(stream: u8, ts: i64, body: &str, attrs: Vec<(String, AttrValue)>) -> LogRecord {
+        let mut r = rec(stream, ts, body);
+        r.attrs = attrs;
+        r
+    }
+
+    fn attr(k: &str, v: AttrValue) -> (String, AttrValue) {
+        (k.to_string(), v)
+    }
+
+    /// A corpus for the columnar view, deliberately awkward: two streams, five
+    /// columned attribute types plus one that overflows into `attrs_raw`, rows
+    /// with no attributes at all (so every dynamic column is partially present),
+    /// an empty `body`, an empty string attribute, a negative and an extreme
+    /// integer, a negative zero, and rows with and without trace/span ids.
+    ///
+    /// Bodies are worded so `HasWord(body, "keep")` keeps a non-contiguous
+    /// subset of every block's rows: an accessor that read a surviving-row index
+    /// as a raw block row position would return another row's data.
+    fn columnar_corpus() -> Vec<LogRecord> {
+        vec![
+            rec_attrs(
+                0,
+                100,
+                "keep alpha",
+                vec![
+                    attr("a_str", AttrValue::Str("x".into())),
+                    attr("b_int", AttrValue::I64(7)),
+                    attr("c_f64", AttrValue::F64(1.5)),
+                    attr("d_bool", AttrValue::Bool(true)),
+                    attr("e_bytes", AttrValue::Bytes(vec![1, 2])),
+                    attr(OVERFLOW_KEY, AttrValue::Str("ov".into())),
+                ],
+            ),
+            rec_attrs(0, 101, "drop beta", Vec::new()),
+            rec_attrs(
+                0,
+                102,
+                "keep gamma",
+                vec![attr("a_str", AttrValue::Str("y".into()))],
+            ),
+            rec_attrs(
+                0,
+                103,
+                "",
+                vec![
+                    attr("b_int", AttrValue::I64(-3)),
+                    attr("c_f64", AttrValue::F64(2.5)),
+                ],
+            ),
+            rec_attrs(
+                0,
+                104,
+                "keep delta",
+                vec![
+                    attr("a_str", AttrValue::Str(String::new())),
+                    attr("d_bool", AttrValue::Bool(false)),
+                ],
+            ),
+            rec_attrs(
+                1,
+                105,
+                "drop epsilon",
+                vec![attr("e_bytes", AttrValue::Bytes(vec![9]))],
+            ),
+            rec_attrs(
+                1,
+                106,
+                "keep zeta",
+                vec![attr(OVERFLOW_KEY, AttrValue::Str("ov2".into()))],
+            ),
+            rec_attrs(1, 107, "drop eta", Vec::new()),
+            rec_attrs(
+                1,
+                108,
+                "keep theta",
+                vec![attr("b_int", AttrValue::I64(i64::MIN))],
+            ),
+            {
+                let mut r = rec_attrs(1, 109, "", Vec::new());
+                r.trace_id = Some([3u8; 16]);
+                r.span_id = Some([4u8; 8]);
+                r
+            },
+            rec_attrs(
+                1,
+                110,
+                "keep iota",
+                vec![attr("c_f64", AttrValue::F64(-0.0))],
+            ),
+            {
+                let mut r = rec_attrs(
+                    1,
+                    111,
+                    "drop kappa",
+                    vec![
+                        attr("a_str", AttrValue::Str("z".into())),
+                        attr("d_bool", AttrValue::Bool(true)),
+                    ],
+                );
+                r.trace_id = Some([5u8; 16]);
+                r
+            },
+        ]
+    }
+
+    /// Which columns a [`ColumnSelection`] under test keeps, so the comparison
+    /// knows when a `None` from the view is the projection working rather than a
+    /// disagreement with the row path.
+    struct Kept {
+        observed_ts: bool,
+        severity_num: bool,
+        flags: bool,
+    }
+
+    /// Reads every field of surviving row `i` through the view and asserts it
+    /// equals the corresponding field of `r`, the record the row exit produced
+    /// for the same block at the same position.
+    fn assert_row_matches(view: &ColumnarBlockView<'_>, i: usize, r: &LogRecord, kept: &Kept) {
+        assert_eq!(view.ts(i), Some(r.ts_ns), "ts at surviving row {i}");
+        assert_eq!(
+            view.stream_id(i),
+            Some(&r.stream_id),
+            "stream_id at surviving row {i}"
+        );
+        assert_eq!(
+            view.stream_attrs(i),
+            Some(r.stream_attrs.as_slice()),
+            "stream_attrs at surviving row {i}"
+        );
+        // The blob is borrowed from STREAM_DIR, so two rows of the same stream
+        // read the identical slice rather than two clones.
+        assert_eq!(
+            view.stream_attrs(i),
+            view.stream_ref(i).and_then(|s| view.stream_attrs_of(s)),
+            "row and stream_ref forms of the blob must agree"
+        );
+
+        assert_eq!(
+            view.observed_ts(i),
+            kept.observed_ts.then_some(r.observed_ts_ns),
+            "observed_ts at surviving row {i}"
+        );
+        assert_eq!(
+            view.severity_num(i),
+            kept.severity_num.then_some(i64::from(r.severity_num)),
+            "severity_num at surviving row {i}"
+        );
+        assert_eq!(
+            view.flags(i),
+            kept.flags.then_some(i64::from(r.flags)),
+            "flags at surviving row {i}"
+        );
+
+        // `severity_text` and `body` are always-present columns whose value can
+        // be empty; the row path reads an absent one as `""` and so does this.
+        assert_eq!(
+            view.severity_text(i).unwrap_or(b""),
+            r.severity_text.as_bytes(),
+            "severity_text at surviving row {i}"
+        );
+        assert_eq!(
+            view.body(i).unwrap_or(b""),
+            r.body.as_bytes(),
+            "body at surviving row {i}"
+        );
+        assert_eq!(
+            view.trace_id(i).map(<[u8]>::to_vec),
+            r.trace_id.map(|t| t.to_vec()),
+            "trace_id at surviving row {i}"
+        );
+        assert_eq!(
+            view.span_id(i).map(<[u8]>::to_vec),
+            r.span_id.map(|s| s.to_vec()),
+            "span_id at surviving row {i}"
+        );
+
+        // Attributes reachable through FIELD_DIR columns, resolved once for the
+        // block and read per row. The row path pushes these in FIELD_DIR order
+        // and then appends whatever `attrs_raw` decoded, so the view-derived
+        // list must be a prefix of the record's and the remainder must be
+        // overflow keys only.
+        let mut got: Vec<(String, AttrValue)> = Vec::new();
+        for (name, col) in view.attr_columns() {
+            let v = match col.ty {
+                FieldType::Str => view
+                    .bytes_at(col.column_id, i)
+                    .and_then(|b| String::from_utf8(b.to_vec()).ok())
+                    .map(AttrValue::Str),
+                FieldType::Bytes => view
+                    .bytes_at(col.column_id, i)
+                    .map(|b| AttrValue::Bytes(b.to_vec())),
+                FieldType::I64 => view.i64_at(col.column_id, i).map(AttrValue::I64),
+                FieldType::F64 => view
+                    .f64_bits_at(col.column_id, i)
+                    .map(|bits| AttrValue::F64(f64::from_bits(bits))),
+                FieldType::Bool => view.bool_at(col.column_id, i).map(AttrValue::Bool),
+            };
+            if let Some(v) = v {
+                // Resolution by key must land on the same column.
+                assert_eq!(
+                    view.resolve_attr(name, col.ty),
+                    Some(col),
+                    "resolve_attr({name}) must match the enumerated column"
+                );
+                got.push((name.to_string(), v));
+            }
+        }
+        assert!(
+            got.len() <= r.attrs.len(),
+            "view produced {} attrs for surviving row {i}, record has {}",
+            got.len(),
+            r.attrs.len()
+        );
+        let (prefix, tail) = r.attrs.split_at(got.len());
+        for (g, w) in got.iter().zip(prefix) {
+            assert_eq!(g.0, w.0, "attr key at surviving row {i}");
+            assert!(
+                attr_value_eq(&g.1, &w.1),
+                "attr {} at surviving row {i}: view {:?} vs record {:?}",
+                g.0,
+                g.1,
+                w.1
+            );
+        }
+        for (k, _) in tail {
+            assert_eq!(
+                k, OVERFLOW_KEY,
+                "record attr {k} at surviving row {i} is not reachable through a \
+                 FIELD_DIR column and is not the known overflow key"
+            );
+        }
+        assert!(
+            view.resolve_attr(OVERFLOW_KEY, FieldType::Str).is_none(),
+            "the overflow key must have no FIELD_DIR column, or the corpus no \
+             longer exercises attrs_raw"
+        );
+    }
+
+    /// Drives the row exit and the columnar exit over the same object with the
+    /// same predicate and column selection, block for block, and asserts they
+    /// agree on every field of every surviving row. Returns each block's
+    /// `attrs_raw` page flag paired with whether that block's records actually
+    /// carried an overflow attribute.
+    fn compare_exits(
+        reader: &RlogReader<'_>,
+        obj: &[u8],
+        pred: &Predicate,
+        columns: &ColumnSelection,
+        kept: &Kept,
+        case: &str,
+    ) -> Vec<(bool, bool)> {
+        let mut rows_cursor = reader
+            .scan_blocks(pred, &[], columns)
+            .expect("open row cursor");
+        let mut col_cursor = reader
+            .scan_blocks(pred, &[], columns)
+            .expect("open columnar cursor");
+        let mut flags = Vec::new();
+        loop {
+            let records = rows_cursor.next_block(obj).expect("row exit");
+            let view = col_cursor.next_block_columnar(obj).expect("columnar exit");
+            match (records, view) {
+                (None, None) => break,
+                (Some(records), Some(view)) => {
+                    assert_eq!(
+                        view.surviving_count(),
+                        records.len(),
+                        "{case}: surviving row count must equal the row exit's record count"
+                    );
+                    assert!(
+                        view.record_count() >= view.surviving_count(),
+                        "{case}: surviving rows cannot outnumber the block's rows"
+                    );
+                    for (i, r) in records.iter().enumerate() {
+                        assert_row_matches(&view, i, r, kept);
+                    }
+                    // Out-of-range reads are `None`, never another row's data.
+                    assert_eq!(view.ts(view.surviving_count()), None, "{case}");
+
+                    // The gather iterators walk the same cells in the same order
+                    // as the per-row readers.
+                    let ts_iter: Vec<Option<i64>> = view.iter_ts().collect();
+                    let ts_rows: Vec<Option<i64>> =
+                        (0..view.surviving_count()).map(|i| view.ts(i)).collect();
+                    assert_eq!(ts_iter, ts_rows, "{case}: iter_ts");
+                    let body_iter: Vec<Option<&[u8]>> = view.iter_body().collect();
+                    let body_rows: Vec<Option<&[u8]>> =
+                        (0..view.surviving_count()).map(|i| view.body(i)).collect();
+                    assert_eq!(body_iter, body_rows, "{case}: iter_body");
+                    assert_eq!(
+                        view.iter_stream_ref().collect::<Vec<_>>(),
+                        (0..view.surviving_count())
+                            .map(|i| view.stream_ref(i))
+                            .collect::<Vec<_>>(),
+                        "{case}: iter_stream_ref"
+                    );
+
+                    if columns.is_all() {
+                        assert_eq!(
+                            view.pages_skipped(),
+                            0,
+                            "{case}: an all-columns decode skips no page"
+                        );
+                    }
+                    assert!(
+                        view.pages_decoded() > 0,
+                        "{case}: a surviving block decodes at least one page"
+                    );
+
+                    let record_has_overflow = records
+                        .iter()
+                        .any(|r| r.attrs.iter().any(|(k, _)| k == OVERFLOW_KEY));
+                    flags.push((view.has_attrs_raw_page(), record_has_overflow));
+                }
+                (records, view) => panic!(
+                    "{case}: exits disagree on exhaustion (row exit {}, columnar exit {})",
+                    records.is_some(),
+                    view.is_some()
+                ),
+            }
+        }
+        assert_eq!(
+            rows_cursor.stats(),
+            col_cursor.stats(),
+            "{case}: both exits must account for the same blocks and pages"
+        );
+        flags
+    }
+
+    /// Acceptance test for the columnar block view (issue #413): every field of
+    /// every surviving row, read through the view, equals the corresponding
+    /// field of the `LogRecord` the row exit produces for the same block at the
+    /// same position -- across an all-columns and a projected decode, and a
+    /// match-everything and a selective predicate.
+    ///
+    /// The selective predicate is the load-bearing half: it keeps a
+    /// non-contiguous subset of each block's rows, so an accessor that read its
+    /// index as a raw block row position would disagree here.
+    #[test]
+    fn columnar_view_matches_rebuilt_records() {
+        let cfg = RlogConfig {
+            block_target_records: 3,
+            max_dynamic_columns: COLUMNAR_MAX_COLUMNS,
+            ..RlogConfig::default()
+        };
+        let obj = build(cfg, columnar_corpus());
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+
+        let all_rows = Predicate::And(Vec::new());
+        let selective = Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "keep".into(),
+        };
+        // Projected: no observed_ts, severity_num, flags, trace_id or span_id,
+        // and only one of the five dynamic columns.
+        let projected = ColumnSelection::fixed_only()
+            .with_body()
+            .with_severity_text()
+            .with_attr("a_str");
+        let all_kept = Kept {
+            observed_ts: true,
+            severity_num: true,
+            flags: true,
+        };
+        let projected_kept = Kept {
+            observed_ts: false,
+            severity_num: false,
+            flags: false,
+        };
+
+        let flags = compare_exits(
+            &reader,
+            &obj,
+            &all_rows,
+            &ColumnSelection::all(),
+            &all_kept,
+            "match-all / all-columns",
+        );
+        // With a match-everything predicate every row survives, so the row
+        // exit's records cover the whole block and the `attrs_raw` page flag is
+        // exactly "some record here spilled".
+        assert!(flags.len() > 1, "corpus must produce several blocks");
+        for (has_page, record_has_overflow) in &flags {
+            assert_eq!(
+                has_page, record_has_overflow,
+                "attrs_raw page presence must match the block's spilled records"
+            );
+        }
+        assert!(
+            flags.iter().any(|(p, _)| *p),
+            "corpus must include a block whose records spill to attrs_raw"
+        );
+        assert!(
+            flags.iter().any(|(p, _)| !*p),
+            "corpus must include a block with no attrs_raw spill"
+        );
+
+        compare_exits(
+            &reader,
+            &obj,
+            &selective,
+            &ColumnSelection::all(),
+            &all_kept,
+            "selective / all-columns",
+        );
+        compare_exits(
+            &reader,
+            &obj,
+            &all_rows,
+            &projected,
+            &projected_kept,
+            "match-all / projected",
+        );
+        let selective_projected = compare_exits(
+            &reader,
+            &obj,
+            &selective,
+            &projected,
+            &projected_kept,
+            "selective / projected",
+        );
+        // The projected decode leaves `attrs_raw` decodable (naming an attribute
+        // key keeps it, since the key may have spilled), so the page flag is
+        // still answered from descriptors and still varies across blocks.
+        assert!(selective_projected.iter().any(|(p, _)| *p));
+        assert!(selective_projected.iter().any(|(p, _)| !*p));
+
+        // A projected decode really did skip pages, so the comparison above was
+        // over a partial decode rather than a silently-full one.
+        let mut cursor = reader
+            .scan_blocks(&all_rows, &[], &projected)
+            .expect("open cursor");
+        while cursor
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .is_some()
+        {}
+        assert!(
+            cursor.stats().pages_skipped > 0,
+            "the projected selection must leave pages undecoded"
+        );
+    }
+
+    /// Both exits reject a corrupt block with the same typed error, and neither
+    /// panics. The flipped byte is inside block 0's stored extent, so its
+    /// crc32c no longer matches its SKIP_IDX entry.
+    #[test]
+    fn corrupt_block_is_a_typed_error_through_both_exits() {
+        let cfg = RlogConfig {
+            block_target_records: 3,
+            ..RlogConfig::default()
+        };
+        let good = build(cfg, columnar_corpus());
+        let blocks_offset = open(&good)
+            .expect("open footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS section")
+            .offset;
+        let skip = skip_of(&good);
+        let entry = skip.l0.first().expect("a first block");
+        let at = usize::try_from(blocks_offset + entry.block_offset).expect("offset fits")
+            + usize::try_from(entry.block_len).expect("len fits") / 2;
+        let mut obj = good.clone();
+        obj[at] ^= 0xff;
+
+        let pred = Predicate::And(Vec::new());
+        let reader = RlogReader::new(&obj, &cfg).expect("footer and sections are intact");
+        let err = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor")
+            .next_block(&obj)
+            .expect_err("row exit rejects the corrupt block");
+        assert!(matches!(err, LogSegError::Corrupted(_)), "{err:?}");
+        let err = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor")
+            .next_block_columnar(&obj)
+            .expect_err("columnar exit rejects the corrupt block");
+        assert!(matches!(err, LogSegError::Corrupted(_)), "{err:?}");
+
+        // Same object, uncorrupted: both exits succeed, so the assertions above
+        // are about the flipped byte and not about the fixture.
+        let reader = RlogReader::new(&good, &cfg).expect("open");
+        assert!(
+            reader
+                .scan_blocks(&pred, &[], &ColumnSelection::all())
+                .expect("open cursor")
+                .next_block(&good)
+                .expect("row exit")
+                .is_some()
+        );
+        assert!(
+            reader
+                .scan_blocks(&pred, &[], &ColumnSelection::all())
+                .expect("open cursor")
+                .next_block_columnar(&good)
+                .expect("columnar exit")
+                .is_some()
+        );
     }
 }

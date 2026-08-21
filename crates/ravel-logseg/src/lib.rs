@@ -13,6 +13,7 @@
 //! panicking.
 
 pub mod block;
+pub mod columnar;
 pub mod columns;
 pub mod error;
 pub mod field_dir;
@@ -32,12 +33,17 @@ pub mod writer;
 // Cargo.toml need to change.
 pub use ravel_codec::{bloom, bloom_section, encoding, tokenizer};
 
+// The columnar block view (ADR-0099 decision 1). `block::DecodedBlock` is
+// deliberately NOT re-exported: the view is the whole public surface over a
+// decoded block, so decision 4 can change how columns are stored without
+// touching a caller.
+pub use columnar::{AttrColumn, ColumnarBlockView};
 pub use columns::ColumnSelection;
 pub use error::LogSegError;
 pub use footer::{SuffixOutcome, open_from_suffix};
 pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockSpan};
 pub use reader::{BlockScan, RlogReader, ScanStats, decode_section, read_section};
-pub use record::{FieldSel, LogRecord, Predicate, stream_attrs_bytes};
+pub use record::{FieldSel, FieldType, LogRecord, Predicate, stream_attrs_bytes};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
 
 // Re-exported for callers building records; these are the ravel-types identity
