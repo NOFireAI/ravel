@@ -67,7 +67,14 @@ time (verify-dispatch cold gate and PR CI); your job is the blast
 radius of your own change, and affected-tests.sh computes it (the
 named crates plus every crate that depends on them). The commit that
 gets gated must already be formatted; never append a formatting-only
-fixup commit after a failed --check.
+fixup commit after a failed --check. Run every gate command UNPIPED and
+read its own real exit code (`cmd; code=$?`), never `| tail` / `| head` /
+`| grep` to keep the output small -- the pipeline's exit code is the last
+stage's, not the gate's, so a real failure buried in a `tail`-truncated
+tool-result can report a false "affected-tests passed" while a test
+actually failed. If the output is long, redirect it to a file and grep or
+read the file separately; the exit code check and the output-size problem
+are independent, solve them independently.
 Commit with trailer "Refs: #N".
 Self-check before the commit (see the checklist below): no tool-call
 artifacts in files, no debug_assert-only guards, generated docs
