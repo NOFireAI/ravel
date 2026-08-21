@@ -206,8 +206,9 @@ const E_CROSS_SIGNAL: &str = "SqlError::CrossSignalQuery";
 /// deliberately NOT exhaustive: the other members of the family stay admitted
 /// (they survive [`crate::session::build_session`]'s scalar gate and are held
 /// exhaustive against the upstream registrations by the drift test in
-/// `crate::session`), but they are covered by this one row and the drift test,
-/// not individually attested here. Registering one row per admitted scalar
+/// `crate::session`), but that drift test constrains membership only. No row
+/// here attests the behaviour of any family member other than the
+/// representative. Registering one row per admitted scalar
 /// would mostly test upstream DataFusion rather than Ravel, which ADR-0097
 /// decision 8 rejects.
 struct ScalarFamily {
@@ -902,8 +903,12 @@ mod tests {
     /// - Admitted scalar: family-based. The bound is not one row per admitted
     ///   scalar (ADR-0097 decision 8 rejects that); it is one row per declared
     ///   family plus each Ravel UDF, and every such row must name a live member
-    ///   of [`ADMITTED_SCALARS`]. A row naming a non-admitted scalar, or a
-    ///   dropped family/UDF, fails here.
+    ///   of [`ADMITTED_SCALARS`]. A row naming a non-admitted scalar, and a
+    ///   family or UDF whose row is missing, fail here. Deleting a family or
+    ///   UDF entry outright does not: the declaration is the only statement of
+    ///   which families are claimed, so removing it removes the claim with it.
+    ///   The size of the admitted-scalar surface is bound by the drift test in
+    ///   [`crate::session`], not by this one.
     #[test]
     fn registry_reads_the_live_allowlist_sets() {
         use std::collections::BTreeSet;
