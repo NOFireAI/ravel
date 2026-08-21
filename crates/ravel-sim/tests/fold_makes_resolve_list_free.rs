@@ -165,17 +165,19 @@ fn fold_makes_resolve_list_free() {
 
         let tenant = TenantId::new("fold-load-bearing-tenant");
         let tenant_hash = tenant.hash();
-        let labels = LabelSet::new(vec![
-            Label {
-                name: "__name__".to_string(),
-                value: "sim_probe".to_string(),
-            },
-            Label {
-                name: "shape".to_string(),
-                value: "f1".to_string(),
-            },
-        ])
-        .expect("valid label set");
+        let labels = Arc::new(
+            LabelSet::new(vec![
+                Label {
+                    name: "__name__".to_string(),
+                    value: "sim_probe".to_string(),
+                },
+                Label {
+                    name: "shape".to_string(),
+                    value: "f1".to_string(),
+                },
+            ])
+            .expect("valid label set"),
+        );
         let series_id = SeriesId::compute(&tenant, "sim_probe", &labels).expect("series id");
 
         let ingest_config = IngestConfig {

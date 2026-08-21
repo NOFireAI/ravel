@@ -732,7 +732,10 @@ fn normalize_impl(
                 let series_id = *series_id;
                 points.push(NormalizedPoint {
                     series_id,
-                    labels: label_set.clone(),
+                    // ADR-0098: ravel-otap keeps its own built-set memo and
+                    // shares nothing across points; it wraps each built set in
+                    // a fresh Arc. Rekeying it is a follow-up.
+                    labels: Arc::new(label_set.clone()),
                     sample: Sample {
                         ts_ns: dp.ts_ns,
                         value,
@@ -2290,7 +2293,8 @@ fn finish_exploded_point(
 
     Ok(NormalizedPoint {
         series_id,
-        labels: label_set,
+        // ADR-0098: fresh Arc per exploded series, no sharing (see above).
+        labels: Arc::new(label_set),
         sample: Sample { ts_ns, value },
         is_monotonic_sum: false,
     })

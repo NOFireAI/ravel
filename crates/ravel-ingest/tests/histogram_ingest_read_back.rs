@@ -45,7 +45,7 @@ fn histogram_point(tenant_id: &ravel_types::TenantId, metric: &str, ts_ns: i64) 
     let series_id = SeriesId::compute(tenant_id, metric, &labels).expect("series id");
     IngestPoint {
         series_id,
-        labels,
+        labels: Arc::new(labels),
         value: IngestValue::Histogram(HistogramSample {
             ts_ns,
             value: HistogramValue {
@@ -80,7 +80,7 @@ fn scalar_point(
     let series_id = SeriesId::compute(tenant_id, metric, &labels).expect("series id");
     IngestPoint {
         series_id,
-        labels,
+        labels: Arc::new(labels),
         value: IngestValue::Scalar(Sample { ts_ns, value }),
     }
 }

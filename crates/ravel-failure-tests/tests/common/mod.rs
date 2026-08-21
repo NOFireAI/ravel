@@ -83,7 +83,7 @@ pub fn make_point(
     let series_id = SeriesId::compute(tenant, metric, &labels).expect("series id");
     NormalizedPoint {
         series_id,
-        labels,
+        labels: Arc::new(labels),
         sample: Sample { ts_ns, value },
         is_monotonic_sum: false,
     }

@@ -6,6 +6,8 @@
 //! reach the same RSEG v5 writer regardless of which wire path decoded the
 //! point.
 
+use std::sync::Arc;
+
 use ravel_segment::{ExemplarInput, HistogramSample};
 use ravel_types::{Exemplar, Label, LabelSet, Sample, SeriesId};
 
@@ -22,7 +24,11 @@ pub enum IngestValue {
 #[derive(Debug, Clone)]
 pub struct IngestPoint {
     pub series_id: SeriesId,
-    pub labels: LabelSet,
+    /// One label set shared across the points of a series run (ADR-0098).
+    /// The points of one run clone the same `Arc` rather than each owning a
+    /// copy, so the shard buffer's collision pre-pass can short-circuit on
+    /// [`Arc::ptr_eq`] and the flush moves a single allocation.
+    pub labels: Arc<LabelSet>,
     pub value: IngestValue,
 }
 
@@ -185,7 +191,7 @@ mod tests {
     fn point_with(labels: LabelSet) -> IngestPoint {
         IngestPoint {
             series_id: SeriesId([0u8; 16]),
-            labels,
+            labels: Arc::new(labels),
             value: IngestValue::Scalar(Sample {
                 ts_ns: 1_000,
                 value: 1.0,
