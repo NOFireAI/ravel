@@ -20,8 +20,8 @@ use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{
-    AttrValue, FieldSel, LogRecord, LogStreamId, Predicate, RlogConfig, RlogWriter,
-    stream_attrs_bytes,
+    AttrValue, ColumnSelection, FieldSel, FieldType, LogRecord, LogStreamId, Predicate, RlogConfig,
+    RlogWriter, stream_attrs_bytes,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -29,7 +29,10 @@ use ravel_object_store::{
     PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::{CacheFetchError, LogQuery, LogSegmentFetcher, StreamAttrEquals};
+use ravel_query::{
+    CacheFetchError, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
+    StreamAttrEquals,
+};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use uuid::Uuid;
@@ -950,4 +953,302 @@ async fn erasure_runs_after_cache_hit() {
             .all(|(k, v)| !(k == "user_id" && *v == AttrValue::Str("u1".into())))),
         "cache-served bytes of the erased subject must not leak"
     );
+}
+
+// --- columnar pass-through (ADR-0099 decision 1) ----------------------------
+
+/// Records with attributes and mixed trace ids, so the columnar comparison
+/// below has something to disagree about beyond `ts`.
+fn columnar_records() -> Vec<LogRecord> {
+    (100..=111)
+        .map(|ts| {
+            let mut r = record_with_attrs(
+                if ts % 3 == 0 { "api" } else { "worker" },
+                ts,
+                if ts % 2 == 0 {
+                    "keep this"
+                } else {
+                    "drop that"
+                },
+                &[
+                    ("user_id".to_string(), AttrValue::Str(format!("u{ts}"))),
+                    ("code".to_string(), AttrValue::I64(ts)),
+                ],
+            );
+            if ts % 4 == 0 {
+                r.trace_id = Some([u8::try_from(ts % 251).unwrap(); 16]);
+            }
+            r
+        })
+        .collect()
+}
+
+/// The columnar pass-through yields the same rows the row API yields for the
+/// same segment: same blocks, same surviving rows in the same order, same field
+/// values, and the same scan counters.
+#[tokio::test]
+async fn columnar_pass_through_yields_the_same_rows_as_the_row_api() {
+    let tenant = TenantHash([9u8; 16]);
+    let mem = MemoryStore::new();
+    let records = columnar_records();
+    let seg_ref = write_object(&mem, "logs/columnar.rlog", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+
+    // A selective predicate, so each block's surviving rows are a proper,
+    // non-contiguous subset and a view that ignored them would disagree.
+    let query = LogQuery::new(0, 5000).with_content(Predicate::HasWord {
+        field: FieldSel::Body,
+        word: "keep".into(),
+    });
+
+    let mut rows_scan = fetcher
+        .scan_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &query,
+            &ColumnSelection::all(),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("open row scan")
+        .expect("in range");
+    let mut col_scan = fetcher
+        .scan_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &query,
+            &ColumnSelection::all(),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("open columnar scan")
+        .expect("in range");
+
+    let mut blocks = 0usize;
+    let mut rows = 0usize;
+    loop {
+        let want = rows_scan.next_block().expect("row exit");
+        let got = col_scan.next_block_columnar().expect("columnar exit");
+        match (want, got) {
+            (None, ColumnarBlockOutcome::Exhausted) => break,
+            (Some(want), ColumnarBlockOutcome::Block(view)) => {
+                blocks += 1;
+                assert_eq!(
+                    view.surviving_count(),
+                    want.len(),
+                    "block {blocks}: surviving row count"
+                );
+                for (i, r) in want.iter().enumerate() {
+                    assert_eq!(view.ts(i), Some(r.ts_ns), "block {blocks} row {i}: ts");
+                    assert_eq!(
+                        view.observed_ts(i),
+                        Some(r.observed_ts_ns),
+                        "block {blocks} row {i}: observed_ts"
+                    );
+                    assert_eq!(
+                        view.body(i).unwrap_or(b""),
+                        r.body.as_bytes(),
+                        "block {blocks} row {i}: body"
+                    );
+                    assert_eq!(
+                        view.severity_text(i).unwrap_or(b""),
+                        r.severity_text.as_bytes(),
+                        "block {blocks} row {i}: severity_text"
+                    );
+                    assert_eq!(
+                        view.trace_id(i).map(<[u8]>::to_vec),
+                        r.trace_id.map(|t| t.to_vec()),
+                        "block {blocks} row {i}: trace_id"
+                    );
+                    assert_eq!(
+                        view.stream_id(i),
+                        Some(&r.stream_id),
+                        "block {blocks} row {i}: stream identity"
+                    );
+                    assert_eq!(
+                        view.stream_attrs(i),
+                        Some(r.stream_attrs.as_slice()),
+                        "block {blocks} row {i}: resource+scope blob"
+                    );
+                    // The declared keys resolve to a column once per block and
+                    // read the same values the record carries.
+                    let code = view
+                        .resolve_attr("code", FieldType::I64)
+                        .expect("code column");
+                    assert_eq!(
+                        view.i64_at(code.column_id, i).map(AttrValue::I64),
+                        r.attrs
+                            .iter()
+                            .find(|(k, _)| k == "code")
+                            .map(|(_, v)| v.clone()),
+                        "block {blocks} row {i}: code attribute"
+                    );
+                    let uid = view
+                        .resolve_attr("user_id", FieldType::Str)
+                        .expect("user_id column");
+                    assert_eq!(
+                        view.bytes_at(uid.column_id, i),
+                        r.attrs
+                            .iter()
+                            .find(|(k, _)| k == "user_id")
+                            .and_then(|(_, v)| match v {
+                                AttrValue::Str(s) => Some(s.as_bytes()),
+                                _ => None,
+                            }),
+                        "block {blocks} row {i}: user_id attribute"
+                    );
+                    rows += 1;
+                }
+                assert!(
+                    !view.has_attrs_raw_page(),
+                    "block {blocks}: two attributes fit the column budget, no spill"
+                );
+            }
+            (want, got) => panic!(
+                "block {blocks}: exits disagree (row exit {:?}, columnar exit {got:?})",
+                want.map(|w| w.len())
+            ),
+        }
+    }
+    assert!(blocks > 1, "the fixture must span several blocks");
+    assert_eq!(rows, 6, "six of the twelve records carry the word 'keep'");
+    assert_eq!(
+        rows_scan.stats(),
+        col_scan.stats(),
+        "both exits must account for the same blocks and pages"
+    );
+}
+
+/// The row path's accounting and erasure behaviour is unchanged by the new
+/// exit: one GET recorded, erased rows still dropped -- and the columnar exit
+/// refuses outright while an erasure predicate is pending rather than handing
+/// out a view it cannot filter.
+#[tokio::test]
+async fn columnar_pass_through_refuses_while_erasure_is_pending() {
+    let tenant = TenantHash([11u8; 16]);
+    let mem = Arc::new(MemoryStore::new());
+    let records = erasure_records();
+    let seg_ref = write_object(&mem, "logs/columnar_erase.rlog", &records).await;
+    let counting = Arc::new(CountingStore::new(mem));
+    let fetcher = LogSegmentFetcher::new(counting.clone() as Arc<dyn ObjectStoreBackend>);
+
+    let query = LogQuery::new(0, 5000).with_erasure(vec![erase("user_id", "u1")]);
+    let accounting = QueryAccounting::new();
+    let mut scan = fetcher
+        .scan_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &query,
+            &ColumnSelection::all(),
+            &accounting,
+        )
+        .await
+        .expect("open scan")
+        .expect("in range");
+
+    assert!(scan.erasure_pending());
+    assert!(
+        matches!(
+            scan.next_block_columnar().expect("columnar exit"),
+            ColumnarBlockOutcome::ErasurePending
+        ),
+        "a pending erasure predicate must not yield a columnar view"
+    );
+    // The refusal decoded nothing and did not advance the cursor, so the row
+    // path still sees every block.
+    let before = scan.remaining_blocks();
+    assert!(before > 0);
+    assert_eq!(scan.stats().blocks_scanned, 0);
+
+    let mut kept = Vec::new();
+    while let Some(rows) = scan.next_block().expect("row exit") {
+        kept.extend(rows);
+    }
+    assert_eq!(kept.len(), 6, "erasure still drops the matching rows");
+    assert!(
+        kept.iter().all(|r| r
+            .attrs
+            .iter()
+            .all(|(k, v)| !(k == "user_id" && *v == AttrValue::Str("u1".into())))),
+        "no erased subject may survive the row path"
+    );
+    assert_eq!(counting.get_count(), 1, "one whole-object GET");
+    let snapshot = accounting.snapshot();
+    assert_eq!(
+        snapshot.s3_requests(AccountedOp::Get),
+        1,
+        "the row path's accounting is unchanged"
+    );
+    assert!(snapshot.s3_bytes(AccountedOp::Get) > 0);
+}
+
+/// A corrupt block is a typed `LogFetchError::Corrupt` through the columnar
+/// exit exactly as through the row exit, never a panic.
+#[tokio::test]
+async fn corrupt_block_is_a_typed_error_through_the_columnar_pass_through() {
+    let tenant = TenantHash([13u8; 16]);
+    let mem = MemoryStore::new();
+    let records = columnar_records();
+    let seg_ref = write_object(&mem, "logs/columnar_corrupt.rlog", &records).await;
+    // Flip a byte inside the BLOCKS region, so the footer and every section
+    // still parse and the failure is the block's own crc mismatch, reached
+    // through whichever exit decodes the block.
+    let good = mem
+        .get(&seg_ref.data_object_key, GetRange::Full)
+        .await
+        .expect("get")
+        .data
+        .to_vec();
+    let blocks = ravel_logseg::footer::open(&good)
+        .expect("footer")
+        .section(ravel_logseg::footer::kind::BLOCKS)
+        .expect("BLOCKS section")
+        .offset;
+    let mut bad = good.clone();
+    let at = usize::try_from(blocks).expect("offset fits") + 1;
+    bad[at] ^= 0xff;
+    mem.put(
+        &seg_ref.data_object_key,
+        bytes::Bytes::from(bad),
+        PutOptions::default(),
+    )
+    .await
+    .expect("overwrite with corrupt bytes");
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+    let query = LogQuery::new(0, 5000);
+
+    let mut scan = fetcher
+        .scan_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &query,
+            &ColumnSelection::all(),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("open scan")
+        .expect("in range");
+    let err = scan
+        .next_block_columnar()
+        .expect_err("the columnar exit must reject the corrupt block");
+    assert!(matches!(err, LogFetchError::Corrupt { .. }), "{err:?}");
+
+    let mut scan = fetcher
+        .scan_accounted_with_tenant(
+            &seg_ref,
+            tenant,
+            &query,
+            &ColumnSelection::all(),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("open scan")
+        .expect("in range");
+    let err = scan
+        .next_block()
+        .expect_err("the row exit must reject the corrupt block");
+    assert!(matches!(err, LogFetchError::Corrupt { .. }), "{err:?}");
 }
