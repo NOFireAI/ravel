@@ -103,7 +103,6 @@ use crate::pushdown::extract;
 use crate::session::{LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, build_session};
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
-use crate::udf::{label_match_udf, label_udf};
 use crate::validate::{referenced_base_tables, validate};
 
 /// Which of the three v1 tables (and thus which `Signal`) a query targets.
@@ -859,24 +858,21 @@ impl SqlExecutor {
     /// `None` (no prune); the real plan surfaces such errors later through
     /// [`Self::plan_pinned`].
     async fn pushed_down_name_filter(&self, tenant_hash: TenantHash, sql: &str) -> Option<String> {
-        let ctx = SessionContext::new();
-        ctx.register_udf(label_udf());
-        ctx.register_udf(label_match_udf());
-        let provider = RavelTableProvider::new(
-            Snapshot {
-                segments: Vec::new(),
-                segments_pruned: 0,
-                pending_erasure: Vec::new(),
-            },
-            tenant_hash,
-            self.fetcher.clone(),
-            self.config,
-            // Throwaway handle: this plans over an empty snapshot purely to
-            // recover predicates, so no store fetch is ever issued through
-            // it and nothing would ever be recorded here.
-            QueryAccounting::new(),
-        );
-        ctx.register_table(SAMPLES_TABLE, Arc::new(provider)).ok()?;
+        // Route through `build_session`, the same construction
+        // `analyzed_classification_plan` uses, rather than a bare
+        // `SessionContext::new()` (ADR-0097 decision 7). This carries the
+        // `EmptyObjectStoreRegistry` (ADR-0013 security invariant 1) and the
+        // per-registry allowlist deregistrations plus the UDAF replacements,
+        // so the two throwaway-session sites converge on one path. The
+        // per-table `label`/`label_match` UDFs a metrics session needs are
+        // registered by `build_session` itself. This is a metrics-only site
+        // (its sole caller resolves the `__name__` postings filter).
+        let table = self.empty_snapshot_table(TargetSignal::Metrics, tenant_hash, &[]);
+        // A private, unbounded pool: this session only logical-plans and never
+        // executes, so nothing is reserved against it and it never touches the
+        // tenant accountant.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let ctx = build_session(&self.config, pool, table, false).ok()?;
         let plan = ctx.state().create_logical_plan(sql).await.ok()?;
         let mut predicates = Vec::new();
         collect_filter_predicates(&plan, &mut predicates);
