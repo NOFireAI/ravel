@@ -83,8 +83,23 @@ pub struct NumRangeArm {
     pub max_bits: Option<u64>,
 }
 
-/// Merges the stats of `children` by column id (type-aware min/max, summed
-/// null counts, OR-ed NaN flags).
+/// Merges the stats of `children` by column id: type-aware min/max and OR-ed NaN
+/// flags folded over the children that carry a stat for the column, and a
+/// `null_count` counting every row beneath the entry that resolves nothing of
+/// the column's type (docs/log-segment-format.md "null_count at both levels").
+///
+/// The bounds fold only stat-carrying children, which is sound because a child
+/// that resolves a value for the column always carries a stat (write-path
+/// completeness, this module's header). `null_count` cannot fold that way: a
+/// child with no stat for the column resolves nothing of that type in any of its
+/// rows, so all `record_count` of them are null and must be counted. Summing
+/// only the stat-carrying children's `null_count` would leave a level-1
+/// `null_count` that undercounts the group's null rows and, for a column resolved
+/// by only some children, has no well-defined meaning at all (issue #356).
+///
+/// `null_count` is a `u32` and the sum can exceed it (up to 64 children each with
+/// a `u32` `record_count`); `saturating_add` clamps at `u32::MAX`, which the doc
+/// defines as a saturated lower bound.
 fn merge_stats(children: &[Level0Entry]) -> Vec<NumStat> {
     let mut merged: Vec<NumStat> = Vec::new();
     for child in children {
@@ -96,6 +111,16 @@ fn merge_stats(children: &[Level0Entry]) -> Vec<NumStat> {
                 m.has_nan |= s.has_nan;
             } else {
                 merged.push(*s);
+            }
+        }
+    }
+    // Every row of a child that carries no stat for a merged column is null for
+    // it: fold those rows in so `null_count` counts all null rows beneath the
+    // entry, not just those in stat-carrying children.
+    for m in &mut merged {
+        for child in children {
+            if !child.stats.iter().any(|s| s.column_id == m.column_id) {
+                m.null_count = m.null_count.saturating_add(child.record_count);
             }
         }
     }
@@ -777,6 +802,142 @@ mod tests {
         assert_eq!(i.max_bits as i64, 900);
         assert_eq!(i.null_count, 9);
         assert!(l1.iter().any(|s| s.column_id == 11 && s.has_nan));
+    }
+
+    /// A block resolving `record_count - null_count` rows of an i64 column over
+    /// `[min, max]` and `null_count` rows that resolve nothing of the type.
+    fn i64_stat_block(
+        idx: u64,
+        column_id: u32,
+        min: i64,
+        max: i64,
+        record_count: u32,
+        null_count: u32,
+    ) -> Level0Entry {
+        let mut e = entry(idx, 0, 1000, 0, 0);
+        e.record_count = record_count;
+        e.stats = vec![NumStat {
+            column_id,
+            ty: FieldType::I64,
+            min_bits: min as u64,
+            max_bits: max as u64,
+            null_count,
+            has_nan: false,
+        }];
+        e
+    }
+
+    /// A block that resolves nothing for the column under test: it carries no
+    /// stat for it, so every one of its `record_count` rows is null for it.
+    fn no_stat_block(idx: u64, record_count: u32) -> Level0Entry {
+        let mut e = entry(idx, 0, 1000, 0, 0);
+        e.record_count = record_count;
+        e.stats = Vec::new();
+        e
+    }
+
+    /// Issue #356's exact repro: two blocks in one level-1 group, block 0
+    /// resolving `dur=9999`, block 1 resolving no `dur` at all (no stat for the
+    /// column). Pre-fix `merge_stats` folded `null_count` only over the
+    /// stat-carrying children, yielding `null_count=0`; the corrected merge
+    /// counts block 1's row. min/max/record_count are asserted unchanged to pin
+    /// that the bounds are untouched.
+    #[test]
+    fn level1_null_count_counts_a_child_with_no_stat() {
+        const DUR: u32 = 20;
+        let l0 = vec![
+            i64_stat_block(0, DUR, 9999, 9999, 1, 0),
+            no_stat_block(1, 1),
+        ];
+        let idx = SkipIndex::build(l0);
+        assert_eq!(idx.l1.len(), 1);
+        let s = idx.l1[0]
+            .stats
+            .iter()
+            .find(|s| s.column_id == DUR)
+            .expect("dur stat");
+        assert_eq!(
+            s.null_count, 1,
+            "block 1's row resolves no dur and must count"
+        );
+        // Bounds and record_count unchanged.
+        assert_eq!(s.min_bits as i64, 9999);
+        assert_eq!(s.max_bits as i64, 9999);
+        assert_eq!(idx.l1[0].record_count, 2);
+    }
+
+    /// More than two children, mixing stat-carrying and non-stat-carrying
+    /// blocks, pins the "every row beneath the entry" claim beyond the
+    /// two-block shape.
+    #[test]
+    fn level1_null_count_sums_every_row_beneath_the_entry() {
+        const DUR: u32 = 20;
+        let l0 = vec![
+            i64_stat_block(0, DUR, 10, 10, 3, 1), // 2 resolved, 1 null within
+            no_stat_block(1, 5),                  // 5 null
+            i64_stat_block(2, DUR, 20, 20, 2, 0), // 2 resolved
+            no_stat_block(3, 4),                  // 4 null
+        ];
+        let idx = SkipIndex::build(l0);
+        assert_eq!(idx.l1.len(), 1);
+        let s = idx.l1[0]
+            .stats
+            .iter()
+            .find(|s| s.column_id == DUR)
+            .expect("dur stat");
+        // 1 (child0 nulls) + 5 (child1) + 0 (child2) + 4 (child3) = 10.
+        assert_eq!(s.null_count, 10);
+        assert_eq!(s.min_bits as i64, 10);
+        assert_eq!(s.max_bits as i64, 20);
+        assert_eq!(idx.l1[0].record_count, 14);
+    }
+
+    /// The corrected level-1 `null_count` is written as a varint and the fix
+    /// makes wider values reachable; a full encode/decode round-trip must
+    /// reproduce it.
+    #[test]
+    fn level1_null_count_survives_round_trip() {
+        const DUR: u32 = 20;
+        let l0 = vec![
+            i64_stat_block(0, DUR, 5, 5, 1, 0),
+            no_stat_block(1, 1_000_000),
+        ];
+        let idx = SkipIndex::build(l0);
+        let s = idx.l1[0]
+            .stats
+            .iter()
+            .find(|s| s.column_id == DUR)
+            .expect("dur stat");
+        assert_eq!(s.null_count, 1_000_000);
+        let got = SkipIndex::decode(&idx.encode(), 100).expect("decode");
+        assert_eq!(got, idx);
+        let ds = got.l1[0]
+            .stats
+            .iter()
+            .find(|s| s.column_id == DUR)
+            .expect("decoded dur stat");
+        assert_eq!(ds.null_count, 1_000_000);
+    }
+
+    /// The level-1 `null_count` sum can exceed `u32`; the merge saturates and
+    /// the doc defines `u32::MAX` as a saturated lower bound. Two no-stat
+    /// children each with `record_count == u32::MAX` drive the sum past the
+    /// ceiling.
+    #[test]
+    fn level1_null_count_saturates() {
+        const DUR: u32 = 20;
+        let l0 = vec![
+            i64_stat_block(0, DUR, 5, 5, 1, 0), // a stat must exist for the column
+            no_stat_block(1, u32::MAX),
+            no_stat_block(2, u32::MAX),
+        ];
+        let idx = SkipIndex::build(l0);
+        let s = idx.l1[0]
+            .stats
+            .iter()
+            .find(|s| s.column_id == DUR)
+            .expect("dur stat");
+        assert_eq!(s.null_count, u32::MAX, "null_count saturates at u32::MAX");
     }
 
     /// Truncating a stat-bearing SKIP_IDX at every prefix length is always a

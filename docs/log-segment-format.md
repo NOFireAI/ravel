@@ -454,16 +454,19 @@ count0 level-0 entries:
     has_nan:   u8   (0 or 1)
 count1: u32
 count1 level-1 entries: same fields as a level-0 entry with the byte
-  range and crc omitted, mins/maxes merged over the entry's <= 64
-  children
+  range and crc omitted, merged over the entry's <= 64 children:
+  mins/maxes by the per-type order, has_nan OR-ed, null_count as
+  defined in "null_count at both levels" below
 ```
 
-A level-1 stat merges only the children that carry a stat for that column, so
-its bounds are the group's bounds only because every child that resolves a
-value for the column carries one (see "What a numeric stat bounds" below). A
-child block that resolved values but carried no stat would read as "no
-information" here and be dropped from the merge silently, leaving a level-1
-entry that looks complete and bounds a subset of its group.
+A level-1 stat merges the min/max bounds of only the children that carry a stat
+for that column, so its bounds are the group's bounds only because every child
+that resolves a value for the column carries one (see "What a numeric stat
+bounds" below). A child block that resolved values but carried no stat would
+read as "no information" for the bounds and be dropped from the merge silently,
+leaving a level-1 entry that looks complete and bounds a subset of its group.
+`null_count`, unlike the bounds, does account for the children that carry no
+stat: see "null_count at both levels" below.
 
 Fanout is 64: one level-1 entry per 64 level-0 blocks. A numeric stat
 stores i64 as its two's-complement `u64` bit pattern (`v as u64`), and
@@ -538,6 +541,66 @@ stat range cannot overlap a queried range holds no matching row. Under version
 2 the stats bounded the raw columnar occurrences instead, which could exclude
 the block holding the record a range query wanted; that is the defect version 3
 fixes, and it is why a v2 object cannot be read as a v3 one.
+
+### null_count at both levels (trailer version 3, normative)
+
+A stat's `null_count` counts rows that resolve nothing the stat's `[min, max]`
+bounds. It never contributes to pruning (`candidate_blocks` reads only min/max,
+and null rows never satisfy a range); it is a per-column cardinality hint for a
+future reader, and this section is its only contract.
+
+- **Level-0** (per block). `null_count` is the number of rows of the block whose
+  resolved merged-view value for the column's name is absent or of a type other
+  than the column's type, i.e. the block's `record_count` minus the count of
+  rows that resolve a value of the column's type (the rows the bounds fold in).
+  A block carries a stat for every column it plans, and it plans a numeric
+  column when some row carries a record-level occurrence of that column, or
+  some row's merged-view winner is of its type. The first condition does not
+  require the second, so a present level-0 stat may have
+  `null_count == record_count`: rows carried an occurrence of the column, but
+  every merged-view winner for the name was of another type. That is the
+  cross-type duplicate case (ADR-0095), and such a stat carries
+  `min_bits == max_bits == 0`, bounds that bound nothing. A stat is absent only
+  when neither condition holds, and then no row of the block resolves the
+  column either (see "What a numeric stat bounds").
+
+- **Level-1** (per <= 64 children). `null_count` is the number of rows *beneath
+  the entry* -- summed across all children -- that resolve nothing of the
+  column's type. This counts, for each child, the rows that child's own stat
+  reports null, PLUS every row of any child that carries no stat for the column
+  at all: by the level-0 rule a child with no stat for a column resolves nothing
+  of that type in any of its rows, so all `record_count` of them are null. The
+  writer computes it as `sum(child.stat.null_count for children with the stat) +
+  sum(child.record_count for children without it)`. A level-1 stat exists iff
+  some child carries one, and a child's stat may itself be all-null, so a
+  level-1 stat may also have `null_count == record_count`. An all-null child
+  stat folds its degenerate `0`/`0` bounds into the merged min/max as well,
+  widening them; pruning stays sound, because a wider range only keeps more
+  blocks, but it is less precise.
+
+The rule a reader must honor at both levels: **neither the presence of a stat
+nor its bounds is evidence that any row resolves the column.** A column no row
+resolves has two encodings, and they carry different information even though
+they state the same fact. The stat is absent when no row carries an occurrence
+of the column and no row's winner is of its type. It is present with
+`null_count == record_count` when rows carry an occurrence but every winner is
+of another type. They differ in whether bounds accompany the fact: an absent
+stat carries none and prunes nothing, exactly like an absent posting list,
+while a present stat always carries bounds, which in this case are the
+degenerate `0`/`0` pair. A reader must not read a present stat as "at least one
+row resolves this column", must not read an absent stat as
+`null_count == record_count`, and must not use `null_count` to prune.
+
+`null_count` is a `u32` written as a varint, and the level-1 sum above can in
+principle exceed `u32::MAX` (up to 64 children, each with a `u32` `record_count`).
+The merge saturates: a level-1 `null_count` of `u32::MAX` means "at least
+`u32::MAX` null rows beneath this entry", an exact value lost to saturation. A
+reader that consumes the field must treat `u32::MAX` as a saturated lower bound,
+not an exact count. Saturation is the only approximation in the field and is
+confined to this case; every non-saturated value is exact. (The current writer's
+block sizing keeps real `record_count` values far below `u32::MAX / 64`, so
+saturation is unreachable in practice; it is documented because the format
+contract, not the current writer, bounds `record_count`.)
 
 `candidate_blocks(ts_min, ts_max, stream_refs, numeric)` returns the level-0
 block indices whose entries survive the coarse predicate. Alongside the ts and
