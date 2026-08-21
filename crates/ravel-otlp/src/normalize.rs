@@ -251,7 +251,7 @@ pub fn normalize_metrics_with_metadata(
 /// the older entry points stay behaviorally identical apart from the names.
 fn normalize_impl(
     tenant: &TenantId,
-    req: ExportMetricsServiceRequest,
+    mut req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
@@ -294,7 +294,7 @@ fn normalize_impl(
     let mut rejected = Vec::new();
     let mut exemplars = Vec::new();
 
-    for rm in &req.resource_metrics {
+    for rm in &mut req.resource_metrics {
         normalize_resource(
             tenant,
             rm,
@@ -372,7 +372,7 @@ fn metric_exemplar_count(metric: &Metric) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn normalize_resource(
     tenant: &TenantId,
-    rm: &ResourceMetrics,
+    rm: &mut ResourceMetrics,
     limits: &IngestLimits,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
@@ -408,8 +408,8 @@ fn normalize_resource(
         }
     };
 
-    for sm in &rm.scope_metrics {
-        for metric in &sm.metrics {
+    for sm in &mut rm.scope_metrics {
+        for metric in &mut sm.metrics {
             normalize_metric(
                 tenant,
                 metric,
@@ -430,7 +430,7 @@ fn normalize_resource(
 #[allow(clippy::too_many_arguments)]
 fn normalize_metric(
     tenant: &TenantId,
-    metric: &Metric,
+    metric: &mut Metric,
     resource_labels: &[Label],
     limits: &IngestLimits,
     ingest_ts_ns: i64,
@@ -472,7 +472,7 @@ fn normalize_metric(
     let points_before = points.len();
     let hist_before = histogram_points.len();
 
-    match &metric.data {
+    match &mut metric.data {
         Some(MetricData::Gauge(gauge)) => {
             let ctx = PointContext {
                 tenant,
@@ -484,7 +484,7 @@ fn normalize_metric(
                 is_monotonic: false,
             };
             let mut memo = SeriesIdMemo::new();
-            for dp in &gauge.data_points {
+            for dp in &mut gauge.data_points {
                 match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
                     Ok((p, info)) => {
                         points.push(p);
@@ -513,7 +513,7 @@ fn normalize_metric(
                 is_monotonic: sum.is_monotonic,
             };
             let mut memo = SeriesIdMemo::new();
-            for dp in &sum.data_points {
+            for dp in &mut sum.data_points {
                 match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
                     Ok((p, info)) => {
                         points.push(p);
@@ -540,7 +540,7 @@ fn normalize_metric(
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
-            for dp in &h.data_points {
+            for dp in &mut h.data_points {
                 match explode_histogram(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
                     Ok((mut new_points, informational)) => {
                         points.append(&mut new_points);
@@ -567,7 +567,7 @@ fn normalize_metric(
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
-            for dp in &h.data_points {
+            for dp in &mut h.data_points {
                 match build_native_histogram_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
                     Ok((p, informational)) => {
                         histogram_points.push(p);
@@ -586,7 +586,7 @@ fn normalize_metric(
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
-            for dp in &s.data_points {
+            for dp in &mut s.data_points {
                 match explode_summary(&ctx, dp, &mut memo) {
                     Ok(mut new_points) => points.append(&mut new_points),
                     Err(r) => rejected.push(r),
@@ -762,7 +762,7 @@ fn int_survives_f64(v: i64) -> bool {
 /// makes "keep the newest" hold even when a single data point carries
 /// several exemplars for the same window.
 fn admit_exemplars<F>(
-    dp_exemplars: &[OtlpExemplar],
+    dp_exemplars: Vec<OtlpExemplar>,
     limits: &IngestLimits,
     cap: &mut ExemplarCap,
     series_id_for: F,
@@ -775,7 +775,8 @@ fn admit_exemplars<F>(
         return;
     }
 
-    let mut candidates = Vec::with_capacity(dp_exemplars.len());
+    let capacity = dp_exemplars.len();
+    let mut candidates = Vec::with_capacity(capacity);
     let mut dropped = 0usize;
     for ex in dp_exemplars {
         match decode_exemplar(ex, limits) {
@@ -815,13 +816,15 @@ fn admit_exemplars<F>(
 /// exemplar (see [`parse_id`]), and an unparsable filtered-attribute value is
 /// skipped rather than failing the exemplar, since filtered attributes are
 /// informational context, not part of series identity.
-fn decode_exemplar(ex: &OtlpExemplar, limits: &IngestLimits) -> Option<Exemplar> {
+fn decode_exemplar(ex: OtlpExemplar, limits: &IngestLimits) -> Option<Exemplar> {
     let value_bits = match ex.value {
         Some(OtlpExemplarValue::AsDouble(v)) => v.to_bits(),
         Some(OtlpExemplarValue::AsInt(v)) => (v as f64).to_bits(),
         None => return None,
     };
     let ts_ns = i64::try_from(ex.time_unix_nano).unwrap_or(i64::MAX);
+    let trace_id = parse_id::<16>(&ex.trace_id);
+    let span_id = parse_id::<8>(&ex.span_id);
 
     let mut filtered_attributes = Vec::with_capacity(
         ex.filtered_attributes
@@ -830,19 +833,19 @@ fn decode_exemplar(ex: &OtlpExemplar, limits: &IngestLimits) -> Option<Exemplar>
     );
     for attr in ex
         .filtered_attributes
-        .iter()
+        .into_iter()
         .take(limits.max_attributes_per_point)
     {
-        let name = sanitize_label_name(&attr.key);
         let value = any_value_to_label_value(attr.value.as_ref()).unwrap_or_default();
+        let name = sanitize_label_name(attr.key);
         filtered_attributes.push(Label { name, value });
     }
 
     Some(Exemplar {
         ts_ns,
         value_bits,
-        trace_id: parse_id::<16>(&ex.trace_id),
-        span_id: parse_id::<8>(&ex.span_id),
+        trace_id,
+        span_id,
         filtered_attributes,
     })
 }
@@ -866,7 +869,7 @@ fn parse_id<const N: usize>(bytes: &[u8]) -> [u8; N] {
 /// so it is surfaced, not rejected.
 fn build_point(
     ctx: &PointContext,
-    dp: &NumberDataPoint,
+    dp: &mut NumberDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
@@ -909,7 +912,7 @@ fn build_point(
         name: METRIC_NAME_LABEL.to_string(),
         value: ctx.metric_name.to_string(),
     });
-    push_attribute_labels(&mut labels, &dp.attributes, ctx.limits)?;
+    push_attribute_labels(&mut labels, std::mem::take(&mut dp.attributes), ctx.limits)?;
 
     let label_set = LabelSet::new(labels).map_err(|err| match err {
         TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
@@ -925,7 +928,7 @@ fn build_point(
 
     let mut informational: Vec<Rejection> = precision_loss.into_iter().collect();
     admit_exemplars(
-        &dp.exemplars,
+        std::mem::take(&mut dp.exemplars),
         ctx.limits,
         exemplar_cap,
         |_| series_id,
@@ -956,7 +959,7 @@ fn build_point(
 /// type).
 fn build_native_histogram_point(
     ctx: &NativeHistogramContext,
-    dp: &ExponentialHistogramDataPoint,
+    dp: &mut ExponentialHistogramDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
@@ -977,7 +980,7 @@ fn build_native_histogram_point(
         name: METRIC_NAME_LABEL.to_string(),
         value: ctx.metric_name.to_string(),
     });
-    push_attribute_labels(&mut labels, &dp.attributes, ctx.limits)?;
+    push_attribute_labels(&mut labels, std::mem::take(&mut dp.attributes), ctx.limits)?;
 
     let label_set = LabelSet::new(labels).map_err(|err| match err {
         TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
@@ -993,7 +996,7 @@ fn build_native_histogram_point(
         informational.push(Rejection::HistogramMinMaxDropped { count: 1 });
     }
     admit_exemplars(
-        &dp.exemplars,
+        std::mem::take(&mut dp.exemplars),
         ctx.limits,
         exemplar_cap,
         |_| series_id,
@@ -1151,12 +1154,12 @@ fn checked_event_ts(
 /// name/value length limits applied to every other label.
 fn push_attribute_labels(
     labels: &mut Vec<Label>,
-    attributes: &[KeyValue],
+    attributes: Vec<KeyValue>,
     limits: &IngestLimits,
 ) -> Result<(), Rejection> {
     for attr in attributes {
-        let name = sanitize_label_name(&attr.key);
         let value = any_value_to_label_value(attr.value.as_ref())?;
+        let name = sanitize_label_name(attr.key);
         push_checked(labels, name, value, limits)?;
     }
     Ok(())
@@ -1168,7 +1171,7 @@ fn push_attribute_labels(
 /// per series).
 fn build_explode_base_labels(
     ctx: &ExplodeContext,
-    attributes: &[KeyValue],
+    attributes: Vec<KeyValue>,
 ) -> Result<Vec<Label>, Rejection> {
     if attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -1237,7 +1240,7 @@ fn finish_point(
 /// through the same per-series cap as every other point type.
 fn explode_histogram(
     ctx: &ExplodeContext,
-    dp: &HistogramDataPoint,
+    dp: &mut HistogramDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
@@ -1259,7 +1262,7 @@ fn explode_histogram(
         return Err(Rejection::HistogramBoundsNotIncreasing);
     }
 
-    let base_labels = build_explode_base_labels(ctx, &dp.attributes)?;
+    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes))?;
     let stale = has_no_recorded_value(dp.flags);
     let bucket_name = format!("{}_bucket", ctx.metric_name);
 
@@ -1332,9 +1335,10 @@ fn explode_histogram(
     // `_sum` was pushed after them, since it and `_count` are always
     // appended last.
     let bucket_series = &series[0..expected_buckets];
+    let dp_exemplars = std::mem::take(&mut dp.exemplars);
     let explicit_bounds = &dp.explicit_bounds;
     admit_exemplars(
-        &dp.exemplars,
+        dp_exemplars,
         ctx.limits,
         exemplar_cap,
         |candidate| {
@@ -1367,7 +1371,7 @@ fn exemplar_bucket_index(explicit_bounds: &[f64], value: f64) -> usize {
 /// `{name}_count`. Rejection is atomic, same as [`explode_histogram`].
 fn explode_summary(
     ctx: &ExplodeContext,
-    dp: &SummaryDataPoint,
+    dp: &mut SummaryDataPoint,
     memo: &mut SeriesIdMemo,
 ) -> Result<Vec<NormalizedPoint>, Rejection> {
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
@@ -1382,7 +1386,7 @@ fn explode_summary(
         }
     }
 
-    let base_labels = build_explode_base_labels(ctx, &dp.attributes)?;
+    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes))?;
     let stale = has_no_recorded_value(dp.flags);
 
     let mut series = Vec::with_capacity(dp.quantile_values.len() + 2);
@@ -1458,7 +1462,10 @@ fn build_resource_labels(
             continue;
         }
         if let Some(value) = find_attr_value(&resource.attributes, key)? {
-            push_checked(&mut labels, sanitize_label_name(key), value, limits)?;
+            // `key` is borrowed from the long-lived allowlist config, so it
+            // cannot be moved; clone it to feed the by-value sanitiser. This is
+            // once per resource attribute, not per data point.
+            push_checked(&mut labels, sanitize_label_name(key.clone()), value, limits)?;
         }
     }
 
@@ -1726,14 +1733,32 @@ impl MetadataCollector {
 }
 
 fn sanitize_metric_name(name: &str) -> String {
-    sanitize(name, is_metric_name_start, is_metric_name_continue)
+    sanitize(
+        name.to_owned(),
+        is_metric_name_start,
+        is_metric_name_continue,
+    )
 }
 
-fn sanitize_label_name(name: &str) -> String {
+fn sanitize_label_name(name: String) -> String {
     sanitize(name, is_label_name_start, is_label_name_continue)
 }
 
-fn sanitize(input: &str, is_start: fn(char) -> bool, is_continue: fn(char) -> bool) -> String {
+/// Rewrite every disallowed character to `_`, classifying the first character
+/// with `is_start` and the rest with `is_continue`. Takes the name by value
+/// and returns it unchanged (moved, not reallocated) when every character is
+/// already valid; only a name that actually needs rewriting allocates a new
+/// `String`. The produced bytes are identical either way. This is on the OTLP
+/// metrics ingest path once per label per data point, where a clean name is
+/// the common case, so the clean path must not allocate.
+fn sanitize(input: String, is_start: fn(char) -> bool, is_continue: fn(char) -> bool) -> String {
+    let all_valid = input
+        .chars()
+        .enumerate()
+        .all(|(i, c)| if i == 0 { is_start(c) } else { is_continue(c) });
+    if all_valid {
+        return input;
+    }
     input
         .chars()
         .enumerate()
@@ -4730,5 +4755,90 @@ mod tests {
         );
         assert!(r.output.points.is_empty());
         assert!(metadata.is_empty());
+    }
+
+    // ---- #367: label-name sanitiser (by value, no allocation when clean) ----
+
+    /// Reference oracle: the pre-#367 sanitiser, kept verbatim. The property
+    /// tests below prove the by-value implementation returns byte-identical
+    /// output to this for arbitrary input, so canonical series identity
+    /// (ADR-0005) is unchanged.
+    fn sanitize_oracle(
+        input: &str,
+        is_start: fn(char) -> bool,
+        is_continue: fn(char) -> bool,
+    ) -> String {
+        input
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                let allowed = if i == 0 { is_start(c) } else { is_continue(c) };
+                if allowed { c } else { '_' }
+            })
+            .collect()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn sanitize_label_name_matches_oracle(
+            chars in proptest::collection::vec(proptest::prelude::any::<char>(), 0..24)
+        ) {
+            let s: String = chars.into_iter().collect();
+            let expected = sanitize_oracle(&s, is_label_name_start, is_label_name_continue);
+            proptest::prop_assert_eq!(sanitize_label_name(s.clone()), expected);
+        }
+
+        #[test]
+        fn sanitize_metric_name_matches_oracle(
+            chars in proptest::collection::vec(proptest::prelude::any::<char>(), 0..24)
+        ) {
+            let s: String = chars.into_iter().collect();
+            let expected = sanitize_oracle(&s, is_metric_name_start, is_metric_name_continue);
+            proptest::prop_assert_eq!(sanitize_metric_name(&s), expected);
+        }
+    }
+
+    #[test]
+    fn sanitize_label_name_covers_edge_inputs() {
+        // Deterministic coverage of the cases the random strategy reaches only
+        // rarely, each compared against the oracle.
+        for input in [
+            "",              // empty
+            "0abc",          // leading digit
+            "...",           // entirely disallowed
+            "naïve.count",   // non-ASCII plus a rewrite
+            "λ",             // non-ASCII, single char, disallowed
+            "already_clean", // already valid, hits the no-rewrite path
+        ] {
+            let expected = sanitize_oracle(input, is_label_name_start, is_label_name_continue);
+            assert_eq!(
+                sanitize_label_name(input.to_string()),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_label_name_is_returned_without_reallocating() {
+        // A clean name must be moved into the Label, not copied. Capture the
+        // heap pointer and capacity before the move; the returned String must
+        // own the same allocation. A byte-equality check alone would pass
+        // against the old always-allocating implementation and prove nothing.
+        let input = String::from("http_status_code");
+        let ptr_before = input.as_ptr();
+        let cap_before = input.capacity();
+        let out = sanitize_label_name(input);
+        assert_eq!(out.as_ptr(), ptr_before, "clean name was reallocated");
+        assert_eq!(out.capacity(), cap_before, "clean name was reallocated");
+        assert_eq!(out, "http_status_code");
+    }
+
+    #[test]
+    fn dirty_label_name_allocates_and_rewrites() {
+        // The complement: a name needing a rewrite does build a new String,
+        // with bytes identical to the oracle's.
+        let out = sanitize_label_name(String::from("http.status.code"));
+        assert_eq!(out, "http_status_code");
     }
 }
