@@ -445,6 +445,64 @@ async fn table_functions_are_not_reachable() {
     }
 }
 
+/// ADR-0097 decision 9 end-to-end reachability: a scalar excluded only by the
+/// registry gate (`uuid`, nondeterministic) and a window function excluded only
+/// by the gate (`first_value` with `OVER`) must both be refused through the
+/// path a real caller takes -- `SqlExecutor::execute` -- with a *typed* error
+/// naming why, not an opaque plan failure. This mirrors
+/// `table_functions_are_not_reachable` above (same fixture shape), but asserts
+/// the specific `ValidationError` variants that make the refusal legible: an
+/// excluded scalar is not an aggregate, and a windowed excluded name is not one
+/// either, so neither reuses `ExcludedAggregate`.
+///
+/// `validate` (step 1 of `execute`) runs before any catalog resolve, so the
+/// `FROM logs` reference never needs a logs snapshot: the request is refused on
+/// its text alone, which is exactly the message layer this test pins. The
+/// registry gate in `build_session` is the backstop that actually fails closed;
+/// this walk only produces the better error, and the gate's independent refusal
+/// is proven by `session::tests::admitted_and_excluded_cover_all_registries_for_every_table`.
+#[tokio::test]
+async fn excluded_scalar_and_window_functions_are_not_reachable() {
+    let tenant = tenant_id("acme");
+    let specs = one_segment();
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+    // An excluded nondeterministic scalar: typed ExcludedScalar, not Plan.
+    let err = fixture
+        .executor
+        .execute(tenant.hash(), &request("SELECT uuid() FROM logs"))
+        .await
+        .expect_err("uuid() must be refused");
+    assert!(
+        matches!(
+            err,
+            SqlError::Validation(ValidationError::ExcludedScalar { ref name }) if name == "uuid"
+        ),
+        "SELECT uuid() must yield a typed ExcludedScalar error, got {err}"
+    );
+    assert_eq!(err.class(), ErrorClass::BadRequest);
+
+    // An excluded window function used with OVER: typed ExcludedWindow, whose
+    // message names the admitted window surface rather than calling it an
+    // aggregate.
+    let err = fixture
+        .executor
+        .execute(
+            tenant.hash(),
+            &request("SELECT first_value(body) OVER (ORDER BY ts) FROM logs"),
+        )
+        .await
+        .expect_err("first_value() OVER must be refused");
+    assert!(
+        matches!(
+            err,
+            SqlError::Validation(ValidationError::ExcludedWindow { ref name }) if name == "first_value"
+        ),
+        "SELECT first_value(...) OVER must yield a typed ExcludedWindow error, got {err}"
+    );
+    assert_eq!(err.class(), ErrorClass::BadRequest);
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

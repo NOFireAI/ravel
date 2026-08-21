@@ -76,7 +76,7 @@ use std::ops::ControlFlow;
 /// Every aggregate UDAF name (primary spelling and alias) the default
 /// DataFusion session registers that is **not** in the admitted set
 /// ([`ADMITTED_AGGREGATES`](crate::session::ADMITTED_AGGREGATES): `count`,
-/// `sum`, `min`, `max`). ADR-0022 decision 2 makes exclusion the default: the
+/// `sum`, `min`, `max`, `avg`, `mean`). ADR-0022 decision 2 makes exclusion the default: the
 /// aggregate walk rejects any call spelled as one of these, and
 /// `crate::session::build_session` deregisters the same names at registration.
 ///
@@ -172,6 +172,40 @@ pub enum ValidationError {
          (docs/adrs/0022-floating-aggregate-exactness.md)"
     )]
     ExcludedAggregate { name: String },
+
+    /// A scalar function excluded from the v1 subset appeared in the query.
+    /// The admitted scalar surface is every default-registered deterministic
+    /// scalar; the excluded ones ([`EXCLUDED_SCALARS`](crate::session::EXCLUDED_SCALARS))
+    /// are nondeterministic or environment-reading (`uuid`, `random`, `now`,
+    /// `version`, ...) and so cannot be attested by the differential
+    /// conformance oracle (ADR-0097 decision 4). Without this variant such a
+    /// call would surface only as an opaque plan failure once the registry
+    /// gate refuses it; `name` is the offending lowercased spelling.
+    #[error(
+        "{name} is not part of the v1 SQL scalar function subset; it is \
+         nondeterministic or environment-reading and is excluded, while the \
+         admitted scalar surface is the deterministic string, unicode, \
+         datetime, math, regex, and encoding functions \
+         (docs/adrs/0097-sql-scalar-function-surface.md)"
+    )]
+    ExcludedScalar { name: String },
+
+    /// A window function excluded from the v1 subset appeared with an `OVER`
+    /// clause. The admitted window functions are the rank/offset families and
+    /// the two correctly-rounded ratio functions; the excluded ones
+    /// ([`EXCLUDED_WINDOWS`](crate::session::EXCLUDED_WINDOWS),
+    /// `first_value`/`last_value`/`nth_value`) are refused pending a
+    /// conformance-row decision (ADR-0097 decision 6). This variant makes that
+    /// refusal window-aware: the message names the admitted window surface
+    /// rather than claiming the call is an aggregate. `name` is the offending
+    /// lowercased spelling.
+    #[error(
+        "{name} is not part of the v1 SQL window function subset; \
+         the admitted window functions are row_number, rank, dense_rank, \
+         ntile, lag, lead, cume_dist, percent_rank \
+         (docs/adrs/0097-sql-scalar-function-surface.md)"
+    )]
+    ExcludedWindow { name: String },
 }
 
 /// Parse `sql` and accept it only if it is exactly one read-only
@@ -213,7 +247,7 @@ pub fn validate(sql: &str) -> Result<(), ValidationError> {
     };
 
     reject_writes_in_query(query)?;
-    reject_excluded_aggregates(query)?;
+    reject_excluded_functions(query)?;
     Ok(())
 }
 
@@ -427,40 +461,94 @@ fn is_excluded_aggregate(bare: &str) -> bool {
     EXCLUDED_AGGREGATES.contains(&bare)
 }
 
-/// Reject any excluded aggregate anywhere in the query, including inside
-/// subqueries and nested function arguments. ADR-0022 decision 2 flips the
-/// subset from a per-function blacklist to an allowlist: only `count`, `sum`,
-/// `min`, `max`, `avg`, `mean` are admitted, so this walk rejects every other
-/// default aggregate. `crate::session::build_session` deregisters the same
-/// names as a backstop; the walk exists for the error message that names the
-/// admitted set.
-fn reject_excluded_aggregates(query: &Query) -> Result<(), ValidationError> {
-    if let ControlFlow::Break(name) = query.visit(&mut ExcludedAggregateFinder) {
-        return Err(ValidationError::ExcludedAggregate { name });
+/// Whether `bare` names a scalar function excluded from the v1 subset. Sourced
+/// straight from [`EXCLUDED_SCALARS`](crate::session::EXCLUDED_SCALARS) so this
+/// message layer cannot drift from the registry allowlist
+/// `crate::session::build_session` enforces: a name added to that constant is
+/// picked up here with no second edit (ADR-0097 decision 9).
+fn is_excluded_scalar(bare: &str) -> bool {
+    crate::session::EXCLUDED_SCALARS.contains(&bare)
+}
+
+/// Whether `bare` names a window function excluded from the v1 subset. Sourced
+/// straight from [`EXCLUDED_WINDOWS`](crate::session::EXCLUDED_WINDOWS), the
+/// same anti-drift discipline [`is_excluded_scalar`] uses.
+fn is_excluded_window(bare: &str) -> bool {
+    crate::session::EXCLUDED_WINDOWS.contains(&bare)
+}
+
+/// Classify a function call by its bare (lowercased, unqualified) name into the
+/// typed error naming why it is refused, or `None` if the name is admitted.
+///
+/// `windowed` is whether the call carried an `OVER` clause. It decides the one
+/// ambiguous case: `first_value`/`last_value`/`nth_value` are in **both** the
+/// excluded-aggregate and excluded-window lists, because DataFusion registers
+/// them in both registries. Used with `OVER` the call resolves through the
+/// window registry and deserves the window-aware message; used bare it is an
+/// aggregate and keeps the aggregate message the existing tests pin. Aggregate
+/// therefore takes precedence over a bare window-name match, and a windowed
+/// excluded-window name is caught first.
+fn classify_excluded(bare: &str, windowed: bool) -> Option<ValidationError> {
+    if windowed && is_excluded_window(bare) {
+        return Some(ValidationError::ExcludedWindow {
+            name: bare.to_string(),
+        });
+    }
+    if is_excluded_aggregate(bare) {
+        return Some(ValidationError::ExcludedAggregate {
+            name: bare.to_string(),
+        });
+    }
+    if is_excluded_scalar(bare) {
+        return Some(ValidationError::ExcludedScalar {
+            name: bare.to_string(),
+        });
+    }
+    // A window-only excluded name used without `OVER` (none exists today, since
+    // all three excluded windows are also excluded aggregates caught above);
+    // kept so a future window-only addition to EXCLUDED_WINDOWS is still named.
+    if is_excluded_window(bare) {
+        return Some(ValidationError::ExcludedWindow {
+            name: bare.to_string(),
+        });
+    }
+    None
+}
+
+/// Reject any excluded function anywhere in the query, including inside
+/// subqueries and nested function arguments. This is the message layer over
+/// the registry allowlists `crate::session::build_session` enforces (ADR-0097
+/// rejected alternative C): the allowlist is what fails closed, this walk runs
+/// first and turns the refusal into a typed error naming the admitted surface.
+/// It admits nothing on its own -- a name absent here is still refused by the
+/// gate, only with a worse message -- and it sources its excluded scalar/window
+/// names from the same constants the gate uses, so the two cannot diverge.
+fn reject_excluded_functions(query: &Query) -> Result<(), ValidationError> {
+    if let ControlFlow::Break(err) = query.visit(&mut ExcludedFunctionFinder) {
+        return Err(err);
     }
     Ok(())
 }
 
-struct ExcludedAggregateFinder;
+struct ExcludedFunctionFinder;
 
-impl Visitor for ExcludedAggregateFinder {
-    /// The offending lowercased bare name, carried out so the error can name
-    /// it.
-    type Break = String;
+impl Visitor for ExcludedFunctionFinder {
+    /// The typed rejection, carried out so the caller returns it verbatim.
+    type Break = ValidationError;
 
-    fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<String> {
+    fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<ValidationError> {
         if let SqlExpr::Function(func) = expr {
             let name = func.name.to_string().to_ascii_lowercase();
             // Match the bare name and any schema-qualified spelling
-            // (`public.avg`), which the planner resolves to the same UDAF.
+            // (`public.uuid`), which the planner resolves to the same UDF.
             let bare = name.rsplit('.').next().unwrap_or(name.as_str());
-            if is_excluded_aggregate(bare) {
-                return ControlFlow::Break(bare.to_string());
+            if let Some(err) = classify_excluded(bare, func.over.is_some()) {
+                return ControlFlow::Break(err);
             }
             // sqlparser does not descend into `FunctionArguments::List`
             // expressions from `pre_visit_expr` on the enclosing call in
-            // every version; walk them explicitly so `sum(avg(x))`-shaped
-            // nesting cannot hide an excluded aggregate.
+            // every version; walk them explicitly so `abs(uuid())`-shaped
+            // nesting cannot hide an excluded function.
             if let FunctionArguments::List(list) = &func.args {
                 for arg in &list.args {
                     let inner = match arg {
@@ -746,6 +834,138 @@ mod tests {
                 name: "stddev".to_string()
             }
         );
+    }
+
+    /// An excluded nondeterministic scalar (`uuid`) is rejected before
+    /// planning with the scalar-specific variant, not the aggregate one: an
+    /// excluded scalar is not an aggregate and the message must not claim it
+    /// is (ADR-0097 decision 9).
+    #[test]
+    fn excluded_scalar_is_rejected_with_the_scalar_variant() {
+        assert_eq!(
+            reject("SELECT uuid() FROM logs"),
+            ValidationError::ExcludedScalar {
+                name: "uuid".to_string()
+            }
+        );
+    }
+
+    /// An excluded window function used with `OVER` is rejected with the
+    /// window-specific variant, whose message names the admitted window
+    /// surface rather than claiming the call is an aggregate -- even though
+    /// `first_value` is also an excluded aggregate name (ADR-0097 decision 9).
+    #[test]
+    fn excluded_window_over_is_rejected_with_the_window_variant() {
+        assert_eq!(
+            reject("SELECT first_value(body) OVER (ORDER BY ts) FROM logs"),
+            ValidationError::ExcludedWindow {
+                name: "first_value".to_string()
+            }
+        );
+        let msg = ValidationError::ExcludedWindow {
+            name: "first_value".to_string(),
+        }
+        .to_string();
+        for admitted in crate::session::ADMITTED_WINDOWS {
+            assert!(
+                msg.contains(admitted),
+                "window message must name the admitted window function {admitted}: {msg}"
+            );
+        }
+    }
+
+    /// The same excluded window name used *without* `OVER` resolves through the
+    /// aggregate registry, so it keeps the aggregate message the existing tests
+    /// pin: the `OVER` clause is what selects the window-aware error.
+    #[test]
+    fn excluded_window_name_without_over_stays_an_aggregate() {
+        assert_eq!(
+            reject("SELECT first_value(value) FROM samples"),
+            ValidationError::ExcludedAggregate {
+                name: "first_value".to_string()
+            }
+        );
+    }
+
+    /// Deliverable 2, matching discipline for the new variants: the scalar walk
+    /// is case-insensitive, strips schema qualification (`public.uuid`), and
+    /// descends into nested function arguments (`abs(uuid())`), exactly as the
+    /// aggregate walk does. One property per case.
+    #[test]
+    fn excluded_scalar_matching_is_case_insensitive() {
+        assert_eq!(
+            reject("SELECT UUID() FROM logs"),
+            ValidationError::ExcludedScalar {
+                name: "uuid".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn excluded_scalar_matching_strips_schema_qualification() {
+        assert_eq!(
+            reject("SELECT public.uuid() FROM logs"),
+            ValidationError::ExcludedScalar {
+                name: "uuid".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn excluded_scalar_nested_in_a_call_cannot_hide() {
+        assert_eq!(
+            reject("SELECT abs(uuid()) FROM logs"),
+            ValidationError::ExcludedScalar {
+                name: "uuid".to_string()
+            }
+        );
+    }
+
+    /// The walk cannot admit: its excluded-name predicates are sourced directly
+    /// from the [`EXCLUDED_SCALARS`](crate::session::EXCLUDED_SCALARS) and
+    /// [`EXCLUDED_WINDOWS`](crate::session::EXCLUDED_WINDOWS) constants
+    /// `build_session` enforces, so the two sets are identical by construction
+    /// and cannot drift. A name cannot be dropped from the walk without dropping
+    /// it from the constant, and a name absent from the walk is still refused by
+    /// the registry gate (proven independently by
+    /// `session::tests::admitted_and_excluded_cover_all_registries_for_every_table`,
+    /// which asserts `build_session` removes every excluded name from its
+    /// registry). This walk only ever produces a *better message*; it is never
+    /// the thing that admits or refuses.
+    #[test]
+    fn the_walk_sources_exactly_the_excluded_constants() {
+        for name in crate::session::EXCLUDED_SCALARS {
+            assert!(
+                is_excluded_scalar(name),
+                "{name} is in EXCLUDED_SCALARS but the walk does not treat it as excluded"
+            );
+        }
+        for name in crate::session::EXCLUDED_WINDOWS {
+            assert!(
+                is_excluded_window(name),
+                "{name} is in EXCLUDED_WINDOWS but the walk does not treat it as excluded"
+            );
+        }
+        // Admitted functions are not swept up by the excluded predicates.
+        assert!(!is_excluded_scalar("lower"));
+        assert!(!is_excluded_scalar("date_trunc"));
+        assert!(!is_excluded_window("row_number"));
+        assert!(!is_excluded_window("rank"));
+    }
+
+    /// A representative spread of the excluded nondeterministic/environment
+    /// scalars is refused, not just `uuid`.
+    #[test]
+    fn nondeterministic_scalars_are_excluded() {
+        for func in ["random", "rand", "now", "version"] {
+            assert_eq!(
+                reject(&format!("SELECT {func}() FROM logs")),
+                ValidationError::ExcludedScalar {
+                    name: func.to_string()
+                },
+                "{func} must be excluded from the v1 scalar subset"
+            );
+        }
     }
 
     #[test]
