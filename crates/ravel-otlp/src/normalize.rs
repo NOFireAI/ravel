@@ -52,6 +52,8 @@
 //! intentional, not an oversight; callers who need collision-free names
 //! for adversarial input should pre-validate before calling in.
 
+use std::sync::Arc;
+
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -99,7 +101,10 @@ fn has_no_recorded_value(flags: u32) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedPoint {
     pub series_id: SeriesId,
-    pub labels: LabelSet,
+    /// One label set shared across the points of a series run (ADR-0098). A
+    /// run of points with identical attributes clone the same `Arc` rather
+    /// than each building and owning a copy.
+    pub labels: Arc<LabelSet>,
     pub sample: Sample,
     /// `true` only for points from a `Sum` metric with `is_monotonic` set;
     /// always `false` for `Gauge` points.
@@ -115,7 +120,8 @@ pub struct NormalizedPoint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedHistogramPoint {
     pub series_id: SeriesId,
-    pub labels: LabelSet,
+    /// Shared per series run, as on [`NormalizedPoint`] (ADR-0098).
+    pub labels: Arc<LabelSet>,
     pub sample: HistogramSample,
 }
 
@@ -939,7 +945,7 @@ fn build_point(
     Ok((
         NormalizedPoint {
             series_id,
-            labels: label_set,
+            labels: Arc::new(label_set),
             sample: Sample {
                 ts_ns: event_ts_ns,
                 value,
@@ -1007,7 +1013,7 @@ fn build_native_histogram_point(
     Ok((
         NormalizedHistogramPoint {
             series_id,
-            labels: label_set,
+            labels: Arc::new(label_set),
             sample: HistogramSample {
                 ts_ns: event_ts_ns,
                 value,
@@ -1218,7 +1224,7 @@ fn finish_point(
 
     Ok(NormalizedPoint {
         series_id,
-        labels: label_set,
+        labels: Arc::new(label_set),
         sample: Sample { ts_ns, value },
         // Whether an exploded bucket/sum/count series behaves like a
         // monotonic counter downstream is not decided here; the field is
@@ -3476,7 +3482,7 @@ mod tests {
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), SERIES * POINTS_PER_SERIES);
 
-        let label_sets: Vec<LabelSet> = out.points.iter().map(|p| p.labels.clone()).collect();
+        let label_sets: Vec<Arc<LabelSet>> = out.points.iter().map(|p| p.labels.clone()).collect();
         let name = "http_requests_total";
 
         // before: recompute the id for every point (pre-memo behavior).

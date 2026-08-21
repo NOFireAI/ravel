@@ -47,7 +47,7 @@ fn scalar_point(tenant_id: &TenantId, metric: &str, ts_ns: i64, value: f64) -> I
     let labels = build_labels(&[(METRIC_NAME_LABEL, metric)]);
     IngestPoint {
         series_id: series_id_of(tenant_id, metric),
-        labels,
+        labels: Arc::new(labels),
         value: IngestValue::Scalar(Sample { ts_ns, value }),
     }
 }

@@ -8,6 +8,8 @@ use ravel_segment::{
     HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint, SeriesInputV3,
     SeriesValues,
 };
+use std::sync::Arc;
+
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId, TypeError};
 
 /// Gauge or cumulative counter.
@@ -336,7 +338,7 @@ fn interleave(series: Vec<GeneratedSeries>) -> Vec<NormalizedPoint> {
             if let Some(sample) = s.samples.get(i) {
                 out.push(NormalizedPoint {
                     series_id: s.series_id,
-                    labels: s.labels.clone(),
+                    labels: Arc::new(s.labels.clone()),
                     sample: *sample,
                     is_monotonic_sum: matches!(s.kind, MetricKind::Counter),
                 });

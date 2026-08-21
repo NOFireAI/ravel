@@ -134,7 +134,12 @@ impl SeriesAccumValues {
 }
 
 struct SeriesAccum {
-    labels: LabelSet,
+    /// The series' shared label set (ADR-0098). Moved in from the first
+    /// point of the run that opened this accumulator; the points that
+    /// followed cloned the same `Arc` and dropped their clones as they
+    /// merged, so by flush time the accumulator holds the last reference and
+    /// [`Arc::try_unwrap`] hands `SeriesInputV3` the allocation by move.
+    labels: Arc<LabelSet>,
     values: SeriesAccumValues,
 }
 
@@ -218,7 +223,7 @@ impl TenantBuf {
     /// losing series' samples under the winning label set (the id-keyed
     /// `HashMap` below cannot tell them apart), which ADR-0005 forbids.
     fn merge(&mut self, points: Vec<IngestPoint>, arrival_ns: i64) -> Result<usize, WriteError> {
-        let mut batch_claims: HashMap<SeriesId, (&LabelSet, ValueKind)> = HashMap::new();
+        let mut batch_claims: HashMap<SeriesId, (&Arc<LabelSet>, ValueKind)> = HashMap::new();
         for point in &points {
             let point_kind = point.value.kind();
             let claimed = self
@@ -227,7 +232,14 @@ impl TenantBuf {
                 .map(|accum| (&accum.labels, accum.values.kind()))
                 .or_else(|| batch_claims.get(&point.series_id).copied());
             match claimed {
-                Some((labels, _)) if *labels != point.labels => {
+                // ADR-0098 decision 3: two points sharing the cached label set
+                // settle in one pointer comparison. The structural comparison
+                // is the fallback for genuinely distinct `Arc`s, so the
+                // collision check keeps exactly the strength it had before:
+                // ptr_eq is a fast path only, never the whole check.
+                Some((labels, _))
+                    if !Arc::ptr_eq(labels, &point.labels) && **labels != *point.labels =>
+                {
                     return Err(WriteError::SeriesIdCollision(format!(
                         "series_id {:?} maps to two distinct label sets in one shard buffer",
                         point.series_id
@@ -471,7 +483,13 @@ impl FlushCtx {
             .into_iter()
             .map(|(series_id, accum)| SeriesInputV3 {
                 series_id,
-                labels: accum.labels,
+                // ADR-0098: the accumulator holds the last reference to the
+                // run's shared label set by flush time (the points that shared
+                // it were consumed into `values`), so this unwraps the `Arc`
+                // by move on the common path; a surviving clone (none today,
+                // but a future cross-request memo could keep one) degrades to a
+                // deep copy rather than aliasing.
+                labels: Arc::try_unwrap(accum.labels).unwrap_or_else(|arc| (*arc).clone()),
                 values: accum.values.into_series_values(),
             })
             .collect();
@@ -1399,7 +1417,7 @@ mod buffer_accounting_tests {
         id[0] = series;
         IngestPoint {
             series_id: SeriesId(id),
-            labels,
+            labels: Arc::new(labels),
             value: IngestValue::Scalar(Sample {
                 ts_ns: 1_000,
                 value: 1.0,
