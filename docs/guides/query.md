@@ -330,6 +330,43 @@ docs/query-engine.md for the full contract, including why an equality predicate
 moved onto a declared column is slower than the equivalent `attrs['k'] = 'v'`
 today.
 
+### Declaring typed attribute columns
+
+Loading a dataset and declaring its typed columns are **two separate steps**,
+in order:
+
+1. **Load** the data with `ravel-cli load --parquet ...` (see
+   [ingest.md](ingest.md#bulk-import-ravel-cli-load---parquet-adr-0089)). The
+   loader writes data objects only; it never touches tenant config.
+2. **Declare** the typed columns with `ravel-cli typed-attr-column set`. This is
+   a control-plane write, kept out of the loader on purpose (a durable
+   CAS whole-list replace does not belong in an append-only data-plane command,
+   where it could clobber a hand-declared column). You can pass the columns
+   explicitly as `KEY:TYPE` specs, or derive them from the same `--mapping` the
+   load used:
+
+   ```sh
+   ravel-cli typed-attr-column set acme --from-mapping map.toml
+   ```
+
+   `--from-mapping` turns every `[[attribute]]` and `[[resource_attribute]]`
+   entry into a declared column of the same-named type (`str`/`i64`/`bool`/
+   `bytes`). A resource (stream-level) key is legitimately declarable because a
+   declared column reads the merged resource+scope+record attribute view. An
+   `f64`-typed entry is **skipped with a per-key warning** (there is no `f64`
+   declared column type yet); the rest are still written. A key declared twice,
+   or a key colliding with a fixed logs column name, is rejected and nothing is
+   written.
+
+**A freshly written declaration is not instantly visible to queries.** A
+query-serving process resolves the durable declaration behind a **staleness
+horizon** (60s by default), so a `set` lands durably at once but a query may
+keep using the previous declaration until the server refreshes within that
+horizon. No restart is needed; wait out the horizon before asserting a newly
+declared column is typed. An attribute that overflowed the load's
+dynamic-column budget (see [ingest.md](ingest.md#the-dynamic-column-budget-and-its-warnings))
+stays queryable through `attrs['<key>']` regardless of whether it is declared.
+
 A `ts` range scan. `ts` is a timestamp, so the bounds are `TIMESTAMP` literals,
 not bare integers:
 

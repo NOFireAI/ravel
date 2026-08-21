@@ -427,6 +427,15 @@ column = "status"
 type = "i64"                # str | i64 | f64 | bool | bytes
 ```
 
+**Date columns.** An Arrow `Date32` or `Date64` source column is mapped with
+`type = "i64"`, and its value is stored in its native unit, unchanged: a
+`Date32` stores **days since the Unix epoch**, a `Date64` stores **milliseconds
+since the Unix epoch**. Neither is rescaled to nanoseconds, and neither may be
+used as the `ts_column` (a date is not a valid event-time source; the loader
+rejects it there). So a query comparing against a mapped date column compares
+against that raw day or millisecond integer, not a timestamp -- e.g. a `Date32`
+for 2024-05-16 is the integer `19876`.
+
 ### Which admission rules this path keeps, relaxes, and bypasses
 
 - **Future skew: kept.** The loader enforces the same `max_future_skew_ns`
@@ -466,6 +475,48 @@ type = "i64"                # str | i64 | f64 | bool | bytes
   through it, and there is no equivalent concept for a single offline bulk load.
   Bulk-loaded volume is therefore not evidence the admission controller's limits
   were exercised. The CLI prints this warning before every run.
+
+### `--batch-rows`: the object-count lever
+
+`load` writes one Strict flush per batch, and one flush is one RLOG object per
+involved shard. `--batch-rows` sets the batch size (default 10000). It is
+therefore the lever that controls how many RLOG objects a load leaves behind:
+a 100M-row load at the default is on the order of 10000 flushes, each an RLOG
+object per shard. Object count is a first-order query-cost variable, because
+per-object cost (LIST, footer read, per-object decode setup) is paid on every
+later query over the affected range. A larger `--batch-rows` writes fewer,
+larger objects (less per-object overhead, more memory held per batch); a
+smaller one writes more, smaller objects.
+
+`--batch-rows 0` is rejected with an error rather than silently clamped: a zero
+would otherwise hide a misconfigured value that changes layout.
+
+### The dynamic-column budget and its warnings
+
+Each RLOG object gives a real typed column to the first
+`max_dynamic_columns` (default 1000) distinct `(attribute name, type)` pairs it
+holds, ordered lexicographically by name; anything past that budget folds into
+the object's `attrs_raw` overflow column. An overflowed attribute is **still
+queryable through `attrs['<key>']`**, but it gets **no typed column**, so a
+typed predicate or aggregate over it is unavailable and a SQL filter over it
+pays a per-row string cast.
+
+After a load, `load` reads the run's cumulative dynamic-column counters and
+prints one of two warnings to stderr when they apply:
+
+- an **overflow** warning when any object crossed the budget, naming the count
+  of overflowed `(name, type)` pairs;
+- a distinct **near-cap** warning when nothing overflowed but the widest object
+  reached **90% or more** of `max_dynamic_columns` -- pressure surfaced before
+  the cap, not only after it.
+
+Both name the same fix: reduce the number of distinct attribute columns per
+stream (map fewer columns, or split the load so each object stays under the
+budget), or accept `attrs`-only access for the overflow keys. To give an
+overflowed key a typed column at query time, declare it with
+`ravel-cli typed-attr-column set` (see [query.md](query.md#declaring-typed-attribute-columns));
+declaring does not change what the object already stored, so the two-step flow
+is load, then declare, then query.
 
 ### Failure, retention, and performance
 

@@ -227,6 +227,13 @@ enum Command {
         /// that record. Defaults to the server's default of 4.
         #[arg(long, default_value_t = 4)]
         shards: u32,
+        /// Rows per Strict flush. One flush is one RLOG object per involved
+        /// shard, so on a large load this is the lever that controls how many
+        /// RLOG objects the load leaves behind (a first-order query-cost
+        /// variable). Must be at least 1; 0 is rejected. Defaults to
+        /// `DEFAULT_BATCH_ROWS` (10000), leaving current behaviour unchanged.
+        #[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
+        batch_rows: usize,
     },
 }
 
@@ -305,9 +312,19 @@ enum TypedAttrColumnCommand {
         tenant: String,
         /// The declaration, as `KEY:TYPE` specs in schema-append order, where
         /// TYPE is one of str/i64/bool/bytes (case-insensitive). A key may
-        /// contain `:`; the type is split off the right.
-        #[arg(value_name = "KEY:TYPE")]
+        /// contain `:`; the type is split off the right. Mutually exclusive
+        /// with `--from-mapping`.
+        #[arg(value_name = "KEY:TYPE", conflicts_with = "from_mapping")]
         columns: Vec<String>,
+        /// Derive the declaration from a `load --mapping` TOML instead of
+        /// positional `KEY:TYPE` specs: every `[[attribute]]` and
+        /// `[[resource_attribute]]` entry becomes a declared column of the
+        /// same-named type. `f64`-typed entries are skipped with a per-key
+        /// warning on stderr (there is no `f64` declared column type); the rest
+        /// are written through the same CAS whole-list replace. Mutually
+        /// exclusive with positional `KEY:TYPE` specs.
+        #[arg(long, value_name = "TOML")]
+        from_mapping: Option<std::path::PathBuf>,
     },
 }
 
@@ -1044,16 +1061,32 @@ async fn main() -> anyhow::Result<()> {
             command: TypedAttrColumnCommand::Show { tenant },
         } => ravel_cli::typed_attr_column::show(store::build_store(&cli.store)?, &tenant).await,
         Command::TypedAttrColumn {
-            command: TypedAttrColumnCommand::Set { tenant, columns },
-        } => {
-            ravel_cli::typed_attr_column::set(
-                store::build_store(&cli.store)?,
-                &tenant,
-                &columns,
-                now_ns()?,
-            )
-            .await
-        }
+            command:
+                TypedAttrColumnCommand::Set {
+                    tenant,
+                    columns,
+                    from_mapping,
+                },
+        } => match from_mapping {
+            Some(mapping_path) => {
+                ravel_cli::typed_attr_column::set_from_mapping(
+                    store::build_store(&cli.store)?,
+                    &tenant,
+                    &mapping_path,
+                    now_ns()?,
+                )
+                .await
+            }
+            None => {
+                ravel_cli::typed_attr_column::set(
+                    store::build_store(&cli.store)?,
+                    &tenant,
+                    &columns,
+                    now_ns()?,
+                )
+                .await
+            }
+        },
         Command::GcConfig {
             command: GcConfigCommand::Show {},
         } => ravel_cli::gc_config::show(store::build_store(&cli.store)?).await,
@@ -1137,6 +1170,7 @@ async fn main() -> anyhow::Result<()> {
             tenant,
             mapping,
             shards,
+            batch_rows,
         } => {
             ravel_cli::load::run(
                 store::build_store(&cli.store)?,
@@ -1144,6 +1178,7 @@ async fn main() -> anyhow::Result<()> {
                 &tenant,
                 &mapping,
                 shards,
+                batch_rows,
                 now_ns()?,
             )
             .await

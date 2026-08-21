@@ -18,17 +18,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::array::{BinaryArray, FixedSizeBinaryArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use ravel_catalog::{AbsentPolicy, validate_or_adopt};
-use ravel_ingest::{Clock, IngestConfig, LogIngestRouter, SystemClock, WriteMode};
+use ravel_ingest::{
+    Clock, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, SystemClock, WriteMode,
+};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::NormalizedLogRecord;
 use ravel_otlp::logs_limits::LogIngestLimits;
@@ -170,9 +172,70 @@ pub const ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes directly t
      re-running after a failure re-ingests the whole file from the start. Retention is measured \
      from load time, not from the records' event times.";
 
+/// Near-cap warning threshold: the loader warns when the widest single object's
+/// `dynamic_columns_used` reaches this fraction of `max_dynamic_columns`,
+/// expressed as a percentage so the comparison is exact integer arithmetic
+/// (`used * 100 >= max * NEAR_CAP_PERCENT`) with no float rounding at the
+/// boundary. 90% is deliberate headroom: it fires before an object overflows,
+/// not only after.
+const NEAR_CAP_PERCENT: u64 = 90;
+
+/// Warnings to print to stderr after a load, derived from the router's
+/// cumulative dynamic-column counters (ADR-0100 decision 1). Returns at most one
+/// message:
+///
+/// - an overflow warning when any object crossed its dynamic-column budget
+///   (`dynamic_columns_overflowed_total > 0`), naming the count; or, when
+///   nothing overflowed,
+/// - a distinct near-cap warning when the widest object's `dynamic_columns_used`
+///   reached [`NEAR_CAP_PERCENT`]% of `max_dynamic_columns`.
+///
+/// Both state the same consequence an operator needs to act on: an overflowed
+/// attribute folds into the object's `attrs_raw` column, so it stays queryable
+/// through `attrs['<key>']` but gets no typed column (a typed predicate or
+/// aggregate over it is unavailable, and a SQL filter pays a per-row string
+/// cast). An empty vector means the load stayed comfortably under the budget and
+/// nothing is printed.
+pub fn dynamic_column_warnings(
+    metrics: &LogIngestMetricsSnapshot,
+    max_dynamic_columns: usize,
+) -> Vec<String> {
+    let max = max_dynamic_columns as u64;
+    if metrics.dynamic_columns_overflowed_total > 0 {
+        return vec![format!(
+            "warning: {overflowed} distinct (attribute name, type) pair(s) overflowed the \
+             per-object dynamic-column budget of {max} during this load. Each overflowed \
+             attribute was folded into the object's attrs_raw overflow column: it stays \
+             queryable through attrs['<key>'], but it gets NO typed column, so a typed predicate \
+             or aggregate over it is unavailable and a SQL filter pays a per-row string cast. To \
+             give an overflowed key a typed column, reduce the number of distinct attribute \
+             columns per stream (map fewer columns, or split the load so each object stays under \
+             {max} distinct (name, type) pairs).",
+            overflowed = metrics.dynamic_columns_overflowed_total,
+        )];
+    }
+    if max > 0 && metrics.dynamic_columns_used_max * 100 >= max * NEAR_CAP_PERCENT {
+        return vec![format!(
+            "warning: this load reached {used} distinct dynamic columns in a single object, at or \
+             above {pct}% of the per-object budget of {max}. No object overflowed, but a wider \
+             stream or one more attribute would push columns past the budget into the attrs_raw \
+             overflow column, where they stay queryable through attrs['<key>'] but get no typed \
+             column. Reduce the number of distinct attribute columns per stream, or split the \
+             load, to keep headroom under {max}.",
+            used = metrics.dynamic_columns_used_max,
+            pct = NEAR_CAP_PERCENT,
+        )];
+    }
+    Vec::new()
+}
+
 /// CLI entry point for `ravel-cli load --parquet`: read the mapping and Parquet
 /// file paths, run the load, and print a summary on success or the error plus
 /// the known-durable commit tokens on failure.
+///
+/// After a successful load, any dynamic-column overflow or near-cap pressure is
+/// reported to stderr from [`dynamic_column_warnings`] over the router's
+/// cumulative counters (ADR-0100 decision 1).
 ///
 /// Returns `Err` (nonzero exit) for any failure. On a flush failure or a
 /// rejected row, the durable commit tokens are printed rather than swallowed
@@ -185,6 +248,7 @@ pub async fn run(
     tenant: &str,
     mapping_path: &Path,
     shards: u32,
+    batch_rows: usize,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     eprintln!("{ADMISSION_BYPASS_WARNING}");
@@ -199,7 +263,7 @@ pub async fn run(
         tenant,
         &mapping,
         shards,
-        DEFAULT_BATCH_ROWS,
+        batch_rows,
         now_ns,
         Arc::new(SystemClock),
     )
@@ -207,6 +271,12 @@ pub async fn run(
     {
         Ok(report) => {
             print_summary(&report);
+            // The loader's writer uses `RlogConfig::default()` (log_shard.rs), so
+            // its per-object dynamic-column budget is that default.
+            let max_dynamic_columns = ravel_logseg::RlogConfig::default().max_dynamic_columns;
+            for warning in dynamic_column_warnings(&report.metrics, max_dynamic_columns) {
+                eprintln!("{warning}");
+            }
             Ok(())
         }
         Err(err) => {
@@ -278,6 +348,12 @@ pub struct LoadReport {
     /// number of objects/segments written.
     pub tokens: Vec<CommitToken>,
     pub elapsed: Duration,
+    /// The router's cumulative write metrics, snapshotted once the load
+    /// finished. Carries the dynamic-column counters (ADR-0100 decision 1) the
+    /// caller reads to emit an overflow or near-cap warning; there is no other
+    /// return path for a per-load signal (`LogIngestRouter::metrics()` is only
+    /// reachable by whoever constructed the router, which is `load` itself).
+    pub metrics: LogIngestMetricsSnapshot,
 }
 
 impl LoadReport {
@@ -379,6 +455,20 @@ pub async fn load(
     now_ns: i64,
     clock: Arc<dyn Clock>,
 ) -> Result<LoadReport, LoadError> {
+    // Reject a zero batch size with a typed error rather than silently clamping
+    // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
+    // silent clamp would hide a misconfigured value that changes object layout.
+    // Reject a zero batch size with a typed error rather than silently clamping
+    // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
+    // silent clamp would hide a misconfigured value that changes object layout.
+    if batch_rows == 0 {
+        return Err(LoadError::Setup(
+            "--batch-rows must be at least 1 (each batch is one Strict flush per shard); 0 was \
+             given"
+                .to_string(),
+        ));
+    }
+
     let limits = LogIngestLimits::default();
     let tenant_id = TenantId::new(tenant);
 
@@ -422,7 +512,7 @@ pub async fn load(
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
     let reader = builder
-        .with_batch_size(batch_rows.max(1))
+        .with_batch_size(batch_rows)
         .build()
         .map_err(|e| LoadError::Setup(format!("failed to build Parquet reader: {e}")))?;
 
@@ -481,6 +571,10 @@ pub async fn load(
     // no-op here (nothing is buffered after a Strict write returns).
     router.flush_all().await;
 
+    // Snapshot the router's cumulative counters before it drops: the caller
+    // reads the dynamic-column figures to warn on overflow or near-cap pressure
+    // (ADR-0100 decision 1).
+    report.metrics = router.metrics().snapshot();
     report.elapsed = started.elapsed();
     Ok(report)
 }
@@ -715,7 +809,16 @@ fn read_attr(arr: &ArrayRef, row: usize, ty: ColType) -> Result<Option<AttrValue
     Ok(Some(value))
 }
 
-/// Read an integer cell as `i64`, accepting any Arrow integer width.
+/// Read an integer cell as `i64`, accepting any Arrow integer width and the two
+/// Arrow date types.
+///
+/// `Date32` (days since the Unix epoch) and `Date64` (milliseconds since the
+/// Unix epoch) land as their native-unit `i64`: a `Date32` day count and a
+/// `Date64` millisecond count, NOT converted to nanoseconds (ADR-0100). A wide
+/// analytical export routinely carries a date column mapped as an `i64`
+/// attribute; the stored number's unit is documented in `docs/guides/ingest.md`
+/// so a mapping author knows what a comparison against it means. Dates are
+/// deliberately not accepted by the `ts` path (see [`read_ts`]).
 fn read_i64(arr: &ArrayRef, row: usize) -> Result<Option<i64>, String> {
     if arr.is_null(row) {
         return Ok(None);
@@ -730,7 +833,15 @@ fn read_i64(arr: &ArrayRef, row: usize) -> Result<Option<i64>, String> {
         DataType::UInt32 => downcast::<UInt32Array>(arr)?.value(row) as i64,
         DataType::UInt64 => i64::try_from(downcast::<UInt64Array>(arr)?.value(row))
             .map_err(|_| "u64 value does not fit in i64".to_string())?,
-        other => return Err(format!("expected an integer column, found {other:?}")),
+        // Date32 is i32 days; Date64 is i64 milliseconds. Stored in their
+        // native unit, never rescaled to nanoseconds.
+        DataType::Date32 => downcast::<Date32Array>(arr)?.value(row) as i64,
+        DataType::Date64 => downcast::<Date64Array>(arr)?.value(row),
+        other => {
+            return Err(format!(
+                "expected an integer or date column, found {other:?}"
+            ));
+        }
     };
     Ok(Some(v))
 }
@@ -810,6 +921,19 @@ fn read_ts(arr: &ArrayRef, row: usize, declared: TsUnit) -> Result<Option<i64>, 
             };
             raw.checked_mul(factor)
                 .ok_or_else(|| "timestamp overflows i64 nanoseconds".to_string())?
+        }
+        // A date column is not a valid event-time source: it lands as a native-
+        // unit i64 attribute (read_i64), never rescaled to nanoseconds through
+        // the ts path (ADR-0100). Reject it here rather than let the read_i64
+        // fallback below silently multiply a day/millisecond count by the
+        // declared ts unit.
+        DataType::Date32 | DataType::Date64 => {
+            return Err(format!(
+                "ts column has date type {:?}; a date is not a valid ts source. Map it as an i64 \
+                 attribute instead (its value is days since the epoch for Date32, milliseconds \
+                 for Date64).",
+                arr.data_type()
+            ));
         }
         _ => {
             let raw =
@@ -1152,6 +1276,174 @@ type = "i64"
         assert_ne!(
             err.durable_tokens(),
             LoadError::Setup("x".into()).durable_tokens()
+        );
+    }
+
+    /// A clock pinned to `NOW_NS`, so the router buckets and routes against the
+    /// same instant the provisioning `now_ns` uses (as the loader integration
+    /// tests do).
+    struct FixedClock(i64);
+    impl Clock for FixedClock {
+        fn now_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    /// Load a fixture of one record with `n_attrs` distinct i64 attribute
+    /// columns (plus one resource attribute) through the real `load`, and return
+    /// its report. `n_attrs` past the writer's 1000-column budget forces
+    /// overflow; below it exercises the near-cap path.
+    async fn run_wide_load(n_attrs: usize) -> LoadReport {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("wide.parquet");
+        let mut cols: Vec<(String, ArrayRef)> = vec![
+            ("ts".to_string(), i64_col(vec![NOW_NS])),
+            ("svc".to_string(), str_col(vec!["api"])),
+        ];
+        let mut attr_toml = String::new();
+        for i in 0..n_attrs {
+            let name = format!("a{i}");
+            cols.push((name.clone(), i64_col(vec![i as i64])));
+            attr_toml.push_str(&format!(
+                "\n[[attribute]]\nkey = \"{name}\"\ncolumn = \"{name}\"\ntype = \"i64\"\n"
+            ));
+        }
+        let batch = RecordBatch::try_from_iter(cols).expect("wide batch");
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let m = parse_mapping(&format!(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n{attr_toml}"
+        ))
+        .expect("valid mapping");
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        load(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &m,
+            4,
+            10_000,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("load succeeds")
+    }
+
+    /// A load whose object crosses the 1000-column dynamic budget produces the
+    /// overflow warning, driven from real router metrics rather than a
+    /// hand-built snapshot. Flip the `dynamic_columns_overflowed_total > 0`
+    /// guard in `dynamic_column_warnings` to `false` and this fails: no warning
+    /// is emitted for a load that genuinely overflowed.
+    #[tokio::test]
+    async fn warns_when_dynamic_columns_overflow() {
+        let report = run_wide_load(1001).await;
+        assert!(
+            report.metrics.dynamic_columns_overflowed_total > 0,
+            "1001 distinct attribute columns overflow the 1000-column per-object budget"
+        );
+        let warnings = dynamic_column_warnings(
+            &report.metrics,
+            ravel_logseg::RlogConfig::default().max_dynamic_columns,
+        );
+        assert_eq!(warnings.len(), 1, "exactly the overflow warning fires");
+        assert!(
+            warnings[0].contains("overflowed the per-object dynamic-column budget")
+                && warnings[0].contains("attrs_raw"),
+            "the overflow warning states the count and the attrs_raw consequence: {}",
+            warnings[0]
+        );
+    }
+
+    /// A load that reaches >= 90% of the budget without overflowing produces the
+    /// distinct near-cap warning, again from real metrics.
+    #[tokio::test]
+    async fn warns_near_cap_without_overflow() {
+        let report = run_wide_load(950).await;
+        assert_eq!(
+            report.metrics.dynamic_columns_overflowed_total, 0,
+            "950 distinct columns stay under the 1000 budget, so nothing overflows"
+        );
+        assert!(
+            report.metrics.dynamic_columns_used_max >= 900,
+            "the widest object should sit near the cap: used_max = {}",
+            report.metrics.dynamic_columns_used_max
+        );
+        let warnings = dynamic_column_warnings(&report.metrics, 1000);
+        assert_eq!(warnings.len(), 1, "exactly the near-cap warning fires");
+        assert!(
+            warnings[0].contains("at or above") && warnings[0].contains("attrs_raw"),
+            "the near-cap warning states the pressure and the attrs_raw consequence: {}",
+            warnings[0]
+        );
+    }
+
+    /// The near-cap boundary is exact: 90% warns, 89% does not, and an overflow
+    /// takes precedence over the near-cap message. Flip the `>=` in
+    /// `dynamic_column_warnings` to `>` and the exactly-90% case fails.
+    #[test]
+    fn near_cap_threshold_is_at_ninety_percent() {
+        let snap = |used: u64, overflowed: u64| LogIngestMetricsSnapshot {
+            dynamic_columns_used_max: used,
+            dynamic_columns_overflowed_total: overflowed,
+            ..Default::default()
+        };
+        assert_eq!(
+            dynamic_column_warnings(&snap(900, 0), 1000).len(),
+            1,
+            "900 / 1000 = exactly 90% warns"
+        );
+        assert!(
+            dynamic_column_warnings(&snap(899, 0), 1000).is_empty(),
+            "899 / 1000 is just under 90% and does not warn"
+        );
+        assert!(
+            dynamic_column_warnings(&snap(890, 0), 1000).is_empty(),
+            "890 / 1000 = 89% does not warn"
+        );
+        let overflow = dynamic_column_warnings(&snap(900, 3), 1000);
+        assert_eq!(overflow.len(), 1, "overflow still yields one message");
+        assert!(
+            overflow[0].contains("overflowed the per-object dynamic-column budget"),
+            "overflow takes precedence over the near-cap message: {}",
+            overflow[0]
+        );
+    }
+
+    /// `--batch-rows 0` is rejected with a typed [`LoadError::Setup`] before any
+    /// work, rather than silently clamped to 1.
+    #[tokio::test]
+    async fn batch_rows_zero_is_rejected() {
+        use ravel_object_store::memory::MemoryStore;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let m = base_mapping();
+        let err = load(
+            store,
+            Path::new("/nonexistent.parquet"),
+            "acme",
+            &m,
+            4,
+            0,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect_err("batch_rows of 0 is rejected");
+        assert!(
+            matches!(err, LoadError::Setup(_)),
+            "a typed setup error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--batch-rows must be at least 1"),
+            "the error names the lever: {err}"
         );
     }
 }

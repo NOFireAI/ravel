@@ -45,6 +45,7 @@
 //! `set_tenant_config` variant that takes the version the caller already read,
 //! which `ravel-catalog` does not expose today.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use ravel_catalog::{
@@ -53,6 +54,8 @@ use ravel_catalog::{
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantId;
+
+use crate::load::{ColType, Mapping, parse_mapping};
 
 /// Parse one `KEY:TYPE` declaration spec, the same syntax `ravel-server`'s
 /// `--typed-attr-column` flag takes. Split on the LAST `:`, so an attribute key
@@ -157,11 +160,115 @@ pub async fn set(
     specs: &[String],
     now_ns: i64,
 ) -> anyhow::Result<()> {
-    let tenant_hash = TenantId::new(tenant).hash();
     let mut columns = Vec::with_capacity(specs.len());
     for spec in specs {
         columns.push(parse_spec(spec)?);
     }
+    set_columns(store, tenant, columns, now_ns).await
+}
+
+/// `typed-attr-column set <TENANT> --from-mapping <TOML>`: derive the
+/// declaration from a `load --mapping` document and write it through the same
+/// CAS whole-list replace [`set`] uses (ADR-0100 decision 2).
+///
+/// Every `[[attribute]]` and `[[resource_attribute]]` entry becomes a declared
+/// column of the same-named type. Resource attributes come first, in file
+/// order, then record attributes in file order (see
+/// [`derive_columns_from_mapping`]); that order is significant (it is the
+/// schema-append order) and is stable across invocations of the same mapping.
+/// `f64`-typed entries are skipped with a per-key warning on stderr, since
+/// `DeclaredColumnType` has no `f64` variant; the rest are written. Duplicate
+/// keys across the two lists, a key repeated with two types, or a key colliding
+/// with a fixed logs SQL column name are rejected by the shared
+/// `validate_typed_attr_columns` gate, writing nothing.
+///
+/// The loader never touches tenant config: this control-plane write stays in
+/// the control-plane subcommand (ADR-0100 decision 2, rejected alternative "the
+/// loader pushes the declaration itself").
+pub async fn set_from_mapping(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    mapping_path: &Path,
+    now_ns: i64,
+) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(mapping_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read --from-mapping {}: {e}",
+            mapping_path.display()
+        )
+    })?;
+    let mapping = parse_mapping(&text)?;
+    let (columns, skipped) = derive_columns_from_mapping(&mapping);
+    for warning in &skipped {
+        eprintln!("{warning}");
+    }
+    set_columns(store, tenant, columns, now_ns).await
+}
+
+/// The `DeclaredColumnType` a mapping `ColType` maps to, or `None` for `F64`
+/// (which has no declared-column counterpart, ADR-0100 decision 2).
+fn declared_type(col_type: ColType) -> Option<DeclaredColumnType> {
+    match col_type {
+        ColType::Str => Some(DeclaredColumnType::Str),
+        ColType::I64 => Some(DeclaredColumnType::I64),
+        ColType::Bool => Some(DeclaredColumnType::Bool),
+        ColType::Bytes => Some(DeclaredColumnType::Bytes),
+        ColType::F64 => None,
+    }
+}
+
+/// Derive the declared-column list from a `--mapping` document (ADR-0100
+/// decision 2), returning the columns and one stderr warning per skipped `f64`
+/// key.
+///
+/// Order is `[[resource_attribute]]` entries first, in file order, then
+/// `[[attribute]]` entries in file order. Declared columns read the merged
+/// resource + scope + record attribute view (`ravel-sql/src/rlog_attrs.rs`), so
+/// a stream-level resource key is legitimately declarable. The order is
+/// significant (schema-append order) and deterministic, so re-running the same
+/// mapping yields byte-identical output; nothing is re-sorted. This is a single
+/// pass over the two lists (plus the O(n) `validate_typed_attr_columns` the
+/// caller runs), so it holds the ~105-column target with no quadratic step.
+///
+/// Duplicate or conflicting keys are NOT resolved here: the returned list may
+/// carry a key twice, and `validate_typed_attr_columns` (run by the caller) is
+/// the single authority that rejects that, so the rule is never reimplemented.
+fn derive_columns_from_mapping(mapping: &Mapping) -> (Vec<DeclaredTypedColumn>, Vec<String>) {
+    let mut columns =
+        Vec::with_capacity(mapping.resource_attributes.len() + mapping.attributes.len());
+    let mut skipped = Vec::new();
+    for attr in mapping
+        .resource_attributes
+        .iter()
+        .chain(mapping.attributes.iter())
+    {
+        match declared_type(attr.value_type) {
+            Some(ty) => columns.push(DeclaredTypedColumn {
+                key: attr.key.clone(),
+                ty,
+            }),
+            None => skipped.push(format!(
+                "warning: mapping key {:?} has type f64, which has no declared typed-column type \
+                 (ADR-0100); skipping it. It stays queryable through attrs['{}'] but gets no \
+                 typed column, so a SQL predicate over it pays a per-row string cast. The rest of \
+                 the mapping is still written.",
+                attr.key, attr.key
+            )),
+        }
+    }
+    (columns, skipped)
+}
+
+/// The shared write core behind [`set`] and [`set_from_mapping`]: validate the
+/// declaration, then perform the CAS whole-list replace (read-modify-write
+/// window documented in the module docs) and print the outcome.
+async fn set_columns(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    columns: Vec<DeclaredTypedColumn>,
+    now_ns: i64,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
     // The same operator-input gate a durable write and the server's flags run.
     // Checked here first so the failure is reported before the read, and
     // reported as this command's own error rather than as a store-write error.
@@ -520,6 +627,181 @@ mod tests {
         fn capabilities(&self) -> Capabilities {
             self.inner.capabilities()
         }
+    }
+
+    /// Write `text` to a temp `.toml` and return the dir (kept alive) and path.
+    fn mapping_file(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("map.toml");
+        std::fs::write(&path, text).expect("write mapping");
+        (dir, path)
+    }
+
+    /// `set --from-mapping` derives a declared column from BOTH a
+    /// `[[resource_attribute]]` and an `[[attribute]]` entry, in resource-then-
+    /// record file order, and writes them through the CAS path.
+    #[tokio::test]
+    async fn from_mapping_derives_record_and_resource_attributes() {
+        let store = store();
+        let (_dir, path) = mapping_file(
+            r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[resource_attribute]]
+key = "service.name"
+column = "svc"
+type = "str"
+
+[[attribute]]
+key = "http.status_code"
+column = "status"
+type = "i64"
+"#,
+        );
+        set_from_mapping(store.clone(), "acme", &path, 1)
+            .await
+            .expect("a mapping-derived declaration is written");
+
+        assert_eq!(
+            durable(store.as_ref(), "acme")
+                .await
+                .expect("present")
+                .typed_attr_columns,
+            Some(vec![
+                DeclaredTypedColumn {
+                    key: "service.name".to_string(),
+                    ty: DeclaredColumnType::Str,
+                },
+                DeclaredTypedColumn {
+                    key: "http.status_code".to_string(),
+                    ty: DeclaredColumnType::I64,
+                },
+            ]),
+            "resource attributes derive first, then record attributes, both in file order"
+        );
+    }
+
+    /// An `f64` mapping entry has no `DeclaredColumnType`: it is skipped with a
+    /// per-key warning naming the key, and every other entry is still written.
+    /// Flip the `None =>` arm of `declared_type` to map `F64` onto some type
+    /// (or drop the `skipped.push`) and this fails: the f64 key would appear in
+    /// the durable list, or the warning would be absent.
+    #[tokio::test]
+    async fn from_mapping_skips_f64_with_warning_and_writes_the_rest() {
+        // Unit half: the derivation skips the f64 key with a warning and keeps
+        // the rest, in order.
+        let mapping = parse_mapping(
+            r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[attribute]]
+key = "http.status_code"
+column = "status"
+type = "i64"
+
+[[attribute]]
+key = "latency_ms"
+column = "latency"
+type = "f64"
+
+[[attribute]]
+key = "cache.hit"
+column = "hit"
+type = "bool"
+"#,
+        )
+        .expect("valid mapping");
+        let (columns, skipped) = derive_columns_from_mapping(&mapping);
+        assert_eq!(
+            columns,
+            vec![
+                DeclaredTypedColumn {
+                    key: "http.status_code".to_string(),
+                    ty: DeclaredColumnType::I64,
+                },
+                DeclaredTypedColumn {
+                    key: "cache.hit".to_string(),
+                    ty: DeclaredColumnType::Bool,
+                },
+            ],
+            "the f64 key is dropped from the list, the rest keep their order"
+        );
+        assert_eq!(skipped.len(), 1, "exactly the one f64 key is skipped");
+        assert!(
+            skipped[0].contains("latency_ms") && skipped[0].contains("f64"),
+            "the warning names the skipped key and its type: {}",
+            skipped[0]
+        );
+
+        // Integration half: the durable list written by the command excludes the
+        // f64 key and carries the rest.
+        let store = store();
+        let (_dir, path) = mapping_file(
+            r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[attribute]]
+key = "http.status_code"
+column = "status"
+type = "i64"
+
+[[attribute]]
+key = "latency_ms"
+column = "latency"
+type = "f64"
+"#,
+        );
+        set_from_mapping(store.clone(), "acme", &path, 1)
+            .await
+            .expect("the rest is still written after skipping the f64 key");
+        assert_eq!(
+            durable(store.as_ref(), "acme")
+                .await
+                .expect("present")
+                .typed_attr_columns,
+            Some(vec![DeclaredTypedColumn {
+                key: "http.status_code".to_string(),
+                ty: DeclaredColumnType::I64,
+            }]),
+            "the f64 key is not declared; the i64 key is"
+        );
+    }
+
+    /// A key appearing twice across the merged resource+record view is rejected
+    /// by the shared `validate_typed_attr_columns` gate, and nothing is written.
+    #[tokio::test]
+    async fn from_mapping_rejects_a_key_declared_twice() {
+        let store = store();
+        let (_dir, path) = mapping_file(
+            r#"
+ts_column = "ts"
+ts_unit = "nanos"
+
+[[resource_attribute]]
+key = "dur"
+column = "dur_res"
+type = "i64"
+
+[[attribute]]
+key = "dur"
+column = "dur_rec"
+type = "i64"
+"#,
+        );
+        let err = set_from_mapping(store.clone(), "acme", &path, 1)
+            .await
+            .expect_err("a key declared twice must be refused");
+        assert!(
+            err.to_string().contains("more than once"),
+            "the error names the duplicate-key rule: {err}"
+        );
+        assert!(
+            durable(store.as_ref(), "acme").await.is_none(),
+            "a refused derivation writes no record"
+        );
     }
 
     /// Sanity: the tenant hash the CLI writes under is the one a server reads,
