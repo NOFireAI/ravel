@@ -503,9 +503,119 @@ async fn excluded_scalar_and_window_functions_are_not_reachable() {
     assert_eq!(err.class(), ErrorClass::BadRequest);
 }
 
+/// ADR-0097 Consequences: "Reachability, not registry state, is the acceptance
+/// evidence." The focused test above pins two representative names end-to-end;
+/// this one drives *every* name in [`ravel_sql::EXCLUDED_SCALARS`] and
+/// [`ravel_sql::EXCLUDED_WINDOWS`] through `SqlExecutor::execute` -- the path a
+/// real caller takes -- and asserts each is refused with its typed error,
+/// never a successful result and never an opaque plan/execution error.
+///
+/// The names are read straight from the two constants, so this test cannot
+/// drift from them: a name added to or removed from either list changes what
+/// this test drives with no second edit here. That closes the gap the
+/// conformance rows leave open, where excluded scalar/window names are attested
+/// only through the validator, not through end-to-end execution.
+///
+/// During ADR-0097's design a probe drove these queries with the registry gate
+/// patched off and confirmed the validator's finder still refused every one
+/// before planning, with zero executing. This is that probe turned into a
+/// standing test; its non-vacuousness rests on the finder producing a *typed*
+/// error rather than the gate's opaque plan failure, so patching the finder off
+/// (its `is_excluded_scalar`/`is_excluded_window` sources) makes every case
+/// here execute or fail differently and the test go red.
+///
+/// Every call here uses a bare identifier. A quoted-identifier spelling
+/// (`"uuid"()`) still reaches the registry gate and is still refused, but as
+/// the same opaque plan failure the finder produces when patched off above,
+/// not a typed error -- this test does not exercise or close that gap.
+#[tokio::test]
+async fn every_excluded_scalar_and_window_is_unreachable_through_execute() {
+    let tenant = tenant_id("acme");
+    let specs = one_segment();
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+    assert!(
+        !ravel_sql::EXCLUDED_SCALARS.is_empty() && !ravel_sql::EXCLUDED_WINDOWS.is_empty(),
+        "the excluded sets must be non-empty or this test asserts nothing"
+    );
+
+    for name in ravel_sql::EXCLUDED_SCALARS {
+        let sql = format!("SELECT {} FROM samples", scalar_call(name));
+        let err = match fixture
+            .executor
+            .execute(tenant.hash(), &request(&sql))
+            .await
+        {
+            Ok(_) => panic!("excluded scalar `{name}` executed to completion: `{sql}`"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                &err,
+                SqlError::Validation(ValidationError::ExcludedScalar { name: got }) if got == name
+            ),
+            "excluded scalar `{name}` must yield a typed ExcludedScalar naming it, \
+             got {err} (sql: {sql})"
+        );
+        assert_eq!(
+            err.class(),
+            ErrorClass::BadRequest,
+            "excluded scalar `{name}` must be a 400-class refusal (sql: {sql})"
+        );
+    }
+
+    for name in ravel_sql::EXCLUDED_WINDOWS {
+        let sql = format!("SELECT {} FROM samples", window_call(name));
+        let err = match fixture
+            .executor
+            .execute(tenant.hash(), &request(&sql))
+            .await
+        {
+            Ok(_) => panic!("excluded window `{name}` executed to completion: `{sql}`"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                &err,
+                SqlError::Validation(ValidationError::ExcludedWindow { name: got }) if got == name
+            ),
+            "excluded window `{name}` used with OVER must yield a typed ExcludedWindow \
+             naming it, got {err} (sql: {sql})"
+        );
+        assert_eq!(
+            err.class(),
+            ErrorClass::BadRequest,
+            "excluded window `{name}` must be a 400-class refusal (sql: {sql})"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// A syntactically valid call for an excluded scalar. Most are ordinary
+/// parenthesized calls; the SQL-standard datetime niladics (`current_timestamp`
+/// and friends) are spelled as bare keywords, the form the parser accepts and
+/// the shape a client is most likely to write. Argument count is irrelevant to
+/// the refusal: the validator matches on the function name before planning, so
+/// the call only has to parse.
+fn scalar_call(name: &str) -> String {
+    match name {
+        "current_timestamp" | "current_date" | "current_time" => name.to_string(),
+        _ => format!("{name}()"),
+    }
+}
+
+/// A syntactically valid windowed call for an excluded window function. The
+/// simplest legal frame (`OVER (ORDER BY ts)`) is enough: the point is that the
+/// name carrying an `OVER` clause is refused, not that a particular frame shape
+/// is. A single column argument parses for all excluded window names, including
+/// `nth_value`, because the validator refuses on the name before any argument
+/// arity check.
+fn window_call(name: &str) -> String {
+    format!("{name}(value) OVER (ORDER BY ts)")
+}
 
 async fn all_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
     let mut keys: Vec<String> = ravel_object_store::list_all(store, "")
