@@ -33,7 +33,8 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_sql::conformance::{
-    Category, Classification, Construct, Verdict, Verified, registry, render_document, score,
+    Category, Classification, Construct, Verdict, Verified, registry, render_document,
+    render_example_manifest, score,
 };
 use ravel_sql::{QueryOutput, SqlError, ValidationError, validate};
 use ravel_types::{Signal, TenantId, logstream};
@@ -529,6 +530,13 @@ fn doc_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/sql-conformance.md")
 }
 
+/// The absolute path of the committed example-SQL manifest, the second artifact
+/// that records what SQL each conformance row runs, independently of the prose
+/// document (#408).
+fn example_manifest_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/sql-conformance-examples.txt")
+}
+
 // ---------------------------------------------------------------------------
 // Acceptance tests
 // ---------------------------------------------------------------------------
@@ -757,5 +765,92 @@ async fn generate_and_check_conformance_doc() {
         committed, rendered,
         "docs/sql-conformance.md is out of date. Regenerate with \
          REGEN_SQL_CONFORMANCE=1 cargo test -p ravel-sql --test conformance"
+    );
+}
+
+/// The live example SQL each construct runs, checked against a committed
+/// manifest that the prose document's `REGEN_SQL_CONFORMANCE=1` does NOT touch.
+///
+/// This closes the escape hatch where a mutated example (SQL changed so it no
+/// longer exercises the function it claims, but still executing) is caught only
+/// by `generate_and_check_conformance_doc`'s byte-compare, which
+/// `REGEN_SQL_CONFORMANCE=1` then silences by regenerating the prose doc to
+/// match the mutation. That regen path never writes this manifest, so a mutated
+/// example still fails here after regeneration. Updating the manifest is a
+/// distinct, deliberate act that produces its own reviewable diff of the changed
+/// SQL:
+///
+///     REGEN_SQL_CONFORMANCE_EXAMPLES=1 cargo test -p ravel-sql --test conformance
+///
+/// "The registry changed" and "an example's SQL changed" are thus two separate,
+/// independently verified facts (#408).
+#[test]
+fn example_sql_matches_committed_manifest() {
+    let constructs = registry();
+    let rendered = render_example_manifest(&constructs);
+    let path = example_manifest_path();
+
+    if std::env::var_os("REGEN_SQL_CONFORMANCE_EXAMPLES").is_some() {
+        std::fs::write(&path, &rendered).expect("write example manifest");
+        return;
+    }
+
+    let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}. Regenerate deliberately with \
+             REGEN_SQL_CONFORMANCE_EXAMPLES=1 cargo test -p ravel-sql --test conformance",
+            path.display()
+        )
+    });
+
+    // Parse the committed manifest into (category, name) -> example, so a
+    // mismatch names the specific construct whose SQL changed rather than
+    // reporting an opaque whole-file diff.
+    let mut committed_examples = std::collections::BTreeMap::new();
+    for line in committed.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let category = parts.next().expect("manifest line has a category");
+        let name = parts.next().expect("manifest line has a construct name");
+        let example = parts.next().expect("manifest line has an example");
+        committed_examples.insert(
+            (category.to_string(), name.to_string()),
+            example.to_string(),
+        );
+    }
+
+    for c in &constructs {
+        let key = (c.category.label().to_string(), c.name.clone());
+        match committed_examples.get(&key) {
+            Some(committed_example) => assert_eq!(
+                &c.example,
+                committed_example,
+                "construct `{}` ({}) runs SQL that differs from the committed example \
+                 manifest (committed: `{committed_example}`; live: `{}`). If this change is \
+                 intentional, update the manifest deliberately with \
+                 REGEN_SQL_CONFORMANCE_EXAMPLES=1; REGEN_SQL_CONFORMANCE=1 must not be used to \
+                 launder an example-SQL change (#408)",
+                c.name,
+                c.category.label(),
+                c.example,
+            ),
+            None => panic!(
+                "construct `{}` ({}) has no entry in the committed example manifest; \
+                 add it deliberately with REGEN_SQL_CONFORMANCE_EXAMPLES=1",
+                c.name,
+                c.category.label()
+            ),
+        }
+    }
+
+    // Byte-match the whole manifest too, so a construct removed from the
+    // registry (leaving a stale manifest line) is caught and the committed file
+    // stays canonically formatted.
+    assert_eq!(
+        committed, rendered,
+        "docs/sql-conformance-examples.txt is out of date. Regenerate deliberately with \
+         REGEN_SQL_CONFORMANCE_EXAMPLES=1 cargo test -p ravel-sql --test conformance"
     );
 }
