@@ -38,6 +38,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -45,7 +46,8 @@ use ravel_commit::{keys, publish, record};
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{ByteLimit, EngineConfig, LogSegmentFetcher, RequestLimit, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
-use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest};
+use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor, SqlRequest};
+use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
 use serde::Serialize;
 use uuid::Uuid;
@@ -67,6 +69,19 @@ const NOW_NS: i64 = 4 * NS_PER_HOUR;
 pub const QUERY: &str = "SELECT series_id, count(*) AS rows, min(ts) AS first_ts, max(ts) AS last_ts \
      FROM samples GROUP BY series_id";
 
+/// Default per-tenant memory ceiling passed to `SqlExecutor::new`. Matches the
+/// value the bench used before it was a flag, so an invocation that does not
+/// pass `--max-tenant-bytes` is unchanged. Exposed as a flag because the whole
+/// point of this bench is measuring at production scale, where the default is
+/// far too small: with the disk manager disabled (ADR-0102 decision 3) an
+/// aggregation over this ceiling returns `SqlError::ResourcesExhausted` rather
+/// than spilling, so a real sweep must be able to raise it.
+pub const DEFAULT_MAX_TENANT_BYTES: usize = 1 << 30;
+
+/// Default per-query wall deadline. Matches the value the bench used before it
+/// was a flag; a large production sweep can raise it with `--deadline-secs`.
+pub const DEFAULT_DEADLINE_SECS: u64 = 30;
+
 /// Inputs for one scaling run.
 pub struct GroupbyScalingConfig {
     pub store: Arc<dyn ObjectStoreBackend>,
@@ -84,9 +99,21 @@ pub struct GroupbyScalingConfig {
     /// run once with the flag off and once on.
     pub target_partitions: Vec<usize>,
     /// Timed repetitions per (partitions x flag) combination. Latency
-    /// min/median/max are taken across these; the fixture is built once up
-    /// front and reused for every combination.
+    /// min/median/max and the dispersion measure are taken across these; the
+    /// fixture is built once up front and reused for every combination.
+    ///
+    /// At the bin's default of 3 this is a thin sample: it cannot support a
+    /// claim like ADR-0094's ~14% parallel-vs-serial regression, whose signal
+    /// is smaller than the run-to-run noise of three iterations. A production
+    /// invocation that means to publish such a number should raise `--runs`
+    /// well above the default (tens of runs) so the stddev this bench records
+    /// is meaningful against the effect size.
     pub runs: usize,
+    /// Per-tenant memory ceiling handed to `SqlExecutor::new`. See
+    /// [`DEFAULT_MAX_TENANT_BYTES`].
+    pub max_tenant_bytes: usize,
+    /// Per-query wall deadline. See [`DEFAULT_DEADLINE_SECS`].
+    pub deadline: Duration,
 }
 
 impl GroupbyScalingConfig {
@@ -102,6 +129,8 @@ impl GroupbyScalingConfig {
             samples_per_series: 20,
             target_partitions: vec![1, 2],
             runs: 2,
+            max_tenant_bytes: DEFAULT_MAX_TENANT_BYTES,
+            deadline: Duration::from_secs(DEFAULT_DEADLINE_SECS),
         }
     }
 }
@@ -114,31 +143,105 @@ pub struct ReportConfig {
     pub series: usize,
     pub samples_per_series: usize,
     pub total_samples: u64,
-    /// Distinct groups the query returned (equals distinct series). Left
-    /// visible so a misconfigured cardinality is obvious in the report rather
-    /// than folded away.
+    /// Distinct groups the query actually returned (equals the distinct
+    /// `series_id` count the dataset published, read from the query result, not
+    /// `series` echoed back). A generation bug that collapses cardinality shows
+    /// up here as `groups != series` rather than being folded away.
     pub groups: usize,
     pub target_partitions: Vec<usize>,
     pub runs: usize,
+    /// Logical cores available to the process. A "scaling versus cores" report
+    /// is uninterpretable without it.
+    pub cores: usize,
+    /// Build profile the measurement ran under, from `debug_assertions`
+    /// (`"debug"` when on, `"release"` when off). A debug build's numbers are
+    /// not comparable to a release build's.
+    pub profile: String,
 }
 
 /// One (target_partitions x parallel_final_aggregation) measurement.
+///
+/// Every field is either the requested axis value or a fact OBSERVED from the
+/// real plan/execution of this combination. `fanned_out`, `scan_partitions`,
+/// and `runs_taken` in particular are read back from what actually happened,
+/// not echoed from the request, so the report can prove each swept axis reached
+/// execution instead of merely restating the config.
 #[derive(Serialize)]
 pub struct ComboResult {
     pub target_partitions: usize,
     pub parallel_final_aggregation: bool,
+    /// Observed: did the physical plan fan its final aggregation across
+    /// partitions? Read from the real plan text via the ADR-0094
+    /// `partitioning=Hash(` marker (see [`fans_out_final_aggregation`]), so a
+    /// flag that never reaches the executor shows up as `fanned_out == false`
+    /// even with `parallel_final_aggregation == true`.
+    pub fanned_out: bool,
+    /// Observed: the RSEG scan node's actual output partition count in the real
+    /// physical plan (`min(target_partitions, segment_count)` under today's
+    /// segment-granular partitioning), read from the plan's properties rather
+    /// than recomputed from the config, so a `target_partitions` that never
+    /// reaches the scan is visible as a disagreement.
+    pub scan_partitions: usize,
     /// Segments the successful attempt actually scanned, from `SqlStats`. With
     /// today's segment-granular partitioning this bounds the scan fan-out.
     pub segments_scanned: usize,
     /// Result rows (groups) the query returned; identical across combinations
     /// for the same dataset, kept per-combo as a correctness check.
     pub result_rows: usize,
+    /// Observed: timed iterations actually performed, not `config.runs` echoed
+    /// back. Equals the requested run count on success.
+    pub runs_taken: usize,
     pub min_ms: f64,
     pub median_ms: f64,
     pub max_ms: f64,
+    /// Sample standard deviation of the timed runs (ms). Zero when fewer than
+    /// two samples were taken. The dispersion `min`/`median`/`max` alone cannot
+    /// give: without it, a claimed parallel-vs-serial delta cannot be told from
+    /// run-to-run noise.
+    pub stddev_ms: f64,
+    /// The full sorted per-run latency sample (ms), so a consumer can compute
+    /// its own dispersion or confidence interval. The human table stays
+    /// summary-only; this rides in the JSON report.
+    pub samples_ms: Vec<f64>,
     /// Scanned input rows per second, computed from `total_samples` and the
     /// median latency. The throughput axis the ADR asks for.
     pub rows_per_sec: f64,
+    /// Set when this ONE combination failed (e.g. a typed
+    /// `SqlError::ResourcesExhausted` from an over-budget aggregation) rather
+    /// than being measured. When present the timing fields are zero and the
+    /// sweep continued past it instead of panicking the whole run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ComboResult {
+    /// A labeled failure slot for one combination: the axes and whatever the
+    /// plan inspection already observed, with zeroed timing and the error
+    /// message. Lets the sweep record the failure and keep going.
+    fn failed(
+        target_partitions: usize,
+        parallel: bool,
+        fanned_out: bool,
+        scan_partitions: usize,
+        error: String,
+    ) -> Self {
+        ComboResult {
+            target_partitions,
+            parallel_final_aggregation: parallel,
+            fanned_out,
+            scan_partitions,
+            segments_scanned: 0,
+            result_rows: 0,
+            runs_taken: 0,
+            min_ms: 0.0,
+            median_ms: 0.0,
+            max_ms: 0.0,
+            stddev_ms: 0.0,
+            samples_ms: Vec::new(),
+            rows_per_sec: 0.0,
+            error: Some(error),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -156,6 +259,69 @@ fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
     }
     let rank = ((sorted_ns.len() - 1) as f64 * pct).round() as usize;
     sorted_ns[rank.min(sorted_ns.len() - 1)]
+}
+
+/// Sample standard deviation (n-1 denominator) of `samples_ns` in nanoseconds.
+/// Zero for fewer than two samples, where dispersion is undefined.
+fn stddev_ns(samples_ns: &[u64]) -> f64 {
+    if samples_ns.len() < 2 {
+        return 0.0;
+    }
+    let n = samples_ns.len() as f64;
+    let mean = samples_ns.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let variance = samples_ns
+        .iter()
+        .map(|&v| {
+            let d = v as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / (n - 1.0);
+    variance.sqrt()
+}
+
+/// ADR-0094's fan-out marker in a physical-plan string: a hash-partitioning
+/// `RepartitionExec` (`partitioning=Hash(...)`) feeding a fanned-out `Final`
+/// `AggregateExec`. Byte-identical to `fans_out_final_aggregation` in
+/// crates/ravel-sql/tests/parallel_final_aggregation.rs, and distinct from the
+/// `RoundRobinBatch` repartition DataFusion always inserts to parallelize the
+/// scan (present under both plans, not the ADR-0094 behavior).
+fn fans_out_final_aggregation(plan_text: &str) -> bool {
+    plan_text.contains("partitioning=Hash(")
+}
+
+/// The RSEG scan node's actual output partition count in `plan`, read from the
+/// real plan's properties. Under today's segment-granular partitioning this is
+/// `min(target_partitions, segment_count)`. Read from the plan, never
+/// recomputed from the config, so the recorded value proves the requested
+/// `target_partitions` reached the scan. Returns 0 if no `RsegScanExec` is
+/// present (it always is for the fixed metrics query here).
+fn scan_partition_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    if plan.name() == "RsegScanExec" {
+        return plan.output_partitioning().partition_count();
+    }
+    plan.children()
+        .into_iter()
+        .map(scan_partition_count)
+        .max()
+        .unwrap_or(0)
+}
+
+/// `"debug"` under `debug_assertions`, `"release"` otherwise. Named so the
+/// report records which build produced its numbers.
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+/// Logical cores visible to the process, or 1 if the platform cannot report it.
+fn available_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Build the multi-part dataset, then sweep every (partitions x flag)
@@ -184,6 +350,8 @@ pub async fn run(config: &GroupbyScalingConfig) -> Report {
                 tp,
                 parallel,
                 config.runs,
+                config.max_tenant_bytes,
+                config.deadline,
                 total_samples,
             )
             .await;
@@ -203,14 +371,21 @@ pub async fn run(config: &GroupbyScalingConfig) -> Report {
             groups,
             target_partitions: config.target_partitions.clone(),
             runs: config.runs,
+            cores: available_cores(),
+            profile: build_profile().to_string(),
         },
         combos,
     }
 }
 
 /// Run the fixed query at one (target_partitions, parallel) combination:
-/// `runs` timed iterations plus one warm-up, returning the latency spread and
-/// derived throughput.
+/// inspect the real physical plan for what the swept axes actually produced,
+/// then `runs` timed iterations plus one warm-up, returning the observed facts,
+/// latency spread, and derived throughput. A typed `ResourcesExhausted` from an
+/// over-budget aggregation fails only this combination and lets the sweep
+/// continue, rather than panicking the whole run and losing every combination
+/// already measured.
+#[allow(clippy::too_many_arguments)]
 async fn run_combo(
     catalog: Arc<Catalog>,
     store: Arc<dyn ObjectStoreBackend>,
@@ -218,6 +393,8 @@ async fn run_combo(
     target_partitions: usize,
     parallel: bool,
     runs: usize,
+    max_tenant_bytes: usize,
+    deadline: Duration,
     total_samples: u64,
 ) -> ComboResult {
     // `target_partitions` is set through `fetch_concurrency`; every budget is
@@ -236,41 +413,83 @@ async fn run_combo(
         ..SqlConfig::default()
     };
     let executor = SqlExecutor::new(
-        catalog,
+        Arc::clone(&catalog),
         SegmentFetcher::new(Arc::clone(&store)),
         LogSegmentFetcher::new(Arc::clone(&store)),
         SpanSegmentFetcher::new(Arc::clone(&store)),
         sql_config,
-        1 << 30,
+        max_tenant_bytes,
     );
 
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: NOW_NS,
+    };
     let request = || SqlRequest {
         sql: QUERY.to_string(),
-        window: TimeRange {
-            start_ns: 0,
-            end_ns: NOW_NS,
-        },
+        window,
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
-        deadline: Duration::from_secs(30),
+        deadline,
     };
 
-    // One warm run establishes the result shape and primes any lazy init
-    // before the timed iterations.
-    let warm = executor
-        .execute(tenant_hash, &request())
+    // Observe the physical plan this combination actually produces, before the
+    // timed runs. Planning does not execute, so it never hits the memory
+    // budget; the two facts below are always available even for a combination
+    // whose execution later fails. Both come from the real plan, so a broken
+    // axis (a flag that never reaches the executor, a `target_partitions` that
+    // never reaches the scan) surfaces as an observed value disagreeing with
+    // the request rather than an echo that always looks correct.
+    let accounting = QueryAccounting::new();
+    let snapshot = catalog
+        .resolve(&tenant_hash, Signal::Metrics, window, &[], NOW_NS)
         .await
-        .expect("warm query");
+        .expect("resolve snapshot for plan inspection");
+    let planned = executor
+        .plan_pinned(tenant_hash, snapshot, QUERY, &accounting, &[])
+        .await
+        .expect("plan query for inspection");
+    let plan = planned
+        .create_physical_plan()
+        .await
+        .expect("build physical plan for inspection");
+    let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+    let fanned_out = fans_out_final_aggregation(&plan_text);
+    let scan_partitions = scan_partition_count(&plan);
+
+    // One warm run establishes the result shape and primes any lazy init
+    // before the timed iterations. A ResourcesExhausted here fails this ONE
+    // combination and the sweep continues.
+    let warm = match executor.execute(tenant_hash, &request()).await {
+        Err(SqlError::ResourcesExhausted(msg)) => {
+            return ComboResult::failed(
+                target_partitions,
+                parallel,
+                fanned_out,
+                scan_partitions,
+                msg,
+            );
+        }
+        other => other.expect("warm query"),
+    };
     let result_rows = warm.output.num_rows();
     let segments_scanned = warm.stats.segments;
 
     let mut latencies_ns = Vec::with_capacity(runs.max(1));
     for _ in 0..runs.max(1) {
         let start = Instant::now();
-        let outcome = executor
-            .execute(tenant_hash, &request())
-            .await
-            .expect("timed query");
+        let outcome = match executor.execute(tenant_hash, &request()).await {
+            Err(SqlError::ResourcesExhausted(msg)) => {
+                return ComboResult::failed(
+                    target_partitions,
+                    parallel,
+                    fanned_out,
+                    scan_partitions,
+                    msg,
+                );
+            }
+            other => other.expect("timed query"),
+        };
         latencies_ns.push(start.elapsed().as_nanos() as u64);
         assert_eq!(
             outcome.output.num_rows(),
@@ -278,11 +497,14 @@ async fn run_combo(
             "group-by result row count is deterministic across runs"
         );
     }
+    let runs_taken = latencies_ns.len();
     latencies_ns.sort_unstable();
 
     let median_ns = percentile(&latencies_ns, 0.50);
     let min_ns = latencies_ns.first().copied().unwrap_or(0);
     let max_ns = latencies_ns.last().copied().unwrap_or(0);
+    let stddev = stddev_ns(&latencies_ns);
+    let samples_ms = latencies_ns.iter().map(|&ns| ns as f64 / 1e6).collect();
     let rows_per_sec = if median_ns == 0 {
         0.0
     } else {
@@ -292,12 +514,18 @@ async fn run_combo(
     ComboResult {
         target_partitions,
         parallel_final_aggregation: parallel,
+        fanned_out,
+        scan_partitions,
         segments_scanned,
         result_rows,
+        runs_taken,
         min_ms: min_ns as f64 / 1e6,
         median_ms: median_ns as f64 / 1e6,
         max_ms: max_ns as f64 / 1e6,
+        stddev_ms: stddev / 1e6,
+        samples_ms,
         rows_per_sec,
+        error: None,
     }
 }
 

@@ -4504,6 +4504,7 @@ dependencies = [
  "clap",
  "crc32c",
  "criterion",
+ "datafusion",
  "futures",
  "lz4_flex 0.14.0",
  "object_store 0.13.2",

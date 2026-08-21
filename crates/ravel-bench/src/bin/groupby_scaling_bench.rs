@@ -14,12 +14,21 @@
 //! production code path. Gated on the `sql-latency` feature so the default
 //! build never compiles ravel-sql/datafusion or this bin.
 //!
+//! ADR-0102 decision 2 requires measuring against a real S3-backed store, not
+//! `MemoryStore` (an in-memory store is exactly what ADR-0094's rejected
+//! preliminary measurement used), so a real sweep runs with `--store s3` and
+//! the `RAVEL_S3_*` env vars set (see `ravel_bench::harness`):
+//!
 //! Run: `cargo run -p ravel-bench --release --features sql-latency \
-//!   --bin groupby_scaling_bench -- --store memory`
+//!   --bin groupby_scaling_bench -- --store s3`
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::time::Duration;
+
 use clap::Parser;
-use ravel_bench::groupby_scaling::{GroupbyScalingConfig, Report, run};
+use ravel_bench::groupby_scaling::{
+    DEFAULT_DEADLINE_SECS, DEFAULT_MAX_TENANT_BYTES, GroupbyScalingConfig, Report, run,
+};
 use ravel_bench::harness::{StoreKind, store_from_env};
 
 #[derive(Parser, Debug)]
@@ -41,9 +50,21 @@ struct Args {
     /// Comma-separated DataFusion `target_partitions` values to sweep.
     #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
     target_partitions: Vec<usize>,
-    /// Timed repetitions per (partitions x flag) combination.
+    /// Timed repetitions per (partitions x flag) combination. The default of 3
+    /// is a thin sample: publishing an effect the size of ADR-0094's ~14%
+    /// regression needs this raised well above the default.
     #[arg(long, default_value_t = 3)]
     runs: usize,
+    /// Per-tenant memory ceiling (bytes) handed to the SQL executor. Default
+    /// matches the pre-flag behavior. With the disk manager disabled (ADR-0102
+    /// decision 3) an aggregation over this ceiling returns a typed error and
+    /// that one combination is recorded as failed; raise it for a real sweep.
+    #[arg(long, default_value_t = DEFAULT_MAX_TENANT_BYTES)]
+    max_tenant_bytes: usize,
+    /// Per-query wall deadline in seconds. Default matches the pre-flag
+    /// behavior; raise it for a large production sweep.
+    #[arg(long, default_value_t = DEFAULT_DEADLINE_SECS)]
+    deadline_secs: u64,
     /// Small dataset and few partition values for a fast CI-sized run.
     /// Overrides `--parts`/`--series`/`--samples-per-series`/
     /// `--target-partitions`/`--runs`.
@@ -55,7 +76,11 @@ struct Args {
 async fn main() {
     let args = Args::parse();
     let config = if args.smoke {
-        GroupbyScalingConfig::smoke(store_from_env(args.store), &args.store.to_string())
+        GroupbyScalingConfig {
+            max_tenant_bytes: args.max_tenant_bytes,
+            deadline: Duration::from_secs(args.deadline_secs),
+            ..GroupbyScalingConfig::smoke(store_from_env(args.store), &args.store.to_string())
+        }
     } else {
         GroupbyScalingConfig {
             store: store_from_env(args.store),
@@ -65,6 +90,8 @@ async fn main() {
             samples_per_series: args.samples_per_series,
             target_partitions: args.target_partitions,
             runs: args.runs,
+            max_tenant_bytes: args.max_tenant_bytes,
+            deadline: Duration::from_secs(args.deadline_secs),
         }
     };
     let report = run(&config).await;
@@ -80,6 +107,8 @@ fn print_human_table(report: &Report) {
     println!();
     println!("groupby_scaling_bench report");
     println!("  store             : {}", report.config.store);
+    println!("  cores             : {}", report.config.cores);
+    println!("  profile           : {}", report.config.profile);
     println!("  query             : {}", report.config.query);
     println!("  parts             : {}", report.config.parts);
     println!("  series (groups)   : {}", report.config.series);
@@ -89,22 +118,48 @@ fn print_human_table(report: &Report) {
     println!("  runs per combo    : {}", report.config.runs);
     println!();
     println!(
-        "{:>7} | {:>8} | {:>9} | {:>10} | {:>10} | {:>10} | {:>16}",
-        "target", "parallel", "segments", "min (ms)", "med (ms)", "max (ms)", "rows/sec"
+        "{:>7} | {:>8} | {:>8} | {:>8} | {:>8} | {:>5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>16}",
+        "target",
+        "parallel",
+        "fanout",
+        "scanpart",
+        "segments",
+        "runs",
+        "min (ms)",
+        "med (ms)",
+        "max (ms)",
+        "sd (ms)",
+        "rows/sec"
     );
     println!(
-        "{:->7}-+-{:->8}-+-{:->9}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->16}",
-        "", "", "", "", "", "", ""
+        "{:->7}-+-{:->8}-+-{:->8}-+-{:->8}-+-{:->8}-+-{:->5}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->16}",
+        "", "", "", "", "", "", "", "", "", "", ""
     );
     for c in &report.combos {
+        if let Some(err) = &c.error {
+            println!(
+                "{:>7} | {:>8} | {:>8} | {:>8} | {:>8} | FAILED: {}",
+                c.target_partitions,
+                c.parallel_final_aggregation,
+                c.fanned_out,
+                c.scan_partitions,
+                c.segments_scanned,
+                err,
+            );
+            continue;
+        }
         println!(
-            "{:>7} | {:>8} | {:>9} | {:>10.3} | {:>10.3} | {:>10.3} | {:>16.0}",
+            "{:>7} | {:>8} | {:>8} | {:>8} | {:>8} | {:>5} | {:>10.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>16.0}",
             c.target_partitions,
             c.parallel_final_aggregation,
+            c.fanned_out,
+            c.scan_partitions,
             c.segments_scanned,
+            c.runs_taken,
             c.min_ms,
             c.median_ms,
             c.max_ms,
+            c.stddev_ms,
             c.rows_per_sec,
         );
     }
