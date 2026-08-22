@@ -4394,6 +4394,86 @@ fn worker_partial_aggregate_filters_staleness_before_counting() {
     });
 }
 
+/// ADR-0103 amendment: the staleness filter must run AFTER `merge_soa_runs`,
+/// not before. Two segments carry the same series at the same timestamp: one
+/// a real value (written first, lower priority), one a staleness marker
+/// (written later, higher priority, so it wins the merge's dedup tie-break).
+/// A pre-merge filter would drop the marker before the merge sees it, letting
+/// the losing real value take the slot the raw path resolves to the marker --
+/// diverging from what the same query gets on the local path. This test is
+/// the discriminator `worker_partial_aggregate_filters_staleness_before_counting`
+/// alone cannot be: that test's single-segment, single-sample corpus makes
+/// pre-merge and post-merge filtering produce the identical answer.
+#[test]
+fn staleness_filter_runs_after_the_merge() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+        let store = Arc::new(MemoryStore::new());
+        // priority (0,1,0): the real sample, written first.
+        let real = write_segment_prov(
+            &store,
+            0,
+            0,
+            1,
+            0,
+            0,
+            100,
+            &[SeriesDesc {
+                metric: "d".to_string(),
+                samples: vec![(2 * NS, 5.0f64.to_bits())],
+            }],
+        )
+        .await;
+        // priority (0,1,1): the marker, written later, so it wins the merge at
+        // the shared timestamp 2*NS.
+        let marker = write_segment_prov(
+            &store,
+            1,
+            0,
+            1,
+            1,
+            0,
+            100,
+            &[SeriesDesc {
+                metric: "d".to_string(),
+                samples: vec![(2 * NS, STALE_NAN_BITS)],
+            }],
+        )
+        .await;
+        let segments = vec![real, marker];
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+        let response = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: false,
+                    want_max: false,
+                    reduce_start_ns: Some(NS),
+                    reduce_end_ns: Some(3 * NS),
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds to a pushdown request");
+        server.abort();
+
+        assert_eq!(response.status, pb::status::Code::Ok);
+        let got = partials_by_metric(&response.partials);
+        let d = got.get("d").expect("a partial for the merged series");
+        assert_eq!(
+            d.count,
+            Some(0),
+            "the marker wins the merge at 2*NS, so the post-merge staleness \
+             filter must leave nothing to count; a pre-merge filter would let \
+             the losing real value (5.0) take the slot instead"
+        );
+    });
+}
+
 /// ADR-0103 amendment F1: a slice that spends real fetch cost before refusing a
 /// pushdown over native-histogram data must report that cost, not lose it. The
 /// native-histogram refusal now returns an `Unsupported` terminal summary
