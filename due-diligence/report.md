@@ -43,7 +43,23 @@ The load-bearing design choices: object storage is used as the coordination laye
 
 ## 4. The strongest parts of the design
 
-NOT YET WRITTEN.
+These are merits established by code and executed tests, not by documentation volume.
+
+1. The acknowledgement point is honest, and everything downstream is built to keep it honest. The strict ack fires only after two conditional PUTs (content-addressed data object, create-if-absent commit record), identity is pinned before the first byte leaves the process, retries are idempotent by construction, and a same-key-different-content collision is a fatal SplitBrain rather than a silent overwrite. Two investigators independently reconstructed the same state machine from code, and the ambiguous cases (applied-but-response-lost on both PUTs) are exercised by fault-injection tests that assert the fault fired. Most systems document a durability story; this one made the ambiguous-response cases unit-testable.
+
+2. Overlap harmlessness as the compaction safety argument. Compaction never dedups; queries always dedup under one deterministic total order (last-writer by (created_unix_ns, epoch, seq, page index), then value bit pattern). Therefore any snapshot containing an L0 input, its L1 replacement, or both yields identical results, and compaction needs no locks, no fencing, and no reader coordination. The correctness burden moves to one place (the dedup order), which is shared bit-for-bit across PromQL, SQL, and the distributed protocol (which ships per-sample provenance on the wire specifically to preserve it). This is a genuinely elegant load-bearing invariant, in the engineering sense: it converts a family of race conditions into one testable function.
+
+3. Deletion is uniformly three-phase with a durable, deployment-wide horizon contract. Every deletion family (compaction supersession, age retention, orphan GC, GDPR erasure, idempotency markers) writes a durable record first, excludes logically second, sweeps physically third. The protection horizon is not a per-process flag: it lives in a CAS'd `sys/gc` object, is validated at write time, and is re-asserted at maintain startup against the running sweeper's own clock-skew declaration, so a skew-uncovered horizon can neither be written nor run against. The fail-closed asymmetries are consistently in the safe direction (an unreadable catalog HEAD blocks retention; an absent one proceeds).
+
+4. Optimizations are constrained to widen, never narrow. Catalog snapshots, the metric-name index, pruning, and caches all follow one rule: a failure or staleness anywhere degrades to more listing and more reading, never to missing data. The one place this rule is violated (the fold's bounded reconcile window interacting with the superseded-input sweep, finding R2) is visible precisely because the rest of the system holds the rule.
+
+5. Event time is never trusted for discovery. Commit records bucket by ingest hour; admission enforces skew bounds (+10 m future, -2 h lag) that are exactly what make the catalog's listing window sound; a broken receiver clock fails loudly (compiled floor, 503) rather than acking data into an unreachable bucket. The coupling between the admission bound and the listing window, the classic silent-loss trap in event-time systems, is documented as a paired-config discipline and asserted at startup where copies exist.
+
+6. Verification culture matches the ambition. The consistency document opens with "tests in tests/failure/ assert every claim here" and this is largely true: a crash matrix as executable tests, a FaultStore that injects by operation kind and occurrence with asserted counters, MemoryStore as a semantics oracle with pagination stress, golden-byte suites per format, mutation fuzzing, a PromQL differential suite against a real pinned Prometheus binary (executed in this review: 91/91), an SQL differential against an independent oracle, and a seeded whole-system simulation checking durability/visibility/conservation invariants per cycle. The conformance tables in the docs are generated from the differential runs, so the documented compatibility gaps are measured, not claimed.
+
+7. Multi-tenancy and admission are structural, not bolted on. Tenant identity flows from a durable hash-scheme marker; object keys, catalogs, caches, admission, and metrics are all tenant-hash-scoped; per-tenant SSE-KMS and legal holds exist; and the admission layering (body cap, byte-rate bucket, structural caps, series caps) is ordered before expensive work. (Depth of the security review is in section 15.)
+
+What keeps these merits from summing to "production ready" is not their quality but their youth: single-version formats pre-release, thin store qualification against non-AWS backends, the fold-window defect family, and the operational surface a section-17/22 reader will find still maturing.
 
 ## 5. Top findings and blockers
 
