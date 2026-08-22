@@ -2340,6 +2340,237 @@ mod tests {
         ));
     }
 
+    // --- #367 / ADR-0098: label bytes are unchanged by the per-scope hoist ---
+
+    /// The label pairs a `LabelSet` carries, in its stored (sorted-by-name)
+    /// order, as owned `(name, value)` tuples for byte-exact comparison.
+    fn label_pairs(ls: &LabelSet) -> Vec<(String, String)> {
+        ls.iter()
+            .map(|l| (l.name.clone(), l.value.clone()))
+            .collect()
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Differential test: for a batch that exercises every case where the
+    /// per-scope hoist (`SeriesIdMemo::series_id_for_attributes`, ADR-0098
+    /// decision 2) could silently re-identify a series, the emitted label sets
+    /// must be byte-identical to the values pinned here, and the
+    /// sanitization-collision rejections must be exactly as pinned. This is the
+    /// primary #367 deliverable: proof that hoisting the resource/metric prefix
+    /// out of the per-datapoint path changed no emitted byte.
+    ///
+    /// Cases covered in one batch: multiple resources; multiple metrics per
+    /// resource; multiple points per metric (memo hits, which must share one
+    /// `Arc` and yield the same id and bytes); attributes that need
+    /// sanitization; two distinct attributes that sanitize to the same name
+    /// (collision); an attribute that collides with `__name__`; an empty
+    /// attribute set; and a duplicate attribute key. The exponential-histogram
+    /// metric exercises the sibling native-histogram build path
+    /// (`build_native_histogram_point`), which duplicates the prefix logic and
+    /// must produce the identical resource-plus-attribute bytes.
+    #[test]
+    fn normalize_label_bytes_stable_across_hard_cases() {
+        // host.name is in the default resource-attribute allowlist.
+        let limits = IngestLimits::default();
+
+        // Resource 1: job=svc1 (from service.name), host_name=h1 (allowlist).
+        let rm1 = resource_metrics(
+            vec![
+                string_kv("service.name", "svc1"),
+                string_kv("host.name", "h1"),
+            ],
+            vec![
+                // Two identical points (memo hits) plus one empty-attribute
+                // point. Metric name carries a dot, sanitized to http_requests.
+                gauge_metric(
+                    "http.requests",
+                    vec![
+                        number_point(
+                            vec![string_kv("http.method", "GET"), int_kv("code", 200)],
+                            1_000,
+                            NumberValue::AsDouble(1.0),
+                        ),
+                        number_point(
+                            vec![string_kv("http.method", "GET"), int_kv("code", 200)],
+                            1_001,
+                            NumberValue::AsDouble(2.0),
+                        ),
+                        number_point(vec![], 1_002, NumberValue::AsDouble(3.0)),
+                    ],
+                ),
+                gauge_metric(
+                    "cpu",
+                    vec![number_point(
+                        vec![int_kv("core", 0)],
+                        1_003,
+                        NumberValue::AsDouble(4.0),
+                    )],
+                ),
+                // Native-histogram sibling of the prefix logic, same attrs as
+                // the http.requests points.
+                exponential_histogram_metric(
+                    "exp.latency",
+                    vec![ExponentialHistogramDataPoint {
+                        attributes: vec![string_kv("http.method", "GET"), int_kv("code", 200)],
+                        time_unix_nano: 1_004,
+                        ..Default::default()
+                    }],
+                    AggregationTemporality::Cumulative,
+                ),
+                // Two attributes sanitizing to the same name: collision.
+                gauge_metric(
+                    "collide_sanitize",
+                    vec![number_point(
+                        vec![string_kv("foo.bar", "1"), string_kv("foo-bar", "2")],
+                        1_005,
+                        NumberValue::AsDouble(5.0),
+                    )],
+                ),
+                // An attribute whose name collides with the injected __name__.
+                gauge_metric(
+                    "collide_name",
+                    vec![number_point(
+                        vec![string_kv("__name__", "oops")],
+                        1_006,
+                        NumberValue::AsDouble(6.0),
+                    )],
+                ),
+                // A duplicate attribute key.
+                gauge_metric(
+                    "collide_dupkey",
+                    vec![number_point(
+                        vec![string_kv("dup", "1"), string_kv("dup", "2")],
+                        1_007,
+                        NumberValue::AsDouble(7.0),
+                    )],
+                ),
+            ],
+        );
+
+        // Resource 2: same metric name and same attrs as resource 1's first
+        // point, but job=svc2 and no host_name. Must be a DIFFERENT series.
+        let rm2 = resource_metrics(
+            vec![string_kv("service.name", "svc2")],
+            vec![gauge_metric(
+                "http.requests",
+                vec![number_point(
+                    vec![string_kv("http.method", "GET"), int_kv("code", 200)],
+                    1_008,
+                    NumberValue::AsDouble(8.0),
+                )],
+            )],
+        );
+
+        let out = normalize_metrics(&tenant(), request(vec![rm1, rm2]), &limits, 1_000);
+
+        // Accepted scalar points, in emission order.
+        assert_eq!(out.points.len(), 5, "unexpected accepted points");
+        let a = pairs(&[
+            ("__name__", "http_requests"),
+            ("code", "200"),
+            ("host_name", "h1"),
+            ("http_method", "GET"),
+            ("job", "svc1"),
+        ]);
+        let c = pairs(&[
+            ("__name__", "http_requests"),
+            ("host_name", "h1"),
+            ("job", "svc1"),
+        ]);
+        let cpu = pairs(&[
+            ("__name__", "cpu"),
+            ("core", "0"),
+            ("host_name", "h1"),
+            ("job", "svc1"),
+        ]);
+        let r2 = pairs(&[
+            ("__name__", "http_requests"),
+            ("code", "200"),
+            ("http_method", "GET"),
+            ("job", "svc2"),
+        ]);
+        assert_eq!(label_pairs(&out.points[0].labels), a, "point A bytes");
+        assert_eq!(
+            label_pairs(&out.points[1].labels),
+            a,
+            "point B (memo hit) bytes"
+        );
+        assert_eq!(
+            label_pairs(&out.points[2].labels),
+            c,
+            "empty-attr point bytes"
+        );
+        assert_eq!(label_pairs(&out.points[3].labels), cpu, "cpu point bytes");
+        assert_eq!(
+            label_pairs(&out.points[4].labels),
+            r2,
+            "resource-2 point bytes"
+        );
+
+        // Memo hit shares one allocation and yields the same id.
+        assert_eq!(
+            out.points[0].series_id, out.points[1].series_id,
+            "two identical points must resolve to one series"
+        );
+        assert!(
+            Arc::ptr_eq(&out.points[0].labels, &out.points[1].labels),
+            "a memo hit must share the cached Arc<LabelSet>, not rebuild it"
+        );
+        // Distinct scopes are distinct series despite the shared metric name.
+        assert_ne!(
+            out.points[0].series_id, out.points[3].series_id,
+            "different metric must be a different series"
+        );
+        assert_ne!(
+            out.points[0].series_id, out.points[4].series_id,
+            "same metric+attrs under a different resource must be a different series"
+        );
+
+        // Native-histogram build path produces the identical prefix bytes.
+        assert_eq!(out.histogram_points.len(), 1, "one native-histogram point");
+        let exp = pairs(&[
+            ("__name__", "exp_latency"),
+            ("code", "200"),
+            ("host_name", "h1"),
+            ("http_method", "GET"),
+            ("job", "svc1"),
+        ]);
+        assert_eq!(
+            label_pairs(&out.histogram_points[0].labels),
+            exp,
+            "native-histogram label bytes"
+        );
+
+        // Sanitization collisions reject wholesale, with the pinned names, and
+        // the collision winner is stable (the injected __name__ is never
+        // displaced by a colliding attribute).
+        let dup_names: Vec<&str> = out
+            .rejected
+            .iter()
+            .filter_map(|r| match r {
+                Rejection::DuplicateLabelName(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dup_names,
+            vec!["foo_bar", "__name__", "dup"],
+            "collision rejections must be exactly these names, in this order"
+        );
+        assert_eq!(
+            out.rejected.len(),
+            3,
+            "only the three collisions reject: {:?}",
+            out.rejected
+        );
+    }
+
     // --- int and double points ---
 
     #[test]
