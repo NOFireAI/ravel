@@ -16,7 +16,30 @@ Method: twelve independent specialist investigations (agents A through L, memos 
 
 ## 3. Architecture in one page
 
-NOT YET WRITTEN.
+Ravel is a multi-tenant telemetry database (metrics, logs, spans, alert records) whose only durable state is an S3-compatible bucket. Every process (`ravel-server` in `all`, `gateway`, `query`, or `maintain` mode) is disposable: it holds caches and in-flight buffers, never state whose loss changes acknowledged durability. Ingest accepts OTLP (gRPC and HTTP), OTLP-Arrow, and Prometheus Remote Write 1.0/2.0. A gateway authenticates and resolves the tenant, admission-limits the request, and routes points by `hash(tenant, series_id) % shard_count` to single-threaded shard actors with bounded queues. Each actor buffers up to a flush budget (default 2 s), builds an immutable segment (RSEG for metrics, RLOG for logs, RSPAN for spans), and publishes it with a two-object protocol: data PUT, then a commit-record PUT with create-if-absent semantics. In strict mode (default) the client is acknowledged only after the commit PUT succeeds, and receives commit tokens for read-your-write.
+
+Readers discover data through the commit records, never data objects: a query LISTs commit records per shard and ingest hour for the recent window, and reads folded catalog snapshot parts (behind a CAS'd HEAD pointer) for sealed history. A query resolves one pinned snapshot and uses it for its whole execution. Duplicate samples across segments are resolved at query time by a deterministic total order, which is what makes compaction (L0 to L1, publish-then-supersede with a conservation gate) safe to run concurrently with reads: an L0 input and its L1 replacement can both appear in a snapshot and yield the same answer. Deletion is three-phase everywhere: a durable record first (compaction record, retention tombstone, erasure request), logical exclusion from new snapshots second, physical sweeping third, gated by a protection horizon that budgets query duration, grace, and clock skew, all pinned in a durable `sys/gc` config object.
+
+Query surfaces: PromQL (own evaluator, Prometheus HTTP API shape), SQL over DataFusion (cargo feature `sql`), Flight SQL (feature `flight-sql`), an analytics stage, and alert evaluation that stores alert state as ordinary durable records, not process memory. Distributed query is opt-in and cost-gated: workers self-register via heartbeat objects in the bucket, coordinators rendezvous-hash slices to peers, and cross-cluster federation reaches remote clusters only through their public API with separate credentials. A Kubernetes operator (`ravel-operator`) and an ingest affinity router (`ravel-ingest-router`) round out the services.
+
+```mermaid
+flowchart TD
+    C[OTLP gRPC/HTTP, OTLP-Arrow, Remote Write 1.0/2.0] --> GW[Gateway: auth, tenant resolve, admission limits]
+    GW --> RT["Router: hash(tenant, series_id) % shards"]
+    RT --> SA[Shard actors: bounded mpsc, buffer, build immutable segment]
+    SA -->|1. data PUT| S3[(S3 bucket: the only durable state)]
+    SA -->|2. commit PUT, create-if-absent| S3
+    SA -->|strict ack + commit tokens| C
+    S3 --> CAT[Catalog: LIST commit records open hours + folded snapshot parts behind CAS HEAD]
+    CAT --> QF["Query frontend: /api/v1/query*, SQL, Flight SQL"]
+    QF --> RD[Segment reader: footer suffix GET, prune, ranged page GETs]
+    RD --> EV[PromQL evaluator / DataFusion pipeline, query-time dedup]
+    MW[Maintain mode: compaction L0-L1, retention, GC sweeper, erasure rewrite] --> S3
+    MW -->|publish-then-supersede, horizon-gated deletes| S3
+    QW[Peer query workers: heartbeat keys in bucket, rendezvous-hashed slices] <-->|SeriesFetch gRPC, fragment token| QF
+```
+
+The load-bearing design choices: object storage is used as the coordination layer (create-if-absent for commit atomicity and compaction races, CAS for catalog HEAD, heartbeat objects for membership); correctness never depends on LIST ordering, only on LIST completeness over bounded windows; event time is never trusted for discovery (commit records bucket by ingest hour, with admission-enforced skew bounds that make listing windows sound); and every optimization (catalog snapshots, indexes, caches, pruning) is constrained to widen, never narrow, the read set, with fail-closed degradation to plain listing.
 
 ## 4. The strongest parts of the design
 

@@ -37,3 +37,16 @@ cargo-nextest present; cargo-deny absent; cargo-audit absent   # exit 0 for next
 $ cargo metadata --format-version 1 > /tmp/cargo-metadata.json
 exit 0
 ```
+
+## Build and lint gates
+
+```
+$ cargo fmt --all --check
+exit 0 (clean)
+$ cargo tree -d > /tmp/cargo-tree-d.log
+exit 0; 1760 lines of duplicate-version output (analyzed under supply chain)
+$ timeout 10 docker info; kind version; kubectl version --client
+docker exit 0 (available); kind exit 127 (absent); kubectl exit 127 (absent)
+$ cargo clippy --workspace --all-targets --jobs 4 -- -D warnings
+exit 0 (clean), 2m59s wall. Decisive line: "Finished `dev` profile ... in 2m 59s", no warnings.
+```
