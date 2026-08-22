@@ -29,21 +29,85 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, BooleanArray, DictionaryArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Int32Type};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::scalar::ScalarValue;
 
 /// The name of the `has_word(text, 'word') -> Boolean` UDF.
 pub const HAS_WORD_UDF: &str = "has_word";
 
+/// The `has_word` scalar UDF implementation.
+///
+/// The text argument is either a fixed `Utf8` column (`body`, `severity_text`)
+/// or a declared `Str` column, which arrives `Dictionary(Int32, Utf8)`
+/// (ADR-0099 decision 5). An exact `create_udf([Utf8, Utf8])` signature would
+/// make DataFusion coerce a dictionary argument to `Utf8`, inserting
+/// `CAST(col AS Utf8)` ahead of the call: the dictionary would be hydrated back
+/// to one value per row before the UDF ran, the dictionary arm of
+/// [`has_word_impl`] would be unreachable, and `has_word` over a declared column
+/// would be *slower* than the plain `Utf8` column it replaced. A user-defined
+/// signature that returns its argument types unchanged (see [`Self::coerce_types`])
+/// keeps the dictionary intact into the evaluator, so it is matched once per
+/// distinct value; #479's LIKE pushdown builds on exactly this shape.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct HasWordUdf {
+    signature: Signature,
+}
+
+impl HasWordUdf {
+    fn new() -> Self {
+        HasWordUdf {
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for HasWordUdf {
+    fn name(&self) -> &str {
+        HAS_WORD_UDF
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    /// Accept the argument types as given, so the text argument stays `Utf8` or
+    /// `Dictionary(Int32, Utf8)` and no coercing `CAST` is inserted over a
+    /// declared `Str` column. Reject any other first-argument type at planning
+    /// rather than letting it reach the evaluator, where it would be a runtime
+    /// downcast failure.
+    fn coerce_types(&self, arg_types: &[DataType]) -> DFResult<Vec<DataType>> {
+        if arg_types.len() != 2 {
+            return Err(DataFusionError::Plan(format!(
+                "has_word() expects 2 arguments, got {}",
+                arg_types.len()
+            )));
+        }
+        let text_ok = matches!(arg_types[0], DataType::Utf8)
+            || matches!(&arg_types[0], DataType::Dictionary(k, v)
+                if **k == DataType::Int32 && **v == DataType::Utf8);
+        if !text_ok {
+            return Err(DataFusionError::Plan(format!(
+                "has_word() first argument must be a Utf8 or Dictionary(Int32, Utf8) column, got {}",
+                arg_types[0]
+            )));
+        }
+        Ok(arg_types.to_vec())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        has_word_impl(&args.args)
+    }
+}
+
 /// Build the `has_word` scalar UDF: `has_word(text, word) -> Boolean`.
 pub fn has_word_udf() -> ScalarUDF {
-    create_udf(
-        HAS_WORD_UDF,
-        vec![DataType::Utf8, DataType::Utf8],
-        DataType::Boolean,
-        Volatility::Immutable,
-        Arc::new(has_word_impl),
-    )
+    ScalarUDF::new_from_impl(HasWordUdf::new())
 }
 
 /// Forwards to `ravel_logseg::reader::phrase_match`, the same function
@@ -100,20 +164,30 @@ pub(crate) fn has_word_impl(args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
             .map(|k| !values.is_null(k) && phrase_match(values.value(k), &word))
             .collect();
         let keys = dict.keys();
-        let out: BooleanArray = (0..dict.len())
-            .map(|i| {
-                if dict.is_null(i) {
-                    Some(false)
-                } else {
-                    let matched = usize::try_from(keys.value(i))
-                        .ok()
-                        .and_then(|k| per_value.get(k).copied())
-                        .unwrap_or(false);
-                    Some(matched)
-                }
-            })
-            .collect();
-        return Ok(ColumnarValue::Array(Arc::new(out)));
+        let mut out: Vec<Option<bool>> = Vec::with_capacity(dict.len());
+        for i in 0..dict.len() {
+            if dict.is_null(i) {
+                out.push(Some(false));
+                continue;
+            }
+            // A key that does not resolve to a distinct value is a corrupt
+            // column, not a non-match: default `false` would serve a
+            // silently-wrong answer on a read path (this crate's rule is exact
+            // semantics by default). Mirror `output.rs`'s `resolve_key`, which
+            // errors on the identical shape.
+            let key = keys.value(i);
+            let idx = usize::try_from(key).map_err(|_| {
+                DataFusionError::Execution(format!("has_word() negative dictionary key {key}"))
+            })?;
+            let matched = *per_value.get(idx).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "has_word() dictionary key {idx} out of range for {} values",
+                    per_value.len()
+                ))
+            })?;
+            out.push(Some(matched));
+        }
+        return Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out))));
     }
     Err(DataFusionError::Execution(
         "has_word() first argument must be a Utf8 or Dictionary(Int32, Utf8) column".into(),

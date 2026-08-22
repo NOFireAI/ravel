@@ -322,7 +322,11 @@ attribute columns*: an attribute key promoted to a native `Int64`, `Boolean`,
 exactly after the key, so a typed comparison or aggregate over it needs no
 `CAST` over the stringified map. A declared `str` column is dictionary-encoded,
 and stays a dictionary over the Flight SQL wire (it is not hydrated back to
-plain `Utf8`); HTTP JSON and Arrow IPC render it exactly as a plain string
+plain `Utf8`). Over HTTP JSON the row *values* are unchanged (a string per row,
+`null` for an absent or type-mismatched cell), but the response envelope's
+declared `columns[].type` reports `Dictionary(Int32, Utf8)` instead of `Utf8`;
+over Arrow IPC the schema and every batch column carry the dictionary type
+verbatim. Both are client-visible changes from the pre-declaration plain `Utf8`
 column. Declared keys still appear in `attrs`. A declaration comes from the server's
 `--typed-attr-column` flags or from the durable per-tenant override written by
 `ravel-cli typed-attr-column set`, and a query process picks a durable change

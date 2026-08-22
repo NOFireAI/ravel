@@ -6,7 +6,8 @@
 //! stringified value and no typed comparison is possible at all. ADR-0090 lets
 //! an operator *declare* a per-tenant set of attribute keys as native typed
 //! columns, appended after `attrs`, so the same value reads back as a real
-//! `Int64`/`Boolean`/`Utf8`/`Binary` Arrow column.
+//! `Int64`/`Boolean`/`Binary` Arrow column, or, for a `Str` column,
+//! `Dictionary(Int32, Utf8)` (ADR-0099 decision 5).
 //!
 //! This module owns the query-side contract only: the [`DeclaredColumnSource`]
 //! trait a plan resolves its declared columns from (ADR-0090 decision 2), the
@@ -38,7 +39,10 @@ use ravel_types::TenantHash;
 /// the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclaredType {
-    /// A `Str`-typed attribute, projected as Arrow `Utf8`.
+    /// A `Str`-typed attribute, projected as Arrow `Dictionary(Int32, Utf8)`
+    /// (ADR-0099 decision 5): a dict-encoded page becomes the Arrow dictionary
+    /// and its ids with no per-row allocation, and a plain page a degenerate
+    /// identity dictionary, so both paths build the one schema DataFusion checks.
     Str,
     /// An `I64`-typed attribute, projected as Arrow `Int64`.
     I64,

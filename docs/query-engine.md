@@ -1167,9 +1167,15 @@ page becomes a degenerate identity dictionary, and the row fallback path builds
 the same dictionary type so every batch validates against the one schema
 DataFusion checks. The public Flight statement stream sets
 `DictionaryHandling::Resend`, so the column stays a dictionary on the wire
-rather than being hydrated back to plain `Utf8`; HTTP JSON and Arrow IPC render
-it identically to the pre-dictionary form. `f64` is deferred (a declared float
-aggregate is
+rather than being hydrated back to plain `Utf8`. Over HTTP JSON the row *values*
+are identical to the pre-dictionary form (`output.rs` unwraps the
+`Dictionary(Int32, _)` cell and recurses to a string per row), but the JSON
+envelope's declared `columns[].type` changes from `Utf8` to
+`Dictionary(Int32, Utf8)`, and the Arrow IPC schema and batch columns carry the
+dictionary type verbatim (`to_arrow_ipc` hands the schema and batches to the
+writer unchanged). Both are client-visible: a consumer reading the reported
+column type or the IPC schema must expect the dictionary type. `f64` is deferred
+(a declared float aggregate is
 order-sensitive under ADR-0013/ADR-0022, which #277 decides), and so are date
 and timestamp (they need a lifting rule from `i64` storage plus a declared
 unit); the four shipped types all aggregate exactly under any partitioning.
@@ -1207,6 +1213,19 @@ pages it needs. The practical consequence: moving an equality predicate from
 `attrs['k'] = 'v'` (which prunes blocks through POSTINGS) to a declared
 `k = 'v'` makes it slower until #278 lands. Declare for typed comparisons and
 aggregates, which the map cannot express at all.
+
+There is also a wire-size trade for a *high-cardinality* `str` column. ADR-0099
+decision 5's "leaves that case exactly as expensive as it is today" is a
+statement about CPU, not egress: a plain (all-distinct) page becomes a
+degenerate identity `Dictionary(Int32, Utf8)`, and with `DictionaryHandling::Resend`
+that dictionary is sent as its values *plus* a 4-byte `Int32` key per row, and
+re-emitted for every batch a block larger than the batch size splits into. For a
+column whose values barely repeat, that is larger on the wire than the old plain
+`Utf8` column, which sent each value once with no key. Declaring a
+high-cardinality attribute (a URL, a request id) as `str` is therefore a
+CPU-neutral but egress-heavier choice; it is the low-cardinality case (a status,
+a region) where the dictionary both saves allocation and shrinks the wire. This
+is a known trade, not a regression to fix here.
 
 ### Scan execution: streaming and column projection (ADR-0087)
 

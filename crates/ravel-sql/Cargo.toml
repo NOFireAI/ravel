@@ -193,6 +193,12 @@ stats_alloc = "0.1.10"
 # the writer's sections around ravel-logseg's own encoders, which means stamping
 # the section table's checksums. Same workspace pin ravel-logseg itself uses.
 crc32c = { workspace = true }
+# Dev-only: tests/logs_columnar.rs asserts a declared `Str` fixture's value set
+# actually encodes as `Enc::Dict`/`Enc::Plain` (the codec function the RLOG
+# writer stages a dynamic string column with), so a shift in the distinct-ratio
+# heuristic fails the dict-page tests loudly instead of silently. Already a
+# workspace pin (ravel-logseg depends on it); no new supply-chain surface.
+ravel-codec = { workspace = true }
 
 [[bench]]
 name = "samples_scan"

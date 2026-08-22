@@ -476,9 +476,13 @@ attribute is a `CAST(attrs['k'] AS ...)` over a stringified value. An operator
 after `attrs` in declaration order, and the same value then reads back as a
 real `Int64`/`Boolean`/`Dictionary(Int32, Utf8)` (for a `str` column)/`Binary`
 Arrow column. A declared `str` column is dictionary-encoded and stays a
-dictionary over the Flight SQL wire; HTTP JSON and Arrow IPC render it as a
-plain string. A declared key still appears in `attrs` as well, so no existing
-query breaks.
+dictionary over the Flight SQL wire. HTTP JSON row values are unchanged (a
+string per row), but the JSON envelope's declared `columns[].type` reads
+`Dictionary(Int32, Utf8)` rather than `Utf8`, and the Arrow IPC schema and
+batch columns carry the dictionary type verbatim -- both client-visible changes
+from the plain `Utf8` column a consumer must expect. A declared key still
+appears in `attrs` as well, so a `SELECT attrs` or `SELECT *` query keeps
+working.
 
 Two ways to declare, one resolution:
 

@@ -32,7 +32,7 @@ use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
-use datafusion::physical_plan::collect;
+use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::{SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
@@ -42,7 +42,7 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::LogSegmentFetcher;
-use ravel_sql::{LogsTableProvider, has_word_udf};
+use ravel_sql::{DeclaredColumn, DeclaredType, LogsTableProvider, has_word_udf};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use uuid::Uuid;
@@ -941,5 +941,100 @@ async fn referencing_attrs_decodes_every_dynamic_column() {
         skipped,
         5 * blocks,
         "referencing attrs must skip only the unprojected fixed columns"
+    );
+}
+
+/// ADR-0099 decision 5 types a declared `Str` column `Dictionary(Int32, Utf8)`.
+/// `has_word` must reach that dictionary column with NO materializing cast: an
+/// exact `create_udf([Utf8, Utf8])` signature makes DataFusion insert
+/// `CAST(name AS Utf8)` over the dictionary argument, which both hydrates the
+/// column back to one value per row (defeating the per-distinct-value shape
+/// #479 builds on) and leaves the dictionary arm of `has_word_impl` unreachable
+/// by any plan. This asserts the optimized physical plan carries no `CAST`, and
+/// that the query still returns exactly the matching rows -- so the dictionary
+/// arm actually executes end to end, which a direct `has_word_impl` unit call
+/// cannot prove.
+#[tokio::test]
+async fn has_word_over_declared_str_column_has_no_cast_and_returns_exact_rows() {
+    let store = MemoryStore::new();
+    // Low-cardinality declared `name` values so the page is a dict page, the
+    // shape decision 5 targets. `name` matches "timeout" on the even rows.
+    let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+    let records: Vec<LogRecord> = (0..6)
+        .map(|i| {
+            let name = if i % 2 == 0 {
+                "connection timeout"
+            } else {
+                "ok"
+            };
+            record_with_resource_and_attrs(
+                &resource,
+                i,
+                "b",
+                &[("name".to_string(), AttrValue::Str(name.to_string()))],
+            )
+        })
+        .collect();
+    let seg = write_object(&store, "logs/declared.rlog", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = LogSegmentFetcher::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        QueryAccounting::new(),
+    )
+    .with_declared_columns(vec![DeclaredColumn::new("name", DeclaredType::Str)]);
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(has_word_udf());
+    ctx.register_table("logs", Arc::new(provider))
+        .expect("register table");
+    let df = ctx
+        .table("logs")
+        .await
+        .expect("table")
+        .filter(has_word_udf().call(vec![col("name"), lit("timeout")]))
+        .expect("filter");
+    let plan = df.create_physical_plan().await.expect("physical plan");
+
+    // The only expression in the plan is the `has_word` residual over the
+    // declared column; a `CAST` anywhere is the coercion the exact signature
+    // would have inserted over the dictionary argument.
+    let text = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        !text.contains("CAST"),
+        "has_word must take the dictionary column with no coercing CAST; plan was:\n{text}"
+    );
+    assert!(
+        text.contains("has_word(name@"),
+        "has_word's first argument must be the bare declared column, not a CAST; \
+         plan was:\n{text}"
+    );
+
+    // End to end: the dictionary arm evaluates and returns exactly the even
+    // rows, whose declared `name` token-contains "timeout".
+    let batches = collect_plan(plan).await;
+    let mut got = BTreeSet::new();
+    for batch in &batches {
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("ts col");
+        for i in 0..batch.num_rows() {
+            got.insert(ts.value(i));
+        }
+    }
+    assert_eq!(
+        got,
+        BTreeSet::from([0i64, 2, 4]),
+        "has_word over the declared dictionary column must match exactly the \
+         'connection timeout' rows"
     );
 }

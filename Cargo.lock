@@ -5120,6 +5120,7 @@ dependencies = [
  "ravel-alerting",
  "ravel-cache",
  "ravel-catalog",
+ "ravel-codec",
  "ravel-commit",
  "ravel-logseg",
  "ravel-maintain",
