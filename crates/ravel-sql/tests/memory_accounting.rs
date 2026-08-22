@@ -330,10 +330,14 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
 // The tests above all drive the `samples` (metrics) scan, whose reservation
 // holds decoded SoA plus one row-built batch. They never touch the `logs` scan,
 // so before this section the return-to-zero property was unproven for what the
-// columnar fast path holds instead: a block's *pre-built* `RecordBatch`es
+// columnar fast path holds instead: the decoded block still resident behind the
+// view plus that block's *pre-built* `RecordBatch`es
 // (`hold_batches`/`emit_next_columnar_batch`), charged once and relabelled from
 // `held` to `emitted` rather than regrown. That release path is arithmetically
 // different from the row path's, and a leak in it would have shown nowhere.
+// Balance alone is not enough, though: the second test here pins the magnitude,
+// which is what catches a charge that balances but covers a fraction of what is
+// held.
 //
 // This test drives it end to end: a fixed-column `logs` query is columnar-
 // eligible, and asserting `columnar_batches > 0` proves the fast path actually
@@ -369,9 +373,32 @@ fn log_record(i: usize) -> LogRecord {
     }
 }
 
-/// Write one RLOG object of `LOG_RECORDS` records into `store` and return a
-/// snapshot over it.
-async fn write_logs(store: &Arc<dyn ObjectStoreBackend>) -> Snapshot {
+/// Records for the two-path magnitude fixture: exactly one block at RLOG's
+/// default 8192-record block target, so one block's charge *is* the peak and
+/// the two paths' peaks are directly comparable.
+const ONE_BLOCK_RECORDS: usize = 8192;
+
+/// A pending erasure whose key exists in no record of this fixture. Any pending
+/// erasure makes a scan columnar-ineligible (ADR-0099 decision 2), so this
+/// drains the row path over the identical projection while erasing nothing --
+/// same data, same rows, same output, only the path differs.
+fn no_match_erasure() -> Vec<ravel_proto::commit::v1::ErasureRequest> {
+    vec![ravel_proto::commit::v1::ErasureRequest {
+        predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: "__does_not_exist__".to_string(),
+            value: "__nope__".to_string(),
+        }],
+        ..Default::default()
+    }]
+}
+
+/// Write one RLOG object of `records` records into `store` and return a
+/// snapshot over it, carrying `erasure` as the snapshot's pending erasure.
+async fn write_logs(
+    store: &Arc<dyn ObjectStoreBackend>,
+    records: usize,
+    erasure: Vec<ravel_proto::commit::v1::ErasureRequest>,
+) -> Snapshot {
     let identity = ObjectIdentity {
         tenant_hash: [7u8; 16],
         shard: 0,
@@ -380,7 +407,7 @@ async fn write_logs(store: &Arc<dyn ObjectStoreBackend>) -> Snapshot {
         writer_seq: 1,
     };
     let mut w = RlogWriter::new(RlogConfig::default(), identity);
-    for i in 0..LOG_RECORDS {
+    for i in 0..records {
         w.push(log_record(i)).expect("push");
     }
     let bytes = w.finish().expect("finish");
@@ -395,9 +422,9 @@ async fn write_logs(store: &Arc<dyn ObjectStoreBackend>) -> Snapshot {
             data_object_key: key.to_string(),
             object_size: size,
             min_event_ts_ns: 0,
-            max_event_ts_ns: (LOG_RECORDS - 1) as i64,
+            max_event_ts_ns: records.saturating_sub(1) as i64,
             ingest_hour_bucket: 0,
-            sample_count: LOG_RECORDS as u64,
+            sample_count: records as u64,
             series_count: 0,
             shard: 0,
             content_hash: [0u8; 32],
@@ -408,7 +435,7 @@ async fn write_logs(store: &Arc<dyn ObjectStoreBackend>) -> Snapshot {
             level: SegmentLevel::L0,
         }],
         segments_pruned: 0,
-        pending_erasure: Vec::new(),
+        pending_erasure: erasure,
     }
 }
 
@@ -426,19 +453,24 @@ fn find_logs_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan
 /// `LogsScanExec` leaf that prove which batch-building path ran.
 struct LogsDrain {
     batches: usize,
+    rows: usize,
     peak: usize,
     columnar: usize,
     rowpath: usize,
 }
 
-/// Drain one `logs` query through a pool the test owns.
+/// Drain one `logs` query over a fixture of `records` records through a pool the
+/// test owns, with `erasure` as the snapshot's pending erasure (empty leaves the
+/// query columnar-eligible).
 async fn drain_logs(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &TenantId,
     pool: Arc<dyn MemoryPool>,
     sql: &str,
+    records: usize,
+    erasure: Vec<ravel_proto::commit::v1::ErasureRequest>,
 ) -> LogsDrain {
-    let snapshot = write_logs(&store).await;
+    let snapshot = write_logs(&store, records, erasure).await;
     let provider = Arc::new(LogsTableProvider::new(
         snapshot,
         tenant.hash(),
@@ -464,10 +496,12 @@ async fn drain_logs(
     let mut stream = execute_stream(Arc::clone(&plan), ctx.task_ctx()).expect("execute");
 
     let mut batches = 0usize;
+    let mut rows = 0usize;
     let mut peak = 0usize;
     while let Some(next) = stream.next().await {
-        let _batch = next.expect("batch");
+        let batch = next.expect("batch");
         batches += 1;
+        rows += batch.num_rows();
         peak = peak.max(pool.reserved());
     }
     drop(stream);
@@ -476,6 +510,7 @@ async fn drain_logs(
     let count = |name: &str| metrics.sum_by_name(name).map(|v| v.as_usize()).unwrap_or(0);
     LogsDrain {
         batches,
+        rows,
         peak,
         columnar: count("columnar_batches"),
         rowpath: count("rowpath_batches"),
@@ -489,11 +524,13 @@ async fn drain_logs(
 /// `repeated_multi_batch_queries_do_not_accumulate_tenant_bytes` uses for the
 /// metrics scan).
 ///
-/// This is the return-to-zero property for what the fast path holds: a block's
-/// pre-built `RecordBatch`es (`hold_batches`/`emit_next_columnar_batch`), charged
-/// once and relabelled from `held` to `emitted`, not a `Vec<LogRecord>`. The
-/// metrics-scan tests above never touch the logs scan, so before this case that
-/// release path was unexercised here.
+/// This is the return-to-zero property for what the fast path holds: the decoded
+/// block plus its pre-built `RecordBatch`es
+/// (`hold_batches`/`emit_next_columnar_batch`), charged once together and
+/// relabelled from `held` to `emitted` batch by batch, not a `Vec<LogRecord>`.
+/// The metrics-scan tests above never touch the logs scan, so before this case
+/// that release path was unexercised here. The magnitude of that charge is the
+/// next test's job.
 ///
 /// There is deliberately no "reserved bytes grew across batches" assertion like
 /// the metrics scan's: the logs scan is block-at-a-time (ADR-0087) and releases
@@ -521,6 +558,8 @@ async fn repeated_logs_columnar_queries_return_every_reserved_byte() {
             &tenant,
             Arc::clone(&pool),
             "SELECT ts, body FROM logs",
+            LOG_RECORDS,
+            Vec::new(),
         )
         .await;
 
@@ -559,4 +598,104 @@ async fn repeated_logs_columnar_queries_return_every_reserved_byte() {
              one query's blocks would accumulate across rounds"
         );
     }
+}
+
+/// How far below the row path's peak the columnar path's peak may sit for the
+/// same data before this test calls it an undercharge.
+///
+/// The two paths hold different things, so their peaks are not equal and pinning
+/// a ratio exactly would be a change detector: the row path holds a
+/// `Vec<LogRecord>` (a per-record struct, a cloned STREAM_DIR blob and an owned
+/// `String` per record), the columnar path holds the decoded block plus the
+/// Arrow batches built from it. On this fixture the columnar peak is a little
+/// under half the row path's, so a factor of 3 leaves room in both directions
+/// while still failing the defect it exists to catch: charging the batches
+/// alone put the columnar peak at under a quarter of the row path's.
+const MAX_COLUMNAR_UNDERCHARGE: usize = 3;
+
+/// The columnar path's pool charge must be the same order of magnitude as the
+/// row path's for the same data, because it holds the same data.
+///
+/// This is the magnitude half of the fast path's accounting, which return-to-zero
+/// cannot see: a charge of one byte per block balances perfectly. The fixture is
+/// one 8192-record block and the identical projection (`ts, body`) on both runs,
+/// with the row path forced by a pending erasure that matches no record, so the
+/// two runs differ in nothing but the batch-building path. `rows` proves that.
+///
+/// The defect this catches: the columnar path holds a view *borrowing*
+/// `BlockScan`'s decoded block, which the reader releases only when the next
+/// block is decoded, so the block is resident for as long as its batches drain.
+/// Charging only the batches admitted a tenant at 24% of the row path's figure
+/// for identical data, which is what a `peak > 0` assertion cannot distinguish
+/// from a correct charge.
+#[tokio::test]
+async fn the_columnar_path_charges_the_same_order_of_bytes_as_the_row_path() {
+    let tenant = tenant_id("acme");
+    let sql = "SELECT ts, body FROM logs";
+
+    let accountant = TenantMemoryAccountant::new(1 << 30);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let (pool, _breach) =
+        SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
+    let fast = drain_logs(
+        Arc::clone(&store),
+        &tenant,
+        Arc::clone(&pool),
+        sql,
+        ONE_BLOCK_RECORDS,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "the columnar run must release its bytes"
+    );
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let (pool, _breach) =
+        SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
+    let row = drain_logs(
+        Arc::clone(&store),
+        &tenant,
+        Arc::clone(&pool),
+        sql,
+        ONE_BLOCK_RECORDS,
+        no_match_erasure(),
+    )
+    .await;
+    assert_eq!(pool.reserved(), 0, "the row run must release its bytes");
+
+    // Both runs must have taken the path this comparison names them for,
+    // otherwise the ratio below compares one path against itself.
+    assert!(
+        fast.columnar > 0 && fast.rowpath == 0,
+        "the eligible run must be columnar: columnar={}, rowpath={}",
+        fast.columnar,
+        fast.rowpath
+    );
+    assert!(
+        row.rowpath > 0 && row.columnar == 0,
+        "the erasure-forced run must be the row path: columnar={}, rowpath={}",
+        row.columnar,
+        row.rowpath
+    );
+    // Same data through both, so the peaks are comparable.
+    assert_eq!(
+        fast.rows, row.rows,
+        "the two paths must emit the same rows for the ratio to mean anything"
+    );
+    assert_eq!(fast.rows, ONE_BLOCK_RECORDS);
+    assert!(fast.peak > 0 && row.peak > 0);
+
+    assert!(
+        fast.peak * MAX_COLUMNAR_UNDERCHARGE >= row.peak,
+        "the columnar path's peak charge ({} bytes) is more than \
+         {MAX_COLUMNAR_UNDERCHARGE}x below the row path's ({} bytes) for the \
+         identical block and projection, so the pool is not bounding what the \
+         scan actually holds (ADR-0087 decision 2). The decoded block stays \
+         resident behind the view while its batches drain; charge it.",
+        fast.peak,
+        row.peak
+    );
 }
