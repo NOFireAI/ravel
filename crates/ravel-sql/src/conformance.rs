@@ -276,6 +276,22 @@ const ADMITTED_SCALAR_FAMILIES: [ScalarFamily; 6] = [
     },
 ];
 
+/// Individually-named upstream admitted scalars (ADR-0097 decision 8: "every
+/// function this repository already names as claimed or relied upon"),
+/// distinct from [`ADMITTED_SCALAR_FAMILIES`]'s one-row-per-family bound.
+/// `length`'s family (unicode) already has a representative row (`reverse`),
+/// but the corpus construct gate (`ravel_bench::sql_corpus`) matches by exact
+/// function name, so a caller who names `length` specifically -- as
+/// ClickBench's Q28/Q29 do (issue #480) -- needs its own row, not coverage
+/// borrowed from a same-family sibling. Every name here is a member of
+/// [`ADMITTED_SCALARS`]; the drift test asserts that.
+const NAMED_ADMITTED_SCALARS: [ScalarFamily; 1] = [ScalarFamily {
+    name: "length",
+    example: "SELECT length('résumé') FROM samples LIMIT 1",
+    note: "character count, not byte count: 'résumé' is 6 characters but 7 bytes \
+           (the 'é's are two-byte UTF-8)",
+}];
+
 /// Ravel's own scalar UDFs (ADR-0097 decision 8), each individually attested
 /// because each is Ravel code rather than upstream DataFusion. Every name is a
 /// member of [`ADMITTED_SCALARS`]; the drift test asserts that. Each carries a
@@ -298,15 +314,16 @@ const RAVEL_SCALAR_UDFS: [(&str, &str); 3] = [
 ];
 
 /// The number of admitted-scalar conformance rows the registry is expected to
-/// emit: one per admitted family plus each Ravel UDF. Recorded as a hard
-/// literal, independent of the array lengths, so a row silently deleted from
-/// [`ADMITTED_SCALAR_FAMILIES`] or [`RAVEL_SCALAR_UDFS`] fails the drift test
+/// emit: one per admitted family, plus each individually-named admitted
+/// scalar, plus each Ravel UDF. Recorded as a hard literal, independent of the
+/// array lengths, so a row silently deleted from [`ADMITTED_SCALAR_FAMILIES`],
+/// [`NAMED_ADMITTED_SCALARS`], or [`RAVEL_SCALAR_UDFS`] fails the drift test
 /// (`registry_reads_the_live_allowlist_sets`) instead of shrinking the score's
 /// denominator along with its numerator and holding the reported score at 100%
 /// (#408). A deliberate change to the family/UDF set updates this literal in the
 /// same edit.
 #[cfg(test)]
-const EXPECTED_ADMITTED_SCALAR_ROW_COUNT: usize = 9;
+const EXPECTED_ADMITTED_SCALAR_ROW_COUNT: usize = 10;
 
 /// The eight admitted native window functions (ADR-0097 decision 6), each with
 /// an `OVER` example whose aggregated result is re-derived from the four
@@ -566,6 +583,19 @@ pub fn registry() -> Vec<Construct> {
             example: fam.example.to_string(),
             classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
             rationale: fam.note,
+        });
+    }
+    // Individually-named upstream admitted scalars: a family member with its
+    // own row because a caller (e.g. the ClickBench corpus, issue #480) names
+    // it by exact function name rather than being covered by the family
+    // representative's row.
+    for named in &NAMED_ADMITTED_SCALARS {
+        out.push(Construct {
+            category: Category::Scalar,
+            name: named.name.to_string(),
+            example: named.example.to_string(),
+            classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
+            rationale: named.note,
         });
     }
     // Ravel's own scalar UDFs, individually attested: each is Ravel code, not
@@ -1062,13 +1092,15 @@ mod tests {
             "rejected scalar rows must be exactly EXCLUDED_SCALARS"
         );
 
-        // Admitted scalar: family-based. One row per family plus each Ravel
-        // UDF, each naming a live admitted scalar.
+        // Admitted scalar: family-based. One row per family, plus each
+        // individually-named admitted scalar, plus each Ravel UDF, each
+        // naming a live admitted scalar.
         let admitted_scalar_rows = names(Category::Scalar, false);
         assert_eq!(
             admitted_scalar_rows.len(),
-            ADMITTED_SCALAR_FAMILIES.len() + RAVEL_SCALAR_UDFS.len(),
-            "admitted scalar rows must be one per family plus each Ravel UDF"
+            ADMITTED_SCALAR_FAMILIES.len() + NAMED_ADMITTED_SCALARS.len() + RAVEL_SCALAR_UDFS.len(),
+            "admitted scalar rows must be one per family, plus each individually-named \
+             admitted scalar, plus each Ravel UDF"
         );
         // Bind the source arrays to a hard-recorded count, not just to each
         // other. The check above compares the registry's rows against the same
@@ -1078,10 +1110,11 @@ mod tests {
         // array length must equal the recorded count, which a deliberate change
         // updates in the same edit.
         assert_eq!(
-            ADMITTED_SCALAR_FAMILIES.len() + RAVEL_SCALAR_UDFS.len(),
+            ADMITTED_SCALAR_FAMILIES.len() + NAMED_ADMITTED_SCALARS.len() + RAVEL_SCALAR_UDFS.len(),
             EXPECTED_ADMITTED_SCALAR_ROW_COUNT,
             "admitted-scalar row count changed: update EXPECTED_ADMITTED_SCALAR_ROW_COUNT \
-             deliberately if a family or Ravel UDF was intentionally added or removed"
+             deliberately if a family, named scalar, or Ravel UDF was intentionally added \
+             or removed"
         );
         for name in &admitted_scalar_rows {
             assert!(
@@ -1094,6 +1127,13 @@ mod tests {
                 admitted_scalar_rows.contains(fam.name),
                 "scalar family representative `{}` has no row",
                 fam.name
+            );
+        }
+        for named in &NAMED_ADMITTED_SCALARS {
+            assert!(
+                admitted_scalar_rows.contains(named.name),
+                "individually-named admitted scalar `{}` has no row",
+                named.name
             );
         }
         for (udf, _) in RAVEL_SCALAR_UDFS {

@@ -38,9 +38,10 @@ const UPSTREAM_COUNT: usize = 43;
 
 /// The ClickBench statements the corpus construct-gate cannot admit, each paired
 /// with the single construct that blocks it. One row per rejected statement; the
-/// distinct missing capabilities are two (`LIKE` pattern matching, and `length`
-/// not being enumerated as a named construct in the conformance registry) -- see
-/// the runbook's gap list and the issues it references.
+/// distinct missing capability is `LIKE` pattern matching (issue #479) -- see
+/// the runbook's gap list and the issue it references. Q28/Q29 (`length`, issue
+/// #480) moved into the corpus file once `length` was registered as a named
+/// construct.
 ///
 /// Each named construct MUST be absent from [`supported_construct_names`]
 /// (asserted by [`each_known_gap_names_a_genuinely_unsupported_construct`]): a
@@ -52,8 +53,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     ("Q22", "LIKE pattern match"),
     ("Q23", "LIKE pattern match"),
     ("Q24", "LIKE pattern match"),
-    ("Q28", "length"),
-    ("Q29", "length"),
 ];
 
 #[test]
