@@ -1,22 +1,30 @@
 //! Logs SQL scan batch-building throughput (ADR-0099 decision 7, issue #415).
 //!
-//! Both benchmarks drain [`ravel_sql::LogsScanExec`] itself over one RLOG object
-//! held in a `MemoryStore`, so what they time is fetch/decode plus the
+//! All three benchmarks drain [`ravel_sql::LogsScanExec`] itself over one RLOG
+//! object held in a `MemoryStore`, so what they time is fetch/decode plus the
 //! per-block batch construction this ADR added, with no object-store latency in
-//! the way. The two fixtures are the *same corpus*; they differ only in the
-//! projection, which is what decides the batch-building path:
+//! the way. They run over the *same corpus*:
 //!
-//! - `fast_path_fixed_columns` projects only fixed columns (`ts`, `body`), so
-//!   the scan is columnar-eligible and every spill-free block is turned into an
-//!   Arrow batch straight from the `ColumnarBlockView`, with no `LogRecord` and
-//!   no `merged_attrs`;
-//! - `row_path_attrs_map` projects the merged `attrs` map, which makes the query
-//!   ineligible ([`columnar_static_eligible`] rejects any `attrs` reference), so
-//!   the unchanged row path rebuilds a `LogRecord` per row and merges its
-//!   attributes.
+//! - `fast_path_fixed_columns` projects `ts, body`, so the scan is
+//!   columnar-eligible and every spill-free block is turned into an Arrow batch
+//!   straight from the `ColumnarBlockView`, with no `LogRecord` and no
+//!   `merged_attrs`;
+//! - `row_path_same_projection` projects **the identical `ts, body`** and is
+//!   forced onto the row path by a pending erasure predicate that matches no
+//!   record (any pending erasure makes a scan ineligible, ADR-0099 decision 2).
+//!   This is the like-for-like pair: same corpus, same output columns, so the
+//!   gap is the batch-building path's. Its one caveat is the forcing mechanism
+//!   itself: an erasure-carrying scan also runs the fetcher's record filter and
+//!   `retain_unerased`, a `merged_attrs` pass per record, which no eligible query
+//!   pays. The gap this arm reports is therefore an upper bound on the path's own
+//!   share, not a pure measure of it.
+//! - `row_path_attrs_map` projects `ts, body, attrs`: the merged map makes the
+//!   query ineligible without any erasure, so this arm carries no filter cost but
+//!   does build a whole `Map(Utf8, Utf8)` column the other two do not. Reported
+//!   alongside so the two confounders stay separable instead of being conflated
+//!   into one "path" number: this arm minus the previous one is roughly what the
+//!   `attrs` column costs to materialize.
 //!
-//! Reporting both over one corpus makes the comparison like-for-like: the only
-//! variable is the path, so the throughput gap is the path's, not the fixture's.
 //! Throughput is reported in records per second (`Throughput::Elements`).
 //! Allocation counting lives in `tests/logs_scan_allocations.rs`, which needs a
 //! one-test binary to keep the count deterministic.
@@ -29,12 +37,13 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
-use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::LogSegmentFetcher;
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_sql::{LOG_COL_ATTRS, LogsScanExec, logs_schema_with_declared};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -124,12 +133,31 @@ async fn build() -> (Arc<dyn ObjectStoreBackend>, Vec<SegmentRef>) {
     (Arc::new(store), vec![seg])
 }
 
-/// Drain a `LogsScanExec` over `segments` with `projection`, returning the rows
-/// it emitted.
+/// A pending erasure whose key exists in no record of the corpus: it forces the
+/// row path (any pending erasure makes a scan columnar-ineligible) while erasing
+/// nothing, so the forced arm emits exactly what the fast arm does. Same
+/// technique as `tests/logs_columnar.rs`.
+fn no_match_erasure(segments: &[SegmentRef]) -> Vec<ErasurePredicate> {
+    snapshot_pending_erasure_predicates(&Snapshot {
+        segments: segments.to_vec(),
+        segments_pruned: 0,
+        pending_erasure: vec![ravel_proto::commit::v1::ErasureRequest {
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: "__does_not_exist__".to_string(),
+                value: "__nope__".to_string(),
+            }],
+            ..Default::default()
+        }],
+    })
+}
+
+/// Drain a `LogsScanExec` over `segments` with `projection` and `erasure`,
+/// returning the rows it emitted.
 async fn drain(
     store: Arc<dyn ObjectStoreBackend>,
     segments: &[SegmentRef],
     projection: Vec<usize>,
+    erasure: Vec<ErasurePredicate>,
 ) -> usize {
     let scan = LogsScanExec::new(
         TENANT,
@@ -140,7 +168,7 @@ async fn drain(
         i64::MAX,
         Arc::new(Vec::new()),
         Arc::new(Vec::new()),
-        Arc::new(Vec::new()),
+        Arc::new(erasure),
         Some(&projection),
         QueryAccounting::new(),
         logs_schema_with_declared(&[]),
@@ -166,22 +194,34 @@ fn bench_scan(c: &mut Criterion) {
     let (store, segments) = rt.block_on(build());
 
     // ts, body: fixed columns only, so the scan takes the columnar fast path.
-    let fast = vec![0usize, 4];
-    // ts, body, attrs: the merged map makes the query columnar-ineligible, so
-    // the same corpus drains the row path.
-    let row = vec![0usize, 4, LOG_COL_ATTRS];
+    let fixed = vec![0usize, 4];
+    // ts, body, attrs: the merged map makes the query columnar-ineligible
+    // without an erasure, at the price of one extra output column.
+    let with_attrs = vec![0usize, 4, LOG_COL_ATTRS];
+    let forced = no_match_erasure(&segments);
 
-    for (name, projection) in [
-        ("fast_path_fixed_columns", fast),
-        ("row_path_attrs_map", row),
+    for (name, projection, erasure) in [
+        ("fast_path_fixed_columns", fixed.clone(), Vec::new()),
+        ("row_path_same_projection", fixed, forced),
+        ("row_path_attrs_map", with_attrs, Vec::new()),
     ] {
-        let rows = rt.block_on(drain(Arc::clone(&store), &segments, projection.clone()));
+        let rows = rt.block_on(drain(
+            Arc::clone(&store),
+            &segments,
+            projection.clone(),
+            erasure.clone(),
+        ));
 
         let mut group = c.benchmark_group("logs_scan");
         group.throughput(Throughput::Elements(rows as u64));
         group.bench_function(name, |b| {
             b.iter(|| {
-                let emitted = rt.block_on(drain(Arc::clone(&store), &segments, projection.clone()));
+                let emitted = rt.block_on(drain(
+                    Arc::clone(&store),
+                    &segments,
+                    projection.clone(),
+                    erasure.clone(),
+                ));
                 std::hint::black_box(emitted);
             });
         });
