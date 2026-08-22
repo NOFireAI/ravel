@@ -124,6 +124,16 @@ exit 0. All four blocking probes PASS against live MinIO:
  bucket-protection state unobservable, as flagged in memos B and later verified)
 ```
 
+## Deterministic whole-system simulation (ADR-0068)
+
+```
+$ RAVEL_SIM_BATCH_START=1 RAVEL_SIM_BATCH_COUNT=100 cargo run --release -p ravel-sim --example nightly_seed_batch
+exit 0: "seed batch [1, +100): all seeds passed"
+(each seed drives real ingest -> fold -> compact -> sweep -> query cycles under injected
+ faults and checks read-your-write, strict-ack-implies-durable, compaction query
+ equivalence, record-count conservation, and no-leak-past-horizon invariants per cycle)
+```
+
 ## Supply chain
 
 ```
