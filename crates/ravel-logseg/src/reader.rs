@@ -905,14 +905,11 @@ fn overflow_attr(
     row: usize,
     name: &str,
 ) -> Result<Option<AttrValue>, LogSegError> {
-    let raw = match block.str_col(crate::record::COL_ATTRS_RAW) {
-        Some(col) => match col.get(row).and_then(|v| v.as_ref()) {
-            Some(bytes) => bytes.clone(),
-            None => return Ok(None),
-        },
+    let raw = match block.str_at(crate::record::COL_ATTRS_RAW, row) {
+        Some(bytes) => bytes,
         None => return Ok(None),
     };
-    let attrs = decode_canonical_attrs(&raw)?;
+    let attrs = decode_canonical_attrs(raw)?;
     Ok(attrs.into_iter().find(|(k, _)| k == name).map(|(_, v)| v))
 }
 
@@ -999,9 +996,7 @@ pub(crate) fn rebuild_record_projected(
             attrs.push((e.name.clone(), v));
         }
     }
-    if let Some(col) = block.str_col(crate::record::COL_ATTRS_RAW)
-        && let Some(Some(raw)) = col.get(row)
-    {
+    if let Some(raw) = block.str_at(crate::record::COL_ATTRS_RAW, row) {
         attrs.extend(decode_canonical_attrs(raw)?);
     }
 
@@ -1137,10 +1132,7 @@ pub(crate) fn i64_at(block: &DecodedBlock, col: u32, row: usize) -> Result<i64, 
 }
 
 fn str_at(block: &DecodedBlock, col: u32, row: usize) -> Option<Vec<u8>> {
-    block
-        .str_col(col)
-        .and_then(|c| c.get(row).cloned())
-        .flatten()
+    block.str_at(col, row).map(<[u8]>::to_vec)
 }
 
 fn fixed_at(block: &DecodedBlock, col: u32, row: usize) -> Option<Vec<u8>> {
@@ -3385,6 +3377,136 @@ mod tests {
         );
     }
 
+    /// `ColumnarBlockView::str_dict` hands out a dictionary-encoded string
+    /// column intact, and fusing it back through the dictionary yields exactly
+    /// the per-row bytes the byte accessor returns for the same surviving rows
+    /// (ADR-0099 decision 4, deliverable 5). Presence is carried by the id
+    /// vector, so a surviving row whose column value is absent reads `None`
+    /// through both, an empty-string value survives as an empty dictionary
+    /// entry, and a plain-page column exposes no dictionary at all.
+    ///
+    /// The selective predicate drops a middle row, so the surviving rows are
+    /// non-contiguous: a dictionary that addressed ids by raw block row rather
+    /// than by surviving-row index would disagree here.
+    #[test]
+    fn columnar_str_dict_fuses_to_byte_accessor() {
+        let cfg = RlogConfig {
+            block_target_records: 8,
+            max_dynamic_columns: COLUMNAR_MAX_COLUMNS,
+            ..RlogConfig::default()
+        };
+        // "svc" is low cardinality (3 distinct across 6 present of 8 rows -> a
+        // dictionary page), carries an empty-string value, and is absent from
+        // two rows. Bodies are all distinct -> a plain page, and worded so
+        // `keep` drops one row to make the survivors non-contiguous.
+        let recs = vec![
+            rec_attrs(
+                0,
+                100,
+                "keep a",
+                vec![attr("svc", AttrValue::Str("api".into()))],
+            ),
+            rec_attrs(
+                0,
+                101,
+                "keep b",
+                vec![attr("svc", AttrValue::Str("".into()))],
+            ),
+            rec_attrs(0, 102, "drop c", Vec::new()),
+            rec_attrs(
+                0,
+                103,
+                "keep d",
+                vec![attr("svc", AttrValue::Str("api".into()))],
+            ),
+            rec_attrs(
+                0,
+                104,
+                "keep e",
+                vec![attr("svc", AttrValue::Str("db".into()))],
+            ),
+            rec_attrs(0, 105, "keep f", Vec::new()),
+            rec_attrs(
+                0,
+                106,
+                "keep g",
+                vec![attr("svc", AttrValue::Str("db".into()))],
+            ),
+            rec_attrs(
+                0,
+                107,
+                "keep h",
+                vec![attr("svc", AttrValue::Str("api".into()))],
+            ),
+        ];
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let pred = Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "keep".into(),
+        };
+
+        let mut cursor = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor");
+        let mut saw_dict = false;
+        let mut saw_absent = false;
+        let mut saw_empty = false;
+        while let Some(view) = cursor.next_block_columnar(&obj).expect("columnar exit") {
+            // A plain-page column (all-distinct bodies) exposes no dictionary.
+            assert!(
+                view.str_dict(COL_BODY).is_none(),
+                "a plain page must not be forced into a dictionary"
+            );
+
+            let svc = view
+                .resolve_attr("svc", FieldType::Str)
+                .expect("svc has a FIELD_DIR column");
+            let dict = view
+                .str_dict(svc.column_id)
+                .expect("the svc column is a dictionary page");
+            saw_dict = true;
+            assert_eq!(
+                dict.len(),
+                view.surviving_count(),
+                "the dictionary column spans exactly the surviving rows"
+            );
+
+            for i in 0..view.surviving_count() {
+                let via_bytes = view.bytes_at(svc.column_id, i);
+                // Fusing the dictionary form equals the byte accessor cell.
+                assert_eq!(dict.value_at(i), via_bytes, "surviving row {i}");
+                match dict.id_at(i) {
+                    Some(id) => {
+                        let entry = dict.dict()[id as usize].as_slice();
+                        assert_eq!(Some(entry), via_bytes, "id maps through dict() at {i}");
+                        if entry.is_empty() {
+                            saw_empty = true;
+                        }
+                    }
+                    None => {
+                        saw_absent = true;
+                        assert_eq!(via_bytes, None, "an absent id must read absent bytes");
+                    }
+                }
+            }
+            // The gather form agrees with the per-row form.
+            let ids_iter: Vec<Option<u32>> = dict.iter_ids().collect();
+            let ids_rows: Vec<Option<u32>> =
+                (0..view.surviving_count()).map(|i| dict.id_at(i)).collect();
+            assert_eq!(ids_iter, ids_rows, "iter_ids");
+        }
+        assert!(
+            saw_dict,
+            "the corpus must produce a dictionary-encoded svc page"
+        );
+        assert!(saw_absent, "a surviving row must carry an absent svc value");
+        assert!(
+            saw_empty,
+            "a surviving row must carry an empty-string svc value"
+        );
+    }
+
     /// Both exits reject a corrupt block with the same typed error, and neither
     /// panics. The flipped byte is inside block 0's stored extent, so its
     /// crc32c no longer matches its SKIP_IDX entry.
@@ -3447,11 +3569,15 @@ mod tests {
     /// footprint: it counts every string cell's own allocation, not just the
     /// column spines, and it tracks what the column selection actually decoded.
     ///
-    /// The bodies are 4 KiB each, so the per-cell term (8 x 4096 = 32768 bytes)
-    /// dwarfs the spines a `record_count`-based estimate would see. A figure
-    /// that counted spines only would land under the cell total and fail the
-    /// first assertion; a figure that ignored the column filter would fail the
-    /// last two.
+    /// The bodies are 4 KiB each and all distinct, so the body column is a plain
+    /// page and its per-cell term (8 x 4096 = 32768 bytes) dwarfs the spines a
+    /// `record_count`-based estimate would see. Distinct is deliberate: an
+    /// identical-body column would dictionary-encode to one 4 KiB entry plus
+    /// eight narrow ids (ADR-0099 decision 4), which is the case
+    /// `dict_decoded_bytes_reports_dictionary_footprint` pins. A figure that
+    /// counted spines only would land under the cell total and fail the first
+    /// assertion; a figure that ignored the column filter would fail the last
+    /// two.
     #[test]
     fn decoded_bytes_counts_cells_and_follows_the_column_selection() {
         const ROWS: i64 = 8;
@@ -3460,9 +3586,14 @@ mod tests {
             block_target_records: 64,
             ..RlogConfig::default()
         };
-        let body = "b".repeat(BODY);
+        // Distinct bodies (a per-row suffix) keep the column a plain page, so the
+        // per-cell accounting under test is exercised rather than dictionary
+        // deduplication.
         let recs: Vec<LogRecord> = (0..ROWS)
-            .map(|i| rec_attrs(0, i, &body, Vec::new()))
+            .map(|i| {
+                let body = format!("{}{i:08}", "b".repeat(BODY - 8));
+                rec_attrs(0, i, &body, Vec::new())
+            })
             .collect();
         let obj = build(cfg, recs);
         let pred = Predicate::And(Vec::new());
