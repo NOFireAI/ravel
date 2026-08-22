@@ -50,18 +50,17 @@ use crate::span_fetcher::SpanRow;
 /// worker is dropped at routing time (never a hard error), so a rolling deploy
 /// degrades to coordinator-local execution, never to a wrong answer.
 ///
-/// Bumped 3 -> 4 for ADR-0103 (epic #64): the coordinator now sets
-/// `FetchRequest.partial_aggregate` to `Some` on an eligible instant
-/// `count_over_time` query, asking the worker for a precomputed per-series
-/// count over an explicit reduction window instead of raw runs. The frame
-/// additions (`PartialAggregateRequest`, `PartialAggregate`) and their
-/// decode-side support landed under version 3 with no behavior change; this bump
-/// lands with the first commit that sets the field live on a real request, the
-/// same staging ADR-0096 used. A version-3 worker seeing a version-4 request
-/// returns `Unsupported` through [`check_protocol_version`], which the
-/// coordinator maps to a silent local fallback, so a version-skewed worker
-/// during a rolling deploy degrades to raw fetch, never a corrupt answer.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// Still 3 as of ADR-0103 (epic #64): the `PartialAggregateRequest`/
+/// `PartialAggregate` frame additions and their decode-side support have
+/// landed with no behavior change (worker computes and returns a partial iff
+/// asked; nothing asks yet). The bump to 4 is deferred to the commit that
+/// sets `FetchRequest.partial_aggregate` live on a real request AND wires
+/// `MergedSource::query_precomputed_count` to consume the result -- the same
+/// staging ADR-0096 used, and load-bearing here: the worker's pushdown
+/// branch returns the partial INSTEAD OF raw runs, so a build that sends the
+/// request without a consumer for the reply would silently see zero raw
+/// series and no replacement for them.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
 /// Distinct from [`PROTOCOL_VERSION`]: it versions the canonical claim encoding
@@ -1651,13 +1650,13 @@ mod tests {
         }
     }
 
-    /// ADR-0103 (epic #64): the protocol version is 4, bumped in the same
-    /// commit that first sets `FetchRequest.partial_aggregate` live on a real
-    /// request. A worker one version behind sees a mismatch and the coordinator
-    /// degrades to a silent local fallback, so this is a safe rolling bump.
+    /// ADR-0103 (epic #64): the protocol version stays 3 until the commit
+    /// that first sets `FetchRequest.partial_aggregate` live on a real
+    /// request AND wires its consumer -- see the doc comment on
+    /// `PROTOCOL_VERSION`.
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_still_three_pending_adr_0103_activation() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]
