@@ -377,4 +377,40 @@ mod tests {
             .expect("json");
         assert_eq!(json["rows"][0][0], json!("deadbeef"));
     }
+
+    /// A declared `Str` column arrives as `Dictionary(Int32, Utf8)` after
+    /// ADR-0099 decision 5, but the HTTP JSON output must be byte-for-byte what
+    /// the pre-dictionary plain `Utf8` column produced: a string per row, JSON
+    /// `null` for a NULL key, and JSON `null` for a key addressing a NULL
+    /// (non-UTF-8) dictionary value. This asserts the existing
+    /// `Dictionary(Int32, _)` arm already covers the new column type.
+    #[test]
+    fn json_encodes_declared_str_dictionary_like_a_plain_string_column() {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+
+        // Values 0="api", 1=<null>. Keys: "api", reuse "api", NULL key,
+        // key->null value.
+        let values = StringArray::from(vec![Some("api"), None]);
+        let keys = Int32Array::from(vec![Some(0), Some(0), None, Some(1)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+            .expect("batch");
+        let json = QueryOutput::new(schema, vec![batch])
+            .to_json()
+            .expect("json");
+        let rows = json["rows"].as_array().expect("rows");
+        assert_eq!(rows[0][0], json!("api"));
+        assert_eq!(rows[1][0], json!("api"));
+        assert_eq!(rows[2][0], Json::Null, "a NULL key is JSON null");
+        assert_eq!(
+            rows[3][0],
+            Json::Null,
+            "a key pointing at a NULL dictionary value is JSON null"
+        );
+    }
 }

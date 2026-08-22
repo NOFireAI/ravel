@@ -25,9 +25,10 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
-    TimestampNanosecondArray, UInt8Array, UInt32Array,
+    Array, BinaryArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Int64Array,
+    RecordBatch, StringArray, TimestampNanosecondArray, UInt8Array, UInt32Array,
 };
+use datafusion::arrow::datatypes::{DataType, Int32Type};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
@@ -432,6 +433,24 @@ fn a<T: Array + 'static>(batch: &RecordBatch, col: usize) -> &T {
         .expect("column type")
 }
 
+/// The logical `Str` value of a declared `Dictionary(Int32, Utf8)` column at row
+/// `i`: `None` for a NULL key or a key addressing a NULL (non-UTF-8) dictionary
+/// value, `Some(s)` otherwise. Declared `Str` columns are dictionary-encoded
+/// (ADR-0099 decision 5), so a plain `StringArray` downcast no longer applies.
+fn dict_str(batch: &RecordBatch, col: usize, i: usize) -> Option<String> {
+    let dict = a::<DictionaryArray<Int32Type>>(batch, col);
+    if dict.is_null(i) {
+        return None;
+    }
+    let values = dict
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("dictionary values are Utf8");
+    let k = usize::try_from(dict.keys().value(i)).expect("non-negative key");
+    (!values.is_null(k)).then(|| values.value(k).to_string())
+}
+
 /// Extract every row of `batches` as a `Vec<Cell>`, one cell per projected
 /// column, so two scans over the same input compare as sorted multisets.
 fn rows(
@@ -476,10 +495,7 @@ fn cell(
                     let arr = a::<Int64Array>(batch, col);
                     Cell::OptI64((!arr.is_null(i)).then(|| arr.value(i)))
                 }
-                DeclaredType::Str => {
-                    let arr = a::<StringArray>(batch, col);
-                    Cell::OptStr((!arr.is_null(i)).then(|| arr.value(i).to_string()))
-                }
+                DeclaredType::Str => Cell::OptStr(dict_str(batch, col, i)),
                 DeclaredType::Bool => {
                     let arr = a::<BooleanArray>(batch, col);
                     Cell::OptBool((!arr.is_null(i)).then(|| arr.value(i)))
@@ -1072,4 +1088,162 @@ async fn a_declared_str_cell_that_is_not_utf8_reads_as_absent_on_both_paths() {
         want,
         "the row path's answer is the reference the fast path must match"
     );
+}
+
+/// The two-paths-one-schema invariant (ADR-0099 decision 5). An erasure-pending
+/// query over a declared `Str` column takes the row path, and its batches must
+/// carry the SAME `Dictionary(Int32, Utf8)` column type the fast path produces:
+/// DataFusion validates every batch against one schema, so a row-path batch that
+/// built a plain `Utf8` array would be rejected by `RecordBatch::try_new` at
+/// runtime. This asserts the type on the returned batch and that the two paths'
+/// batch schemas are identical, not merely that the scan did not error.
+///
+/// Reverting `declared_column_array`'s `Str` arm to a `StringBuilder`
+/// (crates/ravel-sql/src/logs_scan.rs, the `DeclaredType::Str` arm) makes the
+/// row-path scan fail to produce batches at all, failing this test.
+#[tokio::test]
+async fn fallback_batches_match_the_dictionary_schema() {
+    let declared = declared_columns();
+    let name_col = FIRST_DECLARED_COL + 1; // the Str-typed `name`
+    let projection = vec![0usize, name_col];
+
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let mk = |ts: i64, name: &str| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "b".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: vec![("name".to_string(), AttrValue::Str(name.to_string()))],
+    };
+    let records = vec![mk(0, "a"), mk(1, "b"), mk(2, "a")];
+
+    let store = MemoryStore::new();
+    let seg = write_object(&store, "logs/schema.rlog", &records, RlogConfig::default()).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let segments = vec![seg];
+
+    let row = run_scan(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        no_match_erasure(),
+    )
+    .await;
+    assert_eq!(row.columnar_batches, 0, "erasure must force the row path");
+    assert!(row.rowpath_batches > 0, "the row path must have run");
+
+    let fast = run_scan(
+        Arc::clone(&store),
+        segments,
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+    assert!(fast.columnar_batches > 0, "the fast path must have run");
+
+    let dict_ty = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    for b in &row.batches {
+        assert_eq!(
+            b.schema().field(1).data_type(),
+            &dict_ty,
+            "row-path declared Str column must be dictionary-typed"
+        );
+    }
+    assert_eq!(
+        row.batches[0].schema(),
+        fast.batches[0].schema(),
+        "the row path and fast path must agree on the batch schema"
+    );
+    assert_eq!(
+        rows(&row.batches, &projection, &declared),
+        rows(&fast.batches, &projection, &declared),
+        "both paths must read the same values"
+    );
+}
+
+/// A dict-encoded page and a plain page both read back correct declared `Str`
+/// values through the fast path (ADR-0099 decision 5). A page whose distinct
+/// values are at most half its rows is dictionary-encoded (the writer's
+/// distinct-ratio heuristic) and reaches Arrow as its dictionary plus ids; an
+/// all-distinct page stays plain and takes the degenerate identity-dictionary
+/// branch (`str_dict` returns `None`). Both must yield the exact strings.
+#[tokio::test]
+async fn dict_page_and_plain_page_both_read_correct_values() {
+    let declared = declared_columns();
+    let name_col = FIRST_DECLARED_COL + 1;
+    let projection = vec![0usize, name_col];
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let mk = |ts: i64, name: &str| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "b".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: vec![("name".to_string(), AttrValue::Str(name.to_string()))],
+    };
+
+    // One block per object so the encoding decision is per whole corpus.
+    let cfg = RlogConfig {
+        block_target_records: 64,
+        ..RlogConfig::default()
+    };
+
+    // Dict page: 6 rows, 2 distinct values (2*2 <= 6).
+    let dict_records: Vec<LogRecord> = (0..6)
+        .map(|i| mk(i, if i % 2 == 0 { "api" } else { "worker" }))
+        .collect();
+    // Plain page: 6 rows, all distinct (6*2 > 6).
+    let plain_records: Vec<LogRecord> = (0..6).map(|i| mk(i, &format!("n{i}"))).collect();
+
+    for (key, recs) in [
+        ("logs/dictpage.rlog", &dict_records),
+        ("logs/plainpage.rlog", &plain_records),
+    ] {
+        let store = MemoryStore::new();
+        let seg = write_object(&store, key, recs, cfg).await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fast = run_scan(
+            store,
+            vec![seg],
+            declared.clone(),
+            Some(projection.clone()),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+        assert!(fast.columnar_batches > 0, "fast path must have run for {key}");
+        assert_eq!(fast.rowpath_batches, 0, "fast path must not fall back for {key}");
+
+        let mut want: Vec<Vec<Cell>> = recs
+            .iter()
+            .map(|r| {
+                let name = match &r.attrs[0].1 {
+                    AttrValue::Str(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                vec![Cell::Ts(r.ts_ns), Cell::OptStr(Some(name))]
+            })
+            .collect();
+        want.sort();
+        assert_eq!(
+            rows(&fast.batches, &projection, &declared),
+            want,
+            "declared Str values must be correct for {key}"
+        );
+    }
 }
