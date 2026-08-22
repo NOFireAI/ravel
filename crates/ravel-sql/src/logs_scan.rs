@@ -1006,10 +1006,10 @@ impl Stream for LogScanStream {
                             // a later `attrs_raw` fallback skips exactly the
                             // blocks the columnar cursor advanced past.
                             this.seg_columnar_blocks += 1;
-                            if !batches.is_empty() {
-                                if let Err(e) = this.hold_batches(batches) {
-                                    return this.fail(e);
-                                }
+                            if !batches.is_empty()
+                                && let Err(e) = this.hold_batches(batches)
+                            {
+                                return this.fail(e);
                             }
                         }
                     }
@@ -1316,18 +1316,18 @@ fn resource_attrs<'c>(
     cache: &'c mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
     stream_ref: u32,
 ) -> DFResult<&'c Arc<Vec<(String, AttrValue)>>> {
-    if !cache.contains_key(&stream_ref) {
-        let blob = view.stream_attrs_of(stream_ref).ok_or_else(|| {
-            DataFusionError::from(SqlError::CorruptStreamAttrs(
-                "columnar fast path: stream_ref has no STREAM_DIR entry".to_string(),
-            ))
-        })?;
-        let decoded = Arc::new(decode_stream_attrs(blob)?);
-        cache.insert(stream_ref, decoded);
+    match cache.entry(stream_ref) {
+        std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let blob = view.stream_attrs_of(stream_ref).ok_or_else(|| {
+                DataFusionError::from(SqlError::CorruptStreamAttrs(
+                    "columnar fast path: stream_ref has no STREAM_DIR entry".to_string(),
+                ))
+            })?;
+            let decoded = Arc::new(decode_stream_attrs(blob)?);
+            Ok(e.insert(decoded))
+        }
     }
-    Ok(cache
-        .get(&stream_ref)
-        .expect("just inserted the stream_ref entry"))
 }
 
 /// The merged value of a declared key at surviving row `i`, under the same

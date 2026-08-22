@@ -25,14 +25,23 @@ mod util;
 use std::sync::Arc;
 
 use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use futures::StreamExt;
-use ravel_query::SegmentFetcher;
+use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    RavelTableProvider, SessionTable, SqlConfig, TenantMemoryAccountant, build_session,
+    LogsTableProvider, RavelTableProvider, SessionTable, SqlConfig, TenantMemoryAccountant,
+    build_session,
 };
 use ravel_types::TenantId;
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::logstream::log_stream_id;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
+use uuid::Uuid;
 
 /// Comfortably more than `RsegScanExec`'s 8192-row batch size, so the scan
 /// emits several batches from one partition.
@@ -312,4 +321,242 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         0,
         "a query that failed on its own budget must not leak tenant bytes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The `logs` columnar fast path (ADR-0099 decision 2, issue #415)
+// ---------------------------------------------------------------------------
+//
+// The tests above all drive the `samples` (metrics) scan, whose reservation
+// holds decoded SoA plus one row-built batch. They never touch the `logs` scan,
+// so before this section the return-to-zero property was unproven for what the
+// columnar fast path holds instead: a block's *pre-built* `RecordBatch`es
+// (`hold_batches`/`emit_next_columnar_batch`), charged once and relabelled from
+// `held` to `emitted` rather than regrown. That release path is arithmetically
+// different from the row path's, and a leak in it would have shown nowhere.
+//
+// This test drives it end to end: a fixed-column `logs` query is columnar-
+// eligible, and asserting `columnar_batches > 0` proves the fast path actually
+// ran (so the test is not silently reduced to the row path), while the peak /
+// return-to-zero assertions prove the columnar release path balances.
+
+/// Records for the logs fixture. Several full blocks at RLOG's default 8192-row
+/// block target, so the columnar path holds and releases more than one block and
+/// the reserved figure accumulates across them.
+const LOG_RECORDS: usize = 40_000;
+
+/// One log record with a resource attribute and a dynamic attribute. The
+/// fixed-column fast path touches neither, but they are present so the corpus is
+/// realistic and a regression that folded `attrs` into the projection would
+/// change the reserved figures.
+fn log_record(i: usize) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str(format!("svc-{}", i % 8)),
+    )];
+    LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: i as i64,
+        observed_ts_ns: i as i64,
+        severity_num: (i % 24) as u8,
+        severity_text: "INFO".to_string(),
+        body: format!("request {} completed", i % 997),
+        trace_id: None,
+        span_id: None,
+        flags: i as u32,
+        attrs: vec![("user_id".to_string(), AttrValue::Str(format!("u{i}")))],
+    }
+}
+
+/// Write one RLOG object of `LOG_RECORDS` records into `store` and return a
+/// snapshot over it.
+async fn write_logs(store: &Arc<dyn ObjectStoreBackend>) -> Snapshot {
+    let identity = ObjectIdentity {
+        tenant_hash: [7u8; 16],
+        shard: 0,
+        writer_id: [2u8; 16],
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let mut w = RlogWriter::new(RlogConfig::default(), identity);
+    for i in 0..LOG_RECORDS {
+        w.push(log_record(i)).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let size = bytes.len() as u64;
+    let key = "logs/accounting.rlog";
+    store
+        .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    Snapshot {
+        segments: vec![SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: (LOG_RECORDS - 1) as i64,
+            ingest_hour_bucket: 0,
+            sample_count: LOG_RECORDS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        }],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// The `LogsScanExec` leaf of a physical plan, found by walking rather than by
+/// shape: the optimizer inserts operators above it.
+fn find_logs_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    if plan.name() == "LogsScanExec" {
+        return Some(Arc::clone(plan));
+    }
+    plan.children().iter().find_map(|c| find_logs_scan(c))
+}
+
+/// The outcome of one columnar `logs` drain: how many batches it emitted, the
+/// peak bytes the pool held mid-stream, and the two path metrics from the
+/// `LogsScanExec` leaf that prove which batch-building path ran.
+struct LogsDrain {
+    batches: usize,
+    peak: usize,
+    columnar: usize,
+    rowpath: usize,
+}
+
+/// Drain one `logs` query through a pool the test owns.
+async fn drain_logs(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &TenantId,
+    pool: Arc<dyn MemoryPool>,
+    sql: &str,
+) -> LogsDrain {
+    let snapshot = write_logs(&store).await;
+    let provider = Arc::new(LogsTableProvider::new(
+        snapshot,
+        tenant.hash(),
+        LogSegmentFetcher::new(store),
+        QueryAccounting::new(),
+    ));
+    let ctx = build_session(
+        &SqlConfig::default(),
+        Arc::clone(&pool),
+        SessionTable::Logs(provider),
+        false,
+    )
+    .expect("session");
+
+    let plan = ctx
+        .sql(sql)
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let scan = find_logs_scan(&plan).expect("a LogsScanExec leaf");
+    let mut stream = execute_stream(Arc::clone(&plan), ctx.task_ctx()).expect("execute");
+
+    let mut batches = 0usize;
+    let mut peak = 0usize;
+    while let Some(next) = stream.next().await {
+        let _batch = next.expect("batch");
+        batches += 1;
+        peak = peak.max(pool.reserved());
+    }
+    drop(stream);
+
+    let metrics = scan.metrics().expect("scan metrics");
+    let count = |name: &str| metrics.sum_by_name(name).map(|v| v.as_usize()).unwrap_or(0);
+    LogsDrain {
+        batches,
+        peak,
+        columnar: count("columnar_batches"),
+        rowpath: count("rowpath_batches"),
+    }
+}
+
+/// A fixed-column `logs` query takes the columnar fast path, holds real bytes
+/// while streaming, and returns every one of them once the stream drops -- three
+/// times over against one tenant accountant, so a leak of even one block's
+/// batches per query would accumulate and show (the pattern
+/// `repeated_multi_batch_queries_do_not_accumulate_tenant_bytes` uses for the
+/// metrics scan).
+///
+/// This is the return-to-zero property for what the fast path holds: a block's
+/// pre-built `RecordBatch`es (`hold_batches`/`emit_next_columnar_batch`), charged
+/// once and relabelled from `held` to `emitted`, not a `Vec<LogRecord>`. The
+/// metrics-scan tests above never touch the logs scan, so before this case that
+/// release path was unexercised here.
+///
+/// There is deliberately no "reserved bytes grew across batches" assertion like
+/// the metrics scan's: the logs scan is block-at-a-time (ADR-0087) and releases
+/// each block before decoding the next, so its reserved figure is bounded by one
+/// block, not cumulative. Non-vacuity comes from `columnar > 0` (the fast path
+/// actually ran), `peak > 0` (it reserved real bytes), and the cross-round
+/// accountant check (a surviving leak accumulates), not from growth.
+#[tokio::test]
+async fn repeated_logs_columnar_queries_return_every_reserved_byte() {
+    let tenant = tenant_id("acme");
+
+    let accountant = TenantMemoryAccountant::new(1 << 30);
+    for round in 0..3 {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let (pool, _breach) =
+            SqlConfig::default().query_pool(Arc::clone(&accountant), QueryAccounting::new());
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "round {round}: a fresh pool starts empty"
+        );
+
+        let run = drain_logs(
+            Arc::clone(&store),
+            &tenant,
+            Arc::clone(&pool),
+            "SELECT ts, body FROM logs",
+        )
+        .await;
+
+        assert!(
+            run.batches > 1,
+            "round {round}: the test is meaningless with one batch; got {}",
+            run.batches
+        );
+        assert!(
+            run.columnar > 0,
+            "round {round}: the query must take the columnar fast path, else this \
+             case asserts nothing about it; columnar={}, rowpath={}",
+            run.columnar,
+            run.rowpath
+        );
+        assert_eq!(
+            run.rowpath, 0,
+            "round {round}: a fixed-column, spill-free query must not fall back \
+             to the row path"
+        );
+        assert!(
+            run.peak > 0,
+            "round {round}: the fast path must reserve real bytes for its held \
+             block's batches"
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "round {round}: the query pool must return to zero once the columnar \
+             stream drops"
+        );
+        assert_eq!(
+            accountant.reserved(),
+            0,
+            "round {round}: the tenant accountant must be back to zero; a leak of \
+             one query's blocks would accumulate across rounds"
+        );
+    }
 }
