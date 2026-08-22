@@ -186,7 +186,7 @@ Running a 43-query suite against a supported-construct gate means some queries
 fail the gate rather than return a number. That is the intended outcome: an
 unsupported construct becomes a **named capability gap with a failing query
 attached**, not an omission from a results table. The checked-in corpus holds
-the **37** statements that pass the gate; the **6** below are recorded as known
+the **39** statements that pass the gate; the **4** below are recorded as known
 gaps (enforced by `crates/ravel-bench/tests/clickbench_corpus.rs`, which fails if
 any of the 43 is neither in the corpus nor listed as a gap).
 
@@ -196,26 +196,18 @@ any of the 43 is neither in the corpus nor listed as a gap).
 | Q22 | `LIKE` pattern match | `WHERE URL LIKE '%google%'` | substring/pattern search |
 | Q23 | `LIKE` pattern match | `LIKE '%Google%'` and `NOT LIKE '%.google.%'` | substring/pattern search |
 | Q24 | `LIKE` pattern match | `WHERE URL LIKE '%google%'` (also `SELECT *`) | substring/pattern search |
-| Q28 | `length` | `AVG(length(URL))` | scalar not enumerated in the conformance registry |
-| Q29 | `length` | `AVG(length(Referer))` | scalar not enumerated in the conformance registry |
 
-Two distinct capability gaps sit behind these six statements:
+**`LIKE` / SQL pattern matching** is not in Ravel's supported construct set.
+Ravel offers token search (`has_word`) and `regexp_replace`, but no `LIKE`
+with `%`/`_` wildcards, which four ClickBench statements depend on. This is a
+genuine engine capability gap, tracked as issue #479.
 
-1. **`LIKE` / SQL pattern matching** is not in Ravel's supported construct set.
-   Ravel offers token search (`has_word`) and `regexp_replace`, but no `LIKE`
-   with `%`/`_` wildcards, which four ClickBench statements depend on. This is a
-   genuine engine capability gap.
-2. **`length` is admitted by the SQL engine but not enumerated as a named
-   construct** in `ravel_sql::conformance::registry()`. The registry attests
-   scalar functions by family representative (`upper`, `regexp_replace`, ...),
-   not one row per function, so `length` — though it executes — cannot be named
-   by a corpus entry without failing the construct gate. This is an
-   attestation-coverage gap, not an executability gap: the fix is to enumerate
-   `length` (and peers) in the registry, after which Q28/Q29 move into the
-   corpus. See the "corpus format" note in the ADR-0100 epic.
-
-The issue bodies for both are filed with the epic (they could not be filed from
-the executor environment; see the task report).
+Q28/Q29 (`AVG(length(...))`) were also blocked, but that gap was bookkeeping,
+not capability: `length` was already admitted by the SQL engine, just not
+enumerated as a named construct in `ravel_sql::conformance::registry()` (the
+registry attests scalar functions by family representative and did not yet
+have an individual row for `length`). Issue #480 added that row; Q28 and Q29
+now run as ordinary corpus entries.
 
 ## Modified statements
 

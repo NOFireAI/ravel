@@ -151,6 +151,10 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         (Category::Scalar, "regexp_replace") => Some(Expect::Str("fooXbar")),
         // hex of the single byte 0x61 ('a').
         (Category::Scalar, "encode") => Some(Expect::Str("61")),
+        // Character count, not byte count: 'résumé' is 6 characters (r-é-s-u-
+        // m-é) but 7 bytes, since each 'é' is a two-byte UTF-8 sequence. A
+        // byte-counting length would answer 7, so this is load-bearing.
+        (Category::Scalar, "length") => Some(Expect::Scalar(6.0)),
         // Ravel UDFs over the fixture. The sample with value 3.0 belongs to
         // series "b", whose only label is `__name__ = "b"`.
         (Category::Scalar, "label") => Some(Expect::Str("b")),
@@ -260,7 +264,7 @@ fn single_str(output: &QueryOutput) -> Result<String, String> {
 /// The single numeric cell of a one-row, one-column result, as an `f64`.
 /// `count` comes back as an integer column, so both cases are read.
 fn single_f64(output: &QueryOutput) -> Result<f64, String> {
-    use datafusion::arrow::array::{Float64Array, Int64Array, UInt64Array};
+    use datafusion::arrow::array::{Float64Array, Int32Array, Int64Array, UInt64Array};
 
     let batch = output
         .batches()
@@ -278,6 +282,12 @@ fn single_f64(output: &QueryOutput) -> Result<f64, String> {
         return Ok(ints.value(0) as f64);
     }
     if let Some(ints) = column.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(ints.value(0) as f64);
+    }
+    // `length`/`character_length` return Int32 (DataFusion's
+    // `utf8_to_int_type`, narrower than the Int64 the other admitted scalars
+    // and aggregates use).
+    if let Some(ints) = column.as_any().downcast_ref::<Int32Array>() {
         return Ok(ints.value(0) as f64);
     }
     Err(format!(
