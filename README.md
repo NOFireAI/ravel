@@ -60,8 +60,12 @@ Also live:
 - Per-tenant typed attribute columns on the `logs` SQL table: an operator
   declares an attribute key (`ravel-cli typed-attr-column set acme
   http.duration_ms:i64`, or the `--typed-attr-column` server flags) and it
-  becomes a native `Int64`/`Boolean`/`Utf8`/`Binary` column, so typed
-  comparisons and aggregates need no `CAST` over the stringified `attrs` map.
+  becomes a native `Int64`/`Boolean`/`Binary` column, or
+  `Dictionary(Int32, Utf8)` for a declared string, so typed comparisons and
+  aggregates need no `CAST` over the stringified `attrs` map. A declared
+  string column keeps its dictionary encoding through Flight SQL and Arrow
+  IPC rather than being expanded per row; JSON row values are unchanged, but
+  the JSON envelope reports the dictionary type.
 
 Not there yet:
 
