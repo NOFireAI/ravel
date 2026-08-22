@@ -50,3 +50,27 @@ docker exit 0 (available); kind exit 127 (absent); kubectl exit 127 (absent)
 $ cargo clippy --workspace --all-targets --jobs 4 -- -D warnings
 exit 0 (clean), 2m59s wall. Decisive line: "Finished `dev` profile ... in 2m 59s", no warnings.
 ```
+
+## Test batch 1 (high-risk crates, cargo-nextest)
+
+```
+$ cargo clippy -p ravel-server --features sql --all-targets --jobs 4 -- -D warnings
+exit 0
+$ cargo clippy -p ravel-server -p ravel-sql --features flight-sql --all-targets --jobs 4 -- -D warnings
+exit 0
+$ cargo nextest run --jobs 4 -p ravel-types -p ravel-object-store -p ravel-commit -p ravel-catalog -p ravel-segment -p ravel-logseg
+exit 0: "Summary [16.811s] 975 tests run: 975 passed, 4 skipped"
+$ cargo nextest run --jobs 4 -p ravel-ingest -p ravel-promql -p ravel-maintain -p ravel-rspan -p ravel-query
+exit 0: "Summary [10.877s] 1250 tests run: 1250 passed, 2 skipped"
+$ cargo nextest run --jobs 4 -p ravel-failure-tests
+exit 0: "Summary [0.101s] 20 tests run: 20 passed, 0 skipped"
+```
+
+## Live MinIO for contract tests
+
+```
+$ docker run -d --name ravel-minio -p 127.0.0.1:19000:9000 ... minio/minio:latest server /data
+exit 0 (first attempt on port 9000 failed exit 125, port already in use by unrelated host workload)
+$ docker run --rm --network host minio/mc ... mc mb local/ravel-test
+exit 0: "Bucket created successfully `local/ravel-test`."
+```
