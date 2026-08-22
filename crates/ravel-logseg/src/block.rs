@@ -504,6 +504,43 @@ impl DecodedBlock {
     pub fn has_attrs_raw_page(&self) -> bool {
         self.attrs_raw_page
     }
+
+    /// The heap bytes this decoded block holds resident: every column vector's
+    /// allocation plus every present string and fixed-width cell's own buffer.
+    ///
+    /// A caller that keeps a block alive while it drains the block (the SQL
+    /// logs scan's columnar path, which holds a borrowed view) has to charge
+    /// its memory pool for this. The per-cell term is the reason the figure is
+    /// computed here rather than estimated from `record_count`: a byte-valued
+    /// column of `n` rows is `n` separate allocations plus the vector spine, so
+    /// counting spines alone understates a body or string-attribute column
+    /// several-fold.
+    ///
+    /// Capacity, not length, because capacity is what is allocated. The
+    /// per-kind `HashMap` spines are not counted: they hold one entry per
+    /// decoded column, bounded by the scan's column selection and negligible
+    /// against the cells.
+    pub fn decoded_heap_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for v in self.i64_cols.values() {
+            total += v.capacity() * std::mem::size_of::<Option<i64>>();
+        }
+        for v in self.f64_cols.values() {
+            total += v.capacity() * std::mem::size_of::<Option<u64>>();
+        }
+        for v in self.bool_cols.values() {
+            total += v.capacity() * std::mem::size_of::<Option<bool>>();
+        }
+        for cols in [&self.str_cols, &self.fixed_cols] {
+            for v in cols.values() {
+                total += v.capacity() * std::mem::size_of::<Option<Vec<u8>>>();
+                for cell in v.iter().flatten() {
+                    total += cell.capacity();
+                }
+            }
+        }
+        total
+    }
     pub fn i64_col(&self, column_id: u32) -> Option<&[Option<i64>]> {
         self.i64_cols.get(&column_id).map(Vec::as_slice)
     }
