@@ -106,10 +106,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Int64Builder, MapBuilder,
-    StringArray, StringBuilder, TimestampNanosecondArray, UInt8Array, UInt32Array,
+    ArrayRef, BinaryBuilder, BooleanBuilder, DictionaryArray, FixedSizeBinaryBuilder, Int32Array,
+    Int64Builder, MapBuilder, StringArray, StringBuilder, StringDictionaryBuilder,
+    TimestampNanosecondArray, UInt8Array, UInt32Array,
 };
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Int32Type, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -1258,8 +1259,14 @@ fn build_batch(
 /// `attrs_raw` and decoded back as `List`/`Map`.
 fn declared_column_array(dc: &DeclaredColumn, merged: &[Vec<(String, AttrValue)>]) -> ArrayRef {
     match dc.ty {
+        // Dictionary-typed to match the fast path's schema (ADR-0099 decision
+        // 5): every batch DataFusion validates carries one type per column, so
+        // the row path must produce `Dictionary(Int32, Utf8)` too or every
+        // fallback batch (erasure pending, `attrs` projected, an `attrs_raw`
+        // page) would fail schema validation at runtime. The builder dedups; a
+        // wrong variant or absent key is a NULL cell, never a cast (decision 7).
         DeclaredType::Str => {
-            let mut b = StringBuilder::new();
+            let mut b = StringDictionaryBuilder::<Int32Type>::new();
             for row in merged {
                 match find_attr(row, &dc.key) {
                     Some(AttrValue::Str(s)) => b.append_value(s),
@@ -1462,16 +1469,7 @@ fn build_declared_columnar_array(
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
     Ok(match plan.dc.ty {
-        DeclaredType::Str => {
-            let mut b = StringBuilder::new();
-            for i in start..end {
-                match declared_merged_value(view, plan, i, cache)? {
-                    Some(AttrValue::Str(s)) => b.append_value(s),
-                    _ => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
-        }
+        DeclaredType::Str => build_declared_str_columnar(view, plan, start, end, cache)?,
         DeclaredType::I64 => {
             let mut b = Int64Builder::new();
             for i in start..end {
@@ -1510,6 +1508,113 @@ fn build_declared_columnar_array(
                 }
             }
             Arc::new(b.finish())
+        }
+    })
+}
+
+/// Build a declared `Str` column as an Arrow `Dictionary(Int32, Utf8)` for
+/// surviving rows `start..end` (ADR-0099 decision 5).
+///
+/// Two cases, both producing the same logical values [`declared_column_array`]'s
+/// `Str` arm produces on the row path, so a fast-path batch and a fallback batch
+/// validate against the one schema DataFusion checks:
+///
+/// - **Dict-encoded page** ([`ColumnarBlockView::str_dict`] returns `Some`): the
+///   page's distinct values become the Arrow dictionary and the record rows
+///   reuse the page's ids directly, with no per-row string allocation. A page
+///   dict entry that is not UTF-8 becomes a NULL dictionary value, so a row
+///   keyed to it reads NULL; that only happens for a row the record sets in a
+///   *different*-typed column of the same key (record wins, wrong variant is
+///   NULL by ADR-0090 decision 7). A row the record does not set at all reads
+///   through to the resource/scope fallback, whose value is appended to the
+///   dictionary (the one per-row copy, unavoidable because that value is not in
+///   the page).
+/// - **Plain page** (`str_dict` returns `None`, or the key has no `Str`
+///   FIELD_DIR column at all): a degenerate identity dictionary, one entry per
+///   non-null surviving row with keys `0..`, built from [`declared_merged_value`]
+///   exactly as the pre-dictionary code did. No hashing and no dedup pass, so
+///   this case stays exactly as expensive as it was.
+fn build_declared_str_columnar(
+    view: &ColumnarBlockView<'_>,
+    plan: &DeclaredPlan<'_>,
+    start: usize,
+    end: usize,
+    cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
+) -> DFResult<ArrayRef> {
+    let n = end - start;
+    Ok(match plan.matching.and_then(|mc| view.str_dict(mc.column_id)) {
+        Some(col) => {
+            // Dictionary values start as the page's distinct byte values,
+            // decoded to UTF-8; a non-UTF-8 entry becomes a NULL value. Ids
+            // address these in the page's order, so a record row's page id maps
+            // straight to a dictionary index. Resource/scope fallback values are
+            // appended past the page dict.
+            let mut values = StringBuilder::new();
+            for v in col.dict() {
+                match std::str::from_utf8(v) {
+                    Ok(s) => values.append_value(s),
+                    Err(_) => values.append_null(),
+                }
+            }
+            let mut next_extra = i32::try_from(col.dict().len()).map_err(|_| {
+                DataFusionError::Internal("declared Str dictionary exceeds i32 keys".into())
+            })?;
+            let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
+            for i in start..end {
+                if plan.all_cols.iter().any(|&c| attr_present(view, c, i)) {
+                    // Record wins. `id_at` is `Some` only when the record's
+                    // `Str` column has a value at this row; `None` (record set
+                    // the key in another-typed column) is a NULL cell. An `id`
+                    // pointing at a non-UTF-8 (NULL) dictionary value also reads
+                    // NULL, matching `read_str_cell`.
+                    match col.id_at(i) {
+                        Some(id) => keys.push(Some(i32::try_from(id).map_err(|_| {
+                            DataFusionError::Internal("declared Str dictionary id exceeds i32".into())
+                        })?)),
+                        None => keys.push(None),
+                    }
+                } else if let Some(stream_ref) = view.stream_ref(i) {
+                    let resource = resource_attrs(view, cache, stream_ref)?;
+                    match find_attr(resource, &plan.dc.key) {
+                        Some(AttrValue::Str(s)) => {
+                            values.append_value(s);
+                            keys.push(Some(next_extra));
+                            next_extra += 1;
+                        }
+                        _ => keys.push(None),
+                    }
+                } else {
+                    keys.push(None);
+                }
+            }
+            let dict = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                Arc::new(values.finish()),
+            )
+            .map_err(DataFusionError::from)?;
+            Arc::new(dict)
+        }
+        None => {
+            // Identity dictionary: one entry per non-null row, no dedup.
+            let mut values = StringBuilder::new();
+            let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
+            let mut next = 0i32;
+            for i in start..end {
+                match declared_merged_value(view, plan, i, cache)? {
+                    Some(AttrValue::Str(s)) => {
+                        values.append_value(&s);
+                        keys.push(Some(next));
+                        next += 1;
+                    }
+                    _ => keys.push(None),
+                }
+            }
+            let dict = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                Arc::new(values.finish()),
+            )
+            .map_err(DataFusionError::from)?;
+            Arc::new(dict)
         }
     })
 }

@@ -26,8 +26,8 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, BooleanArray, StringArray};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::array::{Array, BooleanArray, DictionaryArray, StringArray};
+use datafusion::arrow::datatypes::{DataType, Int32Type};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
 use datafusion::scalar::ScalarValue;
@@ -67,21 +67,53 @@ pub(crate) fn has_word_impl(args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
         ColumnarValue::Array(a) => Arc::clone(a),
         ColumnarValue::Scalar(s) => s.to_array()?,
     };
-    let strings = text.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        DataFusionError::Execution("has_word() first argument must be a Utf8 column".into())
-    })?;
-    let out: BooleanArray = (0..strings.len())
-        .map(|i| {
-            if strings.is_null(i) {
-                // A NULL cell contains no word; matches the reader treating an
-                // absent/undecodable text field as "no match".
-                Some(false)
-            } else {
-                Some(phrase_match(strings.value(i), &word))
-            }
-        })
-        .collect();
-    Ok(ColumnarValue::Array(Arc::new(out)))
+    // Fixed Utf8 columns (`body`, `severity_text`) arrive as a `StringArray`.
+    if let Some(strings) = text.as_any().downcast_ref::<StringArray>() {
+        let out: BooleanArray = (0..strings.len())
+            .map(|i| {
+                if strings.is_null(i) {
+                    // A NULL cell contains no word; matches the reader treating
+                    // an absent/undecodable text field as "no match".
+                    Some(false)
+                } else {
+                    Some(phrase_match(strings.value(i), &word))
+                }
+            })
+            .collect();
+        return Ok(ColumnarValue::Array(Arc::new(out)));
+    }
+    // Declared `Str` columns arrive dictionary-encoded (ADR-0099 decision 5).
+    // Evaluate `phrase_match` once per distinct dictionary value, then gather
+    // by key, so a column with few distinct values costs far less than one
+    // match per row (the shape #479's LIKE pushdown builds on).
+    if let Some(dict) = text.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+        let values = dict.values().as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            DataFusionError::Execution(
+                "has_word() dictionary column must have Utf8 values".into(),
+            )
+        })?;
+        let per_value: Vec<bool> = (0..values.len())
+            .map(|k| !values.is_null(k) && phrase_match(values.value(k), &word))
+            .collect();
+        let keys = dict.keys();
+        let out: BooleanArray = (0..dict.len())
+            .map(|i| {
+                if dict.is_null(i) {
+                    Some(false)
+                } else {
+                    let matched = usize::try_from(keys.value(i))
+                        .ok()
+                        .and_then(|k| per_value.get(k).copied())
+                        .unwrap_or(false);
+                    Some(matched)
+                }
+            })
+            .collect();
+        return Ok(ColumnarValue::Array(Arc::new(out)));
+    }
+    Err(DataFusionError::Execution(
+        "has_word() first argument must be a Utf8 or Dictionary(Int32, Utf8) column".into(),
+    ))
 }
 
 /// Extract a non-null Utf8 scalar argument, mirroring `crate::udf`'s helper.
@@ -149,5 +181,34 @@ mod tests {
         assert!(b.value(0));
         assert!(!b.value(1));
         assert!(!b.value(2));
+    }
+
+    /// A declared `Str` column reaches `has_word` as a `Dictionary(Int32, Utf8)`
+    /// (ADR-0099 decision 5), not a `StringArray`. Without the dictionary arm the
+    /// downcast fails at runtime; this proves the arm evaluates the same rows the
+    /// plain-column path would, including a NULL key and a repeated value.
+    #[test]
+    fn impl_evaluates_over_a_declared_str_dictionary_column() {
+        use datafusion::arrow::array::{DictionaryArray, Int32Array};
+
+        // Distinct values 0="connection timeout", 1="ok"; keys reuse them and a
+        // NULL key stands in for an absent/undecodable cell.
+        let values = StringArray::from(vec![Some("connection timeout"), Some("ok")]);
+        let keys = Int32Array::from(vec![Some(0), Some(1), None, Some(0)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let args = vec![
+            ColumnarValue::Array(Arc::new(dict)),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("timeout".into()))),
+        ];
+        let out = has_word_impl(&args).expect("eval");
+        let arr = match out {
+            ColumnarValue::Array(a) => a,
+            ColumnarValue::Scalar(_) => panic!("expected array"),
+        };
+        let b = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(b.value(0), "row 0 = 'connection timeout' matches 'timeout'");
+        assert!(!b.value(1), "row 1 = 'ok' does not match");
+        assert!(!b.value(2), "row 2 = NULL key is no match");
+        assert!(b.value(3), "row 3 reuses value 0 and matches");
     }
 }
