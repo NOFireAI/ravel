@@ -87,6 +87,11 @@ Start here to run Ravel, ingest into it, or query it.
   loop (`cargo check` while you edit, the full gate list before you commit) and
   how CI shares build work across jobs with sccache and nextest. Read this
   to change Ravel's code.
+- [guides/clickbench.md](guides/clickbench.md): running the public ClickBench
+  `hits` workload against Ravel -- fetching the dataset, loading it, declaring
+  the typed columns from the checked-in mapping, and measuring with
+  `sql_latency_bench`, plus the gap list of statements the construct gate
+  rejects. Read this to reproduce or extend the ClickBench numbers.
 - [guides/coderabbit-runbook.md](guides/coderabbit-runbook.md): enabling,
   verifying, operating, rotating, and removing the maintainer-gated CodeRabbit
   integration (ADR-0091), including the controls that live in GitHub and
