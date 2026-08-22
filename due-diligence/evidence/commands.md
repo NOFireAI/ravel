@@ -105,6 +105,25 @@ $ cargo nextest run --jobs 4 -p ravel-otlp -p ravel-remote-write -p ravel-alerti
 exit 0: "Summary [28.573s] 556 tests run: 556 passed, 0 skipped"
 ```
 
+## Test batch 3 (services, doctests, store qualification)
+
+```
+$ cargo nextest run --jobs 4 -p ravel-server -p ravel-operator -p ravel-ingest-router -p ravel-cli
+exit 0: "Summary [237.869s] 887 tests run: 887 passed (2 slow), 3 skipped"
+$ cargo test --doc --workspace --jobs 4
+exit 0: 32 "test result: ok" lines, zero failures
+$ RAVEL_S3_ENDPOINT=http://127.0.0.1:19000 ... cargo run -p ravel-cli -- --store s3 ... store qualify
+exit 0. All four blocking probes PASS against live MinIO:
+  conditional_write_create_if_absent  PASS (loser rejected AlreadyExists, winner bytes intact)
+  conditional_write_cas_version       PASS
+  consistent_read_after_write         PASS (5 cycles)
+  consistent_list_after_write         PASS (5 cycles)
+  object_lock/versioning, bucket/versioning, lifecycle probes: "unknown (informational, non-blocking)"
+  "wrote sys/qualification: s3://ravel-test@http://127.0.0.1:19000 qualified (suite v1)"
+(confirms the qualification suite runs and also confirms its thinness: 4 blocking probes,
+ bucket-protection state unobservable, as flagged in memos B and later verified)
+```
+
 ## Supply chain
 
 ```
