@@ -3957,6 +3957,8 @@ fn worker_partial_aggregate_merges_before_reducing() {
                     want_count: true,
                     want_min: true,
                     want_max: true,
+                    reduce_start_ns: None,
+                    reduce_end_ns: None,
                 }),
             ),
         )
@@ -4041,6 +4043,8 @@ fn worker_group_only_partial_aggregate_enumerates_series() {
                     want_count: false,
                     want_min: false,
                     want_max: false,
+                    reduce_start_ns: None,
+                    reduce_end_ns: None,
                 }),
             ),
         )
@@ -4159,6 +4163,8 @@ fn partial_aggregate_on_a_log_slice_is_unsupported() {
                 want_count: true,
                 want_min: false,
                 want_max: false,
+                reduce_start_ns: None,
+                reduce_end_ns: None,
             }),
         );
         request.signal = crate::distrib::codec::signal_to_u32(Signal::Logs);
@@ -4171,6 +4177,434 @@ fn partial_aggregate_on_a_log_slice_is_unsupported() {
             response.status_message.contains("pushdown"),
             "expected the pushdown-not-defined refusal, got {:?}",
             response.status_message
+        );
+    });
+}
+
+/// ADR-0103 amendment: the reduction-window fields are load-bearing. A worker
+/// given `reduce_start_ns`/`reduce_end_ns` counts and folds only the samples in
+/// `(reduce_start_ns, reduce_end_ns]` -- exclusive start, inclusive end, matching
+/// `eval_matrix_selector`.
+///
+/// The corpus is one series with four samples at `1..=4` NS. The window
+/// `(2*NS, 4*NS]` keeps exactly `{3*NS, 4*NS}`. Two boundary cases are the point,
+/// not just somewhere-inside vs somewhere-outside:
+///   - `2*NS` sits exactly AT the exclusive start and must be EXCLUDED (an
+///     inclusive start would count it, giving `count = 3` and `min = 5.0`).
+///   - `4*NS` sits exactly AT the inclusive end and must be INCLUDED (an
+///     exclusive end would drop it, giving `count = 1`).
+///
+/// The `1*NS` sample sits outside the window entirely; its `100.0` value would
+/// become the `max` if the window were ignored, so `max = 7.0` proves the window
+/// gates the fold, not just the count.
+#[test]
+fn worker_partial_aggregate_reduction_window_is_load_bearing() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = vec![
+            write_segment(
+                &store,
+                0,
+                0,
+                100,
+                &[SeriesDesc {
+                    metric: "m".to_string(),
+                    samples: vec![
+                        (NS, 100.0f64.to_bits()),
+                        (2 * NS, 5.0f64.to_bits()),
+                        (3 * NS, 7.0f64.to_bits()),
+                        (4 * NS, 3.0f64.to_bits()),
+                    ],
+                }],
+            )
+            .await,
+        ];
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+        let response = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: true,
+                    want_max: true,
+                    reduce_start_ns: Some(2 * NS),
+                    reduce_end_ns: Some(4 * NS),
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds to a windowed pushdown request");
+        server.abort();
+
+        assert_eq!(response.status, pb::status::Code::Ok);
+        let got = partials_by_metric(&response.partials);
+        let m = got.get("m").expect("m partial");
+        assert_eq!(
+            m.count,
+            Some(2),
+            "only the two in-window samples (3*NS, 4*NS) are counted; \
+             the AT-start (2*NS) and out-of-window (1*NS) samples are excluded"
+        );
+        assert_eq!(
+            m.min.map(f64::to_bits),
+            Some(3.0f64.to_bits()),
+            "min folds only in-window values (3.0 at 4*NS)"
+        );
+        assert_eq!(
+            m.max.map(f64::to_bits),
+            Some(7.0f64.to_bits()),
+            "max folds only in-window values (7.0 at 3*NS), never the \
+             out-of-window 100.0 at 1*NS"
+        );
+        // The summary's reduced-sample count also reflects the window, not the
+        // fetched total.
+        assert_eq!(response.samples_returned, 2);
+    });
+}
+
+/// ADR-0103 amendment: the two reduction-window fields are one window, so a lone
+/// bound is a caller bug. The worker rejects a request carrying exactly one of
+/// `reduce_start_ns`/`reduce_end_ns` with a typed `Internal` status (never a
+/// silent one-sided filter), in either order.
+#[test]
+fn worker_partial_aggregate_lone_window_bound_is_internal_error() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = partial_pushdown_corpus(&store).await;
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+
+        // Only the start bound set.
+        let start_only = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: false,
+                    want_max: false,
+                    reduce_start_ns: Some(NS),
+                    reduce_end_ns: None,
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds");
+        assert_eq!(start_only.status, pb::status::Code::Internal);
+        assert!(
+            start_only.status_message.contains("reduce_start_ns")
+                && start_only.status_message.contains("both or neither"),
+            "expected the lone-bound refusal, got {:?}",
+            start_only.status_message
+        );
+
+        // Only the end bound set: the mirror-image caller bug is rejected the
+        // same way.
+        let end_only = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: false,
+                    want_max: false,
+                    reduce_start_ns: None,
+                    reduce_end_ns: Some(4 * NS),
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds");
+        server.abort();
+        assert_eq!(end_only.status, pb::status::Code::Internal);
+        assert!(
+            end_only.status_message.contains("reduce_end_ns")
+                && end_only.status_message.contains("both or neither"),
+            "expected the lone-bound refusal, got {:?}",
+            end_only.status_message
+        );
+    });
+}
+
+/// ADR-0103 amendment: staleness filtering is load-bearing. A series whose only
+/// merged sample in the reduction window is a `STALE_NAN_BITS` marker must
+/// contribute `count: Some(0)`, not `Some(1)` -- the evaluator drops the marker
+/// before any range function sees it, and the worker's pushed-down count must
+/// match.
+///
+/// Mutation proof: this test is RED against a worker missing the staleness
+/// filter. Removing the `.filter(|s| s.value.to_bits() != STALE_NAN_BITS)` line
+/// in `reduce_partial_aggregates` (`service.rs`) makes the marker count as a
+/// real sample, so `count` comes back `Some(1)` and the assertion below fails.
+/// The window here covers the marker's timestamp, so it is the staleness filter,
+/// not the window, that removes it.
+#[test]
+fn worker_partial_aggregate_filters_staleness_before_counting() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+        let store = Arc::new(MemoryStore::new());
+        let segments = vec![
+            write_segment(
+                &store,
+                0,
+                0,
+                100,
+                &[SeriesDesc {
+                    metric: "s".to_string(),
+                    // The series' only sample is a staleness marker, inside the
+                    // window below.
+                    samples: vec![(2 * NS, STALE_NAN_BITS)],
+                }],
+            )
+            .await,
+        ];
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+        let response = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: false,
+                    want_max: false,
+                    reduce_start_ns: Some(NS),
+                    reduce_end_ns: Some(3 * NS),
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds to a pushdown request");
+        server.abort();
+
+        assert_eq!(response.status, pb::status::Code::Ok);
+        let got = partials_by_metric(&response.partials);
+        let s = got.get("s").expect("a partial for the stale-only series");
+        assert_eq!(
+            s.count,
+            Some(0),
+            "a staleness marker must not inflate the pushed-down count"
+        );
+        // The reduced-sample tally the summary reports also excludes the marker.
+        assert_eq!(response.samples_returned, 0);
+    });
+}
+
+/// ADR-0103 amendment F1: a slice that spends real fetch cost before refusing a
+/// pushdown over native-histogram data must report that cost, not lose it. The
+/// native-histogram refusal now returns an `Unsupported` terminal summary
+/// carrying the accounting the segment fetches already paid for, instead of an
+/// `Err` that `run_slice` rebuilds from a zero-cost default snapshot.
+///
+/// Mutation proof: this test is RED against the pre-fix code on `main`. Restoring
+/// the refusal to `return Err((pb::status::Code::Unsupported, ...))` sends the
+/// outcome through `run_slice`'s catch-all, whose summary carries
+/// `QueryAccountingSnapshot::default()` (all zeros), so the nonzero-spend
+/// assertion below fails while the `Unsupported` status still passes.
+#[test]
+fn native_histogram_pushdown_refusal_reports_real_accounting() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        use ravel_segment::{
+            HistogramCounts, HistogramSample, HistogramValue, ResetHint, SeriesInputV3,
+            SeriesValues,
+        };
+
+        let store = Arc::new(MemoryStore::new());
+        let metric = "h0";
+        let label_set = labels(metric);
+        let series_id = SeriesId::compute(&tenant_id(), metric, &label_set).expect("series id");
+        let hist = HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: Some(2.5),
+            custom_values: None,
+            positive_spans: vec![ravel_segment::HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            counts: HistogramCounts::Int {
+                zero_count: 0,
+                count: 1,
+                positive: vec![1],
+                negative: Vec::new(),
+            },
+            reset_hint: ResetHint::Unknown,
+        };
+        let identity = SegmentIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 0,
+        };
+        let written = SegmentWriter::write_histograms(
+            vec![SeriesInputV3 {
+                series_id,
+                labels: label_set,
+                values: SeriesValues::Histogram(vec![HistogramSample {
+                    ts_ns: NS,
+                    value: hist,
+                }]),
+            }],
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write histogram segment");
+        let object_key = "seg/f1_hist.rseg".to_string();
+        store
+            .put(&object_key, written.bytes.clone(), PutOptions::default())
+            .await
+            .expect("put segment");
+        let seg = SegmentRef {
+            data_object_key: object_key,
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 100,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 0,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+        };
+        let segments = vec![seg];
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+        let response = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: false,
+                    want_max: false,
+                    reduce_start_ns: None,
+                    reduce_end_ns: None,
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds to the histogram pushdown request");
+        server.abort();
+
+        assert_eq!(
+            response.status,
+            pb::status::Code::Unsupported,
+            "a native-histogram pushdown is refused so the coordinator falls back"
+        );
+        assert!(
+            response.status_message.contains("native-histogram"),
+            "expected the native-histogram refusal, got {:?}",
+            response.status_message
+        );
+        assert!(
+            response.accounting.total_s3_bytes() > 0,
+            "the refusal summary must carry the real fetch cost already spent, \
+             not a zero-cost default"
+        );
+    });
+}
+
+/// Regression guard for the "completely unchanged when no window is set" contract
+/// (ADR-0103 amendment, deliverable 1): a `want_count`-only request with NEITHER
+/// reduction-window field set (T3's exact shape) produces the byte-identical
+/// `PartialAggregate` frames the pre-amendment worker produced. The staleness
+/// filter this task adds is unconditional but a no-op over this non-stale corpus,
+/// and with no window the fold runs over every merged sample, so the wire output
+/// must not move.
+///
+/// The expected bytes are built independently from the corpus' hand-known merged
+/// counts (`m0` dedups six fetched samples to four; `m1` keeps two), encoded
+/// through the same `encode_partial_aggregate` path, then compared as a sorted
+/// set so the assertion turns on frame content, not on fetch/group order.
+#[test]
+fn count_only_no_window_request_is_byte_identical() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        use prost::Message;
+
+        let store = Arc::new(MemoryStore::new());
+        let segments = partial_pushdown_corpus(&store).await;
+
+        let encode = |p: &crate::distrib::codec::PartialAggregate| {
+            pb::FetchResponse {
+                frame: Some(pb::fetch_response::Frame::PartialAggregate(
+                    crate::distrib::codec::encode_partial_aggregate(p),
+                )),
+            }
+            .encode_to_vec()
+        };
+        let expected_partial = |metric: &str, count: u64| crate::distrib::codec::PartialAggregate {
+            series_id: SeriesId::compute(&tenant_id(), metric, &labels(metric)).expect("series id"),
+            labels: labels(metric),
+            count: Some(count),
+            min: None,
+            max: None,
+        };
+        let mut expected: Vec<Vec<u8>> = vec![
+            encode(&expected_partial("m0", 4)),
+            encode(&expected_partial("m1", 2)),
+        ];
+        expected.sort();
+
+        // Drive the service directly so the partial frames are observable on the
+        // wire before any decode collapses them.
+        let metrics_store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+        let service = SeriesFetchService::new(
+            SegmentFetcher::new(metrics_store),
+            Arc::new(SnapshotSegmentResolver::new(segments.clone())),
+        );
+        let response = SeriesFetch::fetch(
+            &service,
+            tonic::Request::new(pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: false,
+                    want_max: false,
+                    reduce_start_ns: None,
+                    reduce_end_ns: None,
+                }),
+            )),
+        )
+        .await
+        .expect("worker serves the count-only request");
+        let frames: Vec<pb::FetchResponse> =
+            futures::StreamExt::collect::<Vec<_>>(response.into_inner())
+                .await
+                .into_iter()
+                .map(|f| f.expect("frame"))
+                .collect();
+
+        let mut got: Vec<Vec<u8>> = frames
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.frame,
+                    Some(pb::fetch_response::Frame::PartialAggregate(_))
+                )
+            })
+            .map(|f| f.encode_to_vec())
+            .collect();
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "count-only, no-window partial frames must be byte-identical to the \
+             pre-amendment encode"
         );
     });
 }
