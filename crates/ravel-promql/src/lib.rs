@@ -31,9 +31,14 @@ pub mod testsource;
 
 pub use eval::{
     Annotations, DEFAULT_LOOKBACK_NS, DEFAULT_MAX_RANGE_POINTS, DEFAULT_MAX_TOTAL_EVAL_POINTS,
-    DEFAULT_SUBQUERY_STEP_NS, Error, Evaluator, InstantSample, InstantVector, RangeMatrix, Value,
-    ms_to_ns, ns_to_ms_floor,
+    DEFAULT_SUBQUERY_STEP_NS, Error, Evaluator, InstantSample, InstantVector, QueryWindow,
+    RangeMatrix, Value, ms_to_ns, ns_to_ms_floor,
 };
+// ADR-0103 aggregation pushdown: the coordinator (`ravel-query`) derives a
+// count_over_time reduction window on the distributed path and asserts it
+// byte-for-byte against the evaluator's own `range_window`, so these are
+// public for that cross-crate check. Visibility only; behavior unchanged.
+pub use functions::{MatrixArg, RangeWindow, matrix_arg, range_window};
 pub use histogram::{FloatHistogram, ResetHint, Span};
 pub use matchers::{from_ast_matcher, from_ast_matchers, has_or_group, matches_series};
 pub use plan::{PlanAnchor, SelectorPlan, plan_selectors};

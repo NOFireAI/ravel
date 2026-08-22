@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use promql_parser::parser::{Expr, Offset};
-use ravel_catalog::{Catalog, SegmentRef, Snapshot};
+use ravel_catalog::{Catalog, SegmentRef, ShardGeneration, Snapshot};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
     Annotations, Evaluator, FloatHistogram, HistogramSeriesData, LabelMatcher, MatchOp, PlanAnchor,
     SelectorPlan, SeriesData, SeriesSource, SourceError, Span, Value, from_ast_matchers,
     has_or_group, matches_series, ms_to_ns, plan_selectors,
 };
+use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::ReaderLimits;
 use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{
@@ -645,7 +646,11 @@ impl QueryEngine {
         now_ns: i64,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
         let name_filter = equality_name_filter(matchers);
-        let attempt = |snapshot: Snapshot, accounting: QueryAccounting| async move {
+        // Discovery does not push aggregation down (ADR-0103 is scalar-sample
+        // pushdown), so it ignores the resolve's generation history.
+        let attempt = |snapshot: Snapshot,
+                       _generations: Vec<ShardGeneration>,
+                       accounting: QueryAccounting| async move {
             // The bytes-scanned budget (ADR-0061 decision 1) is enforced
             // inside `fetch_all_series`, once per completed segment fetch, so a
             // labels/series query that matches zero series still evaluates the
@@ -818,6 +823,7 @@ impl QueryEngine {
                 MergedSource {
                     series: Vec::new(),
                     histogram_series: Vec::new(),
+                    precomputed_count: None,
                 },
                 QueryStats::default(),
             ));
@@ -856,7 +862,9 @@ impl QueryEngine {
         // the reference on each retry rather than moving the owned `Vec` out of
         // its environment. The per-plan futures below build owned pairs from it.
         let windows_ref = &windows;
-        let attempt = |snapshot: Snapshot, accounting: QueryAccounting| async move {
+        let attempt = |snapshot: Snapshot,
+                       generations: Vec<ShardGeneration>,
+                       accounting: QueryAccounting| async move {
             // Owned clones, not borrowed slice items: a closure capturing a
             // reference into `plans` through this combinator chain makes
             // rustc infer a fixed (non-higher-ranked) lifetime for the
@@ -867,11 +875,14 @@ impl QueryEngine {
             // Per-plan local result: this selector's raw scalar runs (kept
             // un-merged so cross-cluster federation runs can join the same
             // pool and merge once, below), the merged native-histogram series
-            // (federation contributes no histograms), and the page stats.
+            // (federation contributes no histograms), the page stats, and any
+            // honored ADR-0103 pushdown partials (`Some` only for the single
+            // eligible matcher set; `None` for every other plan).
             type PerPlan = (
                 Vec<Vec<FetchedSeriesSoa>>,
                 Vec<HistogramSeriesData>,
                 FetchStats,
+                Option<Vec<crate::distrib::codec::PartialAggregate>>,
             );
             // Two plans with equal `matchers` fetch byte-identical results
             // off the same snapshot: the fetch is matchers-only with no
@@ -893,11 +904,41 @@ impl QueryEngine {
                     distinct_plans.push(plan.clone());
                 }
             }
+            // ADR-0103 eligibility gate, evaluated ONCE per query over the whole
+            // resolved snapshot's segment set and the generation history THIS
+            // resolve produced (never a per-matcher-set subset, never a
+            // separately-read history). Passing `self.federation.as_deref()`
+            // (not a hardcoded `None`) is load-bearing: `None` here would make
+            // every federated query look eligible, the exact wrong-answer bug
+            // decision 1(a) exists to prevent.
+            let snapshot_eligible = crate::distrib::is_pushdown_eligible(
+                self.federation.as_deref(),
+                &snapshot.segments,
+                &generations,
+            );
+            // The single matcher set (if any) that gets a `count_over_time`
+            // partial-aggregate request, and the reduction window that request
+            // carries. `None` on every query today.
+            let pushdown_target =
+                count_over_time_pushdown_target(plans, eval_window, snapshot_eligible)?;
             let results: Vec<Result<PerPlan, QueryError>> = stream::iter(distinct_plans)
                 .map(|plan| {
                     let snapshot = &snapshot;
                     let accounting = &accounting;
+                    let pushdown_target = &pushdown_target;
                     async move {
+                        // This matcher set gets the pushdown request iff it is
+                        // the one eligible target; every other fetches raw with
+                        // `partial_aggregate: None`, byte-identical to today.
+                        let partial_req = pushdown_target.as_ref().and_then(|t| {
+                            (t.matchers == plan.matchers).then_some(pb::PartialAggregateRequest {
+                                want_count: true,
+                                want_min: false,
+                                want_max: false,
+                                reduce_start_ns: Some(t.reduce_start_ns),
+                                reduce_end_ns: Some(t.reduce_end_ns),
+                            })
+                        });
                         // A selector's segments carry scalar and/or
                         // native-histogram series; fetch both kinds (a series is
                         // one kind for its whole life, so the two sets never
@@ -911,7 +952,7 @@ impl QueryEngine {
                         // fetch charges into -- so the budget bounds the whole
                         // query's scan and cancels it mid-fetch, not after the
                         // merge has already paid for every byte.
-                        let (scalar_fetched, page_stats, hist_fetched) = self
+                        let (scalar_fetched, page_stats, hist_fetched, pushdown_partials) = self
                             .fetch_samples_and_histograms_maybe_distributed(
                                 tenant_hash,
                                 snapshot,
@@ -920,11 +961,17 @@ impl QueryEngine {
                                 max_bytes_scanned,
                                 max_s3_requests,
                                 deadline_unix_ns,
+                                partial_req,
                             )
                             .await?;
                         let histograms =
                             merge_histogram_soa_runs(hist_fetched, max_series, max_samples)?;
-                        Ok::<PerPlan, QueryError>((scalar_fetched, histograms, page_stats))
+                        Ok::<PerPlan, QueryError>((
+                            scalar_fetched,
+                            histograms,
+                            page_stats,
+                            pushdown_partials,
+                        ))
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -959,8 +1006,11 @@ impl QueryEngine {
             let mut all_scalar_runs: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
             let mut combined_histograms: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
             let mut page_stats = FetchStats::default();
+            // At most one plan (the eligible pushdown target) yields honored
+            // partials; every other yields `None`. Collect the one that did.
+            let mut collected_pushdown: Option<Vec<crate::distrib::codec::PartialAggregate>> = None;
             for r in results {
-                let (scalar_runs, histograms, per_plan_stats) = r?;
+                let (scalar_runs, histograms, per_plan_stats, pushdown_partials) = r?;
                 all_scalar_runs.extend(scalar_runs);
                 for series in histograms {
                     combined_histograms
@@ -969,6 +1019,9 @@ impl QueryEngine {
                 }
                 page_stats.raw_f64_pages += per_plan_stats.raw_f64_pages;
                 page_stats.raw_f64_bytes += per_plan_stats.raw_f64_bytes;
+                if let Some(partials) = pushdown_partials {
+                    collected_pushdown = Some(partials);
+                }
             }
 
             // Cross-cluster federation (ADR-0071): fan each
@@ -1042,11 +1095,34 @@ impl QueryEngine {
             let mut histogram_series: Vec<HistogramSeriesData> =
                 combined_histograms.into_values().collect();
             histogram_series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
+            // Stash the collected pushdown count table iff a matcher set was
+            // eligible AND its workers honored the request (`collected_pushdown`
+            // is `Some`). An eligible query that fell back to raw fetch leaves
+            // this `None`, so the raw `series` above are used instead. A zero
+            // count maps to the absence of a series here already: only partials
+            // the worker actually returned (with a present count) become rows.
+            //
+            // This field is inert: `MergedSource` does not override
+            // `SeriesSource::query_precomputed_count`, so the T4b fast path
+            // never reads it. T4d adds that override and its reachability test.
+            let precomputed_count = match (&pushdown_target, collected_pushdown) {
+                (Some(target), Some(partials)) => Some(PrecomputedCount {
+                    matchers: target.matchers.clone(),
+                    start_ns: target.reduce_start_ns,
+                    end_ns: target.reduce_end_ns,
+                    counts: partials
+                        .into_iter()
+                        .filter_map(|p| p.count.map(|c| (p.labels, c)))
+                        .collect(),
+                }),
+                _ => None,
+            };
             Ok((
                 (
                     MergedSource {
                         series,
                         histogram_series,
+                        precomputed_count,
                     },
                     fed_warnings,
                     fed_partial,
@@ -1088,7 +1164,7 @@ impl QueryEngine {
         mut attempt: F,
     ) -> Result<(T, QueryStats), QueryError>
     where
-        F: FnMut(Snapshot, QueryAccounting) -> Fut,
+        F: FnMut(Snapshot, Vec<ShardGeneration>, QueryAccounting) -> Fut,
         Fut: std::future::Future<Output = Result<(T, FetchStats), QueryError>>,
     {
         // The catalog term (ADR-0044 decision 3) is the same for both
@@ -1103,7 +1179,7 @@ impl QueryEngine {
         // discarded first attempt's in-flight counts must not bleed into the
         // attempt that actually produced the result.
         let first_accounting = QueryAccounting::new();
-        let first = self
+        let (first, first_generations) = self
             .resolve_bounded(
                 tenant_hash,
                 window,
@@ -1116,13 +1192,13 @@ impl QueryEngine {
         let first_estimate = estimate_cost(&first, fetch_multiplier, catalog_requests);
         let first_segments = first.segments.len() as u64;
         let first_pruned = first.segments_pruned;
-        match attempt(first, first_accounting.clone()).await {
+        match attempt(first, first_generations, first_accounting.clone()).await {
             Err(QueryError::Fetch(FetchError::Store {
                 source: StoreError::NotFound,
                 ..
             })) => {
                 let second_accounting = QueryAccounting::new();
-                let second = self
+                let (second, second_generations) = self
                     .resolve_bounded(
                         tenant_hash,
                         window,
@@ -1135,7 +1211,7 @@ impl QueryEngine {
                 let second_estimate = estimate_cost(&second, fetch_multiplier, catalog_requests);
                 let second_segments = second.segments.len() as u64;
                 let second_pruned = second.segments_pruned;
-                match attempt(second, second_accounting.clone()).await {
+                match attempt(second, second_generations, second_accounting.clone()).await {
                     Err(QueryError::Fetch(FetchError::Store {
                         source: StoreError::NotFound,
                         ..
@@ -1181,10 +1257,15 @@ impl QueryEngine {
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<Snapshot, QueryError> {
-        let (snapshot, origins) = self
+    ) -> Result<(Snapshot, Vec<ShardGeneration>), QueryError> {
+        // `resolve_pruned_with_generations` returns the shard-generation history
+        // THIS resolve computed its scan set from (ADR-0103 decision 1(b)): the
+        // pushdown eligibility gate reads exactly this copy, never a separately
+        // re-read one, so a generation appended between two reads can never be
+        // visible in the resolved segments while invisible to the gate.
+        let (snapshot, origins, generations) = self
             .catalog
-            .resolve_pruned_with_admission(
+            .resolve_pruned_with_generations(
                 &tenant_hash,
                 Signal::Metrics,
                 window,
@@ -1199,7 +1280,7 @@ impl QueryEngine {
         // 2). Their cost is bounded separately by the request budget
         // checked incrementally during fetch, below.
         segment_admission::admit(&snapshot, &origins, &self.config)?;
-        Ok(snapshot)
+        Ok((snapshot, generations))
     }
 
     /// Fetches every matched series from each snapshot segment in a single
@@ -1303,6 +1384,7 @@ impl QueryEngine {
     /// fetch, which is why an engine that never opts in behaves precisely as
     /// it did before this seam existed.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_samples_and_histograms_maybe_distributed(
         &self,
         tenant_hash: TenantHash,
@@ -1312,14 +1394,24 @@ impl QueryEngine {
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestLimit,
         deadline_unix_ns: i64,
+        partial_aggregate: Option<pb::PartialAggregateRequest>,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
             FetchStats,
             Vec<Vec<FetchedHistogramSeries>>,
+            // `Some` only when a pushdown request was both sent AND honored by
+            // the distributed workers (an empty inner `Vec` then means a
+            // legitimate zero-series answer, not a fallback). `None` whenever
+            // the raw path ran -- no request, the cost gate declined to
+            // distribute, or a worker forced a local fallback -- so the caller
+            // never mistakes an eligible-but-fell-back query for a pushdown
+            // result and must use the raw samples it also returned.
+            Option<Vec<crate::distrib::codec::PartialAggregate>>,
         ),
         QueryError,
     > {
+        let want_pushdown = partial_aggregate.is_some();
         if let Some(distributed) = &self.distributed {
             // The cost gate reads the same estimate shape the engine already
             // computes (ADR-0044); a single per-segment pass (multiplier 1, no
@@ -1328,7 +1420,7 @@ impl QueryEngine {
             let cost = estimate_cost(snapshot, 1, 0);
             if crate::distrib::partition::should_distribute(distributed.thresholds(), &cost) {
                 let erasure = snapshot_erasure_predicates(snapshot);
-                if let Some(triple) = distributed
+                if let Some((triple, partials)) = distributed
                     .fetch(
                         tenant_hash,
                         Signal::Metrics,
@@ -1338,6 +1430,7 @@ impl QueryEngine {
                         accounting,
                         &self.config,
                         deadline_unix_ns,
+                        partial_aggregate,
                     )
                     .await?
                 {
@@ -1361,7 +1454,14 @@ impl QueryEngine {
                     ) {
                         return Err(err);
                     }
-                    return Ok(triple);
+                    let (scalar, stats, hist) = triple;
+                    // Distinguish "pushdown honored" (workers ran the partial
+                    // request; `scalar` is empty and `partials` is the answer,
+                    // possibly zero series) from "no pushdown asked" (raw runs
+                    // in `scalar`, `partials` empty): only the former yields a
+                    // pushdown result the caller may stash.
+                    let pushdown = want_pushdown.then_some(partials);
+                    return Ok((scalar, stats, hist, pushdown));
                 }
                 // `None`: a worker asked for local fallback (version skew, a
                 // histogram-bearing slice). Fall through to the local path.
@@ -1374,15 +1474,21 @@ impl QueryEngine {
                 // that is the true total cost, not a double-count.
             }
         }
-        self.fetch_all_samples_and_histograms(
-            tenant_hash,
-            snapshot,
-            matchers,
-            accounting,
-            max_bytes_scanned,
-            max_s3_requests,
-        )
-        .await
+        let (scalar, stats, hist) = self
+            .fetch_all_samples_and_histograms(
+                tenant_hash,
+                snapshot,
+                matchers,
+                accounting,
+                max_bytes_scanned,
+                max_s3_requests,
+            )
+            .await?;
+        // The local path has no worker to compute a partial: pushdown is a
+        // distributed-only optimization, so an eligible query that does not trip
+        // the cost gate (or a query with no distributed context at all) simply
+        // fetches raw and returns no pushdown result.
+        Ok((scalar, stats, hist, None))
     }
 
     /// Cross-cluster federation fan-out for the metrics path (ADR-0071, ADR-0096).
@@ -1700,6 +1806,83 @@ fn last_grid_ns(start_ns: i64, end_ns: i64, step_ns: i64) -> Result<i64, QueryEr
         .ok_or(QueryError::TimeOverflow)
 }
 
+/// The single matcher set the coordinator selected for ADR-0103
+/// `count_over_time` pushdown, and the reduction window its
+/// `PartialAggregateRequest` carries.
+#[derive(Debug, Clone, PartialEq)]
+struct PushdownTarget {
+    matchers: Vec<LabelMatcher>,
+    /// Exclusive lower bound of the reduction window (`sel_ts - range`).
+    reduce_start_ns: i64,
+    /// Inclusive upper bound of the reduction window (`sel_ts`).
+    reduce_end_ns: i64,
+}
+
+/// Decide whether ADR-0103 `count_over_time` pushdown applies to this query,
+/// and for which matcher set. Returns the single eligible matcher set's
+/// reduction window, or `None` when no matcher set qualifies. All four of the
+/// amendment's conditions are checked here:
+///
+/// - `EvalWindow::Instant`: a range window evaluates at N steps, each needing
+///   its own sub-window; one whole-fetch partial per series cannot serve more
+///   than one, so a `Range` window is excluded entirely (even a single
+///   effective step -- not special-cased).
+/// - Exactly one pushdown candidate in the whole query (the amendment's
+///   "count_over_time exactly once"): two `count_over_time` occurrences, even
+///   over disjoint matcher sets, disqualify the query, since the collected
+///   result stashes a single table.
+/// - That candidate's matcher set has exactly one consuming plan in the
+///   PRE-DEDUP `plans` slice (the selector-plan-dedup consumer-agreement rule):
+///   a second consumer -- a raw `a` in `count_over_time(a[5m]) + a`, or a
+///   different window in `count_over_time(a[5m]) + count_over_time(a[10m])` --
+///   forces the shared fetch to stay raw.
+/// - `snapshot_eligible`: the resolved-segment/generation gate
+///   ([`crate::distrib::is_pushdown_eligible`]), computed ONCE per query by the
+///   caller over the whole snapshot and passed in, never re-evaluated per plan.
+///
+/// The reduction window is the SAME resolution [`selector_fetch_window`]
+/// performs for the candidate plan against the instant: exclusive start
+/// `sel_ts - range_ns`, inclusive end `sel_ts`, with `sel_ts` the offset/`@`
+/// -resolved instant per the plan's `PlanAnchor`.
+fn count_over_time_pushdown_target(
+    plans: &[SelectorPlan],
+    eval_window: &EvalWindow,
+    snapshot_eligible: bool,
+) -> Result<Option<PushdownTarget>, QueryError> {
+    // Range queries are conservatively excluded in this task.
+    let EvalWindow::Instant { .. } = eval_window else {
+        return Ok(None);
+    };
+    if !snapshot_eligible {
+        return Ok(None);
+    }
+    // "count_over_time exactly once": exactly one candidate plan in the query.
+    let mut candidates = plans
+        .iter()
+        .filter(|p| p.count_over_time_pushdown_candidate);
+    let Some(candidate) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.next().is_some() {
+        return Ok(None);
+    }
+    // Consumer agreement: the candidate's matcher set must have exactly one
+    // consuming plan (itself). Matcher equality only, matching `distinct_plans`.
+    let consumers = plans
+        .iter()
+        .filter(|p| p.matchers == candidate.matchers)
+        .count();
+    if consumers != 1 {
+        return Ok(None);
+    }
+    let window = selector_fetch_window(candidate, eval_window)?;
+    Ok(Some(PushdownTarget {
+        matchers: candidate.matchers.clone(),
+        reduce_start_ns: window.start_ns,
+        reduce_end_ns: window.end_ns,
+    }))
+}
+
 /// Translates one selector's plan (`range_ns`/`offset_ns`/`anchor`) into the
 /// concrete window to fetch for it, for either an instant or a range query.
 /// `PlanAnchor::Pinned` is already offset-adjusted and constant regardless
@@ -2001,6 +2184,7 @@ mod name_filter_tests {
             range_ns: 0,
             offset_ns: 0,
             anchor: PlanAnchor::Window,
+            count_over_time_pushdown_candidate: false,
         };
 
         // Same prefix across selectors: shared prefix key.
@@ -2715,9 +2899,42 @@ fn merge_histogram_soa_runs(
 /// native-histogram series), not a materialized per-timestamp window
 /// (docs/query-engine.md / `ravel_promql::source` module doc: by the time
 /// the evaluator runs, everything is plain, synchronous, in-memory data).
+/// The ADR-0103 pushdown result collected on the coordinator: the exact
+/// matcher set and reduction window this count table answers for, plus one
+/// `(labels, count)` per series a worker returned. Populated by
+/// [`QueryEngine::prefetch`] only when a query had an eligible instant
+/// `count_over_time` matcher set; `None` on every other query.
+///
+/// This is inert cargo for now: `MergedSource` does NOT override
+/// `SeriesSource::query_precomputed_count`, so the T4b fast path in
+/// `eval_call` still receives the defaulted `Ok(None)` from every real query
+/// and falls back to the raw path. T4d adds the override plus the reachability
+/// test that makes the fast path actually fire.
+///
+/// Every field is written by `prefetch` but read by nothing until T4d wires
+/// the `query_precomputed_count` override, hence `dead_code` is allowed here
+/// deliberately (removing it once T4d lands is part of that task).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct PrecomputedCount {
+    /// The matcher set this table answers for (the one eligible
+    /// `count_over_time` selector's resolved matchers).
+    matchers: Vec<LabelMatcher>,
+    /// Exclusive lower bound of the reduction window the workers counted over.
+    start_ns: i64,
+    /// Inclusive upper bound of the reduction window.
+    end_ns: i64,
+    /// One per-series count, exactly as the workers reported it.
+    counts: Vec<(LabelSet, u64)>,
+}
+
 struct MergedSource {
     series: Vec<SeriesData>,
     histogram_series: Vec<HistogramSeriesData>,
+    /// ADR-0103 collected pushdown count table (T4d wires the read side).
+    /// Written by `prefetch`, read by nothing until then.
+    #[allow(dead_code)]
+    precomputed_count: Option<PrecomputedCount>,
 }
 
 impl SeriesSource for MergedSource {
@@ -4304,6 +4521,7 @@ mod histogram_source_tests {
         MergedSource {
             series: Vec::new(),
             histogram_series,
+            precomputed_count: None,
         }
     }
 
@@ -4442,6 +4660,7 @@ mod prefetch_tests {
             range_ns: DEFAULT_LOOKBACK_NS,
             offset_ns: 0,
             anchor: PlanAnchor::Window,
+            count_over_time_pushdown_candidate: false,
         }
     }
 
@@ -4897,6 +5116,125 @@ mod prefetch_tests {
         );
     }
 
+    /// ADR-0103 byte-exact reduction window: the `(reduce_start_ns,
+    /// reduce_end_ns)` this task derives for an eligible `count_over_time` must
+    /// equal, to the nanosecond, what the evaluator's own `range_window`
+    /// resolves for the SAME query text and instant. A silent drift here is a
+    /// permanent, gate-undetectable wrong-answer fallback, so this calls the
+    /// real `range_window` (not a hand-computed literal) and covers a nonzero
+    /// `offset`, which gives a different answer if computed from the eval
+    /// instant instead of the offset-resolved selector timestamp.
+    #[test]
+    fn pushdown_reduction_window_is_byte_exact_with_range_window() {
+        for query in [
+            "count_over_time(m[5m])",
+            "count_over_time(m[5m] offset 1h)",
+            "count_over_time(m[10m] offset 30m)",
+        ] {
+            let t_ns = BASE_NS;
+            let t_ms = t_ns / 1_000_000;
+            let plans = plan_selectors(query, t_ms, t_ms).expect("plan");
+            let target =
+                count_over_time_pushdown_target(&plans, &EvalWindow::Instant { t_ns }, true)
+                    .expect("no time overflow")
+                    .expect("an eligible single count_over_time is a target");
+
+            // The real evaluator resolution for the identical query and instant.
+            let expr = promql_parser::parser::parse(query).expect("parse");
+            let promql_parser::parser::Expr::Call(call) = &expr else {
+                panic!("count_over_time is a call");
+            };
+            let arg = ravel_promql::matrix_arg(&call.args.args[0]).expect("matrix arg");
+            let ctx = ravel_promql::QueryWindow::bare(t_ns, t_ns);
+            let rw = ravel_promql::range_window(arg, t_ns, &ctx).expect("range window");
+
+            assert_eq!(
+                target.reduce_start_ns, rw.start_ns,
+                "{query}: exclusive start must match range_window's"
+            );
+            assert_eq!(
+                target.reduce_end_ns, rw.end_ns,
+                "{query}: inclusive end must match range_window's"
+            );
+        }
+    }
+
+    /// ADR-0103 consumer-agreement rule: a matcher set consumed by both a
+    /// pushdown candidate and another plan (`count_over_time(a[5m]) + a`, two
+    /// `SelectorPlan`s sharing one matcher set, only one a candidate) is NOT a
+    /// pushdown target, so it fetches raw exactly as today.
+    #[test]
+    fn shared_matcher_set_with_a_raw_consumer_is_not_a_pushdown_target() {
+        let plans = plan_selectors("count_over_time(a[5m]) + a", 0, 0).expect("plan");
+        // Two plans, both matcher set {a}: one the count_over_time candidate,
+        // one the bare `a`.
+        assert_eq!(plans.len(), 2);
+        let target =
+            count_over_time_pushdown_target(&plans, &EvalWindow::Instant { t_ns: BASE_NS }, true)
+                .expect("no overflow");
+        assert!(
+            target.is_none(),
+            "a matcher set with a second raw consumer stays raw"
+        );
+    }
+
+    /// ADR-0103: a single eligible `count_over_time` over a literal selector IS
+    /// a target, and the four disqualifiers each independently defeat it.
+    #[test]
+    fn pushdown_target_gates() {
+        let single = plan_selectors("count_over_time(m[5m])", 0, 0).expect("plan");
+        let instant = EvalWindow::Instant { t_ns: BASE_NS };
+
+        // The happy path: eligible + instant + single candidate + sole consumer.
+        assert!(
+            count_over_time_pushdown_target(&single, &instant, true)
+                .expect("no overflow")
+                .is_some(),
+            "a lone eligible count_over_time is a target"
+        );
+
+        // Gate 1: the resolved-segment/generation eligibility is false.
+        assert!(
+            count_over_time_pushdown_target(&single, &instant, false)
+                .expect("no overflow")
+                .is_none(),
+            "an ineligible snapshot is never a target"
+        );
+
+        // Gate 2: a range window is excluded entirely.
+        let range = EvalWindow::Range {
+            start_ns: BASE_NS,
+            end_ns: BASE_NS + 60_000_000_000,
+            step_ns: 60_000_000_000,
+        };
+        assert!(
+            count_over_time_pushdown_target(&single, &range, true)
+                .expect("no overflow")
+                .is_none(),
+            "a range query is excluded"
+        );
+
+        // Gate 3: count_over_time appearing more than once (even over disjoint
+        // matcher sets) disqualifies the whole query.
+        let twice =
+            plan_selectors("count_over_time(a[5m]) + count_over_time(b[5m])", 0, 0).expect("plan");
+        assert!(
+            count_over_time_pushdown_target(&twice, &instant, true)
+                .expect("no overflow")
+                .is_none(),
+            "count_over_time must appear exactly once"
+        );
+
+        // Gate 4: a non-candidate call (different function) is never a target.
+        let other = plan_selectors("sum_over_time(m[5m])", 0, 0).expect("plan");
+        assert!(
+            count_over_time_pushdown_target(&other, &instant, true)
+                .expect("no overflow")
+                .is_none(),
+            "sum_over_time is not a candidate"
+        );
+    }
+
     /// ADR-0044: `estimate_cost`'s output must be a genuine upper envelope,
     /// never a prediction -- the actual accounting snapshot recorded by the
     /// same query attempt must never exceed it in any dimension. `divergence`
@@ -5061,6 +5399,7 @@ mod prefetch_tests {
             range_ns: 24 * 60 * NS_PER_MIN,
             offset_ns: 0,
             anchor: PlanAnchor::Window,
+            count_over_time_pushdown_candidate: false,
         }];
         let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
         let (_source, stats) = eng

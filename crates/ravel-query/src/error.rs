@@ -53,4 +53,8 @@ pub enum QueryError {
         "run carries {priorities} per-sample dedup priorities but {samples} samples; the column must be parallel to the samples"
     )]
     PrioritySampleCountMismatch { priorities: usize, samples: usize },
+    #[error(
+        "aggregation pushdown collected series {series_id} from more than one slice; the ADR-0103 eligibility gate guarantees each series lives on exactly one worker, so a repeat means the gate was violated and the query must fail closed rather than keep one of two partials"
+    )]
+    DuplicatePushdownSeries { series_id: String },
 }

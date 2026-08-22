@@ -134,7 +134,13 @@ impl From<QueryError> for ApiError {
             // object contradicts the format's invariants, so it is reported as
             // a server-side fault with a fixed message rather than echoing
             // internal column lengths.
-            | QueryError::PrioritySampleCountMismatch { .. } => {
+            | QueryError::PrioritySampleCountMismatch { .. }
+            // ADR-0103: the same series arrived from two slices under the
+            // pushdown eligibility gate, which guarantees each series lives on
+            // exactly one worker. A repeat is a server-side gate violation the
+            // query fails closed on rather than keeping one of two values; its
+            // message carries only a series id, redacted to the fixed message.
+            | QueryError::DuplicatePushdownSeries { .. } => {
                 ApiError::Unavailable(MSG_UNAVAILABLE.to_string())
             }
         }
