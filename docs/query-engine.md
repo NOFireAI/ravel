@@ -1159,8 +1159,17 @@ An operator can declare a per-tenant set of attribute keys as native typed
 columns, appended after `attrs` (schema index 9 onward) in declaration order.
 The column name is the attribute key verbatim, never mangled, so a key
 containing `.` or uppercase characters needs double-quoting in SQL. Four
-declarable types: `str` (`Utf8`), `i64` (`Int64`), `bool` (`Boolean`), and
-`bytes` (`Binary`). `f64` is deferred (a declared float aggregate is
+declarable types: `str` (`Dictionary(Int32, Utf8)`), `i64` (`Int64`), `bool`
+(`Boolean`), and `bytes` (`Binary`). A declared `str` column is
+dictionary-encoded end to end (ADR-0099 decision 5): a dict-encoded RLOG page
+becomes the Arrow dictionary and its ids with no per-row allocation, a plain
+page becomes a degenerate identity dictionary, and the row fallback path builds
+the same dictionary type so every batch validates against the one schema
+DataFusion checks. The public Flight statement stream sets
+`DictionaryHandling::Resend`, so the column stays a dictionary on the wire
+rather than being hydrated back to plain `Utf8`; HTTP JSON and Arrow IPC render
+it identically to the pre-dictionary form. `f64` is deferred (a declared float
+aggregate is
 order-sensitive under ADR-0013/ADR-0022, which #277 decides), and so are date
 and timestamp (they need a lifting rule from `i64` storage plus a declared
 unit); the four shipped types all aggregate exactly under any partitioning.
