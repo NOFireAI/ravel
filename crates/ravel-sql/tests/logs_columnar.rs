@@ -1295,8 +1295,9 @@ async fn dict_page_and_plain_page_both_read_correct_values() {
 /// `small_blocks()` admits only a single-entry page dictionary.
 ///
 /// The block: rows 0..=3 set the declared `name` to "api", row 4 to "worker",
-/// row 5 to raw `[0xff]` (a non-UTF-8 record cell), rows 6..=7 do not set it at
-/// all. The record `name` column is present on rows 0..=5 (six values, three
+/// row 5 to raw `[b'b', 0xff]` (a non-UTF-8 record cell, sorting between "api"
+/// and "worker" in the page dictionary so a dropped-not-nulled entry would
+/// misnumber a value that is actually used), rows 6..=7 do not set it at all. The record `name` column is present on rows 0..=5 (six values, three
 /// distinct), so `dict_is_worth_it(3, 6)` holds and the page is `Enc::Dict` with
 /// a non-UTF-8 entry. A non-UTF-8 record cell reads as absent (matching the row
 /// path's `String::from_utf8().ok()`), so row 5 and the truly-absent rows 6..=7
@@ -1338,7 +1339,14 @@ async fn dict_page_with_non_utf8_entry_and_resource_fallback_append() {
         Some(b"api".to_vec()),
         Some(b"api".to_vec()),
         Some(b"worker".to_vec()),
-        Some(vec![0xff]),
+        // A non-UTF-8 cell whose bytes sort BETWEEN "api" and "worker" in the
+        // page dictionary. The `Err(_) => append_null()` arm in logs_scan.rs
+        // exists to keep Arrow dictionary indices aligned with the page's ids:
+        // a non-UTF-8 entry must become a NULL SLOT, not be dropped. A value
+        // that sorts last (e.g. `[0xff]`) shifts no in-use id when dropped, so
+        // the test could not tell "null slot" from "dropped"; `[b'b', 0xff]`
+        // sorts mid-dictionary, so skipping it would renumber "worker".
+        Some(vec![b'b', 0xff]),
         None,
         None,
     ];

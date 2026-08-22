@@ -47,9 +47,11 @@ pub const HAS_WORD_UDF: &str = "has_word";
 /// to one value per row before the UDF ran, the dictionary arm of
 /// [`has_word_impl`] would be unreachable, and `has_word` over a declared column
 /// would be *slower* than the plain `Utf8` column it replaced. A user-defined
-/// signature that returns its argument types unchanged (see [`Self::coerce_types`])
-/// keeps the dictionary intact into the evaluator, so it is matched once per
-/// distinct value; #479's LIKE pushdown builds on exactly this shape.
+/// signature that passes a `Dictionary(Int32, Utf8)` first argument through
+/// unchanged (see [`Self::coerce_types`]) keeps the dictionary intact into the
+/// evaluator, so it is matched once per distinct value; #479's LIKE pushdown
+/// builds on exactly this shape. Every other first-argument type still coerces
+/// to `Utf8`, so the UDF accepts exactly what the old exact signature did.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct HasWordUdf {
     signature: Signature,
@@ -76,11 +78,20 @@ impl ScalarUDFImpl for HasWordUdf {
         Ok(DataType::Boolean)
     }
 
-    /// Accept the argument types as given, so the text argument stays `Utf8` or
-    /// `Dictionary(Int32, Utf8)` and no coercing `CAST` is inserted over a
-    /// declared `Str` column. Reject any other first-argument type at planning
-    /// rather than letting it reach the evaluator, where it would be a runtime
-    /// downcast failure.
+    /// Coerce the arguments to what the evaluator consumes while leaving a
+    /// declared `Str` column's `Dictionary(Int32, Utf8)` first argument
+    /// **unchanged**, so no coercing `CAST` hydrates the dictionary away (the
+    /// whole point of the user-defined signature; see the type doc).
+    ///
+    /// Every other first-argument type is coerced to `Utf8`, exactly what the
+    /// original `create_udf([Utf8, Utf8])` exact signature accepted: `Utf8`,
+    /// `LargeUtf8`, `Utf8View` (DataFusion types SQL `VARCHAR` as `Utf8View`
+    /// via `map_varchar_to_utf8view`), a `Dictionary` over any other key/value
+    /// pair, a NULL literal, and any type DataFusion can cast to `Utf8` all plan
+    /// and answer as they did before. The second argument coerces to `Utf8`, so
+    /// a wrong type there is a typed planning error rather than an execution
+    /// failure, consistent with the first. An input DataFusion cannot cast to
+    /// `Utf8` fails with its standard typed planning error at cast insertion.
     fn coerce_types(&self, arg_types: &[DataType]) -> DFResult<Vec<DataType>> {
         if arg_types.len() != 2 {
             return Err(DataFusionError::Plan(format!(
@@ -88,16 +99,13 @@ impl ScalarUDFImpl for HasWordUdf {
                 arg_types.len()
             )));
         }
-        let text_ok = matches!(arg_types[0], DataType::Utf8)
-            || matches!(&arg_types[0], DataType::Dictionary(k, v)
-                if **k == DataType::Int32 && **v == DataType::Utf8);
-        if !text_ok {
-            return Err(DataFusionError::Plan(format!(
-                "has_word() first argument must be a Utf8 or Dictionary(Int32, Utf8) column, got {}",
-                arg_types[0]
-            )));
-        }
-        Ok(arg_types.to_vec())
+        let first = match &arg_types[0] {
+            DataType::Dictionary(k, v) if **k == DataType::Int32 && **v == DataType::Utf8 => {
+                arg_types[0].clone()
+            }
+            _ => DataType::Utf8,
+        };
+        Ok(vec![first, DataType::Utf8])
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
