@@ -28,6 +28,7 @@ mod span_error;
 mod span_metrics;
 mod span_router;
 mod span_shard;
+mod stage_timing;
 mod value;
 
 pub use admission::{
@@ -67,4 +68,6 @@ pub use router::{IngestRouter, WriteMode, WriteReceipt};
 pub use span_error::SpanWriteError;
 pub use span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
 pub use span_router::{SpanIngestRouter, SpanWriteReceipt, shard_for_span};
+#[cfg(feature = "stage-timing")]
+pub use stage_timing::{LogStage, LogStageSnapshot, LogStageTimings, StageTotals};
 pub use value::{IngestExemplar, IngestPoint, IngestValue};

@@ -3,6 +3,17 @@
 //! Actor logic must never read `SystemTime`/`Instant::now()` directly; every
 //! clock read goes through this trait so tests can pin, replay, and advance
 //! time across retries and hour boundaries.
+//!
+//! One bounded exception (ADR-0104 decision 1): the `stage-timing` cargo
+//! feature, off by default, compiles in a profiling seam (`crate::stage_timing`)
+//! that reads `Instant::now()` at stage boundaries to measure per-stage
+//! durations. It is sound only because it never ships (off by default, so every
+//! production and default-gate build is exactly as today), uses monotonic
+//! `Instant` rather than this wall-clock, and its accumulated timings feed no
+//! decision -- no control flow, flush trigger, flush identity, or backpressure
+//! choice reads a stage timing, only the bench reporter does. Extending the
+//! seam must preserve that no-decision-reads-a-timing property, or the
+//! exception stops being defensible.
 
 use std::future::Future;
 use std::pin::Pin;
