@@ -1,0 +1,1761 @@
+arrow v58.4.0
+├── datafusion v54.1.0
+│   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql)
+│       └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server)
+│           [dev-dependencies]
+│           └── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│       [dev-dependencies]
+│       └── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+├── datafusion-catalog v54.1.0
+│   ├── datafusion v54.1.0 (*)
+│   ├── datafusion-catalog-listing v54.1.0
+│   │   └── datafusion v54.1.0 (*)
+│   └── datafusion-functions-table v54.1.0
+│       └── datafusion v54.1.0 (*)
+├── datafusion-catalog-listing v54.1.0 (*)
+├── datafusion-common v54.1.0
+│   ├── datafusion v54.1.0 (*)
+│   ├── datafusion-catalog v54.1.0 (*)
+│   ├── datafusion-catalog-listing v54.1.0 (*)
+│   ├── datafusion-datasource v54.1.0
+│   │   ├── datafusion v54.1.0 (*)
+│   │   ├── datafusion-catalog v54.1.0 (*)
+│   │   ├── datafusion-catalog-listing v54.1.0 (*)
+│   │   ├── datafusion-datasource-arrow v54.1.0
+│   │   │   └── datafusion v54.1.0 (*)
+│   │   ├── datafusion-datasource-csv v54.1.0
+│   │   │   └── datafusion v54.1.0 (*)
+│   │   ├── datafusion-datasource-json v54.1.0
+│   │   │   └── datafusion v54.1.0 (*)
+│   │   └── datafusion-pruning v54.1.0
+│   │       └── datafusion-physical-optimizer v54.1.0
+│   │           └── datafusion v54.1.0 (*)
+│   ├── datafusion-datasource-arrow v54.1.0 (*)
+│   ├── datafusion-datasource-csv v54.1.0 (*)
+│   ├── datafusion-datasource-json v54.1.0 (*)
+│   ├── datafusion-execution v54.1.0
+│   │   ├── datafusion v54.1.0 (*)
+│   │   ├── datafusion-catalog v54.1.0 (*)
+│   │   ├── datafusion-catalog-listing v54.1.0 (*)
+│   │   ├── datafusion-datasource v54.1.0 (*)
+│   │   ├── datafusion-datasource-arrow v54.1.0 (*)
+│   │   ├── datafusion-datasource-csv v54.1.0 (*)
+│   │   ├── datafusion-datasource-json v54.1.0 (*)
+│   │   ├── datafusion-functions v54.1.0
+│   │   │   ├── datafusion v54.1.0 (*)
+│   │   │   ├── datafusion-functions-nested v54.1.0
+│   │   │   │   └── datafusion-sql v54.1.0
+│   │   │   │       └── datafusion v54.1.0 (*)
+│   │   │   ├── datafusion-physical-expr-adapter v54.1.0
+│   │   │   │   ├── datafusion v54.1.0 (*)
+│   │   │   │   ├── datafusion-catalog-listing v54.1.0 (*)
+│   │   │   │   └── datafusion-datasource v54.1.0 (*)
+│   │   │   └── datafusion-physical-plan v54.1.0
+│   │   │       ├── datafusion v54.1.0 (*)
+│   │   │       ├── datafusion-catalog v54.1.0 (*)
+│   │   │       ├── datafusion-catalog-listing v54.1.0 (*)
+│   │   │       ├── datafusion-datasource v54.1.0 (*)
+│   │   │       ├── datafusion-datasource-arrow v54.1.0 (*)
+│   │   │       ├── datafusion-datasource-csv v54.1.0 (*)
+│   │   │       ├── datafusion-datasource-json v54.1.0 (*)
+│   │   │       ├── datafusion-functions-table v54.1.0 (*)
+│   │   │       ├── datafusion-physical-optimizer v54.1.0 (*)
+│   │   │       ├── datafusion-pruning v54.1.0 (*)
+│   │   │       └── datafusion-session v54.1.0
+│   │   │           ├── datafusion v54.1.0 (*)
+│   │   │           ├── datafusion-catalog v54.1.0 (*)
+│   │   │           ├── datafusion-datasource v54.1.0 (*)
+│   │   │           ├── datafusion-datasource-arrow v54.1.0 (*)
+│   │   │           ├── datafusion-datasource-csv v54.1.0 (*)
+│   │   │           └── datafusion-datasource-json v54.1.0 (*)
+│   │   ├── datafusion-functions-aggregate v54.1.0
+│   │   │   ├── datafusion v54.1.0 (*)
+│   │   │   └── datafusion-functions-nested v54.1.0 (*)
+│   │   ├── datafusion-functions-nested v54.1.0 (*)
+│   │   ├── datafusion-physical-optimizer v54.1.0 (*)
+│   │   ├── datafusion-physical-plan v54.1.0 (*)
+│   │   └── datafusion-session v54.1.0 (*)
+│   ├── datafusion-expr v54.1.0
+│   │   ├── datafusion v54.1.0 (*)
+│   │   ├── datafusion-catalog v54.1.0 (*)
+│   │   ├── datafusion-catalog-listing v54.1.0 (*)
+│   │   ├── datafusion-datasource v54.1.0 (*)
+│   │   ├── datafusion-datasource-arrow v54.1.0 (*)
+│   │   ├── datafusion-datasource-csv v54.1.0 (*)
+│   │   ├── datafusion-datasource-json v54.1.0 (*)
+│   │   ├── datafusion-execution v54.1.0 (*)
+│   │   ├── datafusion-functions v54.1.0 (*)
+│   │   ├── datafusion-functions-aggregate v54.1.0 (*)
+│   │   ├── datafusion-functions-nested v54.1.0 (*)
+│   │   ├── datafusion-functions-table v54.1.0 (*)
+│   │   ├── datafusion-functions-window v54.1.0
+│   │   │   └── datafusion v54.1.0 (*)
+│   │   ├── datafusion-optimizer v54.1.0
+│   │   │   └── datafusion v54.1.0 (*)
+│   │   ├── datafusion-physical-expr v54.1.0
+│   │   │   ├── datafusion v54.1.0 (*)
+│   │   │   ├── datafusion-catalog v54.1.0 (*)
+│   │   │   ├── datafusion-catalog-listing v54.1.0 (*)
+│   │   │   ├── datafusion-datasource v54.1.0 (*)
+│   │   │   ├── datafusion-functions-aggregate v54.1.0 (*)
+│   │   │   ├── datafusion-functions-table v54.1.0 (*)
+│   │   │   ├── datafusion-functions-window v54.1.0 (*)
+│   │   │   ├── datafusion-optimizer v54.1.0 (*)
+│   │   │   ├── datafusion-physical-expr-adapter v54.1.0 (*)
+│   │   │   ├── datafusion-physical-optimizer v54.1.0 (*)
+│   │   │   ├── datafusion-physical-plan v54.1.0 (*)
+│   │   │   └── datafusion-pruning v54.1.0 (*)
+│   │   ├── datafusion-physical-expr-adapter v54.1.0 (*)
+│   │   ├── datafusion-physical-optimizer v54.1.0 (*)
+│   │   ├── datafusion-physical-plan v54.1.0 (*)
+│   │   ├── datafusion-session v54.1.0 (*)
+│   │   └── datafusion-sql v54.1.0 (*)
+│   ├── datafusion-expr-common v54.1.0
+│   │   ├── datafusion v54.1.0 (*)
+│   │   ├── datafusion-expr v54.1.0 (*)
+│   │   ├── datafusion-functions v54.1.0 (*)
+│   │   ├── datafusion-functions-aggregate-common v54.1.0
+│   │   │   ├── datafusion-expr v54.1.0 (*)
+│   │   │   ├── datafusion-functions-aggregate v54.1.0 (*)
+│   │   │   ├── datafusion-functions-nested v54.1.0 (*)
+│   │   │   ├── datafusion-physical-expr v54.1.0 (*)
+│   │   │   └── datafusion-physical-plan v54.1.0 (*)
+│   │   ├── datafusion-functions-nested v54.1.0 (*)
+│   │   ├── datafusion-optimizer v54.1.0 (*)
+│   │   ├── datafusion-physical-expr v54.1.0 (*)
+│   │   ├── datafusion-physical-expr-common v54.1.0
+│   │   │   ├── datafusion v54.1.0 (*)
+│   │   │   ├── datafusion-catalog-listing v54.1.0 (*)
+│   │   │   ├── datafusion-datasource v54.1.0 (*)
+│   │   │   ├── datafusion-datasource-arrow v54.1.0 (*)
+│   │   │   ├── datafusion-datasource-csv v54.1.0 (*)
+│   │   │   ├── datafusion-datasource-json v54.1.0 (*)
+│   │   │   ├── datafusion-execution v54.1.0 (*)
+│   │   │   ├── datafusion-expr v54.1.0 (*)
+│   │   │   ├── datafusion-functions v54.1.0 (*)
+│   │   │   ├── datafusion-functions-aggregate v54.1.0 (*)
+│   │   │   ├── datafusion-functions-aggregate-common v54.1.0 (*)
+│   │   │   ├── datafusion-functions-nested v54.1.0 (*)
+│   │   │   ├── datafusion-functions-window v54.1.0 (*)
+│   │   │   ├── datafusion-functions-window-common v54.1.0
+│   │   │   │   ├── datafusion-expr v54.1.0 (*)
+│   │   │   │   ├── datafusion-functions-window v54.1.0 (*)
+│   │   │   │   └── datafusion-physical-plan v54.1.0 (*)
+│   │   │   ├── datafusion-physical-expr v54.1.0 (*)
+│   │   │   ├── datafusion-physical-expr-adapter v54.1.0 (*)
+│   │   │   ├── datafusion-physical-optimizer v54.1.0 (*)
+│   │   │   ├── datafusion-physical-plan v54.1.0 (*)
+│   │   │   └── datafusion-pruning v54.1.0 (*)
+│   │   ├── datafusion-physical-optimizer v54.1.0 (*)
+│   │   └── datafusion-pruning v54.1.0 (*)
+│   ├── datafusion-functions v54.1.0 (*)
+│   ├── datafusion-functions-aggregate v54.1.0 (*)
+│   ├── datafusion-functions-aggregate-common v54.1.0 (*)
+│   ├── datafusion-functions-nested v54.1.0 (*)
+│   ├── datafusion-functions-table v54.1.0 (*)
+│   ├── datafusion-functions-window v54.1.0 (*)
+│   ├── datafusion-functions-window-common v54.1.0 (*)
+│   ├── datafusion-optimizer v54.1.0 (*)
+│   ├── datafusion-physical-expr v54.1.0 (*)
+│   ├── datafusion-physical-expr-adapter v54.1.0 (*)
+│   ├── datafusion-physical-expr-common v54.1.0 (*)
+│   ├── datafusion-physical-optimizer v54.1.0 (*)
+│   ├── datafusion-physical-plan v54.1.0 (*)
+│   ├── datafusion-pruning v54.1.0 (*)
+│   ├── datafusion-session v54.1.0 (*)
+│   └── datafusion-sql v54.1.0 (*)
+├── datafusion-datasource v54.1.0 (*)
+├── datafusion-datasource-arrow v54.1.0 (*)
+├── datafusion-datasource-csv v54.1.0 (*)
+├── datafusion-datasource-json v54.1.0 (*)
+├── datafusion-execution v54.1.0 (*)
+├── datafusion-expr v54.1.0 (*)
+├── datafusion-expr-common v54.1.0 (*)
+├── datafusion-functions v54.1.0 (*)
+├── datafusion-functions-aggregate v54.1.0 (*)
+├── datafusion-functions-aggregate-common v54.1.0 (*)
+├── datafusion-functions-nested v54.1.0 (*)
+├── datafusion-functions-table v54.1.0 (*)
+├── datafusion-functions-window v54.1.0 (*)
+├── datafusion-optimizer v54.1.0 (*)
+├── datafusion-physical-expr v54.1.0 (*)
+├── datafusion-physical-expr-adapter v54.1.0 (*)
+├── datafusion-physical-expr-common v54.1.0 (*)
+├── datafusion-physical-optimizer v54.1.0 (*)
+├── datafusion-physical-plan v54.1.0 (*)
+├── datafusion-pruning v54.1.0 (*)
+└── datafusion-sql v54.1.0 (*)
+
+arrow v59.1.0
+├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+└── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+[dev-dependencies]
+└── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+
+arrow-arith v58.4.0
+└── arrow v58.4.0 (*)
+
+arrow-arith v59.1.0
+└── arrow v59.1.0 (*)
+
+arrow-array v58.4.0
+├── arrow v58.4.0 (*)
+├── arrow-arith v58.4.0 (*)
+├── arrow-cast v58.4.0
+│   ├── arrow v58.4.0 (*)
+│   ├── arrow-csv v58.4.0
+│   │   └── arrow v58.4.0 (*)
+│   └── arrow-json v58.4.0
+│       └── arrow v58.4.0 (*)
+├── arrow-csv v58.4.0 (*)
+├── arrow-ipc v58.4.0
+│   ├── arrow v58.4.0 (*)
+│   ├── datafusion-common v54.1.0 (*)
+│   ├── datafusion-datasource-arrow v54.1.0 (*)
+│   └── datafusion-physical-plan v54.1.0 (*)
+├── arrow-json v58.4.0 (*)
+├── arrow-ord v58.4.0
+│   ├── arrow v58.4.0 (*)
+│   ├── arrow-cast v58.4.0 (*)
+│   ├── arrow-json v58.4.0 (*)
+│   ├── datafusion-functions-nested v54.1.0 (*)
+│   └── datafusion-physical-plan v54.1.0 (*)
+├── arrow-row v58.4.0
+│   └── arrow v58.4.0 (*)
+├── arrow-select v58.4.0
+│   ├── arrow v58.4.0 (*)
+│   ├── arrow-cast v58.4.0 (*)
+│   ├── arrow-ipc v58.4.0 (*)
+│   ├── arrow-json v58.4.0 (*)
+│   ├── arrow-ord v58.4.0 (*)
+│   └── arrow-string v58.4.0
+│       └── arrow v58.4.0 (*)
+└── arrow-string v58.4.0 (*)
+
+arrow-array v59.1.0
+├── arrow v59.1.0 (*)
+├── arrow-arith v59.1.0 (*)
+├── arrow-cast v59.1.0
+│   └── arrow v59.1.0 (*)
+├── arrow-ipc v59.1.0
+│   ├── arrow v59.1.0 (*)
+│   ├── parquet v59.1.0
+│   │   └── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   └── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+├── arrow-ord v59.1.0
+│   ├── arrow v59.1.0 (*)
+│   └── arrow-cast v59.1.0 (*)
+├── arrow-row v59.1.0
+│   └── arrow v59.1.0 (*)
+├── arrow-select v59.1.0
+│   ├── arrow v59.1.0 (*)
+│   ├── arrow-cast v59.1.0 (*)
+│   ├── arrow-ipc v59.1.0 (*)
+│   ├── arrow-ord v59.1.0 (*)
+│   ├── arrow-string v59.1.0
+│   │   └── arrow v59.1.0 (*)
+│   └── parquet v59.1.0 (*)
+├── arrow-string v59.1.0 (*)
+└── parquet v59.1.0 (*)
+
+arrow-buffer v58.4.0
+├── arrow v58.4.0 (*)
+├── arrow-arith v58.4.0 (*)
+├── arrow-array v58.4.0 (*)
+├── arrow-cast v58.4.0 (*)
+├── arrow-data v58.4.0
+│   ├── arrow v58.4.0 (*)
+│   ├── arrow-arith v58.4.0 (*)
+│   ├── arrow-array v58.4.0 (*)
+│   ├── arrow-cast v58.4.0 (*)
+│   ├── arrow-ipc v58.4.0 (*)
+│   ├── arrow-ord v58.4.0 (*)
+│   ├── arrow-row v58.4.0 (*)
+│   ├── arrow-select v58.4.0 (*)
+│   ├── arrow-string v58.4.0 (*)
+│   └── datafusion-physical-plan v54.1.0 (*)
+├── arrow-ipc v58.4.0 (*)
+├── arrow-json v58.4.0 (*)
+├── arrow-ord v58.4.0 (*)
+├── arrow-row v58.4.0 (*)
+├── arrow-select v58.4.0 (*)
+├── arrow-string v58.4.0 (*)
+├── datafusion-execution v54.1.0 (*)
+└── datafusion-functions v54.1.0 (*)
+
+arrow-buffer v59.1.0
+├── arrow v59.1.0 (*)
+├── arrow-arith v59.1.0 (*)
+├── arrow-array v59.1.0 (*)
+├── arrow-cast v59.1.0 (*)
+├── arrow-data v59.1.0
+│   ├── arrow v59.1.0 (*)
+│   ├── arrow-arith v59.1.0 (*)
+│   ├── arrow-array v59.1.0 (*)
+│   ├── arrow-cast v59.1.0 (*)
+│   ├── arrow-ipc v59.1.0 (*)
+│   ├── arrow-ord v59.1.0 (*)
+│   ├── arrow-row v59.1.0 (*)
+│   ├── arrow-select v59.1.0 (*)
+│   ├── arrow-string v59.1.0 (*)
+│   └── parquet v59.1.0 (*)
+├── arrow-ipc v59.1.0 (*)
+├── arrow-ord v59.1.0 (*)
+├── arrow-row v59.1.0 (*)
+├── arrow-select v59.1.0 (*)
+├── arrow-string v59.1.0 (*)
+└── parquet v59.1.0 (*)
+
+arrow-cast v58.4.0 (*)
+
+arrow-cast v59.1.0 (*)
+
+arrow-data v58.4.0 (*)
+
+arrow-data v59.1.0 (*)
+
+arrow-ipc v58.4.0 (*)
+
+arrow-ipc v59.1.0 (*)
+
+arrow-ord v58.4.0 (*)
+
+arrow-ord v59.1.0 (*)
+
+arrow-row v58.4.0 (*)
+
+arrow-row v59.1.0 (*)
+
+arrow-schema v58.4.0
+├── arrow v58.4.0 (*)
+├── arrow-arith v58.4.0 (*)
+├── arrow-array v58.4.0 (*)
+├── arrow-cast v58.4.0 (*)
+├── arrow-csv v58.4.0 (*)
+├── arrow-data v58.4.0 (*)
+├── arrow-ipc v58.4.0 (*)
+├── arrow-json v58.4.0 (*)
+├── arrow-ord v58.4.0 (*)
+├── arrow-row v58.4.0 (*)
+├── arrow-select v58.4.0 (*)
+├── arrow-string v58.4.0 (*)
+├── datafusion v54.1.0 (*)
+├── datafusion-common v54.1.0 (*)
+├── datafusion-expr v54.1.0 (*)
+└── datafusion-physical-plan v54.1.0 (*)
+
+arrow-schema v59.1.0
+├── arrow v59.1.0 (*)
+├── arrow-arith v59.1.0 (*)
+├── arrow-array v59.1.0 (*)
+├── arrow-cast v59.1.0 (*)
+├── arrow-data v59.1.0 (*)
+├── arrow-ipc v59.1.0 (*)
+├── arrow-ord v59.1.0 (*)
+├── arrow-row v59.1.0 (*)
+├── arrow-select v59.1.0 (*)
+├── arrow-string v59.1.0 (*)
+└── parquet v59.1.0 (*)
+
+arrow-select v58.4.0 (*)
+
+arrow-select v59.1.0 (*)
+
+arrow-string v58.4.0 (*)
+
+arrow-string v59.1.0 (*)
+
+base64 v0.22.1
+├── arrow-cast v58.4.0 (*)
+├── arrow-cast v59.1.0 (*)
+├── datafusion-functions v54.1.0 (*)
+├── hyper-util v0.1.20
+│   ├── axum v0.8.9
+│   │   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query)
+│   │   │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │   │   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   │   │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │   │   ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│   │   │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   │   │   [dev-dependencies]
+│   │   │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │   │   ├── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│   │   │   └── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest)
+│   │   │       ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │   │       ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │   │       ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain)
+│   │   │       │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │   │       │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │   │       │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │   │       │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │   │       │   └── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│   │   │       │   [dev-dependencies]
+│   │   │       │   └── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │   │       ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   │   │       ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │   │       └── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│   │   │       [dev-dependencies]
+│   │   │       └── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│   │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │   ├── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve)
+│   │   │   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │   │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │   │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │   └── tonic v0.14.6
+│   │       ├── opentelemetry-otlp v0.32.0
+│   │       │   └── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export)
+│   │       │       ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│   │       │       └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       ├── opentelemetry-proto v0.32.0
+│   │       │   ├── opentelemetry-otlp v0.32.0 (*)
+│   │       │   ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp)
+│   │       │   │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │       │   │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │       │   │   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│   │       │   │   ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│   │       │   │   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   │       │   │   ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write)
+│   │       │   │   │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       │   │   │   [dev-dependencies]
+│   │       │   │   │   └── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│   │       │   │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       │   │   [dev-dependencies]
+│   │       │   │   └── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│   │       │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       │   [dev-dependencies]
+│   │       │   ├── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│   │       │   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │       │   ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│   │       │   └── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+│   │       ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │       ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │       ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│   │       ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │       ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       ├── tonic-prost v0.14.6
+│   │       │   ├── opentelemetry-proto v0.32.0 (*)
+│   │       │   ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│   │       │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │       │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       └── tonic-types v0.14.6
+│   │           └── opentelemetry-otlp v0.32.0 (*)
+│   │       [dev-dependencies]
+│   │       ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │       ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       └── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+│   │   [dev-dependencies]
+│   │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │   └── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store)
+│   │       ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │       ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog)
+│   │       │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │       │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │       │   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│   │       │   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│   │       │   ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│   │       │   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   │       │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │       │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       │   ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│   │       │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   │       │   [dev-dependencies]
+│   │       │   └── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│   │       ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │       ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit)
+│   │       │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │       │   ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│   │       │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │       │   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│   │       │   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│   │       │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       │   └── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│   │       │   [dev-dependencies]
+│   │       │   ├── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│   │       │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │       │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   │       ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet)
+│   │       │   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│   │       │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│   │       ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│   │       ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│   │       ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   │       ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │       ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│   │       └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   │       [dev-dependencies]
+│   │       └── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│   ├── hyper-rustls v0.27.9
+│   │   ├── kube-client v4.2.0
+│   │   │   ├── kube v4.2.0
+│   │   │   │   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │   │   │   └── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│   │   │   └── kube-runtime v4.2.0
+│   │   │       ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │   │       └── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│   │   ├── reqwest v0.12.28
+│   │   │   └── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   │   └── reqwest v0.13.4
+│   │       ├── object_store v0.14.1
+│   │       │   └── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│   │       ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │       ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │       └── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve) (*)
+│   │       [dev-dependencies]
+│   │       └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   ├── hyper-timeout v0.5.2
+│   │   ├── kube-client v4.2.0 (*)
+│   │   └── tonic v0.14.6 (*)
+│   ├── kube-client v4.2.0 (*)
+│   ├── reqwest v0.12.28 (*)
+│   ├── reqwest v0.13.4 (*)
+│   └── tonic v0.14.6 (*)
+├── jsonwebtoken v10.4.0
+│   └── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve) (*)
+│   [dev-dependencies]
+│   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+├── k8s-openapi v0.28.0
+│   ├── kube v4.2.0 (*)
+│   ├── kube-client v4.2.0 (*)
+│   ├── kube-core v4.2.0
+│   │   ├── kube v4.2.0 (*)
+│   │   └── kube-client v4.2.0 (*)
+│   ├── kube-runtime v4.2.0 (*)
+│   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   └── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+├── kube-client v4.2.0 (*)
+├── object_store v0.14.1 (*)
+├── parquet v59.1.0 (*)
+├── pem v3.0.6
+│   ├── jsonwebtoken v10.4.0 (*)
+│   └── kube-client v4.2.0 (*)
+├── reqwest v0.12.28 (*)
+├── reqwest v0.13.4 (*)
+├── serde-saphyr v0.0.29
+│   └── kube-client v4.2.0 (*)
+├── tonic v0.14.6 (*)
+└── tower-http v0.6.11
+    ├── kube-client v4.2.0 (*)
+    ├── reqwest v0.12.28 (*)
+    └── reqwest v0.13.4 (*)
+
+base64 v0.23.0
+└── ravel-types v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-types)
+    ├── ravel-alerting v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-alerting)
+    │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    │   [dev-dependencies]
+    │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+    ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+    ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+    ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+    ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+    ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+    ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+    ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg)
+    │   ├── ravel-alerting v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-alerting) (*)
+    │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+    │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+    │   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+    │   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+    │   ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+    │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+    ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+    ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+    ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+    ├── ravel-promql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql)
+    │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+    │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    │   ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+    │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    │   [dev-dependencies]
+    │   ├── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+    │   └── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+    ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+    ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write) (*)
+    ├── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment)
+    │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+    │   ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+    │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+    │   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+    │   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+    │   ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+    │   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+    │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │   ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write) (*)
+    │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    │   ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+    │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    │   [dev-dependencies]
+    │   ├── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+    │   └── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+    ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+    ├── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    └── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve) (*)
+    [dev-dependencies]
+    └── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+[dev-dependencies]
+├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+└── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve) (*)
+
+crypto-common v0.1.7
+└── digest v0.10.7
+    └── crc-fast v1.10.0
+        └── object_store v0.14.1 (*)
+
+crypto-common v0.2.2
+└── digest v0.11.3
+    └── md-5 v0.11.0
+        └── object_store v0.14.1 (*)
+
+digest v0.10.7 (*)
+
+digest v0.11.3 (*)
+
+either v1.17.0
+├── itertools v0.13.0
+│   ├── criterion v0.8.2
+│   │   [dev-dependencies]
+│   │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │   ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg) (*)
+│   │   ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│   │   ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+│   │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │   ├── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+│   │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   └── criterion-plot v0.8.2
+│       └── criterion v0.8.2 (*)
+├── itertools v0.15.0
+│   └── object_store v0.14.1 (*)
+├── kube-client v4.2.0 (*)
+└── rayon v1.12.0
+    └── criterion v0.8.2 (*)
+
+either v1.17.0
+└── itertools v0.14.0
+    ├── datafusion v54.1.0 (*)
+    ├── datafusion-catalog v54.1.0 (*)
+    ├── datafusion-catalog-listing v54.1.0 (*)
+    ├── datafusion-common v54.1.0 (*)
+    ├── datafusion-datasource v54.1.0 (*)
+    ├── datafusion-datasource-arrow v54.1.0 (*)
+    ├── datafusion-expr v54.1.0 (*)
+    ├── datafusion-expr-common v54.1.0 (*)
+    ├── datafusion-functions v54.1.0 (*)
+    ├── datafusion-functions-nested v54.1.0 (*)
+    ├── datafusion-optimizer v54.1.0 (*)
+    ├── datafusion-physical-expr v54.1.0 (*)
+    ├── datafusion-physical-expr-adapter v54.1.0 (*)
+    ├── datafusion-physical-expr-common v54.1.0 (*)
+    ├── datafusion-physical-optimizer v54.1.0 (*)
+    ├── datafusion-physical-plan v54.1.0 (*)
+    ├── object_store v0.13.2
+    │   ├── datafusion v54.1.0 (*)
+    │   ├── datafusion-catalog v54.1.0 (*)
+    │   ├── datafusion-catalog-listing v54.1.0 (*)
+    │   ├── datafusion-common v54.1.0 (*)
+    │   ├── datafusion-datasource v54.1.0 (*)
+    │   ├── datafusion-datasource-arrow v54.1.0 (*)
+    │   ├── datafusion-datasource-csv v54.1.0 (*)
+    │   ├── datafusion-datasource-json v54.1.0 (*)
+    │   └── datafusion-execution v54.1.0 (*)
+    ├── prost-build v0.14.4
+    │   └── tonic-prost-build v0.14.6
+    │       [build-dependencies]
+    │       ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+    │       └── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │   [build-dependencies]
+    │   ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+    │   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+    │   ├── ravel-proto v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-proto)
+    │   │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+    │   │   ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+    │   │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+    │   │   ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+    │   │   ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+    │   │   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+    │   │   ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg) (*)
+    │   │   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+    │   │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │   │   ├── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+    │   │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    │   │   [dev-dependencies]
+    │   │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │   ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write) (*)
+    │   └── ravel-rspan v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-rspan)
+    │       ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+    │       ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+    │       ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+    │       ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+    │       ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │       └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    │       [dev-dependencies]
+    │       └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    └── prost-derive v0.14.4 (proc-macro)
+        └── prost v0.14.4
+            ├── opentelemetry-otlp v0.32.0 (*)
+            ├── opentelemetry-proto v0.32.0 (*)
+            ├── prost-build v0.14.4 (*)
+            ├── prost-reflect v0.16.5
+            │   └── protox v0.9.1
+            │       [build-dependencies]
+            │       ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+            │       ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+            │       ├── ravel-proto v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-proto) (*)
+            │       ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+            │       ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write) (*)
+            │       └── ravel-rspan v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-rspan) (*)
+            ├── prost-types v0.14.4
+            │   ├── prost-build v0.14.4 (*)
+            │   ├── prost-reflect v0.16.5 (*)
+            │   ├── protox v0.9.1 (*)
+            │   ├── protox-parse v0.9.0
+            │   │   └── protox v0.9.1 (*)
+            │   ├── tonic-prost-build v0.14.6 (*)
+            │   └── tonic-types v0.14.6 (*)
+            ├── protox v0.9.1 (*)
+            ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+            ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+            ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+            ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+            ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+            ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+            ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg) (*)
+            ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+            ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+            ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+            ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+            ├── ravel-proto v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-proto) (*)
+            ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+            ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write) (*)
+            ├── ravel-rspan v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-rspan) (*)
+            ├── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+            ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+            ├── tonic-prost v0.14.6 (*)
+            └── tonic-types v0.14.6 (*)
+
+foldhash v0.1.5
+└── hashbrown v0.15.5
+    ├── petgraph v0.8.3
+    │   └── datafusion-physical-expr v54.1.0 (*)
+    └── petgraph v0.8.3
+        └── prost-build v0.14.4 (*)
+
+foldhash v0.2.0
+├── datafusion-common v54.1.0 (*)
+├── datafusion-functions-aggregate v54.1.0 (*)
+├── hashbrown v0.16.1
+│   └── kube-runtime v4.2.0 (*)
+└── hashbrown v0.17.1
+    ├── arrow-array v58.4.0 (*)
+    ├── arrow-array v59.1.0 (*)
+    ├── datafusion-common v54.1.0 (*)
+    ├── datafusion-functions-nested v54.1.0 (*)
+    ├── datafusion-physical-expr v54.1.0 (*)
+    ├── datafusion-physical-expr-common v54.1.0 (*)
+    ├── datafusion-physical-plan v54.1.0 (*)
+    └── parquet v59.1.0 (*)
+
+getrandom v0.2.17
+└── ring v0.17.14
+    ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    ├── rustls v0.23.42
+    │   ├── hyper-rustls v0.27.9 (*)
+    │   ├── kube-client v4.2.0 (*)
+    │   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+    │   ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+    │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    │   ├── reqwest v0.12.28 (*)
+    │   ├── reqwest v0.13.4 (*)
+    │   ├── rustls-platform-verifier v0.7.0
+    │   │   ├── kube-client v4.2.0 (*)
+    │   │   └── reqwest v0.13.4 (*)
+    │   └── tokio-rustls v0.26.4
+    │       ├── hyper-rustls v0.27.9 (*)
+    │       ├── reqwest v0.12.28 (*)
+    │       ├── reqwest v0.13.4 (*)
+    │       └── tonic v0.14.6 (*)
+    └── rustls-webpki v0.103.13
+        ├── rustls v0.23.42 (*)
+        └── rustls-platform-verifier v0.7.0 (*)
+
+getrandom v0.3.4
+├── ahash v0.8.12
+│   ├── arrow-array v58.4.0 (*)
+│   ├── arrow-array v59.1.0 (*)
+│   ├── arrow-select v58.4.0 (*)
+│   ├── arrow-select v59.1.0 (*)
+│   ├── kube-runtime v4.2.0 (*)
+│   ├── parquet v59.1.0 (*)
+│   └── serde-saphyr v0.0.29 (*)
+└── rand_core v0.9.5
+    ├── rand v0.9.5
+    │   ├── datafusion-datasource v54.1.0 (*)
+    │   ├── datafusion-execution v54.1.0 (*)
+    │   ├── datafusion-functions v54.1.0 (*)
+    │   ├── opentelemetry_sdk v0.32.1
+    │   │   ├── opentelemetry-otlp v0.32.0 (*)
+    │   │   ├── opentelemetry-proto v0.32.0 (*)
+    │   │   └── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+    │   └── proptest v1.11.0
+    │       [dev-dependencies]
+    │       ├── ravel-alerting v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-alerting) (*)
+    │       ├── ravel-analytics v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-analytics)
+    │       │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    │       ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+    │       ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+    │       ├── ravel-codec v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-codec)
+    │       │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+    │       │   ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg) (*)
+    │       │   ├── ravel-rspan v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-rspan) (*)
+    │       │   └── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+    │       │   [dev-dependencies]
+    │       │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    │       ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+    │       ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+    │       ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg) (*)
+    │       ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+    │       ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+    │       ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+    │       ├── ravel-promql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql) (*)
+    │       ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │       ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write) (*)
+    │       ├── ravel-rspan v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-rspan) (*)
+    │       ├── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+    │       ├── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+    │       └── ravel-types v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-types) (*)
+    ├── rand_chacha v0.9.0
+    │   ├── proptest v1.11.0 (*)
+    │   └── rand v0.9.5 (*)
+    └── rand_xorshift v0.4.0
+        └── proptest v1.11.0 (*)
+
+getrandom v0.4.3
+├── rand v0.10.2
+│   ├── object_store v0.14.1 (*)
+│   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+│   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│   ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   └── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│   [dev-dependencies]
+│   └── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+├── tempfile v3.27.0
+│   ├── datafusion v54.1.0 (*)
+│   ├── datafusion-execution v54.1.0 (*)
+│   ├── proptest v1.11.0 (*)
+│   ├── prost-build v0.14.4 (*)
+│   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   ├── rusty-fork v0.3.1
+│   │   └── proptest v1.11.0 (*)
+│   └── tonic-prost-build v0.14.6 (*)
+│   [dev-dependencies]
+│   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   ├── ravel-cache v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-cache)
+│   │   ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│   │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │   [dev-dependencies]
+│   │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│   └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+└── uuid v1.24.0
+    ├── datafusion v54.1.0 (*)
+    ├── datafusion-common v54.1.0 (*)
+    ├── datafusion-functions v54.1.0 (*)
+    ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+    ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+    ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+    ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+    ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+    ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+    ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+    ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+    ├── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve) (*)
+    └── ravel-types v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-types) (*)
+    [dev-dependencies]
+    ├── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+    ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+    └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+
+hashbrown v0.14.5
+└── dashmap v6.2.1
+    ├── datafusion-catalog v54.1.0 (*)
+    └── datafusion-execution v54.1.0 (*)
+
+hashbrown v0.15.5 (*)
+
+hashbrown v0.16.1 (*)
+
+hashbrown v0.17.1
+└── indexmap v2.14.0
+    ├── arrow-json v58.4.0 (*)
+    ├── cfgrammar v0.13.10
+    │   ├── lrlex v0.13.10
+    │   │   └── promql-parser v0.10.0
+    │   │       ├── ravel-promql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql) (*)
+    │   │       └── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+    │   │   [build-dependencies]
+    │   │   └── promql-parser v0.10.0 (*)
+    │   ├── lrpar v0.13.10
+    │   │   ├── lrlex v0.13.10 (*)
+    │   │   └── promql-parser v0.10.0 (*)
+    │   │   [build-dependencies]
+    │   │   └── promql-parser v0.10.0 (*)
+    │   ├── lrtable v0.13.10
+    │   │   └── lrpar v0.13.10 (*)
+    │   └── promql-parser v0.10.0 (*)
+    │   [build-dependencies]
+    │   └── promql-parser v0.10.0 (*)
+    ├── datafusion v54.1.0 (*)
+    ├── datafusion-common v54.1.0 (*)
+    ├── datafusion-expr v54.1.0 (*)
+    ├── datafusion-expr-common v54.1.0 (*)
+    ├── datafusion-optimizer v54.1.0 (*)
+    ├── datafusion-physical-expr v54.1.0 (*)
+    ├── datafusion-physical-expr-common v54.1.0 (*)
+    ├── datafusion-physical-plan v54.1.0 (*)
+    ├── datafusion-sql v54.1.0 (*)
+    ├── h2 v0.4.16
+    │   ├── hyper v1.11.0
+    │   │   ├── axum v0.8.9 (*)
+    │   │   ├── hyper-rustls v0.27.9 (*)
+    │   │   ├── hyper-timeout v0.5.2 (*)
+    │   │   ├── hyper-util v0.1.20 (*)
+    │   │   ├── kube-client v4.2.0 (*)
+    │   │   ├── object_store v0.14.1 (*)
+    │   │   ├── reqwest v0.12.28 (*)
+    │   │   ├── reqwest v0.13.4 (*)
+    │   │   └── tonic v0.14.6 (*)
+    │   ├── reqwest v0.13.4 (*)
+    │   └── tonic v0.14.6 (*)
+    ├── lrpar v0.13.10 (*)
+    ├── petgraph v0.8.3 (*)
+    ├── petgraph v0.8.3 (*)
+    └── tower v0.5.3
+        ├── axum v0.8.9 (*)
+        ├── kube-client v4.2.0 (*)
+        ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+        ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+        ├── reqwest v0.12.28 (*)
+        ├── reqwest v0.13.4 (*)
+        ├── tonic v0.14.6 (*)
+        └── tower-http v0.6.11 (*)
+        [dev-dependencies]
+        ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+        └── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+
+hashbrown v0.17.1 (*)
+
+itertools v0.13.0 (*)
+
+itertools v0.14.0 (*)
+
+itertools v0.15.0 (*)
+
+libc v0.2.189
+├── datafusion-common v54.1.0 (*)
+├── errno v0.3.14
+│   └── signal-hook-registry v1.4.8
+│       └── tokio v1.53.1
+│           ├── axum v0.8.9 (*)
+│           ├── backon v1.6.0
+│           │   └── kube-runtime v4.2.0 (*)
+│           ├── datafusion v54.1.0 (*)
+│           ├── datafusion-catalog v54.1.0 (*)
+│           ├── datafusion-common v54.1.0 (*)
+│           ├── datafusion-common-runtime v54.1.0
+│           │   ├── datafusion v54.1.0 (*)
+│           │   ├── datafusion-catalog v54.1.0 (*)
+│           │   ├── datafusion-datasource v54.1.0 (*)
+│           │   ├── datafusion-datasource-arrow v54.1.0 (*)
+│           │   ├── datafusion-datasource-csv v54.1.0 (*)
+│           │   ├── datafusion-datasource-json v54.1.0 (*)
+│           │   └── datafusion-physical-plan v54.1.0 (*)
+│           ├── datafusion-datasource v54.1.0 (*)
+│           ├── datafusion-datasource-arrow v54.1.0 (*)
+│           ├── datafusion-datasource-csv v54.1.0 (*)
+│           ├── datafusion-datasource-json v54.1.0 (*)
+│           ├── datafusion-physical-expr v54.1.0 (*)
+│           ├── datafusion-physical-plan v54.1.0 (*)
+│           ├── h2 v0.4.16 (*)
+│           ├── hyper v1.11.0 (*)
+│           ├── hyper-rustls v0.27.9 (*)
+│           ├── hyper-timeout v0.5.2 (*)
+│           ├── hyper-util v0.1.20 (*)
+│           ├── kube-client v4.2.0 (*)
+│           ├── kube-runtime v4.2.0 (*)
+│           ├── object_store v0.13.2 (*)
+│           ├── object_store v0.14.1 (*)
+│           ├── opentelemetry-otlp v0.32.0 (*)
+│           ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│           ├── ravel-cache v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-cache) (*)
+│           ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│           ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│           ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+│           ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│           ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│           ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│           ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│           ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│           ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│           ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│           ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│           ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│           ├── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│           ├── reqwest v0.12.28 (*)
+│           ├── reqwest v0.13.4 (*)
+│           ├── tokio-rustls v0.26.4 (*)
+│           ├── tokio-stream v0.1.19
+│           │   ├── datafusion-datasource-json v54.1.0 (*)
+│           │   └── tonic v0.14.6 (*)
+│           ├── tokio-util v0.7.19
+│           │   ├── h2 v0.4.16 (*)
+│           │   ├── kube-client v4.2.0 (*)
+│           │   ├── kube-runtime v4.2.0 (*)
+│           │   ├── reqwest v0.13.4 (*)
+│           │   ├── tokio-stream v0.1.19 (*)
+│           │   └── tower v0.5.3 (*)
+│           ├── tonic v0.14.6 (*)
+│           └── tower v0.5.3 (*)
+│           [dev-dependencies]
+│           ├── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│           ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+│           ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│           ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│           ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│           ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│           ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+│           ├── ravel-promql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql) (*)
+│           ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│           ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│           ├── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+│           ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│           └── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+├── filetime v0.2.29
+│   └── lrpar v0.13.10 (*)
+├── getrandom v0.2.17 (*)
+├── getrandom v0.3.4 (*)
+├── getrandom v0.4.3 (*)
+├── hostname v0.4.2
+│   └── kube-runtime v4.2.0 (*)
+├── hyper-util v0.1.20 (*)
+├── mio v1.2.2
+│   └── tokio v1.53.1 (*)
+├── nix v0.31.3
+│   └── object_store v0.14.1 (*)
+├── page_size v0.6.0
+│   └── criterion v0.8.2 (*)
+├── parking_lot_core v0.9.12
+│   ├── dashmap v6.2.1 (*)
+│   └── parking_lot v0.12.5
+│       ├── datafusion v54.1.0 (*)
+│       ├── datafusion-catalog v54.1.0 (*)
+│       ├── datafusion-datasource v54.1.0 (*)
+│       ├── datafusion-execution v54.1.0 (*)
+│       ├── datafusion-functions-table v54.1.0 (*)
+│       ├── datafusion-physical-expr v54.1.0 (*)
+│       ├── datafusion-physical-expr-common v54.1.0 (*)
+│       ├── datafusion-physical-plan v54.1.0 (*)
+│       ├── datafusion-session v54.1.0 (*)
+│       ├── kube-runtime v4.2.0 (*)
+│       ├── object_store v0.13.2 (*)
+│       ├── object_store v0.14.1 (*)
+│       ├── ravel-cache v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-cache) (*)
+│       ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│       ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│       └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│       [dev-dependencies]
+│       └── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+├── ring v0.17.14 (*)
+├── signal-hook-registry v1.4.8 (*)
+├── socket2 v0.6.5
+│   ├── hyper-util v0.1.20 (*)
+│   ├── tokio v1.53.1 (*)
+│   └── tonic v0.14.6 (*)
+├── tokio v1.53.1 (*)
+├── tokio-util v0.7.19 (*)
+└── wait-timeout v0.2.1
+    └── rusty-fork v0.3.1 (*)
+
+libc v0.2.189
+├── cc v1.4.0
+│   └── cmake v0.1.58
+│       [build-dependencies]
+│       └── aws-lc-sys v0.43.0
+│           └── aws-lc-rs v1.17.3
+│               ├── jsonwebtoken v10.4.0 (*)
+│               ├── object_store v0.14.1 (*)
+│               ├── rustls v0.23.42 (*)
+│               └── rustls-webpki v0.103.13 (*)
+│   [build-dependencies]
+│   ├── alloca v0.4.0
+│   │   └── criterion v0.8.2 (*)
+│   ├── aws-lc-sys v0.43.0 (*)
+│   ├── blake3 v1.8.5
+│   │   ├── ravel-affinity v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-affinity)
+│   │   │   └── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │   ├── ravel-alerting v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-alerting) (*)
+│   │   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   │   ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│   │   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   │   ├── ravel-codec v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-codec) (*)
+│   │   ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+│   │   ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+│   │   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│   │   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   │   ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg) (*)
+│   │   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│   │   ├── ravel-promql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql) (*)
+│   │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   │   ├── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+│   │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   │   ├── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve) (*)
+│   │   └── ravel-types v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-types) (*)
+│   │   [dev-dependencies]
+│   │   ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+│   │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   ├── ring v0.17.14 (*)
+│   └── zstd-sys v2.0.16+zstd.1.5.7
+│       └── zstd-safe v7.2.4
+│           └── zstd v0.13.3
+│               ├── arrow-ipc v58.4.0 (*)
+│               ├── arrow-ipc v59.1.0 (*)
+│               ├── parquet v59.1.0 (*)
+│               ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│               ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│               ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg) (*)
+│               ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│               ├── ravel-rspan v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-rspan) (*)
+│               └── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+├── jobserver v0.1.35
+│   └── cc v1.4.0 (*)
+└── time v0.3.54
+    └── vergen v8.3.2
+        [build-dependencies]
+        ├── lrlex v0.13.10 (*)
+        └── lrpar v0.13.10 (*)
+
+log v0.4.33
+└── prost-build v0.14.4 (*)
+
+log v0.4.33
+├── datafusion v54.1.0 (*)
+├── datafusion-catalog v54.1.0 (*)
+├── datafusion-catalog-listing v54.1.0 (*)
+├── datafusion-common v54.1.0 (*)
+├── datafusion-common-runtime v54.1.0 (*)
+├── datafusion-datasource v54.1.0 (*)
+├── datafusion-execution v54.1.0 (*)
+├── datafusion-functions v54.1.0 (*)
+├── datafusion-functions-aggregate v54.1.0 (*)
+├── datafusion-functions-nested v54.1.0 (*)
+├── datafusion-functions-window v54.1.0 (*)
+├── datafusion-optimizer v54.1.0 (*)
+├── datafusion-physical-plan v54.1.0 (*)
+├── datafusion-pruning v54.1.0 (*)
+├── datafusion-sql v54.1.0 (*)
+├── hyper-rustls v0.27.9 (*)
+├── reqwest v0.12.28 (*)
+├── reqwest v0.13.4 (*)
+├── rustls v0.23.42 (*)
+├── rustls-platform-verifier v0.7.0 (*)
+├── sqlparser v0.62.0
+│   ├── datafusion v54.1.0 (*)
+│   ├── datafusion-common v54.1.0 (*)
+│   ├── datafusion-expr v54.1.0 (*)
+│   └── datafusion-sql v54.1.0 (*)
+├── tracing v0.1.44
+│   ├── axum v0.8.9 (*)
+│   ├── axum-core v0.5.6
+│   │   └── axum v0.8.9 (*)
+│   ├── h2 v0.4.16 (*)
+│   ├── hyper-util v0.1.20 (*)
+│   ├── kube-client v4.2.0 (*)
+│   ├── kube-runtime v4.2.0 (*)
+│   ├── object_store v0.13.2 (*)
+│   ├── object_store v0.14.1 (*)
+│   ├── opentelemetry v0.32.0
+│   │   ├── opentelemetry-otlp v0.32.0 (*)
+│   │   ├── opentelemetry-proto v0.32.0 (*)
+│   │   ├── opentelemetry_sdk v0.32.1 (*)
+│   │   ├── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+│   │   └── tracing-opentelemetry v0.33.0
+│   │       └── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+│   ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│   ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+│   ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+│   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│   ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│   ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│   ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+│   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write) (*)
+│   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   ├── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+│   ├── tonic v0.14.6 (*)
+│   ├── tower v0.5.3 (*)
+│   ├── tower-http v0.6.11 (*)
+│   ├── tracing-opentelemetry v0.33.0 (*)
+│   └── tracing-subscriber v0.3.23
+│       ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│       ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│       ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│       ├── ravel-tracing-export v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tracing-export) (*)
+│       └── tracing-opentelemetry v0.33.0 (*)
+│       [dev-dependencies]
+│       ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│       └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+└── tracing-log v0.2.0
+    └── tracing-subscriber v0.3.23 (*)
+
+logos v0.15.1
+└── protox-parse v0.9.0 (*)
+
+logos v0.16.1
+└── prost-reflect v0.16.5 (*)
+
+logos-codegen v0.15.1
+└── logos-derive v0.15.1 (proc-macro)
+    └── logos v0.15.1 (*)
+
+logos-codegen v0.16.1
+└── logos-derive v0.16.1 (proc-macro)
+    └── logos v0.16.1 (*)
+
+logos-derive v0.15.1 (proc-macro) (*)
+
+logos-derive v0.16.1 (proc-macro) (*)
+
+lz4_flex v0.13.1
+├── arrow-ipc v58.4.0 (*)
+└── parquet v59.1.0 (*)
+
+lz4_flex v0.14.0
+├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+└── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+
+object_store v0.13.2 (*)
+
+object_store v0.14.1 (*)
+
+petgraph v0.8.3 (*)
+
+petgraph v0.8.3 (*)
+
+rand v0.9.5 (*)
+
+rand v0.10.2 (*)
+
+rand_core v0.9.5 (*)
+
+rand_core v0.10.1
+├── chacha20 v0.10.1
+│   └── rand v0.10.2 (*)
+├── getrandom v0.4.3 (*)
+└── rand v0.10.2 (*)
+
+regex-automata v0.4.16
+└── logos-codegen v0.16.1 (*)
+
+regex-automata v0.4.16
+├── matchers v0.2.0
+│   └── tracing-subscriber v0.3.23 (*)
+├── regex v1.13.1
+│   ├── arrow-csv v58.4.0 (*)
+│   ├── arrow-string v58.4.0 (*)
+│   ├── arrow-string v59.1.0 (*)
+│   ├── cfgrammar v0.13.10 (*)
+│   ├── criterion v0.8.2 (*)
+│   ├── datafusion-datasource-csv v54.1.0 (*)
+│   ├── datafusion-functions v54.1.0 (*)
+│   ├── datafusion-optimizer v54.1.0 (*)
+│   ├── datafusion-sql v54.1.0 (*)
+│   ├── jsonpath-rust v1.0.7
+│   │   └── kube-client v4.2.0 (*)
+│   ├── lrlex v0.13.10 (*)
+│   ├── lrpar v0.13.10 (*)
+│   ├── promql-parser v0.10.0 (*)
+│   ├── prost-build v0.14.4 (*)
+│   └── ravel-promql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql) (*)
+│   [dev-dependencies]
+│   └── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+└── tracing-subscriber v0.3.23 (*)
+
+reqwest v0.12.28 (*)
+
+reqwest v0.13.4 (*)
+
+serde v1.0.229
+├── bincode v1.3.3
+│   └── lrpar v0.13.10 (*)
+├── cfgrammar v0.13.10 (*)
+├── chrono v0.4.45
+│   ├── arrow-arith v58.4.0 (*)
+│   ├── arrow-arith v59.1.0 (*)
+│   ├── arrow-array v58.4.0 (*)
+│   ├── arrow-array v59.1.0 (*)
+│   ├── arrow-cast v58.4.0 (*)
+│   ├── arrow-cast v59.1.0 (*)
+│   ├── arrow-csv v58.4.0 (*)
+│   ├── arrow-json v58.4.0 (*)
+│   ├── chrono-tz v0.10.4
+│   │   ├── arrow-array v58.4.0 (*)
+│   │   └── datafusion-functions v54.1.0 (*)
+│   ├── datafusion v54.1.0 (*)
+│   ├── datafusion-common v54.1.0 (*)
+│   ├── datafusion-datasource v54.1.0 (*)
+│   ├── datafusion-expr v54.1.0 (*)
+│   ├── datafusion-functions v54.1.0 (*)
+│   ├── datafusion-optimizer v54.1.0 (*)
+│   ├── datafusion-physical-expr-common v54.1.0 (*)
+│   ├── datafusion-sql v54.1.0 (*)
+│   ├── object_store v0.13.2 (*)
+│   ├── object_store v0.14.1 (*)
+│   ├── parquet v59.1.0 (*)
+│   └── promql-parser v0.10.0 (*)
+├── ciborium v0.2.2
+│   └── criterion v0.8.2 (*)
+├── criterion v0.8.2 (*)
+├── json-patch v4.2.0
+│   ├── kube-core v4.2.0 (*)
+│   └── kube-runtime v4.2.0 (*)
+├── jsonptr v0.7.1
+│   └── json-patch v4.2.0 (*)
+├── jsonwebtoken v10.4.0 (*)
+├── k8s-openapi v0.28.0 (*)
+├── kube-client v4.2.0 (*)
+├── kube-core v4.2.0 (*)
+├── kube-runtime v4.2.0 (*)
+├── lrlex v0.13.10 (*)
+├── lrpar v0.13.10 (*)
+├── lrtable v0.13.10 (*)
+├── object_store v0.14.1 (*)
+├── packedvec v1.2.5
+│   ├── lrpar v0.13.10 (*)
+│   └── sparsevec v0.2.2
+│       └── lrtable v0.13.10 (*)
+├── quick-xml v0.41.0
+│   └── object_store v0.14.1 (*)
+├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+├── reqwest v0.12.28 (*)
+├── reqwest v0.13.4 (*)
+├── schemars v1.2.2
+│   ├── kube-core v4.2.0 (*)
+│   └── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+├── serde-value v0.7.0
+│   └── kube-core v4.2.0 (*)
+├── serde_urlencoded v0.7.1
+│   ├── axum v0.8.9 (*)
+│   ├── object_store v0.14.1 (*)
+│   ├── reqwest v0.12.28 (*)
+│   └── reqwest v0.13.4 (*)
+├── sparsevec v0.2.2 (*)
+├── tinytemplate v1.2.1
+│   └── criterion v0.8.2 (*)
+├── vob v3.0.6
+│   └── sparsevec v0.2.2 (*)
+└── vob v4.0.0
+    ├── cfgrammar v0.13.10 (*)
+    ├── lrpar v0.13.10 (*)
+    └── lrtable v0.13.10 (*)
+
+serde v1.0.229
+└── kube-derive v4.2.0 (proc-macro)
+    └── kube v4.2.0 (*)
+
+serde_core v1.0.229
+├── arrow-json v58.4.0 (*)
+├── arrow-schema v58.4.0 (*)
+├── axum v0.8.9 (*)
+├── csv v1.4.0
+│   └── arrow-csv v58.4.0 (*)
+├── jiff v0.2.35
+│   ├── k8s-openapi v0.28.0 (*)
+│   ├── kube-client v4.2.0 (*)
+│   └── kube-core v4.2.0 (*)
+├── serde v1.0.229 (*)
+├── serde-saphyr v0.0.29 (*)
+├── serde_json v1.0.151
+│   ├── arrow-json v58.4.0 (*)
+│   ├── arrow-schema v58.4.0 (*)
+│   ├── axum v0.8.9 (*)
+│   ├── criterion v0.8.2 (*)
+│   ├── datafusion-expr v54.1.0 (*)
+│   ├── json-patch v4.2.0 (*)
+│   ├── jsonpath-rust v1.0.7 (*)
+│   ├── jsonptr v0.7.1 (*)
+│   ├── jsonwebtoken v10.4.0 (*)
+│   ├── k8s-openapi v0.28.0 (*)
+│   ├── kube-client v4.2.0 (*)
+│   ├── kube-core v4.2.0 (*)
+│   ├── kube-runtime v4.2.0 (*)
+│   ├── object_store v0.14.1 (*)
+│   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+│   ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│   ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│   ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+│   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   ├── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   ├── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve) (*)
+│   ├── reqwest v0.12.28 (*)
+│   ├── reqwest v0.13.4 (*)
+│   ├── schemars v1.2.2 (*)
+│   └── tinytemplate v1.2.1 (*)
+│   [dev-dependencies]
+│   ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+│   └── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+├── serde_path_to_error v0.1.20
+│   └── axum v0.8.9 (*)
+├── serde_spanned v1.1.1
+│   └── toml v1.1.4+spec-1.1.0
+│       ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│       └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+├── toml v1.1.4+spec-1.1.0 (*)
+└── toml_datetime v1.1.1+spec-1.1.0
+    └── toml v1.1.4+spec-1.1.0 (*)
+
+serde_core v1.0.229
+├── serde v1.0.229 (*)
+└── serde_json v1.0.151
+    └── kube-derive v4.2.0 (proc-macro) (*)
+
+serde_json v1.0.151 (*)
+
+serde_json v1.0.151 (*)
+
+syn v2.0.119
+├── async-stream-impl v0.3.6 (proc-macro)
+│   └── async-stream v0.3.6
+│       └── kube-runtime v4.2.0 (*)
+├── darling_core v0.23.0
+│   ├── darling v0.23.0
+│   │   └── kube-derive v4.2.0 (proc-macro) (*)
+│   └── darling_macro v0.23.0 (proc-macro)
+│       └── darling v0.23.0 (*)
+├── darling_macro v0.23.0 (proc-macro) (*)
+├── datafusion-macros v54.1.0 (proc-macro)
+│   ├── datafusion-functions v54.1.0 (*)
+│   ├── datafusion-functions-aggregate v54.1.0 (*)
+│   ├── datafusion-functions-nested v54.1.0 (*)
+│   └── datafusion-functions-window v54.1.0 (*)
+├── derive_more-impl v2.1.1 (proc-macro)
+│   └── derive_more v2.1.1
+│       └── kube-core v4.2.0 (*)
+├── displaydoc v0.2.6 (proc-macro)
+│   ├── icu_collections v2.2.0
+│   │   ├── icu_normalizer v2.2.0
+│   │   │   └── idna_adapter v1.2.2
+│   │   │       └── idna v1.1.0
+│   │   │           └── url v2.5.8
+│   │   │               ├── datafusion v54.1.0 (*)
+│   │   │               ├── datafusion-datasource v54.1.0 (*)
+│   │   │               ├── datafusion-execution v54.1.0 (*)
+│   │   │               ├── object_store v0.13.2 (*)
+│   │   │               ├── object_store v0.14.1 (*)
+│   │   │               ├── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   │   │               ├── reqwest v0.12.28 (*)
+│   │   │               ├── reqwest v0.13.4 (*)
+│   │   │               └── tower-http v0.6.11 (*)
+│   │   └── icu_properties v2.2.0
+│   │       └── idna_adapter v1.2.2 (*)
+│   ├── icu_locale_core v2.2.0
+│   │   ├── icu_properties v2.2.0 (*)
+│   │   └── icu_provider v2.2.0
+│   │       ├── icu_normalizer v2.2.0 (*)
+│   │       └── icu_properties v2.2.0 (*)
+│   ├── icu_provider v2.2.0 (*)
+│   ├── tinystr v0.8.3
+│   │   └── icu_locale_core v2.2.0 (*)
+│   └── zerotrie v0.2.4
+│       ├── icu_properties v2.2.0 (*)
+│       └── icu_provider v2.2.0 (*)
+├── educe v0.6.0 (proc-macro)
+│   └── kube-runtime v4.2.0 (*)
+├── enum-ordinalize-derive v4.4.1 (proc-macro)
+│   └── enum-ordinalize v4.4.2
+│       └── educe v0.6.0 (proc-macro) (*)
+├── futures-macro v0.3.33 (proc-macro)
+│   └── futures-util v0.3.33
+│       ├── axum v0.8.9 (*)
+│       ├── futures v0.3.33
+│       │   ├── datafusion v54.1.0 (*)
+│       │   ├── datafusion-catalog v54.1.0 (*)
+│       │   ├── datafusion-catalog-listing v54.1.0 (*)
+│       │   ├── datafusion-common-runtime v54.1.0 (*)
+│       │   ├── datafusion-datasource v54.1.0 (*)
+│       │   ├── datafusion-datasource-arrow v54.1.0 (*)
+│       │   ├── datafusion-datasource-csv v54.1.0 (*)
+│       │   ├── datafusion-datasource-json v54.1.0 (*)
+│       │   ├── datafusion-execution v54.1.0 (*)
+│       │   ├── datafusion-physical-plan v54.1.0 (*)
+│       │   ├── kube-client v4.2.0 (*)
+│       │   ├── kube-runtime v4.2.0 (*)
+│       │   ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│       │   ├── ravel-fleet v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-fleet) (*)
+│       │   ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+│       │   ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│       │   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│       │   ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│       │   ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│       │   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│       │   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│       │   └── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│       │   [dev-dependencies]
+│       │   └── ravel-failure-tests v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-failure-tests)
+│       ├── futures-executor v0.3.33
+│       │   ├── futures v0.3.33 (*)
+│       │   └── opentelemetry_sdk v0.32.1 (*)
+│       ├── hyper-util v0.1.20 (*)
+│       ├── object_store v0.13.2 (*)
+│       ├── object_store v0.14.1 (*)
+│       ├── opentelemetry_sdk v0.32.1 (*)
+│       ├── reqwest v0.13.4 (*)
+│       ├── tower v0.5.3 (*)
+│       └── tower-http v0.6.11 (*)
+├── kube-derive v4.2.0 (proc-macro) (*)
+├── logos-codegen v0.15.1 (*)
+├── logos-codegen v0.16.1 (*)
+├── miette-derive v7.6.0 (proc-macro)
+│   └── miette v7.6.0
+│       ├── prost-reflect v0.16.5 (*)
+│       ├── protox v0.9.1 (*)
+│       └── protox-parse v0.9.0 (*)
+├── pest_generator v2.8.8
+│   └── pest_derive v2.8.8 (proc-macro)
+│       └── jsonpath-rust v1.0.7 (*)
+├── pin-project-internal v1.1.13 (proc-macro)
+│   └── pin-project v1.1.13
+│       ├── datafusion-physical-expr-common v54.1.0 (*)
+│       ├── kube-runtime v4.2.0 (*)
+│       └── tonic v0.14.6 (*)
+├── prettyplease v0.2.37
+│   ├── prost-build v0.14.4 (*)
+│   ├── tonic-build v0.14.6
+│   │   └── tonic-prost-build v0.14.6 (*)
+│   └── tonic-prost-build v0.14.6 (*)
+├── prost-build v0.14.4 (*)
+├── prost-derive v0.14.4 (proc-macro) (*)
+├── sqlparser_derive v0.5.0 (proc-macro)
+│   └── sqlparser v0.62.0 (*)
+├── synstructure v0.13.2
+│   ├── yoke-derive v0.8.2 (proc-macro)
+│   │   └── yoke v0.8.3
+│   │       ├── icu_collections v2.2.0 (*)
+│   │       ├── icu_provider v2.2.0 (*)
+│   │       ├── zerotrie v0.2.4 (*)
+│   │       └── zerovec v0.11.6
+│   │           ├── icu_collections v2.2.0 (*)
+│   │           ├── icu_locale_core v2.2.0 (*)
+│   │           ├── icu_normalizer v2.2.0 (*)
+│   │           ├── icu_properties v2.2.0 (*)
+│   │           ├── icu_provider v2.2.0 (*)
+│   │           ├── potential_utf v0.1.5
+│   │           │   └── icu_collections v2.2.0 (*)
+│   │           └── tinystr v0.8.3 (*)
+│   └── zerofrom-derive v0.1.7 (proc-macro)
+│       └── zerofrom v0.1.8
+│           ├── icu_collections v2.2.0 (*)
+│           ├── icu_provider v2.2.0 (*)
+│           ├── yoke v0.8.3 (*)
+│           ├── zerotrie v0.2.4 (*)
+│           └── zerovec v0.11.6 (*)
+├── tokio-macros v2.7.1 (proc-macro)
+│   └── tokio v1.53.1 (*)
+├── tonic-build v0.14.6 (*)
+├── tonic-prost-build v0.14.6 (*)
+├── tracing-attributes v0.1.31 (proc-macro)
+│   └── tracing v0.1.44 (*)
+├── yoke-derive v0.8.2 (proc-macro) (*)
+├── zerocopy-derive v0.8.55 (proc-macro)
+│   └── zerocopy v0.8.55
+│       ├── ahash v0.8.12 (*)
+│       ├── half v2.7.1
+│       │   ├── arrow-array v58.4.0 (*)
+│       │   ├── arrow-array v59.1.0 (*)
+│       │   ├── arrow-buffer v58.4.0 (*)
+│       │   ├── arrow-buffer v59.1.0 (*)
+│       │   ├── arrow-cast v58.4.0 (*)
+│       │   ├── arrow-cast v59.1.0 (*)
+│       │   ├── arrow-data v58.4.0 (*)
+│       │   ├── arrow-data v59.1.0 (*)
+│       │   ├── arrow-json v58.4.0 (*)
+│       │   ├── arrow-row v58.4.0 (*)
+│       │   ├── arrow-row v59.1.0 (*)
+│       │   ├── ciborium-ll v0.2.2
+│       │   │   └── ciborium v0.2.2 (*)
+│       │   ├── datafusion-common v54.1.0 (*)
+│       │   ├── datafusion-functions-aggregate v54.1.0 (*)
+│       │   ├── datafusion-physical-expr v54.1.0 (*)
+│       │   ├── datafusion-physical-plan v54.1.0 (*)
+│       │   └── parquet v59.1.0 (*)
+│       └── ppv-lite86 v0.2.21
+│           └── rand_chacha v0.9.0 (*)
+├── zerofrom-derive v0.1.7 (proc-macro) (*)
+├── zeroize_derive v1.5.0 (proc-macro)
+│   └── zeroize v1.9.0
+│       ├── aws-lc-rs v1.17.3 (*)
+│       ├── jsonwebtoken v10.4.0 (*)
+│       ├── rustls v0.23.42 (*)
+│       ├── rustls-pki-types v1.15.1
+│       │   ├── object_store v0.14.1 (*)
+│       │   ├── reqwest v0.12.28 (*)
+│       │   ├── reqwest v0.13.4 (*)
+│       │   ├── rustls v0.23.42 (*)
+│       │   ├── rustls-native-certs v0.8.4
+│       │   │   ├── hyper-rustls v0.27.9 (*)
+│       │   │   ├── rustls-platform-verifier v0.7.0 (*)
+│       │   │   └── tonic v0.14.6 (*)
+│       │   ├── rustls-webpki v0.103.13 (*)
+│       │   └── webpki-roots v1.0.9
+│       │       ├── hyper-rustls v0.27.9 (*)
+│       │       └── reqwest v0.12.28 (*)
+│       └── secrecy v0.10.3
+│           └── kube-client v4.2.0 (*)
+└── zerovec-derive v0.11.3 (proc-macro)
+    └── zerovec v0.11.6 (*)
+
+syn v3.0.3
+├── async-trait v0.1.91 (proc-macro)
+│   ├── datafusion v54.1.0 (*)
+│   ├── datafusion-catalog v54.1.0 (*)
+│   ├── datafusion-catalog-listing v54.1.0 (*)
+│   ├── datafusion-datasource v54.1.0 (*)
+│   ├── datafusion-datasource-arrow v54.1.0 (*)
+│   ├── datafusion-datasource-csv v54.1.0 (*)
+│   ├── datafusion-datasource-json v54.1.0 (*)
+│   ├── datafusion-execution v54.1.0 (*)
+│   ├── datafusion-expr v54.1.0 (*)
+│   ├── datafusion-functions-table v54.1.0 (*)
+│   ├── datafusion-physical-plan v54.1.0 (*)
+│   ├── datafusion-session v54.1.0 (*)
+│   ├── object_store v0.13.2 (*)
+│   ├── object_store v0.14.1 (*)
+│   ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│   ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+│   ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+│   ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+│   ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+│   ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+│   ├── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+│   └── tonic v0.14.6 (*)
+│   [dev-dependencies]
+│   ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+│   ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│   └── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+├── clap_derive v4.6.4 (proc-macro)
+│   └── clap v4.6.4
+│       ├── criterion v0.8.2 (*)
+│       ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+│       ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+│       ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+│       ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+│       └── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+├── ref-cast-impl v1.0.26 (proc-macro)
+│   └── ref-cast v1.0.26
+│       └── schemars v1.2.2 (*)
+├── schemars_derive v1.2.2 (proc-macro)
+│   └── schemars v1.2.2 (*)
+├── serde_derive v1.0.229 (proc-macro)
+│   ├── serde v1.0.229 (*)
+│   └── serde v1.0.229 (*)
+├── serde_derive_internals v0.30.0
+│   └── schemars_derive v1.2.2 (proc-macro) (*)
+└── thiserror-impl v2.0.19 (proc-macro)
+    └── thiserror v2.0.19
+        ├── json-patch v4.2.0 (*)
+        ├── jsonpath-rust v1.0.7 (*)
+        ├── kube-client v4.2.0 (*)
+        ├── kube-core v4.2.0 (*)
+        ├── kube-runtime v4.2.0 (*)
+        ├── object_store v0.13.2 (*)
+        ├── object_store v0.14.1 (*)
+        ├── opentelemetry v0.32.0 (*)
+        ├── opentelemetry-otlp v0.32.0 (*)
+        ├── opentelemetry_sdk v0.32.1 (*)
+        ├── protox v0.9.1 (*)
+        ├── protox-parse v0.9.0 (*)
+        ├── ravel-alerting v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-alerting) (*)
+        ├── ravel-bench v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-bench)
+        ├── ravel-catalog v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-catalog) (*)
+        ├── ravel-cli v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-cli)
+        ├── ravel-codec v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-codec) (*)
+        ├── ravel-commit v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-commit) (*)
+        ├── ravel-ingest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-ingest) (*)
+        ├── ravel-ingest-router v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-ingest-router)
+        ├── ravel-logseg v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-logseg) (*)
+        ├── ravel-maintain v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-maintain) (*)
+        ├── ravel-object-store v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-object-store) (*)
+        ├── ravel-operator v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-operator)
+        ├── ravel-otap v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otap)
+        ├── ravel-otlp v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-otlp) (*)
+        ├── ravel-promql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql) (*)
+        ├── ravel-promql-difftest v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-promql-difftest)
+        ├── ravel-query v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-query) (*)
+        ├── ravel-remote-write v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-remote-write) (*)
+        ├── ravel-rspan v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-rspan) (*)
+        ├── ravel-segment v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-segment) (*)
+        ├── ravel-server v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/services/ravel-server) (*)
+        ├── ravel-sim v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sim)
+        ├── ravel-sql v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-sql) (*)
+        ├── ravel-tenant-resolve v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-tenant-resolve) (*)
+        ├── ravel-types v0.10.0 (/var/lib/fleet/work/2f2aa31f-7aec-41ea-ba8f-5137bf089ec0/crates/ravel-types) (*)
+        └── simple_asn1 v0.6.4
+            └── jsonwebtoken v10.4.0 (*)
+
+time v0.3.54 (*)
+
+time v0.3.54
+└── simple_asn1 v0.6.4 (*)
+
+unicode-width v0.1.14
+└── miette v7.6.0 (*)
+
+unicode-width v0.2.2
+├── annotate-snippets v0.12.16
+│   └── serde-saphyr v0.0.29 (*)
+├── comfy-table v7.2.2
+│   └── arrow-cast v58.4.0 (*)
+└── getopts v0.2.24
+    └── lrlex v0.13.10 (*)
+
+untrusted v0.7.1
+└── aws-lc-rs v1.17.3 (*)
+
+untrusted v0.9.0
+├── ring v0.17.14 (*)
+└── rustls-webpki v0.103.13 (*)
+
+vob v3.0.6 (*)
+
+vob v4.0.0 (*)

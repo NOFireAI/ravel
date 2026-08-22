@@ -49,7 +49,63 @@ DOCUMENTED CLAIM, CONTRADICTED, UNKNOWN, NOT IMPLEMENTED, NOT ASSESSED).
 
 ## 3. Architecture in one page
 
-NOT YET WRITTEN.
+Ravel is an OpenTelemetry-native telemetry database (metrics, logs, traces)
+whose only durable backend is S3-compatible object storage. There is no
+write-ahead log, no replicated ingest tier, no StatefulSet, and no local disk
+in the durability path. The stated bargain: pay object-store latency on the
+write path, and in exchange delete the entire stateful ingest tier.
+
+The write path: an OTLP/Remote-Write request hits a gateway that authenticates
+the tenant and applies admission limits. An ingest router hashes
+`(tenant, series_id) % shards` to a shard actor (single-threaded, bounded
+mpsc). The shard buffers samples, builds an immutable columnar segment in
+memory (RSEG for metrics, RLOG for logs, RSPAN for traces), PUTs the data
+object, then PUTs a commit record with create-if-absent semantics. Only after
+the commit PUT succeeds does the server acknowledge, returning an
+`x-ravel-commit-token`. That is the durability boundary: acknowledged means the
+commit record is on the object store.
+
+The read path: a query frontend resolves a snapshot by LISTing commit records
+per shard and hour, folds them into a catalog view, prunes segments via footer
+metadata (SERIES_META), issues ranged GETs for needed pages, and evaluates
+PromQL or SQL (DataFusion, behind the `sql`/`flight-sql` cargo features).
+Passing a commit token as `min_commit_token` guarantees read-your-write without
+a listing race. Cross-segment duplicate samples are resolved by a fixed total
+order (value bit pattern tiebreak) shared between the PromQL and SQL paths.
+
+Maintenance (`--mode maintain`) is a disposable background worker: it discovers
+tenants from storage prefixes (not CLI flags), then runs L0->L1 compaction,
+age-based retention, and a GC sweeper per tenant. Optional distributed read
+fan-out lets query nodes exchange slices over a cluster-internal gRPC service,
+selected by rendezvous hashing over a heartbeat-based worker set stored in the
+bucket. Cross-cluster federation reaches remote clusters only through their own
+API, each a separate trust domain.
+
+All services are modes of one binary (`ravel-server --mode all|gateway|query|
+maintain`), split by crate boundaries so later phases can deploy them
+separately.
+
+```mermaid
+flowchart TD
+  C[OTLP gRPC/HTTP, Remote Write 1.0/2.0] --> GW[Gateway: auth, tenant, admission limits]
+  GW --> RT["Ingest router: hash(tenant, series_id) % shards"]
+  RT --> SH[Shard actors: single-threaded, bounded mpsc]
+  SH -->|build RSEG/RLOG/RSPAN in memory| DPUT[Data PUT]
+  DPUT --> CPUT[Commit PUT: create-if-absent]
+  CPUT -->|success| ACK[Acknowledge + commit token]
+  CPUT --> OS[(S3-compatible object store: only durable state)]
+  DPUT --> OS
+  OS -->|LIST commits per shard/hour| CAT[Catalog resolve + snapshot fold]
+  QF[Query frontend: /api/v1/query, query_range, /sql, Flight SQL] --> CAT
+  CAT --> SR[Segment reader: suffix GET footer, prune, ranged GETs]
+  SR --> EV[PromQL evaluator / DataFusion SQL pipeline]
+  EV --> RESULT[Result + stats]
+  MNT[Maintain mode] -->|discover tenants from prefixes| OS
+  MNT --> CMP[L0->L1 compaction, retention, GC sweep]
+  CMP --> OS
+  QF -.distributed fan-out.-> WK[Peer query workers: rendezvous-hashed, gRPC fragment service]
+  WK --> OS
+```
 
 ## 4. The strongest parts of the design
 
