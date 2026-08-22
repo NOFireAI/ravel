@@ -1457,3 +1457,251 @@ async fn an_audit_write_failure_fails_the_query_closed_in_required_mode() {
         "the audit PUT fault must have fired"
     );
 }
+
+/// Reachability for the last task of epic #360: a tenant's declared `Str`
+/// column must arrive as Arrow `Dictionary(Int32, Utf8)` when queried through
+/// the shipping server's real Flight SQL surface, not merely inside ravel-sql.
+///
+/// The assertion is on the WIRE `DataType`, not just the values, on purpose.
+/// Downstream #479 (LIKE pushdown) depends on the dictionary SURVIVING to the
+/// operator so it can match once per distinct value; if the Flight encoder
+/// hydrated the dictionary back to plain `Utf8` in transit (the encoder's
+/// default, which the public statement path overrides with
+/// `DictionaryHandling::Resend`), every value assertion would still pass while
+/// the optimisation silently had nothing to key on.
+///
+/// arrow-flight carries arrow 58 and this crate's `arrow` dev-dependency is the
+/// workspace 59 pin, so the decoded batch's `DataType` is compared by its
+/// `Debug` form rather than a cross-major `==`. The plain-form values are
+/// asserted over the HTTP JSON surface, which renders the same dictionary column
+/// as plain strings.
+#[cfg(feature = "flight-sql")]
+mod flight_wire {
+    use std::net::SocketAddr;
+
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
+    use arrow_flight::{FlightData, FlightDescriptor};
+    use futures::TryStreamExt;
+    use prost::Message;
+    use ravel_sql::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
+    use tokio::sync::oneshot;
+    use tonic::Request;
+
+    use super::*;
+
+    /// The tenant's one declared column: a `Str`-typed `name`.
+    fn declared_source() -> Arc<dyn DeclaredColumnSource> {
+        Arc::new(StaticDeclaredColumns::new(vec![DeclaredColumn::new(
+            "name",
+            DeclaredType::Str,
+        )]))
+    }
+
+    /// A `LogRecord` on `service` carrying a record-level `name` attribute, so
+    /// the declared `name` column resolves from the record.
+    fn log_record_named(service: &str, ts: i64, name: &str) -> LogRecord {
+        let mut record = log_record(service, ts, "b");
+        record.attrs = vec![("name".to_string(), AttrValue::Str(name.to_string()))];
+        record
+    }
+
+    /// A [`SqlState`] whose executor resolves the declared `name` column for
+    /// every tenant.
+    fn sql_state_with_declared(
+        store: Arc<dyn ObjectStoreBackend>,
+        tokens: HashMap<String, TenantId>,
+    ) -> SqlState {
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            ravel_sql::SpanSegmentFetcher::new(store.clone()),
+            SqlConfig::default(),
+            1 << 30,
+        )
+        .with_declared_column_source(declared_source());
+        SqlState {
+            executor: Arc::new(executor),
+            tenant_resolver: Arc::new(StaticBearerTokenResolver::new(tokens)),
+            store,
+            clock: Arc::new(FixedClock),
+            max_deadline: Duration::from_secs(30),
+            query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+            query_admission: ravel_query::QueryAdmissionController::shared(
+                ravel_query::QueryConcurrencyLimit::Unlimited,
+            ),
+            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+        }
+    }
+
+    /// A running tonic server carrying only the Flight SQL service, mirroring the
+    /// in-process harness in `flight_sql.rs`.
+    struct FlightServer {
+        addr: SocketAddr,
+        shutdown: oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FlightServer {
+        async fn start(state: &SqlState) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (tx, rx) = oneshot::channel::<()>();
+            let ceiling = ravel_server::gc_config::flight_ceiling(
+                &ravel_maintain::GcConfigValues::maintain_defaults(),
+            );
+            let service = ravel_server::flight::service(state, ceiling, None);
+            let task = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(
+                        tonic::transport::server::TcpIncoming::from(listener),
+                        async {
+                            let _ = rx.await;
+                        },
+                    )
+                    .await
+                    .expect("serve");
+            });
+            FlightServer {
+                addr,
+                shutdown: tx,
+                task,
+            }
+        }
+
+        async fn client(&self) -> FlightServiceClient<tonic::transport::Channel> {
+            let channel = tonic::transport::Channel::from_shared(format!("http://{}", self.addr))
+                .expect("valid endpoint uri")
+                .connect()
+                .await
+                .expect("connect");
+            FlightServiceClient::new(channel)
+        }
+
+        async fn stop(self) {
+            let _ = self.shutdown.send(());
+            let _ = self.task.await;
+        }
+    }
+
+    fn descriptor(command: &impl ProstMessageExt) -> FlightDescriptor {
+        FlightDescriptor::new_cmd(command.as_any().encode_to_vec())
+    }
+
+    fn authed<T>(message: T, token: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        let metadata = request.metadata_mut();
+        metadata.insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii"),
+        );
+        metadata.insert("x-ravel-start", "0".parse().expect("ascii"));
+        metadata.insert(
+            "x-ravel-end",
+            format!("{}", NOW_NS as f64 / 1e9).parse().expect("ascii"),
+        );
+        request
+    }
+
+    /// Decode a `DoGet` response into its total row count and, per column, the
+    /// name and the `Debug` form of the wire `DataType`.
+    async fn decode_schema(stream: tonic::Streaming<FlightData>) -> (usize, Vec<(String, String)>) {
+        let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(|status| arrow_flight::error::FlightError::Tonic(Box::new(status))),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("decode flight data");
+        let rows = batches.iter().map(|batch| batch.num_rows()).sum();
+        let columns = batches
+            .first()
+            .map(|batch| {
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name().clone(), format!("{:?}", field.data_type())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (rows, columns)
+    }
+
+    #[tokio::test]
+    async fn a_declared_str_column_arrives_dictionary_encoded_over_flight() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("acme".to_string());
+        let records = vec![
+            log_record_named("api", 100, "alpha"),
+            log_record_named("worker", 150, "beta"),
+            log_record_named("api", 200, "alpha"),
+        ];
+        publish_log_segment(store.as_ref(), &tenant, 0, &records).await;
+
+        // Flight SQL surface: the declared `name` column must arrive as a
+        // dictionary on the wire, proving the public statement path's
+        // DictionaryHandling::Resend keeps it from being hydrated in transit.
+        let state = sql_state_with_declared(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+        let server = FlightServer::start(&state).await;
+        let mut client = server.client().await;
+        let command = CommandStatementQuery {
+            query: "SELECT \"name\" FROM logs ORDER BY ts".to_string(),
+            transaction_id: None,
+        };
+        let info = client
+            .get_flight_info(authed(descriptor(&command), "acme-token"))
+            .await
+            .expect("flight info")
+            .into_inner();
+        let ticket = info
+            .endpoint
+            .first()
+            .expect("one endpoint")
+            .ticket
+            .clone()
+            .expect("a ticket");
+        let stream = client
+            .do_get(authed(ticket, "acme-token"))
+            .await
+            .expect("do get")
+            .into_inner();
+        let (rows, columns) = decode_schema(stream).await;
+        server.stop().await;
+
+        assert_eq!(rows, records.len(), "every published row comes back");
+        assert_eq!(columns.len(), 1, "one projected column: name");
+        assert_eq!(columns[0].0, "name");
+        assert_eq!(
+            columns[0].1, "Dictionary(Int32, Utf8)",
+            "a declared Str column must survive the Flight wire as a dictionary, \
+             not be hydrated back to plain Utf8"
+        );
+
+        // The same column over HTTP JSON renders the plain-form string values,
+        // so the dictionary wire type carries exactly the plain values.
+        let http_state = sql_state_with_declared(store, tokens(&[("acme-token", "acme")]));
+        let app = router(http_state);
+        let (status, value) =
+            post_json(&app, "acme-token", "SELECT \"name\" FROM logs ORDER BY ts").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let json_rows = value["data"]["rows"].as_array().expect("rows");
+        let got: Vec<Value> = json_rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                serde_json::json!("alpha"),
+                serde_json::json!("beta"),
+                serde_json::json!("alpha"),
+            ],
+            "the dictionary column's values equal the plain string form"
+        );
+    }
+}

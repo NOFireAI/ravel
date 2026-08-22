@@ -318,9 +318,16 @@ semantics).
 
 Beyond those fixed columns, an operator can declare per-tenant *typed
 attribute columns*: an attribute key promoted to a native `Int64`, `Boolean`,
-`Utf8`, or `Binary` column named exactly after the key, so a typed comparison
-or aggregate over it needs no `CAST` over the stringified map. Declared keys
-still appear in `attrs`. A declaration comes from the server's
+`Dictionary(Int32, Utf8)` (for a `str` column), or `Binary` column named
+exactly after the key, so a typed comparison or aggregate over it needs no
+`CAST` over the stringified map. A declared `str` column is dictionary-encoded,
+and stays a dictionary over the Flight SQL wire (it is not hydrated back to
+plain `Utf8`). Over HTTP JSON the row *values* are unchanged (a string per row,
+`null` for an absent or type-mismatched cell), but the response envelope's
+declared `columns[].type` reports `Dictionary(Int32, Utf8)` instead of `Utf8`;
+over Arrow IPC the schema and every batch column carry the dictionary type
+verbatim. Both are client-visible changes from the pre-declaration plain `Utf8`
+column. Declared keys still appear in `attrs`. A declaration comes from the server's
 `--typed-attr-column` flags or from the durable per-tenant override written by
 `ravel-cli typed-attr-column set`, and a query process picks a durable change
 up within 60s. Querying an undeclared column is an unknown-column error, and a

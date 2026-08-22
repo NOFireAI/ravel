@@ -377,4 +377,121 @@ mod tests {
             .expect("json");
         assert_eq!(json["rows"][0][0], json!("deadbeef"));
     }
+
+    /// A declared `Str` column arrives as `Dictionary(Int32, Utf8)` after
+    /// ADR-0099 decision 5, but the HTTP JSON output must be byte-for-byte what
+    /// the pre-dictionary plain `Utf8` column produced: a string per row, JSON
+    /// `null` for a NULL key, and JSON `null` for a key addressing a NULL
+    /// (non-UTF-8) dictionary value. This asserts the existing
+    /// `Dictionary(Int32, _)` arm already covers the new column type.
+    #[test]
+    fn json_encodes_declared_str_dictionary_like_a_plain_string_column() {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+
+        // Values 0="api", 1=<null>. Keys: "api", reuse "api", NULL key,
+        // key->null value.
+        let values = StringArray::from(vec![Some("api"), None]);
+        let keys = Int32Array::from(vec![Some(0), Some(0), None, Some(1)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+            .expect("batch");
+        let json = QueryOutput::new(schema, vec![batch])
+            .to_json()
+            .expect("json");
+        let rows = json["rows"].as_array().expect("rows");
+        assert_eq!(rows[0][0], json!("api"));
+        assert_eq!(rows[1][0], json!("api"));
+        assert_eq!(rows[2][0], Json::Null, "a NULL key is JSON null");
+        assert_eq!(
+            rows[3][0],
+            Json::Null,
+            "a key pointing at a NULL dictionary value is JSON null"
+        );
+    }
+
+    /// The JSON row *values* of a declared `Str` column are plain strings, but
+    /// the response envelope's declared `columns[].type` is the dictionary type,
+    /// not `Utf8`: `to_json` reports `f.data_type().to_string()`, so a client
+    /// reading the column type sees the ADR-0099 decision 5 change. The docs must
+    /// not claim JSON renders "exactly as a plain string column".
+    #[test]
+    fn json_envelope_reports_declared_str_column_as_dictionary_type() {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+
+        let values = StringArray::from(vec![Some("api"), Some("worker")]);
+        let keys = Int32Array::from(vec![Some(0), Some(1)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+            .expect("batch");
+        let json = QueryOutput::new(schema, vec![batch])
+            .to_json()
+            .expect("json");
+
+        let rows = json["rows"].as_array().expect("rows");
+        assert_eq!(rows[0][0], json!("api"), "values are plain strings");
+        assert_eq!(rows[1][0], json!("worker"));
+
+        let cols = json["columns"].as_array().expect("columns");
+        assert_eq!(cols[0]["name"], json!("name"));
+        assert_eq!(
+            cols[0]["type"],
+            json!("Dictionary(Int32, Utf8)"),
+            "the envelope declares the dictionary type, not Utf8"
+        );
+    }
+
+    /// The Arrow IPC surface (`to_arrow_ipc`, served by ravel-server's SQL
+    /// endpoint for an `Accept: application/vnd.apache.arrow.stream` request)
+    /// hands the schema and batches to `StreamWriter` unchanged, so a declared
+    /// `Str` column's `Dictionary(Int32, Utf8)` type crosses the wire verbatim:
+    /// both the IPC schema and the batch column are a dictionary, not `Utf8`.
+    /// The docs must not claim Arrow IPC renders it as a plain string column.
+    #[test]
+    fn arrow_ipc_carries_the_declared_str_dictionary_type() {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+        use datafusion::arrow::ipc::reader::StreamReader;
+
+        let values = StringArray::from(vec![Some("api"), Some("worker")]);
+        let keys = Int32Array::from(vec![Some(0), Some(1), Some(0)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let dict_ty = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("name", dict_ty.clone(), true)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+            .expect("batch");
+        let bytes = QueryOutput::new(schema, vec![batch])
+            .to_arrow_ipc()
+            .expect("ipc");
+
+        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader");
+        let batches: Vec<RecordBatch> = reader.map(|b| b.expect("batch")).collect();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].schema().field(0).data_type(),
+            &dict_ty,
+            "the IPC schema carries the dictionary type verbatim, not Utf8"
+        );
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("the IPC batch column is a real dictionary");
+        let vals = col
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 dictionary values");
+        assert_eq!(vals.value(col.keys().value(0) as usize), "api");
+        assert_eq!(vals.value(col.keys().value(2) as usize), "api");
+    }
 }
