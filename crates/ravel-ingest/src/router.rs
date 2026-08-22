@@ -19,6 +19,8 @@ use crate::error::WriteError;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
 use crate::metrics::IngestMetrics;
 use crate::shard::{ShardActor, ShardMsg};
+#[cfg(feature = "stage-timing")]
+use crate::stage_timing::{MetricStage, MetricStageTimings};
 use crate::value::{IngestExemplar, IngestPoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +69,13 @@ pub struct IngestRouter {
     /// `services/ravel-server` installs the configured budget with
     /// [`IngestRouter::with_budget`].
     budget: Arc<IngestByteBudget>,
+    /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
+    /// every shard actor and flush task so the seam records into one table the
+    /// bench reporter reads via [`IngestRouter::stage_timings`]. Present only
+    /// under the `stage-timing` feature; with it off this field, and every
+    /// timing site, is compiled out.
+    #[cfg(feature = "stage-timing")]
+    stage_timings: Arc<MetricStageTimings>,
 }
 
 impl IngestRouter {
@@ -94,6 +103,8 @@ impl IngestRouter {
         rng: Arc<dyn RngSource>,
     ) -> Self {
         let metrics = Arc::new(IngestMetrics::default());
+        #[cfg(feature = "stage-timing")]
+        let stage_timings = Arc::new(MetricStageTimings::new());
         // Each generation's shard-actor set gets a fresh writer identity, so
         // two sets never collide on a commit key for the same shard index.
         let factory = {
@@ -101,6 +112,8 @@ impl IngestRouter {
             let clock = Arc::clone(&clock);
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
+            #[cfg(feature = "stage-timing")]
+            let stage_timings = Arc::clone(&stage_timings);
             move |shard_count: u32| -> Vec<ShardHandle> {
                 let writer_id = rng.new_uuid();
                 let epoch =
@@ -119,6 +132,8 @@ impl IngestRouter {
                             config,
                             Arc::clone(&metrics),
                             rx,
+                            #[cfg(feature = "stage-timing")]
+                            Arc::clone(&stage_timings),
                         );
                         tokio::spawn(actor.run());
                         ShardHandle {
@@ -140,7 +155,17 @@ impl IngestRouter {
             metrics,
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            #[cfg(feature = "stage-timing")]
+            stage_timings,
         }
+    }
+
+    /// The per-stage timing accumulator (ADR-0104 decision 1), for the bench
+    /// reporter to read a snapshot after driving a write. Present only under the
+    /// `stage-timing` feature.
+    #[cfg(feature = "stage-timing")]
+    pub fn stage_timings(&self) -> Arc<MetricStageTimings> {
+        Arc::clone(&self.stage_timings)
     }
 
     /// Installs the process-wide ingest buffer byte budget (ADR-0069 decision
@@ -314,6 +339,8 @@ impl IngestRouter {
         // amount once the last clone is dropped. On any early return from here
         // on (a stale provisioning view, a dead shard) the clones not yet
         // handed to a live shard drop with this frame, so nothing leaks.
+        #[cfg(feature = "stage-timing")]
+        let admit_start = std::time::Instant::now();
         let estimate: u64 = points
             .iter()
             .map(IngestPoint::est_charge_bytes)
@@ -329,10 +356,15 @@ impl IngestRouter {
                 .try_charge(estimate)
                 .map_err(|_| WriteError::BufferBudgetExceeded)?,
         );
+        #[cfg(feature = "stage-timing")]
+        self.stage_timings
+            .record(MetricStage::Admit, admit_start.elapsed());
 
         // Route this write against the tenant's current generation view,
         // re-reading the provisioning record when the cache is older than `C`
         // and failing closed if that read cannot complete (ADR-0052 section 3).
+        #[cfg(feature = "stage-timing")]
+        let route_start = std::time::Instant::now();
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
         let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<IngestPoint>> = HashMap::new();
@@ -397,6 +429,11 @@ impl IngestRouter {
                 return Err(WriteError::ShardUnavailable);
             }
         }
+        // Routing ends at dispatch: the strict-mode ack wait below is downstream
+        // durability (merge/encode/PUT happen in the shard), not a router stage.
+        #[cfg(feature = "stage-timing")]
+        self.stage_timings
+            .record(MetricStage::Route, route_start.elapsed());
 
         if mode == WriteMode::Buffered {
             return Ok(WriteReceipt::default());
