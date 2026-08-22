@@ -101,10 +101,14 @@ where
 /// decision 1(b) forbids: a generation appended between the two reads would be
 /// invisible here while its segments are already in `segments`.
 ///
-/// This is the whole eligibility gate, and it is intentionally not called by
-/// any production query path yet (epic #64, T4 wires it into the planner). The
-/// expression-shape gate (ADR-0103 decision 4) is a separate, independent
-/// check; neither implies the other.
+/// This is the whole eligibility gate. `QueryEngine::prefetch` calls it on
+/// every real query (epic #64 T4c), but its result does not yet reach the
+/// wire: the coordinator computes and tests the pushdown target this gate
+/// feeds without ever setting `FetchRequest.partial_aggregate` live, because
+/// nothing yet consumes a worker's partial-only reply
+/// (`MergedSource::query_precomputed_count`, T4d). The expression-shape gate
+/// (ADR-0103 decision 4) is a separate, independent check; neither implies
+/// the other.
 pub fn is_pushdown_eligible(
     federation: Option<&Federation>,
     segments: &[SegmentRef],

@@ -456,10 +456,16 @@ slice, or on a slice holding native-histogram series (which have no scalar
 count/min/max shape), is refused with `Unsupported` (with the real accounting
 already spent, never dropped) and falls back to raw fetch.
 
-Reachable at the wire/worker layer, not yet from a query: no coordinator sets
-the request field today, so the eligibility gate, the coordinator-side combine,
-the PromQL plan-extraction wiring, and the `PROTOCOL_VERSION` bump ADR-0103
-stages with them are still to come.
+Reachable at the wire/worker layer, not yet from a query: `QueryEngine::prefetch`
+runs the eligibility gate and computes the pushdown target on every real query
+(epic #64 T4c), and the PromQL-side fast path (`SeriesSource::query_precomputed_count`)
+exists as a mechanism (T4b), but the coordinator does not set
+`FetchRequest.partial_aggregate` live yet, because nothing wires the two
+together: `MergedSource` does not yet override `query_precomputed_count` with
+the collected partials. The `PROTOCOL_VERSION` bump lands together with that
+wiring (T4d), not before — the worker's pushdown branch returns a partial
+INSTEAD OF raw runs, so sending the request live without a consumer already
+produced a silent empty-result bug once (caught before merge).
 
 This is the engine-level (queryfrag) fetch, merge, and federation machinery for
 all five signals — shipped and covered by the per-signal differential, erasure,

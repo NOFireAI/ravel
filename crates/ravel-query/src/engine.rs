@@ -927,18 +927,22 @@ impl QueryEngine {
                     let accounting = &accounting;
                     let pushdown_target = &pushdown_target;
                     async move {
-                        // This matcher set gets the pushdown request iff it is
-                        // the one eligible target; every other fetches raw with
-                        // `partial_aggregate: None`, byte-identical to today.
-                        let partial_req = pushdown_target.as_ref().and_then(|t| {
-                            (t.matchers == plan.matchers).then_some(pb::PartialAggregateRequest {
-                                want_count: true,
-                                want_min: false,
-                                want_max: false,
-                                reduce_start_ns: Some(t.reduce_start_ns),
-                                reduce_end_ns: Some(t.reduce_end_ns),
-                            })
-                        });
+                        // NOT YET LIVE (T4d): a worker that receives
+                        // `partial_aggregate: Some(..)` returns ONLY the
+                        // partial, no raw runs (`service.rs`'s
+                        // `run_slice_metrics` pushdown branch, pre-existing
+                        // T3/T4a behavior) -- there is no partial state
+                        // between "raw" and "pushed down". Sending this live
+                        // before `MergedSource::query_precomputed_count`
+                        // reads the partial back out (T4d, together with the
+                        // `PROTOCOL_VERSION` bump) would make every eligible
+                        // query silently see zero raw series and no
+                        // consumer of the partial that replaced them: a
+                        // real, empty answer instead of the real count.
+                        // `pushdown_target` above is still computed and
+                        // tested end to end; only sending it is deferred.
+                        let _ = pushdown_target.as_ref();
+                        let partial_req: Option<pb::PartialAggregateRequest> = None;
                         // A selector's segments carry scalar and/or
                         // native-histogram series; fetch both kinds (a series is
                         // one kind for its whole life, so the two sets never
@@ -4904,6 +4908,88 @@ mod prefetch_tests {
             2,
             "one slice dispatched on the initial attempt and once more after \
              exactly one re-resolve"
+        );
+    }
+
+    /// A slice fetcher double that records every `FetchRequest.partial_aggregate`
+    /// it receives and answers with a plain, empty, successful raw response.
+    struct CapturingPartialAggregate {
+        seen: Arc<std::sync::Mutex<Vec<Option<pb::PartialAggregateRequest>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for CapturingPartialAggregate {
+        async fn fetch(
+            &self,
+            request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            self.seen.lock().unwrap().push(request.partial_aggregate);
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: crate::fetcher::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Ok,
+                status_message: String::new(),
+            })
+        }
+    }
+
+    /// ADR-0103 (epic #64) reachability guard, not just a mechanism test: an
+    /// otherwise fully eligible `count_over_time` query (single segment, no
+    /// federation, plan tagged `count_over_time_pushdown_candidate`) must
+    /// still dispatch `partial_aggregate: None` over the wire, because
+    /// nothing yet consumes a worker's partial-only reply
+    /// (`MergedSource::query_precomputed_count`, T4d). The worker's pushdown
+    /// branch returns the partial INSTEAD OF raw runs once asked -- landing
+    /// the request live without its consumer already produced one silent
+    /// empty-result bug (caught at checkpoint review, never merged). Flip
+    /// `partial_req` in `prefetch`'s per-plan closure back to `Some` without
+    /// wiring the consumer in the same change and this test fails; that is
+    /// the point.
+    #[tokio::test]
+    async fn eligible_count_over_time_does_not_send_partial_aggregate_yet() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let distributed = Arc::new(crate::distrib::Distributed::new(
+            Arc::new(CapturingPartialAggregate {
+                seen: Arc::clone(&seen),
+            }),
+            crate::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let eng = engine(Arc::clone(&store)).with_distributed(distributed);
+
+        let mut plan = window_plan("metric_a");
+        plan.count_over_time_pushdown_candidate = true;
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        eng.prefetch(tenant_hash, &[plan], &eval_window, &[], BASE_NS)
+            .await
+            .expect("a fully eligible single-segment query must still succeed raw");
+
+        let dispatched = seen.lock().unwrap();
+        assert_eq!(dispatched.len(), 1, "exactly one slice dispatched");
+        assert_eq!(
+            dispatched[0], None,
+            "T4d not landed yet: partial_aggregate must stay None on the wire"
         );
     }
 
