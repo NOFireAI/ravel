@@ -208,6 +208,25 @@ impl WorkerSet {
         }
     }
 
+    /// The same worker under a caller-supplied `process_id` instead of the
+    /// freshly generated one.
+    ///
+    /// Rendezvous ownership is a function of the `process_id`, so a test that
+    /// needs a specific owner for a specific unit must be able to pin the id
+    /// the same way this crate's clocks are injected: a random draw inside the
+    /// constructor is the identity equivalent of `SystemTime::now()` in library
+    /// logic, and a test that searches for a peer id which outweighs a random
+    /// own id fails whenever that draw lands near the top of the weight range.
+    ///
+    /// Production callers never use this: they take [`WorkerSet::new`]'s fresh
+    /// UUID, so every process keeps a distinct membership identity. Two live
+    /// processes sharing one `process_id` would share one heartbeat key and one
+    /// rendezvous weight, which is exactly the collision decision 1 rules out.
+    pub fn with_process_id(mut self, process_id: Uuid) -> Self {
+        self.process_id = process_id;
+        self
+    }
+
     /// A worker with the ADR-0065 defaults (`H = 60s`, `3 * H` liveness window,
     /// 4 units in flight), started at `started_unix_ns`.
     pub fn with_defaults(started_unix_ns: i64) -> Self {
@@ -372,6 +391,33 @@ mod tests {
         for _ in 0..16 {
             assert_eq!(owner(&key, &live), Some(first), "owner must not vary");
         }
+    }
+
+    /// Two workers constructed without an explicit id get DIFFERENT ids. The
+    /// `with_process_id` seam must stay an override, never a shared default: two
+    /// live processes on one id would write one heartbeat key and carry one
+    /// rendezvous weight, colliding on ownership of every unit.
+    #[test]
+    fn default_process_ids_are_distinct() {
+        let a = worker(0);
+        let b = worker(0);
+        assert_ne!(a.process_id(), b.process_id());
+        assert_ne!(
+            WorkerSet::with_defaults(0).process_id(),
+            WorkerSet::with_defaults(0).process_id()
+        );
+    }
+
+    /// `with_process_id` pins the identity the rendezvous hash resolves against,
+    /// leaving the rest of the configuration alone.
+    #[test]
+    fn with_process_id_pins_the_identity() {
+        let pinned = Uuid::from_u128(0xABCD);
+        let w = worker(0).with_process_id(pinned);
+        assert_eq!(w.process_id(), pinned);
+        assert_eq!(w.solo_live_set(), vec![pinned]);
+        assert_eq!(w.unit_concurrency(), DEFAULT_UNIT_CONCURRENCY);
+        assert_eq!(w.heartbeat_interval(), H);
     }
 
     /// Ownership is independent of the order the live set is presented in: the
