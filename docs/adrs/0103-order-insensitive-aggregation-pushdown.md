@@ -334,3 +334,186 @@ flowchart TB
     Fallback --> Merge["merge_series_runs\n(cross-worker/cross-cluster dedup belt)"]
     Merge --> Result
 ```
+
+## Amendment: narrowed to single-step `_over_time` range functions; decision 3's combine is a collect, not a sum
+
+T1-T3 shipped the eligibility gate, the `PartialAggregate` wire frame, and
+worker-side partial computation exactly as decided above. Wiring a real
+caller (T4) surfaced two errors in this ADR's original framing, caught
+before T4 was dispatched rather than after a checkpoint review, this
+time — the same discipline that caught T2's premature version bump.
+
+**The delivered surface is per-series aggregation over samples, which
+only matches PromQL's `count_over_time`/`min_over_time`/`max_over_time`
+range functions (`crates/ravel-promql/src/functions/over_time.rs`:
+`fn count_over_time(samples: &[Sample], w: RangeWindow)` and siblings) —
+not the outer, cross-series `count()`/`min()`/`max()`/`group()`
+aggregate operators PromQL also has** (`crates/ravel-promql/src/
+aggregate.rs`'s `eval_aggregate`, which counts/reduces over how many
+*series* have a sample at an instant, not how many *samples* one series
+has over a window). The two are different aggregation axes. This ADR's
+Context section listed "count, min, max, group" without distinguishing
+them; only the within-series, over-a-window shape is in scope for T4.
+Cross-series aggregate-operator pushdown (PromQL's outer aggregators,
+and SQL's `COUNT(*)`/`GROUP BY` over a table scan) needs its own combine
+semantics — a union/count of *series*, not a per-series value reduction
+— and is explicitly deferred as unscoped future work, not something the
+shipped `PartialAggregate` frame serves without a redesign.
+
+**Decision 3's "coordinator sums every worker's count" is corrected to
+"the coordinator collects one partial per series."** Decision 1's
+eligibility gate guarantees every series in scope lives on exactly one
+worker; there is never a second worker's partial for the same series to
+sum against. The combine step's real job is assembling the per-series
+map from however many workers each contributed a disjoint subset of
+series, not arithmetic across workers on one series. This is a stronger
+exactness guarantee than "sum," not a weaker one, and doesn't change
+decision 1/2's design, only this document's earlier prose about what
+decision 3 does.
+
+**T4 ships `count_over_time` pushdown only. `min_over_time`/
+`max_over_time` pushdown is excluded from T4**, because T3's worker fold
+does not compute the value PromQL's own reducers compute. T3 folds
+min/max under `f64::total_cmp` (ADR-0023's convention, correct for
+SQL-style typed aggregates), but `min_over_time`/`max_over_time`
+(`crates/ravel-promql/src/functions/over_time.rs`) use plain IEEE
+comparison with NaN overwritten by any non-NaN sample (the window's
+result is NaN only when every sample is NaN) and `-0.0` never displacing
+an already-seen `0.0`. The two folds disagree on any window containing a
+NaN (`total_cmp` ranks NaN above every other value; `_over_time` treats
+it as absent unless it's the only sample) and on `{0.0, -0.0}`
+(`total_cmp` picks `-0.0` as the min; `_over_time` keeps `0.0`). Reusing
+the shipped partial for `min_over_time`/`max_over_time` would return a
+visibly wrong number on exactly the values this repo's float-comparison
+discipline exists to get right. Min/max pushdown needs either a second,
+PromQL-semantics fold on the worker or a proof that no query the gate
+admits can ever carry a NaN/-0.0 sample (unlikely — staleness markers
+alone are NaN-encoded, see below); until one of those exists, `want_min`/
+`want_max` stay unused by any real caller. Count is unaffected: a sample
+count under total order and under plain comparison count the same
+samples, so `count_over_time` pushdown ships in T4 without this problem.
+
+**Staleness markers must be filtered before counting, or a stale sample
+inflates the pushed-down count.** The evaluator drops any sample encoded
+as `STALE_NAN_BITS` from every matrix selection before a range function
+sees it (`crates/ravel-promql/src/eval.rs`). T3's worker fold has no such
+filter — it counts every merged sample. A window whose only "sample" is
+a staleness marker (the series went stale inside the window) must
+contribute 0 to `count_over_time`'s pushed-down partial, not 1. T4's
+worker-side change (or a T3 fast-follow, whichever lands first) must
+filter `STALE_NAN_BITS` AFTER `merge_soa_runs`, not before: the merge's
+own dedup tie-break (`is_greater`, a bit-pattern tuple comparison,
+unrelated to `total_cmp`) decides which of two candidates at the same
+timestamp survives, exactly as it does on the raw path today, so
+filtering staleness pre-merge on the worker would let a losing real
+sample win a slot the raw path resolves to the marker (or vice versa),
+diverging from the answer the same query gets on the local path. The
+acceptance test must place a staleness marker inside the exact reduction
+window and confirm it is excluded from the count.
+
+**A zero-count partial maps to the absence of an output sample, never a
+literal `0.0` point.** The raw evaluation path never emits a point for a
+series whose window is empty (the reducer is never invoked); a fully
+erased series is a real case where the shipped worker reports
+`count: Some(0)` (post-erasure, correctly). If T4's coordinator-side
+conversion turns that `0` into an actual `0.0` sample in the resulting
+instant vector, a downstream `count(count_over_time(m[5m]))` composition
+counts a phantom series that would not exist on the raw path. T4 must
+convert `count: Some(0)` to "no output sample for this series," matching
+the raw path's own behavior.
+
+**Four additional eligibility and precision requirements for T4,
+necessary because of how `_over_time` functions actually work:**
+
+- **Single evaluation step only, and the argument must be a literal
+  matrix selector, not a subquery.** A *range* query evaluates
+  `count_over_time(m[5m])` at N independent steps, each needing its own
+  sub-window reduction; one whole-fetch-window partial per series cannot
+  serve more than one step. A *subquery* argument
+  (`count_over_time(m[1h:5m])`) evaluates at exactly one OUTER instant —
+  passing a naive "single evaluation step" check — but its correct value
+  depends on the inner `5m`-step evaluation grid with its own lookback
+  propagation, not a raw sample count over the outer `1h` window; pushing
+  it down would silently return the wrong number. Eligibility (decision
+  1) gains a fourth, independent condition: the query evaluates
+  `count_over_time` exactly once AND its matrix argument, after
+  unwrapping any parentheses, is a literal matrix selector, never a
+  subquery (these are the only two shapes a Matrix-typed function
+  argument can take in this implementation — `crates/ravel-promql/src/
+  functions/mod.rs`'s `matrix_arg`). Both conditions apply regardless of
+  shard-generation stability or federation status.
+- **A literal selector's `offset`/`@` modifiers shift the reduction
+  window; the pushed-down bounds must be computed from the
+  offset/@-resolved selector timestamp, never from the query's own
+  evaluation instant.** `count_over_time(m[5m] offset 1h)` at a single
+  instant passes every eligibility condition above, but its window is
+  `(sel_ts - range, sel_ts]` where `sel_ts` is the offset/@-resolved
+  selector timestamp (`crates/ravel-promql/src/eval.rs`'s
+  `eval_matrix_selector`), not `(eval_ts - range, eval_ts]`. T4 must
+  compute the reduction bounds (next bullet) from `sel_ts`, the same
+  value the raw path already resolves for this exact selector, and the
+  acceptance test suite must include one case with a nonzero `offset`
+  confirming the pushed-down count matches the raw-path count for a
+  window that would give a different answer if computed from `eval_ts`
+  instead. (`@` inside a *range* query is already excluded by the
+  single-step condition above; only the instant-query case needs this
+  bullet.)
+- **The reduction window is not the fetch window, and its start bound is
+  exclusive.** The coordinator's fetch window is deliberately padded left
+  for PromQL lookback (`crates/ravel-query/src/engine.rs`'s `padded`
+  window construction, docs/query-engine.md's `padded_range`), a superset
+  of `count_over_time`'s own `(start, end]` argument (PromQL range
+  windows are left-open — `crates/ravel-promql/src/functions/mod.rs`'s
+  `range_window`). On the distributed path today the mismatch is wider
+  than just lookback padding: the worker (`run_slice_metrics`) does not
+  consult `FetchRequest.window_start_ns`/`window_end_ns` at all for
+  metrics, and reduces over everything the pinned segments hold. T4 must
+  add an explicit reduction-bounds field (new, additive — T3 shipped no
+  such field, only `want_count`/`want_min`/`want_max`) to
+  `PartialAggregateRequest`, carrying the offset/@-resolved `(start,
+  end]` from the bullet above, and the worker must filter to strictly
+  that range before counting. The acceptance test must place one sample
+  exactly at the exclusive start bound (`sel_ts - range`, must be
+  EXCLUDED) and one exactly at the inclusive end bound (must be
+  INCLUDED), not just a sample somewhere in the padding region.
+- **Selector-plan dedup must not starve a shared consumer, and "same
+  pushdown decision" means identical reduction bounds too.** The
+  coordinator dedups fetch plans by matcher-set equality
+  (`crates/ravel-query/src/engine.rs`'s `distinct_plans`,
+  `count_over_time(a[5m]) + a` shares one matcher-set fetch between a
+  pushdown-eligible consumer and a raw-sample consumer). Eligibility for
+  a given matcher set requires every consumer of that deduped plan to
+  want the identical pushdown — the same aggregate AND the same
+  reduction bounds — since matcher equality says nothing about window
+  equality (`count_over_time(a[5m]) + count_over_time(a[10m])` dedups to
+  one fetch plan under today's matcher-only equality but needs two
+  different reduction bounds). If any consumer needs raw samples, or two
+  consumers of one deduped plan want different bounds, the whole shared
+  fetch stays raw. This is a coordinator-side planning check, not a
+  per-worker one.
+- **A duplicate series id across collected partials is a hard error, not
+  last-wins.** Decision 1's gate guarantees each series lives on exactly
+  one worker when eligible, so the coordinator's collect step (corrected
+  above) should never see the same series id twice; if it does, treat it
+  as a gate failure (fall back to raw fetch for the whole query, or hard
+  error) rather than silently keeping one of the two values. A
+  `SnapshotInvalidated` retry rebuilds the collected partial set from
+  scratch; it must never fold a retry's partials on top of the first
+  attempt's.
+
+**F1 (carried from T3's checkpoint review) becomes a required fix in
+T4's diff, not an optional note:** once pushdown is live, a slice
+mixing metric and native-histogram data can reach the native-histogram
+refusal path (`crates/ravel-query/src/distrib/service.rs`, the
+`!histograms.is_empty()` check), whose summary currently reports
+`QueryAccountingSnapshot::default()` instead of the accounting snapshot
+that already paid for the fetch.
+
+**Stale wire-contract comments to fix in the same diff:**
+`proto/ravel/queryfrag.proto`'s `PartialAggregate` doc comment says the
+coordinator "sums the counts and folds the bounds under the ADR-0023
+total_cmp total order" — now false on both counts (collect, not sum;
+min/max combine doesn't ship in T4). Separately, `service.rs`'s
+`replaces` helper doc describes the ADR-0023 total order as what "the
+coordinator's own combine" uses — also stale once min/max combine isn't
+live. Update both comments to match what actually ships.
