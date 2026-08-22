@@ -1,6 +1,6 @@
 # ADR-0094: parallel final aggregation for exact-typed inputs
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -57,7 +57,11 @@ multi-tenant server. It is enough to justify drafting this design; it
 is explicitly **not** enough to justify shipping the resulting feature
 without a release-build, production-scale (S3-backed, multi-GB,
 realistic cardinality distribution) validation pass — Consequences
-below makes that a required follow-up, not optional polish.
+below makes that a required follow-up, not optional polish. **That
+validation pass has since been run** (ADR-0102 decision 2, issue #458);
+its S3-backed release-build numbers, and the decision they drive (the
+flag's default stays `false`), are recorded in Consequences below and
+are why this ADR is now Accepted rather than Proposed.
 
 The type-exactness half of the epic's premise needs more care than "int
 vs float." Two aggregates behave very differently once repartitioning is
@@ -433,15 +437,108 @@ explained there.
   field — no live-reload.
 - No format change: this is pure query-execution-plan behavior, no
   proto, no `TenantConfig`, no RSEG/RLOG change.
-- Required before `parallel_final_aggregation` defaults to `true` in any
-  deployment (not required to merge this ADR's code, gated by the flag
-  itself per decision 4): a release-build, S3-backed, production-scale
-  (multi-GB objects, realistic group-key cardinality distribution)
-  re-run of the Context section's benchmark, plus decision 3's
-  peak-memory measurement — specifically isolating the new
-  redistribution-buffer cost — across the same shapes. Track as a
-  follow-up issue at decompose time, not silently assumed done by this
-  ADR's landing.
+- **S3-backed validation measurement (ADR-0102 decision 2, issue #458).**
+  The Context section's preliminary `MemoryStore` benchmark has now been
+  re-run at release build against a real S3-compatible store, replacing
+  that preliminary framing as the evidence of record. Tool:
+  `crates/ravel-bench/src/bin/groupby_scaling_bench.rs` (issue #457),
+  `--store s3`. Backend: a loopback MinIO reached over `RAVEL_S3_*`
+  (`minio/minio:latest`, HTTP, `127.0.0.1`) — **not** a real AWS S3
+  endpoint. Host: 8 logical cores, release profile. Query: the bin's
+  fixed exact-typed group-by, `SELECT series_id, count(*), min(ts),
+  max(ts) FROM samples GROUP BY series_id` (non-float group key,
+  `count`/`min`/`max` over non-float inputs — provably exact-typed, so
+  the flag genuinely engages: the `fanned_out` column below is read back
+  from the real physical plan). Dataset: 2000 distinct series (= 2000
+  result groups) across 8 RSEG parts, 1000 samples/series (2,000,000
+  scanned rows). 30 timed runs per combination after one warm-up.
+
+  | target_partitions | parallel | fanned_out | median_ms | stddev_ms | runs |
+  |---|---|---|---|---|---|
+  | 1 | false | no  | 6403.8 | 116.7 | 30 |
+  | 1 | true  | no  | 6392.1 | 117.6 | 30 |
+  | 2 | false | yes | 8210.9 | 678.8 | 30 |
+  | 2 | true  | yes | 7742.7 | 185.9 | 30 |
+  | 4 | false | yes | 9834.0 | 464.5 | 30 |
+  | 4 | true  | yes | 9467.5 | 546.4 | 30 |
+  | 8 | false | yes | 18590.1 | 2754.1 | 30 |
+  | 8 | true  | yes | 18552.6 | 2521.8 | 30 |
+
+  (At `target_partitions=1` a single partition already satisfies
+  `EnforceDistribution`, so no `RepartitionExec` is inserted and
+  `fanned_out` is `no` even with the flag on — the expected convergence
+  decision 5 predicts. At 2/4/8 the flag really did fan the `Final`
+  stage out.)
+
+  **Reading, per-partition-count (on median vs off median at the same
+  `target_partitions`):** `tp=1` −0.18% (11.8 ms, well inside the
+  ~117 ms stddev); `tp=2` −5.7% (468 ms — the largest apparent gain, but
+  the off row's 679 ms stddev comes from a high-variance tail and the two
+  distributions overlap heavily); `tp=4` −3.7% (367 ms, inside one
+  combined stddev); `tp=8` −0.20% (37 ms, dwarfed by the ~2500 ms
+  stddev). Parallel final aggregation is **performance-neutral within
+  run-to-run variance at every measured partition count**: the only
+  apparent gains (tp=2, tp=4) are small, sit inside the noise band, and
+  vanish again at tp=8; no partition count shows parallel robustly faster
+  outside noise, and none shows it slower. This does not reproduce the
+  preliminary `MemoryStore` measurement's ~14%-slower-at-low-partition
+  signal (real object-store latency swamps that compute-side difference),
+  but it reaches the same conclusion by the same decision rule.
+
+  **A second, structural finding:** median latency *rises* monotonically
+  with `target_partitions` (6.4 s → 18.6 s from tp=1 to tp=8), the
+  opposite of core-count speed-up. On the real-S3 path the scan fans into
+  more, smaller, contended object-store reads, and that scan I/O — not
+  the serial `Final` merge — dominates the wall clock at this scale. The
+  epic's founding premise (the serial final merge is the bottleneck)
+  holds only when object-store latency is removed, as the preliminary
+  `MemoryStore` run did; with real S3 in the loop the final merge is not
+  where the time goes, so parallelizing it buys nothing net.
+
+  **Decision (mechanical, per ADR-0102 decision 2's agreed rule):**
+  parallel is *no better* than serial outside the noise band at every
+  measured partition count, so the flag's default **stays `false`**
+  (`SqlConfig::default().parallel_final_aggregation`,
+  `crates/ravel-sql/src/config.rs`; unchanged by this measurement) and
+  this ADR moves to Accepted on the strength of a proper S3-backed
+  measurement — a validated "do not default this on" is a real,
+  evidenced decision, not an open question.
+
+  **Caveats, stated plainly:**
+  - *Loopback MinIO, not real AWS S3.* A `127.0.0.1` MinIO has far lower
+    and more uniform latency than a real remote S3 endpoint. Since the
+    result is already scan-I/O-dominated on loopback, a real S3 endpoint
+    would make the scan dominate *more*, not less — this ratio is a
+    **lower bound** on how thoroughly the scan out-weighs the final merge
+    in production. It strengthens, never weakens, the "default off"
+    conclusion.
+  - *Cardinality is 2000 groups / 2M rows, below the 20000-group /
+    ClickBench-class target ADR-0102 framed.* The final-merge cost this
+    ADR parallelizes grows with group cardinality, so a much larger
+    cardinality could in principle shift the balance toward parallel.
+    That regime was not reachable for a 30-run sweep on this real-S3
+    path: scan cost scales with series count (≈25 s per scan at 20000
+    series, and higher `target_partitions` made it slower, not faster,
+    for the same object-store-contention reason above), and a single
+    aggregation over ≈10M+ rows exceeds the shipped 256 MiB per-query
+    pool (`DEFAULT_MAX_QUERY_BYTES`) and fails closed with a typed
+    `ResourcesExhausted` (ADR-0013 no-spill) — which the bench exposes no
+    flag to raise (`--max-tenant-bytes` sets the per-tenant ceiling, not
+    the per-query pool). So the measured point is the largest that both
+    fits the real shipped per-query budget and admits a 30-run sweep
+    within the validation host's time budget. A future task that wants
+    the high-cardinality crossover point specifically would need the bin
+    extended to raise `max_query_bytes`; that is not this decision's
+    blocker, because the scan-dominated real-S3 result is itself the
+    answer for representative execution.
+  - Decision 3's isolated peak-memory (redistribution-buffer)
+    measurement is not reproduced numerically here; the sweep did
+    surface its qualitative shape during scoping (a parallel-plan
+    combination hit `Memory Exhausted while SpillPool (DiskManager is
+    disabled)` where the serial plan reported the plain pool-exhausted
+    error for the same data, i.e. the new redistribution buffer does move
+    the memory ceiling), consistent with decision 3's caveat. A precise
+    peak-memory isolation remains the follow-up decision 3 named.
 - `docs/query-engine.md` gains a short note on `parallel_final_aggregation`,
   the exact-typed admission rule (including that `avg`/`mean` and any
   float group-by key are never eligible), and that a `GROUP BY` without
