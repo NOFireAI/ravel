@@ -32,6 +32,17 @@
 //! handed downstream -- and released as each goes away, so the pool bounds
 //! concurrently-held scan memory rather than cumulative bytes emitted.
 //!
+//! The two batch-building paths hold different things, and each charges what it
+//! actually holds. The row path's [`ravel_logseg::BlockScan::next_block`] drops
+//! the decoded block before it returns, so what remains resident is the
+//! `Vec<LogRecord>` it built ([`records_memory`]) plus the batch handed
+//! downstream. The columnar path's `next_block_columnar` hands out a view
+//! *borrowing* the decoded block, which the reader releases only when the next
+//! block is decoded, so the block stays resident alongside the Arrow batches
+//! built from it: both terms are charged together
+//! ([`LogScanStream::hold_batches`]) and released together. Charging the
+//! batches alone would admit a query at a fraction of its resident footprint.
+//!
 //! # Column projection
 //!
 //! The scan's output schema *is* the projection DataFusion asked for; there is
@@ -703,7 +714,10 @@ enum Pending {
     Rows { records: Vec<LogRecord>, pos: usize },
     /// Columnar fast path: the block's already-built output batches, emitted one
     /// per poll. Built whole from the [`ColumnarBlockView`] so the view (which
-    /// borrows the scan) is dropped before the next block is decoded.
+    /// borrows the scan) is dropped before the next block is decoded. The
+    /// decoded block itself is still resident behind the reader until then, so
+    /// the charge covering this variant includes it (see
+    /// [`LogScanStream::hold_batches`]).
     Batches(VecDeque<RecordBatch>),
 }
 
@@ -781,7 +795,9 @@ impl LogScanStream {
     /// Emit the next columnar-path batch: pop the front pre-built batch, relabel
     /// its already-reserved bytes from `held` to `emitted`, and release the
     /// batch handed out on the previous poll. No new reservation is taken -- the
-    /// whole block's batches were charged once in [`Self::hold_batches`].
+    /// decoded block and all of its batches were charged once in
+    /// [`Self::hold_batches`], and the block's share stays in `held` until the
+    /// block is released.
     fn emit_next_columnar_batch(&mut self) -> DFResult<RecordBatch> {
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         let Pending::Batches(queue) = &mut self.pending else {
@@ -815,11 +831,24 @@ impl LogScanStream {
     }
 
     /// Take ownership of one block's pre-built columnar batches, charging the
-    /// pool for their total Arrow footprint before they are held. This is the
-    /// fast path's live-bytes unit (ADR-0099 decision 2): the scan holds the
-    /// batches it built straight from the view rather than a `Vec<LogRecord>`.
-    fn hold_batches(&mut self, batches: Vec<RecordBatch>) -> DFResult<()> {
-        let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    /// pool for everything the fast path holds while they drain: their total
+    /// Arrow footprint **plus** `block_bytes`, the decoded block's own heap
+    /// footprint ([`ColumnarBlockView::decoded_bytes`]).
+    ///
+    /// Both terms are live at the same time, which is why both are charged. The
+    /// batches were built from a view borrowing the decoded block, and
+    /// `BlockScan` releases that block only when the next one is decoded -- so
+    /// for as long as this stream is emitting these batches, the block is
+    /// resident too. The batch term alone would report a fraction of the true
+    /// footprint and break ADR-0087 decision 2's contract that the pool bounds
+    /// concurrently-held scan memory.
+    ///
+    /// The block's share of the charge stays in [`Self::held`] until
+    /// [`Self::release_block`]: [`Self::emit_next_columnar_batch`] moves only
+    /// the emitted batch's bytes from `held` to `emitted`.
+    fn hold_batches(&mut self, batches: Vec<RecordBatch>, block_bytes: usize) -> DFResult<()> {
+        let batch_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+        let bytes = batch_bytes.saturating_add(block_bytes);
         self.reservation.try_grow(bytes)?;
         self.held = bytes;
         self.pending = Pending::Batches(batches.into());
@@ -943,8 +972,14 @@ impl Stream for LogScanStream {
                         // rest of this segment back to the row path.
                         Fallback,
                         // A clean block's built batches (possibly empty for a
-                        // block with no surviving row).
-                        Held(Vec<RecordBatch>),
+                        // block with no surviving row), and the decoded block's
+                        // own heap footprint, read off the view before its
+                        // borrow ends because the block stays resident behind
+                        // the reader while those batches drain.
+                        Held {
+                            batches: Vec<RecordBatch>,
+                            block_bytes: usize,
+                        },
                         // A decode or build error, carried out of the view's
                         // borrow so it can be handled once the borrow ends.
                         Failed(DataFusionError),
@@ -968,7 +1003,10 @@ impl Stream for LogScanStream {
                                     &this.projection,
                                     &this.declared,
                                 ) {
-                                    Ok(batches) => Step::Held(batches),
+                                    Ok(batches) => Step::Held {
+                                        batches,
+                                        block_bytes: view.decoded_bytes(),
+                                    },
                                     Err(e) => Step::Failed(e),
                                 }
                             }
@@ -1001,13 +1039,21 @@ impl Stream for LogScanStream {
                                 skip: this.seg_columnar_blocks,
                             };
                         }
-                        Step::Held(batches) => {
+                        Step::Held {
+                            batches,
+                            block_bytes,
+                        } => {
                             // Count every consumed clean block, empty or not, so
                             // a later `attrs_raw` fallback skips exactly the
                             // blocks the columnar cursor advanced past.
                             this.seg_columnar_blocks += 1;
+                            // A block with no surviving row is not held at all:
+                            // the loop asks for the next block immediately,
+                            // which releases it inside this same poll, so there
+                            // is no interval during which it is resident and
+                            // uncharged.
                             if !batches.is_empty()
-                                && let Err(e) = this.hold_batches(batches)
+                                && let Err(e) = this.hold_batches(batches, block_bytes)
                             {
                                 return this.fail(e);
                             }
@@ -1296,10 +1342,17 @@ fn declared_field_type(ty: DeclaredType) -> FieldType {
     }
 }
 
-/// Whether a FIELD_DIR column carries a value at surviving row `i`.
+/// Whether a FIELD_DIR column carries a *readable* value at surviving row `i`.
+///
+/// "Readable" is what makes this agree with the row path: a `Str` cell holding
+/// bytes that are not UTF-8 is not a value there
+/// (`get_attr_value`/`read_typed_cell`), so it must not count as the record
+/// setting the key either -- otherwise it would suppress the resource/scope
+/// fallback the row path applies.
 fn attr_present(view: &ColumnarBlockView<'_>, col: AttrColumn, i: usize) -> bool {
     match col.ty {
-        FieldType::Str | FieldType::Bytes => view.bytes_at(col.column_id, i).is_some(),
+        FieldType::Str => read_str_cell(view, col.column_id, i).is_some(),
+        FieldType::Bytes => view.bytes_at(col.column_id, i).is_some(),
         FieldType::I64 => view.i64_at(col.column_id, i).is_some(),
         FieldType::F64 => view.f64_bits_at(col.column_id, i).is_some(),
         FieldType::Bool => view.bool_at(col.column_id, i).is_some(),
@@ -1360,13 +1413,27 @@ fn declared_merged_value(
     Ok(find_attr(resource, &plan.dc.key).cloned())
 }
 
+/// A `Str`-typed FIELD_DIR cell at surviving row `i`, as `&str`: `None` when the
+/// cell is NULL **or** when its bytes are not UTF-8.
+///
+/// Treating invalid UTF-8 as no value is what the row path does
+/// (`get_attr_value`'s `String::from_utf8(b).ok()`, `ravel-logseg`'s
+/// `reader.rs`), which makes the attribute absent for that record and lets the
+/// resource/scope value show through. Substituting U+FFFD instead would both
+/// invent a value and suppress that fallback, and this crate's rule is exact
+/// semantics by default.
+fn read_str_cell<'v>(view: &ColumnarBlockView<'v>, column_id: u32, i: usize) -> Option<&'v str> {
+    std::str::from_utf8(view.bytes_at(column_id, i)?).ok()
+}
+
 /// Read the value of a FIELD_DIR column at surviving row `i` as an
-/// [`AttrValue`], or `None` when the cell is NULL.
+/// [`AttrValue`], or `None` when the cell is NULL (or, for `Str`, not UTF-8;
+/// see [`read_str_cell`]).
 fn read_typed_cell(view: &ColumnarBlockView<'_>, col: AttrColumn, i: usize) -> Option<AttrValue> {
     match col.ty {
-        FieldType::Str => view
-            .bytes_at(col.column_id, i)
-            .map(|b| AttrValue::Str(String::from_utf8_lossy(b).into_owned())),
+        FieldType::Str => {
+            read_str_cell(view, col.column_id, i).map(|s| AttrValue::Str(s.to_string()))
+        }
         FieldType::I64 => view.i64_at(col.column_id, i).map(AttrValue::I64),
         FieldType::F64 => view
             .f64_bits_at(col.column_id, i)

@@ -129,6 +129,25 @@ impl<'a> ColumnarBlockView<'a> {
         self.block.has_attrs_raw_page()
     }
 
+    /// The heap bytes the decoded block behind this view holds resident: every
+    /// decoded column vector plus every present string and fixed-width cell's
+    /// own allocation.
+    ///
+    /// This view borrows the block, and the block stays resident for as long as
+    /// the view (and anything built from it while the cursor has not moved on)
+    /// is alive. A caller charging a memory pool for what it concurrently holds
+    /// therefore has to charge this in addition to whatever it builds
+    /// (ADR-0087 decision 2). It is an accessor like every other method here:
+    /// it reports a size, and exposes neither the block nor any column's
+    /// storage type, so ADR-0099 decision 4 can change how string columns are
+    /// stored without touching a caller.
+    ///
+    /// The figure covers the whole block, not only the surviving rows: a
+    /// content predicate that drops rows does not shrink the decoded columns.
+    pub fn decoded_bytes(&self) -> usize {
+        self.block.decoded_heap_bytes()
+    }
+
     // --- fixed columns ------------------------------------------------------
 
     /// Event timestamp of surviving row `i`.
