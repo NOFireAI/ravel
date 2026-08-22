@@ -91,7 +91,13 @@ pub fn logs_schema() -> SchemaRef {
 /// a cast (ADR-0090 decision 7).
 fn declared_arrow_type(ty: DeclaredType) -> DataType {
     match ty {
-        DeclaredType::Str => DataType::Utf8,
+        // `Str` is dictionary-encoded end to end (ADR-0099 decision 5): a
+        // dict-encoded page reaches Arrow as its dictionary and ids with no
+        // per-row allocation, and the client receives it as
+        // `Dictionary(Int32, Utf8)` over the public Flight statement path.
+        DeclaredType::Str => {
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        }
         DeclaredType::I64 => DataType::Int64,
         DeclaredType::Bool => DataType::Boolean,
         DeclaredType::Bytes => DataType::Binary,
@@ -180,7 +186,10 @@ mod tests {
         assert_eq!(s.field(LOG_COL_ATTRS).name(), "attrs");
         // Declared columns follow, in list order, each nullable.
         assert_eq!(s.field(FIRST_DECLARED_COL).name(), "z.last");
-        assert_eq!(s.field(FIRST_DECLARED_COL).data_type(), &DataType::Utf8);
+        assert_eq!(
+            s.field(FIRST_DECLARED_COL).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
         assert_eq!(s.field(FIRST_DECLARED_COL + 1).name(), "duration_ms");
         assert_eq!(
             s.field(FIRST_DECLARED_COL + 1).data_type(),

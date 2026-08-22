@@ -27,8 +27,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::arrow::array::{
-    Array, BinaryArray, BooleanArray, Int64Array, MapArray, StringArray, StructArray,
+    Array, BinaryArray, BooleanArray, DictionaryArray, Int64Array, MapArray, StringArray,
+    StructArray,
 };
+use datafusion::arrow::datatypes::Int32Type;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -223,11 +225,28 @@ async fn declared_columns_project_as_native_typed_arrays_null_on_mismatch() {
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("dur is a native Int64 column, not a string");
-    let name = batch
+    // A declared Str column is dictionary-encoded (ADR-0099 decision 5), so it
+    // downcasts to `Dictionary(Int32, Utf8)`, not a plain `StringArray`.
+    let name_dict = batch
         .column(2)
         .as_any()
+        .downcast_ref::<DictionaryArray<Int32Type>>()
+        .expect("name is a native Dictionary(Int32, Utf8) column");
+    let name_values = name_dict
+        .values()
+        .as_any()
         .downcast_ref::<StringArray>()
-        .expect("name is a native Utf8 column");
+        .expect("name dictionary values are Utf8");
+    let name: Vec<Option<String>> = (0..name_dict.len())
+        .map(|i| {
+            if name_dict.is_null(i) {
+                None
+            } else {
+                let k = name_dict.keys().value(i) as usize;
+                (!name_values.is_null(k)).then(|| name_values.value(k).to_string())
+            }
+        })
+        .collect();
     let ok = batch
         .column(3)
         .as_any()
@@ -241,13 +260,16 @@ async fn declared_columns_project_as_native_typed_arrays_null_on_mismatch() {
 
     // Row 0 (ts=1): matching values, native and non-null.
     assert!(!dur.is_null(0) && dur.value(0) == 42);
-    assert!(!name.is_null(0) && name.value(0) == "checkout");
+    assert!(name[0].as_deref() == Some("checkout"));
     assert!(!ok.is_null(0) && ok.value(0));
     assert!(!blob.is_null(0) && blob.value(0) == [1u8, 2, 3]);
 
     // Row 1 (ts=2): every value is the wrong variant -> NULL, never a cast.
     assert!(dur.is_null(1), "a Str under an i64 column must read NULL");
-    assert!(name.is_null(1), "an I64 under a str column must read NULL");
+    assert!(
+        name[1].is_none(),
+        "an I64 under a str column must read NULL"
+    );
     assert!(ok.is_null(1), "a Str under a bool column must read NULL");
     assert!(
         blob.is_null(1),
@@ -255,7 +277,7 @@ async fn declared_columns_project_as_native_typed_arrays_null_on_mismatch() {
     );
 
     // Row 2 (ts=3): keys absent -> NULL.
-    assert!(dur.is_null(2) && name.is_null(2) && ok.is_null(2) && blob.is_null(2));
+    assert!(dur.is_null(2) && name[2].is_none() && ok.is_null(2) && blob.is_null(2));
 
     // Decision 6: declared keys still appear in the `attrs` map exactly as they
     // would undeclared. Row 0 carries dur/name/ok/blob plus the resource key.

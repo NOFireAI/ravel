@@ -198,7 +198,15 @@ pub(super) async fn statement_stream(
         .map_err(|err| FlightError::Tonic(Box::new(status_from_sql(&err, tenant))))
     });
 
+    // Resend dictionaries rather than hydrating them (ADR-0099 decision 5). A
+    // declared `Str` column is `Dictionary(Int32, Utf8)`, and the encoder's
+    // default would hydrate it back to plain `Utf8` on the wire, stopping the
+    // win at the operator boundary; #479 (LIKE pushdown) depends on the
+    // dictionary surviving to the client operator so it can match once per
+    // distinct value. The internal worker path (`fragment_stream`) already sets
+    // this for the `labels` dictionary; the public statement path needs it too.
     let encoded = FlightDataEncoderBuilder::new()
+        .with_dictionary_handling(DictionaryHandling::Resend)
         .with_schema(schema)
         .build(batches)
         .map(move |item| {
@@ -316,9 +324,9 @@ pub(super) async fn fragment_stream(
     // that schema. `internal_schema()` dictionary-encodes the `labels` column
     // (`Dictionary(Int32, Map)`, crate::schema), so hydrating it to a plain
     // `Map` on the wire would make every decoded batch fail the coordinator's
-    // schema check. The public statement path (`statement_stream`) can keep the
-    // hydrating default because its consumer is an external client with no
-    // downstream plan to satisfy; this internal fan-out cannot.
+    // schema check. The public statement path (`statement_stream`) sets the same
+    // handling for its own reason (ADR-0099 decision 5: keep declared `Str`
+    // dictionaries intact to the client rather than hydrating them on the wire).
     let encoded = FlightDataEncoderBuilder::new()
         .with_dictionary_handling(DictionaryHandling::Resend)
         .with_schema(schema)
