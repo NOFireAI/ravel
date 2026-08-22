@@ -61,13 +61,30 @@ async fn generated_lane_reports_per_query_min_median_max_and_scan_diagnostics() 
         "dataset object count must be reported and non-zero"
     );
     assert_eq!(report.dataset.object_count, 3, "60 records / 20 per object");
-    assert!(
-        report.dataset.rows > 0,
-        "dataset row count must be non-zero"
+    // Pinned to the exact count, not `> 0`. A harness whose whole job is to
+    // report magnitudes has to be checked against magnitudes: `> 0` holds just
+    // as well when a figure is a fraction of the truth, which is how an
+    // accounting bug survives a green suite. Every record generated must be
+    // counted once.
+    assert_eq!(
+        report.dataset.rows, 60,
+        "every generated record is counted exactly once"
     );
+    // Bytes cannot be pinned exactly (encoding and compression move with the
+    // format), so bound them PER OBJECT rather than in absolute terms. An
+    // absolute floor is the trap: this fixture stores about 1300 bytes per
+    // object, so any floor low enough to be safe for one object is also passed
+    // by a figure that counts only one object out of three. Verified by
+    // mutation -- summing `.take(1)` of the segments passed a flat 1 KiB floor
+    // and fails this. The per-object band is what makes an under-count visible.
+    let per_object = report.dataset.stored_bytes / report.dataset.object_count as u64;
     assert!(
-        report.dataset.stored_bytes > 0,
-        "dataset stored bytes must be non-zero"
+        (512..1024 * 1024).contains(&per_object),
+        "stored bytes {} over {} objects is {} per object, outside the \
+         plausible band: the figure is being under- or over-counted",
+        report.dataset.stored_bytes,
+        report.dataset.object_count,
+        per_object
     );
     assert_eq!(report.dataset.layout, "pre-compaction");
     assert_eq!(report.provenance.runs, 3);
@@ -119,6 +136,35 @@ async fn generated_lane_reports_per_query_min_median_max_and_scan_diagnostics() 
             .iter()
             .any(|e| e.scan.segments == report.dataset.object_count),
         "a full-window statement sees every dataset segment"
+    );
+
+    // A scanning statement must charge object-store reads proportional to the
+    // dataset, not merely non-zero ones. `> 0` cannot distinguish a counter
+    // wired to one object from a counter wired to all three, and this harness
+    // exists to attribute per-object cost -- a systematically low figure here
+    // would point other epics at the wrong bottleneck. Each of the three
+    // objects needs at least one GET, and its bytes must reach the same
+    // plausible floor the dataset does.
+    let scanning = report
+        .entries
+        .iter()
+        .filter(|e| e.scan.blocks_total > 0)
+        .max_by_key(|e| e.scan.object_store_get_requests)
+        .expect("at least one entry scans blocks");
+    assert!(
+        scanning.scan.object_store_get_requests >= report.dataset.object_count as u64,
+        "entry `{}` charged {} GETs for a {}-object dataset: fewer GETs than \
+         objects means the accounting is under-counting reads",
+        scanning.id,
+        scanning.scan.object_store_get_requests,
+        report.dataset.object_count
+    );
+    assert!(
+        scanning.scan.object_store_bytes >= 1_024,
+        "entry `{}` charged only {} object-store bytes across {} objects",
+        scanning.id,
+        scanning.scan.object_store_bytes,
+        report.dataset.object_count
     );
 
     // The report serializes to JSON (the machine-readable half of the
