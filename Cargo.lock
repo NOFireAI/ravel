@@ -5110,6 +5110,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "crc32c",
  "criterion",
  "datafusion",
  "futures",

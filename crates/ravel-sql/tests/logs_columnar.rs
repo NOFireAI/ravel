@@ -33,9 +33,18 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
 use proptest::prelude::*;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
+use ravel_logseg::block::{ColumnPlan, write_block};
+use ravel_logseg::field_dir::FieldDir;
+use ravel_logseg::footer::{
+    COMP_NONE, LogFooter, SectionDesc, kind, open as open_footer, write_footer_and_trailer,
+};
+use ravel_logseg::reader::read_section;
+use ravel_logseg::record::{ColumnValue, ResolvedRow};
+use ravel_logseg::skip_index::{Level0Entry, SkipIndex};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{
-    AttrValue, FieldSel, LogRecord, Predicate, RlogConfig, RlogWriter, stream_attrs_bytes,
+    AttrValue, FieldSel, FieldType, LogRecord, Predicate, RlogConfig, RlogWriter,
+    stream_attrs_bytes,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
@@ -861,5 +870,206 @@ async fn a_later_block_with_attrs_raw_falls_back_without_losing_or_repeating_row
         got, want,
         "every row exactly once across the columnar/row switch, spilled values \
          included"
+    );
+}
+
+// --- a declared `Str` cell that is not UTF-8 --------------------------------
+
+/// Rewrite one writer-produced RLOG object, replacing its single block with one
+/// whose dynamic column `column_id` holds `cells[i]` verbatim at row `i`.
+///
+/// `RlogWriter` cannot produce the fixture this exists for: a `Str` column cell
+/// that is not UTF-8. Its input is `AttrValue::Str(String)` and `resolve_value`
+/// carries those bytes through unchanged, so every `Str` cell it writes is valid
+/// by construction -- while a reader still has to decide what such a cell means,
+/// and the two batch-building paths must decide it the same way.
+///
+/// Everything except the block is the writer's own output: STREAM_DIR, FIELD_DIR
+/// and BLOOM are copied verbatim (bytes, `comp` and `uncomp_len` alike) and the
+/// footer keeps its identity and counters, because `rows` mirrors the object's
+/// records one for one. Only BLOCKS and the SKIP_IDX entry describing it are
+/// rebuilt, through `write_block` and `SkipIndex` themselves, so this carries no
+/// independent knowledge of any section's encoding. The stale BLOOM is harmless
+/// here: it is consulted only to prune on a content predicate, and this fixture
+/// pushes none.
+fn rewrite_str_column_cells(
+    obj: &[u8],
+    cfg: RlogConfig,
+    records: &[LogRecord],
+    column_id: u32,
+    cells: &[Vec<u8>],
+) -> Vec<u8> {
+    assert_eq!(records.len(), cells.len(), "one cell per record");
+    let footer = open_footer(obj).expect("open the writer's footer");
+
+    let rows: Vec<ResolvedRow> = records
+        .iter()
+        .zip(cells)
+        .map(|(r, cell)| ResolvedRow {
+            stream_ref: 0,
+            ts_ns: r.ts_ns,
+            observed_ts_ns: r.observed_ts_ns,
+            severity_num: r.severity_num,
+            severity_text: r.severity_text.clone(),
+            body: r.body.clone(),
+            trace_id: r.trace_id,
+            span_id: r.span_id,
+            flags: r.flags,
+            attrs_raw: None,
+            columns: vec![(column_id, ColumnValue::Str(cell.clone()))],
+            indexed_terms: Vec::new(),
+            stat_winners: Vec::new(),
+        })
+        .collect();
+    let plans = vec![ColumnPlan {
+        column_id,
+        ty: FieldType::Str,
+    }];
+    let block = write_block(&rows, &plans, cfg.zstd_level).expect("write one block");
+    let skip = SkipIndex::build(vec![Level0Entry {
+        block_offset: 0,
+        block_len: block.bytes.len() as u64,
+        block_crc32c: block.crc32c,
+        record_count: block.record_count,
+        min_ts: block.min_ts,
+        max_ts: block.max_ts,
+        min_stream_ref: block.min_stream_ref,
+        max_stream_ref: block.max_stream_ref,
+        stats: block.stats.clone(),
+    }])
+    .encode();
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut sections: Vec<SectionDesc> = Vec::new();
+    for d in &footer.sections {
+        let (bytes, comp, uncomp_len) = match d.kind {
+            kind::BLOCKS => (block.bytes.clone(), COMP_NONE, block.bytes.len() as u64),
+            kind::SKIP_IDX => (skip.clone(), COMP_NONE, skip.len() as u64),
+            _ => {
+                let start = usize::try_from(d.offset).expect("offset fits");
+                let end = start + usize::try_from(d.len).expect("len fits");
+                (obj[start..end].to_vec(), d.comp, d.uncomp_len)
+            }
+        };
+        sections.push(SectionDesc {
+            kind: d.kind,
+            offset: out.len() as u64,
+            len: bytes.len() as u64,
+            crc32c: crc32c::crc32c(&bytes),
+            comp,
+            uncomp_len,
+        });
+        out.extend_from_slice(&bytes);
+    }
+    let patched = LogFooter { sections, ..footer };
+    write_footer_and_trailer(&mut out, &patched);
+    out
+}
+
+/// The `Str`-typed FIELD_DIR column id for `key` in `obj`.
+fn str_column_id(obj: &[u8], cfg: RlogConfig, key: &str) -> u32 {
+    let footer = open_footer(obj).expect("open footer");
+    let desc = *footer
+        .section(kind::FIELD_DIR)
+        .expect("a FIELD_DIR section");
+    let bytes = read_section(obj, &desc, &cfg).expect("read FIELD_DIR");
+    let dir = FieldDir::decode(&bytes, u64::MAX).expect("decode FIELD_DIR");
+    dir.column(key, FieldType::Str)
+        .expect("a Str column for the key")
+        .column_id
+}
+
+/// A declared `Str` cell whose bytes are not UTF-8 means the record does not set
+/// the key, so the resource value shows through -- on both paths.
+///
+/// The row path decides this in `ravel_logseg`'s `get_attr_value`
+/// (`String::from_utf8(b).ok()`): the attribute never enters the record, so the
+/// merged view resolves the key to the resource's value. The fast path used
+/// `String::from_utf8_lossy`, which reported the cell present (suppressing that
+/// fallback) and substituted U+FFFD -- two divergences and a silent
+/// approximation on a read path, from one line.
+///
+/// Row 0 holds `[0xff]` in the declared column while the resource sets the same
+/// key; row 1 holds a valid record value, so the fixture also shows the cell is
+/// still read when it is readable.
+#[tokio::test]
+async fn a_declared_str_cell_that_is_not_utf8_reads_as_absent_on_both_paths() {
+    let cfg = RlogConfig::default();
+    let declared = vec![DeclaredColumn::new("name", DeclaredType::Str)];
+    let resource = vec![("name".to_string(), AttrValue::Str("from-resource".into()))];
+    let mk = |ts: i64, name: &str| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "b".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: vec![("name".to_string(), AttrValue::Str(name.to_string()))],
+    };
+    // The placeholder at row 0 is replaced by `[0xff]` below; row 1 keeps its
+    // value, so both the readable and the unreadable case are in one block.
+    let records = vec![mk(0, "placeholder"), mk(1, "from-record")];
+
+    let clean = encode_object(&records, cfg);
+    let column_id = str_column_id(&clean, cfg, "name");
+    let patched = rewrite_str_column_cells(
+        &clean,
+        cfg,
+        &records,
+        column_id,
+        &[vec![0xff], b"from-record".to_vec()],
+    );
+
+    let store = MemoryStore::new();
+    let seg = put_object(&store, "logs/badutf8.rlog", patched, 0, 1, records.len()).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let segments = vec![seg];
+
+    let projection = vec![0usize, FIRST_DECLARED_COL];
+    let want = vec![
+        vec![Cell::Ts(0), Cell::OptStr(Some("from-resource".to_string()))],
+        vec![Cell::Ts(1), Cell::OptStr(Some("from-record".to_string()))],
+    ];
+
+    let fast = run_scan(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+    assert!(fast.columnar_batches > 0, "the fast path must have run");
+    assert_eq!(fast.rowpath_batches, 0, "the fast path must not fall back");
+    let got = rows(&fast.batches, &projection, &declared);
+    assert_eq!(
+        got, want,
+        "invalid UTF-8 in a declared Str cell must read as absent, letting the \
+         resource value through, not as U+FFFD"
+    );
+
+    let row = run_scan(
+        Arc::clone(&store),
+        segments,
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        no_match_erasure(),
+    )
+    .await;
+    assert_eq!(
+        row.columnar_batches, 0,
+        "the forced run must be the row path"
+    );
+    assert!(row.rowpath_batches > 0, "the row path must have run");
+    assert_eq!(
+        rows(&row.batches, &projection, &declared),
+        want,
+        "the row path's answer is the reference the fast path must match"
     );
 }

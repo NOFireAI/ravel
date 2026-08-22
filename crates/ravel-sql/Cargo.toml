@@ -188,6 +188,11 @@ criterion = { workspace = true }
 # dependency that owns the `unsafe impl GlobalAlloc` itself; this is the same
 # version and pattern crates/ravel-otap/benches/decode.rs uses.
 stats_alloc = "0.1.10"
+# Dev-only: tests/logs_columnar.rs assembles one RLOG object the writer cannot
+# produce (a declared `Str` column cell that is not UTF-8) by rebuilding two of
+# the writer's sections around ravel-logseg's own encoders, which means stamping
+# the section table's checksums. Same workspace pin ravel-logseg itself uses.
+crc32c = { workspace = true }
 
 [[bench]]
 name = "samples_scan"
