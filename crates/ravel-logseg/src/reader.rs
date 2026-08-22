@@ -3442,4 +3442,59 @@ mod tests {
                 .is_some()
         );
     }
+
+    /// `ColumnarBlockView::decoded_bytes` reports the block's real resident
+    /// footprint: it counts every string cell's own allocation, not just the
+    /// column spines, and it tracks what the column selection actually decoded.
+    ///
+    /// The bodies are 4 KiB each, so the per-cell term (8 x 4096 = 32768 bytes)
+    /// dwarfs the spines a `record_count`-based estimate would see. A figure
+    /// that counted spines only would land under the cell total and fail the
+    /// first assertion; a figure that ignored the column filter would fail the
+    /// last two.
+    #[test]
+    fn decoded_bytes_counts_cells_and_follows_the_column_selection() {
+        const ROWS: i64 = 8;
+        const BODY: usize = 4096;
+        let cfg = RlogConfig {
+            block_target_records: 64,
+            ..RlogConfig::default()
+        };
+        let body = "b".repeat(BODY);
+        let recs: Vec<LogRecord> = (0..ROWS)
+            .map(|i| rec_attrs(0, i, &body, Vec::new()))
+            .collect();
+        let obj = build(cfg.clone(), recs);
+        let pred = Predicate::And(Vec::new());
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let bytes_with = |sel: &ColumnSelection| -> usize {
+            let mut cursor = reader.scan_blocks(&pred, &[], sel).expect("open cursor");
+            let view = cursor
+                .next_block_columnar(&obj)
+                .expect("columnar exit")
+                .expect("one block");
+            assert_eq!(view.surviving_count(), ROWS as usize);
+            view.decoded_bytes()
+        };
+
+        let with_body = bytes_with(&ColumnSelection::fixed_only().with_body());
+        let cells = ROWS as usize * BODY;
+        assert!(
+            with_body > cells,
+            "the body column's cells alone are {cells} bytes; got {with_body}"
+        );
+
+        let fixed_only = bytes_with(&ColumnSelection::fixed_only());
+        assert!(
+            fixed_only < cells,
+            "a decode that skipped the body column must not carry its \
+             {cells} bytes of cells; got {fixed_only}"
+        );
+        assert!(
+            with_body - fixed_only >= cells,
+            "adding the body column must add at least its cells \
+             ({cells}); with_body={with_body}, fixed_only={fixed_only}"
+        );
+    }
 }
