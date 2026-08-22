@@ -89,11 +89,9 @@ T1's implementation shipped delta-from-zero, reusing `encode_ts_deltas`'s
 existing transform (and its `u64`-safe counterpart for `writer_epoch`/
 `writer_seq`) verbatim rather than inventing a second scheme — this is now
 the shipped, frozen-contract meaning of the field, not an open question.
-The measurement question below is narrower than the code comment once
-implied: whether delta-from-zero or delta-from-predecessor gives a smaller
-`prov_created_delta` in practice, decided before T3 enables the encoder (no
-version flip has happened yet, so the scheme is still freely changeable
-without a second bump).
+T3 (#379) has since enabled the encoder with this baseline, matching what
+T1 implemented. A future change to the baseline would need
+`PROTOCOL_VERSION` 4, per the pre-release single-version regime.
 
 A length disagreement across the four columns, or against `ts_delta`'s
 length, is a typed `CodecError`, mirroring `RunLengthMismatch`
@@ -128,15 +126,16 @@ alternative to sending these columns is not "send fragmented frames" — it
 is the current refusal — so the wire cost only has to be non-pathological,
 not minimal.
 
-**Settled by measurement, not argument:** the first entry's baseline for
-`prov_created_delta` — delta-from-zero (shipped by T1) vs. delta-from-run-base
-(a delta from the run-wide `created_unix_ns` field instead) — plus real
-bytes per sample across m=1 scrape, backfill m≫1, and overlapping-timestamp
-duplicates. Every later entry is a delta from its predecessor either way,
-unaffected by this choice. `crates/ravel-bench/tests/catalog_byte_gates.rs`
-gets a new wire gate over
-`prost::Message::encoded_len`, reusing its existing generator and
-split-printing pattern rather than inventing a new harness.
+**Shipped, not measured.** T1 chose delta-from-zero for the first entry's
+`prov_created_delta` baseline over the alternative (delta-from-run-base, a
+delta from the run-wide `created_unix_ns` field instead) as an
+implementation detail, not a measured trade-off; no wire byte gate over
+this comparison was built. T3 (#379) has since enabled the encoder on
+that baseline, so it is now the frozen contract per decision 3's version
+regime. Every later entry is a delta from its predecessor either way,
+unaffected by this choice. A byte-size comparison across the two schemes
+would still be useful as an independent measurement, but it does not bear
+on the now-shipped contract; track it separately if it's wanted.
 
 ### Rejected
 
@@ -234,9 +233,9 @@ correction from the issue-body draft this ADR is based on:
   first order as the typed option.
 
 Typed framing costs roughly 10-25% over RSEG's own on-disk record encoding,
-on records tens to hundreds of bytes each. The byte gate (decision 1) can
-measure this; it should not drive the contract decision, since the
-structural argument in fact 2 holds regardless of the size delta.
+on records tens to hundreds of bytes each. That delta does not drive this
+decision, since the structural argument in fact 2 holds regardless of the
+size delta.
 
 ## Decision 3: one `PROTOCOL_VERSION` bump (2 to 3), staged commits, encoders flip last
 
