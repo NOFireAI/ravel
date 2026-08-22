@@ -165,7 +165,28 @@ NOT YET WRITTEN.
 
 ## 15. Security and multi-tenancy threat model
 
-NOT YET WRITTEN.
+Finding first: no cross-tenant read/write path and no remote-compromise path was found (no P0). The isolation model holds by construction rather than by convention: tenant identity is a keyed BLAKE3 hash pinned per bucket, every object key, cache key, catalog path, and idempotency marker is tenant-hash-scoped, and each of the three cross-process trust boundaries (Flight SQL tickets, distributed-fragment capabilities, cross-cluster federation) authenticates with a keyed MAC or a re-resolved credential, cross-checked against the wire tenant in constant time. The real weaknesses are misconfiguration-exposure gaps and a plaintext-by-default network posture, not breaks in the model. Full threat table in due-diligence/memos/agent-f.md; condensed here.
+
+| Threat | Surface | Existing mitigation | Weakness | Severity | Recommendation |
+|---|---|---|---|---|---|
+| Tenant A reads tenant B | object keys, catalog, cache | keyed BLAKE3 tenant hash pinned per bucket; all keys and cache entries tenant-scoped | none found | none | keep |
+| Compromised coordinator names arbitrary tenant | fragment SeriesFetch | per-query keyed-MAC capability over {tenant, signal, query, expiry}, constant-time compare, wire tenant must equal claims | replay within TTL on a plaintext listener | P3 | TLS fragment listener in production |
+| Federation partner reads arbitrary tenant | Resolve scope | remote re-resolves tenant from the presented credential and overwrites the wire tenant_hash; fragment tokens rejected | none found | none | keep |
+| JWT algorithm confusion / alg:none | OIDC resolver | algorithm pinned from the JWKS key, never the token header; symmetric keys refused; exp/iss required; audience enforced; plaintext non-loopback JWKS refused at startup | trust rooted in operator's TLS to IdP | none | keep |
+| Tenant spoof via dev header | --dev-insecure-tenant-header | loopback guard on --listen-http | guard omits --listen-grpc; the header-trusting resolver serves gRPC ingest, so a publicly bound gRPC listener allows unauthenticated tenant spoofing while startup succeeds (config.rs:2058) | P2 | extend the guard to listen_grpc |
+| mTLS header forgery | x-ravel-client-cert-cn | MtlsResolver structurally isolated to the dedicated listener; collisions with public listeners refuse startup | trust still depends on the fronting proxy stripping the header | P2 | network-policy enforcement documented |
+| Forgotten TLS proxy | public HTTP/gRPC listeners | none in process | bearer tokens and telemetry cleartext on the wire; nothing fails closed | P2 | in-process TLS option or explicit startup acknowledgment flag |
+| Decompression bomb | OTLP gzip, RW snappy, OTAP zstd | caps enforced before allocation (take(cap+1); snappy decompress_len pre-check) | none found | none | keep |
+| Series/cardinality explosion | ingest | active-series cap plus creation-rate token bucket; structural per-request caps | caps are per-process, multiply by replicas (documented) | P3 | fleet-level accounting eventually |
+| Unbounded query scan | PromQL/SQL | concurrency ceilings, 25k S3-request budget, SQL read-only single-statement | max_bytes_scanned defaults Unlimited (config.rs:2699) | P3 | ship a finite default |
+| Tenant enumeration via /metrics | unauthenticated /metrics | tenant labels fold to "other" by default; per-tenant labels opt-in | the opt-in discloses tenant_hash and traffic on an unauthenticated route | P3 | keep opt-in, document the trade |
+| Secrets exposure | S3 credentials | file > env > argv precedence, Debug impls redacted | --s3-secret-key still accepted on argv | P3 | drop argv path |
+
+Authentication depth (VERIFIED by memo F at file:line, with regression tests named): static bearer tokens are stored and compared only as keyed hashes (no per-byte timing channel); the JWT path has regression tests for RSA algorithm confusion, string-typed exp claims (a named CVE regression), symmetric-JWKS rejection, wrong issuer, and unknown-key tokens; Flight SQL tickets are MAC'd with a domain-separated derived key and verified constant-time before parse, with client deadlines clamped; fragment capabilities support key rotation and label every reject reason with a counter.
+
+Resource exhaustion: the admission layering claim (body cap, then byte-rate bucket, then structural and series caps, all before expensive work) is VERIFIED at the ingest surfaces: body limits at 16 MiB on both transports, decompression bounded before allocation on all three codecs, structural caps before normalization. On the query side the bounded quantities are requests and concurrency, not bytes, until the operator sets max_bytes_scanned; the default-Unlimited scanned-bytes cap is the one place the "limits before expensive work" discipline ships disarmed.
+
+Posture summary for an adopting security architect: the cryptographic and isolation engineering is above the bar for a system at this maturity, including in the places that are usually weak (internal fragment auth, federation credential handling). What is below the bar is fail-closed network posture: three P2s share the shape "the code is safe if the operator deploys the documented topology, and silently unsafe if not". These are cheap to fix (extend one guard, refuse or warn on missing TLS assumptions) relative to their blast radius.
 
 ## 16. Observability-product assessment
 
