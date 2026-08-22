@@ -491,8 +491,45 @@ pub fn encode_strings(values: &[&[u8]]) -> (Enc, Vec<u8>) {
     }
 }
 
-/// Decodes `count` byte-string values encoded with `enc`.
-pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, CodecError> {
+/// The non-fusing decode of a string column: either the plain per-value form,
+/// or the dictionary form kept intact (the distinct values plus one id per
+/// value). A dictionary page decoded this way keeps its structure instead of
+/// materializing one owned `Vec<u8>` per row, which a columnar consumer
+/// (ADR-0099 decision 4) turns straight into an Arrow dictionary array.
+///
+/// The `ids` are per value in row order, before any presence bitmap is applied:
+/// each indexes `dict`, and every id is validated `< dict.len()` at decode.
+pub enum DecodedStrings {
+    Plain(Vec<Vec<u8>>),
+    Dict { dict: Vec<Vec<u8>>, ids: Vec<u32> },
+}
+
+impl DecodedStrings {
+    /// Fuses the dictionary form back to one owned value per row; the plain form
+    /// is returned as-is. This is exactly what [`decode_strings`] returns, and
+    /// it is the reason `decode_strings` can be a thin wrapper: the fused output
+    /// is byte-for-byte the pre-ADR-0099 result, repeated entries and all.
+    pub fn fuse(self) -> Vec<Vec<u8>> {
+        match self {
+            DecodedStrings::Plain(v) => v,
+            DecodedStrings::Dict { dict, ids } => ids
+                .into_iter()
+                .map(|id| dict[id as usize].clone())
+                .collect(),
+        }
+    }
+}
+
+/// Decodes `count` byte-string values encoded with `enc` without fusing a
+/// dictionary page: a [`Enc::Dict`] page returns its distinct values and ids
+/// intact ([`DecodedStrings::Dict`]), a [`Enc::Plain`] page the per-value form
+/// ([`DecodedStrings::Plain`]). Every corruption guard [`decode_strings`]
+/// applies fires here too; both entry points share this body.
+pub fn decode_strings_columnar(
+    enc: Enc,
+    bytes: &[u8],
+    count: usize,
+) -> Result<DecodedStrings, CodecError> {
     let mut pos = 0usize;
     let out = match enc {
         Enc::Plain => {
@@ -520,7 +557,7 @@ pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8
                 off += len;
             }
             pos = bytes.len();
-            out
+            DecodedStrings::Plain(out)
         }
         Enc::Dict => {
             let dict_count = get_uvarint(bytes, &mut pos)? as usize;
@@ -536,10 +573,12 @@ pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8
                 dict.push(entry.to_vec());
                 pos += len;
             }
+            // `decode_dict_ids` validates every id is `< dict_count`, and
+            // `dict_count` is bounded by `cap` (<= 1 << 16), so each id fits a
+            // u32 losslessly.
             let ids = decode_dict_ids(bytes, &mut pos, count, dict_count)?;
-            ids.into_iter()
-                .map(|id| dict[id as usize].clone())
-                .collect()
+            let ids: Vec<u32> = ids.into_iter().map(|id| id as u32).collect();
+            DecodedStrings::Dict { dict, ids }
         }
         other => {
             return Err(CodecError::Corrupted(format!(
@@ -549,6 +588,14 @@ pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8
     };
     expect_consumed(pos, bytes.len())?;
     Ok(out)
+}
+
+/// Decodes `count` byte-string values encoded with `enc`, fusing a dictionary
+/// page to one owned value per row. A thin wrapper over
+/// [`decode_strings_columnar`] kept byte-for-byte identical in signature and
+/// output so every existing caller is untouched.
+pub fn decode_strings(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, CodecError> {
+    Ok(decode_strings_columnar(enc, bytes, count)?.fuse())
 }
 
 // ---------------------------------------------------------------------------
@@ -932,6 +979,107 @@ mod string_dict_tests {
         assert_eq!(got, vals);
     }
 
+    /// Acceptance test (issue #416): over a corpus that triggers `Enc::Dict`,
+    /// the non-fusing decode returns a dictionary and ids whose fusion equals
+    /// `decode_strings`' output exactly -- repeated entries, an empty value, and
+    /// a single-distinct-value column included -- and a plain page returns the
+    /// plain form.
+    #[test]
+    fn dict_decode_preserves_dictionary_and_ids() {
+        // Low cardinality (2 distinct of many) forces Enc::Dict, and the corpus
+        // carries a repeated entry and an empty value.
+        let corpus: Vec<&[u8]> = vec![b"get", b"", b"get", b"", b"get", b""];
+        let (enc, bytes) = encode_strings(&corpus);
+        assert_eq!(enc, Enc::Dict, "low-cardinality corpus must be a dict page");
+
+        let decoded = decode_strings_columnar(enc, &bytes, corpus.len()).expect("columnar decode");
+        match &decoded {
+            DecodedStrings::Dict { dict, ids } => {
+                // The distinct set survives, sorted (the encoder sorts): "", "get".
+                assert_eq!(dict.len(), 2, "the distinct set is kept, not fused away");
+                assert_eq!(dict[0], b"");
+                assert_eq!(dict[1], b"get");
+                assert_eq!(ids.len(), corpus.len(), "one id per value");
+                // Every id indexes the dictionary in range.
+                for &id in ids {
+                    assert!((id as usize) < dict.len());
+                }
+            }
+            DecodedStrings::Plain(_) => panic!("a dict page must not decode as plain"),
+        }
+
+        // Fusing the non-fusing form equals the fused entry point byte-for-byte.
+        let fused_direct = decode_strings(enc, &bytes, corpus.len()).expect("fused decode");
+        assert_eq!(decoded.fuse(), fused_direct);
+        assert_eq!(fused_direct.len(), corpus.len());
+        for (got, want) in fused_direct.iter().zip(&corpus) {
+            assert_eq!(got.as_slice(), *want);
+        }
+
+        // A single-distinct-value column: still a dict page (1 distinct of 5).
+        let single: Vec<&[u8]> = vec![b"only", b"only", b"only", b"only", b"only"];
+        let (enc, bytes) = encode_strings(&single);
+        assert_eq!(enc, Enc::Dict);
+        match decode_strings_columnar(enc, &bytes, single.len()).expect("decode") {
+            DecodedStrings::Dict { dict, ids } => {
+                assert_eq!(dict, vec![b"only".to_vec()]);
+                assert_eq!(ids, vec![0u32; single.len()]);
+            }
+            DecodedStrings::Plain(_) => panic!("single-distinct must be a dict page"),
+        }
+
+        // A plain page decodes to the plain form (all distinct -> Enc::Plain).
+        let distinct: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d"];
+        let (enc, bytes) = encode_strings(&distinct);
+        assert_eq!(enc, Enc::Plain);
+        match decode_strings_columnar(enc, &bytes, distinct.len()).expect("decode") {
+            DecodedStrings::Plain(v) => {
+                let got: Vec<&[u8]> = v.iter().map(|x| x.as_slice()).collect();
+                assert_eq!(got, distinct);
+            }
+            DecodedStrings::Dict { .. } => panic!("a plain page must not decode as dict"),
+        }
+    }
+
+    /// Every corruption guard still fires through the non-fusing entry point,
+    /// as a typed `CodecError`, never a panic and never wrong data.
+    #[test]
+    fn columnar_decode_rejects_corruption() {
+        // Out-of-range id: dict_count 2, entries "a","b", one id = 3.
+        let out_of_range = vec![0x02, 0x01, 0x61, 0x01, 0x62, 0x02, 0x03];
+        assert!(matches!(
+            decode_strings_columnar(Enc::Dict, &out_of_range, 1),
+            Err(CodecError::Corrupted(_))
+        ));
+        // dict_count larger than the buffer.
+        let lying_count = vec![0x05, 0x01, 0x61];
+        assert!(matches!(
+            decode_strings_columnar(Enc::Dict, &lying_count, 1),
+            Err(CodecError::Corrupted(_))
+        ));
+        // Truncated dict entry: length says 4 but no bytes follow.
+        let truncated = vec![0x01, 0x04];
+        assert!(matches!(
+            decode_strings_columnar(Enc::Dict, &truncated, 1),
+            Err(CodecError::Corrupted(_))
+        ));
+        // Plain page with a length longer than its blob.
+        let short_blob = vec![0x05, 0x61, 0x62];
+        assert!(matches!(
+            decode_strings_columnar(Enc::Plain, &short_blob, 1),
+            Err(CodecError::Corrupted(_))
+        ));
+        // Trailing unconsumed bytes after a valid single-distinct dict page.
+        let single: Vec<&[u8]> = vec![b"x", b"x"];
+        let (enc, mut bytes) = encode_strings(&single);
+        assert_eq!(enc, Enc::Dict);
+        bytes.push(0x00);
+        assert!(matches!(
+            decode_strings_columnar(Enc::Dict, &bytes, single.len()),
+            Err(CodecError::Corrupted(_))
+        ));
+    }
+
     #[test]
     fn f64_constant_and_nan_and_neg_zero() {
         // Constant.
@@ -1067,6 +1215,40 @@ mod string_dict_proptests {
                 let _ = decode_strings(e, &bytes, count);
                 let _ = decode_f64(e, &bytes, count);
                 let _ = decode_fixed(e, &bytes, count, 8);
+            }
+        }
+
+        /// The non-fusing decode fused equals the fusing decode, and every id it
+        /// returns indexes its dictionary in range. A low-cardinality generator
+        /// (values drawn from a small alphabet) makes `Enc::Dict` the common
+        /// case rather than a rarity.
+        #[test]
+        fn columnar_decode_fuses_to_decode_strings(
+            idxs in proptest::collection::vec(0usize..6, 0..400)
+        ) {
+            let alphabet: [&[u8]; 6] = [b"", b"a", b"get", b"post", b"timeout", b"xyz"];
+            let vals: Vec<&[u8]> = idxs.iter().map(|&i| alphabet[i]).collect();
+            let (enc, bytes) = encode_strings(&vals);
+            let columnar = decode_strings_columnar(enc, &bytes, vals.len()).expect("columnar");
+            if let DecodedStrings::Dict { dict, ids } = &columnar {
+                prop_assert_eq!(ids.len(), vals.len());
+                for &id in ids {
+                    prop_assert!((id as usize) < dict.len());
+                }
+            }
+            let fused = decode_strings(enc, &bytes, vals.len()).expect("fused");
+            prop_assert_eq!(columnar.fuse(), fused);
+        }
+
+        /// The non-fusing entry point never panics on arbitrary bytes.
+        #[test]
+        fn columnar_string_decode_never_panics(
+            tag in 1u8..=9,
+            bytes in proptest::collection::vec(any::<u8>(), 0..256),
+            count in 0usize..500,
+        ) {
+            if let Ok(e) = Enc::from_u8(tag) {
+                let _ = decode_strings_columnar(e, &bytes, count);
             }
         }
     }
