@@ -26,6 +26,8 @@ use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
 use crate::log_shard::{LogShardActor, LogShardMsg, est_record_bytes};
 use crate::router::WriteMode;
+#[cfg(feature = "stage-timing")]
+use crate::stage_timing::{LogStage, LogStageTimings};
 
 /// Resolves the POSTINGS indexed-field list for a tenant at flush time
 /// (ADR-0049 decision 3). The shard actor calls this once per
@@ -92,6 +94,13 @@ pub struct LogIngestRouter {
     /// `services/ravel-server` installs the configured budget via
     /// [`LogIngestRouter::with_budget`].
     budget: Arc<IngestByteBudget>,
+    /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
+    /// every shard actor and flush task so the seam records into one table the
+    /// bench reporter reads via [`LogIngestRouter::stage_timings`]. Present only
+    /// under the `stage-timing` feature; with it off this field, and every
+    /// timing site, is compiled out.
+    #[cfg(feature = "stage-timing")]
+    stage_timings: Arc<LogStageTimings>,
 }
 
 impl LogIngestRouter {
@@ -130,12 +139,16 @@ impl LogIngestRouter {
         // routing every draw through the seam still keeps `rand::rng()` and
         // `Uuid::new_v4()` off this production path.
         let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
+        #[cfg(feature = "stage-timing")]
+        let stage_timings = Arc::new(LogStageTimings::new());
         let factory = {
             let store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             let indexed_fields = Arc::clone(&indexed_fields);
+            #[cfg(feature = "stage-timing")]
+            let stage_timings = Arc::clone(&stage_timings);
             move |shard_count: u32| -> Vec<LogShardHandle> {
                 let writer_id = rng.new_uuid();
                 let epoch =
@@ -154,6 +167,8 @@ impl LogIngestRouter {
                             Arc::clone(&metrics),
                             rx,
                             Arc::clone(&indexed_fields),
+                            #[cfg(feature = "stage-timing")]
+                            Arc::clone(&stage_timings),
                         );
                         tokio::spawn(actor.run());
                         LogShardHandle {
@@ -175,7 +190,17 @@ impl LogIngestRouter {
             indexed_fields,
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            #[cfg(feature = "stage-timing")]
+            stage_timings,
         }
+    }
+
+    /// The per-stage timing accumulator (ADR-0104 decision 1), for the bench
+    /// reporter to read a snapshot after driving a write. Present only under the
+    /// `stage-timing` feature.
+    #[cfg(feature = "stage-timing")]
+    pub fn stage_timings(&self) -> Arc<LogStageTimings> {
+        Arc::clone(&self.stage_timings)
     }
 
     /// Installs the shared process-wide ingest buffer byte budget (ADR-0069).
@@ -282,6 +307,8 @@ impl LogIngestRouter {
         // cloned into every shard message below and refunded when the flush(es)
         // holding these bytes complete or fail; any early return from here on
         // drops the not-yet-handed-off clones, so nothing leaks.
+        #[cfg(feature = "stage-timing")]
+        let admit_start = std::time::Instant::now();
         let estimate: u64 = records
             .iter()
             .map(|r| est_record_bytes(r) as u64)
@@ -291,10 +318,15 @@ impl LogIngestRouter {
                 .try_charge(estimate)
                 .map_err(|_| LogWriteError::BufferBudgetExceeded)?,
         );
+        #[cfg(feature = "stage-timing")]
+        self.stage_timings
+            .record(LogStage::Admit, admit_start.elapsed());
 
         // Route against the tenant's current generation view, re-reading the
         // provisioning record when the cache is older than `C` and failing
         // closed if that read cannot complete (ADR-0052 section 3).
+        #[cfg(feature = "stage-timing")]
+        let route_start = std::time::Instant::now();
         let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
         let shard_count = set.len() as u32;
         let mut by_shard: HashMap<u32, Vec<NormalizedLogRecord>> = HashMap::new();
@@ -340,6 +372,11 @@ impl LogIngestRouter {
                 return Err(LogWriteError::ShardUnavailable);
             }
         }
+        // Routing ends at dispatch: the strict-mode ack wait below is downstream
+        // durability (merge/encode/PUT happen in the shard), not a router stage.
+        #[cfg(feature = "stage-timing")]
+        self.stage_timings
+            .record(LogStage::Route, route_start.elapsed());
 
         if mode == WriteMode::Buffered {
             return Ok(LogWriteReceipt::default());

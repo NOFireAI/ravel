@@ -57,6 +57,8 @@ use crate::config::{IngestConfig, LOG_SEGMENT_FORMAT_VERSION, checked_ingest_hou
 use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
 use crate::metrics::FlushTrigger;
+#[cfg(feature = "stage-timing")]
+use crate::stage_timing::{LogStage, LogStageTimings};
 
 pub(crate) type LogAck = oneshot::Sender<Result<CommitToken, LogWriteError>>;
 
@@ -213,6 +215,12 @@ struct LogFlushCtx {
     /// (ADR-0079). Shared across shards by `Arc`; its per-tenant cache is the
     /// one place a tenant's `TenantConfig.indexed_fields` override is read.
     indexed_fields: Arc<IndexedFieldsOverlay>,
+    /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
+    /// the router and every shard. The flush task records `encode` here; the
+    /// actor reaches it through `self.ctx` to record `merge`. Present only under
+    /// the `stage-timing` feature.
+    #[cfg(feature = "stage-timing")]
+    stage_timings: Arc<LogStageTimings>,
 }
 
 /// One log flush's identity and payload, pinned by the actor before the flush
@@ -316,6 +324,10 @@ impl LogFlushCtx {
                 outcome.into_fields()
             }
         };
+        // Encode: RLOG serialization only (RlogWriter push + finish), excluding
+        // the indexed-field resolution above and the object-store PUT below.
+        #[cfg(feature = "stage-timing")]
+        let encode_start = std::time::Instant::now();
         let mut writer =
             RlogWriter::new(RlogConfig::default(), identity).with_indexed_fields(indexed_fields);
         for rec in records {
@@ -343,6 +355,9 @@ impl LogFlushCtx {
                 return;
             }
         };
+        #[cfg(feature = "stage-timing")]
+        self.stage_timings
+            .record(LogStage::Encode, encode_start.elapsed());
 
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let data = Bytes::from(bytes);
@@ -621,6 +636,7 @@ impl LogShardActor {
         metrics: Arc<LogIngestMetrics>,
         rx: mpsc::Receiver<LogShardMsg>,
         indexed_fields: Arc<IndexedFieldsOverlay>,
+        #[cfg(feature = "stage-timing")] stage_timings: Arc<LogStageTimings>,
     ) -> Self {
         let ctx = Arc::new(LogFlushCtx {
             shard,
@@ -632,6 +648,8 @@ impl LogShardActor {
             config,
             metrics: Arc::clone(&metrics),
             indexed_fields,
+            #[cfg(feature = "stage-timing")]
+            stage_timings,
         });
         LogShardActor {
             shard,
@@ -724,8 +742,16 @@ impl LogShardActor {
         let records_len = records.len() as u64;
         let target_bytes = self.config.target_bytes;
 
+        // Grab the timing handle before the mutable buffer borrow so recording
+        // `merge` does not clash with the `&mut self.tenants` borrow held below.
+        #[cfg(feature = "stage-timing")]
+        let merge_timings = Arc::clone(&self.ctx.stage_timings);
         let buf = self.tenants.entry(tenant.clone()).or_default();
+        #[cfg(feature = "stage-timing")]
+        let merge_start = std::time::Instant::now();
         let bytes_added = buf.merge(records, arrival_ns);
+        #[cfg(feature = "stage-timing")]
+        merge_timings.record(LogStage::Merge, merge_start.elapsed());
         // The records are now buffered: hold their budget charge with the buffer
         // until it flushes (ADR-0069).
         if let Some(charge) = charge {
@@ -1048,6 +1074,8 @@ mod tests {
                 Arc::new(IndexedFieldsOverlay::new(Arc::new(
                     crate::log_router::NoIndexedFields,
                 ))),
+                #[cfg(feature = "stage-timing")]
+                Arc::new(LogStageTimings::new()),
             );
             let task = tokio::spawn(actor.run());
             Harness {
@@ -1697,6 +1725,8 @@ mod tests {
             Arc::new(IndexedFieldsOverlay::new(Arc::new(
                 crate::log_router::NoIndexedFields,
             ))),
+            #[cfg(feature = "stage-timing")]
+            Arc::new(LogStageTimings::new()),
         );
         let task = tokio::spawn(actor.run());
 

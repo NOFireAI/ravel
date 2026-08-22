@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Per-stage ingest timing seam (ADR-0104 decision 1). Off by default: with it
+# off the crate compiles and behaves exactly as today, so no shipping build
+# links the seam. On, it compiles in the `Instant`-based accumulator and wires
+# the logs pipeline's admit/route/merge/encode boundaries through it, read only
+# by the bench reporter. A CI lane must build and run this feature.
+stage-timing = []
+
 [dependencies]
 ravel-types = { workspace = true }
 ravel-segment = { workspace = true }
