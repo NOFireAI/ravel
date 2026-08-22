@@ -58,6 +58,37 @@ message FetchRequest {
   // ordinary tenant credential instead. Additive field on this transient wire
   // contract, exactly the evolution this file's header sanctions.
   bytes fragment_capability = 14;
+
+  // The aggregation the coordinator wants this slice to compute itself instead
+  // of streaming raw samples (ADR-0103 decision 2). Absent means today's
+  // behavior, unchanged: the worker streams raw `SeriesFrame`s and the
+  // coordinator merges and aggregates them. Present means the worker merges its
+  // own runs locally (its exact per-series answer under decision 1's
+  // eligibility gate) and streams one `PartialAggregate` per series in place of
+  // every series frame -- all partials or all raw frames for one slice, never a
+  // mix. Additive field on this transient wire contract, exactly the evolution
+  // this file's header sanctions, and the same precedent
+  // `fragment_capability` above set.
+  //
+  // A singular message field carries explicit presence in proto3, so no
+  // `optional` keyword is needed for absent to stay distinct from a
+  // default-valued request (an all-false `PartialAggregateRequest` is the
+  // group-only enumeration, NOT "no pushdown").
+  PartialAggregateRequest partial_aggregate = 15;
+}
+
+// Which aggregates a pushdown-eligible slice must compute (ADR-0103 decision
+// 2/3). Each flag selects one field of the `PartialAggregate` frames the worker
+// returns; a flag left false leaves that field absent on the wire.
+//
+// All three false is the group-only request (distinct group enumeration, ADR-0103
+// decision 3's set-union case): the worker still returns one frame per series it
+// holds, carrying identity only. That is why no separate "group only" flag
+// exists -- the absence of all three IS the request.
+message PartialAggregateRequest {
+  bool want_count = 1;  // populate PartialAggregate.count
+  bool want_min = 2;    // populate PartialAggregate.min_bits
+  bool want_max = 3;    // populate PartialAggregate.max_bits
 }
 
 // Intra-cluster scope: the explicit segment set for this slice, reconstructed

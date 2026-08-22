@@ -412,6 +412,36 @@ extras, `with_log_fetcher`/`with_span_fetcher`), and a log/span slice carrying
 matchers (matcher pushdown for those signals has no mapping in this lane yet, so
 it fails closed rather than under-filter).
 
+### Worker-side aggregation pushdown
+
+A Metrics `FetchRequest` may carry a `PartialAggregateRequest`
+(`want_count`/`want_min`/`want_max`, ADR-0103 decision 2). The worker then
+returns one `PartialAggregate` frame per series — series identity, labels, and
+whichever of count/min/max was asked for, the bounds as raw f64 bit patterns —
+in place of every `SeriesFrame`, under the same slice atomicity. All three flags
+false is the group-only request: identity frames with no value fields, the
+distinct-group enumeration. The branch is per request, so a slice returns all
+partials or all raw frames, never a mix, and a request with no
+`partial_aggregate` is the unchanged raw-frame path.
+
+The worker merges its own runs through the same total-order per-series merge the
+coordinator runs (`merge_soa_runs`) *before* reducing, so a sample two of its
+segments both carry is counted once. That local merge is what makes the partial
+exact, given ADR-0103 decision 1's eligibility gate (not federated, every
+resolved segment inside one shard generation's stable interval): under that gate
+no other worker and no remote cluster holds runs of the same series, so nothing
+is left for the coordinator's cross-worker dedup belt to reconcile. `min`/`max`
+fold under `f64::total_cmp`, the ADR-0023 total order, never `PartialOrd`. The
+terminal summary still reports the slice's real merged sample count, so the
+coordinator's sample-budget re-check works even though no sample crosses the
+wire. Pushdown is metrics-only: an aggregate request on a log or span slice, or
+on a slice holding native-histogram series (which have no scalar count/min/max
+shape), is refused with `Unsupported` and falls back to raw fetch.
+
+Reachable at the wire/worker layer, not yet from a query: no coordinator sets
+the request field today, so the eligibility gate, the coordinator-side combine,
+and the `PROTOCOL_VERSION` bump ADR-0103 stages with them are still to come.
+
 This is the engine-level (queryfrag) fetch, merge, and federation machinery for
 all five signals — shipped and covered by the per-signal differential, erasure,
 skew, and federation tests. The coordinator caller that actually dispatches a

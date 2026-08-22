@@ -935,9 +935,11 @@ pub struct PartialAggregate {
 /// [`f64::to_bits`] pattern. An absent field stays absent on the wire (proto3
 /// `optional`), never a zero sentinel.
 ///
-/// Not reachable from a query today: no encoder call site sends this frame yet
-/// (the worker-side sender lands with the pushdown execution path). This is the
-/// wire format and its codec only.
+/// The worker's slice path is this encoder's call site (ADR-0103 decision 2,
+/// `service.rs`): a Metrics slice whose request carries a
+/// [`pb::PartialAggregateRequest`] emits one of these per series instead of its
+/// raw series frames. Not yet reachable from a real query, though: no
+/// coordinator sets that request field until the planner integration lands.
 pub fn encode_partial_aggregate(partial: &PartialAggregate) -> pb::PartialAggregate {
     pb::PartialAggregate {
         series_id: partial.series_id.0.to_vec(),

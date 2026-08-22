@@ -210,6 +210,11 @@ impl Distributed {
                     // builder leaves the bytes empty. A coordinator-local slice
                     // needs no capability.
                     fragment_capability: Vec::new(),
+                    // No aggregation pushdown from this builder: it always asks
+                    // for raw runs and merges them here (ADR-0103's eligibility
+                    // gate and the coordinator-side combine that would set this
+                    // field are not wired yet).
+                    partial_aggregate: None,
                 };
                 let fetcher = Arc::clone(&self.fetcher);
                 async move { fetcher.fetch(request).await }
@@ -439,6 +444,9 @@ impl Distributed {
                     erasure: encoded_erasure.clone(),
                     trace_context: String::new(),
                     fragment_capability: Vec::new(),
+                    // Pushdown is metrics-only (ADR-0103); a log slice never
+                    // carries an aggregate request.
+                    partial_aggregate: None,
                 };
                 let fetcher = Arc::clone(&self.fetcher);
                 async move { fetcher.fetch_logs(request).await }
@@ -592,6 +600,9 @@ impl Distributed {
                     erasure: encoded_erasure.clone(),
                     trace_context: String::new(),
                     fragment_capability: Vec::new(),
+                    // Pushdown is metrics-only (ADR-0103); a span slice never
+                    // carries an aggregate request.
+                    partial_aggregate: None,
                 };
                 let fetcher = Arc::clone(&self.fetcher);
                 async move { fetcher.fetch_spans(request).await }
