@@ -3464,7 +3464,7 @@ mod tests {
         let recs: Vec<LogRecord> = (0..ROWS)
             .map(|i| rec_attrs(0, i, &body, Vec::new()))
             .collect();
-        let obj = build(cfg.clone(), recs);
+        let obj = build(cfg, recs);
         let pred = Predicate::And(Vec::new());
         let reader = RlogReader::new(&obj, &cfg).expect("open");
 
