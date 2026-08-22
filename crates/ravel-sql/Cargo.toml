@@ -178,8 +178,8 @@ ravel-proto = { workspace = true }
 # Already a workspace pin used elsewhere (ravel-query depends on it);
 # ravel-sql's non-test code has no need for it.
 ravel-cache = { workspace = true }
-# Dev-only: the metrics-scan batch-building bench (benches/samples_scan.rs,
-# ADR-0099 decision 7).
+# Dev-only: the batch-building benches (benches/samples_scan.rs and
+# benches/logs_scan.rs, ADR-0099 decision 7).
 criterion = { workspace = true }
 # Dev-only: the allocation upper bound for batch building
 # (tests/scan_batch_allocations.rs) installs stats_alloc's instrumented global
@@ -191,4 +191,8 @@ stats_alloc = "0.1.10"
 
 [[bench]]
 name = "samples_scan"
+harness = false
+
+[[bench]]
+name = "logs_scan"
 harness = false
