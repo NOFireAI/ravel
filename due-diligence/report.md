@@ -181,7 +181,40 @@ NOT YET WRITTEN.
 
 ## 23. Failure and chaos matrix
 
-NOT YET WRITTEN.
+The central question per row is not "does it recover" but "can this fault convert acknowledged or visible correct data into silently absent or incorrect data". Rows marked Verified cite executed tests or code paths confirmed by two independent memos.
+
+| Fault | Ingest consequence | Query consequence | Correctness impact | Availability impact | Recovery | Verified? |
+|---|---|---|---|---|---|---|
+| Gateway crash | in-flight unacked requests lost; clients retry | none | none (at-least-once; metrics dedup) | brief, per-replica | restart; stateless | Yes: crash_matrix.rs, restart tests executed |
+| Shard actor panic | that shard 1/N of keyspace nacks ShardUnavailable | none | none | partial ingest loss until process restart (no in-process actor restart) | process restart | Yes: router.rs:40-47, 391-420 (memo A P3) |
+| Query node crash | none | in-flight queries fail; clients retry | none | brief | restart; stateless | Yes: design + heartbeat staleness tests |
+| Maintain crash | none | none short-term | none | compaction/GC/fold/erasure stall; cost grows; erasure deadlines at risk | restart from zero, stateless per pass | Yes: sweep/retention restartability tests |
+| S3 timeout | retries within flush deadline, else nack | typed error/retry | none | ack latency up; readiness probe flips after 4 failures | automatic | Yes: s3_http_faults.rs executed (503/429/timeout retry tests) |
+| S3 throttling | as above | budget-bounded retries | none | degraded | automatic | Yes: backoff tests executed |
+| Failed data PUT | nack after budget | n/a | none; orphan possible, GC'd after ~25 h | none | client retry | Yes: crash_matrix.rs executed |
+| Failed commit PUT | nack; data object orphaned | n/a | none | none | client retry; orphan GC | Yes: crash_matrix.rs executed |
+| Ambiguous PUT (applied, response lost) | retry hits AlreadyExists; idempotent | n/a | none (content-hash verified; different content = fatal SplitBrain, never silent) | none | automatic | Yes: fault_tolerance.rs, retry_and_restart.rs executed |
+| LIST failure | flush unaffected | resolve fails typed; retry | none | transient query errors | automatic | Yes: FaultStore tests |
+| Truncated/corrupt object | n/a | typed Corrupted, never wrong data | loss (if no other copy), not corruption | affected segments unreadable | scrub detects (7-day period); no repair path (no redundant copy) | Yes: corruption.rs, fuzz_mutation executed |
+| Missing committed object | n/a | SnapshotInvalidated, one re-resolve, typed failure | none (fails loudly) | affected hours 503 | depends on cause; see fold-window row | Yes: engine.rs:1077-1142 + tests |
+| Commit records lost out-of-band | n/a | data invisible immediately | acked data PERMANENTLY DELETED by orphan GC after ~25 h if below breaker thresholds | affected data gone | reconstruction CLI before the gate; nothing after | Mechanism verified (R1); P1 finding |
+| Compaction record lands >26 h behind fold watermark | none | after horizon sweep: persistent 503 on affected hours | visibility loss, not data loss (L1 parts complete) | hours unreadable for weeks/indefinitely, no alarm | operator HEAD rebuild; retention frontier eventually | Mechanism verified (R2); P1 finding |
+| Erasure rewrite out-of-window | none | erased subject may become servable again after .dreq sweep | compliance violation window | or persistent 503 (same as above) | same fix as fold-window row | Verified consequence (R3); P1 finding |
+| Worker heartbeat stale | none | slices re-dispatched or run locally | none | none to degraded | membership reconverges within 3xH | Code + tests (memo A); heartbeat keys never reaped (P2 cost) |
+| Fragment worker dies mid-slice | none | coordinator re-dispatches or runs locally | none claimed | none | automatic | Deferred to memo D |
+| Network partition (writers split) | both sides keep writing; UUID identity prevents collision | union at resolve | none | none | automatic | Yes: memo A scenario 3 |
+| Compactor races writer (late commit into sealing bucket) | commit lands | resolver serves L0 alongside parts (overlap-harmless) | none within seal margins; fast-folder clock exception documented | none | seal-divergence scrub detects | Yes: memo C CE5/CE6 + tests |
+| Retention races reader | none | pinned snapshot protected by horizon arithmetic | none within declared params | none | n/a | Yes: sweep_crash_matrix rows executed |
+| GC false positive (orphan) | n/a | n/a | requires two consistent LISTs to omit an existing record = store contract violation | n/a | breaker for mass case | Yes: memo C CE8 |
+| Clock skew (writer) | >5 m: data lands in future bucket, temporarily invisible to token-less reads | self-heals as reader clock advances | none permanent (token reads unaffected) | staleness | automatic | Yes: catalog.rs:1262-1276 (memo A P3) |
+| Clock skew (sweeper beyond declared allowance) | none | none | early destruction by the skew delta (retention); pinned-reader deletion (GC) | n/a | mis-declaration residual, documented | Code verified (memo C CE7/CE10) |
+| Mixed binary versions (same format generation) | protocol-versioned queryfrag refuses mismatched peers | as left | none | reduced distributed capacity | upgrade completes | Code (section 12); not chaos-tested |
+| Mixed format generations (e.g. v6 objects under v7 binary) | n/a | typed UnsupportedVersion | none (fail-closed) | affected objects unreadable | wipe/re-ingest (pre-release policy) | Yes: reader version gate + ADR-0027 |
+| KMS unavailable (SSE-KMS tenants) | PUTs fail, nack | GETs fail typed | none | tenant unavailable | automatic on KMS recovery | Code path only; NOT ASSESSED live |
+| Disk cache corrupt/deleted | none | cache miss, refetch | none (ADR-0046: cache-delete-safe) | latency | automatic | Code + doc claim; not executed here |
+| Store LIST omits keys persistently (contract violation) | none visible | data silently invisible; orphan GC may destroy (see commit-record-loss row) | potential silent loss | silent | qualification gate is the only defense; suite is thin (4 probes) | P2 finding (memo B) |
+
+Deterministic whole-system simulation: this review additionally ran the repo's seeded simulation harness (ravel-sim, ADR-0068), which drives real ingest, fold, compaction, sweep, and query cycles under injected faults and checks read-your-write, strict-ack-implies-durable, compaction query equivalence, record-count conservation, and no-leak-past-horizon invariants every cycle. See the evidence appendix for the batch result.
 
 ## 24. Documentation and implementation drift
 
