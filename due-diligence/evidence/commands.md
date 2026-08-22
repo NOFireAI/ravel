@@ -91,8 +91,18 @@ Decisive lines: "PASS ... difftest_selectors selector_and_error_corpus_match_pin
 (PromQL differential vs a REAL Prometheus 3.13.1 binary executed and passed)
 $ cargo nextest run --jobs 4 -p ravel-server --features sql
 exit 0
+$ cargo nextest run --jobs 4 -p ravel-server --features sql
+exit 0: "Summary [219.862s] 623 tests run: 623 passed (2 slow), 2 skipped"
 $ cargo nextest run --jobs 4 -p ravel-sql --test differential
-exit 0
+exit 0: "Summary [5.406s] 14 tests run: 14 passed, 0 skipped"
+$ cargo nextest run --jobs 4 -p ravel-server -p ravel-sql --features flight-sql
+exit 0: "Summary [221.769s] 1092 tests run: 1092 passed (2 slow), 4 skipped"
+$ cargo nextest run --jobs 4 -p ravel-segment --test fuzz_mutation
+exit 0: "Summary [1.866s] 10 tests run: 10 passed, 0 skipped"
+$ cargo nextest run --jobs 4 -p ravel-otap --test fuzz_mutation
+exit 0: "Summary [0.480s] 5 tests run: 5 passed, 1 skipped"
+$ cargo nextest run --jobs 4 -p ravel-otlp -p ravel-remote-write -p ravel-alerting -p ravel-analytics -p ravel-codec -p ravel-tenant-resolve -p ravel-cache -p ravel-fleet -p ravel-affinity -p ravel-sim
+exit 0: "Summary [28.573s] 556 tests run: 556 passed, 0 skipped"
 ```
 
 ## Supply chain
