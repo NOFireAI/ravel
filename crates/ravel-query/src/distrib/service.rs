@@ -413,15 +413,45 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             // A native-histogram series has no scalar count/min/max shape:
             // `PartialAggregate` carries f64 bounds only. Silently omitting such
             // series would answer a pushdown query over an incomplete set, so
-            // fail closed to the coordinator's raw-fetch fallback instead.
+            // fail closed to the coordinator's raw-fetch fallback instead. This
+            // returns an `Unsupported` terminal summary carrying the accounting
+            // already spent on the fetches above, NOT an `Err` (which
+            // `run_slice`'s catch-all would rebuild from a default,
+            // zero-cost snapshot): a slice that paid real fetch cost before
+            // refusing must report that cost so the coordinator folds it, exactly
+            // as the byte-budget short-circuit above already does (ADR-0103
+            // amendment F1).
             if !histograms.is_empty() {
-                return Err((
+                return Ok(vec![summary_frame(
+                    &accounting.snapshot(),
+                    0,
+                    0,
                     pb::status::Code::Unsupported,
                     "aggregation pushdown is not defined for native-histogram series".to_string(),
-                ));
+                    &stats,
+                )]);
             }
+            // The reduction window (ADR-0103 amendment): `reduce_start_ns`
+            // exclusive, `reduce_end_ns` inclusive. Both fields are one window,
+            // so a caller must send both or neither. Both absent is today's only
+            // shape (no reduction restriction, byte-identical to pre-amendment
+            // behavior); exactly one present is a caller bug a lone bound cannot
+            // resolve into a window, so it is a typed `Internal` error rather than
+            // a silent one-sided filter.
+            let window = match (want.reduce_start_ns, want.reduce_end_ns) {
+                (None, None) => None,
+                (Some(start), Some(end)) => Some((start, end)),
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err((
+                        pb::status::Code::Internal,
+                        "PartialAggregateRequest carries exactly one of \
+                         reduce_start_ns/reduce_end_ns; a caller must set both or neither"
+                            .to_string(),
+                    ));
+                }
+            };
             let (partials, samples_merged) =
-                reduce_partial_aggregates(scalar, &want).map_err(map_merge_error)?;
+                reduce_partial_aggregates(scalar, &want, window).map_err(map_merge_error)?;
             let series_returned = partials.len() as u64;
             let mut frames = Vec::with_capacity(partials.len() + 1);
             for partial in &partials {
@@ -845,12 +875,35 @@ fn summary_frame(
 /// min/max UDAF uses (`crates/ravel-sql/src/minmax.rs`): a candidate replaces
 /// the incumbent only on a strict `Less`/`Greater`, so NaN payloads and the sign
 /// of zero behave exactly as they do in every other typed-aggregate path here,
-/// and never through `PartialOrd`. A series whose samples were all erased
-/// carries `count: Some(0)` with no bounds: there is no value to bound, and an
-/// absent bound stays distinct from a present `0.0`.
+/// and never through `PartialOrd`. A series whose samples were all erased (or
+/// all filtered out below) carries `count: Some(0)` with no bounds: there is no
+/// value to bound, and an absent bound stays distinct from a present `0.0`.
+///
+/// Two filters run over each series' merged samples, AFTER the merge and BEFORE
+/// the count/min/max fold, never before the merge:
+///
+/// - Staleness: a sample encoded as [`STALE_NAN_BITS`] is dropped
+///   unconditionally (independent of `window`), matching the evaluator, which
+///   drops staleness markers from every matrix selection before a range function
+///   sees them (`eval_matrix_selector`). A window whose only sample is a
+///   staleness marker must contribute 0 to the count, not 1.
+/// - Reduction window (`window = Some((start, end))`, ADR-0103 amendment): a
+///   sample survives iff `ts_ns > start && ts_ns <= end` -- exclusive start,
+///   inclusive end, the same convention `eval_matrix_selector` uses. `None`
+///   means no window restriction (today's only caller shape), reducing over
+///   every merged sample.
+///
+/// Both filters run after [`merge_soa_runs`] on purpose. The merge's own dedup
+/// tie-break (`is_greater`, a bit-pattern tuple comparison, unrelated to
+/// `total_cmp`) decides which candidate at a shared timestamp survives, exactly
+/// as it does on the raw path. Filtering staleness (or the window) before the
+/// merge could let a losing real sample win a slot the raw path resolves to the
+/// marker (or vice versa), diverging from the answer the same query gets on the
+/// local path.
 fn reduce_partial_aggregates(
     fetched: Vec<Vec<FetchedSeriesSoa>>,
     want: &pb::PartialAggregateRequest,
+    window: Option<(i64, i64)>,
 ) -> Result<(Vec<codec::PartialAggregate>, u64), QueryError> {
     // Insertion-ordered grouping (a positions map beside the runs), so the frame
     // order a worker emits is a deterministic function of its fetch order rather
@@ -877,17 +930,29 @@ fn reduce_partial_aggregates(
         let Some(series) = merged.into_iter().next() else {
             continue;
         };
-        let count = series.samples.len() as u64;
+        // Staleness filter (unconditional) and the optional reduction window,
+        // both applied here -- after the merge resolved each shared timestamp,
+        // before the fold. See this function's doc comment for why the order
+        // matters.
+        let values: Vec<f64> = series
+            .samples
+            .iter()
+            .filter(|s| s.value.to_bits() != STALE_NAN_BITS)
+            .filter(|s| match window {
+                Some((start, end)) => s.ts_ns > start && s.ts_ns <= end,
+                None => true,
+            })
+            .map(|s| s.value)
+            .collect();
+        let count = values.len() as u64;
         samples_merged += count;
-        let min = series
-            .samples
+        let min = values
             .iter()
-            .map(|s| s.value)
+            .copied()
             .reduce(|current, candidate| replaces(candidate, current, Ordering::Less));
-        let max = series
-            .samples
+        let max = values
             .iter()
-            .map(|s| s.value)
+            .copied()
             .reduce(|current, candidate| replaces(candidate, current, Ordering::Greater));
         partials.push(codec::PartialAggregate {
             series_id,
@@ -900,12 +965,22 @@ fn reduce_partial_aggregates(
     Ok((partials, samples_merged))
 }
 
-/// The min/max fold step: `candidate` replaces `current` only when
-/// `candidate.total_cmp(&current)` is the wanted strict ordering (`Less` for
+/// The PromQL staleness marker's bit pattern (a specific quiet-NaN payload),
+/// the same constant `ravel_promql`'s `eval_matrix_selector` filters on. A
+/// sample carrying it marks the series absent from that point forward and must
+/// not be counted; the reduction drops it after the merge, matching the
+/// evaluator's own pre-range-function filter.
+const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+/// The worker's own local min/max fold step: `candidate` replaces `current` only
+/// when `candidate.total_cmp(&current)` is the wanted strict ordering (`Less` for
 /// min, `Greater` for max), so a tie keeps the incumbent. Mirrors
-/// `Extreme::replaces` in `crates/ravel-sql/src/minmax.rs` field for field, the
-/// ADR-0023 total order ADR-0103 decision 3 names for the coordinator's own
-/// combine.
+/// `Extreme::replaces` in `crates/ravel-sql/src/minmax.rs` field for field. This
+/// is only the worker's local reduction over the samples one worker holds; it
+/// makes no claim about any coordinator-side combine. No caller combines
+/// `min`/`max` across workers today: T3's `total_cmp` fold is not the IEEE fold
+/// PromQL's `min_over_time`/`max_over_time` compute, so min/max pushdown does not
+/// ship until a PromQL-semantics worker fold exists (ADR-0103 amendment).
 fn replaces(candidate: f64, current: f64, want: Ordering) -> f64 {
     if candidate.total_cmp(&current) == want {
         candidate
