@@ -231,4 +231,49 @@ pub trait SeriesSource: Send + Sync {
     ) -> Result<Vec<HistogramSeriesData>, SourceError> {
         Ok(Vec::new())
     }
+
+    /// Return a precomputed per-series count for a `count_over_time` window,
+    /// when this source already holds one (e.g. from a distributed
+    /// aggregation-pushdown fetch, ADR-0103's amendment), letting the
+    /// evaluator skip fetching and reducing raw samples entirely.
+    ///
+    /// `start_ns`/`end_ns` are the range function's own left-open window,
+    /// passed verbatim as `count_over_time` computes it: `start_ns` is
+    /// EXCLUSIVE and `end_ns` is INCLUSIVE, i.e. a sample counts iff
+    /// `start_ns < ts_ns <= end_ns`. These are the raw PromQL window bounds
+    /// ([`RangeWindow`](crate::functions::RangeWindow)'s own
+    /// `start_ns`/`end_ns`), NOT a [`ravel_types::TimeRange`] (which is
+    /// inclusive on both ends): an implementor computing a reduction start
+    /// from `start_ns` must treat it as exclusive.
+    ///
+    /// An implementor that already holds an exact per-series count for this
+    /// exact `(matchers, start_ns, end_ns)` returns `Some` with one
+    /// `(labels, count)` entry per series that had a NONZERO count in-window.
+    /// A series with a zero count in-window is ABSENT from the vec, never a
+    /// `(labels, 0)` entry: this matches the raw evaluation path, which emits
+    /// no output point for an empty window, so a caller composing this into a
+    /// further aggregate (e.g. `count(count_over_time(...))`) never sees a
+    /// phantom zero-valued series.
+    ///
+    /// `Ok(None)` means "no precomputed answer available for this call, fetch
+    /// and reduce normally" and is the ONLY way to request the fallback; it
+    /// is never used to mean "I tried and failed." `Err` is reserved for an
+    /// implementor that attempted to serve a precomputed answer and hit a
+    /// real fault. This distinction matters for a future populator: a
+    /// pushdown-eligible query that silently falls back with no signal is the
+    /// invisible-non-acceleration ADR-0103's amendment exists to avoid, so a
+    /// real fault must stay distinguishable from "not applicable here" even
+    /// though the caller's own fallback treats both identically for safety.
+    ///
+    /// The default `Ok(None)` makes every existing and future
+    /// [`SeriesSource`] implementor that never overrides this method behave
+    /// completely unchanged.
+    fn query_precomputed_count(
+        &self,
+        _matchers: &[LabelMatcher],
+        _start_ns: i64,
+        _end_ns: i64,
+    ) -> Result<Option<Vec<(LabelSet, u64)>>, SourceError> {
+        Ok(None)
+    }
 }
