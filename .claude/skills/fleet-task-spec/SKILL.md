@@ -169,6 +169,33 @@ be demonstrated failing, not merely written. The prove-the-test skill (in
 this repo, so executors have it too) lists the known vacuity shapes; point
 the spec's Tests section at it when the task is fix-shaped.
 
+## Numbers need magnitudes, not `> 0`
+
+When a task reports a count, a size, or any other measured quantity, the
+spec must forbid asserting only that it is non-zero or non-empty. A `> 0`
+assertion holds just as well when a figure is a fraction of the truth,
+which is how an accounting bug survives a green suite: a memory-pool charge
+shipped reporting roughly a quarter of its real resident footprint under a
+test that checked exactly that plus return-to-zero. Return-to-zero proves
+you released what you reserved, not that you reserved the right amount.
+
+- Pin an exact value where one exists. Generated 60 records, count 60.
+- Where the exact value moves with encoding or compression, bound it
+  **proportionally to something known** — per object, per row, per shard.
+  A flat floor is the trap: a floor low enough to be safe for one object is
+  also cleared by a figure that counts one object out of three. That exact
+  substitution passed a flat 1 KiB floor and failed a per-object band.
+- Require the magnitude assertion itself to be demonstrated failing, by
+  under-counting the source deliberately. An assertion nobody watched fail
+  is not evidence that it pins anything.
+
+This is also a REVIEWER's instruction, not only the executor's. The
+undercharge above survived its first adversarial review and was caught by a
+second one whose prompt asked, in as many words, whether each assertion
+actually pins a magnitude. Put that question in the review spec: for every
+number the change reports, does a test fail if the number is wrong, or only
+if it is missing?
+
 ## Sizing rules
 
 - One task must fit one context window: one crate, or one module cluster
