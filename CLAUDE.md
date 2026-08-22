@@ -271,6 +271,22 @@ as a precondition, not after the damage.
   `linking with cc failed` (errno 28) that reads as a code bug, and a full
   disk can break the harness's own output capture so nothing runs at all.
   `FLEET_DISK_REAP=1` auto-runs `disk-reap.sh -y` when below the floor.
+  The check proves headroom at one instant, not for the duration of the
+  build. A session that read 82 GB free, started a cold gate, and took
+  the volume to 886 MiB still passed this guard: another session was
+  building at the same time. For anything longer than a few minutes,
+  also arm a watchdog that samples free space every 45 s or so and kills
+  its OWN `cargo`/`rustc` below a floor of about 8 GB. Killing your build
+  costs a retry; letting the volume reach zero stops every Bash command
+  in every session on the host, including the ones that would clean up.
+- A cold gate needs 54-70 GB of `target/` per worktree, so this machine
+  runs ONE at a time regardless of how many sessions are otherwise idle.
+  Two sessions gating concurrently is the expected failure, not bad luck:
+  say so on the shared channel and sequence, or push the gate to PR CI
+  with `FLEET_MERGE_SKIP_GATES=1` (which still needs a valid receipt, so
+  it moves the gate rather than skipping it). This is unrelated to the
+  fleet dispatch concurrency cap: fleet executors build on their own
+  remote host and cost nothing locally.
 - `scripts/guards/assert-fresh-dispatch-ref.sh <ref-sha>`: exits non-zero
   unless `<ref-sha>` is the tip of `origin/main` fetched in THIS
   invocation. Run it against the ref you are about to `fleet_dispatch`: a
