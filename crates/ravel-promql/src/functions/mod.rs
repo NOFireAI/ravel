@@ -131,11 +131,11 @@ pub(crate) type InstantFn = fn(
 /// which is the query's own instant, not the offset/`@`-shifted lookup
 /// time `end_ns` may be).
 #[derive(Clone, Copy)]
-pub(crate) struct RangeWindow {
-    pub(crate) start_ns: i64,
-    pub(crate) end_ns: i64,
-    pub(crate) range_ns: i64,
-    pub(crate) eval_ts_ns: i64,
+pub struct RangeWindow {
+    pub start_ns: i64,
+    pub end_ns: i64,
+    pub range_ns: i64,
+    pub eval_ts_ns: i64,
 }
 
 /// All registered function families, aggregated into one lookup table.
@@ -693,7 +693,7 @@ pub(crate) fn string_arg(
 /// [`Evaluator::eval_subquery_matrix`] produce the same [`RangeMatrix`]
 /// shape for a reducer to consume.
 #[derive(Clone, Copy)]
-pub(crate) enum MatrixArg<'a> {
+pub enum MatrixArg<'a> {
     Selector(&'a promql_parser::parser::MatrixSelector),
     Subquery(&'a promql_parser::parser::SubqueryExpr),
 }
@@ -707,7 +707,11 @@ pub(crate) enum MatrixArg<'a> {
 /// window a reducer like `rate` extrapolates against is the query's own
 /// declared range, matching Prometheus, which computes `rate`'s boundary
 /// extrapolation from the subquery's nominal range regardless of alignment.
-fn range_window(arg: MatrixArg, eval_ts_ns: i64, ctx: &QueryWindow) -> Result<RangeWindow, Error> {
+pub fn range_window(
+    arg: MatrixArg,
+    eval_ts_ns: i64,
+    ctx: &QueryWindow,
+) -> Result<RangeWindow, Error> {
     match arg {
         MatrixArg::Selector(ms) => {
             let sel_ts_ns = selector_eval_ts(&ms.vs, eval_ts_ns, ctx)?;
@@ -795,7 +799,7 @@ fn eval_matrix_arg(
 /// `MatrixSelector`, `Subquery`, or `Paren` wrapping either. Any other node
 /// is unreachable, since the parser rejects the query before this evaluator
 /// ever sees it otherwise.
-fn matrix_arg(expr: &promql_parser::parser::Expr) -> Result<MatrixArg<'_>, Error> {
+pub fn matrix_arg(expr: &promql_parser::parser::Expr) -> Result<MatrixArg<'_>, Error> {
     use promql_parser::parser::Expr;
     let mut cur = expr;
     loop {

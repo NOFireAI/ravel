@@ -376,7 +376,7 @@ const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 /// the whole query's own parameters, fixed regardless of which grid step (if
 /// any) is currently being evaluated. For an instant query both fields equal
 /// the query's evaluation timestamp.
-pub(crate) struct QueryWindow {
+pub struct QueryWindow {
     start_ns: i64,
     end_ns: i64,
     /// Shared cross-level evaluation-grid-point budget, charged
@@ -405,6 +405,23 @@ pub(crate) struct QueryWindow {
 }
 
 impl QueryWindow {
+    /// A bare context for callers outside this crate that invoke a
+    /// window-resolution helper such as [`crate::functions::range_window`]
+    /// directly: the query's `[start_ns, end_ns]` parameters (consulted only to
+    /// resolve `@ start()`/`@ end()`), an effectively unbounded evaluation
+    /// budget, no deadline, and an empty annotation sink. Exposed so a
+    /// distributed-pushdown coordinator can assert its independently-derived
+    /// reduction bounds against the evaluator's own `range_window`.
+    pub fn bare(start_ns: i64, end_ns: i64) -> Self {
+        QueryWindow {
+            start_ns,
+            end_ns,
+            budget: Cell::new(u64::MAX),
+            deadline: None,
+            annotations: RefCell::new(Annotations::default()),
+        }
+    }
+
     /// Test-only bare context: instant window at time zero, effectively
     /// unbounded budget, no deadline, empty annotation sink. For unit tests
     /// that call an internal `eval_*`/annotation helper directly instead of

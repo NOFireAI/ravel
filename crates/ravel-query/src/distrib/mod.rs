@@ -117,9 +117,17 @@ impl Distributed {
     /// results incrementally as each slice completes (so a budget trip or a
     /// hard error short-circuits without draining the rest).
     ///
+    /// `partial_aggregate` (ADR-0103) is `Some` only for an eligible instant
+    /// `count_over_time` query: the coordinator asks every slice for a
+    /// per-series precomputed partial over the request's reduction window
+    /// instead of raw runs, and the returned `Vec<codec::PartialAggregate>` is
+    /// the collected result (empty when the field is `None`, today's every real
+    /// query). `None` is byte-identical to the pre-ADR-0103 behavior.
+    ///
     /// Returns:
-    /// - `Ok(Some(triple))` when every slice succeeded: the coordinator merges
-    ///   it exactly as the local path merges its own fetch.
+    /// - `Ok(Some((triple, partials)))` when every slice succeeded: the
+    ///   coordinator merges `triple` exactly as the local path merges its own
+    ///   fetch, and `partials` carries any collected worker partials.
     /// - `Ok(None)` when the query must fall back to fully local execution: a
     ///   worker reported [`pb::status::Code::Unsupported`] (version skew or a
     ///   resolve-scope slice). ADR-0071's silent fallback, never an error to the
@@ -143,12 +151,16 @@ impl Distributed {
         accounting: &QueryAccounting,
         config: &EngineConfig,
         deadline_unix_ns: i64,
-    ) -> Result<Option<FetchedTriple>, QueryError> {
+        partial_aggregate: Option<pb::PartialAggregateRequest>,
+    ) -> Result<Option<(FetchedTriple, Vec<codec::PartialAggregate>)>, QueryError> {
         let slices = partition_snapshot(snapshot, self.thresholds.max_parallel_slices);
         if slices.is_empty() {
             // Nothing to fetch: an empty snapshot merges to an empty result
             // identically whether local or distributed.
-            return Ok(Some((Vec::new(), FetchStats::default(), Vec::new())));
+            return Ok(Some((
+                (Vec::new(), FetchStats::default(), Vec::new()),
+                Vec::new(),
+            )));
         }
 
         let encoded_matchers = codec::encode_matchers(matchers);
@@ -210,11 +222,17 @@ impl Distributed {
                     // builder leaves the bytes empty. A coordinator-local slice
                     // needs no capability.
                     fragment_capability: Vec::new(),
-                    // No aggregation pushdown from this builder: it always asks
-                    // for raw runs and merges them here (ADR-0103's eligibility
-                    // gate and the coordinator-side combine that would set this
-                    // field are not wired yet).
-                    partial_aggregate: None,
+                    // ADR-0103 aggregation pushdown: `Some` only for an eligible
+                    // instant `count_over_time` query (the coordinator's
+                    // per-matcher-set decision in `engine::prefetch`), in which
+                    // case every slice of this matcher set carries the identical
+                    // request so each worker computes a per-series count over
+                    // the same reduction window. `None` (every other query) asks
+                    // for raw runs, byte-identical to the pre-ADR-0103 builder.
+                    // The request is `Copy` (all-scalar fields), so each
+                    // per-slice build copies it rather than moving the shared
+                    // value out of this `FnMut`.
+                    partial_aggregate,
                 };
                 let fetcher = Arc::clone(&self.fetcher);
                 async move { fetcher.fetch(request).await }
@@ -234,6 +252,16 @@ impl Distributed {
         let mut distinct_hist: HashSet<SeriesId> = HashSet::new();
         let mut per_slice: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
         let mut per_slice_hist: Vec<Vec<FetchedHistogramSeries>> = Vec::new();
+        // ADR-0103 collected worker partials, and a HashSet DEDICATED to
+        // detecting a duplicate series id across `.partials` entries (possibly
+        // from different slices/workers). This is a distinct mechanism from the
+        // `distinct`/`distinct_hist` cap-enforcement sets above: a legitimate
+        // cap truncation is not a duplicate-series bug, so the two must never
+        // share a set. Under decision 1's eligibility gate every series lives on
+        // exactly one worker, so a repeat means the gate was violated and the
+        // query must fail closed (below), never silently keep one of two values.
+        let mut collected_partials: Vec<codec::PartialAggregate> = Vec::new();
+        let mut partial_series: HashSet<SeriesId> = HashSet::new();
         // Running fold of the per-slice accounting snapshots (ADR-0071),
         // combined via the saturating merge so a worker near `u64::MAX` clamps
         // rather than wrapping past the bytes-scanned budget. This is the
@@ -294,6 +322,19 @@ impl Distributed {
                         bytes_scanned_exceeded(running.total_s3_bytes(), config.max_bytes_scanned)
                     {
                         return Err(err);
+                    }
+                    // ADR-0103: fold this slice's worker partials into the
+                    // per-fetch collection, hard-erroring on any repeated series
+                    // id (across this or any prior slice). Empty for a raw fetch
+                    // (`partial_aggregate` was `None`), so this is inert on every
+                    // query shape other than an eligible `count_over_time`.
+                    for pa in response.partials {
+                        if !partial_series.insert(pa.series_id) {
+                            return Err(QueryError::DuplicatePushdownSeries {
+                                series_id: pa.series_id.to_hex(),
+                            });
+                        }
+                        collected_partials.push(pa);
                     }
                     per_slice.push(response.scalar);
                     per_slice_hist.push(response.histogram);
@@ -370,7 +411,10 @@ impl Distributed {
             return Ok(None);
         }
 
-        Ok(Some((per_slice, stats, per_slice_hist)))
+        Ok(Some((
+            (per_slice, stats, per_slice_hist),
+            collected_partials,
+        )))
     }
 
     /// Partitions the snapshot, dispatches one RLOG-family (Logs, Alerts, Audit)
