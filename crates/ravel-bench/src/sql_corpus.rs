@@ -88,6 +88,63 @@ impl Modification {
     }
 }
 
+/// One of the four declared logical types an attribute column can take
+/// (ADR-0090 decision 1), mirrored here as a serializable field so a corpus
+/// entry can state the declared column it depends on. Kept in this crate rather
+/// than reusing [`ravel_sql::DeclaredType`] because that type is deliberately
+/// not `Serialize`/`Deserialize`; [`Self::as_declared_type`] bridges the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredDeclaredType {
+    /// A `Str`-typed declared column (Arrow `Utf8`).
+    Str,
+    /// An `I64`-typed declared column (Arrow `Int64`).
+    I64,
+    /// A `Bool`-typed declared column (Arrow `Boolean`).
+    Bool,
+    /// A `Bytes`-typed declared column (Arrow `Binary`).
+    Bytes,
+}
+
+impl RequiredDeclaredType {
+    /// The matching [`ravel_sql::DeclaredType`], so the harness can compare a
+    /// required declaration against a resolved [`ravel_sql::DeclaredColumn`].
+    pub fn as_declared_type(self) -> ravel_sql::DeclaredType {
+        match self {
+            RequiredDeclaredType::Str => ravel_sql::DeclaredType::Str,
+            RequiredDeclaredType::I64 => ravel_sql::DeclaredType::I64,
+            RequiredDeclaredType::Bool => ravel_sql::DeclaredType::Bool,
+            RequiredDeclaredType::Bytes => ravel_sql::DeclaredType::Bytes,
+        }
+    }
+}
+
+/// A declared typed attribute column a statement depends on: the attribute key
+/// plus the type it must be declared as (ADR-0100 decision 4).
+///
+/// This is data, not a doc comment: a statement that filters or aggregates a
+/// declared column returns wrong numbers (every row NULL) rather than an error
+/// when that column is absent from the tenant under measurement, so the
+/// requirement travels with the statement and the `sql_latency_bench` `--tenant`
+/// lane skips any entry the tenant does not satisfy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredDeclaration {
+    /// The attribute key the statement reads as a declared typed column.
+    pub key: String,
+    /// The declared type that key must carry.
+    pub ty: RequiredDeclaredType,
+}
+
+impl RequiredDeclaration {
+    /// A declared-column requirement for `key` at type `ty`.
+    pub fn new(key: impl Into<String>, ty: RequiredDeclaredType) -> Self {
+        RequiredDeclaration {
+            key: key.into(),
+            ty,
+        }
+    }
+}
+
 /// One corpus statement and everything a reader needs to judge it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusEntry {
@@ -111,6 +168,20 @@ pub struct CorpusEntry {
     /// computes.
     #[serde(default)]
     pub modified: Modification,
+    /// The declared typed attribute columns this statement depends on. Additive
+    /// under corpus `version = 1`: an older corpus file that predates this field
+    /// parses with an empty list (`#[serde(default)]`), and an entry with no
+    /// declared-column dependency carries an empty list too.
+    #[serde(default)]
+    pub required_declarations: Vec<RequiredDeclaration>,
+}
+
+impl CorpusEntry {
+    /// Attach the declared typed attribute columns this statement needs.
+    fn requiring(mut self, declarations: Vec<RequiredDeclaration>) -> Self {
+        self.required_declarations = declarations;
+        self
+    }
 }
 
 /// A parsed corpus document: a format version plus its entries.
@@ -291,6 +362,10 @@ fn entry(id: &str, sql: &str, constructs: &[&str], expected_rows: Option<usize>)
         // so there is no upstream id to diff against and nothing to disclose.
         upstream_id: None,
         modified: Modification::Verbatim,
+        // Most statements read only the fixed `logs` columns and depend on no
+        // declaration; the two that query `duration_ms` state that in
+        // `default_corpus` via `CorpusEntry::requiring`.
+        required_declarations: Vec::new(),
     }
 }
 
@@ -332,13 +407,21 @@ pub fn default_corpus() -> Vec<CorpusEntry> {
             "SELECT count(*) FROM logs WHERE duration_ms >= 1000",
             &["declared i64 typed comparison", "Filter (WHERE)", "count"],
             Some(1),
-        ),
+        )
+        .requiring(vec![RequiredDeclaration::new(
+            "duration_ms",
+            RequiredDeclaredType::I64,
+        )]),
         entry(
             "typed_duration_sum",
             "SELECT sum(duration_ms) FROM logs WHERE severity_num >= 9",
             &["declared i64 typed aggregate", "Filter (WHERE)", "sum"],
             Some(1),
-        ),
+        )
+        .requiring(vec![RequiredDeclaration::new(
+            "duration_ms",
+            RequiredDeclaredType::I64,
+        )]),
         // --- String search ------------------------------------------------
         entry(
             "body_word_search",
@@ -450,6 +533,88 @@ mod tests {
         // The same check through the shipped gate, so the gate itself is what a
         // caller relies on rather than this test's open-coded loop.
         checked_default_corpus().expect("checked-in corpus passes its own gate");
+    }
+
+    #[test]
+    fn the_two_duration_entries_declare_their_dependency_in_data() {
+        let corpus = default_corpus();
+        // The declared-column dependency now lives in the entry data, not in a
+        // doc comment: exactly the two `duration_ms` statements carry it, at
+        // type i64, and every other entry carries an empty list.
+        for e in &corpus {
+            let needs_duration =
+                e.id == "typed_duration_threshold_count" || e.id == "typed_duration_sum";
+            if needs_duration {
+                assert_eq!(
+                    e.required_declarations,
+                    vec![RequiredDeclaration::new(
+                        "duration_ms",
+                        RequiredDeclaredType::I64
+                    )],
+                    "entry `{}` must declare duration_ms:i64 in data",
+                    e.id
+                );
+            } else {
+                assert!(
+                    e.required_declarations.is_empty(),
+                    "entry `{}` reads only fixed columns and must declare nothing",
+                    e.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_declarations_is_additive_over_version_1() {
+        // A corpus file written before this field existed omits it entirely and
+        // must still parse under `version = 1`, its entries carrying an empty
+        // requirement list. Proves the field is additive, not a format break.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_corpus(
+            &dir,
+            "old.json",
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "id": "old_entry",
+                  "sql": "SELECT count(*) FROM logs",
+                  "constructs": ["count"]
+                }
+              ]
+            }"#,
+        );
+        let entries = load_external_corpus(&path).expect("pre-field corpus still parses");
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].required_declarations.is_empty(),
+            "an absent required_declarations field defaults to empty"
+        );
+
+        // And a corpus that does carry the field round-trips through serde.
+        let path2 = write_corpus(
+            &dir,
+            "new.json",
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "id": "new_entry",
+                  "sql": "SELECT count(*) FROM logs WHERE duration_ms >= 1000",
+                  "constructs": ["declared i64 typed comparison", "count"],
+                  "required_declarations": [{"key": "duration_ms", "ty": "i64"}]
+                }
+              ]
+            }"#,
+        );
+        let entries2 = load_external_corpus(&path2).expect("corpus with the field parses");
+        assert_eq!(
+            entries2[0].required_declarations,
+            vec![RequiredDeclaration::new(
+                "duration_ms",
+                RequiredDeclaredType::I64
+            )]
+        );
     }
 
     #[test]
@@ -632,6 +797,7 @@ mod tests {
             modified: Modification::Modified {
                 reason: "   ".to_string(),
             },
+            required_declarations: Vec::new(),
         }];
         let err = gate_corpus(&entries).expect_err("an empty reason must fail");
         assert!(

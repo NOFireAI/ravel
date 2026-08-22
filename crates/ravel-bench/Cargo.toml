@@ -11,6 +11,7 @@ ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-codec = { workspace = true }
 ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-ingest = { workspace = true }
 ravel-object-store = { workspace = true }
@@ -226,6 +227,12 @@ path = "src/bin/groupby_scaling_bench.rs"
 required-features = ["sql-latency"]
 bench = false
 
+[[bin]]
+name = "sql_latency_bench"
+path = "src/bin/sql_latency_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
 [[test]]
 name = "read_accounting"
 path = "tests/read_accounting.rs"
@@ -264,6 +271,12 @@ bench = false
 [[test]]
 name = "query_latency_smoke"
 path = "tests/query_latency_smoke.rs"
+bench = false
+
+[[test]]
+name = "sql_latency_smoke"
+path = "tests/sql_latency_smoke.rs"
+required-features = ["sql-latency"]
 bench = false
 
 [[test]]
