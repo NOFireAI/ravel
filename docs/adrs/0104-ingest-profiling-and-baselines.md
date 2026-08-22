@@ -126,12 +126,28 @@ Decode and normalize need no seam: the bench drives them and can time them
 directly. Only `admit`, `route`, `merge` and `encode` need instrumentation,
 which keeps the seam's surface small.
 
-**Caveat on `admit`, and it matters for the load-time question
-specifically:** the bulk-load path bypasses the per-tenant
-`AdmissionController` by construction (ADR-0089, surfaced to operators as
-`ADMISSION_BYPASS_WARNING`). So an `admit` figure describes OTLP ingest, not
-`load --parquet`. A stage breakdown that reported a nonzero admit cost for a
-bulk load would be measuring something that does not happen.
+**Caveat on `admit` — CORRECTED after T1 (#504) measured it.** The original
+text here said the bulk-load path bypasses the per-tenant
+`AdmissionController` (ADR-0089, `ADMISSION_BYPASS_WARNING`), and therefore
+that an `admit` figure describes OTLP ingest but not `load --parquet`. That
+was wrong, and the error was in the premise rather than the conclusion.
+
+`AdmissionController` is never invoked inside `LogIngestRouter::write` at
+all. It is constructed and applied in the server, upstream of
+`crates/ravel-ingest` — `services/ravel-server/src/otap_grpc.rs:467` and
+`services/ravel-server/src/exemplars.rs:2035`. `log_router.rs` references it
+only in a test comment.
+
+So the `admit` stage measures the router's own ADR-0069 byte-budget
+admission (`est_record_bytes` folded, then `IngestByteBudget::try_charge`),
+which runs for **both** OTLP and `load --parquet`. The figure is comparable
+across both paths, which is more useful than the ADR originally claimed, and
+no `AdmissionController` cost is folded into it on either path.
+
+One real property of the boundary, worth stating because it shapes how the
+number reads: on a budget shed the `?` returns before the `record` call, so a
+shed request contributes **no** admit sample. The stage therefore measures
+the cost of admissions that succeeded, not the cost of deciding.
 
 `encode` deserves its own number rather than being folded into the flush,
 because #368 hypothesises that segment encoding on the tokio worker pool is
