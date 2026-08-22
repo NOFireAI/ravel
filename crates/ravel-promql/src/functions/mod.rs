@@ -180,8 +180,42 @@ pub(crate) fn eval_call(
         FunctionKind::RangeVector(f) => {
             let arg = matrix_arg(&call.args.args[0])?;
             let window = range_window(arg, eval_ts_ns, ctx)?;
-            let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             let keep_name = range_vector_keeps_metric_name(call.func.name);
+            // Aggregation-pushdown fast path (ADR-0103 amendment): for a
+            // `count_over_time` over a literal matrix selector, ask the source
+            // for a precomputed per-series count over this exact window before
+            // fetching and reducing raw samples. Restricted to a literal
+            // selector: a subquery's window is not a simple raw-sample count of
+            // the outer range, so this mechanism must never be asked to serve
+            // one. `Ok(Some(..))` takes the fast path; `Ok(None)` (no
+            // precomputed answer) and `Err(..)` (the optional lookup faulted)
+            // both fall through to the unchanged fetch-and-reduce path, so a
+            // fault forgoes the fast path rather than failing the query.
+            if call.func.name == "count_over_time"
+                && let MatrixArg::Selector(ms) = arg
+            {
+                let matchers = crate::eval::build_matchers(&ms.vs)?;
+                if let Ok(Some(results)) =
+                    source.query_precomputed_count(&matchers, window.start_ns, window.end_ns)
+                {
+                    let out = results
+                        .into_iter()
+                        .map(|(labels, count)| InstantSample {
+                            labels: if keep_name {
+                                labels
+                            } else {
+                                drop_metric_name(labels)
+                            },
+                            ts_ns: eval_ts_ns,
+                            orig_sample_ts_ns: eval_ts_ns,
+                            value: count as f64,
+                            histogram: None,
+                        })
+                        .collect();
+                    return Ok(Value::Vector(out));
+                }
+            }
+            let matrix = eval_matrix_arg(evaluator, source, arg, eval_ts_ns, ctx)?;
             Ok(Value::Vector(apply_reduce(
                 matrix,
                 eval_ts_ns,
@@ -888,12 +922,293 @@ fn maybe_warn_invalid_quantile(q: f64, ctx: &QueryWindow) {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ravel_types::{Label, LabelSet};
+
     use crate::eval::Evaluator;
     use crate::histogram::{FloatHistogram, ResetHint, Span};
+    use crate::source::{HistogramSeriesData, LabelMatcher, SeriesData, SeriesSource, SourceError};
     use crate::testsource::TestSource;
 
     fn ms_ns(ms: i64) -> i64 {
         ms * 1_000_000
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> LabelSet {
+        LabelSet::new(
+            pairs
+                .iter()
+                .map(|(name, value)| Label {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+        )
+        .expect("valid labels")
+    }
+
+    /// What a [`MockSource::query_precomputed_count`] returns.
+    enum Precomputed {
+        Some(Vec<(LabelSet, u64)>),
+        None,
+        Err,
+    }
+
+    /// A `SeriesSource` wrapping a [`TestSource`] for the raw fetch path, with
+    /// a configurable `query_precomputed_count` result and call counters so a
+    /// test can assert WHICH path actually ran, not just the final value.
+    struct MockSource {
+        inner: TestSource,
+        precomputed: Precomputed,
+        query_calls: AtomicUsize,
+        hist_calls: AtomicUsize,
+        precomputed_calls: AtomicUsize,
+        precomputed_window: Mutex<Option<(i64, i64)>>,
+    }
+
+    impl MockSource {
+        fn new(inner: TestSource, precomputed: Precomputed) -> Self {
+            MockSource {
+                inner,
+                precomputed,
+                query_calls: AtomicUsize::new(0),
+                hist_calls: AtomicUsize::new(0),
+                precomputed_calls: AtomicUsize::new(0),
+                precomputed_window: Mutex::new(None),
+            }
+        }
+    }
+
+    impl SeriesSource for MockSource {
+        fn query(
+            &self,
+            matchers: &[LabelMatcher],
+            window: ravel_types::TimeRange,
+        ) -> Result<Vec<SeriesData>, SourceError> {
+            self.query_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.query(matchers, window)
+        }
+
+        fn query_histograms(
+            &self,
+            matchers: &[LabelMatcher],
+            window: ravel_types::TimeRange,
+        ) -> Result<Vec<HistogramSeriesData>, SourceError> {
+            self.hist_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.query_histograms(matchers, window)
+        }
+
+        fn query_precomputed_count(
+            &self,
+            _matchers: &[LabelMatcher],
+            start_ns: i64,
+            end_ns: i64,
+        ) -> Result<Option<Vec<(LabelSet, u64)>>, SourceError> {
+            self.precomputed_calls.fetch_add(1, Ordering::Relaxed);
+            *self.precomputed_window.lock().expect("lock") = Some((start_ns, end_ns));
+            match &self.precomputed {
+                Precomputed::Some(v) => Ok(Some(v.clone())),
+                Precomputed::None => Ok(None),
+                Precomputed::Err => Err(SourceError::Backend("boom".to_string())),
+            }
+        }
+    }
+
+    /// `(k-label, value)` pairs from an instant vector, sorted, so a test can
+    /// compare results independent of series order. `count_over_time` drops
+    /// `__name__`, so series are keyed on their remaining `k` label here.
+    fn by_k(v: &[crate::eval::InstantSample]) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = v
+            .iter()
+            .map(|s| (s.labels.get("k").unwrap_or_default().to_string(), s.value))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    #[test]
+    fn count_over_time_takes_precomputed_fast_path_without_fetching_samples() {
+        // Mock serves a precomputed count for both series; assert the exact
+        // values come back AND that the raw `query` path was never touched, so
+        // the fast path was genuinely taken and not just coincidentally right.
+        let inner = TestSource::new()
+            .with_series(
+                &[("__name__", "m"), ("k", "a")],
+                &[(ms_ns(0), 1.0), (ms_ns(60_000), 2.0)],
+            )
+            .expect("series a")
+            .with_series(&[("__name__", "m"), ("k", "b")], &[(ms_ns(0), 1.0)])
+            .expect("series b");
+        let source = MockSource::new(
+            inner,
+            Precomputed::Some(vec![
+                (labels(&[("__name__", "m"), ("k", "a")]), 3),
+                (labels(&[("__name__", "m"), ("k", "b")]), 7),
+            ]),
+        );
+
+        let got = Evaluator::new()
+            .instant(&source, "count_over_time(m[5m])", 60_000)
+            .expect("evaluates");
+
+        assert_eq!(
+            by_k(&got),
+            vec![("a".to_string(), 3.0), ("b".to_string(), 7.0)],
+        );
+        assert_eq!(
+            source.query_calls.load(Ordering::Relaxed),
+            0,
+            "fast path must not fetch raw samples"
+        );
+        assert_eq!(source.precomputed_calls.load(Ordering::Relaxed), 1);
+        // The pushed-down window is `count_over_time`'s own left-open window
+        // (eval_ts - 5m, eval_ts], in ns.
+        assert_eq!(
+            *source.precomputed_window.lock().expect("lock"),
+            Some((ms_ns(60_000) - ms_ns(300_000), ms_ns(60_000))),
+        );
+        // `count_over_time` drops `__name__`, so the fast path output must too.
+        assert!(got.iter().all(|s| s.labels.get("__name__").is_none()));
+    }
+
+    #[test]
+    fn count_over_time_falls_back_on_none_and_matches_plain_source() {
+        // `Ok(None)` means "no precomputed answer": the query must fetch and
+        // reduce exactly as a source with no override would, and `query` must
+        // actually be called.
+        let raw = &[(ms_ns(0), 1.0), (ms_ns(60_000), 2.0)];
+        let plain = TestSource::new()
+            .with_series(&[("__name__", "m")], raw)
+            .expect("series");
+        let expected = Evaluator::new()
+            .instant(&plain, "count_over_time(m[5m])", 60_000)
+            .expect("plain evaluates");
+
+        let source = MockSource::new(
+            TestSource::new()
+                .with_series(&[("__name__", "m")], raw)
+                .expect("series"),
+            Precomputed::None,
+        );
+        let got = Evaluator::new()
+            .instant(&source, "count_over_time(m[5m])", 60_000)
+            .expect("evaluates");
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].value, 2.0);
+        assert_eq!(got[0].value, expected[0].value);
+        assert_eq!(got[0].labels, expected[0].labels);
+        assert!(
+            source.query_calls.load(Ordering::Relaxed) >= 1,
+            "fallback must fetch raw samples"
+        );
+    }
+
+    #[test]
+    fn precomputed_omitting_a_series_yields_no_sample_for_it_not_zero() {
+        // A series present in the raw data but absent from the precomputed
+        // result must produce NO output sample (the absence-not-zero rule),
+        // never a `0.0` point.
+        let inner = TestSource::new()
+            .with_series(&[("__name__", "m"), ("k", "x")], &[(ms_ns(60_000), 1.0)])
+            .expect("series x")
+            .with_series(&[("__name__", "m"), ("k", "y")], &[(ms_ns(60_000), 1.0)])
+            .expect("series y");
+        let source = MockSource::new(
+            inner,
+            Precomputed::Some(vec![(labels(&[("__name__", "m"), ("k", "x")]), 5)]),
+        );
+
+        let got = Evaluator::new()
+            .instant(&source, "count_over_time(m[5m])", 60_000)
+            .expect("evaluates");
+
+        assert_eq!(by_k(&got), vec![("x".to_string(), 5.0)]);
+        assert!(
+            got.iter().all(|s| s.labels.get("k") != Some("y")),
+            "omitted series must not appear, not even as 0.0"
+        );
+        assert_eq!(source.query_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn subquery_argument_never_asks_for_a_precomputed_count() {
+        // A subquery argument is structurally excluded: the precomputed hook
+        // must not be consulted even when it would return `Some`.
+        let inner = TestSource::new()
+            .with_series(
+                &[("__name__", "m")],
+                &[
+                    (ms_ns(0), 1.0),
+                    (ms_ns(300_000), 2.0),
+                    (ms_ns(600_000), 3.0),
+                ],
+            )
+            .expect("series");
+        let source = MockSource::new(
+            inner,
+            Precomputed::Some(vec![(labels(&[("__name__", "m")]), 99)]),
+        );
+
+        let _ = Evaluator::new()
+            .instant(&source, "count_over_time(m[1h:5m])", 3_600_000)
+            .expect("evaluates");
+
+        assert_eq!(
+            source.precomputed_calls.load(Ordering::Relaxed),
+            0,
+            "subquery exclusion is structural, not a None default"
+        );
+    }
+
+    #[test]
+    fn count_over_time_falls_back_on_error_rather_than_failing() {
+        // An `Err` from the optional precomputed lookup must never fail the
+        // query: it falls back to fetch-and-reduce exactly like `Ok(None)`.
+        let raw = &[(ms_ns(0), 1.0), (ms_ns(60_000), 2.0)];
+        let plain = TestSource::new()
+            .with_series(&[("__name__", "m")], raw)
+            .expect("series");
+        let expected = Evaluator::new()
+            .instant(&plain, "count_over_time(m[5m])", 60_000)
+            .expect("plain evaluates");
+
+        let source = MockSource::new(
+            TestSource::new()
+                .with_series(&[("__name__", "m")], raw)
+                .expect("series"),
+            Precomputed::Err,
+        );
+        let got = Evaluator::new()
+            .instant(&source, "count_over_time(m[5m])", 60_000)
+            .expect("error must not fail the query");
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].value, expected[0].value);
+        assert_eq!(got[0].labels, expected[0].labels);
+        assert!(
+            source.query_calls.load(Ordering::Relaxed) >= 1,
+            "error falls back to raw fetch"
+        );
+    }
+
+    #[test]
+    fn default_source_with_no_override_counts_normally() {
+        // Regression: a source that never overrides `query_precomputed_count`
+        // (default `Ok(None)`) counts exactly as before this mechanism existed.
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "m")],
+                &[(ms_ns(0), 1.0), (ms_ns(30_000), 2.0), (ms_ns(60_000), 3.0)],
+            )
+            .expect("series");
+        let got = Evaluator::new()
+            .instant(&source, "count_over_time(m[5m])", 60_000)
+            .expect("evaluates");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].value, 3.0);
     }
 
     #[test]
