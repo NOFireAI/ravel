@@ -255,7 +255,30 @@ pub async fn handle_export_logs(
         .router
         .write(tenant.clone(), records, mode, state.ack_deadline)
         .await
-        .map_err(LogIngestRequestError::Write)?;
+        .map_err(|err| {
+            // A PartialWrite's durable siblings are real, durably committed
+            // data (docs/consistency-model.md "Opt-in client idempotency
+            // key"). OTLP has no error-response channel to hand their tokens
+            // back to the client (unlike ravel-cli's `load`, which reports
+            // them via LoadError::Flush), and no idempotency marker is
+            // written for them either: the marker replay path always reports
+            // the original commit token with zero rejections, so marking a
+            // partial commit as the request's receipt would make the next
+            // retry skip resending the shard that never committed and
+            // permanently lose it, rather than the honest at-least-once
+            // duplication an unkeyed retry gets today (issue #460). Logging
+            // the count is the only recovery this path offers.
+            let durable_shard_count = err.durable_tokens().len();
+            if durable_shard_count > 0 {
+                tracing::warn!(
+                    durable_shard_count,
+                    "log write partially committed before a sibling shard \
+                     failed; no idempotency marker written for the durable \
+                     siblings"
+                );
+            }
+            LogIngestRequestError::Write(err)
+        })?;
 
     let partial_success = if rejected_count > 0 {
         let error_message = build_error_message(&normalized.rejected, stream_cap_rejected);
@@ -684,6 +707,211 @@ mod tests {
         assert!(
             message.contains("more distinct rejection reason(s) omitted"),
             "expected a truncation indicator, got: {message}"
+        );
+    }
+
+    /// A minimal `tracing_subscriber::Layer` that records every WARN event
+    /// carrying a `durable_shard_count` field, so the next test can prove
+    /// issue #460's log line fires (and only fires) on a genuine partial
+    /// write, without depending on stdout capture.
+    #[derive(Default, Clone)]
+    struct DurableShardCountCapture(Arc<parking_lot::Mutex<Vec<u64>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for DurableShardCountCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Visitor(Option<u64>);
+            impl tracing::field::Visit for Visitor {
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    if field.name() == "durable_shard_count" {
+                        self.0 = Some(value);
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    _value: &dyn std::fmt::Debug,
+                ) {
+                }
+            }
+            let mut visitor = Visitor(None);
+            event.record(&mut visitor);
+            if let Some(count) = visitor.0 {
+                self.0.lock().push(count);
+            }
+        }
+    }
+
+    /// First resource-attribute set (by an incrementing `host` label) whose
+    /// OTLP-normalized `stream_id` routes to `want_shard`, matching exactly
+    /// what [`ravel_otlp::logs_normalize::normalize_logs`] computes (empty
+    /// scope name/version/attrs, since these fixtures never set `scope`).
+    fn resource_attrs_for_shard(want_shard: u32, shard_count: u32) -> Vec<KeyValue> {
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+        for i in 0..100_000u32 {
+            let host = i.to_string();
+            let attrs = vec![
+                (
+                    "service.name".to_string(),
+                    AttrValue::Str("api".to_string()),
+                ),
+                ("host".to_string(), AttrValue::Str(host.clone())),
+            ];
+            let stream_id = log_stream_id(&attrs, "", "", &[]);
+            if ravel_types::shard_for_log(&stream_id, shard_count) == want_shard {
+                return vec![string_kv("service.name", "api"), string_kv("host", &host)];
+            }
+        }
+        panic!("no host found for shard {want_shard} of {shard_count}");
+    }
+
+    fn state_with_store(shard_count: u32, store: Arc<dyn ObjectStoreBackend>) -> LogIngestState {
+        let router = Arc::new(LogIngestRouter::new(
+            IngestConfig {
+                shard_count,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            Arc::new(SystemClock),
+        ));
+        LogIngestState {
+            router,
+            limits: LogIngestLimits::default(),
+            ack_deadline: Duration::from_secs(5),
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            store,
+            recovery: None,
+            provisioning: None,
+        }
+    }
+
+    /// Issue #460: a multi-shard Strict OTLP write where one shard's flush is
+    /// permanently abandoned while a sibling commits durably in the same
+    /// call must (a) log the recovered durable-shard count for operators,
+    /// since OTLP has no error-response channel to hand the caller the
+    /// tokens `LogWriteError::durable_tokens` recovers, and (b) still write
+    /// no idempotency marker even though a key was supplied and part of the
+    /// write did commit durably -- a marker here would make the next retry
+    /// believe the whole request (including the shard that never committed)
+    /// already landed, permanently losing it.
+    ///
+    /// Non-vacuity: before this fix, `map_err(LogIngestRequestError::Write)`
+    /// discarded the error's durable tokens with no side effect, so this
+    /// test's `assert_eq!(captured.lock().as_slice(), &[1])` fails against
+    /// that code (the capture stays empty) even though the marker-absence
+    /// assertion alone would pass either way.
+    #[tokio::test]
+    async fn partial_write_logs_durable_count_and_writes_no_marker() {
+        use ravel_object_store::fault::{
+            FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let shard_count = 2;
+        // Shard 0's data-object PUT fails permanently; shard 1's must survive.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+            )
+            .with_key_contains("/l0/0000/")
+            .with_occurrence(Occurrence::Always),
+        );
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let state = state_with_store(shard_count, store);
+
+        let victim_resource = resource_attrs_for_shard(0, shard_count);
+        let survivor_resource = resource_attrs_for_shard(1, shard_count);
+        assert_ne!(
+            victim_resource, survivor_resource,
+            "the fixture must span two distinct shards"
+        );
+        let otlp_request = ExportLogsServiceRequest {
+            resource_logs: vec![
+                ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: victim_resource,
+                        ..Default::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        log_records: vec![record("victim", Vec::new())],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: survivor_resource,
+                        ..Default::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        log_records: vec![record("survivor", Vec::new())],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let captured: Arc<parking_lot::Mutex<Vec<u64>>> = Arc::default();
+        let subscriber =
+            tracing_subscriber::registry().with(DurableShardCountCapture(captured.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let key = b"idem-460".to_vec();
+        let err = handle_export_logs(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            otlp_request,
+            BASE_TS_NS,
+            Some(key.clone()),
+        )
+        .await
+        .expect_err("shard 0's flush was permanently abandoned");
+
+        let LogIngestRequestError::Write(write_err) = &err else {
+            panic!("expected a Write error, got {err:?}");
+        };
+        assert_eq!(
+            write_err.durable_tokens().len(),
+            1,
+            "exactly the surviving shard's token is recoverable, got {write_err:?}"
+        );
+
+        assert_eq!(
+            captured.lock().as_slice(),
+            &[1u64],
+            "the warn line must fire exactly once, reporting exactly one durable shard"
+        );
+
+        let bucket = request_ingest_hour_bucket(BASE_TS_NS).expect("valid ingest ts");
+        let lookup = read_marker(
+            state.store.as_ref(),
+            &TenantId::new("acme"),
+            Signal::Logs,
+            &key,
+            bucket,
+            DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
+        )
+        .await
+        .expect("marker lookup itself must not error");
+        assert!(
+            matches!(lookup, LookupOutcome::Miss),
+            "a partial commit must not write an idempotency marker, got {lookup:?}"
         );
     }
 }

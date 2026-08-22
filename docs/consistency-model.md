@@ -186,9 +186,19 @@ data PUT -> commit PUT -> marker PUT (CreateIfAbsent) -> ack
 
 The marker records the original request's written row/span count and its
 `x-ravel-commit-token` header value verbatim. A marker is written only for a
-request that produced a durable commit (strict mode with at least one flushed
-shard); buffered-mode and fully-rejected requests commit no durable data and
-write no marker.
+request whose *every* shard committed durably; buffered-mode and
+fully-rejected requests commit no durable data and write no marker. A
+multi-shard request where some but not all shards committed
+(`LogWriteError::PartialWrite`, issue #296) also writes no marker, even
+though it did produce a partial durable commit: a hit on this marker's
+replay path reports the original commit token with zero rejections, so
+marking a partial commit as the request's receipt would make the next retry
+skip resending the shard that never committed, permanently losing its
+records instead of the honest at-least-once duplication an unkeyed retry
+gets today. The recovered tokens for the durable siblings are not returned
+to the OTLP client (the protocol has no error-response channel for them,
+unlike the CLI's `load` path, which does report them); the gateway logs
+them at `warn` for operators instead (issue #460).
 
 **Replay contract.** A retry that supplies the same key first consults the
 marker (one prefix LIST over the dedup window, default 24 h, shared with
