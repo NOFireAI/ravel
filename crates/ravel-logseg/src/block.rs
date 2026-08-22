@@ -11,8 +11,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::encoding::{
-    Enc, decode_bitmap, decode_f64, decode_fixed, decode_i64, decode_strings, encode_bitmap,
-    encode_f64, encode_fixed, encode_i64, encode_strings,
+    DecodedStrings, Enc, decode_bitmap, decode_f64, decode_fixed, decode_i64,
+    decode_strings_columnar, encode_bitmap, encode_f64, encode_fixed, encode_i64, encode_strings,
 };
 use crate::error::LogSegError;
 use crate::page::{PageDesc, read_page, write_page};
@@ -451,6 +451,45 @@ fn winner_value(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
         .map(|(_, v)| v)
 }
 
+/// A decoded string column, kept in whichever shape its page carried
+/// (ADR-0099 decision 4). A dictionary page keeps its distinct set and per-row
+/// ids instead of materializing one owned `Vec<u8>` per row; a plain page keeps
+/// the per-row values. Both are addressed by block row position and carry
+/// presence separately: an absent row reads `None` either way.
+enum StrColumn {
+    /// Per-row values, `None` for an absent row. What a plain page decodes to.
+    Plain(Vec<Option<Vec<u8>>>),
+    /// The distinct values plus one id per block row: `Some(id)` indexes `dict`,
+    /// `None` marks an absent row (the presence bitmap, kept out of the id
+    /// vector rather than folded in as a sentinel). Every `Some(id)` is
+    /// `< dict.len()`, validated at decode.
+    Dict {
+        dict: Vec<Vec<u8>>,
+        ids: Vec<Option<u32>>,
+    },
+}
+
+/// The borrowed dictionary form of a string column: the distinct values and
+/// one id per block row (`None` for an absent row). Returned by
+/// [`DecodedBlock::str_dict`] for the columnar view to build an Arrow
+/// dictionary array from.
+type StrDictRef<'a> = (&'a [Vec<u8>], &'a [Option<u32>]);
+
+impl StrColumn {
+    /// The bytes at block row `row`, or `None` when the row is absent (or out of
+    /// range). Both shapes read identically here, which is what lets the storage
+    /// shape stay invisible above [`DecodedBlock`].
+    fn cell(&self, row: usize) -> Option<&[u8]> {
+        match self {
+            StrColumn::Plain(v) => v.get(row)?.as_deref(),
+            StrColumn::Dict { dict, ids } => {
+                let id = (*ids.get(row)?)? as usize;
+                dict.get(id).map(Vec::as_slice)
+            }
+        }
+    }
+}
+
 /// A decoded block: per-column, per-row values. Every column vector has length
 /// `record_count`; `None` marks a row where the column has no value.
 ///
@@ -465,7 +504,7 @@ pub struct DecodedBlock {
     i64_cols: HashMap<u32, Vec<Option<i64>>>,
     f64_cols: HashMap<u32, Vec<Option<u64>>>,
     bool_cols: HashMap<u32, Vec<Option<bool>>>,
-    str_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
+    str_cols: HashMap<u32, StrColumn>,
     fixed_cols: HashMap<u32, Vec<Option<Vec<u8>>>>,
     /// Whether any page descriptor in this block named [`COL_ATTRS_RAW`], read
     /// off the header and independent of the column filter (see
@@ -531,12 +570,32 @@ impl DecodedBlock {
         for v in self.bool_cols.values() {
             total += v.capacity() * std::mem::size_of::<Option<bool>>();
         }
-        for cols in [&self.str_cols, &self.fixed_cols] {
-            for v in cols.values() {
-                total += v.capacity() * std::mem::size_of::<Option<Vec<u8>>>();
-                for cell in v.iter().flatten() {
-                    total += cell.capacity();
+        // A dictionary-form string column holds its distinct values once plus a
+        // narrow id per row, not one owned buffer per row: charging it as though
+        // every row still owned a `Vec<u8>` would over-report by the
+        // deduplication factor and make `ravel-sql` charge its pool for memory
+        // that no longer exists (ADR-0099 decision 4).
+        for col in self.str_cols.values() {
+            match col {
+                StrColumn::Plain(v) => {
+                    total += v.capacity() * std::mem::size_of::<Option<Vec<u8>>>();
+                    for cell in v.iter().flatten() {
+                        total += cell.capacity();
+                    }
                 }
+                StrColumn::Dict { dict, ids } => {
+                    total += ids.capacity() * std::mem::size_of::<Option<u32>>();
+                    total += dict.capacity() * std::mem::size_of::<Vec<u8>>();
+                    for entry in dict {
+                        total += entry.capacity();
+                    }
+                }
+            }
+        }
+        for v in self.fixed_cols.values() {
+            total += v.capacity() * std::mem::size_of::<Option<Vec<u8>>>();
+            for cell in v.iter().flatten() {
+                total += cell.capacity();
             }
         }
         total
@@ -550,11 +609,41 @@ impl DecodedBlock {
     pub fn bool_col(&self, column_id: u32) -> Option<&[Option<bool>]> {
         self.bool_cols.get(&column_id).map(Vec::as_slice)
     }
-    pub fn str_col(&self, column_id: u32) -> Option<&[Option<Vec<u8>>]> {
-        self.str_cols.get(&column_id).map(Vec::as_slice)
+
+    /// The bytes of string column `column_id` at block row `row`, or `None` when
+    /// the column is absent (or projected away) or the row has no value. Both
+    /// the plain and dictionary storage shapes read through here, so a caller
+    /// never learns which one the column is (ADR-0099 decision 4).
+    pub(crate) fn str_at(&self, column_id: u32, row: usize) -> Option<&[u8]> {
+        self.str_cols.get(&column_id)?.cell(row)
     }
+
+    /// The dictionary form of string column `column_id`: its distinct values and
+    /// one id per block row (`None` for an absent row). `None` when the column is
+    /// absent, projected away, or stored in plain form -- a plain page is read
+    /// through [`Self::str_at`], never forced into a dictionary here.
+    pub(crate) fn str_dict(&self, column_id: u32) -> Option<StrDictRef<'_>> {
+        match self.str_cols.get(&column_id)? {
+            StrColumn::Dict { dict, ids } => Some((dict, ids)),
+            StrColumn::Plain(_) => None,
+        }
+    }
+
     pub fn fixed_col(&self, column_id: u32) -> Option<&[Option<Vec<u8>>]> {
         self.fixed_cols.get(&column_id).map(Vec::as_slice)
+    }
+
+    /// Test-only fused view of a string column, `None` when the column is absent.
+    /// Rebuilds the pre-ADR-0099 `Vec<Option<Vec<u8>>>` shape so existing
+    /// assertions read unchanged regardless of the storage shape.
+    #[cfg(test)]
+    fn str_col_fused(&self, column_id: u32) -> Option<Vec<Option<Vec<u8>>>> {
+        let _ = self.str_cols.get(&column_id)?;
+        Some(
+            (0..self.record_count)
+                .map(|row| self.str_at(column_id, row).map(<[u8]>::to_vec))
+                .collect(),
+        )
     }
 }
 
@@ -809,8 +898,18 @@ pub fn read_block_columns(
                 out.bool_cols.insert(column_id, scatter(&present, vals)?);
             }
             ColKind::Str => {
-                let vals = decode_strings(enc, encoded, present_count)?;
-                out.str_cols.insert(column_id, scatter(&present, vals)?);
+                // Presence is applied by scattering against the block's presence
+                // bitmap; the page's ids are per present row, so an absent row
+                // gets a `None` slot rather than a sentinel id (ADR-0099
+                // decision 4). A dict page keeps its distinct set intact.
+                let col = match decode_strings_columnar(enc, encoded, present_count)? {
+                    DecodedStrings::Plain(vals) => StrColumn::Plain(scatter(&present, vals)?),
+                    DecodedStrings::Dict { dict, ids } => StrColumn::Dict {
+                        dict,
+                        ids: scatter(&present, ids)?,
+                    },
+                };
+                out.str_cols.insert(column_id, col);
             }
             ColKind::Fixed(width) => {
                 let vals = decode_fixed(enc, encoded, present_count, width)?;
@@ -894,7 +993,7 @@ mod tests {
         for (i, v) in ts.iter().enumerate() {
             assert_eq!(*v, Some(1000 + i as i64));
         }
-        let body = dec.str_col(COL_BODY).expect("body");
+        let body = dec.str_col_fused(COL_BODY).expect("body");
         assert_eq!(body[7], Some(b"body 1007".to_vec()));
 
         // Dynamic presence.
@@ -906,7 +1005,7 @@ mod tests {
                 assert_eq!(*v, None);
             }
         }
-        let c11 = dec.str_col(11).expect("c11");
+        let c11 = dec.str_col_fused(11).expect("c11");
         assert_eq!(c11[10], Some(b"s10".to_vec()));
         assert_eq!(c11[60], None);
 
@@ -1161,12 +1260,12 @@ mod tests {
 
         // Kept columns decode identically to the unfiltered decode.
         assert_eq!(projected.i64_col(COL_TS), all.i64_col(COL_TS));
-        assert_eq!(projected.str_col(11), all.str_col(11));
-        assert_eq!(projected.str_col(17), all.str_col(17));
+        assert_eq!(projected.str_col_fused(11), all.str_col_fused(11));
+        assert_eq!(projected.str_col_fused(17), all.str_col_fused(17));
         // Excluded columns are absent, including fixed ones.
-        assert!(projected.str_col(12).is_none());
-        assert!(projected.str_col(COL_BODY).is_none());
-        assert!(all.str_col(COL_BODY).is_some());
+        assert!(projected.str_col_fused(12).is_none());
+        assert!(projected.str_col_fused(COL_BODY).is_none());
+        assert!(all.str_col_fused(COL_BODY).is_some());
     }
 
     /// A filter never weakens the integrity checks: the block crc still covers
@@ -1192,6 +1291,62 @@ mod tests {
             read_block_columns(&bad, out.crc32c, &plans, 1 << 30, Some(&keep)),
             Err(LogSegError::Corrupted(_))
         ));
+    }
+
+    /// `decoded_heap_bytes` charges a dictionary-form string column its true
+    /// footprint -- the distinct set once plus a narrow id per row -- not one
+    /// owned `Vec<u8>` per row (ADR-0099 decision 4, deliverable 4). Pinned
+    /// against a column of known distinct count so a regression to the fused
+    /// figure (which would over-report by the deduplication factor) fails here.
+    #[test]
+    fn dict_decoded_heap_bytes_reports_dictionary_footprint() {
+        const N: usize = 100;
+        const DISTINCT: usize = 4;
+        const LEN: usize = 5;
+        let dict_vals: [&[u8]; DISTINCT] = [b"aaaaa", b"bbbbb", b"ccccc", b"ddddd"];
+
+        let plans = vec![ColumnPlan {
+            column_id: 10,
+            ty: FieldType::Str,
+        }];
+        let mut rows = Vec::new();
+        for i in 0..N {
+            let mut r = row(0, i as i64);
+            r.columns
+                .push((10, ColumnValue::Str(dict_vals[i % DISTINCT].to_vec())));
+            rows.push(r);
+        }
+        let out = write_block(&rows, &plans, 3).expect("write");
+
+        // Decode only column 10 so the figure is exactly that one column's.
+        let keep: HashSet<u32> = HashSet::from([10]);
+        let dec =
+            read_block_columns(&out.bytes, out.crc32c, &plans, 1 << 30, Some(&keep)).expect("read");
+
+        // The column dictionary-encoded (4 distinct of 100) and is kept intact.
+        let (dict, ids) = dec.str_dict(10).expect("column 10 is a dictionary page");
+        assert_eq!(dict.len(), DISTINCT);
+        assert_eq!(ids.len(), N);
+
+        let opt_u32 = std::mem::size_of::<Option<u32>>();
+        let vec_spine = std::mem::size_of::<Vec<u8>>();
+        let opt_vec = std::mem::size_of::<Option<Vec<u8>>>();
+
+        // New (dict) footprint: one id per row + the distinct set once.
+        let dict_figure = N * opt_u32 + DISTINCT * vec_spine + DISTINCT * LEN;
+        assert_eq!(
+            dec.decoded_heap_bytes(),
+            dict_figure,
+            "decoded_heap_bytes must report the dictionary footprint"
+        );
+
+        // Old (fused) footprint the code must no longer report: one owned buffer
+        // per row. On this 64-bit host dict_figure=916, fused_figure=2900.
+        let fused_figure = N * opt_vec + N * LEN;
+        assert!(
+            dict_figure < fused_figure,
+            "the dictionary form must be smaller: dict={dict_figure}, fused={fused_figure}"
+        );
     }
 
     #[test]
