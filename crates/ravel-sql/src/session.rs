@@ -78,6 +78,7 @@
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -428,6 +429,16 @@ pub fn build_session(
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(Arc::new(EmptyObjectStoreRegistry))
+        // ADR-0102 decision 3: disable spill so a query over the memory budget
+        // fails as a typed `ResourcesExhausted` error instead of silently
+        // spilling to local disk (which ADR-0013 forbids: budget exhaustion is
+        // an error, never a partial result, and no durability may depend on
+        // local disk). Without this the disk manager defaults to
+        // `OsTmpDirectory` with a 100 GB ceiling and routes around the pool's
+        // `try_grow` enforcement.
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
         .build_arc()?;
 
     let mut ctx =
