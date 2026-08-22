@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::cache::{CompactionRecordCache, HeadCache, PartCache, PostingsCache, RecordCache};
 use crate::config::CatalogConfig;
 use crate::error::CatalogError;
+use crate::provisioning::ShardGeneration;
 use crate::snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
@@ -664,7 +665,7 @@ impl Catalog {
     ) -> Result<Snapshot, CatalogError> {
         self.resolve_impl(tenant, signal, range, min_tokens, now_ns, None, accounting)
             .await
-            .map(|(snapshot, _origins)| snapshot)
+            .map(|(snapshot, _origins, _generations)| snapshot)
     }
 
     /// Like [`Catalog::resolve`], but applies postings-based segment pruning
@@ -729,7 +730,7 @@ impl Catalog {
             accounting,
         )
         .await
-        .map(|(snapshot, _origins)| snapshot)
+        .map(|(snapshot, _origins, _generations)| snapshot)
     }
 
     /// Like [`Catalog::resolve_pruned_with_accounting`], but also returns the
@@ -763,6 +764,55 @@ impl Catalog {
             accounting,
         )
         .await
+        .map(|(snapshot, origins, _generations)| (snapshot, origins))
+    }
+
+    /// Like [`Catalog::resolve_pruned_with_admission`], but also returns the
+    /// shard-generation history **this resolve itself** computed its scan set
+    /// from (ADR-0052 section 4), for the ADR-0103 pushdown eligibility gate.
+    ///
+    /// The gate (`ravel_query::distrib::pushdown::is_pushdown_eligible`) asks
+    /// whether every resolved segment's ingest hour sits inside one
+    /// generation's stable interval. ADR-0103 decision 1(b) requires it to read
+    /// the same history object the resolve used, never a second store read or a
+    /// separately-cached copy: a generation appended between the two reads would
+    /// otherwise be invisible to the gate while its segments are already
+    /// visible in the resolved set, and the gate would call a
+    /// generation-straddling query eligible. Returning the history the resolve
+    /// already read makes that skew structurally impossible, and costs no
+    /// additional request (`read_scan_generations` runs once per resolve
+    /// regardless).
+    ///
+    /// When head validation performed its one-shot record re-read, the returned
+    /// history is the *revalidated* one -- the same one the listing suffix
+    /// scanned under, and never staler than the one that validated the head.
+    ///
+    /// A separate method rather than a changed
+    /// `resolve_pruned_with_admission` signature, for the same reason each
+    /// `resolve*` variant above is separate: every existing call site
+    /// (`ravel-sql`'s executor, `ravel-query`'s admission seam) stays exactly
+    /// as it was.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_pruned_with_generations(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+    ) -> Result<(Snapshot, SegmentOrigins, Vec<ShardGeneration>), CatalogError> {
+        self.resolve_impl(
+            tenant,
+            signal,
+            range,
+            min_tokens,
+            now_ns,
+            name_filter,
+            accounting,
+        )
+        .await
     }
 
     /// Instruments the whole LIST/GET fan-out with the `catalog_resolve` span
@@ -785,7 +835,7 @@ impl Catalog {
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<(Snapshot, SegmentOrigins), CatalogError> {
+    ) -> Result<(Snapshot, SegmentOrigins, Vec<ShardGeneration>), CatalogError> {
         // Idle-tenant eviction last-touch (ADR-0069 decision 2):
         // stamp this tenant's activity with the caller's injected `now_ns`
         // before the fan-out. Every resolve entry point funnels through here,
@@ -831,7 +881,7 @@ impl Catalog {
                 .total_s3_bytes()
                 .saturating_sub(before.total_s3_bytes()),
         );
-        if let Ok((snapshot, _origins)) = &result {
+        if let Ok((snapshot, _origins, _generations)) = &result {
             span.record("segments_pruned", snapshot.segments_pruned);
         }
         result
@@ -847,7 +897,7 @@ impl Catalog {
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<(Snapshot, SegmentOrigins), CatalogError> {
+    ) -> Result<(Snapshot, SegmentOrigins, Vec<ShardGeneration>), CatalogError> {
         // Durable shard_count enforcement on the read path (ADR-0050 section 5): fail before the `0..shard_count` listing loop below if this
         // catalog's configured shard_count disagrees with the (tenant, signal)'s
         // provisioning record, so a lower value never silently drops the shards
@@ -871,7 +921,14 @@ impl Catalog {
         // knowable -- routed to the prefix path when the per-bucket estimate
         // would be expensive, and capped at runtime by real LIST count if the
         // prefix scan itself turns out to be too large.
-        let generations = self.read_scan_generations(tenant, signal).await?;
+        //
+        // Mutable, and returned to the caller at the end of this function: the
+        // head-revalidation path below can replace it with a fresher read, and
+        // ADR-0103's pushdown eligibility gate must see the very history this
+        // resolve computed its scan set from, not a later independent read (a
+        // generation appended between the two reads would be invisible to the
+        // gate while already visible in the resolved segments).
+        let mut generations = self.read_scan_generations(tenant, signal).await?;
 
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
         let mut segments_pruned = 0u64;
@@ -914,7 +971,9 @@ impl Catalog {
             // computation below too. Otherwise the listing suffix would scan
             // the stale, narrower range the re-read exists to correct, silently
             // omitting data that landed in a wider generation's shards.
-            let generations = revalidated_generations.unwrap_or(generations);
+            if let Some(revalidated) = revalidated_generations {
+                generations = revalidated;
+            }
             let listing_start_hour = match &window {
                 Some(window) if window.watermark_hour >= window_start_hour => {
                     let snapshot_end_hour = window_end_hour.min(window.watermark_hour);
@@ -1100,6 +1159,7 @@ impl Catalog {
                 pending_erasure,
             },
             origins,
+            generations,
         ))
     }
 

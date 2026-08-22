@@ -18,9 +18,11 @@ pub mod client;
 pub mod codec;
 pub mod federation;
 pub mod partition;
+pub mod pushdown;
 pub mod service;
 
 pub use federation::{DEFAULT_REMOTE_SOFT_TIMEOUT, Federation, FederationOutcome, RemoteCluster};
+pub use pushdown::{all_hours_in_one_stable_generation, is_pushdown_eligible};
 
 #[cfg(test)]
 mod tests;
