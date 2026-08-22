@@ -1542,81 +1542,85 @@ fn build_declared_str_columnar(
     cache: &mut HashMap<u32, Arc<Vec<(String, AttrValue)>>>,
 ) -> DFResult<ArrayRef> {
     let n = end - start;
-    Ok(match plan.matching.and_then(|mc| view.str_dict(mc.column_id)) {
-        Some(col) => {
-            // Dictionary values start as the page's distinct byte values,
-            // decoded to UTF-8; a non-UTF-8 entry becomes a NULL value. Ids
-            // address these in the page's order, so a record row's page id maps
-            // straight to a dictionary index. Resource/scope fallback values are
-            // appended past the page dict.
-            let mut values = StringBuilder::new();
-            for v in col.dict() {
-                match std::str::from_utf8(v) {
-                    Ok(s) => values.append_value(s),
-                    Err(_) => values.append_null(),
-                }
-            }
-            let mut next_extra = i32::try_from(col.dict().len()).map_err(|_| {
-                DataFusionError::Internal("declared Str dictionary exceeds i32 keys".into())
-            })?;
-            let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
-            for i in start..end {
-                if plan.all_cols.iter().any(|&c| attr_present(view, c, i)) {
-                    // Record wins. `id_at` is `Some` only when the record's
-                    // `Str` column has a value at this row; `None` (record set
-                    // the key in another-typed column) is a NULL cell. An `id`
-                    // pointing at a non-UTF-8 (NULL) dictionary value also reads
-                    // NULL, matching `read_str_cell`.
-                    match col.id_at(i) {
-                        Some(id) => keys.push(Some(i32::try_from(id).map_err(|_| {
-                            DataFusionError::Internal("declared Str dictionary id exceeds i32".into())
-                        })?)),
-                        None => keys.push(None),
+    Ok(
+        match plan.matching.and_then(|mc| view.str_dict(mc.column_id)) {
+            Some(col) => {
+                // Dictionary values start as the page's distinct byte values,
+                // decoded to UTF-8; a non-UTF-8 entry becomes a NULL value. Ids
+                // address these in the page's order, so a record row's page id maps
+                // straight to a dictionary index. Resource/scope fallback values are
+                // appended past the page dict.
+                let mut values = StringBuilder::new();
+                for v in col.dict() {
+                    match std::str::from_utf8(v) {
+                        Ok(s) => values.append_value(s),
+                        Err(_) => values.append_null(),
                     }
-                } else if let Some(stream_ref) = view.stream_ref(i) {
-                    let resource = resource_attrs(view, cache, stream_ref)?;
-                    match find_attr(resource, &plan.dc.key) {
+                }
+                let mut next_extra = i32::try_from(col.dict().len()).map_err(|_| {
+                    DataFusionError::Internal("declared Str dictionary exceeds i32 keys".into())
+                })?;
+                let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
+                for i in start..end {
+                    if plan.all_cols.iter().any(|&c| attr_present(view, c, i)) {
+                        // Record wins. `id_at` is `Some` only when the record's
+                        // `Str` column has a value at this row; `None` (record set
+                        // the key in another-typed column) is a NULL cell. An `id`
+                        // pointing at a non-UTF-8 (NULL) dictionary value also reads
+                        // NULL, matching `read_str_cell`.
+                        match col.id_at(i) {
+                            Some(id) => keys.push(Some(i32::try_from(id).map_err(|_| {
+                                DataFusionError::Internal(
+                                    "declared Str dictionary id exceeds i32".into(),
+                                )
+                            })?)),
+                            None => keys.push(None),
+                        }
+                    } else if let Some(stream_ref) = view.stream_ref(i) {
+                        let resource = resource_attrs(view, cache, stream_ref)?;
+                        match find_attr(resource, &plan.dc.key) {
+                            Some(AttrValue::Str(s)) => {
+                                values.append_value(s);
+                                keys.push(Some(next_extra));
+                                next_extra += 1;
+                            }
+                            _ => keys.push(None),
+                        }
+                    } else {
+                        keys.push(None);
+                    }
+                }
+                let dict = DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(keys),
+                    Arc::new(values.finish()),
+                )
+                .map_err(DataFusionError::from)?;
+                Arc::new(dict)
+            }
+            None => {
+                // Identity dictionary: one entry per non-null row, no dedup.
+                let mut values = StringBuilder::new();
+                let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
+                let mut next = 0i32;
+                for i in start..end {
+                    match declared_merged_value(view, plan, i, cache)? {
                         Some(AttrValue::Str(s)) => {
-                            values.append_value(s);
-                            keys.push(Some(next_extra));
-                            next_extra += 1;
+                            values.append_value(&s);
+                            keys.push(Some(next));
+                            next += 1;
                         }
                         _ => keys.push(None),
                     }
-                } else {
-                    keys.push(None);
                 }
+                let dict = DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(keys),
+                    Arc::new(values.finish()),
+                )
+                .map_err(DataFusionError::from)?;
+                Arc::new(dict)
             }
-            let dict = DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(keys),
-                Arc::new(values.finish()),
-            )
-            .map_err(DataFusionError::from)?;
-            Arc::new(dict)
-        }
-        None => {
-            // Identity dictionary: one entry per non-null row, no dedup.
-            let mut values = StringBuilder::new();
-            let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
-            let mut next = 0i32;
-            for i in start..end {
-                match declared_merged_value(view, plan, i, cache)? {
-                    Some(AttrValue::Str(s)) => {
-                        values.append_value(&s);
-                        keys.push(Some(next));
-                        next += 1;
-                    }
-                    _ => keys.push(None),
-                }
-            }
-            let dict = DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(keys),
-                Arc::new(values.finish()),
-            )
-            .map_err(DataFusionError::from)?;
-            Arc::new(dict)
-        }
-    })
+        },
+    )
 }
 
 /// A UTF-8 log field (`body`, `severity_text`) read from the view; a violation

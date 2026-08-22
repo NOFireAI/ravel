@@ -266,7 +266,10 @@ async fn declared_columns_project_as_native_typed_arrays_null_on_mismatch() {
 
     // Row 1 (ts=2): every value is the wrong variant -> NULL, never a cast.
     assert!(dur.is_null(1), "a Str under an i64 column must read NULL");
-    assert!(name[1].is_none(), "an I64 under a str column must read NULL");
+    assert!(
+        name[1].is_none(),
+        "an I64 under a str column must read NULL"
+    );
     assert!(ok.is_null(1), "a Str under a bool column must read NULL");
     assert!(
         blob.is_null(1),

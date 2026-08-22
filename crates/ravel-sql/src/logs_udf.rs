@@ -87,11 +87,15 @@ pub(crate) fn has_word_impl(args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
     // by key, so a column with few distinct values costs far less than one
     // match per row (the shape #479's LIKE pushdown builds on).
     if let Some(dict) = text.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
-        let values = dict.values().as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            DataFusionError::Execution(
-                "has_word() dictionary column must have Utf8 values".into(),
-            )
-        })?;
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "has_word() dictionary column must have Utf8 values".into(),
+                )
+            })?;
         let per_value: Vec<bool> = (0..values.len())
             .map(|k| !values.is_null(k) && phrase_match(values.value(k), &word))
             .collect();

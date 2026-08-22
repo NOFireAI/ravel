@@ -1226,8 +1226,14 @@ async fn dict_page_and_plain_page_both_read_correct_values() {
             Vec::new(),
         )
         .await;
-        assert!(fast.columnar_batches > 0, "fast path must have run for {key}");
-        assert_eq!(fast.rowpath_batches, 0, "fast path must not fall back for {key}");
+        assert!(
+            fast.columnar_batches > 0,
+            "fast path must have run for {key}"
+        );
+        assert_eq!(
+            fast.rowpath_batches, 0,
+            "fast path must not fall back for {key}"
+        );
 
         let mut want: Vec<Vec<Cell>> = recs
             .iter()

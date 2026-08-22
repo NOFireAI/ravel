@@ -1613,9 +1613,7 @@ mod flight_wire {
 
     /// Decode a `DoGet` response into its total row count and, per column, the
     /// name and the `Debug` form of the wire `DataType`.
-    async fn decode_schema(
-        stream: tonic::Streaming<FlightData>,
-    ) -> (usize, Vec<(String, String)>) {
+    async fn decode_schema(stream: tonic::Streaming<FlightData>) -> (usize, Vec<(String, String)>) {
         let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
             stream.map_err(|status| arrow_flight::error::FlightError::Tonic(Box::new(status))),
         )
@@ -1630,9 +1628,7 @@ mod flight_wire {
                     .schema()
                     .fields()
                     .iter()
-                    .map(|field| {
-                        (field.name().clone(), format!("{:?}", field.data_type()))
-                    })
+                    .map(|field| (field.name().clone(), format!("{:?}", field.data_type())))
                     .collect()
             })
             .unwrap_or_default();
