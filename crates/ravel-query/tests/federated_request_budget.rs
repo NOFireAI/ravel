@@ -51,6 +51,7 @@ impl SliceFetcher for FixedCostFetcher {
         Ok(SliceResponse {
             scalar: Vec::new(),
             histogram: Vec::new(),
+            partials: Vec::new(),
             accounting,
             stats: Default::default(),
             series_returned: 0,

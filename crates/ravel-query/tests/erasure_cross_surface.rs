@@ -639,6 +639,7 @@ fn ok_response(scalar: Vec<FetchedSeriesSoa>) -> SliceResponse {
     SliceResponse {
         scalar,
         histogram: Vec::new(),
+        partials: Vec::new(),
         accounting: QueryAccountingSnapshot::default(),
         stats: FetchStats::default(),
         series_returned,

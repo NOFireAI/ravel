@@ -42,8 +42,9 @@ pub enum DistribError {
     /// The remote streamed a frame kind this decoder's call site cannot
     /// consume: a per-signal record frame (a log record or a span) for a signal
     /// this coordinator's metrics fetch path does not handle, or a
-    /// `PartialAggregate` (ADR-0103 decision 2), which no coordinator consumes
-    /// yet because no encoder call site sends one.
+    /// `PartialAggregate` (ADR-0103 decision 2) on a log or span slice, where a
+    /// worker-computed scalar aggregate is never expected (the metrics decoder
+    /// does consume it).
     /// Unreachable from a real query today: the metrics coordinator only ever
     /// dispatches `Signal::Metrics`, and the log/span coordinators that would
     /// receive these frames are built by #284/#285. The `frame` oneof is
@@ -69,6 +70,14 @@ pub struct SliceResponse {
     /// (ADR-0096 decision 3 step 4). Post-erasure (the worker applied the
     /// request's predicates). Only meaningful when `status` is `Ok`.
     pub histogram: Vec<FetchedHistogramSeries>,
+    /// Decoded worker-computed partial aggregates, one per series the worker
+    /// held (ADR-0103 decision 2). Non-empty only for a slice whose request
+    /// carried a `partial_aggregate`, and mutually exclusive with `scalar` on
+    /// such a slice: a worker returns all partials or all raw frames, never a
+    /// mix. Nothing combines these into a query result yet -- the
+    /// coordinator-side combine and the planner integration are the next task,
+    /// so today's callers of [`decode_slice_frames`] ignore this field.
+    pub partials: Vec<codec::PartialAggregate>,
     /// The worker's per-slice cost accounting.
     pub accounting: ravel_types::accounting::QueryAccountingSnapshot,
     /// The worker's per-slice `FetchStats` page counters, folded (summed) by
@@ -289,15 +298,23 @@ impl SliceFetcher for RemoteSliceFetcher {
 /// frame that fails to decode ([`DistribError::Codec`], the same as a malformed
 /// scalar frame -- as of `PROTOCOL_VERSION` 3 a `Hist` frame is real data this
 /// build consumes, so a decode failure is corruption, never a coverage gap), a
-/// `PartialAggregate` frame, which this build never consumes because no encoder
-/// sends one yet ([`DistribError::FrameSignalUnsupported`]), a
+/// malformed `PartialAggregate` frame ([`DistribError::Codec`], for the same
+/// reason: a worker only sends one when the coordinator asked for it, so a frame
+/// that fails to decode is corruption), a
 /// frame carrying no oneof variant ([`DistribError::EmptyFrame`]), a second
 /// summary ([`DistribError::MultipleSummaries`]), a stream that ended with no
 /// summary ([`DistribError::NoSummary`]), a summary with no status, or an
 /// unknown status code.
+///
+/// `PartialAggregate` frames (ADR-0103 decision 2) decode into
+/// [`SliceResponse::partials`]. This is the decode side only: no caller acts on
+/// them yet, so a slice that returns partials contributes nothing to a query
+/// result today. The coordinator-side combine and the planner integration that
+/// make a pushdown-computed answer reachable from a real query are the next task.
 pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceResponse, DistribError> {
     let mut scalar = Vec::new();
     let mut histogram = Vec::new();
+    let mut partials = Vec::new();
     let mut summary: Option<pb::Summary> = None;
     for frame in frames {
         match frame.frame {
@@ -313,8 +330,8 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
             Some(pb::fetch_response::Frame::Span(_)) => {
                 return Err(DistribError::FrameSignalUnsupported("span"));
             }
-            Some(pb::fetch_response::Frame::PartialAggregate(_)) => {
-                return Err(DistribError::FrameSignalUnsupported("partial-aggregate"));
+            Some(pb::fetch_response::Frame::PartialAggregate(pa)) => {
+                partials.push(codec::decode_partial_aggregate(pa)?);
             }
             Some(pb::fetch_response::Frame::Summary(s)) => {
                 if summary.is_some() {
@@ -338,6 +355,7 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
     Ok(SliceResponse {
         scalar,
         histogram,
+        partials,
         accounting,
         stats: FetchStats {
             raw_f64_pages: summary.raw_f64_pages,
@@ -889,35 +907,82 @@ mod tests {
         ));
     }
 
-    /// A `PartialAggregate` frame (ADR-0103 decision 2) is rejected as
-    /// `FrameSignalUnsupported` by every decoder: the frame and its codec land
-    /// before any sender exists, so no coordinator consumes one yet. Relaxing
-    /// any of the three explicit `Frame::PartialAggregate(_)` reject arms to a
-    /// wildcard would drop the frame and decode to an empty `Ok`, failing these
-    /// assertions.
-    #[test]
-    fn every_decoder_rejects_partial_aggregate_as_unsupported() {
-        let partial = || pb::FetchResponse {
+    /// A well-formed `PartialAggregate` frame (ADR-0103 decision 2). Its bounds
+    /// are `-0.0` and a NaN payload so a decode that round-tripped them through
+    /// a proto double instead of the bit pattern would be visible.
+    fn partial_frame() -> pb::FetchResponse {
+        pb::FetchResponse {
             frame: Some(pb::fetch_response::Frame::PartialAggregate(
                 pb::PartialAggregate {
-                    series_id: vec![0u8; 16],
-                    labels: Vec::new(),
+                    series_id: vec![4u8; 16],
+                    labels: vec![pb::Label {
+                        name: "__name__".to_string(),
+                        value: "m".to_string(),
+                    }],
                     count: Some(3),
+                    min_bits: Some((-0.0f64).to_bits()),
+                    max_bits: Some(0x7ff8_0000_0000_0abc),
+                },
+            )),
+        }
+    }
+
+    /// The metrics decoder consumes a `PartialAggregate` frame as real data
+    /// (ADR-0103 decision 2): it lands in `SliceResponse::partials`, bit-exact,
+    /// and does not disturb the raw `scalar`/`histogram` collections. Restoring
+    /// the former `FrameSignalUnsupported` reject arm at this one call site fails
+    /// the `expect` below.
+    #[test]
+    fn metrics_decoder_collects_partial_aggregates() {
+        let response =
+            decode_slice_frames(vec![partial_frame(), summary_frame(pb::status::Code::Ok)])
+                .expect("a well-formed partial aggregate decodes");
+        assert!(response.scalar.is_empty());
+        assert!(response.histogram.is_empty());
+        assert_eq!(response.partials.len(), 1);
+        let got = &response.partials[0];
+        assert_eq!(got.series_id, SeriesId([4u8; 16]));
+        assert_eq!(got.count, Some(3));
+        // Bit patterns, never `==`: -0.0 and a NaN payload must survive exactly.
+        assert_eq!(got.min.map(f64::to_bits), Some((-0.0f64).to_bits()));
+        assert_eq!(got.max.map(f64::to_bits), Some(0x7ff8_0000_0000_0abc));
+    }
+
+    /// A malformed `PartialAggregate` (a 15-byte series id) on the metrics path
+    /// is a typed `Codec` error, never a panic and never a silently dropped
+    /// group.
+    #[test]
+    fn malformed_partial_aggregate_is_typed_codec_error() {
+        let bad = pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::PartialAggregate(
+                pb::PartialAggregate {
+                    series_id: vec![0u8; 15],
+                    labels: Vec::new(),
+                    count: Some(1),
                     min_bits: None,
                     max_bits: None,
                 },
             )),
         };
         assert!(matches!(
-            decode_slice_frames(vec![partial(), summary_frame(pb::status::Code::Ok)]),
+            decode_slice_frames(vec![bad, summary_frame(pb::status::Code::Ok)]),
+            Err(DistribError::Codec(CodecError::BadSeriesId { got: 15 }))
+        ));
+    }
+
+    /// The log and span decoders keep rejecting a `PartialAggregate` as
+    /// `FrameSignalUnsupported`: a worker-computed scalar aggregate is never
+    /// expected on those slices (ADR-0103 is metrics-only). Relaxing either
+    /// explicit reject arm to a wildcard would drop the frame and decode to an
+    /// empty `Ok`, failing these assertions.
+    #[test]
+    fn log_and_span_decoders_reject_partial_aggregate_as_unsupported() {
+        assert!(matches!(
+            decode_log_slice_frames(vec![partial_frame(), summary_frame(pb::status::Code::Ok)]),
             Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
         ));
         assert!(matches!(
-            decode_log_slice_frames(vec![partial(), summary_frame(pb::status::Code::Ok)]),
-            Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
-        ));
-        assert!(matches!(
-            decode_span_slice_frames(vec![partial(), summary_frame(pb::status::Code::Ok)]),
+            decode_span_slice_frames(vec![partial_frame(), summary_frame(pb::status::Code::Ok)]),
             Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
         ));
     }

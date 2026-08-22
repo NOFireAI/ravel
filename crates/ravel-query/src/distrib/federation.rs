@@ -262,6 +262,11 @@ impl Federation {
                 // (ADR-0071 amendment, decision 2): it authenticates through an
                 // ordinary tenant credential on the remote, never a capability.
                 fragment_capability: Vec::new(),
+                // A federated query is unconditionally ineligible for
+                // aggregation pushdown (ADR-0103 decision 1(a)): a remote's
+                // local partial cannot be complete for a series the local
+                // cluster may also hold runs of.
+                partial_aggregate: None,
             };
             let handle =
                 tokio::spawn(
@@ -552,6 +557,7 @@ mod tests {
             Ok(SliceResponse {
                 scalar: Vec::new(),
                 histogram: Vec::new(),
+                partials: Vec::new(),
                 accounting: QueryAccountingSnapshot::default(),
                 stats: FetchStats::default(),
                 series_returned: 0,

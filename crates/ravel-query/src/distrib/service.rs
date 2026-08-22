@@ -21,6 +21,21 @@
 //! version ever receives these frames, so the new columns and records are never
 //! silently dropped by an older decoder.
 //!
+//! # Aggregation pushdown
+//!
+//! A Metrics slice whose request carries a [`pb::PartialAggregateRequest`]
+//! (ADR-0103 decision 2) returns one [`pb::PartialAggregate`] frame per series
+//! instead of its raw series frames. The worker merges its own runs first
+//! ([`merge_soa_runs`], the same total-order per-series dedup the coordinator
+//! runs on the raw-fetch path) and reduces each series' deduped samples, so a
+//! sample that two of this worker's segments both carry is counted once, never
+//! twice. That local merge is what makes the partial exact: under ADR-0103
+//! decision 1's eligibility gate the coordinator only asks for a partial when
+//! no other worker and no remote cluster can hold runs of the same series, so
+//! there is nothing left for the coordinator's cross-worker dedup belt to
+//! reconcile. A request with no `partial_aggregate` takes the raw-frame path
+//! unchanged.
+//!
 //! # Segment identity resolution
 //!
 //! A worker receives durable [`pb::SegmentIdentity`] values, not object keys or
@@ -31,6 +46,7 @@
 //! is the interim implementation, resolving against the same pinned snapshot
 //! the coordinator dispatched from.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -39,16 +55,19 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
-use ravel_types::{Signal, TenantHash};
+use ravel_types::{SeriesId, Signal, TenantHash};
 
 use ravel_rspan::SpanQuery;
 
 use crate::config::ByteLimit;
 use crate::distrib::codec;
 use crate::distrib::proto::series_fetch_server::{SeriesFetch, SeriesFetchServer};
-use crate::engine::bytes_scanned_exceeded;
+use crate::engine::{bytes_scanned_exceeded, merge_soa_runs};
 use crate::erasure::is_erased_span;
-use crate::fetcher::{FetchError, FetchStats, FetchedHistogramSeries, SegmentFetcher};
+use crate::error::QueryError;
+use crate::fetcher::{
+    FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, SegmentFetcher,
+};
 use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
 use crate::span_fetcher::{SpanFetchError, SpanSegmentFetcher};
 
@@ -202,6 +221,18 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             .map_err(|e| (pb::status::Code::BadData, e.to_string()))?;
         let erasure = codec::decode_erasure(request.erasure);
 
+        // Aggregation pushdown (ADR-0103) is defined for the scalar Metrics
+        // lane only: `PartialAggregate` carries f64 bounds over scalar samples,
+        // and no log or span shape maps onto it. Fail closed so the coordinator
+        // falls back to raw fetch, rather than silently ignoring the request and
+        // streaming frames a pushdown-expecting caller did not ask for.
+        if request.partial_aggregate.is_some() && !matches!(signal, Signal::Metrics) {
+            return Err((
+                pb::status::Code::Unsupported,
+                format!("aggregation pushdown is not defined for signal {signal:?}"),
+            ));
+        }
+
         match signal {
             // Metrics keeps its exact path: resolve the pinned scope, fetch,
             // and encode scalar series. Unchanged from before #283.
@@ -212,6 +243,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
                     tenant_hash,
                     matchers,
                     erasure,
+                    request.partial_aggregate,
                 )
                 .await
             }
@@ -269,6 +301,12 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     /// scalar series and one `HistogramFrame` per native-histogram series,
     /// ending in a terminal summary (ADR-0096 decision 3 step 4). Extracted from
     /// `run_slice_inner` so the per-signal dispatch there can call it as one arm.
+    ///
+    /// When `partial_aggregate` is `Some`, the fetch loop and the erasure pass
+    /// are unchanged but the encode step is replaced: the worker merges its own
+    /// runs and streams one [`pb::PartialAggregate`] per series instead of every
+    /// series frame (ADR-0103 decision 2). The branch is per request, not per
+    /// series, so one slice returns all partials or all raw frames, never a mix.
     async fn run_slice_metrics(
         &self,
         scope: Option<pb::fetch_request::Scope>,
@@ -276,6 +314,7 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         tenant_hash: TenantHash,
         matchers: Vec<ravel_promql::LabelMatcher>,
         erasure: Vec<crate::erasure::ErasurePredicate>,
+        partial_aggregate: Option<pb::PartialAggregateRequest>,
     ) -> Result<Vec<pb::FetchResponse>, (pb::status::Code, String)> {
         let identities = match scope {
             Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments,
@@ -364,6 +403,47 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             for series in &mut scalar {
                 crate::erasure::retain_series_soa(series, &erasure);
             }
+        }
+
+        // Aggregation pushdown (ADR-0103 decision 2): this slice returns one
+        // partial per series instead of its raw runs. Everything above (fetch,
+        // budget, erasure) already ran exactly as it does on the raw path; only
+        // the encode step below differs.
+        if let Some(want) = partial_aggregate {
+            // A native-histogram series has no scalar count/min/max shape:
+            // `PartialAggregate` carries f64 bounds only. Silently omitting such
+            // series would answer a pushdown query over an incomplete set, so
+            // fail closed to the coordinator's raw-fetch fallback instead.
+            if !histograms.is_empty() {
+                return Err((
+                    pb::status::Code::Unsupported,
+                    "aggregation pushdown is not defined for native-histogram series".to_string(),
+                ));
+            }
+            let (partials, samples_merged) =
+                reduce_partial_aggregates(scalar, &want).map_err(map_merge_error)?;
+            let series_returned = partials.len() as u64;
+            let mut frames = Vec::with_capacity(partials.len() + 1);
+            for partial in &partials {
+                frames.push(pb::FetchResponse {
+                    frame: Some(pb::fetch_response::Frame::PartialAggregate(
+                        codec::encode_partial_aggregate(partial),
+                    )),
+                });
+            }
+            // `samples_returned` stays the count of samples this slice actually
+            // reduced, not the number of frames, so the coordinator's own
+            // sample-budget re-check still sees a slice's real yield even though
+            // the samples themselves never cross the wire.
+            frames.push(summary_frame(
+                &accounting.snapshot(),
+                series_returned,
+                samples_merged,
+                pb::status::Code::Ok,
+                String::new(),
+                &stats,
+            ));
+            return Ok(frames);
         }
 
         // Run-merged scalar runs and native-histogram runs now cross the wire
@@ -732,6 +812,123 @@ fn summary_frame(
             raw_f64_pages: stats.raw_f64_pages,
             raw_f64_bytes: stats.raw_f64_bytes,
         })),
+    }
+}
+
+/// Reduces this worker's fetched scalar runs into one exact partial aggregate
+/// per series (ADR-0103 decisions 1 and 3), plus the total number of deduped
+/// samples the reduction consumed (for the terminal summary's
+/// `samples_returned`).
+///
+/// The merge comes first and is not optional. `fetched` is per-segment, so two
+/// segments of this slice can both carry the same `(series_id, ts)` -- a
+/// duplicate write, or a run-merged L1 segment overlapping its L0 inputs.
+/// Reducing each `FetchedSeriesSoa` on its own would count such a sample twice
+/// and could report a bound from the sample the dedup order drops.
+/// [`merge_soa_runs`] resolves each timestamp under the full ADR-0010 total
+/// order first, so the reduction below runs over exactly one winning sample per
+/// timestamp -- the same samples the coordinator's raw-fetch path would have
+/// merged out of these runs.
+///
+/// Grouping by series id here, then merging one series at a time, is what
+/// preserves the identity the frame must carry: [`merge_soa_runs`] returns
+/// `SeriesData` (labels plus deduped samples) and drops the series id, and a
+/// worker cannot recompute it (`SeriesId::compute` hashes the `TenantId`, and a
+/// worker holds only a [`TenantHash`]). One call per series id is otherwise
+/// identical to one call over everything: `merge_soa_runs` already merges each
+/// series id's runs independently of every other series, and the caps are
+/// unbounded here because the worker's own budget is bytes-scanned only (the
+/// coordinator enforces the series and sample caps, over the summary this
+/// returns).
+///
+/// `min`/`max` fold under [`f64::total_cmp`], the same total order ADR-0023's
+/// min/max UDAF uses (`crates/ravel-sql/src/minmax.rs`): a candidate replaces
+/// the incumbent only on a strict `Less`/`Greater`, so NaN payloads and the sign
+/// of zero behave exactly as they do in every other typed-aggregate path here,
+/// and never through `PartialOrd`. A series whose samples were all erased
+/// carries `count: Some(0)` with no bounds: there is no value to bound, and an
+/// absent bound stays distinct from a present `0.0`.
+fn reduce_partial_aggregates(
+    fetched: Vec<Vec<FetchedSeriesSoa>>,
+    want: &pb::PartialAggregateRequest,
+) -> Result<(Vec<codec::PartialAggregate>, u64), QueryError> {
+    // Insertion-ordered grouping (a positions map beside the runs), so the frame
+    // order a worker emits is a deterministic function of its fetch order rather
+    // than of hash iteration order.
+    let mut positions: HashMap<SeriesId, usize> = HashMap::new();
+    let mut grouped: Vec<(SeriesId, Vec<FetchedSeriesSoa>)> = Vec::new();
+    for segment_series in fetched {
+        for fs in segment_series {
+            match positions.get(&fs.series_id) {
+                Some(&idx) => grouped[idx].1.push(fs),
+                None => {
+                    positions.insert(fs.series_id, grouped.len());
+                    grouped.push((fs.series_id, vec![fs]));
+                }
+            }
+        }
+    }
+
+    let mut partials = Vec::with_capacity(grouped.len());
+    let mut samples_merged = 0u64;
+    for (series_id, runs) in grouped {
+        // One series id in, so at most one `SeriesData` out.
+        let merged = merge_soa_runs(vec![runs], usize::MAX, usize::MAX)?;
+        let Some(series) = merged.into_iter().next() else {
+            continue;
+        };
+        let count = series.samples.len() as u64;
+        samples_merged += count;
+        let min = series
+            .samples
+            .iter()
+            .map(|s| s.value)
+            .reduce(|current, candidate| replaces(candidate, current, Ordering::Less));
+        let max = series
+            .samples
+            .iter()
+            .map(|s| s.value)
+            .reduce(|current, candidate| replaces(candidate, current, Ordering::Greater));
+        partials.push(codec::PartialAggregate {
+            series_id,
+            labels: series.labels,
+            count: want.want_count.then_some(count),
+            min: if want.want_min { min } else { None },
+            max: if want.want_max { max } else { None },
+        });
+    }
+    Ok((partials, samples_merged))
+}
+
+/// The min/max fold step: `candidate` replaces `current` only when
+/// `candidate.total_cmp(&current)` is the wanted strict ordering (`Less` for
+/// min, `Greater` for max), so a tie keeps the incumbent. Mirrors
+/// `Extreme::replaces` in `crates/ravel-sql/src/minmax.rs` field for field, the
+/// ADR-0023 total order ADR-0103 decision 3 names for the coordinator's own
+/// combine.
+fn replaces(candidate: f64, current: f64, want: Ordering) -> f64 {
+    if candidate.total_cmp(&current) == want {
+        candidate
+    } else {
+        current
+    }
+}
+
+/// Maps a worker-side merge failure to the slice's typed status. A run that is
+/// not ascending, or a per-sample dedup column that is not parallel to its run,
+/// is corruption in a decoded segment, not a budget or capability problem. The
+/// caps are unbounded on this path, so the two budget variants cannot fire; they
+/// map to `BudgetExceeded` rather than being collapsed into a catch-all, so a
+/// future capped call site gets the right status instead of `Internal`.
+fn map_merge_error(err: QueryError) -> (pb::status::Code, String) {
+    match err {
+        QueryError::TooManySeries { .. } | QueryError::TooManySamples { .. } => {
+            (pb::status::Code::BudgetExceeded, err.to_string())
+        }
+        QueryError::NonMonotonicSamples { .. } | QueryError::PrioritySampleCountMismatch { .. } => {
+            (pb::status::Code::Corrupt, err.to_string())
+        }
+        other => (pb::status::Code::Internal, other.to_string()),
     }
 }
 

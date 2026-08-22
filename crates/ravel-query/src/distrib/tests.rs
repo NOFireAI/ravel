@@ -1085,6 +1085,7 @@ fn worker_trips_bytes_budget_per_segment() {
             erasure: Vec::new(),
             trace_context: String::new(),
             fragment_capability: Vec::new(),
+            partial_aggregate: None,
         };
         let response = SliceFetcher::fetch(&fetcher, request)
             .await
@@ -1118,6 +1119,7 @@ impl SliceFetcher for LyingBudgetWorker {
         Ok(SliceResponse {
             scalar: Vec::new(),
             histogram: Vec::new(),
+            partials: Vec::new(),
             accounting: acct.snapshot(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
@@ -1214,6 +1216,7 @@ impl SliceFetcher for AlwaysInvalidated {
         Ok(SliceResponse {
             scalar: Vec::new(),
             histogram: Vec::new(),
+            partials: Vec::new(),
             accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
@@ -1339,6 +1342,7 @@ fn worker_rejects_non_metrics_and_unknown_signals() {
             erasure: Vec::new(),
             trace_context: String::new(),
             fragment_capability: Vec::new(),
+            partial_aggregate: None,
         };
 
         // Spans is now served (#285): the request reaches the real span path.
@@ -1434,6 +1438,7 @@ fn run_slice_inner_dispatches_on_signal_not_blanket_rejects() {
             erasure: Vec::new(),
             trace_context: String::new(),
             fragment_capability: Vec::new(),
+            partial_aggregate: None,
         };
 
         // Spans now dispatches to the real span path (#285), no longer a stub.
@@ -1555,6 +1560,7 @@ impl SliceFetcher for OverflowingLyingWorker {
         Ok(SliceResponse {
             scalar: Vec::new(),
             histogram: Vec::new(),
+            partials: Vec::new(),
             accounting: acct.snapshot(),
             stats: crate::fetcher::FetchStats::default(),
             series_returned: 0,
@@ -3574,6 +3580,7 @@ fn raw_slice_request(signal: Signal, tenant: Vec<u8>) -> pb::FetchRequest {
         erasure: Vec::new(),
         trace_context: String::new(),
         fragment_capability: Vec::new(),
+        partial_aggregate: None,
     }
 }
 
@@ -3763,5 +3770,407 @@ fn old_worker_rejecting_nonmetrics_signals_yields_silent_local_fallback() {
              Ok(None), never a wrong or partial result"
         );
         server.abort();
+    });
+}
+
+// --- ADR-0103 aggregation pushdown (worker side) ---------------------------
+//
+// A slice whose request carries a `PartialAggregateRequest` returns one
+// `PartialAggregate` per series instead of its raw runs. The property that makes
+// such a partial exact is the worker's OWN local merge: it must dedup its runs
+// before reducing, or a sample two of its segments both carry is counted twice.
+// The tests below drive the real worker service (no doubles) and compare against
+// a local fetch-merge-reduce over the identical data.
+
+/// The corpus the pushdown tests share: two segments in the SAME shard and hour
+/// (so a coordinator would put them in ONE slice, i.e. on one worker) whose runs
+/// of series `m0` overlap at two timestamps, plus a second series `m1` carrying
+/// `0.0` and `-0.0` so the min/max fold's total order is observable.
+///
+/// `m0` merged (the later `writer_seq` wins each duplicate timestamp):
+/// `1.0, -0.0, 42.0, 7.5` -- four samples, from six fetched.
+async fn partial_pushdown_corpus(store: &MemoryStore) -> Vec<SegmentRef> {
+    let first = write_segment(
+        store,
+        0,
+        0,
+        100,
+        &[
+            SeriesDesc {
+                metric: "m0".to_string(),
+                samples: vec![
+                    (NS, 1.0f64.to_bits()),
+                    (2 * NS, 2.0f64.to_bits()),
+                    (3 * NS, 3.0f64.to_bits()),
+                ],
+            },
+            SeriesDesc {
+                metric: "m1".to_string(),
+                samples: vec![(NS, 0.0f64.to_bits()), (2 * NS, (-0.0f64).to_bits())],
+            },
+        ],
+    )
+    .await;
+    let second = write_segment(
+        store,
+        1,
+        0,
+        100,
+        &[SeriesDesc {
+            metric: "m0".to_string(),
+            // ts 2 and ts 3 duplicate the first segment's samples with different
+            // values; this segment's higher `writer_seq` wins both.
+            samples: vec![
+                (2 * NS, (-0.0f64).to_bits()),
+                (3 * NS, 42.0f64.to_bits()),
+                (4 * NS, 7.5f64.to_bits()),
+            ],
+        }],
+    )
+    .await;
+    vec![first, second]
+}
+
+/// A `FetchRequest` for the whole pinned set, with `partial_aggregate` set to
+/// `want`.
+fn pushdown_request(
+    segments: &[SegmentRef],
+    want: Option<pb::PartialAggregateRequest>,
+) -> pb::FetchRequest {
+    pb::FetchRequest {
+        protocol_version: crate::distrib::codec::PROTOCOL_VERSION,
+        query_id: Vec::new(),
+        tenant_hash: TENANT.0.to_vec(),
+        signal: crate::distrib::codec::signal_to_u32(Signal::Metrics),
+        scope: Some(pb::fetch_request::Scope::Pinned(pb::PinnedScope {
+            segments: segments
+                .iter()
+                .map(crate::distrib::codec::encode_segment_identity)
+                .collect(),
+        })),
+        matchers: Vec::new(),
+        window_start_ns: 0,
+        window_end_ns: 0,
+        budgets: None,
+        deadline_unix_ns: 0,
+        erasure: Vec::new(),
+        trace_context: String::new(),
+        fragment_capability: Vec::new(),
+        partial_aggregate: want,
+    }
+}
+
+/// The local reference reduction: `count`, `min` bits, and `max` bits over one
+/// coordinator-merged series, folded under `f64::total_cmp` exactly as ADR-0023's
+/// min/max UDAF does. This is the answer the worker must reproduce.
+fn reference_reduction(series: &SeriesData) -> (u64, Option<u64>, Option<u64>) {
+    let fold = |want: std::cmp::Ordering| {
+        series
+            .samples
+            .iter()
+            .map(|s| s.value)
+            .reduce(|current, candidate| {
+                if candidate.total_cmp(&current) == want {
+                    candidate
+                } else {
+                    current
+                }
+            })
+            .map(f64::to_bits)
+    };
+    (
+        series.samples.len() as u64,
+        fold(std::cmp::Ordering::Less),
+        fold(std::cmp::Ordering::Greater),
+    )
+}
+
+/// Indexes decoded partials by their metric name, which is this corpus' whole
+/// label set.
+fn partials_by_metric(
+    partials: &[crate::distrib::codec::PartialAggregate],
+) -> std::collections::HashMap<String, &crate::distrib::codec::PartialAggregate> {
+    partials
+        .iter()
+        .map(|p| {
+            let metric = p
+                .labels
+                .iter()
+                .find(|l| l.name == "__name__")
+                .map(|l| l.value.clone())
+                .expect("corpus labels carry __name__");
+            (metric, p)
+        })
+        .collect()
+}
+
+/// ADR-0103 acceptance (worker side): a slice asked for `count`/`min`/`max`
+/// merges its own runs FIRST and returns exactly what a local
+/// fetch-merge-reduce over the identical data produces, over a real loopback
+/// worker and a real decoder.
+///
+/// The corpus is the case that separates a correct implementation from a naive
+/// one: series `m0` has six fetched samples across two segments of one slice,
+/// two of which are duplicate timestamps, so the exact answer is `count = 4`.
+/// Replacing the `merge_soa_runs` call in `reduce_partial_aggregates`
+/// (`service.rs`) with a per-run concatenation reports `count = 6` -- the
+/// duplicates double-counted -- and the `count` assertion below fails. The
+/// `-0.0` min on `m0` and the `0.0`/`-0.0` pair on `m1` pin the fold's total
+/// order: under `PartialOrd` (where `-0.0 == 0.0`) `m1`'s min comes back as
+/// `0.0`, whose bit pattern differs from the asserted `-0.0`.
+#[test]
+fn worker_partial_aggregate_merges_before_reducing() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = partial_pushdown_corpus(&store).await;
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        // Local reference: the same fetch, the same coordinator-side merge, then
+        // the reduction the worker is supposed to have done.
+        let (local_runs, _acct, _stats) = local_scalar(Arc::clone(&store), &snapshot).await;
+        let fetched_samples: usize = local_runs
+            .iter()
+            .flatten()
+            .map(|s| s.timestamps.len())
+            .sum();
+        let local_merged = merge_soa_runs(local_runs, usize::MAX, usize::MAX).expect("local merge");
+        let merged_samples: usize = local_merged.iter().map(|s| s.samples.len()).sum();
+        // The corpus must actually exercise dedup, or the merge-first property is
+        // untested: fewer samples survive the merge than were fetched.
+        assert!(
+            merged_samples < fetched_samples,
+            "corpus must carry cross-segment duplicates: fetched {fetched_samples}, \
+             merged {merged_samples}"
+        );
+
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+        let response = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: true,
+                    want_max: true,
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds to a pushdown request");
+        server.abort();
+
+        assert_eq!(response.status, pb::status::Code::Ok);
+        // All partials, no raw frames: the branch is per request, not per series.
+        assert!(
+            response.scalar.is_empty(),
+            "a pushdown slice must not also stream raw series frames"
+        );
+        assert!(response.histogram.is_empty());
+        assert_eq!(
+            response.partials.len(),
+            local_merged.len(),
+            "one partial per merged series, not one per segment run"
+        );
+
+        let got = partials_by_metric(&response.partials);
+        for series in &local_merged {
+            let metric = series
+                .labels
+                .iter()
+                .find(|l| l.name == "__name__")
+                .map(|l| l.value.clone())
+                .expect("corpus labels carry __name__");
+            let partial = got.get(&metric).expect("a partial for every merged series");
+            let (count, min_bits, max_bits) = reference_reduction(series);
+            assert_eq!(
+                partial.count,
+                Some(count),
+                "{metric}: count must be the deduped sample count"
+            );
+            assert_eq!(
+                partial.min.map(f64::to_bits),
+                min_bits,
+                "{metric}: min bit pattern differs from the local reduction"
+            );
+            assert_eq!(
+                partial.max.map(f64::to_bits),
+                max_bits,
+                "{metric}: max bit pattern differs from the local reduction"
+            );
+        }
+
+        // Hand-computed, independent of the reference fold above: `m0` dedups to
+        // four samples with `-0.0` as its minimum, and `m1`'s `0.0`/`-0.0` pair
+        // separates `total_cmp` from `PartialOrd`.
+        let m0 = got.get("m0").expect("m0 partial");
+        assert_eq!(m0.count, Some(4));
+        assert_eq!(m0.min.map(f64::to_bits), Some((-0.0f64).to_bits()));
+        assert_eq!(m0.max.map(f64::to_bits), Some(42.0f64.to_bits()));
+        let m1 = got.get("m1").expect("m1 partial");
+        assert_eq!(m1.count, Some(2));
+        assert_eq!(m1.min.map(f64::to_bits), Some((-0.0f64).to_bits()));
+        assert_eq!(m1.max.map(f64::to_bits), Some(0.0f64.to_bits()));
+
+        // The summary still reports this slice's real yield, so the coordinator's
+        // own sample-budget re-check works even though no sample crossed the wire.
+        assert_eq!(response.series_returned, local_merged.len() as u64);
+        assert_eq!(response.samples_returned, merged_samples as u64);
+    });
+}
+
+/// A group-only request (no aggregate flag set, ADR-0103 decision 3's set-union
+/// case) enumerates the worker's distinct series: one frame per merged series,
+/// identity only, with every value field absent rather than a zero.
+#[test]
+fn worker_group_only_partial_aggregate_enumerates_series() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = partial_pushdown_corpus(&store).await;
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+        let response = SliceFetcher::fetch(
+            &fetcher,
+            pushdown_request(
+                &segments,
+                Some(pb::PartialAggregateRequest {
+                    want_count: false,
+                    want_min: false,
+                    want_max: false,
+                }),
+            ),
+        )
+        .await
+        .expect("worker responds to a group-only request");
+        server.abort();
+
+        assert_eq!(response.status, pb::status::Code::Ok);
+        assert!(response.scalar.is_empty());
+        // Two distinct series in the corpus, each held once even though `m0`'s
+        // runs came from two segments.
+        assert_eq!(response.partials.len(), 2);
+        let got = partials_by_metric(&response.partials);
+        for metric in ["m0", "m1"] {
+            let partial = got.get(metric).expect("a partial per distinct series");
+            assert_eq!(partial.count, None, "{metric}: count was not requested");
+            assert_eq!(partial.min, None, "{metric}: min was not requested");
+            assert_eq!(partial.max, None, "{metric}: max was not requested");
+        }
+        // The identity a group enumeration exists to carry is present.
+        let expected_id = SeriesId::compute(&tenant_id(), "m0", &labels("m0")).expect("series id");
+        assert_eq!(got.get("m0").expect("m0 partial").series_id, expected_id);
+    });
+}
+
+/// Regression guard for the "completely unchanged" half of the request-level
+/// branch: a request with NO `partial_aggregate` produces exactly the raw-frame
+/// sequence the pre-pushdown worker produced -- one `SeriesFrame` per fetched
+/// per-segment run, in fetch order, byte-identical on the wire, and no
+/// `PartialAggregate` frame anywhere.
+///
+/// The expected bytes are built from an independent local fetch through
+/// `encode_series_frame`, which is exactly what the raw path's encode loop does,
+/// so this compares the worker's output against the encoding rather than against
+/// itself.
+#[test]
+fn request_without_partial_aggregate_streams_unchanged_raw_frames() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        use prost::Message;
+
+        let store = Arc::new(MemoryStore::new());
+        let segments = partial_pushdown_corpus(&store).await;
+        let snapshot = Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let (local_runs, _acct, _stats) = local_scalar(Arc::clone(&store), &snapshot).await;
+        let expected: Vec<Vec<u8>> = local_runs
+            .iter()
+            .flatten()
+            .map(|soa| {
+                pb::FetchResponse {
+                    frame: Some(pb::fetch_response::Frame::Series(
+                        crate::distrib::codec::encode_series_frame(soa),
+                    )),
+                }
+                .encode_to_vec()
+            })
+            .collect();
+
+        // Drive the service directly so the raw frames are observable before any
+        // decode collapses them.
+        let metrics_store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+        let service = SeriesFetchService::new(
+            SegmentFetcher::new(metrics_store),
+            Arc::new(SnapshotSegmentResolver::new(segments.clone())),
+        );
+        let response = SeriesFetch::fetch(
+            &service,
+            tonic::Request::new(pushdown_request(&segments, None)),
+        )
+        .await
+        .expect("worker serves the raw request");
+        let frames: Vec<pb::FetchResponse> =
+            futures::StreamExt::collect::<Vec<_>>(response.into_inner())
+                .await
+                .into_iter()
+                .map(|f| f.expect("frame"))
+                .collect();
+
+        let (summary, series): (Vec<_>, Vec<_>) = frames
+            .iter()
+            .partition(|f| matches!(f.frame, Some(pb::fetch_response::Frame::Summary(_))));
+        assert_eq!(summary.len(), 1, "exactly one terminal summary");
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f.frame,
+                Some(pb::fetch_response::Frame::PartialAggregate(_))
+            )),
+            "a request with no partial_aggregate must never yield a partial frame"
+        );
+        let got: Vec<Vec<u8>> = series.iter().map(|f| f.encode_to_vec()).collect();
+        assert_eq!(
+            got, expected,
+            "raw series frames must be byte-identical to the unchanged encode path"
+        );
+    });
+}
+
+/// Pushdown is metrics-only (ADR-0103): a Logs slice carrying an aggregate
+/// request is refused with `Unsupported` so the coordinator falls back, rather
+/// than being served raw log frames a pushdown-expecting caller never asked for.
+#[test]
+fn partial_aggregate_on_a_log_slice_is_unsupported() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let segments = partial_pushdown_corpus(&store).await;
+        let (fetcher, server) = spawn_worker(Arc::clone(&store), segments.clone()).await;
+        let mut request = pushdown_request(
+            &segments,
+            Some(pb::PartialAggregateRequest {
+                want_count: true,
+                want_min: false,
+                want_max: false,
+            }),
+        );
+        request.signal = crate::distrib::codec::signal_to_u32(Signal::Logs);
+        let response = SliceFetcher::fetch_logs(&fetcher, request)
+            .await
+            .expect("worker responds");
+        server.abort();
+        assert_eq!(response.status, pb::status::Code::Unsupported);
+        assert!(
+            response.status_message.contains("pushdown"),
+            "expected the pushdown-not-defined refusal, got {:?}",
+            response.status_message
+        );
     });
 }

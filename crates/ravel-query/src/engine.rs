@@ -4621,6 +4621,7 @@ mod prefetch_tests {
             Ok(crate::distrib::client::SliceResponse {
                 scalar: Vec::new(),
                 histogram: Vec::new(),
+                partials: Vec::new(),
                 accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
                 stats: crate::fetcher::FetchStats::default(),
                 series_returned: 0,
@@ -5262,6 +5263,7 @@ mod coverage_wrapper_tests {
             Ok(SliceResponse {
                 scalar: Vec::new(),
                 histogram: Vec::new(),
+                partials: Vec::new(),
                 accounting: QueryAccountingSnapshot::default(),
                 stats: FetchStats::default(),
                 series_returned: 0,
