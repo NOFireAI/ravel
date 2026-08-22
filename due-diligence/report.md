@@ -126,7 +126,18 @@ NOT YET WRITTEN.
 
 ## 12. Data formats and upgrade compatibility
 
-NOT YET WRITTEN.
+Finding first: the durable formats (RSEG for metrics, RLOG for logs, RSPAN for spans, protobuf commit/catalog records) are engineered to a high standard for corruption safety, and to a deliberately low standard, pre-release, for version compatibility. The project's own policy (ADR-0027) is a single supported version per format until first public release: RSEG v6 read support was deleted in the same change that shipped v7, there is no v6-to-v7 migration path, and a reader fails closed with a typed `UnsupportedVersion` on any other version (crates/ravel-segment/src/reader.rs:88, 158-161). ADR-0066 supersedes this at first release with an N/N-1 reader window and a decode-and-re-encode migration primitive, but at the frozen commit that policy is declared, not active. Consequence for adopters: an upgrade that bumps a format version makes existing objects unreadable (the accepted disposition is wipe or re-ingest), and a rolling deployment across a format bump has no overlap window. This is a coherent pre-1.0 stance, stated plainly in the ADRs and CHANGELOG, but it is a hard production-readiness gate: no deployment holding data anyone cares about should cross a format-bump upgrade until the ADR-0066 window ships.
+
+Corruption safety is where the format engineering earns credit:
+
+- Checksum hierarchy: whole-object blake3 recorded in the commit record, footer and per-section CRC32C verified on read, structural validation with checked arithmetic on every section range (validate_sections_v7 enforces mandatory kinds, exclusive section pairs, ranges within the page region, and uncompressed-length limits before any section byte is fetched: reader.rs:138-163).
+- Reader limits bound decompression before allocation (ReaderLimits with uncompressed-size caps; a dedicated test pins the uncompressed page size cap: crates/ravel-segment/tests/uncompressed_page_size_cap.rs).
+- Hostile-input testing exists and runs: golden-byte suites pin the exact on-disk layouts (golden_bytes_v7.rs for RSEG, golden_bytes_v3.rs for RLOG, golden_bytes_v4.rs for RSPAN, plus a Remote Write golden), mutation-fuzz suites (fuzz_mutation in ravel-segment and ravel-otap) assert corrupt inputs produce typed errors rather than panics or wrong data, and structural-validator negative tests cover the malformed-footer space. This review executed them: 10/10 and 5/5 fuzz-mutation tests passed, and the corrupt-input tests in ravel-failure-tests (corruption.rs) passed.
+- Version numbers are reserved forever and never reused (format.rs:8-12), and unknown versions fail typed, so a mixed-version accident is loud, not silent.
+
+Two compatibility observations. First, the format version numbers have moved fast (RSEG at v7, RLOG at v3, RSPAN at v4 per the golden suites, against normative docs describing v1 baselines with amendment layers), which is fine under the single-version policy but means the frozen-contract discipline (docs/segment-format.md rewritten as self-contained v7) is doing real work; the golden suites are what keep the docs honest. Second, the protobuf surfaces (proto/ravel) follow additive-field discipline with unknown-field tolerance, and the queryfrag distributed protocol carries an explicit protocol version (bumped to 3 for per-sample dedup provenance, with refusal semantics for mismatched peers), so intra-fleet mixed-binary operation within one format generation is designed for; it is the cross-format-generation case that is deliberately unsupported pre-release.
+
+Verdict: corruption behavior VERIFIED (tests executed); upgrade compatibility across format bumps NOT IMPLEMENTED at this commit, by documented policy, with a credible successor policy (ADR-0066) not yet in force. Adoption decisions should treat every format bump before first release as a data-migration event.
 
 ## 13. PromQL, SQL, query correctness
 
