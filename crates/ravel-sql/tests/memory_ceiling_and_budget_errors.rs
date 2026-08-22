@@ -7,13 +7,100 @@
 
 mod util;
 
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+use datafusion::error::Result as DFResult;
+use datafusion::execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use ravel_object_store::memory::MemoryStore;
-use ravel_sql::{CeilingBreach, SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant};
+use ravel_sql::{
+    CeilingBreach, RavelTableProvider, SessionTable, SqlConfig, SqlError, TenantDelegatingPool,
+    TenantMemoryAccountant, build_session,
+};
 use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
+
+/// A `MemoryPool` decorator that delegates every call to an inner pool and, on
+/// each `try_grow` the inner pool *rejects*, records the failing reservation's
+/// `MemoryConsumer` name and `can_spill` flag.
+///
+/// The budget-error message alone cannot say which operator tripped: an
+/// `RsegScanExec` scan reservation and the final `GroupedHashAggregateStream`
+/// reservation both surface the identical `"query memory pool exhausted: ..."`
+/// prefix when their `try_grow` is refused. Recording the failing consumer's
+/// identity is the signal that discriminates the two failure sites, which the
+/// string prefix cannot.
+#[derive(Debug)]
+struct RecordingPool {
+    inner: Arc<dyn MemoryPool>,
+    /// The consumer name and `can_spill` flag of the most recent rejected
+    /// `try_grow`. Interior mutability so the immutable `&self` pool methods
+    /// can record into it while the query holds the pool as `Arc<dyn ..>`.
+    last_failed: Mutex<Option<(String, bool)>>,
+}
+
+impl RecordingPool {
+    fn new(inner: Arc<dyn MemoryPool>) -> Arc<Self> {
+        Arc::new(RecordingPool {
+            inner,
+            last_failed: Mutex::new(None),
+        })
+    }
+
+    /// The `(consumer_name, can_spill)` of the last rejected `try_grow`, or
+    /// `None` if no `try_grow` was refused.
+    fn last_failed(&self) -> Option<(String, bool)> {
+        self.last_failed.lock().expect("lock").clone()
+    }
+}
+
+impl fmt::Display for RecordingPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RecordingPool({})", self.inner.name())
+    }
+}
+
+impl MemoryPool for RecordingPool {
+    fn name(&self) -> &str {
+        "RecordingPool"
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
+        let result = self.inner.try_grow(reservation, additional);
+        if result.is_err() {
+            let consumer = reservation.consumer();
+            *self.last_failed.lock().expect("lock") =
+                Some((consumer.name().to_string(), consumer.can_spill()));
+        }
+        result
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
+}
 
 /// `MemoryPool::grow` is infallible and checks no ceiling, so a reservation
 /// can grow past both the per-query and per-tenant limits with no error, while
@@ -145,22 +232,44 @@ fn single_series_specs(rows: i64) -> Vec<SegSpec> {
 
 /// ADR-0102 decision 3: with the disk manager disabled in `build_session`, a
 /// high-cardinality final aggregation whose group state exceeds the query
-/// memory budget fails as `SqlError::ResourcesExhausted` carrying the memory
-/// pool's *own* `try_grow` message, instead of routing through DataFusion's
-/// spill path.
+/// memory budget fails because the aggregate's *own* reservation cannot grow,
+/// instead of routing around the budget through DataFusion's spill path.
 ///
 /// With the disk manager disabled, `GroupedHashAggregateStream` is built in
-/// `ReportError` mode: when its reservation cannot grow it propagates the
-/// pool's error directly, so the message begins with the pool's
-/// `"query memory pool exhausted: ..."` text and never mentions spilling.
+/// `ReportError` mode: its `MemoryConsumer` is registered with
+/// `can_spill == false`, and when its reservation's `try_grow` is refused it
+/// propagates the error directly rather than spilling to disk.
+///
+/// Why the `can_spill` flag, not the message string: a message-prefix
+/// assertion cannot distinguish the fixed tree from the broken one. The
+/// aggregate's reservation and the feeding `RsegScanExec` reservation both
+/// draw on the same query pool, and *both* surface the identical `"query
+/// memory pool exhausted: ..."` prefix when a `try_grow` is refused -- so
+/// `starts_with("query memory pool exhausted")` holds whether spilling was
+/// available or not. This test therefore wraps the real query pool in a
+/// [`RecordingPool`] and asserts on the identity of the consumer whose
+/// `try_grow` was refused last: it must be the aggregate
+/// (`GroupedHashAggregateStream`), and -- the load-bearing half -- that
+/// consumer must have been registered with `can_spill == false`. Only the
+/// disk-manager-disabled build registers the aggregate non-spillable.
 ///
 /// Prove-the-test: with the `with_disk_manager_builder(...Disabled)` line
-/// removed from `build_session`, the aggregate is instead built in spill mode
-/// and routes through the (default `OsTmpDirectory`) disk manager. At this
-/// budget it then fails inside the spill machinery with a wrapped
-/// `"Failed to reserve memory for sort during spill: ..."` message, which does
-/// NOT start with the pool's text -- so the `starts_with` assertion below fails.
-/// Verified by removing the line and observing that exact message.
+/// removed from `build_session`, the aggregate is instead built in spill mode,
+/// so its `MemoryConsumer` is registered with `can_spill == true` and it spills
+/// rather than failing hard. The consumer *name* is unchanged (the aggregate is
+/// still the last consumer whose `try_grow` the pool refuses at this budget),
+/// so the name check is not the discriminator -- the `can_spill` flag is. The
+/// recorded pair becomes `("GroupedHashAggregateStream[0] (count(1))", true)`,
+/// so the `!can_spill` assertion below fails. Verified by removing the line and
+/// observing exactly:
+///
+/// ```text
+/// thread 'a_high_cardinality_aggregation_over_budget_is_resources_exhausted'
+/// panicked at crates/ravel-sql/tests/memory_ceiling_and_budget_errors.rs:
+/// the aggregate must be built non-spillable (ReportError mode) so budget
+/// exhaustion is a hard error, not a spill; consumer
+/// "GroupedHashAggregateStream[0] (count(1))" had can_spill=true
+/// ```
 #[tokio::test]
 async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
     let tenant = tenant_id("acme");
@@ -179,28 +288,64 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
     )
     .await;
 
-    let err = fixture
-        .executor
-        .execute(
-            tenant.hash(),
-            &request("SELECT ts, count(*) AS n FROM samples GROUP BY ts"),
-        )
-        .await
-        .expect_err("a high-cardinality aggregation over budget must trip the pool");
+    // Build the query's session directly so the real per-query pool (the same
+    // `TenantDelegatingPool` the executor builds in `plan_pinned_with`) can be
+    // wrapped in a `RecordingPool` before it is installed on the session. The
+    // executor builds its pool internally with no injection seam, and adding
+    // one would be test-only production surface; the public `build_session` /
+    // `RavelTableProvider` API reproduces the executor's construction path
+    // exactly (same disabled disk manager, same single-partition final
+    // aggregate) while letting the test observe the pool. The executor's
+    // mapping of this failure to `SqlError::ResourcesExhausted` is covered by
+    // `a_sort_or_aggregate_budget_error_keeps_its_type`.
+    let tenant_accountant = TenantMemoryAccountant::new(1 << 40);
+    let (inner_pool, _breach) = config.query_pool(tenant_accountant, QueryAccounting::new());
+    let recording = RecordingPool::new(inner_pool);
+    let pool: Arc<dyn MemoryPool> = Arc::clone(&recording) as Arc<dyn MemoryPool>;
 
-    assert!(
-        matches!(err, SqlError::ResourcesExhausted(_)),
-        "aggregation over budget must fail typed rather than spill; got {err:?}"
+    let snapshot = fixture.snapshot(&tenant).await;
+    let provider = RavelTableProvider::new(
+        snapshot,
+        tenant.hash(),
+        fixture.fetcher.clone(),
+        config,
+        QueryAccounting::new(),
     );
-    let SqlError::ResourcesExhausted(msg) = &err else {
-        unreachable!("asserted above");
-    };
-    // The aggregate, unable to spill, surfaces the pool's own try_grow error
-    // directly -- not a spill-path wrapper.
+    let ctx = build_session(
+        &config,
+        pool,
+        SessionTable::Metrics(Arc::new(provider)),
+        false,
+    )
+    .expect("metrics session builds");
+
+    let frame = ctx
+        .sql("SELECT ts, count(*) AS n FROM samples GROUP BY ts")
+        .await
+        .expect("high-cardinality aggregation plans");
+    let result = frame.collect().await;
     assert!(
-        msg.starts_with("query memory pool exhausted"),
-        "aggregation must surface the pool's direct try_grow error, not a spill \
-         wrapper; got {msg:?}"
+        result.is_err(),
+        "a high-cardinality aggregation over budget must trip the pool"
+    );
+
+    // The discriminating assertion: with spilling disabled, the aggregate
+    // itself is the consumer whose `try_grow` is refused, and it is registered
+    // as non-spillable. A scan tripping, or a spillable aggregate, would record
+    // a different consumer or `can_spill == true` and fail here.
+    let (consumer, can_spill) = recording
+        .last_failed()
+        .expect("some try_grow must have been refused");
+    assert!(
+        consumer.starts_with("GroupedHashAggregateStream"),
+        "the aggregate itself, not the scan, must be the consumer that trips; \
+         last refused try_grow was for {consumer:?} (can_spill={can_spill})"
+    );
+    assert!(
+        !can_spill,
+        "the aggregate must be built non-spillable (ReportError mode) so budget \
+         exhaustion is a hard error, not a spill; consumer {consumer:?} had \
+         can_spill={can_spill}"
     );
 }
 
