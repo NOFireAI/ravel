@@ -279,6 +279,14 @@ as a precondition, not after the damage.
   its OWN `cargo`/`rustc` below a floor of about 8 GB. Killing your build
   costs a retry; letting the volume reach zero stops every Bash command
   in every session on the host, including the ones that would clean up.
+- This host is itself a fleet executor. `~/.fleet/executor` holds the
+  cargo target of whatever task it has claimed from the queue, which no
+  session here chose and which grows without warning; it has been observed
+  at 46 GB. So "no other session is building" does not mean the volume is
+  idle, and a gate failure is not evidence about the crates you scoped.
+  Measure before concluding: a `-p ravel-sql -p ravel-server` gate with
+  both feature lanes, the largest in the workspace, completes in 56 GB on
+  a quiet volume. Earlier failures of that same lane were contention.
 - A cold gate needs 54-70 GB of `target/` per worktree, so this machine
   runs ONE at a time regardless of how many sessions are otherwise idle.
   Two sessions gating concurrently is the expected failure, not bad luck:
