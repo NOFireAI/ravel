@@ -52,6 +52,64 @@ pub struct AttrColumn {
     pub ty: FieldType,
 }
 
+/// The dictionary form of a string column, restricted to a view's surviving
+/// rows (ADR-0099 decision 4).
+///
+/// Handed out only for a column whose page was dictionary-encoded, by
+/// [`ColumnarBlockView::str_dict`]. It exposes the distinct values and one id
+/// per surviving row, indexed by surviving row position exactly as every other
+/// per-row accessor is -- never the block's storage vectors.
+pub struct StrDictColumn<'a> {
+    dict: &'a [Vec<u8>],
+    /// One entry per block row, `Some(id)` indexing `dict`, `None` for an absent
+    /// row. Addressed through `rows` so callers see surviving-row indices only.
+    ids: &'a [Option<u32>],
+    /// Block row positions of the surviving rows, ascending (the view's `rows`).
+    rows: &'a [usize],
+}
+
+impl<'a> StrDictColumn<'a> {
+    /// The distinct values, in the page's dictionary order. Id `k` from
+    /// [`id_at`](Self::id_at) addresses `dict()[k as usize]`.
+    pub fn dict(&self) -> &'a [Vec<u8>] {
+        self.dict
+    }
+
+    /// The number of surviving rows: the length [`id_at`](Self::id_at) and
+    /// [`iter_ids`](Self::iter_ids) range over.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether no row survives.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The dictionary id of surviving row `i`, or `None` when that row has no
+    /// value for the column (absent per the presence bitmap) or `i` is out of
+    /// range. `Some(id)` always indexes [`dict`](Self::dict) in bounds.
+    pub fn id_at(&self, i: usize) -> Option<u32> {
+        let row = *self.rows.get(i)?;
+        self.ids.get(row).copied().flatten()
+    }
+
+    /// The dictionary ids of the surviving rows in order (see
+    /// [`id_at`](Self::id_at)).
+    pub fn iter_ids(&self) -> impl Iterator<Item = Option<u32>> + '_ {
+        (0..self.rows.len()).map(move |i| self.id_at(i))
+    }
+
+    /// The bytes of surviving row `i`, resolved through the dictionary. This is
+    /// the same value [`ColumnarBlockView::bytes_at`] returns for the same
+    /// surviving row; it exists so a test can prove the dictionary form fuses
+    /// back to the per-row form.
+    pub fn value_at(&self, i: usize) -> Option<&'a [u8]> {
+        let id = self.id_at(i)? as usize;
+        self.dict.get(id).map(Vec::as_slice)
+    }
+}
+
 /// A borrowed columnar view of one decoded block, restricted to the rows that
 /// survived the scan's exact content predicate.
 ///
@@ -325,10 +383,31 @@ impl<'a> ColumnarBlockView<'a> {
     pub fn bytes_at(&self, column_id: u32, i: usize) -> Option<&'a [u8]> {
         let row = self.row(i)?;
         let block = self.block;
-        if let Some(col) = block.str_col(column_id) {
-            return col.get(row)?.as_deref();
+        if let Some(bytes) = block.str_at(column_id, row) {
+            return Some(bytes);
         }
         block.fixed_col(column_id)?.get(row)?.as_deref()
+    }
+
+    /// The dictionary form of string column `column_id`, restricted to the
+    /// surviving rows (ADR-0099 decision 4): the distinct values plus one id per
+    /// surviving row. `Some` only for a column whose page was dictionary-encoded;
+    /// `None` for a plain page, an absent column, or one projected away -- a
+    /// plain page stays readable through [`bytes_at`](Self::bytes_at) and is
+    /// never forced into a dictionary here.
+    ///
+    /// Issue #417 consumes this to build an Arrow `Dictionary(Int32, Utf8)`
+    /// array without rebuilding a dictionary row by row. Like every accessor
+    /// here it returns values, never the block's storage type: `dict()` borrows
+    /// the distinct byte values and the ids address them, so the caller learns
+    /// nothing of how the column is stored beyond that it deduplicates.
+    pub fn str_dict(&self, column_id: u32) -> Option<StrDictColumn<'a>> {
+        let (dict, ids) = self.block.str_dict(column_id)?;
+        Some(StrDictColumn {
+            dict,
+            ids,
+            rows: self.rows,
+        })
     }
 
     // --- gather iterators ---------------------------------------------------
