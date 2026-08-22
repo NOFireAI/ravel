@@ -58,7 +58,7 @@ pub use provisioning::{
     append_generation, current_floor, current_floor_from_store, max_scan_count_over_range,
     provisioning_key, raise_format_floor, read_floors, read_floors_checked, read_floors_from_store,
     read_generations, read_generations_checked, read_generations_from_store, scan_count,
-    shard_ceiling, validate_or_adopt,
+    shard_ceiling, stable_generation_for_hour, validate_or_adopt,
 };
 pub use seal_divergence::{
     EntryIdentity, SealDivergenceError, SealDivergenceReport, verify_seal_divergence,

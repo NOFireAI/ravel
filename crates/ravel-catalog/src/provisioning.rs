@@ -571,6 +571,82 @@ pub fn max_scan_count_over_range(
     }
 }
 
+/// The generation that *unambiguously* owns ingest-hour bucket `hour`, or
+/// `None` when more than one generation's shards can hold that hour's data
+/// (ADR-0103 decision 1(b)). The generation-identity sibling of [`scan_count`]:
+/// same history, same interval math, but it answers "is exactly one generation
+/// in the scan set for this hour, and which one" instead of "how wide is the
+/// scan set".
+///
+/// A generation `g` owns `hour` iff `hour` falls in `g`'s **stable** interval
+///
+/// ```text
+/// [ activation_hour(g) + S , activation_hour(g+1) )
+/// ```
+///
+/// where `S` is `slack_hours` ([`DEFAULT_SCAN_SLACK_HOURS`]) and a nonexistent
+/// successor activates at infinity. The two ends close the two ways a second
+/// generation can reach into the hour:
+///
+/// - The `+ S` on the lower end excludes `g`'s own activation boundary and the
+///   slack margin above it, where a straggler routed under the retiring
+///   predecessor `g-1` is still in [`scan_count`]'s set (ADR-0052 section 4).
+/// - The exclusive `activation_hour(g+1)` upper end excludes every hour the
+///   successor has already activated for.
+///
+/// The **first** generation carries no lower margin (`activation_hour(0)`, not
+/// `activation_hour(0) + S`): the margin exists only to exclude a predecessor's
+/// stragglers, and generation 0 has no predecessor. For a validated history
+/// generation 0 activates at hour 0, so the first `S` hours of the tenant's
+/// history resolve to `Some(0)` and a single-generation history resolves every
+/// hour to `Some(0)` -- the "never resharded" case, which must stay eligible.
+///
+/// This makes the function exactly equivalent to "the scan set for `hour` is
+/// the single generation `g`": `Some(g)` iff `g` is the only generation
+/// [`scan_count`]'s interval test admits for `hour`, `None` iff two or more are
+/// admitted. `shard_for(series, shard_count)` is therefore provably constant
+/// for every hour this returns `Some` for, which is what ADR-0103's pushdown
+/// eligibility gate needs: no series can be split across two shard values, so
+/// no series can be split across two slice workers.
+///
+/// `None` for an hour that predates the first generation's activation (no
+/// generation owns it) and for an empty slice. Neither happens for the
+/// normalized, validated history [`read_generations`] returns (non-empty,
+/// dense, activation-increasing, generation 0 at `activation_hour` 0); both are
+/// handled defensively rather than assumed away, because the fail-closed answer
+/// here is "ineligible", never "assume generation 0".
+///
+/// A pure function with no I/O, like [`scan_count`] and
+/// [`max_scan_count_over_range`] beside it.
+pub fn stable_generation_for_hour(
+    generations: &[ShardGeneration],
+    hour: u32,
+    slack_hours: u32,
+) -> Option<u32> {
+    for (idx, g) in generations.iter().enumerate() {
+        // `u64` keeps `activation + slack` from overflowing `u32`, matching
+        // `scan_count`.
+        let stable_start = if idx == 0 {
+            // No predecessor, so no straggler margin to clear.
+            u64::from(g.activation_hour)
+        } else {
+            u64::from(g.activation_hour).saturating_add(u64::from(slack_hours))
+        };
+        if u64::from(hour) < stable_start {
+            // `hour` is below this generation's stable interval, and
+            // activations increase, so it is below every later one's too.
+            return None;
+        }
+        let successor_activation = generations
+            .get(idx + 1)
+            .map_or(u64::MAX, |s| u64::from(s.activation_hour));
+        if u64::from(hour) < successor_activation {
+            return Some(g.generation);
+        }
+    }
+    None
+}
+
 /// The fold-time fan-out ceiling (ADR-0052 section 5): `max { count(g) :
 /// activation_hour(g) <= watermark_hour }`, with **no** slack-window upper
 /// bound. This is the value a fold stamps into `SnapshotHead.shard_count` /
@@ -1494,6 +1570,7 @@ pub async fn raise_format_floor(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutMode, PutOptions};
@@ -2005,6 +2082,296 @@ mod tests {
         );
         assert_eq!(scan_count(&gens, 201, 2), 8, "still inside gen1's slack");
         assert_eq!(scan_count(&gens, 202, 2), 2, "slack closed: gen2's count");
+    }
+
+    /// The generation ids [`scan_count`]'s documented interval math admits for
+    /// `hour`: `activation_hour(g) <= hour` and
+    /// `hour < successor_activation(g) + S`, with a nonexistent successor
+    /// activating at infinity. Written out independently here (rather than
+    /// reusing `stable_generation_for_hour`'s own loop) so the property tests
+    /// below compare `stable_generation_for_hour` against the scan rule
+    /// itself, not against its own implementation.
+    fn scan_set_generations(gens: &[ShardGeneration], hour: u32, slack_hours: u32) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for (idx, g) in gens.iter().enumerate() {
+            if g.activation_hour > hour {
+                continue;
+            }
+            let successor_activation = gens
+                .get(idx + 1)
+                .map_or(u64::MAX, |s| u64::from(s.activation_hour));
+            if u64::from(hour) < successor_activation.saturating_add(u64::from(slack_hours)) {
+                ids.push(g.generation);
+            }
+        }
+        ids
+    }
+
+    /// A valid history: generation 0 at `activation_hour` 0, dense generation
+    /// numbers, strictly increasing activations spaced `min_gap..=max_gap`
+    /// apart, adjacent counts always differing.
+    fn history_strategy(
+        min_gap: u32,
+        max_gap: u32,
+        max_extra_gens: usize,
+    ) -> impl Strategy<Value = Vec<ShardGeneration>> {
+        proptest::collection::vec((min_gap..=max_gap, 1u32..=64u32), 0..max_extra_gens).prop_map(
+            |tail| {
+                let mut gens = vec![sg(0, 4, 0)];
+                for (gap, count) in tail {
+                    let prev = gens[gens.len() - 1];
+                    let count = if count == prev.shard_count {
+                        prev.shard_count + 1
+                    } else {
+                        count
+                    };
+                    gens.push(sg(
+                        prev.generation + 1,
+                        count,
+                        prev.activation_hour + gap.max(1),
+                    ));
+                }
+                gens
+            },
+        )
+    }
+
+    /// `stable_generation_for_hour`: a single generation (the never-resharded
+    /// tenant) owns every hour, including the first `S` hours -- generation 0
+    /// has no predecessor, so it carries no straggler margin. This is the case
+    /// pushdown eligibility must never lose (ADR-0103 decision 1(b)).
+    #[test]
+    fn stable_generation_for_hour_single_generation() {
+        let gens = [sg(0, 4, 0)];
+        for hour in [0, 1, 2, 3, 99, 1_000, u32::MAX] {
+            assert_eq!(
+                stable_generation_for_hour(&gens, hour, DEFAULT_SCAN_SLACK_HOURS),
+                Some(0),
+                "hour {hour}"
+            );
+        }
+    }
+
+    /// `stable_generation_for_hour` across a shard-count INCREASE: the last
+    /// hour before the activation belongs to the retiring generation, the
+    /// activation hour and its slack margin belong to neither, and the first
+    /// hour past the margin belongs to the new generation.
+    #[test]
+    fn stable_generation_for_hour_increase_boundary() {
+        // gen0 count 4 @0; gen1 count 8 @100. S = 3.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100)];
+        let s = DEFAULT_SCAN_SLACK_HOURS;
+        assert_eq!(stable_generation_for_hour(&gens, 99, s), Some(0));
+        assert_eq!(
+            stable_generation_for_hour(&gens, 100, s),
+            None,
+            "activation hour: a straggler routed under gen0 can still land here"
+        );
+        assert_eq!(stable_generation_for_hour(&gens, 101, s), None);
+        assert_eq!(
+            stable_generation_for_hour(&gens, 102, s),
+            None,
+            "last hour inside the slack margin"
+        );
+        assert_eq!(
+            stable_generation_for_hour(&gens, 103, s),
+            Some(1),
+            "first stable hour of gen1"
+        );
+        assert_eq!(stable_generation_for_hour(&gens, 10_000, s), Some(1));
+    }
+
+    /// `stable_generation_for_hour` across a shard-count DECREASE: identical
+    /// interval math (the function reads activation hours only, never counts),
+    /// so the retiring larger generation's slack margin is ambiguous the same
+    /// way an increase's is.
+    #[test]
+    fn stable_generation_for_hour_decrease_boundary() {
+        // gen0 count 8 @0; gen1 count 4 @100. S = 3.
+        let gens = [sg(0, 8, 0), sg(1, 4, 100)];
+        let s = DEFAULT_SCAN_SLACK_HOURS;
+        assert_eq!(stable_generation_for_hour(&gens, 99, s), Some(0));
+        assert_eq!(stable_generation_for_hour(&gens, 100, s), None);
+        assert_eq!(stable_generation_for_hour(&gens, 102, s), None);
+        assert_eq!(stable_generation_for_hour(&gens, 103, s), Some(1));
+    }
+
+    /// Three generations: a middle generation whose stable interval is bounded
+    /// on both sides, plus the ambiguous margins around each boundary.
+    #[test]
+    fn stable_generation_for_hour_three_generations() {
+        // gen0 count 4 @0; gen1 count 8 @100; gen2 count 2 @200. S = 3.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100), sg(2, 2, 200)];
+        let s = DEFAULT_SCAN_SLACK_HOURS;
+        assert_eq!(stable_generation_for_hour(&gens, 50, s), Some(0));
+        assert_eq!(stable_generation_for_hour(&gens, 100, s), None);
+        assert_eq!(stable_generation_for_hour(&gens, 103, s), Some(1));
+        assert_eq!(stable_generation_for_hour(&gens, 199, s), Some(1));
+        assert_eq!(stable_generation_for_hour(&gens, 200, s), None);
+        assert_eq!(stable_generation_for_hour(&gens, 202, s), None);
+        assert_eq!(stable_generation_for_hour(&gens, 203, s), Some(2));
+    }
+
+    /// A generation whose successor activates inside its own slack margin has
+    /// NO stable interval at all: every one of its hours is ambiguous. Two
+    /// reshards within `S` hours of each other therefore disable pushdown for
+    /// the whole span, which is the conservative direction.
+    #[test]
+    fn stable_generation_for_hour_gap_narrower_than_slack_has_no_stable_hour() {
+        // gen1 @100, gen2 @102, with S = 3: gen1's stable interval would be
+        // [103, 102), empty.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100), sg(2, 2, 102)];
+        let s = DEFAULT_SCAN_SLACK_HOURS;
+        assert_eq!(stable_generation_for_hour(&gens, 99, s), Some(0));
+        for hour in 100..=104 {
+            assert_eq!(
+                stable_generation_for_hour(&gens, hour, s),
+                None,
+                "hour {hour}"
+            );
+        }
+        assert_eq!(stable_generation_for_hour(&gens, 105, s), Some(2));
+    }
+
+    /// An hour that predates the first generation's activation is owned by no
+    /// generation: `None`, never "assume generation 0". Unreachable for a
+    /// validated history (generation 0 activates at hour 0); the defensive
+    /// branch is pinned so it cannot drift to a fail-open answer.
+    #[test]
+    fn stable_generation_for_hour_before_first_activation_is_none() {
+        let gens = [sg(0, 4, 50)];
+        assert_eq!(
+            stable_generation_for_hour(&gens, 49, DEFAULT_SCAN_SLACK_HOURS),
+            None
+        );
+        assert_eq!(
+            stable_generation_for_hour(&gens, 50, DEFAULT_SCAN_SLACK_HOURS),
+            Some(0),
+            "the first generation carries no lower margin"
+        );
+        assert_eq!(
+            stable_generation_for_hour(&[], 0, DEFAULT_SCAN_SLACK_HOURS),
+            None,
+            "empty (never-validated) history owns nothing"
+        );
+    }
+
+    /// The load-bearing slack-margin test (ADR-0103 decision 1(b)): skipping
+    /// the margin and using `next_activation_hour` directly is unsound, because
+    /// ADR-0052's scan rule keeps the retiring generation's shard indices in
+    /// the scan set for `DEFAULT_SCAN_SLACK_HOURS` past the successor's
+    /// activation. A query resolving a segment from that margin can hold the
+    /// same series under two shard values (two slice workers), and a pushed-down
+    /// count/min/max over it would be silently wrong.
+    ///
+    /// Delete the `+ slack_hours` from `stable_generation_for_hour`'s
+    /// `stable_start` and hour 100 starts returning `Some(1)`: this test fails.
+    #[test]
+    fn nf_stable_generation_for_hour_slack_margin_is_load_bearing() {
+        // Count 4 then 8, activation at hour 100.
+        let gens = [sg(0, 4, 0), sg(1, 8, 100)];
+        assert_eq!(
+            stable_generation_for_hour(&gens, 100, DEFAULT_SCAN_SLACK_HOURS),
+            None,
+            "hour 100 is inside gen1's slack margin: ADR-0052's scan rule still \
+             scans gen0's 4 shards for it, so the hour is ambiguous"
+        );
+        // The scan rule itself is what makes it ambiguous: both generations are
+        // in the scan set for hour 100.
+        assert_eq!(
+            scan_set_generations(&gens, 100, DEFAULT_SCAN_SLACK_HOURS),
+            vec![0, 1]
+        );
+        assert_eq!(
+            stable_generation_for_hour(
+                &gens,
+                100 + DEFAULT_SCAN_SLACK_HOURS,
+                DEFAULT_SCAN_SLACK_HOURS
+            ),
+            Some(1),
+            "one slack window past the activation, gen1 owns the hour alone"
+        );
+        assert_eq!(
+            scan_set_generations(
+                &gens,
+                100 + DEFAULT_SCAN_SLACK_HOURS,
+                DEFAULT_SCAN_SLACK_HOURS
+            ),
+            vec![1]
+        );
+    }
+
+    proptest! {
+        /// `stable_generation_for_hour` is exactly "the scan set for this hour
+        /// holds one generation, and this is it", over arbitrary valid
+        /// histories (one to four generations, increases and decreases, gaps
+        /// both wider and narrower than the slack window), arbitrary hours, and
+        /// arbitrary slack windows. The oracle is `scan_count`'s own documented
+        /// interval math, restated at generation-id level.
+        #[test]
+        fn stable_generation_for_hour_matches_scan_set(
+            gens in history_strategy(1, 120, 4),
+            hour in 0u32..500,
+            slack in 0u32..6,
+        ) {
+            let set = scan_set_generations(&gens, hour, slack);
+            let expected = if set.len() == 1 { Some(set[0]) } else { None };
+            prop_assert_eq!(stable_generation_for_hour(&gens, hour, slack), expected);
+        }
+
+        /// When an hour is stable, the scan set is that one generation, so
+        /// `scan_count` for the hour is exactly that generation's own
+        /// `shard_count`: the shard-index domain is provably a single
+        /// generation's, which is what makes `shard_for` constant over the
+        /// hour (ADR-0103 decision 1(b)).
+        #[test]
+        fn stable_hour_scan_count_is_that_generations_count(
+            gens in history_strategy(1, 120, 4),
+            hour in 0u32..500,
+        ) {
+            let s = DEFAULT_SCAN_SLACK_HOURS;
+            if let Some(id) = stable_generation_for_hour(&gens, hour, s) {
+                let owner = gens
+                    .iter()
+                    .find(|g| g.generation == id)
+                    .expect("returned id is one of the history's generations");
+                prop_assert_eq!(scan_count(&gens, hour, s), owner.shard_count);
+            }
+        }
+
+        /// Both edges of every reshard boundary's slack window, for histories
+        /// whose generations are spaced wider than the window: the activation
+        /// hour and `activation_hour + S - 1` are ambiguous, and
+        /// `activation_hour + S` is the first hour the new generation owns
+        /// alone.
+        #[test]
+        fn stable_generation_for_hour_slack_window_edges(
+            gens in history_strategy(DEFAULT_SCAN_SLACK_HOURS + 1, 200, 4),
+        ) {
+            let s = DEFAULT_SCAN_SLACK_HOURS;
+            for (idx, g) in gens.iter().enumerate().skip(1) {
+                prop_assert_eq!(
+                    stable_generation_for_hour(&gens, g.activation_hour, s),
+                    None,
+                    "activation hour of generation {}", idx
+                );
+                prop_assert_eq!(
+                    stable_generation_for_hour(&gens, g.activation_hour + s - 1, s),
+                    None,
+                    "last hour of generation {}'s slack margin", idx
+                );
+                prop_assert_eq!(
+                    stable_generation_for_hour(&gens, g.activation_hour + s, s),
+                    Some(g.generation),
+                    "first stable hour of generation {}", idx
+                );
+                prop_assert_eq!(
+                    stable_generation_for_hour(&gens, g.activation_hour - 1, s),
+                    Some(gens[idx - 1].generation),
+                    "last stable hour before generation {}", idx
+                );
+            }
+        }
     }
 
     /// `DEFAULT_SCAN_SLACK_HOURS` is the sum of
