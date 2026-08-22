@@ -55,10 +55,12 @@ const CASES: u32 = 48;
 
 // --- vocabularies ----------------------------------------------------------
 
-/// Resource attribute keys, disjoint from the declared keys so the declared
-/// columns are genuinely record-sourced (the common case) without an accidental
-/// resource/record collision confusing the comparison.
-const RESOURCE_KEYS: &[&str] = &["service.name", "host"];
+/// Resource attribute keys. `name` is deliberately also a *declared* key, so a
+/// generated record can set the same key at both resource and record level and
+/// the differential exercises the record-wins-over-resource merge rather than
+/// only the resource-absent case. With a disjoint vocabulary an implementation
+/// that inverted the precedence passed the whole suite.
+const RESOURCE_KEYS: &[&str] = &["service.name", "host", "name"];
 const VALUE_VOCAB: &[&str] = &["api", "worker", "db", "edge"];
 const WORD_VOCAB: &[&str] = &["timeout", "connection", "error", "ok", "retry"];
 const SEVERITY_TEXT: &[&str] = &["INFO", "WARN", "ERROR"];
@@ -268,34 +270,19 @@ async fn write_object(
     records: &[LogRecord],
     cfg: RlogConfig,
 ) -> SegmentRef {
+    let bytes = encode_object(records, cfg);
+    let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+    let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+    put_object(store, key, bytes, min, max, records.len()).await
+}
+
+/// Encode `records` into one RLOG object's bytes.
+fn encode_object(records: &[LogRecord], cfg: RlogConfig) -> Vec<u8> {
     let mut w = RlogWriter::new(cfg, identity());
     for r in records {
         w.push(r.clone()).expect("push");
     }
-    let bytes = w.finish().expect("finish");
-    let size = bytes.len() as u64;
-    store
-        .put(key, bytes::Bytes::from(bytes), PutOptions::default())
-        .await
-        .expect("put");
-    let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
-    let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
-    SegmentRef {
-        data_object_key: key.to_string(),
-        object_size: size,
-        min_event_ts_ns: min,
-        max_event_ts_ns: max,
-        ingest_hour_bucket: 0,
-        sample_count: records.len() as u64,
-        series_count: 0,
-        shard: 0,
-        content_hash: [0u8; 32],
-        writer_id: Uuid::from_u128(1),
-        writer_epoch: 1,
-        writer_seq: 1,
-        created_unix_ns: 0,
-        level: SegmentLevel::L0,
-    }
+    w.finish().expect("finish")
 }
 
 /// Small blocks so a corpus of a dozen records still spans several blocks,
@@ -304,6 +291,40 @@ fn small_blocks() -> RlogConfig {
     RlogConfig {
         block_target_records: 3,
         ..RlogConfig::default()
+    }
+}
+
+/// Put already-encoded RLOG bytes into `store` and describe them as a
+/// `SegmentRef`. Split out of [`write_object`] because one fixture needs an
+/// object the writer cannot produce (see `rewrite_single_block`).
+async fn put_object(
+    store: &MemoryStore,
+    key: &str,
+    bytes: Vec<u8>,
+    min: i64,
+    max: i64,
+    records: usize,
+) -> SegmentRef {
+    let size = bytes.len() as u64;
+    store
+        .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    SegmentRef {
+        data_object_key: key.to_string(),
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: 0,
+        sample_count: records as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash: [0u8; 32],
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: 1,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
     }
 }
 
@@ -664,5 +685,181 @@ async fn attrs_raw_spill_falls_back_to_row_path_and_keeps_the_value() {
         got[0][1],
         Cell::OptStr(Some("spilled".to_string())),
         "the spilled declared value must survive the fallback"
+    );
+}
+
+/// A declared key set at BOTH resource and record level, which is where the
+/// merge's precedence is decided (ADR-0033: the record wins) and where a wrong
+/// variant must read NULL rather than falling through to the resource value
+/// (ADR-0090 decision 7).
+///
+/// Three rows, one per case, asserted on both paths:
+///
+/// - ts 0: resource sets `name`, the record sets it too -> the record's value;
+/// - ts 1: resource sets `name`, the record does not -> the resource's value;
+/// - ts 2: resource sets `name`, the record sets it as an `I64` -> NULL, not the
+///   resource value: the record does set the key, so the fallback is not
+///   consulted, and the value's variant does not match the declared type.
+///
+/// An implementation that inverted the precedence, or that fell through to the
+/// resource layer on a wrong-variant record value, produces a different answer
+/// for ts 0 and ts 2 respectively.
+#[tokio::test]
+async fn a_declared_key_set_at_both_levels_resolves_record_over_resource() {
+    let declared = declared_columns();
+    // Index 1 of `declared_columns()` is the `Str`-typed `name`.
+    let name_col = FIRST_DECLARED_COL + 1;
+    let projection = vec![0usize, name_col];
+
+    let resource = vec![("name".to_string(), AttrValue::Str("from-resource".into()))];
+    let mk = |ts: i64, attrs: Vec<(String, AttrValue)>| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "b".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs,
+    };
+    let records = vec![
+        mk(
+            0,
+            vec![("name".to_string(), AttrValue::Str("from-record".into()))],
+        ),
+        mk(1, Vec::new()),
+        mk(2, vec![("name".to_string(), AttrValue::I64(7))]),
+    ];
+
+    let store = MemoryStore::new();
+    let seg = write_object(&store, "logs/collide.rlog", &records, RlogConfig::default()).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let segments = vec![seg];
+
+    let want = vec![
+        vec![Cell::Ts(0), Cell::OptStr(Some("from-record".to_string()))],
+        vec![Cell::Ts(1), Cell::OptStr(Some("from-resource".to_string()))],
+        vec![Cell::Ts(2), Cell::OptStr(None)],
+    ];
+
+    let fast = run_scan(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+    assert!(fast.columnar_batches > 0, "the fast path must have run");
+    assert_eq!(fast.rowpath_batches, 0, "the fast path must not fall back");
+    assert_eq!(rows(&fast.batches, &projection, &declared), want);
+
+    let row = run_scan(
+        Arc::clone(&store),
+        segments,
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        no_match_erasure(),
+    )
+    .await;
+    assert_eq!(
+        row.columnar_batches, 0,
+        "the forced run must take the row path"
+    );
+    assert!(row.rowpath_batches > 0, "the row path must have run");
+    assert_eq!(rows(&row.batches, &projection, &declared), want);
+}
+
+/// The `attrs_raw` fallback *mid-segment*: an earlier block is clean and a later
+/// one carries an overflow page, so the fast path emits block 0, then re-opens
+/// the segment on the row path and discards the blocks it already emitted.
+///
+/// That discard loop (`LogScanState::Rows`'s `skip`) is the one place in the
+/// columnar change where a row can be emitted twice or dropped, and a fixture of
+/// one block can never reach it: the fallback there fires on block 0 with
+/// `skip == 0`. Here `columnar_batches == 1` and `rowpath_batches == 1` prove
+/// both halves ran, and the `ts` multiset proves every row was emitted exactly
+/// once across the switch.
+///
+/// The spill is forced with `max_dynamic_columns = 1`: `filler` (earlier in the
+/// writer's `(name, type)` order) takes the single dynamic column, so `tags`
+/// overflows into `attrs_raw` -- but only in the block holding the two records
+/// that carry it, because a block whose records all fit their columns has no
+/// `attrs_raw` page at all.
+#[tokio::test]
+async fn a_later_block_with_attrs_raw_falls_back_without_losing_or_repeating_rows() {
+    let declared = vec![DeclaredColumn::new("tags", DeclaredType::Str)];
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let mk = |ts: i64, spilled: bool| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "b".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: {
+            let mut attrs = vec![("filler".to_string(), AttrValue::Str("f".into()))];
+            if spilled {
+                attrs.push(("tags".to_string(), AttrValue::Str(format!("spilled-{ts}"))));
+            }
+            attrs
+        },
+    };
+    // Blocks of two records: block 0 (ts 0, 1) is clean, block 1 (ts 2, 3)
+    // carries the `attrs_raw` page.
+    let records = vec![mk(0, false), mk(1, false), mk(2, true), mk(3, true)];
+    let cfg = RlogConfig {
+        block_target_records: 2,
+        max_dynamic_columns: 1,
+        ..RlogConfig::default()
+    };
+
+    let store = MemoryStore::new();
+    let seg = write_object(&store, "logs/midspill.rlog", &records, cfg).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    let projection = vec![0usize, FIRST_DECLARED_COL];
+    let run = run_scan(
+        store,
+        vec![seg],
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+
+    assert_eq!(
+        run.columnar_batches, 1,
+        "the clean first block must be emitted columnar; columnar={}, rowpath={}",
+        run.columnar_batches, run.rowpath_batches
+    );
+    assert_eq!(
+        run.rowpath_batches, 1,
+        "the spilled second block must be emitted by the re-opened row path; \
+         columnar={}, rowpath={}",
+        run.columnar_batches, run.rowpath_batches
+    );
+
+    let got = rows(&run.batches, &projection, &declared);
+    let want = vec![
+        vec![Cell::Ts(0), Cell::OptStr(None)],
+        vec![Cell::Ts(1), Cell::OptStr(None)],
+        vec![Cell::Ts(2), Cell::OptStr(Some("spilled-2".to_string()))],
+        vec![Cell::Ts(3), Cell::OptStr(Some("spilled-3".to_string()))],
+    ];
+    assert_eq!(
+        got, want,
+        "every row exactly once across the columnar/row switch, spilled values \
+         included"
     );
 }
