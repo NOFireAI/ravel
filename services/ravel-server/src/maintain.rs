@@ -2143,6 +2143,27 @@ mod tests {
         WorkerSet::with_defaults(0)
     }
 
+    /// The pinned membership identity the rendezvous-repartition tests below
+    /// resolve ownership against, plus a peer id that outweighs it for
+    /// `(TenantId::new("acme"), Signal::Metrics, shard 0)`.
+    ///
+    /// Rendezvous weight is a function of the process id, so a test that needs
+    /// a peer to take a specific unit must pin both ids. Searching a candidate
+    /// range for a peer that outweighs a randomly drawn own id fails outright
+    /// whenever that draw lands near the top of the weight range: with an own
+    /// id of `Uuid::from_u128(7282)`, no peer in the old `1..10_000` candidate
+    /// range flips this unit at all. The flip is asserted at each use, so a
+    /// change to `unit_key` or the weight function fails loudly here instead of
+    /// silently leaving the peer without ownership.
+    const PINNED_WORKER_ID: Uuid = Uuid::from_u128(1);
+    const PINNED_PEER_ID: Uuid = Uuid::from_u128(2);
+
+    /// A solo worker on [`PINNED_WORKER_ID`], otherwise identical to
+    /// [`solo_worker`].
+    fn pinned_worker() -> WorkerSet {
+        solo_worker().with_process_id(PINNED_WORKER_ID)
+    }
+
     /// The acceptance test for shared-store ownership (ADR-0065
     /// decisions 1 and 2): two maintain replicas sharing one store partition the
     /// unit set rather than both paying for it.
@@ -4815,21 +4836,23 @@ mod tests {
         let discovery_metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
         let ownership = MaintenanceOwnershipMetrics::new(THRESHOLD);
-        let worker = solo_worker();
+        let worker = pinned_worker();
         let live_solo = worker.solo_live_set();
 
-        // A deterministic peer id whose presence in the live set flips shard
-        // 0's rendezvous owner away from `worker` (the argmax is a function
-        // of both ids, so some peer id must exist that outweighs `worker`'s
-        // own weight for this specific unit key).
-        let peer_id = (1u128..10_000)
-            .map(Uuid::from_u128)
-            .find(|candidate| {
-                let live = vec![worker.process_id(), *candidate];
-                !worker.owns_unit(&live, &tenant, Signal::Metrics, 0)
-            })
-            .expect("some peer id flips shard 0's rendezvous owner away from the solo worker");
-        let live_ab = vec![worker.process_id(), peer_id];
+        // Both ids are pinned, so the repartition this test needs is a fact
+        // about fixed inputs rather than a property of a random draw. Asserted,
+        // not assumed: shard 0 is owned here under the solo live set, and the
+        // peer's presence takes it away.
+        let live_ab = vec![worker.process_id(), PINNED_PEER_ID];
+        assert!(
+            worker.owns_unit(&live_solo, &tenant, Signal::Metrics, 0),
+            "the solo worker must own shard 0 under rendezvous hashing"
+        );
+        assert!(
+            !worker.owns_unit(&live_ab, &tenant, Signal::Metrics, 0),
+            "the pinned peer id must flip shard 0's rendezvous owner away from \
+             the solo worker"
+        );
 
         let inner = MemoryStore::new();
         publish_terminal_bucket(&inner, &tenant_id).await;
@@ -4958,7 +4981,7 @@ mod tests {
         let discovery_metrics = TenantDiscoveryMetrics::default();
         let safety = MaintenanceSafetyMetrics::default();
         let ownership = MaintenanceOwnershipMetrics::new(THRESHOLD);
-        let worker = solo_worker();
+        let worker = pinned_worker();
         let live_solo = worker.solo_live_set();
         let mut memo = MaintainMemo::with_default_interval();
 
@@ -5083,14 +5106,16 @@ mod tests {
         // The unit is now genuinely unowned, so its entry must be pruned --
         // the behavior the evaluated-keyed prune was written for, which
         // keying on ownership must preserve.
-        let peer_id = (1u128..10_000)
-            .map(Uuid::from_u128)
-            .find(|candidate| {
-                let live = vec![worker.process_id(), *candidate];
-                !worker.owns_unit(&live, &tenant, Signal::Metrics, 0)
-            })
-            .expect("some peer id flips shard 0's rendezvous owner away from the solo worker");
-        let live_ab = vec![worker.process_id(), peer_id];
+        let live_ab = vec![worker.process_id(), PINNED_PEER_ID];
+        assert!(
+            worker.owns_unit(&live_solo, &tenant, Signal::Metrics, 0),
+            "the solo worker must own shard 0 under rendezvous hashing"
+        );
+        assert!(
+            !worker.owns_unit(&live_ab, &tenant, Signal::Metrics, 0),
+            "the pinned peer id must flip shard 0's rendezvous owner away from \
+             the solo worker"
+        );
         let clean = store_with_tenant_data(&tenant_id).await;
         let _report = run_discovery_cycle(
             &clean,
