@@ -66,6 +66,13 @@ futures = { workspace = true, optional = true }
 # below reuses a workspace pin.
 ravel-sql = { path = "../ravel-sql", version = "0.10.0", optional = true, features = ["flight-sql"] }
 arrow-flight = { workspace = true, optional = true }
+# Gated behind `sql-latency` (off by default). The groupby scaling bench reads
+# the real physical plan (`displayable`, `ExecutionPlan::output_partitioning`)
+# to record what each swept combination actually did, so it needs datafusion in
+# scope. Not a new external crate to the workspace: ravel-sql already pins and
+# links datafusion 54 with the same version/features, so feature unification
+# resolves this to that same instance rather than a second copy.
+datafusion = { version = "54", default-features = false, features = ["sql"], optional = true }
 # Gated behind `profiling` (off by default). CPU flamegraph lane for the
 # ingest and query bench bins (issue #365). pprof is a NEW external
 # dependency, NOT a workspace pin; its `flamegraph` feature pulls `inferno`
@@ -113,7 +120,7 @@ profiling = ["dep:pprof"]
 # corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
 # same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
 # second datafusion/arrow activation) and the plain gates never compile it.
-sql-latency = ["dep:ravel-sql"]
+sql-latency = ["dep:ravel-sql", "dep:datafusion"]
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -213,6 +220,12 @@ path = "src/bin/flight_sql_egress.rs"
 required-features = ["flight-egress"]
 bench = false
 
+[[bin]]
+name = "groupby_scaling_bench"
+path = "src/bin/groupby_scaling_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
 [[test]]
 name = "read_accounting"
 path = "tests/read_accounting.rs"
@@ -256,6 +269,14 @@ bench = false
 [[test]]
 name = "distrib_crossover_smoke"
 path = "tests/distrib_crossover_smoke.rs"
+bench = false
+
+# The test body is gated on `sql-latency` (empty crate without it), so this
+# entry stays harmless under the default feature set and only exercises the
+# scaling bench under `--features sql-latency`.
+[[test]]
+name = "groupby_scaling_smoke"
+path = "tests/groupby_scaling_smoke.rs"
 bench = false
 
 [[bench]]
