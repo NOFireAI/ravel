@@ -279,6 +279,15 @@ path = "tests/sql_latency_smoke.rs"
 required-features = ["sql-latency"]
 bench = false
 
+# Tripwire for the object_count invariant (issue #481): distinct data-object
+# keys reachable from the resolved snapshot equal the reported object_count.
+# Behind sql-latency because the L0 case drives the sql_latency harness.
+[[test]]
+name = "sql_latency_object_count_invariant"
+path = "tests/sql_latency_object_count_invariant.rs"
+required-features = ["sql-latency"]
+bench = false
+
 # Gate test for the checked-in ClickBench corpus (issue #430). It reads
 # `ravel_bench::sql_corpus`, so it lives behind the same `sql-latency` feature.
 [[test]]
