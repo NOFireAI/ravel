@@ -89,6 +89,27 @@ message PartialAggregateRequest {
   bool want_count = 1;  // populate PartialAggregate.count
   bool want_min = 2;    // populate PartialAggregate.min_bits
   bool want_max = 3;    // populate PartialAggregate.max_bits
+
+  // The reduction window the worker filters merged samples to before it counts
+  // or folds them (ADR-0103 amendment). Matches `eval_matrix_selector`'s range
+  // convention exactly: `reduce_start_ns` is EXCLUSIVE and `reduce_end_ns` is
+  // INCLUSIVE, so a merged sample survives iff
+  // `ts_ns > reduce_start_ns && ts_ns <= reduce_end_ns`. These carry the
+  // offset/@-resolved `(start, end]` of the `_over_time` selector, NOT the
+  // coordinator's fetch window: the fetch window is deliberately left-padded
+  // for PromQL lookback and is a strict superset of this range, so the worker
+  // must never reduce over it directly.
+  //
+  // A caller MUST send BOTH or NEITHER; these two fields are one window, not two
+  // independent knobs. Both absent is the only shape any caller sends today
+  // (T1-T3, and this task adds no caller): the worker then reduces over every
+  // merged sample with no window restriction, byte-identical to the
+  // pre-amendment behavior. Both present: the worker filters to the range above
+  // before the count/min/max fold. Exactly one present is a caller bug -- a lone
+  // bound cannot define a window -- which the worker rejects with
+  // `Status.Code.INTERNAL`, never a silent one-sided filter.
+  optional sint64 reduce_start_ns = 4;  // exclusive lower bound of the reduction window
+  optional sint64 reduce_end_ns = 5;    // inclusive upper bound of the reduction window
 }
 
 // Intra-cluster scope: the explicit segment set for this slice, reconstructed
@@ -177,8 +198,14 @@ message FetchResponse {
 // One worker-computed partial aggregate for a single group (ADR-0103 decision
 // 2): the group's series identity plus whichever of count/min/max the query
 // actually asked for. A worker sends these instead of raw sample runs when the
-// coordinator opted the query into aggregation pushdown; the coordinator sums
-// the counts and folds the bounds under the ADR-0023 `total_cmp` total order.
+// coordinator opted the query into aggregation pushdown. Decision 1's
+// eligibility gate guarantees every series in scope lives on exactly one worker,
+// so the coordinator COLLECTS one partial per series (one worker contributes
+// each series' whole partial) rather than summing counts across workers. Min/max
+// combine does not ship yet (ADR-0103 amendment: T3's `total_cmp` fold is not
+// the IEEE fold `min_over_time`/`max_over_time` compute), so no caller combines
+// `min_bits`/`max_bits` today; only `count`, from `count_over_time` pushdown, is
+// consumed.
 //
 // No dedup-key metadata rides here. ADR-0103 decision 1's eligibility gate
 // (not federated, every resolved segment inside one shard generation's stable
