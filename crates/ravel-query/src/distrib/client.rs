@@ -39,12 +39,15 @@ pub enum DistribError {
     /// A frame carried no `frame` oneof variant.
     #[error("slice stream carried an empty frame")]
     EmptyFrame,
-    /// The remote streamed a per-signal record frame (a log record or a span)
-    /// for a signal this coordinator's metrics fetch path cannot consume.
+    /// The remote streamed a frame kind this decoder's call site cannot
+    /// consume: a per-signal record frame (a log record or a span) for a signal
+    /// this coordinator's metrics fetch path does not handle, or a
+    /// `PartialAggregate` (ADR-0103 decision 2), which no coordinator consumes
+    /// yet because no encoder call site sends one.
     /// Unreachable from a real query today: the metrics coordinator only ever
     /// dispatches `Signal::Metrics`, and the log/span coordinators that would
     /// receive these frames are built by #284/#285. The `frame` oneof is
-    /// exhaustive, so the metrics decoder must still name the variants: this is a
+    /// exhaustive, so every decoder must still name the variants: this is a
     /// well-formed frame this build does not consume, not corruption.
     #[error(
         "remote returned a {0} frame this metrics coordinator cannot decode across the slice boundary"
@@ -286,6 +289,8 @@ impl SliceFetcher for RemoteSliceFetcher {
 /// frame that fails to decode ([`DistribError::Codec`], the same as a malformed
 /// scalar frame -- as of `PROTOCOL_VERSION` 3 a `Hist` frame is real data this
 /// build consumes, so a decode failure is corruption, never a coverage gap), a
+/// `PartialAggregate` frame, which this build never consumes because no encoder
+/// sends one yet ([`DistribError::FrameSignalUnsupported`]), a
 /// frame carrying no oneof variant ([`DistribError::EmptyFrame`]), a second
 /// summary ([`DistribError::MultipleSummaries`]), a stream that ended with no
 /// summary ([`DistribError::NoSummary`]), a summary with no status, or an
@@ -307,6 +312,9 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
             }
             Some(pb::fetch_response::Frame::Span(_)) => {
                 return Err(DistribError::FrameSignalUnsupported("span"));
+            }
+            Some(pb::fetch_response::Frame::PartialAggregate(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("partial-aggregate"));
             }
             Some(pb::fetch_response::Frame::Summary(s)) => {
                 if summary.is_some() {
@@ -369,6 +377,9 @@ pub fn decode_log_slice_frames(
             Some(pb::fetch_response::Frame::Span(_)) => {
                 return Err(DistribError::FrameSignalUnsupported("span"));
             }
+            Some(pb::fetch_response::Frame::PartialAggregate(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("partial-aggregate"));
+            }
             Some(pb::fetch_response::Frame::Summary(s)) => {
                 if summary.is_some() {
                     return Err(DistribError::MultipleSummaries);
@@ -427,6 +438,9 @@ pub fn decode_span_slice_frames(
             }
             Some(pb::fetch_response::Frame::LogRecord(_)) => {
                 return Err(DistribError::FrameSignalUnsupported("log-record"));
+            }
+            Some(pb::fetch_response::Frame::PartialAggregate(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("partial-aggregate"));
             }
             Some(pb::fetch_response::Frame::Summary(s)) => {
                 if summary.is_some() {
@@ -872,6 +886,39 @@ mod tests {
         assert!(matches!(
             decode_span_slice_frames(vec![log, summary_frame(pb::status::Code::Ok)]),
             Err(DistribError::FrameSignalUnsupported("log-record"))
+        ));
+    }
+
+    /// A `PartialAggregate` frame (ADR-0103 decision 2) is rejected as
+    /// `FrameSignalUnsupported` by every decoder: the frame and its codec land
+    /// before any sender exists, so no coordinator consumes one yet. Relaxing
+    /// any of the three explicit `Frame::PartialAggregate(_)` reject arms to a
+    /// wildcard would drop the frame and decode to an empty `Ok`, failing these
+    /// assertions.
+    #[test]
+    fn every_decoder_rejects_partial_aggregate_as_unsupported() {
+        let partial = || pb::FetchResponse {
+            frame: Some(pb::fetch_response::Frame::PartialAggregate(
+                pb::PartialAggregate {
+                    series_id: vec![0u8; 16],
+                    labels: Vec::new(),
+                    count: Some(3),
+                    min_bits: None,
+                    max_bits: None,
+                },
+            )),
+        };
+        assert!(matches!(
+            decode_slice_frames(vec![partial(), summary_frame(pb::status::Code::Ok)]),
+            Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
+        ));
+        assert!(matches!(
+            decode_log_slice_frames(vec![partial(), summary_frame(pb::status::Code::Ok)]),
+            Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
+        ));
+        assert!(matches!(
+            decode_span_slice_frames(vec![partial(), summary_frame(pb::status::Code::Ok)]),
+            Err(DistribError::FrameSignalUnsupported("partial-aggregate"))
         ));
     }
 }

@@ -49,7 +49,14 @@ use crate::span_fetcher::SpanRow;
 /// versioned wire field, not a frozen persistent-format change. A version-skewed
 /// worker is dropped at routing time (never a hard error), so a rolling deploy
 /// degrades to coordinator-local execution, never to a wrong answer.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// Bumped 3 -> 4 for ADR-0103 decision 2: `FetchResponse` carries the new
+/// `PartialAggregate` oneof member for aggregation pushdown. Unlike ADR-0096,
+/// which staged its bump behind the encoders, this one lands together with the
+/// frame and its codec: no encoder call site sends a `PartialAggregate` yet, so
+/// a version-3 peer and a version-4 peer never exchange the frame in practice
+/// until the worker-side sender lands.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
 /// Distinct from [`PROTOCOL_VERSION`]: it versions the canonical claim encoding
@@ -901,6 +908,69 @@ fn decode_labels(labels: Vec<pb::Label>) -> Result<LabelSet, CodecError> {
     LabelSet::new(pairs).map_err(|e| CodecError::InvalidLabels(e.to_string()))
 }
 
+// ---- PartialAggregate <-> in-memory partial -------------------------------
+
+/// One worker-computed partial aggregate for a single group (ADR-0103
+/// decision 2): the group's series identity plus whichever of `count`, `min`,
+/// and `max` the query asked for. A bare group enumeration carries all three
+/// as `None`, which is why each is an `Option` rather than a sentinel: an
+/// absent count must stay distinct from a present zero, and an absent bound
+/// from a present `0.0`.
+///
+/// `min`/`max` are held as `f64` and cross the wire as raw bit patterns, never
+/// proto doubles, so NaN payloads and `-0.0` survive byte-for-byte. Nothing
+/// here compares them; the coordinator's fold uses the `total_cmp` total order
+/// ADR-0023's min/max UDAF already defines.
+#[derive(Debug, Clone)]
+pub struct PartialAggregate {
+    /// Canonical series identity of the group.
+    pub series_id: SeriesId,
+    /// The group's labels, the same shape [`pb::SeriesFrame`] carries.
+    pub labels: LabelSet,
+    /// Sample count for this group on this worker, when the query asked for it.
+    pub count: Option<u64>,
+    /// Minimum value for this group on this worker, when the query asked for it.
+    pub min: Option<f64>,
+    /// Maximum value for this group on this worker, when the query asked for it.
+    pub max: Option<f64>,
+}
+
+/// Encodes one partial aggregate as a `PartialAggregate` frame, mirroring
+/// [`encode_series_frame`]'s shape: the series id as its raw 16 bytes, the
+/// labels through [`encode_labels`], and each present bound as its
+/// [`f64::to_bits`] pattern. An absent field stays absent on the wire (proto3
+/// `optional`), never a zero sentinel.
+///
+/// Not reachable from a query today: no encoder call site sends this frame yet
+/// (the worker-side sender lands with the pushdown execution path). This is the
+/// wire format and its codec only.
+pub fn encode_partial_aggregate(partial: &PartialAggregate) -> pb::PartialAggregate {
+    pb::PartialAggregate {
+        series_id: partial.series_id.0.to_vec(),
+        labels: encode_labels(&partial.labels),
+        count: partial.count,
+        min_bits: partial.min.map(f64::to_bits),
+        max_bits: partial.max.map(f64::to_bits),
+    }
+}
+
+/// Inverse of [`encode_partial_aggregate`]. A mis-sized series id or an invalid
+/// label set is a typed [`CodecError`], never a panic. The bounds are restored
+/// with [`f64::from_bits`] and never touched by float arithmetic or comparison,
+/// so a NaN payload or a `-0.0` bound comes back exactly as the worker computed
+/// it.
+pub fn decode_partial_aggregate(
+    frame: pb::PartialAggregate,
+) -> Result<PartialAggregate, CodecError> {
+    Ok(PartialAggregate {
+        series_id: decode_series_id(&frame.series_id)?,
+        labels: decode_labels(frame.labels)?,
+        count: frame.count,
+        min: frame.min_bits.map(f64::from_bits),
+        max: frame.max_bits.map(f64::from_bits),
+    })
+}
+
 // ---- LogRecordFrame <-> ravel_logseg::LogRecord ---------------------------
 
 /// Encodes one decoded RLOG record as a `LogRecordFrame`, field for field. The
@@ -1591,6 +1661,131 @@ mod tests {
                 expected: PROTOCOL_VERSION,
             })
         );
+    }
+
+    /// The ADR-0103 decision 2 bump, pinned to the literal values rather than
+    /// to `PROTOCOL_VERSION` itself: version 4 is what this build speaks, and a
+    /// peer still speaking 3 is rejected so it degrades to local execution
+    /// instead of receiving a `PartialAggregate` frame it cannot decode.
+    #[test]
+    fn protocol_version_is_four_and_three_is_rejected() {
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(check_protocol_version(4), Ok(()));
+        assert_eq!(
+            check_protocol_version(3),
+            Err(CodecError::UnknownProtocolVersion {
+                got: 3,
+                expected: 4,
+            })
+        );
+    }
+
+    fn partial(count: Option<u64>, min: Option<f64>, max: Option<f64>) -> PartialAggregate {
+        PartialAggregate {
+            series_id: SeriesId([7u8; 16]),
+            labels: label_set(&[("__name__", "m"), ("k", "v")]),
+            count,
+            min,
+            max,
+        }
+    }
+
+    fn assert_partial_round_trip(original: &PartialAggregate) {
+        let frame = encode_partial_aggregate(original);
+        let got = decode_partial_aggregate(frame).expect("decode");
+        assert_eq!(got.series_id, original.series_id);
+        assert_eq!(&got.labels, &original.labels);
+        assert_eq!(got.count, original.count);
+        // Bit-exact, never `==`: -0.0 and NaN must compare by pattern, and an
+        // absent bound must stay absent rather than becoming a present zero.
+        assert_eq!(
+            got.min.map(f64::to_bits),
+            original.min.map(f64::to_bits),
+            "min bit pattern corrupted on the wire"
+        );
+        assert_eq!(
+            got.max.map(f64::to_bits),
+            original.max.map(f64::to_bits),
+            "max bit pattern corrupted on the wire"
+        );
+    }
+
+    /// Every shape the ADR-0103 frame carries round-trips: a count-only
+    /// partial, a min/max-only partial, all three present, and the bare group
+    /// enumeration with none of them. A present zero count and a present `0.0`
+    /// bound stay distinct from absence, which is what the proto3 `optional`
+    /// fields exist for.
+    #[test]
+    fn partial_aggregate_round_trips_every_shape() {
+        assert_partial_round_trip(&partial(Some(42), None, None));
+        assert_partial_round_trip(&partial(None, Some(-3.5), Some(9.25)));
+        assert_partial_round_trip(&partial(Some(7), Some(-3.5), Some(9.25)));
+        assert_partial_round_trip(&partial(None, None, None));
+        assert_partial_round_trip(&partial(Some(0), Some(0.0), Some(0.0)));
+    }
+
+    /// The bounds cross as raw bit patterns, so the values a proto double would
+    /// mangle survive: NaN payloads, a signalling NaN, both infinities, and the
+    /// two zeros (a `-0.0` min is not a `0.0` min).
+    #[test]
+    fn partial_aggregate_preserves_special_f64_bit_patterns() {
+        let specials = [
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_dead_beef),
+            f64::from_bits(0x7ff0_0000_0000_0001),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.0f64,
+            0.0f64,
+        ];
+        for &min in &specials {
+            for &max in &specials {
+                assert_partial_round_trip(&partial(Some(1), Some(min), Some(max)));
+            }
+        }
+    }
+
+    proptest! {
+        /// Arbitrary `u64` words fed through [`f64::from_bits`] cover the whole
+        /// f64 domain including every NaN payload and `-0.0`; presence is
+        /// driven independently per field so absence is exercised too.
+        #[test]
+        fn partial_aggregate_round_trips_bit_for_bit(
+            id in any::<[u8; 16]>(),
+            count in prop::option::of(any::<u64>()),
+            min_bits in prop::option::of(any::<u64>()),
+            max_bits in prop::option::of(any::<u64>()),
+        ) {
+            let original = PartialAggregate {
+                series_id: SeriesId(id),
+                labels: label_set(&[("__name__", "m"), ("k", "v")]),
+                count,
+                min: min_bits.map(f64::from_bits),
+                max: max_bits.map(f64::from_bits),
+            };
+            let got = decode_partial_aggregate(encode_partial_aggregate(&original))
+                .expect("decode");
+            prop_assert_eq!(got.series_id, original.series_id);
+            prop_assert_eq!(&got.labels, &original.labels);
+            prop_assert_eq!(got.count, original.count);
+            prop_assert_eq!(got.min.map(f64::to_bits), min_bits);
+            prop_assert_eq!(got.max.map(f64::to_bits), max_bits);
+        }
+    }
+
+    /// A `PartialAggregate` whose series id is not 16 bytes is a typed error,
+    /// never a panic, exactly as a malformed `SeriesFrame` id is.
+    #[test]
+    fn partial_aggregate_bad_series_id_is_typed_error() {
+        let frame = pb::PartialAggregate {
+            series_id: vec![0u8; 8],
+            labels: Vec::new(),
+            count: Some(1),
+            min_bits: None,
+            max_bits: None,
+        };
+        let err = decode_partial_aggregate(frame).expect_err("mis-sized series id");
+        assert_eq!(err, CodecError::BadSeriesId { got: 8 });
     }
 
     #[test]
