@@ -403,10 +403,12 @@ async fn assert_distributed_matches_local(
             &accounting,
             &config,
             i64::MAX,
+            None,
         )
         .await
         .expect("distributed fetch")
-        .expect("distributed produced a result (not a fallback)");
+        .expect("distributed produced a result (not a fallback)")
+        .0;
     let distributed_stats = triple.1;
     let distributed_merged = merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("dist merge");
 
@@ -682,13 +684,15 @@ fn run_merged_series_distributed_over_the_wire_not_refused() {
                 &accounting,
                 &EngineConfig::default(),
                 i64::MAX,
+                None,
             )
             .await
             .expect("distributed fetch")
             .expect(
                 "a run-merged series is now served over the wire (PROTOCOL_VERSION 3), \
                  not refused to local fallback",
-            );
+            )
+            .0;
         server.abort();
 
         let distributed_merged =
@@ -765,12 +769,15 @@ fn run_merged_series_distributed_equals_local_bitwise() {
                 &accounting,
                 &EngineConfig::default(),
                 i64::MAX,
+                None,
             )
             .await
             .expect("distributed fetch")
         {
             // #348: the frame carries the column; merge the real distributed runs.
-            Some(triple) => merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("dist merge"),
+            Some((triple, _partials)) => {
+                merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("dist merge")
+            }
             // Today: refusal -> the engine runs the query locally instead.
             None => {
                 let (runs, _a, _s) = local_scalar(Arc::clone(&store), &snapshot).await;
@@ -825,10 +832,12 @@ async fn distributed_metric_names(
             &accounting,
             &EngineConfig::default(),
             i64::MAX,
+            None,
         )
         .await
         .expect("distributed fetch")
-        .expect("distributed produced a result");
+        .expect("distributed produced a result")
+        .0;
     let merged = merge_soa_runs(triple.0, usize::MAX, usize::MAX).expect("merge");
     server.abort();
     let mut names: Vec<String> = merged
@@ -1029,6 +1038,7 @@ fn coordinator_reenforces_series_budget_over_honest_worker() {
                 &accounting,
                 &config,
                 i64::MAX,
+                None,
             )
             .await
             .expect_err("budget must trip");
@@ -1183,6 +1193,7 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
                 &accounting,
                 &config,
                 i64::MAX,
+                None,
             )
             .await
             .expect_err("coordinator must re-enforce the bytes budget");
@@ -1281,6 +1292,7 @@ fn many_invalidated_slices_map_to_one_retryable_error() {
                 &accounting,
                 &EngineConfig::default(),
                 i64::MAX,
+                None,
             )
             .await
             .expect_err("invalidation must surface as an error");
@@ -1630,6 +1642,7 @@ fn coordinator_fold_saturates_overflowing_worker_reports() {
                 &accounting,
                 &config,
                 i64::MAX,
+                None,
             )
             .await
             .expect_err("a wrapped fold would let the overflowing report through");
@@ -1766,13 +1779,15 @@ fn histogram_series_distributed_equals_local_bitwise() {
                 &accounting,
                 &EngineConfig::default(),
                 i64::MAX,
+                None,
             )
             .await
             .expect("distributed fetch")
             .expect(
                 "a histogram slice is now served over the wire (PROTOCOL_VERSION 3), \
                  not refused to local fallback",
-            );
+            )
+            .0;
         server.abort();
 
         // The distributed histogram runs (triple's third element) equal the local
@@ -1913,6 +1928,7 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
                 &accounting,
                 &EngineConfig::default(),
                 i64::MAX,
+                None,
             )
             .await
             .expect("unsupported must not be an error");
@@ -1920,7 +1936,8 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
             result.is_some(),
             "an erased histogram slice is served (empty), never a local fallback"
         );
-        let (per_slice, _stats, per_slice_hist) = result.expect("a real (non-fallback) result");
+        let ((per_slice, _stats, per_slice_hist), _partials) =
+            result.expect("a real (non-fallback) result");
         assert!(
             per_slice.iter().all(|series| series.is_empty()),
             "the erased histogram series must not surface as a scalar series"
@@ -4685,6 +4702,96 @@ fn count_only_no_window_request_is_byte_identical() {
             got, expected,
             "count-only, no-window partial frames must be byte-identical to the \
              pre-amendment encode"
+        );
+    });
+}
+
+/// A [`SliceFetcher`] double that returns two `PartialAggregate`s carrying the
+/// SAME series id in one slice response. ADR-0103's eligibility gate guarantees
+/// each series lives on exactly one worker, so the coordinator's collect step
+/// must never see a repeat; if it does, the query fails closed rather than
+/// silently keeping one of the two values.
+struct DuplicatePartialWorker;
+
+#[async_trait::async_trait]
+impl SliceFetcher for DuplicatePartialWorker {
+    async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        let pa = crate::distrib::codec::PartialAggregate {
+            series_id: SeriesId([7u8; 16]),
+            labels: labels("m0"),
+            count: Some(3),
+            min: None,
+            max: None,
+        };
+        Ok(SliceResponse {
+            scalar: Vec::new(),
+            histogram: Vec::new(),
+            partials: vec![pa.clone(), pa],
+            accounting: QueryAccounting::new().snapshot(),
+            stats: crate::fetcher::FetchStats::default(),
+            series_returned: 0,
+            samples_returned: 0,
+            status: pb::status::Code::Ok,
+            status_message: String::new(),
+        })
+    }
+}
+
+/// ADR-0103 amendment: a duplicate series id across collected partials is a hard
+/// error (fail closed), never last-wins. Mutation proof: neutering the dedup
+/// insert in `Distributed::fetch`'s drain loop (mod.rs, the
+/// `if !partial_series.insert(pa.series_id)` guard) makes this `expect_err`
+/// fail, since the query would then succeed keeping one of the two values.
+#[test]
+fn duplicate_partial_series_id_is_a_hard_error() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let descs = vec![SeriesDesc {
+            metric: "m0".to_string(),
+            samples: vec![(NS, 1.0f64.to_bits())],
+        }];
+        let seg = write_segment(&store, 0, 0, 100, &descs).await;
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let distributed = Distributed::new(
+            Arc::new(DuplicatePartialWorker),
+            DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        );
+        let accounting = QueryAccounting::new();
+        let err = distributed
+            .fetch(
+                TENANT,
+                Signal::Metrics,
+                &snapshot,
+                &[],
+                &[],
+                &accounting,
+                &EngineConfig::default(),
+                i64::MAX,
+                Some(pb::PartialAggregateRequest {
+                    want_count: true,
+                    want_min: false,
+                    want_max: false,
+                    reduce_start_ns: Some(0),
+                    reduce_end_ns: Some(NS),
+                }),
+            )
+            .await
+            .expect_err("a duplicate series id across partials must fail closed");
+        assert!(
+            matches!(
+                err,
+                crate::error::QueryError::DuplicatePushdownSeries { .. }
+            ),
+            "expected DuplicatePushdownSeries, got {err:?}"
         );
     });
 }

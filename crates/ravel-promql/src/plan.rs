@@ -36,6 +36,16 @@ pub struct SelectorPlan {
     pub offset_ns: i64,
     /// The resolved anchor for this selector's lookup instant.
     pub anchor: PlanAnchor,
+    /// ADR-0103 aggregation-pushdown tag: `true` only for the single
+    /// `SelectorPlan` produced by a `count_over_time` call whose matrix
+    /// argument, after unwrapping parentheses, is a literal matrix selector
+    /// (never a subquery). This is a purely structural, AST-shape-only marker
+    /// set by [`plan_walk`]'s `Expr::Call` arm; it records nothing about the
+    /// concrete reduction window (a `PlanAnchor::Window` selector has no
+    /// concrete timestamp until a query's evaluation window is known at fetch
+    /// time). Every other selector -- a different range function, a subquery
+    /// argument, or a bare selector with no wrapping call -- leaves it `false`.
+    pub count_over_time_pushdown_candidate: bool,
 }
 
 /// How a selector's lookup instant is anchored, after folding every `@`
@@ -202,6 +212,22 @@ fn plan_walk(
             )
         }
         Expr::Call(c) => {
+            // ADR-0103 pushdown candidate detection, computed BEFORE recursing
+            // so it reflects this call's own shape, not a nested one. A
+            // `count_over_time` over a literal matrix selector (never a
+            // subquery) is the only shape a coordinator may later push a
+            // precomputed count down for. `matrix_arg` is reused verbatim from
+            // `crate::functions` so the Paren-unwrap and the selector-vs-
+            // subquery distinction stay identical to the evaluator's own. A
+            // zero-arg call (`time()`, `pi()`) never reaches the index because
+            // the name check short-circuits first, and `count_over_time` always
+            // parses with exactly one matrix argument.
+            let is_candidate = c.func.name == "count_over_time"
+                && matches!(
+                    crate::functions::matrix_arg(&c.args.args[0]),
+                    Ok(crate::functions::MatrixArg::Selector(_))
+                );
+            let before = out.len();
             for arg in &c.args.args {
                 plan_walk(
                     arg,
@@ -212,6 +238,15 @@ fn plan_walk(
                     query_end_ns,
                     out,
                 )?;
+            }
+            // The literal-selector case pushes exactly one `SelectorPlan`; tag
+            // it. Any other count (a subquery argument recurses through
+            // `Expr::Subquery`'s own arm and never enters this branch's
+            // `is_candidate`, and a candidate whose recursion pushed a
+            // different number of plans is not the simple literal shape) leaves
+            // every plan `false`.
+            if is_candidate && out.len() == before + 1 {
+                out[before].count_over_time_pushdown_candidate = true;
             }
             Ok(())
         }
@@ -264,6 +299,10 @@ fn resolve_selector(
         range_ns,
         offset_ns,
         anchor,
+        // Structural pushdown tag, set by `plan_walk`'s `Expr::Call` arm once
+        // it knows this plan was pushed by a `count_over_time` over a literal
+        // selector; every selector is built here first with it `false`.
+        count_over_time_pushdown_candidate: false,
     })
 }
 
@@ -394,5 +433,50 @@ mod tests {
     fn no_selector_query_reports_nothing() {
         let plans = plan_selectors("42", 0, 0).expect("parses");
         assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn count_over_time_over_literal_selector_is_a_pushdown_candidate() {
+        // The one shape ADR-0103's count pushdown targets: a `count_over_time`
+        // over a literal matrix selector. Exactly one plan, tagged.
+        let plans = plan_selectors("count_over_time(m[5m])", 0, 0).expect("parses");
+        assert_eq!(plans.len(), 1);
+        assert!(
+            plans[0].count_over_time_pushdown_candidate,
+            "count_over_time over a literal selector is a candidate"
+        );
+    }
+
+    #[test]
+    fn other_range_functions_and_bare_selectors_are_not_candidates() {
+        // A different `_over_time` function is not the count shape.
+        let plans = plan_selectors("sum_over_time(m[5m])", 0, 0).expect("parses");
+        assert_eq!(plans.len(), 1);
+        assert!(
+            !plans[0].count_over_time_pushdown_candidate,
+            "sum_over_time is not a count_over_time candidate"
+        );
+
+        // A bare matrix selector with no wrapping call never enters the Call
+        // arm, so it is never tagged.
+        let plans = plan_selectors("m[5m]", 0, 0).expect("parses");
+        assert_eq!(plans.len(), 1);
+        assert!(
+            !plans[0].count_over_time_pushdown_candidate,
+            "a bare selector is not a candidate"
+        );
+    }
+
+    #[test]
+    fn count_over_time_over_subquery_is_not_a_candidate() {
+        // `count_over_time(m[1h:5m])`: the argument is a subquery, whose inner
+        // selector is reached via `Expr::Subquery`'s own recursion, never
+        // through the `Call` arm's `is_candidate` branch. No plan is tagged.
+        let plans = plan_selectors("count_over_time(m[1h:5m])", 0, 0).expect("parses");
+        assert!(!plans.is_empty());
+        assert!(
+            plans.iter().all(|p| !p.count_over_time_pushdown_candidate),
+            "a subquery argument is structurally excluded"
+        );
     }
 }
