@@ -129,7 +129,9 @@ message LabelEquals {
 // series/histogram frames and ends with exactly one summary frame; a slice
 // contributes to the coordinator merge only after its terminal summary arrives
 // (ADR-0071 slice atomicity), so partial frames from a failed attempt are
-// discarded whole.
+// discarded whole. A slice the coordinator opted into aggregation pushdown
+// streams `partial_aggregate` frames in place of its series frames (ADR-0103
+// decision 2), under the same slice atomicity.
 message FetchResponse {
   oneof frame {
     SeriesFrame series = 1;
@@ -137,7 +139,36 @@ message FetchResponse {
     Summary summary = 3;
     LogRecordFrame log_record = 4;
     SpanFrame span = 5;
+    PartialAggregate partial_aggregate = 6;
   }
+}
+
+// One worker-computed partial aggregate for a single group (ADR-0103 decision
+// 2): the group's series identity plus whichever of count/min/max the query
+// actually asked for. A worker sends these instead of raw sample runs when the
+// coordinator opted the query into aggregation pushdown; the coordinator sums
+// the counts and folds the bounds under the ADR-0023 `total_cmp` total order.
+//
+// No dedup-key metadata rides here. ADR-0103 decision 1's eligibility gate
+// (not federated, every resolved segment inside one shard generation's stable
+// interval) is what makes it unnecessary: each worker's partial already covers
+// a provably complete, provably exclusive share of every series in the group,
+// so no cross-worker duplicate can exist to resolve.
+//
+// A group-only enumeration (distinct groups, no aggregate) carries the identity
+// fields with all three value fields absent, which is why they are proto3
+// `optional`: absent must stay distinct from a present zero count or a present
+// bound whose value happens to be 0.0.
+message PartialAggregate {
+  bytes series_id = 1;          // 16 bytes; canonical series identity
+  repeated Label labels = 2;
+  optional uint64 count = 3;
+  // Raw f64 bit patterns (fixed64), never proto doubles, exactly as
+  // `Run.value_bits` above: NaN payloads and -0.0 survive the wire
+  // byte-for-byte, so the coordinator's `total_cmp` fold sees the same values
+  // the worker's local fold did.
+  optional fixed64 min_bits = 4;   // f64::to_bits when present
+  optional fixed64 max_bits = 5;   // f64::to_bits when present
 }
 
 // One scalar series: its labels once, then its dedup-ordered runs.
