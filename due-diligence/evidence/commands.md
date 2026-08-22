@@ -74,3 +74,13 @@ exit 0 (first attempt on port 9000 failed exit 125, port already in use by unrel
 $ docker run --rm --network host minio/mc ... mc mb local/ravel-test
 exit 0: "Bucket created successfully `local/ravel-test`."
 ```
+
+## Supply chain
+
+```
+$ cargo-deny 0.18.4 check
+exit 1: advisory DB parse failure on CVSS 4.0 entries (tool too old, environmental)
+$ cargo-deny 0.20.2 check   (prebuilt musl binary from GitHub release)
+exit 0: "advisories ok, bans ok, licenses ok, sources ok"
+cargo-audit: not installed; cargo deny's advisories check covers RustSec, so not separately installed.
+```
