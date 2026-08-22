@@ -50,13 +50,7 @@ use crate::span_fetcher::SpanRow;
 /// worker is dropped at routing time (never a hard error), so a rolling deploy
 /// degrades to coordinator-local execution, never to a wrong answer.
 ///
-/// Bumped 3 -> 4 for ADR-0103 decision 2: `FetchResponse` carries the new
-/// `PartialAggregate` oneof member for aggregation pushdown. Unlike ADR-0096,
-/// which staged its bump behind the encoders, this one lands together with the
-/// frame and its codec: no encoder call site sends a `PartialAggregate` yet, so
-/// a version-3 peer and a version-4 peer never exchange the frame in practice
-/// until the worker-side sender lands.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The fragment-capability claim-set version (ADR-0071 amendment, decision 2).
 /// Distinct from [`PROTOCOL_VERSION`]: it versions the canonical claim encoding
@@ -1659,23 +1653,6 @@ mod tests {
             Err(CodecError::UnknownProtocolVersion {
                 got: 0,
                 expected: PROTOCOL_VERSION,
-            })
-        );
-    }
-
-    /// The ADR-0103 decision 2 bump, pinned to the literal values rather than
-    /// to `PROTOCOL_VERSION` itself: version 4 is what this build speaks, and a
-    /// peer still speaking 3 is rejected so it degrades to local execution
-    /// instead of receiving a `PartialAggregate` frame it cannot decode.
-    #[test]
-    fn protocol_version_is_four_and_three_is_rejected() {
-        assert_eq!(PROTOCOL_VERSION, 4);
-        assert_eq!(check_protocol_version(4), Ok(()));
-        assert_eq!(
-            check_protocol_version(3),
-            Err(CodecError::UnknownProtocolVersion {
-                got: 3,
-                expected: 4,
             })
         );
     }
