@@ -69,5 +69,8 @@ pub use span_error::SpanWriteError;
 pub use span_metrics::{SpanIngestMetrics, SpanIngestMetricsSnapshot};
 pub use span_router::{SpanIngestRouter, SpanWriteReceipt, shard_for_span};
 #[cfg(feature = "stage-timing")]
-pub use stage_timing::{LogStage, LogStageSnapshot, LogStageTimings, StageTotals};
+pub use stage_timing::{
+    LogStage, LogStageSnapshot, LogStageTimings, MetricStage, MetricStageSnapshot,
+    MetricStageTimings, StageTotals,
+};
 pub use value::{IngestExemplar, IngestPoint, IngestValue};

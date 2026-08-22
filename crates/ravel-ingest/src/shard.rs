@@ -44,6 +44,8 @@ use crate::clock::Clock;
 use crate::config::{IngestConfig, SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
+#[cfg(feature = "stage-timing")]
+use crate::stage_timing::{MetricStage, MetricStageTimings};
 use crate::value::{IngestExemplar, IngestPoint, IngestValue, ValueKind};
 
 pub(crate) type Ack = oneshot::Sender<Result<CommitToken, WriteError>>;
@@ -415,6 +417,12 @@ struct FlushCtx {
     config: IngestConfig,
     metrics: Arc<IngestMetrics>,
     rtt: Arc<RttTracker>,
+    /// Per-stage timing accumulator (ADR-0104 decision 1), shared by `Arc` with
+    /// the router and every shard. The flush task records `encode` here; the
+    /// actor reaches it through `self.ctx` to record `merge`. Present only under
+    /// the `stage-timing` feature.
+    #[cfg(feature = "stage-timing")]
+    stage_timings: Arc<MetricStageTimings>,
 }
 
 /// One flush's identity and payload, pinned by the actor before the flush
@@ -473,6 +481,11 @@ impl FlushCtx {
 
         let exemplar_inputs = self.admit_exemplars(exemplars, &series);
 
+        // Encode: the SeriesInputV3 build plus the RSEG serialization only,
+        // excluding the exemplar admission above and the object-store PUT below
+        // (decision 5 measures the PUT separately).
+        #[cfg(feature = "stage-timing")]
+        let encode_start = std::time::Instant::now();
         // ADR-0027: every flush emits v5, scalar and histogram batches alike.
         // The raw-sample adapter frames each series into a single run, so the
         // writer choice is no longer version- or content-driven; the buffer's
@@ -508,6 +521,9 @@ impl FlushCtx {
                 return;
             }
         };
+        #[cfg(feature = "stage-timing")]
+        self.stage_timings
+            .record(MetricStage::Encode, encode_start.elapsed());
 
         let data_key = match keys::data_key(
             &tenant_hash,
@@ -879,6 +895,7 @@ impl ShardActor {
         config: IngestConfig,
         metrics: Arc<IngestMetrics>,
         rx: mpsc::Receiver<ShardMsg>,
+        #[cfg(feature = "stage-timing")] stage_timings: Arc<MetricStageTimings>,
     ) -> Self {
         let rtt = Arc::new(RttTracker::new());
         let ctx = Arc::new(FlushCtx {
@@ -892,6 +909,8 @@ impl ShardActor {
             config,
             metrics: Arc::clone(&metrics),
             rtt: Arc::clone(&rtt),
+            #[cfg(feature = "stage-timing")]
+            stage_timings,
         });
         ShardActor {
             shard,
@@ -999,18 +1018,25 @@ impl ShardActor {
         let points_len = points.len() as u64;
         let target_bytes = self.config.target_bytes;
 
+        // Grab the timing handle before the mutable buffer borrow so recording
+        // `merge` does not clash with the `&mut self.tenants` borrow held below.
+        #[cfg(feature = "stage-timing")]
+        let merge_timings = Arc::clone(&self.ctx.stage_timings);
         let buf = self.tenants.entry(tenant.clone()).or_default();
         // Merge before enqueuing the waiter: a series-id collision rejects
         // the whole batch fail-loud (ADR-0005) and leaves the buffer
         // untouched, so its ack must carry the error rather than ride the
         // next flush of the surviving series.
+        #[cfg(feature = "stage-timing")]
+        let merge_start = std::time::Instant::now();
         let mut bytes_added = match buf.merge(points, arrival_ns) {
             Ok(bytes_added) => bytes_added,
             Err(err) => {
                 // Fail-loud rejection: the buffer is untouched, so this
-                // request's bytes were never held. Returning drops `charge`,
-                // refunding them (ADR-0069) rather than pinning the budget to a
-                // batch that was rejected.
+                // request's bytes were never held (no merge sample recorded:
+                // the batch was rejected before any append). Returning drops
+                // `charge`, refunding them (ADR-0069) rather than pinning the
+                // budget to a batch that was rejected.
                 self.metrics.record_series_id_collision();
                 if let Some(ack) = ack {
                     self.ctx.ack_waiters(vec![ack], Err(err));
@@ -1018,6 +1044,10 @@ impl ShardActor {
                 return;
             }
         };
+        // Merge times only the sample-buffer append, matching the logs merge;
+        // the exemplar absorb below is a separate ADR-0047 concern, excluded.
+        #[cfg(feature = "stage-timing")]
+        merge_timings.record(MetricStage::Merge, merge_start.elapsed());
         bytes_added += buf.absorb_exemplars(exemplars);
         // The batch is now in the buffer: keep its charge alive with the buffer
         // until it flushes (ADR-0069). It moves into the flush task in
