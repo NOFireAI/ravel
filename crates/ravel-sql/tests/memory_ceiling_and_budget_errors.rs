@@ -7,13 +7,109 @@
 
 mod util;
 
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+use datafusion::error::Result as DFResult;
+use datafusion::execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use ravel_object_store::memory::MemoryStore;
-use ravel_sql::{CeilingBreach, SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant};
+use ravel_sql::{
+    CeilingBreach, RavelTableProvider, SessionTable, SqlConfig, SqlError, TenantDelegatingPool,
+    TenantMemoryAccountant, build_session,
+};
 use ravel_types::accounting::QueryAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
+
+/// A `MemoryPool` decorator that delegates every call to an inner pool and, on
+/// each `try_grow` the inner pool *rejects*, records the failing reservation's
+/// `MemoryConsumer` name and `can_spill` flag.
+///
+/// The budget-error message alone cannot say which operator tripped: an
+/// `RsegScanExec` scan reservation and the final `GroupedHashAggregateStream`
+/// reservation both surface the identical `"query memory pool exhausted: ..."`
+/// prefix when their `try_grow` is refused. Recording the failing consumer's
+/// identity is the signal that discriminates the two failure sites, which the
+/// string prefix cannot.
+#[derive(Debug)]
+struct RecordingPool {
+    inner: Arc<dyn MemoryPool>,
+    /// The `(consumer_name, can_spill)` of every rejected `try_grow`, in the
+    /// order they failed. A query executes across multiple concurrent
+    /// partitions, so the LAST failure is not deterministic across runs (a
+    /// partial aggregate's own refusal can land after the final aggregate's
+    /// during teardown) -- recording every failure and checking whether a
+    /// specific consumer/spillability pair is PRESENT among them, rather than
+    /// asserting on whichever happened to be last, is what makes this
+    /// ordering-independent. Interior mutability so the immutable `&self`
+    /// pool methods can record into it while the query holds the pool as
+    /// `Arc<dyn ..>`.
+    failed: Mutex<Vec<(String, bool)>>,
+}
+
+impl RecordingPool {
+    fn new(inner: Arc<dyn MemoryPool>) -> Arc<Self> {
+        Arc::new(RecordingPool {
+            inner,
+            failed: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Every `(consumer_name, can_spill)` pair recorded from a rejected
+    /// `try_grow`, in failure order.
+    fn failed(&self) -> Vec<(String, bool)> {
+        self.failed.lock().expect("lock").clone()
+    }
+}
+
+impl fmt::Display for RecordingPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RecordingPool({})", self.inner.name())
+    }
+}
+
+impl MemoryPool for RecordingPool {
+    fn name(&self) -> &str {
+        "RecordingPool"
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
+        let result = self.inner.try_grow(reservation, additional);
+        if result.is_err() {
+            let consumer = reservation.consumer();
+            self.failed
+                .lock()
+                .expect("lock")
+                .push((consumer.name().to_string(), consumer.can_spill()));
+        }
+        result
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
+}
 
 /// `MemoryPool::grow` is infallible and checks no ceiling, so a reservation
 /// can grow past both the per-query and per-tenant limits with no error, while
@@ -125,4 +221,249 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
             err.client_message()
         );
     }
+}
+
+/// One segment of `rows` samples in a single series (ts == value == i), so the
+/// scan runs on one partition (segment count caps `target_partitions`) and its
+/// per-partition live set stays small, while every ts is a distinct value the
+/// aggregate/sort above must hold. Sized to overrun a small query budget.
+fn single_series_specs(rows: i64) -> Vec<SegSpec> {
+    vec![SegSpec::new(
+        10,
+        1,
+        0,
+        vec![SeriesSpec::new(
+            "m",
+            (0..rows).map(|i| (i, i as f64)).collect(),
+        )],
+    )]
+}
+
+/// ADR-0102 decision 3: with the disk manager disabled, a high-cardinality
+/// final aggregation whose group state exceeds the query memory budget fails
+/// as `SqlError::ResourcesExhausted`, the typed error the executor maps every
+/// `DataFusionError::ResourcesExhausted` into (`executor.rs:1272/1286/1358`),
+/// rather than succeeding via a silent spill to local disk. This is the
+/// executor-driven half of the coverage: it drives the real
+/// `SqlExecutor::execute` path and checks the error TYPE. The sibling test
+/// below, `a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan`,
+/// checks WHICH consumer produced it -- the two are deliberately separate
+/// tests, not one test doing both, since replacing this type-level check with
+/// the consumer-identity check (an earlier revision of this file did exactly
+/// that) silently dropped the type assertion ADR-0102 decision 3 requires.
+///
+/// This test does NOT assert on the error's message text: both the aggregate
+/// and the `RsegScanExec` feeding it draw on the same query pool and both
+/// surface the identical `"query memory pool exhausted: ..."` prefix when
+/// their `try_grow` is refused, so a message-prefix assertion cannot tell
+/// which one actually tripped (see the sibling test's docstring for the
+/// mechanism that does).
+#[tokio::test]
+async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
+    let tenant = tenant_id("acme");
+    let specs = single_series_specs(300_000);
+
+    let config = SqlConfig {
+        engine: util::engine_config(),
+        max_query_bytes: 16 * 1024 * 1024,
+        parallel_final_aggregation: false,
+    };
+    let fixture = Fixture::build(
+        Arc::new(MemoryStore::new()),
+        &[(&tenant, &specs)],
+        config,
+        1 << 40,
+    )
+    .await;
+
+    let err = fixture
+        .executor
+        .execute(
+            tenant.hash(),
+            &request("SELECT ts, count(*) AS n FROM samples GROUP BY ts"),
+        )
+        .await
+        .expect_err("a high-cardinality aggregation over budget must trip the pool");
+
+    assert!(
+        matches!(err, SqlError::ResourcesExhausted(_)),
+        "aggregation over budget must fail typed rather than spill; got {err:?}"
+    );
+}
+
+/// ADR-0102 decision 3, the WHICH-consumer half: with the disk manager
+/// disabled, the final aggregate itself -- not the scan feeding it -- is the
+/// consumer whose `try_grow` is refused, registered non-spillable
+/// (`can_spill == false`).
+///
+/// Why not the message string: both the aggregate's reservation and the
+/// feeding `RsegScanExec` reservation draw on the same query pool, and BOTH
+/// surface the identical `"query memory pool exhausted: ..."` prefix when a
+/// `try_grow` is refused -- `starts_with("query memory pool exhausted")`
+/// holds regardless of which consumer actually tripped, so it cannot
+/// discriminate the fixed tree from the broken one. This test wraps the real
+/// query pool in a [`RecordingPool`] and asserts a `(GroupedHashAggregateStream,
+/// can_spill == false)` entry is PRESENT among every consumer whose
+/// `try_grow` was refused (not that it was the LAST one refused -- the query
+/// executes across concurrent partitions, so failure order across a partial
+/// aggregate's own reservation and the final aggregate's is not guaranteed
+/// stable run to run; presence, not position, is what's load-bearing here).
+///
+/// Prove-the-test: with the `with_disk_manager_builder(...Disabled)` line
+/// removed from `build_session` (reverting to the pre-#456 tree), this exact
+/// query was observed to refuse `try_grow` for `RsegScanExec[0]`
+/// (`can_spill=false`) -- the scan itself, not the aggregate -- because
+/// spilling lets every `GroupedHashAggregateStream` reservation in this run
+/// succeed (registered `can_spill=true`, confirmed by inspecting every
+/// recorded failure), so the non-spillable scan reservation is what exhausts
+/// the pool instead. No `(GroupedHashAggregateStream*, can_spill=false)` entry
+/// exists anywhere in that failure list, so the presence assertion below
+/// panics with the recorded failures dumped, e.g.:
+///
+/// ```text
+/// thread 'a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan'
+/// panicked at crates/ravel-sql/tests/memory_ceiling_and_budget_errors.rs:
+/// expected a (GroupedHashAggregateStream*, can_spill=false) entry among the
+/// refused try_grow calls; got [("GroupedHashAggregateStream[0] (count(1))", true), ..., ("RsegScanExec[0]", false)]
+/// ```
+///
+/// Verified by removing the line, observing the failure list above (no
+/// non-spillable aggregate entry, only spillable aggregate entries plus the
+/// non-spillable scan), then restoring the line and confirming green.
+#[tokio::test]
+async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan() {
+    let tenant = tenant_id("acme");
+    let specs = single_series_specs(300_000);
+
+    let config = SqlConfig {
+        engine: util::engine_config(),
+        max_query_bytes: 16 * 1024 * 1024,
+        parallel_final_aggregation: false,
+    };
+    let fixture = Fixture::build(
+        Arc::new(MemoryStore::new()),
+        &[(&tenant, &specs)],
+        config,
+        1 << 40,
+    )
+    .await;
+
+    // Build the query's session directly so the real per-query pool (the same
+    // `TenantDelegatingPool` the executor builds internally) can be wrapped in
+    // a `RecordingPool` before it is installed on the session. The executor
+    // builds its pool with no injection seam, and adding one would be
+    // test-only production surface; `build_session`/`RavelTableProvider` are
+    // the same public constructors the executor calls, configured the same
+    // way (same disabled disk manager, `parallel_final_aggregation: false` so
+    // the final aggregate stays single-partition) -- close to, not a
+    // byte-for-byte reproduction of, the executor's own construction path
+    // (notably: two independent `QueryAccounting` handles here instead of one
+    // shared clone, and no `CeilingBreach`/abort-seam wiring, neither of which
+    // this test's assertions depend on).
+    let tenant_accountant = TenantMemoryAccountant::new(1 << 40);
+    let (inner_pool, _breach) = config.query_pool(tenant_accountant, QueryAccounting::new());
+    let recording = RecordingPool::new(inner_pool);
+    let pool: Arc<dyn MemoryPool> = Arc::clone(&recording) as Arc<dyn MemoryPool>;
+
+    let snapshot = fixture.snapshot(&tenant).await;
+    let provider = RavelTableProvider::new(
+        snapshot,
+        tenant.hash(),
+        fixture.fetcher.clone(),
+        config,
+        QueryAccounting::new(),
+    );
+    let ctx = build_session(
+        &config,
+        pool,
+        SessionTable::Metrics(Arc::new(provider)),
+        false,
+    )
+    .expect("metrics session builds");
+
+    let frame = ctx
+        .sql("SELECT ts, count(*) AS n FROM samples GROUP BY ts")
+        .await
+        .expect("high-cardinality aggregation plans");
+    let result = frame.collect().await;
+    assert!(
+        result.is_err(),
+        "a high-cardinality aggregation over budget must trip the pool"
+    );
+
+    // The discriminating assertion: PRESENCE of a non-spillable aggregate
+    // failure among every refused try_grow, not the identity of the LAST one
+    // (see the docstring for why position isn't stable across runs).
+    let failed = recording.failed();
+    let has_nonspillable_aggregate = failed
+        .iter()
+        .any(|(name, can_spill)| name.starts_with("GroupedHashAggregateStream") && !can_spill);
+    assert!(
+        has_nonspillable_aggregate,
+        "expected a (GroupedHashAggregateStream*, can_spill=false) entry among \
+         the refused try_grow calls; got {failed:?}"
+    );
+}
+
+/// ADR-0102 decision 3: with the disk manager disabled, a large `ORDER BY` that
+/// overruns the budget through DataFusion's external sort also fails as
+/// `SqlError::ResourcesExhausted` -- but its message originates in
+/// `DiskManager::create_tmp_file`
+/// (`"Memory Exhausted while Sorting (DiskManager is disabled)"`), propagated as
+/// `DataFusionError::ResourcesExhausted` and mapped to the same
+/// `SqlError::ResourcesExhausted` variant the aggregation path uses. Same typed
+/// variant, distinct message from the aggregation case (which is the pool's
+/// `try_grow` text) -- confirmed here by matching the disk-manager wording.
+///
+/// `ORDER BY value` forces a real external sort: the pipeline output is already
+/// ordered by `(series_id, ts)`, so ordering by `ts` alone could be elided,
+/// whereas `value` is unrelated to that order.
+///
+/// Prove-the-test: with the `with_disk_manager_builder(...Disabled)` line
+/// removed, the sorter's spill attempt reaches the default `OsTmpDirectory`
+/// disk manager and the overrun instead surfaces as the pool's
+/// `"query memory pool exhausted: ..."` error (no disk-manager wording), so the
+/// `contains("DiskManager is disabled")` assertion below fails. Verified by
+/// removing the line and observing that exact message.
+#[tokio::test]
+async fn a_large_order_by_over_budget_is_resources_exhausted() {
+    let tenant = tenant_id("acme");
+    let specs = single_series_specs(300_000);
+
+    let config = SqlConfig {
+        engine: util::engine_config(),
+        max_query_bytes: 16 * 1024 * 1024,
+        parallel_final_aggregation: false,
+    };
+    let fixture = Fixture::build(
+        Arc::new(MemoryStore::new()),
+        &[(&tenant, &specs)],
+        config,
+        1 << 40,
+    )
+    .await;
+
+    let err = fixture
+        .executor
+        .execute(
+            tenant.hash(),
+            &request("SELECT ts, value FROM samples ORDER BY value"),
+        )
+        .await
+        .expect_err("a large ORDER BY over budget must trip the disabled disk manager");
+
+    assert!(
+        matches!(err, SqlError::ResourcesExhausted(_)),
+        "ORDER BY over budget must fail typed rather than spill; got {err:?}"
+    );
+    // The sort path's message originates from the disabled disk manager, a
+    // different source than the aggregation path's pool `try_grow`; both are the
+    // same typed variant, and the distinct message is expected.
+    let SqlError::ResourcesExhausted(msg) = &err else {
+        unreachable!("asserted above");
+    };
+    assert!(
+        msg.contains("DiskManager is disabled"),
+        "the sort path's error must name the disabled disk manager; got {msg:?}"
+    );
 }
