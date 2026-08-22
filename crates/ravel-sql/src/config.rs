@@ -99,3 +99,19 @@ impl SqlConfig {
         (pool, breach)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0094: a proper S3-backed production-scale measurement (issue #458)
+    /// found parallel final aggregation not robustly faster than serial at
+    /// any measured partition count, so the flag's default stays `false`.
+    /// This pins that decision -- a future measurement that finds a real win
+    /// and flips the default should update this assertion in the same
+    /// change, not discover it broken in an unrelated PR.
+    #[test]
+    fn parallel_final_aggregation_defaults_to_false() {
+        assert!(!SqlConfig::default().parallel_final_aggregation);
+    }
+}
