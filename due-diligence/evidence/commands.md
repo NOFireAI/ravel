@@ -75,6 +75,26 @@ $ docker run --rm --network host minio/mc ... mc mb local/ravel-test
 exit 0: "Bucket created successfully `local/ravel-test`."
 ```
 
+## Test batch 2 (contract, differential, feature lanes)
+
+```
+$ RAVEL_MINIO_URL=http://127.0.0.1:19000 ... cargo nextest run --jobs 4 -p ravel-object-store
+exit 0: "Summary [8.301s] 116 tests run: 116 passed, 0 skipped"
+Decisive line: "PASS [1.182s] (112/116) ravel-object-store::contract minio_contract"
+(the S3 contract suite ran against LIVE MinIO, not just MemoryStore)
+$ scripts/fetch-prometheus.sh
+exit 0: fetched sha256-verified prometheus-3.13.1.linux-amd64
+$ RAVEL_DIFFTEST=1 RAVEL_DIFFTEST_PROM_BIN=.../prometheus cargo nextest run --jobs 4 -p ravel-promql-difftest
+exit 0: "Summary [2.202s] 91 tests run: 91 passed, 0 skipped"
+Decisive lines: "PASS ... difftest_selectors selector_and_error_corpus_match_pinned_prometheus"
+"PASS ... conformance_table query_engine_doc_table_matches_a_real_run"
+(PromQL differential vs a REAL Prometheus 3.13.1 binary executed and passed)
+$ cargo nextest run --jobs 4 -p ravel-server --features sql
+exit 0
+$ cargo nextest run --jobs 4 -p ravel-sql --test differential
+exit 0
+```
+
 ## Supply chain
 
 ```
