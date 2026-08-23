@@ -533,6 +533,42 @@ pub async fn load(
     now_ns: i64,
     clock: Arc<dyn Clock>,
 ) -> Result<LoadReport, LoadError> {
+    load_instrumented(
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        now_ns,
+        clock,
+        None,
+    )
+    .await
+}
+
+/// A test-only hook invoked at the start of each batch's decode/build. It lets a
+/// test observe that batch N+1's decode/build begins while batch N's
+/// `router.write` is still in flight (issue #541), which a purely
+/// result-correct assertion cannot prove. `None` in production; the public
+/// [`load`] always passes `None`.
+type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
+
+/// [`load`] with the decode/build start hook injected. See [`load`] for the
+/// contract; `on_build_start` fires once per batch that has data to build, on
+/// the blocking decode/build task, before the per-row loop.
+#[allow(clippy::too_many_arguments)]
+async fn load_instrumented(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &Mapping,
+    shards: u32,
+    batch_rows: usize,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+    on_build_start: Option<BuildStartHook>,
+) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
     // silent clamp would hide a misconfigured value that changes object layout.
@@ -593,58 +629,104 @@ pub async fn load(
 
     let started = Instant::now();
     let mut report = LoadReport::default();
+
+    // Single-batch lookahead (issue #541). Batch N+1's decode/build (sync
+    // Parquet decode via `Iterator::next`, then the per-row `build_record`
+    // loop, both CPU-bound) runs on a `spawn_blocking` task started *before*
+    // batch N's `router.write` I/O is awaited, so N+1's CPU work overlaps N's
+    // I/O wait. The non-`Clone` `ParquetRecordBatchReader` is shuttled into and
+    // back out of the closure each iteration.
+    //
+    // The loop stays sequential in every observable way: exactly one
+    // `router.write` is awaited at a time, N+1's decode is never started before
+    // N's has been consumed, and results are consumed in the same order as the
+    // former serial loop. In particular a build error for batch N+1 (discovered
+    // while N's write is still in flight) is only inspected after N's write
+    // result has been handled, so it surfaces in the same order and with the
+    // same `durable` tokens (those from batches strictly before it) as before;
+    // the prefetch changes only *when* (wall-clock) the decode/build happens.
+    let mapping = Arc::new(mapping.clone());
     let mut row_base: u64 = 0;
 
-    for batch in reader {
-        let batch = batch.map_err(|e| LoadError::BatchFailed {
-            reason: format!("failed to read Parquet batch: {e}"),
-            durable: report.tokens.clone(),
-        })?;
-        // Resolve column indices once per batch (schema is stable across
-        // batches, but re-resolving keeps this self-contained and cheap).
-        let cols =
-            ColumnIndex::resolve(&batch, mapping).map_err(|reason| LoadError::BatchFailed {
-                reason,
-                durable: report.tokens.clone(),
-            })?;
+    // Spawn the decode/build of the batch starting at `row_base`, moving the
+    // reader in; the task hands it back with the outcome.
+    let spawn_build = |reader: BatchReader, row_base: u64| {
+        let mapping = Arc::clone(&mapping);
+        let limits = limits.clone();
+        let hook = on_build_start.clone();
+        tokio::task::spawn_blocking(move || {
+            decode_and_build(reader, mapping, limits, now_ns, row_base, hook.as_ref())
+        })
+    };
 
-        let mut records = Vec::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            let record =
-                build_record(&batch, &cols, mapping, &limits, now_ns, row).map_err(|reason| {
-                    LoadError::RowRejected {
-                        row: row_base + row as u64,
-                        reason,
-                        durable: report.tokens.clone(),
-                    }
-                })?;
-            records.push(record);
-        }
-        row_base += batch.num_rows() as u64;
+    // Prime the pipeline with batch 0.
+    let mut pending = spawn_build(reader, row_base);
+
+    loop {
+        let (reader, built) = match pending.await {
+            Ok(pair) => pair,
+            // A panic in the decode/build task is a batch decode failure;
+            // earlier batches may already be durable.
+            Err(join_err) => {
+                return Err(LoadError::BatchFailed {
+                    reason: format!("Parquet decode/build task failed: {join_err}"),
+                    durable: report.tokens.clone(),
+                });
+            }
+        };
+
+        let (records, num_rows) = match built {
+            Prefetched::Done => break,
+            Prefetched::BatchFailed { reason } => {
+                return Err(LoadError::BatchFailed {
+                    reason,
+                    durable: report.tokens.clone(),
+                });
+            }
+            Prefetched::RowRejected { row, reason } => {
+                return Err(LoadError::RowRejected {
+                    row,
+                    reason,
+                    durable: report.tokens.clone(),
+                });
+            }
+            Prefetched::Batch { records, num_rows } => (records, num_rows),
+        };
+
+        let next_row_base = row_base + num_rows as u64;
 
         if records.is_empty() {
+            // A zero-row batch writes nothing; advance and prefetch the next.
+            row_base = next_row_base;
+            pending = spawn_build(reader, next_row_base);
             continue;
         }
+
         let n = records.len() as u64;
-        let receipt = router
-            .write(
-                tenant_id.clone(),
-                records,
-                WriteMode::Strict,
-                WRITE_ACK_DEADLINE,
-            )
-            .await
-            .map_err(|e| {
-                // Earlier batches are already durable; append this batch's own
-                // durably-acked shards, which `LogWriteError::durable_tokens`
-                // recovers from a multi-shard partial failure (issue #296).
-                let mut durable = report.tokens.clone();
-                durable.extend_from_slice(e.durable_tokens());
-                LoadError::Flush {
-                    durable,
-                    cause: e.to_string(),
-                }
-            })?;
+        // Start (but do not yet await) this batch's write, then spawn the next
+        // batch's decode/build so its CPU work overlaps this write's I/O wait.
+        // Building the future does no work; the write begins when it is awaited
+        // below, by which point the prefetch task is already running.
+        let write_fut = router.write(
+            tenant_id.clone(),
+            records,
+            WriteMode::Strict,
+            WRITE_ACK_DEADLINE,
+        );
+        pending = spawn_build(reader, next_row_base);
+        row_base = next_row_base;
+
+        let receipt = write_fut.await.map_err(|e| {
+            // Earlier batches are already durable; append this batch's own
+            // durably-acked shards, which `LogWriteError::durable_tokens`
+            // recovers from a multi-shard partial failure (issue #296).
+            let mut durable = report.tokens.clone();
+            durable.extend_from_slice(e.durable_tokens());
+            LoadError::Flush {
+                durable,
+                cause: e.to_string(),
+            }
+        })?;
         report.rows_processed += n;
         report.tokens.extend(receipt.tokens);
     }
@@ -663,6 +745,89 @@ pub async fn load(
     }
     report.elapsed = started.elapsed();
     Ok(report)
+}
+
+/// The Parquet reader shuttled through each decode/build task. It owns
+/// file-reading state and is not `Clone`, so a single instance is moved into
+/// the blocking closure and handed back with the outcome each iteration.
+type BatchReader = parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+
+/// One prefetched batch's decode/build outcome. Errors carry only the reason
+/// (and, for a rejected row, its absolute index): the `durable` token list is
+/// attached by the loop when it *consumes* the outcome, after every earlier
+/// batch's write has resolved, so the reported tokens are exactly those durable
+/// from batches strictly before the failure regardless of when (wall-clock) the
+/// decode ran.
+enum Prefetched {
+    /// The reader is exhausted; no batch was produced.
+    Done,
+    /// A batch decoded and built into `records`. `num_rows` is the source row
+    /// count; it equals `records.len()` since every non-rejected row yields one
+    /// record (a rejection returns `RowRejected` instead of a partial batch).
+    Batch {
+        records: Vec<NormalizedLogRecord>,
+        num_rows: usize,
+    },
+    /// The batch failed to read from Parquet or to resolve against the mapping.
+    BatchFailed { reason: String },
+    /// A row failed a kept admission check. `row` is the absolute row index.
+    RowRejected { row: u64, reason: String },
+}
+
+/// Pull the next batch from `reader` and build its records, handing the reader
+/// back for the next iteration. This is the pipeline's CPU-bound half (sync
+/// Parquet decode plus the per-row `build_record` loop), run on a
+/// `spawn_blocking` task so it overlaps the previous batch's `router.write` I/O
+/// wait (issue #541). `on_build_start` fires once, before the per-row loop, only
+/// when there is a batch to build.
+fn decode_and_build(
+    mut reader: BatchReader,
+    mapping: Arc<Mapping>,
+    limits: LogIngestLimits,
+    now_ns: i64,
+    row_base: u64,
+    on_build_start: Option<&BuildStartHook>,
+) -> (BatchReader, Prefetched) {
+    let Some(batch) = reader.next() else {
+        return (reader, Prefetched::Done);
+    };
+    if let Some(hook) = on_build_start {
+        hook();
+    }
+    let batch = match batch {
+        Ok(batch) => batch,
+        Err(e) => {
+            return (
+                reader,
+                Prefetched::BatchFailed {
+                    reason: format!("failed to read Parquet batch: {e}"),
+                },
+            );
+        }
+    };
+    // Resolve column indices once per batch (schema is stable across batches,
+    // but re-resolving keeps this self-contained and cheap).
+    let cols = match ColumnIndex::resolve(&batch, &mapping) {
+        Ok(cols) => cols,
+        Err(reason) => return (reader, Prefetched::BatchFailed { reason }),
+    };
+    let mut records = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        match build_record(&batch, &cols, &mapping, &limits, now_ns, row) {
+            Ok(record) => records.push(record),
+            Err(reason) => {
+                return (
+                    reader,
+                    Prefetched::RowRejected {
+                        row: row_base + row as u64,
+                        reason,
+                    },
+                );
+            }
+        }
+    }
+    let num_rows = batch.num_rows();
+    (reader, Prefetched::Batch { records, num_rows })
 }
 
 /// Resolved column indices for the mapped fields of one batch.
@@ -1757,6 +1922,176 @@ type = "i64"
             store.fault_count(Op::Put, FaultKind::Permanent),
             1,
             "the permanent data-object PUT fault fired exactly once (shard 0, no retry)"
+        );
+    }
+
+    /// A store wrapper whose data-object (`/l0/`) PUT sleeps a fixed duration
+    /// before completing, and which snapshots a shared "builds started" counter
+    /// at the moment each such PUT finishes. Non-data PUTs (provisioning record,
+    /// commit records) pass straight through, so only a batch's real RSEG write
+    /// is timed. Every other method delegates unchanged.
+    struct SlowPutStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        put_delay: Duration,
+        builds_started: Arc<std::sync::atomic::AtomicUsize>,
+        /// `builds_started` observed at completion of each data-object PUT.
+        snapshots: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for SlowPutStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            let is_data_object = key.contains("/l0/");
+            if is_data_object {
+                tokio::time::sleep(self.put_delay).await;
+            }
+            let result = self.inner.put(key, data, opts).await;
+            if is_data_object {
+                self.snapshots.lock().expect("snapshots lock").push(
+                    self.builds_started
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                );
+            }
+            result
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The pipeline actually overlaps (issue #541): batch N+1's decode/build
+    /// begins while batch N's slow object-store PUT is still in flight, not
+    /// after it returns. A single stream over `batch_rows = 2` splits into three
+    /// batches; each batch's RSEG PUT sleeps 50ms, and the decode/build start
+    /// hook bumps a shared counter. At the completion of every data-object PUT
+    /// the counter is snapshotted; a value >= 2 means the *next* batch's build
+    /// had already started before this batch's PUT returned.
+    ///
+    /// Non-vacuity (prove-the-test): against the former fully-serial loop
+    /// (revert the `spawn_build` lookahead so batch N is decoded, written, and
+    /// awaited before batch N+1 is even read) the first data PUT completes with
+    /// only batch 0 built, so the snapshot is 1 and the `min >= 2` assertion
+    /// fails.
+    #[tokio::test]
+    async fn next_batch_decode_overlaps_current_batch_write() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let n_rows = 6;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("multi.parquet");
+        let b = batch(vec![
+            ("ts", i64_col(vec![NOW_NS; n_rows])),
+            ("svc", str_col(vec!["api"; n_rows])),
+        ]);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+        writer.write(&b).expect("write batch");
+        writer.close().expect("close writer");
+
+        let m = parse_mapping(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n",
+        )
+        .expect("valid mapping");
+
+        let builds_started = Arc::new(AtomicUsize::new(0));
+        let snapshots = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let store = Arc::new(SlowPutStore {
+            inner: Arc::new(MemoryStore::new()),
+            put_delay: Duration::from_millis(50),
+            builds_started: Arc::clone(&builds_started),
+            snapshots: Arc::clone(&snapshots),
+        });
+
+        let hook_counter = Arc::clone(&builds_started);
+        let hook: BuildStartHook = Arc::new(move || {
+            hook_counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // `batch_rows = 2` over 6 rows yields three batches through one shard,
+        // so three RSEG PUTs happen in sequence.
+        let report = load_instrumented(
+            store as Arc<dyn ObjectStoreBackend>,
+            &pq,
+            "acme",
+            &m,
+            1,
+            2,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            Some(hook),
+        )
+        .await
+        .expect("the pipelined load succeeds");
+
+        assert_eq!(report.rows_processed, n_rows as u64, "every row is written");
+
+        let snaps = snapshots.lock().expect("snapshots lock").clone();
+        assert!(
+            snaps.len() >= 2,
+            "at least two data-object PUTs happened (three batches, one shard): {snaps:?}"
+        );
+        let min = *snaps.iter().min().expect("non-empty snapshots");
+        assert!(
+            min >= 2,
+            "batch N+1's decode/build must start before batch N's slow PUT returns \
+             (a serial loop leaves the counter at 1 when the first PUT completes); \
+             builds-started-at-PUT-completion snapshots = {snaps:?}"
+        );
+        assert!(
+            builds_started.load(Ordering::SeqCst) >= 3,
+            "all three batches were decoded/built, got {}",
+            builds_started.load(Ordering::SeqCst)
         );
     }
 }
