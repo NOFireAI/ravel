@@ -373,11 +373,90 @@ enum Elem {
     Lit(char),
 }
 
+/// The dispatch shape of a compiled `LIKE` pattern. All but [`MatchKind::General`]
+/// are degenerate shapes that reduce to a byte-level `str` operation over a
+/// resolved literal (`str::contains`/`starts_with`/`ends_with`/`==`, each of
+/// which handles UTF-8 boundaries correctly because both needle and haystack are
+/// valid `&str`). ClickBench's string filters are all `%literal%`
+/// ([`MatchKind::Substring`]), whose byte-level `str::contains` is O(n+m) rather
+/// than the general walk's character-wise backtracking.
+///
+/// Classification reads the compiled [`Elem`] vector, not the raw pattern text,
+/// so escapes are already resolved: in `%\%foo\%%` the literal is `%foo%` and the
+/// needle itself contains `%`. Any [`Elem::Single`] (`_` counts characters, not
+/// bytes) or any [`Elem::Any`] between two literals (a real gap the shortcuts
+/// cannot express) forces [`MatchKind::General`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MatchKind {
+    /// `_` present, or `%` not only at the ends: walk the [`Elem`] vector.
+    General,
+    /// No wildcard at all: `text == literal`.
+    Exact(String),
+    /// `literal%`: `text.starts_with(literal)`.
+    Prefix(String),
+    /// `%literal`: `text.ends_with(literal)`.
+    Suffix(String),
+    /// `%literal%`: `text.contains(literal)` (i.e. `str::find(literal).is_some()`).
+    Substring(String),
+}
+
+/// Classify a compiled [`Elem`] vector into a [`MatchKind`]. Reads the resolved
+/// elements, so escaped wildcards are already ordinary [`Elem::Lit`] here.
+fn classify(elems: &[Elem]) -> MatchKind {
+    // `_` counts a character, not a byte, so no byte/`str`-level shortcut is
+    // valid when one is present anywhere in the pattern.
+    if elems.iter().any(|e| matches!(e, Elem::Single)) {
+        return MatchKind::General;
+    }
+    // With no `_`, the pattern is a run of `%` and literals. Locate the literal
+    // core: everything from the first literal to the last.
+    let Some(first_lit) = elems.iter().position(|e| matches!(e, Elem::Lit(_))) else {
+        // No literals at all: the empty pattern (`''`) matches only the empty
+        // string; a run of `%` (`%`, `%%`) matches every string, which an empty
+        // substring needle expresses (`str::contains("")` is always true).
+        return if elems.is_empty() {
+            MatchKind::Exact(String::new())
+        } else {
+            MatchKind::Substring(String::new())
+        };
+    };
+    let Some(last_lit) = elems.iter().rposition(|e| matches!(e, Elem::Lit(_))) else {
+        return MatchKind::General;
+    };
+    // The core must be one contiguous literal run: a `%` between two literals
+    // (e.g. `a%b`) is a gap the substring shortcuts cannot express.
+    if elems[first_lit..=last_lit]
+        .iter()
+        .any(|e| matches!(e, Elem::Any))
+    {
+        return MatchKind::General;
+    }
+    let literal: String = elems[first_lit..=last_lit]
+        .iter()
+        .filter_map(|e| match e {
+            Elem::Lit(c) => Some(*c),
+            _ => None,
+        })
+        .collect();
+    let leading = first_lit > 0; // at least one `%` before the core
+    let trailing = last_lit + 1 < elems.len(); // at least one `%` after the core
+    match (leading, trailing) {
+        (true, true) => MatchKind::Substring(literal),
+        (true, false) => MatchKind::Suffix(literal),
+        (false, true) => MatchKind::Prefix(literal),
+        (false, false) => MatchKind::Exact(literal),
+    }
+}
+
 /// A `LIKE` pattern compiled into a sequence of [`Elem`]s, matched
-/// character-wise (Unicode scalar values, not bytes) and case-sensitively.
+/// character-wise (Unicode scalar values, not bytes) and case-sensitively. A
+/// `kind` computed once at compile time dispatches the degenerate shapes to a
+/// byte-level `str` operation and everything else to the [`Elem`] walk.
 #[derive(Debug)]
 struct LikeMatcher {
     elems: Vec<Elem>,
+    /// Precomputed dispatch shape; built once per compile, never per row.
+    kind: MatchKind,
 }
 
 impl LikeMatcher {
@@ -401,13 +480,29 @@ impl LikeMatcher {
                 elems.push(Elem::Lit(c));
             }
         }
-        LikeMatcher { elems }
+        let kind = classify(&elems);
+        LikeMatcher { elems, kind }
     }
 
-    /// Whether `text` matches the whole pattern. Classic two-pointer wildcard
-    /// match with backtracking to the last `%`, over character slices so
-    /// multi-byte characters count as one for `_`.
+    /// Whether `text` matches the whole pattern. Dispatches on the precomputed
+    /// [`MatchKind`]: a degenerate shape reduces to one `str` operation over the
+    /// resolved literal, everything else falls to [`LikeMatcher::matches_general`].
     fn matches(&self, text: &str) -> bool {
+        match &self.kind {
+            MatchKind::General => self.matches_general(text),
+            MatchKind::Exact(s) => text == s,
+            MatchKind::Prefix(s) => text.starts_with(s.as_str()),
+            MatchKind::Suffix(s) => text.ends_with(s.as_str()),
+            MatchKind::Substring(s) => text.contains(s.as_str()),
+        }
+    }
+
+    /// The general character-wise wildcard match. Classic two-pointer match with
+    /// backtracking to the last `%`, over character slices so multi-byte
+    /// characters count as one for `_`. This is the correct answer for every
+    /// pattern; [`LikeMatcher::matches`] only shortcuts the shapes that provably
+    /// agree with it.
+    fn matches_general(&self, text: &str) -> bool {
         let text: Vec<char> = text.chars().collect();
         let elems = &self.elems;
         let (n, m) = (text.len(), elems.len());
@@ -462,6 +557,8 @@ impl LikeMatcher {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn matches(pattern: &str, text: &str) -> bool {
@@ -522,5 +619,166 @@ mod tests {
         assert!(matches("%abc", "defabc"));
         assert!(matches("a%b%c", "axxbyyc"));
         assert!(!matches("a%b%c", "axxbyy"));
+    }
+
+    /// Assert the compiled shape so the differential is anchored to the arm it
+    /// is meant to exercise (a refactor that quietly routed everything through
+    /// `General` would still pass the differential but prove nothing).
+    #[test]
+    fn compile_classifies_the_degenerate_shapes() {
+        let k = |p: &str| LikeMatcher::compile(p, DEFAULT_ESCAPE).kind;
+        assert_eq!(k("%google%"), MatchKind::Substring("google".into()));
+        assert_eq!(k("abc%"), MatchKind::Prefix("abc".into()));
+        assert_eq!(k("%abc"), MatchKind::Suffix("abc".into()));
+        assert_eq!(k("abc"), MatchKind::Exact("abc".into()));
+        // Escapes resolved before classifying: the needle itself holds `%`.
+        assert_eq!(k("%\\%foo\\%%"), MatchKind::Substring("%foo%".into()));
+        assert_eq!(k("\\_abc"), MatchKind::Exact("_abc".into()));
+        // `%%` / `%` are an empty substring needle (match every string); `''`
+        // is an exact empty needle (match only "").
+        assert_eq!(k("%%"), MatchKind::Substring(String::new()));
+        assert_eq!(k("%"), MatchKind::Substring(String::new()));
+        assert_eq!(k(""), MatchKind::Exact(String::new()));
+        // Any `_`, or a `%` between literals, stays on the general walk.
+        assert_eq!(k("%_foo%"), MatchKind::General);
+        assert_eq!(k("%foo_%"), MatchKind::General);
+        assert_eq!(k("a_c"), MatchKind::General);
+        assert_eq!(k("a%b%c"), MatchKind::General);
+        assert_eq!(k("a%b"), MatchKind::General);
+    }
+
+    /// The differential corpus: pairs biased toward the shapes that break naive
+    /// substring specializations. The table is enumerated; the proptest below
+    /// adds generated fill over the same alphabet.
+    fn differential_corpus() -> Vec<(&'static str, &'static str)> {
+        let patterns = [
+            // Degenerate shapes.
+            "%google%",
+            "google%",
+            "%google",
+            "google",
+            // Empty needles / empty pattern.
+            "%%",
+            "%",
+            "",
+            // Escaped wildcards: the needle contains `%`/`_`.
+            "%\\%foo\\%%",
+            "\\%foo\\%",
+            "\\_abc",
+            "abc\\", // trailing lone escape -> literal backslash
+            "100\\%",
+            // `_` adjacent to `%` (forces the general path).
+            "%_foo%",
+            "%foo_%",
+            "_google",
+            "google_",
+            "a_c",
+            // `%` between literals (general path).
+            "a%b%c",
+            "a%b",
+            // Multi-byte literals.
+            "%é%",
+            "café%",
+            "%café",
+            "%naïve%",
+            // A repeated-first-character needle (O(n+m) vs naive O(nm)).
+            "%aaab%",
+            "aaab%",
+            "%aaab",
+        ];
+        let haystacks = [
+            "",
+            "google",
+            "http://google.com/",
+            "http://example.com/",
+            "foobar",
+            "barfoo",
+            "%foo%",
+            "bar %foo% baz",
+            "_abc",
+            "xabc",
+            "100%",
+            "1000",
+            "café",
+            "cafe",
+            "naïve",
+            "naive",
+            "é",
+            // Repeats of a needle's first byte: separates O(n+m) from O(nm).
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaabaaabaaab",
+            // Needle only at the very end / very start.
+            "zzzzzgoogle",
+            "googlezzzzz",
+        ];
+        let mut corpus = Vec::new();
+        for p in patterns {
+            for h in haystacks {
+                corpus.push((p, h));
+            }
+        }
+        corpus
+    }
+
+    /// ACCEPTANCE (#518): for every (pattern, haystack) pair the specialized
+    /// dispatch [`LikeMatcher::matches`] and the general [`Elem`] walk
+    /// [`LikeMatcher::matches_general`] must return the identical boolean. A
+    /// specialization that changed any answer would surface here as a named
+    /// disagreement.
+    #[test]
+    fn specialized_shapes_agree_with_the_general_walk() {
+        for (pattern, haystack) in differential_corpus() {
+            let m = LikeMatcher::compile(pattern, DEFAULT_ESCAPE);
+            let specialized = m.matches(haystack);
+            let general = m.matches_general(haystack);
+            assert_eq!(
+                specialized, general,
+                "disagreement for pattern {pattern:?} haystack {haystack:?} \
+                 (kind {:?}): specialized={specialized} general={general}",
+                m.kind
+            );
+        }
+    }
+
+    proptest! {
+        /// Generated fill for the differential over an alphabet dense in
+        /// wildcards, the escape char, and a multi-byte character, so escapes,
+        /// `_`/`%` adjacency, and UTF-8 boundaries all recur.
+        #[test]
+        fn prop_specialized_agrees_with_general_walk(
+            pattern in "[a-c%_\\\\é]{0,8}",
+            haystack in "[a-c é]{0,10}",
+        ) {
+            let m = LikeMatcher::compile(&pattern, DEFAULT_ESCAPE);
+            prop_assert_eq!(
+                m.matches(&haystack),
+                m.matches_general(&haystack),
+                "pattern {:?} haystack {:?} kind {:?}",
+                pattern, haystack, m.kind
+            );
+        }
+    }
+
+    /// Prove the differential has teeth: a deliberately mis-routed `%literal`
+    /// (sent to `starts_with` instead of `ends_with`) disagrees with the general
+    /// walk on a concrete corpus pair, so the acceptance test above would fail
+    /// and name it. This keeps the mutation demonstration in the tree without
+    /// leaving the production dispatch mis-wired.
+    #[test]
+    fn misrouting_a_suffix_is_caught_by_the_differential() {
+        // `%foo` is a Suffix needle; route it (wrongly) through starts_with.
+        let m = LikeMatcher::compile("%foo", DEFAULT_ESCAPE);
+        let MatchKind::Suffix(needle) = &m.kind else {
+            panic!("expected Suffix kind, got {:?}", m.kind);
+        };
+        let haystack = "foobar"; // starts with foo, does not end with foo
+        let misrouted = haystack.starts_with(needle.as_str());
+        let general = m.matches_general(haystack);
+        // The mutation flips the answer, which is exactly what the differential
+        // detects and reports.
+        assert!(misrouted);
+        assert!(!general);
+        assert_ne!(misrouted, general);
     }
 }
