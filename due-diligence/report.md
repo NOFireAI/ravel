@@ -316,7 +316,35 @@ Unknowns, all acknowledged in-repo or flagged in memo I: ingest p50/p99 and stri
 
 ## 20. Cloud cost model
 
-NOT YET WRITTEN.
+Finding first: Ravel's cloud bill is a request bill. At every modeled scale, S3 request charges are 97 to 99 percent of the object-store cost and storage is 1 to 3 percent, which inverts the usual observability-store cost structure and makes the flush cadence, shard count, and replica topology the primary cost controls rather than data volume. The repository understands this (ADR-0076 is a candid internal cost analysis reaching the same conclusion) and ships real levers, but the shipped cost guide's formula covers only ingest PUTs, omitting the background and read-side request streams that dominate at small scale and become the irreducible residue at large scale. Everything in this section is derived from shipped defaults read from code, at the charter's assumed prices (PUT/LIST $5.00 per million, GET $0.40 per million, storage $0.023/GB-month); nothing is a measurement, and the real-dollar benchmark the repo tracks as issue #79 has not been done.
+
+The equations (verified against the shard, reconcile, sweep, and resolve code paths; sources at file:line in memo I's parameter table):
+
+```
+ingest PUTs/day      = 2 x tenants x signals x shards x replicas_receiving x (86400 / cadence_s)
+admission req/day    = (tenant,signal) pairs x processes x 8640 x (2 + siblings)
+orphan LISTs/day     = units x 288 ticks x ceil(l0_objects_per_shard_prefix / 1000)
+compaction GETs/day  ~ 1.0-1.2 x L0 objects/day
+resolve LISTs/query  = shards x open_hour_buckets (2-3) x pages (1-8), uncacheable by design
+cold GETs/query      ~ 2 x flushes in the unsealed window (commit record + data object each)
+```
+
+Key defaults feeding them: 4 shards, 2 s strict flush cadence (ceiling about 2.5 s, section 19), 2 PUTs per flush, admission reconcile every 10 s per (tenant, signal, process), maintain tick 300 s, protection horizon about 25 h (so L0 objects live 26-27 h and are LISTed by orphan GC for that long).
+
+The three modeled deployments, request cost per month at the assumed prices:
+
+| Deployment | Assumptions | Requests/day | Requests $/mo | Storage $/mo |
+|---|---|---|---|---|
+| Small (1 team) | 1 tenant, 2 signals, 1 process, 50 GB/day wire, 30 d retention, 20 panels at 30 s | ~3M | ~$345 | ~$10 |
+| Medium (100 tenants) | 1 TB/day wire, 4 replicas at defaults, dashboards plus 5 rules/tenant | ~430M | ~$33,300 | ~$345 |
+| Medium, tuned | affinity subset 2, light tenants resharded to 1 shard | ~130M | ~$9,000-12,000 | ~$345 |
+| Large (1,000 tenants) | 10 TB/day wire, 16 replicas, levers already applied | ~1.63B | ~$139,000 | ~$2,760 |
+
+Sensitivity, in order of leverage: flush cadence scales nearly everything on both sides (PUTs, open-hour GETs, per-query budget, ack latency) at 1/cadence, and saturates at the 2.5 s strict ceiling; shard count is linear in ingest PUTs, resolve LISTs, sweep LISTs, and sealed segment counts (4 to 1 is 4x); tenant count is strictly linear with a hard per-tenant floor (about $10/month per strict (tenant, signal) at minimum configuration, about $1.30 buffered) because cross-tenant coalescing is rejected on isolation grounds; replica count is linear at defaults and divides by the affinity subset once ADR-0080 routing is enabled. The levers are mandatory at scale: at true defaults with 16-way spray, the large deployment's ingest alone would be about 3.6B PUTs/day (about $18k/day).
+
+What the operator can see and what they cannot: per-query request and byte accounting is threaded end to end and surfaced in query stats, and per-tenant PUT attribution exists (ADR-0076), so attributing the bill is genuinely better supported here than in comparable systems. What the shipped cost-model guide does not tell them: the admission-reconcile and orphan-GC streams (about $180/day at Medium, $740/day at Large), and the per-resolve LIST floor under alerting (about $1,300/day at Large). These are P2 findings: the money is real, the code paths are unambiguous, and the guide's formula omits them.
+
+Comparison, derived not measured: Mimir/Thanos-shaped systems upload one block per tenant per two hours and run request bills of tens of dollars per month at the Medium point, shifting cost into stateful compute (ingesters, store-gateways, NVMe); Loki at the same point runs a few million PUTs/day, order $500-1,500/month. Ravel at Medium is roughly 10-30x Loki and over 100x Mimir on the S3 request bill, tuned, and buys back some of that in compute: no WAL disks, no replay, small stateless pods, no replication factor. Whether the trade wins depends on how much the buyer values disposable compute and the strict-ack contract over request fees; for a single-tenant or few-tenant platform team the delta is hundreds of dollars a month and the operational simplification plausibly dominates, while for a many-tenant strict-mode SaaS the request floor compounds per tenant and the economics do not close at current S3 list prices. That boundary, not any technical ceiling, is where Ravel stops scaling: the architecture remains correct at loads where it is no longer economic.
 
 ## 21. Verification and test-quality assessment
 
