@@ -26,6 +26,11 @@ serde = { workspace = true }
 # production dependency now, not just the dev-only JSON-shape regression test
 # serde_json was here for before.
 serde_json = { workspace = true }
+# HTTP client for the EC2 IMDSv2 instance-role credential provider (ADR-0106,
+# crates/ravel-object-store/src/s3/instance_role.rs): two plain-HTTP calls to
+# the link-local metadata endpoint. Version pinned once in the workspace so all
+# crates resolve the same reqwest.
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

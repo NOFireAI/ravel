@@ -1030,6 +1030,8 @@ fn test_s3_config() -> S3Config {
         kms_key_id: None,
         session_token: None,
         credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
     }
 }
 
@@ -1107,6 +1109,8 @@ fn s3_store_reports_upload_checksum_unsupported() {
         kms_key_id: None,
         session_token: None,
         credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
     };
     let store = S3Store::new(config).expect("dummy config must build without network access");
     assert!(
@@ -1142,6 +1146,8 @@ fn s3_store_satisfies_maintain_mode_capabilities() {
         kms_key_id: None,
         session_token: None,
         credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
     })
     .expect("dummy config must build without network access");
     let maintain_required = Capabilities {
@@ -1196,6 +1202,8 @@ async fn minio_contract() {
         kms_key_id: None,
         session_token: None,
         credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
     };
     // A small page size, like `memory_store_paged_contract`, so the
     // pagination assertion exercises `list_with_offset` continuation
@@ -1276,6 +1284,8 @@ async fn floci_contract() {
         kms_key_id: None,
         session_token: None,
         credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
     };
     // A small page size, as in `minio_contract`, so the pagination assertion
     // exercises `list_with_offset` continuation against the real bucket.

@@ -127,6 +127,8 @@ async fn readers_writers_minio_smoke() {
         kms_key_id: None,
         session_token: None,
         credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
     };
     let store = S3Store::new(s3_config).expect("S3Store::new must succeed with a valid config");
 
