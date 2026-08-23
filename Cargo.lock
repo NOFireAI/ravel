@@ -4590,6 +4590,7 @@ dependencies = [
  "hex",
  "humantime",
  "parquet",
+ "pprof",
  "prost",
  "ravel-catalog",
  "ravel-commit",
