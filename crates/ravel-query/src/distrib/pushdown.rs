@@ -28,10 +28,10 @@
 //! Ineligible means "falls back to today's raw-fetch-and-merge path", never
 //! "wrong": the visible signal is "not accelerated".
 //!
-//! Nothing in the production query path calls this module yet. It is the
-//! primitive ADR-0103's planner-integration task (epic #64, T4) wires into the
-//! planner; the aggregate-expression-shape gate (ADR-0103 decision 4), which is
-//! independent of this one, is separate work.
+//! `QueryEngine::prefetch` calls this gate on every real query and, once it
+//! passes, sends the resulting pushdown request live on the wire (epic #64,
+//! T4c/T4d); the aggregate-expression-shape gate (ADR-0103 decision 4), which
+//! is independent of this one, is separate work.
 
 use ravel_catalog::{
     DEFAULT_SCAN_SLACK_HOURS, SegmentRef, ShardGeneration, stable_generation_for_hour,
@@ -102,13 +102,11 @@ where
 /// invisible here while its segments are already in `segments`.
 ///
 /// This is the whole eligibility gate. `QueryEngine::prefetch` calls it on
-/// every real query (epic #64 T4c), but its result does not yet reach the
-/// wire: the coordinator computes and tests the pushdown target this gate
-/// feeds without ever setting `FetchRequest.partial_aggregate` live, because
-/// nothing yet consumes a worker's partial-only reply
-/// (`MergedSource::query_precomputed_count`, T4d). The expression-shape gate
-/// (ADR-0103 decision 4) is a separate, independent check; neither implies
-/// the other.
+/// every real query (epic #64 T4c), and the coordinator now sends the
+/// resulting pushdown request live on the wire, with
+/// `MergedSource::query_precomputed_count` consuming the reply (T4d). The
+/// expression-shape gate (ADR-0103 decision 4) is a separate, independent
+/// check; neither implies the other.
 pub fn is_pushdown_eligible(
     federation: Option<&Federation>,
     segments: &[SegmentRef],

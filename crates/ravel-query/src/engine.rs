@@ -918,7 +918,8 @@ impl QueryEngine {
             );
             // The single matcher set (if any) that gets a `count_over_time`
             // partial-aggregate request, and the reduction window that request
-            // carries. `None` on every query today.
+            // carries. `None` unless exactly one plan is an eligible pushdown
+            // candidate.
             let pushdown_target =
                 count_over_time_pushdown_target(plans, eval_window, snapshot_eligible)?;
             let results: Vec<Result<PerPlan, QueryError>> = stream::iter(distinct_plans)
@@ -940,13 +941,15 @@ impl QueryEngine {
                         // silent local fallback instead of a corrupt answer.
                         let partial_req: Option<pb::PartialAggregateRequest> =
                             pushdown_target.as_ref().and_then(|t| {
-                                (t.matchers == plan.matchers).then_some(pb::PartialAggregateRequest {
-                                    want_count: true,
-                                    want_min: false,
-                                    want_max: false,
-                                    reduce_start_ns: Some(t.reduce_start_ns),
-                                    reduce_end_ns: Some(t.reduce_end_ns),
-                                })
+                                (t.matchers == plan.matchers).then_some(
+                                    pb::PartialAggregateRequest {
+                                        want_count: true,
+                                        want_min: false,
+                                        want_max: false,
+                                        reduce_start_ns: Some(t.reduce_start_ns),
+                                        reduce_end_ns: Some(t.reduce_end_ns),
+                                    },
+                                )
                             });
                         // A selector's segments carry scalar and/or
                         // native-histogram series; fetch both kinds (a series is
@@ -1107,9 +1110,15 @@ impl QueryEngine {
             // Stash the collected pushdown count table iff a matcher set was
             // eligible AND its workers honored the request (`collected_pushdown`
             // is `Some`). An eligible query that fell back to raw fetch leaves
-            // this `None`, so the raw `series` above are used instead. A zero
-            // count maps to the absence of a series here already: only partials
-            // the worker actually returned (with a present count) become rows.
+            // this `None`, so the raw `series` above are used instead. A
+            // worker's `count: Some(0)` is a real, correctly-computed
+            // zero-in-window count (`distrib/service.rs`'s reduction), not an
+            // absent series -- `SeriesSource::query_precomputed_count`'s
+            // contract (source.rs) requires the OPPOSITE of what this used to
+            // do: a zero-count series must be DROPPED here so it never
+            // becomes a phantom `0.0`-valued output row the raw path would
+            // never have emitted (ADR-0103's amendment, "T4 must convert
+            // `count: Some(0)` to 'no output sample for this series'").
             //
             // `MergedSource::query_precomputed_count` reads this field, so the
             // T4b fast path in `eval_call` fires for an eligible query.
@@ -1120,7 +1129,7 @@ impl QueryEngine {
                     end_ns: target.reduce_end_ns,
                     counts: partials
                         .into_iter()
-                        .filter_map(|p| p.count.map(|c| (p.labels, c)))
+                        .filter_map(|p| p.count.and_then(|c| (c != 0).then_some((p.labels, c))))
                         .collect(),
                 }),
                 _ => None,
@@ -4999,6 +5008,85 @@ mod prefetch_tests {
             .expect("publish");
     }
 
+    /// Like [`publish_metric_segment`], but one segment carries several
+    /// series under the same `metric` name (distinguished by an `id` label,
+    /// so all of them match a `{__name__="<metric>"}` selector). Each entry
+    /// in `series` is `(id, samples)`.
+    async fn publish_metric_segment_multi(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        metric: &str,
+        series: Vec<(&str, Vec<Sample>)>,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+    ) {
+        let inputs: Vec<SeriesInput> = series
+            .into_iter()
+            .map(|(id, samples)| {
+                let labels = LabelSet::new(vec![
+                    Label {
+                        name: METRIC_NAME_LABEL.to_string(),
+                        value: metric.to_string(),
+                    },
+                    Label {
+                        name: "id".to_string(),
+                        value: id.to_string(),
+                    },
+                ])
+                .expect("valid labels");
+                let series_id =
+                    SeriesId::compute(&TenantId::new("acme"), metric, &labels).expect("series id");
+                SeriesInput {
+                    series_id,
+                    labels,
+                    samples,
+                }
+            })
+            .collect();
+        let writer_id = Uuid::new_v4();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written: WrittenSegment =
+            SegmentWriter::write(inputs, identity, bounds).expect("write segment");
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
     /// Resolve every metrics segment currently published for `tenant_hash` over
     /// a window around `BASE_NS`, so a worker's `SnapshotSegmentResolver` holds
     /// exactly the refs the coordinator will pin. Reads the same provisioning
@@ -5303,6 +5391,138 @@ mod prefetch_tests {
             "pushed-down count must equal the raw-path count"
         );
         assert_eq!(count_a[0].value, 2.0, "two in-window samples");
+    }
+
+    /// ADR-0103 (epic #64) regression: a worker's `count: Some(0)` for a
+    /// series with no samples in the reduction window must never surface as
+    /// a phantom `0.0`-valued output row -- `SeriesSource::query_precomputed_count`'s
+    /// contract (source.rs) requires an in-window-zero series to be ABSENT,
+    /// exactly like the raw path. One segment carries two series under the
+    /// same selector: `id="has_samples"` has three in-window samples,
+    /// `id="all_outside"` has only out-of-window samples, so the worker
+    /// legitimately reports `count: Some(0)` for it.
+    #[tokio::test]
+    async fn pushdown_drops_in_window_zero_count_never_emits_phantom_zero() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric_segment_multi(
+            &store,
+            tenant_hash,
+            1,
+            "m",
+            vec![
+                (
+                    "has_samples",
+                    vec![
+                        Sample {
+                            ts_ns: BASE_NS - NS_PER_MIN,
+                            value: 1.0,
+                        },
+                        Sample {
+                            ts_ns: BASE_NS - 2 * NS_PER_MIN,
+                            value: 2.0,
+                        },
+                        Sample {
+                            ts_ns: BASE_NS - 3 * NS_PER_MIN,
+                            value: 3.0,
+                        },
+                    ],
+                ),
+                (
+                    "all_outside",
+                    vec![Sample {
+                        ts_ns: BASE_NS - 10 * NS_PER_MIN,
+                        value: 9.0,
+                    }],
+                ),
+            ],
+            u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket"),
+            BASE_NS,
+        )
+        .await;
+
+        let segments = resolve_metric_segments(Arc::clone(&store), tenant_hash, BASE_NS).await;
+        assert_eq!(segments.len(), 1, "one published segment resolves");
+        let (worker, handle) = spawn_metric_worker(Arc::clone(&store), segments).await;
+        let distributed = Arc::new(crate::distrib::Distributed::new(
+            Arc::new(worker),
+            zero_thresholds(),
+        ));
+        let eng = engine(Arc::clone(&store)).with_distributed(distributed);
+
+        let plans = plan_selectors("count_over_time(m[5m])", BASE_MS, BASE_MS).expect("plans");
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (source, _stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch succeeds");
+        assert!(
+            source.series.is_empty(),
+            "pushdown path taken: no raw series"
+        );
+
+        let got = Evaluator::new()
+            .instant(&source, "count_over_time(m[5m])", BASE_MS)
+            .expect("evaluate");
+        assert_eq!(
+            got.len(),
+            1,
+            "only the in-window series is present, no phantom zero for the \
+             all-outside-window series: got {got:?}"
+        );
+        assert_eq!(got[0].value, 3.0, "the one in-window series' real count");
+
+        handle.abort();
+    }
+
+    /// ADR-0103 (epic #64): `MergedSource::query_precomputed_count` must
+    /// only serve its cached table for the EXACT `(matchers, start_ns,
+    /// end_ns)` it was collected for -- a mismatched window or matcher set
+    /// must fall back to `Ok(None)` (raw fetch), never serve a stale count
+    /// for the wrong query.
+    #[test]
+    fn query_precomputed_count_requires_exact_window_and_matcher_match() {
+        let matchers = vec![name_matcher("m")];
+        let other_matchers = vec![name_matcher("other")];
+        let source = MergedSource {
+            series: Vec::new(),
+            histogram_series: Vec::new(),
+            precomputed_count: Some(PrecomputedCount {
+                matchers: matchers.clone(),
+                start_ns: 100,
+                end_ns: 200,
+                counts: vec![(labels("m"), 5)],
+            }),
+        };
+
+        assert_eq!(
+            source
+                .query_precomputed_count(&matchers, 100, 200)
+                .expect("no fault"),
+            Some(vec![(labels("m"), 5)]),
+            "exact match serves the cached table"
+        );
+        assert_eq!(
+            source
+                .query_precomputed_count(&matchers, 100, 201)
+                .expect("no fault"),
+            None,
+            "a different end_ns must not serve the stale table"
+        );
+        assert_eq!(
+            source
+                .query_precomputed_count(&matchers, 99, 200)
+                .expect("no fault"),
+            None,
+            "a different start_ns must not serve the stale table"
+        );
+        assert_eq!(
+            source
+                .query_precomputed_count(&other_matchers, 100, 200)
+                .expect("no fault"),
+            None,
+            "a different matcher set must not serve the stale table"
+        );
     }
 
     /// Two selectors for two disjoint metrics: the merged source must
