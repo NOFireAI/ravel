@@ -61,11 +61,14 @@ pub struct S3Config {
   `session_token`, and `credentials_file` must all be absent.
   Construction fails with a typed error otherwise. There is no
   precedence question because mixing modes is refused outright.
-- The library-level `instance_metadata_endpoint` override exists so
-  tests can point at a mock IMDS on localhost. Shipped binaries expose
-  no flag and no environment variable for it. An operator who controls
-  the server's argv already owns the machine; tenants never reach this
-  surface, so it does not widen the SSRF attack surface.
+- The library-level `instance_metadata_endpoint` override lets tests
+  point at a mock IMDS on localhost. Shipped binaries expose it as
+  `--s3-instance-metadata-endpoint` /
+  `RAVEL_S3_INSTANCE_METADATA_ENDPOINT`. This is an operator-facing
+  knob on the same trust boundary as every other `--s3-*` flag:
+  whoever sets argv already owns the machine. Tenants never reach this
+  surface, so it does not widen the SSRF attack surface; the default
+  stays the AWS link-local address.
 
 ### Provider behavior
 
@@ -102,7 +105,11 @@ external dependency enters the workspace.
 - ravel-server and ravel-cli gain `--s3-auth <static|instance-role>`
   (default `static`). Under `instance-role`, `RAVEL_S3_ACCESS_KEY` and
   `RAVEL_S3_SECRET_KEY` stop being required; bucket and region
-  semantics are unchanged.
+  semantics are unchanged. Both binaries also take
+  `--s3-instance-metadata-endpoint` /
+  `RAVEL_S3_INSTANCE_METADATA_ENDPOINT`, which defaults to the AWS
+  link-local address and exists so tests and unusual deployments can
+  redirect IMDS.
 - While touching the same argument plumbing, land the two flags ADR-0072
   decision 1 specified but no binary ships: `--s3-session-token` and
   `--s3-credentials-file`. The mechanism is identical and adds no new
