@@ -1290,6 +1290,46 @@ partition count, not of table size. Before ADR-0087 the scan collected a whole
 partition's records in row form, sorted them, and only then emitted batches, so
 a full-table scan's peak memory grew with the table.
 
+#### How many partitions, and the read-cache precondition (ADR-0102)
+
+What a partition owns is *blocks*, not whole segments: every
+`(segment, surviving-block)` pair is flattened into one list and unit `i` goes to
+partition `i % n`. So a query touching fewer segments than `target_partitions`
+can still fan out past the segment count, which the old segment-granular rule
+(`min(target_partitions, segment_count)`) made impossible.
+
+That fan-out is gated on the logs fetcher carrying ADR-0046's read cache, which
+is the precondition ADR-0102 decision 1 names for it:
+
+- **Cache wired** (`ravel-server` built a read cache and called
+  `LogSegmentFetcher::with_cache`, i.e. `--disable-cache` is off): the scan
+  declares `target_partitions` partitions, even where the snapshot has fewer
+  segments than that.
+- **No cache** (`--disable-cache`, or any embedding that never calls
+  `with_cache`): the scan declares `min(target_partitions, segment_count)`, the
+  pre-ADR-0102 bound.
+
+The reason is the fetch unit. There is no ranged block reader on the SQL read
+path, so each partition that owns blocks in a segment fetches that segment's
+whole object. With the cache, those reads coalesce through single-flight on one
+key; without it, each is a real object-store GET, and partitions beyond the
+segment count would multiply GETs with nothing absorbing them. Note what the cap
+does and does not buy: it stops `target_partitions` from setting the multiplier,
+but below the cap a plan with `n` partitions still opens each sufficiently-blocky
+segment `n` times, and the planning prune that counts surviving blocks adds one
+more read per segment. `ravel-bench`'s `logs_scan_scaling` report measures the
+cached and un-cached request counts side by side; its figures describe that
+fixture (a `MemoryStore`, a cache sized to hold the whole dataset), not striping
+in general.
+
+The peak-memory consequence follows the same gate. Concurrently-held scan memory
+is bounded by block size times the number of partitions decoding at once, so
+only the cached configuration raises that bound above the old
+`min(target_partitions, segment_count)` one — an un-cached deployment's bound is
+unchanged by ADR-0102. The per-query DataFusion pool enforces it either way:
+a partition count that would exceed the budget fails the query rather than
+spilling (ADR-0013).
+
 Two consequences an operator and a plan reader both see:
 
 - **The scan declares no output ordering.** It used to declare `ts` ascending

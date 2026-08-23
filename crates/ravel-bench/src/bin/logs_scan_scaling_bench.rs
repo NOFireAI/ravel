@@ -33,10 +33,11 @@ use ravel_bench::logs_scan_scaling::{LogsScanScalingConfig, Report, run};
 struct Args {
     #[arg(long, value_enum, default_value_t = StoreKind::Memory)]
     store: StoreKind,
-    /// RLOG objects the tenant is split across. Deliberately small (and smaller
-    /// than the largest `--target-partitions`) so the undersubscribed case is
-    /// exercised.
-    #[arg(long, default_value_t = 2)]
+    /// RLOG objects the tenant is split across. Smaller than the largest
+    /// `--target-partitions` so the undersubscribed case is exercised, but large
+    /// enough that the planning prune's per-segment serialized await is
+    /// measurable.
+    #[arg(long, default_value_t = 32)]
     segments: usize,
     /// Records per object. With a small block target this sets the block count
     /// the striping fans out across.
@@ -45,8 +46,10 @@ struct Args {
     /// Writer block target. Small so each segment holds many blocks.
     #[arg(long, default_value_t = 64)]
     block_target_records: usize,
-    /// Comma-separated DataFusion `target_partitions` values to sweep.
-    #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16")]
+    /// Comma-separated DataFusion `target_partitions` values to sweep. Straddle
+    /// `--segments` so the report shows both the un-cached cap binding and the
+    /// cache-wired fan-out continuing past it.
+    #[arg(long, value_delimiter = ',', default_value = "1,8,32,64,128")]
     target_partitions: Vec<usize>,
     /// Timed repetitions per combination.
     #[arg(long, default_value_t = 5)]
@@ -106,6 +109,15 @@ fn print_human_table(report: &Report) {
     );
     println!("  total_records       : {}", report.config.total_records);
     println!("  runs per combo      : {}", report.config.runs);
+    println!();
+    println!(
+        "  planning prune ({} segments, {} blocks): {:.3} ms serial (what \
+         compute_plan_counts pays), {:.3} ms concurrent",
+        report.planning.segments,
+        report.planning.total_blocks,
+        report.planning.serial_ms,
+        report.planning.concurrent_ms,
+    );
     println!();
     println!(
         "{:>7} | {:>6} | {:>8} | {:>9} | {:>8} | {:>7} | {:>8} | {:>10} | {:>10} | {:>10} | {:>14}",

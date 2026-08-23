@@ -11,6 +11,11 @@
 //! the old segment-granular rule (`min(target_partitions, segment_count)`)
 //! pinned such a query to at most `segment_count` partitions.
 //!
+//! That fan-out is gated on the fetcher carrying ADR-0046's read cache
+//! ([`LogSegmentFetcher::has_cache`]); an un-cached fetcher keeps the old
+//! `min(target_partitions, segment_count)` bound. See
+//! [`LogsScanExec::new`] and the request-count paragraph below for why.
+//!
 //! The per-segment surviving-block counts the assignment needs are determined
 //! once, before draining, by [`LogSegmentFetcher::plan_segment`] (a prune with
 //! no block decode), shared across partitions through a
@@ -21,12 +26,45 @@
 //! at a time**, and turns each block's [`ravel_logseg::LogRecord`]s into Arrow
 //! arrays matching this scan's projection of [`crate::logs_schema::logs_schema`].
 //!
-//! Because the whole object is still fetched with one whole-object GET
-//! (ADR-0087 decision 3: no ranged block reader here) and the read cache keys
-//! the whole object, the several partitions that stripe one segment's blocks
-//! coalesce onto one cached GET via single-flight rather than issuing one GET
-//! each; the object-store request count is unchanged from the whole-segment
-//! path. A future ranged reader would change that.
+//! # Object-store request count, and the cache gate
+//!
+//! The whole object is still fetched with one whole-object GET (ADR-0087
+//! decision 3: no ranged block reader here), so every partition that owns
+//! blocks in a segment issues its own whole-object read at that segment's key.
+//! What those reads cost depends on the cache, and so does how many partitions
+//! are planned:
+//!
+//! - **Un-cached fetcher.** The partition count is capped at the segment count,
+//!   so the request count stops responding to `target_partitions` once that cap
+//!   binds. It is the pre-ADR-0102 whole-segment count only when the plan
+//!   collapses to a single partition; with `n > 1` partitions, every segment
+//!   holding at least `n` surviving blocks is opened by all `n` of them, so the
+//!   scan costs up to `n` whole-object reads per segment, and planning's prune
+//!   (`compute_plan_counts`) adds one more per relevant segment. The cap
+//!   bounds that multiplier by the segment count instead of letting
+//!   `target_partitions` set it; it does not remove it. `ravel-bench`'s
+//!   `logs_scan_scaling` report measures both.
+//! - **Cache-wired fetcher.** The partition count is `target_partitions`, so
+//!   several partitions can stripe one segment's blocks. The read cache keys the
+//!   whole object, so those reads coalesce onto one GET via single-flight, and
+//!   on the bench fixture the request count is flat across the whole
+//!   `target_partitions` sweep (planning's prune coalesces with them too).
+//!   Coalescing is not free of request count in general, though: a read that
+//!   misses the in-flight window, or finds its key already evicted, issues its
+//!   own GET. So striding past the segment count *can* raise the GET count above
+//!   the whole-segment path's, and that is the cost ADR-0102 accepts in exchange
+//!   for the cache absorbing the repeat reads and for the extra scan
+//!   parallelism.
+//!
+//! A future ranged (per-block) reader would remove the trade entirely by making
+//! each partition's fetch cover only its own blocks.
+//!
+//! Any "no amplification" or "flat request count" figure reported for this path
+//! (here, in `ravel-bench`'s `logs_scan_scaling` report, or in that bench's
+//! smoke test) is a measurement of one fixture -- a `MemoryStore`, a specific
+//! segment/block/partition shape, a cache sized to hold the whole dataset -- and
+//! not a general result about striping. Cache size, eviction, object size, and
+//! store latency all move it.
 //!
 //! # Streaming, and why no ordering is declared (ADR-0087)
 //!
@@ -488,8 +526,10 @@ impl BlockMetrics {
 }
 
 impl LogsScanExec {
-    /// Build a scan over `segments`, split round-robin into
-    /// `min(target_partitions, segments.len())` partitions, with the given ts
+    /// Build a scan over `segments`, striping their blocks round-robin across
+    /// `target_partitions` partitions when `fetcher` carries ADR-0046's read
+    /// cache and across `min(target_partitions, segments.len())` when it does
+    /// not (see the `declared_partitions` comment below), with the given ts
     /// bounds, content predicates, and prune-only predicates. Stream-attribute
     /// equalities are deliberately not accepted: they are not pushed into the
     /// fetch, because a stream-level prune is unsound against the merged `attrs`
@@ -528,13 +568,29 @@ impl LogsScanExec {
         // Blocks, not segments, are what get striped (ADR-0102), but the
         // per-segment block counts are not known until a prune runs, which is
         // async and cannot happen in this synchronous constructor. So the
-        // declared partition count is `target_partitions.max(1)` and the
-        // block-level assignment (with the stride `n` capped by the real block
-        // count) happens lazily on first poll, shared through `counts`. When
-        // there are fewer blocks than partitions the surplus partitions run
+        // declared partition count is a function of `target_partitions` alone
+        // and the block-level assignment (with the stride `n` capped by the real
+        // block count) happens lazily on first poll, shared through `counts`.
+        // When there are fewer blocks than partitions the surplus partitions run
         // empty, which is equivalent to capping `n` here and DataFusion handles
         // empty partitions.
-        let declared_partitions = target_partitions.max(1);
+        //
+        // Striping past the segment count is gated on the fetcher carrying
+        // ADR-0046's read cache, which is the precondition ADR-0102 decision 1
+        // names for it: the fetch unit here is the whole object
+        // (`GetRange::Full`, no ranged block reader -- ADR-0087 decision 3), so K
+        // partitions sharing one segment issue K whole-object reads at the same
+        // key. With the cache those coalesce onto one GET through single-flight;
+        // without it each is a real request, and requesting more partitions than
+        // there are segments would multiply object-store GETs for no reason. So
+        // an un-cached fetcher falls back to the pre-ADR-0102 bound,
+        // `min(target_partitions, segment_count)`, and never plans a partition
+        // whose extra GETs nothing absorbs.
+        let declared_partitions = if fetcher.has_cache() {
+            target_partitions.max(1)
+        } else {
+            target_partitions.max(1).min(segments.len().max(1))
+        };
         let full = full_schema;
         // A `None` projection means every column, in schema order. Resolving it
         // here rather than carrying an `Option` keeps one code path for the

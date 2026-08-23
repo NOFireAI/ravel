@@ -10,17 +10,37 @@
 //! FEW-segment / MANY-block dataset, and sweeps `target_partitions` to show the
 //! scan fanning out past the segment count and the wall time responding.
 //!
-//! It also reports the object-store request count the striping issues, read from
-//! the executed query's `QueryAccounting` (the same source
-//! [`crate::sql_latency`] and [`crate::pushdown_crossover`] use), on both a
-//! cache-wired fetcher and an un-cached one. Striping one segment's blocks
-//! across N partitions turns one sequential whole-object read into N whole-object
-//! reads at the same key; ADR-0046's read cache keys the whole object, so with
-//! the cache wired those N reads coalesce (single-flight) onto ONE GET and the
-//! request count is flat across the sweep, while without it the raw GET count
-//! climbs with the partition count. Both numbers are reported so the checkpoint
-//! review can see the effect and confirm the cache neutralizes it (there is no
-//! ranged block reader here; ADR-0087 decision 3).
+//! The fan-out is gated on ADR-0046's read cache
+//! (`LogSegmentFetcher::has_cache`, the precondition ADR-0102 decision 1 names):
+//! a cache-wired fetcher gets `target_partitions` partitions, an un-cached one
+//! keeps the old `min(target_partitions, segment_count)` bound. So this bench
+//! sweeps every `target_partitions` value on BOTH a cache-wired and an un-cached
+//! fetcher, and the two sides answer different questions: the cached side shows
+//! how far the scan fans out past the segment count and what the wall time does,
+//! the un-cached side shows the request count staying put once the cap binds.
+//!
+//! It also reports the object-store request count each combination issues, read
+//! from the executed query's `QueryAccounting` (the same source
+//! [`crate::sql_latency`] and [`crate::pushdown_crossover`] use). The fetch unit
+//! is the whole object (ADR-0087 decision 3: no ranged block reader), so every
+//! partition owning blocks in a segment issues its own whole-object read at that
+//! segment's key. Un-cached, the partition count is capped at the segment count,
+//! so raising `target_partitions` past that changes nothing. Cache-wired, the
+//! partition count keeps climbing and those repeated reads are what ADR-0046's
+//! single-flight cache absorbs.
+//!
+//! Every request-count figure in this report is a measurement of THIS fixture --
+//! a `MemoryStore`, this segment/block/partition shape, a cache sized to hold the
+//! whole dataset with no eviction -- and not a general "no amplification" result
+//! about striping. Cache size, eviction, object size, and store latency all move
+//! it.
+//!
+//! Finally it reports the cost of the planning prune itself
+//! ([`PlanningLatency`]): `ravel_sql`'s `compute_plan_counts` awaits
+//! [`LogSegmentFetcher::plan_segment`] once per segment, sequentially, before any
+//! partition drains a block. That serialization is invisible at two or three
+//! segments, so this measures it over the fixture's full segment set and reports
+//! the serial wall time next to the same prunes issued concurrently.
 //!
 //! Report-only: it never changes library behavior. Gated on the `sql-latency`
 //! feature, like the other SQL scaling benches.
@@ -40,7 +60,8 @@ use ravel_logseg::{
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
-    ByteLimit, CacheFetchError, EngineConfig, LogSegmentFetcher, RequestLimit, SegmentFetcher,
+    ByteLimit, CacheFetchError, EngineConfig, LogQuery, LogSegmentFetcher, RequestLimit,
+    SegmentFetcher,
 };
 use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest};
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -67,9 +88,11 @@ const SCOPE_VERSION: &str = "1.0";
 pub struct LogsScanScalingConfig {
     pub store: Arc<dyn ObjectStoreBackend>,
     pub store_label: String,
-    /// RLOG objects the tenant is split across. Deliberately SMALL (and smaller
-    /// than the largest swept `target_partitions`) so the run exercises the
-    /// undersubscribed case this item fixes.
+    /// RLOG objects the tenant is split across. Smaller than the largest swept
+    /// `target_partitions` so the run exercises the undersubscribed case this
+    /// item fixes, but large enough that the planning prune's per-segment
+    /// serialized await ([`PlanningLatency`]) is measurable rather than lost in
+    /// noise.
     pub segments: usize,
     /// Records per object. With [`block_target_records`](Self::block_target_records)
     /// small, this sets how many blocks each segment carries, which is the pool
@@ -87,16 +110,24 @@ pub struct LogsScanScalingConfig {
 
 impl LogsScanScalingConfig {
     /// A cheap fixture for the acceptance test and CI.
+    ///
+    /// 32 segments, not the 2 this started at: at two segments the planning
+    /// prune's per-segment serialized await is a rounding error, so the
+    /// [`PlanningLatency`] figure said nothing. The swept partition counts
+    /// straddle the segment count on both sides (1 below it, 32 at it, 64 above
+    /// it) so the report shows the un-cached cap binding and the cached fan-out
+    /// continuing past it. Objects stay small (96 records, 6 blocks each) to keep
+    /// the run cheap despite the segment count.
     pub fn smoke(store: Arc<dyn ObjectStoreBackend>, store_label: &str) -> Self {
         LogsScanScalingConfig {
             store,
             store_label: store_label.to_string(),
-            segments: 2,
-            records_per_object: 300,
+            segments: 32,
+            records_per_object: 96,
             block_target_records: 16,
-            target_partitions: vec![1, 4, 8],
+            target_partitions: vec![1, 32, 64],
             runs: 2,
-            deadline: Duration::from_secs(30),
+            deadline: Duration::from_secs(60),
         }
     }
 }
@@ -124,8 +155,10 @@ pub struct ComboResult {
     pub cache_wired: bool,
     /// Observed: the `LogsScanExec` node's declared output partition count in the
     /// real physical plan. Under block-level striping (ADR-0102) this is
-    /// `target_partitions` even when the segment count is smaller -- the whole
-    /// point of the item, read from the plan rather than recomputed.
+    /// `target_partitions` when the cache is wired, even where the segment count
+    /// is smaller -- the whole point of the item -- and
+    /// `min(target_partitions, segment_count)` when it is not. Read from the plan
+    /// rather than recomputed.
     pub scan_partitions: usize,
     /// Observed: partitions of the scan that actually decoded blocks, from
     /// `SqlStats`/metrics via a drained execution -- see `non_empty_partitions`.
@@ -137,9 +170,12 @@ pub struct ComboResult {
     pub blocks_total: u64,
     pub blocks_scanned: u64,
     /// Object-store GET requests the cold run issued (`QueryAccounting`). The
-    /// number this deliverable exists to report: with the cache wired it is flat
-    /// across the sweep (whole-object reads coalesce on one key); un-cached it
-    /// climbs with the partition count.
+    /// number this deliverable exists to report. Un-cached, the partition count
+    /// is capped at the segment count, so this stops moving once
+    /// `target_partitions` reaches that cap. Cache-wired, the partition count
+    /// keeps climbing and the repeated whole-object reads at one key are what
+    /// single-flight absorbs. A figure for THIS fixture only, not a general
+    /// result (see the module doc).
     pub object_store_get_requests: u64,
     /// Cache hits/misses the cold run recorded (zero when un-cached).
     pub cache_hits: u64,
@@ -190,9 +226,32 @@ impl ComboResult {
     }
 }
 
+/// The planning prune's cost, measured directly against the same call
+/// `ravel_sql`'s `compute_plan_counts` makes
+/// ([`LogSegmentFetcher::plan_segment`], one per segment).
+///
+/// `compute_plan_counts` awaits those prunes SEQUENTIALLY, once per query,
+/// before any partition drains its first block, so this latency sits on the
+/// critical path of every partition. `serial_ms` is that loop; `concurrent_ms`
+/// is the same prunes issued together, i.e. what the serialization costs. Both
+/// use a fresh un-cached fetcher, so neither is served warm by the other.
+#[derive(Serialize)]
+pub struct PlanningLatency {
+    /// Segments pruned, i.e. how many serialized awaits the figure covers.
+    pub segments: usize,
+    /// Surviving blocks the prunes counted, summed over segments.
+    pub total_blocks: usize,
+    /// Wall time of the per-segment sequential loop `compute_plan_counts` runs.
+    pub serial_ms: f64,
+    /// Wall time of the same prunes awaited concurrently.
+    pub concurrent_ms: f64,
+}
+
 #[derive(Serialize)]
 pub struct Report {
     pub config: ReportConfig,
+    /// What the per-segment serialized planning prune costs on this fixture.
+    pub planning: PlanningLatency,
     pub combos: Vec<ComboResult>,
 }
 
@@ -266,6 +325,8 @@ pub async fn run(config: &LogsScanScalingConfig) -> Report {
 
     let total_records = publish_dataset(store.as_ref(), &tenant, config).await;
 
+    let planning = measure_planning_latency(Arc::clone(&store), tenant_hash).await;
+
     let mut combos = Vec::with_capacity(config.target_partitions.len() * 2);
     for &tp in &config.target_partitions {
         for cache_wired in [false, true] {
@@ -296,7 +357,76 @@ pub async fn run(config: &LogsScanScalingConfig) -> Report {
             cores: available_cores(),
             profile: build_profile().to_string(),
         },
+        planning,
         combos,
+    }
+}
+
+/// Time the planning prune both ways: the per-segment sequential loop
+/// `ravel_sql`'s `compute_plan_counts` runs, and the same prunes awaited
+/// concurrently. Each uses its own un-cached fetcher so neither reads bytes the
+/// other warmed.
+async fn measure_planning_latency(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant_hash: TenantHash,
+) -> PlanningLatency {
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: NOW_NS,
+    };
+    let catalog = Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog");
+    let snapshot = catalog
+        .resolve(&tenant_hash, Signal::Logs, window, &[], NOW_NS)
+        .await
+        .expect("resolve snapshot");
+    let segments = snapshot.segments;
+    let query = LogQuery::new(0, NOW_NS);
+
+    let serial_fetcher = LogSegmentFetcher::new(Arc::clone(&store));
+    let accounting = QueryAccounting::new();
+    let start = Instant::now();
+    let mut total_blocks = 0usize;
+    for seg in &segments {
+        let planned = serial_fetcher
+            .plan_segment(seg, tenant_hash, &query, &accounting)
+            .await
+            .expect("plan segment");
+        if let Some((survivors, _)) = planned {
+            total_blocks += survivors;
+        }
+    }
+    let serial = start.elapsed();
+
+    let concurrent_fetcher = LogSegmentFetcher::new(store);
+    let accounting = QueryAccounting::new();
+    let start = Instant::now();
+    let planned = futures::future::join_all(segments.iter().map(|seg| {
+        let fetcher = concurrent_fetcher.clone();
+        let query = query.clone();
+        let accounting = accounting.clone();
+        async move {
+            fetcher
+                .plan_segment(seg, tenant_hash, &query, &accounting)
+                .await
+                .expect("plan segment")
+        }
+    }))
+    .await;
+    let concurrent = start.elapsed();
+    assert_eq!(
+        planned
+            .iter()
+            .filter_map(|p| p.as_ref().map(|(s, _)| *s))
+            .sum::<usize>(),
+        total_blocks,
+        "both planning passes must prune to the same surviving-block count"
+    );
+
+    PlanningLatency {
+        segments: segments.len(),
+        total_blocks,
+        serial_ms: serial.as_secs_f64() * 1e3,
+        concurrent_ms: concurrent.as_secs_f64() * 1e3,
     }
 }
 
@@ -580,7 +710,13 @@ async fn publish_dataset(
             writer_epoch: 1,
             writer_seq,
             object_size: bytes.len() as u64,
-            content_hash: [0u8; 32],
+            // The real BLAKE3 of the bytes, not a zero placeholder: ADR-0046's
+            // cache key is `(tenant, content_hash, offset, object_size)`, so
+            // objects sharing a zero hash collide with each other whenever their
+            // sizes also match, and the cached side of this sweep would report
+            // cross-segment collisions as if they were single-flight
+            // coalescing.
+            content_hash: *blake3::hash(&bytes).as_bytes(),
             sample_count: per_object as u64,
             series_count: 1,
             min_event_ts_ns: min,

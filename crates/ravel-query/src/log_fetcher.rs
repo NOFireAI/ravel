@@ -411,6 +411,17 @@ impl LogSegmentFetcher {
         self
     }
 
+    /// Whether ADR-0046's read cache is wired ([`with_cache`](Self::with_cache)
+    /// was called). A caller that would issue several whole-object GETs at the
+    /// same key needs this: with a cache those coalesce onto one fetch through
+    /// single-flight, without one each is a real object-store request. ADR-0102
+    /// decision 1 names the cache as the precondition for that fan-out, and
+    /// `LogsScanExec::new` gates its partition count on this.
+    #[must_use]
+    pub fn has_cache(&self) -> bool {
+        self.cache.is_some()
+    }
+
     /// Per-object relevance from the catalog summary alone, with no object
     /// read: true iff the segment's event-ts span (`SegmentRef`'s
     /// `min_event_ts_ns..=max_event_ts_ns`, the same bounds the footer carries)
