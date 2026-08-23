@@ -1,11 +1,18 @@
 # ADR-0102: Intra-segment scan partitioning and pinned spill policy
 
-Status: Accepted for decisions 2-4 (parallel final aggregation acceptance,
-spill policy, benchmark). Decision 1 (intra-segment scan partitioning) is
-Deferred — a review pass found its core fetch-granularity premise doesn't
-hold as designed; see the note at the end of that section. This ADR still
-claims the number for the epic as a whole; decision 1 will be revised in
-place once redesigned, not moved to a new document.
+Status: Accepted.
+
+Decision 1 was Deferred after a review pass found its original
+fetch-granularity premise (flattening `candidate_blocks` before partitions
+exist) didn't hold. It was redesigned and shipped in place, not moved to a
+new document: `crates/ravel-sql/src/logs_scan.rs`'s `LogsScanExec` now
+determines per-segment surviving-block counts at plan time via
+`LogSegmentFetcher::plan_segment` (a prune with no block decode), shared
+across partitions through a `tokio::sync::OnceCell`, and gates the fan-out
+past segment count on `LogSegmentFetcher::has_cache` (ADR-0046's
+single-flight cache), the precondition the deferral note named. See the
+end of that section for what changed from the original draft and what
+remains explicitly out of scope (a ranged per-block reader, ADR-0107).
 
 ## Context
 
@@ -25,8 +32,8 @@ Epic #361 identified three independent ceilings on SQL execution parallelism:
    `crates/ravel-logseg/src/reader.rs:615` that walks the pruned set one at a
    time) — nothing distributes them across partitions. Whether and how that
    enumeration can drive partition assignment without changing the fetch
-   path's cost shape is exactly what decision 1 below turned out not to have
-   answered on the first pass.
+   path's cost shape is what decision 1 below did not answer on its first
+   pass, and was resolved on its second (see decision 1).
 2. **Parallel final aggregation exists but has never been measured at
    production scale.** ADR-0094 (`docs/adrs/0094-parallel-final-aggregation-exact-typed.md`)
    already specifies the full mechanism: an exact-typed classification pass
@@ -57,12 +64,9 @@ These three are independent: item 1 touches `logs_scan.rs` and the
 `session.rs`/`executor.rs`'s classification and is orthogonal to how many
 scan partitions feed it; item 3 touches only `RuntimeEnvBuilder`
 configuration. None blocks another structurally. Item 2's production
-measurement would be more representative once item 1 lands (wider fan-in
-gives a cleaner signal on whether the serial merge is the bottleneck), but
-item 1 is deferred with no fixed timeline (see decision 1) and is also
-externally sequenced behind a peer epic's in-flight work on the same file
-— items 2-4 do not wait for it and proceed on their own schedule, with the
-measurement caveat above noted rather than blocking.
+measurement is more representative now that item 1 has landed (see
+decision 1): a wider fan-in gives a cleaner signal on whether the serial
+merge is the bottleneck.
 
 Epic #360 (columnar decode-to-Arrow, in flight on a peer session) changes
 what happens *inside* one partition's block-decode loop; this ADR changes
@@ -71,70 +75,84 @@ depends on the other landing first.
 
 ## Decision
 
-### 1. Intra-segment partitioning — DEFERRED, real design gap found
+### 1. Intra-segment partitioning — redesigned and shipped
 
-The original design here (flatten `(segment, block_index)` pairs from
+The original design (flatten `(segment, block_index)` pairs from
 `SkipIndex::candidate_blocks` and round-robin them across
-`target_partitions`, mirroring how `LogsScanExec` already round-robins
-whole segments) does not hold up against the actual fetch path and is not
-being shipped as first drafted. Recorded here for whoever picks this back
-up:
+`target_partitions`) did not hold up against the actual fetch path, for
+the four reasons recorded when this decision was deferred: `candidate_blocks`
+only exists at *execute* time inside `RlogReader::scan_blocks`, after the
+object is already fetched, so there was no candidate list to flatten before
+partition assignment (`LogsScanExec::new`, synchronous) runs; the fetcher's
+unit is the whole object (`GetRange::Full`), so K partitions striping one
+segment's blocks would issue K whole-object GETs of the same part unless
+something coalesced them; the "byte-accounting stays additive" claim was
+false, since naive per-partition `BlockMetrics` would record a segment's
+`blocks_total` once per (partition × segment) instead of once per segment;
+and `candidate_blocks` is only the first of three pruning tiers
+(skip-index, POSTINGS, bloom), so a redesign had to say where the other two
+run relative to the partitioned subset.
 
-- `candidate_blocks` only runs inside `RlogReader::scan_blocks` at
-  *execute* time, per partition, after the object is fetched — not at plan
-  time where partition assignment (`LogsScanExec::new`) happens. There is
-  no candidate list to flatten before partitions already exist.
-- The fetcher's unit is the whole object: `log_fetcher.rs` fetches with
-  `GetRange::Full`. K partitions each owning a slice of one segment's
-  blocks means K independent full-object GETs of the same 256 MiB L1
-  part — real S3 request/egress amplification, landing right after the
-  S3-request-cost epic (#84) specifically reduced that class of cost. The
-  ADR-0046 single-flight cache mitigates this only when wired, which the
-  original draft didn't require or even mention.
-- The "byte-accounting stays additive, no re-derivation" claim was false:
-  `QueryAccounting` is one shared `Arc` of atomics with no per-partition
-  fold to begin with, and per-partition `BlockMetrics` would record each
-  segment's `blocks_total` once per (partition × segment) rather than
-  once per segment — a real double-count, not just an unproven claim.
-- `candidate_blocks` is only the first of three pruning tiers
-  (skip-index, POSTINGS, bloom); a redesign needs to say which tier the
-  partitioned subset indexes and where the other two run.
+The shipped design (`crates/ravel-sql/src/logs_scan.rs`) resolves all four:
 
-A real design here needs to resolve the fetch-granularity mismatch first —
-plausible directions include byte-range `GetRange` fetches per partition
-(block offsets are already known from the footer/FIELD_DIR before block
-data is fetched, so a footer-only read could drive partition assignment
-without a full-object fetch) or requiring the ADR-0046 single-flight cache
-as a precondition so K partitions share one fetch — but neither is decided
-here. This item is also externally sequenced behind peer epic #360's T3-T5
-(`crates/ravel-sql/src/logs_scan.rs` is under active, non-trivial rewrite
-there — a per-partition columnar/row-path eligibility split that a
-partitioning redesign needs to interact with deliberately, not merge
-textually on top of), so there is no urgency to resolve the fetch-mechanism
-question before that lands either. Before redrafting, also confirm ADR-0087
-(which deliberately dropped `LogsScanExec`'s per-partition timestamp
-ordering guarantee) hasn't been silently reacquired downstream — the same
-failure family `RsegDedupExec`'s own history documents on the metrics side:
-an ordering declaration removed once let the optimizer strip a merge and
-execute one partition silently.
+- **Plan-time pruning, not execute-time.** A new `LogSegmentFetcher::plan_segment`
+  prunes every segment once, with no block decode, before any partition
+  drains a block. Every partition awaits the same computation through a
+  shared `tokio::sync::OnceCell` (`compute_plan_counts`), so the
+  per-segment surviving-block counts partition assignment needs exist
+  before partitions start draining, not after.
+- **Fetch-cost gated on the read cache, not assumed away.** The whole
+  object is still fetched with one `GetRange::Full` GET per partition per
+  segment it touches (no ranged block reader — that's ADR-0107, explicitly
+  future work, not this decision). `LogsScanExec::new` checks
+  `LogSegmentFetcher::has_cache`: with ADR-0046's single-flight cache
+  wired, several partitions striping one segment coalesce onto one GET, so
+  fan-out proceeds to `target_partitions`; without a cache, striping past
+  the segment count would multiply GETs for nothing, so the partition count
+  falls back to the pre-this-decision bound,
+  `target_partitions.max(1).min(segment_count.max(1))`. `ravel-bench`'s
+  `logs_scan_scaling` report measures both sides: on its fixture,
+  cache-wired request count stays flat across the `target_partitions`
+  sweep, un-cached it climbs until the segment-count cap binds.
+- **Double-count fixed by assigning ownership of the whole-segment totals
+  to one partition.** `blocks_total` and the postings-prune drop are
+  recorded once, by partition 0 only, during the shared planning step;
+  every other partition's `BlockMetrics` records only the blocks it
+  actually decoded. Striping a segment across N partitions no longer
+  multiplies its whole-segment totals by N.
+- **All three pruning tiers still run, at their original layer.**
+  `plan_segment`'s prune covers skip-index and POSTINGS (matching what
+  `candidate_blocks` did before, just earlier); the partitioned subset is
+  the resulting surviving-block list. Bloom pruning is unchanged: it still
+  runs per-block during decode, inside whichever partition owns that block.
+
+ADR-0087's "no output ordering" guarantee (decision 1 there) is
+unaffected, not silently reacquired: `LogsScanExec::compute_properties`
+still declares `Partitioning::UnknownPartitioning`, explicitly, and the
+module doc states why a block-streaming, striped scan cannot claim an
+ordering a whole-segment scan couldn't either.
+
+Outstanding from the original scope, deliberately not resolved here: a
+ranged (per-block) reader that would remove the whole-object-GET tradeoff
+entirely is claimed as ADR-0107, not folded into this decision.
 
 ### 2. Accept ADR-0094 in place; measure at production scale before flipping the default
 
 ADR-0094's mechanism is not revisited — ship it as designed. This epic adds
 the missing evidence: a benchmark against a real S3-backed store (not
 `MemoryStore`), release profile, realistic cardinality (matching the
-group-by shapes ClickBench-class workloads exercise). Measure at today's
-segment-granular fan-in — decision 1 is deferred with no fixed timeline,
-so this measurement does not wait for it. Note the fan-in caveat alongside
-the published numbers, and re-measure if/when decision 1 lands, since
-wider fan-in could shift the crossover point. Publish the numbers into
-ADR-0094's own Consequences section and flip its Status from Proposed to
-Accepted in the
-same change that defaults `parallel_final_aggregation` on. If production
-numbers repeat the preliminary regression (parallel slower at low
-cardinality), the default stays off and ADR-0094 documents the measured
-crossover point instead of defaulting on unconditionally — this ADR does
-not pre-decide which way the number comes out, only that the flag's
+group-by shapes ClickBench-class workloads exercise). The measurement ran
+at the segment-granular fan-in that predates decision 1's redesign above
+(measuring first, not waiting on it, was the plan; decision 1 has since
+landed, so a re-measurement at wider fan-in would need to note that the
+published numbers here predate it). Publish the numbers into ADR-0094's
+own Consequences section and flip its Status from Proposed to Accepted in
+the same change that defaults `parallel_final_aggregation` on. If
+production numbers repeat the preliminary regression (parallel slower at
+low cardinality), the default stays off and ADR-0094 documents the
+measured crossover point instead of defaulting on unconditionally — this
+ADR does not pre-decide which way the number comes out, only that the
+flag's
 default follows the measurement, not a guess.
 
 ### 3. Disable the disk manager explicitly; spill is a typed error, not silent degradation
@@ -189,9 +207,10 @@ add, not built here.
 No existing harness in `ravel-bench` measures core-count scaling for
 aggregation (`query_latency.rs` covers PromQL percentiles with no
 core-count axis; `sql_corpus.rs` covers query generation for #428, not
-scaling). Measure before AND after item 2's default flip and before/after
-decision 1 lands (whenever it's redesigned), so both "before" numbers are
-captured, not assumed.
+scaling). Measure before AND after item 2's default flip; a re-measurement
+at decision 1's wider fan-in (now that it has landed, see decision 1) is a
+separate, not-yet-taken step, since the harness's original before/after
+axis was item 2's flip, not item 1's landing.
 
 ## Rejected alternatives
 
@@ -248,16 +267,14 @@ ADR-0088's operator-configurable memory budget, or a narrower query — not
 `parallel_final_aggregation`, which (per the note above) can tighten the
 effective budget rather than loosen it.
 
-Decision 1 (intra-segment partitioning) is not yet shipped; its
-consequences aren't real until it's redesigned and accepted. The
-Diagram below shows the target end state including decision 1, not
-current behavior.
+Decision 1 (intra-segment partitioning) has shipped; its consequences are
+current behavior, not a target state. The diagram below reflects it.
 
 ## Diagram
 
-Target end state, once decision 1 is redesigned and lands — the left half
-(block-range partitioning) is not yet shipped by this ADR; decisions 2-4
-(the aggregation/spill/budget half on the right) are.
+Current end state: the left half (intra-segment, block-index striping) and
+the aggregation/spill/budget half on the right are both shipped by this
+ADR.
 
 ```mermaid
 flowchart TB
@@ -266,13 +283,15 @@ flowchart TB
         S2[Segment 2] --> P2[Partition 2]
         S3["Segment 3 (large L1 part)"] --> P3["Partition 3\n(all blocks, no fan-out)"]
     end
-    subgraph After["After: block-range partitioning"]
-        S3b["Segment 3 (large L1 part)"] --> B1[Blocks 0-999]
-        S3b --> B2[Blocks 1000-1999]
-        S3b --> B3[Blocks 2000-2999]
-        B1 --> Pa[Partition A]
-        B2 --> Pb[Partition B]
-        B3 --> Pc[Partition C]
+    subgraph After["After: intra-segment block striping"]
+        Plan["plan_segment prune\n(shared via OnceCell,\nonce per query)"]
+        S3b["Segment 3 (large L1 part)"] --> Plan
+        Plan --> B1["Surviving blocks\nstriped i % n = A"]
+        Plan --> B2["Surviving blocks\nstriped i % n = B"]
+        Plan --> B3["Surviving blocks\nstriped i % n = C"]
+        B1 --> Pa["Partition A\n(cache-coalesced GET)"]
+        B2 --> Pb["Partition B\n(cache-coalesced GET)"]
+        B3 --> Pc["Partition C\n(cache-coalesced GET)"]
     end
     Pa --> Agg{"Final AggregateExec\n(serial, or repartitioned\nper ADR-0094 if exact-typed)"}
     Pb --> Agg
