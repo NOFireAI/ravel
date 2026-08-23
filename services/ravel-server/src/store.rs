@@ -308,6 +308,8 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
                 kms_key_id: cli.s3_kms_key.clone(),
                 session_token: None,
                 credentials_file: None,
+                auth: Default::default(),
+                instance_metadata_endpoint: None,
             };
             let store = S3Store::new(config.clone())
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
@@ -524,6 +526,8 @@ mod tests {
             kms_key_id: None,
             session_token: None,
             credentials_file: None,
+            auth: Default::default(),
+            instance_metadata_endpoint: None,
         })
         .expect("dummy S3 config must build without network access");
         assert!(

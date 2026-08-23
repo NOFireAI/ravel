@@ -430,6 +430,8 @@ async fn build_auth_store(
         kms_key_id: None,
         session_token: None,
         credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
     };
     S3Store::new(config).map_err(Error::Store)
 }

@@ -267,7 +267,12 @@ client, which is why `S3Store` reports `upload_checksum: false` for both.
 
 ### Credentials
 
-`S3Config` (ADR-0072 decision 1) takes long-lived `access_key_id` /
+`S3Config` selects a credential source explicitly through `auth`
+(`S3AuthMode`), never by inferring one from the absence of keys. The default
+is `S3AuthMode::Static`, which is every deployment today and behaves exactly
+as before ADR-0106.
+
+**Static mode (ADR-0072 decision 1).** Takes long-lived `access_key_id` /
 `secret_access_key`, an optional temporary `session_token` for STS-issued or
 IRSA-style credentials, and an optional `credentials_file` for credentials
 an external process rotates on disk (a Kubernetes secret mount, an STS
@@ -282,6 +287,41 @@ credential atomically, so a request already in flight finishes on whatever
 credential it already obtained. A read or parse failure while rotating
 never fails the request: the last-good credential is kept and a
 rate-limited warning is logged, never a panic.
+
+**Instance-role mode (ADR-0106).** `auth = S3AuthMode::InstanceRole` fetches
+short-lived credentials from the EC2 instance metadata service (IMDSv2) on
+the link-local address, so an EC2 deployment stores no static key at all.
+`access_key_id`, `secret_access_key`, `session_token`, and `credentials_file`
+must all be absent; setting `auth = InstanceRole` together with any of them is
+a configuration error, and `S3Store::new` rejects it with a typed `StoreError`
+at construction (there is no precedence question, because the mix is refused
+outright). `instance_metadata_endpoint` overrides the IMDS base URL (default
+`http://169.254.169.254`); it is an operator-facing knob on the same trust
+boundary as every other `--s3-*` setting and exists so tests and unusual
+deployments can redirect IMDS.
+
+The provider is IMDSv2 only: it `PUT`s for a session token, then `GET`s the
+role document (`AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`). Any
+non-success from the metadata endpoint, including a `403` from a disabled or
+hop-limited IMDS, is a typed error, never a downgrade to the token-less
+IMDSv1 flow. The first fetch runs eagerly at `S3Store::new` under a bounded
+timeout, so an instance misconfigured for a role fails at startup rather than
+on its first S3 request, and construction never hangs indefinitely. The
+credential is cached and refreshed on the request path once the clock comes
+within 5 minutes of its `Expiration`. A transient refresh failure keeps
+serving the cached credential while it is still unexpired; once the cached
+credential has actually expired, the request fails with a typed error, a
+failure counter (`S3Store::credential_refresh_failures`, mirroring
+`credential_rotation_failures`) increments, and a warning is logged
+rate-limited to once per 60s. Credentials live only in memory: never written
+to disk, and redacted from the provider's `Debug`.
+
+**SSE-KMS under an instance role.** `kms_key_id` works unchanged in either
+mode, because S3 performs the KMS call server-side on every PUT. When
+`kms_key_id` is set with `auth = InstanceRole`, the instance role's IAM
+policy must grant `kms:GenerateDataKey` and `kms:Decrypt` on that key, since
+the role is the identity S3 evaluates for the encryption and decryption
+calls.
 
 ## Runtime qualification (executable contract)
 

@@ -180,6 +180,8 @@ impl Minio {
             kms_key_id: None,
             session_token: None,
             credentials_file: None,
+            auth: Default::default(),
+            instance_metadata_endpoint: None,
         }
     }
 }

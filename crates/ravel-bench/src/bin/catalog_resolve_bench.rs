@@ -98,6 +98,8 @@ fn s3_config_from_env() -> S3Config {
         kms_key_id: None,
         session_token: None,
         credentials_file: None,
+        auth: Default::default(),
+        instance_metadata_endpoint: None,
     }
 }
 

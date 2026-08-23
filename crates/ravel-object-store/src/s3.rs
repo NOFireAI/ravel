@@ -90,6 +90,9 @@ use crate::{
 mod credentials;
 use credentials::FileCredentialProvider;
 
+mod instance_role;
+use instance_role::{DEFAULT_IMDS_ENDPOINT, InstanceRoleCredentialProvider};
+
 /// Default entries per `ListPage`, chosen to line up with S3's own
 /// `ListObjectsV2` page size. Overridable per instance via
 /// [`S3Store::with_page_size`].
@@ -129,6 +132,27 @@ const _: () = assert!(crate::MULTIPART_MAX_PARTS * MULTIPART_PART_SIZE >= 64 * 1
 /// compactor writing several objects at once must not open an unbounded
 /// number of connections per object.
 const MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
+
+/// How [`S3Store`] sources AWS credentials (ADR-0106).
+///
+/// `Static` (the default) is every deployment today: inline keys, an optional
+/// `session_token`, or a rotating `credentials_file`. `InstanceRole` fetches
+/// short-lived credentials from the EC2 instance metadata service (IMDSv2) and
+/// forbids any inline credential field being set at the same time. Selecting
+/// the source is explicit, never inferred from the absence of keys, per
+/// `S3Config`'s "no credential-chain magic" contract. Future sources (EKS
+/// IRSA, ECS task roles) fit as additional variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum S3AuthMode {
+    /// Inline `access_key_id`/`secret_access_key`, optionally with
+    /// `session_token` or `credentials_file`. Behaves exactly as before
+    /// ADR-0106.
+    #[default]
+    Static,
+    /// Short-lived credentials from the EC2 IMDSv2 endpoint. Requires every
+    /// inline credential field to be absent.
+    InstanceRole,
+}
 
 /// Explicit configuration for the S3 / MinIO adapter. No environment or
 /// credential-chain magic: every value that changes behavior is a field
@@ -190,6 +214,17 @@ pub struct S3Config {
     /// `access_key_id`/`secret_access_key`/`session_token` are set, the file
     /// wins.
     pub credentials_file: Option<PathBuf>,
+    /// Which credential source [`S3Store`] uses (ADR-0106). `Static` (the
+    /// default) is every caller today and preserves byte-identical behavior.
+    /// `InstanceRole` fetches from EC2 IMDSv2 and requires `access_key_id`,
+    /// `secret_access_key`, `session_token`, and `credentials_file` all to be
+    /// absent; [`S3Store::new`] rejects the mix with a typed [`StoreError`].
+    pub auth: S3AuthMode,
+    /// Base URL of the EC2 instance metadata service, used only when
+    /// `auth` is [`S3AuthMode::InstanceRole`]. `None` uses the AWS link-local
+    /// address (`http://169.254.169.254`); a value redirects IMDS to a mock in
+    /// tests or an unusual deployment. Ignored under [`S3AuthMode::Static`].
+    pub instance_metadata_endpoint: Option<String>,
 }
 
 /// S3 / MinIO backend implementing [`ObjectStoreBackend`] over
@@ -202,11 +237,15 @@ pub struct S3Store {
     /// opaque `object_store::CredentialProvider` trait object) purely so
     /// [`S3Store::credential_rotation_failures`] has something to read.
     credential_provider: Option<Arc<FileCredentialProvider>>,
+    /// `Some` only under [`S3AuthMode::InstanceRole`]; kept for the same reason
+    /// as `credential_provider`, so [`S3Store::credential_refresh_failures`]
+    /// can read its counter (ADR-0106).
+    instance_role_provider: Option<Arc<InstanceRoleCredentialProvider>>,
 }
 
 impl S3Store {
     pub fn new(config: S3Config) -> Result<Self, StoreError> {
-        let (builder, credential_provider) = Self::builder(&config)?;
+        let (builder, credential_provider, instance_role_provider) = Self::builder(&config)?;
         let store = builder
             .build()
             .map_err(|e| StoreError::Permanent(format!("failed to build S3 client: {e}")))?;
@@ -214,6 +253,7 @@ impl S3Store {
             store,
             page_size: LIST_PAGE_SIZE,
             credential_provider,
+            instance_role_provider,
         })
     }
 
@@ -228,6 +268,19 @@ impl S3Store {
             .unwrap_or(0)
     }
 
+    /// Count of [`S3AuthMode::InstanceRole`] request-path refreshes that failed
+    /// while the cached credential was already expired, so the S3 request had
+    /// to fail (ADR-0106). A transient failure that still served an unexpired
+    /// last-good credential does not count. Always `0` under
+    /// [`S3AuthMode::Static`]. Mirrors [`S3Store::credential_rotation_failures`]
+    /// so #545 can wire both into ravel-server observability.
+    pub fn credential_refresh_failures(&self) -> u64 {
+        self.instance_role_provider
+            .as_deref()
+            .map(InstanceRoleCredentialProvider::refresh_failures)
+            .unwrap_or(0)
+    }
+
     /// Build the `AmazonS3Builder` from a [`S3Config`], with no network
     /// access (`build()` only validates local config shape). Split out from
     /// [`S3Store::new`] so a test can assert the fully-configured builder
@@ -238,17 +291,40 @@ impl S3Store {
     /// contract) only when `credentials_file` is `Some` and that file is
     /// unreadable or not valid JSON in the expected shape; every other
     /// config shape only sets local builder fields and cannot fail here.
-    /// Returns the [`FileCredentialProvider`] alongside the builder (rather
-    /// than only handing it to `with_credentials` as an opaque trait object)
-    /// so [`S3Store::new`] can keep its own handle for observability.
+    /// Returns the [`FileCredentialProvider`] and
+    /// [`InstanceRoleCredentialProvider`] alongside the builder (rather than
+    /// only handing whichever is active to `with_credentials` as an opaque
+    /// trait object) so [`S3Store::new`] can keep its own handle for
+    /// observability. At most one is ever `Some`.
+    ///
+    /// Under [`S3AuthMode::InstanceRole`] the inline key setters are skipped
+    /// entirely and the eager IMDS fetch runs here (so a misconfigured
+    /// instance fails at construction); mixing that mode with any inline
+    /// credential field is rejected with a typed [`StoreError`] before any
+    /// network call.
+    #[allow(clippy::type_complexity)]
     fn builder(
         config: &S3Config,
-    ) -> Result<(AmazonS3Builder, Option<Arc<FileCredentialProvider>>), StoreError> {
+    ) -> Result<
+        (
+            AmazonS3Builder,
+            Option<Arc<FileCredentialProvider>>,
+            Option<Arc<InstanceRoleCredentialProvider>>,
+        ),
+        StoreError,
+    > {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket)
-            .with_region(&config.region)
-            .with_access_key_id(&config.access_key_id)
-            .with_secret_access_key(&config.secret_access_key)
+            .with_region(&config.region);
+        // The inline key setters exist only under Static: `InstanceRole` never
+        // signs with a static key, and setting one would be exactly the mix the
+        // check below forbids.
+        if matches!(config.auth, S3AuthMode::Static) {
+            builder = builder
+                .with_access_key_id(&config.access_key_id)
+                .with_secret_access_key(&config.secret_access_key);
+        }
+        builder = builder
             .with_allow_http(config.allow_http)
             .with_virtual_hosted_style_request(!config.force_path_style);
         if let Some(endpoint) = &config.endpoint {
@@ -258,23 +334,60 @@ impl S3Store {
         // inside S3 on every PUT, no crypto code here. Dual-layer DSSE is
         // reachable via `with_dsse_kms_encryption` on this same builder if a
         // future requirement needs it; single-layer is the sufficient default.
+        // Applies to both auth modes: an instance role needs
+        // kms:GenerateDataKey/kms:Decrypt on this key (docs/object-store-contract.md).
         if let Some(kms_key_id) = &config.kms_key_id {
             builder = builder.with_sse_kms_encryption(kms_key_id);
         }
-        // Rotating file credentials win over inline ones (ADR-0072 decision
-        // 1, S3Config::credentials_file doc comment): `with_credentials`
-        // overrides the access_key_id/secret_access_key/token set above.
-        // `FileCredentialProvider::load` does the fail-fast read+parse this
-        // function's Result exists for.
+
         let mut credential_provider = None;
-        if let Some(credentials_file) = &config.credentials_file {
-            let provider = Arc::new(FileCredentialProvider::load(credentials_file.clone())?);
-            builder = builder.with_credentials(Arc::clone(&provider) as AwsCredentialProvider);
-            credential_provider = Some(provider);
-        } else if let Some(session_token) = &config.session_token {
-            builder = builder.with_token(session_token.clone());
+        let mut instance_role_provider = None;
+        match config.auth {
+            S3AuthMode::Static => {
+                // Rotating file credentials win over inline ones (ADR-0072
+                // decision 1, S3Config::credentials_file doc comment):
+                // `with_credentials` overrides the
+                // access_key_id/secret_access_key/token set above.
+                // `FileCredentialProvider::load` does the fail-fast read+parse
+                // this function's Result exists for.
+                if let Some(credentials_file) = &config.credentials_file {
+                    let provider =
+                        Arc::new(FileCredentialProvider::load(credentials_file.clone())?);
+                    builder =
+                        builder.with_credentials(Arc::clone(&provider) as AwsCredentialProvider);
+                    credential_provider = Some(provider);
+                } else if let Some(session_token) = &config.session_token {
+                    builder = builder.with_token(session_token.clone());
+                }
+            }
+            S3AuthMode::InstanceRole => {
+                // Mixing an instance role with any inline credential is a
+                // configuration error, not a precedence question: refuse it
+                // outright (ADR-0106), before the eager IMDS fetch.
+                if !config.access_key_id.is_empty()
+                    || !config.secret_access_key.is_empty()
+                    || config.session_token.is_some()
+                    || config.credentials_file.is_some()
+                {
+                    return Err(StoreError::Permanent(
+                        "auth=InstanceRole must not be combined with access_key_id, \
+                         secret_access_key, session_token, or credentials_file"
+                            .to_string(),
+                    ));
+                }
+                let endpoint = config
+                    .instance_metadata_endpoint
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_IMDS_ENDPOINT.to_string());
+                // Eager fetch: a server misconfigured for EC2 fails here rather
+                // than on its first S3 request. `with_credentials` installs the
+                // provider as the client's credential source.
+                let provider = Arc::new(InstanceRoleCredentialProvider::load(endpoint)?);
+                builder = builder.with_credentials(Arc::clone(&provider) as AwsCredentialProvider);
+                instance_role_provider = Some(provider);
+            }
         }
-        Ok((builder, credential_provider))
+        Ok((builder, credential_provider, instance_role_provider))
     }
 
     /// Same backend, a smaller `list()` page size. Mirrors
@@ -1022,6 +1135,8 @@ mod tests {
             kms_key_id: None,
             session_token: None,
             credentials_file: None,
+            auth: S3AuthMode::Static,
+            instance_metadata_endpoint: None,
         }
     }
 
@@ -1113,6 +1228,146 @@ mod tests {
         );
     }
 
+    /// Stand up a minimal always-succeeding mock IMDS on an ephemeral loopback
+    /// port and return its `http://addr` base. Shared by the InstanceRole
+    /// builder tests, whose only need is a working eager fetch.
+    async fn spawn_ok_imds() -> String {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::{get, put};
+
+        let app = Router::new()
+            .route("/latest/api/token", put(|| async { "mock-token" }))
+            .route(
+                "/latest/meta-data/iam/security-credentials/",
+                get(|| async { "ravel-role" }),
+            )
+            .route(
+                "/latest/meta-data/iam/security-credentials/{role}",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        r#"{"Code":"Success","AccessKeyId":"AKIA_IMDS",
+                            "SecretAccessKey":"imds-secret","Token":"imds-token",
+                            "Expiration":"2033-11-14T22:13:20Z"}"#,
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        endpoint
+    }
+
+    /// `auth=InstanceRole` combined with any inline credential is a
+    /// construction-time typed error (ADR-0106). Non-vacuous by pointing at a
+    /// *working* mock IMDS: the all-absent config builds cleanly against it, so
+    /// each mixed config's failure can only be the mix guard, not a fetch
+    /// failure or a blanket InstanceRole refusal. Each inline field is
+    /// exercised on its own so a future field dropped from the guard is caught.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn builder_rejects_mixed_instance_role_and_inline_credentials() {
+        let endpoint = spawn_ok_imds().await;
+        let base = move || {
+            let mut config = test_config();
+            config.auth = S3AuthMode::InstanceRole;
+            config.instance_metadata_endpoint = Some(endpoint.clone());
+            config.access_key_id = String::new();
+            config.secret_access_key = String::new();
+            config
+        };
+
+        let mut with_key = base();
+        with_key.access_key_id = "AKIA_INLINE".to_string();
+
+        let mut with_secret = base();
+        with_secret.secret_access_key = "inline-secret".to_string();
+
+        let mut with_token = base();
+        with_token.session_token = Some("inline-token".to_string());
+
+        let mut with_file = base();
+        with_file.credentials_file = Some(PathBuf::from("/nonexistent/creds.json"));
+
+        let clean = base();
+
+        // spawn_blocking: builder() blocks on the eager fetch, which must be
+        // able to reach the mock task on this same runtime.
+        tokio::task::spawn_blocking(move || {
+            for (label, config) in [
+                ("access_key_id", with_key),
+                ("secret_access_key", with_secret),
+                ("session_token", with_token),
+                ("credentials_file", with_file),
+            ] {
+                let err = S3Store::builder(&config)
+                    .expect_err(&format!("InstanceRole + {label} must be rejected"));
+                assert!(
+                    matches!(err, StoreError::Permanent(_)),
+                    "{label}: got {err:?}"
+                );
+            }
+
+            // All-absent against the same working endpoint builds cleanly: the
+            // rejections above are the mix guard, not a blanket refusal.
+            S3Store::builder(&clean)
+                .expect("all-absent InstanceRole must build against a working IMDS");
+        })
+        .await
+        .expect("join");
+    }
+
+    /// The `InstanceRole` builder installs a credential provider that a Static
+    /// builder over the same non-credential config does not. Mirrors
+    /// [`none_kms_key_leaves_builder_unchanged`]'s manual-baseline shape so the
+    /// comparison isolates exactly the provider: the baseline reproduces every
+    /// non-credential setter and omits only `with_credentials`, so removing the
+    /// provider install would make the two Debug outputs equal and fail this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instance_role_builder_differs_from_static_baseline() {
+        let endpoint = spawn_ok_imds().await;
+
+        let mut instance_role = test_config();
+        instance_role.auth = S3AuthMode::InstanceRole;
+        instance_role.access_key_id = String::new();
+        instance_role.secret_access_key = String::new();
+        instance_role.instance_metadata_endpoint = Some(endpoint);
+
+        let baseline_config = instance_role.clone();
+
+        let (instance_debug, baseline_debug) = tokio::task::spawn_blocking(move || {
+            let instance_debug = format!(
+                "{:?}",
+                S3Store::builder(&instance_role)
+                    .expect("instance-role builder must construct against the mock")
+                    .0
+            );
+            // Every non-credential setter the InstanceRole path applies, with
+            // no key setters and no provider: the one difference must be the
+            // installed credential provider.
+            let mut baseline = AmazonS3Builder::new()
+                .with_bucket_name(&baseline_config.bucket)
+                .with_region(&baseline_config.region)
+                .with_allow_http(baseline_config.allow_http)
+                .with_virtual_hosted_style_request(!baseline_config.force_path_style);
+            if let Some(endpoint) = &baseline_config.endpoint {
+                baseline = baseline.with_endpoint(endpoint.clone());
+            }
+            (instance_debug, format!("{baseline:?}"))
+        })
+        .await
+        .expect("join");
+
+        assert_ne!(
+            instance_debug, baseline_debug,
+            "InstanceRole must install a credential provider the plain builder lacks"
+        );
+    }
+
     #[tokio::test]
     async fn credentials_file_wins_over_inline_credentials_and_token() {
         use object_store::CredentialProvider as _;
@@ -1128,7 +1383,7 @@ mod tests {
         let mut config = test_config();
         config.session_token = Some("inline-token".to_string());
         config.credentials_file = Some(path);
-        let (_, provider) = S3Store::builder(&config).expect("valid credentials file");
+        let (_, provider, _) = S3Store::builder(&config).expect("valid credentials file");
         let provider = provider.expect("a credentials file must produce a provider");
         let credential = provider.get_credential().await.expect("file credentials");
         assert_eq!(
