@@ -416,6 +416,102 @@
       ]
     },
     {
+      "id": "q21_count_google_urls",
+      "sql": "SELECT COUNT(*) FROM logs WHERE \"URL\" LIKE '%google%'",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "count",
+        "LIKE"
+      ],
+      "expected_rows": 1,
+      "upstream_id": "Q21",
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q22_google_phrase_breakdown",
+      "sql": "SELECT \"SearchPhrase\", MIN(\"URL\"), COUNT(*) AS c FROM logs WHERE \"URL\" LIKE '%google%' AND \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "min",
+        "count",
+        "LIKE",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q22",
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        }
+      ]
+    },
+    {
+      "id": "q23_google_title_not_google_url",
+      "sql": "SELECT \"SearchPhrase\", MIN(\"URL\"), MIN(\"Title\"), COUNT(*) AS c, COUNT(DISTINCT \"UserID\") FROM logs WHERE \"Title\" LIKE '%Google%' AND \"URL\" NOT LIKE '%.google.%' AND \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" ORDER BY c DESC LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Filter (WHERE)",
+        "min",
+        "count",
+        "count(DISTINCT)",
+        "LIKE",
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q23",
+      "required_declarations": [
+        {
+          "key": "Title",
+          "ty": "str"
+        },
+        {
+          "key": "URL",
+          "ty": "str"
+        },
+        {
+          "key": "SearchPhrase",
+          "ty": "str"
+        },
+        {
+          "key": "UserID",
+          "ty": "i64"
+        }
+      ]
+    },
+    {
+      "id": "q24_google_urls_by_time",
+      "sql": "SELECT * FROM logs WHERE \"URL\" LIKE '%google%' ORDER BY ts LIMIT 10",
+      "constructs": [
+        "logs -> Signal::Logs",
+        "Projection",
+        "Filter (WHERE)",
+        "LIKE",
+        "ORDER BY",
+        "LIMIT"
+      ],
+      "upstream_id": "Q24",
+      "required_declarations": [
+        {
+          "key": "URL",
+          "ty": "str"
+        }
+      ]
+    },
+    {
       "id": "q25_phrases_by_time",
       "sql": "SELECT \"SearchPhrase\" FROM logs WHERE \"SearchPhrase\" <> '' ORDER BY ts LIMIT 10",
       "constructs": [

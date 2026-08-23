@@ -1167,3 +1167,158 @@ async fn has_word_first_argument_coercion_matrix() {
         "has_word's first argument must be the bare dictionary column; plan was:\n{text}"
     );
 }
+
+/// The #479 acceptance test: `col LIKE 'pattern'` over the `logs` table plans
+/// with NO coercing CAST on a declared `Str` column (its `Dictionary(Int32,
+/// Utf8)` reaches the Ravel `like` UDF intact, matched once per distinct value),
+/// while still planning and answering correctly for every other first-argument
+/// type DataFusion's built-in `LIKE` accepted. The second argument (the pattern)
+/// is coerced to `Utf8` too, so a `LargeUtf8`/`Utf8View` pattern plans rather
+/// than failing at execution.
+///
+/// This runs through the real `logs` session (`build_session`, via
+/// [`logs_session`]), which is where the `LIKE` -> `like` function rewrite is
+/// registered: a bare `SessionContext` would not rewrite `Expr::Like` at all, so
+/// the dictionary fast path and its no-CAST plan would never be exercised. A
+/// unit call into `like_impl` cannot catch the CAST class either -- it is handed
+/// whatever array type the test picks, which is exactly what DataFusion's
+/// coercion was silently changing.
+#[tokio::test]
+async fn like_matrix_plans_without_cast_and_matches_rows() {
+    let store = MemoryStore::new();
+    let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+    // `body` (fixed Utf8) and the declared `name` (dictionary) carry the same
+    // low-cardinality text; both substring-contain "timeout" on ts 0 and 2.
+    let rows_spec = [
+        (0i64, "connection timeout"),
+        (1, "ok"),
+        (2, "request timeout"),
+        (3, "fine"),
+    ];
+    let records: Vec<LogRecord> = rows_spec
+        .iter()
+        .map(|(ts, text)| {
+            record_with_resource_and_attrs(
+                &resource,
+                *ts,
+                text,
+                &[("name".to_string(), AttrValue::Str((*text).to_string()))],
+            )
+        })
+        .collect();
+    let seg = write_object(&store, "logs/like-matrix.rlog", &records).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let fetcher = LogSegmentFetcher::new(store);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash([7u8; 16]),
+        fetcher,
+        QueryAccounting::new(),
+    )
+    .with_declared_columns(vec![DeclaredColumn::new("name", DeclaredType::Str)]);
+
+    // The real production `logs` session: this is what registers the LIKE
+    // rewrite. `arrow_cast` is an admitted scalar, so the cast probes plan.
+    let ctx = logs_session(provider).expect("session");
+
+    // (label, WHERE predicate, expected surviving ts values in order).
+    let cases: &[(&str, &str, &[i64])] = &[
+        // --- first-argument (matched column) coercion ---
+        ("Utf8 body", "body LIKE '%timeout%'", &[0, 2]),
+        ("declared Str dictionary", "name LIKE '%timeout%'", &[0, 2]),
+        (
+            "SQL CAST(body AS VARCHAR) -> Utf8View",
+            "CAST(body AS VARCHAR) LIKE '%timeout%'",
+            &[0, 2],
+        ),
+        (
+            "LargeUtf8",
+            "arrow_cast(body, 'LargeUtf8') LIKE '%timeout%'",
+            &[0, 2],
+        ),
+        (
+            "Utf8View",
+            "arrow_cast(body, 'Utf8View') LIKE '%timeout%'",
+            &[0, 2],
+        ),
+        (
+            "Dictionary(Int8, Utf8)",
+            "arrow_cast(name, 'Dictionary(Int8, Utf8)') LIKE '%timeout%'",
+            &[0, 2],
+        ),
+        // Int64 casts to its decimal text ("0".."3"), which contains no
+        // "timeout" substring.
+        ("Int64", "arrow_cast(ts, 'Int64') LIKE '%timeout%'", &[]),
+        // A NULL first argument is never a match (NULL LIKE x is NULL).
+        ("NULL literal", "NULL LIKE '%timeout%'", &[]),
+        // A constant-matching string literal matches every row.
+        (
+            "string literal",
+            "'connection timeout' LIKE '%timeout%'",
+            &[0, 1, 2, 3],
+        ),
+        // --- second-argument (pattern) coercion, which the impl must survive ---
+        (
+            "LargeUtf8 pattern",
+            "body LIKE arrow_cast('%timeout%', 'LargeUtf8')",
+            &[0, 2],
+        ),
+        (
+            "Utf8View pattern",
+            "body LIKE arrow_cast('%timeout%', 'Utf8View')",
+            &[0, 2],
+        ),
+        // A NULL pattern makes every comparison NULL: no surviving rows.
+        ("NULL pattern", "body LIKE NULL", &[]),
+        // NOT LIKE inverts the match (and keeps NULL NULL): the two non-matching
+        // rows survive.
+        ("NOT LIKE", "body NOT LIKE '%timeout%'", &[1, 3]),
+        // Case sensitivity is load-bearing (ClickBench Q23): lowercase pattern
+        // over capitalized text matches nothing.
+        ("case sensitive", "body LIKE '%TIMEOUT%'", &[]),
+    ];
+
+    for (label, predicate, expected) in cases {
+        let sql = format!("SELECT ts FROM logs WHERE {predicate} ORDER BY ts");
+        let df = ctx
+            .sql(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] planning failed: {e}"));
+        let batches = df
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] execution failed: {e}"));
+        let got = ts_sequence(&batches);
+        assert_eq!(
+            got, *expected,
+            "[{label}] `{predicate}` returned unexpected rows"
+        );
+    }
+
+    // The dictionary case must carry NO CAST in the optimized physical plan:
+    // leaving `Dictionary(Int32, Utf8)` intact into the `like` UDF is the whole
+    // point. A `CAST` here is the coercion DataFusion's built-in LIKE would have
+    // inserted over the dictionary argument, defeating the per-distinct-value arm
+    // and hydrating the column to one value per row.
+    let dict_plan = ctx
+        .sql("SELECT ts FROM logs WHERE name LIKE '%timeout%'")
+        .await
+        .expect("plan dict case")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let text = displayable(dict_plan.as_ref()).indent(true).to_string();
+    assert!(
+        !text.contains("CAST"),
+        "LIKE over the declared dictionary column must carry no coercing CAST; plan was:\n{text}"
+    );
+    assert!(
+        text.contains("like(name@"),
+        "LIKE's matched argument must be the bare dictionary column, not a CAST; plan was:\n{text}"
+    );
+}

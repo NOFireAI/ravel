@@ -37,23 +37,19 @@ fn corpus_path() -> PathBuf {
 const UPSTREAM_COUNT: usize = 43;
 
 /// The ClickBench statements the corpus construct-gate cannot admit, each paired
-/// with the single construct that blocks it. One row per rejected statement; the
-/// distinct missing capability is `LIKE` pattern matching (issue #479) -- see
-/// the runbook's gap list and the issue it references. Q28/Q29 (`length`, issue
-/// #480) moved into the corpus file once `length` was registered as a named
-/// construct.
+/// with the single construct that blocks it. One row per rejected statement.
+///
+/// Now empty: every ClickBench statement Q1..Q43 is in the corpus file. Q21-Q24
+/// (`LIKE` pattern matching, issue #479) moved into the corpus once `LIKE` was
+/// registered as a named construct; Q28/Q29 (`length`, issue #480) moved earlier
+/// once `length` was registered.
 ///
 /// Each named construct MUST be absent from [`supported_construct_names`]
 /// (asserted by [`each_known_gap_names_a_genuinely_unsupported_construct`]): a
 /// gap cannot be claimed for a construct that is actually supported, and if a
 /// construct here later becomes supported this test fails, which is the signal to
 /// move that statement into the corpus file.
-const KNOWN_GAPS: &[(&str, &str)] = &[
-    ("Q21", "LIKE pattern match"),
-    ("Q22", "LIKE pattern match"),
-    ("Q23", "LIKE pattern match"),
-    ("Q24", "LIKE pattern match"),
-];
+const KNOWN_GAPS: &[(&str, &str)] = &[];
 
 #[test]
 fn checked_in_clickbench_corpus_parses_and_passes_the_construct_gate() {

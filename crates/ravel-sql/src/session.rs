@@ -550,6 +550,12 @@ pub fn build_session(
         }
         SessionTable::Logs(provider) => {
             ctx.register_udf(has_word_udf());
+            // Rewrite `col LIKE 'pattern'` into the Ravel `like` UDF (#479) so a
+            // declared `Str` column's dictionary reaches the matcher intact,
+            // matched once per distinct value. Registered as a function rewrite
+            // (runs before type coercion) so it sees the un-hydrated operands;
+            // see `crate::like_udf`.
+            ctx.register_function_rewrite(Arc::new(crate::like_udf::LikeToUdf))?;
             ctx.register_table(LOGS_TABLE, provider)?;
         }
         SessionTable::Spans(provider) => {

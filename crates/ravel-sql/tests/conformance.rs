@@ -137,6 +137,9 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         // `dur >= 20`; the sum is 60.
         (Category::Clause, "declared i64 typed comparison") => Some(Expect::Rows(2)),
         (Category::Clause, "declared i64 typed aggregate") => Some(Expect::Scalar(60.0)),
+        // Of the three log bodies ("conformance record 0/1/2"), only the second
+        // contains the substring "record 1".
+        (Category::Clause, "LIKE") => Some(Expect::Scalar(1.0)),
 
         // ADR-0097 decision 8: one representative scalar per admitted family,
         // each result re-derived from its literal inputs.

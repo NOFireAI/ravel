@@ -185,22 +185,21 @@ runs) is recorded beside the numbers so two runs are comparable or provably not.
 Running a 43-query suite against a supported-construct gate means some queries
 fail the gate rather than return a number. That is the intended outcome: an
 unsupported construct becomes a **named capability gap with a failing query
-attached**, not an omission from a results table. The checked-in corpus holds
-the **39** statements that pass the gate; the **4** below are recorded as known
-gaps (enforced by `crates/ravel-bench/tests/clickbench_corpus.rs`, which fails if
-any of the 43 is neither in the corpus nor listed as a gap).
+attached**, not an omission from a results table. The checked-in corpus now
+holds **all 43** statements; the gap list is empty (enforced by
+`crates/ravel-bench/tests/clickbench_corpus.rs`, which fails if any of the 43 is
+neither in the corpus nor listed as a gap).
 
-| Upstream | Blocking construct | Why | Issue |
-|---|---|---|---|
-| Q21 | `LIKE` pattern match | `WHERE URL LIKE '%google%'` | substring/pattern search |
-| Q22 | `LIKE` pattern match | `WHERE URL LIKE '%google%'` | substring/pattern search |
-| Q23 | `LIKE` pattern match | `LIKE '%Google%'` and `NOT LIKE '%.google.%'` | substring/pattern search |
-| Q24 | `LIKE` pattern match | `WHERE URL LIKE '%google%'` (also `SELECT *`) | substring/pattern search |
+There are currently no known gaps.
 
-**`LIKE` / SQL pattern matching** is not in Ravel's supported construct set.
-Ravel offers token search (`has_word`) and `regexp_replace`, but no `LIKE`
-with `%`/`_` wildcards, which four ClickBench statements depend on. This is a
-genuine engine capability gap, tracked as issue #479.
+**`LIKE` / SQL pattern matching** used to block Q21-Q24 and is now supported
+(issue #479): `col LIKE 'pattern'` / `NOT LIKE` with `%`/`_` wildcards is
+evaluated by the Ravel `like` UDF (`crates/ravel-sql/src/like_udf.rs`), which
+matches a declared `Str` column's dictionary once per distinct value and leaves
+`body` (plain `Utf8`) on a row-wise path. It is case-sensitive and pushes down
+nothing: substring `LIKE` is not a sound superset of the RLOG reader's exact
+`HasWord`/`Equals` predicates, so it is evaluated exactly over the scanned rows.
+Ravel also offers token search (`has_word`) and `regexp_replace`.
 
 Q28/Q29 (`AVG(length(...))`) were also blocked, but that gap was bookkeeping,
 not capability: `length` was already admitted by the SQL engine, just not

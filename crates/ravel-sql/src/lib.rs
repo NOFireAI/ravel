@@ -61,6 +61,7 @@ pub mod flight;
 #[cfg(feature = "flight-sql")]
 mod flight_ticket;
 mod labels;
+mod like_udf;
 mod logs_provider;
 mod logs_pushdown;
 mod logs_scan;
