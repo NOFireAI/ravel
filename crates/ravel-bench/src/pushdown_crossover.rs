@@ -34,9 +34,27 @@
 //! second generation but querying through a default catalog would let
 //! `is_pushdown_eligible` return `true` on both arms. Both would silently take
 //! the pushdown path and every number here would be meaningless while looking
-//! fine. Keeping the corpus byte-for-byte identical between arms means any
-//! wall-time or bytes-moved delta is attributable to the pushdown decision
-//! alone, not to a different segment count or scan range.
+//! fine -- `tests/pushdown_crossover_smoke.rs` proves this by construction: it
+//! asserts the observed gate matches the requested one on both arms, and a
+//! mutation removing `.with_provisioning_enforcement()` turns that assertion
+//! red with `gate=true` on the arm requesting `false`.
+//!
+//! Keeping the corpus byte-for-byte identical between arms isolates the
+//! pushdown DECISION as the only variable, but at the small cardinalities this
+//! bench's default sweep covers, most of the accounting columns end up
+//! IDENTICAL across arms too (`s3_bytes`, `s3_get_requests`,
+//! `decompressed_bytes` all matched exactly in a smoke run at 4 and 32
+//! series): both arms fetch the same segment bytes from the store regardless
+//! of whether the worker then reduces them to a partial or ships raw runs, so
+//! the wire-shape saving pushdown is meant to prove out only shows up in what
+//! the WORKER RETURNS to the coordinator, which this bench's reported
+//! `QueryStats::accounting` does not separately break out from the underlying
+//! segment fetch. `s3_requests` DOES differ between arms, by a constant offset
+//! independent of `target_series` -- that is the enforcing catalog's extra
+//! generation-history reads on the ineligible arm, a construction artifact of
+//! how this bench forces ineligibility, not a signal about the pushdown
+//! decision. Do not read a `s3_requests` delta as a pushdown effect. Wall-time
+//! is the column this bench actually measures the pushdown effect through.
 //!
 //! # The distributed path is real
 //!
@@ -58,9 +76,28 @@
 //! not the object-store-latency regime where pushdown's win (shipping a count
 //! instead of every raw sample) is largest. It is therefore a lower bound on
 //! the benefit of engaging pushdown; an object-store-backed run (`--store s3`)
-//! is the follow-up for the latency-dominated regime. Bytes-moved and
-//! S3-request counts, by contrast, are host-independent and reported so the
-//! difference in what each path materializes is visible.
+//! is the follow-up for the latency-dominated regime. `QueryStats::accounting`
+//! is still reported per arm for visibility, but see the caveat above: at
+//! this bench's default cardinalities most of those columns match across
+//! arms and are not themselves evidence of a pushdown effect. Wall-time is.
+//!
+//! This bench cannot observe whether the worker's `run_slice_metrics`
+//! pushdown branch actually engaged, only the final answer and the wall
+//! time -- no reported column distinguishes "computed via partial" from
+//! "computed via raw fetch that happened to agree." Proving pushdown itself
+//! engages and produces the correct answer is T4c/T4d's own reachability and
+//! regression tests' job, not this bench's; this bench assumes those hold
+//! and measures cost, not correctness.
+//!
+//! `distrib_crossover.rs` builds its corpus through `IngestRouter` +
+//! `SystemClock`, which gives no control over `ingest_hour_bucket`. This
+//! bench's ineligible arm needs two segments straddling a specific shard-
+//! generation boundary, so it publishes directly via `ravel_segment`/
+//! `ravel_commit` instead (the same technique
+//! `crates/ravel-query/src/engine.rs`'s `publish_metric_segment_multi` test
+//! helper uses). The two crossover benches therefore build their corpora
+//! through different routes, and their reported numbers are NOT directly
+//! comparable to each other.
 //!
 //! # Report-only
 //!
