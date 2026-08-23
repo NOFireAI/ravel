@@ -158,4 +158,54 @@ rustc 1.97.1, cargo 1.97.1, cargo-deny 0.20.2 (homebrew)   # exit 0
 No warm cargo target directory exists on this host; the heavy validation
 batches above (Linux host) were not rerun. Commands run by agents J, K, L
 are logged in their memos and summarized below as they land.
+
+## Agent K (supply chain), summary of executed commands
+
+Full list with exit codes in due-diligence/memos/agent-k.md. Key runs:
+
+```
+$ /opt/homebrew/bin/cargo-deny check          # repo deny.toml
+exit 0: "advisories ok, bans ok, licenses ok, sources ok"
+34 duplicate warnings + 1 license-exception-not-encountered (inferno).
+Advisory DB dated 2026-08-21 (two days old at run time).
+$ cargo metadata --format-version 1 --locked
+exit 0: 581 packages, 549 external, all crates.io, 0 wildcards
+$ cargo tree -i bincode@1.3.3 / -i paste      # both ignore justifications confirmed
+exit 0
+```
+
+## Agent J (test quality): no cargo commands run (read-only audit)
+
+Full command list in due-diligence/memos/agent-j.md. All evidence is greps
+and reads; panel-run suite results above cited as execution evidence.
+
+## Agent L (documentation): no builds (read-only audit)
+
+Full command list in due-diligence/memos/agent-l.md. Flag census: 57 of 89
+`#[arg(` fields documented in operations.md, 1 phantom flag. Metric census:
+106 doc-named `ravel_*` metrics tested against metrics.rs, 1 nonexistent.
+
+## Chair verification for rebuttals R7-R14 (this host)
+
+```
+$ grep -n "First public release" CHANGELOG.md
+182: "First public release. Ravel is an OpenTelemetry-native ..."   # exit 0
+$ sed -n '1,6p' docs/adrs/0027*.md
+"Status: Accepted (superseded at first public release by ADR-0066)" # exit 0
+$ grep -n "pre-release" docs/adrs/0092*.md | head -5
+7: "pre-release regime of ADR-0027 applies" ... 244 ... 310         # exit 0
+$ grep -n "SUPPORTED_VERSIONS" crates/ravel-segment/src/format.rs
+129: SupportedVersions::single(VERSION_V7)                          # exit 0
+$ grep -n "MAX_STRICT_VISIBILITY_BUDGET" services/ravel-server/src/config.rs
+1023 (constant = 3s), 2025 (startup enforcement)                    # exit 0
+$ sed -n '395,402p' scripts/chaos/lib.sh ; sed -n '704,708p' services/ravel-server/src/metrics.rs
+awk '$1 == n' exact-name match vs labeled render
+ravel_ingest_flushes_by_size_total{mode=...}: parser label-blind    # exit 0
+$ grep -n "chaos_requests_total|demo_requests_total" scripts/chaos/kill-ingest-flush.sh services/ravel-server/examples/gen_otlp_fixture.rs
+script queries chaos_requests_total; fixture emits demo_requests_total  # exit 0
+$ grep -c '"ravel_alert' services/ravel-server/src/metrics.rs
+0                                                                   # (no alert metric family)
+$ sed -n '99,112p' crates/ravel-bench/tests/catalog_byte_gates_golden.txt
+26.5167 and 8.8767 both under random_float(ctrl) arm                # exit 0
+```
 ```
