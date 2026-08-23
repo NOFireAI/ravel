@@ -668,6 +668,86 @@ impl LogSegmentFetcher {
         }))
     }
 
+    /// Prune one segment for intra-segment scan partitioning (ADR-0102) WITHOUT
+    /// decoding any block: returns how many of its blocks survive this query's
+    /// pruning, plus the whole-segment [`ScanStats`] the prune produced, or
+    /// `Ok(None)` when the catalog summary proved the segment irrelevant (no
+    /// GET, exactly like [`scan_accounted_with_tenant`](Self::
+    /// scan_accounted_with_tenant)).
+    ///
+    /// The survivor count is column-independent -- pruning never consults the
+    /// [`ColumnSelection`], which only narrows which pages a decoded block
+    /// reads -- so this opens the scan with [`ColumnSelection::all`] and decodes
+    /// nothing (`blocks_scanned`/`pages_*` in the returned stats are therefore
+    /// zero; the totals describe the whole segment). The byte read goes through
+    /// the same cache-aware funnel [`scan_accounted_with_tenant`](Self::
+    /// scan_accounted_with_tenant) uses, so in production it is single-flight
+    /// coalesced with the per-partition subset scans that follow rather than
+    /// issuing an extra distinct GET.
+    ///
+    /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
+    pub async fn plan_segment(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<(usize, ScanStats)>, LogFetchError> {
+        let Some(bytes) = self
+            .tenant_bytes(seg_ref, tenant_hash, query, accounting)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let key = &seg_ref.data_object_key;
+        let span = decode_span();
+        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &ColumnSelection::all()))?;
+        Ok(Some((scan.remaining_blocks(), scan.stats())))
+    }
+
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant),
+    /// restricted to the surviving blocks at the positions in `indices`
+    /// (intra-segment scan partitioning, ADR-0102). Same GET, same cache, same
+    /// pruning; the returned [`LogSegmentScan`] drains only the named subset of
+    /// the segment's surviving blocks, in the order given.
+    ///
+    /// `indices` index into the ordered survivor list this query's pruning
+    /// produces over this (immutable) object, the same list a prior
+    /// [`plan_segment`](Self::plan_segment) counted, so a partition hands the
+    /// exact positions it was assigned. The returned scan's whole-segment stats
+    /// totals are reported by [`plan_segment`] instead, to keep one segment's
+    /// totals from being counted once per partition (see `ravel_sql::
+    /// logs_scan`).
+    ///
+    /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
+    pub async fn scan_accounted_with_tenant_subset(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        indices: &[usize],
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        let Some(bytes) = self
+            .tenant_bytes(seg_ref, tenant_hash, query, accounting)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let key = &seg_ref.data_object_key;
+        let span = decode_span();
+        let scan = span.in_scope(|| self.open_scan_subset(key, &bytes, query, columns, indices))?;
+        Ok(Some(LogSegmentScan {
+            bytes,
+            scan,
+            erasure: query.erasure.clone(),
+            span,
+            key: key.to_string(),
+            finished: false,
+        }))
+    }
+
     /// The byte-fetch half of the tenant-aware funnel: the ts-range pre-check,
     /// then the object's bytes from the read cache or a whole-object GET, with
     /// the `page_fetch` span and the accounting both entry points share.
@@ -863,6 +943,51 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
     ) -> Result<BlockScan, LogFetchError> {
+        let pred = self.combined_predicate(key, bytes, query)?;
+        let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        // `prune` is passed as the reader's prune-only channel, never folded
+        // into `pred`: an arm there would become an exact per-row filter and
+        // drop resource/scope-only matches (docs/adrs/0049-rlog-postings.md
+        // amendment 2026-08-03). An empty channel makes this identical to
+        // `scan`.
+        reader
+            .scan_blocks(&pred, &query.prune, columns)
+            .map_err(|source| corrupt(key, source))
+    }
+
+    /// [`open_scan`](Self::open_scan), restricted to the surviving blocks at the
+    /// positions in `indices` (intra-segment scan partitioning, ADR-0102). The
+    /// predicate, prune channel, and pruning are identical to `open_scan`; only
+    /// the set of blocks the returned cursor will drain differs. `indices`
+    /// index into the same ordered survivor list `open_scan` would produce over
+    /// this (immutable) object, so they line up with a prior
+    /// [`plan_segment`](Self::plan_segment) count.
+    fn open_scan_subset(
+        &self,
+        key: &str,
+        bytes: &Bytes,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        indices: &[usize],
+    ) -> Result<BlockScan, LogFetchError> {
+        let pred = self.combined_predicate(key, bytes, query)?;
+        let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        reader
+            .scan_blocks_subset(&pred, &query.prune, columns, indices)
+            .map_err(|source| corrupt(key, source))
+    }
+
+    /// The combined exact predicate (`ts range AND resolved streams AND
+    /// content`) both scan-opening paths hand to the reader. Stream-attribute
+    /// equalities are resolved against STREAM_DIR here (over-approximating, see
+    /// [`matching_streams`](Self::matching_streams)); the prune-only channel is
+    /// passed separately by the caller.
+    fn combined_predicate(
+        &self,
+        key: &str,
+        bytes: &Bytes,
+        query: &LogQuery,
+    ) -> Result<Predicate, LogFetchError> {
         let stream_ids = if query.stream_attrs.is_empty() {
             None
         } else {
@@ -884,17 +1009,7 @@ impl LogSegmentFetcher {
             arms.push(Predicate::StreamIn(ids));
         }
         arms.extend(query.content.iter().cloned());
-        let pred = Predicate::And(arms);
-
-        let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
-        // `prune` is passed as the reader's prune-only channel, never folded
-        // into `pred`: an arm there would become an exact per-row filter and
-        // drop resource/scope-only matches (docs/adrs/0049-rlog-postings.md
-        // amendment 2026-08-03). An empty channel makes this identical to
-        // `scan`.
-        reader
-            .scan_blocks(&pred, &query.prune, columns)
-            .map_err(|source| corrupt(key, source))
+        Ok(Predicate::And(arms))
     }
 
     /// Decodes the STREAM_DIR section of an object from its own public section
