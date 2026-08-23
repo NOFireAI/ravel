@@ -216,6 +216,37 @@ pub fn generate_batches(config: &WorkloadConfig) -> Result<Vec<Vec<NormalizedPoi
     Ok(batches)
 }
 
+/// The harness's synthetic "decode" stage (ADR-0104 decision 2, the "harness,
+/// no seam" rows): materialize the structured per-series samples the seed
+/// expands to. This is the bench analogue of decoding a wire request into
+/// structured points; [`normalize_into_batches`] is the normalize half.
+/// `generate_batches` is exactly
+/// `normalize_into_batches(config, generate_decoded(config)?)`, so timing the
+/// two halves separately measures the same fixture work the ingest bench
+/// already does, split at the decode/normalize boundary.
+pub fn generate_decoded(config: &WorkloadConfig) -> Result<Vec<GeneratedSeries>, TypeError> {
+    generate_series(config)
+}
+
+/// The harness's synthetic "normalize" stage (ADR-0104 decision 2): flatten
+/// decoded series into arrival-order [`NormalizedPoint`]s (building each point's
+/// shared `Arc<LabelSet>`) and chunk them into per-request batches with the same
+/// size distribution [`generate_batches`] uses. The normalize half of
+/// [`generate_decoded`].
+pub fn normalize_into_batches(
+    config: &WorkloadConfig,
+    series: Vec<GeneratedSeries>,
+) -> Vec<Vec<NormalizedPoint>> {
+    let mut rng = StdRng::seed_from_u64(config.seed ^ 0xBA7C_BA7C_BA7C_BA7C);
+    let mut rest = interleave(series);
+    let mut batches = Vec::new();
+    while !rest.is_empty() {
+        let take = config.batch_size.sample(&mut rng).min(rest.len());
+        batches.push(rest.drain(..take).collect());
+    }
+    batches
+}
+
 /// Populated buckets per side in the representative native-histogram shape:
 /// 30 per side, 60 total, a mid-range latency-style population.
 pub const HIST_BUCKETS_PER_SIDE: usize = 30;

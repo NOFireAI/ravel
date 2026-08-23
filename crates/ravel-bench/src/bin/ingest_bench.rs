@@ -93,4 +93,19 @@ fn print_human_table(report: &Report) {
         report.visibility_lag_ms.resolved_count,
         report.visibility_lag_ms.unresolved_count
     );
+    #[cfg(feature = "stage-timing")]
+    {
+        let b = &report.stage_breakdown;
+        println!(
+            "  stage harness ns  : decode={} normalize={}",
+            b.harness_stages.decode.total_ns, b.harness_stages.normalize.total_ns
+        );
+        println!(
+            "  stage seam ns     : admit={} route={} merge={} encode={}",
+            b.seam_stages.admit.total_ns,
+            b.seam_stages.route.total_ns,
+            b.seam_stages.merge.total_ns,
+            b.seam_stages.encode.total_ns
+        );
+    }
 }
