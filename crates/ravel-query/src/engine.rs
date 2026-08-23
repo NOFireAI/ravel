@@ -927,22 +927,27 @@ impl QueryEngine {
                     let accounting = &accounting;
                     let pushdown_target = &pushdown_target;
                     async move {
-                        // NOT YET LIVE (T4d): a worker that receives
-                        // `partial_aggregate: Some(..)` returns ONLY the
-                        // partial, no raw runs (`service.rs`'s
-                        // `run_slice_metrics` pushdown branch, pre-existing
-                        // T3/T4a behavior) -- there is no partial state
-                        // between "raw" and "pushed down". Sending this live
-                        // before `MergedSource::query_precomputed_count`
-                        // reads the partial back out (T4d, together with the
-                        // `PROTOCOL_VERSION` bump) would make every eligible
-                        // query silently see zero raw series and no
-                        // consumer of the partial that replaced them: a
-                        // real, empty answer instead of the real count.
-                        // `pushdown_target` above is still computed and
-                        // tested end to end; only sending it is deferred.
-                        let _ = pushdown_target.as_ref();
-                        let partial_req: Option<pb::PartialAggregateRequest> = None;
+                        // ADR-0103 live: send the partial-aggregate request for
+                        // the one eligible matcher set, `None` for every other
+                        // plan. A worker that receives `Some(..)` returns ONLY
+                        // the partial, no raw runs (`service.rs`'s
+                        // `run_slice_metrics` pushdown branch); this is safe to
+                        // set live now because the consumer
+                        // (`MergedSource::query_precomputed_count`, deliverable
+                        // 1) reads the partial back out and the
+                        // `PROTOCOL_VERSION` bump to 4 (deliverable 4) lands in
+                        // this same commit, so a version-3 worker degrades to a
+                        // silent local fallback instead of a corrupt answer.
+                        let partial_req: Option<pb::PartialAggregateRequest> =
+                            pushdown_target.as_ref().and_then(|t| {
+                                (t.matchers == plan.matchers).then_some(pb::PartialAggregateRequest {
+                                    want_count: true,
+                                    want_min: false,
+                                    want_max: false,
+                                    reduce_start_ns: Some(t.reduce_start_ns),
+                                    reduce_end_ns: Some(t.reduce_end_ns),
+                                })
+                            });
                         // A selector's segments carry scalar and/or
                         // native-histogram series; fetch both kinds (a series is
                         // one kind for its whole life, so the two sets never
@@ -1106,9 +1111,8 @@ impl QueryEngine {
             // count maps to the absence of a series here already: only partials
             // the worker actually returned (with a present count) become rows.
             //
-            // This field is inert: `MergedSource` does not override
-            // `SeriesSource::query_precomputed_count`, so the T4b fast path
-            // never reads it. T4d adds that override and its reachability test.
+            // `MergedSource::query_precomputed_count` reads this field, so the
+            // T4b fast path in `eval_call` fires for an eligible query.
             let precomputed_count = match (&pushdown_target, collected_pushdown) {
                 (Some(target), Some(partials)) => Some(PrecomputedCount {
                     matchers: target.matchers.clone(),
@@ -2909,17 +2913,12 @@ fn merge_histogram_soa_runs(
 /// [`QueryEngine::prefetch`] only when a query had an eligible instant
 /// `count_over_time` matcher set; `None` on every other query.
 ///
-/// This is inert cargo for now: `MergedSource` does NOT override
-/// `SeriesSource::query_precomputed_count`, so the T4b fast path in
-/// `eval_call` still receives the defaulted `Ok(None)` from every real query
-/// and falls back to the raw path. T4d adds the override plus the reachability
-/// test that makes the fast path actually fire.
-///
-/// Every field is written by `prefetch` but read by nothing until T4d wires
-/// the `query_precomputed_count` override, hence `dead_code` is allowed here
-/// deliberately (removing it once T4d lands is part of that task).
+/// `MergedSource::query_precomputed_count` reads this table now: when a query
+/// resolved an eligible instant `count_over_time` matcher set and its workers
+/// honored the partial-aggregate request, that override returns these counts
+/// for the exact `(matchers, start_ns, end_ns)`, so the T4b fast path in
+/// `eval_call` fires instead of the raw fetch-and-reduce path.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct PrecomputedCount {
     /// The matcher set this table answers for (the one eligible
     /// `count_over_time` selector's resolved matchers).
@@ -2935,9 +2934,8 @@ struct PrecomputedCount {
 struct MergedSource {
     series: Vec<SeriesData>,
     histogram_series: Vec<HistogramSeriesData>,
-    /// ADR-0103 collected pushdown count table (T4d wires the read side).
-    /// Written by `prefetch`, read by nothing until then.
-    #[allow(dead_code)]
+    /// ADR-0103 collected pushdown count table. Written by `prefetch` and read
+    /// by `query_precomputed_count` (this impl) on the T4b fast path.
     precomputed_count: Option<PrecomputedCount>,
 }
 
@@ -2986,6 +2984,30 @@ impl SeriesSource for MergedSource {
                     .collect(),
             })
             .collect())
+    }
+
+    /// ADR-0103 pushdown fast path: when `prefetch` stashed a collected
+    /// pushdown count table for exactly this `(matchers, start_ns, end_ns)`,
+    /// hand it back so the evaluator skips fetching and reducing raw samples.
+    /// The bounds must match verbatim: `start_ns`/`end_ns` are the range
+    /// function's own exclusive-start/inclusive-end window (not a `TimeRange`),
+    /// the same values `prefetch` derived for the eligible target.
+    fn query_precomputed_count(
+        &self,
+        matchers: &[LabelMatcher],
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Result<Option<Vec<(LabelSet, u64)>>, SourceError> {
+        match &self.precomputed_count {
+            Some(pc)
+                if pc.matchers.as_slice() == matchers
+                    && pc.start_ns == start_ns
+                    && pc.end_ns == end_ns =>
+            {
+                Ok(Some(pc.counts.clone()))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -4637,6 +4659,7 @@ mod prefetch_tests {
     const NS_PER_SEC: i64 = 1_000_000_000;
     const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
     const BASE_NS: i64 = 1_700_000_000_000_000_000;
+    const BASE_MS: i64 = BASE_NS / 1_000_000;
     // Single source of truth for the lookback delta lives in ravel-promql
     // (the evaluator owns the semantic). A hand-built plan reuses it so the
     // test window can never drift from what the evaluator selects.
@@ -4911,86 +4934,375 @@ mod prefetch_tests {
         );
     }
 
-    /// A slice fetcher double that records every `FetchRequest.partial_aggregate`
-    /// it receives and answers with a plain, empty, successful raw response.
-    struct CapturingPartialAggregate {
-        seen: Arc<std::sync::Mutex<Vec<Option<pb::PartialAggregateRequest>>>>,
+    /// Publishes one real RSEG segment holding a single series (`metric`) with
+    /// all of `samples`, at a chosen ingest hour and creation time. The
+    /// multi-sample and explicit-ingest-hour flexibility `publish_metric` lacks:
+    /// deliverable 6 needs a known >1 count in one segment, and deliverable 7's
+    /// ineligible arm needs two segments in two different shard generations.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_metric_segment(
+        store: &MemoryStore,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        metric: &str,
+        samples: Vec<Sample>,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+    ) {
+        let series_id =
+            SeriesId::compute(&TenantId::new("acme"), metric, &labels(metric)).expect("series id");
+        let series = vec![SeriesInput {
+            series_id,
+            labels: labels(metric),
+            samples,
+        }];
+        let writer_id = Uuid::new_v4();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let written: WrittenSegment =
+            SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
     }
 
-    #[async_trait::async_trait]
-    impl crate::distrib::client::SliceFetcher for CapturingPartialAggregate {
-        async fn fetch(
-            &self,
-            request: ravel_proto::queryfrag::v1::FetchRequest,
-        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
-        {
-            self.seen.lock().unwrap().push(request.partial_aggregate);
-            Ok(crate::distrib::client::SliceResponse {
-                scalar: Vec::new(),
-                histogram: Vec::new(),
-                partials: Vec::new(),
-                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
-                stats: crate::fetcher::FetchStats::default(),
-                series_returned: 0,
-                samples_returned: 0,
-                status: ravel_proto::queryfrag::v1::status::Code::Ok,
-                status_message: String::new(),
-            })
+    /// Resolve every metrics segment currently published for `tenant_hash` over
+    /// a window around `BASE_NS`, so a worker's `SnapshotSegmentResolver` holds
+    /// exactly the refs the coordinator will pin. Reads the same provisioning
+    /// record the coordinator reads (generations included), so an ineligible
+    /// two-generation setup still resolves both segments for the raw path.
+    async fn resolve_metric_segments(
+        store: Arc<MemoryStore>,
+        tenant_hash: TenantHash,
+        now_ns: i64,
+    ) -> Vec<ravel_catalog::SegmentRef> {
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        let (snapshot, _origins, _generations) = catalog
+            .resolve_pruned_with_generations(
+                &tenant_hash,
+                Signal::Metrics,
+                TimeRange {
+                    start_ns: BASE_NS - 3_600 * NS_PER_SEC,
+                    end_ns: now_ns,
+                },
+                &[],
+                now_ns,
+                None,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("resolve segments for worker");
+        snapshot.segments
+    }
+
+    /// Starts a real in-process `tonic` metrics worker over `store`/`segments`
+    /// (the same construction `distrib/tests.rs` uses) and returns a
+    /// `RemoteSliceFetcher` wired to it plus the server task handle. Using the
+    /// real `SeriesFetchService` means the pushdown path exercises the actual
+    /// `run_slice_metrics` partial-aggregate branch, not a hand-rolled double.
+    async fn spawn_metric_worker(
+        store: Arc<MemoryStore>,
+        segments: Vec<ravel_catalog::SegmentRef>,
+    ) -> (
+        crate::distrib::client::RemoteSliceFetcher,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let metrics_store: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = crate::fetcher::SegmentFetcher::new(metrics_store);
+        let resolver = Arc::new(crate::distrib::service::SnapshotSegmentResolver::new(
+            segments,
+        ));
+        let service =
+            crate::distrib::service::SeriesFetchService::new(fetcher, resolver).into_server();
+        let incoming =
+            tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
+                .expect("bind");
+        let addr = incoming.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect_lazy();
+        (
+            crate::distrib::client::RemoteSliceFetcher::new(channel),
+            handle,
+        )
+    }
+
+    fn zero_thresholds() -> crate::distrib::partition::DistribThresholds {
+        crate::distrib::partition::DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: 1,
         }
     }
 
-    /// ADR-0103 (epic #64) reachability guard, not just a mechanism test: an
-    /// otherwise fully eligible `count_over_time` query (single segment, no
-    /// federation, plan tagged `count_over_time_pushdown_candidate`) must
-    /// still dispatch `partial_aggregate: None` over the wire, because
-    /// nothing yet consumes a worker's partial-only reply
-    /// (`MergedSource::query_precomputed_count`, T4d). The worker's pushdown
-    /// branch returns the partial INSTEAD OF raw runs once asked -- landing
-    /// the request live without its consumer already produced one silent
-    /// empty-result bug (caught at checkpoint review, never merged). Flip
-    /// `partial_req` in `prefetch`'s per-plan closure back to `Some` without
-    /// wiring the consumer in the same change and this test fails; that is
-    /// the point.
+    /// ADR-0103 (epic #64) reachability proof: a fully eligible instant
+    /// `count_over_time` query, run end to end through `prefetch` + a REAL
+    /// loopback worker + the `ravel-promql` evaluator, actually takes the
+    /// pushdown fast path. The count comes back correct AND the raw
+    /// `MergedSource.series` is empty, which can only happen if the answer came
+    /// from the worker's partial (the pushdown branch returns the partial
+    /// INSTEAD OF raw runs) and `MergedSource::query_precomputed_count` fed it
+    /// to the evaluator. A sample outside the `(t-5m, t]` reduction window is
+    /// published too, so the asserted count also proves the worker honored the
+    /// reduction bounds rather than counting the whole segment.
     #[tokio::test]
-    async fn eligible_count_over_time_does_not_send_partial_aggregate_yet() {
+    async fn eligible_count_over_time_takes_the_pushdown_path() {
         let store = Arc::new(MemoryStore::new());
         let tenant_hash = TenantId::new("acme").hash();
-        publish_metric(
+        // Three samples inside (BASE-5m, BASE], one outside it: eligible count 3.
+        publish_metric_segment(
             &store,
             tenant_hash,
             1,
-            "metric_a",
-            BASE_NS - NS_PER_MIN,
-            1.0,
+            "m",
+            vec![
+                Sample {
+                    ts_ns: BASE_NS - NS_PER_MIN,
+                    value: 1.0,
+                },
+                Sample {
+                    ts_ns: BASE_NS - 2 * NS_PER_MIN,
+                    value: 2.0,
+                },
+                Sample {
+                    ts_ns: BASE_NS - 3 * NS_PER_MIN,
+                    value: 3.0,
+                },
+                Sample {
+                    ts_ns: BASE_NS - 10 * NS_PER_MIN,
+                    value: 9.0,
+                },
+            ],
+            u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket"),
+            BASE_NS,
         )
         .await;
 
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let segments = resolve_metric_segments(Arc::clone(&store), tenant_hash, BASE_NS).await;
+        assert_eq!(segments.len(), 1, "one published segment resolves");
+        let (worker, handle) = spawn_metric_worker(Arc::clone(&store), segments).await;
         let distributed = Arc::new(crate::distrib::Distributed::new(
-            Arc::new(CapturingPartialAggregate {
-                seen: Arc::clone(&seen),
-            }),
-            crate::distrib::partition::DistribThresholds {
-                min_store_bytes: 0,
-                min_segments: 0,
-                max_parallel_slices: 1,
-            },
+            Arc::new(worker),
+            zero_thresholds(),
         ));
         let eng = engine(Arc::clone(&store)).with_distributed(distributed);
 
-        let mut plan = window_plan("metric_a");
-        plan.count_over_time_pushdown_candidate = true;
-        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
-        eng.prefetch(tenant_hash, &[plan], &eval_window, &[], BASE_NS)
-            .await
-            .expect("a fully eligible single-segment query must still succeed raw");
-
-        let dispatched = seen.lock().unwrap();
-        assert_eq!(dispatched.len(), 1, "exactly one slice dispatched");
-        assert_eq!(
-            dispatched[0], None,
-            "T4d not landed yet: partial_aggregate must stay None on the wire"
+        let plans = plan_selectors("count_over_time(m[5m])", BASE_MS, BASE_MS).expect("plans");
+        assert!(
+            plans[0].count_over_time_pushdown_candidate,
+            "count_over_time over a literal selector is a pushdown candidate"
         );
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (source, _stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch succeeds");
+
+        let got = Evaluator::new()
+            .instant(&source, "count_over_time(m[5m])", BASE_MS)
+            .expect("evaluate");
+        assert_eq!(got.len(), 1, "one series");
+        assert_eq!(
+            got[0].value, 3.0,
+            "count of the three in-window samples, excluding the out-of-window one"
+        );
+        assert!(
+            source.series.is_empty(),
+            "the answer came from the pushed-down partial: the worker returned no raw series"
+        );
+
+        handle.abort();
+    }
+
+    /// ADR-0103 (epic #64) differential: the pushed-down result is identical to
+    /// the non-pushdown result for the same samples. The eligible arm (single
+    /// stable generation) takes the pushdown path; the ineligible arm (segments
+    /// spanning two shard generations, so `is_pushdown_eligible` is false) falls
+    /// back to raw fetch and coordinator merge. Both must report the same count.
+    #[tokio::test]
+    async fn count_over_time_pushdown_on_and_off_agree() {
+        const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
+        let base_hour = u32::try_from(BASE_NS / NS_PER_HOUR).expect("hour bucket");
+        let in_window = vec![
+            Sample {
+                ts_ns: BASE_NS - NS_PER_MIN,
+                value: 1.0,
+            },
+            Sample {
+                ts_ns: BASE_NS - 2 * NS_PER_MIN,
+                value: 2.0,
+            },
+        ];
+
+        // --- Eligible arm: one segment, default (implicit gen 0) catalog. ---
+        let store_a = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric_segment(
+            &store_a,
+            tenant_hash,
+            1,
+            "m",
+            in_window.clone(),
+            base_hour,
+            BASE_NS,
+        )
+        .await;
+        let segments_a = resolve_metric_segments(Arc::clone(&store_a), tenant_hash, BASE_NS).await;
+        let (worker_a, handle_a) = spawn_metric_worker(Arc::clone(&store_a), segments_a).await;
+        let eng_a = engine(Arc::clone(&store_a)).with_distributed(Arc::new(
+            crate::distrib::Distributed::new(Arc::new(worker_a), zero_thresholds()),
+        ));
+        let plans = plan_selectors("count_over_time(m[5m])", BASE_MS, BASE_MS).expect("plans");
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (source_a, _stats) = eng_a
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("eligible prefetch succeeds");
+        let count_a = Evaluator::new()
+            .instant(&source_a, "count_over_time(m[5m])", BASE_MS)
+            .expect("eligible evaluate");
+        assert!(
+            source_a.series.is_empty(),
+            "eligible arm took the pushdown path (no raw series)"
+        );
+        handle_a.abort();
+
+        // --- Ineligible arm: two segments in two distinct shard generations. ---
+        // gen 1 activates at base_hour + 8, so gen 0's stable interval covers
+        // base_hour and gen 1's stable interval covers base_hour + 11; the two
+        // segments land in different generations, disqualifying pushdown.
+        let store_b = Arc::new(MemoryStore::new());
+        let activation = base_hour + 8;
+        ravel_catalog::validate_or_adopt(
+            store_b.as_ref(),
+            &tenant_hash,
+            Signal::Metrics,
+            1,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+        ravel_catalog::append_generation(
+            store_b.as_ref(),
+            &tenant_hash,
+            Signal::Metrics,
+            2,
+            activation,
+            i64::from(activation - 1) * NS_PER_HOUR,
+        )
+        .await
+        .expect("append generation 1");
+        // Same two samples, split across two segments at two ingest hours.
+        publish_metric_segment(
+            &store_b,
+            tenant_hash,
+            1,
+            "m",
+            vec![in_window[0]],
+            base_hour,
+            BASE_NS,
+        )
+        .await;
+        publish_metric_segment(
+            &store_b,
+            tenant_hash,
+            2,
+            "m",
+            vec![in_window[1]],
+            base_hour + 11,
+            i64::from(base_hour + 11) * NS_PER_HOUR,
+        )
+        .await;
+        let now_ns_b = i64::from(base_hour + 20) * NS_PER_HOUR;
+        let segments_b = resolve_metric_segments(Arc::clone(&store_b), tenant_hash, now_ns_b).await;
+        assert_eq!(
+            segments_b.len(),
+            2,
+            "both segments resolve for the ineligible arm"
+        );
+        let (worker_b, handle_b) = spawn_metric_worker(Arc::clone(&store_b), segments_b).await;
+        // The eligibility gate reads the shard-generation history only under
+        // provisioning enforcement; the coordinator's catalog must enforce so
+        // the two-generation record (not the implicit gen 0) drives the gate.
+        let backend_b: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&store_b) as Arc<dyn ObjectStoreBackend>;
+        let catalog_b = Catalog::new(
+            Arc::clone(&backend_b),
+            CatalogConfig {
+                shard_count: 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog")
+        .with_provisioning_enforcement();
+        let eng_b = QueryEngine::new(Arc::new(catalog_b), backend_b, EngineConfig::default())
+            .with_distributed(Arc::new(crate::distrib::Distributed::new(
+                Arc::new(worker_b),
+                zero_thresholds(),
+            )));
+        let (source_b, _stats) = eng_b
+            .prefetch(tenant_hash, &plans, &eval_window, &[], now_ns_b)
+            .await
+            .expect("ineligible prefetch succeeds");
+        let count_b = Evaluator::new()
+            .instant(&source_b, "count_over_time(m[5m])", BASE_MS)
+            .expect("ineligible evaluate");
+        assert!(
+            !source_b.series.is_empty(),
+            "ineligible arm took the raw path (raw series present)"
+        );
+        handle_b.abort();
+
+        assert_eq!(count_a.len(), 1);
+        assert_eq!(count_b.len(), 1);
+        assert_eq!(
+            count_a[0].value, count_b[0].value,
+            "pushed-down count must equal the raw-path count"
+        );
+        assert_eq!(count_a[0].value, 2.0, "two in-window samples");
     }
 
     /// Two selectors for two disjoint metrics: the merged source must
