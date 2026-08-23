@@ -414,6 +414,18 @@ pub struct StoreMetricsSnapshot {
 }
 
 impl StoreMetricsSnapshot {
+    /// Total LIST-family calls: paged [`list`](ObjectStoreBackend::list) plus
+    /// [`list_delimited`](ObjectStoreBackend::list_delimited).
+    ///
+    /// Both are one S3 `LIST` request, billed identically, so a request-cost
+    /// model wants them summed. The two `OpMetrics` blocks stay separate for
+    /// diagnostics; this is the seam a caller that only cares about billable
+    /// request count reads instead of forgetting `list_delimited` and
+    /// undercounting.
+    pub fn list_calls(&self) -> u64 {
+        self.list.calls + self.list_delimited.calls
+    }
+
     /// One operation's block, for iterating [`StoreOp::ALL`] in an exporter.
     pub fn op(&self, op: StoreOp) -> &OpMetricsSnapshot {
         match op {

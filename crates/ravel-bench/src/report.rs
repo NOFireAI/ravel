@@ -14,34 +14,33 @@
 //! ADR-0075 decision 3 requires published performance and cost figures to come
 //! from real object storage rather than a store with no request charges,
 //! because a request-budget defect is free on the latter and billable on the
-//! former. The whole workload runs through one [`CountingStore`] wrapper that
-//! records every PUT, GET, and LIST plus the bytes each direction, so the
-//! report always states, per operation kind, how many object-store requests
-//! the workload issued -- the number the cost model is built from.
+//! former. The whole workload runs through one
+//! [`InstrumentedStore`](ravel_object_store::InstrumentedStore) that records
+//! every PUT, GET, and LIST plus the bytes each direction, so the report always
+//! states, per operation kind, how many object-store requests the workload
+//! issued -- the number the cost model is built from. This is the same counter
+//! the server scrapes (ADR-0104 decision 5): the bench reporter and production
+//! read one implementation, so a count here cannot drift from a count there.
 //!
 //! Those counts are real call counts on any backend, `MemoryStore` included.
 //! What differs is whether they are *billed*: a `MemoryStore` operation is
-//! free, an S3 operation is not. The report marks this with
-//! [`RequestCounts::backend_bills_requests`] rather than folding the
-//! distinction away or emitting a misleading zero. A `MemoryStore` run is a
-//! valid schema and correctness substrate; only a *published* number needs the
-//! S3 backend, where `backend_bills_requests` is true.
+//! free, an S3 operation is not. `InstrumentedStore` counts calls but is
+//! backend-agnostic about billing, so the report carries that distinction
+//! itself in [`RequestCounts::backend_bills_requests`] rather than folding it
+//! away or emitting a misleading zero. A `MemoryStore` run is a valid schema
+//! and correctness substrate; only a *published* number needs the S3 backend,
+//! where `backend_bills_requests` is true.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use bytes::Bytes;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
-use ravel_object_store::{
-    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
-    PageToken, PutOptions, PutOutcome, StoreError,
-};
+use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, StoreMetricsSnapshot};
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
 use ravel_types::{Signal, TenantId, TimeRange};
@@ -195,93 +194,33 @@ pub struct RequestCounts {
     pub list: u64,
 }
 
+impl RequestCounts {
+    /// Build the request counts from an [`InstrumentedStore`] snapshot, pairing
+    /// them with the caller-supplied billing flag.
+    ///
+    /// The counts come from the store's own per-operation call counters (`put`
+    /// = every completed PUT, `get` = every completed GET, `list` = paged LIST
+    /// plus `list_delimited`, which S3 bills as one LIST each). Billing is not
+    /// something the counter knows -- a call count is identical on `MemoryStore`
+    /// and S3, only its price differs -- so `backend_bills_requests` is passed
+    /// in by whoever chose the backend, `false` for `MemoryStore` and `true`
+    /// for S3. Keeping the flag beside the true counts is the honest
+    /// representation of a non-billable measurement, not a misleading zero; see
+    /// the module docs.
+    fn from_metrics(snapshot: &StoreMetricsSnapshot, backend_bills_requests: bool) -> Self {
+        RequestCounts {
+            backend_bills_requests,
+            put: snapshot.put.calls,
+            get: snapshot.get.calls,
+            list: snapshot.list_calls(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BytesSection {
     pub written: u64,
     pub read: u64,
-}
-
-/// Per-operation-kind object-store call counter, shared behind an `Arc`.
-#[derive(Default)]
-struct Counters {
-    put: AtomicU64,
-    get: AtomicU64,
-    list: AtomicU64,
-    bytes_written: AtomicU64,
-    bytes_read: AtomicU64,
-}
-
-/// Wraps any `ObjectStoreBackend` and counts every PUT/GET/LIST and the bytes
-/// each way. Distinct from `e2e`'s query-only `CountingStore` (which counts no
-/// PUTs): this one wraps the *whole* workload, ingest included, because PUT
-/// count is the request kind most missing today and the one the cost model
-/// most needs.
-struct CountingStore {
-    inner: Arc<dyn ObjectStoreBackend>,
-    counters: Arc<Counters>,
-}
-
-impl CountingStore {
-    fn wrap(inner: Arc<dyn ObjectStoreBackend>) -> (Arc<dyn ObjectStoreBackend>, Arc<Counters>) {
-        let counters = Arc::new(Counters::default());
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(CountingStore {
-            inner,
-            counters: Arc::clone(&counters),
-        });
-        (store, counters)
-    }
-}
-
-#[async_trait]
-impl ObjectStoreBackend for CountingStore {
-    async fn put(
-        &self,
-        key: &str,
-        data: Bytes,
-        opts: PutOptions,
-    ) -> Result<PutOutcome, StoreError> {
-        self.counters.put.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .bytes_written
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-        self.inner.put(key, data, opts).await
-    }
-
-    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        self.counters.get.fetch_add(1, Ordering::Relaxed);
-        let outcome = self.inner.get(key, range).await?;
-        self.counters
-            .bytes_read
-            .fetch_add(outcome.data.len() as u64, Ordering::Relaxed);
-        Ok(outcome)
-    }
-
-    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
-        self.inner.head(key).await
-    }
-
-    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        self.counters.list.fetch_add(1, Ordering::Relaxed);
-        self.inner.list(prefix, page).await
-    }
-
-    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        self.counters.list.fetch_add(1, Ordering::Relaxed);
-        self.inner.list_delimited(prefix).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.inner.delete(key).await
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        // multipart: false to match the refusing default `put_multipart` this
-        // wrapper inherits, exactly as `e2e::CountingStore` does.
-        Capabilities {
-            multipart: false,
-            ..self.inner.capabilities()
-        }
-    }
 }
 
 fn lock<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
@@ -289,10 +228,14 @@ fn lock<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
 }
 
 /// Runs one ingest-then-query workload and returns the populated report. The
-/// whole run goes through a single [`CountingStore`], so `s3_requests`/`bytes`
-/// reflect the entire workload, ingest and query together.
+/// whole run goes through a single
+/// [`InstrumentedStore`](ravel_object_store::InstrumentedStore), so
+/// `s3_requests`/`bytes` reflect the entire workload, ingest and query
+/// together.
 pub async fn run(config: &ReportRunConfig) -> BenchReport {
-    let (store, counters) = CountingStore::wrap(Arc::clone(&config.store));
+    let instrumented = Arc::new(InstrumentedStore::new(Arc::clone(&config.store)));
+    let metrics = instrumented.metrics();
+    let store: Arc<dyn ObjectStoreBackend> = instrumented;
     let w = &config.workload;
 
     // Unique tenant per run so consecutive runs against the same shared bucket
@@ -502,11 +445,10 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
         warm_ns.push(ns);
     }
 
-    let put = counters.put.load(Ordering::Relaxed);
-    let get = counters.get.load(Ordering::Relaxed);
-    let list = counters.list.load(Ordering::Relaxed);
-    let bytes_written = counters.bytes_written.load(Ordering::Relaxed);
-    let bytes_read = counters.bytes_read.load(Ordering::Relaxed);
+    let snapshot = metrics.snapshot();
+    let request_counts = RequestCounts::from_metrics(&snapshot, config.backend_bills_requests);
+    let bytes_written = snapshot.put.bytes;
+    let bytes_read = snapshot.get.bytes;
     let write_amplification = if logical_bytes == 0 {
         0.0
     } else {
@@ -534,12 +476,7 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
             warm_latency_ms: latency_report(warm_ns),
             matched_series,
         },
-        s3_requests: RequestCounts {
-            backend_bills_requests: config.backend_bills_requests,
-            put,
-            get,
-            list,
-        },
+        s3_requests: request_counts,
         bytes: BytesSection {
             written: bytes_written,
             read: bytes_read,
@@ -549,8 +486,96 @@ pub async fn run(config: &ReportRunConfig) -> BenchReport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use bytes::Bytes;
     use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{GetRange, PutOptions};
+
+    use super::*;
+
+    /// Acceptance test (ADR-0104 decision 5, #507): the reporter now reads
+    /// object-store request counts from `InstrumentedStore`, and the migration
+    /// must preserve two properties the deleted `CountingStore` guaranteed.
+    ///
+    /// 1. The counts are exact. A fixed workload of 3 PUTs, 2 GETs, 1 `list`
+    ///    and 1 `list_delimited` is driven through the same
+    ///    `InstrumentedStore` wrapping `run` uses, and the derived
+    ///    [`RequestCounts`] are asserted to the exact call count -- not `> 0`,
+    ///    which would pass just as well against an accounting bug that reported
+    ///    a fraction of the truth. `list` folds `list_delimited` in because S3
+    ///    bills both as one LIST.
+    /// 2. `backend_bills_requests` is carried, not dropped: `false` for a
+    ///    `MemoryStore` run (real counts, but free), `true` for a
+    ///    request-billing backend. The counter itself is backend-agnostic, so
+    ///    the flag rides beside the counts rather than being inferred from a
+    ///    zero.
+    #[tokio::test]
+    async fn instrumented_store_counts_match_and_preserve_billing_flag() {
+        let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = store.metrics();
+
+        // Fixed workload with known, exact counts.
+        for (key, body) in [
+            ("a", &b"aa"[..]),
+            ("b", &b"bbbb"[..]),
+            ("c", &b"cccccc"[..]),
+        ] {
+            store
+                .put(key, Bytes::from_static(body), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        for key in ["a", "b"] {
+            store.get(key, GetRange::Full).await.expect("get");
+        }
+        store.list("", None).await.expect("list");
+        store.list_delimited("").await.expect("list_delimited");
+
+        let snapshot = metrics.snapshot();
+
+        // MemoryStore run: real counts, not billed.
+        let memory_counts = RequestCounts::from_metrics(&snapshot, false);
+        assert_eq!(memory_counts.put, 3, "exact PUT count");
+        assert_eq!(memory_counts.get, 2, "exact GET count");
+        assert_eq!(
+            memory_counts.list, 2,
+            "exact LIST count folds list + list_delimited"
+        );
+        assert!(
+            !memory_counts.backend_bills_requests,
+            "MemoryStore requests are free: backend_bills_requests must be false, the explicit \
+             representation of a non-billable count instead of a misleading zero"
+        );
+
+        // Bytes track the offered/returned payloads, the same fields `run`
+        // reports as bytes_written/bytes_read.
+        assert_eq!(
+            snapshot.put.bytes,
+            2 + 4 + 6,
+            "bytes written = PUT payloads"
+        );
+        assert_eq!(snapshot.get.bytes, 2 + 4, "bytes read = GET a + b");
+
+        // Request-billing backend: same counts, but now billed. Only the flag
+        // moves; the counts are identical because a call count does not depend
+        // on price.
+        let billed_counts = RequestCounts::from_metrics(&snapshot, true);
+        assert!(
+            billed_counts.backend_bills_requests,
+            "a request-billing backend must report backend_bills_requests true"
+        );
+        assert_eq!(
+            billed_counts.put, memory_counts.put,
+            "counts are price-blind"
+        );
+        assert_eq!(
+            billed_counts.get, memory_counts.get,
+            "counts are price-blind"
+        );
+        assert_eq!(
+            billed_counts.list, memory_counts.list,
+            "counts are price-blind"
+        );
+    }
 
     fn memory_config() -> ReportRunConfig {
         ReportRunConfig {
