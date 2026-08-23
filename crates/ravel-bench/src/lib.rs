@@ -11,6 +11,8 @@ pub mod generator;
 pub mod groupby_scaling;
 pub mod harness;
 pub mod ingest;
+#[cfg(feature = "sql-latency")]
+pub mod logs_scan_scaling;
 pub mod profiling;
 pub mod pushdown_crossover;
 pub mod query_latency;

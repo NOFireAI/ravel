@@ -74,6 +74,12 @@ arrow-flight = { workspace = true, optional = true }
 # links datafusion 54 with the same version/features, so feature unification
 # resolves this to that same instance rather than a second copy.
 datafusion = { version = "54", default-features = false, features = ["sql"], optional = true }
+# Gated behind `sql-latency`. The logs scan-partitioning scaling bench
+# (`logs_scan_scaling`) wires ADR-0046's read cache into `LogSegmentFetcher` so
+# it can report the object-store request count with and without the cache's
+# single-flight coalescing. Reuses the workspace pin ravel-query/ravel-sql
+# already link; no new external crate enters the workspace.
+ravel-cache = { workspace = true, optional = true }
 # Gated behind `profiling` (off by default). CPU flamegraph lane for the
 # ingest and query bench bins (issue #365). pprof is a NEW external
 # dependency, NOT a workspace pin; its `flamegraph` feature pulls `inferno`
@@ -128,7 +134,7 @@ stage-timing = ["ravel-ingest/stage-timing"]
 # corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
 # same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
 # second datafusion/arrow activation) and the plain gates never compile it.
-sql-latency = ["dep:ravel-sql", "dep:datafusion"]
+sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:futures"]
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -240,6 +246,12 @@ required-features = ["sql-latency"]
 bench = false
 
 [[bin]]
+name = "logs_scan_scaling_bench"
+path = "src/bin/logs_scan_scaling_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
+[[bin]]
 name = "sql_latency_bench"
 path = "src/bin/sql_latency_bench.rs"
 required-features = ["sql-latency"]
@@ -324,6 +336,14 @@ bench = false
 [[test]]
 name = "groupby_scaling_smoke"
 path = "tests/groupby_scaling_smoke.rs"
+bench = false
+
+# The test body is gated on `sql-latency` (empty crate without it), so this
+# entry stays harmless under the default feature set and only exercises the
+# logs scan-partitioning scaling bench under `--features sql-latency`.
+[[test]]
+name = "logs_scan_scaling_smoke"
+path = "tests/logs_scan_scaling_smoke.rs"
 bench = false
 
 [[bench]]

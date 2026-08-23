@@ -1,14 +1,32 @@
 //! `LogsScanExec`: the leaf of the `logs` pipeline, the log-signal sibling of
 //! [`crate::scan::RsegScanExec`] (ADR-0033).
 //!
-//! Partitions the snapshot's segments round-robin into
-//! `N = min(target_partitions, segment_count)` partitions. Each partition
-//! opens its segments one at a time through
-//! [`LogSegmentFetcher::scan_accounted_with_tenant`] (one [`LogQuery`] per
-//! segment: the extracted ts range, stream-attribute equalities, and content
-//! predicates), decodes **one block at a time**, and turns each block's
-//! [`ravel_logseg::LogRecord`]s into Arrow arrays matching this scan's
-//! projection of [`crate::logs_schema::logs_schema`].
+//! Partitions the snapshot's segments' *blocks* round-robin across
+//! `target_partitions` partitions (intra-segment scan partitioning, ADR-0102).
+//! Every `(segment, surviving-block)` unit across all segments is flattened
+//! into one ordered list (segment order, then block order) and unit `i` is
+//! assigned to partition `i % n`, where `n = target_partitions.max(1).
+//! min(total_block_count.max(1))`. This lets a query touching fewer segments
+//! than `target_partitions` still fan out to `target_partitions` partitions:
+//! the old segment-granular rule (`min(target_partitions, segment_count)`)
+//! pinned such a query to at most `segment_count` partitions.
+//!
+//! The per-segment surviving-block counts the assignment needs are determined
+//! once, before draining, by [`LogSegmentFetcher::plan_segment`] (a prune with
+//! no block decode), shared across partitions through a
+//! [`tokio::sync::OnceCell`]. Each partition then opens each segment it owns
+//! blocks in through [`LogSegmentFetcher::scan_accounted_with_tenant_subset`]
+//! (the same [`LogQuery`] and cache-aware GET as the whole-segment path,
+//! restricted to that partition's own block-index list), decodes **one block
+//! at a time**, and turns each block's [`ravel_logseg::LogRecord`]s into Arrow
+//! arrays matching this scan's projection of [`crate::logs_schema::logs_schema`].
+//!
+//! Because the whole object is still fetched with one whole-object GET
+//! (ADR-0087 decision 3: no ranged block reader here) and the read cache keys
+//! the whole object, the several partitions that stripe one segment's blocks
+//! coalesce onto one cached GET via single-flight rather than issuing one GET
+//! each; the object-store request count is unchanged from the whole-segment
+//! path. A future ranged reader would change that.
 //!
 //! # Streaming, and why no ordering is declared (ADR-0087)
 //!
@@ -135,6 +153,7 @@ use ravel_query::{ColumnarBlockOutcome, LogQuery, LogSegmentFetcher, LogSegmentS
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::AttrValue;
+use tokio::sync::OnceCell;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::error::SqlError;
@@ -324,9 +343,23 @@ fn columnar_static_eligible(projection: &[usize], erasure: &[ErasurePredicate]) 
 pub struct LogsScanExec {
     tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
-    /// Round-robin segment assignment; `partitions[k]` runs as DataFusion
-    /// partition `k`.
-    partitions: Vec<Vec<SegmentRef>>,
+    /// Every segment in the snapshot, in snapshot order. Blocks are flattened
+    /// across these (segment order, then block order) and striped across
+    /// partitions; the per-segment block counts the striping needs are
+    /// resolved lazily into [`Self::counts`].
+    segments: Arc<Vec<SegmentRef>>,
+    /// DataFusion partition count this scan declares. Equal to
+    /// `target_partitions.max(1)`; the assignment stride `n` is
+    /// `target_partitions.max(1).min(total_block_count.max(1))`, which only
+    /// differs when there are fewer blocks than partitions, and then the
+    /// partitions past `n` simply run empty streams (DataFusion tolerates
+    /// them), so the observed non-empty partition count is identical either way.
+    target_partitions: usize,
+    /// The shared per-segment block plan (surviving-block counts and
+    /// whole-segment prune stats), computed once by the first partition to
+    /// poll and reused by the rest (ADR-0102). `None` entries are ts-irrelevant
+    /// segments that issue no GET.
+    counts: Arc<OnceCell<Arc<PlanCounts>>>,
     /// Inclusive ts bounds for the fetch's [`LogQuery`].
     ts_min: i64,
     ts_max: i64,
@@ -420,19 +453,35 @@ impl BlockMetrics {
         }
     }
 
-    /// Accumulates one segment's [`ScanStats`]. `blocks_pruned_by_postings` is
-    /// the drop across the postings step alone (`blocks_after_skip` minus
-    /// `blocks_after_postings`), so it credits POSTINGS with nothing the skip
-    /// index or the bloom did. `saturating_sub` because a degraded postings
-    /// section leaves the two counts equal rather than ordered by construction.
-    fn record(&self, stats: &ScanStats) {
+    /// Accumulates one segment's *whole-segment* prune totals: `blocks_total`
+    /// and `blocks_pruned_by_postings` (the drop across the postings step
+    /// alone, `blocks_after_skip` minus `blocks_after_postings`, so it credits
+    /// POSTINGS with nothing the skip index or the bloom did; `saturating_sub`
+    /// because a degraded postings section leaves the two counts equal rather
+    /// than ordered by construction).
+    ///
+    /// Recorded once per relevant segment by partition 0 during planning
+    /// (ADR-0102), never per partition: several partitions stripe one segment's
+    /// blocks, and each re-prunes the whole segment to open its own subset, so
+    /// attributing the whole-segment totals per partition would multiply them.
+    /// The per-partition decode counts come from [`Self::record_scan`] instead.
+    fn record_segment_totals(&self, stats: &ScanStats) {
         self.total.add(stats.blocks_total as usize);
-        self.scanned.add(stats.blocks_scanned as usize);
         self.pruned_by_postings.add(
             stats
                 .blocks_after_skip
                 .saturating_sub(stats.blocks_after_postings) as usize,
         );
+    }
+
+    /// Accumulates what one partition's cursor actually decoded: the blocks it
+    /// scanned and the column pages it decoded or skipped. Per partition, unlike
+    /// [`Self::record_segment_totals`], because each partition decodes only its
+    /// own striped subset of a segment's blocks. Summed across every partition
+    /// this equals what a single whole-segment scan would have reported for
+    /// `blocks_scanned`/`pages_*`.
+    fn record_scan(&self, stats: &ScanStats) {
+        self.scanned.add(stats.blocks_scanned as usize);
         self.pages_decoded.add(stats.pages_decoded as usize);
         self.pages_skipped.add(stats.pages_skipped as usize);
     }
@@ -476,11 +525,16 @@ impl LogsScanExec {
         full_schema: SchemaRef,
         declared: Arc<Vec<DeclaredColumn>>,
     ) -> DFResult<Self> {
-        let n = target_partitions.max(1).min(segments.len().max(1));
-        let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
-        for (i, seg) in segments.iter().enumerate() {
-            partitions[i % n].push(seg.clone());
-        }
+        // Blocks, not segments, are what get striped (ADR-0102), but the
+        // per-segment block counts are not known until a prune runs, which is
+        // async and cannot happen in this synchronous constructor. So the
+        // declared partition count is `target_partitions.max(1)` and the
+        // block-level assignment (with the stride `n` capped by the real block
+        // count) happens lazily on first poll, shared through `counts`. When
+        // there are fewer blocks than partitions the surplus partitions run
+        // empty, which is equivalent to capping `n` here and DataFusion handles
+        // empty partitions.
+        let declared_partitions = target_partitions.max(1);
         let full = full_schema;
         // A `None` projection means every column, in schema order. Resolving it
         // here rather than carrying an `Option` keeps one code path for the
@@ -499,11 +553,13 @@ impl LogsScanExec {
         let columns = resolve_columns(&projection, &content, &erasure, &declared);
         let schema: SchemaRef = Arc::new(full.project(&projection)?);
         let columnar_eligible = columnar_static_eligible(&projection, &erasure);
-        let properties = Arc::new(Self::compute_properties(&schema, n));
+        let properties = Arc::new(Self::compute_properties(&schema, declared_partitions));
         Ok(LogsScanExec {
             tenant_hash,
             fetcher,
-            partitions,
+            segments: Arc::new(segments.to_vec()),
+            target_partitions: declared_partitions,
+            counts: Arc::new(OnceCell::new()),
             ts_min,
             ts_max,
             content,
@@ -522,8 +578,11 @@ impl LogsScanExec {
 
     /// No output ordering (ADR-0087 decision 1). A block-streaming scan emits a
     /// partition's blocks in stored order, which is `(stream_ref, ts)` within a
-    /// block and segment order across a partition, so no `ts` ordering holds.
-    /// Downstream operators that need one get an explicit sort.
+    /// block and, across a partition, whatever striped subset of segments'
+    /// blocks it was assigned, so no `ts` ordering holds. Striping blocks rather
+    /// than whole segments (ADR-0102) removes even the per-segment grouping a
+    /// partition used to have, which only reinforces that no ordering can be
+    /// declared. Downstream operators that need one get an explicit sort.
     fn compute_properties(schema: &SchemaRef, n: usize) -> PlanProperties {
         let eq = EquivalenceProperties::new(Arc::clone(schema));
         PlanProperties::new(
@@ -539,8 +598,9 @@ impl fmt::Debug for LogsScanExec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "LogsScanExec {{ partitions: {} }}",
-            self.partitions.len()
+            "LogsScanExec {{ partitions: {}, segments: {} }}",
+            self.target_partitions,
+            self.segments.len()
         )
     }
 }
@@ -550,7 +610,7 @@ impl DisplayAs for LogsScanExec {
         write!(
             f,
             "LogsScanExec: partitions={}, content={}, prune={}, projection=[{}]",
-            self.partitions.len(),
+            self.target_partitions,
             self.content.len(),
             self.prune.len(),
             self.schema
@@ -592,13 +652,6 @@ impl ExecutionPlan for LogsScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let segments: VecDeque<SegmentRef> = self
-            .partitions
-            .get(partition)
-            .cloned()
-            .unwrap_or_default()
-            .into();
-
         let mut query =
             LogQuery::new(self.ts_min, self.ts_max).with_erasure((*self.erasure).clone());
         for c in self.content.iter() {
@@ -615,30 +668,153 @@ impl ExecutionPlan for LogsScanExec {
         let reservation = MemoryConsumer::new(format!("LogsScanExec[{partition}]"))
             .register(context.memory_pool());
 
+        let ctx = Arc::new(PartitionCtx {
+            fetcher: self.fetcher.clone(),
+            tenant_hash: self.tenant_hash,
+            query,
+            columns: self.columns.clone(),
+            accounting: self.accounting.clone(),
+        });
+
+        // The block-level assignment needs each segment's surviving-block count,
+        // which a prune must produce (async). The first partition to poll runs
+        // that prune for every segment through the shared `counts` cell; the
+        // rest await its result. Building the future here (not awaiting it)
+        // keeps `execute` synchronous, as DataFusion requires.
+        let counts_fut = plan_counts_future(
+            Arc::clone(&self.counts),
+            Arc::clone(&ctx),
+            Arc::clone(&self.segments),
+        );
+
         Ok(Box::pin(LogScanStream {
             schema: Arc::clone(&self.schema),
             projection: Arc::clone(&self.projection),
             declared: Arc::clone(&self.declared),
-            ctx: Arc::new(PartitionCtx {
-                fetcher: self.fetcher.clone(),
-                tenant_hash: self.tenant_hash,
-                query,
-                columns: self.columns.clone(),
-                accounting: self.accounting.clone(),
-            }),
+            ctx,
             erasure: Arc::clone(&self.erasure),
             columnar_eligible: self.columnar_eligible,
             blocks: BlockMetrics::new(&self.metrics, partition),
-            segments,
+            partition,
+            target_partitions: self.target_partitions,
+            segments: Arc::clone(&self.segments),
+            work: VecDeque::new(),
             reservation,
             held: 0,
             emitted: 0,
             pending: Pending::None,
             current_seg: None,
+            current_indices: Vec::new(),
             seg_columnar_blocks: 0,
-            state: LogScanState::NextSegment,
+            state: LogScanState::Planning(counts_fut),
         }))
     }
+}
+
+/// The shared per-segment block plan (ADR-0102): for each segment, in snapshot
+/// order, the count of blocks that survive this query's pruning and the
+/// whole-segment [`ScanStats`] the prune produced, or `None` for a
+/// ts-irrelevant segment (no GET, no blocks). Computed once and reused by every
+/// partition.
+struct PlanCounts {
+    segs: Vec<Option<SegPlan>>,
+    total_blocks: usize,
+}
+
+/// One relevant segment's contribution to [`PlanCounts`].
+struct SegPlan {
+    /// Blocks surviving this query's pruning; the count the block-index stripe
+    /// is computed over.
+    survivors: usize,
+    /// The whole-segment prune stats ([`BlockMetrics::record_segment_totals`]
+    /// consumes `blocks_total` and the postings drop). `blocks_scanned`/`pages`
+    /// are zero here -- planning decodes nothing.
+    stats: ScanStats,
+}
+
+type CountsFuture = Pin<Box<dyn Future<Output = DFResult<Arc<PlanCounts>>> + Send>>;
+
+/// A future resolving the shared [`PlanCounts`] through `cell`: the first
+/// partition to poll computes it (pruning every segment once), the rest await
+/// that one computation. Errors are not cached, so a transient fetch failure
+/// can be retried by a later poll.
+fn plan_counts_future(
+    cell: Arc<OnceCell<Arc<PlanCounts>>>,
+    ctx: Arc<PartitionCtx>,
+    segments: Arc<Vec<SegmentRef>>,
+) -> CountsFuture {
+    Box::pin(async move {
+        let counts = cell
+            .get_or_try_init(|| compute_plan_counts(&ctx, &segments))
+            .await?;
+        Ok(Arc::clone(counts))
+    })
+}
+
+/// Prune every segment once (no block decode) to build the shared block plan.
+/// Sequential on purpose: the reads are single-flight coalesced with the
+/// per-partition scans that follow, and this runs once per query, not per
+/// partition.
+async fn compute_plan_counts(
+    ctx: &PartitionCtx,
+    segments: &[SegmentRef],
+) -> DFResult<Arc<PlanCounts>> {
+    let mut segs = Vec::with_capacity(segments.len());
+    let mut total_blocks = 0usize;
+    for seg in segments {
+        let planned = ctx
+            .fetcher
+            .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting)
+            .await
+            .map_err(SqlError::from)?;
+        match planned {
+            Some((survivors, stats)) => {
+                total_blocks += survivors;
+                segs.push(Some(SegPlan { survivors, stats }));
+            }
+            None => segs.push(None),
+        }
+    }
+    Ok(Arc::new(PlanCounts { segs, total_blocks }))
+}
+
+/// One segment this partition owns blocks in, and the block-index list (into
+/// the segment's surviving-block list) it must drain.
+struct OwnedSeg {
+    seg: SegmentRef,
+    indices: Vec<usize>,
+}
+
+/// This partition's share of the flattened block assignment (ADR-0102): unit
+/// `i` in the segment-then-block order over all surviving blocks goes to
+/// partition `i % n`, with `n = target_partitions.max(1).min(total.max(1))`.
+/// Returns, per owned segment, the surviving-block indices this partition
+/// drains, in ascending order.
+fn owned_work(
+    counts: &PlanCounts,
+    segments: &[SegmentRef],
+    partition: usize,
+    n: usize,
+) -> VecDeque<OwnedSeg> {
+    let mut work = VecDeque::new();
+    let mut global = 0usize;
+    for (seg_idx, plan) in counts.segs.iter().enumerate() {
+        let Some(plan) = plan else { continue };
+        let mut indices = Vec::new();
+        for local in 0..plan.survivors {
+            if (global + local) % n == partition {
+                indices.push(local);
+            }
+        }
+        global += plan.survivors;
+        if !indices.is_empty() {
+            work.push_back(OwnedSeg {
+                seg: segments[seg_idx].clone(),
+                indices,
+            });
+        }
+    }
+    work
 }
 
 /// Everything one partition's fetches need, shared by every per-segment open
@@ -653,18 +829,21 @@ struct PartitionCtx {
 
 type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> + Send>>;
 
-/// Fetch one segment's bytes and open its pruned, column-projected scan.
+/// Fetch one segment's bytes and open its pruned, column-projected scan
+/// restricted to the surviving-block positions in `indices` (ADR-0102).
 /// `Ok(None)` means the catalog summary proved the segment irrelevant, with no
-/// GET issued.
-fn open_segment(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
+/// GET issued -- which cannot happen for a segment that was already counted
+/// with survivors, but is handled as end-of-segment rather than panicking.
+fn open_segment_subset(ctx: Arc<PartitionCtx>, seg: SegmentRef, indices: Vec<usize>) -> OpenFuture {
     Box::pin(async move {
         let scan = ctx
             .fetcher
-            .scan_accounted_with_tenant(
+            .scan_accounted_with_tenant_subset(
                 &seg,
                 ctx.tenant_hash,
                 &ctx.query,
                 &ctx.columns,
+                &indices,
                 &ctx.accounting,
             )
             .await
@@ -674,9 +853,14 @@ fn open_segment(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
 }
 
 enum LogScanState {
-    /// Advance to the next segment of this partition, or finish.
+    /// Awaiting the shared per-segment block plan (ADR-0102). Once it resolves,
+    /// this partition's owned `(segment, block-index-list)` work is computed and
+    /// the stream advances to draining.
+    Planning(CountsFuture),
+    /// Advance to the next owned segment of this partition, or finish.
     NextSegment,
-    /// Awaiting one segment's GET and prune.
+    /// Awaiting one owned segment's GET and prune (restricted to this
+    /// partition's block-index list).
     Opening(OpenFuture),
     /// Draining one segment's surviving blocks through the columnar fast path
     /// (ADR-0099 decision 2). Entered only when the scan is statically eligible;
@@ -694,9 +878,14 @@ enum LogScanState {
         skip: usize,
     },
     /// Re-opening the current segment to restart it on the row path after a
-    /// block turned out to carry an `attrs_raw` overflow page. `skip` is the
-    /// number of blocks already emitted columnar for this segment, which the
-    /// re-opened row scan drains and discards so no row is emitted twice.
+    /// block turned out to carry an `attrs_raw` overflow page. The re-opened
+    /// scan is given the SAME block-index list this partition owns for the
+    /// segment (ADR-0102), so `skip` is a position within that list: the number
+    /// of this partition's blocks already emitted columnar. The re-opened row
+    /// scan drains and discards exactly those, then resumes, so no row this
+    /// partition owns is emitted twice or dropped -- and because the list is
+    /// this partition's own, a fallback another partition independently triggers
+    /// for the same segment concerns a disjoint list and cannot interfere.
     ReopenRows {
         fut: OpenFuture,
         skip: usize,
@@ -749,7 +938,17 @@ struct LogScanStream {
     /// drains the row path.
     columnar_eligible: bool,
     blocks: BlockMetrics,
-    segments: VecDeque<SegmentRef>,
+    /// This stream's DataFusion partition index, and the total declared count.
+    /// Together with the shared [`PlanCounts`] they determine which
+    /// `(segment, block-index-list)` units this partition owns (ADR-0102).
+    partition: usize,
+    target_partitions: usize,
+    /// Every segment in the snapshot, snapshot order, shared with the exec. The
+    /// owned-work computation indexes this by segment position.
+    segments: Arc<Vec<SegmentRef>>,
+    /// This partition's owned segments and their block-index lists, filled once
+    /// [`LogScanState::Planning`] resolves. Drained front to back.
+    work: VecDeque<OwnedSeg>,
     reservation: MemoryReservation,
     /// Reservation bytes currently covering `pending`.
     held: usize,
@@ -760,9 +959,14 @@ struct LogScanStream {
     /// The segment currently being drained, kept so the `attrs_raw` fallback can
     /// re-open it on the row path. Set when a segment's open resolves.
     current_seg: Option<SegmentRef>,
-    /// How many blocks of the current segment the columnar fast path has already
-    /// emitted. The `attrs_raw` fallback re-opens the segment and skips this many
-    /// blocks so none is emitted twice. Reset when a new segment starts draining.
+    /// The surviving-block index list this partition owns for [`Self::
+    /// current_seg`], kept so the `attrs_raw` fallback re-opens the row path
+    /// over the SAME list (ADR-0102). Set alongside `current_seg`.
+    current_indices: Vec<usize>,
+    /// How many of this partition's blocks in the current segment the columnar
+    /// fast path has already emitted. The `attrs_raw` fallback re-opens the
+    /// segment over `current_indices` and skips this many positions so none is
+    /// emitted twice. Reset when a new segment starts draining.
     seg_columnar_blocks: usize,
     state: LogScanState,
 }
@@ -919,12 +1123,40 @@ impl Stream for LogScanStream {
             }
 
             match &mut this.state {
-                LogScanState::NextSegment => match this.segments.pop_front() {
-                    Some(seg) => {
+                LogScanState::Planning(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(counts)) => {
+                        // Cap the stride by the real block count (ADR-0102): with
+                        // fewer blocks than partitions this collapses the extra
+                        // partitions to empty work, exactly what the declared
+                        // `min(target_partitions, total_blocks)` would give.
+                        let n = this
+                            .target_partitions
+                            .max(1)
+                            .min(counts.total_blocks.max(1));
+                        // Partition 0 publishes every relevant segment's
+                        // whole-segment prune totals, once, so striping a segment
+                        // across partitions does not multiply them.
+                        if this.partition == 0 {
+                            for plan in counts.segs.iter().flatten() {
+                                this.blocks.record_segment_totals(&plan.stats);
+                            }
+                        }
+                        this.work = owned_work(&counts, &this.segments, this.partition, n);
+                        this.state = LogScanState::NextSegment;
+                    }
+                    Poll::Ready(Err(e)) => return this.fail(e),
+                    Poll::Pending => return Poll::Pending,
+                },
+                LogScanState::NextSegment => match this.work.pop_front() {
+                    Some(OwnedSeg { seg, indices }) => {
                         this.current_seg = Some(seg.clone());
+                        this.current_indices = indices.clone();
                         this.seg_columnar_blocks = 0;
-                        this.state =
-                            LogScanState::Opening(open_segment(Arc::clone(&this.ctx), seg));
+                        this.state = LogScanState::Opening(open_segment_subset(
+                            Arc::clone(&this.ctx),
+                            seg,
+                            indices,
+                        ));
                     }
                     None => {
                         this.state = LogScanState::Done;
@@ -1017,15 +1249,19 @@ impl Stream for LogScanStream {
                     match step {
                         Step::Failed(e) => return this.fail(e),
                         Step::Exhausted(stats) => {
-                            this.blocks.record(&stats);
+                            this.blocks.record_scan(&stats);
                             this.state = LogScanState::NextSegment;
                         }
                         Step::Fallback => {
-                            // Re-open the segment and restart it on the row path,
+                            // Re-open the segment on the row path over the SAME
+                            // block-index list this partition owns (ADR-0102),
                             // skipping the blocks already emitted columnar so no
-                            // row is emitted twice. The abandoned columnar scan's
-                            // partial counters are dropped; the row scan re-counts
-                            // the whole segment.
+                            // row is emitted twice. `skip` is a position within
+                            // this partition's own list, so the count and the list
+                            // line up even when the segment's blocks are striped
+                            // across several partitions. The abandoned columnar
+                            // scan's partial counters are dropped; the row scan
+                            // re-scans this partition's whole list.
                             let seg = match this.current_seg.clone() {
                                 Some(seg) => seg,
                                 None => {
@@ -1034,7 +1270,11 @@ impl Stream for LogScanStream {
                                     ));
                                 }
                             };
-                            let fut = open_segment(Arc::clone(&this.ctx), seg);
+                            let fut = open_segment_subset(
+                                Arc::clone(&this.ctx),
+                                seg,
+                                this.current_indices.clone(),
+                            );
                             this.state = LogScanState::ReopenRows {
                                 fut,
                                 skip: this.seg_columnar_blocks,
@@ -1069,7 +1309,7 @@ impl Stream for LogScanStream {
                             Ok(Some(_)) => *skip -= 1,
                             Ok(None) => {
                                 let stats = scan.stats();
-                                this.blocks.record(&stats);
+                                this.blocks.record_scan(&stats);
                                 this.state = LogScanState::NextSegment;
                             }
                             Err(e) => return this.fail(SqlError::from(e).into()),
@@ -1086,7 +1326,7 @@ impl Stream for LogScanStream {
                         // now, so publish them before moving on.
                         Ok(None) => {
                             let stats = scan.stats();
-                            this.blocks.record(&stats);
+                            this.blocks.record_scan(&stats);
                             this.state = LogScanState::NextSegment;
                         }
                         Err(e) => return this.fail(SqlError::from(e).into()),

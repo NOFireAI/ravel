@@ -361,6 +361,58 @@ impl<'a> RlogReader<'a> {
         })
     }
 
+    /// Like [`RlogReader::scan_blocks`], but the returned cursor drains only the
+    /// surviving blocks at the positions named in `indices`, in the order given,
+    /// rather than every surviving block (intra-segment scan partitioning,
+    /// ADR-0102).
+    ///
+    /// `indices` are positions into the full surviving-block list
+    /// [`scan_blocks`](Self::scan_blocks) would produce for the same
+    /// `content`/`prune`: the same skip-index, POSTINGS, and bloom pruning runs
+    /// here, once, and produces the same ordered survivor list; this then keeps
+    /// only the entries the caller named. Callers derive `indices` from a prior
+    /// `scan_blocks` (or an equivalent count) over the SAME immutable object, so
+    /// the two survivor lists are identical by construction and an index at or
+    /// past the survivor count can only mean corruption -- it is a typed
+    /// `Corrupted` error, never a panic.
+    ///
+    /// It is deliberately an explicit index list, not a contiguous range: the
+    /// SQL logs scan hands one segment's blocks to several partitions on a
+    /// `pos % n` stride, so a partition owns a non-contiguous subset (0, n, 2n,
+    /// ...) that a range cannot express.
+    ///
+    /// The returned cursor's [`ScanStats`] totals (`blocks_total`,
+    /// `blocks_after_skip`/`_postings`/`_bloom`) describe the WHOLE segment's
+    /// pruning, exactly as `scan_blocks` reports them, because the same pruning
+    /// ran; only `blocks_scanned`/`pages_*` grow as this subset drains. A caller
+    /// striping one segment across partitions must therefore attribute the
+    /// whole-segment totals to a single partition to avoid counting them once
+    /// per partition (see `ravel_sql::logs_scan`).
+    ///
+    /// [`scan_blocks`](Self::scan_blocks) itself, and every other caller, is
+    /// unchanged: this adds a way to restrict which of the already-pruned blocks
+    /// a cursor drains, and changes nothing about what is read from the object.
+    pub fn scan_blocks_subset(
+        &self,
+        content: &Predicate,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+        indices: &[usize],
+    ) -> Result<BlockScan, LogSegError> {
+        let mut scan = self.scan_blocks(content, prune, columns)?;
+        let mut subset = Vec::with_capacity(indices.len());
+        for &i in indices {
+            let loc =
+                scan.blocks.get(i).copied().ok_or_else(|| {
+                    LogSegError::Corrupted("subset block index out of range".into())
+                })?;
+            subset.push(loc);
+        }
+        scan.blocks = subset;
+        scan.next = 0;
+        Ok(scan)
+    }
+
     /// A cursor over zero surviving blocks, for the two pre-decode short
     /// circuits (an empty ts range, an empty resolved stream set). Draining it
     /// yields nothing, which is what those paths returned before.

@@ -399,6 +399,89 @@ async fn run_scan(
     }
 }
 
+/// The result of executing a `LogsScanExec` across ALL of its declared
+/// partitions (intra-segment scan partitioning, ADR-0102), for the tests that
+/// need block striping to actually fan out.
+struct MultiRun {
+    /// Every partition's batches, concatenated. Row order across partitions is
+    /// meaningless (no ordering is declared), so callers compare as a multiset.
+    batches: Vec<RecordBatch>,
+    columnar_batches: usize,
+    rowpath_batches: usize,
+    blocks_total: usize,
+    blocks_scanned: usize,
+    /// Partitions that emitted at least one row. The capability this item adds
+    /// is that this can exceed the segment count.
+    non_empty_partitions: usize,
+    /// The DataFusion partition count the scan declared (`target_partitions`).
+    declared_partitions: usize,
+}
+
+/// Execute `LogsScanExec` over `segments` at `target_partitions`, draining every
+/// declared partition and summing the path/block metrics across all of them.
+#[allow(clippy::too_many_arguments)]
+async fn run_scan_tp(
+    store: Arc<dyn ObjectStoreBackend>,
+    segments: Vec<SegmentRef>,
+    declared: Vec<DeclaredColumn>,
+    projection: Option<Vec<usize>>,
+    content: Vec<Predicate>,
+    erasure_reqs: Vec<ravel_proto::commit::v1::ErasureRequest>,
+    target_partitions: usize,
+) -> MultiRun {
+    let full_schema = logs_schema_with_declared(&declared);
+    let erasure = snapshot_pending_erasure_predicates(&Snapshot {
+        segments: segments.clone(),
+        segments_pruned: 0,
+        pending_erasure: erasure_reqs,
+    });
+    let scan = LogsScanExec::new(
+        TENANT,
+        LogSegmentFetcher::new(store),
+        &segments,
+        target_partitions,
+        i64::MIN,
+        i64::MAX,
+        Arc::new(content),
+        Arc::new(Vec::new()),
+        Arc::new(erasure),
+        projection.as_ref(),
+        QueryAccounting::new(),
+        full_schema,
+        Arc::new(declared),
+    )
+    .expect("build scan");
+
+    let declared_partitions = scan.properties().output_partitioning().partition_count();
+    let ctx = Arc::new(TaskContext::default());
+    let mut batches = Vec::new();
+    let mut non_empty_partitions = 0;
+    for p in 0..declared_partitions {
+        let mut stream = scan.execute(p, Arc::clone(&ctx)).expect("execute");
+        let mut rows_here = 0usize;
+        while let Some(next) = stream.next().await {
+            let batch = next.expect("batch");
+            rows_here += batch.num_rows();
+            batches.push(batch);
+        }
+        if rows_here > 0 {
+            non_empty_partitions += 1;
+        }
+    }
+
+    let metrics = scan.metrics().expect("metrics");
+    let count = |name: &str| metrics.sum_by_name(name).map(|v| v.as_usize()).unwrap_or(0);
+    MultiRun {
+        batches,
+        columnar_batches: count("columnar_batches"),
+        rowpath_batches: count("rowpath_batches"),
+        blocks_total: count("blocks_total"),
+        blocks_scanned: count("blocks_scanned"),
+        non_empty_partitions,
+        declared_partitions,
+    }
+}
+
 /// A dummy pending erasure whose key exists in no record, so it forces the row
 /// path (any erasure makes a scan ineligible) yet erases nothing, leaving the
 /// output identical to the fast path over the same input.
@@ -887,6 +970,367 @@ async fn a_later_block_with_attrs_raw_falls_back_without_losing_or_repeating_row
         got, want,
         "every row exactly once across the columnar/row switch, spilled values \
          included"
+    );
+}
+
+/// The strided sibling of the test above, for intra-segment scan partitioning
+/// (ADR-0102, deliverable 4): the single most important test in this item,
+/// because a wrong `ReopenRows` fallback drops or duplicates rows *silently* --
+/// no crash, just a wrong answer.
+///
+/// One segment of four two-record blocks is striped across `target_partitions =
+/// 2`. Blocks flatten to surviving positions 0..3 and unit `i` goes to partition
+/// `i % 2`, so partition 0 owns positions {0, 2} and partition 1 owns {1, 3}.
+/// The `attrs_raw` overflow is placed on positions 2 and 3 (the LATER block each
+/// partition owns), so on each partition the fallback fires on a block it does
+/// NOT own contiguously from the start of the segment: it has already emitted
+/// its position-0/1 block columnar (`seg_columnar_blocks == 1`) and must skip
+/// exactly ONE position of its OWN index list, not one block of the whole
+/// segment.
+///
+/// The fix (ADR-0102) is that the reopened row scan is handed the SAME
+/// `current_indices` this partition owns, so `skip` is a position within that
+/// list. Proven by mutation: temporarily change the `LogScanState::Fallback`
+/// arm in `crates/ravel-sql/src/logs_scan.rs` to reopen a contiguous
+/// whole-segment range instead of `this.current_indices.clone()` -- e.g.
+/// `open_segment_subset(ctx, seg, (0..=this.current_indices.iter().copied()
+/// .max().unwrap_or(0)).collect())` -- and this test goes RED with duplicated
+/// rows (each partition's whole-segment skip-by-count re-emits blocks the other
+/// partition owns). Restoring `this.current_indices.clone()` makes it pass.
+#[tokio::test]
+async fn a_strided_fallback_across_partitions_neither_drops_nor_repeats_rows() {
+    let declared = vec![DeclaredColumn::new("tags", DeclaredType::Str)];
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let mk = |ts: i64, spilled: bool| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "b".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: {
+            let mut attrs = vec![("filler".to_string(), AttrValue::Str("f".into()))];
+            if spilled {
+                attrs.push(("tags".to_string(), AttrValue::Str(format!("spilled-{ts}"))));
+            }
+            attrs
+        },
+    };
+    // Four blocks of two records: positions 0 (ts 0,1) and 1 (ts 2,3) are clean,
+    // positions 2 (ts 4,5) and 3 (ts 6,7) carry the `attrs_raw` page. Under the
+    // 2-way stride, partition 0 gets {clean pos 0, spilled pos 2} and partition 1
+    // gets {clean pos 1, spilled pos 3}: each falls back on its SECOND owned
+    // block, so `skip == 1` against its own two-element index list.
+    let records = vec![
+        mk(0, false),
+        mk(1, false),
+        mk(2, false),
+        mk(3, false),
+        mk(4, true),
+        mk(5, true),
+        mk(6, true),
+        mk(7, true),
+    ];
+    let cfg = RlogConfig {
+        block_target_records: 2,
+        max_dynamic_columns: 1,
+        ..RlogConfig::default()
+    };
+
+    let store = MemoryStore::new();
+    let seg = write_object(&store, "logs/strided-midspill.rlog", &records, cfg).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    let projection = vec![0usize, FIRST_DECLARED_COL];
+    let run = run_scan_tp(
+        store,
+        vec![seg],
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+        2,
+    )
+    .await;
+
+    // Both partitions ran, each emitting one clean block columnar and one
+    // spilled block through the re-opened row path.
+    assert_eq!(run.declared_partitions, 2, "target_partitions=2 declared");
+    assert_eq!(
+        run.non_empty_partitions, 2,
+        "both partitions own blocks and emit rows"
+    );
+    assert_eq!(
+        run.columnar_batches, 2,
+        "each partition emits its clean block columnar; columnar={}, rowpath={}",
+        run.columnar_batches, run.rowpath_batches
+    );
+    assert_eq!(
+        run.rowpath_batches, 2,
+        "each partition emits its spilled block via the re-opened row path; \
+         columnar={}, rowpath={}",
+        run.columnar_batches, run.rowpath_batches
+    );
+
+    let got = rows(&run.batches, &projection, &declared);
+    let want = vec![
+        vec![Cell::Ts(0), Cell::OptStr(None)],
+        vec![Cell::Ts(1), Cell::OptStr(None)],
+        vec![Cell::Ts(2), Cell::OptStr(None)],
+        vec![Cell::Ts(3), Cell::OptStr(None)],
+        vec![Cell::Ts(4), Cell::OptStr(Some("spilled-4".to_string()))],
+        vec![Cell::Ts(5), Cell::OptStr(Some("spilled-5".to_string()))],
+        vec![Cell::Ts(6), Cell::OptStr(Some("spilled-6".to_string()))],
+        vec![Cell::Ts(7), Cell::OptStr(Some("spilled-7".to_string()))],
+    ];
+    assert_eq!(
+        got, want,
+        "every row exactly once across the strided columnar/row switch, no drops \
+         and no duplicates"
+    );
+}
+
+/// Differential correctness (ADR-0102): the SAME query over the SAME segments
+/// yields the SAME row multiset under a single partition (blocks drained in
+/// order, the closest analogue of the old whole-segment partitioning) and under
+/// block-level striping across many partitions. Covers BOTH the
+/// already-adequately-partitioned case (segment count >= target_partitions) and
+/// the undersubscribed case (segment count < target_partitions), the latter
+/// being the one this item exists to fix.
+#[tokio::test]
+async fn block_striping_is_row_identical_to_single_partition() {
+    let declared = declared_columns();
+    // Vary block counts per segment so the stride crosses segment boundaries at
+    // non-trivial offsets (block_target_records = 3, see `small_blocks`).
+    let seg_sizes = [7usize, 4, 11, 5];
+    let mut all_records: Vec<Vec<LogRecord>> = Vec::new();
+    let mut ts = 0i64;
+    for &size in &seg_sizes {
+        let mut recs = Vec::with_capacity(size);
+        for _ in 0..size {
+            let spilled = ts % 3 == 0;
+            recs.push(LogRecord {
+                stream_id: log_stream_id(
+                    &[("service.name".to_string(), AttrValue::Str("api".into()))],
+                    "scope",
+                    "1.0",
+                    &[],
+                ),
+                stream_attrs: stream_attrs_bytes(
+                    &[("service.name".to_string(), AttrValue::Str("api".into()))],
+                    "scope",
+                    "1.0",
+                    &[],
+                ),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: (ts % 5) as u8,
+                severity_text: "INFO".into(),
+                body: format!("body-{ts}"),
+                trace_id: None,
+                span_id: None,
+                flags: ts as u32,
+                attrs: {
+                    let mut a = vec![("filler".to_string(), AttrValue::Str("f".into()))];
+                    if spilled {
+                        // Overflow into attrs_raw for some blocks so the run also
+                        // exercises the fallback path under striping.
+                        a.push(("tags".to_string(), AttrValue::Str(format!("t-{ts}"))));
+                    }
+                    a
+                },
+            });
+            ts += 1;
+        }
+        all_records.push(recs);
+    }
+
+    // max_dynamic_columns = 1 so `tags` overflows into attrs_raw wherever it is
+    // set, forcing the columnar->row fallback on those blocks.
+    let cfg = RlogConfig {
+        block_target_records: 3,
+        max_dynamic_columns: 1,
+        ..RlogConfig::default()
+    };
+
+    let store = MemoryStore::new();
+    let mut segments = Vec::new();
+    for (i, recs) in all_records.iter().enumerate() {
+        segments.push(write_object(&store, &format!("logs/diff-{i}.rlog"), recs, cfg).await);
+    }
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    let projection = vec![0usize, 4usize, FIRST_DECLARED_COL + 1];
+
+    let baseline = run_scan_tp(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+        1,
+    )
+    .await;
+    let baseline_rows = rows(&baseline.batches, &projection, &declared);
+
+    // Adequately partitioned: 4 segments, target_partitions = 4.
+    let adequate = run_scan_tp(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+        4,
+    )
+    .await;
+    assert_eq!(
+        rows(&adequate.batches, &projection, &declared),
+        baseline_rows,
+        "block striping at target_partitions=4 (>= segment count) must be \
+         row-identical to a single partition"
+    );
+
+    // Undersubscribed: 4 segments, target_partitions = 12 (the case this fixes).
+    let under = run_scan_tp(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+        12,
+    )
+    .await;
+    assert_eq!(
+        rows(&under.batches, &projection, &declared),
+        baseline_rows,
+        "block striping at target_partitions=12 (< nothing; > segment count) \
+         must be row-identical to a single partition"
+    );
+
+    // The whole-segment prune totals are counted once regardless of how many
+    // partitions stripe a segment: blocks_total is stable across the sweep.
+    assert_eq!(
+        baseline.blocks_total, adequate.blocks_total,
+        "blocks_total is a whole-object figure, counted once, not per partition"
+    );
+    assert_eq!(
+        baseline.blocks_total, under.blocks_total,
+        "blocks_total stays stable under heavy striping"
+    );
+    // Every surviving block is decoded exactly once across all partitions.
+    assert_eq!(
+        baseline.blocks_scanned, under.blocks_scanned,
+        "each surviving block is decoded exactly once whatever the partitioning"
+    );
+}
+
+/// The capability this item adds (ADR-0102): in the undersubscribed case
+/// (segment count < target_partitions) the scan now uses MORE than
+/// `segment_count` non-empty partitions when the block count allows it. Asserts
+/// the non-empty partition count directly, not just row correctness.
+#[tokio::test]
+async fn undersubscribed_uses_more_partitions_than_segments() {
+    let declared = declared_columns();
+    // Two segments, but 18 and 21 records at 3 records/block => 6 and 7 blocks,
+    // 13 surviving blocks total. With target_partitions = 8 the stride is
+    // min(8, 13) = 8, so 8 partitions each own at least one block -- four times
+    // the segment count.
+    let store = MemoryStore::new();
+    let cfg = small_blocks();
+    let mut segments = Vec::new();
+    let mut ts = 0i64;
+    for (i, &size) in [18usize, 21].iter().enumerate() {
+        let mut recs = Vec::with_capacity(size);
+        for _ in 0..size {
+            recs.push(LogRecord {
+                stream_id: log_stream_id(
+                    &[("service.name".to_string(), AttrValue::Str("api".into()))],
+                    "scope",
+                    "1.0",
+                    &[],
+                ),
+                stream_attrs: stream_attrs_bytes(
+                    &[("service.name".to_string(), AttrValue::Str("api".into()))],
+                    "scope",
+                    "1.0",
+                    &[],
+                ),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 1,
+                severity_text: "INFO".into(),
+                body: format!("b-{ts}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![],
+            });
+            ts += 1;
+        }
+        segments.push(write_object(&store, &format!("logs/under-{i}.rlog"), &recs, cfg).await);
+    }
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    let projection = vec![0usize];
+    let run = run_scan_tp(
+        store,
+        segments,
+        declared,
+        Some(projection),
+        Vec::new(),
+        Vec::new(),
+        8,
+    )
+    .await;
+
+    assert_eq!(run.declared_partitions, 8, "target_partitions=8 declared");
+    assert!(
+        run.non_empty_partitions > 2,
+        "undersubscribed (2 segments) must fan out to more than 2 non-empty \
+         partitions; got {}",
+        run.non_empty_partitions
+    );
+    assert_eq!(
+        total_rows(&run.batches),
+        39,
+        "all 18+21 records are emitted once"
+    );
+}
+
+/// `LogsScanExec` still declares NO output ordering after the change to
+/// block-level striping (ADR-0087 decision 1, ADR-0102): striping blocks rather
+/// than segments only weakens any per-partition order, so declaring one would
+/// be unsound. Nothing downstream in this crate depends on scan order; an
+/// `ORDER BY` gets an explicit `SortExec` above this leaf.
+#[tokio::test]
+async fn logs_scan_declares_no_output_ordering() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let scan = LogsScanExec::new(
+        TENANT,
+        LogSegmentFetcher::new(store),
+        &[],
+        8,
+        i64::MIN,
+        i64::MAX,
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        None,
+        QueryAccounting::new(),
+        logs_schema_with_declared(&[]),
+        Arc::new(Vec::new()),
+    )
+    .expect("build scan");
+    assert!(
+        scan.properties().output_ordering().is_none(),
+        "LogsScanExec must declare no output ordering"
     );
 }
 
