@@ -54,10 +54,10 @@ and stays conformant.
 
 ## Score
 
-- Supported and covered: 42
+- Supported and covered: 43
 - Intentionally rejected: 68
 - Unclassified / broken: 0
-- **Conformance: 110 / 110 = 100.0%**
+- **Conformance: 111 / 111 = 100.0%**
 
 ## Conformance table
 
@@ -115,6 +115,7 @@ and stays conformant.
 | Clause / operator | `GROUP BY ordinal` | `SELECT series_id, count(value) FROM samples GROUP BY 1 ORDER BY series_id` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `HAVING` | `SELECT series_id, count(value) FROM samples GROUP BY series_id HAVING count(value) > 2` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `IN list` | `SELECT value FROM samples WHERE value IN (1, 2)` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `LIKE` | `SELECT count(*) FROM logs WHERE body LIKE '%record 1%'` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | substring pattern match via the Ravel like UDF (#479) |
 | Clause / operator | `LIMIT` | `SELECT ts, value FROM samples ORDER BY series_id, ts LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
 | Clause / operator | `OFFSET` | `SELECT value FROM samples ORDER BY value OFFSET 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `ORDER BY` | `SELECT ts, value FROM samples ORDER BY ts` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |

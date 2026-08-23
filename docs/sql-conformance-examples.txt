@@ -62,6 +62,7 @@ Clause / operator	GROUP BY	SELECT series_id, count(value) FROM samples GROUP BY 
 Clause / operator	GROUP BY ordinal	SELECT series_id, count(value) FROM samples GROUP BY 1 ORDER BY series_id
 Clause / operator	HAVING	SELECT series_id, count(value) FROM samples GROUP BY series_id HAVING count(value) > 2
 Clause / operator	IN list	SELECT value FROM samples WHERE value IN (1, 2)
+Clause / operator	LIKE	SELECT count(*) FROM logs WHERE body LIKE '%record 1%'
 Clause / operator	LIMIT	SELECT ts, value FROM samples ORDER BY series_id, ts LIMIT 1
 Clause / operator	OFFSET	SELECT value FROM samples ORDER BY value OFFSET 1
 Clause / operator	ORDER BY	SELECT ts, value FROM samples ORDER BY ts

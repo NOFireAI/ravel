@@ -569,6 +569,20 @@ pub fn registry() -> Vec<Construct> {
         });
     }
 
+    // `col LIKE 'pattern'` / `NOT LIKE` substring matching on the `logs` table
+    // (#479), evaluated by the Ravel `like` UDF (crate::like_udf) so a declared
+    // `Str` column's dictionary is matched once per distinct value. Only `body`
+    // is exercised here (a fixed `Utf8` column); the dictionary path is proven in
+    // `tests/logs_provider.rs`. Not pushed down: substring `LIKE` is not a sound
+    // superset of the reader's exact `HasWord`/`Equals` predicates.
+    out.push(Construct {
+        category: Category::Clause,
+        name: "LIKE".to_string(),
+        example: "SELECT count(*) FROM logs WHERE body LIKE '%record 1%'".to_string(),
+        classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
+        rationale: "substring pattern match via the Ravel like UDF (#479)",
+    });
+
     // --- Scalar functions (ADR-0097 decisions 4, 8) ----------------------
     // One representative row per admitted upstream family. The other members
     // of each family stay admitted (they survive build_session's scalar gate,
