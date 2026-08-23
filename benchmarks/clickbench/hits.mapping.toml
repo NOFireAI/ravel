@@ -42,10 +42,33 @@ ts_column = "EventTime"
 # the parquet only when EventTime is stored as an integer.
 ts_unit = "seconds"
 
-# All 104 non-EventTime columns, as record attributes (typed values in `attrs`, not
-# part of stream identity). No resource_attribute entries: the flat `hits` table has
-# no per-entity stream key, so every row shares one logstream. 104 attributes sit far
-# under the per-object dynamic-column budget of 1000 (RlogConfig::max_dynamic_columns).
+# CounterID (issue #519): the one column in `hits` that acts as a per-entity
+# key -- ClickBench's "counter" is the site/tag being measured, so CounterID
+# is the natural stream boundary. Declared as a resource_attribute rather than
+# an attribute so it becomes part of stream identity (ADR-0029 log_stream_id):
+# `shard_for_log` hashes resource attributes, so this is what actually spreads
+# ingest across `--shards`. In the pre-#519 mapping, CounterID was a record
+# attribute: every row's resource-attribute set was empty, so every row hashed
+# to the same stream and 100% of writes landed on one shard regardless of
+# --shards -- one core did all merge+encode work no matter how many shards
+# were provisioned.
+#
+# `ravel-cli load` runs with a fixed `target_bytes: 1` (one Strict flush per
+# batch), so raising --shards without raising --batch-rows to compensate
+# produces MORE, SMALLER objects: a batch's rows now split across shards by
+# CounterID hash, and each shard's slice flushes immediately as its own
+# object, before it can reach the `block_target_records` target (8192). See
+# docs/guides/clickbench.md step 2 for the --batch-rows this requires.
+#
+# The other 103 non-EventTime columns stay record attributes (typed values in
+# `attrs`, not part of stream identity). 104 declared columns total (103
+# attribute + 1 resource_attribute) sit far under the per-object dynamic-column
+# budget of 1000 (RlogConfig::max_dynamic_columns).
+
+[[resource_attribute]]
+key = "CounterID"
+column = "CounterID"
+type = "i64"
 
 [[attribute]]
 key = "WatchID"
@@ -70,11 +93,6 @@ type = "i64"
 [[attribute]]
 key = "EventDate"
 column = "EventDate"
-type = "i64"
-
-[[attribute]]
-key = "CounterID"
-column = "CounterID"
 type = "i64"
 
 [[attribute]]
