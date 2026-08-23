@@ -142,4 +142,20 @@ exit 1: advisory DB parse failure on CVSS 4.0 entries (tool too old, environment
 $ cargo-deny 0.20.2 check   (prebuilt musl binary from GitHub release)
 exit 0: "advisories ok, bans ok, licenses ok, sources ok"
 cargo-audit: not installed; cargo deny's advisories check covers RustSec, so not separately installed.
+
+## Host change for the continuation session (agents J, K, L and synthesis)
+
+The review continued on a second executor host after a checkpoint. Same frozen
+checkout and commit; different machine.
+
+```
+$ uname -s; sysctl -n hw.ncpu; sysctl -n hw.memsize
+Darwin (macOS), 8 cores, 16 GiB RAM, 127 GiB free   # exit 0
+$ rustc --version; cargo --version; cargo-deny --version
+rustc 1.97.1, cargo 1.97.1, cargo-deny 0.20.2 (homebrew)   # exit 0
+```
+
+No warm cargo target directory exists on this host; the heavy validation
+batches above (Linux host) were not rerun. Commands run by agents J, K, L
+are logged in their memos and summarized below as they land.
 ```
