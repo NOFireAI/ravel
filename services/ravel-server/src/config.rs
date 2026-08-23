@@ -33,6 +33,31 @@ pub enum StoreKind {
     S3,
 }
 
+/// Which credential source `--store s3` uses (ADR-0106). The CLI-facing mirror
+/// of [`ravel_object_store::s3::S3AuthMode`], which lives in a crate that does
+/// not depend on clap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum S3Auth {
+    /// Inline keys from `--s3-access-key`/`--s3-secret-key`, optionally with
+    /// `--s3-session-token` or `--s3-credentials-file`. Both keys are
+    /// required, exactly as before ADR-0106.
+    #[default]
+    Static,
+    /// Short-lived credentials fetched from the EC2 instance metadata service
+    /// (IMDSv2). No inline credential flag may be set alongside it.
+    InstanceRole,
+}
+
+impl S3Auth {
+    /// The library-level mode this flag value selects.
+    pub fn mode(self) -> ravel_object_store::s3::S3AuthMode {
+        match self {
+            S3Auth::Static => ravel_object_store::s3::S3AuthMode::Static,
+            S3Auth::InstanceRole => ravel_object_store::s3::S3AuthMode::InstanceRole,
+        }
+    }
+}
+
 /// Dev binary wiring gateway + ingest + query into one process.
 #[derive(Debug, Parser)]
 #[command(
@@ -100,6 +125,37 @@ pub struct Cli {
 
     #[arg(long, env = "RAVEL_S3_SECRET_KEY")]
     pub s3_secret_key: Option<String>,
+
+    /// Where `--store s3` gets its credentials (ADR-0106). `static` (the
+    /// default) is unchanged behavior: `--s3-access-key` and
+    /// `--s3-secret-key` are both required. `instance-role` drops that
+    /// requirement and fetches short-lived credentials from the EC2 instance
+    /// metadata service instead; combining it with any inline credential flag
+    /// is refused at startup rather than resolved by precedence.
+    #[arg(long, value_enum, default_value = "static", env = "RAVEL_S3_AUTH")]
+    pub s3_auth: S3Auth,
+
+    /// Temporary AWS session token paired with `--s3-access-key` /
+    /// `--s3-secret-key` for STS-issued credentials (ADR-0072 decision 1).
+    /// Ignored when `--s3-credentials-file` is set: the file wins. Only
+    /// meaningful under `--s3-auth static`.
+    #[arg(long, env = "RAVEL_S3_SESSION_TOKEN")]
+    pub s3_session_token: Option<String>,
+
+    /// Path to a JSON file of `{access_key_id, secret_access_key,
+    /// session_token}` that an external process rotates on disk (ADR-0072
+    /// decision 1). Read once at startup (an unreadable or malformed file
+    /// fails startup) and re-read lazily on the request path when its mtime
+    /// changes. Wins over the inline key flags. Only meaningful under
+    /// `--s3-auth static`.
+    #[arg(long, env = "RAVEL_S3_CREDENTIALS_FILE", value_name = "PATH")]
+    pub s3_credentials_file: Option<PathBuf>,
+
+    /// Base URL of the EC2 instance metadata service, used only under
+    /// `--s3-auth instance-role` (ADR-0106). Unset uses the AWS link-local
+    /// address; a value redirects IMDS for tests and unusual deployments.
+    #[arg(long, env = "RAVEL_S3_INSTANCE_METADATA_ENDPOINT", value_name = "URL")]
+    pub s3_instance_metadata_endpoint: Option<String>,
 
     /// Single-key SSE-KMS (ADR-0062 decision 1c): every PUT this process
     /// makes through the default store is encrypted with this KMS key ARN,
