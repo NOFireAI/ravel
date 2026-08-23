@@ -104,10 +104,16 @@ kinds are already skipped by readers (docs/log-segment-format.md:116-117)
 and an absent kind is already legal; POSTINGS itself (kind 6) shipped
 under exactly this carve-out (docs/log-segment-format.md:802-809). Only a
 change to an existing section's grammar, or to a kind's legality, needs a
-trailer bump. This matters doubly pre-release: `SUPPORTED_VERSIONS` is a
-single version, so a trailer bump would strand every stored object; an
-additive section strands nothing and costs nothing to tenants who do not
-enable it.
+trailer bump. Pre-release, `SUPPORTED_VERSIONS` is a
+single version, so a trailer bump strands every stored object until
+re-ingestion. The operator has ruled (2026-08-23) that pre-1.0 this is
+acceptable: compatibility may be broken before first release. The
+carve-out is therefore the cheap path, not the only path -- this ADR uses
+it because GRAM_IDX genuinely needs no grammar change, not because a bump
+is forbidden. Designs that DO need one (the object-level value dictionary
+in Rejected alternatives, which is the genuinely ClickBench-shaped
+structure) are not blocked by compatibility, only by their own cost and
+their own ADR.
 
 Migration class (ADR-0066 decision 4): Class A, RLOG bulk data object.
 No version change, so no migration and no dual-reader window: an old
@@ -761,6 +767,22 @@ that honesty.
   (docs/log-segment-format.md "String codec layouts"), which
   high-cardinality URL pages in an 8192-row block typically exceed.
   Noted for the scan path's own backlog; out of scope here.
+
+- **An object-level value dictionary for declared Str columns
+  (LowCardinality-style).** The genuinely ClickBench-shaped structure,
+  and the only one in this list that beats the block-granularity floor,
+  because it changes the pruning unit from block to VALUE: store each
+  distinct value once per object, reference it by id from row pages, and
+  evaluate a LIKE once per distinct value (plausibly 0.5-1M distinct URLs
+  per L1 part) instead of once per row (10M+), with the id->row mapping
+  yielding exact row sets rather than candidate blocks. Rejected HERE,
+  not outright: it changes the BLOCKS section's page grammar, so it is a
+  trailer-bump format change with write-path, compaction and memory
+  consequences that deserve their own ADR and their own measured budget.
+  The operator's pre-1.0 ruling (Format ground rules above) means
+  compatibility does not block it; only its own cost does. If Q21-Q24
+  latency matters after the scan-path work lands, this is the design to
+  take up next.
 
 ## Consequences
 
