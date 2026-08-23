@@ -33,6 +33,7 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
 use proptest::prelude::*;
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_codec::encoding::{Enc, encode_strings};
 use ravel_logseg::block::{ColumnPlan, write_block};
@@ -50,8 +51,8 @@ use ravel_logseg::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::LogSegmentFetcher;
 use ravel_query::erasure::snapshot_pending_erasure_predicates;
+use ravel_query::{CacheFetchError, LogSegmentFetcher};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, FIRST_DECLARED_COL, LOG_COL_ATTRS, LogsScanExec,
     logs_schema_with_declared,
@@ -399,6 +400,14 @@ async fn run_scan(
     }
 }
 
+/// A logs fetcher with ADR-0046's read cache wired, sized to hold any fixture
+/// in this file with room to spare so the striping's repeated whole-object reads
+/// coalesce rather than evict each other.
+fn cached_fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
+    let cache: Cache<CacheFetchError> = Cache::new(CacheLimits::new(1 << 26, 1 << 20, 1 << 26));
+    LogSegmentFetcher::new(store).with_cache(Arc::new(cache))
+}
+
 /// The result of executing a `LogsScanExec` across ALL of its declared
 /// partitions (intra-segment scan partitioning, ADR-0102), for the tests that
 /// need block striping to actually fan out.
@@ -419,6 +428,13 @@ struct MultiRun {
 
 /// Execute `LogsScanExec` over `segments` at `target_partitions`, draining every
 /// declared partition and summing the path/block metrics across all of them.
+///
+/// The fetcher is wired with ADR-0046's read cache, because that is the
+/// precondition `LogsScanExec::new` requires before it declares more partitions
+/// than there are segments (ADR-0102 decision 1): an un-cached fetcher is capped
+/// at the segment count, which is what
+/// `an_uncached_fetcher_caps_partitions_at_the_segment_count` pins. These tests
+/// exercise the striping itself, so they take the cached side of that gate.
 #[allow(clippy::too_many_arguments)]
 async fn run_scan_tp(
     store: Arc<dyn ObjectStoreBackend>,
@@ -437,7 +453,7 @@ async fn run_scan_tp(
     });
     let scan = LogsScanExec::new(
         TENANT,
-        LogSegmentFetcher::new(store),
+        cached_fetcher(store),
         &segments,
         target_partitions,
         i64::MIN,
@@ -1301,6 +1317,123 @@ async fn undersubscribed_uses_more_partitions_than_segments() {
         total_rows(&run.batches),
         39,
         "all 18+21 records are emitted once"
+    );
+}
+
+/// The cache gate on the fan-out (ADR-0102 decision 1): striping one segment's
+/// blocks across K partitions means K whole-object GETs at that segment's key,
+/// because the fetch unit is the whole object (ADR-0087 decision 3, no ranged
+/// block reader). ADR-0046's read cache is what makes those coalesce, so the
+/// planner only declares more partitions than segments when the fetcher carries
+/// one. Un-cached, the partition count falls back to the pre-ADR-0102 bound,
+/// `min(target_partitions, segment_count)`.
+///
+/// Both halves are asserted over the SAME fixture and the SAME
+/// `target_partitions`, so the only difference is the cache.
+#[tokio::test]
+async fn an_uncached_fetcher_caps_partitions_at_the_segment_count() {
+    let declared = declared_columns();
+    let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+    let mk = |ts: i64| LogRecord {
+        stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: format!("b-{ts}"),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    };
+
+    // Two segments, 12 records each at 3 records/block: 4 blocks per segment, 8
+    // surviving blocks total, so the block count is NOT what limits the fan-out
+    // at target_partitions = 6. Only the cache gate is.
+    const SEGMENTS: usize = 2;
+    const TARGET_PARTITIONS: usize = 6;
+    let store = MemoryStore::new();
+    let mut segments = Vec::new();
+    let mut ts = 0i64;
+    for i in 0..SEGMENTS {
+        let recs: Vec<LogRecord> = (0..12)
+            .map(|_| {
+                let r = mk(ts);
+                ts += 1;
+                r
+            })
+            .collect();
+        segments.push(
+            write_object(
+                &store,
+                &format!("logs/gate-{i}.rlog"),
+                &recs,
+                small_blocks(),
+            )
+            .await,
+        );
+    }
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let full_schema = logs_schema_with_declared(&declared);
+    let projection = vec![0usize];
+
+    let build = |fetcher: LogSegmentFetcher| {
+        LogsScanExec::new(
+            TENANT,
+            fetcher,
+            &segments,
+            TARGET_PARTITIONS,
+            i64::MIN,
+            i64::MAX,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Some(&projection),
+            QueryAccounting::new(),
+            Arc::clone(&full_schema),
+            Arc::new(declared.clone()),
+        )
+        .expect("build scan")
+    };
+
+    let uncached = build(LogSegmentFetcher::new(Arc::clone(&store)));
+    assert_eq!(
+        uncached
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+        SEGMENTS,
+        "an un-cached fetcher caps the partition count at the segment count \
+         ({SEGMENTS}), not target_partitions ({TARGET_PARTITIONS}): nothing \
+         absorbs the extra whole-object GETs"
+    );
+
+    let cached = build(cached_fetcher(Arc::clone(&store)));
+    assert_eq!(
+        cached.properties().output_partitioning().partition_count(),
+        TARGET_PARTITIONS,
+        "a cache-wired fetcher declares target_partitions ({TARGET_PARTITIONS}) \
+         even though only {SEGMENTS} segments are scanned"
+    );
+
+    // The clamp must not lose rows: the capped plan still emits every record.
+    let ctx = Arc::new(TaskContext::default());
+    let mut rows_seen = 0usize;
+    for p in 0..uncached
+        .properties()
+        .output_partitioning()
+        .partition_count()
+    {
+        let mut stream = uncached.execute(p, Arc::clone(&ctx)).expect("execute");
+        while let Some(next) = stream.next().await {
+            rows_seen += next.expect("batch").num_rows();
+        }
+    }
+    assert_eq!(
+        rows_seen,
+        SEGMENTS * 12,
+        "the un-cached, segment-capped plan still emits every record"
     );
 }
 

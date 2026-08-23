@@ -2,11 +2,12 @@
 //! epic #361 item 1).
 //!
 //! Drives `logs_scan_scaling::run` in its smoke configuration end to end against
-//! an in-process `MemoryStore` and asserts the report proves the two facts this
-//! item exists to demonstrate: the undersubscribed `logs` scan fans out to
-//! `target_partitions` (more than the segment count) block-level partitions, and
-//! ADR-0046's read cache keeps the object-store GET count flat across the sweep
-//! while the un-cached path's climbs.
+//! an in-process `MemoryStore` and asserts the report proves what this item
+//! actually ships: with ADR-0046's read cache wired, an undersubscribed `logs`
+//! scan fans out to `target_partitions` block-level partitions (more than the
+//! segment count); without it the partition count is capped at the segment count
+//! and the object-store GET count therefore stops responding to
+//! `target_partitions` once the cap binds.
 //!
 //! Gated on `sql-latency` (the module and bin's gate), so a default
 //! `cargo test -p ravel-bench` sees an empty crate rather than a link error. Run
@@ -21,7 +22,7 @@ use ravel_bench::logs_scan_scaling::{LogsScanScalingConfig, run};
 use ravel_object_store::memory::MemoryStore;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn logs_scan_scaling_smoke_proves_fanout_and_flat_request_count() {
+async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
     let config = LogsScanScalingConfig::smoke(Arc::new(MemoryStore::new()), "memory");
     let segments = config.segments;
     let expected_partitions = config.target_partitions.clone();
@@ -35,6 +36,25 @@ async fn logs_scan_scaling_smoke_proves_fanout_and_flat_request_count() {
         report.combos.len(),
         expected_partitions.len() * 2,
         "one entry per (target_partitions x cache) combination"
+    );
+
+    // The planning prune's per-segment serialized await is only visible with
+    // enough segments to serialize; two made it a rounding error. The report
+    // carries the real figure rather than prose about it.
+    assert_eq!(
+        report.planning.segments, segments,
+        "the planning measurement must cover every segment in the fixture"
+    );
+    assert!(
+        segments >= 32,
+        "the fixture needs enough segments for `compute_plan_counts`'s \
+         per-segment serialized await to be measurable; got {segments}"
+    );
+    assert!(
+        report.planning.serial_ms > 0.0 && report.planning.total_blocks > 0,
+        "planning measurement must report real work: {} ms over {} blocks",
+        report.planning.serial_ms,
+        report.planning.total_blocks
     );
 
     let mut get_by_combo: HashMap<(usize, bool), u64> = HashMap::new();
@@ -57,35 +77,39 @@ async fn logs_scan_scaling_smoke_proves_fanout_and_flat_request_count() {
             "a bare `SELECT ts, body FROM logs` returns every record"
         );
 
-        // The declared scan fan-out is target_partitions regardless of the
-        // segment count -- the capability block-level striping adds. Under the
-        // old segment-granular rule this would have been min(tp, segments).
+        // The declared fan-out is `target_partitions` only when the read cache is
+        // wired (ADR-0102 decision 1's precondition: the fetch unit is the whole
+        // object, so the extra partitions' repeated reads need the cache to
+        // coalesce). Un-cached it falls back to the pre-item-1 bound.
+        let expected = if c.cache_wired {
+            c.target_partitions
+        } else {
+            c.target_partitions.min(segments)
+        };
         assert_eq!(
-            c.scan_partitions, c.target_partitions,
-            "block-level striping declares target_partitions scan partitions, not \
-             min(tp, segments): tp={}, observed {}",
-            c.target_partitions, c.scan_partitions
+            c.scan_partitions, expected,
+            "tp={} cache={}: expected {expected} scan partitions, got {}",
+            c.target_partitions, c.cache_wired, c.scan_partitions
         );
 
-        // The undersubscribed capability: more non-empty partitions than
-        // segments once the partition count exceeds the segment count. The
-        // dataset has many blocks per segment, so every partition up to tp gets
-        // at least one block.
-        if c.target_partitions > segments {
+        // Every declared partition owns blocks on this fixture (192 blocks across
+        // at most 64 partitions), so the non-empty count matches the declared
+        // one -- and in the cached, undersubscribed case that exceeds the segment
+        // count, which is the capability this item adds.
+        assert_eq!(
+            c.non_empty_partitions, expected,
+            "tp={} cache={}: every declared partition should decode blocks; got {}",
+            c.target_partitions, c.cache_wired, c.non_empty_partitions
+        );
+        if c.cache_wired && c.target_partitions > segments {
             assert!(
                 c.non_empty_partitions > segments,
-                "tp={} (> {segments} segments) must fan out to more than {segments} \
-                 non-empty partitions; got {}",
+                "cached tp={} (> {segments} segments) must fan out past the \
+                 segment count; got {}",
                 c.target_partitions,
                 c.non_empty_partitions
             );
         }
-        assert_eq!(
-            c.non_empty_partitions, c.target_partitions,
-            "with many blocks per segment every partition up to tp={} decodes \
-             blocks; got {}",
-            c.target_partitions, c.non_empty_partitions
-        );
 
         get_by_combo.insert(
             (c.target_partitions, c.cache_wired),
@@ -93,39 +117,69 @@ async fn logs_scan_scaling_smoke_proves_fanout_and_flat_request_count() {
         );
     }
 
-    // Request-count story (ADR-0046): with the cache wired, the whole-object
-    // reads the striping issues coalesce (single-flight) so the GET count is
-    // FLAT across the whole sweep -- one whole-object GET per segment plus the
-    // constant catalog-resolve traffic, independent of the partition count.
-    // Without the cache each partition issues its own whole-object GET, so the
-    // raw count is at least the cached count and climbs with the partition
-    // count. (`segments` is unused directly here because the absolute count
-    // includes constant catalog GETs; the invariant is flatness, not a literal.)
-    let _ = segments;
-    let cached_at_1 = get_by_combo[&(1, true)];
-    for &tp in &expected_partitions {
-        let cached = get_by_combo[&(tp, true)];
-        let uncached = get_by_combo[&(tp, false)];
+    // Request count, un-cached: once `target_partitions` reaches the segment
+    // count the partition count stops growing, so the GET count stops growing
+    // with it. This is the property the has_cache gate buys -- without it, every
+    // partition past the segment count added whole-object reads that nothing
+    // absorbed.
+    let at_cap = expected_partitions
+        .iter()
+        .copied()
+        .filter(|&tp| tp >= segments)
+        .collect::<Vec<_>>();
+    assert!(
+        at_cap.len() >= 2,
+        "the sweep must contain at least two `target_partitions` values at or \
+         above the segment count to show the un-cached count going flat; got {at_cap:?}"
+    );
+    let baseline = get_by_combo[&(at_cap[0], false)];
+    for &tp in &at_cap[1..] {
         assert_eq!(
-            cached, cached_at_1,
-            "cache-wired GET count must be flat across the sweep: tp={tp} issued \
-             {cached}, tp=1 issued {cached_at_1}"
-        );
-        assert!(
-            uncached >= cached,
-            "un-cached tp={tp} GET count ({uncached}) must be at least the cached count ({cached})"
+            get_by_combo[&(tp, false)],
+            baseline,
+            "un-cached GET count must be flat once the segment-count cap binds: \
+             tp={tp} issued {}, tp={} issued {baseline}",
+            get_by_combo[&(tp, false)],
+            at_cap[0]
         );
     }
 
-    // The un-cached raw GET count actually grows with the partition count: the
-    // largest swept tp issues strictly more GETs than tp=1. This is the
-    // regression the cache neutralizes, measured directly.
+    // Request count, cache-wired: this is the side that keeps adding partitions
+    // past the segment count, so it is the side where repeated whole-object reads
+    // at one key actually happen. On this fixture -- a cache sized to hold every
+    // object, no eviction -- they coalesce completely and the GET count is flat
+    // across the sweep, and below the un-cached count at every partition value.
+    // "Flat" is a property of THIS fixture, not of striping: a cache too small to
+    // hold the working set would evict between partitions and issue GETs again.
+    let &min_tp = expected_partitions.iter().min().unwrap();
+    let cached_baseline = get_by_combo[&(min_tp, true)];
+    for &tp in &expected_partitions {
+        assert_eq!(
+            get_by_combo[&(tp, true)],
+            cached_baseline,
+            "cache-wired GET count is flat across the sweep on this fixture: \
+             tp={tp} issued {}, tp={min_tp} issued {cached_baseline}",
+            get_by_combo[&(tp, true)]
+        );
+        assert!(
+            get_by_combo[&(tp, true)] <= get_by_combo[&(tp, false)],
+            "cache-wired tp={tp} GET count ({}) must not exceed the un-cached \
+             count ({})",
+            get_by_combo[&(tp, true)],
+            get_by_combo[&(tp, false)]
+        );
+    }
+
+    // The multiplier the segment-count cap bounds but does not remove: below the
+    // cap, raising `target_partitions` still adds whole-object reads, because
+    // every partition owning blocks in a segment opens that segment itself. Only
+    // a single-partition plan matches the pre-item-1 whole-segment request count.
     let &max_tp = expected_partitions.iter().max().unwrap();
-    if max_tp > 1 {
+    if min_tp == 1 && max_tp > 1 {
         assert!(
             get_by_combo[&(max_tp, false)] > get_by_combo[&(1, false)],
-            "un-cached GET count must climb with target_partitions: tp={max_tp} \
-             issued {}, tp=1 issued {}",
+            "un-cached GET count still climbs from a single partition to the cap: \
+             tp={max_tp} issued {}, tp=1 issued {}",
             get_by_combo[&(max_tp, false)],
             get_by_combo[&(1, false)]
         );
