@@ -169,6 +169,11 @@ path = "src/bin/distrib_crossover_bench.rs"
 bench = false
 
 [[bin]]
+name = "pushdown_crossover_bench"
+path = "src/bin/pushdown_crossover_bench.rs"
+bench = false
+
+[[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
 bench = false
@@ -299,6 +304,11 @@ bench = false
 [[test]]
 name = "distrib_crossover_smoke"
 path = "tests/distrib_crossover_smoke.rs"
+bench = false
+
+[[test]]
+name = "pushdown_crossover_smoke"
+path = "tests/pushdown_crossover_smoke.rs"
 bench = false
 
 # The test body is gated on `sql-latency` (empty crate without it), so this

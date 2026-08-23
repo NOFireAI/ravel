@@ -12,6 +12,7 @@ pub mod groupby_scaling;
 pub mod harness;
 pub mod ingest;
 pub mod profiling;
+pub mod pushdown_crossover;
 pub mod query_latency;
 #[cfg(feature = "parquet-baseline")]
 pub mod read_accounting;
