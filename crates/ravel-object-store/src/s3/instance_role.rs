@@ -268,7 +268,12 @@ impl CredentialProvider for InstanceRoleCredentialProvider {
             Err(e) => {
                 // A transient failure keeps serving the cached credential while
                 // it is still valid; only an actually-expired credential fails
-                // the request (and counts).
+                // the request (and counts). Re-read the clock: a refresh runs
+                // three bounded IMDS calls and can take seconds, so a credential
+                // that was unexpired at the pre-refresh `now` may have crossed
+                // its Expiration by the time the refresh failed. Deciding on the
+                // stale `now` would serve it once, uncounted and unlogged.
+                let now = self.clock.now_unix_nanos();
                 let (credential, expiration) = {
                     let guard = self.state.read();
                     (Arc::clone(&guard.credential), guard.expiration_unix_nanos)
@@ -297,16 +302,21 @@ impl CredentialProvider for InstanceRoleCredentialProvider {
 /// and safe to call from either context without touching the caller's runtime.
 fn fetch_blocking(endpoint: &str) -> Result<Fetched, FetchError> {
     std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
+        // spawn_scoped, not scope.spawn: the latter panics if the OS refuses
+        // the thread (EAGAIN under a thread-count or memory limit), which would
+        // panic through this synchronous constructor. Map that failure to a
+        // typed error like the runtime-build failure inside the thread already
+        // is.
+        let handle = std::thread::Builder::new()
+            .spawn_scoped(scope, || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| FetchError::Client(e.to_string()))?;
                 runtime.block_on(fetch_once(endpoint))
             })
-            .join()
-            .unwrap_or(Err(FetchError::Panicked))
+            .map_err(|e| FetchError::Client(e.to_string()))?;
+        handle.join().unwrap_or(Err(FetchError::Panicked))
     })
 }
 
@@ -426,7 +436,16 @@ fn parse_imds_expiration(value: &str) -> Result<i64, FetchError> {
         .ok_or_else(bad)?
         .parse()
         .map_err(|_| bad())?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Bound the year before the era math: days_from_civil multiplies the era
+    // by 146_097, which overflows i64 for a year past ~2.5e16 (a debug-build
+    // panic, a release-build wrap that can slip past the later checked_mul).
+    // No real IMDS emits such a value; a hostile or mock endpoint can. Four
+    // digits covers every Expiration IMDS can carry.
+    if date_parts.next().is_some()
+        || !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
         return Err(bad());
     }
 
@@ -541,6 +560,28 @@ mod tests {
     impl WallClock for FakeClock {
         fn now_unix_nanos(&self) -> i64 {
             self.0.load(O::Relaxed)
+        }
+    }
+
+    /// A clock that reports `before` until the mock IMDS has served its second
+    /// credential-document GET (one at construction, one for the request-path
+    /// refresh), then `after`. Models a credential whose `Expiration` crosses
+    /// during the refresh's network window: unexpired when `get_credential`
+    /// samples the clock before refreshing, expired by the time the refresh has
+    /// run and failed.
+    struct RefreshCrossingClock {
+        imds: Arc<ImdsState>,
+        before: i64,
+        after: i64,
+    }
+
+    impl WallClock for RefreshCrossingClock {
+        fn now_unix_nanos(&self) -> i64 {
+            if self.imds.doc_requests.load(O::Relaxed) >= 2 {
+                self.after
+            } else {
+                self.before
+            }
         }
     }
 
@@ -824,5 +865,127 @@ mod tests {
                 "{bad:?} must be rejected, not parsed or panic"
             );
         }
+    }
+
+    /// Finding 1: a credential whose `Expiration` crosses during the refresh
+    /// window must not be served once, uncounted. The refresh is broken and
+    /// the clock is unexpired when sampled before the refresh but expired once
+    /// the refresh has run and failed; the request must fail typed and count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn just_expired_during_refresh_fails_typed() {
+        let state = ImdsState::new(role_doc("AKIA_CROSS", "cross-secret", "cross-token", EXP_A));
+        let endpoint = spawn_imds(Arc::clone(&state)).await;
+        let exp_a = parse_imds_expiration(EXP_A).expect("exp");
+
+        // Inside the refresh margin but unexpired when sampled before the
+        // refresh; one nanosecond past expiry after the refresh's document GET.
+        let clock: Arc<dyn WallClock> = Arc::new(RefreshCrossingClock {
+            imds: Arc::clone(&state),
+            before: exp_a - 60 * 1_000_000_000,
+            after: exp_a + 1,
+        });
+        let provider = tokio::task::spawn_blocking(move || {
+            InstanceRoleCredentialProvider::with_clock(endpoint, clock)
+        })
+        .await
+        .expect("join")
+        .expect("eager fetch");
+
+        // Break the refresh so it fails after its document GET has advanced the
+        // clock past expiry.
+        state.doc_status.store(500, O::Relaxed);
+
+        let err = provider.get_credential().await.expect_err(
+            "a credential that expires during the refresh must fail, not be served once",
+        );
+        assert!(
+            matches!(err, object_store::Error::Generic { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            provider.refresh_failures(),
+            1,
+            "the expiry that crossed during the refresh must be counted, not served silently"
+        );
+    }
+
+    /// Finding 2: two expiries inside one warning interval both increment the
+    /// failure counter (it accumulates past 1), while the warning is
+    /// rate-limited to the first, and a later expiry past the interval warns
+    /// again. Mirrors the `s3::credentials` rate-limit shape via the injected
+    /// clock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warning_rate_limited_and_counter_accumulates() {
+        let state = ImdsState::new(role_doc("AKIA_EXP", "exp-secret", "exp-token", EXP_A));
+        let endpoint = spawn_imds(Arc::clone(&state)).await;
+        let exp_a = parse_imds_expiration(EXP_A).expect("exp");
+
+        let clock = FakeClock::new(exp_a - ONE_HOUR_NANOS);
+        let provider = build_provider(endpoint, Arc::clone(&clock))
+            .await
+            .expect("eager fetch");
+
+        // Refresh broken and the credential expired: the request fails, counts,
+        // and warns (first expiry stamps the clock).
+        state.doc_status.store(500, O::Relaxed);
+        clock.set(exp_a + 1);
+        provider
+            .get_credential()
+            .await
+            .expect_err("first expired-and-broken refresh must fail");
+        assert_eq!(provider.refresh_failures(), 1);
+        let first_warn = provider.last_warned_nanos.load(O::Relaxed);
+        assert_eq!(
+            first_warn,
+            exp_a + 1,
+            "the first expiry must warn and stamp the clock"
+        );
+
+        // A second expiry still inside WARNING_INTERVAL_NANOS: the counter must
+        // accumulate past 1, but the warning is suppressed (stamp unchanged).
+        clock.set(exp_a + 2);
+        provider
+            .get_credential()
+            .await
+            .expect_err("second expired failure");
+        assert_eq!(
+            provider.refresh_failures(),
+            2,
+            "every expiry counts, whether its warning is suppressed or not"
+        );
+        assert_eq!(
+            provider.last_warned_nanos.load(O::Relaxed),
+            first_warn,
+            "a warning inside the interval must be rate-limited, not re-emitted"
+        );
+
+        // Past the interval: the warning is due again and re-stamps.
+        let later = exp_a + 1 + WARNING_INTERVAL_NANOS;
+        clock.set(later);
+        provider
+            .get_credential()
+            .await
+            .expect_err("third expired failure");
+        assert_eq!(provider.refresh_failures(), 3);
+        assert_eq!(
+            provider.last_warned_nanos.load(O::Relaxed),
+            later,
+            "past the interval the warning fires again"
+        );
+    }
+
+    /// Finding 3: an absurd parsed year (past the ~2.5e16 overflow threshold of
+    /// `days_from_civil`) must be a typed parse error, never a debug-build panic
+    /// or a release-build wrap. Unreachable from real IMDS, reachable from a
+    /// hostile or mock endpoint.
+    #[test]
+    fn absurd_expiration_year_is_typed_error() {
+        let err = parse_imds_expiration("30000000000000000-01-01T00:00:00Z")
+            .expect_err("an absurd year must be a typed error, never a panic or overflow");
+        assert!(matches!(err, FetchError::BadExpiration(_)), "{err:?}");
+        // A normal far-future year (inside the i64-nanoseconds range, which
+        // itself caps near year 2262) still parses: the bound rejects the
+        // absurd, not ordinary timestamps.
+        assert!(parse_imds_expiration("2200-06-15T12:00:00Z").is_ok());
     }
 }
