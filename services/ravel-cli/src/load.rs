@@ -2094,4 +2094,69 @@ type = "i64"
             builds_started.load(Ordering::SeqCst)
         );
     }
+
+    /// A rejected row in the *second* batch must report its absolute index
+    /// into the whole file, not an index relative to that batch. `row_base` is
+    /// now threaded through `decode_and_build`, a free function outside the
+    /// loop the prefetch refactor introduced, and easy to drop by accident
+    /// (no existing test drove a real multi-batch `load()` far enough to catch
+    /// it: `future_skew_beyond_the_bound_is_rejected` calls `build_record`
+    /// directly on row 0, and `batch_failed_reports_durable_tokens_not_empty`
+    /// hand-constructs a `LoadError` rather than running a load). Change
+    /// `row_base + row as u64` to `row as u64` in `decode_and_build`'s
+    /// `RowRejected` arm and this fails with `left: 2, right: 0`.
+    #[tokio::test]
+    async fn a_rejected_row_in_a_later_batch_reports_its_absolute_index() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+
+        let limits = LogIngestLimits::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("two_batches.parquet");
+
+        // Rows 0-1 are batch 1 (batch_rows: 2) and valid. Row 2, the first row
+        // of batch 2, is far enough in the future to be rejected.
+        let ts = vec![
+            NOW_NS,
+            NOW_NS,
+            NOW_NS + limits.max_future_skew_ns + 1,
+            NOW_NS,
+        ];
+        let batch_data = batch(vec![("ts", i64_col(ts))]);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, batch_data.schema(), None).expect("arrow writer");
+        writer.write(&batch_data).expect("write batch");
+        writer.close().expect("close writer");
+
+        let m = base_mapping();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let err = load(
+            Arc::clone(&store),
+            &pq,
+            "acme",
+            &m,
+            4,
+            2,
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect_err("the far-future row must be rejected");
+
+        match err {
+            LoadError::RowRejected { row, durable, .. } => {
+                assert_eq!(
+                    row, 2,
+                    "row index must be absolute across batches, not relative to its own batch"
+                );
+                assert!(
+                    !durable.is_empty(),
+                    "batch 1's write must already be durable: it was fully awaited before \
+                     batch 2 was even decoded"
+                );
+            }
+            other => panic!("expected RowRejected, got {other:?}"),
+        }
+    }
 }
