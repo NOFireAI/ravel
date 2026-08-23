@@ -9,18 +9,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use bytes::Bytes;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{Clock, IngestConfig, IngestRouter, SystemClock, WriteMode};
-use ravel_object_store::{
-    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
-    PageToken, PutOptions, PutOutcome, StoreError, list_all,
-};
+use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, list_all};
 use ravel_promql::Value;
 use ravel_query::{EngineConfig, QueryEngine};
 use ravel_types::{Signal, TenantId, TimeRange};
@@ -152,85 +147,6 @@ pub struct VisibilityReport {
     pub unresolved_count: usize,
     pub avg: f64,
     pub max: f64,
-}
-
-/// GET/LIST call counts and GET bytes returned, for the query phase. Not the
-/// same type as
-/// `catalog_resolve_bench`'s `Counters`/`CountingStore`: that one has no byte
-/// counter (it only needed request counts) and is private to that bin, so it
-/// is duplicated here rather than shared -- see the final report for why
-/// this was not worth extracting alongside `harness::store_from_env`.
-#[derive(Default)]
-struct QueryCounters {
-    get: AtomicU64,
-    list: AtomicU64,
-    bytes_read: AtomicU64,
-}
-
-struct CountingStore {
-    inner: Arc<dyn ObjectStoreBackend>,
-    counters: Arc<QueryCounters>,
-}
-
-impl CountingStore {
-    fn wrap(
-        inner: Arc<dyn ObjectStoreBackend>,
-    ) -> (Arc<dyn ObjectStoreBackend>, Arc<QueryCounters>) {
-        let counters = Arc::new(QueryCounters::default());
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(CountingStore {
-            inner,
-            counters: Arc::clone(&counters),
-        });
-        (store, counters)
-    }
-}
-
-#[async_trait]
-impl ObjectStoreBackend for CountingStore {
-    async fn put(
-        &self,
-        key: &str,
-        data: Bytes,
-        opts: PutOptions,
-    ) -> Result<PutOutcome, StoreError> {
-        self.inner.put(key, data, opts).await
-    }
-
-    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        self.counters.get.fetch_add(1, Ordering::Relaxed);
-        let outcome = self.inner.get(key, range).await?;
-        self.counters
-            .bytes_read
-            .fetch_add(outcome.data.len() as u64, Ordering::Relaxed);
-        Ok(outcome)
-    }
-
-    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
-        self.inner.head(key).await
-    }
-
-    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
-        self.counters.list.fetch_add(1, Ordering::Relaxed);
-        self.inner.list(prefix, page).await
-    }
-
-    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
-        self.counters.list.fetch_add(1, Ordering::Relaxed);
-        self.inner.list_delimited(prefix).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.inner.delete(key).await
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        // multipart: false to match the refusing default `put_multipart` this
-        // double inherits.
-        Capabilities {
-            multipart: false,
-            ..self.inner.capabilities()
-        }
-    }
 }
 
 pub async fn run(config: &E2eConfig) -> Report {
@@ -448,11 +364,15 @@ pub async fn run(config: &E2eConfig) -> Report {
         2 * (metrics.flushes_by_size + metrics.flushes_by_age + metrics.flushes_manual);
 
     // Query phase: wraps the same (now-populated) store in a fresh
-    // GET/LIST/byte counter and a fresh Catalog/QueryEngine, then runs the
-    // configured instant selector repeatedly for latency percentiles. Always
-    // "hot" -- there is no segment-footer cache in `ravel-query` yet
-    // (a cold-state variant is future work).
-    let (query_store, query_counters) = CountingStore::wrap(Arc::clone(&store));
+    // `InstrumentedStore` (the one object-store counter this crate uses, shared
+    // with the server per ADR-0104 decision 5) and a fresh Catalog/QueryEngine,
+    // then runs the configured instant selector repeatedly for latency
+    // percentiles. Always "hot" -- there is no segment-footer cache in
+    // `ravel-query` yet (a cold-state variant is future work). Only the query
+    // phase is counted, so ingest PUTs never enter these GET/LIST totals.
+    let query_instrumented = Arc::new(InstrumentedStore::new(Arc::clone(&store)));
+    let query_metrics = query_instrumented.metrics();
+    let query_store: Arc<dyn ObjectStoreBackend> = query_instrumented;
     let query_catalog = Arc::new(
         Catalog::new(
             Arc::clone(&query_store),
@@ -491,10 +411,11 @@ pub async fn run(config: &E2eConfig) -> Report {
             };
         }
     }
+    let query_snapshot = query_metrics.snapshot();
     let (query_get_count, query_list_count, query_bytes_read) = (
-        query_counters.get.load(Ordering::Relaxed),
-        query_counters.list.load(Ordering::Relaxed),
-        query_counters.bytes_read.load(Ordering::Relaxed),
+        query_snapshot.get.calls,
+        query_snapshot.list_calls(),
+        query_snapshot.get.bytes,
     );
 
     Report {

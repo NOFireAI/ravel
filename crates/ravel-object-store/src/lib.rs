@@ -13,13 +13,17 @@ pub mod memory;
 pub mod s3;
 pub mod scheduling;
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 /// Per-operation counters, latency histogram, and byte totals for any backend
 /// ([`instrument`]). Observability only: never correctness-bearing, and
 /// wrapping a backend is a zero behavior change (results and
 /// [`Capabilities`] pass through verbatim).
-pub use instrument::{InstrumentedStore, StoreMetrics};
+pub use instrument::{
+    InstrumentedStore, OpMetricsSnapshot, StoreMetrics, StoreMetricsSnapshot, StoreOp,
+};
 
 /// Per-tenant SSE-KMS key routing decorator (ADR-0062 decision 1a): routes
 /// tenant writes to lazily-built, cached per-tenant [`s3::S3Store`]s while every
@@ -451,6 +455,59 @@ pub trait ObjectStoreBackend: Send + Sync + 'static {
     async fn delete(&self, key: &str) -> Result<(), StoreError>;
 
     fn capabilities(&self) -> Capabilities;
+}
+
+/// A shared handle is itself a backend, forwarding every method to the pointee.
+///
+/// `?Sized` so this covers `Arc<dyn ObjectStoreBackend>` as well as
+/// `Arc<ConcreteStore>`, which is what lets a decorator whose type parameter is
+/// `S: ObjectStoreBackend` (for example [`InstrumentedStore`]) wrap an
+/// already-type-erased `Arc<dyn ObjectStoreBackend>`: without this impl the
+/// erased handle is not itself a backend and cannot be a decorator's `S`. Every
+/// method delegates to the pointee, `put_multipart` and `capabilities`
+/// included, so a `multipart: true` backend keeps that capability through the
+/// `Arc` rather than falling back to the refusing default.
+#[async_trait::async_trait]
+impl<T: ObjectStoreBackend + ?Sized> ObjectStoreBackend for Arc<T> {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        (**self).put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        (**self).get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        (**self).put_multipart(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        (**self).head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        (**self).list(prefix, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        (**self).list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        (**self).delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        (**self).capabilities()
+    }
 }
 
 /// Drain every page of a listing, deduplicating by key per the cross-page
