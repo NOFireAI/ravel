@@ -445,6 +445,10 @@ jobs:
   #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
   #   - ravel-bench --features sql-latency      (ravel-sql; the SQL corpus and
   #                                              its construct gate, ADR-0100)
+  #   - ravel-bench --features stage-timing     (ravel-ingest/stage-timing;
+  #                                              per-stage ingest breakdown,
+  #                                              ADR-0104. RUNS its test, does
+  #                                              not merely compile it)
   #
   # `flight-sql` used to be probed here too. It moved to the `flight-sql` job
   # above, which lints and RUNS it: a compile-only probe let every test behind
@@ -497,6 +501,18 @@ jobs:
         # the step above (same feature set, same target dir).
       - name: Test ravel-bench --features sql-latency
         run: cargo test --locked -p ravel-bench --features sql-latency
+      - name: Check ravel-bench --features stage-timing
+        run: cargo check --locked -p ravel-bench --features stage-timing --all-targets
+        # RUN the stage-timing acceptance test, not merely compile it (ADR-0104
+        # decision 2b). The test drives the default-built `ingest_bench` binary
+        # as a subprocess and asserts it emits the per-stage breakdown, so this
+        # lane proves the shipping binary is reachable, not only that
+        # ravel-ingest compiles the seam. `cargo test` also builds every
+        # consumer bin with the feature on, which is where a cfg-gated
+        # constructor param would break: it proves the CALLERS link, not just
+        # the crate that declares the feature.
+      - name: Test ravel-bench --features stage-timing
+        run: cargo test --locked -p ravel-bench --features stage-timing
 
   # Supply-chain gate. deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no

@@ -24,7 +24,7 @@ use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_types::{Signal, TenantId, TimeRange};
 use serde::Serialize;
 
-use crate::generator::{BatchSizeDistribution, WorkloadConfig, generate_batches};
+use crate::generator::{BatchSizeDistribution, WorkloadConfig};
 use crate::harness::{StoreKind, store_from_env};
 
 /// Bytes on the wire per logical sample: `ts_ns: i64` + `value: f64`. Used as
@@ -234,6 +234,98 @@ pub struct Report {
     pub logical_bytes: u64,
     pub write_amplification: f64,
     pub visibility_lag_ms: VisibilityReport,
+    /// Per-stage ingest timing (ADR-0104 decision 2b). Present only when the bin
+    /// is built with the `stage-timing` feature; the field is compiled out
+    /// otherwise, so a feature-off run emits valid JSON simply lacking it and
+    /// every consumer (epic #51's `bench_compare`) must treat it as optional.
+    #[cfg(feature = "stage-timing")]
+    pub stage_breakdown: StageBreakdown,
+}
+
+/// Per-stage ingest timing breakdown (ADR-0104 decision 2). Two groups kept
+/// deliberately apart so a `decode`/`normalize` figure the harness timed itself
+/// can never be misread as a seam-reported router/shard stage: `harness_stages`
+/// are the bench's own synthetic decode/normalize (measured before the router,
+/// no seam), `seam_stages` are the four stages the `ravel-ingest/stage-timing`
+/// seam reports (`admit`/`route` in the router, `merge`/`encode` in the shard).
+#[cfg(feature = "stage-timing")]
+#[derive(Serialize)]
+pub struct StageBreakdown {
+    pub harness_stages: HarnessStages,
+    pub seam_stages: SeamStages,
+}
+
+/// The two stages the harness times directly (ADR-0104 decision 2, "harness, no
+/// seam"). Named fields, not a map, so the stage set is exactly these two.
+#[cfg(feature = "stage-timing")]
+#[derive(Serialize)]
+pub struct HarnessStages {
+    pub decode: StageTiming,
+    pub normalize: StageTiming,
+}
+
+/// The four stages the `ravel-ingest` stage-timing seam reports for the metrics
+/// pipeline (`ingest_bench` drives `IngestRouter`). Named fields, not a map, so
+/// the stage set is exactly these four: no missing stage, no extra one.
+#[cfg(feature = "stage-timing")]
+#[derive(Serialize)]
+pub struct SeamStages {
+    pub admit: StageTiming,
+    pub route: StageTiming,
+    pub merge: StageTiming,
+    pub encode: StageTiming,
+}
+
+/// One stage's accumulated nanoseconds and the number of measurements folded
+/// into them.
+#[cfg(feature = "stage-timing")]
+#[derive(Serialize)]
+pub struct StageTiming {
+    pub total_ns: u64,
+    pub samples: u64,
+}
+
+#[cfg(feature = "stage-timing")]
+impl StageBreakdown {
+    /// Assembles the breakdown from the two harness-measured durations and a
+    /// snapshot of the seam accumulator. A seam stage that recorded nothing maps
+    /// to a zero timing rather than being dropped, so a never-wired stage shows
+    /// up as a zero the acceptance test names instead of a silently absent key.
+    fn collect(
+        decode: std::time::Duration,
+        normalize: std::time::Duration,
+        snap: &ravel_ingest::MetricStageSnapshot,
+    ) -> Self {
+        use ravel_ingest::MetricStage;
+        let seam = |stage: MetricStage| match snap.get(stage) {
+            Some(t) => StageTiming {
+                total_ns: t.total_ns,
+                samples: t.samples,
+            },
+            None => StageTiming {
+                total_ns: 0,
+                samples: 0,
+            },
+        };
+        StageBreakdown {
+            harness_stages: HarnessStages {
+                decode: StageTiming {
+                    total_ns: decode.as_nanos() as u64,
+                    samples: 1,
+                },
+                normalize: StageTiming {
+                    total_ns: normalize.as_nanos() as u64,
+                    samples: 1,
+                },
+            },
+            seam_stages: SeamStages {
+                admit: seam(MetricStage::Admit),
+                route: seam(MetricStage::Route),
+                merge: seam(MetricStage::Merge),
+                encode: seam(MetricStage::Encode),
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -344,7 +436,24 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         batch_size: BatchSizeDistribution::fixed(config.batch_size),
         ..WorkloadConfig::default()
     };
-    let batches = generate_batches(&workload).expect("generate workload");
+    // Fixture generation. With `stage-timing` on, split it at the
+    // decode/normalize boundary and time each half directly: these are the
+    // harness's own synthetic decode/normalize (ADR-0104 decision 2, "harness,
+    // no seam"), measured here before the router so they are excluded from the
+    // seam and from the flamegraph below. The batches produced are identical to
+    // `generate_batches`, so the measured ingest path is unchanged either way.
+    #[cfg(not(feature = "stage-timing"))]
+    let batches = crate::generator::generate_batches(&workload).expect("generate workload");
+    #[cfg(feature = "stage-timing")]
+    let (batches, decode_elapsed, normalize_elapsed) = {
+        let decode_start = std::time::Instant::now();
+        let series = crate::generator::generate_decoded(&workload).expect("generate workload");
+        let decode_elapsed = decode_start.elapsed();
+        let normalize_start = std::time::Instant::now();
+        let batches = crate::generator::normalize_into_batches(&workload, series);
+        let normalize_elapsed = normalize_start.elapsed();
+        (batches, decode_elapsed, normalize_elapsed)
+    };
 
     // Start the CPU profiler here, immediately after fixture generation, so the
     // measured region brackets the ingest write path and excludes workload
@@ -558,6 +667,16 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         depth_report(samples.clone())
     };
 
+    // Snapshot the seam after every strict write has acked and the trailing
+    // flush drained, so admit/route (router) and merge/encode (shard flush)
+    // have all recorded.
+    #[cfg(feature = "stage-timing")]
+    let stage_breakdown = StageBreakdown::collect(
+        decode_elapsed,
+        normalize_elapsed,
+        &router.stage_timings().snapshot(),
+    );
+
     let metrics = router.metrics().snapshot();
     let objects = list_all(store.as_ref(), "")
         .await
@@ -604,6 +723,8 @@ pub async fn run(config: &IngestBenchConfig) -> Report {
         logical_bytes,
         write_amplification,
         visibility_lag_ms: visibility,
+        #[cfg(feature = "stage-timing")]
+        stage_breakdown,
     }
 }
 

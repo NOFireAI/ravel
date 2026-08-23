@@ -116,6 +116,13 @@ flight-egress = [
 # bench bins wrap their measured region in a sampler when
 # `RAVEL_BENCH_PROFILE_SVG` names an output path (see `src/profiling.rs`).
 profiling = ["dep:pprof"]
+# Per-stage ingest timing (ADR-0104 decision 2b). Off by default: the shipping
+# `ingest_bench` bin compiles and runs in BOTH modes and only emits the
+# stage-breakdown field with this on, so no default gate stops covering the bin
+# and the default build never fails on a cfg-gated seam. Forwards to
+# `ravel-ingest/stage-timing`, which compiles the monotonic `Instant` seam into
+# the metrics/logs actors. Adds no new external dependency.
+stage-timing = ["ravel-ingest/stage-timing"]
 # The ADR-0100 decision 3 SQL corpus (`src/sql_corpus.rs`) and, once #428
 # lands, the `sql_latency_bench` harness that runs it. Off by default: the
 # corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
