@@ -13,7 +13,17 @@ rust-version.workspace = true
 # compiled out entirely, so a default build is unchanged.
 stage-timing = ["ravel-ingest/stage-timing"]
 
+# CPU flamegraph lane for `load --parquet` (issue #365's pattern, mirroring
+# crates/ravel-bench/src/profiling.rs). Off by default so a default build never
+# links `pprof`. When on and RAVEL_CLI_PROFILE_SVG names a path, `load`'s
+# measured region is wrapped in a `pprof` CPU sampler and a flamegraph SVG is
+# written there.
+profiling = ["dep:pprof"]
+
 [dependencies]
+# Optional: see the `profiling` feature above. Same version/feature set as
+# crates/ravel-bench's pin so the two crates' flamegraphs are comparable.
+pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }

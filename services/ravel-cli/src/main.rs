@@ -1172,7 +1172,8 @@ async fn main() -> anyhow::Result<()> {
             shards,
             batch_rows,
         } => {
-            ravel_cli::load::run(
+            let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
+            let result = ravel_cli::load::run(
                 store::build_store(&cli.store)?,
                 &parquet,
                 &tenant,
@@ -1181,7 +1182,9 @@ async fn main() -> anyhow::Result<()> {
                 batch_rows,
                 now_ns()?,
             )
-            .await
+            .await;
+            profile.finish();
+            result
         }
     }
 }
