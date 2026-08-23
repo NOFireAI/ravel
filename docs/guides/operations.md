@@ -24,8 +24,12 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 | `--s3-endpoint <url>` | `RAVEL_S3_ENDPOINT` | none | Custom S3 endpoint (MinIO, or any S3-compatible store). Unset means real AWS S3. It also turns on `allow_http` for that endpoint. |
 | `--s3-bucket <name>` | `RAVEL_S3_BUCKET` | none | Required when `--store s3`. |
 | `--s3-region <region>` | `RAVEL_S3_REGION` | `us-east-1` | |
-| `--s3-access-key <key>` | `RAVEL_S3_ACCESS_KEY` | none | Required when `--store s3`. |
-| `--s3-secret-key <secret>` | `RAVEL_S3_SECRET_KEY` | none | Required when `--store s3`. |
+| `--s3-access-key <key>` | `RAVEL_S3_ACCESS_KEY` | none | Required when `--store s3` under the default `--s3-auth static`. Must be unset under `--s3-auth instance-role`. |
+| `--s3-secret-key <secret>` | `RAVEL_S3_SECRET_KEY` | none | Required when `--store s3` under the default `--s3-auth static`. Must be unset under `--s3-auth instance-role`. |
+| `--s3-auth <static\|instance-role>` | `RAVEL_S3_AUTH` | `static` | Where `--store s3` gets its credentials (ADR-0106). `static` is unchanged behavior: the access key and secret key are both required. `instance-role` drops that requirement and fetches short-lived credentials from the EC2 instance metadata service (IMDSv2) instead, so an EC2 deployment stores no static keys at all; the first fetch happens at startup, so a misconfigured instance role fails to start rather than failing its first request. Combining it with `--s3-access-key`, `--s3-secret-key`, `--s3-session-token`, or `--s3-credentials-file` is a startup error naming the conflicting flag, not a precedence rule. With SSE-KMS on, the instance role needs `kms:GenerateDataKey` and `kms:Decrypt` on the key. |
+| `--s3-session-token <token>` | `RAVEL_S3_SESSION_TOKEN` | none | Temporary AWS session token paired with the access key and secret key for STS-issued credentials (ADR-0072 decision 1). Ignored when `--s3-credentials-file` is set: the file wins. Only meaningful under `--s3-auth static`. |
+| `--s3-credentials-file <path>` | `RAVEL_S3_CREDENTIALS_FILE` | none | JSON file of `{access_key_id, secret_access_key, session_token}` (`session_token` optional) that an external process rotates on disk (ADR-0072 decision 1). Read and parsed once at startup, so an unreadable or malformed file fails startup; after that it is re-read on the request path only when its mtime changes, and a parse failure while rotating keeps serving the last-good credential with a rate-limited warning. Wins over the inline key flags. Only meaningful under `--s3-auth static`. |
+| `--s3-instance-metadata-endpoint <url>` | `RAVEL_S3_INSTANCE_METADATA_ENDPOINT` | none (the AWS link-local address) | Base URL of the instance metadata service, used only under `--s3-auth instance-role`. Exists so tests and unusual deployments can redirect IMDS; leave it unset on EC2. |
 | `--s3-kms-key <arn>` | `RAVEL_S3_KMS_KEY` | none | Single-key SSE-KMS (ADR-0062 decision 1c): every PUT the default store makes is encrypted with this KMS key ARN, applied to `S3Config.kms_key_id`. Off by default: unset, the store's SSE behavior is unchanged from before this flag existed (whatever bucket-default SSE the deployment has). |
 | `--tenant-kms-config <path>` | `RAVEL_TENANT_KMS_CONFIG` | none | TOML file mapping tenant name to KMS key ARN (`[tenants]` table, ADR-0062 decision 1, ADR-0072 decision 2). Requires `--store s3` — refuses to start under `--store memory`, since the per-tenant routing decorator always constructs a real `S3Store`. Off by default: unset, `build_store` produces exactly the store it always has, with no per-tenant routing decorator in the chain at all. See "Per-tenant SSE-KMS routing" below. |
 | `--disable-fold` | | off | Disables the per-(tenant, signal) background catalog fold task. Folding only lowers query resolve cost; disabling it never changes query results. |
@@ -66,7 +70,13 @@ All flags, verified against [services/ravel-server/src/config.rs](../../services
 
 `--store s3` without `--s3-bucket`/`--s3-access-key`/`--s3-secret-key` (through
 flag or env) fails at startup with an explicit error that names the missing
-one. It does not start in a broken state.
+one. It does not start in a broken state. Under `--s3-auth instance-role` only
+`--s3-bucket` is required: the two key flags must be absent, and startup fails
+naming both `--s3-auth instance-role` and the offending flag if either is set
+(an exported `RAVEL_S3_ACCESS_KEY` counts).
+
+The same `--s3-*` flags and `RAVEL_S3_*` env vars, including `--s3-auth`, work
+identically on `ravel-cli`.
 
 Note: the real S3 env var flags are `RAVEL_S3_ACCESS_KEY` and
 `RAVEL_S3_SECRET_KEY`, above; use those.

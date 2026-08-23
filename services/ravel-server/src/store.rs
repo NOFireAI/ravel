@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::s3::{S3Config, S3Store};
+use ravel_object_store::s3::{S3AuthMode, S3Config, S3Store};
 use ravel_object_store::{
     Capabilities, ClassedStore, DelimitedList, GetOutcome, GetRange, InstrumentedStore,
     KmsRoutingStore, ListPage, MultipartUpload, ObjectMeta, ObjectStoreBackend, PageToken,
@@ -266,6 +266,46 @@ impl ObjectStoreBackend for SharedKmsStore {
     }
 }
 
+/// The argument error for `--s3-auth instance-role` combined with an inline
+/// credential (ADR-0106), or `None` when no inline credential is set.
+///
+/// `S3Store::new` rejects the same mix, but its message is written for the
+/// `S3Config` field names. Operators set flags, so the CLI names the flags
+/// (and the env var clap also reads each one from, since a stray exported
+/// `RAVEL_S3_*` is the likelier source of the conflict).
+fn instance_role_credential_conflict(cli: &Cli) -> Option<anyhow::Error> {
+    let conflicting: Vec<&str> = [
+        (
+            cli.s3_access_key.is_some(),
+            "--s3-access-key (RAVEL_S3_ACCESS_KEY)",
+        ),
+        (
+            cli.s3_secret_key.is_some(),
+            "--s3-secret-key (RAVEL_S3_SECRET_KEY)",
+        ),
+        (
+            cli.s3_session_token.is_some(),
+            "--s3-session-token (RAVEL_S3_SESSION_TOKEN)",
+        ),
+        (
+            cli.s3_credentials_file.is_some(),
+            "--s3-credentials-file (RAVEL_S3_CREDENTIALS_FILE)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(present, name)| present.then_some(name))
+    .collect();
+    if conflicting.is_empty() {
+        return None;
+    }
+    Some(anyhow::anyhow!(
+        "--s3-auth instance-role conflicts with {}: under instance-role every \
+         credential comes from the EC2 instance metadata service, so those \
+         must be unset (or select --s3-auth static)",
+        conflicting.join(", ")
+    ))
+}
+
 pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
     let (store, metrics, kms): (
         Arc<dyn ObjectStoreBackend>,
@@ -286,14 +326,25 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
                 .s3_region
                 .clone()
                 .unwrap_or_else(|| "us-east-1".to_string());
-            let access_key_id = cli
-                .s3_access_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--store s3 requires RAVEL_S3_ACCESS_KEY"))?;
-            let secret_access_key = cli
-                .s3_secret_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--store s3 requires RAVEL_S3_SECRET_KEY"))?;
+            let auth = cli.s3_auth.mode();
+            let (access_key_id, secret_access_key, session_token, credentials_file) = match auth {
+                S3AuthMode::Static => (
+                    cli.s3_access_key.clone().ok_or_else(|| {
+                        anyhow::anyhow!("--store s3 requires RAVEL_S3_ACCESS_KEY")
+                    })?,
+                    cli.s3_secret_key.clone().ok_or_else(|| {
+                        anyhow::anyhow!("--store s3 requires RAVEL_S3_SECRET_KEY")
+                    })?,
+                    cli.s3_session_token.clone(),
+                    cli.s3_credentials_file.clone(),
+                ),
+                S3AuthMode::InstanceRole => {
+                    if let Some(conflict) = instance_role_credential_conflict(cli) {
+                        return Err(conflict);
+                    }
+                    (String::new(), String::new(), None, None)
+                }
+            };
             let endpoint = cli.s3_endpoint.clone();
             let allow_http = endpoint.is_some();
 
@@ -306,10 +357,10 @@ pub fn build_store(cli: &Cli) -> anyhow::Result<BuiltStore> {
                 allow_http,
                 force_path_style: true,
                 kms_key_id: cli.s3_kms_key.clone(),
-                session_token: None,
-                credentials_file: None,
-                auth: Default::default(),
-                instance_metadata_endpoint: None,
+                session_token,
+                credentials_file,
+                auth,
+                instance_metadata_endpoint: cli.s3_instance_metadata_endpoint.clone(),
             };
             let store = S3Store::new(config.clone())
                 .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
@@ -733,6 +784,341 @@ mod tests {
             kms.capabilities(),
             "the returned store handle must be (or wrap) the same KmsRoutingStore instance"
         );
+    }
+
+    /// `build_store`'s error text, panicking with `context` if it succeeded.
+    /// `BuiltStore` is not `Debug`, so `expect_err` is unavailable.
+    fn build_store_error(cli: &Cli, context: &str) -> String {
+        match build_store(cli) {
+            Ok(_) => panic!("{context}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// Stand up a minimal always-succeeding mock IMDSv2 on an ephemeral
+    /// loopback port and return its `http://addr` base. Mirrors
+    /// ravel-object-store's own `spawn_ok_imds`; the credential it hands out
+    /// is what the mock S3 below expects to see on the wire.
+    async fn spawn_mock_imds() -> String {
+        use axum::Router;
+        use axum::routing::{get, put};
+
+        let app = Router::new()
+            .route("/latest/api/token", put(|| async { "mock-token" }))
+            .route(
+                "/latest/meta-data/iam/security-credentials/",
+                get(|| async { "ravel-role" }),
+            )
+            .route(
+                "/latest/meta-data/iam/security-credentials/{role}",
+                get(|| async {
+                    r#"{"Code":"Success","AccessKeyId":"AKIA_IMDS",
+                        "SecretAccessKey":"imds-secret","Token":"imds-token",
+                        "Expiration":"2033-11-14T22:13:20Z"}"#
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        endpoint
+    }
+
+    /// A path-style S3 endpoint over an in-memory map: one PUT and one GET,
+    /// plus the SigV4 credential the client signed the PUT with, so a test can
+    /// prove which credential source the constructed store actually used.
+    #[derive(Default)]
+    struct MockS3 {
+        objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+        signed_with: std::sync::Mutex<Option<(String, String)>>,
+    }
+
+    async fn spawn_mock_s3() -> (String, Arc<MockS3>) {
+        use axum::Router;
+        use axum::extract::{Path as AxumPath, State};
+        use axum::http::{HeaderMap, StatusCode, header};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::put;
+
+        async fn put_object(
+            State(state): State<Arc<MockS3>>,
+            AxumPath((_bucket, key)): AxumPath<(String, String)>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Response {
+            let header_text = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            *state.signed_with.lock().expect("signed_with lock") = Some((
+                header_text("authorization"),
+                header_text("x-amz-security-token"),
+            ));
+            state
+                .objects
+                .lock()
+                .expect("objects lock")
+                .insert(key, body);
+            (StatusCode::OK, [(header::ETAG, "\"mock-etag\"")], "").into_response()
+        }
+
+        async fn get_object(
+            State(state): State<Arc<MockS3>>,
+            AxumPath((_bucket, key)): AxumPath<(String, String)>,
+        ) -> Response {
+            let found = state
+                .objects
+                .lock()
+                .expect("objects lock")
+                .get(&key)
+                .cloned();
+            match found {
+                Some(data) => (
+                    StatusCode::OK,
+                    [
+                        (header::ETAG, "\"mock-etag\""),
+                        (header::LAST_MODIFIED, "Wed, 21 Oct 2020 07:28:00 GMT"),
+                    ],
+                    data,
+                )
+                    .into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        let state = Arc::new(MockS3::default());
+        let app = Router::new()
+            .route("/{bucket}/{*key}", put(put_object).get(get_object))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, state)
+    }
+
+    /// The ADR-0106 reachability acceptance test: parsed CLI args go through
+    /// the real `build_store` entry point with `--s3-auth instance-role` and no
+    /// keys anywhere, the credential comes from a mock IMDS reached via
+    /// `--s3-instance-metadata-endpoint`, and the constructed backend serves a
+    /// put/get round trip. Without this the provider is unreachable from any
+    /// shipped binary.
+    ///
+    /// Non-vacuous on the credential source, not just on "it built": the mock
+    /// S3 records the `Authorization` and `x-amz-security-token` headers, and
+    /// they must carry the key id and token the mock IMDS minted. A store that
+    /// signed with anything else (or with no token at all) fails here.
+    ///
+    /// `spawn_blocking`: `S3Store::new` blocks on the eager IMDS fetch, which
+    /// has to reach the mock task on this same runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instance_role_auth_builds_serving_store() {
+        use clap::Parser;
+
+        let imds = spawn_mock_imds().await;
+        let (s3_endpoint, mock) = spawn_mock_s3().await;
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            &s3_endpoint,
+            "--s3-auth",
+            "instance-role",
+            "--s3-instance-metadata-endpoint",
+            &imds,
+        ])
+        .expect("instance-role flags parse");
+        assert!(
+            cli.s3_access_key.is_none() && cli.s3_secret_key.is_none(),
+            "precondition: instance-role starts with no inline keys set"
+        );
+
+        let built = tokio::task::spawn_blocking(move || build_store(&cli))
+            .await
+            .expect("join")
+            .expect("instance-role build_store must construct against the mock IMDS");
+
+        built
+            .foreground
+            .put("t/k", Bytes::from_static(b"hello"), PutOptions::default())
+            .await
+            .expect("put through the instance-role store");
+        let got = built
+            .foreground
+            .get("t/k", GetRange::Full)
+            .await
+            .expect("get through the instance-role store");
+        assert_eq!(
+            got.data.as_ref(),
+            b"hello",
+            "the constructed backend must serve back what it stored"
+        );
+
+        let (authorization, token) = mock
+            .signed_with
+            .lock()
+            .expect("signed_with lock")
+            .clone()
+            .expect("the mock S3 must have seen the signed PUT");
+        assert!(
+            authorization.contains("AKIA_IMDS"),
+            "the request must be signed with the IMDS key id, got: {authorization}"
+        );
+        assert_eq!(
+            token, "imds-token",
+            "the request must carry the IMDS session token"
+        );
+    }
+
+    /// `--s3-auth instance-role` plus any inline credential flag is an
+    /// argument error naming both flags, refused before any IMDS contact (no
+    /// mock is running here, and the test does not hang or wait on a network
+    /// timeout). Each flag is exercised on its own so one dropped from the
+    /// check is caught.
+    ///
+    /// The message assertions are what make this non-vacuous: `S3Store::new`
+    /// would reject the same mix, but with the `S3Config` field names, so an
+    /// error naming `--s3-access-key` can only have come from the CLI-level
+    /// check.
+    #[test]
+    fn instance_role_auth_rejects_inline_keys() {
+        use clap::Parser;
+
+        for (flag, value) in [
+            ("--s3-access-key", "AKIA_INLINE"),
+            ("--s3-secret-key", "inline-secret"),
+            ("--s3-session-token", "inline-token"),
+            ("--s3-credentials-file", "/nonexistent/creds.json"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "ravel-server",
+                "--store",
+                "s3",
+                "--s3-bucket",
+                "ravel-test",
+                "--s3-endpoint",
+                "http://127.0.0.1:9000",
+                "--s3-auth",
+                "instance-role",
+                flag,
+                value,
+            ])
+            .expect("flags parse");
+
+            let rendered =
+                build_store_error(&cli, &format!("instance-role plus {flag} must be an error"));
+            assert!(
+                rendered.contains("--s3-auth instance-role") && rendered.contains(flag),
+                "the error must name both conflicting flags, got: {rendered}"
+            );
+        }
+    }
+
+    /// `--s3-auth` defaults to `static`, and static mode still requires both
+    /// keys with their exact pre-ADR-0106 messages. This is the
+    /// no-behavior-change half of the change: the new flag must not have made
+    /// any existing deployment's startup differ.
+    #[test]
+    fn static_auth_is_the_default_and_still_requires_both_keys() {
+        use clap::Parser;
+
+        let base = [
+            "ravel-server",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+        ];
+        let cli = Cli::try_parse_from(base).expect("flags parse");
+        assert_eq!(
+            cli.s3_auth,
+            crate::config::S3Auth::Static,
+            "--s3-auth must default to static"
+        );
+        assert!(cli.s3_session_token.is_none() && cli.s3_credentials_file.is_none());
+        assert!(cli.s3_instance_metadata_endpoint.is_none());
+
+        assert_eq!(
+            build_store_error(&cli, "static mode without keys must fail"),
+            "--store s3 requires RAVEL_S3_ACCESS_KEY",
+            "the access-key error text must be unchanged"
+        );
+
+        let mut with_key = base.to_vec();
+        with_key.extend(["--s3-access-key", "test"]);
+        let cli = Cli::try_parse_from(with_key).expect("flags parse");
+        assert_eq!(
+            build_store_error(&cli, "static mode without a secret key must fail"),
+            "--store s3 requires RAVEL_S3_SECRET_KEY",
+            "the secret-key error text must be unchanged"
+        );
+    }
+
+    /// The ADR-0072 decision 1 flags reach `S3Config` rather than being parsed
+    /// and dropped: `--s3-credentials-file` is read at construction, so a
+    /// missing file fails the build, and a valid one builds. That failure is
+    /// only reachable if the flag's value was actually placed in
+    /// `S3Config::credentials_file`.
+    #[test]
+    fn session_token_and_credentials_file_flags_reach_the_store() {
+        use clap::Parser;
+        use std::io::Write;
+
+        let base = [
+            "ravel-server",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+        ];
+
+        let mut with_token = base.to_vec();
+        with_token.extend(["--s3-session-token", "sts-token"]);
+        let cli = Cli::try_parse_from(with_token).expect("flags parse");
+        assert_eq!(cli.s3_session_token.as_deref(), Some("sts-token"));
+        build_store(&cli).expect("a session token must not break construction");
+
+        let mut missing_file = base.to_vec();
+        missing_file.extend(["--s3-credentials-file", "/nonexistent/ravel-creds.json"]);
+        let cli = Cli::try_parse_from(missing_file).expect("flags parse");
+        let err = build_store_error(
+            &cli,
+            "an unreadable --s3-credentials-file must fail construction",
+        );
+        assert!(
+            err.contains("/nonexistent/ravel-creds.json"),
+            "the error must name the path the flag carried, got: {err}"
+        );
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp credentials file");
+        file.write_all(br#"{"access_key_id":"AKIA_FILE","secret_access_key":"file-secret"}"#)
+            .expect("write temp file");
+        let mut with_file = base.to_vec();
+        let file_path = file.path().to_str().expect("temp path is valid utf-8");
+        with_file.extend(["--s3-credentials-file", file_path]);
+        let cli = Cli::try_parse_from(with_file).expect("flags parse");
+        build_store(&cli).expect("a readable --s3-credentials-file must build");
     }
 
     /// The reachability acceptance test (ADR-0070) for the
