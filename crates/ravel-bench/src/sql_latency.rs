@@ -338,6 +338,12 @@ pub async fn measure_corpus(
     let mut measured = Vec::new();
     let mut skipped = Vec::new();
 
+    // CPU flamegraph lane (issue #365's pattern; see crate::profiling). Covers
+    // every entry's execution, both lanes (run_generated/run_tenant funnel
+    // through this one function), so a query-side profile always reflects the
+    // full corpus rather than one statement in isolation.
+    let profile = crate::profiling::ProfileSession::from_env("sql_latency_bench");
+
     for entry in entries {
         // Verify the declared-column dependency before running anything. A
         // missing declared column reads NULL for every row, so an unsatisfied
@@ -423,6 +429,8 @@ pub async fn measure_corpus(
             scan,
         });
     }
+
+    profile.finish();
 
     Ok((measured, skipped))
 }
