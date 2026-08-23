@@ -65,16 +65,31 @@ ravel-cli --store <your-store-flags> load \
   --tenant clickbench \
   --mapping benchmarks/clickbench/hits.mapping.toml \
   --shards 4 \
-  --batch-rows 10000
+  --batch-rows 40000
 ```
 
 `--batch-rows` is the object-count lever. One batch is one Strict flush, which is
-one RLOG object per involved shard, so ~100M rows at the default `10000` leaves
-on the order of 10,000 flushes' worth of objects behind. Per-object cost (LIST,
-footer read, decode setup) is then paid thousands of times per query and can
-dominate everything the columnar and pushdown work saves, so object count is a
+one RLOG object per shard the batch's rows land on. Per-object cost (LIST,
+footer read, decode setup) is paid thousands of times per query and can dominate
+everything the columnar and pushdown work saves, so object count is a
 first-class variable: raise `--batch-rows` for fewer, larger objects; lower it
 for the opposite. Measure both if you care where the time goes.
+
+`hits.mapping.toml` declares `CounterID` as a `resource_attribute` (issue
+#519), so it is part of stream identity and `shard_for_log` hashes it to pick
+a shard: rows spread across all `--shards` instead of every row landing on
+shard 0. That changes the batch-rows arithmetic. A batch's rows now split
+across up to `--shards` shards, and each shard's slice flushes as its own
+object *immediately* (the loader's `target_bytes` is fixed at `1`) — before it
+can reach the `block_target_records` block target (8192 rows). With the
+default `--batch-rows 10000` and `--shards 4`, a shard's slice averages ~2500
+rows, well under one full block, and object count would inflate well past
+`--shards`x rather than by a clean multiple. Raise `--batch-rows` to keep each
+shard's average slice at or above 8192: `40000` keeps that margin (`40000 / 4
+= 10000` rows/shard) while landing on roughly the same total object count as
+the pre-#519 single-shard `10000` batch size at ~100M rows. Lower `--shards`
+or raise `--batch-rows` further if a load still reports objects smaller than
+expected.
 
 The loader prints a completion summary to stdout — `rows processed`,
 `objects written`, and `elapsed` (the load wall-time ClickBench reports). It also
@@ -95,8 +110,9 @@ ravel-cli --store <your-store-flags> typed-attr-column set clickbench \
   --from-mapping benchmarks/clickbench/hits.mapping.toml
 ```
 
-This writes ~104 declared columns (every `[[attribute]]` entry) through the
-config CAS path. Notes specific to `hits`:
+This writes ~104 declared columns (every `[[attribute]]` and
+`[[resource_attribute]]` entry) through the config CAS path. Notes specific to
+`hits`:
 
 - **`EventTime` is not declared.** It is the mapping's `ts_column`, so it rides
   the native typed `ts` path; range predicates over it need no declared column.
