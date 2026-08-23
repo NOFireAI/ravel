@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Prints the logs-pipeline per-stage timing breakdown (ADR-0104 decision 1)
+# after `load --parquet` finishes. Off by default, forwarding to
+# ravel-ingest's own off-by-default feature of the same name: with it off,
+# `LoadReport` carries no timing field and `ravel-ingest`'s accumulator is
+# compiled out entirely, so a default build is unchanged.
+stage-timing = ["ravel-ingest/stage-timing"]
+
 [dependencies]
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }

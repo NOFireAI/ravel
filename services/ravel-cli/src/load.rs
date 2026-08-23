@@ -28,6 +28,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use ravel_catalog::{AbsentPolicy, validate_or_adopt};
+#[cfg(feature = "stage-timing")]
+use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
     Clock, IngestConfig, LogIngestMetricsSnapshot, LogIngestRouter, SystemClock, WriteMode,
 };
@@ -333,6 +335,32 @@ fn print_summary(report: &LoadReport) {
     println!("  rows/sec         : {rows_per_sec:.0}");
     println!("  objects written  : {}", report.objects_written());
     println!("  elapsed          : {secs:.3}s");
+    #[cfg(feature = "stage-timing")]
+    print_stage_timings(report);
+}
+
+/// Print the logs pipeline's per-stage timing breakdown (ADR-0104 decision 1)
+/// after [`print_summary`]'s totals. A stage with zero samples (never wired,
+/// or never reached) is omitted rather than printed as zero, matching
+/// [`LogStageSnapshot::stages`]'s own present-only-if-recorded contract.
+#[cfg(feature = "stage-timing")]
+fn print_stage_timings(report: &LoadReport) {
+    if report.stage_timings.is_empty() {
+        return;
+    }
+    println!("  stage timings:");
+    for stage in report.stage_timings.stages() {
+        let Some(totals) = report.stage_timings.get(stage) else {
+            continue;
+        };
+        let avg_us = (totals.total_ns as f64 / totals.samples.max(1) as f64) / 1e3;
+        println!(
+            "    {name:<8} samples={samples:<10} total_ms={total_ms:<12.3} avg_us={avg_us:.3}",
+            name = stage.name(),
+            samples = totals.samples,
+            total_ms = totals.total_ns as f64 / 1e6,
+        );
+    }
 }
 
 /// Print the commit tokens known durable before a failure, one per line, so
@@ -392,6 +420,12 @@ pub struct LoadReport {
     /// return path for a per-load signal (`LogIngestRouter::metrics()` is only
     /// reachable by whoever constructed the router, which is `load` itself).
     pub metrics: LogIngestMetricsSnapshot,
+    /// The logs pipeline's per-stage timing breakdown (ADR-0104 decision 1),
+    /// snapshotted once the load finished. Present only under the
+    /// `stage-timing` feature; with it off this field does not exist, so a
+    /// default build carries no timing seam.
+    #[cfg(feature = "stage-timing")]
+    pub stage_timings: LogStageSnapshot,
 }
 
 impl LoadReport {
@@ -623,6 +657,10 @@ pub async fn load(
     // reads the dynamic-column figures to warn on overflow or near-cap pressure
     // (ADR-0100 decision 1).
     report.metrics = router.metrics().snapshot();
+    #[cfg(feature = "stage-timing")]
+    {
+        report.stage_timings = router.stage_timings().snapshot();
+    }
     report.elapsed = started.elapsed();
     Ok(report)
 }
@@ -1384,6 +1422,35 @@ type = "i64"
         )
         .await
         .expect("load succeeds")
+    }
+
+    /// A real `load --parquet` run wires and records every stage of the logs
+    /// pipeline, not a subset: admit, route, merge, and encode all recorded at
+    /// least one sample. Drop `#[cfg(feature = "stage-timing")]` from
+    /// `LogIngestRouter::stage_timings` (or from any one stage boundary) and
+    /// this fails, either at compile time or on an empty/partial stage set.
+    #[cfg(feature = "stage-timing")]
+    #[tokio::test]
+    async fn load_populates_the_stage_timing_breakdown() {
+        let report = run_wide_load(4).await;
+        let stages: Vec<_> = report.stage_timings.stages().collect();
+        assert_eq!(
+            stages,
+            vec![
+                ravel_ingest::LogStage::Admit,
+                ravel_ingest::LogStage::Route,
+                ravel_ingest::LogStage::Merge,
+                ravel_ingest::LogStage::Encode,
+            ],
+            "a real load must wire and record every stage, not a subset"
+        );
+        for stage in stages {
+            let totals = report
+                .stage_timings
+                .get(stage)
+                .expect("a stage in `stages()` has totals");
+            assert!(totals.samples > 0, "{stage:?} recorded zero samples");
+        }
     }
 
     /// A load whose object crosses the 1000-column dynamic budget produces the
