@@ -21,9 +21,11 @@
 //! like) are a follow-up performance refinement (#603 covers the dictionary
 //! shape); this task builds the plain-value, correctness-anchoring form.
 
+use std::collections::HashMap;
+
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
-use crate::record::{FieldType, LogRecord, resolve_value};
+use crate::record::{ColumnValue, FieldType, LogRecord, resolve_value};
 
 /// A packed presence bitmap, one bit per row, LSB-first within each byte.
 ///
@@ -159,6 +161,24 @@ pub struct DynColumn {
     pub validity: Bitmap,
 }
 
+/// The dictionary shape of one Str/Bytes dynamic column (ADR-0109 decision 3,
+/// mirroring a decoded RLOG dictionary string column, ADR-0099 decision 4):
+/// a `distinct` value set and one `id` per PRESENT cell, parallel to the
+/// column's [`DynColumn::cells`]. `ids[slot]` indexes `distinct`, and
+/// `distinct[ids[slot]]` equals `resolve_value(&cells[slot]).1`'s bytes, so the
+/// writer can map each distinct value to its RLOG entry once per block instead
+/// of once per row. `distinct` may hold entries no id references. The set order
+/// is the producer's; the writer sorts it to match [`encode_strings`].
+///
+/// [`encode_strings`]: crate::encoding::encode_strings
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrColumnDict {
+    /// Distinct value bytes, in the producer's order.
+    pub distinct: Vec<Vec<u8>>,
+    /// One index into `distinct` per present cell, parallel to `DynColumn::cells`.
+    pub ids: Vec<u32>,
+}
+
 /// A batch of log records in column-major form. Row `i` is assembled by reading
 /// index `i` (or the `i`-th present slot, for optional columns) out of each
 /// buffer. All per-row buffers describe the same `num_rows` rows.
@@ -200,6 +220,16 @@ pub struct ColumnarLogBatch {
     /// Dynamic attribute columns, one per distinct `(name, FieldType)`.
     pub dyn_columns: Vec<DynColumn>,
 
+    /// Optional dictionary shape per dynamic column: when non-empty this has
+    /// one entry per [`Self::dyn_columns`] entry, `Some` only for a Str/Bytes
+    /// column whose distinct set and per-cell ids the producer supplies (a
+    /// Parquet dictionary, #604). The writer then pays string encoding and
+    /// token bloom per distinct value, not per row (ADR-0109 decision 3). An
+    /// empty vector (the default) means no column carries a dictionary and the
+    /// writer takes the plain per-cell path unchanged, so this field is purely
+    /// additive: a producer built against the pre-#603 type leaves it empty.
+    pub dyn_col_dicts: Vec<Option<StrColumnDict>>,
+
     /// Per-row duplicate-loser attributes: the second and later occurrences of
     /// a `(name, type)` pair within one record, which cannot occupy that row's
     /// single column cell. Empty for almost every row. The writer folds these
@@ -226,6 +256,7 @@ impl ColumnarLogBatch {
             stream_ids: Vec::new(),
             stream_attrs: Vec::new(),
             dyn_columns: Vec::new(),
+            dyn_col_dicts: Vec::new(),
             residual_attrs: Vec::new(),
         }
     }
@@ -354,6 +385,53 @@ impl ColumnarLogBatch {
         }
 
         batch
+    }
+
+    /// Fills [`Self::dyn_col_dicts`] with the dictionary shape of every
+    /// Str/Bytes dynamic column, derived from its plain `cells`: the distinct
+    /// value bytes in first-seen order plus one id per present cell. This is
+    /// the bridge the writer-level differential test uses to drive the writer's
+    /// dictionary fast path from records; a producer that already holds Parquet
+    /// dictionaries (#604) supplies the shape directly instead. Non-string
+    /// columns get `None`. Idempotent in effect; overwrites any prior value.
+    pub fn with_dictionaries(mut self) -> Self {
+        let mut dicts: Vec<Option<StrColumnDict>> = Vec::with_capacity(self.dyn_columns.len());
+        for c in &self.dyn_columns {
+            match c.field_type {
+                FieldType::Str | FieldType::Bytes => {
+                    let mut interner: HashMap<Vec<u8>, u32> = HashMap::new();
+                    let mut distinct: Vec<Vec<u8>> = Vec::new();
+                    let mut ids: Vec<u32> = Vec::with_capacity(c.cells.len());
+                    for cell in &c.cells {
+                        let bytes = match resolve_value(cell).1 {
+                            ColumnValue::Str(b) | ColumnValue::Bytes(b) => b,
+                            // A Str/Bytes column resolves only to Str/Bytes; any
+                            // other value would be a mis-typed column, so fall
+                            // back to the plain path rather than guess.
+                            _ => {
+                                distinct.clear();
+                                ids.clear();
+                                break;
+                            }
+                        };
+                        let next = distinct.len() as u32;
+                        let id = *interner.entry(bytes.clone()).or_insert_with(|| {
+                            distinct.push(bytes);
+                            next
+                        });
+                        ids.push(id);
+                    }
+                    if ids.len() == c.cells.len() {
+                        dicts.push(Some(StrColumnDict { distinct, ids }));
+                    } else {
+                        dicts.push(None);
+                    }
+                }
+                _ => dicts.push(None),
+            }
+        }
+        self.dyn_col_dicts = dicts;
+        self
     }
 }
 
