@@ -137,3 +137,19 @@ corrected in place; `crates/ravel-commit/tests/iam_templates.rs` (added by
 ADR-0072) now checks every shipped policy prefix against real key shapes
 built by `ravel-commit`'s own constructors, so a future recurrence of this
 mismatch fails CI instead of shipping silently.
+
+## Amendment: mid-stream audit-flush failure fails closed symmetrically
+
+Issue #55 found that the Flight SQL mid-stream audit-flush-failure path
+was the one holdout that did not fail closed. Section 2b makes a failed
+`required`-mode flush fail the request with `Unavailable`, and the
+pre-stream and clean-stream paths did so, but a query that errored partway
+through its stream still yielded its original error even when the audit
+flush for that failed query then failed too, leaving the client unable to
+tell whether the failure was audited. All three paths are now symmetric:
+under `audit_mode=required`, a failed audit flush fails the request or
+stream closed with `Unavailable`, discarding the original error in favor of
+the audit-failure signal, so a client whose query already failed still
+learns definitively whether that failure was recorded. This records a
+decision already made in #55; it changes no format, key layout, or config
+surface.
