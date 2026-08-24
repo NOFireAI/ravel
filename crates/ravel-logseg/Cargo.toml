@@ -36,3 +36,7 @@ harness = false
 [[bench]]
 name = "logseg_scan"
 harness = false
+
+[[bench]]
+name = "wide_gather"
+harness = false

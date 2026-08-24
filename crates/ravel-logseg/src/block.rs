@@ -451,6 +451,219 @@ fn winner_value(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
         .map(|(_, v)| v)
 }
 
+/// One block's data already in column-major form, the input to
+/// [`write_block_columnar`]. Each per-row slice has `n` entries; the optional
+/// fixed columns pair a per-row `*_present` bitmap with a dense `*_vals` slice
+/// holding only the present rows. The dynamic columns are given as one
+/// `Option<ColumnValue>` per row (the row's columnar occurrence) and one
+/// `Option<ColumnValue>` per row for the stat winner, so the encoder never
+/// gathers a value out of a per-row column vector.
+pub struct ColumnarBlockInput<'a> {
+    pub n: usize,
+    pub ts: &'a [i64],
+    pub observed_ts: &'a [i64],
+    pub stream_ref: &'a [u32],
+    pub severity_num: &'a [u8],
+    pub flags: &'a [u32],
+    pub severity_text: &'a [&'a [u8]],
+    pub body: &'a [&'a [u8]],
+    pub trace_present: &'a [bool],
+    pub trace_vals: &'a [&'a [u8]],
+    pub span_present: &'a [bool],
+    pub span_vals: &'a [&'a [u8]],
+    pub attrs_raw_present: &'a [bool],
+    pub attrs_raw_vals: &'a [&'a [u8]],
+    pub plans: &'a [ColumnPlan],
+    /// Per plan (in `plans` order), one entry per row: the row's columnar
+    /// occurrence for the column, `None` if absent.
+    pub values: &'a [Vec<Option<ColumnValue>>],
+    /// Per plan (in `plans` order), one entry per row: the row's merged-view
+    /// stat winner for the column, `None` when the row contributes only to
+    /// `null_count`.
+    pub stat_values: &'a [Vec<Option<ColumnValue>>],
+}
+
+/// Encodes one block from column-major input, byte-identical to
+/// [`write_block`] fed the equivalent rows, but with no per-row value gather:
+/// the value and stat arrays are supplied already grouped by column
+/// (ADR-0109 decision 6, "Value gather ... Deleted").
+///
+/// This mirrors [`write_block`] line for line; the only substitution is that
+/// each dynamic column's per-row value and stat come from `input.values` /
+/// `input.stat_values` instead of the `row_column` / `winner_value` linear
+/// scans.
+pub fn write_block_columnar(
+    input: &ColumnarBlockInput<'_>,
+    zstd_level: i32,
+) -> Result<BlockWriteOut, LogSegError> {
+    let n = input.n;
+    if n == 0 {
+        return Err(LogSegError::Corrupted("empty block".into()));
+    }
+    let mut pages: Vec<StagedPage> = Vec::new();
+    let mut stats: Vec<NumStat> = Vec::new();
+
+    // Fixed always-present integer columns.
+    let all_present = vec![true; n];
+    let (enc, b) = encode_i64(input.ts);
+    stage_column(&mut pages, COL_TS, &all_present, enc, b);
+    let (enc, b) = encode_i64(input.observed_ts);
+    stage_column(&mut pages, COL_OBSERVED_TS, &all_present, enc, b);
+    let sref: Vec<i64> = input.stream_ref.iter().map(|r| i64::from(*r)).collect();
+    let (enc, b) = encode_i64(&sref);
+    stage_column(&mut pages, COL_STREAM_REF, &all_present, enc, b);
+    let sev: Vec<i64> = input.severity_num.iter().map(|r| i64::from(*r)).collect();
+    let (enc, b) = encode_i64(&sev);
+    stage_column(&mut pages, COL_SEVERITY_NUM, &all_present, enc, b);
+    let flags: Vec<i64> = input.flags.iter().map(|r| i64::from(*r)).collect();
+    let (enc, b) = encode_i64(&flags);
+    stage_column(&mut pages, COL_FLAGS, &all_present, enc, b);
+
+    // Fixed always-present string columns.
+    let (enc, b) = encode_strings(input.severity_text);
+    stage_column(&mut pages, COL_SEVERITY_TEXT, &all_present, enc, b);
+    let (enc, b) = encode_strings(input.body);
+    stage_column(&mut pages, COL_BODY, &all_present, enc, b);
+
+    // Fixed optional fixed-width id columns.
+    let (enc, b) = encode_fixed(input.trace_vals, TRACE_ID_WIDTH);
+    stage_column(&mut pages, COL_TRACE_ID, input.trace_present, enc, b);
+    let (enc, b) = encode_fixed(input.span_vals, SPAN_ID_WIDTH);
+    stage_column(&mut pages, COL_SPAN_ID, input.span_present, enc, b);
+
+    // Fixed optional attrs_raw column (canonical overflow bytes per row).
+    let (enc, b) = encode_strings(input.attrs_raw_vals);
+    stage_column(&mut pages, COL_ATTRS_RAW, input.attrs_raw_present, enc, b);
+
+    // Dynamic columns, in plan order.
+    for (idx, plan) in input.plans.iter().enumerate() {
+        let cid = plan.column_id;
+        let vals = &input.values[idx];
+        let stat_vals = &input.stat_values[idx];
+        let present: Vec<bool> = vals.iter().map(Option::is_some).collect();
+        match plan.ty {
+            FieldType::I64 => {
+                let sv: Vec<Option<i64>> = stat_vals
+                    .iter()
+                    .map(|v| match v {
+                        Some(ColumnValue::I64(x)) => Some(*x),
+                        _ => None,
+                    })
+                    .collect();
+                let present_vals: Vec<i64> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Some(ColumnValue::I64(x)) => Some(*x),
+                        _ => None,
+                    })
+                    .collect();
+                let (enc, b) = encode_i64(&present_vals);
+                stats.push(i64_stat(cid, &sv));
+                stage_column(&mut pages, cid, &present, enc, b);
+            }
+            FieldType::F64 => {
+                let sv: Vec<Option<u64>> = stat_vals
+                    .iter()
+                    .map(|v| match v {
+                        Some(ColumnValue::F64(x)) => Some(*x),
+                        _ => None,
+                    })
+                    .collect();
+                let present_vals: Vec<u64> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Some(ColumnValue::F64(x)) => Some(*x),
+                        _ => None,
+                    })
+                    .collect();
+                let (enc, b) = encode_f64(&present_vals);
+                stats.push(f64_stat(cid, &sv));
+                stage_column(&mut pages, cid, &present, enc, b);
+            }
+            FieldType::Bool => {
+                let sv: Vec<Option<bool>> = stat_vals
+                    .iter()
+                    .map(|v| match v {
+                        Some(ColumnValue::Bool(x)) => Some(*x),
+                        _ => None,
+                    })
+                    .collect();
+                let present_vals: Vec<bool> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Some(ColumnValue::Bool(x)) => Some(*x),
+                        _ => None,
+                    })
+                    .collect();
+                stats.push(bool_stat(cid, &sv));
+                stage_column(
+                    &mut pages,
+                    cid,
+                    &present,
+                    Enc::Bitmap,
+                    encode_bitmap(&present_vals),
+                );
+            }
+            FieldType::Str | FieldType::Bytes => {
+                let vv: Vec<&[u8]> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Some(ColumnValue::Str(x)) | Some(ColumnValue::Bytes(x)) => {
+                            Some(x.as_slice())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let (enc, b) = encode_strings(&vv);
+                stage_column(&mut pages, cid, &present, enc, b);
+            }
+        }
+    }
+
+    // Compress pages into a payload buffer, collecting descriptors.
+    let mut payload = Vec::new();
+    let mut descs: Vec<PageDesc> = Vec::with_capacity(pages.len());
+    for p in &pages {
+        descs.push(write_page(
+            &mut payload,
+            p.column_id,
+            p.enc,
+            &p.bytes,
+            zstd_level,
+        ));
+    }
+
+    // Header, then the payload.
+    let mut block = Vec::new();
+    put_uvarint(&mut block, n as u64);
+    put_uvarint(&mut block, descs.len() as u64);
+    for d in &descs {
+        put_uvarint(&mut block, u64::from(d.column_id));
+        block.push(d.enc.to_u8());
+        block.push(d.comp);
+        put_uvarint(&mut block, d.len);
+        put_uvarint(&mut block, d.uncomp_len);
+    }
+    block.extend_from_slice(&payload);
+
+    let crc = crc32c::crc32c(&block);
+    let min_ts = input.ts.iter().copied().min().unwrap_or(0);
+    let max_ts = input.ts.iter().copied().max().unwrap_or(0);
+    let min_stream_ref = input.stream_ref.iter().copied().min().unwrap_or(0);
+    let max_stream_ref = input.stream_ref.iter().copied().max().unwrap_or(0);
+
+    Ok(BlockWriteOut {
+        bytes: block,
+        crc32c: crc,
+        record_count: n as u32,
+        stats,
+        min_ts,
+        max_ts,
+        min_stream_ref,
+        max_stream_ref,
+    })
+}
+
 /// A decoded string column, kept in whichever shape its page carried
 /// (ADR-0099 decision 4). A dictionary page keeps its distinct set and per-row
 /// ids instead of materializing one owned `Vec<u8>` per row; a plain page keeps
