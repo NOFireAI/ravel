@@ -781,6 +781,38 @@ async fn generate_and_check_conformance_doc() {
     );
 }
 
+/// The generated document states, in prose, that the `samples` table silently
+/// excludes native-histogram samples, so counts and aggregations over it
+/// undercount on tenants that ingest histograms (#581). The defect this guards
+/// is that `SELECT count(*) FROM samples` reports fewer rows than were ingested
+/// with no documentation saying why: the table's float-only shape
+/// (`schema.rs::public_fields`) has no column for a histogram sample.
+///
+/// The assertion reads the rendered output of `render_document`, not the
+/// committed file, so it fails the moment the generator stops emitting the
+/// statement rather than only when the committed doc drifts.
+#[tokio::test]
+async fn samples_table_documents_histogram_exclusion() {
+    let verified = verify_all().await;
+    let rendered = render_document(&verified);
+
+    // Collapse whitespace so the check is independent of where the generator's
+    // prose wraps: a rewrap that moves a line break mid-sentence must not break
+    // this assertion (only dropping the statement should).
+    let flat = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        flat.contains("Native-histogram samples are excluded from the `samples` table entirely"),
+        "the generated conformance doc must state that native-histogram samples are excluded \
+         from the samples table entirely (#581)"
+    );
+    assert!(
+        flat.contains("undercount on tenants that ingest histograms"),
+        "the generated conformance doc must state that counts and aggregations over the samples \
+         table undercount on tenants that ingest histograms (#581)"
+    );
+}
+
 /// The live example SQL each construct runs, checked against a committed
 /// manifest that the prose document's `REGEN_SQL_CONFORMANCE=1` does NOT touch.
 ///
