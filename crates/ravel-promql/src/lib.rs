@@ -20,6 +20,7 @@
 
 mod aggregate;
 mod binop;
+pub mod complexity_guard;
 mod eval;
 mod functions;
 pub mod histogram;

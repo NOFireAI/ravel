@@ -61,11 +61,16 @@ const TOKEN_HEX_LEN: usize = 16;
 /// ADR keeps readable, so it is never tokenized.
 const METRIC_NAME_LABEL: &str = "__name__";
 
-/// A failure to redact a query. The only failure mode is the underlying
-/// parser rejecting malformed input; the walk and re-render are infallible.
+/// A failure to redact a query. The only failure modes are the underlying
+/// parser rejecting malformed input and the pre-parse complexity guard
+/// ([`crate::complexity_guard`]) rejecting an excessively complex one; the
+/// walk and re-render are infallible.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RedactError {
-    /// `query` did not parse as PromQL.
+    /// `query` did not parse as PromQL, or was rejected before parsing for
+    /// exceeding the complexity guard (issue #529): a malformed audit-log
+    /// query and a maliciously deep one are both PromQL text this module
+    /// cannot turn into a redacted record.
     ///
     /// Carries no parser detail on purpose: `promql_parser`'s own error
     /// message echoes fragments of the offending input verbatim (an illegal
@@ -100,6 +105,7 @@ pub fn audit_token(token_key: &[u8; 32], value: &[u8]) -> String {
 /// operands change, and only into other valid values. See the module docs for
 /// the exact redaction rules (and why numeric literals stay readable).
 pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> {
+    crate::complexity_guard::check(query).map_err(|_| RedactError::Parse)?;
     let mut expr = parser::parse(query).map_err(|_| RedactError::Parse)?;
     redact_expr(&mut expr, token_key);
     Ok(expr.to_string())
@@ -283,6 +289,19 @@ mod tests {
     #[test]
     fn malformed_input_returns_typed_error_without_panic() {
         let err = redact("up{job=", &KEY_A).expect_err("must reject malformed input");
+        assert!(matches!(err, RedactError::Parse));
+    }
+
+    /// Issue #529: the audit trail calls `redact` on every query it
+    /// records, so it needs the same pre-parse complexity guard the
+    /// evaluator has, not just a well-formed-syntax check.
+    #[test]
+    fn overly_complex_query_returns_typed_error_without_panic() {
+        let mut query = String::from("1");
+        for _ in 0..300 {
+            query.push_str("+1");
+        }
+        let err = redact(&query, &KEY_A).expect_err("must reject an overly complex query");
         assert!(matches!(err, RedactError::Parse));
     }
 

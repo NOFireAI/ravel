@@ -318,6 +318,8 @@ pub enum Error {
     InvalidRegex { pattern: String, reason: String },
     #[error("multiple matches for labels: {detail}")]
     AmbiguousMatch { detail: String },
+    #[error(transparent)]
+    TooComplex(#[from] crate::complexity_guard::QueryTooComplex),
 }
 
 /// Default PromQL lookback: 5 minutes, in nanoseconds (ADR-0007). This is
@@ -588,6 +590,7 @@ impl Evaluator {
         query: &str,
         t_ms: i64,
     ) -> Result<(Value, Annotations), Error> {
+        crate::complexity_guard::check(query)?;
         let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
         let t_ns = ms_to_ns(t_ms)?;
         let ctx = QueryWindow {
@@ -679,6 +682,7 @@ impl Evaluator {
             });
         }
 
+        crate::complexity_guard::check(query)?;
         let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
         let ctx = QueryWindow {
             start_ns,
@@ -2667,6 +2671,44 @@ mod tests {
             .eval_instant(&TestSource::new(), r#""hello""#, 0)
             .expect("evaluates");
         assert_eq!(result, Value::String("hello".to_string()));
+    }
+
+    /// A query built to exceed [`crate::complexity_guard::MAX_QUERY_COMPLEXITY`]
+    /// must fail with a typed error, not attempt to parse (issue #529). The
+    /// query used here is a flat operator chain with no parens at all: it is
+    /// the construct that proved a bracket/unary-only guard insufficient, and
+    /// it stays orders of magnitude below the depth that would actually
+    /// crash `promql_parser::parser::parse` (see the module docs on
+    /// `complexity_guard` for the measured crash thresholds) -- this test
+    /// proves the guard rejects it, not that the unguarded parser survives it.
+    #[test]
+    fn overly_complex_instant_query_is_rejected_not_parsed() {
+        let mut query = String::from("1");
+        for _ in 0..300 {
+            query.push_str("+1");
+        }
+        let err = Evaluator::new()
+            .eval_instant(&TestSource::new(), &query, 0)
+            .expect_err("must be rejected before parsing");
+        assert!(
+            matches!(err, Error::TooComplex(_)),
+            "expected Error::TooComplex, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn overly_complex_range_query_is_rejected_not_parsed() {
+        let mut query = String::from("1");
+        for _ in 0..300 {
+            query.push_str("+1");
+        }
+        let err = Evaluator::new()
+            .eval_range(&TestSource::new(), &query, 0, minutes(1), minutes(1))
+            .expect_err("must be rejected before parsing");
+        assert!(
+            matches!(err, Error::TooComplex(_)),
+            "expected Error::TooComplex, got {err:?}"
+        );
     }
 
     #[test]

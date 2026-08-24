@@ -71,6 +71,7 @@ pub fn plan_selectors(
     eval_start_ms: i64,
     eval_end_ms: i64,
 ) -> Result<Vec<SelectorPlan>, Error> {
+    crate::complexity_guard::check(query)?;
     let expr = promql_parser::parser::parse(query).map_err(Error::Parse)?;
     let start_ns = eval::ms_to_ns(eval_start_ms)?;
     let end_ns = eval::ms_to_ns(eval_end_ms)?;
@@ -310,6 +311,22 @@ fn resolve_selector(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Issue #529: `plan_selectors` parses independently of the evaluator,
+    /// so it needs its own guard against a query built to exceed
+    /// [`crate::complexity_guard::MAX_QUERY_COMPLEXITY`].
+    #[test]
+    fn overly_complex_query_is_rejected_not_parsed() {
+        let mut query = String::from("1");
+        for _ in 0..300 {
+            query.push_str("+1");
+        }
+        let err = plan_selectors(&query, 0, 0).expect_err("must be rejected before parsing");
+        assert!(
+            matches!(err, Error::TooComplex(_)),
+            "expected Error::TooComplex, got {err:?}"
+        );
+    }
 
     #[test]
     fn bare_selector_has_default_lookback_range_and_no_offset() {
