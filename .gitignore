@@ -17,3 +17,6 @@ node_modules/
 
 # graft's local graph cache - regenerable, not committed (run `graft build`).
 graft/
+
+# Local, per-checkout state for .claude/guards/epic-status-nudge.mjs.
+.claude/.epic-status-nudge-state.json

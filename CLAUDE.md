@@ -156,6 +156,17 @@ the fallback becomes no-op status polls that burn turns and tokens.
   Run it instead of repeated `gh issue view` reads, and post a one-line
   status to the epic ledger at each state transition so the user can
   self-serve.
+- Both of the above are standing behavior, not something to do only when
+  asked (issue #613: over four days, `epic-status.sh` ran 15 times
+  against 440 hand-rolled `gh issue view` calls, and every fleet task
+  death in that window was found by someone remembering to reconcile,
+  never by an error surfacing on its own). Concretely: run
+  `scripts/epic-status.sh <epic>` for every epic you are actively
+  driving before dispatching new work on it, and again at each idle
+  wakeup while a wave is in flight -- not only in response to a status
+  question. On a terminal fleet event (a dispatched task reaching
+  done/failed), send a `PushNotification` as part of handling that
+  event, not only after the user asks what happened.
 
 ### CI workflow changes
 
