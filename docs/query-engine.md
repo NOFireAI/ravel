@@ -1381,6 +1381,28 @@ Two consequences an operator and a plan reader both see:
 alongside its block counters, so `EXPLAIN ANALYZE` shows how much of each block
 the projection avoided touching.
 
+Two decode-time byte counters sit next to those page counts on the query's
+`QueryAccounting` handle (ADR-0107 decision 4): `page_bytes_fetched`, the stored
+(post-compression) bytes of every page present in the blocks a scan decoded,
+regardless of the projection; and `page_bytes_decoded`, the stored bytes of only
+the pages the `ColumnSelection` kept. `LogSegmentScan::finish` folds each scan's
+`ScanStats` totals into the handle once, at exhaustion. Their gap is the
+column-filtering waste: for an all-columns scan they are equal; for a
+wide-schema, narrow-projection query `page_bytes_decoded` can be a small
+fraction of `page_bytes_fetched`.
+
+These are a decode-time measurement, a **different axis** from the wire bytes the
+`page_fetch` span and `s3_bytes` record (and from `BlockRangeStats::
+block_bytes_fetched`, the T1 block-range fetch counter above): they count stored
+page bytes that a fetched block already holds, not bytes moved over the network,
+so a projection changes `page_bytes_decoded` without changing any wire counter.
+Reading them together tells both stories in one place -- how many bytes the fetch
+brought in, and how many of the bytes already resident the decode actually
+needed. The instrument exists to measure whether block-level pruning alone
+already captures most of the realistic win before a future per-page-crc RLOG
+section is proposed to shrink the wire fetch to columns (ADR-0107 "Explicitly out
+of scope").
+
 The per-query DataFusion memory pool now bounds concurrently-held scan memory:
 the reservation grows when a decoded block and the batch built from it are held
 and shrinks as each is released. It is not a cumulative-output budget, and

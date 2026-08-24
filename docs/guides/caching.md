@@ -140,6 +140,39 @@ These counters cover every ADR-0046 cache in the process. Request hit rate is
 bytes_admitted)`. Filter by the `cache` label for one cache's rate, or omit it
 (let PromQL sum the series) for the whole process.
 
+## Sizing for logs column-filtering waste
+
+A logs (RLOG) query's `QueryAccounting` carries two decode-time byte counters
+next to its wire-byte counters (ADR-0107 decision 4): `page_bytes_fetched`, the
+stored bytes of every page present in the blocks the query decoded, and
+`page_bytes_decoded`, the stored bytes of only the pages the query's column
+projection kept. These are a decode-time measurement, not a wire measurement:
+they count bytes a fetched block already holds, distinct from `s3_bytes` (the
+actual bytes moved over the network). Column filtering today is decode-time only
+-- a narrow projection skips decompressing the pages it does not need, but the
+whole block still arrives on the wire, because RLOG has no per-page checksum to
+verify a sub-block fetch against.
+
+The ratio `page_bytes_decoded / page_bytes_fetched` is the interpretation lever.
+When it is close to 1, the query decodes nearly everything its blocks contain and
+a larger cache working set is the main way to make repeat runs cheaper. When it
+is small -- most fetched page bytes are thrown away by column filtering, the
+wide-schema, narrow-projection shape -- the same block is being fetched and cached
+in full to serve a few columns. Two responses apply: narrow the projection
+further where the query allows it (fewer columns decoded per block, though not
+fewer bytes fetched until a future per-page-crc format change lands), and size the
+cache to the *working set of whole blocks* the workload touches rather than to the
+decoded byte volume, since the cache admits and holds whole blocks regardless of
+how little of each a given query decodes. A small decoded fraction across a
+tenant's queries is the signal that its cache should be sized against block
+footprint, not against what its projections actually read.
+
+A concrete measured ratio for a representative workload is not quoted here: no
+`ravel-bench` logs run was executed in the environment this guidance was written
+in, so a fabricated number is deliberately avoided. Read the two counters off a
+real query's accounting (or `EXPLAIN ANALYZE`, which surfaces the sibling
+`pages_decoded`/`pages_skipped` counts) to get the ratio for your own workload.
+
 ## Known gaps
 
 - **`--cache-dir` is not wired up.** The disk tier (`DiskCache`) exists
