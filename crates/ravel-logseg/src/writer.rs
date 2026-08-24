@@ -9,11 +9,11 @@
 //! the footer and trailer. Identical input yields byte-identical output.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
-use crate::block::{ColumnPlan, ColumnarBlockInput, write_block, write_block_columnar};
+use crate::block::{BlockStrDict, ColumnPlan, ColumnarBlockInput, write_block, write_block_columnar};
 use crate::bloom::BloomBuilder;
 use crate::bloom_section::encode_bloom_section;
 use crate::columnar_batch::ColumnarLogBatch;
@@ -1006,6 +1006,67 @@ impl RlogWriter {
             }
         }
 
+        // Dictionary fast path (ADR-0109 decision 3): for each Str/Bytes plan
+        // column whose every contributing batch column arrived dictionary-
+        // shaped, build one per-object distinct table and a per-global-row
+        // index into it. The block string encode and the token bloom then run
+        // per distinct value, not per row. A plan column with any plain
+        // contributor stays on the per-row `col_values` path built above,
+        // untouched, so byte-identity with the row path is preserved either way.
+        let mut plan_uses_dict = vec![false; num_plans];
+        let mut global_dict: Vec<Vec<Vec<u8>>> = vec![Vec::new(); num_plans];
+        let mut col_dict_ids: Vec<Vec<Option<u32>>> = vec![Vec::new(); num_plans];
+        {
+            let mut interners: Vec<HashMap<Vec<u8>, u32>> = vec![HashMap::new(); num_plans];
+            for (pi, (_, ty, _)) in columns.iter().enumerate() {
+                if matches!(ty, FieldType::Str | FieldType::Bytes) {
+                    plan_uses_dict[pi] = true;
+                    col_dict_ids[pi] = vec![None; total_rows];
+                }
+            }
+            for (bi, b) in batches.iter().enumerate() {
+                let base = bases[bi];
+                for (ci, c) in b.dyn_columns.iter().enumerate() {
+                    if !matches!(c.field_type, FieldType::Str | FieldType::Bytes) {
+                        continue;
+                    }
+                    let Some(cid) = column_lookup(&column_of, &c.name, c.field_type.to_u8()) else {
+                        continue; // overflowed the budget: folds into attrs_raw
+                    };
+                    let pi = plan_of_cid[&cid];
+                    if !plan_uses_dict[pi] {
+                        continue; // already poisoned by a plain contributor
+                    }
+                    let Some(d) = b.dyn_col_dicts.get(ci).and_then(Option::as_ref) else {
+                        plan_uses_dict[pi] = false; // plain contributor: fall back
+                        continue;
+                    };
+                    let mut slot = 0usize;
+                    for row in 0..b.num_rows {
+                        if !c.validity.get(row) {
+                            continue;
+                        }
+                        let val = &d.distinct[d.ids[slot] as usize];
+                        slot += 1;
+                        let next = global_dict[pi].len() as u32;
+                        let gid = *interners[pi].entry(val.clone()).or_insert_with(|| {
+                            global_dict[pi].push(val.clone());
+                            next
+                        });
+                        col_dict_ids[pi][base + row] = Some(gid);
+                    }
+                }
+            }
+        }
+        // Str plan column ids on the dict path: their per-row bloom tokens are
+        // set once per distinct value below, so the per-row loop skips them.
+        let dict_str_cids: HashSet<u32> = columns
+            .iter()
+            .enumerate()
+            .filter(|(pi, (_, ty, _))| plan_uses_dict[*pi] && matches!(ty, FieldType::Str))
+            .map(|(_, (_, _, cid))| *cid)
+            .collect();
+
         // Finish each row: sort its columnar occurrences by column id (matching
         // the row path's BTreeMap collection), resolve the merged view, and
         // project it into POSTINGS terms, NumStat winners, and attrs_raw.
@@ -1143,10 +1204,41 @@ impl RlogWriter {
                 .iter()
                 .map(|p| {
                     let plan_idx = plan_of_cid[&p.column_id];
-                    block_rows
-                        .iter()
-                        .map(|&g| col_values[plan_idx][g].clone())
-                        .collect()
+                    if plan_uses_dict[plan_idx] {
+                        // The dict path below carries this column's page; the
+                        // per-row value gather is skipped.
+                        Vec::new()
+                    } else {
+                        block_rows
+                            .iter()
+                            .map(|&g| col_values[plan_idx][g].clone())
+                            .collect()
+                    }
+                })
+                .collect();
+            // Owned per-block dict ids (one Option<index> per block row) for
+            // every dict-path plan, referenced by `str_dicts_v` below.
+            let str_dict_ids_v: Vec<Option<Vec<Option<u32>>>> = plans
+                .iter()
+                .map(|p| {
+                    let plan_idx = plan_of_cid[&p.column_id];
+                    plan_uses_dict[plan_idx].then(|| {
+                        block_rows
+                            .iter()
+                            .map(|&g| col_dict_ids[plan_idx][g])
+                            .collect()
+                    })
+                })
+                .collect();
+            let str_dicts_v: Vec<Option<BlockStrDict>> = plans
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let plan_idx = plan_of_cid[&p.column_id];
+                    str_dict_ids_v[i].as_ref().map(|ids| BlockStrDict {
+                        dict: &global_dict[plan_idx],
+                        ids,
+                    })
                 })
                 .collect();
             let stat_v: Vec<Vec<Option<ColumnValue>>> = plans
@@ -1178,6 +1270,7 @@ impl RlogWriter {
                 plans: &plans,
                 values: &values_v,
                 stat_values: &stat_v,
+                str_dicts: &str_dicts_v,
             };
             let out = write_block_columnar(&input, self.cfg.zstd_level)?;
 
@@ -1189,7 +1282,11 @@ impl RlogWriter {
                 insert_text(&mut builder, COL_SEVERITY_TEXT, g_sevtext[g]);
                 for (cid, v) in &g_cols[g] {
                     if let ColumnValue::Str(bytes) = v {
-                        insert_text(&mut builder, *cid, bytes);
+                        // Dict-path Str columns are tokenized per distinct value
+                        // after this loop; skip their per-row occurrence here.
+                        if !dict_str_cids.contains(cid) {
+                            insert_text(&mut builder, *cid, bytes);
+                        }
                     }
                 }
                 for (cid, v) in &g_indexed_terms[g] {
@@ -1204,6 +1301,23 @@ impl RlogWriter {
                     if field_map.len() > self.cfg.postings_max_distinct {
                         postings_terms.remove(cid);
                         postings_capped.insert(*cid);
+                    }
+                }
+            }
+            // Dict-path Str columns: tokenize each distinct value present in the
+            // block exactly once. Bloom bit setting is idempotent, so these set
+            // the same bits the per-row path would, at per-distinct cost.
+            for p in &plans {
+                let plan_idx = plan_of_cid[&p.column_id];
+                if !(plan_uses_dict[plan_idx] && matches!(p.ty, FieldType::Str)) {
+                    continue;
+                }
+                let mut seen: HashSet<u32> = HashSet::new();
+                for &g in block_rows {
+                    if let Some(gid) = col_dict_ids[plan_idx][g] {
+                        if seen.insert(gid) {
+                            insert_text(&mut builder, p.column_id, &global_dict[plan_idx][gid as usize]);
+                        }
                     }
                 }
             }
