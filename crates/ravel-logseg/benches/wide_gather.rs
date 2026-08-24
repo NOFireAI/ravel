@@ -17,6 +17,8 @@
 //! staging each column from contiguous per-column data, so this bench is the
 //! standing evidence for the cost it removes.
 
+#![allow(clippy::expect_used)]
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -97,10 +99,8 @@ fn gather_scans(rows: &[ResolvedRow], plans: &[ColumnPlan]) -> u64 {
             }
         }
         for r in rows {
-            if let Some((_, v)) = r.stat_winners.iter().find(|(c, _)| *c == cid) {
-                if let ColumnValue::I64(x) = v {
-                    acc = acc.wrapping_add(*x as u64);
-                }
+            if let Some((_, ColumnValue::I64(x))) = r.stat_winners.iter().find(|(c, _)| *c == cid) {
+                acc = acc.wrapping_add(*x as u64);
             }
         }
     }

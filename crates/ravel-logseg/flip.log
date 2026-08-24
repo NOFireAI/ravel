@@ -1,4 +1,0 @@
-   Compiling ravel-logseg v0.10.0 (/var/lib/fleet/work/a47c20ed-b084-433f-8049-aa3b1ddf2c9e/crates/ravel-logseg)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.62s
-     Running unittests src/lib.rs (/var/lib/fleet/cache/cargo-target/a47c20ed-b084-433f-8049-aa3b1ddf2c9e/debug/deps/ravel_logseg-f715b339b7184a9e)
-error: test failed, to rerun pass `-p ravel-logseg --lib`
