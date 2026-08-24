@@ -225,6 +225,13 @@ pub struct GenerateConfig {
     /// Extra distinct filler attribute keys per record, on top of the fixed
     /// `duration_ms` declared column, to widen the schema.
     pub extra_attrs: usize,
+    /// Per-query DataFusion memory-pool ceiling, in bytes, fed to
+    /// [`SqlConfig::max_query_bytes`]. Mirrors `ravel-server`'s
+    /// `--sql-max-query-bytes` (ADR-0088): raise it to measure a heavy query
+    /// that otherwise aborts with `query memory budget exhausted`. Defaults to
+    /// [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`], so an unset flag leaves the
+    /// executor's budget byte-for-byte unchanged.
+    pub max_query_bytes: usize,
 }
 
 /// Inputs for the loaded-tenant lane.
@@ -245,6 +252,13 @@ pub struct TenantConfigInput {
     pub now_ns: i64,
     /// Which layout the operator is measuring.
     pub compaction: Compaction,
+    /// Per-query DataFusion memory-pool ceiling, in bytes, fed to
+    /// [`SqlConfig::max_query_bytes`]. Mirrors `ravel-server`'s
+    /// `--sql-max-query-bytes` (ADR-0088): raise it to measure a heavy query
+    /// that otherwise aborts with `query memory budget exhausted`. Defaults to
+    /// [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`], so an unset flag leaves the
+    /// executor's budget byte-for-byte unchanged.
+    pub max_query_bytes: usize,
 }
 
 fn percentile(sorted_ns: &[u64], pct: f64) -> u64 {
@@ -303,6 +317,7 @@ fn declaration_union(entries: &[CorpusEntry]) -> Vec<DeclaredColumn> {
 fn cold_executor(
     store: &Arc<dyn ObjectStoreBackend>,
     declared: &[DeclaredColumn],
+    max_query_bytes: usize,
 ) -> Result<SqlExecutor, Error> {
     let catalog = Arc::new(Catalog::new(Arc::clone(store), CatalogConfig::default())?);
     Ok(SqlExecutor::new(
@@ -310,7 +325,10 @@ fn cold_executor(
         SegmentFetcher::new(Arc::clone(store)),
         LogSegmentFetcher::new(Arc::clone(store)),
         SpanSegmentFetcher::new(Arc::clone(store)),
-        SqlConfig::default(),
+        SqlConfig {
+            max_query_bytes,
+            ..SqlConfig::default()
+        },
         1 << 30,
     )
     .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.to_vec()))))
@@ -333,6 +351,7 @@ pub async fn measure_corpus(
     runs: usize,
     window: TimeRange,
     now_ns: i64,
+    max_query_bytes: usize,
 ) -> Result<(Vec<EntryReport>, Vec<SkippedEntry>), Error> {
     let runs = runs.max(1);
     let mut measured = Vec::new();
@@ -361,7 +380,7 @@ pub async fn measure_corpus(
             continue;
         }
 
-        let executor = cold_executor(store, declared)?;
+        let executor = cold_executor(store, declared, max_query_bytes)?;
         let req = SqlRequest {
             sql: entry.sql.clone(),
             window,
@@ -495,6 +514,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         cfg.runs,
         window,
         NOW_NS,
+        cfg.max_query_bytes,
     )
     .await?;
 
@@ -546,6 +566,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         cfg.runs,
         cfg.window,
         cfg.now_ns,
+        cfg.max_query_bytes,
     )
     .await?;
 
@@ -711,4 +732,46 @@ fn build_records(count: usize, extra_attrs: usize) -> Vec<LogRecord> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
+
+    fn empty_store() -> Arc<dyn ObjectStoreBackend> {
+        Arc::new(MemoryStore::new())
+    }
+
+    /// The `--sql-max-query-bytes` value threaded through `GenerateConfig`/
+    /// `TenantConfigInput` into `measure_corpus` must land on
+    /// `SqlConfig::max_query_bytes`, not stop at a parsed field. A value distinct
+    /// from the compiled-in default proves the override is wired end to end;
+    /// reverting `cold_executor` to `SqlConfig::default()` makes this fail rather
+    /// than pass on a coincidental default (its companion test covers the
+    /// default itself).
+    #[test]
+    fn cold_executor_threads_max_query_bytes_override() {
+        let store = empty_store();
+        let custom = DEFAULT_MAX_QUERY_BYTES * 4;
+        assert_ne!(custom, DEFAULT_MAX_QUERY_BYTES);
+        let executor = cold_executor(&store, &[], custom).expect("build executor");
+        assert_eq!(executor.config().max_query_bytes, custom);
+    }
+
+    /// Passing the default (an omitted flag) leaves the measured budget
+    /// byte-for-byte unchanged. Paired with the override test so a regression
+    /// that silently drops the override cannot pass by leaving the default
+    /// coincidentally correct.
+    #[test]
+    fn cold_executor_defaults_to_compiled_in_budget() {
+        let store = empty_store();
+        let executor =
+            cold_executor(&store, &[], DEFAULT_MAX_QUERY_BYTES).expect("build executor");
+        assert_eq!(
+            executor.config().max_query_bytes,
+            DEFAULT_MAX_QUERY_BYTES
+        );
+    }
 }

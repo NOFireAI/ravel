@@ -189,6 +189,13 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   span. ClickBench's `EventTime` values are from 2013, so widen the window well
   past the default 24 hours (relative to `--now-secs`, default the wall clock),
   or the catalog resolve will not see the segments.
+- `--sql-max-query-bytes` raises the per-query DataFusion memory-pool ceiling,
+  mirroring `ravel-server`'s flag of the same name (ADR-0088). A heavy statement
+  (a wide `SELECT *` with a row-wise filter and a pre-`LIMIT` `ORDER BY`) can
+  abort with `query memory budget exhausted`; that aborts the whole run with no
+  number for it. Pass a larger byte budget (for example `--sql-max-query-bytes
+  1073741824` for 1 GiB) to measure it instead. Omitted, it defaults to
+  ravel-sql's compiled-in 256 MiB, leaving the measured budget unchanged.
 
 ### How to read the report
 

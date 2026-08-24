@@ -36,6 +36,7 @@ use ravel_maintain::{Bucket, CompactionOutcome, CompactorConfig, FixedClock, com
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_proto::commit::v1::CompactionRecord;
+use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_segment::{
     IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7, WrittenSegment,
 };
@@ -87,6 +88,7 @@ async fn l0_object_count_equals_distinct_data_object_keys() {
         records: 60,
         records_per_object: 20,
         extra_attrs: 4,
+        max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
     };
     let report = run_generated(&cfg).await.expect("generated lane runs");
 
