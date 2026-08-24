@@ -710,11 +710,8 @@ mod tests {
 
         // The durable cap of 5 was applied despite the miss traffic: admission
         // now admits five fresh series where the base cap of 2 would admit two.
-        let admitted = admission.admit_series(
-            &tenant,
-            (1u8..=5).map(|b| SeriesId([b; 16])),
-            SystemClock.now_ns(),
-        );
+        let candidates: Vec<SeriesId> = (1u8..=5).map(|b| SeriesId([b; 16])).collect();
+        let admitted = admission.admit_series(&tenant, &candidates, SystemClock.now_ns());
         assert_eq!(
             admitted.admitted.len(),
             5,

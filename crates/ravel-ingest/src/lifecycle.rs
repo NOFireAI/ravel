@@ -358,7 +358,7 @@ mod tests {
 
         let now = SystemClock.now_ns();
         // At the base cap of 2, a fresh tenant admits 2 of 3 new series.
-        let admitted = controller.admit_series(&tenant, [series(1), series(2), series(3)], now);
+        let admitted = controller.admit_series(&tenant, &[series(1), series(2), series(3)], now);
         assert_eq!(admitted.admitted.len(), 2, "base cap of 2 admits two");
         assert_eq!(
             admitted.rejected.len(),
@@ -388,7 +388,7 @@ mod tests {
         // series 1 and 2 are still active (2 used); with the cap now 5 the next
         // three new series are all admitted, where before they would have been
         // rejected.
-        let admitted = controller.admit_series(&tenant, [series(4), series(5), series(6)], now);
+        let admitted = controller.admit_series(&tenant, &[series(4), series(5), series(6)], now);
         assert_eq!(
             admitted.admitted.len(),
             3,

@@ -31,8 +31,9 @@
 //! limit. This is a deliberate trade (see ADR-0051 "Rejected alternatives"
 //! 1), not an oversight.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use ravel_types::logstream::LogStreamId;
@@ -512,15 +513,19 @@ impl TenantState {
 /// bucket, and bounded usage counters. See the [module docs](self) for the
 /// call sequence a wiring task drives this with.
 ///
-/// Internally a single [`Mutex`] guards a `HashMap<TenantId, TenantState>`.
-/// Every operation is O(1) amortized arithmetic and hash-map/hash-set work
-/// with no `.await` under the lock, so contention is short; a busier
-/// design (sharded locks, one per tenant) is not needed at the process
-/// throughput this crate's shard actors already bound.
+/// The per-tenant state is split across [`ADMISSION_SHARD_COUNT`] shards, each
+/// its own [`Mutex`]-guarded map. A tenant maps to exactly one shard by
+/// [`shard_of`] for the process's lifetime, so every operation on a given
+/// tenant serializes on that one shard and operations on tenants in different
+/// shards never contend. Each operation is O(1) amortized arithmetic and
+/// hash-map/hash-set work with no `.await` under a shard lock, and the
+/// allocating per-point work (candidate dedup, admitted/rejected partitioning)
+/// is kept off the locked section entirely. No operation holds more than one
+/// shard lock at a time, so there is no lock ordering to reason about.
 pub struct AdmissionController {
     clock: Arc<dyn Clock>,
     defaults: AdmissionLimits,
-    tenants: Mutex<HashMap<TenantId, TenantState>>,
+    shards: [Mutex<HashMap<TenantId, TenantState>>; ADMISSION_SHARD_COUNT],
     /// A value stable for this process's lifetime and unique fleet-wide
     /// (ADR-0057 section 1). It names the one snapshot key this process owns and
     /// alone ever writes, `t/<tenant_hash>/<sig>/admission/<process_id>.snapshot`,
@@ -528,6 +533,13 @@ pub struct AdmissionController {
     /// sibling sum. Generated once at construction; it need not be meaningful
     /// outside this mechanism.
     process_id: Uuid,
+    /// Test-only count of `TenantId` clones taken on the shard-map insert path
+    /// (deliverable 4). A steady-state lookup finds an existing entry by borrow
+    /// and clones nothing, so this stays equal to the number of distinct
+    /// tenants ever first-seen. Pinned by
+    /// [`tests::steady_state_lookup_does_not_allocate_tenant_id`].
+    #[cfg(test)]
+    tenant_id_clones: std::sync::atomic::AtomicUsize,
 }
 
 impl AdmissionController {
@@ -535,8 +547,10 @@ impl AdmissionController {
         AdmissionController {
             clock,
             defaults,
-            tenants: Mutex::new(HashMap::new()),
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             process_id: Uuid::new_v4(),
+            #[cfg(test)]
+            tenant_id_clones: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -561,7 +575,9 @@ impl AdmissionController {
     /// fleet-reconciled narrowing (ADR-0057) in force.
     pub fn set_tenant_limits(&self, tenant: TenantId, limits: AdmissionLimits) {
         let now_ns = self.now_ns();
-        let mut tenants = lock(&self.tenants);
+        // The owned `tenant` is moved into `entry`, so the hit path drops it and
+        // the miss path stores it; neither clones.
+        let mut tenants = lock(&self.shards[shard_of(&tenant)]);
         tenants
             .entry(tenant)
             .and_modify(|state| state.set_limits(limits, now_ns))
@@ -574,11 +590,32 @@ impl AdmissionController {
         now_ns: i64,
         f: impl FnOnce(&mut TenantState) -> R,
     ) -> R {
-        let mut tenants = lock(&self.tenants);
+        let mut tenants = lock(&self.shards[shard_of(tenant)]);
+        // Steady state (deliverable 4): an existing tenant is found by borrow,
+        // so the common path clones nothing. The early return keeps the borrow
+        // from `get_mut` from extending past this block.
+        if let Some(state) = tenants.get_mut(tenant) {
+            return f(state);
+        }
+        // First sighting of this tenant in its shard: clone the id once to own
+        // the map key. This is the only `TenantId` clone on any hot path.
+        #[cfg(test)]
+        self.tenant_id_clones
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = tenants
             .entry(tenant.clone())
             .or_insert_with(|| TenantState::new(self.defaults, now_ns));
         f(state)
+    }
+
+    /// Test-only observation of the `TenantId` clone count (deliverable 4). The
+    /// counter is bumped exactly where [`Self::with_tenant`] clones the id on
+    /// its insert path, so this equals the number of distinct tenants ever
+    /// first-seen and never grows under steady-state lookups.
+    #[cfg(test)]
+    fn tenant_id_clone_count(&self) -> usize {
+        self.tenant_id_clones
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Charges `request_bytes` against the tenant's ingest byte-rate
@@ -686,9 +723,13 @@ impl AdmissionController {
         candidate_series: &[SeriesId],
         now_ns: i64,
     ) -> Result<(), RequestRejection> {
+        // Deduplicate candidates before taking the shard lock: the allocating
+        // hash-set work is per-point and does not need the shared state. Under
+        // the lock we only probe `is_active` per distinct id.
+        let unique = dedup_candidates(candidate_series);
         self.with_tenant(tenant, now_ns, |state| {
             state.series.rotate(now_ns);
-            let new_count = count_new(&state.series, candidate_series);
+            let new_count = count_new_unique(&state.series, &unique);
             charge_creation_rate(state, Signal::Metrics, new_count, now_ns)
         })
     }
@@ -702,9 +743,10 @@ impl AdmissionController {
         candidate_streams: &[LogStreamId],
         now_ns: i64,
     ) -> Result<(), RequestRejection> {
+        let unique = dedup_candidates(candidate_streams);
         self.with_tenant(tenant, now_ns, |state| {
             state.streams.rotate(now_ns);
-            let new_count = count_new(&state.streams, candidate_streams);
+            let new_count = count_new_unique(&state.streams, &unique);
             charge_creation_rate(state, Signal::Logs, new_count, now_ns)
         })
     }
@@ -717,9 +759,12 @@ impl AdmissionController {
     pub fn admit_series(
         &self,
         tenant: &TenantId,
-        candidate_series: impl IntoIterator<Item = SeriesId>,
+        candidate_series: &[SeriesId],
         now_ns: i64,
     ) -> IdentityAdmission<SeriesId> {
+        // The admitted-index bitmap is sized and allocated before the lock; the
+        // locked section only flips bits, never grows a per-point Vec.
+        let mut mask = AdmitMask::new(candidate_series.len());
         self.with_tenant(tenant, now_ns, |state| {
             state.series.rotate(now_ns);
             // The effective fleet-reconciled cap (ADR-0057 section 2), which
@@ -727,8 +772,10 @@ impl AdmissionController {
             // reconciliation off the hot path. Same field read, same cost.
             let cap = state.fleet_max_active_series;
             let usage = state.usage.entry(Signal::Metrics).or_default();
-            admit_batch(&mut state.series, candidate_series, cap, usage)
-        })
+            admit_batch(&mut state.series, candidate_series, cap, usage, &mut mask);
+        });
+        // Partition into admitted/rejected after the lock is dropped.
+        split_admission(candidate_series, &mask)
     }
 
     /// Log-stream analogue of [`Self::admit_series`], against
@@ -736,17 +783,19 @@ impl AdmissionController {
     pub fn admit_streams(
         &self,
         tenant: &TenantId,
-        candidate_streams: impl IntoIterator<Item = LogStreamId>,
+        candidate_streams: &[LogStreamId],
         now_ns: i64,
     ) -> IdentityAdmission<LogStreamId> {
+        let mut mask = AdmitMask::new(candidate_streams.len());
         self.with_tenant(tenant, now_ns, |state| {
             state.streams.rotate(now_ns);
             // The effective fleet-reconciled cap (ADR-0057 section 2), as in
             // `admit_series`.
             let cap = state.fleet_max_active_streams;
             let usage = state.usage.entry(Signal::Logs).or_default();
-            admit_batch(&mut state.streams, candidate_streams, cap, usage)
-        })
+            admit_batch(&mut state.streams, candidate_streams, cap, usage, &mut mask);
+        });
+        split_admission(candidate_streams, &mask)
     }
 
     /// Bounded per-tenant usage snapshot for export (ADR-0051 section 6):
@@ -755,29 +804,32 @@ impl AdmissionController {
     /// a closed 6-member enum); it is never keyed by a raw tenant-supplied
     /// string; see [`TenantUsage`].
     pub fn usage_snapshot(&self) -> Vec<TenantUsage> {
-        let tenants = lock(&self.tenants);
         let mut out = Vec::new();
-        for (tenant, state) in tenants.iter() {
-            let tenant_hash = tenant.hash();
-            for (&signal, usage) in &state.usage {
-                let active_series = match signal {
-                    Signal::Metrics => state.series.active_count,
-                    Signal::Logs => state.streams.active_count,
-                    _ => 0,
-                };
-                out.push(TenantUsage {
-                    tenant_hash,
-                    signal,
-                    active_series,
-                    requests_admitted_total: usage.requests_admitted_total,
-                    bytes_admitted_total: usage.bytes_admitted_total,
-                    series_admitted_total: usage.series_admitted_total,
-                    requests_rejected_byte_rate_total: usage.requests_rejected_byte_rate_total,
-                    requests_rejected_series_rate_total: usage.requests_rejected_series_rate_total,
-                    requests_rejected_clock_total: usage.requests_rejected_clock_total,
-                    series_rejected_cap_total: usage.series_rejected_cap_total,
-                    reconciliation_failures_total: usage.reconciliation_failures_total,
-                });
+        for shard in &self.shards {
+            let tenants = lock(shard);
+            for (tenant, state) in tenants.iter() {
+                let tenant_hash = tenant.hash();
+                for (&signal, usage) in &state.usage {
+                    let active_series = match signal {
+                        Signal::Metrics => state.series.active_count,
+                        Signal::Logs => state.streams.active_count,
+                        _ => 0,
+                    };
+                    out.push(TenantUsage {
+                        tenant_hash,
+                        signal,
+                        active_series,
+                        requests_admitted_total: usage.requests_admitted_total,
+                        bytes_admitted_total: usage.bytes_admitted_total,
+                        series_admitted_total: usage.series_admitted_total,
+                        requests_rejected_byte_rate_total: usage.requests_rejected_byte_rate_total,
+                        requests_rejected_series_rate_total: usage
+                            .requests_rejected_series_rate_total,
+                        requests_rejected_clock_total: usage.requests_rejected_clock_total,
+                        series_rejected_cap_total: usage.series_rejected_cap_total,
+                        reconciliation_failures_total: usage.reconciliation_failures_total,
+                    });
+                }
             }
         }
         out
@@ -804,55 +856,59 @@ impl AdmissionController {
     /// per tenant that has any recorded activity; the caller writes a per-signal
     /// snapshot for each and reads the siblings.
     pub(crate) fn snapshot_for_reconciliation(&self, now_ns: i64) -> Vec<TenantReconcileState> {
-        let mut tenants = lock(&self.tenants);
-        let mut out = Vec::with_capacity(tenants.len());
-        for (tenant, state) in tenants.iter_mut() {
-            if state.usage.is_empty() {
-                continue;
+        let mut out = Vec::new();
+        // Each shard is locked in turn and released before the next; no two
+        // shard locks are ever held at once.
+        for shard in &self.shards {
+            let mut tenants = lock(shard);
+            for (tenant, state) in tenants.iter_mut() {
+                if state.usage.is_empty() {
+                    continue;
+                }
+                state.series.rotate(now_ns);
+                state.streams.rotate(now_ns);
+
+                // Tenant-wide flow: bytes admitted across every signal, and new
+                // identities created across series and streams. Both buckets are
+                // per-tenant (ADR-0051), so the deltas are tenant-wide, carried
+                // identically in each of the tenant's per-signal snapshots.
+                let bytes_total: u64 = state
+                    .usage
+                    .values()
+                    .map(|u| u.bytes_admitted_total)
+                    .fold(0u64, u64::saturating_add);
+                let created_total = state
+                    .series
+                    .created_total
+                    .saturating_add(state.streams.created_total);
+                let byte_delta = bytes_total.saturating_sub(state.snapshot_baseline_bytes);
+                let creation_delta = created_total.saturating_sub(state.snapshot_baseline_created);
+                // Baselines are NOT advanced here: they commit in
+                // `apply_reconciliation`, only after this tenant's sibling read
+                // succeeds. The running totals ride along so that commit can pin
+                // the baseline to exactly the totals this delta was measured
+                // against (traffic that arrives between here and the commit is
+                // attributed to the next interval, not this one).
+
+                let mut signals: Vec<Signal> = state.usage.keys().copied().collect();
+                signals.sort_by_key(|s| s.key_prefix());
+
+                out.push(TenantReconcileState {
+                    tenant: tenant.clone(),
+                    tenant_hash: tenant.hash(),
+                    configured_series: state.limits.max_active_series,
+                    configured_streams: state.limits.max_active_streams,
+                    configured_byte_rate: state.limits.ingest_byte_rate,
+                    configured_creation_rate: state.limits.series_creation_rate,
+                    active_series: state.series.active_count,
+                    active_streams: state.streams.active_count,
+                    byte_delta,
+                    creation_delta,
+                    snapshot_bytes_total: bytes_total,
+                    snapshot_created_total: created_total,
+                    signals,
+                });
             }
-            state.series.rotate(now_ns);
-            state.streams.rotate(now_ns);
-
-            // Tenant-wide flow: bytes admitted across every signal, and new
-            // identities created across series and streams. Both buckets are
-            // per-tenant (ADR-0051), so the deltas are tenant-wide, carried
-            // identically in each of the tenant's per-signal snapshots.
-            let bytes_total: u64 = state
-                .usage
-                .values()
-                .map(|u| u.bytes_admitted_total)
-                .fold(0u64, u64::saturating_add);
-            let created_total = state
-                .series
-                .created_total
-                .saturating_add(state.streams.created_total);
-            let byte_delta = bytes_total.saturating_sub(state.snapshot_baseline_bytes);
-            let creation_delta = created_total.saturating_sub(state.snapshot_baseline_created);
-            // Baselines are NOT advanced here: they commit in
-            // `apply_reconciliation`, only after this tenant's sibling read
-            // succeeds. The running totals ride along so that commit can pin the
-            // baseline to exactly the totals this delta was measured against
-            // (traffic that arrives between here and the commit is attributed to
-            // the next interval, not this one).
-
-            let mut signals: Vec<Signal> = state.usage.keys().copied().collect();
-            signals.sort_by_key(|s| s.key_prefix());
-
-            out.push(TenantReconcileState {
-                tenant: tenant.clone(),
-                tenant_hash: tenant.hash(),
-                configured_series: state.limits.max_active_series,
-                configured_streams: state.limits.max_active_streams,
-                configured_byte_rate: state.limits.ingest_byte_rate,
-                configured_creation_rate: state.limits.series_creation_rate,
-                active_series: state.series.active_count,
-                active_streams: state.streams.active_count,
-                byte_delta,
-                creation_delta,
-                snapshot_bytes_total: bytes_total,
-                snapshot_created_total: created_total,
-                signals,
-            });
         }
         out
     }
@@ -867,7 +923,7 @@ impl AdmissionController {
     /// dropped (the commit half of [`Self::snapshot_for_reconciliation`]'s
     /// exactly-once contract).
     pub(crate) fn apply_reconciliation(&self, update: &TenantReconcileApply) {
-        let mut tenants = lock(&self.tenants);
+        let mut tenants = lock(&self.shards[shard_of(&update.tenant)]);
         let Some(state) = tenants.get_mut(&update.tenant) else {
             return;
         };
@@ -916,7 +972,7 @@ impl AdmissionController {
     /// hook for the reconciliation tests; the hot path reads this same field.
     #[cfg(test)]
     pub(crate) fn effective_max_active_series(&self, tenant: &TenantId) -> Option<CountLimit> {
-        lock(&self.tenants)
+        lock(&self.shards[shard_of(tenant)])
             .get(tenant)
             .map(|state| state.fleet_max_active_series)
     }
@@ -927,7 +983,7 @@ impl AdmissionController {
     /// tests; the hot-path `try_take` reads this same bucket field.
     #[cfg(test)]
     pub(crate) fn effective_byte_rate_per_sec(&self, tenant: &TenantId) -> Option<u64> {
-        lock(&self.tenants)
+        lock(&self.shards[shard_of(tenant)])
             .get(tenant)
             .and_then(|state| state.byte_rate.as_ref())
             .map(|bucket| bucket.rate_per_sec)
@@ -982,15 +1038,37 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn count_new<T: Eq + Hash + Copy>(set: &EpochIdSet<T>, candidates: &[T]) -> u64 {
-    let mut seen = HashSet::new();
-    let mut new_count: u64 = 0;
-    for id in candidates {
-        if seen.insert(*id) && !set.is_active(id) {
-            new_count += 1;
+/// The shard owning `tenant`. Deterministic for the process's lifetime, so a
+/// given tenant always lands in the same shard and every operation on it
+/// serializes on that one mutex. The mapping only needs to spread tenants
+/// uniformly across shards, so a cheap non-cryptographic hash of the id is
+/// used here rather than the BLAKE3 [`TenantId::hash`] the object-key layout
+/// requires.
+fn shard_of(tenant: &TenantId) -> usize {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(tenant.as_str().as_bytes());
+    (hasher.finish() % ADMISSION_SHARD_COUNT as u64) as usize
+}
+
+/// Deduplicates `candidates`, preserving first-seen order. Called BEFORE the
+/// shard lock so the allocating hash-set work stays off the critical section;
+/// the returned slice then feeds [`count_new_unique`] under the lock.
+fn dedup_candidates<T: Eq + Hash + Copy>(candidates: &[T]) -> Vec<T> {
+    let mut seen = HashSet::with_capacity(candidates.len());
+    let mut unique = Vec::new();
+    for &id in candidates {
+        if seen.insert(id) {
+            unique.push(id);
         }
     }
-    new_count
+    unique
+}
+
+/// Counts how many already-deduplicated `unique` ids are not yet active in
+/// `set`. Runs under the shard lock but allocates nothing: dedup happened in
+/// [`dedup_candidates`] before the lock was taken.
+fn count_new_unique<T: Eq + Hash + Copy>(set: &EpochIdSet<T>, unique: &[T]) -> u64 {
+    unique.iter().filter(|id| !set.is_active(id)).count() as u64
 }
 
 fn charge_creation_rate(
@@ -1015,19 +1093,62 @@ fn charge_creation_rate(
     result
 }
 
+/// A compact bitmap over a candidate slice: bit `i` set means candidate `i`
+/// was admitted. Sized to the candidate count and allocated by the caller
+/// BEFORE the shard lock is taken, so the locked [`admit_batch`] only flips
+/// bits and never grows a per-point Vec; [`split_admission`] reads the bits
+/// back after the lock is dropped.
+struct AdmitMask {
+    words: Vec<u64>,
+}
+
+impl AdmitMask {
+    fn new(len: usize) -> Self {
+        AdmitMask {
+            words: vec![0u64; len.div_ceil(64)],
+        }
+    }
+
+    fn set(&mut self, index: usize) {
+        self.words[index / 64] |= 1u64 << (index % 64);
+    }
+
+    fn get(&self, index: usize) -> bool {
+        self.words[index / 64] & (1u64 << (index % 64)) != 0
+    }
+}
+
+/// Admits each candidate against `cap`, recording the outcome in `mask` and the
+/// per-signal counters. This is the only work that needs the shard lock: it
+/// mutates the shared [`EpochIdSet`] and `usage`, and flips bits in the
+/// pre-sized `mask`. No allocation and no per-point Vec growth happens here;
+/// [`split_admission`] turns the mask into the admitted/rejected lists once the
+/// lock is dropped.
 fn admit_batch<T: Eq + Hash + Copy>(
     set: &mut EpochIdSet<T>,
-    candidates: impl IntoIterator<Item = T>,
+    candidates: &[T],
     cap: CountLimit,
     usage: &mut SignalUsage,
-) -> IdentityAdmission<T> {
-    let mut out = IdentityAdmission::default();
-    for id in candidates {
+    mask: &mut AdmitMask,
+) {
+    for (index, &id) in candidates.iter().enumerate() {
         if set.admit(id, cap) {
             usage.series_admitted_total += 1;
-            out.admitted.push(id);
+            mask.set(index);
         } else {
             usage.series_rejected_cap_total += 1;
+        }
+    }
+}
+
+/// Partitions `candidates` into admitted/rejected by `mask`. Runs OUTSIDE the
+/// shard lock: this is the per-point Vec building that used to happen under it.
+fn split_admission<T: Copy>(candidates: &[T], mask: &AdmitMask) -> IdentityAdmission<T> {
+    let mut out = IdentityAdmission::default();
+    for (index, &id) in candidates.iter().enumerate() {
+        if mask.get(index) {
+            out.admitted.push(id);
+        } else {
             out.rejected.push(id);
         }
     }
@@ -1086,13 +1207,13 @@ mod tests {
         let tenant = TenantId::new("acme");
         controller.set_tenant_limits(tenant.clone(), tight_limits(2));
 
-        let first = controller.admit_series(&tenant, [series(1), series(2)], clock.now());
+        let first = controller.admit_series(&tenant, &[series(1), series(2)], clock.now());
         assert_eq!(first.admitted, vec![series(1), series(2)]);
         assert!(first.rejected.is_empty());
 
         // series(1) is already active and keeps flowing; series(3) is new
         // and the cap (2) has no room, so only it is rejected.
-        let second = controller.admit_series(&tenant, [series(1), series(3)], clock.now());
+        let second = controller.admit_series(&tenant, &[series(1), series(3)], clock.now());
         assert_eq!(second.admitted, vec![series(1)]);
         assert_eq!(second.rejected, vec![series(3)]);
     }
@@ -1147,7 +1268,7 @@ mod tests {
                 .check_series_creation_rate(&tenant, &[series(1)], clock.now())
                 .is_ok()
         );
-        let admitted = controller.admit_series(&tenant, [series(1)], clock.now());
+        let admitted = controller.admit_series(&tenant, &[series(1)], clock.now());
         assert_eq!(admitted.admitted, vec![series(1)]);
 
         // A new series exhausts the creation-rate bucket: whole-request reject.
@@ -1266,7 +1387,7 @@ mod tests {
                 .check_byte_rate(&noisy, Signal::Metrics, 1, clock.now())
                 .is_err()
         );
-        let noisy_admit = controller.admit_series(&noisy, [series(1), series(2)], clock.now());
+        let noisy_admit = controller.admit_series(&noisy, &[series(1), series(2)], clock.now());
         assert_eq!(noisy_admit.admitted, vec![series(1)]);
         assert_eq!(noisy_admit.rejected, vec![series(2)]);
 
@@ -1276,7 +1397,7 @@ mod tests {
                 .check_byte_rate(&quiet, Signal::Metrics, 10, clock.now())
                 .is_ok()
         );
-        let quiet_admit = controller.admit_series(&quiet, [series(1)], clock.now());
+        let quiet_admit = controller.admit_series(&quiet, &[series(1)], clock.now());
         assert_eq!(quiet_admit.admitted, vec![series(1)]);
         assert!(quiet_admit.rejected.is_empty());
     }
@@ -1288,21 +1409,21 @@ mod tests {
         let tenant = TenantId::new("acme");
         controller.set_tenant_limits(tenant.clone(), tight_limits(1));
 
-        let first = controller.admit_series(&tenant, [series(1)], clock.now());
+        let first = controller.admit_series(&tenant, &[series(1)], clock.now());
         assert_eq!(first.admitted, vec![series(1)]);
 
         // One epoch later, series(1) is still active (current epoch's
         // window looks at current + previous), so a fresh series is still
         // rejected: the cap has no room.
         clock.advance(ACTIVE_EPOCH_NS);
-        let still_active = controller.admit_series(&tenant, [series(2)], clock.now());
+        let still_active = controller.admit_series(&tenant, &[series(2)], clock.now());
         assert!(still_active.admitted.is_empty());
         assert_eq!(still_active.rejected, vec![series(2)]);
 
         // Two more epochs with no traffic for series(1) age it out entirely,
         // freeing the cap for a new series.
         clock.advance(ACTIVE_EPOCH_NS * 2);
-        let after_expiry = controller.admit_series(&tenant, [series(2)], clock.now());
+        let after_expiry = controller.admit_series(&tenant, &[series(2)], clock.now());
         assert_eq!(after_expiry.admitted, vec![series(2)]);
     }
 
@@ -1313,10 +1434,10 @@ mod tests {
         let tenant = TenantId::new("acme");
         controller.set_tenant_limits(tenant.clone(), tight_limits(1));
 
-        let first = controller.admit_streams(&tenant, [stream(1)], clock.now());
+        let first = controller.admit_streams(&tenant, &[stream(1)], clock.now());
         assert_eq!(first.admitted, vec![stream(1)]);
 
-        let second = controller.admit_streams(&tenant, [stream(1), stream(2)], clock.now());
+        let second = controller.admit_streams(&tenant, &[stream(1), stream(2)], clock.now());
         assert_eq!(second.admitted, vec![stream(1)]);
         assert_eq!(second.rejected, vec![stream(2)]);
     }
@@ -1328,7 +1449,7 @@ mod tests {
         let tenant = TenantId::new("acme");
         controller.set_tenant_limits(tenant.clone(), tight_limits(10));
 
-        controller.admit_series(&tenant, [series(1), series(2)], clock.now());
+        controller.admit_series(&tenant, &[series(1), series(2)], clock.now());
         let _ = controller.check_byte_rate(&tenant, Signal::Metrics, 128, clock.now());
 
         let snapshot = controller.usage_snapshot();
