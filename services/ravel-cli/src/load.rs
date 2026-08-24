@@ -245,6 +245,7 @@ pub fn dynamic_column_warnings(
 /// [`print_durable_tokens`] for the residual cases (a flush that timed out or
 /// lost a shard at send time) where the printed list can still be a lower
 /// bound rather than exact.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: Arc<dyn ObjectStoreBackend>,
     parquet_path: &Path,
@@ -252,6 +253,7 @@ pub async fn run(
     mapping_path: &Path,
     shards: u32,
     batch_rows: usize,
+    read_cursors: Option<usize>,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_warning_to(
@@ -261,6 +263,7 @@ pub async fn run(
         mapping_path,
         shards,
         batch_rows,
+        read_cursors,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -282,6 +285,7 @@ pub(crate) async fn run_warning_to(
     mapping_path: &Path,
     shards: u32,
     batch_rows: usize,
+    read_cursors: Option<usize>,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -300,6 +304,7 @@ pub(crate) async fn run_warning_to(
         &mapping,
         shards,
         batch_rows,
+        read_cursors,
         now_ns,
         Arc::new(SystemClock),
     )
@@ -307,6 +312,11 @@ pub(crate) async fn run_warning_to(
     {
         Ok(report) => {
             print_summary(&report);
+            // Early, so an operator watching a long load sees it as soon as it is
+            // known, ahead of the end-of-load dynamic-column pressure warnings.
+            if let Some(skew) = &report.skew_warning {
+                let _ = writeln!(warnings, "{skew}");
+            }
             // The loader's writer uses `RlogConfig::default()` (log_shard.rs), so
             // its per-object dynamic-column budget is that default.
             let max_dynamic_columns = ravel_logseg::RlogConfig::default().max_dynamic_columns;
@@ -420,6 +430,11 @@ pub struct LoadReport {
     /// return path for a per-load signal (`LogIngestRouter::metrics()` is only
     /// reachable by whoever constructed the router, which is `load` itself).
     pub metrics: LogIngestMetricsSnapshot,
+    /// The early shard-skew warning (issue #560), set at most once, the first
+    /// time the check at [`SKEW_CHECK_AFTER_BATCHES`] data batches finds the
+    /// spread at or below the [`SKEW_WARN_DENOMINATOR`] threshold. `None` when
+    /// the load never reached the check point or stayed above it.
+    pub skew_warning: Option<String>,
     /// The logs pipeline's per-stage timing breakdown (ADR-0104 decision 1),
     /// snapshotted once the load finished. Present only under the
     /// `stage-timing` feature; with it off this field does not exist, so a
@@ -530,6 +545,7 @@ pub async fn load(
     mapping: &Mapping,
     shards: u32,
     batch_rows: usize,
+    read_cursors: Option<usize>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
 ) -> Result<LoadReport, LoadError> {
@@ -540,6 +556,7 @@ pub async fn load(
         mapping,
         shards,
         batch_rows,
+        read_cursors,
         now_ns,
         clock,
         None,
@@ -565,6 +582,7 @@ async fn load_instrumented(
     mapping: &Mapping,
     shards: u32,
     batch_rows: usize,
+    read_cursors: Option<usize>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
     on_build_start: Option<BuildStartHook>,
@@ -576,6 +594,16 @@ async fn load_instrumented(
         return Err(LoadError::Setup(
             "--batch-rows must be at least 1 (each batch is one Strict flush per shard); 0 was \
              given"
+                .to_string(),
+        ));
+    }
+    // Same shape as the `batch_rows == 0` guard above: `--read-cursors` is
+    // operator-facing (issue #560), so 0 is a rejected value, not a silent
+    // clamp to 1.
+    if read_cursors == Some(0) {
+        return Err(LoadError::Setup(
+            "--read-cursors must be at least 1, or omitted for automatic sizing \
+             (min(shard count, row-group count)); 0 was given"
                 .to_string(),
         ));
     }
@@ -618,17 +646,14 @@ async fn load_instrumented(
         clock,
     );
 
-    let file = std::fs::File::open(parquet_path)
-        .map_err(|e| LoadError::Setup(format!("failed to open {}: {e}", parquet_path.display())))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
-    let reader = builder
-        .with_batch_size(batch_rows)
-        .build()
-        .map_err(|e| LoadError::Setup(format!("failed to build Parquet reader: {e}")))?;
+    let row_group_lens = row_group_row_counts(parquet_path)?;
+    let cursor_count = resolve_read_cursors(read_cursors, shards, row_group_lens.len());
+    let cursors = open_stride_cursors(parquet_path, &row_group_lens, cursor_count, batch_rows)?;
 
     let started = Instant::now();
     let mut report = LoadReport::default();
+    let mut shards_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut data_batches_flushed: u64 = 0;
 
     // Single-batch lookahead (issue #541). Batch N+1's decode/build (sync
     // Parquet decode via `Iterator::next`, then the per-row `build_record`
@@ -646,24 +671,27 @@ async fn load_instrumented(
     // same `durable` tokens (those from batches strictly before it) as before;
     // the prefetch changes only *when* (wall-clock) the decode/build happens.
     let mapping = Arc::new(mapping.clone());
-    let mut row_base: u64 = 0;
+    let state = StrideCursors {
+        cursors,
+        deal_offset: 0,
+    };
 
-    // Spawn the decode/build of the batch starting at `row_base`, moving the
-    // reader in; the task hands it back with the outcome.
-    let spawn_build = |reader: BatchReader, row_base: u64| {
+    // Spawn the decode/build of the next batch, moving the stride cursors in;
+    // the task hands them back with the outcome.
+    let spawn_build = |state: StrideCursors| {
         let mapping = Arc::clone(&mapping);
         let limits = limits.clone();
         let hook = on_build_start.clone();
         tokio::task::spawn_blocking(move || {
-            decode_and_build(reader, mapping, limits, now_ns, row_base, hook.as_ref())
+            decode_and_build_stride(state, mapping, limits, now_ns, batch_rows, hook.as_ref())
         })
     };
 
     // Prime the pipeline with batch 0.
-    let mut pending = spawn_build(reader, row_base);
+    let mut pending = spawn_build(state);
 
     loop {
-        let (reader, built) = match pending.await {
+        let (state, built) = match pending.await {
             Ok(pair) => pair,
             // A panic in the decode/build task is a batch decode failure;
             // earlier batches may already be durable.
@@ -675,7 +703,7 @@ async fn load_instrumented(
             }
         };
 
-        let (records, num_rows) = match built {
+        let records = match built {
             Prefetched::Done => break,
             Prefetched::BatchFailed { reason } => {
                 return Err(LoadError::BatchFailed {
@@ -690,15 +718,12 @@ async fn load_instrumented(
                     durable: report.tokens.clone(),
                 });
             }
-            Prefetched::Batch { records, num_rows } => (records, num_rows),
+            Prefetched::Batch { records, .. } => records,
         };
-
-        let next_row_base = row_base + num_rows as u64;
 
         if records.is_empty() {
             // A zero-row batch writes nothing; advance and prefetch the next.
-            row_base = next_row_base;
-            pending = spawn_build(reader, next_row_base);
+            pending = spawn_build(state);
             continue;
         }
 
@@ -713,8 +738,7 @@ async fn load_instrumented(
             WriteMode::Strict,
             WRITE_ACK_DEADLINE,
         );
-        pending = spawn_build(reader, next_row_base);
-        row_base = next_row_base;
+        pending = spawn_build(state);
 
         let receipt = write_fut.await.map_err(|e| {
             // Earlier batches are already durable; append this batch's own
@@ -728,7 +752,13 @@ async fn load_instrumented(
             }
         })?;
         report.rows_processed += n;
+        shards_seen.extend(receipt.tokens.iter().map(|t| t.shard));
         report.tokens.extend(receipt.tokens);
+
+        data_batches_flushed += 1;
+        if data_batches_flushed == SKEW_CHECK_AFTER_BATCHES && report.skew_warning.is_none() {
+            report.skew_warning = shard_skew_warning(shards_seen.len(), shards);
+        }
     }
 
     // Strict acks already guarantee durability; flush_all is a defensive
@@ -747,9 +777,8 @@ async fn load_instrumented(
     Ok(report)
 }
 
-/// The Parquet reader shuttled through each decode/build task. It owns
-/// file-reading state and is not `Clone`, so a single instance is moved into
-/// the blocking closure and handed back with the outcome each iteration.
+/// The Parquet reader shuttled through each stride cursor's decode/build task.
+/// It owns file-reading state and is not `Clone`.
 type BatchReader = parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 
 /// One prefetched batch's decode/build outcome. Errors carry only the reason
@@ -759,75 +788,324 @@ type BatchReader = parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 /// from batches strictly before the failure regardless of when (wall-clock) the
 /// decode ran.
 enum Prefetched {
-    /// The reader is exhausted; no batch was produced.
+    /// Every stride cursor is exhausted; no batch was produced.
     Done,
-    /// A batch decoded and built into `records`. `num_rows` is the source row
-    /// count; it equals `records.len()` since every non-rejected row yields one
-    /// record (a rejection returns `RowRejected` instead of a partial batch).
-    Batch {
-        records: Vec<NormalizedLogRecord>,
-        num_rows: usize,
-    },
+    /// A batch decoded and built into `records`, assembled from up to K
+    /// contiguous spans (one per live stride cursor, issue #560). Every
+    /// non-rejected row yields one record (a rejection returns `RowRejected`
+    /// instead of a partial batch), so `records.len()` is already the source
+    /// row count; no separate count is carried.
+    Batch { records: Vec<NormalizedLogRecord> },
     /// The batch failed to read from Parquet or to resolve against the mapping.
     BatchFailed { reason: String },
-    /// A row failed a kept admission check. `row` is the absolute row index.
+    /// A row failed a kept admission check. `row` is the FILE-absolute row
+    /// index, translated from whichever cursor's span produced it.
     RowRejected { row: u64, reason: String },
 }
 
-/// Pull the next batch from `reader` and build its records, handing the reader
-/// back for the next iteration. This is the pipeline's CPU-bound half (sync
-/// Parquet decode plus the per-row `build_record` loop), run on a
-/// `spawn_blocking` task so it overlaps the previous batch's `router.write` I/O
-/// wait (issue #541). `on_build_start` fires once, before the per-row loop, only
-/// when there is a batch to build.
-fn decode_and_build(
-    mut reader: BatchReader,
+/// One of the K stride cursors' state (issue #560): its own file-backed
+/// Parquet reader, restricted to a contiguous partition of row groups, plus
+/// whatever Arrow batch it has pulled from `reader.next()` but not yet fully
+/// handed out via [`cursor_take`]. Not `Clone`; shuttled into and back out of
+/// the decode/build `spawn_blocking` task each iteration, same as the single
+/// reader before it.
+struct CursorState {
+    /// `None` once the underlying reader is exhausted.
+    reader: Option<BatchReader>,
+    /// Rows pulled from `reader.next()` not yet fully consumed.
+    buffered: Option<RecordBatch>,
+    /// File-absolute row index of this cursor's partition's first row.
+    partition_base: u64,
+    /// Rows already handed out from this partition, so
+    /// `partition_base + consumed` is the file-absolute index of the next row
+    /// this cursor will yield.
+    consumed: u64,
+}
+
+impl CursorState {
+    /// This cursor has no more rows to give, now or in a future round.
+    fn is_exhausted(&self) -> bool {
+        self.reader.is_none() && self.buffered.as_ref().is_none_or(|b| b.num_rows() == 0)
+    }
+}
+
+/// The K stride cursors' shared state, threaded through the decode/build
+/// `spawn_blocking` task each iteration (issue #560): the K-cursor
+/// generalization of the single [`BatchReader`] the pre-#560 loop shuttled.
+struct StrideCursors {
+    cursors: Vec<CursorState>,
+    /// Rotates which live cursors receive the remainder share each round, so
+    /// a live-cursor count that outnumbers `batch_rows` (an unusual but valid
+    /// configuration) does not starve any cursor forever: see
+    /// [`decode_and_build_stride`].
+    deal_offset: usize,
+}
+
+/// Drain up to `want` contiguous rows from `cur`, pulling fresh Arrow batches
+/// from its reader as needed. Returns `Ok(None)` once the cursor has no more
+/// rows at all. The returned batch's row 0 is at the returned file-absolute
+/// index. [`RecordBatch::slice`] is a zero-copy view, so a cursor whose
+/// buffered batch is consumed in one call (the common case, including every
+/// K=1 call once `with_batch_size` bounds a batch at `want`) is handed back
+/// unsliced.
+fn cursor_take(cur: &mut CursorState, want: usize) -> Result<Option<(RecordBatch, u64)>, String> {
+    let buf = loop {
+        match cur.buffered.take() {
+            Some(buf) if buf.num_rows() > 0 => break buf,
+            Some(_) | None => {}
+        }
+        let Some(reader) = cur.reader.as_mut() else {
+            return Ok(None);
+        };
+        match reader.next() {
+            None => {
+                cur.reader = None;
+                return Ok(None);
+            }
+            Some(Ok(batch)) => cur.buffered = Some(batch),
+            Some(Err(e)) => return Err(format!("failed to read Parquet batch: {e}")),
+        }
+    };
+    let total = buf.num_rows();
+    let take_n = want.min(total);
+    let file_base = cur.partition_base + cur.consumed;
+    cur.consumed += take_n as u64;
+    if take_n == total {
+        Ok(Some((buf, file_base)))
+    } else {
+        let out = buf.slice(0, take_n);
+        cur.buffered = Some(buf.slice(take_n, total - take_n));
+        Ok(Some((out, file_base)))
+    }
+}
+
+/// Assemble one batch from every live cursor's contiguous share of
+/// `batch_rows` and build its records (issue #560). Each live cursor
+/// contributes up to its share as one contiguous run via [`cursor_take`]; the
+/// resulting spans keep their own `file_base` so a rejected row's reported
+/// index translates to its FILE-absolute position regardless of which cursor
+/// produced it.
+///
+/// Share sizing: `batch_rows` split evenly across the currently live cursor
+/// count, with the remainder distributed via a rotating window
+/// (`deal_offset`) rather than always to the same cursors. This *is* what
+/// "redistribute an exhausted cursor's share across the remaining cursors"
+/// means in practice: the denominator (live cursor count) shrinks as cursors
+/// exhaust, so each remaining cursor's share grows on its own with no
+/// separate redistribution step, and the rotation guarantees that even a
+/// pathological live-cursor count greater than `batch_rows` (some cursors get
+/// a zero share this round) eventually asks every live cursor for rows.
+///
+/// `on_build_start` fires once, before any row is built, whenever there is at
+/// least one live cursor (matching the pre-#560 hook timing of firing
+/// whenever `reader.next()` would yield `Some(_)`, regardless of whether that
+/// attempt goes on to decode or resolve cleanly).
+fn decode_and_build_stride(
+    mut state: StrideCursors,
     mapping: Arc<Mapping>,
     limits: LogIngestLimits,
     now_ns: i64,
-    row_base: u64,
+    batch_rows: usize,
     on_build_start: Option<&BuildStartHook>,
-) -> (BatchReader, Prefetched) {
-    let Some(batch) = reader.next() else {
-        return (reader, Prefetched::Done);
-    };
+) -> (StrideCursors, Prefetched) {
+    let live: Vec<usize> = state
+        .cursors
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_exhausted())
+        .map(|(i, _)| i)
+        .collect();
+    if live.is_empty() {
+        return (state, Prefetched::Done);
+    }
     if let Some(hook) = on_build_start {
         hook();
     }
-    let batch = match batch {
-        Ok(batch) => batch,
-        Err(e) => {
-            return (
-                reader,
-                Prefetched::BatchFailed {
-                    reason: format!("failed to read Parquet batch: {e}"),
-                },
-            );
+
+    let l = live.len();
+    let base = batch_rows / l;
+    let extra = batch_rows % l;
+
+    let mut spans: Vec<(RecordBatch, u64)> = Vec::with_capacity(l);
+    for (j, &idx) in live.iter().enumerate() {
+        let bonus = usize::from((j + state.deal_offset) % l < extra);
+        let share = base + bonus;
+        if share == 0 {
+            continue;
         }
-    };
-    // Resolve column indices once per batch (schema is stable across batches,
-    // but re-resolving keeps this self-contained and cheap).
-    let cols = match ColumnIndex::resolve(&batch, &mapping) {
-        Ok(cols) => cols,
-        Err(reason) => return (reader, Prefetched::BatchFailed { reason }),
-    };
-    let mut records = Vec::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        match build_record(&batch, &cols, &mapping, &limits, now_ns, row) {
-            Ok(record) => records.push(record),
-            Err(reason) => {
-                return (
-                    reader,
-                    Prefetched::RowRejected {
-                        row: row_base + row as u64,
-                        reason,
-                    },
-                );
+        match cursor_take(&mut state.cursors[idx], share) {
+            Ok(Some((batch, file_base))) if batch.num_rows() > 0 => spans.push((batch, file_base)),
+            Ok(_) => {}
+            Err(reason) => return (state, Prefetched::BatchFailed { reason }),
+        }
+    }
+    state.deal_offset = (state.deal_offset + extra) % l;
+
+    let total_rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
+    if total_rows == 0 {
+        return (
+            state,
+            Prefetched::Batch {
+                records: Vec::new(),
+            },
+        );
+    }
+
+    let mut records = Vec::with_capacity(total_rows);
+    for (batch, file_base) in &spans {
+        // Resolve column indices once per span (schema is stable across
+        // spans and batches, but re-resolving keeps this self-contained and
+        // cheap).
+        let cols = match ColumnIndex::resolve(batch, &mapping) {
+            Ok(cols) => cols,
+            Err(reason) => return (state, Prefetched::BatchFailed { reason }),
+        };
+        for row in 0..batch.num_rows() {
+            match build_record(batch, &cols, &mapping, &limits, now_ns, row) {
+                Ok(record) => records.push(record),
+                Err(reason) => {
+                    return (
+                        state,
+                        Prefetched::RowRejected {
+                            row: file_base + row as u64,
+                            reason,
+                        },
+                    );
+                }
             }
         }
     }
-    let num_rows = batch.num_rows();
-    (reader, Prefetched::Batch { records, num_rows })
+    (state, Prefetched::Batch { records })
+}
+
+/// The early shard-skew warning checkpoint (issue #560): the number of data
+/// batches flushed at which [`shard_skew_warning`] is evaluated, once.
+const SKEW_CHECK_AFTER_BATCHES: u64 = 8;
+
+/// The shard-skew warning threshold denominator (issue #560): the warning
+/// fires when the distinct shard count seen so far is at or below
+/// `shards / SKEW_WARN_DENOMINATOR`.
+const SKEW_WARN_DENOMINATOR: u32 = 4;
+
+/// Build the early shard-skew warning message, or `None` if the observed
+/// spread does not cross the threshold (or `shards < 2`, where "skew" is not
+/// a meaningful idea). Called once, at the [`SKEW_CHECK_AFTER_BATCHES`]
+/// checkpoint.
+fn shard_skew_warning(distinct_shards: usize, shards: u32) -> Option<String> {
+    if shards < 2 {
+        return None;
+    }
+    let threshold = shards / SKEW_WARN_DENOMINATOR;
+    if distinct_shards as u32 > threshold {
+        return None;
+    }
+    Some(format!(
+        "warning: after the first {SKEW_CHECK_AFTER_BATCHES} data batches, only \
+         {distinct_shards} of {shards} shards have received data (shard spread is at or below \
+         shards / {SKEW_WARN_DENOMINATOR} = {threshold}). This usually means input rows are \
+         arriving grouped by resource-attribute value, e.g. an entity-sorted bulk export \
+         (ClickBench's hits.parquet, sorted by CounterID, is exactly this shape). \
+         --read-cursors stride-reads the file so each batch draws rows from multiple far-apart \
+         file regions instead of one contiguous run; the mapping's [[resource_attribute]] \
+         choice is the other lever, since it determines what shard_for_log hashes on."
+    ))
+}
+
+/// Read each row group's row count from `parquet_path`'s footer, in row-group
+/// order, without decoding any data. Used to size and partition the stride
+/// cursors (issue #560) before any reader is opened.
+fn row_group_row_counts(parquet_path: &Path) -> Result<Vec<u64>, LoadError> {
+    let file = std::fs::File::open(parquet_path)
+        .map_err(|e| LoadError::Setup(format!("failed to open {}: {e}", parquet_path.display())))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
+    Ok(builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| rg.num_rows() as u64)
+        .collect())
+}
+
+/// Resolve `--read-cursors` (issue #560): absent means auto-sized to
+/// `min(shard count, row-group count)`, floored at 1; an explicit value is
+/// clamped to `[1, row_group_count.max(1)]` (more cursors than row groups
+/// cannot each get a distinct contiguous partition). Zero is rejected by the
+/// caller before this is reached, never clamped up silently.
+fn resolve_read_cursors(read_cursors: Option<usize>, shards: u32, row_group_count: usize) -> usize {
+    let max_cursors = row_group_count.max(1);
+    match read_cursors {
+        Some(k) => k.clamp(1, max_cursors),
+        None => (shards as usize).min(row_group_count).max(1),
+    }
+}
+
+/// Split `n` row groups into `k` contiguous, near-even ranges (the first
+/// `n % k` ranges get one extra row group). Used to give each stride cursor
+/// its own disjoint partition of row groups.
+fn partition_row_group_ranges(n: usize, k: usize) -> Vec<std::ops::Range<usize>> {
+    let base = n / k;
+    let extra = n % k;
+    let mut ranges = Vec::with_capacity(k);
+    let mut start = 0;
+    for i in 0..k {
+        let len = base + usize::from(i < extra);
+        ranges.push(start..start + len);
+        start += len;
+    }
+    ranges
+}
+
+/// Open one [`BatchReader`] per stride cursor (issue #560), each restricted to
+/// its own contiguous partition of `parquet_path`'s row groups, with
+/// `partition_base` set to that partition's first row's file-absolute index.
+/// An empty partition (only possible when `row_group_lens` is empty, the
+/// degenerate zero-row-group case, which forces `k == 1`) yields an
+/// already-exhausted cursor with no reader opened, rather than asking Parquet
+/// to build a reader over zero row groups.
+fn open_stride_cursors(
+    parquet_path: &Path,
+    row_group_lens: &[u64],
+    k: usize,
+    batch_rows: usize,
+) -> Result<Vec<CursorState>, LoadError> {
+    let mut group_file_base = Vec::with_capacity(row_group_lens.len());
+    let mut running = 0u64;
+    for &len in row_group_lens {
+        group_file_base.push(running);
+        running += len;
+    }
+
+    let mut cursors = Vec::with_capacity(k);
+    for range in partition_row_group_ranges(row_group_lens.len(), k) {
+        if range.is_empty() {
+            cursors.push(CursorState {
+                reader: None,
+                buffered: None,
+                partition_base: running,
+                consumed: 0,
+            });
+            continue;
+        }
+        let partition_base = group_file_base[range.start];
+        let file = std::fs::File::open(parquet_path).map_err(|e| {
+            LoadError::Setup(format!("failed to open {}: {e}", parquet_path.display()))
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| LoadError::Setup(format!("failed to open Parquet reader: {e}")))?;
+        let reader = builder
+            .with_row_groups(range.collect())
+            .with_batch_size(batch_rows)
+            .build()
+            .map_err(|e| LoadError::Setup(format!("failed to build Parquet reader: {e}")))?;
+        cursors.push(CursorState {
+            reader: Some(reader),
+            buffered: None,
+            partition_base,
+            consumed: 0,
+        });
+    }
+    Ok(cursors)
 }
 
 /// Resolved column indices for the mapped fields of one batch.
@@ -1582,6 +1860,7 @@ type = "i64"
             &m,
             4,
             10_000,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -1697,6 +1976,7 @@ type = "i64"
             &mapping_path,
             4,
             10_000,
+            None,
             NOW_NS,
             &mut sink,
         )
@@ -1783,6 +2063,7 @@ type = "i64"
             &m,
             4,
             0,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -1794,6 +2075,38 @@ type = "i64"
         );
         assert!(
             err.to_string().contains("--batch-rows must be at least 1"),
+            "the error names the lever: {err}"
+        );
+    }
+
+    /// `--read-cursors 0` is rejected with a typed [`LoadError::Setup`] before
+    /// any work, rather than silently clamped to 1 (issue #560), mirroring
+    /// `batch_rows_zero_is_rejected` above.
+    #[tokio::test]
+    async fn read_cursors_zero_is_rejected() {
+        use ravel_object_store::memory::MemoryStore;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let m = base_mapping();
+        let err = load(
+            store,
+            Path::new("/nonexistent.parquet"),
+            "acme",
+            &m,
+            4,
+            10,
+            Some(0),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect_err("read_cursors of 0 is rejected");
+        assert!(
+            matches!(err, LoadError::Setup(_)),
+            "a typed setup error, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("--read-cursors must be at least 1"),
             "the error names the lever: {err}"
         );
     }
@@ -1889,6 +2202,7 @@ type = "i64"
             shards,
             // Both rows in one batch, so one Strict write spans both shards.
             10,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -2067,6 +2381,7 @@ type = "i64"
             &m,
             1,
             2,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             Some(hook),
@@ -2096,15 +2411,29 @@ type = "i64"
     }
 
     /// A rejected row in the *second* batch must report its absolute index
-    /// into the whole file, not an index relative to that batch. `row_base` is
-    /// now threaded through `decode_and_build`, a free function outside the
-    /// loop the prefetch refactor introduced, and easy to drop by accident
-    /// (no existing test drove a real multi-batch `load()` far enough to catch
+    /// into the whole file, not an index relative to that batch or to its own
+    /// stride cursor's partition. `file_base` is threaded through
+    /// `decode_and_build_stride`, a free function outside the loop the
+    /// prefetch refactor introduced, and easy to drop by accident (no
+    /// existing test drove a real multi-batch `load()` far enough to catch
     /// it: `future_skew_beyond_the_bound_is_rejected` calls `build_record`
     /// directly on row 0, and `batch_failed_reports_durable_tokens_not_empty`
     /// hand-constructs a `LoadError` rather than running a load). Change
-    /// `row_base + row as u64` to `row as u64` in `decode_and_build`'s
-    /// `RowRejected` arm and this fails with `left: 2, right: 0`.
+    /// `file_base + row as u64` to `row as u64` in `decode_and_build_stride`'s
+    /// `RowRejected` arm and the first half of this test (the `read-cursors`
+    /// auto-resolved to `1` case below) fails at `assert_eq!(row, 2, ..)` with
+    /// `left: 0, right: 2` -- confirmed by performing the flip. The test
+    /// panics there, before ever reaching the second half, because both
+    /// halves exercise the same shared line: `decode_and_build_stride` is now
+    /// the only row-decode path, used for every `--read-cursors` value
+    /// including `1`, so this one flip is non-vacuous for both.
+    ///
+    /// Extended for issue #560: under `--read-cursors 4`, the same guarantee
+    /// must hold when the rejected row sits in a stride cursor whose own
+    /// partition starts partway through the file (row 5, at local index 1
+    /// within its own stride cursor's 2-row span starting at file row 4), so
+    /// the translation is via that span's own `file_base`, not a single
+    /// file-wide accumulator.
     #[tokio::test]
     async fn a_rejected_row_in_a_later_batch_reports_its_absolute_index() {
         use parquet::arrow::ArrowWriter;
@@ -2138,6 +2467,7 @@ type = "i64"
             &m,
             4,
             2,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
         )
@@ -2158,5 +2488,347 @@ type = "i64"
             }
             other => panic!("expected RowRejected, got {other:?}"),
         }
+
+        // Same guarantee under `--read-cursors 4`: a 4-row-group file, one row
+        // group per stride cursor, with the future-skew violator at
+        // file-absolute row 5 (local index 1 within row group 2's 2-row
+        // span). Its reported index must still be 5, translated via that
+        // span's own `file_base` rather than a shared `row_base`.
+        let pq4 = dir.path().join("four_row_groups.parquet");
+        let row_groups: Vec<Vec<i64>> = vec![
+            vec![NOW_NS, NOW_NS],
+            vec![NOW_NS, NOW_NS],
+            vec![NOW_NS, NOW_NS + limits.max_future_skew_ns + 1],
+            vec![NOW_NS, NOW_NS],
+        ];
+        let file4 = std::fs::File::create(&pq4).expect("create parquet");
+        let mut writer4 =
+            ArrowWriter::try_new(file4, batch_data.schema(), None).expect("arrow writer");
+        for rg in &row_groups {
+            let rg_batch = batch(vec![("ts", i64_col(rg.clone()))]);
+            writer4.write(&rg_batch).expect("write row group");
+            writer4.flush().expect("flush row group");
+        }
+        writer4.close().expect("close writer");
+
+        let err4 = load(
+            Arc::clone(&store),
+            &pq4,
+            "acme",
+            &m,
+            4,
+            8,
+            Some(4),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect_err("the far-future row must be rejected under read-cursors=4");
+
+        match err4 {
+            LoadError::RowRejected { row, .. } => {
+                assert_eq!(
+                    row, 5,
+                    "row index must be FILE-absolute even when a stride cursor's own \
+                     span starts partway through the file"
+                );
+            }
+            other => panic!("expected RowRejected, got {other:?}"),
+        }
+    }
+
+    /// Stride reading (issue #560) turns a sorted, one-shard-per-run input
+    /// into per-batch shard spread: a 4-row-group file where each row group
+    /// holds only one shard's host value (`hits.parquet`'s CounterID-sorted
+    /// shape in miniature). With one stride cursor per row group
+    /// (`--read-cursors 4`), every `batch_rows`-sized batch draws one row
+    /// from each group, so every flush touches all 4 shards and
+    /// `objects_written()` is exactly `batches * shards`. With
+    /// `--read-cursors 1` (today's sequential read), each batch is one whole
+    /// row group -- one shard -- so it is exactly `batches * 1`.
+    ///
+    /// Non-vacuity (prove-the-test): change the `Some(shards as usize)`
+    /// argument in the first `load` call below to `Some(1)` and the `16`
+    /// assertion fails (`left: 4, right: 16`), since a single sequential
+    /// cursor never interleaves the row groups.
+    #[tokio::test]
+    async fn stride_reading_spreads_a_sorted_batch_across_all_shards() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+
+        let shards = 4u32;
+        let rows_per_group = 4usize;
+        let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("sorted_by_shard.parquet");
+        let first = batch(vec![
+            ("ts", i64_col(vec![NOW_NS; rows_per_group])),
+            ("svc", str_col(vec!["api"; rows_per_group])),
+            ("host", str_col(vec![hosts[0].as_str(); rows_per_group])),
+        ]);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for host in &hosts[1..] {
+            let rg = batch(vec![
+                ("ts", i64_col(vec![NOW_NS; rows_per_group])),
+                ("svc", str_col(vec!["api"; rows_per_group])),
+                ("host", str_col(vec![host.as_str(); rows_per_group])),
+            ]);
+            writer.write(&rg).expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+
+        let m = parse_mapping(
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+        )
+        .expect("valid mapping");
+
+        let n_rows = rows_per_group * shards as usize;
+        let batches = n_rows / rows_per_group;
+
+        let store4: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report4 = load(
+            store4,
+            &pq,
+            "acme",
+            &m,
+            shards,
+            rows_per_group,
+            Some(shards as usize),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("stride-read load succeeds");
+        assert_eq!(report4.rows_processed, n_rows as u64);
+        assert_eq!(
+            report4.objects_written(),
+            batches * shards as usize,
+            "read-cursors=4: every batch draws one row from each row group/shard"
+        );
+
+        let store1: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report1 = load(
+            store1,
+            &pq,
+            "acme",
+            &m,
+            shards,
+            rows_per_group,
+            Some(1),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+        )
+        .await
+        .expect("sequential-read load succeeds");
+        assert_eq!(report1.rows_processed, n_rows as u64);
+        assert_eq!(
+            report1.objects_written(),
+            batches,
+            "read-cursors=1: each batch is one whole row group, one shard"
+        );
+    }
+
+    /// Every row is delivered exactly once regardless of `--read-cursors`,
+    /// including the exhaustion/redistribution path: a 14-row, 4-row-group
+    /// file with deliberately unequal group sizes (4/3/5/2, no two equal),
+    /// loaded with `batch_rows=5` under `read-cursors=1` (sequential),
+    /// `read-cursors=4` (one cursor per row group, all exhaust together),
+    /// and `read-cursors=3` (partitions of uneven length `[7, 5, 2]` rows,
+    /// so partitions exhaust at different rounds -- `3` divides neither
+    /// `batch_rows` (5) nor the row-group count (4)) -- reports exactly 14
+    /// durable rows every time.
+    #[tokio::test]
+    async fn every_read_cursors_setting_delivers_the_exact_row_count() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pq = dir.path().join("uneven_row_groups.parquet");
+        let group_sizes = [4usize, 3, 5, 2];
+        let total: usize = group_sizes.iter().sum();
+
+        let first = batch(vec![("ts", i64_col(vec![NOW_NS; group_sizes[0]]))]);
+        let file = std::fs::File::create(&pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for &size in &group_sizes[1..] {
+            let rg = batch(vec![("ts", i64_col(vec![NOW_NS; size]))]);
+            writer.write(&rg).expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+
+        let m = base_mapping();
+        for read_cursors in [Some(1), Some(4), Some(3)] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let report = load(
+                store,
+                &pq,
+                "acme",
+                &m,
+                4,
+                5,
+                read_cursors,
+                NOW_NS,
+                Arc::new(FixedClock(NOW_NS)),
+            )
+            .await
+            .expect("load succeeds");
+            assert_eq!(
+                report.rows_processed, total as u64,
+                "read_cursors={read_cursors:?}: every row must be loaded exactly once"
+            );
+        }
+    }
+
+    /// The early shard-skew warning (issue #560) fires exactly once when the
+    /// observed spread stays at or below `shards / SKEW_WARN_DENOMINATOR`
+    /// through the `SKEW_CHECK_AFTER_BATCHES`-batch checkpoint, and stays
+    /// silent whenever stride reading (or an already-interleaved input)
+    /// keeps the spread above it.
+    ///
+    /// Non-vacuity (prove-the-test): change `distinct_shards as u32 >
+    /// threshold` to `>=` in `shard_skew_warning` and the first case below
+    /// (distinct=1, threshold=1, an exact-boundary case) stops warning:
+    /// `1 >= 1` incorrectly early-returns `None`.
+    #[tokio::test]
+    async fn early_skew_warning_fires_once_and_only_when_the_spread_stays_narrow() {
+        use parquet::arrow::ArrowWriter;
+        use ravel_object_store::memory::MemoryStore;
+
+        let shards = 4u32;
+        let group_len = 20usize;
+        let batch_rows = 2usize;
+        let hosts: Vec<String> = (0..shards).map(|s| host_for_shard(s, shards)).collect();
+
+        let mapping_dir = tempfile::tempdir().expect("tempdir");
+        let mapping_path = mapping_dir.path().join("mapping.toml");
+        std::fs::write(
+            &mapping_path,
+            "ts_column = \"ts\"\nts_unit = \"nanos\"\n\n\
+             [[resource_attribute]]\nkey = \"service.name\"\ncolumn = \"svc\"\ntype = \"str\"\n\n\
+             [[resource_attribute]]\nkey = \"host\"\ncolumn = \"host\"\ntype = \"str\"\n",
+        )
+        .expect("write mapping");
+
+        // (a)/(b): a sorted file -- 4 row groups, one per shard's host value,
+        // `group_len` rows each.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sorted_pq = dir.path().join("sorted.parquet");
+        let first = batch(vec![
+            ("ts", i64_col(vec![NOW_NS; group_len])),
+            ("svc", str_col(vec!["api"; group_len])),
+            ("host", str_col(vec![hosts[0].as_str(); group_len])),
+        ]);
+        let file = std::fs::File::create(&sorted_pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, first.schema(), None).expect("arrow writer");
+        writer.write(&first).expect("write row group");
+        writer.flush().expect("flush row group");
+        for host in &hosts[1..] {
+            let rg = batch(vec![
+                ("ts", i64_col(vec![NOW_NS; group_len])),
+                ("svc", str_col(vec!["api"; group_len])),
+                ("host", str_col(vec![host.as_str(); group_len])),
+            ]);
+            writer.write(&rg).expect("write row group");
+            writer.flush().expect("flush row group");
+        }
+        writer.close().expect("close writer");
+
+        // (a) sorted + read-cursors=1: the first `SKEW_CHECK_AFTER_BATCHES`
+        // batches (16 rows) stay inside row group 0's single host/shard, so
+        // the warning fires -- exactly once.
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut sink = Vec::new();
+        run_warning_to(
+            store,
+            &sorted_pq,
+            "acme",
+            &mapping_path,
+            shards,
+            batch_rows,
+            Some(1),
+            NOW_NS,
+            &mut sink,
+        )
+        .await
+        .expect("load succeeds");
+        let emitted = String::from_utf8(sink).expect("utf8");
+        assert_eq!(
+            emitted.matches("shard spread is at or below").count(),
+            1,
+            "sorted input read sequentially must warn exactly once: {emitted}"
+        );
+
+        // (b) sorted + read-cursors=4: one stride cursor per row group mixes
+        // all 4 shards into the first couple of batches, so the spread never
+        // narrows and the warning stays silent.
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut sink = Vec::new();
+        run_warning_to(
+            store,
+            &sorted_pq,
+            "acme",
+            &mapping_path,
+            shards,
+            batch_rows,
+            Some(4),
+            NOW_NS,
+            &mut sink,
+        )
+        .await
+        .expect("load succeeds");
+        let emitted = String::from_utf8(sink).expect("utf8");
+        assert!(
+            !emitted.contains("shard spread is at or below"),
+            "stride reading the same sorted input must not warn: {emitted}"
+        );
+
+        // (c) an already-interleaved input, read-cursors=1: even a
+        // sequential reader sees all 4 shards from row 0, so the warning
+        // stays silent.
+        let interleaved_pq = dir.path().join("interleaved.parquet");
+        let n_rows = 32usize;
+        let host_seq: Vec<&str> = (0..n_rows)
+            .map(|i| hosts[i % shards as usize].as_str())
+            .collect();
+        let b = batch(vec![
+            ("ts", i64_col(vec![NOW_NS; n_rows])),
+            ("svc", str_col(vec!["api"; n_rows])),
+            ("host", str_col(host_seq)),
+        ]);
+        let file = std::fs::File::create(&interleaved_pq).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, b.schema(), None).expect("arrow writer");
+        writer.write(&b).expect("write batch");
+        writer.close().expect("close writer");
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut sink = Vec::new();
+        run_warning_to(
+            store,
+            &interleaved_pq,
+            "acme",
+            &mapping_path,
+            shards,
+            batch_rows,
+            Some(1),
+            NOW_NS,
+            &mut sink,
+        )
+        .await
+        .expect("load succeeds");
+        let emitted = String::from_utf8(sink).expect("utf8");
+        assert!(
+            !emitted.contains("shard spread is at or below"),
+            "an already-interleaved input must not warn: {emitted}"
+        );
     }
 }

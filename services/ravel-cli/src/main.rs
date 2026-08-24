@@ -234,6 +234,21 @@ enum Command {
         /// `DEFAULT_BATCH_ROWS` (10000), leaving current behaviour unchanged.
         #[arg(long, default_value_t = ravel_cli::load::DEFAULT_BATCH_ROWS)]
         batch_rows: usize,
+        /// Number of parallel stride read cursors over the Parquet file's row
+        /// groups (issue #560). A file sorted by a resource-attribute column
+        /// (e.g. ClickBench's `hits.parquet`, sorted by `CounterID`) puts one
+        /// value's rows in one contiguous run, so a single sequential reader
+        /// fills each `--batch-rows` batch with just that one value: one
+        /// `shard_for_log` hash, one shard, no spread across `--shards`. K
+        /// cursors each read a disjoint, near-even, far-apart partition of the
+        /// file's row groups, and each batch is assembled from a contiguous
+        /// run out of every live cursor, so one batch's rows span K different
+        /// regions of the file instead of one. Omit for automatic sizing
+        /// (`min(--shards, row-group count)`, floored at 1); an explicit value
+        /// is clamped to `[1, row-group count]`. `1` is exactly today's
+        /// sequential read. `0` is rejected.
+        #[arg(long, value_name = "K")]
+        read_cursors: Option<usize>,
     },
 }
 
@@ -1171,6 +1186,7 @@ async fn main() -> anyhow::Result<()> {
             mapping,
             shards,
             batch_rows,
+            read_cursors,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -1180,6 +1196,7 @@ async fn main() -> anyhow::Result<()> {
                 &mapping,
                 shards,
                 batch_rows,
+                read_cursors,
                 now_ns()?,
             )
             .await;

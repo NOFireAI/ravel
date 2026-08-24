@@ -153,6 +153,7 @@ type = "i64"
         // mismatch would silently resolve over a subset of shards.
         1,
         10_000,
+        None,
         CLOCK_NS,
         Arc::new(AdvancingClock(Arc::new(AtomicI64::new(CLOCK_NS)))),
     )
