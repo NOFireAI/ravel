@@ -186,3 +186,31 @@ query: diff_group_left * on(job) diff_group_right
 kind: instant
 time: +0s
 mode: error
+
+# Native-histogram binop guard (#524): Prometheus implements real histogram
+# arithmetic/comparison semantics for these, Ravel does not yet and rejects
+# instead of silently combining the histogram element's meaningless
+# placeholder `value` (see ravel-promql's binop.rs `histogram_binop_unsupported`
+# and its unit tests for the full guard). `mode: ravel_error_prom_success`
+# (the same ADR-0030 one-sided-divergence shape used above) asserts exactly
+# this: Ravel errors, Prometheus succeeds, and any other outcome is a real
+# mismatch. `diff_native_hist` is the fixed dataset's native-histogram
+# counter series (see histogram_native.txt).
+
+name: error_scalar_vector_arith_over_histogram
+query: diff_native_hist * 2
+kind: instant
+time: +0s
+mode: ravel_error_prom_success
+
+name: error_vector_vector_arith_over_histogram
+query: diff_native_hist + diff_native_hist
+kind: instant
+time: +0s
+mode: ravel_error_prom_success
+
+name: error_comparison_over_histogram
+query: diff_native_hist > 0
+kind: instant
+time: +0s
+mode: ravel_error_prom_success
