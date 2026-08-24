@@ -1025,9 +1025,7 @@ impl QueryEngine {
                 let (scalar_runs, histograms, per_plan_stats, pushdown_partials) = r?;
                 all_scalar_runs.extend(scalar_runs);
                 for series in histograms {
-                    combined_histograms
-                        .entry(series.labels.clone())
-                        .or_insert(series);
+                    insert_or_union_histogram_series(&mut combined_histograms, series);
                 }
                 page_stats.raw_f64_pages += per_plan_stats.raw_f64_pages;
                 page_stats.raw_f64_bytes += per_plan_stats.raw_f64_bytes;
@@ -1071,23 +1069,18 @@ impl QueryEngine {
             // (ADR-0096 decision 3 step 4): each remote resolved its own
             // snapshot and merged its own runs under the same provenance total
             // order, so per cluster we run the identical `merge_histogram_soa_runs`
-            // and union by label set. `or_insert` keeps the first cluster's
-            // series on the assumption that clusters own disjoint series identity
-            // (the same cross-cluster assumption `series` relies on, documented in
-            // the federation module). On a same-label collision this differs from
-            // the scalar pool's behavior: scalars union samples under a shared
-            // `SeriesId` (an unspecified per-timestamp winner, never a dropped
-            // series), while a colliding histogram series is dropped whole in
-            // favor of whichever cluster's insert won. A globally meaningful
-            // cross-cluster histogram merge is out of scope; tracked as a
-            // follow-up.
+            // and union by label set (issue #441: a same-label collision across
+            // clusters now unions samples via `insert_or_union_histogram_series`,
+            // matching the scalar pool's behavior -- scalars union samples under
+            // a shared `SeriesId`, an unspecified per-timestamp winner but never
+            // a dropped series -- instead of the previous `or_insert`, which kept
+            // only the first cluster's series and dropped every other cluster's
+            // samples for that label set whole).
             if !fed_hist_runs.is_empty() {
                 let fed_histograms =
                     merge_histogram_soa_runs(fed_hist_runs, max_series, max_samples)?;
                 for series in fed_histograms {
-                    combined_histograms
-                        .entry(series.labels.clone())
-                        .or_insert(series);
+                    insert_or_union_histogram_series(&mut combined_histograms, series);
                 }
             }
             // `fed_stats` is reported by a remote cluster over the wire, so a
@@ -2912,6 +2905,136 @@ fn merge_histogram_soa_runs(
     Ok(out)
 }
 
+// --- Cross-cluster histogram union (issue #441) ---
+//
+// Each cluster's own `merge_histogram_soa_runs` call already resolved every
+// intra-cluster duplicate via provenance + `histogram_sort_key`, so by the
+// time two `HistogramSeriesData` values reach the cross-cluster combine step
+// there is no provenance left to compare (the type carries only `labels` and
+// already-merged `samples`, ravel-promql's `source.rs` doc). A same-label
+// collision across clusters is unspecified-by-design, exactly like the
+// scalar merge's per-timestamp winner (`is_greater`'s bit-pattern tiebreak);
+// the fix is to keep every sample from both clusters (this is a union, not a
+// pick), breaking only an exact-timestamp overlap with the same
+// deterministic-bit-pattern philosophy `histogram_is_greater` uses for the
+// storage model, adapted to the evaluator's `FloatHistogram`.
+
+/// Bit-pattern total order over one [`FloatHistogram`]'s structure, the
+/// evaluator-float-model counterpart of [`HistogramSortKey`]/
+/// [`histogram_sort_key`]: every float field compared by its raw bit
+/// pattern, never `==`/`PartialOrd` on `f64` itself, so NaN payloads and
+/// -0.0 are significant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FloatHistogramSortKey {
+    scale: i32,
+    zero_threshold_bits: u64,
+    zero_count_bits: u64,
+    count_bits: u64,
+    sum_bits: u64,
+    positive_spans: Vec<(i32, u32)>,
+    negative_spans: Vec<(i32, u32)>,
+    positive_bucket_bits: Vec<u64>,
+    negative_bucket_bits: Vec<u64>,
+    custom_values_bits: Vec<u64>,
+    reset_hint_rank: u8,
+}
+
+/// Stable, deterministic rank for [`ravel_promql::ResetHint`] (which has no
+/// `Ord` of its own), the `FloatHistogram` counterpart of
+/// [`reset_hint_rank`]: only used to make [`FloatHistogramSortKey`] total.
+fn float_reset_hint_rank(hint: ravel_promql::ResetHint) -> u8 {
+    use ravel_promql::ResetHint;
+    match hint {
+        ResetHint::Unknown => 0,
+        ResetHint::Yes => 1,
+        ResetHint::No => 2,
+        ResetHint::Gauge => 3,
+    }
+}
+
+fn float_histogram_sort_key(v: &FloatHistogram) -> FloatHistogramSortKey {
+    FloatHistogramSortKey {
+        scale: v.scale,
+        zero_threshold_bits: v.zero_threshold.to_bits(),
+        zero_count_bits: v.zero_count.to_bits(),
+        count_bits: v.count.to_bits(),
+        sum_bits: v.sum.to_bits(),
+        positive_spans: spans_sort_key_float(&v.positive_spans),
+        negative_spans: spans_sort_key_float(&v.negative_spans),
+        positive_bucket_bits: v.positive_buckets.iter().map(|f| f.to_bits()).collect(),
+        negative_bucket_bits: v.negative_buckets.iter().map(|f| f.to_bits()).collect(),
+        custom_values_bits: v.custom_values.iter().map(|f| f.to_bits()).collect(),
+        reset_hint_rank: float_reset_hint_rank(v.counter_reset_hint),
+    }
+}
+
+fn spans_sort_key_float(spans: &[ravel_promql::Span]) -> Vec<(i32, u32)> {
+    spans.iter().map(|s| (s.offset, s.length)).collect()
+}
+
+/// Unions two ascending-`ts_ns` histogram sample lists for the same label
+/// set (both already satisfy `HistogramSeriesData::samples`'s documented
+/// ascending-sort contract, so this is a plain two-pointer merge, not a
+/// k-way heap: each input is already one cluster's fully deduped result).
+/// Every sample from both inputs survives; an exact-timestamp collision is
+/// resolved by [`float_histogram_sort_key`]'s deterministic order rather
+/// than one whole side winning.
+fn union_histogram_samples(
+    a: Vec<ravel_promql::HistogramSample>,
+    b: Vec<ravel_promql::HistogramSample>,
+) -> Vec<ravel_promql::HistogramSample> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut ai = 0usize;
+    let mut bi = 0usize;
+    while ai < a.len() && bi < b.len() {
+        match a[ai].ts_ns.cmp(&b[bi].ts_ns) {
+            std::cmp::Ordering::Less => {
+                out.push(a[ai].clone());
+                ai += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[bi].clone());
+                bi += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let winner = if float_histogram_sort_key(&b[bi].value)
+                    > float_histogram_sort_key(&a[ai].value)
+                {
+                    b[bi].clone()
+                } else {
+                    a[ai].clone()
+                };
+                out.push(winner);
+                ai += 1;
+                bi += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[ai..]);
+    out.extend_from_slice(&b[bi..]);
+    out
+}
+
+/// Inserts `series` into `combined_histograms`, unioning with any series
+/// already present under the same label set instead of dropping one whole
+/// side (issue #441: the previous `.entry(...).or_insert(...)` silently
+/// discarded every sample from every cluster but the first to insert).
+fn insert_or_union_histogram_series(
+    combined_histograms: &mut HashMap<LabelSet, HistogramSeriesData>,
+    series: HistogramSeriesData,
+) {
+    use std::collections::hash_map::Entry;
+    match combined_histograms.entry(series.labels.clone()) {
+        Entry::Occupied(mut e) => {
+            let merged = union_histogram_samples(e.get().samples.clone(), series.samples);
+            e.get_mut().samples = merged;
+        }
+        Entry::Vacant(e) => {
+            e.insert(series);
+        }
+    }
+}
+
 /// A `SeriesSource` backed by the per-series output of the lazy k-way merge
 /// ([`merge_soa_runs`] for scalar series, [`merge_histogram_soa_runs`] for
 /// native-histogram series), not a materialized per-timestamp window
@@ -4653,6 +4776,153 @@ mod histogram_source_tests {
         assert_eq!(h.sum, 9.5);
         assert_eq!(h.positive_buckets, vec![1.0]);
         assert_eq!(h.positive_spans.len(), 1);
+    }
+}
+
+/// Exercises `insert_or_union_histogram_series` (issue #441): the
+/// cross-cluster combine step `execute_range`/`execute_instant` runs when
+/// two clusters both report a histogram series for the same label set. The
+/// pre-fix code silently dropped every sample from every cluster but the
+/// first `or_insert` -- these tests prove the fix keeps every sample from
+/// both, in ascending order, breaking only an exact-timestamp overlap
+/// deterministically.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod histogram_cross_cluster_union_tests {
+    use ravel_types::{Label, LabelSet};
+
+    use super::*;
+
+    fn labels() -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "same_label_set".to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    /// A single-bucket int histogram, converted to the evaluator's float
+    /// model, distinguished only by `sum`, mirroring `histogram_source_tests::hv`.
+    fn sample(ts_ns: i64, sum: f64) -> ravel_promql::HistogramSample {
+        let value = ravel_segment::HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: Some(sum),
+            custom_values: None,
+            positive_spans: vec![ravel_segment::HistogramSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            counts: ravel_segment::HistogramCounts::Int {
+                zero_count: 0,
+                count: 1,
+                positive: vec![1],
+                negative: vec![],
+            },
+            reset_hint: ravel_segment::ResetHint::Unknown,
+        };
+        ravel_promql::HistogramSample {
+            ts_ns,
+            value: histogram_value_to_float(&value),
+        }
+    }
+
+    fn series(samples: Vec<ravel_promql::HistogramSample>) -> HistogramSeriesData {
+        HistogramSeriesData {
+            labels: labels(),
+            samples,
+        }
+    }
+
+    #[test]
+    fn disjoint_timestamps_from_two_clusters_are_all_kept() {
+        // Cluster A reports ts 0 and 20; cluster B reports ts 10. Before the
+        // fix, cluster B's insert into `combined_histograms` would have been
+        // dropped whole by the first `or_insert` (or vice versa depending on
+        // iteration order) -- only one cluster's samples would survive at
+        // all, not just the colliding timestamp.
+        let a = series(vec![sample(0, 1.0), sample(20, 3.0)]);
+        let b = series(vec![sample(10, 2.0)]);
+
+        let mut combined: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
+        insert_or_union_histogram_series(&mut combined, a);
+        insert_or_union_histogram_series(&mut combined, b);
+
+        assert_eq!(combined.len(), 1, "still one series for the label set");
+        let merged = &combined[&labels()];
+        let ts: Vec<i64> = merged.samples.iter().map(|s| s.ts_ns).collect();
+        assert_eq!(
+            ts,
+            vec![0, 10, 20],
+            "every sample from both clusters survives, in ascending order"
+        );
+        let sums: Vec<f64> = merged.samples.iter().map(|s| s.value.sum).collect();
+        assert_eq!(sums, vec![1.0, 2.0, 3.0]);
+
+        // Order-independent: the second cluster inserted first yields the
+        // same union.
+        let mut combined_swapped: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
+        insert_or_union_histogram_series(&mut combined_swapped, series(vec![sample(10, 2.0)]));
+        insert_or_union_histogram_series(
+            &mut combined_swapped,
+            series(vec![sample(0, 1.0), sample(20, 3.0)]),
+        );
+        let ts_swapped: Vec<i64> = combined_swapped[&labels()]
+            .samples
+            .iter()
+            .map(|s| s.ts_ns)
+            .collect();
+        assert_eq!(ts_swapped, vec![0, 10, 20]);
+    }
+
+    #[test]
+    fn exact_timestamp_collision_keeps_the_series_and_picks_a_deterministic_winner() {
+        // Both clusters report a sample at ts=5. The series must not be
+        // dropped whole (the pre-fix bug); the collision at ts=5 is resolved
+        // by `float_histogram_sort_key`'s bit-pattern order, matching the
+        // scalar merge's `is_greater` philosophy for an unspecified winner.
+        let a = series(vec![sample(0, 9.0), sample(5, 1.0)]);
+        let b = series(vec![sample(5, 2.0), sample(10, 9.0)]);
+
+        let mut combined: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
+        insert_or_union_histogram_series(&mut combined, a);
+        insert_or_union_histogram_series(&mut combined, b);
+
+        let merged = &combined[&labels()];
+        let ts: Vec<i64> = merged.samples.iter().map(|s| s.ts_ns).collect();
+        assert_eq!(
+            ts,
+            vec![0, 5, 10],
+            "the colliding series is not dropped; ts=5 is deduped to one sample, not two"
+        );
+        let at_five = merged
+            .samples
+            .iter()
+            .find(|s| s.ts_ns == 5)
+            .expect("ts=5 present");
+        assert_eq!(
+            at_five.value.sum, 2.0,
+            "the larger bit-pattern sum wins the collision deterministically"
+        );
+
+        // Order-independent: swapping which cluster inserts first yields the
+        // same winner.
+        let mut combined_swapped: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
+        insert_or_union_histogram_series(
+            &mut combined_swapped,
+            series(vec![sample(5, 2.0), sample(10, 9.0)]),
+        );
+        insert_or_union_histogram_series(
+            &mut combined_swapped,
+            series(vec![sample(0, 9.0), sample(5, 1.0)]),
+        );
+        let at_five_swapped = combined_swapped[&labels()]
+            .samples
+            .iter()
+            .find(|s| s.ts_ns == 5)
+            .expect("ts=5 present");
+        assert_eq!(at_five_swapped.value.sum, 2.0);
     }
 }
 
