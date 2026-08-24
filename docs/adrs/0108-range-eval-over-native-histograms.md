@@ -142,30 +142,6 @@ tested; the entire defect is range-side plumbing. Specifically:
 11. **SQL documentation**: the `samples` table's histogram exclusion is
     documented by editing the generator behind `docs/sql-conformance.md`
     and regenerating, never by hand-editing the artifact.
-6. **Absent**: `absent_over_time`/`absent` treat a non-empty histogram
-   fetch as presence.
-7. **Refusals**: any path that cannot reach bit-exact parity returns
-   `Error::Unsupported` with a named construct, registered as a rejection
-   row in the difftest scoring table and surfaced in the generated
-   conformance section of `docs/query-engine.md`. The expected set is
-   near-empty; it is an escape hatch per path, not a phase.
-8. **HTTP JSON**: matrix elements gain Prometheus' `histograms` field
-   (`MatrixResult`/`range_value_to_json` in
-   `crates/ravel-query/src/http/json.rs`), so Grafana and the difftest
-   client see the standard encoding.
-9. **Difftest**: the comparator learns histogram-valued samples, comparing
-   a canonical semantic form (schema, zero threshold/count, spans, bucket
-   counts, `count`/`sum` floats under the existing bit-exact/ULP rules),
-   because two engines may encode the same histogram with different span
-   layouts. New corpus entries cover, at minimum: range
-   `sum(rate(h[5m]))`, range `rate(h[5m])`, bare `h` as a range query,
-   `count_over_time(h[5m])`, `absent_over_time(h[15m])` with histogram
-   data flowing, plus rejection-mode entries for anything refused. Each
-   new test is demonstrated failing before its fix lands.
-10. **SQL documentation**: the `samples` table's histogram exclusion is
-    documented by editing the generator behind `docs/sql-conformance.md`
-    and regenerating, never by hand-editing the artifact.
-
 ```mermaid
 flowchart TD
     R["range request<br/>/api/v1/query_range"] -> RR["eval_range_annotated"]
