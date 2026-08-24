@@ -432,11 +432,15 @@ enum AuditPhase {
     /// tonic's server-role `EncodeBody` ends the body on the first `Err` and
     /// never polls again). The audit event is in flight and its durability is
     /// being awaited before the client observes the error; once the flush
-    /// resolves, the carried original stream error `Status` is yielded to the
-    /// client (never the flush's own error -- see the poll impl). This mirrors
-    /// `Flushing`'s await-before-yield discipline for the error path, so the
-    /// audit is submitted and awaited inline rather than fire-and-forget from
-    /// `Drop` (ADR-0062 §2a).
+    /// resolves the outcome is symmetric with the other audit-flush paths (see
+    /// the poll impl): if the flush succeeded, the carried original stream
+    /// error `Status` is yielded so the client learns why the query failed and
+    /// that the failure was audited; if the flush FAILED, the request fails
+    /// closed with `Unavailable`, discarding the carried status, exactly as the
+    /// pre-stream and clean-stream paths do. This mirrors `Flushing`'s
+    /// await-before-yield discipline for the error path, so the audit is
+    /// submitted and awaited inline rather than fire-and-forget from `Drop`
+    /// (ADR-0062 §2a).
     FlushingError(
         Pin<Box<dyn Future<Output = ravel_maintain::Result<()>> + Send>>,
         Status,
@@ -465,7 +469,10 @@ enum AuditPhase {
 /// the client, rather than being left to `Drop`'s detached best-effort task
 /// (which would race the response). `Drop` remains only for the one path that
 /// genuinely cannot await -- client cancellation, where no response is left to
-/// gate.
+/// gate. Both terminal paths fail closed on a flush failure the same way: a
+/// clean end becomes a trailing `Unavailable`, and a mid-stream error's carried
+/// status is replaced with `Unavailable` rather than yielded, so the client of
+/// a failed query still learns definitively whether that failure was audited.
 struct AuditedStream {
     inner: DoGetStream,
     /// The audit context, taken when the audit begins (terminal event) or when
@@ -509,21 +516,33 @@ impl Stream for AuditedStream {
                 },
                 AuditPhase::FlushingError(fut, carried) => match fut.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    // The audit for the failed query is now durable. Yield the
-                    // ORIGINAL stream error to the client, whether the flush
-                    // itself succeeded or failed: the client is already being
-                    // handed a real error, so the success-path fail-closed
-                    // `Unavailable` substitution does not apply here. The
-                    // carried `Status` is swapped out in place rather than
-                    // destructured out of a re-matched phase, so no
-                    // unreachable-arm panic is needed: panicking in a query
-                    // path is never an acceptable failure mode (`start_pinned`
-                    // takes the same rule). The placeholder left behind is
-                    // never observed; the phase becomes `Done` immediately.
-                    Poll::Ready(_) => {
+                    // The audit for the failed query is durable: yield the
+                    // ORIGINAL stream error, so the client learns why the query
+                    // actually failed and knows that failure was audited.
+                    Poll::Ready(Ok(())) => {
+                        // The carried `Status` is swapped out in place rather
+                        // than destructured out of a re-matched phase, so no
+                        // unreachable-arm panic is needed: panicking in a query
+                        // path is never an acceptable failure mode
+                        // (`start_pinned` takes the same rule). The placeholder
+                        // left behind is never observed; the phase becomes
+                        // `Done` immediately.
                         let status = std::mem::replace(carried, Status::ok(""));
                         this.phase = AuditPhase::Done;
                         return Poll::Ready(Some(Err(status)));
+                    }
+                    // The audit flush FAILED, so fail closed symmetrically with
+                    // the pre-stream and clean-stream paths: substitute the
+                    // fixed `Unavailable` and discard the carried original
+                    // status. A client whose query already failed should still
+                    // learn definitively whether that failure was audited, not
+                    // receive a query error that silently might be unaudited. An
+                    // `Unavailable` invites the retry that a `required`-mode
+                    // deployment needs; the original error, correct as it is,
+                    // would let the client treat an unaudited failure as final.
+                    Poll::Ready(Err(_)) => {
+                        this.phase = AuditPhase::Done;
+                        return Poll::Ready(Some(Err(Status::unavailable(AUDIT_UNAVAILABLE_MSG))));
                     }
                 },
                 AuditPhase::Streaming => match this.inner.poll_next_unpin(cx) {
@@ -928,13 +947,14 @@ mod tests {
         );
     }
 
-    /// The error path yields the ORIGINAL stream error even when the audit
-    /// flush itself fails. The clean-stream fail-closed substitution does not
-    /// apply here: the client is already being handed a real error, and
-    /// replacing it with `Unavailable` would hide why the query actually
-    /// failed behind an audit-infrastructure message.
+    /// The error path fails closed when the audit flush itself fails, the same
+    /// way the pre-stream and clean-stream paths do: a mid-stream error plus a
+    /// failed `required`-mode flush yields `Unavailable`, discarding the
+    /// original error. A client whose query already failed should still learn
+    /// definitively whether that failure was audited; yielding the original
+    /// error unchanged would let it treat a silently-unaudited failure as final.
     #[tokio::test]
-    async fn a_failed_flush_on_the_error_path_still_yields_the_original_error() {
+    async fn a_failed_flush_on_the_error_path_now_fails_closed() {
         let inner = inner_stream(vec![
             Ok(FlightData::default()),
             Err(Status::internal("boom")),
@@ -948,18 +968,20 @@ mod tests {
         );
 
         let items = drain(stream).await;
-        assert_eq!(items.len(), 2, "one data item, then the original error");
+        assert_eq!(items.len(), 2, "one data item, then the fail-closed error");
         assert!(items[0].is_ok());
-        let err = items[1].as_ref().expect_err("the mid-stream error");
+        let err = items[1]
+            .as_ref()
+            .expect_err("the trailing fail-closed error");
         assert_eq!(
             err.code(),
-            tonic::Code::Internal,
-            "the original error code survives a failed audit flush"
+            tonic::Code::Unavailable,
+            "a failed audit flush replaces the original error with Unavailable"
         );
         assert_eq!(
             err.message(),
-            "boom",
-            "the original error message survives a failed audit flush"
+            AUDIT_UNAVAILABLE_MSG,
+            "the client sees the audit-unavailable signal, not the original error"
         );
     }
 
