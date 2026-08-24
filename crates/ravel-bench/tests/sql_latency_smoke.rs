@@ -24,6 +24,7 @@ use ravel_bench::sql_corpus::{
 use ravel_bench::sql_latency::{GenerateConfig, measure_corpus, run_generated};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
+use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::{TenantId, TimeRange};
 
 /// The frozen query clock the generated lane uses (`4h` in ns); the generated
@@ -44,6 +45,7 @@ fn small_generate_config(store: Arc<dyn ObjectStoreBackend>, runs: usize) -> Gen
         records: 60,
         records_per_object: 20,
         extra_attrs: 4,
+        max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
     }
 }
 
@@ -209,6 +211,7 @@ async fn an_entry_with_an_unsatisfied_required_declaration_is_skipped_with_the_k
         1,
         window,
         NOW_NS,
+        DEFAULT_MAX_QUERY_BYTES,
     )
     .await
     .expect("measure_corpus runs");

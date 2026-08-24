@@ -24,6 +24,7 @@ use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
     Compaction, GenerateConfig, SqlLatencyReport, TenantConfigInput, run_generated, run_tenant,
 };
+use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::TimeRange;
 
 #[derive(Parser, Debug)]
@@ -47,6 +48,13 @@ struct Args {
     /// of the checked-in corpus.
     #[arg(long)]
     corpus: Option<String>,
+    /// Per-query ceiling, in bytes, on the SQL DataFusion memory pool, mirroring
+    /// `ravel-server`'s `--sql-max-query-bytes` (ADR-0088). Raise it to measure
+    /// a heavy query that otherwise aborts with `query memory budget exhausted`.
+    /// Defaults to ravel-sql's compiled-in 256 MiB, so an unset flag leaves the
+    /// measured budget byte-for-byte unchanged.
+    #[arg(long = "sql-max-query-bytes", value_name = "BYTES", default_value_t = DEFAULT_MAX_QUERY_BYTES)]
+    sql_max_query_bytes: usize,
 
     // --- generated lane knobs ---------------------------------------------
     /// Distinct log records to generate.
@@ -167,6 +175,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 },
                 now_ns,
                 compaction: args.compaction.into(),
+                max_query_bytes: args.sql_max_query_bytes,
             };
             run_tenant(&cfg).await
         }
@@ -184,6 +193,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 records: args.records,
                 records_per_object: args.records_per_object,
                 extra_attrs: args.extra_attrs,
+                max_query_bytes: args.sql_max_query_bytes,
             };
             run_generated(&cfg).await
         }
