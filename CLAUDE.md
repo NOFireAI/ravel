@@ -257,6 +257,15 @@ Fast, dependency-free checks that fail closed BEFORE a known-expensive
 mistake. Each encodes a failure class that recurs; run the relevant one
 as a precondition, not after the damage.
 
+`.claude/settings.json` is the team's, and it is where a guard that must
+bind every session belongs. Personal tooling - an indexer's hooks, a
+custom status line, a helper script with a machine-specific path - goes in
+`.claude/settings.local.json` and `.claude/helpers/`, both gitignored.
+Editing the tracked file for personal setup puts a permanent conflict
+between your working tree and every change anyone else makes to it, and it
+ships your paths to fleet executors. Both settings files are read and
+merged, local last, so nothing is lost by splitting them.
+
 Four of these no longer depend on being remembered.
 `.claude/guards/pretooluse.mjs` runs as a PreToolUse hook and refuses the
 tool call outright: a gate piped into `tail`/`head`/`grep`/`rg`/`sed` or
