@@ -26,6 +26,7 @@
 //! untrusted and returns [`SpanSegError`] on any violation, never panicking.
 
 pub mod block;
+pub mod columnar;
 pub mod error;
 pub mod footer;
 pub mod ranged;
@@ -42,6 +43,7 @@ pub(crate) mod pb {
     include!(concat!(env!("OUT_DIR"), "/ravel.rspan.v1.rs"));
 }
 
+pub use columnar::{BytesColumn, ColumnarBlockView, I64Column};
 pub use error::SpanSegError;
 pub use footer::{SpanFooter, SuffixOutcome, decode_section, open, open_from_suffix, read_section};
 pub use ranged::{BlockLoc, RspanRangeReader, TraceBlockSpan};

@@ -29,7 +29,7 @@
 //! from the block is untrusted: bounds-checked, overflow-checked, and turned
 //! into a typed `Corrupted` error, never a panic.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ravel_codec::encoding::{
     Enc, decode_bitmap, decode_fixed, decode_i64, decode_strings, encode_bitmap, encode_fixed,
@@ -353,9 +353,68 @@ fn stage_column(
     });
 }
 
+/// Which columns a decode was asked to materialize (docs/adrs/0110 decision 1).
+/// [`read_block`] uses [`ColumnProjection::All`]; [`read_block_projected`] uses
+/// [`ColumnProjection::Only`] with the caller's set. The distinction is what
+/// lets the columnar view tell a column that is absent from the block (a
+/// legitimate `NULL` for every row) from one that was never requested (a caller
+/// bug, a typed [`SpanSegError::ColumnNotRequested`]).
+enum ColumnProjection {
+    /// Decode every page, exactly as the reader did before projection existed.
+    All,
+    /// Decode only the pages for these column ids (plus the event columns as a
+    /// group when any event column is named).
+    Only(HashSet<u32>),
+}
+
+impl ColumnProjection {
+    /// Whether column `col` was requested by the caller, verbatim. Event columns
+    /// are not group-expanded here: this reflects the caller's literal request,
+    /// so an accessor for a column the caller did not name fails loudly.
+    fn is_requested(&self, col: u32) -> bool {
+        match self {
+            ColumnProjection::All => true,
+            ColumnProjection::Only(set) => set.contains(&col),
+        }
+    }
+
+    /// Whether the flattened nested event columns should be decoded and each
+    /// row's events reconstructed. `true` for a full decode; for a projected
+    /// decode, `true` only when the caller named at least one event column, so
+    /// `decode_events` never runs for a projection that excludes them all.
+    fn wants_events(&self) -> bool {
+        match self {
+            ColumnProjection::All => true,
+            ColumnProjection::Only(set) => {
+                set.contains(&COL_EVENT_COUNT)
+                    || set.contains(&COL_EVENT_TS)
+                    || set.contains(&COL_EVENT_NAME)
+                    || set.contains(&COL_EVENT_ATTRS_BLOB)
+            }
+        }
+    }
+
+    /// Whether the page(s) for column `col` must be decompressed and decoded.
+    /// The four event columns decode as a group (all or none), because
+    /// reconstructing a row's events needs `event_count` and all three value
+    /// columns together; every other column decodes iff it was requested.
+    fn page_needed(&self, col: u32) -> bool {
+        if matches!(
+            col,
+            COL_EVENT_COUNT | COL_EVENT_TS | COL_EVENT_NAME | COL_EVENT_ATTRS_BLOB
+        ) {
+            self.wants_events()
+        } else {
+            self.is_requested(col)
+        }
+    }
+}
+
 /// A decoded block: per-column, per-row values plus the reconstructed nested
 /// events. Every fixed/dynamic column vector has length `record_count`; `None`
-/// marks a row where a nullable column has no value.
+/// marks a row where a nullable column has no value. A projected decode
+/// ([`read_block_projected`]) holds only the requested columns; the rest are
+/// absent from these maps and reachable only as a typed error through the view.
 pub struct DecodedBlock {
     record_count: usize,
     i64_cols: HashMap<u32, Vec<Option<i64>>>,
@@ -365,11 +424,79 @@ pub struct DecodedBlock {
     dyn_names: BTreeMap<u32, String>,
     /// Per-row events, length `record_count`; empty vec for a row with none.
     events: Vec<Vec<SpanEvent>>,
+    /// The projection this block was decoded under, for the view's
+    /// requested-vs-absent distinction.
+    projection: ColumnProjection,
+    /// Whether the block's header carried a [`COL_ATTRS_RAW`] page. Read from
+    /// the page descriptors, so it holds even when `attrs_raw` was projected
+    /// away and never decoded.
+    has_attrs_raw_page: bool,
+    /// Pages this decode decompressed and decoded.
+    pages_decoded: usize,
+    /// Pages this decode skipped because the projection excluded their column.
+    pages_skipped: usize,
 }
 
 impl DecodedBlock {
     pub fn record_count(&self) -> usize {
         self.record_count
+    }
+
+    /// Pages this decode decompressed and decoded. A projected decode reports
+    /// strictly fewer than a full decode of the same block whenever the block
+    /// carries a page the projection excluded (docs/adrs/0110 decision 1).
+    pub fn pages_decoded(&self) -> usize {
+        self.pages_decoded
+    }
+
+    /// Pages this decode skipped because the projection excluded their column.
+    /// Zero for a full decode.
+    pub fn pages_skipped(&self) -> usize {
+        self.pages_skipped
+    }
+
+    /// Whether this block carries a [`COL_ATTRS_RAW`] overflow page, answered
+    /// from the block header's page descriptors without decoding it
+    /// (docs/adrs/0110 decision 1, the SQL eligibility rule in T3). A block
+    /// whose records all fit their per-key columns has no `attrs_raw` page at
+    /// all, so this is a metadata read; decoding the page to discover it is
+    /// empty would pay exactly the cost the projection removes.
+    pub fn has_attrs_raw_page(&self) -> bool {
+        self.has_attrs_raw_page
+    }
+
+    /// A borrowed columnar view over this block's decoded columns
+    /// (docs/adrs/0110 decision 1). The view exposes per-column typed accessors
+    /// and gather iterators over caller-supplied surviving row indices; it never
+    /// hands out a storage vector, so a later change to how string columns are
+    /// stored lands without touching a caller.
+    pub fn view(&self) -> crate::columnar::ColumnarBlockView<'_> {
+        crate::columnar::ColumnarBlockView::new(self)
+    }
+
+    /// Whether `col` was requested by the decode that produced this block.
+    /// `true` for every column of a full decode.
+    pub(crate) fn is_requested(&self, col: u32) -> bool {
+        self.projection.is_requested(col)
+    }
+
+    /// The decoded i64 column `col`, or `None` when the column is absent from
+    /// the block. Length `record_count`. Crate-internal: the columnar view is
+    /// the only public reader, and it never leaks this storage type.
+    pub(crate) fn i64_col(&self, col: u32) -> Option<&[Option<i64>]> {
+        self.i64_cols.get(&col).map(Vec::as_slice)
+    }
+
+    /// The decoded string column `col`, or `None` when it is absent from the
+    /// block. Length `record_count`.
+    pub(crate) fn str_col(&self, col: u32) -> Option<&[Option<Vec<u8>>]> {
+        self.str_cols.get(&col).map(Vec::as_slice)
+    }
+
+    /// The decoded fixed-width column `col`, or `None` when it is absent from
+    /// the block. Length `record_count`.
+    pub(crate) fn fixed_col(&self, col: u32) -> Option<&[Option<Vec<u8>>]> {
+        self.fixed_cols.get(&col).map(Vec::as_slice)
     }
 
     fn i64_at(&self, col: u32, row: usize) -> Result<i64, SpanSegError> {
@@ -505,11 +632,45 @@ fn column_kind(column_id: u32, dyn_names: &BTreeMap<u32, String>) -> Result<ColK
     })
 }
 
-/// Decodes a block, verifying its crc32c first.
+/// Decodes a block, verifying its crc32c first. Every page is decoded, exactly
+/// as before column projection existed. This is [`read_block_projected`] with
+/// the full column set: the whole-object reader, the ranged reader, and
+/// compaction all take this path and stay byte-identical.
 pub fn read_block(
     bytes: &[u8],
     expected_crc: u32,
     max_uncomp: u64,
+) -> Result<DecodedBlock, SpanSegError> {
+    read_block_inner(bytes, expected_crc, max_uncomp, ColumnProjection::All)
+}
+
+/// Decodes only the pages for `columns`, verifying the block's crc32c first
+/// (docs/adrs/0110 decision 1). A page whose column id is not in `columns` is
+/// neither decompressed nor allocated; in particular the nested event columns
+/// are decoded, and each row's events reconstructed, only when `columns` names
+/// at least one event column ([`COL_EVENT_COUNT`]/[`COL_EVENT_TS`]/
+/// [`COL_EVENT_NAME`]/[`COL_EVENT_ATTRS_BLOB`]).
+///
+/// The returned [`DecodedBlock`] holds only the requested columns. Reading a
+/// column that was not requested through the block's columnar view is a typed
+/// [`SpanSegError::ColumnNotRequested`], never a silent column of nulls; a
+/// column that was requested but is genuinely absent from this block reads as a
+/// legitimate `NULL` for every row.
+pub fn read_block_projected(
+    bytes: &[u8],
+    expected_crc: u32,
+    max_uncomp: u64,
+    columns: &[u32],
+) -> Result<DecodedBlock, SpanSegError> {
+    let set: HashSet<u32> = columns.iter().copied().collect();
+    read_block_inner(bytes, expected_crc, max_uncomp, ColumnProjection::Only(set))
+}
+
+fn read_block_inner(
+    bytes: &[u8],
+    expected_crc: u32,
+    max_uncomp: u64,
+    projection: ColumnProjection,
 ) -> Result<DecodedBlock, SpanSegError> {
     if crc32c::crc32c(bytes) != expected_crc {
         return Err(SpanSegError::Corrupted("block crc mismatch".into()));
@@ -592,8 +753,19 @@ pub fn read_block(
         dyn_names.insert(cid, name);
     }
 
-    // Slice and decompress each page to its encoded bytes.
+    // Whether the block carries an attrs_raw overflow page, from the
+    // descriptors alone (docs/adrs/0110 decision 1): a metadata read that holds
+    // even when the projection excludes the column and never decodes it.
+    let has_attrs_raw_page = descs.iter().any(|d| d.column_id == COL_ATTRS_RAW);
+
+    // Slice each page, decompressing only the ones the projection needs. A page
+    // whose column is not requested keeps its bytes untouched (no decompress,
+    // no allocation): its slot holds an empty placeholder and is never read.
+    // The byte range is still walked so `pos` advances and the trailing-bytes
+    // check below stays exact.
     let mut page_bytes: Vec<Vec<u8>> = Vec::with_capacity(descs.len());
+    let mut pages_decoded = 0usize;
+    let mut pages_skipped = 0usize;
     for d in &descs {
         let len = usize::try_from(d.len)
             .map_err(|_| SpanSegError::Corrupted("page len out of range".into()))?;
@@ -603,7 +775,13 @@ pub fn read_block(
         let stored = bytes
             .get(pos..end)
             .ok_or_else(|| SpanSegError::Corrupted("page range out of bounds".into()))?;
-        page_bytes.push(read_page(stored, d, max_uncomp)?);
+        if projection.page_needed(d.column_id) {
+            page_bytes.push(read_page(stored, d, max_uncomp)?);
+            pages_decoded += 1;
+        } else {
+            page_bytes.push(Vec::new());
+            pages_skipped += 1;
+        }
         pos = end;
     }
     if pos != bytes.len() {
@@ -632,6 +810,10 @@ pub fn read_block(
         fixed_cols: HashMap::new(),
         dyn_names,
         events: vec![Vec::new(); record_count],
+        projection,
+        has_attrs_raw_page,
+        pages_decoded,
+        pages_skipped,
     };
 
     // Decode fixed and dynamic columns via the presence/scatter model. The
@@ -642,6 +824,12 @@ pub fn read_block(
             column_id,
             COL_EVENT_TS | COL_EVENT_NAME | COL_EVENT_ATTRS_BLOB
         ) {
+            continue;
+        }
+        // Skip a column whose page the projection did not decode; it stays
+        // absent from the decoded maps and is reachable only as a typed error
+        // through the view.
+        if !out.projection.page_needed(column_id) {
             continue;
         }
         let idxs = &groups[&column_id];
@@ -679,7 +867,12 @@ pub fn read_block(
         }
     }
 
-    decode_events(&mut out, &descs, &page_bytes, &groups)?;
+    // Reconstruct the nested events only when the projection asked for them; a
+    // decode that named no event column never touches their pages (they were
+    // left undecoded above) and leaves every row's events empty.
+    if out.projection.wants_events() {
+        decode_events(&mut out, &descs, &page_bytes, &groups)?;
+    }
 
     Ok(out)
 }
@@ -1199,6 +1392,177 @@ mod tests {
         let out = write_block(std::slice::from_ref(&r), &[], 3).expect("write");
         let dec = read_block(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP).expect("read");
         assert_eq!(dec.events[0], r.events);
+    }
+
+    /// A block carrying attribute and event pages built once, for the projected
+    /// decode tests. Two spans: dynamic per-key columns, an attrs_raw overflow,
+    /// nested events, service_name and (partly) status_message present.
+    fn attr_and_event_block() -> (Vec<u8>, u32) {
+        let plans = vec![
+            ColumnPlan {
+                column_id: FIRST_DYNAMIC_COL,
+                name: "http.method".into(),
+            },
+            ColumnPlan {
+                column_id: FIRST_DYNAMIC_COL + 1,
+                name: "http.route".into(),
+            },
+        ];
+        let mut r0 = row(1, 0, 100, 200);
+        r0.service_name = Some("checkout".into());
+        r0.status_message = Some("ok".into());
+        r0.columns = vec![
+            (FIRST_DYNAMIC_COL, "GET".into()),
+            (FIRST_DYNAMIC_COL + 1, "/cart".into()),
+        ];
+        r0.attrs_raw = Some(crate::record::encode_attrs(&[(
+            "overflow.key".to_string(),
+            "v".to_string(),
+        )]));
+        r0.events = vec![SpanEvent {
+            ts_ns: 150,
+            name: "exception".into(),
+            attrs_blob: vec![1, 2, 3],
+        }];
+        let mut r1 = row(1, 1, 210, 220);
+        r1.service_name = Some("payments".into());
+        r1.columns = vec![(FIRST_DYNAMIC_COL, "POST".into())];
+        r1.events = vec![SpanEvent {
+            ts_ns: 215,
+            name: "log".into(),
+            attrs_blob: vec![],
+        }];
+        let out = write_block(&[r0, r1], &plans, 3).expect("write");
+        (out.bytes, out.crc32c)
+    }
+
+    /// Projecting a set of columns decodes those pages and no others, and the
+    /// values it yields match a full decode row for row.
+    #[test]
+    fn projected_decode_skips_unrequested_pages_and_matches_full_decode() {
+        // The fixture MUST carry attribute and event pages. Over spans with no
+        // attributes and no events there are no dynamic-column, attrs_raw, or
+        // COL_EVENT_* pages to skip: both decodes would touch the same pages and
+        // the "strictly lower" assertion below would be false for a *correct*
+        // implementation. If that assertion ever fails, fix the fixture, never
+        // weaken the assertion -- weakening it makes the test vacuous.
+        let (bytes, crc) = attr_and_event_block();
+        let full = read_block(&bytes, crc, DEFAULT_MAX_UNCOMP).expect("full read");
+
+        // The projected span-table columns: the fixed identity/timing/status
+        // columns and service_name, but no dynamic attribute column, no
+        // attrs_raw overflow, and no event column.
+        let requested = [
+            COL_TRACE_ID,
+            COL_SPAN_ID,
+            COL_PARENT_SPAN_ID,
+            COL_NAME,
+            COL_START_TS,
+            COL_END_TS,
+            COL_STATUS_CODE,
+            COL_STATUS_MESSAGE,
+            COL_SERVICE_NAME,
+        ];
+        let projected =
+            read_block_projected(&bytes, crc, DEFAULT_MAX_UNCOMP, &requested).expect("projected");
+
+        assert_eq!(projected.record_count(), full.record_count());
+        let n = full.record_count();
+        let fv = full.view();
+        let pv = projected.view();
+
+        // Equivalence: every requested column reads value-for-value equal to the
+        // full decode, row for row, including null placement (COL_PARENT_SPAN_ID
+        // is absent from the block, so it is None on both).
+        for &col in &[COL_START_TS, COL_END_TS, COL_STATUS_CODE] {
+            let fc = fv.i64_column(col).expect("full i64");
+            let pc = pv.i64_column(col).expect("proj i64");
+            for r in 0..n {
+                assert_eq!(pc.value_at(r), fc.value_at(r), "i64 col {col} row {r}");
+            }
+        }
+        for &col in &[COL_TRACE_ID, COL_SPAN_ID, COL_PARENT_SPAN_ID] {
+            let fc = fv.fixed_column(col).expect("full fixed");
+            let pc = pv.fixed_column(col).expect("proj fixed");
+            for r in 0..n {
+                assert_eq!(pc.value_at(r), fc.value_at(r), "fixed col {col} row {r}");
+            }
+        }
+        for &col in &[COL_NAME, COL_STATUS_MESSAGE, COL_SERVICE_NAME] {
+            let fc = fv.str_column(col).expect("full str");
+            let pc = pv.str_column(col).expect("proj str");
+            for r in 0..n {
+                assert_eq!(pc.value_at(r), fc.value_at(r), "str col {col} row {r}");
+            }
+        }
+
+        // The gather iterator yields one cell per surviving row index, in order.
+        let survivors = [1usize];
+        let start = pv.i64_column(COL_START_TS).expect("start col");
+        assert_eq!(
+            start.gather(&survivors).collect::<Vec<_>>(),
+            vec![Some(210)]
+        );
+
+        // The win, asserted as a magnitude not a boolean: the projected decode
+        // skips the two dynamic-column pages, the attrs_raw pages, and the four
+        // event pages, so it decodes strictly fewer pages than the full decode.
+        assert!(
+            projected.pages_decoded() < full.pages_decoded(),
+            "projected decoded {} pages, full decoded {}",
+            projected.pages_decoded(),
+            full.pages_decoded()
+        );
+        assert!(projected.pages_skipped() > 0);
+        assert_eq!(full.pages_skipped(), 0);
+    }
+
+    /// Reading a column the projection excluded is a typed error, while a column
+    /// that was requested but is genuinely absent from the block reads as nulls.
+    /// If both returned the same thing, the requested-vs-absent distinction
+    /// (docs/adrs/0110 decision 1) would not exist.
+    #[test]
+    fn unrequested_column_access_is_typed_error_not_null() {
+        // Two spans with service_name present (so COL_SERVICE_NAME has a page)
+        // and status_message absent on every row (so COL_STATUS_MESSAGE has no
+        // page at all).
+        let mut r0 = row(1, 0, 10, 20);
+        r0.service_name = Some("checkout".into());
+        let mut r1 = row(1, 1, 30, 40);
+        r1.service_name = Some("payments".into());
+        let out = write_block(&[r0, r1], &[], 3).expect("write");
+
+        // Request status_message (absent from the block) but NOT service_name
+        // (present in the block).
+        let requested = [
+            COL_TRACE_ID,
+            COL_SPAN_ID,
+            COL_NAME,
+            COL_START_TS,
+            COL_END_TS,
+            COL_STATUS_CODE,
+            COL_STATUS_MESSAGE,
+        ];
+        let dec = read_block_projected(&out.bytes, out.crc32c, DEFAULT_MAX_UNCOMP, &requested)
+            .expect("projected");
+        let view = dec.view();
+
+        // Case (b), caller bug: a column the projection excluded is a typed
+        // error, never a silent column of nulls.
+        match view.str_column(COL_SERVICE_NAME) {
+            Err(SpanSegError::ColumnNotRequested(col)) => assert_eq!(col, COL_SERVICE_NAME),
+            Err(other) => panic!("expected ColumnNotRequested, got {other:?}"),
+            Ok(_) => panic!("expected ColumnNotRequested, got a column"),
+        }
+
+        // Case (a), legitimate null: a requested column genuinely absent from
+        // the block reads None for every row, not an error.
+        let msg = view
+            .str_column(COL_STATUS_MESSAGE)
+            .expect("status_message was requested");
+        for r in 0..dec.record_count() {
+            assert_eq!(msg.value_at(r), None, "row {r}");
+        }
     }
 
     /// Truncating a v4 block that carries dynamic columns and events -- at every
