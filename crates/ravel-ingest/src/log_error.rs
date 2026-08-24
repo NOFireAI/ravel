@@ -47,6 +47,17 @@ pub enum LogWriteError {
     /// (ADR-0052 section 3). Retryable once the background refresher re-reads.
     #[error("provisioning view stale: refusing to route on a view older than the refresh interval")]
     StaleProvisioningView,
+    /// A tenant's shard buffer already holds one representation (row-major or
+    /// columnar) and this write carried the other (ADR-0109 decision 5: a
+    /// tenant's shard buffer is columnar or row-major, never both). The two
+    /// forms are never silently merged; the write is refused fail-loud. Not
+    /// retryable at the shard level: identical input reproduces the same
+    /// refusal until the buffer flushes. In practice this cannot arise on any
+    /// live path (the bulk loader builds its own router in its own process
+    /// while OTLP traffic goes through the server's), so the variant is a
+    /// guard against a future caller mixing the two, not a live failure mode.
+    #[error("mixed buffer representation: {0}")]
+    MixedBufferRepresentation(String),
     /// The process-wide ingest buffer byte budget is at its ceiling
     /// (`--max-ingest-buffer-bytes`, ADR-0069 decision 1): charging this
     /// request's estimated buffered bytes would exceed it, so it is shed before
@@ -94,7 +105,9 @@ impl LogWriteError {
             | LogWriteError::Abandoned(_)
             | LogWriteError::StaleProvisioningView
             | LogWriteError::BufferBudgetExceeded => true,
-            LogWriteError::SegmentBuild(_) | LogWriteError::StreamIdCollision(_) => false,
+            LogWriteError::SegmentBuild(_)
+            | LogWriteError::StreamIdCollision(_)
+            | LogWriteError::MixedBufferRepresentation(_) => false,
             LogWriteError::PartialWrite { inner, .. } => inner.is_retryable(),
         }
     }

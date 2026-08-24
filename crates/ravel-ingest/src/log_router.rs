@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ravel_commit::rng::{RngSource, SystemRng};
+use ravel_logseg::{Bitmap, ColumnarLogBatch, DynColumn};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
+use ravel_types::logstream::AttrValue;
 use ravel_types::{CommitToken, TenantHash, shard_for_log};
 use tokio::sync::{mpsc, oneshot};
 
@@ -24,7 +26,7 @@ use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, l
 use crate::indexed_fields::IndexedFieldsOverlay;
 use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
-use crate::log_shard::{LogShardActor, LogShardMsg, est_record_bytes};
+use crate::log_shard::{LogShardActor, LogShardMsg, est_columnar_bytes, est_record_bytes};
 use crate::router::WriteMode;
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{LogStage, LogStageTimings};
@@ -132,13 +134,27 @@ impl LogIngestRouter {
         clock: Arc<dyn Clock>,
         indexed_fields: Arc<IndexedFieldsOverlay>,
     ) -> Self {
-        let metrics = Arc::new(LogIngestMetrics::default());
         // Production OS-entropy source for writer ids and PUT-retry jitter
         // (ADR-0068 decision 2). The log pipeline is not exercised by the
-        // seeded simulation driver, so this router has no injected variant;
-        // routing every draw through the seam still keeps `rand::rng()` and
-        // `Uuid::new_v4()` off this production path.
-        let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
+        // seeded simulation driver, so this router has no injected variant on
+        // the production path; routing every draw through the seam still keeps
+        // `rand::rng()` and `Uuid::new_v4()` off it.
+        Self::with_rng(config, store, clock, indexed_fields, Arc::new(SystemRng))
+    }
+
+    /// Like [`Self::new_with_indexed_fields`] but with an injected
+    /// [`RngSource`]. A [`ravel_commit::rng::SeededRng`] here makes writer ids
+    /// deterministic, which the router-level byte-identity differential test
+    /// (row vs columnar) needs so two routers over two stores stamp the same
+    /// `ObjectIdentity` and object keys.
+    pub(crate) fn with_rng(
+        config: IngestConfig,
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<dyn Clock>,
+        indexed_fields: Arc<IndexedFieldsOverlay>,
+        rng: Arc<dyn RngSource>,
+    ) -> Self {
+        let metrics = Arc::new(LogIngestMetrics::default());
         #[cfg(feature = "stage-timing")]
         let stage_timings = Arc::new(LogStageTimings::new());
         let factory = {
@@ -382,6 +398,22 @@ impl LogIngestRouter {
             return Ok(LogWriteReceipt::default());
         }
 
+        self.await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline)
+            .await
+    }
+
+    /// Awaits the strict-mode acks of a dispatched write and folds them into a
+    /// receipt (or a classified error), shared verbatim by [`Self::write`] and
+    /// [`Self::write_columnar`] so the issue #296 partial-failure accounting has
+    /// exactly one implementation. `ack_shards[i]` is the shard `ack_rxs[i]`
+    /// belongs to; both are in ascending shard order.
+    async fn await_strict_acks(
+        &self,
+        set: &Arc<Vec<LogShardHandle>>,
+        ack_shards: Vec<u32>,
+        ack_rxs: Vec<oneshot::Receiver<Result<CommitToken, LogWriteError>>>,
+        ack_deadline: Duration,
+    ) -> Result<LogWriteReceipt, LogWriteError> {
         // `join_all` preserves input order, so `joined[i]` is `ack_shards[i]`.
         // On a deadline elapse the whole `join_all` future is dropped, so no
         // per-shard ack is observed: `AckTimeout` carries no recovered tokens
@@ -441,6 +473,87 @@ impl LogIngestRouter {
         Ok(LogWriteReceipt { tokens: durable })
     }
 
+    /// The columnar counterpart of [`Self::write`] (ADR-0109 decision 4): the
+    /// same sequence -- charge the ADR-0069 byte budget, resolve the generation
+    /// view, partition by shard, dispatch, await Strict acks -- with the
+    /// partition step building a per-shard [`ColumnarLogBatch`] instead of a
+    /// `Vec` per shard. Shard placement is `shard_for_log` over each row's
+    /// stream id, exactly as [`Self::write`]. The commit protocol, object key
+    /// layout, `WriteMode::Strict` ack contract, flush triggers, and RLOG format
+    /// are unchanged; only the buffered input shape differs.
+    ///
+    /// Until #605 wires the Parquet bulk loader, no shipping binary constructs a
+    /// [`ColumnarLogBatch`] to hand here; this is the router seam that loader
+    /// will call, reachable today only from tests.
+    pub async fn write_columnar(
+        &self,
+        tenant: ravel_types::TenantId,
+        batch: ColumnarLogBatch,
+        mode: WriteMode,
+        ack_deadline: Duration,
+    ) -> Result<LogWriteReceipt, LogWriteError> {
+        if batch.is_empty() {
+            return Ok(LogWriteReceipt::default());
+        }
+
+        // Global ingest byte budget (ADR-0069 decision 1): the columnar estimate
+        // equals the row path's `est_record_bytes` sum for the same records
+        // exactly, so the shared ceiling means the same thing on both paths. As
+        // in `write`, the charge is cloned into every shard message and refunded
+        // when the flush(es) holding these bytes complete or fail.
+        let estimate = est_columnar_bytes(&batch) as u64;
+        let charge = Arc::new(
+            self.budget
+                .try_charge(estimate)
+                .map_err(|_| LogWriteError::BufferBudgetExceeded)?,
+        );
+
+        // Route against the tenant's current generation view, exactly as `write`.
+        let set = self.active_set(tenant.hash(), self.clock.now_ns()).await?;
+        let shard_count = set.len() as u32;
+
+        // Partition into per-shard column selections. `partition_columnar`
+        // returns ascending-shard order and omits a shard with no rows, matching
+        // `write`'s sorted `by_shard` keys.
+        let by_shard = partition_columnar(&batch, shard_count);
+        if by_shard.is_empty() {
+            return Ok(LogWriteReceipt::default());
+        }
+
+        let mut ack_shards = Vec::with_capacity(by_shard.len());
+        let mut ack_rxs = Vec::with_capacity(by_shard.len());
+        for (shard, shard_batch) in by_shard {
+            let ack = match mode {
+                WriteMode::Strict => {
+                    let (tx, rx) = oneshot::channel();
+                    ack_shards.push(shard);
+                    ack_rxs.push(rx);
+                    Some(tx)
+                }
+                WriteMode::Buffered => None,
+            };
+            let msg = LogShardMsg::WriteColumnar {
+                tenant: tenant.clone(),
+                batch: Box::new(shard_batch),
+                ack,
+                charge: Some(Arc::clone(&charge)),
+            };
+            if set[shard as usize].tx.send(msg).await.is_err() {
+                // The actor task is gone; count the death once and surface the
+                // typed error rather than acking as if the batch landed.
+                self.mark_shard_dead(&set[shard as usize]);
+                return Err(LogWriteError::ShardUnavailable);
+            }
+        }
+
+        if mode == WriteMode::Buffered {
+            return Ok(LogWriteReceipt::default());
+        }
+
+        self.await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline)
+            .await
+    }
+
     /// Records the first observation of a shard actor's death, deduped so a
     /// permanently dead shard is counted once no matter how many later writes
     /// route to it.
@@ -492,6 +605,139 @@ impl LogIngestRouter {
             let _ = rx.await;
         }
     }
+}
+
+/// Partitions a [`ColumnarLogBatch`] into per-shard sub-batches by
+/// `shard_for_log` over each row's stream id (ADR-0109 decision 4), the
+/// columnar analogue of [`LogIngestRouter::write`]'s `by_shard` grouping.
+///
+/// Each returned sub-batch is exactly what `ColumnarLogBatch::from_records`
+/// would build from that shard's rows taken in row order: dynamic columns keep
+/// the parent's `(name, type)`-sorted order and any the subset leaves all-absent
+/// are dropped (`from_records` over the subset would never have created them),
+/// and the stream directory is rebuilt id-ascending with dense refs. That
+/// equivalence is what makes each per-shard object byte-identical to the row
+/// path's, whose per-shard record vector this reproduces (the writer-level proof
+/// is #602). Returns ascending-shard order; a shard with no rows is omitted,
+/// exactly as the row path omits it.
+fn partition_columnar(batch: &ColumnarLogBatch, shard_count: u32) -> Vec<(u32, ColumnarLogBatch)> {
+    // Per-shard accumulator: the sub-batch under construction, the parent stream
+    // refs of its rows (remapped to dense child refs once all rows are seen),
+    // and one dense (cells, validity) pair per parent dynamic column.
+    struct Acc {
+        out: ColumnarLogBatch,
+        parent_refs: Vec<u32>,
+        dyn_cells: Vec<Vec<AttrValue>>,
+        dyn_validity: Vec<Bitmap>,
+    }
+    let ncol = batch.dyn_columns.len();
+    let mut accs: HashMap<u32, Acc> = HashMap::new();
+
+    // Dense-slot cursors into the parent's packed buffers, advanced once per row
+    // (regardless of shard) so a present cell reads the correct dense slot.
+    let mut trace_slot = 0usize;
+    let mut span_slot = 0usize;
+    let mut col_slot = vec![0usize; ncol];
+
+    for row in 0..batch.num_rows {
+        let stream_id = batch.stream_ids[batch.stream_refs[row] as usize];
+        let shard = shard_for_log(&stream_id, shard_count);
+        let acc = accs.entry(shard).or_insert_with(|| Acc {
+            out: ColumnarLogBatch::new(),
+            parent_refs: Vec::new(),
+            dyn_cells: vec![Vec::new(); ncol],
+            dyn_validity: vec![Bitmap::new(); ncol],
+        });
+
+        acc.out.num_rows += 1;
+        acc.out.ts_ns.push(batch.ts_ns[row]);
+        acc.out.observed_ts_ns.push(batch.observed_ts_ns[row]);
+        acc.out.severity_num.push(batch.severity_num[row]);
+        acc.out.flags.push(batch.flags[row]);
+        acc.out.severity_text.push(batch.severity_text.get(row));
+        acc.out.body.push(batch.body.get(row));
+
+        if batch.trace_id_validity.get(row) {
+            acc.out
+                .trace_id
+                .extend_from_slice(batch.trace_id_at(trace_slot));
+            acc.out.trace_id_validity.push(true);
+            trace_slot += 1;
+        } else {
+            acc.out.trace_id_validity.push(false);
+        }
+        if batch.span_id_validity.get(row) {
+            acc.out
+                .span_id
+                .extend_from_slice(batch.span_id_at(span_slot));
+            acc.out.span_id_validity.push(true);
+            span_slot += 1;
+        } else {
+            acc.out.span_id_validity.push(false);
+        }
+
+        acc.out
+            .residual_attrs
+            .push(batch.residual_attrs[row].clone());
+        acc.parent_refs.push(batch.stream_refs[row]);
+
+        for (c, slot) in col_slot.iter_mut().enumerate() {
+            let col = &batch.dyn_columns[c];
+            if col.validity.get(row) {
+                acc.dyn_cells[c].push(col.cells[*slot].clone());
+                acc.dyn_validity[c].push(true);
+                *slot += 1;
+            } else {
+                acc.dyn_validity[c].push(false);
+            }
+        }
+    }
+
+    let mut result: Vec<(u32, ColumnarLogBatch)> = Vec::with_capacity(accs.len());
+    for (shard, acc) in accs {
+        let Acc {
+            mut out,
+            parent_refs,
+            dyn_cells,
+            dyn_validity,
+        } = acc;
+
+        // Stream directory: distinct parent refs ascending. The parent's
+        // `stream_ids` are id-ascending, so ascending parent refs are
+        // id-ascending too; rebuild them as dense child refs.
+        let mut distinct: Vec<u32> = parent_refs.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut child_ref_of: HashMap<u32, u32> = HashMap::with_capacity(distinct.len());
+        for (child, &parent_ref) in distinct.iter().enumerate() {
+            child_ref_of.insert(parent_ref, child as u32);
+            out.stream_ids.push(batch.stream_ids[parent_ref as usize]);
+            out.stream_attrs
+                .push(batch.stream_attrs[parent_ref as usize].clone());
+        }
+        out.stream_refs = parent_refs
+            .iter()
+            .map(|parent_ref| child_ref_of[parent_ref])
+            .collect();
+
+        // Dynamic columns: keep the parent's `(name, type)` order, dropping any
+        // column the subset left all-absent.
+        for (c, (cells, validity)) in dyn_cells.into_iter().zip(dyn_validity).enumerate() {
+            if validity.count_present() == 0 {
+                continue;
+            }
+            out.dyn_columns.push(DynColumn {
+                name: batch.dyn_columns[c].name.clone(),
+                field_type: batch.dyn_columns[c].field_type,
+                cells,
+                validity,
+            });
+        }
+
+        result.push((shard, out));
+    }
+    result.sort_by_key(|(shard, _)| *shard);
+    result
 }
 
 #[cfg(test)]
@@ -715,5 +961,256 @@ mod tests {
             0,
             "no degraded routing when the store is healthy"
         );
+    }
+
+    // ---- ADR-0109 columnar write path ----
+
+    use ravel_commit::rng::SeededRng;
+    use ravel_logseg::{ColumnarLogBatch, LogRecord, stream_attrs_bytes};
+    use ravel_object_store::{GetRange, list_all};
+    use ravel_types::TenantId;
+    use ravel_types::logstream::log_stream_id;
+
+    /// A clock pinned to one instant: makes `epoch`, `flush_open_ns`, and every
+    /// clock-derived flush-identity field deterministic and identical across two
+    /// routers, which the byte-identity differential test requires. The tests
+    /// that use it drive flushes through `flush_all`, never the age tick, so the
+    /// real-timer default `sleep` is never depended on.
+    struct FixedClock(i64);
+    impl Clock for FixedClock {
+        fn now_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    fn overlay() -> Arc<IndexedFieldsOverlay> {
+        Arc::new(IndexedFieldsOverlay::new(Arc::new(NoIndexedFields)))
+    }
+
+    /// Buffers every write without a size or age flush, so a single `flush_all`
+    /// drives exactly one flush per shard (seq 0 on both routers).
+    fn buffer_all() -> IngestConfig {
+        IngestConfig {
+            shard_count: 4,
+            target_bytes: 64 * 1024 * 1024,
+            max_flush_delay: Duration::from_secs(3600),
+            max_flush_delay_idle: Duration::from_secs(3600),
+            flush_tick: Duration::from_secs(3600),
+            ..IngestConfig::default()
+        }
+    }
+
+    fn to_logrecord(r: &NormalizedLogRecord) -> LogRecord {
+        LogRecord {
+            stream_id: r.stream_id,
+            stream_attrs: r.stream_attrs.clone(),
+            ts_ns: r.ts_ns,
+            observed_ts_ns: r.observed_ts_ns,
+            severity_num: r.severity_num,
+            severity_text: r.severity_text.clone(),
+            body: r.body.clone(),
+            trace_id: r.trace_id,
+            span_id: r.span_id,
+            flags: r.flags,
+            attrs: r.attrs.clone(),
+        }
+    }
+
+    /// Records spread across streams (so across shards) and carrying the
+    /// features that stress the two paths' agreement: multiple attribute types,
+    /// a within-record duplicate `(name, type)` that folds into `residual_attrs`,
+    /// a nested `Map` value that resolves to canonical bytes, and present/absent
+    /// trace and span ids.
+    fn diverse_records() -> Vec<NormalizedLogRecord> {
+        let mut out = Vec::new();
+        for i in 0..48u32 {
+            let host = format!("h{i}");
+            let res: Vec<(String, AttrValue)> = vec![
+                (
+                    "service.name".to_string(),
+                    AttrValue::Str("api".to_string()),
+                ),
+                ("host".to_string(), AttrValue::Str(host)),
+            ];
+            let stream_id = log_stream_id(&res, "scope", "", &[]);
+            let stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]);
+            let mut attrs: Vec<(String, AttrValue)> = vec![
+                ("k_str".to_string(), AttrValue::Str(format!("v{i}"))),
+                ("k_int".to_string(), AttrValue::I64(i as i64)),
+                ("k_bool".to_string(), AttrValue::Bool(i % 2 == 0)),
+            ];
+            if i % 3 == 0 {
+                attrs.push(("k_str".to_string(), AttrValue::Str("dup".to_string())));
+            }
+            if i % 5 == 0 {
+                attrs.push((
+                    "nested".to_string(),
+                    AttrValue::Map(vec![("a".to_string(), AttrValue::Bool(true))]),
+                ));
+            }
+            let trace_id = if i % 2 == 0 {
+                Some([i as u8; 16])
+            } else {
+                None
+            };
+            let span_id = if i % 4 == 0 {
+                Some([(i as u8).wrapping_add(1); 8])
+            } else {
+                None
+            };
+            out.push(NormalizedLogRecord {
+                stream_id,
+                stream_attrs,
+                ts_ns: 1_000 + i as i64,
+                observed_ts_ns: 1_000 + i as i64,
+                severity_num: (i % 24) as u8,
+                severity_text: "INFO".to_string(),
+                body: format!("body {i}"),
+                trace_id,
+                span_id,
+                flags: i,
+                attrs,
+            });
+        }
+        out
+    }
+
+    async fn collect_objects(store: &dyn ObjectStoreBackend) -> Vec<(String, Vec<u8>)> {
+        let mut metas = list_all(store, "").await.expect("list all objects");
+        metas.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut out = Vec::with_capacity(metas.len());
+        for meta in metas {
+            let bytes = store
+                .get(&meta.key, GetRange::Full)
+                .await
+                .expect("get object")
+                .data;
+            out.push((meta.key, bytes.to_vec()));
+        }
+        out
+    }
+
+    /// The acceptance anchor (ADR-0109 decision 7, router level): the same
+    /// records written through `write` and through `write_columnar` produce
+    /// byte-identical stored objects. Two routers over two stores share one
+    /// pinned clock and one seed, so `writer_id`, `epoch`, and `seq` match and
+    /// only a real drift in admission, coercion, dynamic-column assignment, or
+    /// stream-directory building could make a byte differ. Compared byte for
+    /// byte over every stored object (data and commit records both), not row
+    /// counts and not decoded content.
+    #[tokio::test]
+    async fn columnar_write_produces_the_same_objects_as_row_write() {
+        let seed = 0x00C0_FFEE_u64;
+        // A realistic wall-clock reading (2023): flush identity derives its hour
+        // bucket from this, and `checked_ingest_hour_bucket` rejects a reading
+        // below its plausibility floor.
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_700_000_000_000_000_000));
+
+        let store_row: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router_row = LogIngestRouter::with_rng(
+            buffer_all(),
+            Arc::clone(&store_row),
+            Arc::clone(&clock),
+            overlay(),
+            Arc::new(SeededRng::new(seed)),
+        );
+
+        let store_col: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router_col = LogIngestRouter::with_rng(
+            buffer_all(),
+            Arc::clone(&store_col),
+            Arc::clone(&clock),
+            overlay(),
+            Arc::new(SeededRng::new(seed)),
+        );
+
+        let tenant = TenantId::new("acme");
+        let records = diverse_records();
+        let shards: std::collections::HashSet<u32> = records
+            .iter()
+            .map(|r| shard_for_log(&r.stream_id, 4))
+            .collect();
+        assert!(
+            shards.len() > 1,
+            "the fixture must span multiple shards to exercise partitioning, spans {}",
+            shards.len()
+        );
+
+        router_row
+            .write(
+                tenant.clone(),
+                records.clone(),
+                WriteMode::Buffered,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("row buffered write enqueues");
+        router_row.flush_all().await;
+
+        let batch =
+            ColumnarLogBatch::from_records(&records.iter().map(to_logrecord).collect::<Vec<_>>());
+        router_col
+            .write_columnar(
+                tenant.clone(),
+                batch,
+                WriteMode::Buffered,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("columnar buffered write enqueues");
+        router_col.flush_all().await;
+
+        let objs_row = collect_objects(store_row.as_ref()).await;
+        let objs_col = collect_objects(store_col.as_ref()).await;
+        assert!(
+            !objs_row.is_empty(),
+            "the row path must have written at least one object"
+        );
+        assert_eq!(
+            objs_row, objs_col,
+            "row and columnar paths must produce byte-identical stored objects"
+        );
+    }
+
+    /// Each per-shard sub-batch `partition_columnar` builds is exactly what
+    /// `ColumnarLogBatch::from_records` would build from that shard's rows in row
+    /// order (dynamic-column order and drop, stream-directory rebuild, dense
+    /// slots). This is the structural invariant the byte-identity test relies
+    /// on, checked directly so a partition bug is localized here rather than
+    /// surfacing only as an opaque byte diff.
+    #[test]
+    fn partition_columnar_matches_from_records_per_shard() {
+        let shard_count = 4u32;
+        let records = diverse_records();
+        let logrecords: Vec<LogRecord> = records.iter().map(to_logrecord).collect();
+        let batch = ColumnarLogBatch::from_records(&logrecords);
+
+        let mut expected: std::collections::HashMap<u32, Vec<LogRecord>> =
+            std::collections::HashMap::new();
+        for lr in &logrecords {
+            let shard = shard_for_log(&lr.stream_id, shard_count);
+            expected.entry(shard).or_default().push(lr.clone());
+        }
+
+        let parts = partition_columnar(&batch, shard_count);
+        let seen: std::collections::HashSet<u32> = parts.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            seen.len(),
+            parts.len(),
+            "each shard appears at most once in the partition"
+        );
+        assert_eq!(
+            seen,
+            expected.keys().copied().collect(),
+            "the partition covers exactly the shards the row path routes to"
+        );
+
+        for (shard, part) in parts {
+            let want = ColumnarLogBatch::from_records(&expected[&shard]);
+            assert_eq!(
+                part, want,
+                "shard {shard}'s partition must equal from_records of its rows"
+            );
+        }
     }
 }
