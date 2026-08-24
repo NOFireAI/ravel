@@ -38,7 +38,9 @@ use ravel_commit::keys;
 use ravel_commit::publish::{self, PublishError, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::rng::RngSource;
-use ravel_logseg::{LogRecord, LogSegError, ObjectIdentity, RlogConfig, RlogWriter};
+use ravel_logseg::{
+    ColumnarLogBatch, LogRecord, LogSegError, ObjectIdentity, RlogConfig, RlogWriter,
+};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_proto::commit::v1::CommitRecord;
@@ -72,6 +74,23 @@ pub(crate) enum LogShardMsg {
         /// bytes -- when the flush's outcome is reached. `None` only for a test
         /// write that bypasses the budget; production charges via
         /// [`crate::LogIngestRouter`].
+        charge: Option<Arc<IngestByteCharge>>,
+    },
+    /// The columnar counterpart of [`LogShardMsg::Write`] (ADR-0109 decision
+    /// 5): one already-partitioned [`ColumnarLogBatch`] for this shard,
+    /// buffered column-major and pushed to the writer with
+    /// [`RlogWriter::push_columnar`] at flush. A tenant buffer that already
+    /// holds row-major records refuses this and vice versa; the two shapes are
+    /// never merged.
+    WriteColumnar {
+        tenant: TenantId,
+        /// Boxed to keep the enum small: a [`ColumnarLogBatch`] is far larger
+        /// than the other variants, and boxing moves that size off every
+        /// `LogShardMsg` the channel carries.
+        batch: Box<ColumnarLogBatch>,
+        ack: Option<LogAck>,
+        /// This request's ADR-0069 byte-budget charge, held until flush exactly
+        /// as [`LogShardMsg::Write`]'s `charge` is.
         charge: Option<Arc<IngestByteCharge>>,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
@@ -131,6 +150,46 @@ pub(crate) fn est_record_bytes(rec: &NormalizedLogRecord) -> usize {
     rec.body.len() + rec.severity_text.len() + rec.stream_attrs.len() + attr_bytes + 32
 }
 
+/// The [`est_record_bytes`] byte estimate computed column-wise over a
+/// [`ColumnarLogBatch`] (ADR-0109 decision 6). This must equal the sum of
+/// [`est_record_bytes`] over the records the batch was built from, exactly, so
+/// the one process-wide ADR-0069 ceiling means the same thing on both the row
+/// and columnar paths.
+///
+/// Term by term against [`est_record_bytes`]: `body` and `severity_text` are
+/// each the concatenated value bytes across all rows (a `VarBytes` holds one
+/// value per row); `stream_attrs` is summed per row through each row's stream
+/// reference (the batch dedups the blob per distinct stream, so it is
+/// re-expanded here to match the row path's per-record charge); every dynamic
+/// column cell and every `residual_attrs` entry is one attribute occurrence,
+/// each charging its `(String, AttrValue)` pair header, its key bytes, and its
+/// [`attr_value_len`] exactly as the row path charges the same occurrence; and
+/// the fixed 32 (two timestamps, severity_num, flags, optional trace/span ids)
+/// is charged per row.
+pub(crate) fn est_columnar_bytes(batch: &ColumnarLogBatch) -> usize {
+    let body = batch.body.data().len();
+    let severity_text = batch.severity_text.data().len();
+    let stream_attrs: usize = batch
+        .stream_refs
+        .iter()
+        .map(|&r| batch.stream_attrs[r as usize].len())
+        .sum();
+
+    let mut attr_bytes = 0usize;
+    for col in &batch.dyn_columns {
+        for cell in &col.cells {
+            attr_bytes += size_of::<(String, AttrValue)>() + col.name.len() + attr_value_len(cell);
+        }
+    }
+    for row in &batch.residual_attrs {
+        for (k, v) in row {
+            attr_bytes += size_of::<(String, AttrValue)>() + k.len() + attr_value_len(v);
+        }
+    }
+
+    body + severity_text + stream_attrs + attr_bytes + 32 * batch.num_rows
+}
+
 /// Type-level bridge from the OTLP-independent [`NormalizedLogRecord`] to the
 /// writer's [`LogRecord`]. Every field maps one to one; there is no data
 /// transformation, only a struct rename.
@@ -150,6 +209,18 @@ fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
     }
 }
 
+/// A tenant's buffered payload: one representation at a time (ADR-0109 decision
+/// 5). `Empty` is the pre-first-write state that accepts either shape; once a
+/// write lands, the buffer is `Rows` or `Columnar` until it flushes, and the
+/// other shape is refused.
+#[derive(Default)]
+enum BufContent {
+    #[default]
+    Empty,
+    Rows(Vec<NormalizedLogRecord>),
+    Columnar(Vec<ColumnarLogBatch>),
+}
+
 /// One tenant's accumulated log records in a single shard buffer, the
 /// log-pipeline counterpart of [`crate::shard::TenantBuf`].
 ///
@@ -157,7 +228,7 @@ fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
 /// docs): the fail-loud collision check is [`RlogWriter::finish`]'s job.
 #[derive(Default)]
 struct LogTenantBuf {
-    records: Vec<NormalizedLogRecord>,
+    content: BufContent,
     est_bytes: usize,
     oldest_arrival_ns: Option<i64>,
     min_ingest_ts_ns: Option<i64>,
@@ -182,16 +253,65 @@ impl LogTenantBuf {
         });
     }
 
-    /// Appends `records` to this buffer and returns the estimated byte cost
-    /// added (per [`est_record_bytes`]). Unlike the metrics buffer this never
-    /// fails: the stream-id collision check is deferred to
-    /// [`RlogWriter::finish`] at flush time, so a merge cannot reject.
-    fn merge(&mut self, records: Vec<NormalizedLogRecord>, arrival_ns: i64) -> usize {
-        self.note_arrival(arrival_ns);
+    /// Appends row-major `records` to this buffer and returns the estimated
+    /// byte cost added (per [`est_record_bytes`]). Refuses fail-loud if the
+    /// buffer already holds columnar batches (ADR-0109 decision 5); no state is
+    /// mutated on that refusal. Unlike the metrics buffer this never fails on
+    /// stream identity: that collision check is deferred to
+    /// [`RlogWriter::finish`] at flush time.
+    fn merge_rows(
+        &mut self,
+        records: Vec<NormalizedLogRecord>,
+        arrival_ns: i64,
+    ) -> Result<usize, LogWriteError> {
         let bytes_added: usize = records.iter().map(est_record_bytes).sum();
-        self.records.extend(records);
+        match &mut self.content {
+            BufContent::Empty => self.content = BufContent::Rows(records),
+            BufContent::Rows(existing) => existing.extend(records),
+            BufContent::Columnar(_) => {
+                return Err(LogWriteError::MixedBufferRepresentation(
+                    "row-major write into a tenant buffer already holding columnar batches".into(),
+                ));
+            }
+        }
+        self.note_arrival(arrival_ns);
         self.est_bytes += bytes_added;
-        bytes_added
+        Ok(bytes_added)
+    }
+
+    /// Appends one columnar `batch` to this buffer and returns the estimated
+    /// byte cost added (per [`est_columnar_bytes`], equal to the row path's
+    /// number for the same records). Refuses fail-loud if the buffer already
+    /// holds row-major records (ADR-0109 decision 5); no state is mutated on
+    /// that refusal. The caller passes only non-empty batches.
+    fn merge_columnar(
+        &mut self,
+        batch: ColumnarLogBatch,
+        arrival_ns: i64,
+    ) -> Result<usize, LogWriteError> {
+        let bytes_added = est_columnar_bytes(&batch);
+        match &mut self.content {
+            BufContent::Empty => self.content = BufContent::Columnar(vec![batch]),
+            BufContent::Columnar(existing) => existing.push(batch),
+            BufContent::Rows(_) => {
+                return Err(LogWriteError::MixedBufferRepresentation(
+                    "columnar write into a tenant buffer already holding row-major records".into(),
+                ));
+            }
+        }
+        self.note_arrival(arrival_ns);
+        self.est_bytes += bytes_added;
+        Ok(bytes_added)
+    }
+
+    /// Total buffered record (row) count across whichever representation the
+    /// buffer holds, for the channel-close summary line.
+    fn record_count(&self) -> u64 {
+        match &self.content {
+            BufContent::Empty => 0,
+            BufContent::Rows(records) => records.len() as u64,
+            BufContent::Columnar(batches) => batches.iter().map(|b| b.num_rows as u64).sum(),
+        }
     }
 }
 
@@ -237,12 +357,64 @@ struct LogPinnedFlush {
     deadline_ns: i64,
     min_ingest_ts_ns: i64,
     max_ingest_ts_ns: i64,
-    records: Vec<NormalizedLogRecord>,
+    payload: FlushPayload,
     waiters: Vec<LogAck>,
     /// The global ingest-byte-budget charges this flush's buffer held (ADR-0069).
     /// Carried into the flush task purely so they are dropped -- and the bytes
     /// refunded -- when the flush's terminal outcome is reached, no earlier.
     charges: Vec<Arc<IngestByteCharge>>,
+}
+
+/// One flush's buffered payload, in whichever representation the tenant buffer
+/// held (ADR-0109 decision 5). The row and columnar arms produce byte-identical
+/// RLOG objects for the same records; the writer-level differential test in
+/// `ravel-logseg` (#602) is the proof of that.
+enum FlushPayload {
+    Rows(Vec<NormalizedLogRecord>),
+    Columnar(Vec<ColumnarLogBatch>),
+}
+
+impl FlushPayload {
+    /// Distinct stream count, event-time bounds, and total row count over the
+    /// payload, the commit-record fields [`RlogWriter`] does not surface after
+    /// `finish()`. Computed identically to the row path's single pass whichever
+    /// representation this is: a `ColumnarLogBatch` already carries its distinct
+    /// stream ids, so the union across batches is the same distinct set the row
+    /// path derives by inserting every record's `stream_id`.
+    fn commit_stats(&self) -> (u64, i64, i64, u64) {
+        let mut stream_ids: HashSet<LogStreamId> = HashSet::new();
+        let mut min_event_ts_ns = i64::MAX;
+        let mut max_event_ts_ns = i64::MIN;
+        let mut sample_count: u64 = 0;
+        match self {
+            FlushPayload::Rows(records) => {
+                for rec in records {
+                    stream_ids.insert(rec.stream_id);
+                    min_event_ts_ns = min_event_ts_ns.min(rec.ts_ns);
+                    max_event_ts_ns = max_event_ts_ns.max(rec.ts_ns);
+                }
+                sample_count = records.len() as u64;
+            }
+            FlushPayload::Columnar(batches) => {
+                for batch in batches {
+                    for id in &batch.stream_ids {
+                        stream_ids.insert(*id);
+                    }
+                    for &ts in &batch.ts_ns {
+                        min_event_ts_ns = min_event_ts_ns.min(ts);
+                        max_event_ts_ns = max_event_ts_ns.max(ts);
+                    }
+                    sample_count += batch.num_rows as u64;
+                }
+            }
+        }
+        (
+            stream_ids.len() as u64,
+            min_event_ts_ns,
+            max_event_ts_ns,
+            sample_count,
+        )
+    }
 }
 
 impl LogFlushCtx {
@@ -269,7 +441,7 @@ impl LogFlushCtx {
             deadline_ns,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
-            records,
+            payload,
             waiters,
             charges,
         } = pinned;
@@ -278,22 +450,15 @@ impl LogFlushCtx {
         // ADR-0069 budget refund for exactly the bytes this buffer held.
         let _charges = charges;
 
-        // One pass over the batch computes the commit-record fields RlogWriter
-        // does not surface after `finish()`: the distinct stream count (the log
-        // analogue of series_count) and the event-time bounds. `records` is
-        // never empty here: the actor's `flush_tenant` returns before spawning
-        // for an empty buffer, so `min_event_ts_ns`/`max_event_ts_ns` always
-        // see at least one record.
-        let mut stream_ids: HashSet<LogStreamId> = HashSet::new();
-        let mut min_event_ts_ns = i64::MAX;
-        let mut max_event_ts_ns = i64::MIN;
-        for rec in &records {
-            stream_ids.insert(rec.stream_id);
-            min_event_ts_ns = min_event_ts_ns.min(rec.ts_ns);
-            max_event_ts_ns = max_event_ts_ns.max(rec.ts_ns);
-        }
-        let series_count = stream_ids.len() as u64;
-        let sample_count = records.len() as u64;
+        // One pass over the payload computes the commit-record fields
+        // RlogWriter does not surface after `finish()`: the distinct stream
+        // count (the log analogue of series_count) and the event-time bounds.
+        // The payload is never empty here: the actor's `flush_tenant` returns
+        // before spawning for an empty buffer, so `min_event_ts_ns`/
+        // `max_event_ts_ns` always see at least one record. The row and columnar
+        // arms derive an identical distinct-stream set, event-time range, and
+        // row count for the same records.
+        let (series_count, min_event_ts_ns, max_event_ts_ns, sample_count) = payload.commit_stats();
 
         // Resolve this tenant's POSTINGS indexed-field list (ADR-0049 decision
         // 3) once per object and hand it to the writer. An empty list leaves the
@@ -330,12 +495,18 @@ impl LogFlushCtx {
         let encode_start = std::time::Instant::now();
         let mut writer =
             RlogWriter::new(RlogConfig::default(), identity).with_indexed_fields(indexed_fields);
-        for rec in records {
-            if let Err(e) = writer.push(to_logseg_record(rec)) {
-                self.metrics.record_abandoned_input_rejected();
-                self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
-                return;
-            }
+        let push_result = match payload {
+            FlushPayload::Rows(records) => records
+                .into_iter()
+                .try_for_each(|rec| writer.push(to_logseg_record(rec))),
+            FlushPayload::Columnar(batches) => batches
+                .into_iter()
+                .try_for_each(|batch| writer.push_columnar(batch)),
+        };
+        if let Err(e) = push_result {
+            self.metrics.record_abandoned_input_rejected();
+            self.ack_waiters(waiters, Err(LogWriteError::SegmentBuild(e.to_string())));
+            return;
         }
         let bytes = match writer.finish_with_stats() {
             Ok((bytes, stats)) => {
@@ -685,6 +856,9 @@ impl LogShardActor {
                         Some(LogShardMsg::Write { tenant, records, ack, charge }) => {
                             self.handle_write(tenant, records, ack, charge).await;
                         }
+                        Some(LogShardMsg::WriteColumnar { tenant, batch, ack, charge }) => {
+                            self.handle_write_columnar(tenant, *batch, ack, charge).await;
+                        }
                         Some(LogShardMsg::FlushNow { done }) => {
                             self.flush_all(FlushTrigger::Manual).await;
                             let _ = done.send(());
@@ -749,11 +923,83 @@ impl LogShardActor {
         let buf = self.tenants.entry(tenant.clone()).or_default();
         #[cfg(feature = "stage-timing")]
         let merge_start = std::time::Instant::now();
-        let bytes_added = buf.merge(records, arrival_ns);
+        let bytes_added = match buf.merge_rows(records, arrival_ns) {
+            Ok(bytes_added) => bytes_added,
+            Err(err) => {
+                // A row write into a columnar buffer: refuse fail-loud. Nothing
+                // was buffered, so drop the charge to refund its bytes (ADR-0069)
+                // and answer the waiter with the typed error rather than a panic
+                // or a silent merge (ADR-0109 decision 5).
+                drop(charge);
+                if let Some(ack) = ack {
+                    let _ = ack.send(Err(err));
+                }
+                return;
+            }
+        };
         #[cfg(feature = "stage-timing")]
         merge_timings.record(LogStage::Merge, merge_start.elapsed());
         // The records are now buffered: hold their budget charge with the buffer
         // until it flushes (ADR-0069).
+        if let Some(charge) = charge {
+            buf.charges.push(charge);
+        }
+        if let Some(ack) = ack {
+            buf.waiters.push(ack);
+        }
+        self.metrics
+            .record_buffered(bytes_added as u64, records_len);
+
+        let should_flush = self
+            .tenants
+            .get(&tenant)
+            .map(|b| b.est_bytes >= target_bytes)
+            .unwrap_or(false);
+        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
+            self.flush_tenant(tenant, buf, FlushTrigger::Size).await;
+        }
+    }
+
+    /// The columnar counterpart of [`Self::handle_write`] (ADR-0109 decision 5):
+    /// buffers one already-partitioned [`ColumnarLogBatch`] for `tenant`,
+    /// refusing fail-loud if the buffer already holds row-major records. The
+    /// flush-trigger accounting (`est_bytes >= target_bytes`), the charge and
+    /// waiter handling, and the size-flush path are identical to the row path.
+    async fn handle_write_columnar(
+        &mut self,
+        tenant: TenantId,
+        batch: ColumnarLogBatch,
+        ack: Option<LogAck>,
+        charge: Option<Arc<IngestByteCharge>>,
+    ) {
+        if batch.is_empty() && ack.is_none() {
+            // Nothing buffered: dropping `charge` here refunds its bytes.
+            return;
+        }
+        let arrival_ns = self.clock.now_ns();
+        let records_len = batch.num_rows as u64;
+        let target_bytes = self.config.target_bytes;
+
+        #[cfg(feature = "stage-timing")]
+        let merge_timings = Arc::clone(&self.ctx.stage_timings);
+        let buf = self.tenants.entry(tenant.clone()).or_default();
+        #[cfg(feature = "stage-timing")]
+        let merge_start = std::time::Instant::now();
+        let bytes_added = match buf.merge_columnar(batch, arrival_ns) {
+            Ok(bytes_added) => bytes_added,
+            Err(err) => {
+                // A columnar write into a row-major buffer: refuse fail-loud,
+                // exactly as the row path refuses the reverse. Drop the charge
+                // (refund) and answer the waiter with the typed error.
+                drop(charge);
+                if let Some(ack) = ack {
+                    let _ = ack.send(Err(err));
+                }
+                return;
+            }
+        };
+        #[cfg(feature = "stage-timing")]
+        merge_timings.record(LogStage::Merge, merge_start.elapsed());
         if let Some(charge) = charge {
             buf.charges.push(charge);
         }
@@ -810,11 +1056,7 @@ impl LogShardActor {
     /// Returns `(tenant_count, buffered_record_count)` across every buffered
     /// tenant, for the channel-close log line.
     fn buffered_summary(&self) -> (usize, u64) {
-        let records: u64 = self
-            .tenants
-            .values()
-            .map(|buf| buf.records.len() as u64)
-            .sum();
+        let records: u64 = self.tenants.values().map(|buf| buf.record_count()).sum();
         (self.tenants.len(), records)
     }
 
@@ -857,27 +1099,44 @@ impl LogShardActor {
     /// `seq` for no object.
     async fn flush_tenant(&mut self, tenant: TenantId, buf: LogTenantBuf, trigger: FlushTrigger) {
         let LogTenantBuf {
-            records,
+            content,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
             waiters,
             charges,
             ..
         } = buf;
-        if records.is_empty() {
-            // Nothing to write, so no flush task runs: dropping `charges` here
-            // is the ADR-0069 refund for this (record-less) buffer.
-            drop(charges);
-            // `waiters` is empty here by construction: the log router mints a
-            // strict-mode ack only for a shard that actually received records
-            // (`by_shard` only holds shards with at least one record, and the
-            // ack rides that same shard message), so a record-less buffer has
-            // nobody to answer. If that ever changes, this returns without
-            // acking and the router reads the dropped oneshot as a dead shard;
-            // the assert makes the invariant loud rather than silently dropping.
-            debug_assert!(waiters.is_empty());
-            return;
-        }
+        // `waiters` is empty on the record-less paths below by construction: the
+        // log router mints a strict-mode ack only for a shard that actually
+        // received records (`by_shard`/the columnar partition only holds shards
+        // with at least one row, and the ack rides that same shard message), so
+        // a record-less buffer has nobody to answer. If that ever changes, this
+        // returns without acking and the router reads the dropped oneshot as a
+        // dead shard; the assert makes the invariant loud rather than silently
+        // dropping. Dropping `charges` on those paths is the ADR-0069 refund.
+        let payload = match content {
+            BufContent::Empty => {
+                drop(charges);
+                debug_assert!(waiters.is_empty());
+                return;
+            }
+            BufContent::Rows(records) => {
+                if records.is_empty() {
+                    drop(charges);
+                    debug_assert!(waiters.is_empty());
+                    return;
+                }
+                FlushPayload::Rows(records)
+            }
+            BufContent::Columnar(batches) => {
+                if batches.iter().all(|b| b.is_empty()) {
+                    drop(charges);
+                    debug_assert!(waiters.is_empty());
+                    return;
+                }
+                FlushPayload::Columnar(batches)
+            }
+        };
         self.metrics.record_flush(trigger);
 
         let tenant_hash = tenant.hash();
@@ -915,7 +1174,7 @@ impl LogShardActor {
             deadline_ns,
             min_ingest_ts_ns,
             max_ingest_ts_ns,
-            records,
+            payload,
             waiters,
             charges,
         };
@@ -2029,5 +2288,269 @@ mod tests {
             expected,
             "a header must be charged at the top Map, the List, and the inner Map"
         );
+    }
+
+    // ---- ADR-0109 columnar path (decisions 3, 5, 6) ----
+
+    use proptest::prelude::*;
+
+    /// A record built consistently (stream id derived from its resource attrs,
+    /// so `stream_attrs` is stable for a stream id), carrying an arbitrary
+    /// dynamic-attribute list -- keys and value types may repeat within one
+    /// record, exercising the residual (`attrs_raw`) fold.
+    fn record_strategy() -> impl Strategy<Value = NormalizedLogRecord> {
+        (
+            proptest::collection::vec(("[a-z]{1,4}", "[a-z0-9]{0,6}"), 1..3),
+            proptest::collection::vec(("[a-z]{1,5}", attr_value_strategy()), 0..8),
+            "[ -~]{0,12}",
+            "[A-Z]{0,6}",
+            any::<u8>(),
+            any::<u32>(),
+            proptest::option::of(any::<[u8; 16]>()),
+            proptest::option::of(any::<[u8; 8]>()),
+        )
+            .prop_map(
+                |(res_kv, attrs, body, severity_text, severity_num, flags, trace_id, span_id)| {
+                    let res: Vec<(String, AttrValue)> = res_kv
+                        .into_iter()
+                        .map(|(k, v)| (k, AttrValue::Str(v)))
+                        .collect();
+                    let stream_id = ravel_types::logstream::log_stream_id(&res, "scope", "", &[]);
+                    let stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]);
+                    NormalizedLogRecord {
+                        stream_id,
+                        stream_attrs,
+                        ts_ns: 1,
+                        observed_ts_ns: 1,
+                        severity_num,
+                        severity_text,
+                        body,
+                        trace_id,
+                        span_id,
+                        flags,
+                        attrs,
+                    }
+                },
+            )
+    }
+
+    /// An arbitrary [`AttrValue`], including nested `List`/`Map` so the per-level
+    /// header terms of the estimate are exercised.
+    fn attr_value_strategy() -> impl Strategy<Value = AttrValue> {
+        let leaf = prop_oneof![
+            any::<String>().prop_map(AttrValue::Str),
+            any::<i64>().prop_map(AttrValue::I64),
+            any::<f64>().prop_map(AttrValue::F64),
+            any::<bool>().prop_map(AttrValue::Bool),
+            proptest::collection::vec(any::<u8>(), 0..8).prop_map(AttrValue::Bytes),
+        ];
+        leaf.prop_recursive(3, 16, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(AttrValue::List),
+                proptest::collection::vec(("[a-z]{1,4}", inner), 0..4).prop_map(AttrValue::Map),
+            ]
+        })
+    }
+
+    proptest! {
+        /// ADR-0109 decision 6: the columnar byte estimate must equal the row
+        /// path's `est_record_bytes` sum for the same records exactly, so the
+        /// one ADR-0069 ceiling means the same thing on both paths. Over
+        /// generated records, including attribute-heavy and nested ones.
+        #[test]
+        fn columnar_byte_estimate_equals_row_estimate(
+            records in proptest::collection::vec(record_strategy(), 0..12)
+        ) {
+            let row_total: usize = records.iter().map(est_record_bytes).sum();
+            let logrecords: Vec<LogRecord> =
+                records.iter().map(|r| to_logseg_record(r.clone())).collect();
+            let batch = ColumnarLogBatch::from_records(&logrecords);
+            prop_assert_eq!(est_columnar_bytes(&batch), row_total);
+        }
+    }
+
+    /// The same equality on a deliberately attribute-heavy record: 200 distinct
+    /// names each observed with two types (so 400 dynamic columns), a within-
+    /// record duplicate `(name, type)` that folds into `residual_attrs`, and a
+    /// nested `Map`/`List` value. A drift in any per-attribute term (the pair
+    /// header, the key bytes, or `attr_value_len`) between the two paths breaks
+    /// it.
+    #[test]
+    fn columnar_byte_estimate_equals_row_estimate_attribute_heavy() {
+        let mut attrs: Vec<(String, AttrValue)> = Vec::new();
+        for i in 0..200u32 {
+            attrs.push((format!("k{i}"), AttrValue::Str(format!("value-{i}"))));
+            attrs.push((format!("k{i}"), AttrValue::I64(i as i64)));
+        }
+        // A duplicate (k0, Str): the first won the column cell above, so this
+        // folds into residual_attrs on both paths.
+        attrs.push(("k0".to_string(), AttrValue::Str("dup".to_string())));
+        attrs.push((
+            "nested".to_string(),
+            AttrValue::Map(vec![(
+                "a".to_string(),
+                AttrValue::List(vec![AttrValue::I64(1), AttrValue::Str("x".to_string())]),
+            )]),
+        ));
+        let res = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let rec = NormalizedLogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&res, "scope", "", &[]),
+            stream_attrs: stream_attrs_bytes(&res, "scope", "", &[]),
+            ts_ns: 1,
+            observed_ts_ns: 1,
+            severity_num: 9,
+            severity_text: "INFO".to_string(),
+            body: "hello".to_string(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs,
+        };
+        let row_total = est_record_bytes(&rec);
+        let batch = ColumnarLogBatch::from_records(&[to_logseg_record(rec)]);
+        assert_eq!(est_columnar_bytes(&batch), row_total);
+    }
+
+    /// ADR-0109 decision 5: a tenant's shard buffer is columnar or row-major,
+    /// never both. A columnar write into a row-major buffer is refused with a
+    /// typed error, and a row-major write into a columnar buffer likewise --
+    /// never a panic and never a silent merge. `no_size_flush` keeps the first
+    /// write buffered so the second meets a populated buffer of the other shape.
+    #[tokio::test]
+    async fn mixed_representation_write_is_refused_in_both_directions() {
+        // Direction 1: a row-major buffer refuses a columnar write.
+        {
+            let h = Harness::spawn(no_size_flush(Duration::from_secs(3600)));
+            let tenant = TenantId::new("acme");
+            let row = norm_record(&[("service.name", "api")], "scope", 1_000, "row");
+            let (a1, _r1) = oneshot::channel();
+            h.tx.send(LogShardMsg::Write {
+                tenant: tenant.clone(),
+                records: vec![row],
+                ack: Some(a1),
+                charge: None,
+            })
+            .await
+            .expect("send buffered row write");
+
+            let batch = ColumnarLogBatch::from_records(&[to_logseg_record(norm_record(
+                &[("service.name", "api")],
+                "scope",
+                2_000,
+                "col",
+            ))]);
+            let (a2, r2) = oneshot::channel();
+            h.tx.send(LogShardMsg::WriteColumnar {
+                tenant: tenant.clone(),
+                batch: Box::new(batch),
+                ack: Some(a2),
+                charge: None,
+            })
+            .await
+            .expect("send columnar write");
+            let err = r2
+                .await
+                .expect("ack sender not dropped")
+                .expect_err("a columnar write into a row-major buffer is refused");
+            assert!(
+                matches!(err, LogWriteError::MixedBufferRepresentation(_)),
+                "expected the typed mixed-representation error, got {err:?}"
+            );
+            h.shutdown().await;
+        }
+
+        // Direction 2: a columnar buffer refuses a row-major write.
+        {
+            let h = Harness::spawn(no_size_flush(Duration::from_secs(3600)));
+            let tenant = TenantId::new("acme");
+            let batch = ColumnarLogBatch::from_records(&[to_logseg_record(norm_record(
+                &[("service.name", "api")],
+                "scope",
+                1_000,
+                "col",
+            ))]);
+            let (a1, _r1) = oneshot::channel();
+            h.tx.send(LogShardMsg::WriteColumnar {
+                tenant: tenant.clone(),
+                batch: Box::new(batch),
+                ack: Some(a1),
+                charge: None,
+            })
+            .await
+            .expect("send buffered columnar write");
+
+            let row = norm_record(&[("service.name", "api")], "scope", 2_000, "row");
+            let (a2, r2) = oneshot::channel();
+            h.tx.send(LogShardMsg::Write {
+                tenant: tenant.clone(),
+                records: vec![row],
+                ack: Some(a2),
+                charge: None,
+            })
+            .await
+            .expect("send row write");
+            let err = r2
+                .await
+                .expect("ack sender not dropped")
+                .expect_err("a row-major write into a columnar buffer is refused");
+            assert!(
+                matches!(err, LogWriteError::MixedBufferRepresentation(_)),
+                "expected the typed mixed-representation error, got {err:?}"
+            );
+            h.shutdown().await;
+        }
+    }
+
+    /// A columnar buffer round-trips through the flush to a readable RLOG object
+    /// exactly as the row path does: same commit-record fields and the same
+    /// scanned records. Proves `run_flush`'s columnar arm (push_columnar +
+    /// commit_stats) is wired, not just that it compiles.
+    #[tokio::test]
+    async fn columnar_size_flush_round_trips_to_a_readable_rlog_object() {
+        let h = Harness::spawn(flush_on_first());
+        let tenant = TenantId::new("acme");
+        let records = [
+            to_logseg_record(norm_record(
+                &[("service.name", "api")],
+                "scope",
+                1_000,
+                "first",
+            )),
+            to_logseg_record(norm_record(
+                &[("service.name", "api")],
+                "scope",
+                2_000,
+                "second",
+            )),
+        ];
+        let batch = ColumnarLogBatch::from_records(&records);
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::WriteColumnar {
+            tenant: tenant.clone(),
+            batch: Box::new(batch),
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send columnar write");
+        let token = ack_rx
+            .await
+            .expect("ack sender not dropped")
+            .expect("strict columnar write commits");
+
+        let (rec, scanned) = read_back(h.store.as_ref(), &tenant.hash(), &token).await;
+        assert_eq!(rec.sample_count, 2, "both rows in one RLOG object");
+        assert_eq!(rec.series_count, 1, "both rows share one stream");
+        assert_eq!(scanned.len(), 2, "every row reads back");
+
+        let snap = h.metrics.snapshot();
+        assert_eq!(snap.flushes_by_size, 1);
+        assert_eq!(snap.acks_ok, 1);
+        assert_eq!(snap.stream_id_collisions, 0);
+        h.shutdown().await;
     }
 }
