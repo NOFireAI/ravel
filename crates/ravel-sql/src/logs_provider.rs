@@ -1505,16 +1505,27 @@ mod tests {
 
     /// TEST 5: an `IN (v1, v2, v3)` over a declared I64 column returns correct
     /// results even though the envelope range is coarser than the exact set. A
-    /// value strictly between the IN set's min and max but not a member (code
-    /// 500, between 200 and 800) exists in the data. The envelope `[200, 800]`
-    /// keeps its block (the prune alone cannot exclude it), so correctness rests
-    /// on the Inexact residual excluding it. Proven by the final row set: ts=3
-    /// (code 500) is absent, while its block WAS scanned.
+    /// value strictly between the IN set's min and max but not a member exists
+    /// in the data. The envelope range keeps its block (the prune alone cannot
+    /// exclude it), so correctness rests on the Inexact residual excluding it.
+    /// Proven by the final row set.
+    ///
+    /// Checkpoint review found the original two-value form of this test
+    /// (`IN (200, 800)`) does not exercise `declared_in_list_predicate`
+    /// (`logs_pushdown.rs`) at all: DataFusion's own simplifier rewrites a
+    /// two-element `IN` into `col = a OR col = b` before the scan sees it, so
+    /// the test was actually driving `declared_i64_or_envelope`'s OR handling,
+    /// not the `Expr::InList` arm its own doc names. A five-element `IN`
+    /// survives as a real `InList` through the optimizer (confirmed by
+    /// inspecting the optimized `TableScan.filters`), so this uses five
+    /// values to close that gap. Mutating the InList envelope down to a
+    /// single point reddens this test (5 of 6 matching rows silently
+    /// dropped); the two-value form stayed green under that same mutation.
     #[tokio::test]
     async fn declared_i64_in_list_envelope_is_corrected_by_residual() {
         let store = MemoryStore::new();
         let worker = vec![("service.name".to_string(), s("worker"))];
-        let codes = [100i64, 200, 500, 800, 900];
+        let codes = [100i64, 200, 300, 500, 700, 800, 900];
         let records: Vec<LogRecord> = codes
             .iter()
             .enumerate()
@@ -1554,24 +1565,29 @@ mod tests {
 
         let (rows_got, counts) = run_counted(
             &ctx,
-            "SELECT ts, body FROM logs WHERE status_code IN (200, 800)",
+            "SELECT ts, body FROM logs WHERE status_code IN (200, 300, 700, 800)",
         )
         .await;
-        // ts=3 (code 500) is inside the envelope but not in the set: the residual
-        // must exclude it, never the prune.
+        // ts=4 (code 500) is inside the envelope [200, 800] but not in the set:
+        // the residual must exclude it, never the prune.
         assert_eq!(
             rows_got,
-            BTreeSet::from([(2, "body 2".to_string()), (4, "body 4".to_string())]),
+            BTreeSet::from([
+                (2, "body 2".to_string()),
+                (3, "body 3".to_string()),
+                (5, "body 5".to_string()),
+                (6, "body 6".to_string()),
+            ]),
             "the in-envelope non-member (code 500) is excluded by the residual"
         );
         assert_eq!(
             counts,
             ScanCounts {
-                total: 5,
-                scanned: 3,
+                total: 7,
+                scanned: 5,
                 pruned_by_postings: 0,
             },
-            "codes 100 and 900 prune; the envelope keeps 200/500/800's blocks"
+            "codes 100 and 900 prune; the envelope keeps 200/300/500/700/800's blocks"
         );
     }
 
