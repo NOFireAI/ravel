@@ -46,6 +46,12 @@ use crate::Clock;
 /// current or previous epoch.
 const ACTIVE_EPOCH_NS: i64 = 3_600 * 1_000_000_000;
 
+/// Number of shards the per-tenant admission map is split across. A tenant
+/// maps to exactly one shard by its `TenantHash`, so operations on distinct
+/// tenants that hash to distinct shards never contend on the same mutex.
+/// Fixed, not a configuration knob.
+const ADMISSION_SHARD_COUNT: usize = 64;
+
 /// A per-tenant count cap, or an explicit opt-in to no cap at all.
 ///
 /// ADR-0051 section 3: enforcement is on by default with finite shipped
