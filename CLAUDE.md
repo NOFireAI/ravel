@@ -257,6 +257,17 @@ Fast, dependency-free checks that fail closed BEFORE a known-expensive
 mistake. Each encodes a failure class that recurs; run the relevant one
 as a precondition, not after the damage.
 
+Four of these no longer depend on being remembered.
+`.claude/guards/pretooluse.mjs` runs as a PreToolUse hook and refuses the
+tool call outright: a gate piped into `tail`/`head`/`grep`/`rg`/`sed` or
+followed by `&& echo`, an assignment to zsh's reserved `status`/`path`/
+`argv`/`PWD`, a `ScheduleWakeup` under 900 s, and an `Edit`/`Write`
+inside the primary checkout. It fails open on any internal error, and it
+exempts a dispatched fleet clone (which is itself the isolated
+workspace). `RAVEL_GUARD_ALLOW_PRIMARY=1` is the escape hatch for the
+last rule. Its cases live in `.claude/guards/pretooluse.test.sh`; add one
+there before changing a rule.
+
 - `scripts/guards/assert-worktree.sh`: exits non-zero if the cwd is the
   PRIMARY checkout rather than a linked worktree. Run it before the first
   edit/commit of any isolated unit of work. A concurrent session can hold
