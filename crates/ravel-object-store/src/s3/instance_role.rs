@@ -202,8 +202,22 @@ impl InstanceRoleCredentialProvider {
     /// by [`Self::refresh_lock`]; the caller re-checks the cache after
     /// acquiring the lock so a credential another task already refreshed is not
     /// fetched again.
+    ///
+    /// Validates the fetched document's `Expiration` against the current
+    /// clock before installing it (issue #562): a document that is already
+    /// past due when the refresh completes -- rotation lag crossing expiry
+    /// mid-refresh, or instance clock skew ahead of AWS -- is never written
+    /// into the cache or returned as `Ok`. Without this check a stale
+    /// document would be served once uncounted and unlogged, then every
+    /// subsequent call would repeat a full three-call IMDS round trip that
+    /// keeps returning the same stale document, exactly the confusing-S3-403s
+    /// failure mode ADR-0106's provider-behavior section says this design
+    /// prevents.
     async fn refresh(&self) -> Result<Arc<AwsCredential>, FetchError> {
         let fetched = fetch_once(&self.endpoint).await?;
+        if self.clock.now_unix_nanos() >= fetched.expiration_unix_nanos {
+            return Err(FetchError::AlreadyExpired);
+        }
         let credential = Arc::new(fetched.credential);
         let mut guard = self.state.write();
         guard.credential = Arc::clone(&credential);
@@ -526,6 +540,13 @@ enum FetchError {
     Parse(String),
     /// The `Expiration` field was not a parseable UTC timestamp.
     BadExpiration(String),
+    /// The fetched document parsed fine, but its `Expiration` was already at
+    /// or past the current wall clock when the refresh completed (issue
+    /// #562): rotation lag crossing expiry mid-refresh, or instance clock
+    /// skew ahead of AWS. Treated as a refresh failure rather than installed,
+    /// so the existing last-good/expired logic in `get_credential` decides
+    /// whether to serve the still-cached credential or fail typed.
+    AlreadyExpired,
 }
 
 impl std::fmt::Display for FetchError {
@@ -537,6 +558,9 @@ impl std::fmt::Display for FetchError {
             FetchError::NoRole => write!(f, "no IAM role attached to this instance"),
             FetchError::Parse(e) => write!(f, "parsing IMDS credential document: {e}"),
             FetchError::BadExpiration(v) => write!(f, "unparseable IMDS Expiration {v:?}"),
+            FetchError::AlreadyExpired => {
+                write!(f, "fetched IMDS credential document was already expired")
+            }
         }
     }
 }
@@ -846,6 +870,73 @@ mod tests {
             1,
             "the mid-refresh expiry must be counted, not silently served"
         );
+    }
+
+    /// Issue #562: a *successful* refresh whose fetched document's
+    /// `Expiration` is already at or past the clock when the refresh
+    /// completes must not be installed or served. The initially-cached
+    /// credential and the refreshed one carry the SAME `Expiration`
+    /// (`EXP_A`) so that once the clock crosses it, both the fetched document
+    /// and the still-cached one are genuinely expired -- otherwise
+    /// `get_credential`'s failed-refresh fallback would correctly serve a
+    /// still-valid cached credential and the test would prove nothing about
+    /// this fix. The clock is advanced past `exp_a` from inside the mock
+    /// server's doc handler (the seam `just_expired_during_refresh_fails_typed`
+    /// uses), with `doc_status` left at 200 throughout -- this is not a
+    /// transient IMDS failure, it is a stale-but-well-formed document arriving
+    /// after real elapsed time.
+    ///
+    /// Non-vacuity: reverting the fix (dropping `refresh`'s
+    /// `now_unix_nanos() >= expiration_unix_nanos` check) makes this test
+    /// fail: `refresh()` would return `Ok` with the (by-then-expired)
+    /// credential, so `get_credential` never reaches its failed-refresh arm,
+    /// `refresh_failures` stays 0, and the call returns the past-due
+    /// credential as `Ok`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn already_expired_refresh_document_fails_typed_and_counts() {
+        let state = ImdsState::new(role_doc("AKIA_OLD", "old-secret", "old-token", EXP_A));
+        let endpoint = spawn_imds(Arc::clone(&state)).await;
+        let exp_a = parse_imds_expiration(EXP_A).expect("exp");
+
+        // Inside the refresh margin, comfortably still valid when the
+        // eager-construction fetch and the request-path call both start.
+        let clock = FakeClock::new(exp_a - 60 * 1_000_000_000);
+        let provider = build_provider(endpoint, Arc::clone(&clock))
+            .await
+            .expect("eager fetch");
+
+        // The refresh this call triggers succeeds at the HTTP layer
+        // (doc_status stays 200), but the clock crosses exp_a from inside the
+        // server's handling of the doc GET, so the fetched document (still
+        // carrying EXP_A) is already past due by the time refresh() checks
+        // it. The cached credential (also EXP_A) is equally past due, so the
+        // failed-refresh fallback has no still-valid credential to serve.
+        *state.advance_clock_on_doc_request.lock() = Some((Arc::clone(&clock), exp_a + 1));
+
+        let err = provider
+            .get_credential()
+            .await
+            .expect_err("a refresh that fetches an already-expired document must fail");
+        assert!(
+            matches!(err, object_store::Error::Generic { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            provider.refresh_failures(),
+            1,
+            "an already-expired fetched document must count as a refresh failure"
+        );
+
+        // The stale document must never have been installed into the cache:
+        // a second call, with the clock already past exp_a and no further
+        // clock manipulation needed, must keep failing rather than having
+        // silently cached AKIA_OLD as newly-good.
+        state.doc_status.store(500, O::Relaxed);
+        let err2 = provider
+            .get_credential()
+            .await
+            .expect_err("the stale document must not have been cached as good");
+        assert!(matches!(err2, object_store::Error::Generic { .. }));
     }
 
     /// Issue #555 finding 2: the 60s warning-suppression window and the
