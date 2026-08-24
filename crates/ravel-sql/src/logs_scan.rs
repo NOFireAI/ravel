@@ -1315,9 +1315,20 @@ impl Stream for LogScanStream {
                             // row is emitted twice. `skip` is a position within
                             // this partition's own list, so the count and the list
                             // line up even when the segment's blocks are striped
-                            // across several partitions. The abandoned columnar
-                            // scan's partial counters are dropped; the row scan
-                            // re-scans this partition's whole list.
+                            // across several partitions.
+                            //
+                            // Publish the abandoned columnar cursor's partial
+                            // counters (issue #474) before it is dropped: the
+                            // re-opened row scan below re-decodes this partition's
+                            // whole list from the start, so those blocks' pages are
+                            // decoded twice, but the abandoned cursor's own count
+                            // of its first pass was previously discarded along with
+                            // it. `record_scan` accumulates, so this and the row
+                            // scan's own eventual `record_scan` call sum to the
+                            // real total decode work across both passes, matching
+                            // what `EXPLAIN ANALYZE` claims the counters prove
+                            // (ADR-0087): that projection reached the page level.
+                            this.blocks.record_scan(&scan.stats());
                             let seg = match this.current_seg.clone() {
                                 Some(seg) => seg,
                                 None => {
