@@ -26,6 +26,15 @@ pub enum SpanSegError {
     /// `ravel_segment::SegmentError::UnsupportedVersion`.
     #[error("unsupported format version {0}")]
     UnsupportedVersion(u16),
+    /// A columnar view accessor was asked for a column the projected decode did
+    /// not request. This is a caller bug (a mis-specified projection), not data
+    /// corruption: the column's page may well exist in the block, but it was
+    /// deliberately not decoded, so answering with a column of nulls would
+    /// silently serve a query an all-`NULL` column. Distinct from a column that
+    /// is genuinely absent from the block, which is a legitimate `NULL` for
+    /// every row and never an error (docs/adrs/0110 decision 1).
+    #[error("column {0} not requested in this projected decode")]
+    ColumnNotRequested(u32),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
     #[error("io: {0}")]
