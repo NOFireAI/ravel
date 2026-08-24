@@ -486,16 +486,28 @@ async fn not_found_on_block_range_get_is_the_segment_not_found_shape() {
 
 // ---- Test 4: corrupt cache hit ------------------------------------------
 
-/// A corrupted per-block cache hit fails closed exactly like a corrupt live
-/// fetch (ADR-0046 §4 / ADR-0107 decision 3). Using `Cache::with_corruption`,
-/// the first `fetch_object` populates the per-block cache (a miss, clean bytes);
-/// the second is a genuine hit against the now-corrupted entry, which the
-/// fetcher's own `block_crc32c` re-verification must reject.
+/// A corrupted cache hit fails closed exactly like a corrupt live fetch
+/// (ADR-0046 §4 / ADR-0107 decision 3). Using `Cache::with_corruption`, the
+/// first `fetch_object` populates the cache (misses, clean bytes -- probe,
+/// sections, and blocks alike); the second call re-reads every one of those
+/// entries, now corrupted.
 ///
-/// Prove-the-test: with the cache-hit `verify_block_crc(key, &bytes, ext)?`
-/// removed from `BlockRangeFetcher::fetch_blocks`, the corrupted block is placed
-/// into the assembled buffer and `fetch_object` returns `Ok`, so this assertion
-/// fails. Restoring the check makes it fail closed with `Corrupt`.
+/// This does NOT isolate the per-block gate: since this fix's probe caching
+/// (decision 2), the second call's probe hit is corrupted too, and its
+/// `open_from_suffix` decode fails with a bad-magic `Corrupted` error before
+/// any block is ever reached. That is still a genuine fail-closed result (a
+/// corrupted cache entry, wherever it lives, must never surface as `Ok`), but
+/// the failure this test actually exercises is the probe's decode-time
+/// rejection, not `fetch_blocks`'s `verify_block_crc`. Test
+/// `corrupt_block_hit_fails_closed_with_only_blocks_resident` isolates the
+/// per-block gate specifically, by pre-admitting only block entries so the
+/// probe and sections stay clean.
+///
+/// Prove-the-test: with the etag/footer decode's own corruption handling
+/// intact but every OTHER integrity check in the fetch path bypassed, this
+/// assertion still fails closed purely on the probe's corrupted bytes -- this
+/// test does not need `fetch_blocks`'s block-crc gate to pass, and does not
+/// prove it. See the isolated test above for that proof.
 #[tokio::test]
 async fn corrupt_per_block_cache_hit_fails_closed() {
     let (records, bytes) = subset_object();
@@ -983,6 +995,16 @@ async fn concurrent_cold_partitions_collapse_onto_one_get_per_extent() {
 /// never touches -- and pre-admits exactly the candidate blocks, so the ONLY
 /// corrupted hit is a block and the gate under test is the block gate.
 ///
+/// This calls `BlockRangeFetcher::fetch_object` directly rather than going
+/// through `LogSegmentFetcher::fetch_accounted_with_tenant`: the latter decodes
+/// the assembled buffer afterward, and the reader's own `read_block_columns`
+/// crc check (`ravel-logseg`) fires first and masks the fetcher's own cache-hit
+/// gate this test names -- confirmed by mutating the fetcher's gate alone and
+/// observing the suite stay green through the decode path. Calling
+/// `fetch_object` directly returns the assembled bytes without decoding them,
+/// so only `BlockRangeFetcher::fetch_blocks`'s own `verify_block_crc` can catch
+/// the corruption.
+///
 /// Prove-the-test: with the cache-hit `verify_block_crc` removed from
 /// `fetch_blocks`, the corrupted block bytes are placed into the assembled
 /// buffer and this returns `Ok`.
@@ -1013,14 +1035,9 @@ async fn corrupt_block_hit_fails_closed_with_only_blocks_resident() {
         );
     }
 
-    let err = LogSegmentFetcher::new(store)
-        .with_cache(cache)
-        .fetch_accounted_with_tenant(
-            &seg,
-            TENANT,
-            &LogQuery::new(ts_min, ts_max),
-            &QueryAccounting::new(),
-        )
+    let br = BlockRangeFetcher::new(store).with_cache(cache);
+    let err = br
+        .fetch_object(&seg, TENANT, ts_min, ts_max, &QueryAccounting::new())
         .await
         .expect_err("a corrupted per-block cache hit must fail closed");
     assert!(
