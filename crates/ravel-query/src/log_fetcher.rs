@@ -26,10 +26,18 @@
 //! is exact: ts-range pruning and the content predicates are evaluated exactly
 //! by the reader.
 //!
-//! v1 fetches the whole object with a single [`GetRange::Full`]. RLOG objects
-//! are not yet large enough to justify the suffix-then-range-chase read
-//! `SegmentFetcher` uses for RSEG; this may deserve revisiting once they
-//! grow.
+//! Two read shapes, split by object size (ADR-0107). The tenant-aware funnels
+//! fetch an object at or below [`LogSegmentFetcher::with_block_range_threshold`]
+//! (512 KiB by default) with a single [`GetRange::Full`], which is every small
+//! RLOG object and every fixture here. Above it they read only the blocks
+//! skip-index pruning proved relevant, through [`BlockRangeFetcher`]: a suffix
+//! probe that pins the etag, the directory sections, and coalesced
+//! candidate-block ranges, assembled into an object-sized buffer the unchanged
+//! reader decodes from. Every GET of either shape is routed through ADR-0046's
+//! read cache when one is wired, keyed by the extent it fetched, so concurrent
+//! callers for the same extent collapse onto one request. The untenanted
+//! [`LogSegmentFetcher::fetch`]/[`LogSegmentFetcher::fetch_accounted`] entry
+//! points have no cache key and always read the whole object in one GET.
 
 use std::sync::Arc;
 
@@ -472,11 +480,19 @@ impl LogSegmentFetcher {
     }
 
     /// Whether ADR-0046's read cache is wired ([`with_cache`](Self::with_cache)
-    /// was called). A caller that would issue several whole-object GETs at the
-    /// same key needs this: with a cache those coalesce onto one fetch through
-    /// single-flight, without one each is a real object-store request. ADR-0102
-    /// decision 1 names the cache as the precondition for that fan-out, and
-    /// `LogsScanExec::new` gates its partition count on this.
+    /// was called). A caller that would issue several GETs at the same key needs
+    /// this: with a cache those coalesce onto one fetch through single-flight,
+    /// without one each is a real object-store request. ADR-0102 decision 1 names
+    /// the cache as the precondition for that fan-out, and `LogsScanExec::new`
+    /// gates its partition count on this.
+    ///
+    /// This holds on both fetch shapes, which is what keeps that gate honest
+    /// (ADR-0107): at or below
+    /// [`with_block_range_threshold`](Self::with_block_range_threshold) the
+    /// coalesced request is the one whole-object GET keyed `(0, object_size)`;
+    /// above it, the block-range path's probe, directory sections, and per-block
+    /// ranges each coalesce on their own extent key, so a segment striped across
+    /// N partitions still costs one request per distinct extent rather than N.
     #[must_use]
     pub fn has_cache(&self) -> bool {
         self.cache.is_some()
@@ -708,10 +724,16 @@ impl LogSegmentFetcher {
     /// column it (or anything downstream of it, including its selective-erasure
     /// exclusion) reads.
     ///
-    /// The whole object is still fetched with one [`GetRange::Full`] GET: this
-    /// bounds *decoded* memory, not raw bytes. A ranged block read is
-    /// [`ravel_logseg::RlogRangeReader`]'s territory and out of scope here
-    /// (ADR-0087 decision 3).
+    /// This bounds *decoded* memory, not raw bytes: the object's bytes are
+    /// resident before the first block is decoded either way. Which read shape
+    /// produced them depends on the object's size
+    /// ([`with_block_range_threshold`](Self::with_block_range_threshold),
+    /// ADR-0107). At or below the threshold it is one [`GetRange::Full`] GET of
+    /// the whole object. Above it the bytes are an object-sized buffer with only
+    /// the directory sections and the pruning-relevant blocks populated, fetched
+    /// by [`BlockRangeFetcher`] as a probe plus coalesced block ranges, so the
+    /// raw bytes moved are proportional to pruning rather than to object size --
+    /// but the resident buffer is still object-sized, per call.
     pub async fn scan_accounted_with_tenant(
         &self,
         seg_ref: &SegmentRef,
@@ -754,7 +776,11 @@ impl LogSegmentFetcher {
     /// the same cache-aware funnel [`scan_accounted_with_tenant`](Self::
     /// scan_accounted_with_tenant) uses, so in production it is single-flight
     /// coalesced with the per-partition subset scans that follow rather than
-    /// issuing an extra distinct GET.
+    /// issuing an extra distinct GET. That holds on both read shapes: one
+    /// whole-object key at or below
+    /// [`with_block_range_threshold`](Self::with_block_range_threshold), and
+    /// per-extent keys (probe, sections, blocks) above it, each of which the
+    /// following subset scans hit rather than re-fetch (ADR-0107).
     ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
     pub async fn plan_segment(
@@ -926,29 +952,12 @@ impl LogSegmentFetcher {
             }
             .instrument(fetch_span.clone())
             .await
-            .map_err(|err| LogFetchError::Store {
-                    key: key.to_string(),
-                    source: match err {
-                        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Store(
-                            source,
-                        )) => crate::fetcher::clone_store_error(&source),
-                        // Unreachable in practice: this funnel never sets an
-                        // `expected_etag` (module doc, no suffix/range-chase
-                        // read exists to compare against), so its closure
-                        // never constructs `EtagChanged`. Handled explicitly
-                        // rather than a wildcard so a future etag check added
-                        // here can't silently fall through this arm.
-                        SingleFlightError::Upstream(
-                            crate::fetcher::CacheFetchError::EtagChanged { .. },
-                        ) => StoreError::Transient(
-                            "cache single-flight closure reported an etag change, which this funnel never produces"
-                                .to_string(),
-                        ),
-                        SingleFlightError::LeaderLost => StoreError::Transient(
-                            "cache single-flight leader lost before producing a result".to_string(),
-                        ),
-                    },
-                })?;
+            // Shared with the block-range path's mapping, which is the only one
+            // whose closure can produce the `EtagChanged`/`Corrupt` classes: this
+            // funnel's closure is one unconditional whole-object GET that
+            // verifies nothing, so those arms are unreachable here rather than
+            // wrong.
+            .map_err(|err| from_cache_error(key, err))?;
             // A miss issues one store GET for the resulting bytes. A
             // single-flight follower that rode another caller's GET is the
             // rare exception; recording one GET here still bounds this call's
@@ -1364,6 +1373,15 @@ impl BlockRangeFetcher {
         self
     }
 
+    /// Whether ADR-0046's read cache is wired into this fetcher. Every GET the
+    /// block-range protocol issues is routed through the cache's single-flight
+    /// when it is, which is what makes several partitions striping one segment
+    /// collapse onto one real GET (ADR-0102 decision 1's premise).
+    #[must_use]
+    pub fn has_cache(&self) -> bool {
+        self.cache.is_some()
+    }
+
     /// One bounded store GET, recorded against `accounting`. A `NotFound` (or any
     /// other store error) surfaces as [`LogFetchError::Store`], the SAME typed
     /// error a whole-object GET already produces, so a `NotFound` on a pinned
@@ -1397,24 +1415,81 @@ impl BlockRangeFetcher {
         Ok(got)
     }
 
-    /// A store GET whose etag is checked against the pinned `expected` etag: a
+    /// A store GET whose etag is checked against the sequence's pinned etag: a
     /// mismatch means the object was replaced mid-sequence and is a hard
     /// [`LogFetchError::EtagChanged`] (ADR-0107 decision 1), never silently
-    /// mixed data.
+    /// mixed data. The first live GET of a sequence establishes the pin (see
+    /// [`EtagPin`]).
     async fn store_get_pinned(
         &self,
         key: &str,
         range: GetRange,
-        expected: &Etag,
+        pin: &EtagPin,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, LogFetchError> {
         let got = self.store_get(key, range, accounting).await?;
-        if &got.etag != expected {
-            return Err(LogFetchError::EtagChanged {
-                key: key.to_string(),
-            });
-        }
+        pin.check(key, &got.etag)?;
         Ok(got)
+    }
+
+    /// One absolute `[start, start + len)` extent of the object, served from
+    /// ADR-0046's read cache when it is resident and otherwise fetched with one
+    /// live etag-pinned GET that concurrent callers for the same extent collapse
+    /// onto through the cache's single-flight, exactly as the whole-object funnel
+    /// in [`LogSegmentFetcher::tenant_bytes`] does for its one key. Without a
+    /// cache every call is a live GET, as before.
+    ///
+    /// This is what keeps ADR-0102 decision 1's premise true above the
+    /// block-range threshold: the partitions striping one segment resolve the
+    /// same extents and coalesce onto one real request each instead of one per
+    /// partition.
+    ///
+    /// `range` is passed alongside `[start, len)` rather than derived from it
+    /// because the etag-establishing probe must stay a [`GetRange::Suffix`]
+    /// (a `Range` GET of the same bytes is a different request to the store)
+    /// while still keying as the absolute extent it returns.
+    ///
+    /// The returned flag is true when this call crossed the network, so callers
+    /// count only real store GETs. A single-flight follower that rode another
+    /// caller's in-flight GET reports true as well: the same attribution
+    /// convention `tenant_bytes` documents, which bounds this call's own cost
+    /// and never under-counts the query total.
+    #[allow(clippy::too_many_arguments)]
+    async fn cached_extent(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        start: u64,
+        len: u64,
+        range: GetRange,
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+    ) -> Result<(Bytes, bool), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let Some(cache) = &self.cache else {
+            let got = self.store_get_pinned(key, range, pin, accounting).await?;
+            check_extent_len(key, got.data.len(), len)?;
+            return Ok((got.data, true));
+        };
+        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, start, len);
+        if let Some(bytes) = cache.get(&cache_key) {
+            accounting.record_cache_hit();
+            accounting.add_cache_bytes(bytes.len() as u64);
+            return Ok((bytes, false));
+        }
+        accounting.record_cache_miss();
+        let bytes = cache
+            .get_or_fetch(cache_key, || async move {
+                let got = self
+                    .store_get_pinned(key, range, pin, accounting)
+                    .await
+                    .map_err(to_cache_error)?;
+                check_extent_len(key, got.data.len(), len).map_err(to_cache_error)?;
+                Ok(got.data)
+            })
+            .await
+            .map_err(|err| from_cache_error(key, err))?;
+        Ok((bytes, true))
     }
 
     /// Fetch one segment's object as an assembled, decode-ready buffer, reading
@@ -1436,52 +1511,102 @@ impl BlockRangeFetcher {
     ) -> Result<(Bytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
+        let pin = EtagPin::default();
 
-        // Size-threshold pre-probe crossover (ADR-0107 decision 1): a small
-        // object is read whole in one GET, mirroring `SegmentFetcher`.
-        if seg_ref.object_size != 0 && seg_ref.object_size <= self.whole_object_threshold {
+        // An object whose commit record carries no size cannot be range-planned
+        // at all: every range in this protocol, starting with the probe's own
+        // cache key, is derived from that size. Read it whole, uncached (the
+        // cache key would have to claim a length too).
+        if seg_ref.object_size == 0 {
             let got = self.store_get(key, GetRange::Full, accounting).await?;
             stats.probe_gets = 1;
             stats.whole_object = true;
+            stats.block_bytes_fetched = got.data.len() as u64;
             return Ok((got.data, stats));
         }
 
-        // Etag-establishing probe: a suffix GET that pins the etag every later
-        // GET is checked against, and carries the footer (and, for a small
-        // object, the whole tail directory).
-        let suffix = self.suffix_len.min(seg_ref.object_size.max(1));
-        let probe = self
-            .store_get(key, GetRange::Suffix(suffix), accounting)
-            .await?;
-        stats.probe_gets = 1;
-        let total_size = probe.total_size;
-        let pinned = probe.etag.clone();
+        // Size-threshold pre-probe crossover (ADR-0107 decision 1): a small
+        // object is read whole in one GET, mirroring `SegmentFetcher`. Keyed
+        // `(0, object_size)`, the same key `LogSegmentFetcher::tenant_bytes`
+        // gives its whole-object read, so the two compose and concurrent callers
+        // coalesce instead of each paying the GET.
+        if seg_ref.object_size <= self.whole_object_threshold {
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    0,
+                    seg_ref.object_size,
+                    GetRange::Full,
+                    &pin,
+                    accounting,
+                )
+                .await?;
+            if live {
+                stats.probe_gets = 1;
+                stats.block_bytes_fetched = bytes.len() as u64;
+            }
+            stats.whole_object = true;
+            return Ok((bytes, stats));
+        }
+
+        // The object size from the commit record is the authoritative total on
+        // this path: it already decided the crossover above, it already keys the
+        // whole-object funnel's cache entry, and the probe's own cache key needs
+        // the suffix's absolute extent BEFORE the GET that would report a size.
+        // A size that disagrees with the stored object fails closed rather than
+        // silently mixing: the probe's length check rejects a short read, and a
+        // footer parsed at wrong absolute offsets is a `Corrupt`.
+        let total_size = seg_ref.object_size;
         let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
 
+        // Etag-establishing probe: a suffix GET that pins the etag every later
+        // live GET is checked against, and carries the footer (and, for a small
+        // object, the whole tail directory). Cache-routed like every other GET
+        // here, so concurrent partitions' probes collapse onto one request.
+        let suffix = self.suffix_len.min(total_size);
+        let probe_start = total_size - suffix;
+        let (probe_bytes, probe_live) = self
+            .cached_extent(
+                seg_ref,
+                tenant_hash,
+                probe_start,
+                suffix,
+                GetRange::Suffix(suffix),
+                &pin,
+                accounting,
+            )
+            .await?;
+        if probe_live {
+            stats.probe_gets = 1;
+        }
+
         let mut asm = ObjectAssembler::new(total);
-        let probe_start = total_size.saturating_sub(probe.data.len() as u64);
-        asm.place(key, probe_start, &probe.data)?;
+        asm.place(key, probe_start, &probe_bytes)?;
 
         // Footer: parse from the probe suffix, chasing one range if the suffix
         // did not cover the whole footer (mirrors `SegmentFetcher::open_segment`).
-        let footer = match open_from_suffix(&probe.data, total_size)
+        let footer = match open_from_suffix(&probe_bytes, total_size)
             .map_err(|source| corrupt(key, source))?
         {
             SuffixOutcome::Ready(footer) => footer,
             SuffixOutcome::NeedRange { offset, len } => {
-                let got = self
-                    .store_get_pinned(
-                        key,
+                let (bytes, live) = self
+                    .cached_extent(
+                        seg_ref,
+                        tenant_hash,
+                        offset,
+                        len,
                         GetRange::Range(offset, offset + len),
-                        &pinned,
+                        &pin,
                         accounting,
                     )
                     .await?;
-                stats.probe_gets += 1;
-                asm.place(key, offset, &got.data)?;
-                match open_from_suffix(&got.data, total_size)
-                    .map_err(|source| corrupt(key, source))?
-                {
+                if live {
+                    stats.probe_gets += 1;
+                }
+                asm.place(key, offset, &bytes)?;
+                match open_from_suffix(&bytes, total_size).map_err(|source| corrupt(key, source))? {
                     SuffixOutcome::Ready(footer) => footer,
                     SuffixOutcome::NeedRange { .. } => {
                         return Err(corrupt(
@@ -1493,39 +1618,32 @@ impl BlockRangeFetcher {
             }
         };
 
-        // Fetch and place every non-BLOCKS directory section not already covered
-        // by the probe: STREAM_DIR/FIELD_DIR (object front) always, plus any tail
-        // section (SKIP_IDX/BLOOM/POSTINGS) a short probe missed. The reader
-        // re-verifies each section's crc on decode, so a corrupt section hit
-        // fails closed there (ADR-0046).
-        for section in &footer.sections {
-            if section.kind == kind::BLOCKS {
-                continue;
-            }
-            let (start, end) = (section.offset, section.offset + section.len);
-            if asm.covers(start, end) {
-                continue;
-            }
-            let bytes = self
-                .section_bytes(
-                    seg_ref,
-                    tenant_hash,
-                    section,
-                    &pinned,
-                    accounting,
-                    &mut stats,
-                )
-                .await?;
-            asm.place(key, section.offset, &bytes)?;
-        }
-
-        // Decode the skip index (now resident) and resolve the candidate blocks.
         let skip_desc = footer
             .section(kind::SKIP_IDX)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;
         let blocks_desc = footer
             .section(kind::BLOCKS)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing BLOCKS".into())))?;
+
+        // SKIP_IDX first and alone. The coverage crossover below can decide the
+        // whole object is cheaper than the candidate ranges, and every OTHER
+        // section it would have fetched first is then wasted: a wide-time-range
+        // query on a large object would pay probe + section GETs and THEN a
+        // whole-object GET, strictly worse than the plain whole-object path it
+        // falls back to. Resolving the candidate extents needs SKIP_IDX and
+        // nothing else, so only SKIP_IDX is fetched before the decision.
+        self.place_section(
+            seg_ref,
+            tenant_hash,
+            skip_desc,
+            &pin,
+            &mut asm,
+            accounting,
+            &mut stats,
+        )
+        .await?;
+
+        // Decode the skip index (now resident) and resolve the candidate blocks.
         let skip_start = usize::try_from(skip_desc.offset).map_err(|_| corrupt_range(key))?;
         let skip_end = skip_start
             .checked_add(usize::try_from(skip_desc.len).map_err(|_| corrupt_range(key))?)
@@ -1543,26 +1661,65 @@ impl BlockRangeFetcher {
         stats.candidate_blocks = extents.len() as u64;
 
         // Coverage-based post-pruning crossover (ADR-0107 decision 1): when the
-        // candidate ranges already cover most of the object, one whole-object GET
-        // beats many range GETs.
+        // candidate ranges already cover most of the blocks, one whole-object GET
+        // beats many range GETs. The comparison is against the BLOCKS section's
+        // own size, not the object size: the numerator is BLOCKS-only candidate
+        // bytes, so measuring it against an object that also carries the
+        // directory sections can never reach 1.0 even when every block is a
+        // candidate, and under-triggers by exactly the metadata fraction.
         let candidate_bytes: u64 = extents.iter().map(|e| e.len).sum();
-        let coverage = candidate_bytes as f64 / total_size.max(1) as f64;
+        let coverage = candidate_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
-            let got = self
-                .store_get_pinned(key, GetRange::Full, &pinned, accounting)
+            // Keyed and single-flighted like every other GET here, on the same
+            // `(0, object_size)` key the whole-object funnel uses: without that,
+            // N partitions all crossing over would issue N whole-object GETs,
+            // which is the amplification this path exists to avoid.
+            let (bytes, live) = self
+                .cached_extent(
+                    seg_ref,
+                    tenant_hash,
+                    0,
+                    total_size,
+                    GetRange::Full,
+                    &pin,
+                    accounting,
+                )
                 .await?;
-            stats.block_range_gets = 1;
+            if live {
+                stats.block_range_gets = 1;
+                stats.block_bytes_fetched = bytes.len() as u64;
+            }
             stats.whole_object = true;
             // Still admit per-block cache entries so a later partition's fetch of
             // a subset composes with this one (ADR-0107 decision 3).
-            self.admit_blocks_from_whole(seg_ref, tenant_hash, &got.data, &extents);
-            return Ok((got.data, stats));
+            self.admit_blocks_from_whole(seg_ref, tenant_hash, &bytes, &extents);
+            return Ok((bytes, stats));
+        }
+
+        // The remaining non-BLOCKS sections: STREAM_DIR/FIELD_DIR (object front)
+        // and any tail section (BLOOM/POSTINGS) a short probe missed. The reader
+        // re-verifies each section's crc on decode, so a corrupt section hit
+        // fails closed there (ADR-0046).
+        for section in &footer.sections {
+            if section.kind == kind::BLOCKS {
+                continue;
+            }
+            self.place_section(
+                seg_ref,
+                tenant_hash,
+                section,
+                &pin,
+                &mut asm,
+                accounting,
+                &mut stats,
+            )
+            .await?;
         }
 
         self.fetch_blocks(
             seg_ref,
             tenant_hash,
-            &pinned,
+            &pin,
             &extents,
             &mut asm,
             accounting,
@@ -1605,64 +1762,58 @@ impl BlockRangeFetcher {
         Ok(out)
     }
 
-    /// Fetch one directory section's stored bytes, through the read cache when
-    /// configured. The bytes are the section's exact `[offset, offset+len)`
-    /// stored form (crc-verified by the reader on decode); the cache key is the
-    /// section's own extent.
+    /// Place one directory section into `asm`, fetching it through the read
+    /// cache's single-flight when it is not already covered by an earlier read.
+    /// The bytes are the section's exact `[offset, offset+len)` stored form
+    /// (crc-verified by the reader on decode) and the cache key is the section's
+    /// own extent, so two partitions missing the same section issue one GET
+    /// between them rather than one each.
     #[allow(clippy::too_many_arguments)]
-    async fn section_bytes(
+    async fn place_section(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         section: &SectionDesc,
-        pinned: &Etag,
+        pin: &EtagPin,
+        asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
         stats: &mut BlockRangeStats,
-    ) -> Result<Bytes, LogFetchError> {
+    ) -> Result<(), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
-        let cache_key = CacheKey::new(
-            tenant_hash.0,
-            seg_ref.content_hash,
-            section.offset,
-            section.len,
-        );
-        if let Some(cache) = &self.cache
-            && let Some(bytes) = cache.get(&cache_key)
-        {
-            accounting.record_cache_hit();
-            accounting.add_cache_bytes(bytes.len() as u64);
-            return Ok(bytes);
+        let (start, end) = (section.offset, section.offset + section.len);
+        if asm.covers(start, end) {
+            return Ok(());
         }
-        if self.cache.is_some() {
-            accounting.record_cache_miss();
-        }
-        let got = self
-            .store_get_pinned(
-                key,
-                GetRange::Range(section.offset, section.offset + section.len),
-                pinned,
+        let (bytes, live) = self
+            .cached_extent(
+                seg_ref,
+                tenant_hash,
+                section.offset,
+                section.len,
+                GetRange::Range(start, end),
+                pin,
                 accounting,
             )
             .await?;
-        stats.metadata_gets += 1;
-        if let Some(cache) = &self.cache {
-            cache.insert(cache_key, got.data.clone());
+        if live {
+            stats.metadata_gets += 1;
         }
-        Ok(got.data)
+        asm.place(key, section.offset, &bytes)
     }
 
     /// Fetch the candidate blocks into `asm`: serve each from the per-block cache
     /// when present (re-verifying `block_crc32c` on the cached bytes -- ADR-0046's
     /// corrupt-hit gate, which this admitting funnel owns), coalesce the misses
-    /// within `coalesce_gap`, GET each coalesced range (etag-pinned, bounded by
-    /// the semaphore), split each response at block boundaries, verify each
-    /// block's crc independently, admit one cache entry per block, and place it.
+    /// within `coalesce_gap`, and fetch every coalesced run concurrently through
+    /// [`fetch_run`](Self::fetch_run), which splits each response at block
+    /// boundaries, verifies each block's crc independently, admits one cache
+    /// entry per block, and hands the blocks back to be placed.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_blocks(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
-        pinned: &Etag,
+        pin: &EtagPin,
         extents: &[BlockExtent],
         asm: &mut ObjectAssembler,
         accounting: &QueryAccounting,
@@ -1709,40 +1860,161 @@ impl BlockRangeFetcher {
             missing.push(*ext);
         }
 
-        for run in coalesce_extents(&missing, self.coalesce_gap) {
-            let (start, end) = (run.abs_start, run.abs_start.saturating_add(run.len));
-            let got = self
-                .store_get_pinned(key, GetRange::Range(start, end), pinned, accounting)
-                .await?;
-            stats.block_range_gets += 1;
-            stats.block_bytes_fetched = stats
-                .block_bytes_fetched
-                .saturating_add(got.data.len() as u64);
-            // Split the coalesced response at block boundaries, verify and admit
-            // one entry per block; the gap bytes between blocks are discarded,
-            // never cached, never interpreted (ADR-0107 decision 3).
-            for ext in &missing {
-                if ext.abs_start < start || ext.abs_end() > end {
-                    continue;
-                }
-                let rel = usize::try_from(ext.abs_start - start).map_err(|_| corrupt_range(key))?;
-                let rel_end = rel
-                    .checked_add(usize::try_from(ext.len).map_err(|_| corrupt_range(key))?)
-                    .ok_or_else(|| corrupt_range(key))?;
-                let block = got
-                    .data
-                    .get(rel..rel_end)
-                    .ok_or_else(|| corrupt_range(key))?;
-                verify_block_crc(key, block, ext)?;
-                if let Some(cache) = &self.cache {
-                    let cache_key =
-                        CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-                    cache.insert(cache_key, Bytes::copy_from_slice(block));
-                }
-                asm.place(key, ext.abs_start, block)?;
+        // Every coalesced run concurrently, not one await at a time (mirrors
+        // `crate::fetcher::SegmentFetcher::ensure_ranges`' `join_all`). Awaiting
+        // the runs in series made `get_semaphore` inert: a sequential loop never
+        // has more than one GET in flight to bound.
+        let runs = coalesce_extents(&missing, self.coalesce_gap);
+        let outcomes = futures::future::join_all(runs.iter().map(|run| {
+            let blocks: Vec<BlockExtent> = missing
+                .iter()
+                .copied()
+                .filter(|e| e.abs_start >= run.abs_start && e.abs_end() <= run.abs_end())
+                .collect();
+            self.fetch_run(seg_ref, tenant_hash, pin, *run, blocks, accounting)
+        }))
+        .await;
+        for outcome in outcomes {
+            let run = outcome?;
+            stats.block_range_gets += run.gets;
+            stats.block_cache_hits += run.cache_hits;
+            stats.block_bytes_fetched = stats.block_bytes_fetched.saturating_add(run.bytes);
+            for (start, bytes) in run.blocks {
+                asm.place(key, start, &bytes)?;
             }
         }
         Ok(())
+    }
+
+    /// Fetch one coalesced run's blocks with one range GET, split at block
+    /// boundaries and verified block by block.
+    ///
+    /// With a cache attached the run is single-flighted on its FIRST block's
+    /// cache key: the partitions striping one segment resolve the identical
+    /// candidate set from the same skip index, so they produce the identical runs
+    /// and collapse onto one real GET instead of one each (ADR-0102 decision 1's
+    /// premise, which the block-range path would otherwise break). The key is a
+    /// block's own extent, never the coalesced run's, because cache admission
+    /// here is per block and a run's gap bytes are never cached (ADR-0107
+    /// decision 3): the leader verifies every block in the run and admits one
+    /// entry per block before it returns, so a follower finds the run's other
+    /// blocks resident and issues no GET of its own. A follower that still
+    /// misses one -- evicted in the meantime, or larger than the cache's
+    /// single-entry cap -- fetches that block alone, still single-flighted.
+    async fn fetch_run(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        pin: &EtagPin,
+        run: BlockExtent,
+        blocks: Vec<BlockExtent>,
+        accounting: &QueryAccounting,
+    ) -> Result<RunOutcome, LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let range = GetRange::Range(run.abs_start, run.abs_end());
+        let Some(cache) = &self.cache else {
+            let got = self.store_get_pinned(key, range, pin, accounting).await?;
+            let blocks = split_run(key, run.abs_start, &got.data, &blocks)?;
+            return Ok(RunOutcome {
+                blocks,
+                gets: 1,
+                bytes: got.data.len() as u64,
+                cache_hits: 0,
+            });
+        };
+        let Some(lead) = blocks.first().copied() else {
+            // A run with no block in it cannot happen (runs are built from the
+            // blocks themselves), and fetching bytes no block claims would admit
+            // exactly the unverifiable gap bytes decision 3 forbids.
+            return Ok(RunOutcome::default());
+        };
+        let lead_key = CacheKey::new(
+            tenant_hash.0,
+            seg_ref.content_hash,
+            lead.abs_start,
+            lead.len,
+        );
+        // Set by our own closure, so `Some` after the await means this call led
+        // the fetch and already holds every block of the run; `None` means it
+        // followed another caller's in-flight GET.
+        let led: std::sync::OnceLock<(Vec<(u64, Bytes)>, u64)> = std::sync::OnceLock::new();
+        let lead_bytes = cache
+            .get_or_fetch(lead_key, || async {
+                let got = self
+                    .store_get_pinned(key, range, pin, accounting)
+                    .await
+                    .map_err(to_cache_error)?;
+                let split =
+                    split_run(key, run.abs_start, &got.data, &blocks).map_err(to_cache_error)?;
+                let Some((_, lead_bytes)) = split.first().cloned() else {
+                    return Err(to_cache_error(corrupt_range(key)));
+                };
+                // One entry per block, all verified above. The lead block's own
+                // admission is `get_or_fetch`'s, under the key it was called
+                // with, so it is admitted exactly once.
+                for (start, bytes) in split.iter().skip(1) {
+                    cache.insert(
+                        CacheKey::new(
+                            tenant_hash.0,
+                            seg_ref.content_hash,
+                            *start,
+                            bytes.len() as u64,
+                        ),
+                        bytes.clone(),
+                    );
+                }
+                let _ = led.set((split, got.data.len() as u64));
+                Ok(lead_bytes)
+            })
+            .await
+            .map_err(|err| from_cache_error(key, err))?;
+        if let Some((split, bytes)) = led.get() {
+            return Ok(RunOutcome {
+                blocks: split.clone(),
+                gets: 1,
+                bytes: *bytes,
+                cache_hits: 0,
+            });
+        }
+        // Follower: the lead block is the leader's own verified bytes, and the
+        // leader admitted the rest of the run before it returned.
+        let mut out = Vec::with_capacity(blocks.len());
+        out.push((lead.abs_start, lead_bytes));
+        let mut outcome = RunOutcome::default();
+        for ext in blocks.iter().skip(1) {
+            let block_key =
+                CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
+            if let Some(bytes) = cache.get(&block_key) {
+                verify_block_crc(key, &bytes, ext)?;
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+                outcome.cache_hits += 1;
+                out.push((ext.abs_start, bytes));
+                continue;
+            }
+            accounting.record_cache_miss();
+            let bytes = cache
+                .get_or_fetch(block_key, || async {
+                    let got = self
+                        .store_get_pinned(
+                            key,
+                            GetRange::Range(ext.abs_start, ext.abs_end()),
+                            pin,
+                            accounting,
+                        )
+                        .await
+                        .map_err(to_cache_error)?;
+                    verify_block_crc(key, &got.data, ext).map_err(to_cache_error)?;
+                    Ok(got.data)
+                })
+                .await
+                .map_err(|err| from_cache_error(key, err))?;
+            outcome.gets += 1;
+            outcome.bytes = outcome.bytes.saturating_add(bytes.len() as u64);
+            out.push((ext.abs_start, bytes));
+        }
+        outcome.blocks = out;
+        Ok(outcome)
     }
 
     /// Split whole-object bytes (the coverage-crossover path) at block boundaries
@@ -1779,6 +2051,140 @@ impl BlockRangeFetcher {
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
             cache.insert(cache_key, Bytes::copy_from_slice(block));
         }
+    }
+}
+
+/// One coalesced run's fetched blocks (`(abs_start, bytes)`, crc-verified) plus
+/// the store cost this caller paid for them: `gets` real range GETs moving
+/// `bytes` stored bytes, and `cache_hits` blocks served with no round trip.
+///
+/// A single-flight follower that rode another caller's GET reports zero gets and
+/// zero bytes here, unlike [`BlockRangeFetcher::cached_extent`] and the
+/// whole-object funnels, which attribute one request to a follower because they
+/// cannot tell one from a leader. This path can: the leader is whichever call
+/// ran the closure. Reporting what actually crossed the network is strictly
+/// better information, and the block-range GET count is the figure ADR-0107's
+/// acceptance test is written against.
+#[derive(Default)]
+struct RunOutcome {
+    blocks: Vec<(u64, Bytes)>,
+    gets: u64,
+    bytes: u64,
+    cache_hits: u64,
+}
+
+/// The etag every LIVE GET of one fetch sequence is checked against (ADR-0107
+/// decision 1's mandatory etag pinning). Whichever live GET completes first pins
+/// it -- normally the suffix probe, or the first section/block GET when the probe
+/// was served from the read cache -- and every live GET after it must report the
+/// same etag or the fetch fails with [`LogFetchError::EtagChanged`] rather than
+/// assembling bytes from two object states.
+///
+/// Cache-served bytes are not checked against it and need no check: a cache key
+/// carries the object's `content_hash`, so an entry is by construction bytes of
+/// this exact content rather than of whatever the store holds now. What the pin
+/// has to rule out is a sequence of LIVE GETs spanning a replacement, which is
+/// exactly what it still does.
+#[derive(Default)]
+struct EtagPin(std::sync::OnceLock<Etag>);
+
+impl EtagPin {
+    /// Pin `got` if nothing is pinned yet, otherwise require it to match.
+    fn check(&self, key: &str, got: &Etag) -> Result<(), LogFetchError> {
+        if self.0.get_or_init(|| got.clone()) == got {
+            return Ok(());
+        }
+        Err(LogFetchError::EtagChanged {
+            key: key.to_string(),
+        })
+    }
+}
+
+/// A live GET must return exactly the extent that was asked for: a short read
+/// would be placed at the right offset with the wrong bytes after it, and cached
+/// under a key claiming a length it does not have.
+fn check_extent_len(key: &str, got: usize, want: u64) -> Result<(), LogFetchError> {
+    if got as u64 == want {
+        return Ok(());
+    }
+    Err(corrupt(
+        key,
+        LogSegError::Corrupted(format!("short read: got {got} bytes of {want}")),
+    ))
+}
+
+/// Split one coalesced run's response at block boundaries, verifying each
+/// block's `block_crc32c` independently before the caller can admit or place it.
+/// The gap bytes between blocks are dropped here: never cached, never
+/// interpreted (ADR-0107 decision 3).
+fn split_run(
+    key: &str,
+    run_start: u64,
+    data: &Bytes,
+    blocks: &[BlockExtent],
+) -> Result<Vec<(u64, Bytes)>, LogFetchError> {
+    let mut out = Vec::with_capacity(blocks.len());
+    for ext in blocks {
+        let offset = ext
+            .abs_start
+            .checked_sub(run_start)
+            .ok_or_else(|| corrupt_range(key))?;
+        let rel = usize::try_from(offset).map_err(|_| corrupt_range(key))?;
+        let rel_end = rel
+            .checked_add(usize::try_from(ext.len).map_err(|_| corrupt_range(key))?)
+            .ok_or_else(|| corrupt_range(key))?;
+        let block = data.get(rel..rel_end).ok_or_else(|| corrupt_range(key))?;
+        verify_block_crc(key, block, ext)?;
+        out.push((ext.abs_start, Bytes::copy_from_slice(block)));
+    }
+    Ok(out)
+}
+
+/// This module's error into the cache's single-flight error channel, preserving
+/// the class: a follower waiting on a leader's fetch must see the same store
+/// error, etag change, or hard corruption the leader saw, never a flattened one.
+fn to_cache_error(err: LogFetchError) -> crate::fetcher::CacheFetchError {
+    match err {
+        LogFetchError::Store { source, .. } => {
+            crate::fetcher::CacheFetchError::Store(Arc::new(source))
+        }
+        LogFetchError::EtagChanged { key } => crate::fetcher::CacheFetchError::EtagChanged { key },
+        LogFetchError::Corrupt { key, source } => crate::fetcher::CacheFetchError::Corrupt {
+            key,
+            message: source.to_string(),
+        },
+    }
+}
+
+/// The inverse of [`to_cache_error`], plus the single-flight channel's own
+/// `LeaderLost` (a leader whose future was cancelled or panicked before
+/// producing a result), which is transient and retryable.
+fn from_cache_error(
+    key: &str,
+    err: SingleFlightError<crate::fetcher::CacheFetchError>,
+) -> LogFetchError {
+    match err {
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Store(source)) => {
+            LogFetchError::Store {
+                key: key.to_string(),
+                source: crate::fetcher::clone_store_error(&source),
+            }
+        }
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::EtagChanged { key }) => {
+            LogFetchError::EtagChanged { key }
+        }
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::Corrupt { key, message }) => {
+            LogFetchError::Corrupt {
+                key,
+                source: LogSegError::Corrupted(message),
+            }
+        }
+        SingleFlightError::LeaderLost => LogFetchError::Store {
+            key: key.to_string(),
+            source: StoreError::Transient(
+                "cache single-flight leader lost before producing a result".to_string(),
+            ),
+        },
     }
 }
 

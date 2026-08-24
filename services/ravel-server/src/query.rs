@@ -257,7 +257,12 @@ pub fn build_sql_state(
     };
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone());
-    let mut logs_fetcher = LogSegmentFetcher::new(store.clone());
+    // ADR-0107's read-shape crossover, from `--logs-block-range-threshold` via
+    // `QueryBudgets::apply_to_engine`. This is the single wiring point for it, so
+    // an operator who sets the flag to `u64::MAX` gets whole-object logs reads
+    // (the pre-ADR-0107 shape) on every SQL logs scan this process serves.
+    let mut logs_fetcher = LogSegmentFetcher::new(store.clone())
+        .with_block_range_threshold(config.engine.logs_block_range_threshold);
     // The spans fetcher (RSPAN) reads the same object store, with the default
     // RspanConfig (ADR-0045 decision 5). It attaches no fetcher cache: unlike
     // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired

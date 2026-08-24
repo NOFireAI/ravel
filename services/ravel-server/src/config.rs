@@ -500,6 +500,22 @@ pub struct Cli {
     #[arg(long = "sql-parallel-final-aggregation")]
     pub sql_parallel_final_aggregation: bool,
 
+    /// Object size above which a logs scan reads only the pruning-relevant
+    /// blocks of an RLOG object (a suffix probe plus coalesced block-range GETs)
+    /// instead of one whole-object GET (ADR-0107), threaded into
+    /// `ravel_query::EngineConfig::logs_block_range_threshold` and from there
+    /// into `LogSegmentFetcher::with_block_range_threshold`.
+    ///
+    /// Defaults to [`DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD`] (512 KiB), the
+    /// compiled-in crossover, so an unset flag is byte-identical to before it
+    /// existed. This is the mitigation knob for that path: set it to
+    /// `18446744073709551615` (`u64::MAX`) to read every object whole, the
+    /// pre-ADR-0107 shape, without a rollback; set it to `0` to send every
+    /// object through the block-range path. Read at startup only, like
+    /// `--disable-cache` and every other cache/read knob here.
+    #[arg(long = "logs-block-range-threshold", value_name = "BYTES", default_value_t = DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD)]
+    pub logs_block_range_threshold: u64,
+
     /// Bound on concurrent in-flight segment fetches per query (ADR-0088),
     /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is a
     /// single knob with three coupled effects, NOT decoupled by this change: it
@@ -994,6 +1010,11 @@ pub struct QueryBudgets {
     /// (ADR-0094). Reaches `SqlConfig::parallel_final_aggregation`. Default
     /// `false`, so a server built without the flag is byte-identical to before.
     pub sql_parallel_final_aggregation: bool,
+    /// Object size above which a logs scan reads only the pruning-relevant RLOG
+    /// blocks instead of the whole object (ADR-0107). Reaches
+    /// `EngineConfig::logs_block_range_threshold` and from there
+    /// `LogSegmentFetcher::with_block_range_threshold`.
+    pub logs_block_range_threshold: u64,
 }
 
 impl Default for QueryBudgets {
@@ -1004,6 +1025,7 @@ impl Default for QueryBudgets {
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: false,
+            logs_block_range_threshold: DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD,
         }
     }
 }
@@ -1021,10 +1043,17 @@ impl QueryBudgets {
         ravel_query::EngineConfig {
             fetch_concurrency: self.fetch_concurrency,
             max_segments: self.max_segments,
+            logs_block_range_threshold: self.logs_block_range_threshold,
             ..base
         }
     }
 }
+
+/// Default `--logs-block-range-threshold`: the compiled-in ADR-0107 crossover
+/// (512 KiB), `ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`. Named through
+/// that constant rather than repeated, so the flag's default cannot drift from
+/// the fetcher's own.
+pub const DEFAULT_LOGS_BLOCK_RANGE_THRESHOLD: u64 = ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD;
 
 /// Default `--cache-max-bytes`: generous enough to hold a working set of
 /// recently fetched segment/log byte ranges across a handful of concurrent
@@ -1690,6 +1719,7 @@ impl Cli {
             sql_max_query_bytes: self.sql_max_query_bytes,
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
+            logs_block_range_threshold: self.logs_block_range_threshold,
         }
     }
 
@@ -3721,6 +3751,50 @@ mod tests {
                 .apply_to_engine(EngineConfig::default())
                 .max_segments,
             EngineConfig::default().max_segments,
+        );
+    }
+
+    /// ADR-0107 reachability: `--logs-block-range-threshold` must reach the
+    /// `EngineConfig` `build_sql_state` reads when it builds the logs fetcher,
+    /// not stop at a parsed field. Same wiring trace as
+    /// [`fetch_concurrency_is_reachable_from_cli`]; the last hop from there is
+    /// `LogSegmentFetcher::with_block_range_threshold` in
+    /// `crate::query::build_sql_state`.
+    ///
+    /// `u64::MAX` is the value under test because it is the operator-facing
+    /// point of the flag: it turns the ADR-0107 block-range path off for every
+    /// object, which is the mitigation for a regression on that path.
+    #[test]
+    fn logs_block_range_threshold_is_reachable_from_cli() {
+        use ravel_query::EngineConfig;
+
+        assert_ne!(
+            u64::MAX,
+            ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "the value under test must differ from the default, or an ignored flag would pass"
+        );
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--logs-block-range-threshold",
+            "18446744073709551615",
+        ])
+        .expect("flag parses");
+        let engine = cli.query_budgets().apply_to_engine(EngineConfig::default());
+        assert_eq!(
+            engine.logs_block_range_threshold,
+            u64::MAX,
+            "the logs fetcher's crossover must be the configured flag, not the compiled-in 512 KiB"
+        );
+
+        // Default path: unset flag leaves the crossover at the fetcher's own
+        // compiled-in constant.
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.query_budgets()
+                .apply_to_engine(EngineConfig::default())
+                .logs_block_range_threshold,
+            ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
         );
     }
 
