@@ -55,6 +55,15 @@ pub struct ScanStats {
     /// their column. Zero for an all-columns scan; the observable proof that
     /// column projection reached the page level (ADR-0087 decision 3).
     pub pages_skipped: u64,
+    /// Stored bytes of pages present in the blocks this scan decoded,
+    /// regardless of the [`ColumnSelection`]. A decode-time column-filtering
+    /// measurement, distinct from any wire-byte count. Grows as blocks are
+    /// decoded (ADR-0107 decision 4).
+    pub page_bytes_fetched: u64,
+    /// Stored bytes of the pages this scan actually decoded after column
+    /// filtering. Equal to `page_bytes_fetched` for an all-columns scan; the
+    /// gap to it is the column-filtering waste (ADR-0107 decision 4).
+    pub page_bytes_decoded: u64,
 }
 
 /// An opened RLOG object ready to scan.
@@ -825,6 +834,14 @@ impl BlockScan {
         self.stats.blocks_scanned += 1;
         self.stats.pages_decoded += decoded.pages_decoded() as u64;
         self.stats.pages_skipped += decoded.pages_skipped() as u64;
+        self.stats.page_bytes_fetched = self
+            .stats
+            .page_bytes_fetched
+            .saturating_add(decoded.page_bytes_fetched());
+        self.stats.page_bytes_decoded = self
+            .stats
+            .page_bytes_decoded
+            .saturating_add(decoded.page_bytes_decoded());
 
         for row in 0..decoded.record_count() {
             if eval(

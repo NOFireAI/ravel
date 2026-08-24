@@ -227,6 +227,11 @@ pub struct LogSegmentScan {
     span: tracing::Span,
     /// The object key, for error attribution.
     key: String,
+    /// This query's accounting handle, folded once at exhaustion with the
+    /// scan's decode-time `page_bytes_fetched`/`page_bytes_decoded` totals
+    /// (ADR-0107 decision 4). The same handle T1's fetch path already recorded
+    /// wire bytes against; these are a separate, additive axis.
+    accounting: QueryAccounting,
     /// Set once [`next_block`](Self::next_block) has reported exhaustion, so
     /// the span's counters are recorded exactly once.
     finished: bool,
@@ -340,6 +345,15 @@ impl LogSegmentScan {
         let stats = self.scan.stats();
         self.span.record("blocks_scanned", stats.blocks_scanned);
         self.span.record("blocks_total", stats.blocks_total);
+        // Decode-time column-filtering accounting (ADR-0107 decision 4), folded
+        // once at exhaustion into the query's handle: page_bytes_fetched vs.
+        // page_bytes_decoded expose how much of each fetched block a narrow
+        // projection discards. A separate, additive axis from the wire bytes T1
+        // records through `add_s3_bytes`; see the QueryAccounting field docs.
+        self.accounting
+            .add_page_bytes_fetched(stats.page_bytes_fetched);
+        self.accounting
+            .add_page_bytes_decoded(stats.page_bytes_decoded);
     }
 }
 
@@ -757,6 +771,7 @@ impl LogSegmentFetcher {
             erasure: query.erasure.clone(),
             span,
             key: key.to_string(),
+            accounting: accounting.clone(),
             finished: false,
         }))
     }
@@ -841,6 +856,7 @@ impl LogSegmentFetcher {
             erasure: query.erasure.clone(),
             span,
             key: key.to_string(),
+            accounting: accounting.clone(),
             finished: false,
         }))
     }
