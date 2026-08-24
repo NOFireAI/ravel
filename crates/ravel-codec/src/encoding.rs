@@ -491,6 +491,63 @@ pub fn encode_strings(values: &[&[u8]]) -> (Enc, Vec<u8>) {
     }
 }
 
+/// Encodes a string column already in dictionary shape. `present_ids[i]` is
+/// the dictionary index of present row `i` into `dict`, the column's distinct
+/// values (in any order); `dict` may hold entries no id references. Produces
+/// bytes byte-identical to `encode_strings(&values)` where
+/// `values[i] == dict[present_ids[i] as usize]`, but derives the
+/// dictionary-versus-plain choice and the sorted entry set from the referenced
+/// distinct values alone, never sorting or scanning the per-row values.
+///
+/// A dictionary-shaped columnar producer (ADR-0109 decision 3) calls this once
+/// per block so string encoding costs one sort per distinct value, not the
+/// `encode_strings` sort-plus-`partition_point` per row.
+pub fn encode_strings_dict(dict: &[&[u8]], present_ids: &[u32]) -> (Enc, Vec<u8>) {
+    if present_ids.is_empty() {
+        return (Enc::Plain, Vec::new());
+    }
+    // One pass over the per-row ids (integers) to mark the referenced entries;
+    // the sort below runs over those distinct values, never the per-row values.
+    let mut referenced = vec![false; dict.len()];
+    let mut distinct: Vec<&[u8]> = Vec::new();
+    for &id in present_ids {
+        let i = id as usize;
+        if !referenced[i] {
+            referenced[i] = true;
+            distinct.push(dict[i]);
+        }
+    }
+    distinct.sort_unstable();
+    distinct.dedup();
+
+    if dict_is_worth_it(distinct.len(), present_ids.len()) {
+        // Map each referenced dictionary index to its position in the sorted
+        // distinct set once (per distinct), so the per-row id is an integer
+        // lookup rather than a `partition_point` string search.
+        let mut pos_of = vec![0u32; dict.len()];
+        for (i, seen) in referenced.iter().enumerate() {
+            if *seen {
+                pos_of[i] = distinct.partition_point(|e| *e < dict[i]) as u32;
+            }
+        }
+        let mut out = Vec::new();
+        put_uvarint(&mut out, distinct.len() as u64);
+        for entry in &distinct {
+            put_uvarint(&mut out, entry.len() as u64);
+            out.extend_from_slice(entry);
+        }
+        let ids: Vec<u64> = present_ids
+            .iter()
+            .map(|&id| u64::from(pos_of[id as usize]))
+            .collect();
+        encode_dict_ids(&mut out, &ids, distinct.len());
+        (Enc::Dict, out)
+    } else {
+        let values: Vec<&[u8]> = present_ids.iter().map(|&id| dict[id as usize]).collect();
+        (Enc::Plain, enc_plain_strings(&values))
+    }
+}
+
 /// The non-fusing decode of a string column: either the plain per-value form,
 /// or the dictionary form kept intact (the distinct values plus one id per
 /// value). A dictionary page decoded this way keeps its structure instead of
@@ -1177,6 +1234,28 @@ mod string_dict_proptests {
             let (enc, bytes) = encode_strings(&refs);
             let got = decode_strings(enc, &bytes, refs.len()).expect("decode");
             prop_assert_eq!(got, vals);
+        }
+
+        /// `encode_strings_dict` fed a dictionary and per-row ids produces the
+        /// exact bytes `encode_strings` produces over the fused per-row values,
+        /// across both sides of the dict-versus-plain threshold, with an
+        /// unreferenced dictionary entry and a dictionary carrying duplicate
+        /// values both present.
+        #[test]
+        fn encode_strings_dict_matches_encode_strings(
+            dict in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..6), 1..8),
+            ids in proptest::collection::vec(0u32..8, 0..400),
+        ) {
+            // Keep ids in range of the generated dictionary.
+            let ids: Vec<u32> = ids.iter().map(|&i| i % dict.len() as u32).collect();
+            let dref: Vec<&[u8]> = dict.iter().map(|v| v.as_slice()).collect();
+            let fused: Vec<&[u8]> = ids.iter().map(|&i| dref[i as usize]).collect();
+
+            let (want_enc, want_bytes) = encode_strings(&fused);
+            let (got_enc, got_bytes) = encode_strings_dict(&dref, &ids);
+            prop_assert_eq!(got_enc, want_enc);
+            prop_assert_eq!(got_bytes, want_bytes);
         }
 
         #[test]
