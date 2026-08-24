@@ -800,7 +800,11 @@ impl ObjectStoreBackend for SlowCountingStore {
     }
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // 50ms, not 5ms (see #618): under real host contention, tokio task
+        // scheduling delays alone can exceed a few ms, reopening the race
+        // this sleep exists to close (see the type doc above). 50ms is still
+        // well under S3's real 15-80ms and gives ample headroom.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         self.inner.get(key, range).await
     }
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
