@@ -77,6 +77,29 @@ fn is_set_operator(op: TokenId) -> bool {
     matches!(op, T_LAND | T_LOR | T_LUNLESS)
 }
 
+/// Whether any element of `v` is a native-histogram sample.
+fn has_histogram(v: &InstantVector) -> bool {
+    v.iter().any(|s| s.histogram.is_some())
+}
+
+/// Native-histogram arithmetic/comparison is not yet implemented (issue
+/// #524): [`combine_value`] and its callers only ever read `l`/`r` as plain
+/// `f64`, so a histogram element's real value is invisible to them and its
+/// `value` field is a meaningless `0.0` placeholder (see
+/// [`crate::eval::InstantSample::histogram`]'s doc comment). Combining that
+/// placeholder would silently fabricate a wrong answer -- exactly the
+/// defect this guard exists to prevent -- so every arithmetic/comparison
+/// binop rejects histogram-carrying operands with a typed error instead.
+/// Set operators (`and`/`or`/`unless`) are unaffected: they pass matched
+/// [`InstantSample`](crate::eval::InstantSample)s through unchanged (label
+/// matching only, no value combination), so they already handle histogram
+/// operands correctly and are not guarded here.
+fn histogram_binop_unsupported() -> Error {
+    Error::Unsupported {
+        construct: "binary operator over native histograms".to_string(),
+    }
+}
+
 /// Go's `math.Mod`/C `fmod` semantics: Rust's float `%` already implements
 /// truncated-division remainder (sign follows the dividend), matching
 /// Prometheus' `%` bit for bit in the general case.
@@ -161,6 +184,9 @@ fn eval_scalar_vector(
     modifier: &BinModifier,
     scalar_is_lhs: bool,
 ) -> Result<InstantVector, Error> {
+    if has_histogram(&vector) {
+        return Err(histogram_binop_unsupported());
+    }
     let drop_name = should_drop_metric_name(op, modifier.return_bool);
     let mut out = Vec::with_capacity(vector.len());
     for s in vector {
@@ -204,6 +230,9 @@ fn eval_vector_vector(
             T_LUNLESS => set_unless(lhs, rhs, matching),
             _ => unreachable!("is_set_operator matched an unhandled token"),
         });
+    }
+    if has_histogram(&lhs) || has_histogram(&rhs) {
+        return Err(histogram_binop_unsupported());
     }
     match &modifier.card {
         VectorMatchCardinality::OneToOne => one_to_one(op, lhs, rhs, modifier),
@@ -489,6 +518,36 @@ fn set_or(
 mod tests {
     use crate::eval::{Error, Evaluator, Value};
     use crate::testsource::TestSource;
+
+    /// One native histogram, mirroring `eval::tests::nh`'s fixture.
+    fn nh(count: f64, sum: f64) -> crate::histogram::FloatHistogram {
+        crate::histogram::FloatHistogram {
+            counter_reset_hint: crate::histogram::ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![crate::histogram::Span {
+                offset: 1,
+                length: 1,
+            }],
+            negative_spans: Vec::new(),
+            positive_buckets: vec![count],
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        }
+    }
+
+    fn expect_histogram_binop_unsupported(err: Error) {
+        let Error::Unsupported { construct } = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            construct.contains("binary operator over native histograms"),
+            "construct {construct:?} should name the histogram-binop construct"
+        );
+    }
 
     fn source() -> TestSource {
         TestSource::new()
@@ -831,5 +890,77 @@ mod tests {
             .instant(&src, "many + on(job) group_left one", 0)
             .expect_err("one-side duplicate must be rejected even though many-side matches");
         assert!(matches!(err, Error::AmbiguousMatch { .. }));
+    }
+
+    /// Issue #524: a binop over a native histogram must be a typed error,
+    /// never a silently fabricated float computed from the histogram
+    /// element's meaningless placeholder `value` (always `0.0`).
+    #[test]
+    fn scalar_vector_arithmetic_over_histogram_is_unsupported() {
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .instant(&src, "h * 2", 0)
+            .expect_err("h * 2 must be rejected, not silently computed on a placeholder 0.0");
+        expect_histogram_binop_unsupported(err);
+    }
+
+    #[test]
+    fn vector_vector_arithmetic_over_two_histograms_is_unsupported() {
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .instant(&src, "h + h", 0)
+            .expect_err("h + h must be rejected, not silently computed on placeholder 0.0s");
+        expect_histogram_binop_unsupported(err);
+    }
+
+    #[test]
+    fn vector_vector_arithmetic_mixed_histogram_and_float_is_unsupported() {
+        // Histogram on the lhs, plain float on the rhs: the guard must fire
+        // regardless of which side carries the histogram.
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series")
+            .with_series(&[("__name__", "f"), ("job", "x")], &[(0, 3.0)])
+            .expect("valid series");
+        let err = Evaluator::new()
+            .instant(&src, "h + on(job) f", 0)
+            .expect_err("h + f must be rejected: h's value is a meaningless placeholder");
+        expect_histogram_binop_unsupported(err);
+    }
+
+    #[test]
+    fn comparison_over_histogram_is_unsupported() {
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series");
+        let err = Evaluator::new()
+            .instant(&src, "h > 5", 0)
+            .expect_err("comparing a histogram's placeholder value must be rejected");
+        expect_histogram_binop_unsupported(err);
+    }
+
+    /// Set operators pass matched samples through unchanged (no value
+    /// combination), so they already handle histogram operands correctly
+    /// and must NOT be guarded: this pins that `and` keeps working, so a
+    /// future change can't silently widen the guard onto set operators.
+    #[test]
+    fn set_operator_and_over_histograms_is_unaffected() {
+        let src = TestSource::new()
+            .with_histogram_series(&[("__name__", "h"), ("job", "x")], &[(0, nh(6.0, 42.0))])
+            .expect("valid histogram series")
+            .with_series(&[("__name__", "g"), ("job", "x")], &[(0, 1.0)])
+            .expect("valid series");
+        let v = Evaluator::new()
+            .instant(&src, "h and on(job) g", 0)
+            .expect("set operators over histograms must keep working");
+        assert_eq!(v.len(), 1);
+        assert!(
+            v[0].histogram.is_some(),
+            "the histogram element must survive `and` unchanged"
+        );
     }
 }

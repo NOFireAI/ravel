@@ -254,9 +254,15 @@ pub enum Probe {
     Shape(Shape),
     /// Any entry carrying a `tolerance:` field (ADR-0025's allowlist).
     ToleranceEntry,
-    /// Any entry using `mode: ravel_error_prom_success` (ADR-0030's
-    /// allowlist).
-    DivergenceModeEntry,
+    /// Any entry using `mode: ravel_error_prom_success` whose `name` also
+    /// contains this marker substring. The mode alone is not distinguishing:
+    /// more than one accepted divergence can use it (ADR-0030's per-node
+    /// point cap and issue #524's histogram-binop guard both do), so a
+    /// bare mode match would double-count one divergence's corpus entries
+    /// as evidence for another's `Construct` row. The marker scopes each
+    /// registry entry to only the corpus entries actually naming it (e.g.
+    /// `"subquery"` for ADR-0030's `error_*subquery*` entries).
+    DivergenceModeEntry(&'static str),
     /// Not expressible as corpus query text. Intentionally-rejected
     /// constructs use this: their evidence is a rejection case in
     /// [`REJECTION_CASES`], not a corpus entry.
@@ -570,6 +576,18 @@ pub static REGISTRY: &[Construct] = &[
          histogram element would be silently dropped; the trigger is \
          matched histogram data, not the syntactic shape",
     ),
+    rejected_modifier(
+        "binary operator over native histograms",
+        "Unsupported: binary operator over native histograms (422 execution)",
+        "the binop evaluator (`combine_value` and its callers) only ever \
+         reads a sample's plain float `value`, which is a meaningless 0.0 \
+         placeholder for a histogram element (issue #524); guarded before \
+         any value combination so the fabricated-zero result is never \
+         produced. `corpus/binop.txt`'s `error_*_over_histogram` entries \
+         (mode: ravel_error_prom_success) additionally pin that Prometheus \
+         itself succeeds here, so this is a real capability gap, not a \
+         shared limitation",
+    ),
     // ---- Binary operators ----
     binop("+", corpus("corpus/binop.txt")),
     binop("-", corpus("corpus/binop.txt")),
@@ -693,7 +711,7 @@ pub static REGISTRY: &[Construct] = &[
         name: "subquery per-node point cap",
         category: Category::Divergence,
         state: ConstructState::AcceptedDivergence { adr: "ADR-0030" },
-        probe: Probe::DivergenceModeEntry,
+        probe: Probe::DivergenceModeEntry("subquery"),
         note: "Ravel's per-subquery-node 11,000-point budget has no \
                Prometheus counterpart, so Ravel rejects by design where \
                Prometheus accepts; the comparator asserts exactly that shape",
@@ -774,6 +792,13 @@ pub static REJECTION_CASES: &[RejectionCase] = &[
         eval: RejectionEval::Instant,
         time_offset_ms: 600_000,
         message_contains: "subquery over native histograms",
+    },
+    RejectionCase {
+        construct: "binary operator over native histograms",
+        query: "diff_native_hist * 2",
+        eval: RejectionEval::Instant,
+        time_offset_ms: 0,
+        message_contains: "binary operator over native histograms",
     },
 ];
 
@@ -1148,7 +1173,9 @@ pub fn exercises(probe: Probe, tokens: &[Token], entry: &CorpusEntry) -> bool {
             .any(|t| t.brace_depth > 0 && matches!(&t.tok, Tok::Op(op) if op == sym)),
         Probe::Shape(shape) => exercises_shape(shape, tokens),
         Probe::ToleranceEntry => entry.tolerance_ulps.is_some(),
-        Probe::DivergenceModeEntry => entry.mode == ComparisonMode::RavelErrorPromSuccess,
+        Probe::DivergenceModeEntry(marker) => {
+            entry.mode == ComparisonMode::RavelErrorPromSuccess && entry.name.contains(marker)
+        }
         Probe::None => false,
     }
 }
@@ -2284,21 +2311,45 @@ mod tests {
             &toleranced
         ));
         assert!(!exercises(
-            Probe::DivergenceModeEntry,
+            Probe::DivergenceModeEntry(""),
             &lex(&toleranced.query),
             &toleranced
         ));
 
         let diverging = parse_corpus(
-            "name: d\nquery: up\nkind: instant\ntime: +0s\nmode: ravel_error_prom_success\n",
+            "name: error_subquery_over_x\nquery: up\nkind: instant\ntime: +0s\nmode: ravel_error_prom_success\n",
         )
         .expect("parse")
         .pop()
         .expect("one entry");
         assert!(exercises(
-            Probe::DivergenceModeEntry,
+            Probe::DivergenceModeEntry("subquery"),
             &lex(&diverging.query),
             &diverging
+        ));
+    }
+
+    #[test]
+    fn divergence_probe_marker_does_not_cross_match_a_different_divergence() {
+        // Two entries can both use `mode: ravel_error_prom_success` for
+        // unrelated reasons (ADR-0030's subquery point cap, issue #524's
+        // histogram-binop guard); a registry row's marker must not count
+        // the other's corpus entries as its own evidence.
+        let histogram_entry = parse_corpus(
+            "name: error_binop_over_histogram\nquery: h * 2\nkind: instant\ntime: +0s\nmode: ravel_error_prom_success\n",
+        )
+        .expect("parse")
+        .pop()
+        .expect("one entry");
+        assert!(!exercises(
+            Probe::DivergenceModeEntry("subquery"),
+            &lex(&histogram_entry.query),
+            &histogram_entry
+        ));
+        assert!(exercises(
+            Probe::DivergenceModeEntry("histogram"),
+            &lex(&histogram_entry.query),
+            &histogram_entry
         ));
     }
 

@@ -1016,23 +1016,23 @@ conformance_table`; regenerate that same command with
 `RAVEL_UPDATE_CONFORMANCE_TABLE=1`. Do not edit the block between
 the markers by hand.
 
-Surface: 131 constructs over 218 corpus entries in 10 corpus files.
+Surface: 132 constructs over 221 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
 | supported | 124 |
-| intentionally rejected | 5 |
+| intentionally rejected | 6 |
 | accepted divergence | 2 |
 | unclassified | 0 |
-| **score** (supported + intentionally rejected + accepted divergence / total) | **131/131 = 100%** |
+| **score** (supported + intentionally rejected + accepted divergence / total) | **132/132 = 100%** |
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
 | aggregate expression | ast node | supported | `corpus/aggregate.txt`, 20 entries |
-| binary expression | ast node | supported | `corpus/binop.txt`, 28 entries |
+| binary expression | ast node | supported | `corpus/binop.txt`, 31 entries |
 | function call | ast node | supported | `corpus/transform.txt`, 59 entries |
 | matrix selector | ast node | supported | `corpus/selectors.txt`, 4 entries |
-| number literal | ast node | supported | `corpus/binop.txt`, 14 entries |
+| number literal | ast node | supported | `corpus/binop.txt`, 16 entries |
 | paren expression | ast node | supported | `corpus/selectors.txt`, 2 entries |
 | string literal | ast node | supported | `corpus/transform.txt`, 6 entries |
 | `subquery` | ast node | supported | `corpus/subquery.txt`, 11 entries |
@@ -1041,6 +1041,7 @@ Surface: 131 constructs over 218 corpus entries in 10 corpus files.
 | @ <timestamp> | modifier | supported | `corpus/selectors.txt`, 2 entries |
 | @ end() | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | @ start() | modifier | supported | `corpus/selectors.txt`, 1 entry |
+| binary operator over native histograms | modifier | intentionally rejected | `Unsupported: binary operator over native histograms (422 execution)`; rejection verified; the binop evaluator (`combine_value` and its callers) only ever reads a sample's plain float `value`, which is a meaningless 0.0 placeholder for a histogram element (issue #524); guarded before any value combination so the fabricated-zero result is never produced. `corpus/binop.txt`'s `error_*_over_histogram` entries (mode: ravel_error_prom_success) additionally pin that Prometheus itself succeeds here, so this is a real capability gap, not a shared limitation |
 | `bool` | modifier | supported | `corpus/binop.txt`, 7 entries |
 | `by` | modifier | supported | `corpus/aggregate.txt`, 11 entries |
 | `group_left` | modifier | supported | `corpus/binop.txt`, 2 entries |
@@ -1059,14 +1060,14 @@ Surface: 131 constructs over 218 corpus entries in 10 corpus files.
 | `without` | modifier | supported | `corpus/aggregate.txt`, 1 entry |
 | `!=` | binary operator | supported | `corpus/binop.txt`, 2 entries |
 | `%` | binary operator | supported | `corpus/binop.txt`, 1 entry |
-| `*` | binary operator | supported | `corpus/binop.txt`, 5 entries |
-| `+` | binary operator | supported | `corpus/binop.txt`, 4 entries |
+| `*` | binary operator | supported | `corpus/binop.txt`, 6 entries |
+| `+` | binary operator | supported | `corpus/binop.txt`, 5 entries |
 | `-` | binary operator | supported | `corpus/binop.txt`, 1 entry |
 | `/` | binary operator | supported | no difftest corpus entry; proven by `ravel-promql`'s `scalar_scalar_arithmetic_and_bool_comparison` |
 | `<` | binary operator | supported | no difftest corpus entry; proven by `ravel-promql`'s `scalar_vector_filter_and_bool_both_directions` |
 | `<=` | binary operator | supported | `corpus/binop.txt`, 2 entries |
 | `==` | binary operator | supported | `corpus/binop.txt`, 2 entries |
-| `>` | binary operator | supported | `corpus/binop.txt`, 3 entries |
+| `>` | binary operator | supported | `corpus/binop.txt`, 4 entries |
 | `>=` | binary operator | supported | `corpus/binop.txt`, 1 entry |
 | `^` | binary operator | supported | `corpus/binop.txt`, 2 entries |
 | `and` | binary operator | supported | `corpus/binop.txt`, 1 entry |
