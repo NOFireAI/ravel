@@ -281,10 +281,14 @@ fn attr_value_memory(v: &AttrValue) -> usize {
 ///   [`FIRST_DECLARED_COL`]; DataFusion already folds a residual-filter column
 ///   into the projection it hands the scan, so a declared column named only in
 ///   a `WHERE` clause is still decoded. This adds the declared key to the
-///   selection exactly like the content- and erasure-predicate contributors do;
-///   declared-column predicates are NOT extracted into the prune or
-///   content-predicate channels in this ADR (a typed comparison is a residual
-///   filter above the scan; typed-predicate pushdown is #278).
+///   selection exactly like the content- and erasure-predicate contributors do.
+///   Since #278/ADR-0093, an I64/Bool comparison or a Str/Bytes equality on a
+///   declared column IS extracted into the prune-only channel
+///   (`crate::logs_pushdown::extract_logs`) -- see that module's doc for the
+///   exact allowlist. The declared column is still, separately, added to the
+///   selection here regardless, because the prune channel narrows candidate
+///   blocks but never substitutes for DataFusion's own Inexact residual
+///   re-evaluation of the original predicate above the scan.
 ///
 /// The prune-only channel contributes nothing: its arms drive POSTINGS block
 /// pruning and are never evaluated per row, so no page has to be decoded for
