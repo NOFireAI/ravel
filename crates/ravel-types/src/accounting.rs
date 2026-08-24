@@ -114,6 +114,15 @@ struct Inner {
     segments_pruned: AtomicU64,
     series_matched: AtomicU64,
     bytes_reused: AtomicU64,
+    /// Stored bytes of pages present in the RLOG blocks a logs scan decoded,
+    /// regardless of column filtering. Decode-time column-filtering
+    /// measurement, NOT wire bytes; see `ops`'s `s3_bytes` for wire bytes
+    /// (ADR-0107 decision 4).
+    page_bytes_fetched: AtomicU64,
+    /// Stored bytes of the pages a logs scan actually decoded after column
+    /// filtering. Decode-time column-filtering measurement, NOT wire bytes; see
+    /// `ops`'s `s3_bytes` for wire bytes (ADR-0107 decision 4).
+    page_bytes_decoded: AtomicU64,
     /// Recorded as a running maximum (compare-and-swap loop), never a sum;
     /// see [`QueryAccounting::observe_intermediate_bytes`].
     peak_intermediate_bytes: AtomicU64,
@@ -193,6 +202,27 @@ impl QueryAccounting {
         self.0.bytes_reused.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Add stored bytes of pages present in the RLOG blocks a logs scan
+    /// decoded, regardless of column filtering (the "fetched" side of ADR-0107
+    /// decision 4's decode-time measurement). This is NOT wire-byte accounting:
+    /// actual bytes moved over the wire stay measured by [`Self::add_s3_bytes`].
+    /// Paired with [`Self::add_page_bytes_decoded`], the two expose how much of
+    /// each fetched block a narrow projection throws away at decode.
+    pub fn add_page_bytes_fetched(&self, bytes: u64) {
+        self.0
+            .page_bytes_fetched
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Add stored bytes of the pages a logs scan actually decoded after column
+    /// filtering (the "decoded" side of ADR-0107 decision 4). NOT wire bytes;
+    /// see [`Self::add_s3_bytes`] for wire bytes.
+    pub fn add_page_bytes_decoded(&self, bytes: u64) {
+        self.0
+            .page_bytes_decoded
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Update the peak intermediate byte high-water mark. This is a
     /// maximum, never a sum: call it with the current intermediate size at
     /// each point it might grow, and the counter keeps the largest value
@@ -241,6 +271,8 @@ impl QueryAccounting {
         saturating_fetch_add(&self.0.segments_pruned, other.segments_pruned);
         saturating_fetch_add(&self.0.series_matched, other.series_matched);
         saturating_fetch_add(&self.0.bytes_reused, other.bytes_reused);
+        saturating_fetch_add(&self.0.page_bytes_fetched, other.page_bytes_fetched);
+        saturating_fetch_add(&self.0.page_bytes_decoded, other.page_bytes_decoded);
         self.observe_intermediate_bytes(other.peak_intermediate_bytes);
     }
 
@@ -266,6 +298,8 @@ impl QueryAccounting {
             segments_pruned: self.0.segments_pruned.load(Ordering::Relaxed),
             series_matched: self.0.series_matched.load(Ordering::Relaxed),
             bytes_reused: self.0.bytes_reused.load(Ordering::Relaxed),
+            page_bytes_fetched: self.0.page_bytes_fetched.load(Ordering::Relaxed),
+            page_bytes_decoded: self.0.page_bytes_decoded.load(Ordering::Relaxed),
             peak_intermediate_bytes: self.0.peak_intermediate_bytes.load(Ordering::Relaxed),
         }
     }
@@ -289,6 +323,16 @@ pub struct QueryAccountingSnapshot {
     pub segments_pruned: u64,
     pub series_matched: u64,
     pub bytes_reused: u64,
+    /// Stored bytes of pages present in the RLOG blocks a logs scan decoded,
+    /// regardless of column filtering. A decode-time column-filtering
+    /// measurement, NOT wire bytes; see [`Self::s3_bytes`] for wire bytes
+    /// (ADR-0107 decision 4).
+    pub page_bytes_fetched: u64,
+    /// Stored bytes of the pages a logs scan actually decoded after column
+    /// filtering. Equal to `page_bytes_fetched` for an all-columns scan; the
+    /// gap to it is the column-filtering waste. NOT wire bytes; see
+    /// [`Self::s3_bytes`] for wire bytes (ADR-0107 decision 4).
+    pub page_bytes_decoded: u64,
     pub peak_intermediate_bytes: u64,
 }
 
@@ -354,6 +398,12 @@ impl QueryAccountingSnapshot {
             segments_pruned: self.segments_pruned.saturating_add(other.segments_pruned),
             series_matched: self.series_matched.saturating_add(other.series_matched),
             bytes_reused: self.bytes_reused.saturating_add(other.bytes_reused),
+            page_bytes_fetched: self
+                .page_bytes_fetched
+                .saturating_add(other.page_bytes_fetched),
+            page_bytes_decoded: self
+                .page_bytes_decoded
+                .saturating_add(other.page_bytes_decoded),
             peak_intermediate_bytes: self
                 .peak_intermediate_bytes
                 .max(other.peak_intermediate_bytes),

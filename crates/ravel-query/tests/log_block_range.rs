@@ -46,7 +46,7 @@ use ravel_object_store::{
 };
 use ravel_query::{BlockRangeFetcher, LogFetchError, LogQuery, LogSegmentFetcher};
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -87,6 +87,31 @@ fn record(name: &str, ts: i64, body: &str) -> LogRecord {
         span_id: None,
         flags: 0,
         attrs: Vec::new(),
+    }
+}
+
+/// A record carrying five distinct string attributes, so its block gets five
+/// dynamic columns a narrow projection can skip (on top of the always-present
+/// fixed columns). Used by the decode-accounting test to create real
+/// column-filtering waste.
+fn record_with_attrs(name: &str, ts: i64, body: &str) -> LogRecord {
+    let resource = vec![("service.name".to_string(), AttrValue::Str(name.to_string()))];
+    let attrs = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|k| (k.to_string(), AttrValue::Str(format!("{k}{ts}"))))
+        .collect();
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body.into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs,
     }
 }
 
@@ -1043,5 +1068,135 @@ async fn corrupt_block_hit_fails_closed_with_only_blocks_resident() {
     assert!(
         matches!(err, LogFetchError::Corrupt { .. }),
         "expected Corrupt from the per-block gate, got {err:?}"
+    );
+}
+
+// ---- Decode-time page accounting (ADR-0107 decision 4) --------------------
+
+/// `page_bytes_fetched`/`page_bytes_decoded` (ADR-0107 decision 4) populate on
+/// the same `QueryAccounting` handle T1 records wire bytes against, as a
+/// SEPARATE, ADDITIVE axis -- not a repurposing of the wire-byte counters.
+///
+/// The fixture forces the T1 block-range path (`with_block_range_threshold(0)`),
+/// so both axes are exercised in one scan. Two scans over the same segment, one
+/// all-columns and one projecting a single attribute, prove the split:
+///
+/// - Wire bytes (`total_s3_bytes`, `AccountedOp::Get`) are IDENTICAL across the
+///   two projections and non-zero: column filtering is decode-time only, so the
+///   block-range path fetches the same bytes regardless of the projection. This
+///   is the regression guard that the new pair did not repurpose an existing
+///   wire counter.
+/// - `page_bytes_fetched` is filter-independent (every present page counts) and
+///   equal across the two scans; `page_bytes_decoded` is strictly smaller under
+///   the narrow projection -- the column-filtering waste this axis measures.
+/// - The `QueryAccounting` totals equal the scan's own `ScanStats` totals,
+///   proving `LogSegmentScan::finish` folds them through exactly.
+#[tokio::test]
+async fn page_decode_accounting_is_a_separate_axis_from_wire_bytes() {
+    let records: Vec<LogRecord> = (0..12)
+        .map(|ts| record_with_attrs("api", ts, "body"))
+        .collect();
+    let bytes = build_object(&records);
+    let (_blocks_offset, _blocks_len, tail_len) = layout(&bytes);
+    let (ts_min, ts_max) = (3, 9);
+
+    let mem = Arc::new(MemoryStore::new());
+    mem.put("logs/pa.rlog", bytes.clone().into(), PutOptions::default())
+        .await
+        .expect("put");
+    let seg = seg_ref("logs/pa.rlog", bytes.len() as u64, &records);
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let query = LogQuery::new(ts_min, ts_max);
+
+    // Fresh fetcher per scan (no cache), forced onto the T1 block-range path so
+    // the wire-byte counters are genuinely exercised alongside the new pair.
+    let run = |columns: ravel_logseg::ColumnSelection| {
+        let store = Arc::clone(&store);
+        let seg = seg.clone();
+        let query = query.clone();
+        async move {
+            let br = BlockRangeFetcher::new(Arc::clone(&store))
+                .with_whole_object_threshold(0)
+                .with_suffix_len(tail_len)
+                .with_coverage_threshold(2.0);
+            let fetcher = LogSegmentFetcher::new(store)
+                .with_block_range_threshold(0)
+                .with_block_range(br);
+            let acc = QueryAccounting::new();
+            let mut scan = fetcher
+                .scan_accounted_with_tenant(&seg, TENANT, &query, &columns, &acc)
+                .await
+                .expect("scan")
+                .expect("in range");
+            let mut rows = 0usize;
+            while let Some(block) = scan.next_block().expect("decode") {
+                rows += block.len();
+            }
+            let stats = scan.stats();
+            (acc.snapshot(), stats, rows)
+        }
+    };
+
+    let (all_snap, all_stats, all_rows) = run(ravel_logseg::ColumnSelection::all()).await;
+    let (proj_snap, proj_stats, proj_rows) =
+        run(ravel_logseg::ColumnSelection::fixed_only().with_attr("a")).await;
+
+    // Both projections match the same rows (projection changes decode, not which
+    // rows survive the exact filter).
+    assert_eq!(
+        all_rows, proj_rows,
+        "projection must not change matched rows"
+    );
+    assert_eq!(
+        all_rows,
+        (ts_max - ts_min + 1) as usize,
+        "ts range [3,9] selects seven one-record blocks"
+    );
+
+    // finish() folds the scan's ScanStats page-byte totals into the handle
+    // exactly (deliverable 3 wiring).
+    assert_eq!(all_snap.page_bytes_fetched, all_stats.page_bytes_fetched);
+    assert_eq!(all_snap.page_bytes_decoded, all_stats.page_bytes_decoded);
+    assert_eq!(proj_snap.page_bytes_fetched, proj_stats.page_bytes_fetched);
+    assert_eq!(proj_snap.page_bytes_decoded, proj_stats.page_bytes_decoded);
+
+    // An all-columns scan decodes every fetched page byte.
+    assert!(all_snap.page_bytes_fetched > 0, "some pages were decoded");
+    assert_eq!(
+        all_snap.page_bytes_decoded, all_snap.page_bytes_fetched,
+        "an all-columns scan decodes every fetched page byte"
+    );
+
+    // Fetched is filter-independent: the projection fetched the same pages.
+    assert_eq!(
+        proj_snap.page_bytes_fetched, all_snap.page_bytes_fetched,
+        "page_bytes_fetched counts every present page, projection or not"
+    );
+    // Decoded is strictly smaller under the narrow projection: real waste.
+    assert!(
+        proj_snap.page_bytes_decoded < proj_snap.page_bytes_fetched,
+        "narrow projection must decode strictly fewer page bytes: {} < {}",
+        proj_snap.page_bytes_decoded,
+        proj_snap.page_bytes_fetched
+    );
+
+    // The regression guard: wire bytes are UNCHANGED by projection and by the
+    // new pair. Same query, same pruning, same block-range fetch, so T1's
+    // wire-byte and GET counters are byte-identical across the two scans; the
+    // page-byte pair is additive, not a repurposing of these counters.
+    assert!(
+        all_snap.total_s3_bytes() > 0,
+        "T1 block-range fetch must record wire bytes"
+    );
+    assert_eq!(
+        all_snap.total_s3_bytes(),
+        proj_snap.total_s3_bytes(),
+        "wire bytes are unchanged by projection; page-byte pair is a separate axis"
+    );
+    assert!(all_snap.s3_requests(AccountedOp::Get) > 0);
+    assert_eq!(
+        all_snap.s3_requests(AccountedOp::Get),
+        proj_snap.s3_requests(AccountedOp::Get),
+        "the T1 GET count is unmoved by the decode-time pair"
     );
 }

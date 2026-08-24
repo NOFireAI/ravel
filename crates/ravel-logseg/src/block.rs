@@ -512,6 +512,8 @@ pub struct DecodedBlock {
     attrs_raw_page: bool,
     pages_decoded: usize,
     pages_skipped: usize,
+    page_bytes_fetched: u64,
+    page_bytes_decoded: u64,
 }
 
 impl DecodedBlock {
@@ -530,6 +532,24 @@ impl DecodedBlock {
     /// projection reached the page level rather than being applied after decode.
     pub fn pages_skipped(&self) -> usize {
         self.pages_skipped
+    }
+
+    /// Stored bytes of every page present in this block, regardless of whether
+    /// the column filter kept it: the "fetched" side of ADR-0107 decision 4's
+    /// decode-time column-filtering measurement. Summed from each
+    /// [`PageDesc::len`], so it counts stored (post-compression) bytes, the same
+    /// units the block's payload occupies -- decode-time accounting, not wire
+    /// bytes.
+    pub fn page_bytes_fetched(&self) -> u64 {
+        self.page_bytes_fetched
+    }
+
+    /// Stored bytes of the pages this decode actually decompressed and decoded,
+    /// i.e. only the columns the filter kept: the "decoded" side of the same
+    /// measurement. Equal to [`Self::page_bytes_fetched`] for an all-columns
+    /// decode; strictly less whenever a projection skipped any present page.
+    pub fn page_bytes_decoded(&self) -> u64 {
+        self.page_bytes_decoded
     }
 
     /// Whether this block carries any page for the `attrs_raw` overflow column.
@@ -806,6 +826,11 @@ pub fn read_block_columns(
     let mut page_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(descs.len());
     let mut pages_decoded = 0usize;
     let mut pages_skipped = 0usize;
+    // "Fetched" sums every present page's stored length; "decoded" sums only the
+    // pages the filter kept. Their gap is the column-filtering waste (ADR-0107
+    // decision 4). Stored (post-compression) bytes, matching `PageDesc::len`.
+    let mut page_bytes_fetched = 0u64;
+    let mut page_bytes_decoded = 0u64;
     for d in &descs {
         let len = usize::try_from(d.len)
             .map_err(|_| LogSegError::Corrupted("page len out of range".into()))?;
@@ -815,9 +840,11 @@ pub fn read_block_columns(
         let stored = bytes
             .get(pos..end)
             .ok_or_else(|| LogSegError::Corrupted("page range out of bounds".into()))?;
+        page_bytes_fetched = page_bytes_fetched.saturating_add(d.len);
         if wanted(d.column_id) {
             page_bytes.push(Some(read_page(stored, d, max_uncomp)?));
             pages_decoded += 1;
+            page_bytes_decoded = page_bytes_decoded.saturating_add(d.len);
         } else {
             page_bytes.push(None);
             pages_skipped += 1;
@@ -857,6 +884,8 @@ pub fn read_block_columns(
         attrs_raw_page: descs.iter().any(|d| d.column_id == COL_ATTRS_RAW),
         pages_decoded,
         pages_skipped,
+        page_bytes_fetched,
+        page_bytes_decoded,
     };
 
     for column_id in order {
@@ -1271,6 +1300,110 @@ mod tests {
     /// A filter never weakens the integrity checks: the block crc still covers
     /// the whole block, so a corrupted byte inside a *skipped* column's page is
     /// still caught.
+    /// `page_bytes_fetched`/`page_bytes_decoded` split each block's page bytes
+    /// by the column filter (ADR-0107 decision 4). Every dynamic column here is
+    /// present in every row, so each maps to exactly one page and the byte
+    /// totals are the sums of those pages' stored lengths -- pinned exactly by
+    /// decomposition, not by inequality: fetched is the sum over every present
+    /// column, decoded is the sum over only the kept columns.
+    #[test]
+    fn page_byte_accounting_splits_fetched_and_decoded_by_filter() {
+        let plans: Vec<ColumnPlan> = (10..15)
+            .map(|column_id| ColumnPlan {
+                column_id,
+                ty: FieldType::Str,
+            })
+            .collect();
+        let mut rows = Vec::new();
+        for i in 0..64i64 {
+            let mut r = row(0, 1000 + i);
+            for p in &plans {
+                r.columns.push((
+                    p.column_id,
+                    ColumnValue::Str(format!("c{}r{i}", p.column_id).into_bytes()),
+                ));
+            }
+            rows.push(r);
+        }
+        let out = write_block(&rows, &plans, 3).expect("write");
+
+        // Single-column decode of one raw column id: its one page's stored bytes.
+        // `read_block_columns` takes raw ids and adds nothing implicit, so this
+        // isolates exactly that column's page (present in every row => no
+        // presence bitmap, one page per column).
+        let single = |cid: u32| {
+            let keep: HashSet<u32> = HashSet::from([cid]);
+            read_block_columns(&out.bytes, out.crc32c, &plans, 1 << 30, Some(&keep))
+                .expect("read")
+                .page_bytes_decoded()
+        };
+
+        let all = read_block(&out.bytes, out.crc32c, &plans, 1 << 30).expect("read all");
+        let fetched = all.page_bytes_fetched();
+        assert!(fetched > 0);
+        assert_eq!(
+            all.page_bytes_decoded(),
+            fetched,
+            "an all-columns decode decodes every fetched page byte"
+        );
+
+        // Fetched is the exact sum over every present column's page bytes: the
+        // seven always-present fixed columns plus the five dynamic ones.
+        let present: [u32; 12] = [
+            COL_TS,
+            COL_OBSERVED_TS,
+            COL_STREAM_REF,
+            COL_SEVERITY_NUM,
+            COL_FLAGS,
+            COL_SEVERITY_TEXT,
+            COL_BODY,
+            10,
+            11,
+            12,
+            13,
+            14,
+        ];
+        let fetched_oracle: u64 = present.iter().map(|&c| single(c)).sum();
+        assert_eq!(
+            fetched, fetched_oracle,
+            "fetched bytes are the sum of every present column's page bytes"
+        );
+
+        // A strict projection: decoded is exactly the kept columns' page bytes,
+        // fetched is unchanged, and the split is exact (decoded + skipped ==
+        // fetched).
+        let keep: HashSet<u32> = HashSet::from([COL_TS, 11, 13]);
+        let projected =
+            read_block_columns(&out.bytes, out.crc32c, &plans, 1 << 30, Some(&keep)).expect("read");
+        assert_eq!(
+            projected.page_bytes_fetched(),
+            fetched,
+            "fetched is filter-independent: every present page counts"
+        );
+        let kept_oracle: u64 = single(COL_TS) + single(11) + single(13);
+        assert_eq!(
+            projected.page_bytes_decoded(),
+            kept_oracle,
+            "decoded is exactly the kept columns' page bytes"
+        );
+        assert!(
+            projected.page_bytes_decoded() < fetched,
+            "a strict projection decodes strictly fewer bytes than are present: {} < {}",
+            projected.page_bytes_decoded(),
+            fetched
+        );
+        let skipped_bytes = fetched - projected.page_bytes_decoded();
+        let skipped_oracle: u64 = present
+            .iter()
+            .filter(|c| !keep.contains(c))
+            .map(|&c| single(c))
+            .sum();
+        assert_eq!(
+            skipped_bytes, skipped_oracle,
+            "skipped bytes are exactly the excluded columns' page bytes"
+        );
+    }
+
     #[test]
     fn column_filter_still_verifies_the_whole_block_crc() {
         let plans = vec![ColumnPlan {
