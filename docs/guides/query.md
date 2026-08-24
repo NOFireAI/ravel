@@ -331,11 +331,23 @@ column. Declared keys still appear in `attrs`. A declaration comes from the serv
 `--typed-attr-column` flags or from the durable per-tenant override written by
 `ravel-cli typed-attr-column set`, and a query process picks a durable change
 up within 60s. Querying an undeclared column is an unknown-column error, and a
-row whose stored value has another type reads NULL rather than being cast. See
+row whose stored value has another type reads NULL rather than being cast.
+
+A predicate on a declared column now prunes blocks before decode (ADR-0093), so
+it is no longer slower than the equivalent `attrs['k']` filter. A selective
+`i64`/`bool` comparison, `BETWEEN`, or `i64` `IN (...)` skips blocks through the
+RLOG skip index (`status_code > 500`, `is_active = true`, `status_code IN (200,
+404)`), and a `str`/`bytes` equality prunes through POSTINGS exactly like
+`attrs['k'] = 'v'`. Pruning is always widen-only: the original predicate is
+re-applied above the scan, so the `IN` envelope's coarser range and any
+type-mismatched shape (`!=`, a range on a `str` column, a float compared to an
+`i64` column) never change which rows return, only which blocks the fetch reads.
+Two caveats carry over unchanged: the `str`/`bytes` equality half sees no
+pruning benefit on a POSTINGS section written before the #333 write-path fix, and
+a name that also carries a non-`str` column anywhere declines equality pruning
+for that name. See
 [operations.md](operations.md#declared-typed-attribute-columns-adr-0090) and
-docs/query-engine.md for the full contract, including why an equality predicate
-moved onto a declared column is slower than the equivalent `attrs['k'] = 'v'`
-today.
+docs/query-engine.md for the full contract.
 
 ### Declaring typed attribute columns
 

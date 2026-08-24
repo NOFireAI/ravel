@@ -1233,6 +1233,39 @@ never drop a true result):
   match. The merged `attrs` residual evaluates the equality exactly.
   `attrs['k'] IN (...)` stays unextracted, because an `IN` list is a
   disjunction the intersecting prune channel cannot represent soundly.
+- A predicate on a **declared typed column** (ADR-0093). `extract_logs` resolves
+  a bare `Expr::Column` whose name is not one of the nine fixed columns against
+  the tenant's declared vocabulary and dispatches on the declared type:
+  - `i64`/`bool` with `<`, `<=`, `>`, `>=`, `=`, or `BETWEEN` against a
+    matching-type literal → a prune-only `Predicate::NumRange` with bit-pattern
+    bounds, driving the RLOG skip index's per-block `NumStat` min/max (ADR-0095,
+    #331). `status_code > 500` and `is_active = true` now skip blocks that
+    provably hold no matching value.
+  - `i64` `IN (v1, v2, ...)` → ONE envelope `NumRange` spanning `[min, max]`, not
+    one arm per value (the reader intersects prune arms, so a per-value arm would
+    drop rows the full `IN` keeps). The envelope is coarser than the exact set,
+    so a value between the listed ones is excluded by the residual, never the
+    prune. DataFusion's simplifier rewrites a small `IN` into a same-column
+    `col = v1 OR col = v2 OR ...` disjunction before the scan; that shape maps to
+    the same envelope.
+  - `str`/`bytes` `=` against a matching-type literal → the same
+    `Predicate::Equals` the `attrs['k'] = 'v'` shape builds, driving POSTINGS.
+  Everything else — `!=`, `NOT`, negated `BETWEEN`, `IS [NOT] NULL`, a general
+  `OR`, a range operator on a `str`/`bytes` column, a `str`/`bytes` `IN`, or a
+  type-mismatched literal (including one DataFusion coercion has already wrapped
+  in a `Cast`, which is no longer a bare column) — is not extracted and scans as
+  before. Two soundness caveats are inherited, not new: the equality half
+  declines all pruning on a POSTINGS section written before the #333 write-path
+  fix (a section-version gate, so no per-predicate code carries it), and inherits
+  the over-conservative rule that a name also carrying a non-`str` column
+  anywhere declines equality pruning entirely (a performance no-op, not a
+  correctness gap). The `NumRange` half has no version gate: under ADR-0095's
+  single-version RLOG regime every stat is merged-view-correct, and a block with
+  no stat for the column (an object predating the declaration) is scanned, never
+  pruned (ADR-0013). `f64` is not reachable yet (no declared `f64` type); its
+  future arm must honor `NumRange`'s float contract (widen a zero-including range
+  across both `0.0`/`-0.0` bit patterns, never build a bound from a NaN literal),
+  which the i64/bool code does not need.
 
 ### Declared typed attribute columns (ADR-0090)
 
@@ -1285,15 +1318,18 @@ last resolved declaration instead and counts
 [guides/operations.md](guides/operations.md#declared-typed-attribute-columns-adr-0090)
 for the operator-facing contract.
 
-Predicates on a declared column are NOT pushed down in this version: a typed
-comparison is evaluated as a residual filter above the scan (typed-predicate
-pushdown is #278). A declared column referenced by the query's projection --
-which DataFusion also folds residual-filter columns into -- is decoded by the
-scan's column selection, so `WHERE` on a declared column still decodes only the
-pages it needs. The practical consequence: moving an equality predicate from
-`attrs['k'] = 'v'` (which prunes blocks through POSTINGS) to a declared
-`k = 'v'` makes it slower until #278 lands. Declare for typed comparisons and
-aggregates, which the map cannot express at all.
+Predicates on a declared column are pushed down as prune-only arms (ADR-0093):
+an `i64`/`bool` comparison or `BETWEEN` and an `i64` `IN` drive the skip index,
+and a `str`/`bytes` equality drives POSTINGS, exactly as the "Supported
+predicates" list above describes. The pushdown is always `Inexact`, so the typed
+comparison is still re-evaluated exactly as a residual filter above the scan; the
+prune only changes which blocks the fetch decodes. A declared column referenced
+by the query's projection -- which DataFusion also folds residual-filter columns
+into -- is decoded by the scan's column selection, so `WHERE` on a declared
+column decodes only the pages it needs. Moving an equality predicate from
+`attrs['k'] = 'v'` to a declared `k = 'v'` now prunes through the same POSTINGS
+index (subject to the section-version caveat above). Declare for typed
+comparisons and aggregates, which the map cannot express at all.
 
 There is also a wire-size trade for a *high-cardinality* `str` column. ADR-0099
 decision 5's "leaves that case exactly as expensive as it is today" is a

@@ -191,7 +191,11 @@ impl LogsTableProvider {
         target_partitions: usize,
         filters: &[Expr],
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(target_partitions, &extract_logs(filters), None)
+        self.build_scan(
+            target_partitions,
+            &extract_logs(filters, self.declared.as_ref()),
+            None,
+        )
     }
 
     /// Admission (the sealed-segment cap) is decided exactly once, at
@@ -302,7 +306,7 @@ impl TableProvider for LogsTableProvider {
         }
 
         let target_partitions = state.config().target_partitions();
-        let pushdown = extract_logs(filters);
+        let pushdown = extract_logs(filters, self.declared.as_ref());
         // Projection pushdown reaches the reader (ADR-0087 decision 3): the
         // scan's output schema *is* the projection, and the resolved column set
         // stops the RLOG reader decoding the pages of columns nothing reads.
@@ -1245,6 +1249,436 @@ mod tests {
             rows(&batches),
             BTreeSet::from([(10, "out of window".to_string())]),
             "only the in-window (ts=5) row is erased; ts=10 survives"
+        );
+    }
+
+    // --- declared typed column pushdown (ADR-0093) ---------------------------
+
+    use crate::declared::{DeclaredColumn, DeclaredType};
+    use crate::logs_pushdown::extract_logs;
+
+    /// Twelve one-record blocks on one stream, ts 1..=12, each carrying a
+    /// per-record I64 `status_code = ts * 100`. The skip index folds a `NumStat`
+    /// for the (status_code, I64) column with no POSTINGS indexing needed.
+    fn i64_code_records() -> Vec<LogRecord> {
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        (1..=12)
+            .map(|ts| {
+                record(
+                    &worker,
+                    &[("status_code".to_string(), AttrValue::I64(ts * 100))],
+                    ts,
+                    &format!("body {ts}"),
+                )
+            })
+            .collect()
+    }
+
+    fn i64_status_code() -> Vec<DeclaredColumn> {
+        vec![DeclaredColumn::new("status_code", DeclaredType::I64)]
+    }
+
+    /// TEST 1: a selective I64 comparison on a declared column reduces
+    /// `blocks_scanned` through the skip index (#331), following #331's own
+    /// counter-assertion pattern. `status_code >= 1100` keeps only the two
+    /// blocks whose code is 1100/1200; the other ten never decode.
+    #[tokio::test]
+    async fn declared_i64_comparison_reduces_blocks_scanned() {
+        let store = MemoryStore::new();
+        let seg = write_object_with(
+            &store,
+            "logs/decl-i64.rlog",
+            &i64_code_records(),
+            one_record_per_block(),
+            &[],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            QueryAccounting::new(),
+        )
+        .with_declared_columns(i64_status_code());
+        let ctx = logs_session(provider).expect("build session");
+
+        let (rows_got, counts) =
+            run_counted(&ctx, "SELECT ts, body FROM logs WHERE status_code >= 1100").await;
+        assert_eq!(
+            rows_got,
+            BTreeSet::from([(11, "body 11".to_string()), (12, "body 12".to_string())]),
+        );
+        assert_eq!(
+            counts,
+            ScanCounts {
+                total: 12,
+                scanned: 2,
+                pruned_by_postings: 0,
+            },
+            "the skip index leaves only the two in-range blocks"
+        );
+        assert!(
+            counts.scanned < counts.total,
+            "the numeric prune reduced blocks_scanned"
+        );
+    }
+
+    /// TEST 2: a selective declared-Str equality reduces `blocks_pruned_by_postings`
+    /// via POSTINGS, matching the existing `attrs['k']='v'` test's assertion shape.
+    /// `region` is indexed and only ts=5 carries `region = 'eu'`.
+    #[tokio::test]
+    async fn declared_str_equality_prunes_via_postings() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records: Vec<LogRecord> = (1..=12)
+            .map(|ts| {
+                let region = if ts == 5 { "eu" } else { "us" };
+                record(
+                    &worker,
+                    &[("region".to_string(), s(region))],
+                    ts,
+                    &format!("body {ts}"),
+                )
+            })
+            .collect();
+        let seg = write_object_with(
+            &store,
+            "logs/decl-str.rlog",
+            &records,
+            one_record_per_block(),
+            &["region"],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            QueryAccounting::new(),
+        )
+        .with_declared_columns(vec![DeclaredColumn::new("region", DeclaredType::Str)]);
+        let ctx = logs_session(provider).expect("build session");
+
+        let (rows_got, counts) =
+            run_counted(&ctx, "SELECT ts, body FROM logs WHERE region = 'eu'").await;
+        assert_eq!(rows_got, BTreeSet::from([(5, "body 5".to_string())]));
+        assert_eq!(
+            counts,
+            ScanCounts {
+                total: 12,
+                scanned: 1,
+                pruned_by_postings: 11,
+            },
+            "the declared-Str equality reached POSTINGS and left one block"
+        );
+    }
+
+    /// TEST 3: the same query with an extractable prune arm and without one
+    /// returns identical rows while reading a different number of blocks. The
+    /// pruned query is `status_code = 500`; the plain query OR-s it with a
+    /// body equality no record satisfies, an unextractable disjunction across
+    /// two columns, so `extract_logs` yields no prune arm and the scan decodes
+    /// every block. `FALSE OR FALSE` filters those rows in the residual, so the
+    /// rows are identical: the pair differs only in whether the prune bit.
+    #[tokio::test]
+    async fn declared_i64_prune_changes_no_row() {
+        let store = MemoryStore::new();
+        let seg = write_object_with(
+            &store,
+            "logs/decl-diff.rlog",
+            &i64_code_records(),
+            one_record_per_block(),
+            &[],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            QueryAccounting::new(),
+        )
+        .with_declared_columns(i64_status_code());
+        let ctx = logs_session(provider).expect("build session");
+
+        let (pruned_rows, pruned) =
+            run_counted(&ctx, "SELECT ts, body FROM logs WHERE status_code = 500").await;
+        let (plain_rows, plain) = run_counted(
+            &ctx,
+            "SELECT ts, body FROM logs WHERE status_code = 500 OR body = 'zzz'",
+        )
+        .await;
+
+        let expected = BTreeSet::from([(5, "body 5".to_string())]);
+        assert_eq!(pruned_rows, expected);
+        assert_eq!(plain_rows, expected);
+        assert_eq!(pruned_rows, plain_rows, "the prune changed no row");
+        assert_eq!(plain.scanned, 12, "the OR shape decodes every block");
+        assert_eq!(pruned.scanned, 1, "the equality prune leaves one block");
+        assert!(pruned.scanned < plain.scanned);
+    }
+
+    /// TEST 4: a predicate on a declared column absent from some objects (a
+    /// tenant that added the column later) still returns correct results. Object
+    /// A carries `status_code`; object B does not. The absence rule (a block with
+    /// no stat is never pruned, ADR-0013) is already proven at the reader; this
+    /// exercises it through this ADR's NEW extraction call site. Object B's two
+    /// blocks must all be SCANNED (not pruned by a stat they lack), which the
+    /// counter proves: a bug pruning no-stat objects would drop `scanned` to 2.
+    #[tokio::test]
+    async fn declared_column_absent_from_some_objects_returns_correct_results() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let seg_a = write_object_with(
+            &store,
+            "logs/decl-a.rlog",
+            &i64_code_records(),
+            one_record_per_block(),
+            &[],
+        )
+        .await;
+        // Object B predates the column: ts 13/14, no `status_code` anywhere.
+        let b_records = vec![
+            record(&worker, &[], 13, "body 13"),
+            record(&worker, &[], 14, "body 14"),
+        ];
+        let seg_b = write_object_with(
+            &store,
+            "logs/decl-b.rlog",
+            &b_records,
+            one_record_per_block(),
+            &[],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg_a, seg_b],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            QueryAccounting::new(),
+        )
+        .with_declared_columns(i64_status_code());
+        let ctx = logs_session(provider).expect("build session");
+
+        let (rows_got, counts) =
+            run_counted(&ctx, "SELECT ts, body FROM logs WHERE status_code >= 1100").await;
+        // B's rows have a NULL status_code, so the residual `>= 1100` drops them.
+        assert_eq!(
+            rows_got,
+            BTreeSet::from([(11, "body 11".to_string()), (12, "body 12".to_string())]),
+        );
+        assert_eq!(
+            counts,
+            ScanCounts {
+                total: 14,
+                scanned: 4,
+                pruned_by_postings: 0,
+            },
+            "A's ten out-of-range blocks prune; B's two no-stat blocks must NOT"
+        );
+    }
+
+    /// TEST 5: an `IN (v1, v2, v3)` over a declared I64 column returns correct
+    /// results even though the envelope range is coarser than the exact set. A
+    /// value strictly between the IN set's min and max but not a member (code
+    /// 500, between 200 and 800) exists in the data. The envelope `[200, 800]`
+    /// keeps its block (the prune alone cannot exclude it), so correctness rests
+    /// on the Inexact residual excluding it. Proven by the final row set: ts=3
+    /// (code 500) is absent, while its block WAS scanned.
+    #[tokio::test]
+    async fn declared_i64_in_list_envelope_is_corrected_by_residual() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let codes = [100i64, 200, 500, 800, 900];
+        let records: Vec<LogRecord> = codes
+            .iter()
+            .enumerate()
+            .map(|(i, &code)| {
+                let ts = i as i64 + 1;
+                record(
+                    &worker,
+                    &[("status_code".to_string(), AttrValue::I64(code))],
+                    ts,
+                    &format!("body {ts}"),
+                )
+            })
+            .collect();
+        let seg = write_object_with(
+            &store,
+            "logs/decl-in.rlog",
+            &records,
+            one_record_per_block(),
+            &[],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            QueryAccounting::new(),
+        )
+        .with_declared_columns(i64_status_code());
+        let ctx = logs_session(provider).expect("build session");
+
+        let (rows_got, counts) = run_counted(
+            &ctx,
+            "SELECT ts, body FROM logs WHERE status_code IN (200, 800)",
+        )
+        .await;
+        // ts=3 (code 500) is inside the envelope but not in the set: the residual
+        // must exclude it, never the prune.
+        assert_eq!(
+            rows_got,
+            BTreeSet::from([(2, "body 2".to_string()), (4, "body 4".to_string())]),
+            "the in-envelope non-member (code 500) is excluded by the residual"
+        );
+        assert_eq!(
+            counts,
+            ScanCounts {
+                total: 5,
+                scanned: 3,
+                pruned_by_postings: 0,
+            },
+            "codes 100 and 900 prune; the envelope keeps 200/500/800's blocks"
+        );
+    }
+
+    /// TEST 8 (CRITICAL): the decline of `!=` and of a type-mismatched literal
+    /// must hold against the filters DataFusion's optimizer actually hands to
+    /// `TableProvider::scan`, not a hand-built `Expr`. A type-coercion pass can
+    /// rewrite `status_code > 2.5` into a `Cast`-wrapped comparison before the
+    /// extractor sees it; the extractor must still decline (a `Cast` is not a bare
+    /// `Expr::Column`, so resolution fails). Built over a real
+    /// `LogsTableProvider`/session and read off the optimized `LogicalPlan`.
+    #[tokio::test]
+    async fn declined_shapes_decline_on_real_optimized_filters() {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::LogicalPlan;
+
+        fn table_scan_filters(plan: &LogicalPlan) -> Vec<Expr> {
+            if let LogicalPlan::TableScan(ts) = plan {
+                return ts.filters.clone();
+            }
+            for input in plan.inputs() {
+                let f = table_scan_filters(input);
+                if !f.is_empty() {
+                    return f;
+                }
+            }
+            Vec::new()
+        }
+
+        fn contains_cast(e: &Expr) -> bool {
+            let mut found = false;
+            e.apply(|node| {
+                if matches!(node, Expr::Cast(_) | Expr::TryCast(_)) {
+                    found = true;
+                    Ok(TreeNodeRecursion::Stop)
+                } else {
+                    Ok(TreeNodeRecursion::Continue)
+                }
+            })
+            .expect("walk");
+            found
+        }
+
+        let store = MemoryStore::new();
+        let seg = write_object_with(
+            &store,
+            "logs/decl-real.rlog",
+            &i64_code_records(),
+            one_record_per_block(),
+            &[],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            QueryAccounting::new(),
+        )
+        .with_declared_columns(i64_status_code());
+        let ctx = logs_session(provider).expect("build session");
+        let declared = i64_status_code();
+
+        // `!=` on a declared column: the optimizer keeps it a `NotEq`, not in the
+        // comparison allowlist, so no prune arm.
+        let plan = ctx
+            .sql("SELECT ts, body FROM logs WHERE status_code != 500")
+            .await
+            .expect("plan")
+            .into_optimized_plan()
+            .expect("optimize");
+        let ne_filters = table_scan_filters(&plan);
+        assert!(
+            !ne_filters.is_empty(),
+            "the != predicate must reach the scan"
+        );
+        assert!(
+            extract_logs(&ne_filters, &declared).prune.is_empty(),
+            "!= must produce no prune arm on the real optimized filter"
+        );
+
+        // Type-mismatched literal: the optimizer coerces `status_code > 2.5` by
+        // casting the Int64 column to Float64. The extractor must decline on the
+        // Cast-wrapped operand it actually receives.
+        let plan = ctx
+            .sql("SELECT ts, body FROM logs WHERE status_code > 2.5")
+            .await
+            .expect("plan")
+            .into_optimized_plan()
+            .expect("optimize");
+        let cast_filters = table_scan_filters(&plan);
+        assert!(
+            !cast_filters.is_empty(),
+            "the mismatched comparison must reach the scan"
+        );
+        assert!(
+            cast_filters.iter().any(contains_cast),
+            "DataFusion is expected to insert a Cast for the Int64-vs-Float64 comparison"
+        );
+        assert!(
+            extract_logs(&cast_filters, &declared).prune.is_empty(),
+            "a Cast-wrapped comparison must produce no prune arm"
         );
     }
 }
