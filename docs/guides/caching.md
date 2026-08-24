@@ -169,9 +169,13 @@ footprint, not against what its projections actually read.
 
 A concrete measured ratio for a representative workload is not quoted here: no
 `ravel-bench` logs run was executed in the environment this guidance was written
-in, so a fabricated number is deliberately avoided. Read the two counters off a
-real query's accounting (or `EXPLAIN ANALYZE`, which surfaces the sibling
-`pages_decoded`/`pages_skipped` counts) to get the ratio for your own workload.
+in, so a fabricated number is deliberately avoided. Neither counter is exposed
+through the server's query-facing accounting today (`EXPLAIN ANALYZE` surfaces
+only the sibling page-count fields, `pages_decoded`/`pages_skipped`, not their
+byte-denominated equivalents), so to see the ratio for your own workload, drive
+the query through `QueryAccounting` in-process -- an in-process `ravel-bench`
+run against `crates/ravel-bench/src/logs_scan_scaling.rs` is the existing
+example -- rather than reading it off a running server.
 
 ## Known gaps
 
