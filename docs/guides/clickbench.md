@@ -65,7 +65,8 @@ ravel-cli --store <your-store-flags> load \
   --tenant clickbench \
   --mapping benchmarks/clickbench/hits.mapping.toml \
   --shards 4 \
-  --batch-rows 40000
+  --batch-rows 40000 \
+  --read-cursors 4
 ```
 
 `--batch-rows` is the object-count lever. One batch is one Strict flush, which is
@@ -74,6 +75,20 @@ footer read, decode setup) is paid thousands of times per query and can dominate
 everything the columnar and pushdown work saves, so object count is a
 first-class variable: raise `--batch-rows` for fewer, larger objects; lower it
 for the opposite. Measure both if you care where the time goes.
+
+`--read-cursors` matters because `hits.parquet` is globally sorted by
+`CounterID` (issue #560), and `CounterID` is `hits.mapping.toml`'s sole
+`resource_attribute`. A single sequential reader therefore fills every
+`--batch-rows` batch with one contiguous run of one `CounterID` value: one
+`shard_for_log` hash, one shard, and one core doing all of that batch's encode
+work while the other `--shards - 1` sit idle. `--read-cursors 4` opens 4 stride
+cursors over disjoint, near-even, far-apart row-group partitions and assembles
+each batch from a contiguous run out of every live cursor, so one batch spans 4
+different regions of the file (and, on this entity-sorted input, 4 different
+`CounterID`s) instead of one. Match it to `--shards` so a batch can spread
+across every shard; `1` reproduces today's sequential read exactly. A load that
+still reports a narrow shard spread prints a stderr warning naming the observed
+spread and this flag as one of the levers to raise it.
 
 `hits.mapping.toml` declares `CounterID` as a `resource_attribute` (issue
 #519), so it is part of stream identity and `shard_for_log` hashes it to pick
@@ -90,6 +105,12 @@ shard's average slice at or above 8192: `40000` keeps that margin (`40000 / 4
 the pre-#519 single-shard `10000` batch size at ~100M rows. Lower `--shards`
 or raise `--batch-rows` further if a load still reports objects smaller than
 expected.
+
+This `--batch-rows`-scales-with-`--shards` sizing floor still applies once
+`--read-cursors` is in play: stride reading changes which rows a batch is
+assembled *from*, not how many rows in total each shard receives per batch, so
+the ~8192-rows-per-shard floor above is unchanged. Raising `--shards` still
+means raising `--batch-rows` to match, regardless of `--read-cursors`.
 
 The loader prints a completion summary to stdout — `rows processed`,
 `objects written`, and `elapsed` (the load wall-time ClickBench reports). It also
