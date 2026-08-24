@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::encoding::{
     DecodedStrings, Enc, decode_bitmap, decode_f64, decode_fixed, decode_i64,
     decode_strings_columnar, encode_bitmap, encode_f64, encode_fixed, encode_i64, encode_strings,
+    encode_strings_dict,
 };
 use crate::error::LogSegError;
 use crate::page::{PageDesc, read_page, write_page};
@@ -451,6 +452,17 @@ fn winner_value(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
         .map(|(_, v)| v)
 }
 
+/// A block's dictionary-shaped view of one Str/Bytes plan column: the column's
+/// distinct value set (`dict`, in any order, possibly with entries no id
+/// references) and one `Option<index into dict>` per block row (`Some` for a
+/// present row, `None` for absent). The encoder derives the sorted RLOG
+/// dictionary and the dict-versus-plain choice from the referenced distinct
+/// values, so string encoding costs a sort per distinct value, not per row.
+pub struct BlockStrDict<'a> {
+    pub dict: &'a [Vec<u8>],
+    pub ids: &'a [Option<u32>],
+}
+
 /// One block's data already in column-major form, the input to
 /// [`write_block_columnar`]. Each per-row slice has `n` entries; the optional
 /// fixed columns pair a per-row `*_present` bitmap with a dense `*_vals` slice
@@ -481,6 +493,12 @@ pub struct ColumnarBlockInput<'a> {
     /// stat winner for the column, `None` when the row contributes only to
     /// `null_count`.
     pub stat_values: &'a [Vec<Option<ColumnValue>>],
+    /// Per plan (in `plans` order): `Some` when the plan is a Str/Bytes column
+    /// supplied in dictionary shape, in which case its value page is encoded
+    /// via [`encode_strings_dict`] (per distinct value, ADR-0109 decision 3)
+    /// and `values[idx]` is ignored for that plan. `None` keeps the plain
+    /// per-row `values` path unchanged.
+    pub str_dicts: &'a [Option<BlockStrDict<'a>>],
 }
 
 /// Encodes one block from column-major input, byte-identical to
@@ -605,17 +623,26 @@ pub fn write_block_columnar(
                 );
             }
             FieldType::Str | FieldType::Bytes => {
-                let vv: Vec<&[u8]> = vals
-                    .iter()
-                    .filter_map(|v| match v {
-                        Some(ColumnValue::Str(x)) | Some(ColumnValue::Bytes(x)) => {
-                            Some(x.as_slice())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let (enc, b) = encode_strings(&vv);
-                stage_column(&mut pages, cid, &present, enc, b);
+                if let Some(dp) = &input.str_dicts[idx] {
+                    // Dictionary-shaped column: encode per distinct value.
+                    let dpresent: Vec<bool> = dp.ids.iter().map(Option::is_some).collect();
+                    let present_ids: Vec<u32> = dp.ids.iter().filter_map(|x| *x).collect();
+                    let dref: Vec<&[u8]> = dp.dict.iter().map(Vec::as_slice).collect();
+                    let (enc, b) = encode_strings_dict(&dref, &present_ids);
+                    stage_column(&mut pages, cid, &dpresent, enc, b);
+                } else {
+                    let vv: Vec<&[u8]> = vals
+                        .iter()
+                        .filter_map(|v| match v {
+                            Some(ColumnValue::Str(x)) | Some(ColumnValue::Bytes(x)) => {
+                                Some(x.as_slice())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let (enc, b) = encode_strings(&vv);
+                    stage_column(&mut pages, cid, &present, enc, b);
+                }
             }
         }
     }
