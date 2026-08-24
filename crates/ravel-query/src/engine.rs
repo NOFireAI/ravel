@@ -2236,6 +2236,7 @@ mod name_filter_tests {
 /// so the pre-fetch window this computes lines up with what the evaluator
 /// itself will later select.
 fn parse_selector(query: &str) -> Result<(Vec<LabelMatcher>, i64), QueryError> {
+    ravel_promql::complexity_guard::check(query).map_err(|e| QueryError::Parse(e.to_string()))?;
     let expr = promql_parser::parser::parse(query).map_err(QueryError::Parse)?;
     let vs = match expr {
         Expr::VectorSelector(vs) => vs,
@@ -3538,6 +3539,23 @@ mod tests {
     use ravel_types::{Label, LabelSet, SeriesId};
 
     use super::*;
+
+    /// Issue #529: the labels/series HTTP endpoints
+    /// (`http/handlers.rs`'s `match[]` parameter) reach `parse_selector`
+    /// through this wrapper before the evaluator's own parse ever runs, so
+    /// it needs the same pre-parse complexity guard.
+    #[test]
+    fn overly_complex_match_selector_is_rejected_not_parsed() {
+        let mut selector = String::from("1");
+        for _ in 0..300 {
+            selector.push_str("+1");
+        }
+        let err = parse_match_selector(&selector).expect_err("must be rejected before parsing");
+        assert!(
+            matches!(err, QueryError::Parse(_)),
+            "expected QueryError::Parse, got {err:?}"
+        );
+    }
 
     /// A cluster-local (or all-remotes-healthy) query is `Complete`: its stats
     /// carry `partial = false`, so no coverage gap is reported (ADR-0071

@@ -187,6 +187,7 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
 fn from_eval_error(inner: &ravel_promql::Error, outer: &QueryError) -> ApiError {
     match inner {
         ravel_promql::Error::Parse(_)
+        | ravel_promql::Error::TooComplex(_)
         | ravel_promql::Error::TimeOverflow
         | ravel_promql::Error::NonPositiveStep { .. }
         | ravel_promql::Error::InvalidRange { .. }
@@ -417,6 +418,20 @@ mod tests {
             expected: "instant vector",
             got: "range vector",
         });
+        match ApiError::from(err) {
+            ApiError::BadData(_) => {}
+            other => panic!("expected BadData, got a different ApiError variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_too_complex_maps_to_bad_data_not_unavailable() {
+        // A query rejected by the pre-parse complexity guard (issue #529)
+        // is a malformed-input-shaped rejection, exactly like Parse: it
+        // must not fall into the catch-all's blanket 503 redaction.
+        let err = QueryError::Eval(ravel_promql::Error::TooComplex(
+            ravel_promql::complexity_guard::QueryTooComplex { count: 9, max: 3 },
+        ));
         match ApiError::from(err) {
             ApiError::BadData(_) => {}
             other => panic!("expected BadData, got a different ApiError variant: {other:?}"),
@@ -683,6 +698,11 @@ mod tests {
                 })
             },
             || QueryError::Eval(PromErr::TooManyPoints { points: 9, max: 3 }),
+            || {
+                QueryError::Eval(PromErr::TooComplex(
+                    ravel_promql::complexity_guard::QueryTooComplex { count: 9, max: 3 },
+                ))
+            },
             || {
                 QueryError::Eval(PromErr::AmbiguousMatch {
                     detail: "many-to-many".to_string(),
