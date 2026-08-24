@@ -2,6 +2,12 @@
 
 One decision per document. Status: Proposed | Accepted | Superseded.
 
+Numbering: ADR 0001 through 0109 are sequential. From ADR 0110 onward the
+number is the GitHub issue number of the epic that produced it, so the
+sequence jumps. GitHub allocates issue numbers atomically, which removes
+the collision that sequential numbering had between parallel sessions and
+the reservation commit that used to work around it.
+
 | # | Title | Status |
 |---|-------|--------|
 | [0001](0001-object-native-l0.md) | Object-native L0, no local WAL | Accepted |

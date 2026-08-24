@@ -19,6 +19,7 @@ stage.
 
 | Stage | Output | Gate |
 |---|---|---|
+| 0 Measure | Profiled baseline on the real workload | a number, not a hypothesis |
 | 1 Design | ADR + epic issue | HUMAN APPROVAL (only one) |
 | 2 Decompose | Task table, DAG, waves, sub-issues | waves have zero file overlap |
 | 3 Execute | Fleet dispatch per wave, ledger entries | all tasks terminal |
@@ -28,36 +29,49 @@ stage.
 Stages 3-5 loop per wave. Wave N+1 is not dispatched until wave N has
 landed on main.
 
+## Stage 0 - Measure
+
+A performance epic aimed by a report instead of a profile spends its
+whole budget on the wrong half of the system. Before Stage 1:
+
+1. Run the real target workload end to end and record where the time
+   goes, per phase. Use the profile-hotspot skill; the CLI and bench
+   crates already carry stage-timing and flamegraph lanes.
+2. Write the numbers into the epic issue body: total, the phase that
+   dominates, and the measurement command so anyone can re-run it.
+3. The epic's Decision must name the measured bottleneck it attacks and
+   the number it moves. "The audit suggests X is slow" is not a
+   bottleneck; a stage timing is.
+
+Skip Stage 0 only for an epic with no performance claim at all. If you
+skip it, say so in the epic body and say why.
+
 ## Stage 1 - Design
 
 1. Research against the actual codebase: Explore subagents over the
    crates the intent touches, plus their normative docs from the
    CLAUDE.md doc map. Never read vendored dependency sources.
-2. Claim the ADR number the moment you pick it, before writing the full
-   ADR. Commit a one-line stub at `docs/adrs/NNNN-<slug>.md` (next free
-   number) containing just a title line and `Status: claimed`, and land
-   it on main through its own small PR right away. The reservation is
-   then visible on main to every other in-flight epic, so two parallel
-   epics cannot pick the same number. A number reserved only locally
-   collides: nothing hits main until after the approval gate, and two
-   parallel epics pick the same next-free number. Then write the full
-   ADR (Context, Decision, Rejected alternatives, each with the
-   concrete reason it lost, Consequences) into the same path,
-   overwriting the stub's content. Include at least one diagram
-   (Mermaid: component or data-flow; trust-boundary for anything
-   security-shaped). The approval gate is the most expensive place in
-   the pipeline to loop back, and a prose-only ADR has cost an extra
-   approval round trip there when the approver sent it back for
-   diagrams. If any frozen format is touched,
-   follow the format-change skill before writing the full ADR.
-3. Open the epic issue:
+2. Open the epic issue FIRST:
    `gh issue create --title "Epic: <feature>" --body-file <body>`
-   Body: intent paragraph, ADR path, empty `## Tasks` checklist, empty
-   `## Ledger` section.
+   Body: intent paragraph, Stage 0 numbers, empty `## Tasks` checklist,
+   empty `## Ledger` section. Then assign it to yourself
+   (`gh issue edit <n> --add-assignee @me`). The assignee is the claim:
+   ownership that lives only in a session's head collides the moment a
+   second session picks "the next obvious thing".
+3. **The ADR number is the epic issue number.** GitHub allocates issue
+   numbers atomically, so two parallel epics cannot collide, and no
+   reservation step is needed. Write the full ADR at
+   `docs/adrs/NNNN-<slug>.md` where NNNN is the zero-padded issue
+   number. Sections: Context, Decision, Rejected alternatives (each with
+   the concrete reason it lost), Consequences. Include at least one
+   diagram (Mermaid: component or data-flow; trust-boundary for anything
+   security-shaped) - a prose-only ADR has cost an extra approval round
+   trip. If any frozen format is touched, follow the format-change skill
+   before writing the full ADR.
 4. STOP. Present ADR summary, rejected alternatives, and issue number.
-   The stub from step 2 is already on main (that only reserves the
-   number); do not commit the full ADR content yet. This is the only
-   mandatory human gate; on approval, commit the full ADR over the stub
+   Nothing is committed yet: there is no stub to land, because the issue
+   number already reserves the ADR number. This is the only mandatory
+   human gate; on approval, commit the ADR
    (`docs: add ADR-NNNN <title>`, trailer `Refs: #<epic>`), push, and
    proceed without further confirmation.
 
