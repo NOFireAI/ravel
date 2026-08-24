@@ -282,7 +282,9 @@ impl SqlError {
             },
             SqlError::LogFetch(fetch) => match fetch {
                 LogFetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
-                LogFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
+                LogFetchError::Store { .. } | LogFetchError::EtagChanged { .. } => {
+                    MSG_UNAVAILABLE.to_string()
+                }
             },
             SqlError::SpanFetch(fetch) => match fetch {
                 // A cross-tenant object is an integrity violation of the fetched
