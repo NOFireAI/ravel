@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
 use crate::block::{ColumnPlan, ColumnarBlockInput, write_block, write_block_columnar};
-use crate::columnar_batch::ColumnarLogBatch;
 use crate::bloom::BloomBuilder;
 use crate::bloom_section::encode_bloom_section;
+use crate::columnar_batch::ColumnarLogBatch;
 use crate::error::LogSegError;
 use crate::field_dir::{FieldDir, FieldEntry};
 use crate::footer::{COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, kind, write_footer_and_trailer};
@@ -937,8 +937,7 @@ impl RlogWriter {
 
         // Per-plan, per-row value and stat arrays: contiguous per column, so a
         // block's value page is an O(1) index per row, never a gather.
-        let mut col_values: Vec<Vec<Option<ColumnValue>>> =
-            vec![vec![None; total_rows]; num_plans];
+        let mut col_values: Vec<Vec<Option<ColumnValue>>> = vec![vec![None; total_rows]; num_plans];
         let mut col_stat: Vec<Vec<Option<ColumnValue>>> = vec![vec![None; total_rows]; num_plans];
 
         // Per-row in-budget columnar occurrences (row.columns), overflow
@@ -1060,8 +1059,8 @@ impl RlogWriter {
         {
             let mut start = 0usize;
             let mut bytes = 0usize;
-            for i in 0..perm.len() {
-                let est = row_estimate(perm[i]);
+            for (i, &grow) in perm.iter().enumerate() {
+                let est = row_estimate(grow);
                 let count = i - start;
                 if count > 0
                     && (count >= self.cfg.block_target_records
@@ -1128,8 +1127,7 @@ impl RlogWriter {
             let body_v: Vec<&[u8]> = block_rows.iter().map(|&g| g_body[g]).collect();
             let trace_present_v: Vec<bool> =
                 block_rows.iter().map(|&g| g_trace[g].is_some()).collect();
-            let trace_vals_v: Vec<&[u8]> =
-                block_rows.iter().filter_map(|&g| g_trace[g]).collect();
+            let trace_vals_v: Vec<&[u8]> = block_rows.iter().filter_map(|&g| g_trace[g]).collect();
             let span_present_v: Vec<bool> =
                 block_rows.iter().map(|&g| g_span[g].is_some()).collect();
             let span_vals_v: Vec<&[u8]> = block_rows.iter().filter_map(|&g| g_span[g]).collect();
@@ -2810,8 +2808,8 @@ mod tests {
                 any::<u32>(),
                 proptest::collection::vec((arb_name(), arb_attr_value()), 0..6),
             )
-                .prop_map(
-                    |(s, ts, sev, sevt, body, trace, span, flags, attrs)| LogRecord {
+                .prop_map(|(s, ts, sev, sevt, body, trace, span, flags, attrs)| {
+                    LogRecord {
                         stream_id: id(s),
                         stream_attrs: attrs_blob(s),
                         ts_ns: ts,
@@ -2823,8 +2821,8 @@ mod tests {
                         span_id: span,
                         flags,
                         attrs,
-                    },
-                )
+                    }
+                })
         }
 
         fn split(recs: &[LogRecord], n: usize) -> Vec<&[LogRecord]> {
@@ -2912,8 +2910,8 @@ mod tests {
 
             let cfg = RlogConfig::default();
             let mut w = RlogWriter::new(cfg, identity());
-            w.push(r1.clone()).unwrap();
-            w.push(r2.clone()).unwrap();
+            w.push(r1.clone()).expect("row push r1");
+            w.push(r2.clone()).expect("row push r2");
             assert!(matches!(
                 w.finish(),
                 Err(LogSegError::InconsistentStreamAttrs(_))
@@ -2921,9 +2919,9 @@ mod tests {
 
             let mut w2 = RlogWriter::new(cfg, identity());
             w2.push_columnar(ColumnarLogBatch::from_records(std::slice::from_ref(&r1)))
-                .unwrap();
+                .expect("columnar push r1");
             w2.push_columnar(ColumnarLogBatch::from_records(std::slice::from_ref(&r2)))
-                .unwrap();
+                .expect("columnar push r2");
             assert!(matches!(
                 w2.finish(),
                 Err(LogSegError::InconsistentStreamAttrs(_))

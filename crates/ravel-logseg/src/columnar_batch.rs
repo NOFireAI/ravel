@@ -305,14 +305,13 @@ impl ColumnarLogBatch {
 
             // First occurrence of a (name, type) takes the column cell; a later
             // same-(name,type) occurrence in this record is a residual.
-            let mut taken: std::collections::HashSet<(String, u8)> = std::collections::HashSet::new();
+            let mut taken: std::collections::HashSet<(String, u8)> =
+                std::collections::HashSet::new();
             for (k, v) in &r.attrs {
                 let (ty, _) = resolve_value(v);
                 let key = (k.clone(), ty.to_u8());
                 if taken.insert(key.clone()) {
-                    let col = col_cells
-                        .entry(key)
-                        .or_insert_with(|| vec![None; n]);
+                    let col = col_cells.entry(key).or_insert_with(|| vec![None; n]);
                     col[row] = Some(v.clone());
                 } else {
                     batch.residual_attrs[row].push((k.clone(), v.clone()));
