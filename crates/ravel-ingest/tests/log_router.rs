@@ -19,7 +19,9 @@ use common::{TestClock, tenant};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_ingest::{IngestConfig, LogIngestRouter, LogWriteError, WriteMode};
-use ravel_logseg::{Predicate, RlogConfig, RlogReader, stream_attrs_bytes};
+use ravel_logseg::{
+    ColumnarLogBatch, LogRecord, Predicate, RlogConfig, RlogReader, stream_attrs_bytes,
+};
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
@@ -451,6 +453,104 @@ async fn partial_failure_recovers_the_surviving_shards_token() {
     );
 
     // Prove the injected fault fired: the victim shard's data PUT was rejected.
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::Permanent),
+        1,
+        "the permanent data-object PUT fault fired exactly once (shard 0, no retry)"
+    );
+
+    router.shutdown().await;
+}
+
+/// A field-for-field rename of a [`NormalizedLogRecord`] into a [`LogRecord`],
+/// so a fixture built for the row path can seed a [`ColumnarLogBatch`] for the
+/// columnar path with the identical records.
+fn to_logrecord(r: &NormalizedLogRecord) -> LogRecord {
+    LogRecord {
+        stream_id: r.stream_id,
+        stream_attrs: r.stream_attrs.clone(),
+        ts_ns: r.ts_ns,
+        observed_ts_ns: r.observed_ts_ns,
+        severity_num: r.severity_num,
+        severity_text: r.severity_text.clone(),
+        body: r.body.clone(),
+        trace_id: r.trace_id,
+        span_id: r.span_id,
+        flags: r.flags,
+        attrs: r.attrs.clone(),
+    }
+}
+
+/// Issue #296 on the columnar path (ADR-0109 decision 4): a multi-shard Strict
+/// `write_columnar` where one shard's flush is abandoned (its data-object PUT
+/// fails permanently) while a sibling shard commits durably in the same call.
+/// The failure must still surface as an error, and the sibling's commit token
+/// must be recoverable via `LogWriteError::durable_tokens`. This proves the
+/// partial-failure durable-token accounting is unchanged by the new input
+/// shape: `write_columnar` folds acks through the exact same `await_strict_acks`
+/// path as `write`.
+///
+/// The injected fault is asserted via the `FaultStore` counter so the test
+/// proves the abandonment actually fired.
+#[tokio::test]
+async fn columnar_partial_failure_recovers_the_surviving_shards_token() {
+    let shard_count = 4;
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("simulated permanent data-object PUT failure".into()),
+        )
+        .with_key_contains("/l0/0000/")
+        .with_occurrence(Occurrence::Always),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let clock = TestClock::new(BASE_NS);
+    let router = LogIngestRouter::new(
+        flush_on_first(shard_count),
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        clock.clone(),
+    );
+
+    let tenant = tenant("acme");
+    let victim = record_on_shard(0, shard_count, 1_000, "victim");
+    let survivor = record_on_shard(1, shard_count, 2_000, "survivor");
+    assert_ne!(
+        shard_for_log(&victim.stream_id, shard_count),
+        shard_for_log(&survivor.stream_id, shard_count),
+        "the fixture must span two shards"
+    );
+
+    // One batch carrying both records; `write_columnar` partitions it back to
+    // the two shards by `shard_for_log`, exactly as `write` groups the records.
+    let batch = ColumnarLogBatch::from_records(&[to_logrecord(&victim), to_logrecord(&survivor)]);
+    let err = router
+        .write_columnar(
+            tenant.clone(),
+            batch,
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("one shard's flush was abandoned, so the write is a failure");
+
+    assert!(
+        err.is_retryable(),
+        "an abandoned-flush partial write stays retryable, got {err}"
+    );
+
+    let recovered = err.durable_tokens();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "exactly the surviving shard's token is recoverable, got {recovered:?}"
+    );
+    let records = read_back(store.as_ref(), &tenant.hash(), &recovered[0]).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].body, "survivor",
+        "the recovered token points at the shard that actually committed"
+    );
+
     assert_eq!(
         store.fault_count(Op::Put, FaultKind::Permanent),
         1,
