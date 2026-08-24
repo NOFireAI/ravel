@@ -162,6 +162,20 @@ is a fixed development value: the `demo-token` bearer token and the MinIO
 (`127.0.0.1`) only, so the checked-in token never fronts an ingest endpoint on
 your network. None of these values are for a deployment that a network can reach.
 
+### Storage beyond the demo stack
+
+A real deployment points `--store s3` at any S3-compatible store with static
+keys, exactly as the quickstart points it at MinIO. On EC2 you can drop the
+static keys entirely: attach an IAM role to the instance and start with
+
+    ravel-server --store s3 --s3-bucket my-bucket --s3-region us-east-1 --s3-auth instance-role
+
+Credentials are fetched from the instance metadata service at startup and
+refreshed before they expire, so nothing long-lived is stored on the instance.
+The [operations guide](docs/guides/operations.md) documents every storage flag,
+including temporary session tokens and a rotating credentials file for
+non-EC2 deployments (ADR-0106, ADR-0072).
+
 ## How it fits together
 
 ![architecture](docs/diagrams/architecture.svg)
